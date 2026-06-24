@@ -1,0 +1,102 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/flux-core",
+    "crates/flux-policy",
+    "crates/flux-secret",
+    "crates/flux-spec",
+    "crates/flux-config",
+    "crates/flux-provider",
+    "crates/flux-system",
+    "crates/flux-runtime",
+    "crates/flux-tools",
+    "crates/flux-session",
+    "crates/flux-context",
+    "crates/flux-skill",
+    "crates/flux-agent",
+    "crates/flux-orchestrate",
+    "crates/flux-plugin",
+    "crates/flux-hooks",
+    "crates/flux-anthropic",
+    "crates/flux-openai",
+    "crates/flux-credentials",
+    "crates/flux-sdk",
+    "crates/flux-auth",
+    "crates/flux-evidence",
+    "crates/flux-datasource",
+    "crates/flux-server",
+    "crates/flux-integrations",
+    "crates/flux-browser",
+    "crates/flux-tui",
+    "crates/flux-cli",
+    "crates/flux-codegate",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/codewandler/flux"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# internal
+flux-core = { path = "crates/flux-core" }
+flux-policy = { path = "crates/flux-policy" }
+flux-secret = { path = "crates/flux-secret" }
+flux-spec = { path = "crates/flux-spec" }
+flux-config = { path = "crates/flux-config" }
+flux-system = { path = "crates/flux-system" }
+flux-runtime = { path = "crates/flux-runtime" }
+flux-tools = { path = "crates/flux-tools" }
+flux-session = { path = "crates/flux-session" }
+flux-agent = { path = "crates/flux-agent" }
+flux-context = { path = "crates/flux-context" }
+flux-skill = { path = "crates/flux-skill" }
+flux-orchestrate = { path = "crates/flux-orchestrate" }
+flux-plugin = { path = "crates/flux-plugin" }
+flux-hooks = { path = "crates/flux-hooks" }
+flux-auth = { path = "crates/flux-auth" }
+flux-evidence = { path = "crates/flux-evidence" }
+flux-datasource = { path = "crates/flux-datasource" }
+flux-server = { path = "crates/flux-server" }
+flux-integrations = { path = "crates/flux-integrations" }
+flux-browser = { path = "crates/flux-browser" }
+flux-sdk = { path = "crates/flux-sdk" }
+flux-tui = { path = "crates/flux-tui" }
+flux-provider = { path = "crates/flux-provider" }
+flux-anthropic = { path = "crates/flux-anthropic" }
+flux-openai = { path = "crates/flux-openai" }
+flux-credentials = { path = "crates/flux-credentials" }
+
+# external
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+futures-util = "0.3"
+bytes = "1"
+async-trait = "0.1"
+async-stream = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+eventsource-stream = "0.2"
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.29"
+crossterm = "0.28"
+toml = "0.8"
+base64 = "0.22"
+sha2 = "0.10"
+rand = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+rquickjs = "0.6"
+axum = "0.7"
+url = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

@@ -1,0 +1,34 @@
+[package]
+name = "flux-plugin"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "flux subprocess plugin protocol + host + SDK: any-language plugins over framed (NDJSON) stdio"
+
+[dependencies]
+flux-core.workspace = true
+flux-runtime.workspace = true
+flux-spec.workspace = true
+flux-system.workspace = true
+flux-secret.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+url.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+flux-runtime.workspace = true
+flux-system.workspace = true
+
+[[bin]]
+name = "echo_plugin"
+path = "src/bin/echo_plugin.rs"
+
+[[bin]]
+name = "caps_plugin"
+path = "src/bin/caps_plugin.rs"

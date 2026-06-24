@@ -1,0 +1,22 @@
+[package]
+name = "flux-server"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "flux HTTP API daemon: create/drive/inspect agent sessions over REST (axum)"
+
+[dependencies]
+flux-core.workspace = true
+flux-agent.workspace = true
+flux-runtime.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+async-stream.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+reqwest.workspace = true

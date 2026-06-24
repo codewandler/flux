@@ -1,0 +1,9 @@
+[package]
+name = "flux-codegate"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "flux architecture lint: enforces that inner crates never depend on outer layers (the codegate analog)"
+
+[dev-dependencies]
+toml.workspace = true

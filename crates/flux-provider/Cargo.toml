@@ -1,0 +1,20 @@
+[package]
+name = "flux-provider"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "flux provider abstraction: the Provider trait, request/stream types, model resolution"
+
+[dependencies]
+flux-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "flux-sdk"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "flux high-level library API: build a tool-enabled, policy-gated agent and run turns"
+
+[dependencies]
+flux-core.workspace = true
+flux-provider.workspace = true
+flux-runtime.workspace = true
+flux-system.workspace = true
+flux-tools.workspace = true
+flux-session.workspace = true
+flux-agent.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+futures.workspace = true

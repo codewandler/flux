@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Note: deliberately NOT setting `RUSTFLAGS: -D warnings` globally — that would also deny warnings
+  # in third-party dependencies, breaking CI on any upstream warning or new rustc lint. Warning
+  # enforcement for our own code lives in the clippy step below (`-- -D warnings`).
+
+jobs:
+  check:
+    name: build · test · clippy · fmt · layering
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Test
+        run: cargo test --workspace
+
+      # The architecture lint (fluxplane `codegate` analog): inner crates must not depend on outer
+      # layers. Run explicitly too so a layering regression is an obvious, named failure.
+      - name: Architecture layering lint
+        run: cargo test -p flux-codegate

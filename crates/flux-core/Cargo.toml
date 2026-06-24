@@ -1,0 +1,11 @@
+[package]
+name = "flux-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "flux core contracts: content blocks, messages, streaming chunks, events, errors (pure, no IO)"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

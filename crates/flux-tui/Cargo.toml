@@ -1,0 +1,20 @@
+[package]
+name = "flux-tui"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "flux ratatui chat UI: streaming chat view + input, driving the agent loop"
+
+[dependencies]
+flux-core.workspace = true
+flux-agent.workspace = true
+flux-runtime.workspace = true
+flux-spec.workspace = true
+flux-evidence.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+async-trait.workspace = true

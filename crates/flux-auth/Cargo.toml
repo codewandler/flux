@@ -1,0 +1,9 @@
+[package]
+name = "flux-auth"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "flux caller identity: IdentityProvider trait, local single-user default, OIDC plugin seam"
+
+[dependencies]
+flux-policy.workspace = true

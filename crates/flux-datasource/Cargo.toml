@@ -1,0 +1,18 @@
+[package]
+name = "flux-datasource"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "flux datasource: an in-memory keyword index with a `search` tool for the agent"
+
+[dependencies]
+flux-core.workspace = true
+flux-runtime.workspace = true
+flux-spec.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+flux-system.workspace = true

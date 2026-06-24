@@ -1,0 +1,9 @@
+[package]
+name = "flux-policy"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "flux pure authorization: default-deny grant evaluation with trust levels, scopes, and wildcard/path matching"
+
+[dependencies]
+serde.workspace = true

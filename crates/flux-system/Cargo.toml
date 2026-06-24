@@ -1,0 +1,13 @@
+[package]
+name = "flux-system"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "flux guarded IO boundary: workspace path resolution (escape/symlink rejection), argv-only process exec, env"
+
+[dependencies]
+flux-core.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

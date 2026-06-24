@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+.flux/
+*.db
+*.db-wal
+*.db-shm
+.env
+
+# IDE
+/.idea/

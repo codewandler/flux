@@ -1,0 +1,12 @@
+[package]
+name = "flux-config"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "flux configuration: load/merge .flux/config.toml (project + user) — perm rules, default model, policy grants, network policy"
+
+[dependencies]
+flux-core.workspace = true
+flux-policy.workspace = true
+serde.workspace = true
+toml.workspace = true

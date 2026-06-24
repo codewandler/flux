@@ -1,0 +1,21 @@
+[package]
+name = "flux-runtime"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "flux safety envelope: Tool trait, registry, permission rules, approval gate, and the dispatcher that enforces them"
+
+[dependencies]
+flux-core.workspace = true
+flux-spec.workspace = true
+flux-secret.workspace = true
+flux-system.workspace = true
+flux-policy.workspace = true
+flux-evidence.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

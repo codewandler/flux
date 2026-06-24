@@ -1,0 +1,9 @@
+[package]
+name = "flux-skill"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "flux skills: markdown + frontmatter knowledge packs with triggers, discovered from skill directories"
+
+[dependencies]
+serde.workspace = true

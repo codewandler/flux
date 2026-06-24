@@ -1,0 +1,9 @@
+[package]
+name = "flux-secret"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "flux secret references, material, sensitivity, and log/output redaction (pure)"
+
+[dependencies]
+serde.workspace = true

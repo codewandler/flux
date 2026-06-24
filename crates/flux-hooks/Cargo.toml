@@ -1,0 +1,11 @@
+[package]
+name = "flux-hooks"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "flux JavaScript hooks: pre-tool observe/modify/deny hooks evaluated in an embedded JS engine (QuickJS)"
+
+[dependencies]
+flux-runtime.workspace = true
+serde_json.workspace = true
+rquickjs = "0.6"

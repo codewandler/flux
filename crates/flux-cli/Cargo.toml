@@ -1,0 +1,44 @@
+[package]
+name = "flux-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "the flux binary"
+
+[[bin]]
+name = "flux"
+path = "src/main.rs"
+
+[dependencies]
+flux-core.workspace = true
+flux-provider.workspace = true
+flux-anthropic.workspace = true
+flux-openai.workspace = true
+flux-credentials.workspace = true
+flux-runtime.workspace = true
+flux-spec.workspace = true
+flux-config.workspace = true
+flux-policy.workspace = true
+flux-auth.workspace = true
+flux-secret.workspace = true
+flux-evidence.workspace = true
+flux-system.workspace = true
+flux-tools.workspace = true
+flux-session.workspace = true
+flux-context.workspace = true
+flux-agent.workspace = true
+flux-orchestrate.workspace = true
+flux-hooks.workspace = true
+flux-server.workspace = true
+flux-tui.workspace = true
+flux-browser.workspace = true
+flux-datasource.workspace = true
+flux-plugin.workspace = true
+flux-skill.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
