@@ -100,36 +100,56 @@ fn store_path() -> Result<std::path::PathBuf> {
     Ok(home()?.join(".flux").join("credentials.toml"))
 }
 
-fn load_store() -> Store {
-    let Ok(path) = store_path() else {
-        return Store::default();
-    };
+/// Load the credential store. A corrupt file is an **error**, not an empty default — otherwise a
+/// subsequent `save_stored` would happily overwrite it, wiping every other provider's token.
+fn load_store() -> Result<Store> {
+    let path = store_path()?;
     match std::fs::read_to_string(&path) {
-        Ok(s) => toml::from_str(&s).unwrap_or_default(),
-        Err(_) => Store::default(),
+        Ok(s) => toml::from_str(&s).map_err(|e| {
+            Error::Config(format!(
+                "credentials store {} is corrupt ({e}); fix or remove it",
+                path.display()
+            ))
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Store::default()),
+        Err(e) => Err(Error::Io(e)),
     }
 }
 
 fn load_stored(provider: &str) -> Option<OAuthToken> {
-    load_store().entries.remove(provider)
+    // Reads tolerate a corrupt/missing store (fall back to env/import); only writes must not clobber.
+    load_store().ok()?.entries.remove(provider)
 }
 
-/// Persist one provider's token to the store, creating `~/.flux` and forcing 0600.
+/// Persist one provider's token to the store, creating `~/.flux` and forcing 0600. Writes
+/// atomically (temp file created 0600 + rename) so there is no world-readable window and a crash
+/// mid-write can't truncate the existing credentials.
 fn save_stored(provider: &str, token: &OAuthToken) -> Result<()> {
     let path = store_path()?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut store = load_store();
+    // Propagates a corrupt-store error rather than silently dropping the other providers' tokens.
+    let mut store = load_store()?;
     store.entries.insert(provider.to_string(), token.clone());
     let body = toml::to_string_pretty(&store)
         .map_err(|e| Error::Config(format!("serialize credentials: {e}")))?;
-    std::fs::write(&path, body)?;
-    #[cfg(unix)]
+
+    let tmp = path.with_extension("toml.tmp");
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600); // 0600 from creation — no default-umask race window
+        }
+        let mut f = opts.open(&tmp)?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all().ok();
     }
+    std::fs::rename(&tmp, &path)?; // atomic replace; the temp file's 0600 carries over
     Ok(())
 }
 
@@ -454,8 +474,22 @@ pub fn anthropic_authorize_url(pkce: &Pkce, state: &str) -> String {
 /// Exchange an authorization code (the user pastes the callback value) for tokens and persist
 /// them under the `claude` provider.
 pub async fn anthropic_exchange_and_store(code: &str, state: &str, verifier: &str) -> Result<()> {
-    // The callback value may be pasted as `code#state`.
-    let code = code.split('#').next().unwrap_or(code).trim();
+    // The callback value is pasted as `code#state`. When a state is present it MUST match the one
+    // we generated for this login — otherwise the user may have pasted an attacker-supplied code
+    // (OAuth login-CSRF / account injection). PKCE is the primary defense; this is the binding.
+    let (code, callback_state) = match code.split_once('#') {
+        Some((c, s)) => (c.trim(), Some(s.trim())),
+        None => (code.trim(), None),
+    };
+    if let Some(cb) = callback_state {
+        if cb != state {
+            return Err(Error::Config(
+                "OAuth state mismatch — aborting login (possible CSRF or a code from a different \
+                 session was pasted)"
+                    .into(),
+            ));
+        }
+    }
     let resp = reqwest::Client::new()
         .post(ANTHROPIC_TOKEN_URL)
         .json(&serde_json::json!({
@@ -606,6 +640,17 @@ mod tests {
         .unwrap();
         assert_eq!(r.access, "tok");
         assert!(r.expires_at_ms.unwrap() > now_ms());
+    }
+
+    #[tokio::test]
+    async fn oauth_rejects_state_mismatch_before_any_network() {
+        // A pasted `code#state` whose state doesn't match the one we generated must abort the login
+        // (CSRF / wrong-session guard). The mismatch returns before any HTTP call.
+        let r =
+            anthropic_exchange_and_store("attackercode#attackerstate", "my-real-state", "verifier")
+                .await;
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("state mismatch"));
     }
 
     #[test]

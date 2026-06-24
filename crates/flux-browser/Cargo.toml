@@ -9,6 +9,7 @@ description = "flux web access: a guarded web_fetch tool (no loopback/private eg
 flux-core.workspace = true
 flux-runtime.workspace = true
 flux-spec.workspace = true
+flux-system.workspace = true
 reqwest.workspace = true
 url.workspace = true
 async-trait.workspace = true
@@ -16,4 +17,3 @@ serde_json.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
-flux-system.workspace = true

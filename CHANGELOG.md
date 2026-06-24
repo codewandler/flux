@@ -4,6 +4,60 @@ All notable changes to this project are documented in this file. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] — 2026-06-25
+
+Security and robustness hardening from a full source-tree review. No API additions; existing
+behavior is preserved except where it was unsafe.
+
+### Security
+
+- **Sandbox escape closed** — the workspace path guard now resolves symlinks component-by-component
+  (including *dangling* symlinks, which `Path::exists()` skips), so a write through an in-workspace
+  symlink pointing outside the root is rejected.
+- **Subprocess isolation** — model-run commands no longer inherit flux's environment; only a minimal
+  non-secret allow-list (`PATH`, `HOME`, …) is passed, so secrets like `ANTHROPIC_API_KEY` can't be
+  read by a spawned command.
+- **Plugin capability model** — host capabilities (`process.run`, `secret`, `http.do`) are now granted
+  per-plugin from the manifest and checked on every call: a plugin can only run allow-listed programs,
+  read allow-listed env keys, and reach the network if it declared `http`. Plugin operations also
+  declare effects, so they pass through the authorization floor like built-in tools.
+- **HTTP daemon authentication** — `flux --serve` now requires a bearer token (`FLUX_SERVER_TOKEN`) on
+  every route except `/health`, and refuses a non-loopback bind without one (it auto-approves tools, so
+  an open listener was remote code execution).
+- **Authorization floor** — a policy grant marked `requires_approval` now forces the approval prompt
+  even under a permissive permission rule (previously the `ApprovalRequired` decision was discarded).
+- **Sub-agent scoping** — a role with `tools: []` now grants *zero* tools (an explicit empty allowlist),
+  instead of inheriting the parent's full toolset.
+- **SSRF guard** — web egress (`web_fetch` and plugin `http.do`) share one guard that resolves hostnames
+  to IPs and blocks private/loopback/link-local/unique-local/CGNAT and IPv4-mapped ranges, plus internal
+  hostnames — closing hostname- and IPv6-based metadata-endpoint access.
+- **Secret redaction** — registered secrets are stored trimmed (so a trailing newline no longer defeats
+  redaction) and punctuation-glued credential shapes (`api_key=sk-…`) are now scrubbed.
+- **OAuth login** — the Claude PKCE login validates the callback `state` against the locally generated
+  value (CSRF / code-injection guard).
+- **Credential store** — written atomically with `0600` from creation (no world-readable window); a
+  corrupt store is now an error instead of being silently overwritten (which wiped other providers'
+  tokens).
+- **Defense-in-depth** — policy path globs are normalized before matching (a `..` traversal can't widen a
+  grant), subject-scoped deny rules fail safe to a prompt when no subjects are reported, unscoped writes
+  force approval, user+project policy grants concatenate (a project policy no longer drops user grants),
+  and `bash` permission parsing surfaces programs hidden behind `VAR=`/`$(…)`/backticks and flags
+  unresolved shell expansion for approval.
+
+### Fixed
+
+- **Session shape** — reaching the per-turn iteration cap while still calling tools now appends a final
+  assistant message, so the next turn isn't poisoned by an invalid user-after-user sequence (the third
+  of the cancel/compaction/iteration-cap family).
+- **Panics & DoS** — char-boundary-safe truncation of fetched/plugin bodies; `saturating_add` in the
+  `read` tool's line range; byte→char offset in search snippets; caps on captured process output, framed
+  plugin reads, and the OpenAI tool-call accumulator; and a wall-clock interrupt on JS hooks.
+- **Provider accounting** — Anthropic input/cache token counts from `message_start` are preserved into the
+  final usage chunk instead of being zeroed by the `message_delta`; OpenAI Responses truncation now maps
+  to a `MaxTokens` stop reason.
+- **Resilience** — `--continue` surfaces real SQLite errors instead of silently starting fresh; a failed
+  worker in a parallel `/pd` wave no longer discards its completed siblings.
+
 ## [0.1.0] — 2026-06-24
 
 First release.
@@ -36,4 +90,5 @@ First release.
 - **Tooling** — an architecture layering lint that fails on inner→outer crate dependencies, and CI
   running build/test/clippy/fmt.
 
+[0.1.1]: https://github.com/codewandler/flux/releases/tag/v0.1.1
 [0.1.0]: https://github.com/codewandler/flux/releases/tag/v0.1.0

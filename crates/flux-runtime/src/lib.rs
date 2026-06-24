@@ -176,12 +176,14 @@ impl ToolRegistry {
         self.tools.values().map(|t| t.spec()).collect()
     }
 
-    /// A registry containing only the named tools (empty `names` = clone all). Used to give a
-    /// sub-agent a scoped toolset.
-    pub fn subset(&self, names: &[String]) -> ToolRegistry {
-        if names.is_empty() {
+    /// A registry scoped to a sub-agent's allowed tools. `None` (the role declared no `tools` key)
+    /// inherits all parent tools; `Some(names)` keeps only those — so `Some(&[])`, an *explicitly
+    /// empty* allowlist, yields an empty registry. (Previously an empty slice meant "all", which
+    /// silently turned the most-restrictive declaration into the least-restrictive outcome.)
+    pub fn subset(&self, names: Option<&[String]>) -> ToolRegistry {
+        let Some(names) = names else {
             return self.clone();
-        }
+        };
         let tools = self
             .tools
             .iter()
@@ -422,9 +424,11 @@ impl Executor {
         let subjects = tool.permission_subjects(&params);
         let intents = tool.intents(&params);
 
-        // 1. Authorization-policy floor (if configured): default-deny on any ungranted effect.
-        //    Policy `ApprovalRequired` is a *soft* escalation — an allow-rule may satisfy it, so it
-        //    falls through to the approval gate below rather than forcing a prompt here.
+        // 1. Authorization-policy floor (if configured): default-deny on any ungranted effect. A
+        //    `Deny` short-circuits; an `ApprovalRequired` (e.g. a grant marked `requires_approval`,
+        //    like the default `process.exec`) forces the approval gate below even if a permissive
+        //    allow-rule would otherwise satisfy it — the policy is the floor, rules can't widen it.
+        let mut policy_requires_approval = false;
         if let Some(policy) = &self.policy {
             for (action, resource) in effect_requests(&spec, &subjects) {
                 let req = PolicyRequest {
@@ -433,11 +437,15 @@ impl Executor {
                     action: &action,
                     resource: &resource,
                 };
-                if evaluate(policy, &req).decision == Decision::Deny {
-                    return ToolResult::error(format!(
-                        "`{name}` denied by policy ({} on {:?})",
-                        action.0, resource.kind
-                    ));
+                match evaluate(policy, &req).decision {
+                    Decision::Deny => {
+                        return ToolResult::error(format!(
+                            "`{name}` denied by policy ({} on {:?})",
+                            action.0, resource.kind
+                        ));
+                    }
+                    Decision::ApprovalRequired => policy_requires_approval = true,
+                    Decision::Allow => {}
                 }
             }
         }
@@ -467,9 +475,16 @@ impl Executor {
             .any(|o| !DestructiveEscalation.react(o).is_empty());
         self.evidence.lock().unwrap().extend(observations);
 
-        // 4. Approval gate. Destructive operations are forced to approval even under a permissive
-        //    allow-rule; everything else asks only when the rules didn't already allow it.
-        let force_approval = escalate || spec.risk == Risk::Destructive;
+        // 4. Approval gate. Destructive operations — and any effect the policy marked
+        //    `requires_approval` — are forced to approval even under a permissive allow-rule;
+        //    everything else asks only when the rules didn't already allow it. A write tool that
+        //    reports no path subjects is also forced to prompt: its effect would otherwise resolve
+        //    to an unscoped (`path:"*"`-matching) authorization rather than a specific file.
+        let unscoped_write = spec.effects.contains(&Effect::Write) && subjects.is_empty();
+        let force_approval = escalate
+            || spec.risk == Risk::Destructive
+            || policy_requires_approval
+            || unscoped_write;
         if force_approval || perm != PermDecision::Allow {
             match self.approver.request(name, &subjects, &intents).await {
                 ApprovalChoice::Allow => {}
@@ -750,6 +765,111 @@ mod tests {
         let r = ex.dispatch("save", json!({})).await;
         assert!(r.is_error);
         assert!(r.content.contains("denied by policy"), "got: {}", r.content);
+    }
+
+    #[test]
+    fn subset_none_inherits_all_some_empty_grants_none() {
+        let r = registry(); // contains "echo"
+        assert_eq!(r.subset(None).names(), vec!["echo".to_string()]);
+        assert!(
+            r.subset(Some(&[])).names().is_empty(),
+            "an explicit empty allowlist (tools: []) must grant zero tools"
+        );
+        assert_eq!(
+            r.subset(Some(&["echo".to_string()])).names(),
+            vec!["echo".to_string()]
+        );
+        assert!(r.subset(Some(&["nope".to_string()])).names().is_empty());
+    }
+
+    /// A non-destructive tool with a Process effect (gated only by the policy floor).
+    struct ProcTool;
+    #[async_trait]
+    impl Tool for ProcTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only("proc", "run", json!({"type": "object"}))
+                .with_effects(vec![Effect::Process])
+        }
+        async fn execute(&self, _c: &ToolContext, _p: Value) -> Result<ToolResult> {
+            Ok(ToolResult::ok("ran"))
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_requires_approval_forces_prompt_even_under_allow_rule() {
+        use flux_policy::{Grant, SubjectKind, SubjectRef};
+        // A grant that permits process.exec but marks it requires_approval (mirrors the default
+        // local grant for process exec). The op is non-destructive, so only this flag should force
+        // the prompt.
+        let policy = AuthorizationPolicy {
+            grants: vec![Grant {
+                subjects: vec![SubjectRef {
+                    kind: SubjectKind::User,
+                    id: "*".into(),
+                }],
+                resources: vec![ResourceRef::any(ResourceKind::Process)],
+                actions: vec![Action::from("process.exec")],
+                required_trust: TrustLevel::Untrusted,
+                required_scopes: Vec::new(),
+                requires_approval: true,
+            }],
+        };
+        let approver = Arc::new(RecordingApprover {
+            asked: AtomicBool::new(false),
+            choice: || ApprovalChoice::Allow,
+        });
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(ProcTool));
+        // A permissive allow-rule would normally skip the prompt entirely.
+        let ex = Executor::new(
+            reg,
+            PermissionManager::from_rules(&["proc".into()], &[]),
+            approver.clone(),
+            test_ctx(),
+        )
+        .with_policy(policy);
+        let r = ex.dispatch("proc", json!({})).await;
+        assert!(!r.is_error, "approved → executes: {}", r.content);
+        assert!(
+            approver.asked.load(Ordering::Relaxed),
+            "a policy grant marked requires_approval must force a prompt despite the allow-rule"
+        );
+    }
+
+    /// A write-effect tool that reports no path subjects (the unscoped-write case).
+    struct UnscopedWriteTool;
+    #[async_trait]
+    impl Tool for UnscopedWriteTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only("blindwrite", "write", json!({"type": "object"}))
+                .with_effects(vec![Effect::Write])
+        }
+        async fn execute(&self, _c: &ToolContext, _p: Value) -> Result<ToolResult> {
+            Ok(ToolResult::ok("wrote"))
+        }
+    }
+
+    #[tokio::test]
+    async fn write_without_subjects_forces_approval() {
+        let approver = Arc::new(RecordingApprover {
+            asked: AtomicBool::new(false),
+            choice: || ApprovalChoice::Allow,
+        });
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(UnscopedWriteTool));
+        // A bare allow-rule would normally skip the prompt entirely.
+        let ex = Executor::new(
+            reg,
+            PermissionManager::from_rules(&["blindwrite".into()], &[]),
+            approver.clone(),
+            test_ctx(),
+        );
+        let r = ex.dispatch("blindwrite", json!({})).await;
+        assert!(!r.is_error);
+        assert!(
+            approver.asked.load(Ordering::Relaxed),
+            "a write tool reporting no path subjects must force an approval prompt"
+        );
     }
 
     #[tokio::test]

@@ -308,7 +308,7 @@ fn load_roles(cwd: &std::path::Path) -> RoleRegistry {
                 name: (*name).to_string(),
                 description: (*desc).to_string(),
                 model: None,
-                tools: Vec::new(),
+                tools: None, // built-in roles inherit the parent's full toolset
                 prompt: (*prompt).to_string(),
             });
         }
@@ -391,15 +391,22 @@ async fn build_agent(cli: &Cli) -> Result<(Agent, String, Arc<dyn flux_runtime::
     // Discover subprocess plugins (~/.flux/plugins/*.toml) and project their operations as tools.
     // Each plugin's host capabilities are the guarded System (same boundary as built-in tools).
     if let Some(dir) = plugins_dir() {
-        let caps: Arc<dyn flux_plugin::HostCapabilities> = Arc::new(
-            flux_plugin::SystemHostCaps::new(system.clone())
-                .allow_private_net(cfg.allow_private_net),
-        );
         for p in flux_plugin::discover(&dir) {
+            // Build host capabilities from the plugin's own manifest declaration, so each plugin
+            // gets only the process/secret/http access it asked for (and nothing by default).
+            let system = system.clone();
+            let allow_private = cfg.allow_private_net;
+            let make_caps = move |m: &flux_plugin::PluginManifest| {
+                Arc::new(
+                    flux_plugin::SystemHostCaps::new(system)
+                        .allow_private_net(allow_private)
+                        .with_grants(m.capabilities.clone()),
+                ) as Arc<dyn flux_plugin::HostCapabilities>
+            };
             match flux_plugin::load_plugin_tools(
                 &p.descriptor.program,
                 &p.descriptor.args,
-                caps.clone(),
+                make_caps,
             )
             .await
             {
@@ -1012,8 +1019,34 @@ async fn run_serve(cli: Cli, addr: String) -> Result<()> {
     if !cli.yes {
         bail!("`--serve` requires `--yes` (HTTP requests have no interactive approver)");
     }
+    // The daemon auto-approves every tool call, so an unauthenticated listener is remote code
+    // execution. Require a bearer token (`FLUX_SERVER_TOKEN`) for any non-loopback bind; loopback
+    // may run tokenless for local use.
+    let token = std::env::var("FLUX_SERVER_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    if token.is_none() && !addr_is_loopback(&addr) {
+        bail!(
+            "refusing to serve on a non-loopback address ({addr}) without authentication — set \
+             FLUX_SERVER_TOKEN to require `Authorization: Bearer <token>`, or bind 127.0.0.1"
+        );
+    }
     let (agent, _session_id, _spawner) = build_agent(&cli).await?;
-    flux_server::serve(&addr, agent).await
+    flux_server::serve(&addr, agent, token).await
+}
+
+/// Whether `addr` (host:port or bare host) binds only the loopback interface.
+fn addr_is_loopback(addr: &str) -> bool {
+    use std::net::{IpAddr, SocketAddr};
+    if let Ok(sa) = addr.parse::<SocketAddr>() {
+        return sa.ip().is_loopback();
+    }
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    match host.parse::<IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    }
 }
 
 /// Launch the ratatui chat TUI. The TUI installs its own modal approver, so `--yes` is not required

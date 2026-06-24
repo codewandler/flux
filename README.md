@@ -124,7 +124,9 @@ Sub-agents inherit the same policy and refuse destructive operations.
   summarizer (built-in defaults; override with your own).
 - **Plugins** (`~/.flux/plugins/*.toml`): any-language subprocess binaries over a framed protocol;
   their operations become policy-gated tools, and they call back to host capabilities
-  (`process.run` / `secret` / `http.do`) through the guarded boundary.
+  (`process.run` / `secret` / `http.do`) through the guarded boundary. A plugin gets **only** the
+  capabilities it declares in its manifest — the host grants an allow-list of runnable programs and
+  readable secret keys (and an `http` toggle) and checks every callback against it.
   - `flux plugin add <name> <program> [args…] | ls | pin <name> <ver> | rollback <name>`
 - **Hooks** (`.flux/hooks/*.js`): pre-tool observe / modify / deny in JavaScript.
 
@@ -154,6 +156,10 @@ the session passes a budget (`FLUX_COMPACT_CHARS`, default 48k characters; `0` d
 | `GET  /sessions/:id/stream?input=…` | **Server-Sent Events**: `text` / `tool` / `done` |
 | `POST /webhook` | external trigger → fresh session + one turn |
 
+The daemon auto-approves tool calls, so it is access-controlled: every route except `GET /health`
+requires `Authorization: Bearer $FLUX_SERVER_TOKEN`. A non-loopback bind without `FLUX_SERVER_TOKEN`
+set is refused; loopback may run tokenless for local use.
+
 ---
 
 ## Library use (`flux-sdk`)
@@ -170,7 +176,9 @@ println!("{}", out.text);
 ## Architecture
 
 flux is a workspace of strictly-layered crates; inner crates never depend on outer ones (enforced by a
-test). See [AGENTS.md](AGENTS.md) for the full crate map and contributor guide.
+test). See [docs/architecture.md](docs/architecture.md) for the full design and the safety envelope,
+[docs/vision.md](docs/vision.md) for the project's direction and principles, and
+[AGENTS.md](AGENTS.md) for the crate map and contributor guide.
 
 - **Contracts (pure):** core types, authorization policy, secrets, tool specs, config, evidence, skills
 - **Providers:** the provider abstraction + Anthropic/OpenAI clients + credentials
@@ -191,8 +199,9 @@ cargo fmt --all --check                                  # formatting
 cargo test -p flux-codegate                              # architecture layering lint
 ```
 
-CI runs all of the above on every pull request. See [CHANGELOG.md](CHANGELOG.md) for release notes and
-[AGENTS.md](AGENTS.md) if you're contributing (human or agent).
+CI runs all of the above on every pull request. See [CHANGELOG.md](CHANGELOG.md) for release notes,
+[docs/roadmap.md](docs/roadmap.md) for status and what's next, and [AGENTS.md](AGENTS.md) if you're
+contributing (human or agent).
 
 ## License
 

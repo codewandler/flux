@@ -256,14 +256,44 @@ fn resource_matches(grant: &ResourceRef, req: &ResourceRef) -> bool {
     if !wildcard_match(&grant.id, &req.id) {
         return false;
     }
-    // If the grant constrains a path, the request must carry a matching path.
+    // If the grant constrains a path, the request must carry a matching path. Normalize the request
+    // path lexically (collapse `.`/`..`) first so a traversal like `workspace/../../etc/passwd`
+    // can't be widened to match a `workspace/*` grant — defense-in-depth alongside flux-system's
+    // canonicalizing IO boundary.
     if let Some(gp) = &grant.path {
         match &req.path {
-            Some(rp) => wildcard_match(gp, rp),
+            Some(rp) => wildcard_match(gp, &normalize_path_lexically(rp)),
             None => false,
         }
     } else {
         true
+    }
+}
+
+/// Collapse `.`/`..` segments in a path string without touching the filesystem. `..` that would
+/// escape the leading segment is preserved literally (so it simply fails to match an in-root grant
+/// glob rather than silently climbing out).
+fn normalize_path_lexically(p: &str) -> String {
+    let absolute = p.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if matches!(out.last(), Some(&last) if last != "..") {
+                    out.pop();
+                } else if !absolute {
+                    out.push("..");
+                }
+            }
+            s => out.push(s),
+        }
+    }
+    let joined = out.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else {
+        joined
     }
 }
 
@@ -499,6 +529,34 @@ mod tests {
             .decision,
             Decision::Deny
         );
+    }
+
+    #[test]
+    fn path_grant_not_widened_by_traversal() {
+        let grant = ResourceRef::path("workspace/*");
+        assert!(resource_matches(
+            &grant,
+            &ResourceRef::path("workspace/sub/file.rs")
+        ));
+        assert!(
+            !resource_matches(&grant, &ResourceRef::path("workspace/../../etc/passwd")),
+            "a `..` traversal must not match an in-root grant glob"
+        );
+        // A `*` grant still matches anything (default-local-grant behavior preserved).
+        assert!(resource_matches(
+            &ResourceRef::path("*"),
+            &ResourceRef::path("anything/at/all")
+        ));
+    }
+
+    #[test]
+    fn normalize_lexical_collapses_traversal() {
+        assert_eq!(
+            normalize_path_lexically("workspace/../../etc/passwd"),
+            "../etc/passwd"
+        );
+        assert_eq!(normalize_path_lexically("src/./a/b"), "src/a/b");
+        assert_eq!(normalize_path_lexically("/a/b/../c"), "/a/c");
     }
 
     #[test]

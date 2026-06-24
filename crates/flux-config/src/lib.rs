@@ -62,8 +62,8 @@ fn read_optional(path: &Path) -> Result<Option<Config>> {
     }
 }
 
-/// Merge `project` onto `user`: lists concatenate (user first), scalars/policy prefer project,
-/// `allow_private_net` is true if either enables it.
+/// Merge `project` onto `user`: lists (and policy grants) concatenate (user first), scalars prefer
+/// project, `allow_private_net` is true if either enables it.
 fn merge(user: Config, project: Config) -> Config {
     Config {
         model: project.model.or(user.model),
@@ -72,7 +72,17 @@ fn merge(user: Config, project: Config) -> Config {
             allow: [user.permissions.allow, project.permissions.allow].concat(),
             deny: [user.permissions.deny, project.permissions.deny].concat(),
         },
-        policy: project.policy.or(user.policy),
+        // Concatenate grants like permissions — a project policy refines (adds to) the user's, it
+        // doesn't silently discard it. (Previously `project.policy.or(user.policy)` dropped every
+        // user grant the moment a project defined any policy block.)
+        policy: match (user.policy, project.policy) {
+            (None, None) => None,
+            (Some(u), None) => Some(u),
+            (None, Some(p)) => Some(p),
+            (Some(u), Some(p)) => Some(AuthorizationPolicy {
+                grants: [u.grants, p.grants].concat(),
+            }),
+        },
     }
 }
 
@@ -184,6 +194,42 @@ actions = ["workspace.read"]
         assert_eq!(policy.grants.len(), 1);
         assert_eq!(policy.grants[0].actions[0].0, "workspace.read");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn policy_grants_concatenate_across_user_and_project() {
+        use flux_policy::{
+            Action, AuthorizationPolicy, Grant, ResourceKind, ResourceRef, SubjectKind, SubjectRef,
+            TrustLevel,
+        };
+        let mk = |action: &str| AuthorizationPolicy {
+            grants: vec![Grant {
+                subjects: vec![SubjectRef {
+                    kind: SubjectKind::User,
+                    id: "*".into(),
+                }],
+                resources: vec![ResourceRef::any(ResourceKind::Workspace)],
+                actions: vec![Action::from(action)],
+                required_trust: TrustLevel::Untrusted,
+                required_scopes: Vec::new(),
+                requires_approval: false,
+            }],
+        };
+        let user = Config {
+            policy: Some(mk("workspace.read")),
+            ..Default::default()
+        };
+        let project = Config {
+            policy: Some(mk("workspace.write")),
+            ..Default::default()
+        };
+        let merged = merge(user, project);
+        let grants = merged.policy.expect("policy present").grants;
+        assert_eq!(
+            grants.len(),
+            2,
+            "user + project policy grants must concatenate, not replace"
+        );
     }
 
     #[test]

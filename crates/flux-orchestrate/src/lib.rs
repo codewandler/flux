@@ -121,7 +121,7 @@ impl Spawner for LocalSpawner {
 
         // Scoped toolset; sub-agents run autonomously under the policy-bounded headless approver
         // (auto-approve scoped, policy-permitted calls; refuse destructive ones).
-        let registry = self.base_registry.subset(&role.tools);
+        let registry = self.base_registry.subset(role.tools.as_deref());
         let mut executor = Executor::new(
             registry,
             PermissionManager::new(),
@@ -307,9 +307,19 @@ pub async fn plan_and_dispatch_waves(
             async move { (id, spawner.spawn("worker", &prompt, cancel).await) }
         });
         for (id, res) in futures::future::join_all(futures).await {
-            let text = res?;
-            output.push_str(&format!("── {id} ──\n{text}\n\n"));
-            results.insert(id, text);
+            // One worker failing must not discard its already-completed siblings (or skip later
+            // waves): record the failure as that subtask's result and carry on. Dependents see the
+            // failure note in their context rather than the whole dispatch aborting.
+            match res {
+                Ok(text) => {
+                    output.push_str(&format!("── {id} ──\n{text}\n\n"));
+                    results.insert(id, text);
+                }
+                Err(e) => {
+                    output.push_str(&format!("── {id} (failed) ──\n{e}\n\n"));
+                    results.insert(id, format!("(failed: {e})"));
+                }
+            }
         }
     }
     Ok(output)
@@ -725,6 +735,41 @@ mod tests {
             "wave 1 must be skipped after cancel"
         );
         assert!(out.contains("interrupted"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_waves_keeps_sibling_results_when_one_worker_fails() {
+        // Two independent subtasks in one wave: one fails, the other succeeds. The failure must not
+        // discard the successful sibling or abort the whole dispatch.
+        struct FlakySpawner;
+        #[async_trait]
+        impl Spawner for FlakySpawner {
+            async fn spawn(
+                &self,
+                role: &str,
+                task: &str,
+                _c: &CancellationToken,
+            ) -> Result<String> {
+                match role {
+                    "planner" => Ok(r#"[
+                        {"id":"a","task":"ok-one","depends_on":[]},
+                        {"id":"b","task":"will-fail","depends_on":[]}
+                    ]"#
+                    .into()),
+                    "worker" if task.contains("will-fail") => Err(Error::Other("boom".into())),
+                    "worker" => Ok("ok-one done".into()),
+                    other => Err(Error::Other(format!("unknown role {other}"))),
+                }
+            }
+        }
+        let out = plan_and_dispatch_waves(&FlakySpawner, "goal", &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(out.contains("ok-one done"), "sibling result kept: {out}");
+        assert!(
+            out.contains("(failed"),
+            "failure recorded, not dropped: {out}"
+        );
     }
 
     #[tokio::test]

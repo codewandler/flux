@@ -8,6 +8,7 @@ description = "flux guarded IO boundary: workspace path resolution (escape/symli
 [dependencies]
 flux-core.workspace = true
 tokio.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

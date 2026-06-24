@@ -90,11 +90,14 @@ impl Index {
 
 /// Build a ~160-char snippet around the first matching term (or the start of the doc).
 fn snippet(text: &str, lower: &str, terms: &[String]) -> String {
-    let pos = terms
+    // `find` returns a BYTE offset; convert it to a char index so the char-based windowing below
+    // isn't off (or empty) on multibyte text.
+    let byte_pos = terms
         .iter()
         .filter_map(|t| lower.find(t.as_str()))
         .min()
         .unwrap_or(0);
+    let pos = lower.get(..byte_pos).map_or(0, |s| s.chars().count());
     let start = pos.saturating_sub(40);
     let take = 160;
     let snip: String = text.chars().skip(start).take(take).collect();
@@ -178,6 +181,16 @@ mod tests {
         );
         idx.add("c", "Sessions are stored in SQLite and can be resumed.");
         idx
+    }
+
+    #[test]
+    fn snippet_handles_multibyte_text() {
+        // A match after multibyte chars: the byte offset must be converted to a char index so the
+        // window is right (and never panics).
+        let text = "café au lait — the agent dispatches tools after the résumé section";
+        let lower = text.to_lowercase();
+        let snip = snippet(text, &lower, &["dispatches".into()]);
+        assert!(snip.contains("dispatches"), "got: {snip}");
     }
 
     #[test]

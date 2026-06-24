@@ -235,6 +235,19 @@ impl Agent {
             }
         }
 
+        // Reached the iteration cap while still calling tools: the log now ends on a
+        // `user(tool_result)` the model never got to answer. Append a final assistant message so
+        // the next turn's user input doesn't produce an invalid user-after-user sequence (a
+        // provider 400). This is the third sibling of the R1 (cancel) / R2 (compaction) shape fixes.
+        let note = format!(
+            "Reached the maximum of {} tool-use iterations for this turn; stopping.",
+            self.max_iterations
+        );
+        sink.text_delta(&note);
+        self.store.append_message(
+            session_id,
+            &Message::assistant(vec![ContentBlock::Text { text: note }]),
+        )?;
         sink.turn_end(None);
         Ok(())
     }
@@ -487,6 +500,84 @@ mod tests {
         assert!(sink.text.contains("Created hello.txt"));
         // Persisted: user, assistant(tool_use), user(tool_result), assistant(text) = 4 messages.
         assert_eq!(store.load_messages(&sid).unwrap().len(), 4);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn max_iterations_appends_final_assistant_so_session_stays_valid() {
+        use flux_core::Role;
+        let dir = std::env::temp_dir().join(format!("flux-agent-maxiter-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let mut registry = ToolRegistry::new();
+        flux_tools::register_builtins(&mut registry);
+        let perms = PermissionManager::from_rules(&["read".into()], &[]);
+        let executor = Executor::new(
+            registry,
+            perms,
+            Arc::new(DenyApprover),
+            ToolContext::new(system.clone()),
+        );
+        let store = Arc::new(SessionStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+
+        // Turn 1: the model keeps calling a tool (would loop forever); max_iterations=1 cuts it off.
+        // The follow-up turn returns text and stops.
+        let responses = VecDeque::from(vec![
+            vec![
+                Chunk::Block(ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "read".into(),
+                    input: json!({"path": "nope.txt"}),
+                }),
+                Chunk::Done {
+                    stop_reason: Some(flux_core::StopReason::ToolUse),
+                },
+            ],
+            vec![
+                Chunk::TextDelta("done".into()),
+                Chunk::Block(ContentBlock::Text {
+                    text: "done".into(),
+                }),
+                Chunk::Done {
+                    stop_reason: Some(flux_core::StopReason::EndTurn),
+                },
+            ],
+        ]);
+        let agent = Agent {
+            provider: Box::new(MockProvider {
+                responses: Mutex::new(responses),
+            }),
+            executor,
+            store: store.clone(),
+            model: "mock".into(),
+            system_prompt: "test".into(),
+            max_tokens: 1024,
+            max_iterations: 1,
+            skills: Vec::new(),
+            compact_threshold_chars: 0,
+        };
+
+        let mut sink = CollectSink::default();
+        agent.run_turn(&sid, "do it", &mut sink).await.unwrap();
+
+        let msgs = store.load_messages(&sid).unwrap();
+        // The log must end on an assistant message, not a dangling user(tool_result).
+        assert_eq!(
+            msgs.last().unwrap().role,
+            Role::Assistant,
+            "session must end on an assistant message after the iteration cap"
+        );
+        // No two consecutive user messages (would 400 on the next request).
+        for w in msgs.windows(2) {
+            assert!(
+                !(w[0].role == Role::User && w[1].role == Role::User),
+                "user-after-user message sequence is invalid"
+            );
+        }
+        // A follow-up turn in the same session still succeeds (session not poisoned).
+        agent.run_turn(&sid, "and again", &mut sink).await.unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -66,7 +66,7 @@ async fn plugin_operations_project_as_tools() {
     use flux_plugin::{load_plugin_tools, DenyHostCaps};
 
     let exe = env!("CARGO_BIN_EXE_echo_plugin");
-    let (tools, host) = load_plugin_tools(exe, &[], Arc::new(DenyHostCaps))
+    let (tools, host) = load_plugin_tools(exe, &[], |_| Arc::new(DenyHostCaps))
         .await
         .unwrap();
     assert_eq!(tools.len(), 1);
@@ -74,6 +74,12 @@ async fn plugin_operations_project_as_tools() {
     assert_eq!(
         tools[0].permission_subjects(&json!({})),
         vec!["echo.upper".to_string()]
+    );
+    // The op declares no effects, so it projects a conservative effect set and is NOT a no-op for
+    // the authorization floor (which would otherwise skip plugin ops entirely).
+    assert!(
+        !tools[0].spec().effects.is_empty(),
+        "plugin op must declare effects so the policy floor gates it"
     );
 
     // Drive the projected tool through the Tool interface.

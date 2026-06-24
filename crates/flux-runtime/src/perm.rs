@@ -94,6 +94,7 @@ impl PermissionManager {
     pub fn check(&self, tool: &str, subjects: &[String]) -> PermDecision {
         let tool = tool.to_lowercase();
 
+        let mut subject_scoped_deny_for_tool = false;
         for d in &self.deny {
             if d.tool != tool {
                 continue;
@@ -101,11 +102,19 @@ impl PermissionManager {
             match &d.subject {
                 None => return PermDecision::Deny,
                 Some(_) => {
+                    subject_scoped_deny_for_tool = true;
                     if subjects.iter().any(|s| d.matches(&tool, s)) {
                         return PermDecision::Deny;
                     }
                 }
             }
+        }
+
+        // If this tool has a subject-scoped deny but the call reported no subjects, we can't prove
+        // the invocation is outside the denied set — fail safe to an approval prompt rather than
+        // letting a bare allow rule silently authorize it (an empty `.any()` would skip the deny).
+        if subjects.is_empty() && subject_scoped_deny_for_tool {
+            return PermDecision::Ask;
         }
 
         if self.allow.iter().any(|a| a.is_bare_for(&tool)) {
@@ -162,6 +171,16 @@ mod tests {
     fn unmatched_is_ask() {
         let m = PermissionManager::new();
         assert_eq!(m.check("write", &["secret.key".into()]), PermDecision::Ask);
+    }
+
+    #[test]
+    fn empty_subjects_with_subject_scoped_deny_asks_not_allows() {
+        // A subject-scoped deny + a bare allow; a no-subject invocation must NOT slip past the deny.
+        let m = PermissionManager::from_rules(&["bash".into()], &["Bash(rm:*)".into()]);
+        assert_eq!(m.check("bash", &[]), PermDecision::Ask);
+        // Without any subject-scoped deny, a bare allow still covers a no-subject invocation.
+        let m2 = PermissionManager::from_rules(&["bash".into()], &[]);
+        assert_eq!(m2.check("bash", &[]), PermDecision::Allow);
     }
 
     #[test]

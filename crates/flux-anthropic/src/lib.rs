@@ -291,6 +291,10 @@ fn map_anthropic_stream(byte_stream: ByteStream) -> impl futures::Stream<Item = 
     try_stream! {
         let mut events = byte_stream.eventsource();
         let mut blocks: HashMap<usize, BlockAcc> = HashMap::new();
+        // The `message_start` event carries the input/cache token counts; `message_delta` carries
+        // only the running output count (its input fields default to 0). Remember the input side so
+        // the final usage chunk keeps it, instead of consumers' last-wins assignment zeroing it.
+        let mut prior_usage = flux_core::Usage::default();
 
         while let Some(event) = events.next().await {
             let event = event.map_err(|e| Error::Provider(format!("sse stream: {e}")))?;
@@ -302,7 +306,9 @@ fn map_anthropic_stream(byte_stream: ByteStream) -> impl futures::Stream<Item = 
             match parsed {
                 StreamEvent::MessageStart { message } => {
                     yield Chunk::MessageStart { model: message.model };
-                    yield Chunk::Usage(message.usage.into());
+                    let u: flux_core::Usage = message.usage.into();
+                    prior_usage = u.clone();
+                    yield Chunk::Usage(u);
                 }
                 StreamEvent::ContentBlockStart { index, content_block } => {
                     blocks.insert(index, BlockAcc::from_wire(content_block));
@@ -338,7 +344,19 @@ fn map_anthropic_stream(byte_stream: ByteStream) -> impl futures::Stream<Item = 
                 }
                 StreamEvent::MessageDelta { delta, usage } => {
                     if let Some(u) = usage {
-                        yield Chunk::Usage(u.into());
+                        // Carry the input/cache counts forward from message_start so they aren't
+                        // clobbered to 0 by the delta (which only reports output tokens).
+                        let mut u: flux_core::Usage = u.into();
+                        if u.input_tokens == 0 {
+                            u.input_tokens = prior_usage.input_tokens;
+                        }
+                        if u.cache_creation_input_tokens == 0 {
+                            u.cache_creation_input_tokens = prior_usage.cache_creation_input_tokens;
+                        }
+                        if u.cache_read_input_tokens == 0 {
+                            u.cache_read_input_tokens = prior_usage.cache_read_input_tokens;
+                        }
+                        yield Chunk::Usage(u);
                     }
                     if let Some(reason) = delta.stop_reason {
                         yield Chunk::Done { stop_reason: Some(wire::map_stop_reason(&reason)) };
@@ -456,7 +474,13 @@ mod tests {
 
         assert_eq!(text, "Hello world");
         assert_eq!(stop, Some(StopReason::ToolUse));
-        assert_eq!(last_usage.unwrap().output_tokens, 15);
+        let usage = last_usage.unwrap();
+        assert_eq!(usage.output_tokens, 15);
+        // The final (message_delta) usage must preserve message_start's input_tokens, not zero it.
+        assert_eq!(
+            usage.input_tokens, 10,
+            "input tokens from message_start must be carried into the final usage"
+        );
         assert_eq!(blocks.len(), 2);
         match &blocks[1] {
             ContentBlock::ToolUse { id, name, input } => {

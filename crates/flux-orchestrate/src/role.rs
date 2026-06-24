@@ -15,9 +15,10 @@ pub struct Role {
     /// Model override; `None` inherits the parent's model.
     #[serde(default)]
     pub model: Option<String>,
-    /// Tool allowlist; empty = all tools available to the parent.
+    /// Tool allowlist. `None` (no `tools` key) inherits all tools available to the parent;
+    /// `Some([])` (an explicit empty list) grants none.
     #[serde(default)]
-    pub tools: Vec<String>,
+    pub tools: Option<Vec<String>>,
     /// The role's system prompt (markdown body).
     pub prompt: String,
 }
@@ -58,7 +59,7 @@ pub fn parse_role(content: &str, name_fallback: &str) -> Role {
     let mut name = String::new();
     let mut description = String::new();
     let mut model = None;
-    let mut tools = Vec::new();
+    let mut tools = None;
     for line in fm.lines() {
         if let Some((k, v)) = line.split_once(':') {
             match k.trim() {
@@ -68,7 +69,7 @@ pub fn parse_role(content: &str, name_fallback: &str) -> Role {
                     let m = unquote(v);
                     model = (!m.is_empty()).then_some(m);
                 }
-                "tools" => tools = parse_list(v),
+                "tools" => tools = Some(parse_list(v)),
                 _ => {}
             }
         }
@@ -143,7 +144,10 @@ mod tests {
         assert_eq!(r.name, "scout");
         assert_eq!(r.description, "fast recon");
         assert_eq!(r.model.as_deref(), Some("haiku"));
-        assert_eq!(r.tools, vec!["read", "grep", "ls"]);
+        assert_eq!(
+            r.tools.as_deref(),
+            Some(&["read".into(), "grep".into(), "ls".into()][..])
+        );
         assert_eq!(r.prompt, "You are a scout.");
     }
 
@@ -152,7 +156,17 @@ mod tests {
         let r = parse_role("---\nmodel:\n---\nbody", "worker");
         assert_eq!(r.name, "worker");
         assert_eq!(r.model, None);
-        assert!(r.tools.is_empty());
+        assert!(
+            r.tools.is_none(),
+            "no tools key → inherit all (None), not an empty allowlist"
+        );
+    }
+
+    #[test]
+    fn explicit_empty_tools_is_some_empty() {
+        // `tools: []` is the most-restrictive declaration and must parse to Some([]), not None.
+        let r = parse_role("---\ntools: []\n---\nbody", "locked");
+        assert_eq!(r.tools, Some(Vec::new()));
     }
 
     #[test]

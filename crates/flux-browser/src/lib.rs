@@ -15,37 +15,11 @@ use flux_spec::ToolSpec;
 
 const MAX_BYTES: usize = 256 * 1024;
 
-/// Reject URLs that aren't safe to fetch: non-HTTP(S) schemes, and (unless `allow_private`)
-/// loopback/private/link-local IP literals or `localhost`.
+/// Reject URLs that aren't safe to fetch. Delegates to the shared egress guard in `flux-system`
+/// (the single SSRF policy: scheme check + host→IP resolution against private/loopback/link-local
+/// ranges). Re-exported here so callers and tests of `flux-browser` keep a stable entry point.
 pub fn guard_url(raw: &str, allow_private: bool) -> Result<url::Url> {
-    let url = url::Url::parse(raw).map_err(|e| Error::Other(format!("invalid url: {e}")))?;
-    match url.scheme() {
-        "http" | "https" => {}
-        other => return Err(Error::Other(format!("unsupported url scheme: {other}"))),
-    }
-    if allow_private {
-        return Ok(url);
-    }
-    let host = url
-        .host_str()
-        .ok_or_else(|| Error::Other("url has no host".into()))?;
-    if host.eq_ignore_ascii_case("localhost") {
-        return Err(Error::Other("refusing to fetch localhost".into()));
-    }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        let blocked = match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-            }
-            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
-        };
-        if blocked {
-            return Err(Error::Other(format!(
-                "refusing to fetch private/loopback address {ip}"
-            )));
-        }
-    }
-    Ok(url)
+    flux_system::net::guard_url(raw, allow_private)
 }
 
 /// A tool that fetches a URL's body (guarded, size-capped).
@@ -111,7 +85,13 @@ impl Tool for WebFetchTool {
         let bytes = resp.bytes().await.map_err(|e| Error::Http(e.to_string()))?;
         let mut body = String::from_utf8_lossy(&bytes).into_owned();
         if body.len() > MAX_BYTES {
-            body.truncate(MAX_BYTES);
+            // Cut on a char boundary — `String::truncate` panics off one (the cut can land inside a
+            // multibyte codepoint of an arbitrary response body).
+            let mut end = MAX_BYTES;
+            while end > 0 && !body.is_char_boundary(end) {
+                end -= 1;
+            }
+            body.truncate(end);
             body.push_str("\n…[truncated]");
         }
         Ok(ToolResult {

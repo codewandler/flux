@@ -181,10 +181,13 @@ impl Redactor {
     }
 
     /// Register a known secret value (no-op for trivially short values to avoid over-redaction).
+    /// The value is stored **trimmed** — env/file-sourced secrets often carry a trailing newline,
+    /// and storing the raw value would mean the bare token never matches in tool output.
     pub fn add_secret(&mut self, value: impl Into<String>) {
         let v = value.into();
-        if v.trim().len() >= 6 {
-            self.values.push(v);
+        let trimmed = v.trim();
+        if trimmed.len() >= 6 {
+            self.values.push(trimmed.to_string());
         }
     }
 
@@ -203,24 +206,52 @@ impl Redactor {
     }
 }
 
-/// Redact whitespace/quote-delimited tokens that look like credentials.
+/// Redact credential-shaped tokens. A token is a maximal run of non-boundary characters; any run
+/// that begins with a known secret prefix is replaced. Boundaries include whitespace AND common
+/// delimiters (`= : " ' ` ( ) [ ] { } , ;`), so punctuation-glued forms like `api_key=sk-ant-…`
+/// and `"sk-ant-…"` are caught, not just whitespace-separated tokens.
 fn redact_patterns(input: &str) -> String {
-    input
-        .split_inclusive(|c: char| c.is_whitespace())
-        .map(|chunk| {
-            // Separate the trailing whitespace so it is preserved.
-            let trimmed = chunk.trim_end();
-            let ws = &chunk[trimmed.len()..];
-            // Strip surrounding quotes/brackets for the prefix check.
-            let core =
-                trimmed.trim_matches(|c| matches!(c, '"' | '\'' | '`' | '(' | ')' | ',' | ';'));
-            if core.len() >= 8 && SECRET_PREFIXES.iter().any(|p| core.starts_with(p)) {
-                format!("{REDACTED}{ws}")
-            } else {
-                chunk.to_string()
-            }
-        })
-        .collect()
+    fn is_boundary(c: char) -> bool {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\''
+                    | '`'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | ','
+                    | ';'
+                    | '='
+                    | ':'
+                    | '<'
+                    | '>'
+            )
+    }
+    fn flush(token: &mut String, out: &mut String) {
+        if token.len() >= 8 && SECRET_PREFIXES.iter().any(|p| token.starts_with(p)) {
+            out.push_str(REDACTED);
+        } else {
+            out.push_str(token);
+        }
+        token.clear();
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut token = String::new();
+    for c in input.chars() {
+        if is_boundary(c) {
+            flush(&mut token, &mut out);
+            out.push(c);
+        } else {
+            token.push(c);
+        }
+    }
+    flush(&mut token, &mut out);
+    out
 }
 
 #[cfg(test)]
@@ -263,6 +294,22 @@ mod tests {
         assert!(out.contains("[redacted]"));
         assert!(out.contains("using key"));
         assert!(out.contains("now"));
+    }
+
+    #[test]
+    fn redacts_glued_and_trimmed_secrets() {
+        let mut r = Redactor::new();
+        // A file-sourced value with a trailing newline must still redact the bare token in output.
+        r.add_secret("topsecretvalue\n");
+        assert_eq!(
+            r.redact("the value is topsecretvalue!"),
+            "the value is [redacted]!"
+        );
+        // A punctuation-glued, unregistered credential shape is still caught.
+        let out = r.redact("api_key=sk-ant-abc123def456;next");
+        assert!(!out.contains("sk-ant-abc123def456"), "leaked: {out}");
+        assert!(out.contains("api_key="));
+        assert!(out.contains("next"));
     }
 
     #[test]

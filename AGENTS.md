@@ -8,6 +8,12 @@ A Rust agent SDK / harness / coding agent built as a Cargo **workspace of small,
 crates**. The core invariant: every tool call — built-in, plugin, or sub-agent — goes through one
 mandatory safety envelope (authorization → approval → guarded IO). Don't add code paths that bypass it.
 
+For the *why* and the direction, read [docs/vision.md](docs/vision.md); for the full design,
+[docs/architecture.md](docs/architecture.md); for status and what's next, [docs/roadmap.md](docs/roadmap.md).
+The headline principle that governs review: **non-bypassable safety, and quality over quantity — flux
+is deliberately not a sprawling, bug-ridden codebase. Every behavioral change ships with a test, and
+the gate stays green.**
+
 ## The dev loop (run before you call a change done)
 
 ```bash
@@ -61,6 +67,35 @@ Rules that fall out of this:
 - **Match the surrounding code** — comment density, naming, module layout. Keep doc comments on public
   items.
 
+## Safety invariants — never regress these
+
+These were established (and several re-learned the hard way) during security review. Each is covered
+by a test; if you touch the relevant code, keep the test passing and add to it. **Non-bypassable
+safety is the project's north star** ([docs/vision.md](docs/vision.md)) — a regression here is a
+release blocker, not a nit.
+
+- **Session shape is always a valid provider history.** Every turn-termination path (normal stop,
+  cancel, compaction, *max-iterations*) must leave the log free of: an empty assistant message, a
+  split tool_use/tool_result pair, or a user-after-user sequence. Treat any new termination path as
+  suspect — this bug class has recurred three times (cancel, compaction, iteration cap), and the mock
+  provider does **not** catch it (only a live provider 400 does — see the pre-release gate in
+  [docs/roadmap.md](docs/roadmap.md)).
+- **`permission_subjects` must be accurate.** A tool that declares a `Write` effect but reports no
+  subjects is forced to approval (an unscoped write would otherwise match a `*` path grant). Don't
+  return empty subjects to dodge gating.
+- **Plugin host capabilities are deny-by-default and manifest-scoped.** A plugin may only run programs
+  / read secret keys / reach the network that its manifest's `capabilities` declares; `SystemHostCaps`
+  checks every callback. Never widen this to "all plugins get everything."
+- **All web egress goes through `flux_system::net::guard_url`.** It resolves hostnames to IPs and
+  blocks private/loopback/link-local/unique-local/CGNAT/IPv4-mapped ranges + internal hostnames. Don't
+  hand-roll a second URL guard; reuse this one.
+- **The HTTP server is authenticated.** `flux-server` requires a bearer token on every route except
+  `/health`; a non-loopback bind without `FLUX_SERVER_TOKEN` is refused. The daemon auto-approves
+  tools, so an open listener is RCE.
+- **Subprocesses don't inherit the agent's environment** (`flux-system` clears it and passes a minimal
+  allow-list), and captured output is byte-capped. Untrusted bytes (HTTP bodies, plugin frames) are
+  truncated on char boundaries and parsed with size bounds — never `String::truncate` at a byte offset.
+
 ## How things fit together (where to make a change)
 
 - **Add a built-in tool:** implement `flux_runtime::Tool` (spec + `permission_subjects` + `intents` +
@@ -75,7 +110,9 @@ Rules that fall out of this:
   by the agent loop.
 - **Write a plugin:** any executable speaking the framed NDJSON protocol in `flux-plugin`; the Rust SDK
   (`serve` + `PluginHandler` + `GuestHost`) is the reference. Operations are projected as policy-gated
-  tools; privileged IO is requested back from the host via capability callbacks.
+  tools; privileged IO is requested back from the host via capability callbacks. Declare the
+  operation's `effects`/`risk` and the `capabilities` (allow-listed `process` programs, `secret` keys,
+  `http`) in the manifest — the host grants nothing you don't ask for.
 
 ## Testing
 

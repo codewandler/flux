@@ -71,6 +71,14 @@ fn eval_pre(src: &str, tool: &str, input: &Value) -> Result<PreResult, String> {
     let ctx_json = json!({ "tool": tool, "input": input }).to_string();
 
     let rt = rquickjs::Runtime::new().map_err(|e| e.to_string())?;
+    // Kill a runaway hook (`while(true){}`, a huge allocation loop, …): interrupt evaluation once a
+    // wall-clock deadline passes. The interrupt surfaces as an eval error → the hook fails closed
+    // (denied by the caller) rather than hanging the agent.
+    const HOOK_TIMEOUT_MS: u64 = 1000;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(HOOK_TIMEOUT_MS);
+    rt.set_interrupt_handler(Some(Box::new(move || {
+        std::time::Instant::now() >= deadline
+    })));
     let context = rquickjs::Context::full(&rt).map_err(|e| e.to_string())?;
 
     let out: String = context
@@ -133,6 +141,16 @@ mod tests {
 
     fn engine(src: &str) -> JsHookEngine {
         JsHookEngine::from_sources(vec![("test.js".to_string(), src.to_string())])
+    }
+
+    #[test]
+    fn runaway_hook_is_interrupted_not_hung() {
+        // An infinite loop must be interrupted by the deadline and fail closed (deny), not hang.
+        let e = engine("function preToolUse(ctx){ while(true){} }");
+        match e.pre_tool("bash", &json!({})) {
+            HookOutcome::Deny(r) => assert!(r.contains("hook error"), "got: {r}"),
+            _ => panic!("expected a deny on hook timeout"),
+        }
     }
 
     #[test]

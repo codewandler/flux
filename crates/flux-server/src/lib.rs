@@ -13,9 +13,11 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::Stream;
@@ -26,20 +28,26 @@ use flux_core::Usage;
 
 type Shared = Arc<Agent>;
 
-/// Bind `addr` and serve until shutdown.
-pub async fn serve(addr: &str, agent: Agent) -> anyhow::Result<()> {
+/// Bind `addr` and serve until shutdown. When `token` is `Some`, every route except `/health`
+/// requires `Authorization: Bearer <token>`; when `None`, no authentication is enforced (the CLI
+/// only permits that for a loopback bind).
+pub async fn serve(addr: &str, agent: Agent, token: Option<String>) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("flux server listening on http://{}", listener.local_addr()?);
-    serve_on(listener, agent).await
+    serve_on(listener, agent, token).await
 }
 
 /// Serve on an already-bound listener (lets callers pick an ephemeral port).
-pub async fn serve_on(listener: tokio::net::TcpListener, agent: Agent) -> anyhow::Result<()> {
-    axum::serve(listener, router(Arc::new(agent))).await?;
+pub async fn serve_on(
+    listener: tokio::net::TcpListener,
+    agent: Agent,
+    token: Option<String>,
+) -> anyhow::Result<()> {
+    axum::serve(listener, router(Arc::new(agent), token)).await?;
     Ok(())
 }
 
-fn router(state: Shared) -> Router {
+fn router(state: Shared, token: Option<String>) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/sessions", post(create_session))
@@ -47,7 +55,47 @@ fn router(state: Shared) -> Router {
         .route("/sessions/:id/messages", post(post_message))
         .route("/sessions/:id/stream", get(stream_message))
         .route("/webhook", post(webhook))
+        // Auth runs for every matched route; the handler exempts `/health`.
+        .route_layer(middleware::from_fn_with_state(
+            Arc::new(token),
+            require_auth,
+        ))
         .with_state(state)
+}
+
+/// Bearer-token gate. With no configured token this is a pass-through; otherwise every path except
+/// `/health` must present a matching `Authorization: Bearer` header (compared in constant time).
+async fn require_auth(
+    State(token): State<Arc<Option<String>>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if let Some(expected) = token.as_ref() {
+        if req.uri().path() != "/health" {
+            let presented = req
+                .headers()
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .unwrap_or("");
+            if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+        }
+    }
+    Ok(next.run(req).await)
+}
+
+/// Length-aware constant-time byte comparison (avoids leaking the token via response timing).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn err500(e: impl std::fmt::Display) -> (StatusCode, String) {
@@ -175,5 +223,74 @@ impl AgentSink for Collect {
     }
     fn turn_end(&mut self, usage: Option<Usage>) {
         self.usage = usage;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use axum::routing::get;
+    use tower::ServiceExt; // for `oneshot`
+
+    #[test]
+    fn constant_time_eq_matches() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secres"));
+        assert!(!constant_time_eq(b"secret", b"secre")); // length mismatch
+    }
+
+    /// Build a tiny router carrying only the auth layer over a `/health` and a protected route, so
+    /// the gate can be exercised without standing up a full `Agent`.
+    fn guarded_app(token: Option<String>) -> Router {
+        Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route("/protected", get(|| async { "data" }))
+            .route_layer(middleware::from_fn_with_state(
+                Arc::new(token),
+                require_auth,
+            ))
+    }
+
+    async fn status(app: Router, path: &str, auth: Option<&str>) -> StatusCode {
+        let mut rb = HttpRequest::get(path);
+        if let Some(a) = auth {
+            rb = rb.header("authorization", a);
+        }
+        app.oneshot(rb.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn auth_required_when_token_configured() {
+        let app = || guarded_app(Some("s3cr3t".to_string()));
+        // No / wrong token → 401 on a protected route.
+        assert_eq!(
+            status(app(), "/protected", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(app(), "/protected", Some("Bearer nope")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // Correct token → 200.
+        assert_eq!(
+            status(app(), "/protected", Some("Bearer s3cr3t")).await,
+            StatusCode::OK
+        );
+        // /health is exempt even without a token (liveness probes).
+        assert_eq!(status(app(), "/health", None).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn no_token_configured_is_pass_through() {
+        // With no configured token (loopback-only mode), routes are open.
+        assert_eq!(
+            status(guarded_app(None), "/protected", None).await,
+            StatusCode::OK
+        );
     }
 }

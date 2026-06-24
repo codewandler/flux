@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use flux_core::{Error, Result};
 use flux_runtime::{Tool, ToolContext, ToolResult};
-use flux_spec::{Idempotency, Risk, ToolSpec};
+use flux_spec::{Effect, Idempotency, Risk, ToolSpec};
 
 pub const PROTOCOL: &str = "flux.plugin.v1";
 
@@ -86,13 +86,37 @@ impl Frame {
     }
 }
 
-/// A plugin-declared operation (becomes a tool projected to the agent, after the policy gate).
+/// A plugin-declared operation (becomes a tool projected to the agent, after the policy gate). The
+/// `effects`/`risk` an operation declares feed the authorization floor; when omitted, the projection
+/// assumes a conservative default (see [`PluginTool::new`]) so an undeclared op can't slip the gate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationSpec {
     pub name: String,
     #[serde(default)]
     pub description: String,
     pub input_schema: Value,
+    /// IO effects this operation may produce (drives the policy floor + approval).
+    #[serde(default)]
+    pub effects: Vec<Effect>,
+    /// Declared risk; `None` → `Risk::Medium`.
+    #[serde(default)]
+    pub risk: Option<Risk>,
+}
+
+/// The host capabilities a plugin requests. The host grants ONLY what is declared here and checks
+/// each callback against it, so a plugin can never run an arbitrary binary, read an arbitrary env
+/// var, or reach the network unless its manifest said so. Empty/false = that capability is denied.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginCapabilities {
+    /// Allowed `argv[0]` programs for `process.run` (matched exactly; empty = `process.run` denied).
+    #[serde(default)]
+    pub process: Vec<String>,
+    /// Allowed env-var keys for the `secret` capability (empty = `secret` denied).
+    #[serde(default)]
+    pub secrets: Vec<String>,
+    /// Whether `http.do` is permitted at all (host-side SSRF guard still applies).
+    #[serde(default)]
+    pub http: bool,
 }
 
 /// What a plugin advertises about itself.
@@ -103,6 +127,9 @@ pub struct PluginManifest {
     pub version: String,
     #[serde(default)]
     pub operations: Vec<OperationSpec>,
+    /// Host capabilities the plugin requests (default: none — the plugin gets no privileged IO).
+    #[serde(default)]
+    pub capabilities: PluginCapabilities,
 }
 
 // ---------------------------------------------------------------------------
@@ -246,9 +273,15 @@ impl HostCapabilities for DenyHostCaps {
 /// Host capabilities backed by the guarded [`System`](flux_system::System): `process.run` (argv
 /// only), `http.do` (GET, loopback/private blocked unless allowed), and `secret` (env refs). This
 /// is the bridge that keeps plugin IO inside the same safety boundary as the agent's own tools.
+///
+/// Every callback is additionally gated by the per-plugin [`PluginCapabilities`] grants (built from
+/// the plugin's manifest): `process.run` only for allow-listed programs, `secret` only for
+/// allow-listed keys, `http.do` only if the plugin declared it. A fresh `SystemHostCaps` grants
+/// nothing — call [`with_grants`](Self::with_grants).
 pub struct SystemHostCaps {
     system: Arc<flux_system::System>,
     allow_private_net: bool,
+    grants: PluginCapabilities,
 }
 
 impl SystemHostCaps {
@@ -256,11 +289,18 @@ impl SystemHostCaps {
         Self {
             system,
             allow_private_net: false,
+            grants: PluginCapabilities::default(),
         }
     }
 
     pub fn allow_private_net(mut self, yes: bool) -> Self {
         self.allow_private_net = yes;
+        self
+    }
+
+    /// Restrict this host's callbacks to the capabilities the plugin declared in its manifest.
+    pub fn with_grants(mut self, grants: PluginCapabilities) -> Self {
+        self.grants = grants;
         self
     }
 }
@@ -282,6 +322,13 @@ impl HostCapabilities for SystemHostCaps {
                 if argv.is_empty() {
                     return Err("process.run: `argv` (non-empty array) required".into());
                 }
+                // The plugin may only run programs it declared in its manifest's capabilities.
+                if !self.grants.process.iter().any(|p| p == &argv[0]) {
+                    return Err(format!(
+                        "process.run: program `{}` not in this plugin's granted capabilities",
+                        argv[0]
+                    ));
+                }
                 let secs = payload
                     .get("timeout_secs")
                     .and_then(|v| v.as_u64())
@@ -297,12 +344,21 @@ impl HostCapabilities for SystemHostCaps {
             }
             "secret" => {
                 let key = payload.get("key").and_then(|v| v.as_str()).unwrap_or("");
+                // Only env keys the plugin declared may be read — never arbitrary host secrets.
+                if !self.grants.secrets.iter().any(|k| k == key) {
+                    return Err(format!(
+                        "secret `{key}` not in this plugin's granted capabilities"
+                    ));
+                }
                 match self.system.env(key) {
                     Some(v) => Ok(json!({ "value": v })),
                     None => Err(format!("secret `{key}` not set")),
                 }
             }
             "http.do" => {
+                if !self.grants.http {
+                    return Err("http.do not granted to this plugin".into());
+                }
                 let raw = payload.get("url").and_then(|v| v.as_str()).unwrap_or("");
                 let url = guard_http_url(raw, self.allow_private_net)?;
                 let resp = reqwest::Client::new()
@@ -311,8 +367,8 @@ impl HostCapabilities for SystemHostCaps {
                     .await
                     .map_err(|e| e.to_string())?;
                 let status = resp.status().as_u16();
-                let mut body = resp.text().await.unwrap_or_default();
-                body.truncate(64 * 1024);
+                let body = resp.text().await.unwrap_or_default();
+                let body = truncate_on_char_boundary(body, 64 * 1024);
                 Ok(json!({ "status": status, "body": body }))
             }
             other => Err(format!("unknown host capability: {other}")),
@@ -320,33 +376,25 @@ impl HostCapabilities for SystemHostCaps {
     }
 }
 
-/// Reject non-HTTP(S) schemes and (unless `allow_private`) loopback/private/link-local hosts.
+/// Truncate a `String` to at most `max` bytes without splitting a UTF-8 codepoint (`String::truncate`
+/// panics off a char boundary on attacker-controlled bodies).
+fn truncate_on_char_boundary(mut s: String, max: usize) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    s
+}
+
+/// Reject non-HTTP(S) schemes and (unless `allow_private`) private/loopback/link-local hosts —
+/// delegating to the shared egress guard in `flux-system` (host→IP resolution, IPv6/IPv4-mapped
+/// coverage), the same SSRF policy the agent's own `web_fetch` uses.
 fn guard_http_url(raw: &str, allow_private: bool) -> std::result::Result<url::Url, String> {
-    let url = url::Url::parse(raw).map_err(|e| format!("invalid url: {e}"))?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(format!("unsupported url scheme: {}", url.scheme()));
-    }
-    if allow_private {
-        return Ok(url);
-    }
-    let host = url
-        .host_str()
-        .ok_or_else(|| "url has no host".to_string())?;
-    if host.eq_ignore_ascii_case("localhost") {
-        return Err("refusing to fetch localhost".into());
-    }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        let blocked = match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-            }
-            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
-        };
-        if blocked {
-            return Err(format!("refusing to fetch private/loopback address {ip}"));
-        }
-    }
-    Ok(url)
+    flux_system::net::guard_url(raw, allow_private).map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -401,13 +449,27 @@ impl PluginHost {
     }
 
     async fn read_frame(&mut self) -> Result<Frame> {
-        use tokio::io::AsyncBufReadExt;
-        let mut resp = String::new();
-        let n = self.reader.read_line(&mut resp).await.map_err(Error::Io)?;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+        // Bound a single framed message so a malicious/buggy plugin can't OOM the host by emitting
+        // a gigantic line with no newline. `Take` caps the bytes `read_until` will consume.
+        const MAX_FRAME: usize = 8 * 1024 * 1024;
+        let mut buf = Vec::new();
+        let n = (&mut self.reader)
+            .take(MAX_FRAME as u64)
+            .read_until(b'\n', &mut buf)
+            .await
+            .map_err(Error::Io)?;
         if n == 0 {
             return Err(Error::Provider("plugin closed the connection".into()));
         }
-        Ok(serde_json::from_str(resp.trim())?)
+        if buf.last() != Some(&b'\n') {
+            return Err(Error::Provider(
+                "plugin frame exceeded the size limit (no newline within bound)".into(),
+            ));
+        }
+        let line = std::str::from_utf8(&buf)
+            .map_err(|e| Error::Provider(format!("plugin frame not valid UTF-8: {e}")))?;
+        Ok(serde_json::from_str(line.trim())?)
     }
 
     async fn request(&mut self, command: &str, payload: Value) -> Result<Frame> {
@@ -504,15 +566,22 @@ impl PluginTool {
         plugin: &str,
         op: &OperationSpec,
     ) -> Self {
-        // Plugin operations declare no effects, so the policy layer doesn't auto-allow them — the
-        // perm rules + approval gate apply (they prompt by default under their `plugin.op` name).
+        // Project the operation's declared effects so the authorization floor gates it like any
+        // built-in tool. An operation that declares none could still touch the network or run a
+        // process via host capabilities, so default to those — under the default grants that forces
+        // approval rather than letting the op slip the envelope.
+        let effects = if op.effects.is_empty() {
+            vec![Effect::Process, Effect::Network]
+        } else {
+            op.effects.clone()
+        };
         let spec = ToolSpec {
             name: format!("{plugin}.{}", op.name),
             description: op.description.clone(),
             input_schema: op.input_schema.clone(),
             output_schema: None,
-            effects: Vec::new(),
-            risk: Risk::Medium,
+            effects,
+            risk: op.risk.unwrap_or(Risk::Medium),
             idempotency: Idempotency::NonIdempotent,
             access: Vec::new(),
         };
@@ -552,13 +621,18 @@ impl Tool for PluginTool {
 
 /// Spawn a plugin, fetch its manifest, and project every operation as a [`PluginTool`] sharing one
 /// host connection. Returns the tools plus the shared host handle (keep it alive for the session).
+///
+/// `make_caps` builds the host capabilities *from the fetched manifest*, so the caps can be scoped
+/// to exactly what the plugin declared (see [`SystemHostCaps::with_grants`]) — the binding point
+/// where a plugin's requested privileges are pinned to its manifest.
 pub async fn load_plugin_tools(
     program: &str,
     args: &[String],
-    caps: Arc<dyn HostCapabilities>,
+    make_caps: impl FnOnce(&PluginManifest) -> Arc<dyn HostCapabilities>,
 ) -> Result<(Vec<Arc<dyn Tool>>, Arc<tokio::sync::Mutex<PluginHost>>)> {
     let mut host = PluginHost::spawn(program, args).await?;
     let manifest = host.manifest().await?;
+    let caps = make_caps(&manifest);
     let host = Arc::new(tokio::sync::Mutex::new(host));
     let tools: Vec<Arc<dyn Tool>> = manifest
         .operations
@@ -665,6 +739,74 @@ pub fn set_pinned(dir: &std::path::Path, name: &str, version: Option<String>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn host_caps_deny_ungranted_and_allow_granted() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!("flux-caps-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+
+        // A fresh SystemHostCaps grants nothing.
+        let none = SystemHostCaps::new(sys.clone());
+        assert!(
+            none.handle("process.run", &json!({"argv": ["echo", "hi"]}))
+                .await
+                .is_err(),
+            "ungranted process.run must be denied"
+        );
+        assert!(
+            none.handle("secret", &json!({"key": "PATH"}))
+                .await
+                .is_err(),
+            "ungranted secret must be denied (no arbitrary env reads)"
+        );
+        assert!(
+            none.handle("http.do", &json!({"url": "http://example.com"}))
+                .await
+                .is_err(),
+            "ungranted http.do must be denied"
+        );
+
+        // Granting only `echo` lets echo run but nothing else; secret stays denied.
+        let limited = SystemHostCaps::new(sys.clone()).with_grants(PluginCapabilities {
+            process: vec!["echo".into()],
+            secrets: vec![],
+            http: false,
+        });
+        assert!(
+            limited
+                .handle("process.run", &json!({"argv": ["echo", "hi"]}))
+                .await
+                .is_ok(),
+            "a granted program should run"
+        );
+        assert!(
+            limited
+                .handle("process.run", &json!({"argv": ["cat", "/etc/passwd"]}))
+                .await
+                .is_err(),
+            "a non-granted program must be denied"
+        );
+        assert!(
+            limited
+                .handle("secret", &json!({"key": "PATH"}))
+                .await
+                .is_err(),
+            "secret not in the grant list must be denied"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_never_panics() {
+        let s = format!("{}é", "a".repeat(100)); // multibyte char near the cut
+                                                 // Cut at a byte that lands inside the 'é' — must not panic and stays valid UTF-8.
+        let out = truncate_on_char_boundary(s.clone(), 101);
+        assert!(out.len() <= 101);
+        assert!(out.is_char_boundary(out.len()));
+        assert_eq!(truncate_on_char_boundary("short".into(), 1024), "short");
+    }
 
     #[test]
     fn frame_roundtrips_as_ndjson() {

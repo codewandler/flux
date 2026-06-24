@@ -3,7 +3,9 @@
 
 use serde_json::{json, Value};
 
-use flux_plugin::{serve, GuestHost, OperationSpec, PluginHandler, PluginManifest};
+use flux_plugin::{
+    serve, GuestHost, OperationSpec, PluginCapabilities, PluginHandler, PluginManifest,
+};
 
 struct Caps;
 
@@ -20,7 +22,10 @@ impl PluginHandler for Caps {
                     "properties": {"msg": {"type": "string"}},
                     "required": ["msg"]
                 }),
+                effects: Vec::new(),
+                risk: None,
             }],
+            capabilities: PluginCapabilities::default(),
         }
     }
 

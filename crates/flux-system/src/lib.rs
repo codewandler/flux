@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use flux_core::{Error, Result};
 
+pub mod net;
+
 // ---------------------------------------------------------------------------
 // Workspace
 // ---------------------------------------------------------------------------
@@ -73,35 +75,16 @@ impl Workspace {
             )));
         }
 
-        // Symlink guard: canonicalize the path (or its parent for not-yet-existing files) and
-        // re-check that the real target stays inside the root.
-        if norm.exists() {
-            let canon = norm
-                .canonicalize()
-                .map_err(|e| Error::Io(std::io::Error::other(e)))?;
-            if !canon.starts_with(&base) {
-                return Err(Error::Config(format!(
-                    "path {input:?} resolves (via symlink) outside the workspace root"
-                )));
-            }
-            return Ok(canon);
-        }
-        if let Some(parent) = norm.parent() {
-            if parent.exists() {
-                let cp = parent
-                    .canonicalize()
-                    .map_err(|e| Error::Io(std::io::Error::other(e)))?;
-                if !cp.starts_with(&base) {
-                    return Err(Error::Config(format!(
-                        "path {input:?} resolves (via symlink) outside the workspace root"
-                    )));
-                }
-                if let Some(file) = norm.file_name() {
-                    return Ok(cp.join(file));
-                }
-            }
-        }
-        Ok(norm)
+        // Symlink guard: walk the path component-by-component, chasing every symlink found in the
+        // physically-existing prefix and rejecting any whose target escapes the root. Unlike
+        // `Path::exists()` (which follows links, so a *dangling* symlink to an outside target reads
+        // as "not existing"), this uses `symlink_metadata` and so also catches symlinks whose
+        // targets don't exist yet — the case a plain parent-canonicalize misses on write.
+        resolve_within_root(&base, &norm).map_err(|_| {
+            Error::Config(format!(
+                "path {input:?} resolves outside the workspace root"
+            ))
+        })
     }
 
     fn base_for<'a>(&self, input: &'a str) -> (PathBuf, &'a str) {
@@ -139,6 +122,55 @@ fn normalize_lexically(p: &Path) -> PathBuf {
         pb.push(c);
     }
     pb
+}
+
+/// Resolve `norm` (already lexically normalized and known to be under the canonical `base`) to a
+/// real path, chasing every symlink encountered in the physically-existing prefix and rejecting
+/// any hop that escapes `base`. The not-yet-existing tail (which therefore cannot contain symlinks)
+/// is appended verbatim. This is the security boundary for writes: it catches dangling symlinks
+/// that `Path::exists()` would skip.
+fn resolve_within_root(base: &Path, norm: &Path) -> std::result::Result<PathBuf, ()> {
+    let rel = norm.strip_prefix(base).map_err(|_| ())?;
+    let mut real = base.to_path_buf();
+    for comp in rel.components() {
+        let mut node = real.join(comp.as_os_str());
+        // Chase a chain of symlinks at this node, keeping every hop inside `base`.
+        let mut hops = 0u32;
+        while let Ok(meta) = std::fs::symlink_metadata(&node) {
+            if !meta.file_type().is_symlink() {
+                break;
+            }
+            hops += 1;
+            if hops > 40 {
+                return Err(()); // symlink loop / excessive indirection
+            }
+            let target = std::fs::read_link(&node).map_err(|_| ())?;
+            let joined = if target.is_absolute() {
+                target
+            } else {
+                node.parent().unwrap_or(base).join(target)
+            };
+            node = normalize_lexically(&joined);
+            if !node.starts_with(base) {
+                return Err(()); // symlink target escapes the workspace root
+            }
+        }
+        real = node;
+    }
+    Ok(real)
+}
+
+/// Decode captured subprocess output, capping it at `max` bytes so a runaway command can't OOM the
+/// host. Truncating a byte slice mid-codepoint is safe: `from_utf8_lossy` emits replacement chars
+/// rather than panicking (unlike `String::truncate`, which panics off a char boundary).
+fn capped_lossy(bytes: &[u8], max: usize) -> String {
+    if bytes.len() <= max {
+        String::from_utf8_lossy(bytes).into_owned()
+    } else {
+        let mut s = String::from_utf8_lossy(&bytes[..max]).into_owned();
+        s.push_str("\n…[output truncated]");
+        s
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +289,19 @@ impl System {
             .current_dir(self.workspace.root())
             .stdin(std::process::Stdio::null());
 
+        // Don't leak the agent's environment (which may hold ANTHROPIC_API_KEY and other secrets)
+        // into model-spawned commands: start from an empty env and pass only a minimal, non-secret
+        // set needed for programs to function.
+        cmd.env_clear();
+        const SAFE_ENV: &[&str] = &[
+            "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "USER", "LOGNAME", "TMPDIR",
+        ];
+        for key in SAFE_ENV {
+            if let Ok(val) = std::env::var(key) {
+                cmd.env(key, val);
+            }
+        }
+
         let fut = cmd.output();
         let output = match tokio::time::timeout(timeout, fut).await {
             Ok(r) => r.map_err(|e| Error::Other(format!("spawn {program}: {e}")))?,
@@ -267,9 +312,11 @@ impl System {
                 )))
             }
         };
+        // Cap captured output so a command emitting gigabytes can't exhaust host memory.
+        const MAX_OUTPUT: usize = 1024 * 1024;
         Ok(ProcessOutput {
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            stdout: capped_lossy(&output.stdout, MAX_OUTPUT),
+            stderr: capped_lossy(&output.stderr, MAX_OUTPUT),
             exit_code: output.status.code().unwrap_or(-1),
         })
     }
@@ -356,6 +403,69 @@ mod tests {
         let err = sys.read_file("etclink/hostname").await;
         assert!(err.is_err(), "expected symlink escape to be rejected");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn rejects_dangling_symlink_escape_on_write() {
+        let (dir, sys) = temp_workspace();
+        // A symlink inside the workspace pointing at a NON-EXISTENT outside target. `Path::exists()`
+        // follows the link → false, so the old parent-only canonicalize let the write through.
+        let outside = std::env::temp_dir().join(format!(
+            "flux-escape-target-{}-{}.txt",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::remove_file(&outside).ok();
+        std::os::unix::fs::symlink(&outside, dir.join("evil")).unwrap();
+        let err = sys.write_file("evil", "pwned").await;
+        assert!(
+            err.is_err(),
+            "writing through a dangling out-of-root symlink must be rejected"
+        );
+        assert!(
+            !outside.exists(),
+            "the outside target must not have been created"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn allows_in_root_symlink_write() {
+        let (dir, sys) = temp_workspace();
+        // A symlink that stays inside the workspace is fine to write through.
+        sys.write_file("realdir/.keep", "x").await.unwrap();
+        std::os::unix::fs::symlink(dir.join("realdir"), dir.join("link")).unwrap();
+        sys.write_file("link/a.txt", "hi").await.unwrap();
+        assert_eq!(sys.read_file("realdir/a.txt").await.unwrap(), "hi");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn run_does_not_leak_parent_secrets() {
+        let (dir, sys) = temp_workspace();
+        std::env::set_var("FLUX_TEST_SECRET_ENVX", "topsecret-do-not-leak");
+        let out = sys
+            .run(&["env".to_string()], Duration::from_secs(10))
+            .await
+            .unwrap();
+        std::env::remove_var("FLUX_TEST_SECRET_ENVX");
+        assert!(
+            !out.stdout.contains("topsecret-do-not-leak"),
+            "subprocess inherited a parent-process secret: {}",
+            out.stdout
+        );
+        assert!(!out.stdout.contains("FLUX_TEST_SECRET_ENVX"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn capped_lossy_truncates_huge_output() {
+        let big = vec![b'a'; 2 * 1024 * 1024];
+        let s = capped_lossy(&big, 1024 * 1024);
+        assert!(s.len() < big.len());
+        assert!(s.contains("truncated"));
+        // Small output is passed through verbatim.
+        assert_eq!(capped_lossy(b"hello", 1024), "hello");
     }
 
     #[tokio::test]

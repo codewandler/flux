@@ -90,13 +90,17 @@ impl SessionStore {
     /// The most recently created session id, if any (for `--continue`).
     pub fn latest_session_id(&self) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
-        let id: Option<i64> = conn
-            .query_row(
-                "SELECT id FROM sessions ORDER BY id DESC LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .ok();
+        // Distinguish "no sessions yet" from a real DB error — `.ok()` used to swallow lock/disk/
+        // corruption errors, silently starting a fresh session on `--continue` instead of failing.
+        let id: Option<i64> = match conn.query_row(
+            "SELECT id FROM sessions ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        ) {
+            Ok(n) => Some(n),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(map_sql(e)),
+        };
         Ok(id.map(|n| format!("s_{n}")))
     }
 
@@ -115,7 +119,10 @@ impl SessionStore {
                 })
             },
         )
-        .map_err(|_| Error::Other(format!("session {id} not found")))
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Error::Other(format!("session {id} not found")),
+            other => map_sql(other), // a real DB error must not masquerade as "not found"
+        })
     }
 
     /// Append a message to the session log.

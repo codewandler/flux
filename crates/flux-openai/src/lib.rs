@@ -235,6 +235,10 @@ struct ChatUsage {
 
 /// Parse the OpenAI Chat Completions SSE stream into normalized [`Chunk`]s. Tool-call argument
 /// fragments arrive across many deltas keyed by index; we accumulate and emit each as an
+/// Upper bound on concurrent tool-call slots, so a malicious/buggy server can't drive the
+/// wire-supplied `index` arbitrarily high and OOM us by growing the accumulator vector.
+const MAX_TOOL_CALLS: usize = 256;
+
 /// assembled `tool_use` block at stream end (matching the Anthropic codec's contract).
 fn map_chat_stream(byte_stream: ByteStream) -> impl futures::Stream<Item = Result<Chunk>> {
     try_stream! {
@@ -272,6 +276,9 @@ fn map_chat_stream(byte_stream: ByteStream) -> impl futures::Stream<Item = Resul
                     }
                 }
                 for tc in choice.delta.tool_calls {
+                    if tc.index >= MAX_TOOL_CALLS {
+                        continue; // ignore an absurd index rather than growing the vec unboundedly
+                    }
                     while calls.len() <= tc.index {
                         calls.push((String::new(), String::new(), String::new()));
                     }
@@ -638,6 +645,18 @@ fn map_responses_stream(byte_stream: ByteStream) -> impl futures::Stream<Item = 
                     if stop.is_none() {
                         stop = Some(StopReason::EndTurn);
                     }
+                }
+                "response.incomplete" => {
+                    // The response was truncated (e.g. hit `max_output_tokens`) — surface it as a
+                    // MaxTokens stop rather than letting `response.completed` report a clean EndTurn.
+                    let reason = v["response"]["incomplete_details"]["reason"]
+                        .as_str()
+                        .unwrap_or("");
+                    stop = Some(if reason == "max_output_tokens" {
+                        StopReason::MaxTokens
+                    } else {
+                        StopReason::EndTurn
+                    });
                 }
                 "response.failed" => {
                     let msg = v["response"]["error"]["message"]

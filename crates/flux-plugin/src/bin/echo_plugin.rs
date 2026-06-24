@@ -3,7 +3,9 @@
 
 use serde_json::{json, Value};
 
-use flux_plugin::{serve, GuestHost, OperationSpec, PluginHandler, PluginManifest};
+use flux_plugin::{
+    serve, GuestHost, OperationSpec, PluginCapabilities, PluginHandler, PluginManifest,
+};
 
 struct Echo;
 
@@ -20,7 +22,10 @@ impl PluginHandler for Echo {
                     "properties": {"text": {"type": "string"}},
                     "required": ["text"]
                 }),
+                effects: Vec::new(), // pure transform — no IO
+                risk: None,
             }],
+            capabilities: PluginCapabilities::default(), // requests no host capabilities
         }
     }
 

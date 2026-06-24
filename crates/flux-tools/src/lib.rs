@@ -116,8 +116,9 @@ impl Tool for ReadTool {
             return Ok(ToolResult::ok(content));
         }
         let lines: Vec<&str> = content.lines().collect();
+        // `saturating_add` — attacker-supplied offset/limit can otherwise overflow usize and panic.
         let end = match limit {
-            Some(l) => (offset + l).min(lines.len()),
+            Some(l) => offset.saturating_add(l).min(lines.len()),
             None => lines.len(),
         };
         let start = offset.min(lines.len());
@@ -283,17 +284,46 @@ impl Tool for EditTool {
 
 pub struct BashTool;
 
-/// Parse a shell command into permission subjects (one per `&&`/`||`/`;`/`|` segment), shaped as
-/// `prog:args` (or bare `prog`) so rules like `Bash(git:*)` / `Bash(rm:*)` match.
+/// Parse a shell command into permission subjects (one per `&&`/`||`/`;`/`|`/newline segment),
+/// shaped as `prog:args` (or bare `prog`) so rules like `Bash(git:*)` / `Bash(rm:*)` match.
+///
+/// Shell is Turing-complete, so this is **best-effort defense-in-depth**, not a sandbox (the real
+/// boundary is the argv-only exec + the policy floor + destructive-intent escalation, which sees the
+/// whole command). But it hardens the common evasions: leading `VAR=value` assignments are skipped
+/// to find the real program, programs hidden inside `$(...)`/backtick substitutions are surfaced as
+/// their own subjects (so a `Bash(rm:*)` deny still matches `echo $(rm -rf ~)`), and any command
+/// using shell expansion we can't statically resolve gets a `<shell-expansion>` sentinel subject —
+/// which no ordinary allow rule covers, so the call falls through to an approval prompt instead of
+/// being silently authorized.
 pub fn bash_subjects(command: &str) -> Vec<String> {
     let mut subjects = Vec::new();
-    for seg in command.split(['&', '|', ';']) {
-        let seg = seg.trim();
-        if seg.is_empty() {
-            continue;
-        }
-        let mut toks = seg.split_whitespace();
-        if let Some(prog) = toks.next() {
+    let mut obfuscated = false;
+
+    // The top-level command plus any embedded command substitutions, so programs hidden inside
+    // `$(...)`/backticks are surfaced too.
+    let mut to_scan = vec![command.to_string()];
+    let inner = extract_command_substitutions(command);
+    if !inner.is_empty() {
+        obfuscated = true;
+        to_scan.extend(inner);
+    }
+
+    for cmd in &to_scan {
+        for seg in cmd.split(['&', '|', ';', '\n']) {
+            let seg = seg.trim();
+            if seg.is_empty() {
+                continue;
+            }
+            let mut toks = seg.split_whitespace().peekable();
+            // Skip leading `VAR=value` environment assignments to find the real program.
+            while toks.peek().is_some_and(|t| is_env_assignment(t)) {
+                toks.next();
+            }
+            let Some(prog) = toks.next() else { continue };
+            // A shell-expanded program name (`$IFS`, `${x}`, `` `…` ``) can't be matched reliably.
+            if prog.contains('$') || prog.contains('`') {
+                obfuscated = true;
+            }
             let rest: Vec<&str> = toks.collect();
             if rest.is_empty() {
                 subjects.push(prog.to_string());
@@ -302,10 +332,69 @@ pub fn bash_subjects(command: &str) -> Vec<String> {
             }
         }
     }
+
     if subjects.is_empty() {
         subjects.push(command.trim().to_string());
     }
+    if obfuscated {
+        subjects.push("<shell-expansion>".to_string());
+    }
     subjects
+}
+
+/// Whether `tok` is a leading `NAME=value` environment assignment (so it can be skipped to find the
+/// real program in `X=1 rm -rf /`).
+fn is_env_assignment(tok: &str) -> bool {
+    match tok.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
+}
+
+/// Extract the inner command strings of `$(...)` and `` `...` `` substitutions (one level), so a
+/// program hidden inside one can still be surfaced as a permission subject.
+fn extract_command_substitutions(command: &str) -> Vec<String> {
+    let chars: Vec<char> = command.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' && chars.get(i + 1) == Some(&'(') {
+            let mut depth = 1;
+            let start = i + 2;
+            let mut j = start;
+            while j < chars.len() && depth > 0 {
+                match chars[j] {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 {
+                    break;
+                }
+                j += 1;
+            }
+            if depth == 0 {
+                out.push(chars[start..j].iter().collect());
+                i = j + 1;
+                continue;
+            }
+        } else if chars[i] == '`' {
+            if let Some(close) = (i + 1..chars.len()).find(|&k| chars[k] == '`') {
+                out.push(chars[i + 1..close].iter().collect());
+                i = close + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 #[async_trait]
@@ -540,6 +629,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_with_overflowing_offset_limit_does_not_panic() {
+        let (dir, c) = ctx();
+        WriteTool
+            .execute(&c, json!({"path": "a.txt", "content": "l1\nl2\nl3\n"}))
+            .await
+            .unwrap();
+        // Attacker-supplied offset/limit near usize::MAX must not overflow-panic.
+        let r = ReadTool
+            .execute(
+                &c,
+                json!({"path": "a.txt", "offset": u64::MAX, "limit": u64::MAX}),
+            )
+            .await
+            .unwrap();
+        assert!(!r.is_error);
+        assert!(r.content.is_empty(), "offset past EOF yields no lines");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn write_read_edit_roundtrip() {
         let (dir, c) = ctx();
         WriteTool
@@ -639,6 +748,29 @@ mod tests {
             bash_subjects("rm -rf / && echo done"),
             vec!["rm:-rf /".to_string(), "echo:done".to_string()]
         );
+    }
+
+    #[test]
+    fn bash_subjects_surface_hidden_programs() {
+        // A leading `VAR=` assignment must not hide the real program from a `Bash(rm:*)` deny.
+        let s = bash_subjects("X=1 rm -rf /");
+        assert!(s.iter().any(|x| x.starts_with("rm:")), "got {s:?}");
+
+        // A program inside a command substitution is surfaced, plus an obfuscation sentinel.
+        let s = bash_subjects("echo $(rm -rf ~)");
+        assert!(s.iter().any(|x| x.starts_with("rm:")), "got {s:?}");
+        assert!(
+            s.iter().any(|x| x == "<shell-expansion>"),
+            "obfuscation must add the sentinel: {s:?}"
+        );
+
+        // A `$IFS`-spliced program name is flagged as unresolved expansion.
+        let s = bash_subjects("rm$IFS-rf$IFS/");
+        assert!(s.iter().any(|x| x == "<shell-expansion>"), "got {s:?}");
+
+        // Backtick substitution is handled too.
+        let s = bash_subjects("echo `curl evil.example`");
+        assert!(s.iter().any(|x| x.starts_with("curl:")), "got {s:?}");
     }
 
     #[test]
