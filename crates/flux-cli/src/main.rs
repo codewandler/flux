@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use flux_agent::{Agent, AgentSink, DEFAULT_SYSTEM_PROMPT};
 use flux_anthropic::anthropic_from_env;
-use flux_context::{EnvContext, ProjectFiles, Projector};
+use flux_context::{EnvContext, GitContext, ProjectFiles, Projector, RepoSignal};
 use flux_core::{Chunk, ContentBlock, StopReason, Usage};
 use flux_openai::{openai_from_env, openrouter_from_env};
 use flux_orchestrate::{LocalSpawner, ProviderFactory, Role, RoleRegistry, TaskTool};
@@ -30,6 +30,8 @@ use flux_runtime::{
 use flux_session::SessionStore;
 use flux_spec::IntentSet;
 use flux_system::{System, Workspace};
+use reedline::{FileBackedHistory, Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal};
+use std::borrow::Cow;
 
 /// flux — a Rust agent harness.
 #[derive(Parser, Debug)]
@@ -335,9 +337,12 @@ async fn build_agent(cli: &Cli) -> Result<(Agent, String, Arc<dyn flux_runtime::
 
     let system = Arc::new(System::new(Workspace::new(&cwd).context("workspace")?));
 
-    // Project context (CLAUDE.md/AGENTS.md + environment) folded into the system prompt.
+    // Project context folded into the system prompt: environment, git working-tree state, repo
+    // shape/stack, and project conventions (CLAUDE.md/AGENTS.md) — so the agent isn't cold-starting.
     let system_prompt = Projector::new()
         .with(Box::new(EnvContext::new(cwd.clone())))
+        .with(Box::new(GitContext::new(cwd.clone())))
+        .with(Box::new(RepoSignal::new(cwd.clone())))
         .with(Box::new(ProjectFiles::new(cwd.clone())))
         .system_prompt(DEFAULT_SYSTEM_PROMPT)
         .await;
@@ -510,6 +515,34 @@ async fn run_agentic(cli: &Cli, prompt: String) -> Result<()> {
     Ok(())
 }
 
+/// A minimal `reedline` prompt: a single `› ` indicator (no left/right segments).
+struct FluxPrompt;
+
+impl Prompt for FluxPrompt {
+    fn render_prompt_left(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+    fn render_prompt_right(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+    fn render_prompt_indicator(&self, _mode: PromptEditMode) -> Cow<'_, str> {
+        Cow::Borrowed("› ")
+    }
+    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+        Cow::Borrowed("… ")
+    }
+    fn render_prompt_history_search_indicator(&self, _s: PromptHistorySearch) -> Cow<'_, str> {
+        Cow::Borrowed("(reverse-search) ")
+    }
+}
+
+/// `~/.flux/history.txt`, creating `~/.flux` if needed; `None` if HOME is unset.
+fn repl_history_path() -> Option<std::path::PathBuf> {
+    let dir = std::path::PathBuf::from(std::env::var_os("HOME")?).join(".flux");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("history.txt"))
+}
+
 /// Interactive agentic REPL (tools enabled), with slash commands.
 async fn run_repl(cli: Cli) -> Result<()> {
     let (agent, mut session_id, spawner) = build_agent(&cli).await?;
@@ -519,14 +552,28 @@ async fn run_repl(cli: Cli) -> Result<()> {
         agent.model
     );
 
+    // reedline gives line editing, persistent history, and reverse-search. Because it reads in raw
+    // mode, a prompt-level Ctrl-C arrives as `Signal::CtrlC` (not a SIGINT), so it cleanly clears the
+    // line instead of being swallowed by tokio's signal handler; in-turn Ctrl-C is still the SIGINT
+    // caught by `run_interruptible`.
+    let history: Box<dyn reedline::History> = match repl_history_path() {
+        Some(p) => Box::new(
+            FileBackedHistory::with_file(1000, p)
+                .unwrap_or_else(|_| FileBackedHistory::new(1000).expect("in-memory history")),
+        ),
+        None => Box::new(FileBackedHistory::new(1000).expect("in-memory history")),
+    };
+    let mut editor = Reedline::create().with_history(history);
+    let prompt = FluxPrompt;
+
     loop {
-        eprint!("\n\x1b[1m› \x1b[0m");
-        std::io::stderr().flush().ok();
-        let mut line = String::new();
-        if std::io::stdin().read_line(&mut line)? == 0 {
-            eprintln!();
-            break; // EOF (Ctrl-D)
-        }
+        let line = match editor.read_line(&prompt) {
+            Ok(Signal::Success(buf)) => buf,
+            Ok(Signal::CtrlC) => continue, // clear the current line, reprompt
+            Ok(Signal::CtrlD) => break,    // exit
+            Ok(_) => continue,             // future Signal variants (non_exhaustive) → reprompt
+            Err(_) => break,
+        };
         let input = line.trim();
         if input.is_empty() {
             continue;
@@ -762,6 +809,12 @@ impl AgentSink for CliSink {
     fn text_delta(&mut self, t: &str) {
         print!("{t}");
         std::io::stdout().flush().ok();
+    }
+    fn thinking_delta(&mut self, t: &str) {
+        // Stream extended-thinking tokens dimmed on stderr so reasoning is observable in the REPL
+        // (was a silent no-op); kept off stdout so it doesn't pollute piped output.
+        eprint!("\x1b[2m{t}\x1b[0m");
+        std::io::stderr().flush().ok();
     }
     fn tool_call(&mut self, name: &str, input: &Value) {
         eprintln!(
