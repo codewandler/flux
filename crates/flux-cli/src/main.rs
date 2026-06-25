@@ -236,6 +236,41 @@ fn plugins_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".flux").join("plugins"))
 }
 
+/// A coarse "… ago" string from a millisecond epoch timestamp (for session listings).
+fn fmt_age(created_at_ms: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(created_at_ms);
+    let secs = ((now - created_at_ms) / 1000).max(0);
+    match secs {
+        s if s < 60 => format!("{s}s ago"),
+        s if s < 3_600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3_600),
+        s => format!("{}d ago", s / 86_400),
+    }
+}
+
+/// `flux sessions` — list recent sessions (newest first).
+fn run_sessions() -> Result<()> {
+    let store = open_session_store()?;
+    let sessions = store.list(30)?;
+    if sessions.is_empty() {
+        eprintln!("no sessions yet — start one with `flux` or `flux --agent`");
+        return Ok(());
+    }
+    for s in sessions {
+        println!(
+            "{}  {:>3} msg  {:<22} {}",
+            s.id,
+            s.messages,
+            s.model,
+            fmt_age(s.created_at_ms)
+        );
+    }
+    Ok(())
+}
+
 /// Open the session store under `~/.flux/sessions.db`.
 fn open_session_store() -> Result<SessionStore> {
     let home = std::env::var_os("HOME")
@@ -545,7 +580,7 @@ fn repl_history_path() -> Option<std::path::PathBuf> {
 
 /// Interactive agentic REPL (tools enabled), with slash commands.
 async fn run_repl(cli: Cli) -> Result<()> {
-    let (agent, mut session_id, spawner) = build_agent(&cli).await?;
+    let (mut agent, mut session_id, spawner) = build_agent(&cli).await?;
     let initial_rules = agent.executor.allow_rules();
     eprintln!(
         "\x1b[2mflux · {} · session {session_id} — /help, Ctrl-C interrupts a turn, Ctrl-D exits\x1b[0m",
@@ -582,9 +617,27 @@ async fn run_repl(cli: Cli) -> Result<()> {
             match rest.split_whitespace().next().unwrap_or("") {
                 "exit" | "quit" => break,
                 "help" => eprintln!(
-                    "commands: /help  /tools  /session  /clear  /pd <goal>  /goal <cond>  \
-                     /loop <n> <task>  /exit"
+                    "commands: /help  /tools  /model <spec>  /session  /sessions  /resume <id>  \
+                     /clear  /pd <goal>  /goal <cond>  /loop <n> <task>  /exit"
                 ),
+                "model" => {
+                    let spec = rest.strip_prefix("model").unwrap_or("").trim();
+                    if spec.is_empty() {
+                        eprintln!(
+                            "model: {} · usage: /model <provider/model | opus | sonnet | haiku>",
+                            agent.model
+                        );
+                    } else {
+                        match build_provider(spec) {
+                            Ok((native, model)) => {
+                                agent.provider = Box::new(native);
+                                agent.model = model;
+                                eprintln!("switched to {}", agent.model);
+                            }
+                            Err(e) => eprintln!("cannot switch model: {e}"),
+                        }
+                    }
+                }
                 "pd" => {
                     let goal = rest.strip_prefix("pd").unwrap_or("").trim().to_string();
                     if goal.is_empty() {
@@ -644,6 +697,44 @@ async fn run_repl(cli: Cli) -> Result<()> {
                     eprintln!("tools: {}", names.join(", "));
                 }
                 "session" => eprintln!("session {session_id} · model {}", agent.model),
+                "sessions" => match agent.store.list(30) {
+                    Ok(list) if !list.is_empty() => {
+                        for s in list {
+                            let here = if s.id == session_id { "*" } else { " " };
+                            eprintln!(
+                                "{here} {}  {:>3} msg  {:<20} {}",
+                                s.id,
+                                s.messages,
+                                s.model,
+                                fmt_age(s.created_at_ms)
+                            );
+                        }
+                    }
+                    Ok(_) => eprintln!("no sessions yet"),
+                    Err(e) => eprintln!("error listing sessions: {e}"),
+                },
+                "resume" => {
+                    let id = rest.strip_prefix("resume").unwrap_or("").trim();
+                    if id.is_empty() {
+                        eprintln!("usage: /resume <session_id>  (see /sessions)");
+                    } else {
+                        match agent.store.info(id) {
+                            Ok(info) => {
+                                let n = agent
+                                    .store
+                                    .load_messages(&info.id)
+                                    .map(|m| m.len())
+                                    .unwrap_or(0);
+                                session_id = info.id;
+                                eprintln!(
+                                    "resumed {session_id} · created with model {} · {n} messages",
+                                    info.model
+                                );
+                            }
+                            Err(e) => eprintln!("cannot resume `{id}`: {e}"),
+                        }
+                    }
+                }
                 "clear" => {
                     session_id = agent
                         .store
@@ -855,8 +946,16 @@ impl AgentSink for CliSink {
     fn turn_end(&mut self, usage: Option<Usage>) {
         println!();
         if let Some(u) = usage {
+            let cache = if u.cache_creation_input_tokens > 0 || u.cache_read_input_tokens > 0 {
+                format!(
+                    " cache_w={} cache_r={}",
+                    u.cache_creation_input_tokens, u.cache_read_input_tokens
+                )
+            } else {
+                String::new()
+            };
             eprintln!(
-                "\x1b[2m[usage in={} out={}]\x1b[0m",
+                "\x1b[2m[usage in={} out={}{cache}]\x1b[0m",
                 u.input_tokens, u.output_tokens
             );
         }
@@ -1053,6 +1152,9 @@ async fn main() -> Result<()> {
     }
     if argv.get(1).map(|s| s == "plugin").unwrap_or(false) {
         return run_plugin(&argv[2..]);
+    }
+    if argv.get(1).map(|s| s == "sessions").unwrap_or(false) {
+        return run_sessions();
     }
     let cli = Cli::parse();
     if let Some(addr) = cli.serve.clone() {

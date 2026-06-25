@@ -36,6 +36,15 @@ pub struct SessionInfo {
     pub created_at_ms: i64,
 }
 
+/// A one-line session summary for listings (`flux sessions` / the REPL `/sessions`).
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    pub id: String,
+    pub model: String,
+    pub created_at_ms: i64,
+    pub messages: usize,
+}
+
 /// A SQLite-backed session store.
 pub struct SessionStore {
     conn: Mutex<Connection>,
@@ -123,6 +132,32 @@ impl SessionStore {
             rusqlite::Error::QueryReturnedNoRows => Error::Other(format!("session {id} not found")),
             other => map_sql(other), // a real DB error must not masquerade as "not found"
         })
+    }
+
+    /// The most recent sessions (newest first), with their message counts, for listing/resuming.
+    pub fn list(&self, limit: usize) -> Result<Vec<SessionSummary>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.id, s.model, s.created_at, \
+                 (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) \
+                 FROM sessions s ORDER BY s.id DESC LIMIT ?1",
+            )
+            .map_err(map_sql)?;
+        let rows = stmt
+            .query_map([limit as i64], |r| {
+                let rowid: i64 = r.get(0)?;
+                let n: i64 = r.get(3)?;
+                Ok(SessionSummary {
+                    id: format!("s_{rowid}"),
+                    model: r.get(1)?,
+                    created_at_ms: r.get(2)?,
+                    messages: n as usize,
+                })
+            })
+            .map_err(map_sql)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_sql)
     }
 
     /// Append a message to the session log.
@@ -254,5 +289,26 @@ mod tests {
         let store = SessionStore::in_memory().unwrap();
         assert!(store.load_messages("nope").is_err());
         assert!(store.info("s_999").is_err());
+    }
+
+    #[test]
+    fn list_returns_newest_first_with_counts() {
+        let store = SessionStore::in_memory().unwrap();
+        let a = store.create_session("m1").unwrap();
+        store.append_message(&a, &Message::user_text("hi")).unwrap();
+        store
+            .append_message(&a, &Message::user_text("there"))
+            .unwrap();
+        let b = store.create_session("m2").unwrap();
+
+        let list = store.list(10).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, b, "newest first");
+        assert_eq!(list[0].messages, 0);
+        assert_eq!(list[1].id, a);
+        assert_eq!(list[1].messages, 2);
+        assert_eq!(list[1].model, "m1");
+        // limit is honored
+        assert_eq!(store.list(1).unwrap().len(), 1);
     }
 }
