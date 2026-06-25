@@ -13,7 +13,7 @@ the project `README.md`. The remaining `logo-*` / `icon` PNGs are the original g
 
 | Preview | File | Dimensions | Background | Purpose / when to use |
 | --- | --- | --- | --- | --- |
-| <img src="flux-logo.png" alt="flux-logo" width="180"> | `flux-logo.svg` / `flux-logo.png` | vector / 1496×560 | Transparent | **Primary logo / README hero.** Sharp, flat (no glow) horizontal lockup: flow mark + "Flux / flux-flow" wordmark. Edit the `.svg` and re-render the `.png` (`rsvg-convert -h 700 flux-logo.svg \| magick - -trim +repage -bordercolor none -border 36 flux-logo.png`). |
+| <img src="flux-logo.png" alt="flux-logo" width="180"> | `flux-logo.svg` / `flux-logo.png` | vector / 1508×570 | Transparent | **Primary logo / README hero.** Sharp, flat (no glow) horizontal lockup: flow mark + "Flux / flux-flow" wordmark. Edit the `.svg` and re-render the `.png` (`rsvg-convert -h 700 flux-logo.svg \| magick - -trim +repage -bordercolor none -border 36 flux-logo.png`). |
 | <img src="logo-neon.png" alt="logo-neon" width="150"> | `logo-neon.png` | 1254×1254 | Transparent | Icon-only neon `λ` mark (generated). Reads best on dark surfaces. |
 | <img src="logo-horizontal.png" alt="logo-horizontal" width="150"> | `logo-horizontal.png` | 1448×1086 | Transparent | Generated horizontal lockup: circular flow icon (3 nodes + dotted arrow → square) left of the wordmark. |
 | <img src="logo-horizontal-dashed.png" alt="logo-horizontal-dashed" width="150"> | `logo-horizontal-dashed.png` | 1448×1086 | Transparent | Horizontal lockup variant with an open **dashed-arc** flow icon. Airier feel. |

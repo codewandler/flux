@@ -8,43 +8,43 @@
     <!-- knock the connecting strokes out of the node interiors for clean rings -->
     <mask id="nodeMask" maskUnits="userSpaceOnUse" x="0" y="0" width="470" height="180">
       <rect x="0" y="0" width="470" height="180" fill="white"/>
-      <circle cx="60" cy="40" r="11" fill="black"/>
-      <circle cx="34" cy="90" r="11" fill="black"/>
-      <circle cx="60" cy="140" r="11" fill="black"/>
+      <circle cx="62" cy="40" r="11" fill="black"/>
+      <circle cx="36" cy="90" r="11" fill="black"/>
+      <circle cx="62" cy="140" r="11" fill="black"/>
     </mask>
   </defs>
 
-  <!-- ===== mark ===== -->
+  <!-- ===== mark: all arcs lie on one circle, center (98,90) r=62 ===== -->
   <g stroke="url(#g)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
     <g mask="url(#nodeMask)">
-      <!-- left dashed arc through the three input nodes -->
-      <path d="M 60 40 A 62 62 0 0 0 60 140" stroke-dasharray="2 11"/>
-      <!-- top flow arrow: top node -> square top -->
-      <path d="M 66 40 C 112 18 156 34 150 70"/>
-      <path d="M 141 62 L 151 72 L 159 62"/>
-      <!-- bottom flow arrow: bottom node -> square bottom -->
-      <path d="M 66 140 C 112 162 156 146 150 110"/>
-      <path d="M 141 118 L 151 108 L 159 118"/>
+      <!-- left dashed arc: top node -> left node -> bottom node -->
+      <path d="M 62 40 A 62 62 0 0 0 62 140" stroke-dasharray="2 11"/>
+      <!-- top flow arc: top node, over the top, down to the square -->
+      <path d="M 62 40 A 62 62 0 0 1 157 72"/>
+      <path d="M 148 64.5 L 157 72 L 159.4 60.6"/>
+      <!-- bottom flow arc: bottom node, under the bottom, up to the square -->
+      <path d="M 62 140 A 62 62 0 0 0 157 108"/>
+      <path d="M 148 115.5 L 157 108 L 159.4 119.4"/>
       <!-- middle flow: dotted line -> lambda -> arrow into square -->
-      <path d="M 46 90 L 82 90" stroke-dasharray="1 9"/>
+      <path d="M 48 90 L 82 90" stroke-dasharray="1 9"/>
       <path d="M 95 72 L 109 108"/>
       <path d="M 102 90 L 89 108"/>
-      <path d="M 114 90 L 127 90"/>
-      <path d="M 120 84 L 128 90 L 120 96"/>
+      <path d="M 114 90 L 129 90"/>
+      <path d="M 122 84 L 130 90 L 122 96"/>
     </g>
 
     <!-- input nodes (drawn on top, unmasked) -->
-    <circle cx="60" cy="40" r="9"/>
-    <circle cx="34" cy="90" r="9"/>
-    <circle cx="60" cy="140" r="9"/>
+    <circle cx="62" cy="40" r="9"/>
+    <circle cx="36" cy="90" r="9"/>
+    <circle cx="62" cy="140" r="9"/>
 
-    <!-- output square -->
-    <rect x="129" y="73" width="34" height="34" rx="7"/>
+    <!-- output square, nested in the right opening of the circle -->
+    <rect x="132" y="72" width="36" height="36" rx="7"/>
   </g>
 
   <!-- ===== wordmark ===== -->
-  <text x="200" y="110" font-family="Liberation Sans, DejaVu Sans, sans-serif" font-weight="bold"
+  <text x="205" y="110" font-family="Liberation Sans, DejaVu Sans, sans-serif" font-weight="bold"
         font-size="92" fill="url(#g)">Flux</text>
-  <text x="203" y="146" font-family="Liberation Sans, DejaVu Sans, sans-serif" font-weight="bold"
+  <text x="208" y="146" font-family="Liberation Sans, DejaVu Sans, sans-serif" font-weight="bold"
         font-size="29" letter-spacing="7" fill="url(#g)">flux-flow</text>
 </svg>
