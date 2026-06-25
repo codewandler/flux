@@ -5,33 +5,35 @@
       <stop offset="0.5" stop-color="#3b82f6"/>
       <stop offset="1" stop-color="#8b5cf6"/>
     </linearGradient>
-    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
-      <feGaussianBlur stdDeviation="1.8" result="b"/>
-      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
-    </filter>
+    <!-- knock the connecting strokes out of the node interiors for clean rings -->
+    <mask id="nodeMask" maskUnits="userSpaceOnUse" x="0" y="0" width="470" height="180">
+      <rect x="0" y="0" width="470" height="180" fill="white"/>
+      <circle cx="60" cy="40" r="11" fill="black"/>
+      <circle cx="34" cy="90" r="11" fill="black"/>
+      <circle cx="60" cy="140" r="11" fill="black"/>
+    </mask>
   </defs>
 
   <!-- ===== mark ===== -->
-  <g stroke="url(#g)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)">
-    <!-- left dashed arc through the three input nodes -->
-    <path d="M 60 40 A 62 62 0 0 0 60 140" stroke-dasharray="2 11"/>
+  <g stroke="url(#g)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+    <g mask="url(#nodeMask)">
+      <!-- left dashed arc through the three input nodes -->
+      <path d="M 60 40 A 62 62 0 0 0 60 140" stroke-dasharray="2 11"/>
+      <!-- top flow arrow: top node -> square top -->
+      <path d="M 66 40 C 112 18 156 34 150 70"/>
+      <path d="M 141 62 L 151 72 L 159 62"/>
+      <!-- bottom flow arrow: bottom node -> square bottom -->
+      <path d="M 66 140 C 112 162 156 146 150 110"/>
+      <path d="M 141 118 L 151 108 L 159 118"/>
+      <!-- middle flow: dotted line -> lambda -> arrow into square -->
+      <path d="M 46 90 L 82 90" stroke-dasharray="1 9"/>
+      <path d="M 95 72 L 109 108"/>
+      <path d="M 102 90 L 89 108"/>
+      <path d="M 114 90 L 127 90"/>
+      <path d="M 120 84 L 128 90 L 120 96"/>
+    </g>
 
-    <!-- top flow arrow: top node -> square top -->
-    <path d="M 66 40 C 112 18 156 34 150 70"/>
-    <path d="M 141 62 L 151 72 L 159 62" fill="none"/>
-
-    <!-- bottom flow arrow: bottom node -> square bottom -->
-    <path d="M 66 140 C 112 162 156 146 150 110"/>
-    <path d="M 141 118 L 151 108 L 159 118" fill="none"/>
-
-    <!-- middle flow: dotted line -> lambda -> arrow into square -->
-    <path d="M 46 90 L 82 90" stroke-dasharray="1 9"/>
-    <path d="M 95 72 L 109 108"/>
-    <path d="M 102 90 L 89 108"/>
-    <path d="M 114 90 L 127 90"/>
-    <path d="M 120 84 L 128 90 L 120 96" fill="none"/>
-
-    <!-- input nodes -->
+    <!-- input nodes (drawn on top, unmasked) -->
     <circle cx="60" cy="40" r="9"/>
     <circle cx="34" cy="90" r="9"/>
     <circle cx="60" cy="140" r="9"/>
@@ -41,10 +43,8 @@
   </g>
 
   <!-- ===== wordmark ===== -->
-  <g filter="url(#glow)">
-    <text x="200" y="110" font-family="Liberation Sans, DejaVu Sans, sans-serif" font-weight="bold"
-          font-size="92" fill="url(#g)">Flux</text>
-    <text x="203" y="146" font-family="Liberation Sans, DejaVu Sans, sans-serif" font-weight="bold"
-          font-size="29" letter-spacing="7" fill="url(#g)">flux-flow</text>
-  </g>
+  <text x="200" y="110" font-family="Liberation Sans, DejaVu Sans, sans-serif" font-weight="bold"
+        font-size="92" fill="url(#g)">Flux</text>
+  <text x="203" y="146" font-family="Liberation Sans, DejaVu Sans, sans-serif" font-weight="bold"
+        font-size="29" letter-spacing="7" fill="url(#g)">flux-flow</text>
 </svg>
