@@ -14,6 +14,8 @@ leak secrets.
 
 ## Quickstart
 
+Requires **Rust 1.85+** (`rustup update stable`).
+
 ```bash
 # build the `flux` binary
 cargo build --release            # → target/release/flux
@@ -30,8 +32,9 @@ flux --tui
 # agentic one-shot that can edit files / run commands under the safety envelope
 flux --agent "add a test for the parser"     # prompts for approval; --yes to auto-approve
 
-# resume the most recent session
-flux -c "...continue..."
+# resume the most recent session (optionally with a new prompt)
+flux -c
+flux -c -p "now add tests"
 
 # HTTP daemon (REST + SSE streaming)
 flux --serve 127.0.0.1:8787 --yes
@@ -39,6 +42,11 @@ flux --serve 127.0.0.1:8787 --yes
 
 No network or API keys are needed to try the machinery: `-m mock` runs a built-in offline provider
 through the full agent loop.
+
+```bash
+# try the full agentic loop offline — no API key needed
+flux --agent --yes -m mock "summarise this repo"
+```
 
 ---
 

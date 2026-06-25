@@ -1,0 +1,50 @@
+name: Bug report
+description: Report a defect in flux
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. **For security vulnerabilities, do not file a public issue** — see
+        [SECURITY.md](https://github.com/codewandler/flux/blob/main/SECURITY.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+      placeholder: Steps to reproduce, expected vs. actual behavior.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: flux version
+      description: Output of `flux --version` (or the commit you built from).
+      placeholder: "0.2.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface
+      options:
+        - CLI one-shot (-p)
+        - Interactive REPL
+        - Agentic mode (--agent)
+        - TUI (--tui)
+        - HTTP server (--serve)
+        - SDK (flux-sdk)
+        - Plugin / hook
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: Provider / model
+      description: e.g. `anthropic/opus`, `mock`. Mention if the provider is required to reproduce.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: Error messages or logs. **Redact any secrets.**
+      render: shell
