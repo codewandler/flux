@@ -53,6 +53,16 @@ fn str_param<'a>(params: &'a Value, key: &str, tool: &str) -> Result<&'a str> {
         .ok_or_else(|| Error::Other(format!("{tool}: required string param `{key}` missing")))
 }
 
+/// Read an integer argument from `obj[key]`, accepting either a JSON number or a numeric string —
+/// LLMs frequently emit `"120"` instead of `120`, and a strict `as_u64()` would silently drop it
+/// (e.g. a paged `read` would fall back to an unbounded read and hit the large-file guard). Returns
+/// `None` when the key is absent or the value isn't a non-negative integer.
+fn u64_arg(obj: &Value, key: &str) -> Option<u64> {
+    let v = obj.get(key)?;
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
 // ---------------------------------------------------------------------------
 // shared file-read / diff helpers
 // ---------------------------------------------------------------------------
@@ -246,11 +256,8 @@ impl Tool for ReadTool {
                 });
             }
         };
-        let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let limit = params
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as usize);
+        let offset = u64_arg(&params, "offset").unwrap_or(0) as usize;
+        let limit = u64_arg(&params, "limit").map(|n| n as usize);
 
         // Unbounded read: refuse to dump an over-cap file — return guidance (NOT an error) so the
         // planner re-reads a window. The model picked no window, so there's no clean value to bind.
@@ -876,10 +883,7 @@ impl Tool for BashTool {
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let command = str_param(&params, "command", "bash")?;
-        let timeout = params
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
+        let timeout = u64_arg(&params, "timeout_secs").unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
         let argv = vec!["sh".to_string(), "-c".to_string(), command.to_string()];
         let out = ctx.system.run(&argv, Duration::from_secs(timeout)).await?;
         let mut body = String::new();
@@ -1008,9 +1012,7 @@ impl Tool for GrepTool {
             .get("literal")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let max = params
-            .get("max_results")
-            .and_then(|v| v.as_u64())
+        let max = u64_arg(&params, "max_results")
             .map(|n| n as usize)
             .unwrap_or(DEFAULT_GREP_LIMIT);
 
@@ -1362,12 +1364,8 @@ impl Tool for PatchTool {
         let mut ops = Vec::with_capacity(edits_json.len());
         for (idx, e) in edits_json.iter().enumerate() {
             let op = e.get("op").and_then(|v| v.as_str()).unwrap_or("");
-            let line = e.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let end_line = e
-                .get("end_line")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as usize)
-                .unwrap_or(line);
+            let line = u64_arg(e, "line").unwrap_or(0) as usize;
+            let end_line = u64_arg(e, "end_line").map(|n| n as usize).unwrap_or(line);
             let text = e
                 .get("text")
                 .and_then(|v| v.as_str())
@@ -2192,6 +2190,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.content, "b\nc");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn read_coerces_string_offset_limit() {
+        // LLMs often emit offset/limit as strings ("1"); they must be honored, not silently dropped
+        // (which would fall through to an unbounded read / the large-file guard).
+        let (dir, c) = ctx();
+        WriteTool
+            .execute(&c, json!({"path": "n.txt", "content": "a\nb\nc\nd"}))
+            .await
+            .unwrap();
+        let r = ReadTool
+            .execute(&c, json!({"path": "n.txt", "offset": "1", "limit": "2"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.content, "b\nc",
+            "string offset/limit should window like numbers"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
