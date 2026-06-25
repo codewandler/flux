@@ -10,6 +10,10 @@ mandatory safety envelope (authorization → approval → guarded IO). Don't add
 
 For the *why* and the direction, read [docs/vision.md](docs/vision.md); for the full design,
 [docs/architecture.md](docs/architecture.md); for status and what's next, [docs/roadmap.md](docs/roadmap.md).
+Active execution plans live in [`.flux/plans/`](.flux/plans/) (local, gitignored) — e.g.
+[`markdown-rendering-and-m2-compliance.md`](.flux/plans/markdown-rendering-and-m2-compliance.md)
+(CLI markdown rendering, shipped in 0.2.4, + the markdown-library compliance push) and the separate
+`flux-flow-implementation.md` effort; read the relevant plan before continuing that work.
 The headline principle that governs review: **non-bypassable safety, and quality over quantity — flux
 is deliberately not a sprawling, bug-ridden codebase. Every behavioral change ships with a test, and
 the gate stays green.**
