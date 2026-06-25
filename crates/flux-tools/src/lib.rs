@@ -199,8 +199,10 @@ impl Tool for EditTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "edit".into(),
-            description: "Replace an exact string in a workspace file. By default `old_string` \
-                          must occur exactly once; set `replace_all` for multiple."
+            description: "Replace a string in a workspace file. `old_string` must occur exactly \
+                          once (or set `replace_all` to replace every occurrence). If the exact \
+                          text isn't found, a whitespace-tolerant line match is tried before \
+                          failing, so trailing-whitespace differences don't block the edit."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -254,14 +256,33 @@ impl Tool for EditTool {
 
         let content = ctx.system.read_file(path).await?;
         let count = content.matches(old).count();
+
         if count == 0 {
-            return Err(Error::Other(format!(
-                "edit: `old_string` not found in {path}"
-            )));
+            // Exact match failed — the usual cause is a trailing-whitespace or final-newline
+            // mismatch. Try a whitespace-tolerant, line-aligned match before giving up, so the
+            // model doesn't burn a turn re-guessing the exact bytes.
+            return match flexible_edit(&content, old, new) {
+                FlexMatch::One(updated) => {
+                    ctx.system.write_file(path, &updated).await?;
+                    Ok(ToolResult::ok(format!(
+                        "edited {path} (matched `old_string` ignoring trailing whitespace)"
+                    )))
+                }
+                FlexMatch::Many(n) => Err(Error::Other(format!(
+                    "edit: `old_string` not found exactly in {path}, and a whitespace-insensitive \
+                     match is ambiguous ({n} candidates); add surrounding lines for context"
+                ))),
+                FlexMatch::None => Err(Error::Other(format!(
+                    "edit: `old_string` not found in {path}{}",
+                    not_found_hint(&content, old)
+                ))),
+            };
         }
         if count > 1 && !replace_all {
             return Err(Error::Other(format!(
-                "edit: `old_string` occurs {count} times in {path}; pass replace_all or add context"
+                "edit: `old_string` occurs {count} times in {path} (lines {}); pass replace_all or \
+                 add surrounding context to make it unique",
+                occurrence_lines(&content, old)
             )));
         }
         let updated = if replace_all {
@@ -276,6 +297,81 @@ impl Tool for EditTool {
             if replace_all && count != 1 { "s" } else { "" }
         )))
     }
+}
+
+/// Outcome of a whitespace-tolerant, line-aligned match (tried only when an exact match fails).
+enum FlexMatch {
+    /// Exactly one match; carries the rewritten file content.
+    One(String),
+    /// Multiple candidate matches (ambiguous — refuse rather than guess).
+    Many(usize),
+    /// No match.
+    None,
+}
+
+/// Locate `old` in `content` allowing only **trailing-whitespace / final-newline** differences
+/// (leading whitespace/indentation must still match exactly), at line granularity. Returns the
+/// rewritten content when exactly one block matches — the common "trailing space the model didn't
+/// reproduce" case, without the false-match risk of fuzzy matching.
+fn flexible_edit(content: &str, old: &str, new: &str) -> FlexMatch {
+    let cl: Vec<&str> = content.split_inclusive('\n').collect();
+    let ol: Vec<&str> = old.split_inclusive('\n').collect();
+    if ol.is_empty() || ol.len() > cl.len() {
+        return FlexMatch::None;
+    }
+    let same = |a: &str, b: &str| a.trim_end() == b.trim_end();
+    let hits: Vec<usize> = (0..=cl.len() - ol.len())
+        .filter(|&i| (0..ol.len()).all(|j| same(cl[i + j], ol[j])))
+        .collect();
+    match hits.as_slice() {
+        [] => FlexMatch::None,
+        [i] => {
+            let start: usize = cl[..*i].iter().map(|s| s.len()).sum();
+            let end: usize = start + cl[*i..*i + ol.len()].iter().map(|s| s.len()).sum::<usize>();
+            let mut replacement = new.to_string();
+            // Keep a trailing newline the matched block had, so we don't merge the next line.
+            if content[start..end].ends_with('\n') && !replacement.ends_with('\n') {
+                replacement.push('\n');
+            }
+            FlexMatch::One(format!(
+                "{}{replacement}{}",
+                &content[..start],
+                &content[end..]
+            ))
+        }
+        many => FlexMatch::Many(many.len()),
+    }
+}
+
+/// Hint for a failed exact match: flag when a line with the same text exists but indented
+/// differently (the agent should match the exact leading whitespace).
+fn not_found_hint(content: &str, old: &str) -> String {
+    let first = old.lines().next().unwrap_or("").trim();
+    if !first.is_empty() && content.lines().any(|l| l.trim() == first) {
+        " (a line with matching text exists but the indentation differs — match the exact leading \
+         whitespace)"
+            .to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// 1-based line numbers where `old` begins in `content` (capped at 10), for the not-unique error.
+fn occurrence_lines(content: &str, old: &str) -> String {
+    if old.is_empty() {
+        return String::new();
+    }
+    let mut nums = Vec::new();
+    let mut from = 0;
+    while let Some(pos) = content[from..].find(old) {
+        let abs = from + pos;
+        nums.push((content[..abs].matches('\n').count() + 1).to_string());
+        from = abs + old.len();
+        if nums.len() >= 10 {
+            break;
+        }
+    }
+    nums.join(", ")
 }
 
 // ---------------------------------------------------------------------------
@@ -626,6 +722,75 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let c = ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap())));
         (dir, c)
+    }
+
+    #[tokio::test]
+    async fn edit_tolerates_trailing_whitespace() {
+        let (dir, c) = ctx();
+        // The file's first line has trailing spaces the model won't reproduce in `old_string`.
+        WriteTool
+            .execute(
+                &c,
+                json!({"path": "a.rs", "content": "fn main() {   \n    let x = 1;\n}\n"}),
+            )
+            .await
+            .unwrap();
+        let r = EditTool
+            .execute(
+                &c,
+                json!({
+                    "path": "a.rs",
+                    "old_string": "fn main() {\n    let x = 1;",
+                    "new_string": "fn main() {\n    let x = 2;"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!r.is_error, "flexible edit should succeed: {}", r.content);
+        let after = ReadTool.execute(&c, json!({"path": "a.rs"})).await.unwrap();
+        assert!(after.content.contains("let x = 2;"));
+        assert!(after.content.ends_with("}\n"), "structure preserved");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_reports_occurrence_lines_when_ambiguous() {
+        let (dir, c) = ctx();
+        WriteTool
+            .execute(&c, json!({"path": "a.txt", "content": "x\nfoo\ny\nfoo\n"}))
+            .await
+            .unwrap();
+        let err = EditTool
+            .execute(
+                &c,
+                json!({"path": "a.txt", "old_string": "foo", "new_string": "bar"}),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("lines 2, 4"), "got: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_hints_on_indentation_mismatch() {
+        let (dir, c) = ctx();
+        // File is tab-indented; the model's old_string uses spaces — so it's neither an exact
+        // substring nor a flexible (trailing-ws-only) match, but the text is clearly present.
+        WriteTool
+            .execute(&c, json!({"path": "a.txt", "content": "\tindented line\n"}))
+            .await
+            .unwrap();
+        let err = EditTool
+            .execute(
+                &c,
+                json!({"path": "a.txt", "old_string": "    indented line", "new_string": "x"}),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("indentation differs"), "got: {err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
