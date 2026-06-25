@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] — 2026-06-25
+
+First publicly installable release — no functional changes from 0.2.0.
+
+### Added
+
+- **Prebuilt binaries + installer** — `flux` for Linux, macOS (x86_64 + aarch64), and Windows,
+  with a `curl … | sh` / PowerShell installer, produced on each tagged release (cargo-dist).
+- Dual-license files (MIT + Apache-2.0), contributor and security policies, and GitHub issue/PR
+  templates.
+
 ## [0.2.0] — 2026-06-25
 
 Daily-driver readiness: make flux a coding agent you actually reach for. Validated end-to-end against
@@ -119,6 +130,7 @@ First release.
 - **Tooling** — an architecture layering lint that fails on inner→outer crate dependencies, and CI
   running build/test/clippy/fmt.
 
+[0.2.1]: https://github.com/codewandler/flux/releases/tag/v0.2.1
 [0.2.0]: https://github.com/codewandler/flux/releases/tag/v0.2.0
 [0.1.1]: https://github.com/codewandler/flux/releases/tag/v0.1.1
 [0.1.0]: https://github.com/codewandler/flux/releases/tag/v0.1.0
