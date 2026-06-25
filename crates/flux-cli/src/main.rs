@@ -48,9 +48,11 @@ struct Cli {
     #[arg(short = 'p', long = "print", hide = true)]
     print: bool,
 
-    /// `provider/model` (provider ∈ anthropic|claude|openai|codex|openrouter; default anthropic).
-    /// Bare aliases `sonnet|opus|haiku` resolve against Anthropic. E.g. `openrouter/anthropic/claude-sonnet-4.5`.
-    /// Overrides `model` in `.flux/config.toml`; falls back to `sonnet`.
+    /// Fully-qualified `provider/model` spec. Provider must be one of:
+    ///   `anthropic` (API key), `claude` (OAuth/subscription), `openai`, `codex`, `openrouter`.
+    /// Short aliases `sonnet`, `opus`, `haiku` are convenience shorthands for `anthropic/<model>`.
+    /// Examples: `claude/claude-sonnet-4-6`, `openai/gpt-4o`, `openrouter/anthropic/claude-sonnet-4-5`.
+    /// Overrides `model` in `.flux/config.toml`; falls back to `sonnet` (= `anthropic/claude-sonnet-4-6`).
     #[arg(short = 'm', long)]
     model: Option<String>,
 
@@ -87,7 +89,8 @@ struct Cli {
     #[arg(long, value_enum, default_value_t)]
     color: style::ColorChoice,
 
-    /// Launch the ratatui chat TUI (requires a real terminal; currently also needs `--yes`).
+    /// Launch the ratatui chat TUI (requires a real terminal). Tool calls raise a y/a/N modal;
+    /// pass `--yes` to auto-approve all calls without a modal.
     #[arg(long)]
     tui: bool,
 
@@ -188,12 +191,28 @@ fn persist_new_rules(initial: &[String], current: &[String]) {
 
 const KNOWN_PROVIDERS: &[&str] = &["anthropic", "claude", "openai", "codex", "openrouter"];
 
-/// Parse a `provider/model` spec (default provider `anthropic`) and build the matching provider
-/// from environment credentials. Returns the live provider plus the resolved concrete model id.
+/// Parse a fully-qualified `provider/model` spec and build the matching provider from environment
+/// credentials. Provider must be an explicit prefix (`anthropic/`, `claude/`, `openai/`, `codex/`,
+/// `openrouter/`). Bare short aliases (`sonnet`, `opus`, `haiku`) are implicitly `anthropic/<alias>`.
+/// Any other bare string (no `/`) is an error — use `anthropic/` or `claude/` to disambiguate.
 fn build_provider(spec: &str) -> Result<(NativeProvider, String)> {
     let (provider, model) = match spec.split_once('/') {
         Some((p, m)) if KNOWN_PROVIDERS.contains(&p) => (p.to_string(), m.to_string()),
-        _ => ("anthropic".to_string(), spec.to_string()),
+        Some((p, _)) => bail!(
+            "unknown provider `{p}` — use one of: {}",
+            KNOWN_PROVIDERS.join(", ")
+        ),
+        None => {
+            // Allow bare short aliases only; everything else requires an explicit provider prefix.
+            match spec {
+                "sonnet" | "opus" | "haiku" | "mock" => ("anthropic".to_string(), spec.to_string()),
+                other => bail!(
+                    "model spec `{other}` has no provider prefix — use `provider/model`, e.g. \
+                     `anthropic/{other}` or `claude/{other}` (providers: {})",
+                    KNOWN_PROVIDERS.join(", ")
+                ),
+            }
+        }
     };
 
     let native = match provider.as_str() {
@@ -340,7 +359,9 @@ fn provider_for(spec: &str) -> Result<Box<dyn Provider>> {
     if spec == "mock" || spec.starts_with("mock/") {
         Ok(Box::<MockCliProvider>::default())
     } else {
-        let (native, _model) = build_provider(spec)?;
+        let (native, _model) = build_provider(spec).map_err(|e| anyhow::anyhow!(
+            "sub-agent provider: {e} (hint: the parent --model spec is forwarded to sub-agents)"
+        ))?;
         Ok(Box::new(native))
     }
 }
@@ -657,7 +678,7 @@ async fn run_plan(cli: Cli) -> Result<()> {
     let compiled = match engine
         .compile_once(&session_id, &prompt, terminal_ask(&cli_ask))
         .await
-        .context("compile")?
+        .map_err(|e| anyhow::anyhow!("{}", flux_flow::engine::planner_error(&e)))?
     {
         flux_flow::compile::TurnOutput::Plan(c) => c,
         flux_flow::compile::TurnOutput::Chat(text) => {
@@ -1805,11 +1826,12 @@ fn addr_is_loopback(addr: &str) -> bool {
     }
 }
 
-/// Launch the ratatui chat TUI. The TUI installs its own modal approver, so `--yes` is not required
-/// (tool calls raise an in-TUI y/a/N prompt).
+/// Launch the ratatui chat TUI. The TUI installs its own modal approver unless `--yes` was passed,
+/// in which case all tool calls are auto-approved (no modal).
 async fn run_tui(cli: Cli) -> Result<()> {
+    let auto_approve = cli.yes;
     let (agent, session_id, _spawner) = build_agent(&cli).await?;
-    flux_tui::run(agent, session_id).await
+    flux_tui::run(agent, session_id, auto_approve).await
 }
 
 /// `flux plugin add <name> <program> [args…] | ls | pin <name> <version> | rollback <name>`.

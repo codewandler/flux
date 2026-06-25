@@ -12,10 +12,19 @@ flux-flow.workspace = true
 flux-runtime.workspace = true
 flux-spec.workspace = true
 flux-evidence.workspace = true
-ratatui.workspace = true
+# `unstable-rendered-line-info` exposes `Paragraph::line_count`, used to size the scrollback.
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 crossterm.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 async-trait.workspace = true
+
+# Markdown + ANSI rendering for the transcript. markdown-{stream,terminal} are pinned to the same
+# git rev flux-cli uses (so the workspace resolves a single copy); ansi-to-tui turns the ANSI that
+# markdown-terminal and the flux-flow plan tree emit into ratatui `Text`.
+markdown-stream = { git = "https://github.com/codewandler/markdown", rev = "e3b765b6d11599ad279db8de96109d4cdf178b2a" }
+markdown-terminal = { git = "https://github.com/codewandler/markdown", rev = "e3b765b6d11599ad279db8de96109d4cdf178b2a" }
+ansi-to-tui = "7"
+tui-textarea = "0.7"

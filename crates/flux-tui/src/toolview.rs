@@ -117,6 +117,65 @@ pub fn format_result(name: &str, content: &str, is_error: bool) -> Option<String
     }
 }
 
+/// The kind of an expanded-detail line, so the surface can color it (diff add/del, metadata, plain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailKind {
+    Plain,
+    Add,
+    Del,
+    Meta,
+}
+
+/// Expanded detail for a tool call, as color-free `(kind, text)` lines. `edit` becomes a unified
+/// `-old`/`+new` diff and `write` a `+`-prefixed new-file preview — both read from the *input*, which
+/// is exact and available before the result — while everything else shows the raw result `content`.
+/// The caller caps the line count and applies color per [`DetailKind`].
+pub fn format_detail(
+    name: &str,
+    input: &Value,
+    content: &str,
+    is_error: bool,
+) -> Vec<(DetailKind, String)> {
+    let s = |k: &str| input.get(k).and_then(Value::as_str);
+    if is_error {
+        return plain(content);
+    }
+    match name {
+        "edit" => {
+            let mut out = Vec::new();
+            if let Some(p) = s("path") {
+                out.push((DetailKind::Meta, format!("@ {p}")));
+            }
+            for l in s("old_string").unwrap_or_default().lines() {
+                out.push((DetailKind::Del, format!("- {l}")));
+            }
+            for l in s("new_string").unwrap_or_default().lines() {
+                out.push((DetailKind::Add, format!("+ {l}")));
+            }
+            out
+        }
+        "write" => {
+            let mut out = Vec::new();
+            if let Some(p) = s("path") {
+                out.push((DetailKind::Meta, format!("@ {p}")));
+            }
+            for l in s("content").unwrap_or_default().lines() {
+                out.push((DetailKind::Add, format!("+ {l}")));
+            }
+            out
+        }
+        _ => plain(content),
+    }
+}
+
+fn plain(content: &str) -> Vec<(DetailKind, String)> {
+    content
+        .trim_end()
+        .lines()
+        .map(|l| (DetailKind::Plain, l.to_string()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +254,25 @@ mod tests {
         );
         assert_eq!(format_result("bash", "anything", false), None);
         assert_eq!(format_result("grep", "x", true), None); // errors keep the generic preview
+    }
+
+    #[test]
+    fn edit_detail_is_a_unified_diff() {
+        let d = format_detail(
+            "edit",
+            &json!({"path": "a.rs", "old_string": "let x = 1;", "new_string": "let x = 2;"}),
+            "ok",
+            false,
+        );
+        assert_eq!(d[0], (DetailKind::Meta, "@ a.rs".to_string()));
+        assert_eq!(d[1], (DetailKind::Del, "- let x = 1;".to_string()));
+        assert_eq!(d[2], (DetailKind::Add, "+ let x = 2;".to_string()));
+    }
+
+    #[test]
+    fn bash_detail_is_plain_content() {
+        let d = format_detail("bash", &json!({"command": "ls"}), "a.rs\nb.rs", false);
+        assert_eq!(d.len(), 2);
+        assert!(d.iter().all(|(k, _)| *k == DetailKind::Plain));
     }
 }
