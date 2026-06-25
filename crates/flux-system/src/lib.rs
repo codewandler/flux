@@ -218,6 +218,39 @@ impl System {
         Ok(())
     }
 
+    /// Read the raw bytes of a file within the workspace (no UTF-8 decode). Used to sniff binary
+    /// files (NUL bytes) and report byte sizes *before* a lossy text decode.
+    pub async fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>> {
+        let p = self.workspace.resolve(path)?;
+        Ok(tokio::fs::read(&p).await?)
+    }
+
+    /// Append text to a file within the workspace, creating it (and parent directories) if absent.
+    /// Goes through the same `resolve()` jail as `write_file` (including the dangling-symlink guard)
+    /// before opening.
+    pub async fn append_file(&self, path: &str, contents: &str) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let p = self.workspace.resolve(path)?;
+        if let Some(parent) = p.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let mut f = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+            .await?;
+        f.write_all(contents.as_bytes()).await?;
+        Ok(())
+    }
+
+    /// Last-modification time of a file within the workspace. Used by the read-before-write guard to
+    /// detect a file that changed on disk since the model last read it.
+    pub async fn file_mtime(&self, path: &str) -> Result<std::time::SystemTime> {
+        let p = self.workspace.resolve(path)?;
+        let meta = tokio::fs::metadata(&p).await?;
+        Ok(meta.modified()?)
+    }
+
     /// List the entries of a directory within the workspace (names only).
     pub async fn list_dir(&self, path: &str) -> Result<Vec<String>> {
         let p = self.workspace.resolve(path)?;
@@ -357,6 +390,51 @@ mod tests {
         assert_eq!(sys.read_file("sub/a.txt").await.unwrap(), "hello");
         let listing = sys.list_dir(".").await.unwrap();
         assert!(listing.contains(&"sub".to_string()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn read_file_bytes_returns_raw_including_nul() {
+        let (dir, sys) = temp_workspace();
+        // Bytes with an embedded NUL and invalid UTF-8 — read_file_bytes must NOT decode/error.
+        let raw = [b'h', b'i', 0u8, 0xFF, b'!'];
+        std::fs::write(dir.join("b.bin"), raw).unwrap();
+        let got = sys.read_file_bytes("b.bin").await.unwrap();
+        assert_eq!(got, raw);
+        // The UTF-8 read path, by contrast, rejects it.
+        assert!(sys.read_file("b.bin").await.is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn append_creates_and_appends() {
+        let (dir, sys) = temp_workspace();
+        // Appending to a not-yet-existing nested path creates the file and its parent dir.
+        sys.append_file("logs/run.txt", "line1\n").await.unwrap();
+        sys.append_file("logs/run.txt", "line2\n").await.unwrap();
+        assert_eq!(
+            sys.read_file("logs/run.txt").await.unwrap(),
+            "line1\nline2\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn append_rejects_escape() {
+        let (dir, sys) = temp_workspace();
+        assert!(sys.append_file("../escape.txt", "x").await.is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn file_mtime_advances_after_write() {
+        let (dir, sys) = temp_workspace();
+        sys.write_file("m.txt", "a").await.unwrap();
+        let t1 = sys.file_mtime("m.txt").await.unwrap();
+        // A second write must not move mtime backwards (it's monotonic per file here).
+        sys.write_file("m.txt", "ab").await.unwrap();
+        let t2 = sys.file_mtime("m.txt").await.unwrap();
+        assert!(t2 >= t1, "mtime should not go backwards");
         std::fs::remove_dir_all(&dir).ok();
     }
 

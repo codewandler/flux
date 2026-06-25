@@ -93,6 +93,8 @@ crossterm = "0.28"
 toml = "0.8"
 base64 = "0.22"
 sha2 = "0.10"
+regex = "1"
+similar = "2"
 rand = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
 rquickjs = "0.6"

@@ -166,6 +166,28 @@ directly through existing `Workspace`/path primitives (no ambiguity); the richer
 (`confidence`/`Source`/disambiguation) phases in. The rule "no side effects until required things are
 resolved unambiguously" holds at execution time.
 
+### 5.7 Two-face tool results & the file-tool surface
+
+A `flux_runtime::ToolResult` carries **two faces**: `content` (the *canonical* value — bound to a symbol,
+spliced into `{{symbol}}` interpolation, and used for `when`/`return` truthiness) and an optional `view`
+(the *LLM-facing* rendering shown to the model and user). `runtime::execute_call` binds/stores the
+canonical `content`; the model-facing observation (and the per-op sink line) use `view()` — so a `read`
+stores the raw file bytes (clean to interpolate) while showing the model a line-numbered view, and an
+`edit`/`write` attaches a unified diff without polluting the bound value. `view` defaults to `content`.
+
+On that base, the built-in file tools (`flux-tools`) match a strong coding agent:
+- **`read`** — canonical = raw bytes; view = line-numbered. Detects binary (NUL sniff) and refuses; an
+  unbounded read over the line/byte cap returns *guidance* ("use offset/limit"), not a dump.
+- **`edit`** — exact match, then a fall-back chain (trailing-whitespace → indentation → block-anchor,
+  first-unique-hit wins, reporting which strategy matched); the view carries a unified diff.
+- **`write`** — view carries a diff vs prior content (all-additions for a new file).
+- **`grep`** — regex by default (`literal` escape hatch for substring).
+- **`append`** (lower-risk than `write`), **`read_many`** (survey several files in one node), **`patch`**
+  (line-anchored `insert_before/after`/`replace_range`/`delete_range`, resolved against ORIGINAL
+  coordinates with overlap-conflict detection).
+- **Read-before-write guard** — `edit`/`patch` require the file to have been read (or written) this
+  session and refuse if it changed on disk since; the read-set lives on the shared `ToolContext`.
+
 ## 6. Flows as artifacts
 
 A flow is first-class and durable: **NL instruction → compile to graph → optionally user-verifies → run

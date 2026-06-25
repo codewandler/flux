@@ -96,6 +96,7 @@ impl Tool for WebFetchTool {
         }
         Ok(ToolResult {
             content: format!("[{status}]\n{body}"),
+            view: None,
             is_error: !status.is_success(),
         })
     }

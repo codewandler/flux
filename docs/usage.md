@@ -14,6 +14,14 @@ Every turn, the model does exactly one of two things:
 - **emits a plan** — a graph of operations (`read`, `bash`, `edit`, `repeat`, `when`, …), or
 - **answers in prose** — when no operation is needed.
 
+The built-in file operations are: `read` (raw text, with a line-numbered view; refuses binary and
+guides you to a range for very large files), `read_many` (survey several files in one node), `write`
+(create/overwrite, returns a diff), `append` (lower-risk add to a file), `edit` (string replace with
+progressively looser whitespace/indentation matching and a unified diff), `patch` (line-anchored
+`insert_before/after`/`replace_range`/`delete_range`), `glob`, and `grep` (regex by default; pass
+`literal` for a plain substring). A file must be **read before you `edit`/`patch` it** — and if it
+changed on disk since you read it, the edit is refused so you re-read first.
+
 It has **no other tools.** It can't call `bash` or `read` directly; even reading a file is a node in a
 plan. This is what makes a turn auditable: what you see *is* what runs.
 

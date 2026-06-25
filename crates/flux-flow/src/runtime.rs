@@ -40,7 +40,12 @@ pub struct CallOutcome {
     /// The stored value id, or `None` if the op errored (nothing is bound on error).
     pub value_id: Option<ValueId>,
     pub is_error: bool,
+    /// The canonical value: bound to the symbol, spliced into `{{interpolation}}`, used for control
+    /// flow (`when`/`return`). Deterministic execution works with this.
     pub content: String,
+    /// The model-facing rendering (line-numbered read, diff, …). Equals `content` when the op set no
+    /// distinct view. Surfaced to the sink/observation, never bound or interpolated.
+    pub view: String,
 }
 
 fn sha256_hex(s: &str) -> String {
@@ -83,6 +88,8 @@ pub async fn execute_call(
     )?;
 
     let result = executor.dispatch(op, input).await;
+    // The model-facing view (line numbers, diff, guidance); falls back to canonical content.
+    let view = result.view().to_string();
 
     if result.is_error {
         store.append_event(
@@ -96,9 +103,11 @@ pub async fn execute_call(
             value_id: None,
             is_error: true,
             content: result.content,
+            view,
         });
     }
 
+    // Bind/store the CANONICAL content (so `{{symbol}}` interpolation stays clean) — never the view.
     let value_id = store.put_value(session_id, &Value::String(result.content.clone()))?;
     store.append_event(
         session_id,
@@ -122,6 +131,7 @@ pub async fn execute_call(
         value_id: Some(value_id),
         is_error: false,
         content: result.content,
+        view,
     })
 }
 
@@ -216,7 +226,9 @@ fn exec_body<'a>(
                             outcome.content
                         )));
                     }
-                    last = outcome.content;
+                    // The model reasons over intermediate results → feed the model-facing VIEW
+                    // (line-numbered read, diff, …). Control flow (`when`/`return`) stays canonical.
+                    last = outcome.view;
                 }
                 Node::Call { op, args } => {
                     let outcome =
@@ -228,7 +240,9 @@ fn exec_body<'a>(
                             outcome.content
                         )));
                     }
-                    last = outcome.content;
+                    // The model reasons over intermediate results → feed the model-facing VIEW
+                    // (line-numbered read, diff, …). Control flow (`when`/`return`) stays canonical.
+                    last = outcome.view;
                 }
                 Node::Return { value } => {
                     let (content, vid) =
@@ -355,10 +369,13 @@ async fn run_call(
     let input = map_args_to_input(op, arg_values, executor.registry())?;
     sink.tool_call(op, &input);
     let outcome = execute_call(store, executor, session_id, op, input, bind).await?;
+    // Surface the model-facing VIEW (numbered read, diff, …) to the sink — what the model/user sees.
+    // The canonical `outcome.content` remains what control flow and interpolation use.
     sink.tool_result(
         op,
         &ToolResult {
-            content: outcome.content.clone(),
+            content: outcome.view.clone(),
+            view: None,
             is_error: outcome.is_error,
         },
     );
@@ -787,6 +804,27 @@ mod tests {
         }
     }
 
+    /// A tool whose canonical content ("RAW") differs from its model-facing view ("VIEW").
+    struct TwoFaceTool;
+
+    #[async_trait]
+    impl Tool for TwoFaceTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only(
+                "twoface",
+                "two-face",
+                json!({ "type": "object", "properties": {} }),
+            )
+        }
+        async fn execute(
+            &self,
+            _ctx: &ToolContext,
+            _params: serde_json::Value,
+        ) -> Result<ToolResult> {
+            Ok(ToolResult::ok_view("RAW", "VIEW"))
+        }
+    }
+
     fn temp_executor(allow: bool) -> Executor {
         let dir = std::env::temp_dir().join(format!(
             "flux-flow-rt-{}-{}",
@@ -851,6 +889,48 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, RunEvent::StepSucceeded { .. })));
+    }
+
+    #[tokio::test]
+    async fn two_face_result_binds_canonical_shows_view() {
+        // The two-face invariant: the bound symbol value (and `{{interpolation}}` source) is the
+        // CANONICAL content, while the model/sink-facing outcome carries the distinct VIEW.
+        let store = FlowStore::in_memory().unwrap();
+        let dir = std::env::temp_dir().join(format!("flux-flow-twoface-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(TwoFaceTool));
+        let ex = Executor::new(
+            reg,
+            PermissionManager::from_rules(&["twoface".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap()))),
+        );
+        let sym = SymbolName("x".into());
+        let outcome = execute_call(
+            &store,
+            &ex,
+            "sess",
+            "twoface",
+            json!({}),
+            Some(BindSpec {
+                name: &sym,
+                ty: None,
+                visibility: Visibility::Visible,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.content, "RAW", "canonical content");
+        assert_eq!(outcome.view, "VIEW", "model-facing view");
+        // The STORED/interpolated value is the canonical content, never the view.
+        let vid = outcome.value_id.clone().unwrap();
+        assert_eq!(
+            store.get_value(&vid).unwrap(),
+            Some(Value::String("RAW".into()))
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

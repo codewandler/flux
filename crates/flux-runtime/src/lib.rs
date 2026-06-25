@@ -27,9 +27,18 @@ use flux_spec::{Effect, IntentSet, Risk, ToolSpec};
 use flux_system::System;
 
 /// The result of executing a tool.
+///
+/// A result has **two faces**. `content` is the *canonical* value: it is what gets bound to a session
+/// symbol, spliced into `{{symbol}}` interpolations, and used for `when`/`return` truthiness — i.e.
+/// what deterministic execution works with. `view` is an optional *LLM-facing* rendering shown to the
+/// model (and the user) — e.g. a line-numbered file, or a status line with a unified diff appended.
+/// When `view` is `None` the model sees `content`. Keeping them separate lets a `read` return raw
+/// bytes (clean to interpolate) while showing the model a numbered view, and lets `edit`/`write`
+/// attach a diff without polluting the canonical value.
 #[derive(Debug, Clone)]
 pub struct ToolResult {
     pub content: String,
+    pub view: Option<String>,
     pub is_error: bool,
 }
 
@@ -37,6 +46,16 @@ impl ToolResult {
     pub fn ok(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            view: None,
+            is_error: false,
+        }
+    }
+
+    /// An OK result whose model-facing `view` differs from the canonical `content`.
+    pub fn ok_view(content: impl Into<String>, view: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            view: Some(view.into()),
             is_error: false,
         }
     }
@@ -44,8 +63,20 @@ impl ToolResult {
     pub fn error(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            view: None,
             is_error: true,
         }
+    }
+
+    /// Attach (or replace) the model-facing view.
+    pub fn with_view(mut self, view: impl Into<String>) -> Self {
+        self.view = Some(view.into());
+        self
+    }
+
+    /// The model-facing rendering: the explicit `view` if set, else the canonical `content`.
+    pub fn view(&self) -> &str {
+        self.view.as_deref().unwrap_or(&self.content)
     }
 }
 
@@ -63,13 +94,16 @@ pub trait Spawner: Send + Sync {
     ) -> flux_core::Result<String>;
 }
 
-/// What a tool is given at execution time: the guarded IO surface, the secret redactor, and an
-/// optional sub-agent spawner.
+/// What a tool is given at execution time: the guarded IO surface, the secret redactor, an optional
+/// sub-agent spawner, and the per-session read-set (file → mtime at last read) used by the
+/// read-before-write guard. The read-set is shared (an `Arc<Mutex<…>>`) so every op in a session sees
+/// the same map: a `read` in one node records an mtime an `edit` in a later node checks against.
 #[derive(Clone)]
 pub struct ToolContext {
     pub system: Arc<System>,
     pub redactor: Redactor,
     pub spawner: Option<Arc<dyn Spawner>>,
+    pub read_times: Arc<Mutex<HashMap<String, std::time::SystemTime>>>,
 }
 
 impl ToolContext {
@@ -78,7 +112,21 @@ impl ToolContext {
             system,
             redactor: Redactor::new(),
             spawner: None,
+            read_times: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Record that `path` was read at `mtime` (called by `read`/`read_many`).
+    pub fn record_read(&self, path: &str, mtime: std::time::SystemTime) {
+        self.read_times
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), mtime);
+    }
+
+    /// The mtime `path` had when it was last read this session, if ever.
+    pub fn read_mtime(&self, path: &str) -> Option<std::time::SystemTime> {
+        self.read_times.lock().unwrap().get(path).copied()
     }
 
     pub fn with_spawner(mut self, spawner: Arc<dyn Spawner>) -> Self {
@@ -169,6 +217,12 @@ impl ToolRegistry {
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
+    }
+
+    /// Remove a tool by name, returning it if present. Used to scope a sub-agent's registry (e.g.
+    /// drop `task` so a sub-agent can't spawn further sub-agents).
+    pub fn remove(&mut self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools.remove(name)
     }
 
     /// Specs for every registered tool (e.g. to advertise to the model).
@@ -508,7 +562,9 @@ impl Executor {
         //    both the success content and any error — before it reaches the model or the logs.
         match tool.execute(&self.ctx, params).await {
             Ok(mut r) => {
+                // Redact BOTH faces: the view can carry file content / diffs that include secrets.
                 r.content = self.ctx.redactor.redact(&r.content);
+                r.view = r.view.map(|v| self.ctx.redactor.redact(&v));
                 r
             }
             Err(e) => ToolResult::error(self.ctx.redactor.redact(&e.to_string())),
