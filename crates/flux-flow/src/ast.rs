@@ -282,8 +282,8 @@ pub enum Node {
     Return { value: Box<Node> },
     /// Reference a bound symbol.
     Var { name: SymbolName },
-    /// A literal value.
-    Lit { value: Value },
+    /// A literal value (raw JSON, as written in the AST by the compiler front-end).
+    Lit { value: serde_json::Value },
     /// A reference to an external thing.
     Thing { thing: ThingRef },
 }
@@ -450,7 +450,7 @@ mod tests {
                                 name: "ticket".into(),
                             },
                             Node::Lit {
-                                value: Value::String("renewal".into()),
+                                value: serde_json::json!("renewal"),
                             },
                         ],
                     }),

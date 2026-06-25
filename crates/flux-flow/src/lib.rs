@@ -14,15 +14,17 @@
 //!
 //! See `docs/designs/flux-flow.md` for the full design. Modules: the pure [`ast`] contracts, the
 //! [`registry`] adapter over the existing tool registry, flux-flow's own [`state`] store (values,
-//! symbols, run-event trace), the [`analyze`] validator, the [`runtime`] interpreter, and the
-//! [`engine`] turn loop — flux-flow's seat of execution.
+//! symbols, run-event trace), the [`analyze`] validator, the [`compile`] front-end (natural language
+//! → AST), the [`render`] pretty-printer, the [`runtime`] interpreter, and the [`engine`] turn loop.
 
 pub mod analyze;
 pub mod ast;
+pub mod compile;
 mod effects;
 pub mod engine;
 mod error;
 pub mod registry;
+pub mod render;
 pub mod runtime;
 pub mod state;
 

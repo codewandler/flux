@@ -45,5 +45,6 @@ clap.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
+serde_norway.workspace = true
 reedline = "0.48.0"
 markdown-terminal = { git = "https://github.com/codewandler/markdown", rev = "9dad52ece623c3b2da75ab5dfd10d0d2727108d1" }

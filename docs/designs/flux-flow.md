@@ -99,7 +99,7 @@ first-class, latency-preserving fast path so the coding agent never feels slower
 | `registry` | `OpSpec` (`fn lower() -> ToolSpec`), `OpRegistry` over `ToolRegistry`, `ThingResolver` + `ModelClient` traits |
 | `state` | `SymbolTable` (visibility tiers), `ValueStore` (immutable, versioned, **budgeted**), `ThingStore`, `view(Session)`, **flow persistence** |
 | `runtime` | interpreter (`bind/call/when/repeat/await/return`); thing-resolution at exec; emits `RunEvent` + bridging `Observation`; await/resume; re-run |
-| `compile` | `compile_turn(NL, view, registry, llm) -> DraftAst`; schema-constrained output; analyze→repair loop; **determinism-biased prompt** |
+| `compile` | `compile_turn(NL, view, registry, llm) -> DraftAst`; **prompt-and-parse** (no forced structured output); analyze→repair loop; **determinism-biased prompt** |
 | `engine` | turn spine: incremental fast-path vs. planned compile; execute; risk-gated approval; update session |
 | `render` | pure projections of the graph + trace for CLI/TUI (ASCII DAG / indented tree) + per-node live status |
 
@@ -119,7 +119,7 @@ extra round-trip vs. today.**
 **Planned path:**
 ```
 user_input + view(Session)
-  → compile::compile_turn   → DraftAst    (LLM, schema-constrained, determinism-biased; repair on invalid multi-node AST)
+  → compile                 → DraftAst    (LLM prompt-and-parse, determinism-biased; analyze→repair on invalid AST)
   → analyze                 → HirFlow | diagnostics
   → optimize                → PhysicalPlan (Sequential/Parallel/Branch/Repeat/Await/ApprovalFence)
   → [render graph; risk(graph); if risky → approve whole plan once]
@@ -249,6 +249,23 @@ new claim *before* the default flips.
 
 Resolved in design (no longer open):
 
+- **Compiler output (prompt-and-parse).** The provider abstraction has no forced structured output
+  (`Request` carries only a `metadata` passthrough; neither the Anthropic nor OpenAI codec sends
+  `tool_choice`/`response_format`). So the `compile` front-end **prompts the model to emit the AST as
+  JSON, then extracts + parses + validates it, with a bounded analyze→repair loop**. A provider-level
+  structured-output seam is future work. Surfaced today via `flux --compile-only [-o json|yaml|pretty]
+  "…"`, which compiles and prints the AST without executing (the `render` module produces the `pretty`
+  execution-path tree). `Node::Lit` holds raw JSON so model-written literals are natural.
+- **Agentic planner (the agent decides how to plan).** Beyond one-shot, the `compile::plan` loop gives
+  the model agency: it may call **read-only research tools** (`read`/`grep`/`glob`, gated through
+  `Executor::dispatch`) to gather context, **`ask_user`** to clarify (when a terminal is attached), and
+  emits the AST via a synthetic **`emit_plan`** tool (repair runs *inside* the loop). One-shot is the
+  degenerate case (emit immediately) — **no mode flag**; the agent decides. The planner is
+  **session-aware**: a `view(Session)` lets it reference already-created `$symbols` instead of
+  re-fetching. **Catalog vs. tools:** the emitted AST may use *any* op (it is the plan), but only the
+  read-only research tools are ever *executed* while planning. `flux --compile-only` uses this planner
+  (`-c` attaches the session view, read-only); the "plan → approve → run" execution wiring is the next
+  slice. Verified live — complex instructions research the real code before emitting a grounded plan.
 - **Compact syntax.** The JSON AST is the canonical, persisted form; compact syntax is a *readable
   review projection* (rendered in CLI/TUI for auditability). A full public authoring grammar waits for
   the editor.

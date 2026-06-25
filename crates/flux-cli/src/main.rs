@@ -4,7 +4,7 @@
 //! interactive REPL and TUI land in M2; this establishes the end-to-end path
 //! (CLI → provider → stream → render).
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -26,8 +26,8 @@ use flux_openai::{openai_from_env, openrouter_from_env};
 use flux_orchestrate::{LocalSpawner, ProviderFactory, Role, RoleRegistry, TaskTool};
 use flux_provider::{ChunkStream, Effort, NativeProvider, Provider, Request};
 use flux_runtime::{
-    AllowApprover, ApprovalChoice, Approver, Executor, PermissionManager, ToolContext,
-    ToolRegistry, ToolResult,
+    AllowApprover, ApprovalChoice, Approver, DenyApprover, Executor, PermissionManager,
+    ToolContext, ToolRegistry, ToolResult,
 };
 use flux_session::SessionStore;
 use flux_spec::IntentSet;
@@ -88,6 +88,14 @@ struct Cli {
     /// Bind a long-running HTTP API daemon at this address (e.g. 127.0.0.1:8787).
     #[arg(long)]
     serve: Option<String>,
+
+    /// Compile the prompt to a Flux-Lang execution-graph AST and print it, without executing.
+    #[arg(long)]
+    compile_only: bool,
+
+    /// Output format for `--compile-only`: json, yaml, or pretty (default).
+    #[arg(short = 'o', long, value_enum)]
+    output: Option<OutputFormat>,
 }
 
 /// Reasoning effort, as a CLI value-enum mirroring [`Effort`].
@@ -110,6 +118,15 @@ impl From<EffortArg> for Effort {
             EffortArg::Max => Effort::Max,
         }
     }
+}
+
+/// Output format for `--compile-only`.
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum OutputFormat {
+    Json,
+    Yaml,
+    #[default]
+    Pretty,
 }
 
 /// Resolve a friendly Anthropic alias to a concrete model id (pass-through otherwise).
@@ -560,6 +577,97 @@ async fn run_agentic(cli: &Cli, prompt: String) -> Result<()> {
         .await
         .context("agent turn")?;
     persist_new_rules(&initial_rules, &agent.executor.allow_rules());
+    Ok(())
+}
+
+/// An `AskUser` that prompts on stdin — used by `--compile-only` when attached to a terminal.
+struct CliAsk;
+impl flux_flow::compile::AskUser for CliAsk {
+    fn ask(&self, question: &str) -> String {
+        eprint!("\n\x1b[36m? {question}\x1b[0m ");
+        std::io::stderr().flush().ok();
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        line.trim().to_string()
+    }
+}
+
+/// `--compile-only`: compile the prompt into a Flux-Lang AST and print it (no execution). The agentic
+/// planner may read/grep/glob to gather context and ask the user, then emits the AST.
+async fn run_compile_only(cli: Cli) -> Result<()> {
+    let prompt = cli.prompt.join(" ");
+    if prompt.trim().is_empty() {
+        bail!("--compile-only needs a prompt, e.g. `flux --compile-only \"read the README\"`");
+    }
+    let cwd = std::env::current_dir().context("current dir")?;
+    let cfg = flux_config::load(&cwd).unwrap_or_default();
+    let model_spec = resolve_model_spec(&cli.model, &cfg);
+    let (provider, model) = build_provider(&model_spec)?;
+
+    // Full op catalog (the AST may use any op) + a safe-scoped executor for read-only research.
+    let mut registry = ToolRegistry::new();
+    flux_tools::register_builtins(&mut registry);
+    let ops = flux_flow::registry::OpRegistry::new(&registry);
+
+    let safe_names = ["read".to_string(), "grep".to_string(), "glob".to_string()];
+    let research = Executor::new(
+        registry.subset(Some(&safe_names)),
+        PermissionManager::from_rules(&safe_names, &[]),
+        Arc::new(DenyApprover),
+        ToolContext::new(Arc::new(System::new(
+            Workspace::new(&cwd).context("workspace")?,
+        ))),
+    );
+
+    // Session-aware (`-c`): reference values from prior executed turns (read-only on the session).
+    let view = if cli.continue_ {
+        let store = open_session_store()?;
+        match store.latest_session_id()? {
+            Some(sid) => Some(open_flow_store()?.view(&sid)?),
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    // Interactive `ask_user` only when attached to a terminal.
+    let cli_ask = CliAsk;
+    let ask: Option<&dyn flux_flow::compile::AskUser> = if std::io::stdin().is_terminal() {
+        Some(&cli_ask)
+    } else {
+        None
+    };
+
+    eprintln!("\x1b[2m[compile · {model} · agentic]\x1b[0m");
+    let compiled = flux_flow::compile::plan(
+        &provider,
+        &model,
+        &prompt,
+        &ops,
+        &research,
+        view.as_ref(),
+        ask,
+        flux_flow::compile::CompileOptions::default(),
+    )
+    .await
+    .context("compile")?;
+
+    let rendered = match cli.output.unwrap_or_default() {
+        OutputFormat::Json => serde_json::to_string_pretty(&compiled.ast).context("render json")?,
+        OutputFormat::Yaml => serde_norway::to_string(&compiled.ast).context("render yaml")?,
+        OutputFormat::Pretty => flux_flow::render::render_pretty(&compiled.ast),
+    };
+    println!("{rendered}");
+
+    if !compiled.diagnostics.is_empty() {
+        eprintln!("\x1b[33m[diagnostics — the AST references unknown operations]\x1b[0m");
+        for d in &compiled.diagnostics {
+            eprintln!("\x1b[2m  - {}\x1b[0m", d.message);
+        }
+    }
+    if compiled.attempts > 1 {
+        eprintln!("\x1b[2m({} planning steps)\x1b[0m", compiled.attempts);
+    }
     Ok(())
 }
 
@@ -1234,6 +1342,8 @@ async fn main() -> Result<()> {
         run_serve(cli, addr).await
     } else if cli.tui {
         run_tui(cli).await
+    } else if cli.compile_only {
+        run_compile_only(cli).await
     } else if cli.prompt.is_empty() && !cli.print {
         // No prompt and not one-shot → interactive agentic REPL.
         run_repl(cli).await
