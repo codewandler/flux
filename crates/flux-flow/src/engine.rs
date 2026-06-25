@@ -348,7 +348,7 @@ impl FlowEngine {
     /// recent messages into one synthetic message and rewrite the session log. A no-op when
     /// compaction is disabled or the session is small. Snaps the boundary back so a `tool_result` is
     /// never orphaned from the `tool_use` that compaction would summarize away.
-    async fn maybe_compact(
+    pub async fn maybe_compact(
         &self,
         session_id: &str,
         sink: &mut dyn AgentSink,

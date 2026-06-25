@@ -95,6 +95,14 @@ struct Cli {
     #[arg(short = 'c', long)]
     continue_: bool,
 
+    /// Resume the most recent session (equivalent to --continue; used by hot-reload).
+    #[arg(long)]
+    resume: bool,
+
+    /// Dev mode: enables hot-reload (`flux_reload` tool) and other developer tools.
+    #[arg(long)]
+    dev: bool,
+
     /// Bind a long-running HTTP API daemon at this address (e.g. 127.0.0.1:8787).
     #[arg(long)]
     serve: Option<String>,
@@ -463,6 +471,9 @@ async fn build_agent(cli: &Cli) -> Result<(FlowEngine, String, Arc<dyn flux_runt
     // (unless --yes) and "always-allow" choices are persisted back by the caller.
     let mut registry = ToolRegistry::new();
     flux_tools::register_builtins(&mut registry);
+    if cli.dev {
+        flux_tools::register_dev_builtins(&mut registry);
+    }
     registry.register(Arc::new(TaskTool));
 
     // Guarded web access (policy-gated as network egress; private/loopback per config).
@@ -564,11 +575,11 @@ async fn build_agent(cli: &Cli) -> Result<(FlowEngine, String, Arc<dyn flux_runt
     ));
 
     let store = Arc::new(open_session_store()?);
-    let session_id = if cli.continue_ {
+    let session_id = if cli.continue_ || cli.resume {
         store
             .latest_session_id()
             .context("latest session")?
-            .ok_or_else(|| anyhow::anyhow!("no session to continue"))?
+            .ok_or_else(|| anyhow::anyhow!("no session to resume"))?
     } else {
         store.create_session(&model).context("create session")?
     };
@@ -982,6 +993,15 @@ async fn run_repl(cli: Cli) -> Result<()> {
                             }
                             Err(e) => eprintln!("cannot resume `{id}`: {e}"),
                         }
+                    }
+                }
+                "compact" => {
+                    eprintln!("{}", style::dim("compacting context…"));
+                    let cancel = tokio_util::sync::CancellationToken::new();
+                    let mut sink = CliSink::new();
+                    match agent.maybe_compact(&session_id, &mut sink, &cancel).await {
+                        Ok(()) => eprintln!("{}", style::dim("context compacted")),
+                        Err(e) => eprintln!("{} {e}", style::red("compact error:")),
                     }
                 }
                 "clear" => {
