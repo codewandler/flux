@@ -3,6 +3,7 @@ name = "flux-cli"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "the flux binary"
 
 [[bin]]

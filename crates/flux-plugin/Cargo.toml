@@ -5,6 +5,10 @@ version.workspace = true
 license.workspace = true
 description = "flux subprocess plugin protocol + host + SDK: any-language plugins over framed (NDJSON) stdio"
 
+# The `echo_plugin` / `caps_plugin` binaries are protocol test fixtures, not shippable artifacts.
+[package.metadata.dist]
+dist = false
+
 [dependencies]
 flux-core.workspace = true
 flux-runtime.workspace = true
