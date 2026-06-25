@@ -1,5 +1,9 @@
 # flux
 
+[![CI](https://github.com/codewandler/flux/actions/workflows/ci.yml/badge.svg)](https://github.com/codewandler/flux/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/codewandler/flux)](https://github.com/codewandler/flux/releases/latest)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+
 A Rust agent SDK, harness, and coding agent — **as easy to use as a zero-config REPL, as safe and
 durable as a policy-gated platform**, with first-class extensibility (JavaScript hooks + any-language
 subprocess plugins).
@@ -12,14 +16,36 @@ leak secrets.
 
 ---
 
-## Quickstart
+## Install
 
-Requires **Rust 1.85+** (`rustup update stable`).
+**Prebuilt binary** — installs the `flux` binary into `~/.cargo/bin` (Linux, macOS, Windows; x86_64 +
+aarch64):
 
 ```bash
-# build the `flux` binary
-cargo build --release            # → target/release/flux
+# Linux / macOS
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/codewandler/flux/releases/latest/download/flux-cli-installer.sh | sh
+```
 
+```powershell
+# Windows (PowerShell)
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/codewandler/flux/releases/latest/download/flux-cli-installer.ps1 | iex"
+```
+
+**From source** — requires **Rust 1.85+** (`rustup update stable`):
+
+```bash
+cargo install --git https://github.com/codewandler/flux flux-cli
+# …or clone and build: cargo build --release   → target/release/flux
+```
+
+Prebuilt binaries, installers, and checksums are attached to every
+[tagged release](https://github.com/codewandler/flux/releases/latest).
+
+---
+
+## Quickstart
+
+```bash
 # one-shot (prints a streamed response)
 flux -p "explain this repo's architecture"
 

@@ -558,7 +558,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "flux-agent"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "flux-core",
@@ -578,7 +578,7 @@ dependencies = [
 
 [[package]]
 name = "flux-anthropic"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -595,14 +595,14 @@ dependencies = [
 
 [[package]]
 name = "flux-auth"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "flux-policy",
 ]
 
 [[package]]
 name = "flux-browser"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "flux-core",
@@ -617,7 +617,7 @@ dependencies = [
 
 [[package]]
 name = "flux-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -656,14 +656,14 @@ dependencies = [
 
 [[package]]
 name = "flux-codegate"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "toml",
 ]
 
 [[package]]
 name = "flux-config"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "flux-core",
  "flux-policy",
@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "flux-context"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "flux-core",
@@ -682,7 +682,7 @@ dependencies = [
 
 [[package]]
 name = "flux-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -691,7 +691,7 @@ dependencies = [
 
 [[package]]
 name = "flux-credentials"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -708,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "flux-datasource"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "flux-core",
@@ -722,7 +722,7 @@ dependencies = [
 
 [[package]]
 name = "flux-evidence"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -730,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "flux-hooks"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "flux-runtime",
  "rquickjs",
@@ -739,7 +739,7 @@ dependencies = [
 
 [[package]]
 name = "flux-integrations"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "flux-core",
  "reqwest",
@@ -749,7 +749,7 @@ dependencies = [
 
 [[package]]
 name = "flux-openai"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -766,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "flux-orchestrate"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "flux-agent",
@@ -786,7 +786,7 @@ dependencies = [
 
 [[package]]
 name = "flux-plugin"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "flux-core",
@@ -804,14 +804,14 @@ dependencies = [
 
 [[package]]
 name = "flux-policy"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "flux-provider"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "flux-runtime"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "flux-core",
@@ -843,7 +843,7 @@ dependencies = [
 
 [[package]]
 name = "flux-sdk"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "flux-agent",
@@ -860,14 +860,14 @@ dependencies = [
 
 [[package]]
 name = "flux-secret"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "flux-server"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "flux-session"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "flux-core",
  "rusqlite",
@@ -894,14 +894,14 @@ dependencies = [
 
 [[package]]
 name = "flux-skill"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "flux-spec"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -909,7 +909,7 @@ dependencies = [
 
 [[package]]
 name = "flux-system"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "flux-core",
  "tokio",
@@ -918,7 +918,7 @@ dependencies = [
 
 [[package]]
 name = "flux-tools"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "flux-core",
@@ -933,7 +933,7 @@ dependencies = [
 
 [[package]]
 name = "flux-tui"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",

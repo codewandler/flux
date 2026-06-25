@@ -1,8 +1,10 @@
 # flux — roadmap & status
 
-Status as of **0.1.1 (2026-06-25)**: 29 crates, **169 tests**, a permanently green gate (tests,
-clippy `-D warnings`, fmt, the `flux-codegate` layering lint). See [CHANGELOG.md](../CHANGELOG.md)
-for the released history and [architecture.md](architecture.md) for the design.
+Status as of **0.2.1 (2026-06-25)**: public + installable at
+[codewandler/flux](https://github.com/codewandler/flux); 29 crates, **177 tests**, a permanently green
+gate (tests, clippy `-D warnings`, fmt, the `flux-codegate` layering lint). See
+[CHANGELOG.md](../CHANGELOG.md) for the released history and [architecture.md](architecture.md) for the
+design.
 
 ## Delivered
 
@@ -31,6 +33,16 @@ confirmed finding fixed with a regression test:
   policy-approval, SSRF, redaction, OAuth-state, and a batch of panic/DoS/correctness fixes. See the
   `[0.1.1]` CHANGELOG entry for the itemized list.
 
+**Daily-driver readiness (0.2.0)** — repo-aware context (git working-tree + project-shape context
+providers), a real reedline REPL (line editing, persistent history, reverse-search, visible thinking),
+a whitespace-tolerant `edit` tool, `flux sessions` + `/resume`, mid-session `/model` switching, and a
+live-provider smoke gate (`scripts/smoke-live.sh`). Validated end-to-end against a real provider.
+
+**Public release (0.2.1)** — flux is open-source (MIT OR Apache-2.0) and installable at
+`codewandler/flux`: dual-license files + CONTRIBUTING/SECURITY + issue/PR templates; a cargo-dist
+release pipeline producing prebuilt binaries for all five targets + shell/PowerShell installers on every
+tagged release; CI running the full gate on every push.
+
 ## Standing pre-release gate (do this before every release)
 
 A **live-provider smoke test** is the manual gate that the offline mock can't replace (the mock
@@ -42,14 +54,23 @@ slipped through). With a real key (e.g. `anthropic/opus`), exercise:
 - a compaction-then-continue past a tiny `FLUX_COMPACT_CHARS` (validates no 400 on the rewritten log),
 - (semi-manual) a Ctrl-C mid-turn in the REPL, then a follow-up turn in the same session.
 
-This is the next concrete task and should be scripted (`scripts/smoke-live.sh`) so it's repeatable.
+This is scripted as `scripts/smoke-live.sh` (model overridable via `FLUX_SMOKE_MODEL`) — run it
+before every release.
 
 ## Next
 
+**Candidate phases (vision tail, in priority order):**
+- **Dogfood & harden** (tier 1) — drive flux's agentic mode on real coding work, capture friction as
+  issues, and fix the top biters. Validates the daily-driver claim on real tasks.
+- **SDK + crates.io** (tier 2) — stabilize and document the `flux-sdk` public API with runnable
+  examples, then publish the crates so others can embed flux as a library.
+
 **Environment-gated (need a live key or external infra):**
+- **Homebrew tap** — an auto-updating `brew install codewandler/tap/flux` formula via cargo-dist
+  (`publish-jobs = ["homebrew"]` + `tap`/`formula` in `dist-workspace.toml`); needs a
+  `HOMEBREW_TAP_TOKEN` PAT with push access to a `codewandler/homebrew-tap` repo.
 - Switch `openai`'s default wire from Chat to Responses, verified with a live round-trip.
 - `web_search` server tool; live token-count endpoint.
-- `cargo-dist` release binaries + the GitHub Actions release run.
 - Wire a real OIDC IdP behind the existing `OidcIdentity` seam (the multi-user platform tier).
 
 **Deferred behind existing seams (add on concrete demand):**

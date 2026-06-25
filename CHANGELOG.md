@@ -4,6 +4,23 @@ All notable changes to this project are documented in this file. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.2] — 2026-06-25
+
+Post-publish adoption — making the published release discoverable and installable from the front door.
+No functional code changes.
+
+### Added
+
+- **README install section** — prebuilt-binary one-liners (shell + PowerShell, via the auto-tracking
+  `releases/latest/download/…` URL) and a from-source fallback, plus CI / release / license status
+  badges.
+
+### Changed
+
+- `docs/roadmap.md` refreshed to 0.2.1 status (cargo-dist binaries moved to *Delivered*; the
+  0.2.0 daily-driver and 0.2.1 publish milestones recorded; dogfooding and SDK/crates.io noted as the
+  next candidate phases).
+
 ## [0.2.1] — 2026-06-25
 
 First publicly installable release — no functional changes from 0.2.0.
@@ -130,6 +147,7 @@ First release.
 - **Tooling** — an architecture layering lint that fails on inner→outer crate dependencies, and CI
   running build/test/clippy/fmt.
 
+[0.2.2]: https://github.com/codewandler/flux/releases/tag/v0.2.2
 [0.2.1]: https://github.com/codewandler/flux/releases/tag/v0.2.1
 [0.2.0]: https://github.com/codewandler/flux/releases/tag/v0.2.0
 [0.1.1]: https://github.com/codewandler/flux/releases/tag/v0.1.1
