@@ -1,7 +1,7 @@
 # flux
 
 <p align="center">
-  <img src="assets/flux-logo.png" alt="Flux logo" width="320">
+  <img src="assets/logo-neon.png" alt="Flux logo" width="220">
 </p>
 
 [![CI](https://github.com/codewandler/flux/actions/workflows/ci.yml/badge.svg)](https://github.com/codewandler/flux/actions/workflows/ci.yml)
