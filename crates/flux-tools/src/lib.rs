@@ -762,6 +762,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grep_searches_a_single_file_path() {
+        // Regression (dogfood F1): grep/glob scoped to a *file* path used to return "no matches"
+        // because the underlying walk only ever `read_dir`'d the base (which errors on a file). A
+        // file `path` must search that file.
+        let (dir, c) = ctx();
+        WriteTool
+            .execute(&c, json!({"path": "a.rs", "content": "fn needle() {}\n"}))
+            .await
+            .unwrap();
+        WriteTool
+            .execute(&c, json!({"path": "b.rs", "content": "fn other() {}\n"}))
+            .await
+            .unwrap();
+        // Scoped to the single file a.rs → must find the match.
+        let hit = GrepTool
+            .execute(&c, json!({"pattern": "needle", "path": "a.rs"}))
+            .await
+            .unwrap();
+        assert!(!hit.is_error);
+        assert!(
+            hit.content.contains("a.rs:1:") && hit.content.contains("needle"),
+            "grep on a file path must find the match, got: {:?}",
+            hit.content
+        );
+        // A file path that lacks the pattern → a genuine "no matches" (not a false negative).
+        let none = GrepTool
+            .execute(&c, json!({"pattern": "needle", "path": "b.rs"}))
+            .await
+            .unwrap();
+        assert_eq!(none.content, "no matches");
+        // glob scoped to a single file lists exactly that file.
+        let g = GlobTool
+            .execute(&c, json!({"pattern": "*", "path": "a.rs"}))
+            .await
+            .unwrap();
+        assert_eq!(g.content.trim(), "a.rs");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn edit_preserves_crlf_line_endings() {
         let (dir, c) = ctx();
         WriteTool

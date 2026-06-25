@@ -893,6 +893,35 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+/// A multi-line preview of a tool result for the CLI: up to `MAX_LINES` lines (each width-capped),
+/// continuation lines indented under the header, with a trailing note when lines were elided. This
+/// affects only what the user sees — the model still receives the full, separately-capped result.
+/// (Single-line results render exactly as before.)
+fn tool_preview(s: &str) -> String {
+    const MAX_LINES: usize = 12;
+    const MAX_LINE_CHARS: usize = 200;
+    let lines: Vec<&str> = s.lines().collect();
+    if lines.len() <= 1 {
+        return truncate(s, MAX_LINE_CHARS);
+    }
+    let shown = lines.len().min(MAX_LINES);
+    let mut out = String::new();
+    for (i, line) in lines.iter().take(shown).enumerate() {
+        if i > 0 {
+            out.push_str("\n  ");
+        }
+        out.push_str(&truncate(line.trim_end(), MAX_LINE_CHARS));
+    }
+    let extra = lines.len() - shown;
+    if extra > 0 {
+        out.push_str(&format!(
+            "\n  … (+{extra} more line{})",
+            if extra == 1 { "" } else { "s" }
+        ));
+    }
+    out
+}
+
 /// Renders streaming text to stdout and tool activity to stderr.
 #[derive(Default)]
 struct CliSink;
@@ -918,7 +947,7 @@ impl AgentSink for CliSink {
         let tag = if result.is_error { "✗" } else { "✓" };
         eprintln!(
             "\x1b[2m{tag} {name}: {}\x1b[0m",
-            truncate(result.content.trim(), 200)
+            tool_preview(result.content.trim())
         );
     }
     fn observation(&mut self, o: &flux_evidence::Observation) {
@@ -985,7 +1014,7 @@ impl AgentSink for GoalSink {
         let tag = if result.is_error { "✗" } else { "✓" };
         eprintln!(
             "\x1b[2m{tag} {name}: {}\x1b[0m",
-            truncate(result.content.trim(), 200)
+            tool_preview(result.content.trim())
         );
     }
     fn turn_end(&mut self, _usage: Option<Usage>) {
@@ -1400,4 +1429,43 @@ async fn run_prompt(cli: Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{tool_preview, truncate};
+
+    #[test]
+    fn truncate_caps_with_ellipsis() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello", 3), "hel…");
+    }
+
+    #[test]
+    fn tool_preview_single_line_unchanged() {
+        assert_eq!(tool_preview("no matches"), "no matches");
+    }
+
+    #[test]
+    fn tool_preview_shows_multiple_lines_and_counts_elided() {
+        // Regression (dogfood F3): multi-line tool output used to collapse to one 200-char line,
+        // hiding results (e.g. the `test result: ok` line). Now up to 12 lines are shown, with the
+        // remainder counted.
+        let many: String = (1..=20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let p = tool_preview(&many);
+        assert!(p.contains("line 12"), "12th line shown: {p}");
+        assert!(!p.contains("line 13"), "13th line elided: {p}");
+        assert!(p.contains("(+8 more lines)"), "elision note present: {p}");
+        assert!(p.contains("\n  line 2"), "continuation lines indented: {p}");
+    }
+
+    #[test]
+    fn tool_preview_caps_a_long_single_line() {
+        let p = tool_preview(&"x".repeat(500));
+        assert!(p.ends_with('…'));
+        assert!(p.chars().count() <= 201);
+    }
 }

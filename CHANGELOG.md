@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.3] — 2026-06-25
+
+Dogfood-driven fixes — surfaced by driving flux's own agentic mode on real coding tasks (see
+[docs/dogfood-notes.md](docs/dogfood-notes.md)). flux completed every task; the friction was in the
+tooling/UX layer.
+
+### Fixed
+
+- **`grep`/`glob` scoped to a file `path` now searches that file** instead of silently returning "no
+  matches". The shared workspace walk (`System::walk_files`) only ever listed directories, so a file
+  path produced an empty result — wasting agent turns and risking false "symbol not found" conclusions.
+
+### Changed
+
+- **The CLI shows a multi-line preview of tool output** (up to 12 lines, indented, with a `… (+N more
+  lines)` note) instead of collapsing each result to a single 200-character line — so test output, grep
+  matches, and file reads are actually visible. Display only; the model still receives the full result.
+
 ## [0.2.2] — 2026-06-25
 
 Post-publish adoption — making the published release discoverable and installable from the front door.
@@ -147,6 +165,7 @@ First release.
 - **Tooling** — an architecture layering lint that fails on inner→outer crate dependencies, and CI
   running build/test/clippy/fmt.
 
+[0.2.3]: https://github.com/codewandler/flux/releases/tag/v0.2.3
 [0.2.2]: https://github.com/codewandler/flux/releases/tag/v0.2.2
 [0.2.1]: https://github.com/codewandler/flux/releases/tag/v0.2.1
 [0.2.0]: https://github.com/codewandler/flux/releases/tag/v0.2.0

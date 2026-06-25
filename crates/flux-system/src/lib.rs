@@ -238,6 +238,19 @@ impl System {
         let root = self.workspace.resolve(base)?;
         let ws_root = self.workspace.root().to_path_buf();
         let mut out = Vec::new();
+        // A `base` that resolves to a single file → return just that file, so `grep`/`glob` scoped to
+        // a file path search that file instead of silently finding nothing (`read_dir` on a file
+        // errors, which would otherwise yield an empty walk and a misleading "no matches").
+        if tokio::fs::metadata(&root)
+            .await
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+        {
+            if let Ok(rel) = root.strip_prefix(&ws_root) {
+                out.push(rel.to_string_lossy().into_owned());
+            }
+            return Ok(out);
+        }
         let mut stack = vec![root];
         while let Some(dir) = stack.pop() {
             if out.len() >= max {
