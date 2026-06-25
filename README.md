@@ -1,5 +1,9 @@
 # flux
 
+<p align="center">
+  <img src="assets/flux-logo.png" alt="Flux logo" width="320">
+</p>
+
 [![CI](https://github.com/codewandler/flux/actions/workflows/ci.yml/badge.svg)](https://github.com/codewandler/flux/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/codewandler/flux)](https://github.com/codewandler/flux/releases/latest)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
