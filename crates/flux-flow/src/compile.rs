@@ -432,8 +432,12 @@ fn ops_catalog(ops: &OpRegistry) -> String {
             .collect::<Vec<_>>()
             .join(",");
         s.push_str(&format!(
-            "- {} : {} [effects: {}; risk: {:?}]\n",
-            sig.name, sig.description, effects, sig.risk
+            "- {}({}) : {} [effects: {}; risk: {:?}]\n",
+            sig.name,
+            sig.param_signature(),
+            sig.description,
+            effects,
+            sig.risk
         ));
     }
     s
@@ -463,8 +467,10 @@ fn build_oneshot_prompt(instruction: &str, ops: &OpRegistry, view: Option<&Sessi
     format!(
         "You are Flux-Lang's compiler front-end. Convert the user's instruction into a Flux-Lang flow \
 AST as JSON. Do NOT execute anything. Prefer deterministic operations; minimise model-dependent \
-steps. Use ONLY operations from the catalog.\n\nOperation catalog:\n{catalog}{symbols}\n{grammar}\n\n\
-Output ONLY the JSON AST in a single ```json code block.\n\nInstruction: {instruction}\n",
+steps. Use ONLY operations from the catalog. Each op is shown as `name(params)`; a call's `args` are \
+positional in that parameter order ([optional] params come last).\n\nOperation catalog:\n\
+{catalog}{symbols}\n{grammar}\n\nOutput ONLY the JSON AST in a single ```json code block.\n\n\
+Instruction: {instruction}\n",
         catalog = ops_catalog(ops),
         symbols = symbols_block(view),
         grammar = AST_GRAMMAR,
@@ -483,8 +489,9 @@ user's instruction.\n\nYou have read-only research tools — `read`, `grep`, `gl
 Use them ONLY if you need information you do not already have (e.g. to find file paths or inspect \
 code); do not over-research.{ask_line} When ready, call `emit_plan` with the final AST as its `ast` \
 argument. The AST may use ANY operation from the catalog (it is the plan, not executed now); prefer \
-deterministic ops and reference existing session symbols instead of re-fetching.\n\n\
-Operation catalog (for the AST):\n{catalog}{symbols}\n{grammar}\n",
+deterministic ops and reference existing session symbols instead of re-fetching. Each op is shown as \
+`name(params)`; a call's `args` are positional in that parameter order ([optional] params come \
+last).\n\nOperation catalog (for the AST):\n{catalog}{symbols}\n{grammar}\n",
         catalog = ops_catalog(ops),
         symbols = symbols_block(view),
         grammar = AST_GRAMMAR,

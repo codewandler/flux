@@ -75,6 +75,21 @@ pub enum TypeRef {
     Named(String),
 }
 
+impl TypeRef {
+    /// A compact human label (`List<String>`, `Ticket`, …) — the type-hint shown in renders and
+    /// stored alongside a bound symbol.
+    pub fn label(&self) -> String {
+        match self {
+            TypeRef::Any => "Any".to_string(),
+            TypeRef::Bool => "Bool".to_string(),
+            TypeRef::Number => "Number".to_string(),
+            TypeRef::String => "String".to_string(),
+            TypeRef::List(inner) => format!("List<{}>", inner.label()),
+            TypeRef::Named(n) => n.clone(),
+        }
+    }
+}
+
 /// A first-class *semantic* effect, declared on operations. Distinct from the host-resource
 /// [`flux_spec::Effect`] (Read/Write/Network/…): a `FlowEffect` expresses execution *meaning*
 /// (this op sends mail, costs money, touches a calendar) and lowers onto the host effect + a policy
@@ -172,6 +187,33 @@ pub enum Value {
     Thing(ResolvedThing),
     /// A reference to another stored value.
     Ref(ValueId),
+}
+
+impl Value {
+    /// Project to *natural* JSON — a [`Value::String`] becomes a JSON string, not the tagged
+    /// `{"string": …}` serde form. This is the shape an op input expects, so the interpreter injects
+    /// a stored value into a call argument through here (the symbols-over-values thesis, executed).
+    pub fn to_json(&self) -> serde_json::Value {
+        use serde_json::Value as J;
+        match self {
+            Value::Null => J::Null,
+            Value::Bool(b) => J::Bool(*b),
+            Value::Number(n) => serde_json::Number::from_f64(*n)
+                .map(J::Number)
+                .unwrap_or(J::Null),
+            Value::String(s) => J::String(s.clone()),
+            Value::List(items) => J::Array(items.iter().map(Value::to_json).collect()),
+            Value::Struct(fields) => J::Object(
+                fields
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.to_json()))
+                    .collect(),
+            ),
+            // A resolved thing surfaces as its display string; a stored-value ref as its id.
+            Value::Thing(t) => J::String(t.display.clone()),
+            Value::Ref(id) => J::String(id.0.clone()),
+        }
+    }
 }
 
 /// The kind of an addressable external object.
@@ -480,6 +522,27 @@ mod tests {
         let json = serde_json::to_value(&ast).unwrap();
         let back: DraftAst = serde_json::from_value(json).unwrap();
         assert_eq!(ast, back);
+    }
+
+    /// `Value::to_json` produces the natural JSON shape (a string is a JSON string, not the tagged
+    /// serde form), recursing through lists and structs.
+    #[test]
+    fn value_to_json_is_natural() {
+        assert_eq!(
+            Value::String("hi".into()).to_json(),
+            serde_json::json!("hi")
+        );
+        assert_eq!(Value::Number(3.0).to_json(), serde_json::json!(3.0));
+        assert_eq!(Value::Bool(true).to_json(), serde_json::json!(true));
+        assert_eq!(Value::Null.to_json(), serde_json::Value::Null);
+
+        let mut fields = BTreeMap::new();
+        fields.insert("a".to_string(), Value::String("x".into()));
+        fields.insert("b".to_string(), Value::List(vec![Value::Number(1.0)]));
+        assert_eq!(
+            Value::Struct(fields).to_json(),
+            serde_json::json!({"a": "x", "b": [1.0]})
+        );
     }
 
     /// The `kind` tag and bare-string symbol names match the documented JSON shape.

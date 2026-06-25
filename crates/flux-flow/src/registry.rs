@@ -54,6 +54,32 @@ impl OpSpec {
     }
 }
 
+/// The input parameter names of a tool's JSON-Schema, as `(required, optional)`. The `required`
+/// array fixes the order of mandatory params; the optional ones are whatever remaining `properties`
+/// the schema declares (key order is the schema map's order). A flow's positional `Call.args` map
+/// onto `required ++ optional` at execution (see `runtime::map_args_to_input`), and the planner
+/// catalog renders the same signature so the model emits args in this order.
+pub fn schema_params(schema: &serde_json::Value) -> (Vec<String>, Vec<String>) {
+    let required: Vec<String> = schema
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut optional = Vec::new();
+    if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+        for k in props.keys() {
+            if !required.contains(k) {
+                optional.push(k.clone());
+            }
+        }
+    }
+    (required, optional)
+}
+
 /// The compiler/analyzer's view of an available operation, derived from a registered [`ToolSpec`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpSignature {
@@ -63,18 +89,42 @@ pub struct OpSignature {
     pub effects: Vec<Effect>,
     pub risk: Risk,
     pub idempotency: Idempotency,
+    /// Required input parameters, in declared order (positional call args bind to these first).
+    #[serde(default)]
+    pub required_params: Vec<String>,
+    /// Optional input parameters (bound after the required ones).
+    #[serde(default)]
+    pub optional_params: Vec<String>,
 }
 
 impl OpSignature {
     /// Derive an op signature from a registered tool spec.
     pub fn from_spec(spec: &ToolSpec) -> Self {
+        let (required_params, optional_params) = schema_params(&spec.input_schema);
         Self {
             name: spec.name.clone(),
             description: spec.description.clone(),
             effects: spec.effects.clone(),
             risk: spec.risk,
             idempotency: spec.idempotency,
+            required_params,
+            optional_params,
         }
+    }
+
+    /// A compact parameter signature for the planner catalog, e.g. `path[, offset, limit]` or
+    /// `pattern` (empty when the op takes no declared params).
+    pub fn param_signature(&self) -> String {
+        let mut s = self.required_params.join(", ");
+        if !self.optional_params.is_empty() {
+            let opt = self.optional_params.join(", ");
+            if self.required_params.is_empty() {
+                s.push_str(&format!("[{opt}]"));
+            } else {
+                s.push_str(&format!("[, {opt}]"));
+            }
+        }
+        s
     }
 }
 
@@ -152,6 +202,31 @@ mod tests {
         assert!(!from_ops.is_empty(), "builtins should register some ops");
         assert_eq!(ops.signatures().len(), from_tools.len());
         assert!(ops.get("read").is_some());
+    }
+
+    #[test]
+    fn signature_carries_param_names_in_required_then_optional_order() {
+        let mut reg = ToolRegistry::new();
+        flux_tools::register_builtins(&mut reg);
+        let ops = OpRegistry::new(&reg);
+
+        let read = ops.get("read").unwrap();
+        assert_eq!(read.required_params, vec!["path".to_string()]);
+        // `offset`/`limit` are optional; required order is fixed, so `path` always renders first.
+        assert!(read.param_signature().starts_with("path["));
+
+        let edit = ops.get("edit").unwrap();
+        assert_eq!(
+            edit.required_params,
+            vec![
+                "path".to_string(),
+                "old_string".to_string(),
+                "new_string".to_string()
+            ]
+        );
+        assert!(edit
+            .param_signature()
+            .starts_with("path, old_string, new_string"));
     }
 
     #[test]

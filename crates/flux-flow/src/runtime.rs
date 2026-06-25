@@ -6,12 +6,21 @@
 //! surface. Symbol-placeholder resolution in op inputs arrives with multi-op flows (M3); for now the
 //! input is dispatched as given.
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
-use flux_core::Result;
-use flux_runtime::Executor;
+use flux_agent::AgentSink;
+use flux_core::{Error, Result};
+use flux_runtime::{ApprovalChoice, Approver, Executor, ToolRegistry, ToolResult};
+use flux_spec::{IntentSet, Risk};
 
-use crate::ast::{RunEvent, StepId, SymbolName, Value, ValueId, Visibility};
+use crate::ast::{
+    DraftAst, Node, RunEvent, StepId, SymbolName, TypeRef, Value, ValueId, Visibility,
+};
+use crate::registry::schema_params;
 use crate::state::FlowStore;
 
 /// How to bind a single op's result to a session symbol.
@@ -112,6 +121,433 @@ pub async fn execute_call(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Flow execution (linear v1)
+// ---------------------------------------------------------------------------
+
+/// The outcome of executing a whole flow.
+#[derive(Debug, Clone)]
+pub struct FlowOutcome {
+    /// The value id the flow returned (only an explicit `return` sets this).
+    pub returned: Option<ValueId>,
+    /// The flow's result rendered as text (for display).
+    pub result: String,
+    /// How many operations were dispatched.
+    pub steps: usize,
+}
+
+/// Execute a compiled flow's body sequentially, dispatching each operation through the same
+/// [`execute_call`] envelope. **Linear v1**: `bind` / `call` / `return` only; `when` / `repeat` /
+/// `await` return a clear error (a condition/loop evaluator lands in the next slice). Every op still
+/// goes through [`Executor::dispatch`] — no new bypass surface.
+pub async fn execute_flow(
+    store: &FlowStore,
+    executor: &Executor,
+    session_id: &str,
+    ast: &DraftAst,
+    sink: &mut dyn AgentSink,
+) -> Result<FlowOutcome> {
+    let mut steps = 0usize;
+    let mut last = String::new();
+    let mut returned: Option<ValueId> = None;
+
+    for node in &ast.body {
+        match node {
+            Node::Bind {
+                name, value, ty, ..
+            } => {
+                let Node::Call { op, args } = value.as_ref() else {
+                    return Err(Error::Other(
+                        "linear execution (v1) can only bind the result of a `call`".to_string(),
+                    ));
+                };
+                let ty_label = ty.as_ref().map(TypeRef::label);
+                let bind = BindSpec {
+                    name,
+                    ty: ty_label.as_deref(),
+                    visibility: Visibility::Visible,
+                };
+                let outcome =
+                    run_call(store, executor, session_id, op, args, Some(bind), sink).await?;
+                steps += 1;
+                if outcome.is_error {
+                    return Err(Error::Other(format!(
+                        "step `{op}` failed: {}",
+                        outcome.content
+                    )));
+                }
+                last = outcome.content;
+            }
+            Node::Call { op, args } => {
+                let outcome = run_call(store, executor, session_id, op, args, None, sink).await?;
+                steps += 1;
+                if outcome.is_error {
+                    return Err(Error::Other(format!(
+                        "step `{op}` failed: {}",
+                        outcome.content
+                    )));
+                }
+                last = outcome.content;
+            }
+            Node::Return { value } => {
+                let (content, vid) =
+                    eval_return(store, executor, session_id, value, sink, &mut steps).await?;
+                last = content;
+                returned = vid;
+                break;
+            }
+            Node::When { .. } | Node::Repeat { .. } | Node::Await { .. } => {
+                return Err(Error::Other(
+                    "control-flow execution (when/repeat/await) lands in the next slice"
+                        .to_string(),
+                ));
+            }
+            Node::Var { .. } | Node::Lit { .. } | Node::Thing { .. } => {
+                return Err(Error::Other(
+                    "a bare value is not an executable statement".to_string(),
+                ));
+            }
+        }
+    }
+
+    if let Some(vid) = &returned {
+        store.append_event(session_id, &RunEvent::FlowReturned { value: vid.clone() })?;
+    }
+
+    Ok(FlowOutcome {
+        returned,
+        result: last,
+        steps,
+    })
+}
+
+/// Evaluate a call's arguments, map them to the op's named input, surface the call/result to the
+/// sink, and dispatch through [`execute_call`].
+async fn run_call(
+    store: &FlowStore,
+    executor: &Executor,
+    session_id: &str,
+    op: &str,
+    args: &[Node],
+    bind: Option<BindSpec<'_>>,
+    sink: &mut dyn AgentSink,
+) -> Result<CallOutcome> {
+    let arg_values = args
+        .iter()
+        .map(|a| eval_arg(a, store, session_id))
+        .collect::<Result<Vec<_>>>()?;
+    let input = map_args_to_input(op, arg_values, executor.registry())?;
+    sink.tool_call(op, &input);
+    let outcome = execute_call(store, executor, session_id, op, input, bind).await?;
+    sink.tool_result(
+        op,
+        &ToolResult {
+            content: outcome.content.clone(),
+            is_error: outcome.is_error,
+        },
+    );
+    Ok(outcome)
+}
+
+/// Evaluate a call-argument expression to a concrete JSON value. `Lit` yields its raw JSON; `Var`
+/// resolves the symbol to its stored value and projects it to natural JSON (the runtime injects the
+/// value it owns — symbols-over-values, executed). Other node kinds are not valid argument positions
+/// in linear v1.
+fn eval_arg(node: &Node, store: &FlowStore, session_id: &str) -> Result<serde_json::Value> {
+    match node {
+        Node::Lit { value } => Ok(value.clone()),
+        Node::Var { name } => {
+            let vid = store
+                .resolve(session_id, name)?
+                .ok_or_else(|| Error::Other(format!("unbound symbol ${}", name.0)))?;
+            let value = store
+                .get_value(&vid)?
+                .ok_or_else(|| Error::Other(format!("dangling value for ${}", name.0)))?;
+            Ok(value.to_json())
+        }
+        other => Err(Error::Other(format!(
+            "unsupported call argument `{}` (only literals and $symbols are valid args in v1)",
+            node_kind(other)
+        ))),
+    }
+}
+
+/// Map a call's positional argument *values* onto the op's named JSON input. A lone object argument
+/// is taken as the whole named input; otherwise the values bind to the op's parameters in
+/// `required ++ optional` order (from its JSON-Schema). The AST stays positional — this is the one
+/// place positional args become the named object a tool expects.
+fn map_args_to_input(
+    op: &str,
+    args: Vec<serde_json::Value>,
+    registry: &ToolRegistry,
+) -> Result<serde_json::Value> {
+    let tool = registry
+        .get(op)
+        .ok_or_else(|| Error::Other(format!("unknown op `{op}`")))?;
+    let schema = tool.spec().input_schema;
+
+    // A lone object argument is already the named input map — pass it straight through.
+    if let [serde_json::Value::Object(_)] = args.as_slice() {
+        return Ok(args.into_iter().next().unwrap());
+    }
+
+    let (required, optional) = schema_params(&schema);
+    let order: Vec<String> = required.into_iter().chain(optional).collect();
+    let mut input = serde_json::Map::new();
+    for (i, val) in args.into_iter().enumerate() {
+        match order.get(i) {
+            Some(name) => {
+                input.insert(name.clone(), val);
+            }
+            None => {
+                return Err(Error::Other(format!(
+                    "op `{op}` accepts {} parameter(s) but {} argument(s) were supplied",
+                    order.len(),
+                    i + 1
+                )))
+            }
+        }
+    }
+    Ok(serde_json::Value::Object(input))
+}
+
+/// Evaluate a `return` expression to `(text, value_id)`: `var` → the symbol's stored value; `call`
+/// → execute it and use its output; `lit` → store the literal as the flow's return value.
+async fn eval_return(
+    store: &FlowStore,
+    executor: &Executor,
+    session_id: &str,
+    value: &Node,
+    sink: &mut dyn AgentSink,
+    steps: &mut usize,
+) -> Result<(String, Option<ValueId>)> {
+    match value {
+        Node::Var { name } => {
+            let vid = store
+                .resolve(session_id, name)?
+                .ok_or_else(|| Error::Other(format!("return of unbound symbol ${}", name.0)))?;
+            let value = store
+                .get_value(&vid)?
+                .ok_or_else(|| Error::Other(format!("dangling value for ${}", name.0)))?;
+            Ok((value_text(&value), Some(vid)))
+        }
+        Node::Lit { value } => {
+            let text = lit_text(value);
+            let vid = store.put_value(session_id, &Value::String(text.clone()))?;
+            Ok((text, Some(vid)))
+        }
+        Node::Call { op, args } => {
+            let outcome = run_call(store, executor, session_id, op, args, None, sink).await?;
+            *steps += 1;
+            if outcome.is_error {
+                return Err(Error::Other(format!(
+                    "return step `{op}` failed: {}",
+                    outcome.content
+                )));
+            }
+            Ok((outcome.content, outcome.value_id))
+        }
+        other => Err(Error::Other(format!(
+            "unsupported return expression `{}`",
+            node_kind(other)
+        ))),
+    }
+}
+
+/// Render a stored value as text (a string value is itself; anything else is its compact JSON).
+fn value_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => serde_json::to_string(&other.to_json()).unwrap_or_default(),
+    }
+}
+
+/// Render a literal JSON value as text (a JSON string is itself; anything else is compact JSON).
+fn lit_text(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// The node-kind tag (for error messages).
+fn node_kind(node: &Node) -> &'static str {
+    match node {
+        Node::Call { .. } => "call",
+        Node::Bind { .. } => "bind",
+        Node::When { .. } => "when",
+        Node::Repeat { .. } => "repeat",
+        Node::Await { .. } => "await",
+        Node::Return { .. } => "return",
+        Node::Var { .. } => "var",
+        Node::Lit { .. } => "lit",
+        Node::Thing { .. } => "thing",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plan risk + whole-plan approval
+// ---------------------------------------------------------------------------
+
+/// A best-effort risk preview of a compiled plan, aggregated from the ops it calls. Dispatch
+/// re-checks every op at execution, so the safety floor never depends on this — it drives the one
+/// whole-plan approval prompt.
+#[derive(Debug, Clone, Default)]
+pub struct PlanRisk {
+    /// The highest [`Risk`] across the plan's ops (`None` if it calls nothing registered).
+    pub max_risk: Option<Risk>,
+    /// True if any op is destructive-shaped — forces a per-op re-confirm even inside an approved plan.
+    pub destructive: bool,
+    /// True if any op writes / executes / connects out.
+    pub mutating: bool,
+    /// The distinct op names the plan calls, in first-seen order.
+    pub ops: Vec<String>,
+}
+
+impl PlanRisk {
+    /// A one-line human summary (for the approval prompt).
+    pub fn summary(&self) -> String {
+        let base = match self.max_risk {
+            Some(Risk::Destructive) => "destructive",
+            Some(Risk::High) => "high",
+            Some(Risk::Medium) => "medium",
+            Some(Risk::Low) => "low",
+            None => "no-op",
+        };
+        if self.destructive {
+            format!("{base} · contains a destructive operation (will re-confirm)")
+        } else if self.mutating {
+            format!("{base} · mutating")
+        } else {
+            base.to_string()
+        }
+    }
+}
+
+/// Compute a plan's [`PlanRisk`] by walking every `call` node and looking up each op's spec (risk)
+/// and intents (destructive / mutating) in `registry`. Only literal args are known statically, so
+/// they are fed to `Tool::intents` for command/path-shaped detection; `$symbol` args are skipped.
+pub fn plan_risk(ast: &DraftAst, registry: &ToolRegistry) -> PlanRisk {
+    let mut risk = PlanRisk::default();
+    walk_calls(&ast.body, &mut |op, args| {
+        if !risk.ops.iter().any(|o| o == op) {
+            risk.ops.push(op.to_string());
+        }
+        let Some(tool) = registry.get(op) else {
+            return;
+        };
+        let spec = tool.spec();
+        risk.max_risk = Some(match risk.max_risk {
+            Some(r) => r.max(spec.risk),
+            None => spec.risk,
+        });
+        if spec.risk == Risk::Destructive {
+            risk.destructive = true;
+        }
+        let intents = tool.intents(&literal_input(args, &spec.input_schema));
+        if intents.is_destructive() {
+            risk.destructive = true;
+        }
+        if intents.is_mutating() {
+            risk.mutating = true;
+        }
+    });
+    risk
+}
+
+/// Visit every `call` node reachable in `nodes` (recursing through binds, branches, loops, returns,
+/// and nested call args), invoking `f(op, args)` for each.
+fn walk_calls<'a>(nodes: &'a [Node], f: &mut impl FnMut(&'a str, &'a [Node])) {
+    for node in nodes {
+        walk_node(node, f);
+    }
+}
+
+fn walk_node<'a>(node: &'a Node, f: &mut impl FnMut(&'a str, &'a [Node])) {
+    match node {
+        Node::Call { op, args } => {
+            f(op, args);
+            walk_calls(args, f);
+        }
+        Node::Bind { value, .. } => walk_node(value, f),
+        Node::When {
+            cond,
+            then,
+            otherwise,
+        } => {
+            walk_node(cond, f);
+            walk_calls(then, f);
+            walk_calls(otherwise, f);
+        }
+        Node::Repeat { until, body, .. } => {
+            if let Some(u) = until {
+                walk_node(u, f);
+            }
+            walk_calls(body, f);
+        }
+        Node::Return { value } => walk_node(value, f),
+        Node::Var { .. } | Node::Lit { .. } | Node::Thing { .. } | Node::Await { .. } => {}
+    }
+}
+
+/// Build a best-effort named input from a call's *literal* args only (for intent preview); non-literal
+/// args (`$symbols`) are skipped and arity is not enforced.
+fn literal_input(args: &[Node], schema: &serde_json::Value) -> serde_json::Value {
+    if let [Node::Lit { value }] = args {
+        if value.is_object() {
+            return value.clone();
+        }
+    }
+    let (required, optional) = schema_params(schema);
+    let order: Vec<String> = required.into_iter().chain(optional).collect();
+    let mut input = serde_json::Map::new();
+    for (i, arg) in args.iter().enumerate() {
+        if let Node::Lit { value } = arg {
+            if let Some(name) = order.get(i) {
+                input.insert(name.clone(), value.clone());
+            }
+        }
+    }
+    serde_json::Value::Object(input)
+}
+
+/// An [`Approver`] for a pre-approved plan: a non-destructive op whose name is in the approved set is
+/// allowed without prompting; a **destructive** op (or any op not in the set) falls through to
+/// `fallback`, so destructive operations still escalate to a per-op confirmation even inside an
+/// approved plan — the safety invariant. Installed on the execution executor after the user approves
+/// the rendered plan.
+pub struct PlanApprover {
+    approved: HashSet<String>,
+    fallback: Arc<dyn Approver>,
+}
+
+impl PlanApprover {
+    /// Approve the given op names as a unit; everything else (and any destructive op) defers to
+    /// `fallback`.
+    pub fn new(approved: impl IntoIterator<Item = String>, fallback: Arc<dyn Approver>) -> Self {
+        Self {
+            approved: approved.into_iter().collect(),
+            fallback,
+        }
+    }
+}
+
+#[async_trait]
+impl Approver for PlanApprover {
+    async fn request(
+        &self,
+        tool: &str,
+        subjects: &[String],
+        intents: &IntentSet,
+    ) -> ApprovalChoice {
+        if !intents.is_destructive() && self.approved.contains(tool) {
+            ApprovalChoice::Allow
+        } else {
+            self.fallback.request(tool, subjects, intents).await
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,7 +568,15 @@ mod tests {
     #[async_trait]
     impl Tool for EchoTool {
         fn spec(&self) -> ToolSpec {
-            ToolSpec::read_only("echo", "echo text", json!({"type": "object"}))
+            ToolSpec::read_only(
+                "echo",
+                "echo text",
+                json!({
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } },
+                    "required": ["text"]
+                }),
+            )
         }
         async fn execute(
             &self,
@@ -243,5 +687,251 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, RunEvent::StepFailed { .. })));
+    }
+
+    // ---- flow execution + risk (linear v1) ----
+
+    /// A sink that records the op names it was told about.
+    #[derive(Default)]
+    struct CollectSink {
+        calls: Vec<String>,
+    }
+    impl AgentSink for CollectSink {
+        fn tool_call(&mut self, name: &str, _input: &serde_json::Value) {
+            self.calls.push(name.to_string());
+        }
+    }
+
+    fn flow_bind(name: &str, op: &str, args: Vec<Node>) -> Node {
+        Node::Bind {
+            name: SymbolName(name.into()),
+            value: Box::new(Node::Call {
+                op: op.into(),
+                args,
+            }),
+            ty: None,
+            effect: None,
+        }
+    }
+    fn flow_lit(v: serde_json::Value) -> Node {
+        Node::Lit { value: v }
+    }
+    fn flow_var(name: &str) -> Node {
+        Node::Var {
+            name: SymbolName(name.into()),
+        }
+    }
+
+    #[test]
+    fn map_args_maps_positional_to_required_param_names() {
+        let mut reg = ToolRegistry::new();
+        flux_tools::register_builtins(&mut reg);
+
+        // read("README.md") → {"path": "README.md"}
+        let input = map_args_to_input("read", vec![json!("README.md")], &reg).unwrap();
+        assert_eq!(input, json!({ "path": "README.md" }));
+
+        // write("out.txt", "hi") → required order {path, content}
+        let input = map_args_to_input("write", vec![json!("out.txt"), json!("hi")], &reg).unwrap();
+        assert_eq!(input, json!({ "path": "out.txt", "content": "hi" }));
+
+        // edit(path, old, new) → all three required params, in order
+        let input =
+            map_args_to_input("edit", vec![json!("f"), json!("a"), json!("b")], &reg).unwrap();
+        assert_eq!(
+            input,
+            json!({ "path": "f", "old_string": "a", "new_string": "b" })
+        );
+
+        // A lone object argument passes straight through as the named input.
+        let input =
+            map_args_to_input("write", vec![json!({ "path": "x", "content": "y" })], &reg).unwrap();
+        assert_eq!(input, json!({ "path": "x", "content": "y" }));
+
+        // More args than the op has params (read takes 3: path, offset, limit) is a clear error,
+        // not a silent drop.
+        assert!(map_args_to_input(
+            "read",
+            vec![json!("a"), json!("b"), json!("c"), json!("d")],
+            &reg
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn eval_arg_resolves_a_var_to_its_stored_value() {
+        let store = FlowStore::in_memory().unwrap();
+        let vid = store
+            .put_value("sess", &Value::String("hello".into()))
+            .unwrap();
+        store
+            .bind(
+                "sess",
+                &SymbolName("greeting".into()),
+                &vid,
+                None,
+                "hello",
+                Visibility::Visible,
+            )
+            .unwrap();
+
+        // A $symbol resolves to the natural JSON of its stored value.
+        assert_eq!(
+            eval_arg(&flow_var("greeting"), &store, "sess").unwrap(),
+            json!("hello")
+        );
+        // A literal is returned verbatim; an unbound symbol is a clear error.
+        assert_eq!(
+            eval_arg(&flow_lit(json!(42)), &store, "sess").unwrap(),
+            json!(42)
+        );
+        assert!(eval_arg(&flow_var("missing"), &store, "sess").is_err());
+    }
+
+    #[tokio::test]
+    async fn execute_flow_runs_a_linear_plan_through_dispatch() {
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        // $a = echo("hi"); $b = echo($a); return $b
+        let ast = DraftAst {
+            body: vec![
+                flow_bind("a", "echo", vec![flow_lit(json!("hi"))]),
+                flow_bind("b", "echo", vec![flow_var("a")]),
+                Node::Return {
+                    value: Box::new(flow_var("b")),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess", &ast, &mut sink)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.steps, 2, "both echo ops dispatched");
+        assert_eq!(outcome.result, "hi");
+        assert_eq!(sink.calls, vec!["echo", "echo"]);
+        // $b holds the value $a flowed into it (symbols carried the value, not the prose).
+        let vid = store
+            .resolve("sess", &SymbolName("b".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.get_value(&vid).unwrap(),
+            Some(Value::String("hi".into()))
+        );
+        // The trace records the return.
+        assert!(store
+            .events("sess")
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, RunEvent::FlowReturned { .. })));
+    }
+
+    #[tokio::test]
+    async fn execute_flow_errors_on_control_flow() {
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        let ast = DraftAst {
+            body: vec![Node::When {
+                cond: Box::new(flow_lit(json!(true))),
+                then: vec![],
+                otherwise: vec![],
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let err = execute_flow(&store, &ex, "sess", &ast, &mut sink)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("control-flow"));
+    }
+
+    #[test]
+    fn plan_risk_flags_destructive_and_mutating() {
+        let mut reg = ToolRegistry::new();
+        flux_tools::register_builtins(&mut reg);
+
+        // bash "rm -rf build" (destructive) + write (mutating).
+        let ast = DraftAst {
+            body: vec![
+                flow_bind("x", "bash", vec![flow_lit(json!("rm -rf build"))]),
+                flow_bind(
+                    "y",
+                    "write",
+                    vec![flow_lit(json!("out.txt")), flow_lit(json!("data"))],
+                ),
+            ],
+            ..Default::default()
+        };
+        let risk = plan_risk(&ast, &reg);
+        assert!(risk.destructive, "rm -rf is destructive-shaped");
+        assert!(risk.mutating);
+        assert_eq!(risk.max_risk, Some(Risk::High)); // bash is High, write Medium
+        assert_eq!(risk.ops, vec!["bash".to_string(), "write".to_string()]);
+
+        // A read-only plan is neither destructive nor mutating.
+        let safe = DraftAst {
+            body: vec![flow_bind("r", "read", vec![flow_lit(json!("README.md"))])],
+            ..Default::default()
+        };
+        let risk = plan_risk(&safe, &reg);
+        assert!(!risk.destructive);
+        assert!(!risk.mutating);
+        assert_eq!(risk.max_risk, Some(Risk::Low));
+    }
+
+    #[tokio::test]
+    async fn plan_approver_allows_approved_nondestructive_and_escalates_destructive() {
+        use flux_spec::{Intent, IntentBehavior, IntentCertainty, IntentRole, IntentTarget};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// A fallback approver that records being consulted, then denies.
+        struct Recording {
+            hit: AtomicBool,
+        }
+        #[async_trait]
+        impl Approver for Recording {
+            async fn request(&self, _t: &str, _s: &[String], _i: &IntentSet) -> ApprovalChoice {
+                self.hit.store(true, Ordering::Relaxed);
+                ApprovalChoice::Deny
+            }
+        }
+
+        let fallback = Arc::new(Recording {
+            hit: AtomicBool::new(false),
+        });
+
+        // An approved, non-destructive op is allowed without consulting the fallback.
+        let approver = PlanApprover::new(["write".to_string()], fallback.clone());
+        let empty = IntentSet::new();
+        assert!(matches!(
+            approver.request("write", &[], &empty).await,
+            ApprovalChoice::Allow
+        ));
+        assert!(
+            !fallback.hit.load(Ordering::Relaxed),
+            "approved op must not prompt"
+        );
+
+        // A destructive op falls through to the fallback even though it is in the approved set.
+        let mut destructive = IntentSet::new();
+        destructive.push(Intent {
+            behavior: IntentBehavior::CommandExecution,
+            target: IntentTarget::Process {
+                command: "rm -rf /".into(),
+            },
+            role: IntentRole::ProcessCommand,
+            certainty: IntentCertainty::Certain,
+        });
+        let approver = PlanApprover::new(["bash".to_string()], fallback.clone());
+        assert!(matches!(
+            approver.request("bash", &[], &destructive).await,
+            ApprovalChoice::Deny
+        ));
+        assert!(
+            fallback.hit.load(Ordering::Relaxed),
+            "a destructive op must still escalate to the fallback"
+        );
     }
 }

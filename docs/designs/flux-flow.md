@@ -264,8 +264,21 @@ Resolved in design (no longer open):
   **session-aware**: a `view(Session)` lets it reference already-created `$symbols` instead of
   re-fetching. **Catalog vs. tools:** the emitted AST may use *any* op (it is the plan), but only the
   read-only research tools are ever *executed* while planning. `flux --compile-only` uses this planner
-  (`-c` attaches the session view, read-only); the "plan → approve → run" execution wiring is the next
-  slice. Verified live — complex instructions research the real code before emitting a grounded plan.
+  (`-c` attaches the session view, read-only). Verified live — complex instructions research the real
+  code before emitting a grounded plan.
+- **Plan → approve → run (executed, linear v1).** `flux --plan "…"` closes the loop: it compiles via the
+  agentic planner, computes a best-effort `plan_risk` preview (max risk + destructive/mutating, from each
+  op's `ToolSpec` + `Tool::intents`), renders the plan, takes **one whole-plan approval** (`--yes`
+  auto-approves), then executes it. The interpreter (`runtime::execute_flow`) walks the body
+  sequentially — `bind`/`call`/`return` — resolving each `$symbol` arg to its stored `Value`
+  (`Value::to_json`, natural form) and dispatching through the same `Executor::dispatch` envelope as any
+  tool (no new bypass). `when`/`repeat`/`await` execution returns a clear "next slice" error for now.
+  Whole-plan approval is a custom `PlanApprover { approved, fallback }`: a non-destructive op in the
+  approved set is allowed without prompting, but a **destructive op still falls through to the fallback**
+  (a per-op confirm, or auto under `--yes`) — the escalation invariant. **Arg mapping:** the AST keeps
+  positional `Call.args`; at execution they map onto each op's named input by its JSON-Schema
+  `required ++ optional` order, and the planner catalog renders the same `op(params)` signature so the
+  model emits args in that order.
 - **Compact syntax.** The JSON AST is the canonical, persisted form; compact syntax is a *readable
   review projection* (rendered in CLI/TUI for auditability). A full public authoring grammar waits for
   the editor.

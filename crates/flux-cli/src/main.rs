@@ -93,6 +93,12 @@ struct Cli {
     #[arg(long)]
     compile_only: bool,
 
+    /// Compile the prompt to a Flux-Lang plan, approve it as a whole, then execute it through the
+    /// safety envelope (`--yes` auto-approves; destructive ops still re-confirm). Linear flows
+    /// (read/call/return) for now.
+    #[arg(long)]
+    plan: bool,
+
     /// Output format for `--compile-only`: json, yaml, or pretty (default).
     #[arg(short = 'o', long, value_enum)]
     output: Option<OutputFormat>,
@@ -592,13 +598,20 @@ impl flux_flow::compile::AskUser for CliAsk {
     }
 }
 
-/// `--compile-only`: compile the prompt into a Flux-Lang AST and print it (no execution). The agentic
-/// planner may read/grep/glob to gather context and ask the user, then emits the AST.
-async fn run_compile_only(cli: Cli) -> Result<()> {
-    let prompt = cli.prompt.join(" ");
-    if prompt.trim().is_empty() {
-        bail!("--compile-only needs a prompt, e.g. `flux --compile-only \"read the README\"`");
-    }
+/// Shared setup for the compile front-end (`--compile-only` and `--plan`): a live provider + model,
+/// the full op registry, a read-only research executor, and the optional session view (`-c`).
+struct CompileCtx {
+    provider: NativeProvider,
+    model: String,
+    registry: ToolRegistry,
+    research: Executor,
+    view: Option<flux_flow::state::SessionView>,
+    cwd: std::path::PathBuf,
+}
+
+/// Build the shared compile context from the CLI args. The research executor is scoped to read-only
+/// tools (`read`/`grep`/`glob`) so the agentic planner gathers context without side effects.
+fn compile_setup(cli: &Cli) -> Result<CompileCtx> {
     let cwd = std::env::current_dir().context("current dir")?;
     let cfg = flux_config::load(&cwd).unwrap_or_default();
     let model_spec = resolve_model_spec(&cli.model, &cfg);
@@ -607,7 +620,6 @@ async fn run_compile_only(cli: Cli) -> Result<()> {
     // Full op catalog (the AST may use any op) + a safe-scoped executor for read-only research.
     let mut registry = ToolRegistry::new();
     flux_tools::register_builtins(&mut registry);
-    let ops = flux_flow::registry::OpRegistry::new(&registry);
 
     let safe_names = ["read".to_string(), "grep".to_string(), "glob".to_string()];
     let research = Executor::new(
@@ -630,23 +642,44 @@ async fn run_compile_only(cli: Cli) -> Result<()> {
         None
     };
 
-    // Interactive `ask_user` only when attached to a terminal.
-    let cli_ask = CliAsk;
-    let ask: Option<&dyn flux_flow::compile::AskUser> = if std::io::stdin().is_terminal() {
-        Some(&cli_ask)
-    } else {
-        None
-    };
+    Ok(CompileCtx {
+        provider,
+        model,
+        registry,
+        research,
+        view,
+        cwd,
+    })
+}
 
-    eprintln!("\x1b[2m[compile · {model} · agentic]\x1b[0m");
+/// The stdin `ask_user` seam, offered only when attached to a terminal (otherwise the planner runs
+/// without the clarifying-question tool).
+fn terminal_ask(ask: &CliAsk) -> Option<&dyn flux_flow::compile::AskUser> {
+    std::io::stdin()
+        .is_terminal()
+        .then_some(ask as &dyn flux_flow::compile::AskUser)
+}
+
+/// `--compile-only`: compile the prompt into a Flux-Lang AST and print it (no execution). The agentic
+/// planner may read/grep/glob to gather context and ask the user, then emits the AST.
+async fn run_compile_only(cli: Cli) -> Result<()> {
+    let prompt = cli.prompt.join(" ");
+    if prompt.trim().is_empty() {
+        bail!("--compile-only needs a prompt, e.g. `flux --compile-only \"read the README\"`");
+    }
+    let ctx = compile_setup(&cli)?;
+    let ops = flux_flow::registry::OpRegistry::new(&ctx.registry);
+    let cli_ask = CliAsk;
+
+    eprintln!("\x1b[2m[compile · {} · agentic]\x1b[0m", ctx.model);
     let compiled = flux_flow::compile::plan(
-        &provider,
-        &model,
+        &ctx.provider,
+        &ctx.model,
         &prompt,
         &ops,
-        &research,
-        view.as_ref(),
-        ask,
+        &ctx.research,
+        ctx.view.as_ref(),
+        terminal_ask(&cli_ask),
         flux_flow::compile::CompileOptions::default(),
     )
     .await
@@ -669,6 +702,125 @@ async fn run_compile_only(cli: Cli) -> Result<()> {
         eprintln!("\x1b[2m({} planning steps)\x1b[0m", compiled.attempts);
     }
     Ok(())
+}
+
+/// `--plan`: compile the prompt into a Flux-Lang plan, show it with a risk line, take one whole-plan
+/// approval, then execute it linearly through the safety envelope. Values + trace persist in
+/// `~/.flux/flow.db` (auditable + the basis for re-run). Destructive ops still re-confirm per op even
+/// inside the approved plan — the invariant.
+async fn run_plan(cli: Cli) -> Result<()> {
+    let prompt = cli.prompt.join(" ");
+    if prompt.trim().is_empty() {
+        bail!(
+            "--plan needs a prompt, e.g. `flux --plan \"summarize the README into SUMMARY.txt\"`"
+        );
+    }
+    let ctx = compile_setup(&cli)?;
+    let cfg = flux_config::load(&ctx.cwd).unwrap_or_default();
+
+    // 1. Compile (agentic): research + ask_user + emit_plan.
+    let compiled = {
+        let ops = flux_flow::registry::OpRegistry::new(&ctx.registry);
+        let cli_ask = CliAsk;
+        eprintln!("\x1b[2m[plan · {} · agentic]\x1b[0m", ctx.model);
+        flux_flow::compile::plan(
+            &ctx.provider,
+            &ctx.model,
+            &prompt,
+            &ops,
+            &ctx.research,
+            ctx.view.as_ref(),
+            terminal_ask(&cli_ask),
+            flux_flow::compile::CompileOptions::default(),
+        )
+        .await
+        .context("compile")?
+    };
+
+    // 2. Show the plan + a risk line.
+    let risk = flux_flow::runtime::plan_risk(&compiled.ast, &ctx.registry);
+    println!("{}", flux_flow::render::render_pretty(&compiled.ast));
+    eprintln!(
+        "\x1b[2m[risk: {} · {} op(s): {}]\x1b[0m",
+        risk.summary(),
+        risk.ops.len(),
+        risk.ops.join(", ")
+    );
+
+    // A plan that references unknown ops is surfaced, never executed.
+    if !compiled.diagnostics.is_empty() {
+        eprintln!(
+            "\x1b[33m[diagnostics — the plan references unknown operations; not executing]\x1b[0m"
+        );
+        for d in &compiled.diagnostics {
+            eprintln!("\x1b[2m  - {}\x1b[0m", d.message);
+        }
+        return Ok(());
+    }
+    if risk.ops.is_empty() {
+        eprintln!("\x1b[2m(empty plan — nothing to run)\x1b[0m");
+        return Ok(());
+    }
+
+    // 3. Approve the plan as a whole.
+    if !(cli.yes || confirm_plan(risk.ops.len())) {
+        eprintln!("\x1b[2m(plan not approved — not executing)\x1b[0m");
+        return Ok(());
+    }
+
+    // 4. Execution executor: full builtins, default-allow reads, and a PlanApprover that lets the
+    //    approved ops through but still routes destructive ops to the fallback (a per-op confirm, or
+    //    auto under --yes). Dispatch re-checks every op, so this is gating, not a bypass.
+    let mut exec_registry = ToolRegistry::new();
+    flux_tools::register_builtins(&mut exec_registry);
+    let mut allow = cfg.permissions.allow.clone();
+    if allow.is_empty() {
+        allow.extend(["read", "glob", "grep", "search"].map(String::from));
+    }
+    let perms = PermissionManager::from_rules(&allow, &cfg.permissions.deny);
+    let fallback: Arc<dyn Approver> = if cli.yes {
+        Arc::new(AllowApprover)
+    } else {
+        Arc::new(StdinApprover)
+    };
+    let approver = Arc::new(flux_flow::runtime::PlanApprover::new(
+        risk.ops.clone(),
+        fallback,
+    ));
+    let system = Arc::new(System::new(Workspace::new(&ctx.cwd).context("workspace")?));
+    let executor = Executor::new(exec_registry, perms, approver, ToolContext::new(system));
+
+    // 5. Execute linearly; values + trace persist under a new flow session.
+    let flow = open_flow_store()?;
+    let session_id = open_session_store()?
+        .create_session(&ctx.model)
+        .context("create session")?;
+    eprintln!("\x1b[2m[run · session {session_id}]\x1b[0m");
+    let mut sink = CliSink::new();
+    let outcome =
+        flux_flow::runtime::execute_flow(&flow, &executor, &session_id, &compiled.ast, &mut sink)
+            .await
+            .context("execute flow")?;
+
+    if !outcome.result.trim().is_empty() {
+        println!("{}", outcome.result);
+    }
+    eprintln!(
+        "\x1b[2m[ran {} step(s) · values in ~/.flux/flow.db]\x1b[0m",
+        outcome.steps
+    );
+    Ok(())
+}
+
+/// One stdin `y/N` confirmation for a whole compiled plan.
+fn confirm_plan(steps: usize) -> bool {
+    eprint!("\n\x1b[33mRun this {steps}-op plan?\x1b[0m [y/N]: ");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
 /// A minimal `reedline` prompt: a single `› ` indicator (no left/right segments).
@@ -1344,6 +1496,8 @@ async fn main() -> Result<()> {
         run_tui(cli).await
     } else if cli.compile_only {
         run_compile_only(cli).await
+    } else if cli.plan {
+        run_plan(cli).await
     } else if cli.prompt.is_empty() && !cli.print {
         // No prompt and not one-shot → interactive agentic REPL.
         run_repl(cli).await

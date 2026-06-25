@@ -173,14 +173,7 @@ fn thing_str(thing: &ThingRef) -> String {
 }
 
 fn type_str(t: &TypeRef) -> String {
-    match t {
-        TypeRef::Any => "Any".to_string(),
-        TypeRef::Bool => "Bool".to_string(),
-        TypeRef::Number => "Number".to_string(),
-        TypeRef::String => "String".to_string(),
-        TypeRef::List(inner) => format!("List<{}>", type_str(inner)),
-        TypeRef::Named(n) => n.clone(),
-    }
+    t.label()
 }
 
 #[cfg(test)]
