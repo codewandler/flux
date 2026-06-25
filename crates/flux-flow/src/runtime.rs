@@ -144,8 +144,13 @@ pub async fn execute_call(
 pub struct FlowOutcome {
     /// The value id the flow returned (only an explicit `return` sets this).
     pub returned: Option<ValueId>,
-    /// The flow's result rendered as text (for display).
+    /// The flow's result rendered as text (for display) — the *last* node's view. This is what a
+    /// one-shot CLI prints and what an explicit `return` carries.
     pub result: String,
+    /// The model-facing transcript: every read/call node's view, labeled and concatenated. The engine
+    /// feeds THIS back between rounds so the model sees *all* of a plan's reads — not just the last —
+    /// which is what lets "read N files, then answer" converge instead of re-reading every round.
+    pub transcript: String,
     /// How many operations were dispatched.
     pub steps: usize,
 }
@@ -174,7 +179,17 @@ pub async fn execute_flow(
     sink: &mut dyn AgentSink,
 ) -> Result<FlowOutcome> {
     let mut steps = 0usize;
-    let (last, step) = exec_body(store, executor, session_id, &ast.body, sink, &mut steps).await?;
+    let mut transcript: Vec<String> = Vec::new();
+    let (last, step) = exec_body(
+        store,
+        executor,
+        session_id,
+        &ast.body,
+        sink,
+        &mut steps,
+        &mut transcript,
+    )
+    .await?;
     let returned = match step {
         Step::Return(vid) => vid,
         Step::Next => None,
@@ -185,6 +200,7 @@ pub async fn execute_flow(
     Ok(FlowOutcome {
         returned,
         result: last,
+        transcript: transcript.join("\n\n"),
         steps,
     })
 }
@@ -198,6 +214,7 @@ fn exec_body<'a>(
     body: &'a [Node],
     sink: &'a mut dyn AgentSink,
     steps: &'a mut usize,
+    transcript: &'a mut Vec<String>,
 ) -> BodyFuture<'a> {
     Box::pin(async move {
         let mut last = String::new();
@@ -228,6 +245,9 @@ fn exec_body<'a>(
                     }
                     // The model reasons over intermediate results → feed the model-facing VIEW
                     // (line-numbered read, diff, …). Control flow (`when`/`return`) stays canonical.
+                    // Record EVERY node's view in the transcript so the round feedback surfaces all of
+                    // a plan's reads, not just the last one.
+                    transcript.push(format!("[${} = {op}]\n{}", name.0, outcome.view));
                     last = outcome.view;
                 }
                 Node::Call { op, args } => {
@@ -242,6 +262,7 @@ fn exec_body<'a>(
                     }
                     // The model reasons over intermediate results → feed the model-facing VIEW
                     // (line-numbered read, diff, …). Control flow (`when`/`return`) stays canonical.
+                    transcript.push(format!("[{op}]\n{}", outcome.view));
                     last = outcome.view;
                 }
                 Node::Return { value } => {
@@ -256,9 +277,16 @@ fn exec_body<'a>(
                 } => {
                     let take = eval_cond(store, executor, session_id, cond, sink, steps).await?;
                     let branch = if take { then } else { otherwise };
-                    let (blast, step) =
-                        exec_body(store, executor, session_id, branch, &mut *sink, &mut *steps)
-                            .await?;
+                    let (blast, step) = exec_body(
+                        store,
+                        executor,
+                        session_id,
+                        branch,
+                        &mut *sink,
+                        &mut *steps,
+                        &mut *transcript,
+                    )
+                    .await?;
                     if !blast.is_empty() {
                         last = blast;
                     }
@@ -272,9 +300,16 @@ fn exec_body<'a>(
                     body: rbody,
                 } => {
                     for _ in 0..*max {
-                        let (blast, step) =
-                            exec_body(store, executor, session_id, rbody, &mut *sink, &mut *steps)
-                                .await?;
+                        let (blast, step) = exec_body(
+                            store,
+                            executor,
+                            session_id,
+                            rbody,
+                            &mut *sink,
+                            &mut *steps,
+                            &mut *transcript,
+                        )
+                        .await?;
                         if !blast.is_empty() {
                             last = blast;
                         }
@@ -1138,6 +1173,36 @@ mod tests {
             .unwrap()
             .iter()
             .any(|e| matches!(e, RunEvent::FlowReturned { .. })));
+    }
+
+    #[tokio::test]
+    async fn execute_flow_transcript_carries_every_node_not_just_last() {
+        // The round feedback must surface ALL of a plan's reads, not just the last node — otherwise a
+        // multi-read plan loops (the model re-reads what it couldn't see). `transcript` is that feed.
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        // $a = echo("alpha"); $b = echo("beta")  (no return)
+        let ast = DraftAst {
+            body: vec![
+                flow_bind("a", "echo", vec![flow_lit(json!("alpha"))]),
+                flow_bind("b", "echo", vec![flow_lit(json!("beta"))]),
+            ],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(outcome.result, "beta", "result is still the LAST node's view");
+        assert!(
+            outcome.transcript.contains("alpha") && outcome.transcript.contains("beta"),
+            "transcript must carry BOTH nodes, got: {}",
+            outcome.transcript
+        );
+        assert!(
+            outcome.transcript.contains("[$a = echo]"),
+            "transcript labels each node by its bound symbol"
+        );
     }
 
     #[tokio::test]
