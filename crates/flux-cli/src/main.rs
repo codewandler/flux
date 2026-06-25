@@ -26,8 +26,8 @@ use flux_openai::{openai_from_env, openrouter_from_env};
 use flux_orchestrate::{LocalSpawner, ProviderFactory, Role, RoleRegistry, TaskTool};
 use flux_provider::{ChunkStream, Effort, NativeProvider, Provider, Request};
 use flux_runtime::{
-    AllowApprover, ApprovalChoice, Approver, DenyApprover, Executor, PermissionManager,
-    ToolContext, ToolRegistry, ToolResult,
+    AllowApprover, ApprovalChoice, Approver, Executor, PermissionManager, ToolContext,
+    ToolRegistry, ToolResult,
 };
 use flux_session::SessionStore;
 use flux_spec::IntentSet;
@@ -42,8 +42,8 @@ struct Cli {
     /// The prompt (joined with spaces if given as multiple words).
     prompt: Vec<String>,
 
-    /// One-shot, non-interactive mode (print the response and exit).
-    #[arg(short = 'p', long = "print")]
+    /// (Hidden) Non-interactive print mode — a bare prompt is already one-shot, so this is a no-op alias.
+    #[arg(short = 'p', long = "print", hide = true)]
     print: bool,
 
     /// `provider/model` (provider ∈ anthropic|claude|openai|codex|openrouter; default anthropic).
@@ -52,25 +52,24 @@ struct Cli {
     #[arg(short = 'm', long)]
     model: Option<String>,
 
-    /// Enable adaptive thinking.
-    #[arg(long)]
+    /// (Hidden) Adaptive thinking — only wired on the `-p` raw path; a no-op for the engine for now.
+    #[arg(long, hide = true)]
     think: bool,
 
-    /// Reasoning effort (model-dependent; some models reject it).
-    #[arg(long, value_enum)]
+    /// (Hidden) Reasoning effort — only wired on the `-p` raw path; a no-op for the engine for now.
+    #[arg(long, value_enum, hide = true)]
     effort: Option<EffortArg>,
 
     /// Maximum tokens to generate.
     #[arg(long, default_value_t = 4096)]
     max_tokens: u32,
 
-    /// Print token usage to stderr when the turn completes.
-    #[arg(long)]
+    /// (Hidden) Print token usage — only wired on the `-p` raw path.
+    #[arg(long, hide = true)]
     usage: bool,
 
-    /// Agentic mode: enable tools (read/write/edit/bash) under the safety envelope, persist
-    /// the session, and loop until the model stops calling tools.
-    #[arg(long)]
+    /// (Hidden, deprecated) The Flux-Lang engine is the default for a bare prompt; this is a no-op.
+    #[arg(long, hide = true)]
     agent: bool,
 
     /// Auto-approve every tool call (headless). Without it, unmatched calls prompt for approval.
@@ -89,17 +88,12 @@ struct Cli {
     #[arg(long)]
     serve: Option<String>,
 
-    /// Compile the prompt to a Flux-Lang execution-graph AST and print it, without executing.
-    #[arg(long)]
-    compile_only: bool,
-
-    /// Compile the prompt to a Flux-Lang plan, approve it as a whole, then execute it through the
-    /// safety envelope (`--yes` auto-approves; destructive ops still re-confirm). Linear flows
-    /// (read/call/return) for now.
-    #[arg(long)]
+    /// Plan mode: compile the prompt to a Flux-Lang plan and show it. On a terminal it then asks
+    /// `run it? [y/N]`; piped or with `-o json|yaml` it just prints the plan and exits (never runs).
+    #[arg(long, alias = "compile-only")]
     plan: bool,
 
-    /// Output format for `--compile-only`: json, yaml, or pretty (default).
+    /// Plan output format for `--plan` when not running it: json, yaml, or pretty (default).
     #[arg(short = 'o', long, value_enum)]
     output: Option<OutputFormat>,
 }
@@ -598,60 +592,6 @@ impl flux_flow::compile::AskUser for CliAsk {
     }
 }
 
-/// Shared setup for the compile front-end (`--compile-only` and `--plan`): a live provider + model,
-/// the full op registry, a read-only research executor, and the optional session view (`-c`).
-struct CompileCtx {
-    provider: NativeProvider,
-    model: String,
-    registry: ToolRegistry,
-    research: Executor,
-    view: Option<flux_flow::state::SessionView>,
-    cwd: std::path::PathBuf,
-}
-
-/// Build the shared compile context from the CLI args. The research executor is scoped to read-only
-/// tools (`read`/`grep`/`glob`) so the agentic planner gathers context without side effects.
-fn compile_setup(cli: &Cli) -> Result<CompileCtx> {
-    let cwd = std::env::current_dir().context("current dir")?;
-    let cfg = flux_config::load(&cwd).unwrap_or_default();
-    let model_spec = resolve_model_spec(&cli.model, &cfg);
-    let (provider, model) = build_provider(&model_spec)?;
-
-    // Full op catalog (the AST may use any op) + a safe-scoped executor for read-only research.
-    let mut registry = ToolRegistry::new();
-    flux_tools::register_builtins(&mut registry);
-
-    let safe_names = ["read".to_string(), "grep".to_string(), "glob".to_string()];
-    let research = Executor::new(
-        registry.subset(Some(&safe_names)),
-        PermissionManager::from_rules(&safe_names, &[]),
-        Arc::new(DenyApprover),
-        ToolContext::new(Arc::new(System::new(
-            Workspace::new(&cwd).context("workspace")?,
-        ))),
-    );
-
-    // Session-aware (`-c`): reference values from prior executed turns (read-only on the session).
-    let view = if cli.continue_ {
-        let store = open_session_store()?;
-        match store.latest_session_id()? {
-            Some(sid) => Some(open_flow_store()?.view(&sid)?),
-            None => None,
-        }
-    } else {
-        None
-    };
-
-    Ok(CompileCtx {
-        provider,
-        model,
-        registry,
-        research,
-        view,
-        cwd,
-    })
-}
-
 /// The stdin `ask_user` seam, offered only when attached to a terminal (otherwise the planner runs
 /// without the clarifying-question tool).
 fn terminal_ask(ask: &CliAsk) -> Option<&dyn flux_flow::compile::AskUser> {
@@ -660,54 +600,10 @@ fn terminal_ask(ask: &CliAsk) -> Option<&dyn flux_flow::compile::AskUser> {
         .then_some(ask as &dyn flux_flow::compile::AskUser)
 }
 
-/// `--compile-only`: compile the prompt into a Flux-Lang AST and print it (no execution). The agentic
-/// planner may read/grep/glob to gather context and ask the user, then emits the AST.
-async fn run_compile_only(cli: Cli) -> Result<()> {
-    let prompt = cli.prompt.join(" ");
-    if prompt.trim().is_empty() {
-        bail!("--compile-only needs a prompt, e.g. `flux --compile-only \"read the README\"`");
-    }
-    let ctx = compile_setup(&cli)?;
-    let ops = flux_flow::registry::OpRegistry::new(&ctx.registry);
-    let cli_ask = CliAsk;
-
-    eprintln!("\x1b[2m[compile · {} · agentic]\x1b[0m", ctx.model);
-    let compiled = flux_flow::compile::plan(
-        &ctx.provider,
-        &ctx.model,
-        &prompt,
-        &ops,
-        &ctx.research,
-        ctx.view.as_ref(),
-        terminal_ask(&cli_ask),
-        flux_flow::compile::CompileOptions::default(),
-    )
-    .await
-    .context("compile")?;
-
-    let rendered = match cli.output.unwrap_or_default() {
-        OutputFormat::Json => serde_json::to_string_pretty(&compiled.ast).context("render json")?,
-        OutputFormat::Yaml => serde_norway::to_string(&compiled.ast).context("render yaml")?,
-        OutputFormat::Pretty => flux_flow::render::render_pretty(&compiled.ast),
-    };
-    println!("{rendered}");
-
-    if !compiled.diagnostics.is_empty() {
-        eprintln!("\x1b[33m[diagnostics — the AST references unknown operations]\x1b[0m");
-        for d in &compiled.diagnostics {
-            eprintln!("\x1b[2m  - {}\x1b[0m", d.message);
-        }
-    }
-    if compiled.attempts > 1 {
-        eprintln!("\x1b[2m({} planning steps)\x1b[0m", compiled.attempts);
-    }
-    Ok(())
-}
-
-/// `--plan`: compile the prompt into a Flux-Lang plan, show it with a risk line, take one whole-plan
-/// approval, then execute it linearly through the safety envelope. Values + trace persist in
-/// `~/.flux/flow.db` (auditable + the basis for re-run). Destructive ops still re-confirm per op even
-/// inside the approved plan — the invariant.
+/// `--plan` (plan mode, one-shot): compile the prompt into a Flux-Lang plan and show it. On an
+/// interactive terminal it then asks `run it? [y/N]` and executes on yes; piped or with `-o json|yaml`
+/// it just prints the plan and exits (never runs). The same engine drives this and a real turn, so the
+/// plan you see is the plan that runs.
 async fn run_plan(cli: Cli) -> Result<()> {
     let prompt = cli.prompt.join(" ");
     if prompt.trim().is_empty() {
@@ -715,30 +611,39 @@ async fn run_plan(cli: Cli) -> Result<()> {
             "--plan needs a prompt, e.g. `flux --plan \"summarize the README into SUMMARY.txt\"`"
         );
     }
-    let ctx = compile_setup(&cli)?;
-    let cfg = flux_config::load(&ctx.cwd).unwrap_or_default();
+    let (mut engine, session_id, _spawner) = build_agent(&cli).await?;
+    let cli_ask = CliAsk;
+    eprintln!("\x1b[2m[plan · {} · agentic]\x1b[0m", engine.model);
 
-    // 1. Compile (agentic): research + ask_user + emit_plan.
-    let compiled = {
-        let ops = flux_flow::registry::OpRegistry::new(&ctx.registry);
-        let cli_ask = CliAsk;
-        eprintln!("\x1b[2m[plan · {} · agentic]\x1b[0m", ctx.model);
-        flux_flow::compile::plan(
-            &ctx.provider,
-            &ctx.model,
-            &prompt,
-            &ops,
-            &ctx.research,
-            ctx.view.as_ref(),
-            terminal_ask(&cli_ask),
-            flux_flow::compile::CompileOptions::default(),
-        )
+    let compiled = match engine
+        .compile_once(&session_id, &prompt, terminal_ask(&cli_ask))
         .await
         .context("compile")?
+    {
+        flux_flow::compile::TurnOutput::Plan(c) => c,
+        flux_flow::compile::TurnOutput::Chat(text) => {
+            // The model answered rather than planning — show the answer, no plan.
+            println!("{text}");
+            return Ok(());
+        }
     };
 
-    // 2. Show the plan + a risk line.
-    let risk = flux_flow::runtime::plan_risk(&compiled.ast, &ctx.registry);
+    // Non-interactive (`-o json|yaml`, or piped stdout): print the plan and exit — never run.
+    if cli.output.is_some() || !std::io::stdout().is_terminal() {
+        let rendered = match cli.output.unwrap_or_default() {
+            OutputFormat::Json => {
+                serde_json::to_string_pretty(&compiled.ast).context("render json")?
+            }
+            OutputFormat::Yaml => serde_norway::to_string(&compiled.ast).context("render yaml")?,
+            OutputFormat::Pretty => flux_flow::render::render_pretty(&compiled.ast),
+        };
+        println!("{rendered}");
+        print_diagnostics(&compiled.diagnostics);
+        return Ok(());
+    }
+
+    // Interactive: show the plan + a risk line, then offer to run it.
+    let risk = flux_flow::runtime::plan_risk(&compiled.ast, engine.executor.registry());
     println!("{}", flux_flow::render::render_pretty(&compiled.ast));
     eprintln!(
         "\x1b[2m[risk: {} · {} op(s): {}]\x1b[0m",
@@ -746,62 +651,44 @@ async fn run_plan(cli: Cli) -> Result<()> {
         risk.ops.len(),
         risk.ops.join(", ")
     );
-
-    // A plan that references unknown ops is surfaced, never executed.
     if !compiled.diagnostics.is_empty() {
-        eprintln!(
-            "\x1b[33m[diagnostics — the plan references unknown operations; not executing]\x1b[0m"
-        );
-        for d in &compiled.diagnostics {
-            eprintln!("\x1b[2m  - {}\x1b[0m", d.message);
-        }
+        print_diagnostics(&compiled.diagnostics);
+        eprintln!("\x1b[33m(plan references unknown operations — not running)\x1b[0m");
         return Ok(());
     }
     if risk.ops.is_empty() {
         eprintln!("\x1b[2m(empty plan — nothing to run)\x1b[0m");
         return Ok(());
     }
-
-    // 3. Approve the plan as a whole.
     if !(cli.yes || confirm_plan(risk.ops.len())) {
-        eprintln!("\x1b[2m(plan not approved — not executing)\x1b[0m");
+        eprintln!("\x1b[2m(not run)\x1b[0m");
         return Ok(());
     }
 
-    // 4. Execution executor: full builtins, default-allow reads, and a PlanApprover that lets the
-    //    approved ops through but still routes destructive ops to the fallback (a per-op confirm, or
-    //    auto under --yes). Dispatch re-checks every op, so this is gating, not a bypass.
-    let mut exec_registry = ToolRegistry::new();
-    flux_tools::register_builtins(&mut exec_registry);
-    let mut allow = cfg.permissions.allow.clone();
-    if allow.is_empty() {
-        allow.extend(["read", "glob", "grep", "search"].map(String::from));
-    }
-    let perms = PermissionManager::from_rules(&allow, &cfg.permissions.deny);
+    // Approved → run it through the same envelope (PlanApprover: approved ops pass without a re-prompt;
+    // destructive ops still escalate to the fallback — per-op confirm, or auto under --yes).
     let fallback: Arc<dyn Approver> = if cli.yes {
         Arc::new(AllowApprover)
     } else {
         Arc::new(StdinApprover)
     };
-    let approver = Arc::new(flux_flow::runtime::PlanApprover::new(
-        risk.ops.clone(),
-        fallback,
-    ));
-    let system = Arc::new(System::new(Workspace::new(&ctx.cwd).context("workspace")?));
-    let executor = Executor::new(exec_registry, perms, approver, ToolContext::new(system));
-
-    // 5. Execute linearly; values + trace persist under a new flow session.
-    let flow = open_flow_store()?;
-    let session_id = open_session_store()?
-        .create_session(&ctx.model)
-        .context("create session")?;
+    engine
+        .executor
+        .set_approver(Arc::new(flux_flow::runtime::PlanApprover::new(
+            risk.ops.clone(),
+            fallback,
+        )));
     eprintln!("\x1b[2m[run · session {session_id}]\x1b[0m");
     let mut sink = CliSink::new();
-    let outcome =
-        flux_flow::runtime::execute_flow(&flow, &executor, &session_id, &compiled.ast, &mut sink)
-            .await
-            .context("execute flow")?;
-
+    let outcome = flux_flow::runtime::execute_flow(
+        &engine.flow,
+        &engine.executor,
+        &session_id,
+        &compiled.ast,
+        &mut sink,
+    )
+    .await
+    .context("execute flow")?;
     if !outcome.result.trim().is_empty() {
         println!("{}", outcome.result);
     }
@@ -810,6 +697,17 @@ async fn run_plan(cli: Cli) -> Result<()> {
         outcome.steps
     );
     Ok(())
+}
+
+/// Print analyzer diagnostics (unknown ops referenced by a plan) to stderr, if any.
+fn print_diagnostics(diags: &[flux_flow::analyze::Diagnostic]) {
+    if diags.is_empty() {
+        return;
+    }
+    eprintln!("\x1b[33m[diagnostics — the plan references unknown operations]\x1b[0m");
+    for d in diags {
+        eprintln!("\x1b[2m  - {}\x1b[0m", d.message);
+    }
 }
 
 /// One stdin `y/N` confirmation for a whole compiled plan.
@@ -824,7 +722,9 @@ fn confirm_plan(steps: usize) -> bool {
 }
 
 /// A minimal `reedline` prompt: a single `› ` indicator (no left/right segments).
-struct FluxPrompt;
+struct FluxPrompt {
+    plan_mode: bool,
+}
 
 impl Prompt for FluxPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
@@ -834,7 +734,8 @@ impl Prompt for FluxPrompt {
         Cow::Borrowed("")
     }
     fn render_prompt_indicator(&self, _mode: PromptEditMode) -> Cow<'_, str> {
-        Cow::Borrowed("› ")
+        // A distinct indicator in plan mode, so it's obvious turns won't execute.
+        Cow::Borrowed(if self.plan_mode { "plan › " } else { "› " })
     }
     fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
         Cow::Borrowed("… ")
@@ -872,9 +773,13 @@ async fn run_repl(cli: Cli) -> Result<()> {
         None => Box::new(FileBackedHistory::new(1000).expect("in-memory history")),
     };
     let mut editor = Reedline::create().with_history(history);
-    let prompt = FluxPrompt;
+
+    // Plan mode (`/plan`): turns produce a plan but DON'T execute; `/run` executes the pending plan.
+    let mut plan_mode = false;
+    let mut pending_plan: Option<flux_flow::ast::DraftAst> = None;
 
     loop {
+        let prompt = FluxPrompt { plan_mode };
         let line = match editor.read_line(&prompt) {
             Ok(Signal::Success(buf)) => buf,
             Ok(Signal::CtrlC) => continue, // clear the current line, reprompt
@@ -890,9 +795,36 @@ async fn run_repl(cli: Cli) -> Result<()> {
             match rest.split_whitespace().next().unwrap_or("") {
                 "exit" | "quit" => break,
                 "help" => eprintln!(
-                    "commands: /help  /tools  /model <spec>  /session  /sessions  /resume <id>  \
-                     /clear  /pd <goal>  /goal <cond>  /loop <n> <task>  /exit"
+                    "commands: /help  /plan  /run  /tools  /model <spec>  /session  /sessions  \
+                     /resume <id>  /clear  /pd <goal>  /goal <cond>  /loop <n> <task>  /exit\n\
+                     /plan toggles plan mode (turns show a plan, don't run it); /run executes it."
                 ),
+                "plan" => {
+                    plan_mode = !plan_mode;
+                    pending_plan = None;
+                    eprintln!(
+                        "\x1b[2mplan mode {} — {}\x1b[0m",
+                        if plan_mode { "on" } else { "off" },
+                        if plan_mode {
+                            "turns show a plan; `/run` to execute, or keep chatting to refine"
+                        } else {
+                            "turns run normally"
+                        }
+                    );
+                }
+                "run" => match pending_plan.take() {
+                    Some(ast) => {
+                        let agent_ref = &agent;
+                        let sid_ref = session_id.as_str();
+                        run_interruptible(move |c| async move {
+                            run_pending_plan(agent_ref, sid_ref, &ast, &c).await;
+                        })
+                        .await;
+                    }
+                    None => eprintln!(
+                        "\x1b[2m(no pending plan — use /plan, then describe a task)\x1b[0m"
+                    ),
+                },
                 "model" => {
                     let spec = rest.strip_prefix("model").unwrap_or("").trim();
                     if spec.is_empty() {
@@ -1020,8 +952,24 @@ async fn run_repl(cli: Cli) -> Result<()> {
             }
             continue;
         }
-        // Run the turn interruptibly: the first Ctrl-C cancels it (without killing the REPL); the
-        // turn unwinds cleanly and we return to the prompt. (Ctrl-D exits.)
+        // Plan mode: compile + show a plan, store it for `/run`, but DON'T execute. Refine by chatting.
+        if plan_mode {
+            let mut sink = CliSink::new();
+            match agent.plan_turn(&session_id, input, &mut sink).await {
+                Ok(Some(ast)) => {
+                    pending_plan = Some(ast);
+                    eprintln!(
+                        "\x1b[2m(plan ready — `/run` to execute, or send a message to refine)\x1b[0m"
+                    );
+                }
+                Ok(None) => {} // the model answered in prose; nothing to run
+                Err(e) => eprintln!("\x1b[31merror:\x1b[0m {e}"),
+            }
+            continue;
+        }
+
+        // Normal mode: run the turn interruptibly. The first Ctrl-C cancels it (without killing the
+        // REPL); the turn unwinds cleanly and we return to the prompt. (Ctrl-D exits.)
         let agent_ref = &agent;
         let sid_ref = session_id.as_str();
         run_interruptible(move |c| async move {
@@ -1037,6 +985,28 @@ async fn run_repl(cli: Cli) -> Result<()> {
     }
     persist_new_rules(&initial_rules, &agent.executor.allow_rules());
     Ok(())
+}
+
+/// REPL `/run`: execute a reviewed plan through the engine's existing envelope (per-op approval still
+/// applies, unless the REPL was started with `--yes`). The human reviewed the whole plan already.
+async fn run_pending_plan(
+    agent: &FlowEngine,
+    session_id: &str,
+    ast: &flux_flow::ast::DraftAst,
+    _cancel: &tokio_util::sync::CancellationToken,
+) {
+    let mut sink = CliSink::new();
+    match flux_flow::runtime::execute_flow(&agent.flow, &agent.executor, session_id, ast, &mut sink)
+        .await
+    {
+        Ok(outcome) => {
+            if !outcome.result.trim().is_empty() {
+                println!("{}", outcome.result);
+            }
+            eprintln!("\x1b[2m[ran {} step(s)]\x1b[0m", outcome.steps);
+        }
+        Err(e) => eprintln!("\x1b[31merror:\x1b[0m {e}"),
+    }
 }
 
 /// Run `make(cancel)` to completion, but cancel it on Ctrl-C (the token's clones are linked, so
@@ -1274,6 +1244,11 @@ impl AgentSink for CliSink {
             eprintln!("\x1b[2m⊙ context compacted ({from} → {to} messages)\x1b[0m");
         } else if o.kind == "turn.cancelled" {
             eprintln!("\x1b[2m⊘ turn cancelled\x1b[0m");
+        } else if o.kind == "flow.plan" {
+            // The compiled Flux-Lang plan about to execute — show it so the turn is auditable.
+            if let Some(plan) = o.data.get("plan").and_then(|v| v.as_str()) {
+                eprintln!("\x1b[2m{plan}\x1b[0m");
+            }
         }
     }
     fn turn_end(&mut self, usage: Option<Usage>) {
@@ -1494,8 +1469,6 @@ async fn main() -> Result<()> {
         run_serve(cli, addr).await
     } else if cli.tui {
         run_tui(cli).await
-    } else if cli.compile_only {
-        run_compile_only(cli).await
     } else if cli.plan {
         run_plan(cli).await
     } else if cli.prompt.is_empty() && !cli.print {
@@ -1662,92 +1635,13 @@ async fn run_prompt(cli: Cli) -> Result<()> {
     let prompt = cli.prompt.join(" ");
 
     if prompt.trim().is_empty() {
-        // The interactive REPL arrives in M2; for now a prompt is required.
-        bail!("provide a prompt, e.g. `flux -p \"hello\"` (interactive mode lands in M2)");
+        bail!("provide a prompt, e.g. `flux \"summarize the README\"`");
     }
 
-    if cli.agent {
-        return run_agentic(&cli, prompt).await;
-    }
-
-    let cfg = std::env::current_dir()
-        .ok()
-        .map(|cwd| flux_config::load(&cwd))
-        .transpose()
-        .context("load .flux/config.toml")?
-        .unwrap_or_default();
-    let model_spec = resolve_model_spec(&cli.model, &cfg);
-    let (provider, model) = build_provider(&model_spec)?;
-
-    let mut req = Request::new(model, prompt).with_max_tokens(cli.max_tokens);
-    if cli.think {
-        req = req.with_thinking(true);
-    }
-    if let Some(effort) = cli.effort {
-        req = req.with_effort(effort.into());
-    }
-
-    let mut stream = provider
-        .stream(req)
-        .await
-        .context("failed to start the response stream")?;
-
-    let mut live = {
-        use std::io::IsTerminal;
-        let tty = std::io::stdout().is_terminal();
-        let width = std::env::var("COLUMNS")
-            .ok()
-            .and_then(|c| c.parse::<usize>().ok())
-            .filter(|&w| w >= 20)
-            .unwrap_or(80);
-        markdown_terminal::LiveRenderer::new(markdown_terminal::Theme::auto(), width, tty)
-    };
-    let mut in_thinking = false;
-    let mut final_usage = None;
-
-    while let Some(chunk) = stream.next().await {
-        match chunk.context("stream error")? {
-            Chunk::TextDelta(text) => {
-                if in_thinking {
-                    // Close the dimmed thinking block before visible output.
-                    eprintln!("\x1b[0m");
-                    in_thinking = false;
-                }
-                let mut out = std::io::stdout().lock();
-                let _ = live.push(&text, &mut out);
-            }
-            Chunk::ThinkingDelta(text) => {
-                if !in_thinking {
-                    eprint!("\x1b[2m[thinking] ");
-                    in_thinking = true;
-                }
-                eprint!("{text}");
-            }
-            Chunk::Usage(u) => final_usage = Some(u),
-            Chunk::Done { .. } => {}
-            Chunk::MessageStart { .. } | Chunk::Block(_) => {}
-        }
-    }
-
-    {
-        let mut out = std::io::stdout().lock();
-        let _ = live.finish(&mut out);
-    }
-
-    if cli.usage {
-        if let Some(u) = final_usage {
-            eprintln!(
-                "[usage] in={} out={} cache_w={} cache_r={} total={}",
-                u.input_tokens,
-                u.output_tokens,
-                u.cache_creation_input_tokens,
-                u.cache_read_input_tokens,
-                u.total()
-            );
-        }
-    }
-
-    Ok(())
+    // One engine: a prompt always runs the agentic Flux-Lang engine. `-p`/`--print` only means
+    // print-and-exit (a chat-only turn just answers in prose; pass `--yes` for non-interactive
+    // tool approval). The legacy tool-less raw-completion path is gone — there is one engine.
+    run_agentic(&cli, prompt).await
 }
 
 #[cfg(test)]

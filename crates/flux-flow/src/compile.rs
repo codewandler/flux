@@ -1,25 +1,26 @@
-//! The compiler front-end: turn a natural-language instruction into a typed [`DraftAst`].
+//! The compiler front-end: turn natural language into a typed [`DraftAst`]. Prompt-and-parse (the
+//! provider has no forced structured output).
 //!
-//! Two entry points share the prompt-and-parse approach (the provider has no forced structured
-//! output):
-//! - [`compile`] — **one-shot**: a single model call. Cheap; plans from the instruction (and the
-//!   session symbol view) alone.
-//! - [`plan`] — **agentic**: a bounded loop where the model has agency. It may call read-only research
-//!   tools (`read`/`grep`/`glob`, dispatched through the safety envelope) to gather context, ask the
-//!   user a clarifying question ([`AskUser`]), and emits the final AST via a synthetic `emit_plan`
-//!   tool. One-shot is the degenerate case (it emits immediately). The emitted AST may reference *any*
-//!   registered op (it is the *plan*, not executed here); only read-only tools execute during planning.
+//! **Pure DAG:** the model has NO directly-callable ops — its only tool is `emit_plan` (+ `ask_user`).
+//! Every operation, *reads included*, is a node in the emitted graph, so a turn is always an auditable
+//! plan, never a free-form tool call. To gather information the model emits a plan with read nodes; the
+//! runtime executes it and feeds the results back so it can plan the next step.
 //!
-//! Both are session-aware: a [`SessionView`] lets the model reference already-created `$values` instead
-//! of re-fetching. This is the seat of "the LLM plans": the model proposes structure; the runtime owns
-//! execution.
+//! - [`compile_turn`] — **the seat of the one engine**: plan a turn from the *conversation*. The model
+//!   calls `emit_plan` with the execution graph, asks one clarifying question ([`AskUser`]), or answers
+//!   in prose. Returns [`TurnOutput::Plan`] (the runtime executes it) or [`TurnOutput::Chat`].
+//! - [`plan`] — a thin wrapper over `compile_turn` for the one-shot `--plan` surface (a single
+//!   instruction; a prose-only answer is an error, since that surface wants a graph).
+//! - [`compile`] — one-shot, single model call (no tools); kept for the simple path.
+//!
+//! All are session-aware: a [`SessionView`] lets the model reference already-created `$values` instead
+//! of re-fetching, and the emitted AST may reference *any* registered op (it is the *plan*, not executed
+//! here). This is the seat of "the LLM plans": the model proposes structure; the runtime owns execution.
 
 use futures::StreamExt;
 
 use flux_core::{Chunk, ContentBlock, Error, Message, Result};
 use flux_provider::{Provider, Request, ToolDef};
-use flux_runtime::Executor;
-use flux_spec::{Effect, Risk, ToolSpec};
 
 use crate::analyze::{analyze_flow, Diagnostic};
 use crate::ast::DraftAst;
@@ -57,22 +58,20 @@ pub struct Compiled {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// What the planner produced for a turn: an executable plan, or a plain-prose answer (a chat turn —
+/// the model chose to respond rather than emit a graph). The one engine drives [`compile_turn`] every
+/// turn and either executes the `Plan` or surfaces the `Chat` text as the assistant reply.
+#[derive(Debug, Clone)]
+pub enum TurnOutput {
+    Plan(Compiled),
+    Chat(String),
+}
+
 /// How the planner asks the user a clarifying question mid-plan (interactive mode). The CLI implements
 /// this over stdin; `None` means no user is attached, so the `ask_user` tool is not offered.
 pub trait AskUser: Send + Sync {
     /// Ask `question` and return the user's reply.
     fn ask(&self, question: &str) -> String;
-}
-
-/// True if a tool is safe for the planner to *execute* while planning: read-only and low-risk
-/// (effects ⊆ {Read, Filesystem}, no Write/Process/Network/Browser/LocalSystem). Over the builtins
-/// this is `read`, `grep`, `glob`.
-pub fn is_safe(spec: &ToolSpec) -> bool {
-    spec.risk == Risk::Low
-        && spec
-            .effects
-            .iter()
-            .all(|e| matches!(e, Effect::Read | Effect::Filesystem))
 }
 
 // ---------------------------------------------------------------------------
@@ -135,28 +134,38 @@ pub async fn compile(
 // Agentic planner
 // ---------------------------------------------------------------------------
 
-/// Compile a natural-language instruction into a [`DraftAst`] with an agentic planner loop: the model
-/// may call the read-only `research` tools to gather context, [`AskUser`] to clarify, and emits the
-/// final AST via the synthetic `emit_plan` tool. `ops` is the full op catalog (the AST may use any of
-/// them); `research` is a safety-gated executor scoped to read-only tools (the only ones run here).
-// Each argument is a distinct, meaningful input (provider, model, catalog, research executor, session
-// view, user-ask, options); bundling them would obscure rather than clarify.
+/// Plan **one turn** of the conversation: the seat of the single engine. Seeded with the prior
+/// `messages` (the conversation), the model calls **`emit_plan`** with the execution graph, [`AskUser`]
+/// to clarify, or **answers in prose** (a chat turn). Pure DAG — there are no directly-callable ops, so
+/// every operation lives in the emitted plan. Returns [`TurnOutput::Plan`] for a graph the runtime will
+/// execute, or [`TurnOutput::Chat`] for a prose answer. `ops` is the full op catalog (the AST may use
+/// any of them).
+// Each argument is a distinct, meaningful input (provider, model, conversation, base system, catalog,
+// session view, user-ask, options); bundling them would obscure rather than clarify.
 #[allow(clippy::too_many_arguments)]
-pub async fn plan(
+pub async fn compile_turn(
     provider: &dyn Provider,
     model: &str,
-    instruction: &str,
+    conversation: &[Message],
+    base_system: Option<&str>,
     ops: &OpRegistry<'_>,
-    research: &Executor,
     view: Option<&SessionView>,
     ask: Option<&dyn AskUser>,
     opts: CompileOptions,
-) -> Result<Compiled> {
+) -> Result<TurnOutput> {
     let steps = opts.max_steps.max(1);
     let interactive = ask.is_some();
-    let system = build_planner_prompt(ops, view, interactive);
-    let tools = planner_tools(research, interactive);
-    let mut messages = vec![Message::user_text(instruction)];
+    let planner = build_planner_prompt(ops, view, interactive);
+    // The engine prepends its agent identity + project context + active skills; the CLI surfaces pass
+    // `None` (the planner block alone, as before).
+    let system = match base_system {
+        Some(b) if !b.trim().is_empty() => format!("{b}\n\n{planner}"),
+        _ => planner,
+    };
+    // Pure DAG: the model's ONLY tools are `emit_plan` (+ `ask_user`). Every op — reads included — is a
+    // node in the emitted graph, so a turn is always an auditable plan, never a free-form tool call.
+    let tools = planner_tools(interactive);
+    let mut messages = conversation.to_vec();
 
     for step in 1..=steps {
         let req = Request {
@@ -184,28 +193,26 @@ pub async fn plan(
         }
 
         if tool_uses.is_empty() {
-            // No tool call — perhaps the model emitted the AST as plain text. Try it; else nudge.
+            // No tool call. Perhaps the model emitted the AST as plain text → a plan.
             if let Ok(ast) = parse_draft_ast(&assistant.text()) {
                 if analyze_flow(&ast, ops).is_ok() {
-                    return Ok(Compiled {
+                    return Ok(TurnOutput::Plan(Compiled {
                         ast,
                         attempts: step,
                         diagnostics: Vec::new(),
-                    });
+                    }));
                 }
+            }
+            // Otherwise prose is a chat answer (the engine surfaces it; the turn ends). A *truly empty*
+            // turn (no blocks, no text) wasn't pushed, so just retry on the next step.
+            let text = assistant.text();
+            if !text.trim().is_empty() {
+                return Ok(TurnOutput::Chat(text));
             }
             if step == steps {
                 return Err(Error::Other(format!(
-                    "planner produced no plan within {steps} steps"
+                    "planner produced neither a plan nor an answer within {steps} steps"
                 )));
-            }
-            // Nudge only if the assistant turn was non-empty (so it was pushed). A nudge after a prior
-            // `user(results)` with no assistant in between would be an invalid user-after-user
-            // sequence; an empty turn just retries on the next step.
-            if !assistant.content.is_empty() {
-                messages.push(Message::user_text(
-                    "Call `emit_plan` with the final AST when you are ready.",
-                ));
             }
             continue;
         }
@@ -272,22 +279,49 @@ pub async fn plan(
                         .unwrap_or_else(|| "(no user)".to_string());
                     results.push(ContentBlock::tool_result_text(id, answer, false));
                 }
-                // Research tool: dispatch through the safe envelope. Unknown / non-safe names are
-                // refused by `dispatch` (they aren't in the scoped registry).
-                _ => {
-                    let r = research.dispatch(&name, input).await;
-                    results.push(ContentBlock::tool_result_text(id, r.content, r.is_error));
-                }
+                // Pure DAG: nothing but `emit_plan`/`ask_user` is advertised, so any other tool name is
+                // a model error — there is no direct tool execution. Steer it back to `emit_plan`.
+                other => results.push(ContentBlock::tool_result_text(
+                    id,
+                    format!(
+                        "`{other}` is not callable — you have no direct tools. Put it in a plan node \
+                         and call `emit_plan` instead."
+                    ),
+                    true,
+                )),
             }
         }
         messages.push(Message::user(results));
         if let Some(c) = done {
-            return Ok(c);
+            return Ok(TurnOutput::Plan(c));
         }
     }
     Err(Error::Other(format!(
         "planner did not produce a plan within {steps} steps"
     )))
+}
+
+/// Compile a single natural-language instruction into a [`DraftAst`] (the one-shot `--plan` surface).
+/// A thin wrapper over [`compile_turn`]: a one-message conversation, where a prose-only answer (no plan)
+/// is an error since that surface explicitly wants a graph.
+// One meaningful argument per parameter, mirroring `compile_turn`.
+#[allow(clippy::too_many_arguments)]
+pub async fn plan(
+    provider: &dyn Provider,
+    model: &str,
+    instruction: &str,
+    ops: &OpRegistry<'_>,
+    view: Option<&SessionView>,
+    ask: Option<&dyn AskUser>,
+    opts: CompileOptions,
+) -> Result<Compiled> {
+    let conversation = [Message::user_text(instruction)];
+    match compile_turn(provider, model, &conversation, None, ops, view, ask, opts).await? {
+        TurnOutput::Plan(c) => Ok(c),
+        TurnOutput::Chat(_) => Err(Error::Other(
+            "the model answered without emitting a plan".to_string(),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -479,42 +513,40 @@ Instruction: {instruction}\n",
 
 fn build_planner_prompt(ops: &OpRegistry, view: Option<&SessionView>, interactive: bool) -> String {
     let ask_line = if interactive {
-        " You may call `ask_user` to ask the user ONE clarifying question if the instruction is genuinely ambiguous."
+        " and `ask_user` (ask ONE clarifying question only if the request is genuinely ambiguous)"
     } else {
         ""
     };
     format!(
-        "You are Flux-Lang's planning agent. Produce a Flux-Lang flow AST (the execution plan) for the \
-user's instruction.\n\nYou have read-only research tools — `read`, `grep`, `glob` — to gather context. \
-Use them ONLY if you need information you do not already have (e.g. to find file paths or inspect \
-code); do not over-research.{ask_line} When ready, call `emit_plan` with the final AST as its `ast` \
-argument. The AST may use ANY operation from the catalog (it is the plan, not executed now); prefer \
-deterministic ops and reference existing session symbols instead of re-fetching. Each op is shown as \
-`name(params)`; a call's `args` are positional in that parameter order ([optional] params come \
-last).\n\nOperation catalog (for the AST):\n{catalog}{symbols}\n{grammar}\n",
+        "You are Flux-Lang's planning agent. For the user's request, either call `emit_plan` with ONE \
+execution plan (a Flux-Lang flow AST) that accomplishes it, or — if the request needs no operations or is \
+ALREADY satisfied by results shown earlier in the conversation — answer directly in prose (do NOT emit a \
+plan, and do NOT repeat work already done).\n\nYou have NO directly-callable tools except `emit_plan`\
+{ask_line} — you cannot run `read`/`grep`/`bash`/etc. yourself. To gather information, put `read`/`grep`/\
+`glob` as NODES in a plan and emit it; the runtime executes the plan and gives you the results, so you \
+can plan the next step. Put the WHOLE task in one plan rather than many tiny plans.\n\nIMPORTANT — \
+express control flow as Flux-Lang nodes, NOT inside shell commands, so the plan stays auditable: use a \
+`repeat` node for loops and a `when` node for branches. Do NOT write shell loops/conditionals (`for`, \
+`while`, `if`, `&&`, `;`) inside a `bash` command — a `bash` op is ONE discrete command. E.g. \"print X \
+three times\" is `repeat max 3 {{ bash(\"echo X\") }}`, never `bash(\"for i in 1 2 3; do echo X; \
+done\")`.\n\nThe AST may use ANY operation from the catalog; prefer deterministic ops and reference \
+existing session symbols instead of re-fetching. Each op is shown as `name(params)`; a call's `args` are \
+positional in that parameter order ([optional] params come last).\n\nOperation catalog (for the AST):\n\
+{catalog}{symbols}\n{grammar}\n",
         catalog = ops_catalog(ops),
         symbols = symbols_block(view),
         grammar = AST_GRAMMAR,
     )
 }
 
-/// The tools advertised to the planner: the read-only research tools + the synthetic `emit_plan` (and
-/// `ask_user` when interactive). Non-safe ops are NOT advertised — they can appear in the emitted AST
-/// but cannot be executed during planning.
-fn planner_tools(research: &Executor, interactive: bool) -> Vec<ToolDef> {
-    let mut tools: Vec<ToolDef> = research
-        .registry()
-        .specs()
-        .into_iter()
-        .map(|s| ToolDef {
-            name: s.name,
-            description: s.description,
-            input_schema: s.input_schema,
-        })
-        .collect();
+/// The only tools the planner can call: the synthetic `emit_plan` (and `ask_user` when interactive).
+/// There are NO directly-callable ops — every operation (reads included) is a node in the emitted AST,
+/// so a turn is always an auditable plan (pure DAG).
+fn planner_tools(interactive: bool) -> Vec<ToolDef> {
+    let mut tools: Vec<ToolDef> = Vec::new();
     tools.push(ToolDef {
         name: "emit_plan".to_string(),
-        description: "Emit the final Flux-Lang flow AST. Call when ready; pass the AST as `ast`."
+        description: "Emit the Flux-Lang flow AST to run (your only way to act). Pass the AST as `ast`."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -547,14 +579,13 @@ Return a corrected AST. Output ONLY the JSON AST in a single ```json code block.
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     use async_trait::async_trait;
     use serde_json::json;
 
     use flux_provider::ChunkStream;
-    use flux_runtime::{DenyApprover, PermissionManager, ToolContext, ToolRegistry};
-    use flux_system::{System, Workspace};
+    use flux_runtime::ToolRegistry;
 
     /// A provider that replays canned chunk sequences, one per `stream()` call.
     struct Mock {
@@ -601,26 +632,6 @@ mod tests {
         r
     }
 
-    fn research_executor() -> Executor {
-        let dir = std::env::temp_dir().join(format!("flux-plan-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let safe = full_registry().subset(Some(&[
-            "read".to_string(),
-            "grep".to_string(),
-            "glob".to_string(),
-        ]));
-        let perms = PermissionManager::from_rules(
-            &["read".to_string(), "grep".to_string(), "glob".to_string()],
-            &[],
-        );
-        Executor::new(
-            safe,
-            perms,
-            Arc::new(DenyApprover),
-            ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap()))),
-        )
-    }
-
     struct StubAsk {
         asked: Mutex<Vec<String>>,
         reply: String,
@@ -636,40 +647,22 @@ mod tests {
         r#"{"ast":{"body":[{"kind":"call","op":"read","args":[{"kind":"lit","value":"x"}]}]}}"#;
 
     #[test]
-    fn is_safe_classifies_builtins() {
-        let reg = full_registry();
-        for (name, want) in [("read", true), ("grep", true), ("glob", true)] {
-            assert_eq!(is_safe(&reg.get(name).unwrap().spec()), want, "{name}");
-        }
-        for name in ["write", "edit", "bash"] {
-            assert!(
-                !is_safe(&reg.get(name).unwrap().spec()),
-                "{name} must not be safe"
-            );
-        }
-    }
-
-    #[test]
-    fn planner_advertises_only_safe_tools_plus_synthetics() {
-        let ex = research_executor();
-        let mut names: Vec<String> = planner_tools(&ex, false)
-            .into_iter()
-            .map(|t| t.name)
-            .collect();
-        names.sort();
-        assert_eq!(names, vec!["emit_plan", "glob", "grep", "read"]);
-        assert!(planner_tools(&ex, true)
-            .iter()
-            .any(|t| t.name == "ask_user"));
+    fn planner_advertises_only_emit_plan_and_ask_user() {
+        // Pure DAG: the model has NO directly-callable ops — only `emit_plan` (+ `ask_user`).
+        let names: Vec<String> = planner_tools(false).into_iter().map(|t| t.name).collect();
+        assert_eq!(names, vec!["emit_plan"]);
+        let interactive: Vec<String> = planner_tools(true).into_iter().map(|t| t.name).collect();
+        assert_eq!(interactive, vec!["emit_plan", "ask_user"]);
     }
 
     #[tokio::test]
-    async fn plan_researches_then_emits() {
+    async fn plan_rejects_a_bare_tool_call_then_emits() {
+        // Pure DAG: the model has no directly-callable ops. If it tries to call one (here `read`), it
+        // is told it has no direct tools; it then emits the op as a plan node instead.
         let reg = full_registry();
         let ops = OpRegistry::new(&reg);
-        let research = research_executor();
         let p = mock(vec![
-            tool_call("read", json!({"path": "Cargo.toml"})),
+            tool_call("read", json!({ "path": "Cargo.toml" })),
             tool_call("emit_plan", serde_json::from_str(VALID_AST).unwrap()),
         ]);
         let out = plan(
@@ -677,7 +670,6 @@ mod tests {
             "mock",
             "do it",
             &ops,
-            &research,
             None,
             None,
             CompileOptions::default(),
@@ -689,35 +681,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_refuses_non_safe_tool_then_emits() {
-        let reg = full_registry();
-        let ops = OpRegistry::new(&reg);
-        let research = research_executor();
-        // `write` is not in the safe research registry → dispatch refuses it; planner still emits.
-        let p = mock(vec![
-            tool_call("write", json!({"path": "x", "content": "y"})),
-            tool_call("emit_plan", serde_json::from_str(VALID_AST).unwrap()),
-        ]);
-        let out = plan(
-            &p,
-            "mock",
-            "do it",
-            &ops,
-            &research,
-            None,
-            None,
-            CompileOptions::default(),
-        )
-        .await
-        .unwrap();
-        assert!(out.diagnostics.is_empty());
-    }
-
-    #[tokio::test]
     async fn plan_asks_the_user() {
         let reg = full_registry();
         let ops = OpRegistry::new(&reg);
-        let research = research_executor();
         let ask = StubAsk {
             asked: Mutex::new(Vec::new()),
             reply: "the readme".to_string(),
@@ -731,7 +697,6 @@ mod tests {
             "mock",
             "do it",
             &ops,
-            &research,
             None,
             Some(&ask),
             CompileOptions::default(),
@@ -746,7 +711,6 @@ mod tests {
     async fn plan_repairs_an_invalid_emit() {
         let reg = full_registry();
         let ops = OpRegistry::new(&reg);
-        let research = research_executor();
         let invalid = r#"{"ast":{"body":[{"kind":"call","op":"nope.op","args":[]}]}}"#;
         let p = mock(vec![
             tool_call("emit_plan", serde_json::from_str(invalid).unwrap()),
@@ -757,7 +721,6 @@ mod tests {
             "mock",
             "do it",
             &ops,
-            &research,
             None,
             None,
             CompileOptions::default(),
@@ -772,7 +735,6 @@ mod tests {
     async fn plan_accepts_side_effecting_ops_in_the_graph() {
         let reg = full_registry();
         let ops = OpRegistry::new(&reg);
-        let research = research_executor();
         // The plan may include `write` (a side-effecting op) — it's the plan, not executed here.
         let with_write = r#"{"ast":{"body":[{"kind":"call","op":"write","args":[{"kind":"lit","value":"out.txt"}]}]}}"#;
         let p = mock(vec![tool_call(
@@ -784,7 +746,6 @@ mod tests {
             "mock",
             "write a file",
             &ops,
-            &research,
             None,
             None,
             CompileOptions::default(),
@@ -799,7 +760,6 @@ mod tests {
     async fn plan_recovers_from_an_empty_turn() {
         let reg = full_registry();
         let ops = OpRegistry::new(&reg);
-        let research = research_executor();
         // An empty model turn (no blocks, no text) must not corrupt the local history; the planner
         // skips the nudge and retries on the next step.
         let p = mock(vec![
@@ -811,7 +771,6 @@ mod tests {
             "mock",
             "do it",
             &ops,
-            &research,
             None,
             None,
             CompileOptions::default(),
@@ -819,6 +778,53 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out.attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn compile_turn_returns_chat_for_prose() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        // Prose with no `emit_plan` and no tool calls = a chat answer, not an error.
+        let p = mock(vec![text_chunk("Here's an explanation — no plan needed.")]);
+        let out = compile_turn(
+            &p,
+            "mock",
+            &[Message::user_text("explain the safety model")],
+            None,
+            &ops,
+            None,
+            None,
+            CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+        match out {
+            TurnOutput::Chat(t) => assert!(t.contains("explanation")),
+            TurnOutput::Plan(_) => panic!("expected a chat answer, got a plan"),
+        }
+    }
+
+    #[tokio::test]
+    async fn compile_turn_returns_plan_for_emit() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let p = mock(vec![tool_call(
+            "emit_plan",
+            serde_json::from_str(VALID_AST).unwrap(),
+        )]);
+        let out = compile_turn(
+            &p,
+            "mock",
+            &[Message::user_text("read x")],
+            None,
+            &ops,
+            None,
+            None,
+            CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(out, TurnOutput::Plan(_)));
     }
 
     // ---- one-shot compile (with the view param) ----

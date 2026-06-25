@@ -1,12 +1,16 @@
-//! The interpreter. M1 executes a single operation: dispatch it through the safety envelope, store
-//! the result as an immutable value, optionally bind a symbol, and record the run-event trace.
+//! The interpreter: execute a compiled Flux-Lang flow through the safety envelope. `execute_call`
+//! dispatches one op (store the result as an immutable value, optionally bind a symbol, trace it);
+//! `execute_flow` walks a whole graph — `bind` / `call` / `return` plus `when` (typed branch) and
+//! `repeat` (bounded loop) — resolving each `$symbol` argument to the value the runtime owns
+//! (`await` cross-turn suspend/resume is the next slice). `plan_risk` previews a plan's risk and
+//! `PlanApprover` enforces whole-plan approval (destructive ops still escalate per op).
 //!
-//! The interpreter is the *only* caller of [`Executor::dispatch`](flux_runtime::Executor) in
-//! flux-flow — every op runs through the same gate as any other tool, so there is no new bypass
-//! surface. Symbol-placeholder resolution in op inputs arrives with multi-op flows (M3); for now the
-//! input is dispatched as given.
+//! This is the *only* caller of [`Executor::dispatch`](flux_runtime::Executor) in flux-flow — every
+//! op runs through the same gate as any other tool, so there is no new bypass surface.
 
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -136,10 +140,22 @@ pub struct FlowOutcome {
     pub steps: usize,
 }
 
-/// Execute a compiled flow's body sequentially, dispatching each operation through the same
-/// [`execute_call`] envelope. **Linear v1**: `bind` / `call` / `return` only; `when` / `repeat` /
-/// `await` return a clear error (a condition/loop evaluator lands in the next slice). Every op still
-/// goes through [`Executor::dispatch`] — no new bypass surface.
+/// Whether body execution should keep going or unwind because a `return` fired.
+enum Step {
+    /// Keep executing the rest of the body.
+    Next,
+    /// A `return` executed — unwind the whole flow with this value.
+    Return(Option<ValueId>),
+}
+
+/// A boxed, borrowed future producing `(last_text, control)` — the recursion-safe shape `exec_body`
+/// returns so `when`/`repeat` can recurse into nested bodies.
+type BodyFuture<'a> = Pin<Box<dyn Future<Output = Result<(String, Step)>> + Send + 'a>>;
+
+/// Execute a compiled flow's body, dispatching each operation through the same [`execute_call`]
+/// envelope. Handles `bind` / `call` / `return` plus `when` (typed branch) and `repeat` (bounded
+/// loop). `await` (cross-turn suspend/resume) still returns a clear error — the engine loop covers
+/// iteration for now. Every op still goes through [`Executor::dispatch`] — no new bypass surface.
 pub async fn execute_flow(
     store: &FlowStore,
     executor: &Executor,
@@ -148,77 +164,177 @@ pub async fn execute_flow(
     sink: &mut dyn AgentSink,
 ) -> Result<FlowOutcome> {
     let mut steps = 0usize;
-    let mut last = String::new();
-    let mut returned: Option<ValueId> = None;
-
-    for node in &ast.body {
-        match node {
-            Node::Bind {
-                name, value, ty, ..
-            } => {
-                let Node::Call { op, args } = value.as_ref() else {
-                    return Err(Error::Other(
-                        "linear execution (v1) can only bind the result of a `call`".to_string(),
-                    ));
-                };
-                let ty_label = ty.as_ref().map(TypeRef::label);
-                let bind = BindSpec {
-                    name,
-                    ty: ty_label.as_deref(),
-                    visibility: Visibility::Visible,
-                };
-                let outcome =
-                    run_call(store, executor, session_id, op, args, Some(bind), sink).await?;
-                steps += 1;
-                if outcome.is_error {
-                    return Err(Error::Other(format!(
-                        "step `{op}` failed: {}",
-                        outcome.content
-                    )));
-                }
-                last = outcome.content;
-            }
-            Node::Call { op, args } => {
-                let outcome = run_call(store, executor, session_id, op, args, None, sink).await?;
-                steps += 1;
-                if outcome.is_error {
-                    return Err(Error::Other(format!(
-                        "step `{op}` failed: {}",
-                        outcome.content
-                    )));
-                }
-                last = outcome.content;
-            }
-            Node::Return { value } => {
-                let (content, vid) =
-                    eval_return(store, executor, session_id, value, sink, &mut steps).await?;
-                last = content;
-                returned = vid;
-                break;
-            }
-            Node::When { .. } | Node::Repeat { .. } | Node::Await { .. } => {
-                return Err(Error::Other(
-                    "control-flow execution (when/repeat/await) lands in the next slice"
-                        .to_string(),
-                ));
-            }
-            Node::Var { .. } | Node::Lit { .. } | Node::Thing { .. } => {
-                return Err(Error::Other(
-                    "a bare value is not an executable statement".to_string(),
-                ));
-            }
-        }
-    }
-
+    let (last, step) = exec_body(store, executor, session_id, &ast.body, sink, &mut steps).await?;
+    let returned = match step {
+        Step::Return(vid) => vid,
+        Step::Next => None,
+    };
     if let Some(vid) = &returned {
         store.append_event(session_id, &RunEvent::FlowReturned { value: vid.clone() })?;
     }
-
     Ok(FlowOutcome {
         returned,
         result: last,
         steps,
     })
+}
+
+/// Execute a sequence of nodes, returning the last produced text and whether a `return` unwound the
+/// flow. Boxed because `when`/`repeat` recurse into nested bodies (async recursion needs indirection).
+fn exec_body<'a>(
+    store: &'a FlowStore,
+    executor: &'a Executor,
+    session_id: &'a str,
+    body: &'a [Node],
+    sink: &'a mut dyn AgentSink,
+    steps: &'a mut usize,
+) -> BodyFuture<'a> {
+    Box::pin(async move {
+        let mut last = String::new();
+        for node in body {
+            match node {
+                Node::Bind {
+                    name, value, ty, ..
+                } => {
+                    let Node::Call { op, args } = value.as_ref() else {
+                        return Err(Error::Other(
+                            "execution can only bind the result of a `call`".to_string(),
+                        ));
+                    };
+                    let ty_label = ty.as_ref().map(TypeRef::label);
+                    let bind = BindSpec {
+                        name,
+                        ty: ty_label.as_deref(),
+                        visibility: Visibility::Visible,
+                    };
+                    let outcome =
+                        run_call(store, executor, session_id, op, args, Some(bind), sink).await?;
+                    *steps += 1;
+                    if outcome.is_error {
+                        return Err(Error::Other(format!(
+                            "step `{op}` failed: {}",
+                            outcome.content
+                        )));
+                    }
+                    last = outcome.content;
+                }
+                Node::Call { op, args } => {
+                    let outcome =
+                        run_call(store, executor, session_id, op, args, None, sink).await?;
+                    *steps += 1;
+                    if outcome.is_error {
+                        return Err(Error::Other(format!(
+                            "step `{op}` failed: {}",
+                            outcome.content
+                        )));
+                    }
+                    last = outcome.content;
+                }
+                Node::Return { value } => {
+                    let (content, vid) =
+                        eval_return(store, executor, session_id, value, sink, steps).await?;
+                    return Ok((content, Step::Return(vid)));
+                }
+                Node::When {
+                    cond,
+                    then,
+                    otherwise,
+                } => {
+                    let take = eval_cond(store, executor, session_id, cond, sink, steps).await?;
+                    let branch = if take { then } else { otherwise };
+                    let (blast, step) =
+                        exec_body(store, executor, session_id, branch, &mut *sink, &mut *steps)
+                            .await?;
+                    if !blast.is_empty() {
+                        last = blast;
+                    }
+                    if let Step::Return(v) = step {
+                        return Ok((last, Step::Return(v)));
+                    }
+                }
+                Node::Repeat {
+                    max,
+                    until,
+                    body: rbody,
+                } => {
+                    for _ in 0..*max {
+                        let (blast, step) =
+                            exec_body(store, executor, session_id, rbody, &mut *sink, &mut *steps)
+                                .await?;
+                        if !blast.is_empty() {
+                            last = blast;
+                        }
+                        if let Step::Return(v) = step {
+                            return Ok((last, Step::Return(v)));
+                        }
+                        // `until` is a *stop-when-true* guard, evaluated after each iteration.
+                        if let Some(u) = until {
+                            if eval_cond(store, executor, session_id, u, &mut *sink, &mut *steps)
+                                .await?
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Node::Await { .. } => {
+                    return Err(Error::Other(
+                        "`await` execution (cross-turn suspend/resume) lands in a later slice"
+                            .to_string(),
+                    ));
+                }
+                Node::Var { .. } | Node::Lit { .. } | Node::Thing { .. } => {
+                    return Err(Error::Other(
+                        "a bare value is not an executable statement".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok((last, Step::Next))
+    })
+}
+
+/// Evaluate a `when` / `repeat-until` condition to a boolean. `lit`/`var` are resolved without side
+/// effects; a `call` executes (its content's truthiness is the result). An errored call is falsey.
+async fn eval_cond(
+    store: &FlowStore,
+    executor: &Executor,
+    session_id: &str,
+    node: &Node,
+    sink: &mut dyn AgentSink,
+    steps: &mut usize,
+) -> Result<bool> {
+    match node {
+        Node::Call { op, args } => {
+            let outcome = run_call(store, executor, session_id, op, args, None, sink).await?;
+            *steps += 1;
+            if outcome.is_error {
+                return Ok(false);
+            }
+            Ok(json_truthy(&serde_json::Value::String(outcome.content)))
+        }
+        Node::Lit { .. } | Node::Var { .. } => Ok(json_truthy(&eval_arg(node, store, session_id)?)),
+        other => Err(Error::Other(format!(
+            "unsupported condition `{}`",
+            node_kind(other)
+        ))),
+    }
+}
+
+/// JSON truthiness for conditions: null/false/0/empty are falsey; a string is truthy unless it is
+/// empty, `"false"`, or `"0"` (so a tool's textual `"false"` output reads as false).
+fn json_truthy(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+        serde_json::Value::String(s) => {
+            let t = s.trim();
+            !t.is_empty() && !t.eq_ignore_ascii_case("false") && t != "0"
+        }
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Object(o) => !o.is_empty(),
+    }
 }
 
 /// Evaluate a call's arguments, map them to the op's named input, surface the call/result to the
@@ -829,14 +945,107 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_flow_errors_on_control_flow() {
+    async fn execute_flow_when_takes_the_true_branch() {
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        // when true { $taken = echo("then") } else { $taken = echo("else") }
+        let ast = DraftAst {
+            body: vec![Node::When {
+                cond: Box::new(flow_lit(json!(true))),
+                then: vec![flow_bind("taken", "echo", vec![flow_lit(json!("then"))])],
+                otherwise: vec![flow_bind("taken", "echo", vec![flow_lit(json!("else"))])],
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(outcome.steps, 1, "only the taken branch's op runs");
+        let vid = store
+            .resolve("sess", &SymbolName("taken".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.get_value(&vid).unwrap(),
+            Some(Value::String("then".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_flow_when_takes_the_false_branch() {
         let store = FlowStore::in_memory().unwrap();
         let ex = temp_executor(true);
         let ast = DraftAst {
             body: vec![Node::When {
-                cond: Box::new(flow_lit(json!(true))),
-                then: vec![],
-                otherwise: vec![],
+                cond: Box::new(flow_lit(json!(false))),
+                then: vec![flow_bind("taken", "echo", vec![flow_lit(json!("then"))])],
+                otherwise: vec![flow_bind("taken", "echo", vec![flow_lit(json!("else"))])],
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        execute_flow(&store, &ex, "sess", &ast, &mut sink)
+            .await
+            .unwrap();
+        let vid = store
+            .resolve("sess", &SymbolName("taken".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.get_value(&vid).unwrap(),
+            Some(Value::String("else".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_flow_repeat_caps_at_max_and_until_breaks_early() {
+        // repeat max 3 { echo } → runs 3 times (no `until`).
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        let ast = DraftAst {
+            body: vec![Node::Repeat {
+                max: 3,
+                until: None,
+                body: vec![flow_bind("x", "echo", vec![flow_lit(json!("hi"))])],
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(outcome.steps, 3, "repeat runs exactly max times");
+
+        // repeat max 3 until true { echo } → the always-true guard stops it after one iteration.
+        let store = FlowStore::in_memory().unwrap();
+        let ast = DraftAst {
+            body: vec![Node::Repeat {
+                max: 3,
+                until: Some(Box::new(flow_lit(json!(true)))),
+                body: vec![flow_bind("x", "echo", vec![flow_lit(json!("hi"))])],
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.steps, 1,
+            "`until` true after iteration 1 breaks the loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_flow_still_errors_on_await() {
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        let ast = DraftAst {
+            body: vec![Node::Await {
+                binding: None,
+                source: "input".into(),
+                as_type: None,
             }],
             ..Default::default()
         };
@@ -844,7 +1053,7 @@ mod tests {
         let err = execute_flow(&store, &ex, "sess", &ast, &mut sink)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("control-flow"));
+        assert!(err.to_string().contains("await"));
     }
 
     #[test]

@@ -1,19 +1,20 @@
-//! The engine: flux-flow's own turn loop, and the seat of the "the LLM plans, the runtime runs"
-//! model. It is a strict superset of the legacy `flux-agent` loop — the free-form "one tool at a
-//! time" behavior is the degenerate single-op case — and additionally stores each result as an
-//! immutable [`Value`](crate::ast::Value), binds a session symbol, projects `view(Session)` into the
-//! system prompt, and records the run-event trace.
+//! The engine: flux-flow's single turn loop, and the seat of "the LLM plans, the runtime runs".
 //!
-//! M1 runs the single-op fast path: the provider round-trips are identical to the legacy loop (so
-//! latency is unchanged), and the session message log keeps exactly the same shape invariants —
-//! never an empty assistant message, a split tool_use/tool_result pair, or a user-after-user
-//! sequence. Skill activation and context compaction match the legacy loop, so this can be the sole
-//! engine without regression. Multi-op planned flows (one assistant summary per turn — the
-//! don't-re-send win) build on this loop in later milestones.
+//! There is exactly **one** engine. Every turn the model is a compiler front-end: it either emits a
+//! typed Flux-Lang plan (a graph the runtime executes through [`Executor::dispatch`](flux_runtime))
+//! or answers in prose (a chat turn). The free-form "one provider-native tool call at a time" loop is
+//! gone — a single op is just a one-node plan. `flux --compile-only` shows exactly what a turn would
+//! run, because the same [`compile_turn`] drives the engine and the CLI.
 //!
-//! The engine reuses [`flux_agent::AgentSink`] so a surface (CLI/TUI) can drive it with the same
-//! sink. Every op still executes through [`Executor::dispatch`](flux_runtime::Executor) — there is no
-//! new bypass surface.
+//! Per turn: append the user message → compile a plan (pure DAG — the model's only tool is emit_plan) →
+//! risk-gated execution via [`execute_flow`] (per-op approval through the same envelope) → feed the
+//! result back *ephemerally* so the model can iterate (read → fix → re-run) → persist **one** assistant
+//! summary. The persisted session log is pure `user → assistant(text)` alternation: raw op outputs
+//! never re-enter history (the "don't re-send" token win), which also removes the session-shape bug
+//! class (no persisted tool_use/tool_result pairs). Symbols + summaries carry state forward.
+//!
+//! The engine reuses [`flux_agent::AgentSink`] so a surface (CLI/TUI) can drive it with the same sink.
+//! Every op still executes through `Executor::dispatch` — there is no new bypass surface.
 
 use std::sync::Arc;
 
@@ -21,13 +22,15 @@ use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use flux_agent::AgentSink;
-use flux_core::{Chunk, ContentBlock, Message, Result, Usage};
-use flux_provider::{Provider, Request, ToolDef};
-use flux_runtime::{Executor, ToolResult};
+use flux_core::{Chunk, ContentBlock, Message, Result};
+use flux_provider::{Provider, Request};
+use flux_runtime::Executor;
 use flux_session::SessionStore;
 
-use crate::ast::{SymbolName, Visibility};
-use crate::runtime::{execute_call, BindSpec};
+use crate::ast::DraftAst;
+use crate::compile::{compile_turn, CompileOptions, TurnOutput};
+use crate::registry::OpRegistry;
+use crate::runtime::execute_flow;
 use crate::state::FlowStore;
 
 /// flux-flow's turn engine: a provider, the tool executor (safety envelope), the session message
@@ -61,8 +64,9 @@ impl FlowEngine {
             .await
     }
 
-    /// Run one user turn, abortable via `cancel`. Preserves the session message-shape invariant on
-    /// every termination path (normal stop, no tool calls, cancel, max-iterations).
+    /// Run one user turn, abortable via `cancel` (checked between plan rounds). Every termination path
+    /// persists exactly one assistant message, so the session stays a valid `user → assistant`
+    /// alternation.
     pub async fn run_turn_cancellable(
         &self,
         session_id: &str,
@@ -73,12 +77,209 @@ impl FlowEngine {
         self.store
             .append_message(session_id, &Message::user_text(user_input))?;
 
-        // Skill activation: any skill whose triggers match this turn's input contributes its body to
-        // the system prompt for this turn (and is recorded/surfaced as evidence).
-        let mut system_prompt = self.system_prompt.clone();
+        // Agent identity + project context + any skills whose triggers match this turn — prepended to
+        // the planner's own instructions inside `compile_turn`.
+        let base_system = self.base_system_with_skills(user_input, sink);
+
+        // Compact the persisted session if it has grown past the budget.
+        self.maybe_compact(session_id, sink, cancel).await?;
+
+        // The full op catalog (a plan may use any op). Pure DAG: the model's only tool is `emit_plan`,
+        // so there is no research executor — reads are plan nodes, executed by the multi-round loop.
+        let ops = OpRegistry::new(self.executor.registry());
+        let opts = CompileOptions {
+            max_tokens: self.max_tokens,
+            ..CompileOptions::default()
+        };
+
+        // Working conversation: seeded from the clean persisted log, then extended *ephemerally* with
+        // each plan's results so the model can iterate within one turn. Only ONE assistant summary is
+        // persisted (below); the ephemeral rounds never touch the session log.
+        let mut working = self.store.load_messages(session_id)?;
+        let mut answer: Option<String> = None;
+
+        for _ in 0..self.max_iterations {
+            if cancel.is_cancelled() {
+                return self.finish_turn(session_id, sink, "(turn cancelled)", true);
+            }
+            let view = self.flow.view(session_id)?;
+            let view_ref = (!view.symbols.is_empty()).then_some(&view);
+
+            let out = match compile_turn(
+                &*self.provider,
+                &self.model,
+                &working,
+                Some(&base_system),
+                &ops,
+                view_ref,
+                None,
+                opts.clone(),
+            )
+            .await
+            {
+                Ok(out) => out,
+                // No fallback (one engine): a turn the planner can't compile fails cleanly, surfaced as
+                // the assistant's answer so the session shape stays valid.
+                Err(e) => {
+                    answer = Some(format!("I couldn't produce a plan: {e}"));
+                    break;
+                }
+            };
+
+            match out {
+                TurnOutput::Chat(text) => {
+                    sink.text_delta(&text);
+                    answer = Some(text);
+                    break;
+                }
+                TurnOutput::Plan(compiled) => {
+                    // Surface the compiled plan before running it — this is what executes, so the turn
+                    // is auditable (and visibly the planner, not a free-form tool loop).
+                    sink.observation(&flux_evidence::Observation::new(
+                        "flow.plan",
+                        flux_evidence::Phase::Turn,
+                        serde_json::json!({ "plan": crate::render::render_pretty(&compiled.ast) }),
+                    ));
+                    match execute_flow(&self.flow, &self.executor, session_id, &compiled.ast, sink)
+                        .await
+                    {
+                        Ok(outcome) => {
+                            let summary = if outcome.result.trim().is_empty() {
+                                format!("Executed a {}-step plan.", outcome.steps)
+                            } else {
+                                outcome.result.clone()
+                            };
+                            working.push(Message::assistant(vec![ContentBlock::Text {
+                                text: format!("Executed a {}-step plan.", outcome.steps),
+                            }]));
+                            working.push(Message::user_text(format!(
+                                "[plan result]\n{summary}\n\nIf this completes the user's request, \
+                                 reply with a short final answer in prose now. Emit another plan ONLY \
+                                 if essential work genuinely remains — do not repeat work."
+                            )));
+                        }
+                        // Feed the error back so the model can self-correct (model-in-the-loop),
+                        // bounded by max_iterations.
+                        Err(e) => {
+                            working.push(Message::assistant(vec![ContentBlock::Text {
+                                text: "A plan step failed.".to_string(),
+                            }]));
+                            working.push(Message::user_text(format!(
+                                "[plan error]\n{e}\n\nAdjust and try another plan, or give your final \
+                                 answer in prose."
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        let answer = answer.unwrap_or_else(|| {
+            format!(
+                "Reached the maximum of {} plan iterations for this turn; stopping.",
+                self.max_iterations
+            )
+        });
+        self.finish_turn(session_id, sink, &answer, false)
+    }
+
+    /// Compile a single instruction into a [`TurnOutput`] using this engine's full catalog + current
+    /// session symbols — *without executing*. The one-shot `--plan` surface uses this, so what it shows
+    /// is exactly what the engine would run.
+    pub async fn compile_once(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        ask: Option<&dyn crate::compile::AskUser>,
+    ) -> Result<TurnOutput> {
+        let ops = OpRegistry::new(self.executor.registry());
+        let view = self.flow.view(session_id)?;
+        let view_ref = (!view.symbols.is_empty()).then_some(&view);
+        let opts = CompileOptions {
+            max_tokens: self.max_tokens,
+            ..CompileOptions::default()
+        };
+        compile_turn(
+            &*self.provider,
+            &self.model,
+            &[Message::user_text(prompt)],
+            Some(&self.system_prompt),
+            &ops,
+            view_ref,
+            ask,
+            opts,
+        )
+        .await
+    }
+
+    /// A plan-mode turn (the REPL `/plan` toggle): compile ONE plan from the conversation, render it,
+    /// and persist it as the assistant turn (so a refinement sees it) — but DO NOT execute. Returns the
+    /// AST for the caller to hold and run later (`/run`); a chat answer is surfaced and returns `None`.
+    pub async fn plan_turn(
+        &self,
+        session_id: &str,
+        user_input: &str,
+        sink: &mut dyn AgentSink,
+    ) -> Result<Option<DraftAst>> {
+        self.store
+            .append_message(session_id, &Message::user_text(user_input))?;
+        let base_system = self.base_system_with_skills(user_input, sink);
+        let ops = OpRegistry::new(self.executor.registry());
+        let view = self.flow.view(session_id)?;
+        let view_ref = (!view.symbols.is_empty()).then_some(&view);
+        let opts = CompileOptions {
+            max_tokens: self.max_tokens,
+            ..CompileOptions::default()
+        };
+        let conversation = self.store.load_messages(session_id)?;
+        let out = compile_turn(
+            &*self.provider,
+            &self.model,
+            &conversation,
+            Some(&base_system),
+            &ops,
+            view_ref,
+            None,
+            opts,
+        )
+        .await?;
+
+        match out {
+            TurnOutput::Plan(compiled) => {
+                let rendered = crate::render::render_pretty(&compiled.ast);
+                sink.observation(&flux_evidence::Observation::new(
+                    "flow.plan",
+                    flux_evidence::Phase::Turn,
+                    serde_json::json!({ "plan": rendered }),
+                ));
+                self.store.append_message(
+                    session_id,
+                    &Message::assistant(vec![ContentBlock::Text {
+                        text: format!("Proposed plan:\n{rendered}"),
+                    }]),
+                )?;
+                sink.turn_end(None);
+                Ok(Some(compiled.ast))
+            }
+            TurnOutput::Chat(text) => {
+                sink.text_delta(&text);
+                self.store.append_message(
+                    session_id,
+                    &Message::assistant(vec![ContentBlock::Text { text }]),
+                )?;
+                sink.turn_end(None);
+                Ok(None)
+            }
+        }
+    }
+
+    /// The agent identity + project context + any skills whose triggers match this turn — the base the
+    /// planner prompt is appended to (shared by `run_turn` and `plan_turn`).
+    fn base_system_with_skills(&self, user_input: &str, sink: &mut dyn AgentSink) -> String {
+        let mut base_system = self.system_prompt.clone();
         for skill in &self.skills {
             if skill.matches(user_input) {
-                system_prompt.push_str(&format!(
+                base_system.push_str(&format!(
                     "\n\n<skill name=\"{}\">\n{}\n</skill>",
                     skill.name, skill.body
                 ));
@@ -91,194 +292,34 @@ impl FlowEngine {
                 sink.observation(&obs);
             }
         }
-
-        // Compact the session if it has grown past the budget (summarize old turns).
-        self.maybe_compact(session_id, sink, cancel).await?;
-
-        // Project flux-flow's session symbols into the system prompt: the model references values by
-        // symbol; only the runtime dereferences them.
-        let view = self.flow.view(session_id)?;
-        if !view.symbols.is_empty() {
-            system_prompt.push_str(&format!(
-                "\n\n<session_symbols>\n{}</session_symbols>",
-                view.render()
-            ));
-        }
-
-        let tools: Vec<ToolDef> = self
-            .executor
-            .registry()
-            .specs()
-            .into_iter()
-            .map(|s| ToolDef {
-                name: s.name,
-                description: s.description,
-                input_schema: s.input_schema,
-            })
-            .collect();
-
-        for _ in 0..self.max_iterations {
-            if cancel.is_cancelled() {
-                return self.finish_cancelled(sink, None);
-            }
-            let messages = self.store.load_messages(session_id)?;
-            let req = Request {
-                model: self.model.clone(),
-                system: Some(system_prompt.clone()),
-                messages,
-                tools: tools.clone(),
-                max_tokens: self.max_tokens,
-                temperature: None,
-                top_p: None,
-                stop_sequences: Vec::new(),
-                thinking: false,
-                effort: None,
-                metadata: serde_json::Map::new(),
-            };
-
-            let mut stream = self.provider.stream(req).await?;
-            let mut blocks: Vec<ContentBlock> = Vec::new();
-            let mut usage: Option<Usage> = None;
-            let mut text_acc = String::new();
-            let mut cancelled = false;
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => { cancelled = true; break; }
-                    chunk = stream.next() => {
-                        let Some(chunk) = chunk else { break };
-                        match chunk? {
-                            Chunk::TextDelta(t) => {
-                                sink.text_delta(&t);
-                                text_acc.push_str(&t);
-                            }
-                            Chunk::ThinkingDelta(t) => sink.thinking_delta(&t),
-                            Chunk::Block(b) => blocks.push(b),
-                            Chunk::Usage(u) => usage = Some(u),
-                            Chunk::Done { .. } | Chunk::MessageStart { .. } => {}
-                        }
-                    }
-                }
-            }
-
-            // Never persist an empty assistant message; recover streamed-but-uncompleted text.
-            if blocks.is_empty() && !text_acc.trim().is_empty() {
-                blocks.push(ContentBlock::Text {
-                    text: std::mem::take(&mut text_acc),
-                });
-            }
-            let assistant = Message::assistant(blocks);
-            let has_content = !assistant.content.is_empty();
-            if has_content {
-                self.store.append_message(session_id, &assistant)?;
-            }
-
-            if cancelled {
-                // Answer any unanswered tool_use blocks so the session stays valid, then end.
-                if has_content {
-                    let pending = collect_tool_uses(&assistant);
-                    if !pending.is_empty() {
-                        let results = pending
-                            .into_iter()
-                            .map(|(id, _, _)| {
-                                ContentBlock::tool_result_text(id, "cancelled".to_string(), true)
-                            })
-                            .collect();
-                        self.store
-                            .append_message(session_id, &Message::user(results))?;
-                    }
-                }
-                return self.finish_cancelled(sink, usage);
-            }
-
-            let tool_uses = if has_content {
-                collect_tool_uses(&assistant)
-            } else {
-                Vec::new()
-            };
-            if tool_uses.is_empty() {
-                sink.turn_end(usage);
-                return Ok(());
-            }
-
-            // Execute each op through the envelope via the interpreter, which also stores the result
-            // as an immutable value, binds a session symbol, and records the run-event trace.
-            let mut results = Vec::new();
-            let mut seen = self.executor.evidence().all().len();
-            let mut cancelled_tools = false;
-            for (id, name, input) in tool_uses {
-                if cancelled_tools || cancel.is_cancelled() {
-                    cancelled_tools = true;
-                    results.push(ContentBlock::tool_result_text(
-                        id,
-                        "cancelled".to_string(),
-                        true,
-                    ));
-                    continue;
-                }
-                sink.tool_call(&name, &input);
-                let sym = SymbolName(name.replace('.', "_"));
-                let outcome = execute_call(
-                    &self.flow,
-                    &self.executor,
-                    session_id,
-                    &name,
-                    input,
-                    Some(BindSpec {
-                        name: &sym,
-                        ty: None,
-                        visibility: Visibility::Visible,
-                    }),
-                )
-                .await?;
-                let ev = self.executor.evidence();
-                for o in &ev.all()[seen..] {
-                    sink.observation(o);
-                }
-                seen = ev.all().len();
-                let result = ToolResult {
-                    content: outcome.content.clone(),
-                    is_error: outcome.is_error,
-                };
-                sink.tool_result(&name, &result);
-                results.push(ContentBlock::tool_result_text(
-                    id,
-                    outcome.content,
-                    outcome.is_error,
-                ));
-            }
-            self.store
-                .append_message(session_id, &Message::user(results))?;
-            if cancelled_tools {
-                return self.finish_cancelled(sink, None);
-            }
-        }
-
-        // Reached the iteration cap mid-tool-use: append a final assistant message so the next turn's
-        // user input doesn't produce an invalid user-after-user sequence.
-        let note = format!(
-            "Reached the maximum of {} tool-use iterations for this turn; stopping.",
-            self.max_iterations
-        );
-        sink.text_delta(&note);
-        self.store.append_message(
-            session_id,
-            &Message::assistant(vec![ContentBlock::Text { text: note }]),
-        )?;
-        sink.turn_end(None);
-        Ok(())
+        base_system
     }
 
-    /// Record + surface a `turn.cancelled` observation and end the turn.
-    fn finish_cancelled(&self, sink: &mut dyn AgentSink, usage: Option<Usage>) -> Result<()> {
-        let obs = flux_evidence::Observation::new(
-            "turn.cancelled",
-            flux_evidence::Phase::Turn,
-            serde_json::json!({}),
-        );
-        self.executor.observe(obs.clone());
-        sink.observation(&obs);
-        sink.turn_end(usage);
+    /// Persist the single assistant message for this turn (keeping the `user → assistant` session
+    /// shape) and end the turn. `cancelled` records the audit observation.
+    fn finish_turn(
+        &self,
+        session_id: &str,
+        sink: &mut dyn AgentSink,
+        answer: &str,
+        cancelled: bool,
+    ) -> Result<()> {
+        if cancelled {
+            let obs = flux_evidence::Observation::new(
+                "turn.cancelled",
+                flux_evidence::Phase::Turn,
+                serde_json::json!({}),
+            );
+            self.executor.observe(obs.clone());
+            sink.observation(&obs);
+        }
+        self.store.append_message(
+            session_id,
+            &Message::assistant(vec![ContentBlock::Text {
+                text: answer.to_string(),
+            }]),
+        )?;
+        sink.turn_end(None);
         Ok(())
     }
 
@@ -378,19 +419,6 @@ fn has_tool_result(msg: &Message) -> bool {
         .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
 }
 
-/// Extract `(id, name, input)` for every tool_use block in a message.
-fn collect_tool_uses(msg: &Message) -> Vec<(String, String, serde_json::Value)> {
-    msg.content
-        .iter()
-        .filter_map(|b| match b {
-            ContentBlock::ToolUse { id, name, input } => {
-                Some((id.clone(), name.clone(), input.clone()))
-            }
-            _ => None,
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,10 +428,15 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
 
-    use flux_provider::ChunkStream;
-    use flux_runtime::{AllowApprover, PermissionManager, Tool, ToolContext, ToolRegistry};
+    use flux_core::StopReason;
+    use flux_provider::{ChunkStream, Request};
+    use flux_runtime::{
+        AllowApprover, PermissionManager, Tool, ToolContext, ToolRegistry, ToolResult,
+    };
     use flux_spec::ToolSpec;
     use flux_system::{System, Workspace};
+
+    use crate::ast::SymbolName;
 
     /// A provider that replays canned chunk sequences, one per `stream()` call.
     struct MockProvider {
@@ -426,12 +459,21 @@ mod tests {
         }
     }
 
+    /// Echo the `text` param back as content (with a real schema so positional args map).
     struct EchoTool;
 
     #[async_trait]
     impl Tool for EchoTool {
         fn spec(&self) -> ToolSpec {
-            ToolSpec::read_only("echo", "echo text", json!({"type": "object"}))
+            ToolSpec::read_only(
+                "echo",
+                "echo text",
+                json!({
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } },
+                    "required": ["text"]
+                }),
+            )
         }
         async fn execute(&self, _c: &ToolContext, params: serde_json::Value) -> Result<ToolResult> {
             Ok(ToolResult::ok(
@@ -456,6 +498,30 @@ mod tests {
         fn tool_call(&mut self, name: &str, _input: &serde_json::Value) {
             self.tools.push(name.to_string());
         }
+    }
+
+    /// One model turn that emits an `emit_plan` tool call carrying `ast`.
+    fn emit_plan(ast: serde_json::Value) -> Vec<Chunk> {
+        vec![
+            Chunk::Block(ContentBlock::ToolUse {
+                id: "p1".into(),
+                name: "emit_plan".into(),
+                input: json!({ "ast": ast }),
+            }),
+            Chunk::Done {
+                stop_reason: Some(StopReason::ToolUse),
+            },
+        ]
+    }
+
+    /// One model turn that answers in prose (a chat turn).
+    fn prose(text: &str) -> Vec<Chunk> {
+        vec![
+            Chunk::TextDelta(text.to_string()),
+            Chunk::Done {
+                stop_reason: Some(StopReason::EndTurn),
+            },
+        ]
     }
 
     fn engine_with(responses: VecDeque<Vec<Chunk>>, store: Arc<SessionStore>) -> FlowEngine {
@@ -491,32 +557,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn engine_runs_op_tracks_state_and_keeps_session_shape() {
+    async fn engine_plans_executes_and_keeps_session_shape() {
         let store = Arc::new(SessionStore::in_memory().unwrap());
         let sid = store.create_session("mock").unwrap();
 
-        // Turn 1: the model calls `echo`. Turn 2: it returns text and stops.
-        let responses = VecDeque::from(vec![
-            vec![
-                Chunk::Block(ContentBlock::ToolUse {
-                    id: "t1".into(),
-                    name: "echo".into(),
-                    input: json!({"text": "renewal follow-up"}),
-                }),
-                Chunk::Done {
-                    stop_reason: Some(flux_core::StopReason::ToolUse),
-                },
-            ],
-            vec![
-                Chunk::TextDelta("done".into()),
-                Chunk::Block(ContentBlock::Text {
-                    text: "done".into(),
-                }),
-                Chunk::Done {
-                    stop_reason: Some(flux_core::StopReason::EndTurn),
-                },
-            ],
-        ]);
+        // Round 1: the model emits a plan binding $greeting = echo("hi"). Round 2: it answers in prose.
+        let plan_ast = json!({
+            "body": [{
+                "kind": "bind", "name": "greeting",
+                "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "hi" }] }
+            }]
+        });
+        let responses = VecDeque::from(vec![emit_plan(plan_ast), prose("Done.")]);
 
         let engine = engine_with(responses, store.clone());
         let mut sink = CollectSink::default();
@@ -525,49 +577,40 @@ mod tests {
             .await
             .unwrap();
 
-        // flux-flow tracked the op: value stored, symbol bound, view shows it, trace recorded.
+        // The plan executed through dispatch: echo ran, $greeting bound, trace recorded.
         assert_eq!(sink.tools, vec!["echo"]);
-        assert!(engine
+        let vid = engine
             .flow
-            .resolve(&sid, &SymbolName("echo".into()))
-            .unwrap()
-            .is_some());
-        let fview = engine.flow.view(&sid).unwrap();
-        assert!(fview.symbols.iter().any(|s| s.name.0 == "echo"));
+            .resolve(&sid, &SymbolName("greeting".into()))
+            .unwrap();
+        assert!(vid.is_some());
         assert!(!engine.flow.events(&sid).unwrap().is_empty());
 
-        // Session message shape: user, assistant(tool_use), user(tool_result), assistant(text).
+        // Session log is pure user/assistant-text alternation: user input, then ONE assistant summary.
         let msgs = store.load_messages(&sid).unwrap();
-        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs.len(), 2, "user + one assistant summary");
         assert!(msgs.iter().all(|m| !m.content.is_empty()));
-        for w in msgs.windows(2) {
-            assert!(
-                !(w[0].role == flux_core::Role::User && w[1].role == flux_core::Role::User),
-                "user-after-user is invalid"
-            );
-        }
+        assert_eq!(msgs[0].role, flux_core::Role::User);
+        assert_eq!(msgs[1].role, flux_core::Role::Assistant);
+        assert!(msgs[1].text().contains("Done."));
+        // No tool_use/tool_result ever lands in the persisted log.
+        assert!(msgs.iter().all(|m| m
+            .content
+            .iter()
+            .all(|b| matches!(b, ContentBlock::Text { .. }))));
     }
 
     #[tokio::test]
-    async fn text_only_turn_ends_cleanly() {
+    async fn text_only_turn_answers_in_prose() {
         let store = Arc::new(SessionStore::in_memory().unwrap());
         let sid = store.create_session("mock").unwrap();
-        let responses = VecDeque::from(vec![vec![
-            Chunk::TextDelta("hello".into()),
-            Chunk::Block(ContentBlock::Text {
-                text: "hello".into(),
-            }),
-            Chunk::Done {
-                stop_reason: Some(flux_core::StopReason::EndTurn),
-            },
-        ]]);
+        let responses = VecDeque::from(vec![prose("Here's the explanation.")]);
         let engine = engine_with(responses, store.clone());
         let mut sink = CollectSink::default();
-        engine.run_turn(&sid, "hi", &mut sink).await.unwrap();
+        engine.run_turn(&sid, "explain", &mut sink).await.unwrap();
 
-        assert!(sink.tools.is_empty());
-        assert!(sink.text.contains("hello"));
-        // user + assistant(text) = 2 messages, valid shape.
+        assert!(sink.tools.is_empty(), "a chat turn runs no ops");
+        assert!(sink.text.contains("explanation"));
         let msgs = store.load_messages(&sid).unwrap();
         assert_eq!(msgs.len(), 2);
         assert!(msgs.iter().all(|m| !m.content.is_empty()));

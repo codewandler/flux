@@ -109,24 +109,27 @@ ops are embedder-registered anyway. The L0-purity a crate wall would otherwise e
 `ast`/`parse`/`analyze`/`optimize` becomes a **module discipline** (no IO imports), guarded by a unit
 test on those modules' import set.
 
-### 5.2 The pipeline
+### 5.2 The pipeline (one loop)
 
-**Incremental fast path (single op / chat):** the model emits one constrained tool-call inline in the
-normal stream → `analyze` (cheap, local) → `Executor::dispatch` → store output as a `Value` + `Binding`
-→ next turn the model sees a *summary* (not re-sent bytes), or content via a scoped `!model` op. **No
-extra round-trip vs. today.**
-
-**Planned path:**
+Every turn runs the **same** loop; a single op is the degenerate case of a plan:
 ```
-user_input + view(Session)
-  → compile                 → DraftAst    (LLM prompt-and-parse, determinism-biased; analyze→repair on invalid AST)
-  → analyze                 → HirFlow | diagnostics
-  → optimize                → PhysicalPlan (Sequential/Parallel/Branch/Repeat/Await/ApprovalFence)
-  → [render graph; risk(graph); if risky → approve whole plan once]
-  → runtime::execute(plan)  → Executor::dispatch per call node (Parallel via join_all; !model ops use the ModelClient seam)
-                            → ValueStore writes + RunEvent trace + bridging Observations + live node status
-  → project Session' + ONE assistant summary message into the message log
+user_input + conversation + view(Session)
+  → compile_turn            → TurnOutput::Plan(DraftAst) | TurnOutput::Chat(text)
+                              (LLM prompt-and-parse; PURE DAG — the model's only tool is emit_plan;
+                               analyze→repair on invalid AST; emit_plan, or answer in prose)
+  → [Chat]  persist ONE assistant message; turn ends
+  → [Plan]  render the plan (auditable) → analyze → risk(graph) → execute_flow:
+              Executor::dispatch per call node; bind/call/return + when/repeat control flow;
+              per-op approval at dispatch (destructive escalates); !model ops use the ModelClient seam
+            → ValueStore writes + RunEvent trace + live node status (sink)
+  → feed the plan's result back *ephemerally*; loop until the model answers in prose
+  → persist Session' + ONE assistant summary into the message log
 ```
+**Pure DAG:** the model has no directly-callable ops — *every* operation, reads included, is a node in
+the emitted plan. To gather context it emits a plan with read nodes; the runtime executes it and feeds
+the result back so it can plan the next step (the loop above). The persisted log stays
+`user → assistant(text)` — symbols + summaries carry state forward, raw outputs are never re-sent.
+(`Parallel` scheduling + the optimizer are M6.)
 
 ### 5.3 Operations lower to the existing envelope
 
@@ -235,15 +238,34 @@ move.
 - The `flux-evidence` log remains the security/audit trail and the sole input to `DestructiveEscalation`;
   `RunEvent` is the complementary execution trace.
 
-## 11. Relationship to the free-form loop & cutover
+## 11. One engine (the free-form loop is gone)
 
-The free-form loop (`flux-agent::run_turn_cancellable`) stays the **default and fallback**, behind a
-`FLUX_LANG` flag, and is **later re-expressed as a trivial Flux-Lang flow** once the language covers its
-semantics — then retired (a deletion, not a refactor, because the shared message-log shape invariants are
-extracted to an L2 helper). The **default cutover is gated on coding *and* ops parity dogfooding**: a
-fixed head-to-head suite (multi-file edits, read→fix loops, an incident runbook, a Slack/kubectl flow)
-must show no regression in success rate, turn count, and p95 latency. `docs/vision.md` is updated to the
-new claim *before* the default flips.
+There is exactly **one** engine: `flux-flow::engine::FlowEngine`. Every turn the model is a compiler
+front-end — it emits a typed Flux-Lang plan (a graph the runtime executes through `Executor::dispatch`)
+or answers in prose. **Pure DAG:** the model has no directly-callable tools at all (only `emit_plan` +
+`ask_user`), so even a read is a plan node — a turn is *always* an auditable graph. The old free-form
+"one provider-native tool call at a time" loop has been **deleted**, not flag-gated.
+
+**Two modes** (mirroring this tool's plan mode): **normal** = plan + execute each turn; **plan** = plan
+only, review/refine, approve to run. A `/plan` toggle in the REPL (with `/run`), and a one-shot `--plan`
+flag (show the plan, then on a TTY ask `run it? [y/N]`; piped or `-o json|yaml` just prints it). A bare
+prompt runs the engine in normal mode (`-p`/`--agent` are hidden no-op aliases; there is no separate
+raw-completion mode). There is **no `FLUX_LANG` flag and no free-form fallback** — a turn the planner
+cannot compile fails cleanly (surfaced as the assistant's answer), bounded by the repair loop and the
+prose-chat exit. The engine **renders the compiled plan before executing it** (auditable), and the
+planner is instructed to express loops/branches as Flux-Lang `repeat`/`when` nodes rather than hide them
+inside a `bash` command.
+
+Per turn: compile (pure DAG — only `emit_plan`) → risk-gated execution via
+`execute_flow` (per-op approval through the same envelope; destructive ops escalate) → feed each plan's
+result back **ephemerally** so the model can iterate (read → fix → re-run) → persist **one** assistant
+summary. The persisted session log is pure `user → assistant(text)` alternation: raw op outputs never
+re-enter history (the don't-re-send win), which structurally removes the session-shape bug class
+(no persisted tool_use/tool_result pairs). The quality bar still holds — a fixed head-to-head dogfood
+suite (multi-file edits, read→fix loops, an incident runbook, a Slack/kubectl flow) must show no
+regression in success rate, turn count, and p95 latency before this is trusted; `docs/vision.md` reflects
+the new claim. (The legacy `flux-agent::Agent` loop remains in-tree as dead code, no surface uses it, to
+be removed.)
 
 ## 12. Resolved decisions & deferred details
 
@@ -253,32 +275,35 @@ Resolved in design (no longer open):
   (`Request` carries only a `metadata` passthrough; neither the Anthropic nor OpenAI codec sends
   `tool_choice`/`response_format`). So the `compile` front-end **prompts the model to emit the AST as
   JSON, then extracts + parses + validates it, with a bounded analyze→repair loop**. A provider-level
-  structured-output seam is future work. Surfaced today via `flux --compile-only [-o json|yaml|pretty]
-  "…"`, which compiles and prints the AST without executing (the `render` module produces the `pretty`
-  execution-path tree). `Node::Lit` holds raw JSON so model-written literals are natural.
-- **Agentic planner (the agent decides how to plan).** Beyond one-shot, the `compile::plan` loop gives
-  the model agency: it may call **read-only research tools** (`read`/`grep`/`glob`, gated through
-  `Executor::dispatch`) to gather context, **`ask_user`** to clarify (when a terminal is attached), and
-  emits the AST via a synthetic **`emit_plan`** tool (repair runs *inside* the loop). One-shot is the
-  degenerate case (emit immediately) — **no mode flag**; the agent decides. The planner is
-  **session-aware**: a `view(Session)` lets it reference already-created `$symbols` instead of
-  re-fetching. **Catalog vs. tools:** the emitted AST may use *any* op (it is the plan), but only the
-  read-only research tools are ever *executed* while planning. `flux --compile-only` uses this planner
-  (`-c` attaches the session view, read-only). Verified live — complex instructions research the real
-  code before emitting a grounded plan.
-- **Plan → approve → run (executed, linear v1).** `flux --plan "…"` closes the loop: it compiles via the
-  agentic planner, computes a best-effort `plan_risk` preview (max risk + destructive/mutating, from each
-  op's `ToolSpec` + `Tool::intents`), renders the plan, takes **one whole-plan approval** (`--yes`
-  auto-approves), then executes it. The interpreter (`runtime::execute_flow`) walks the body
-  sequentially — `bind`/`call`/`return` — resolving each `$symbol` arg to its stored `Value`
-  (`Value::to_json`, natural form) and dispatching through the same `Executor::dispatch` envelope as any
-  tool (no new bypass). `when`/`repeat`/`await` execution returns a clear "next slice" error for now.
-  Whole-plan approval is a custom `PlanApprover { approved, fallback }`: a non-destructive op in the
-  approved set is allowed without prompting, but a **destructive op still falls through to the fallback**
-  (a per-op confirm, or auto under `--yes`) — the escalation invariant. **Arg mapping:** the AST keeps
-  positional `Call.args`; at execution they map onto each op's named input by its JSON-Schema
-  `required ++ optional` order, and the planner catalog renders the same `op(params)` signature so the
-  model emits args in that order.
+  structured-output seam is future work. Surfaced via `flux --plan [-o json|yaml|pretty] "…"` (plan
+  mode), which compiles and shows the AST (the `render` module produces the `pretty` execution-path
+  tree). `Node::Lit` holds raw JSON so model-written literals are natural.
+- **Pure DAG (the model's only tool is `emit_plan`).** The planner advertises **no directly-callable
+  ops** — only the synthetic `emit_plan` (+ `ask_user` when a terminal is attached). *Every* operation,
+  **reads included**, is a node in the emitted graph, so a turn is always an auditable plan, never a
+  free-form tool call. To gather context the model emits a plan with `read`/`grep`/`glob` nodes; the
+  runtime executes it and feeds the result back so it can plan the next step (the engine's multi-round
+  loop). The planner is **session-aware** (`view(Session)` lets it reference existing `$symbols`) and is
+  told to express control flow as `repeat`/`when` nodes, never shell loops, so the plan stays auditable.
+  Trade-off: read-then-act tasks take an extra round (a read is its own plan round); re-enabling
+  read-only research is a one-line revert. Verified live — `print hello 3×` plans `repeat max 3 { bash }`,
+  and `read README then answer` reads in round 1 and answers in round 2 from the fed-back content.
+- **The planner is the engine (one engine, no fallback).** `compile::compile_turn` plans a turn from the
+  *conversation* and returns `TurnOutput::Plan` (a graph to execute) or `TurnOutput::Chat` (a prose
+  answer); `FlowEngine` drives it every turn. **Two modes:** *normal* (plan + execute) is the default;
+  *plan* (`/plan` in the REPL, `--plan` one-shot) shows the plan and runs it only on approval/`/run`.
+  The free-form loop is deleted — see §11.
+  The interpreter (`runtime::execute_flow`) walks the body — `bind`/`call`/`return` plus `when` (typed
+  branch) and `repeat` (bounded loop, optional `until`; a `when`/`repeat` *condition* is a node's
+  truthiness) — resolving each `$symbol` arg to its stored `Value` (`Value::to_json`, natural form) and
+  dispatching through the same `Executor::dispatch` envelope (no new bypass). `await` (cross-turn
+  suspend/resume) is the next slice; the engine loop covers iteration meanwhile. `plan_risk` previews
+  risk; the default path gates per-op at dispatch (destructive escalates), and `--plan` adds a custom
+  `PlanApprover { approved, fallback }` — a non-destructive approved op runs without a prompt, a
+  **destructive op still falls through to the fallback** (per-op confirm, or auto under `--yes`). **Arg
+  mapping:** the AST keeps positional `Call.args`; at execution they map onto each op's named input by
+  its JSON-Schema `required ++ optional` order, and the planner catalog renders the same `op(params)`
+  signature so the model emits args in that order.
 - **Compact syntax.** The JSON AST is the canonical, persisted form; compact syntax is a *readable
   review projection* (rendered in CLI/TUI for auditability). A full public authoring grammar waits for
   the editor.

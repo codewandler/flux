@@ -387,6 +387,13 @@ impl Executor {
         &self.registry
     }
 
+    /// The execution context (guarded system, redactor, spawner). Lets a caller derive a sibling
+    /// executor over the *same* guarded surface — e.g. a read-only research executor scoped to a
+    /// subset of tools for the planner.
+    pub fn context(&self) -> &ToolContext {
+        &self.ctx
+    }
+
     /// The current allow rules (for persistence by the caller).
     pub fn allow_rules(&self) -> Vec<String> {
         self.perms.lock().unwrap().allow_rules()

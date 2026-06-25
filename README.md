@@ -49,33 +49,37 @@ Prebuilt binaries, installers, and checksums are attached to every
 
 ## Quickstart
 
+flux runs on **one engine**: the model turns your request into a typed execution **plan** (a small
+graph), and the runtime executes it through the safety envelope — you always see the plan before it
+runs. The model has no direct tools; even a file read is a node in a plan. See
+[`docs/usage.md`](docs/usage.md) for the full guide.
+
 ```bash
-# one-shot (prints a streamed response)
-flux -p "explain this repo's architecture"
+# do it — the agent plans + runs (risky steps prompt for approval; --yes auto-approves)
+flux "add a test for the parser"
 
-# interactive REPL (tools enabled, session auto-saved); /help for commands
+# plan mode — show the plan; on a terminal it then asks "run it? [y/N]"
+flux --plan "summarize README.md into SUMMARY.txt"
+
+# inspect a plan as data (prints the graph and exits, never runs)
+flux --plan -o json "print hello world 3 times"
+
+# interactive REPL (session auto-saved); /plan toggles plan mode, /run executes, /help for commands
 flux
+flux -c                       # continue the most recent session
 
-# ratatui TUI with live token streaming + in-TUI approval modal
+# ratatui TUI with live streaming + in-UI approval modal
 flux --tui
-
-# agentic one-shot that can edit files / run commands under the safety envelope
-flux --agent "add a test for the parser"     # prompts for approval; --yes to auto-approve
-
-# resume the most recent session (optionally with a new prompt)
-flux -c
-flux -c -p "now add tests"
 
 # HTTP daemon (REST + SSE streaming)
 flux --serve 127.0.0.1:8787 --yes
 ```
 
 No network or API keys are needed to try the machinery: `-m mock` runs a built-in offline provider
-through the full agent loop.
+through the full engine.
 
 ```bash
-# try the full agentic loop offline — no API key needed
-flux --agent --yes -m mock "summarise this repo"
+flux --yes -m mock "summarise this repo"
 ```
 
 ---
@@ -172,6 +176,8 @@ Sub-agents inherit the same policy and refuse destructive operations.
 
 ```
 /help  /tools  /session  /clear
+/plan               toggle plan mode (turns show a plan but don't run it)
+/run                execute the plan you reviewed in plan mode
 /model <spec>       switch model/provider mid-session (e.g. /model opus)
 /sessions           list recent sessions; /resume <id> reattaches to one
 /pd <goal>          plan-and-dispatch: planner → parallel dependency waves of workers
