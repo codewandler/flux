@@ -7,6 +7,8 @@
 //! need approval raise a y/a/N modal (the TUI installs its own [`ChannelApprover`], so it no longer
 //! requires `--yes`).
 
+pub mod toolview;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -131,6 +133,8 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
 /// A UI event produced by the running turn (on a background task) for the event loop to render.
 enum UiEvent {
     Text(String),
+    /// The planner is composing (`true`) / done (`false`) — drives the status line.
+    Planning(bool),
     Tool(String),
     ToolResult(String),
     Observation(String),
@@ -151,15 +155,23 @@ impl AgentSink for ChannelSink {
     fn text_delta(&mut self, t: &str) {
         let _ = self.tx.send(UiEvent::Text(t.to_string()));
     }
-    fn tool_call(&mut self, name: &str, _input: &serde_json::Value) {
-        let _ = self.tx.send(UiEvent::Tool(name.to_string()));
+    fn planning(&mut self, active: bool) {
+        let _ = self.tx.send(UiEvent::Planning(active));
+    }
+    fn tool_call(&mut self, name: &str, input: &serde_json::Value) {
+        let call = crate::toolview::format_call(name, input);
+        let label = if call.arg.is_empty() {
+            call.verb
+        } else {
+            format!("{}  {}", call.verb, call.arg)
+        };
+        let _ = self.tx.send(UiEvent::Tool(label));
     }
     fn tool_result(&mut self, name: &str, result: &ToolResult) {
         let tag = if result.is_error { "✗" } else { "✓" };
-        let snippet: String = result.content.trim().chars().take(160).collect();
-        let _ = self
-            .tx
-            .send(UiEvent::ToolResult(format!("{tag} {name}: {snippet}")));
+        let body = crate::toolview::format_result(name, &result.content, result.is_error)
+            .unwrap_or_else(|| result.content.trim().chars().take(160).collect());
+        let _ = self.tx.send(UiEvent::ToolResult(format!("  {tag} {body}")));
     }
     fn observation(&mut self, o: &flux_evidence::Observation) {
         if o.kind == flux_evidence::KIND_DESTRUCTIVE {
@@ -259,6 +271,13 @@ async fn event_loop(
         while let Ok(ev) = rx.try_recv() {
             match ev {
                 UiEvent::Text(t) => state.stream_text(&t),
+                UiEvent::Planning(active) => {
+                    state.status = if active {
+                        "composing plan…".to_string()
+                    } else {
+                        "thinking…".to_string()
+                    };
+                }
                 UiEvent::Tool(t) => state.push(Role::System, format!("→ {t}")),
                 UiEvent::ToolResult(t) => state.push(Role::System, t),
                 UiEvent::Observation(t) => state.push(Role::System, t),

@@ -1233,28 +1233,24 @@ struct SpinnerState {
     frame: usize,
 }
 
-/// Render a tool call as a concise, colored `op("arg", …)` label (the full args are in the shown plan;
-/// `-v` un-caps them here too).
+/// Render an op call as a concise, colored *semantic* label: the cyan op name padded to a gutter, then
+/// a readable argument — `bash → $ cargo test`, `read → foo.rs:100-180`, `grep → "needle" in src/`. The
+/// arg is capped unless `-v`; the full plan is always shown separately (the `flow.plan` tree).
 fn render_call_label(name: &str, input: &Value, verbose: bool) -> String {
-    let args = match input {
-        Value::Object(o) => o
-            .values()
-            .map(|v| short_arg(v, verbose))
-            .collect::<Vec<_>>()
-            .join(", "),
-        Value::Null => String::new(),
-        other => short_arg(other, verbose),
+    const GUTTER: usize = 7;
+    const ARG_CAP: usize = 120;
+    let call = flux_tui::toolview::format_call(name, input);
+    let verb = style::cyan(&call.verb);
+    if call.arg.is_empty() {
+        return verb;
+    }
+    let arg = if verbose {
+        call.arg
+    } else {
+        truncate(&call.arg, ARG_CAP)
     };
-    format!("{}({args})", style::cyan(name))
-}
-
-fn short_arg(v: &Value, verbose: bool) -> String {
-    let s = match v {
-        Value::String(s) if !verbose => format!("{:?}", truncate(s, 40)),
-        Value::String(s) => format!("{s:?}"),
-        other => other.to_string(),
-    };
-    style::dim(&s)
+    let pad = GUTTER.saturating_sub(call.verb.chars().count()).max(1);
+    format!("{verb}{}{arg}", " ".repeat(pad))
 }
 
 /// A concise result summary for the execution stream: `done` for empty output, the line(s) for a small
@@ -1396,6 +1392,18 @@ impl AgentSink for CliSink {
         eprint!("{}", style::dim(t));
         std::io::stderr().flush().ok();
     }
+    fn planning(&mut self, active: bool) {
+        // Fill the otherwise-silent compile wait with a spinner; the compiled plan tree replaces it
+        // (via the `flow.plan` observation) once the planner is done.
+        if active {
+            self.commit();
+            if self.use_spinner() {
+                self.start_spinner(style::dim("composing plan…"));
+            }
+        } else {
+            self.stop_spinner();
+        }
+    }
     fn tool_call(&mut self, name: &str, input: &Value) {
         self.commit();
         self.steps += 1;
@@ -1410,7 +1418,7 @@ impl AgentSink for CliSink {
         }
         self.pending = Some((label, std::time::Instant::now()));
     }
-    fn tool_result(&mut self, _name: &str, result: &ToolResult) {
+    fn tool_result(&mut self, name: &str, result: &ToolResult) {
         let (label, start) = self
             .pending
             .take()
@@ -1420,16 +1428,12 @@ impl AgentSink for CliSink {
             eprintln!("\n{} {label}", style::blue("→"));
         }
         let elapsed = style::dim(&format!("· {}", style::fmt_elapsed(start.elapsed())));
-        let (mark, body) = if result.is_error {
-            (
-                style::red("✗"),
-                result_summary(&result.content, self.verbose),
-            )
+        let body = flux_tui::toolview::format_result(name, &result.content, result.is_error)
+            .unwrap_or_else(|| result_summary(&result.content, self.verbose));
+        let mark = if result.is_error {
+            style::red("✗")
         } else {
-            (
-                style::green("✓"),
-                result_summary(&result.content, self.verbose),
-            )
+            style::green("✓")
         };
         eprintln!("  {mark} {body}  {elapsed}");
     }
@@ -1544,13 +1548,15 @@ impl AgentSink for GoalSink {
             render_call_label(name, input, verbose())
         );
     }
-    fn tool_result(&mut self, _name: &str, result: &ToolResult) {
+    fn tool_result(&mut self, name: &str, result: &ToolResult) {
         let mark = if result.is_error {
             style::red("✗")
         } else {
             style::green("✓")
         };
-        eprintln!("  {mark} {}", result_summary(&result.content, verbose()));
+        let body = flux_tui::toolview::format_result(name, &result.content, result.is_error)
+            .unwrap_or_else(|| result_summary(&result.content, verbose()));
+        eprintln!("  {mark} {body}");
     }
     fn turn_end(&mut self, _usage: Option<Usage>) {
         println!();

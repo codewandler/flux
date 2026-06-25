@@ -38,6 +38,9 @@ stop.";
 pub trait AgentSink: Send {
     fn text_delta(&mut self, _text: &str) {}
     fn thinking_delta(&mut self, _text: &str) {}
+    /// The planner is composing a plan (`true`) / has finished (`false`). Surfaces the otherwise-silent
+    /// compile wait as a "composing plan…" indicator; the compiled plan is then shown via [`Self::observation`].
+    fn planning(&mut self, _active: bool) {}
     fn tool_call(&mut self, _name: &str, _input: &Value) {}
     fn tool_result(&mut self, _name: &str, _result: &ToolResult) {}
     /// An audit observation made during dispatch (e.g. a destructive-command marker).

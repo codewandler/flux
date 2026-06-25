@@ -105,7 +105,8 @@ impl FlowEngine {
             let view = self.flow.view(session_id)?;
             let view_ref = (!view.symbols.is_empty()).then_some(&view);
 
-            let out = match compile_turn(
+            sink.planning(true);
+            let compiled = compile_turn(
                 &*self.provider,
                 &self.model,
                 &working,
@@ -115,8 +116,9 @@ impl FlowEngine {
                 None,
                 opts.clone(),
             )
-            .await
-            {
+            .await;
+            sink.planning(false);
+            let out = match compiled {
                 Ok(out) => out,
                 // No fallback (one engine): a turn the planner can't compile fails cleanly, surfaced as
                 // the assistant's answer so the session shape stays valid.
@@ -236,6 +238,7 @@ impl FlowEngine {
             ..CompileOptions::default()
         };
         let conversation = self.store.load_messages(session_id)?;
+        sink.planning(true);
         let out = compile_turn(
             &*self.provider,
             &self.model,
@@ -246,7 +249,9 @@ impl FlowEngine {
             None,
             opts,
         )
-        .await?;
+        .await;
+        sink.planning(false);
+        let out = out?;
 
         match out {
             TurnOutput::Plan(compiled) => {
