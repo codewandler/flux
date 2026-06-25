@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.4] — 2026-06-25
+
+Markdown rendering in the CLI — the highest-frequency dogfood readability gap (F2, [#1](https://github.com/codewandler/flux/issues/1)).
+
+### Added
+
+- **Assistant output now renders Markdown to the terminal.** The REPL, agentic mode, and `-p` one-shot
+  feed streaming model text through the [`codewandler/markdown`](https://github.com/codewandler/markdown)
+  renderer: on a TTY it redraws the reply in place as tokens arrive (headings, bold/italic, inline and
+  fenced code with syntax highlighting, lists, links, GFM tables); piped (`flux … | cat`) it stays clean
+  plain text with no escape sequences. Closes #1.
+
 ## [0.2.3] — 2026-06-25
 
 Dogfood-driven fixes — surfaced by driving flux's own agentic mode on real coding tasks (see

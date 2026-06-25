@@ -541,7 +541,7 @@ async fn run_agentic(cli: &Cli, prompt: String) -> Result<()> {
     let (agent, session_id, _spawner) = build_agent(cli).await?;
     eprintln!("\x1b[2m[session {session_id} · {}]\x1b[0m", agent.model);
     let initial_rules = agent.executor.allow_rules();
-    let mut sink = CliSink;
+    let mut sink = CliSink::new();
     agent
         .run_turn(&session_id, &prompt, &mut sink)
         .await
@@ -752,7 +752,7 @@ async fn run_repl(cli: Cli) -> Result<()> {
         let agent_ref = &agent;
         let sid_ref = session_id.as_str();
         run_interruptible(move |c| async move {
-            let mut sink = CliSink;
+            let mut sink = CliSink::new();
             if let Err(e) = agent_ref
                 .run_turn_cancellable(sid_ref, input, &mut sink, &c)
                 .await
@@ -862,7 +862,7 @@ async fn run_loop(
             break;
         }
         eprintln!("\x1b[2m[loop {}/{}]\x1b[0m", i + 1, count);
-        let mut sink = CliSink;
+        let mut sink = CliSink::new();
         if let Err(e) = agent
             .run_turn_cancellable(session_id, task, &mut sink, &cancel)
             .await
@@ -922,14 +922,42 @@ fn tool_preview(s: &str) -> String {
     out
 }
 
-/// Renders streaming text to stdout and tool activity to stderr.
-#[derive(Default)]
-struct CliSink;
+/// Renders streaming assistant text to stdout as live-rendered Markdown, and tool activity to stderr.
+struct CliSink {
+    live: markdown_terminal::LiveRenderer,
+}
+
+impl CliSink {
+    fn new() -> Self {
+        use std::io::IsTerminal;
+        let tty = std::io::stdout().is_terminal();
+        let width = std::env::var("COLUMNS")
+            .ok()
+            .and_then(|c| c.parse::<usize>().ok())
+            .filter(|&w| w >= 20)
+            .unwrap_or(80);
+        CliSink {
+            live: markdown_terminal::LiveRenderer::new(
+                markdown_terminal::Theme::auto(),
+                width,
+                tty,
+            ),
+        }
+    }
+
+    /// Commit any in-progress assistant render so subsequent stderr lines appear below it.
+    fn commit(&mut self) {
+        if self.live.is_active() {
+            let mut out = std::io::stdout().lock();
+            let _ = self.live.finish(&mut out);
+        }
+    }
+}
 
 impl AgentSink for CliSink {
     fn text_delta(&mut self, t: &str) {
-        print!("{t}");
-        std::io::stdout().flush().ok();
+        let mut out = std::io::stdout().lock();
+        let _ = self.live.push(t, &mut out);
     }
     fn thinking_delta(&mut self, t: &str) {
         // Stream extended-thinking tokens dimmed on stderr so reasoning is observable in the REPL
@@ -938,6 +966,7 @@ impl AgentSink for CliSink {
         std::io::stderr().flush().ok();
     }
     fn tool_call(&mut self, name: &str, input: &Value) {
+        self.commit();
         eprintln!(
             "\n\x1b[2m→ {name} {}\x1b[0m",
             truncate(&input.to_string(), 120)
@@ -951,6 +980,7 @@ impl AgentSink for CliSink {
         );
     }
     fn observation(&mut self, o: &flux_evidence::Observation) {
+        self.commit();
         if o.kind == flux_evidence::KIND_DESTRUCTIVE {
             eprintln!("\x1b[33m⚠ destructive operation flagged — approval required\x1b[0m");
         } else if o.kind == "skill.activated" {
@@ -974,7 +1004,7 @@ impl AgentSink for CliSink {
         }
     }
     fn turn_end(&mut self, usage: Option<Usage>) {
-        println!();
+        self.commit();
         if let Some(u) = usage {
             let cache = if u.cache_creation_input_tokens > 0 || u.cache_read_input_tokens > 0 {
                 format!(
@@ -1385,7 +1415,16 @@ async fn run_prompt(cli: Cli) -> Result<()> {
         .await
         .context("failed to start the response stream")?;
 
-    let mut stdout = std::io::stdout();
+    let mut live = {
+        use std::io::IsTerminal;
+        let tty = std::io::stdout().is_terminal();
+        let width = std::env::var("COLUMNS")
+            .ok()
+            .and_then(|c| c.parse::<usize>().ok())
+            .filter(|&w| w >= 20)
+            .unwrap_or(80);
+        markdown_terminal::LiveRenderer::new(markdown_terminal::Theme::auto(), width, tty)
+    };
     let mut in_thinking = false;
     let mut final_usage = None;
 
@@ -1397,8 +1436,8 @@ async fn run_prompt(cli: Cli) -> Result<()> {
                     eprintln!("\x1b[0m");
                     in_thinking = false;
                 }
-                print!("{text}");
-                stdout.flush().ok();
+                let mut out = std::io::stdout().lock();
+                let _ = live.push(&text, &mut out);
             }
             Chunk::ThinkingDelta(text) => {
                 if !in_thinking {
@@ -1413,7 +1452,10 @@ async fn run_prompt(cli: Cli) -> Result<()> {
         }
     }
 
-    println!();
+    {
+        let mut out = std::io::stdout().lock();
+        let _ = live.finish(&mut out);
+    }
 
     if cli.usage {
         if let Some(u) = final_usage {
