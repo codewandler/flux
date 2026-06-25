@@ -29,6 +29,7 @@ flux-tools.workspace = true
 flux-session.workspace = true
 flux-context.workspace = true
 flux-agent.workspace = true
+flux-flow.workspace = true
 flux-orchestrate.workspace = true
 flux-hooks.workspace = true
 flux-server.workspace = true

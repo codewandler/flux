@@ -16,8 +16,9 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use flux_agent::{Agent, AgentSink};
+use flux_agent::AgentSink;
 use flux_core::Role;
+use flux_flow::engine::FlowEngine;
 use flux_runtime::{ApprovalChoice, Approver, ToolResult};
 use flux_spec::IntentSet;
 
@@ -212,7 +213,7 @@ type Tui = Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
 
 /// Run the interactive TUI against `agent`/`session_id`. Requires a real terminal. Installs a modal
 /// approver, then always restores the terminal (raw mode + alternate screen) even on error.
-pub async fn run(mut agent: Agent, session_id: String) -> anyhow::Result<()> {
+pub async fn run(mut agent: FlowEngine, session_id: String) -> anyhow::Result<()> {
     use crossterm::terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
     };
@@ -241,7 +242,7 @@ pub async fn run(mut agent: Agent, session_id: String) -> anyhow::Result<()> {
 
 async fn event_loop(
     terminal: &mut Tui,
-    agent: Arc<Agent>,
+    agent: Arc<FlowEngine>,
     session_id: &str,
     state: &mut ChatState,
     tx: mpsc::UnboundedSender<UiEvent>,

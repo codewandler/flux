@@ -12,12 +12,18 @@
 //! envelope rather than replacing it. Every operation lowers to a [`flux_spec::ToolSpec`] and runs
 //! through `Executor::dispatch`, so there is no new bypass surface.
 //!
-//! See `docs/designs/flux-flow.md` for the full design. This is M0: the pure [`ast`] contracts and
-//! the [`registry`] adapter over the existing tool registry.
+//! See `docs/designs/flux-flow.md` for the full design. Modules: the pure [`ast`] contracts, the
+//! [`registry`] adapter over the existing tool registry, flux-flow's own [`state`] store (values,
+//! symbols, run-event trace), the [`analyze`] validator, the [`runtime`] interpreter, and the
+//! [`engine`] turn loop — flux-flow's seat of execution.
 
+pub mod analyze;
 pub mod ast;
 mod effects;
+pub mod engine;
 mod error;
 pub mod registry;
+pub mod runtime;
+pub mod state;
 
 pub use error::{FlowError, Result};

@@ -16,10 +16,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use flux_agent::{Agent, AgentSink, DEFAULT_SYSTEM_PROMPT};
+use flux_agent::{AgentSink, DEFAULT_SYSTEM_PROMPT};
 use flux_anthropic::anthropic_from_env;
 use flux_context::{EnvContext, GitContext, ProjectFiles, Projector, RepoSignal};
 use flux_core::{Chunk, ContentBlock, StopReason, Usage};
+use flux_flow::engine::FlowEngine;
+use flux_flow::state::FlowStore;
 use flux_openai::{openai_from_env, openrouter_from_env};
 use flux_orchestrate::{LocalSpawner, ProviderFactory, Role, RoleRegistry, TaskTool};
 use flux_provider::{ChunkStream, Effort, NativeProvider, Provider, Request};
@@ -281,6 +283,16 @@ fn open_session_store() -> Result<SessionStore> {
     SessionStore::open(dir.join("sessions.db")).context("open session store")
 }
 
+/// Open flux-flow's own store under `~/.flux/flow.db` (values, symbols, run-event trace).
+fn open_flow_store() -> Result<FlowStore> {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+    let dir = home.join(".flux");
+    std::fs::create_dir_all(&dir)?;
+    FlowStore::open(dir.join("flow.db")).context("open flow store")
+}
+
 /// Build a fresh boxed provider for a model spec (used by the sub-agent factory).
 fn provider_for(spec: &str) -> Result<Box<dyn Provider>> {
     if spec == "mock" || spec.starts_with("mock/") {
@@ -355,7 +367,7 @@ fn load_roles(cwd: &std::path::Path) -> RoleRegistry {
 
 /// Agentic mode: run a tool-enabled, policy-gated, session-persisted turn.
 /// Build a tool-enabled agent (provider + safety envelope + session) for agentic mode / the REPL.
-async fn build_agent(cli: &Cli) -> Result<(Agent, String, Arc<dyn flux_runtime::Spawner>)> {
+async fn build_agent(cli: &Cli) -> Result<(FlowEngine, String, Arc<dyn flux_runtime::Spawner>)> {
     // Guarded system rooted at the current directory; layered config loaded from it.
     let cwd = std::env::current_dir().context("current dir")?;
     let cfg = flux_config::load(&cwd).context("load .flux/config.toml")?;
@@ -522,10 +534,11 @@ async fn build_agent(cli: &Cli) -> Result<(Agent, String, Arc<dyn flux_runtime::
         store.create_session(&model).context("create session")?
     };
 
-    let agent = Agent {
+    let agent = FlowEngine {
         provider,
         executor,
         store,
+        flow: open_flow_store()?,
         model,
         system_prompt,
         max_tokens: cli.max_tokens,
@@ -794,7 +807,7 @@ where
 /// `/goal <cond>`: drive turns toward a goal, asking a cheap `evaluator` sub-agent after each turn
 /// whether the goal is satisfied; stop on SATISFIED, max-iterations, or cancellation.
 async fn run_goal(
-    agent: &Agent,
+    agent: &FlowEngine,
     session_id: &str,
     spawner: &dyn flux_runtime::Spawner,
     goal: &str,
@@ -851,7 +864,7 @@ async fn run_goal(
 
 /// `/loop <count> <task>`: run `task` up to `count` times (stops early on cancellation).
 async fn run_loop(
-    agent: &Agent,
+    agent: &FlowEngine,
     session_id: &str,
     count: usize,
     task: &str,

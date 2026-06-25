@@ -23,15 +23,16 @@ use axum::{Json, Router};
 use futures::Stream;
 use serde_json::{json, Value};
 
-use flux_agent::{Agent, AgentSink};
+use flux_agent::AgentSink;
 use flux_core::Usage;
+use flux_flow::engine::FlowEngine;
 
-type Shared = Arc<Agent>;
+type Shared = Arc<FlowEngine>;
 
 /// Bind `addr` and serve until shutdown. When `token` is `Some`, every route except `/health`
 /// requires `Authorization: Bearer <token>`; when `None`, no authentication is enforced (the CLI
 /// only permits that for a loopback bind).
-pub async fn serve(addr: &str, agent: Agent, token: Option<String>) -> anyhow::Result<()> {
+pub async fn serve(addr: &str, agent: FlowEngine, token: Option<String>) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("flux server listening on http://{}", listener.local_addr()?);
     serve_on(listener, agent, token).await
@@ -40,7 +41,7 @@ pub async fn serve(addr: &str, agent: Agent, token: Option<String>) -> anyhow::R
 /// Serve on an already-bound listener (lets callers pick an ephemeral port).
 pub async fn serve_on(
     listener: tokio::net::TcpListener,
-    agent: Agent,
+    agent: FlowEngine,
     token: Option<String>,
 ) -> anyhow::Result<()> {
     axum::serve(listener, router(Arc::new(agent), token)).await?;

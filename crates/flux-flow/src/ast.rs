@@ -106,6 +106,52 @@ pub enum FlowEffect {
     HumanVisible,
 }
 
+/// How visible a session symbol is to the model when projecting `view(Session)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Visibility {
+    /// Referenced naturally and shown in the projected view.
+    Visible,
+    /// Stored but not shown by default.
+    Hidden,
+    /// Always shown.
+    Pinned,
+    /// Only accessible via explicit search.
+    Expired,
+    /// Never shown to the model unless explicitly required.
+    Private,
+}
+
+impl Visibility {
+    /// The stable lowercase tag (used as a storage key).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Visibility::Visible => "visible",
+            Visibility::Hidden => "hidden",
+            Visibility::Pinned => "pinned",
+            Visibility::Expired => "expired",
+            Visibility::Private => "private",
+        }
+    }
+
+    /// Parse from the stable tag.
+    pub fn from_tag(s: &str) -> Option<Self> {
+        Some(match s {
+            "visible" => Visibility::Visible,
+            "hidden" => Visibility::Hidden,
+            "pinned" => Visibility::Pinned,
+            "expired" => Visibility::Expired,
+            "private" => Visibility::Private,
+            _ => return None,
+        })
+    }
+
+    /// Whether a symbol with this visibility appears in the default model-facing view.
+    pub fn is_shown(self) -> bool {
+        matches!(self, Visibility::Visible | Visibility::Pinned)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Values and things
 // ---------------------------------------------------------------------------
