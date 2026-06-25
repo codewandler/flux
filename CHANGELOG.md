@@ -4,6 +4,35 @@ All notable changes to this project are documented in this file. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] — 2026-06-25
+
+Daily-driver readiness: make flux a coding agent you actually reach for. Validated end-to-end against
+a live provider (see `scripts/smoke-live.sh`).
+
+### Added
+
+- **Repo-aware context** — each turn's system prompt now includes the git working-tree state (branch,
+  short status, recent commits, diff stat) and the project's shape (detected stack + top-level
+  listing), so the agent no longer starts each turn blind.
+- **A real REPL** — line editing, persistent history, reverse-search, and multiline input (reedline);
+  a prompt-level Ctrl-C now clears the line instead of being swallowed.
+- **Mid-session controls** — `/model <spec>` switches model/provider without restarting; `flux
+  sessions` (and the REPL `/sessions`) list recent sessions with message counts, and `/resume <id>`
+  reattaches to one.
+- **A live-provider smoke gate** (`scripts/smoke-live.sh`) — exercises the real-provider
+  message-shape paths the offline mock can't, as a standing pre-release check.
+- Extended thinking is now visible in the REPL, and the usage line shows cache tokens when prompt
+  caching is active.
+
+### Changed
+
+- **Stronger coding-agent system prompt** — an explicit inspect → smallest change → verify → summarize
+  contract that honors `AGENTS.md`/`CLAUDE.md` conventions.
+- **The `edit` tool is resilient to whitespace mismatches** — when the exact text isn't found it
+  falls back to a whitespace-tolerant, line-aligned match (leading indentation must still match, and
+  CRLF endings are preserved), and its errors now report occurrence line numbers / indentation hints
+  instead of just failing.
+
 ## [0.1.1] — 2026-06-25
 
 Security and robustness hardening from a full source-tree review. No API additions; existing
@@ -90,5 +119,6 @@ First release.
 - **Tooling** — an architecture layering lint that fails on inner→outer crate dependencies, and CI
   running build/test/clippy/fmt.
 
+[0.2.0]: https://github.com/codewandler/flux/releases/tag/v0.2.0
 [0.1.1]: https://github.com/codewandler/flux/releases/tag/v0.1.1
 [0.1.0]: https://github.com/codewandler/flux/releases/tag/v0.1.0

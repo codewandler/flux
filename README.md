@@ -134,11 +134,16 @@ Sub-agents inherit the same policy and refuse destructive operations.
 
 ```
 /help  /tools  /session  /clear
+/model <spec>       switch model/provider mid-session (e.g. /model opus)
+/sessions           list recent sessions; /resume <id> reattaches to one
 /pd <goal>          plan-and-dispatch: planner → parallel dependency waves of workers
 /goal <condition>   drive turns toward a goal, judged by an evaluator sub-agent
 /loop <n> <task>    run a task up to n times
 /exit               (Ctrl-C interrupts a running turn or command; Ctrl-D exits)
 ```
+
+The REPL has line editing, persistent history, and reverse-search; `flux sessions` lists past
+sessions from the shell.
 
 Long sessions are **compacted** automatically: older turns are summarized into a synthetic message once
 the session passes a budget (`FLUX_COMPACT_CHARS`, default 48k characters; `0` disables).
