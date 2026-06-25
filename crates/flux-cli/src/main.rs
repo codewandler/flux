@@ -632,6 +632,7 @@ async fn run_repl(cli: Cli) -> Result<()> {
                             Ok((native, model)) => {
                                 agent.provider = Box::new(native);
                                 agent.model = model;
+                                let _ = agent.store.set_model(&session_id, &agent.model);
                                 eprintln!("switched to {}", agent.model);
                             }
                             Err(e) => eprintln!("cannot switch model: {e}"),

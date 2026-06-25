@@ -160,6 +160,18 @@ impl SessionStore {
             .map_err(map_sql)
     }
 
+    /// Update the model recorded for a session (so listings reflect a mid-session `/model` switch).
+    pub fn set_model(&self, id: &str, model: &str) -> Result<()> {
+        let rowid = parse_id(id)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET model = ?1 WHERE id = ?2",
+            rusqlite::params![model, rowid],
+        )
+        .map_err(map_sql)?;
+        Ok(())
+    }
+
     /// Append a message to the session log.
     pub fn append_message(&self, id: &str, msg: &Message) -> Result<()> {
         let rowid = parse_id(id)?;
@@ -310,5 +322,14 @@ mod tests {
         assert_eq!(list[1].model, "m1");
         // limit is honored
         assert_eq!(store.list(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn set_model_updates_listing() {
+        let store = SessionStore::in_memory().unwrap();
+        let a = store.create_session("sonnet").unwrap();
+        store.set_model(&a, "opus").unwrap();
+        assert_eq!(store.list(1).unwrap()[0].model, "opus");
+        assert_eq!(store.info(&a).unwrap().model, "opus");
     }
 }

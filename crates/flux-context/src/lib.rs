@@ -140,11 +140,14 @@ impl ContextProvider for GitContext {
         };
         let mut out = format!("Branch: {branch}");
         match git(&self.root, &["status", "--short"]).await.as_deref() {
-            Some("") | None => out.push_str("\nWorking tree: clean"),
+            // Distinguish a genuinely empty status (clean) from a failed command (None): don't
+            // claim "clean" when `git status` didn't actually run.
+            Some("") => out.push_str("\nWorking tree: clean"),
             Some(status) => out.push_str(&format!(
                 "\nWorking tree (git status --short):\n{}",
                 cap_lines(status, 40)
             )),
+            None => {}
         }
         if let Some(log) = git(&self.root, &["log", "--oneline", "-10"]).await {
             if !log.is_empty() {

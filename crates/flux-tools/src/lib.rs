@@ -328,10 +328,18 @@ fn flexible_edit(content: &str, old: &str, new: &str) -> FlexMatch {
         [i] => {
             let start: usize = cl[..*i].iter().map(|s| s.len()).sum();
             let end: usize = start + cl[*i..*i + ol.len()].iter().map(|s| s.len()).sum::<usize>();
-            let mut replacement = new.to_string();
+            let matched = &content[start..end];
+            // Match the file's line endings: the trim_end()-based compare strips `\r`, so an LF
+            // `old_string` matches a CRLF block — emit `new` as CRLF too, or we'd leave mixed endings.
+            let crlf = matched.contains("\r\n");
+            let mut replacement = if crlf {
+                new.replace("\r\n", "\n").replace('\n', "\r\n")
+            } else {
+                new.to_string()
+            };
             // Keep a trailing newline the matched block had, so we don't merge the next line.
-            if content[start..end].ends_with('\n') && !replacement.ends_with('\n') {
-                replacement.push('\n');
+            if matched.ends_with('\n') && !replacement.ends_with('\n') {
+                replacement.push_str(if crlf { "\r\n" } else { "\n" });
             }
             FlexMatch::One(format!(
                 "{}{replacement}{}",
@@ -750,6 +758,40 @@ mod tests {
         let after = ReadTool.execute(&c, json!({"path": "a.rs"})).await.unwrap();
         assert!(after.content.contains("let x = 2;"));
         assert!(after.content.ends_with("}\n"), "structure preserved");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_preserves_crlf_line_endings() {
+        let (dir, c) = ctx();
+        WriteTool
+            .execute(
+                &c,
+                json!({"path": "a.rs", "content": "fn main() {\r\n    let x = 1;\r\n}\r\n"}),
+            )
+            .await
+            .unwrap();
+        // The model sends an LF old_string/new_string (it doesn't reproduce \r).
+        EditTool
+            .execute(
+                &c,
+                json!({
+                    "path": "a.rs",
+                    "old_string": "fn main() {\n    let x = 1;",
+                    "new_string": "fn main() {\n    let y = 9;"
+                }),
+            )
+            .await
+            .unwrap();
+        let after = ReadTool.execute(&c, json!({"path": "a.rs"})).await.unwrap();
+        assert!(after.content.contains("let y = 9;"));
+        // Every newline is still part of a CRLF — no bare LF introduced into the CRLF file.
+        assert_eq!(
+            after.content.matches('\n').count(),
+            after.content.matches("\r\n").count(),
+            "edit must not introduce bare LFs into a CRLF file: {:?}",
+            after.content
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
