@@ -56,6 +56,10 @@ pub struct Compiled {
     pub ast: DraftAst,
     pub attempts: u32,
     pub diagnostics: Vec<Diagnostic>,
+    /// The model's one-line closing message, attached to `emit_plan` when this plan *completes* the
+    /// request. When set, the engine runs the plan, shows it, and ends the turn — no extra "summarize"
+    /// round. `None` means "I need to see the results first" → the engine loops (read→reason).
+    pub reply: Option<String>,
 }
 
 /// What the planner produced for a turn: an executable plan, or a plain-prose answer (a chat turn —
@@ -102,6 +106,7 @@ pub async fn compile(
                         ast,
                         attempts: attempt,
                         diagnostics: Vec::new(),
+                        reply: None,
                     })
                 }
                 Err(diags) => {
@@ -110,6 +115,7 @@ pub async fn compile(
                             ast,
                             attempts: attempt,
                             diagnostics: diags,
+                            reply: None,
                         });
                     }
                     last_err = join_diags(&diags);
@@ -200,6 +206,7 @@ pub async fn compile_turn(
                         ast,
                         attempts: step,
                         diagnostics: Vec::new(),
+                        reply: None,
                     }));
                 }
             }
@@ -223,6 +230,14 @@ pub async fn compile_turn(
         for (id, name, input) in tool_uses {
             match name.as_str() {
                 "emit_plan" => {
+                    // The model's optional one-line closing message (captured before `input` is moved):
+                    // present ⇒ this plan completes the task, so the engine ends the turn after running it.
+                    let reply = input
+                        .get("reply")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
                     let ast_val = input.get("ast").cloned().unwrap_or(input);
                     match serde_json::from_value::<DraftAst>(ast_val) {
                         Ok(ast) => {
@@ -237,6 +252,7 @@ pub async fn compile_turn(
                                         ast,
                                         attempts: step,
                                         diagnostics: Vec::new(),
+                                        reply,
                                     });
                                 }
                                 Err(diags) => {
@@ -251,6 +267,7 @@ pub async fn compile_turn(
                                             ast,
                                             attempts: step,
                                             diagnostics: diags,
+                                            reply,
                                         });
                                     } else {
                                         results.push(ContentBlock::tool_result_text(
@@ -521,7 +538,11 @@ fn build_planner_prompt(ops: &OpRegistry, view: Option<&SessionView>, interactiv
         "You are Flux-Lang's planning agent. For the user's request, either call `emit_plan` with ONE \
 execution plan (a Flux-Lang flow AST) that accomplishes it, or — if the request needs no operations or is \
 ALREADY satisfied by results shown earlier in the conversation — answer directly in prose (do NOT emit a \
-plan, and do NOT repeat work already done).\n\nYou have NO directly-callable tools except `emit_plan`\
+plan, and do NOT repeat work already done).\n\nWhen a plan COMPLETES the request, pass a one-line \
+`reply` to `emit_plan` (your closing message to the user) — the runtime runs the plan, shows your \
+`reply`, and the turn ends; do NOT narrate what the runtime did. Omit `reply` only when you must SEE \
+the results before you can answer (e.g. you read a file to reason about it) — you'll get the results \
+and can answer or plan again.\n\nYou have NO directly-callable tools except `emit_plan`\
 {ask_line} — you cannot run `read`/`grep`/`bash`/etc. yourself. To gather information, put `read`/`grep`/\
 `glob` as NODES in a plan and emit it; the runtime executes the plan and gives you the results, so you \
 can plan the next step. Put the WHOLE task in one plan rather than many tiny plans.\n\nIMPORTANT — \
@@ -530,9 +551,11 @@ express control flow as Flux-Lang nodes, NOT inside shell commands, so the plan 
 `while`, `if`, `&&`, `;`) inside a `bash` command — a `bash` op is ONE discrete command. E.g. \"print X \
 three times\" is `repeat max 3 {{ bash(\"echo X\") }}`, never `bash(\"for i in 1 2 3; do echo X; \
 done\")`.\n\nThe AST may use ANY operation from the catalog; prefer deterministic ops and reference \
-existing session symbols instead of re-fetching. Each op is shown as `name(params)`; a call's `args` are \
-positional in that parameter order ([optional] params come last).\n\nOperation catalog (for the AST):\n\
-{catalog}{symbols}\n{grammar}\n",
+existing session symbols instead of re-fetching. To embed a stored symbol's value INSIDE a string \
+argument (e.g. a `task` prompt or a message), write `{{symbol_name}}` — the runtime substitutes the \
+value at execution; to pass a symbol's value as a whole argument, use it directly as a `var` node. Each \
+op is shown as `name(params)`; a call's `args` are positional in that parameter order ([optional] \
+params come last).\n\nOperation catalog (for the AST):\n{catalog}{symbols}\n{grammar}\n",
         catalog = ops_catalog(ops),
         symbols = symbols_block(view),
         grammar = AST_GRAMMAR,
@@ -546,11 +569,20 @@ fn planner_tools(interactive: bool) -> Vec<ToolDef> {
     let mut tools: Vec<ToolDef> = Vec::new();
     tools.push(ToolDef {
         name: "emit_plan".to_string(),
-        description: "Emit the Flux-Lang flow AST to run (your only way to act). Pass the AST as `ast`."
+        description: "Emit the Flux-Lang flow AST to run (your only way to act). Pass the AST as `ast`. \
+                      If this plan completes the request, also pass `reply` — a one-line closing message \
+                      to the user — and the turn ends after running. Omit `reply` if you must see the \
+                      results before you can answer."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
-            "properties": { "ast": { "type": "object", "description": "The flow AST (DraftAst) as JSON" } },
+            "properties": {
+                "ast": { "type": "object", "description": "The flow AST (DraftAst) as JSON" },
+                "reply": {
+                    "type": "string",
+                    "description": "One-line closing message, ONLY if this plan completes the request"
+                }
+            },
             "required": ["ast"]
         }),
     });
@@ -825,6 +857,49 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(out, TurnOutput::Plan(_)));
+    }
+
+    #[tokio::test]
+    async fn emit_plan_captures_optional_reply() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+
+        // `emit_plan` with a `reply` → captured on the Compiled (the engine ends the turn with it).
+        let with_reply = r#"{"ast":{"body":[{"kind":"call","op":"read","args":[{"kind":"lit","value":"x"}]}]},"reply":"all done"}"#;
+        let p = mock(vec![tool_call(
+            "emit_plan",
+            serde_json::from_str(with_reply).unwrap(),
+        )]);
+        let out = plan(
+            &p,
+            "mock",
+            "do it",
+            &ops,
+            None,
+            None,
+            CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.reply.as_deref(), Some("all done"));
+
+        // `emit_plan` without a `reply` → None (the engine loops to let the model answer).
+        let p = mock(vec![tool_call(
+            "emit_plan",
+            serde_json::from_str(VALID_AST).unwrap(),
+        )]);
+        let out = plan(
+            &p,
+            "mock",
+            "do it",
+            &ops,
+            None,
+            None,
+            CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.reply, None);
     }
 
     // ---- one-shot compile (with the view param) ----

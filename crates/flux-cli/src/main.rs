@@ -4,6 +4,8 @@
 //! interactive REPL and TUI land in M2; this establishes the end-to-end path
 //! (CLI → provider → stream → render).
 
+mod style;
+
 use std::io::{IsTerminal, Write};
 
 use anyhow::{bail, Context, Result};
@@ -75,6 +77,15 @@ struct Cli {
     /// Auto-approve every tool call (headless). Without it, unmatched calls prompt for approval.
     #[arg(long)]
     yes: bool,
+
+    /// Show tool output in full (no truncation). Plans and tool inputs are always shown in full; this
+    /// also un-caps tool *output* (e.g. large file reads). Also enabled by `FLUX_VERBOSE`.
+    #[arg(short = 'v', long)]
+    verbose: bool,
+
+    /// When to colorize output: auto (a terminal, `NO_COLOR` unset), always, or never.
+    #[arg(long, value_enum, default_value_t)]
+    color: style::ColorChoice,
 
     /// Launch the ratatui chat TUI (requires a real terminal; currently also needs `--yes`).
     #[arg(long)]
@@ -155,8 +166,14 @@ fn persist_new_rules(initial: &[String], current: &[String]) {
     }
     if let Ok(cwd) = std::env::current_dir() {
         match flux_config::persist_allow_rules(&cwd, current) {
-            Ok(()) => eprintln!("\x1b[2m(saved updated permissions to .flux/config.toml)\x1b[0m"),
-            Err(e) => eprintln!("\x1b[2m(could not save permissions: {e})\x1b[0m"),
+            Ok(()) => eprintln!(
+                "{}",
+                style::dim("(saved updated permissions to .flux/config.toml)")
+            ),
+            Err(e) => eprintln!(
+                "{}",
+                style::dim(&format!("(could not save permissions: {e})"))
+            ),
         }
     }
 }
@@ -485,7 +502,12 @@ async fn build_agent(cli: &Cli) -> Result<(FlowEngine, String, Arc<dyn flux_runt
                         registry.register(t);
                     }
                 }
-                Err(e) => eprintln!("\x1b[2m(plugin `{}` failed to load: {e})\x1b[0m", p.name),
+                Err(e) => {
+                    eprintln!(
+                        "{}",
+                        style::dim(&format!("(plugin `{}` failed to load: {e})", p.name))
+                    )
+                }
             }
         }
     }
@@ -569,7 +591,10 @@ async fn build_agent(cli: &Cli) -> Result<(FlowEngine, String, Arc<dyn flux_runt
 /// One-shot agentic turn.
 async fn run_agentic(cli: &Cli, prompt: String) -> Result<()> {
     let (agent, session_id, _spawner) = build_agent(cli).await?;
-    eprintln!("\x1b[2m[session {session_id} · {}]\x1b[0m", agent.model);
+    eprintln!(
+        "{}",
+        style::dim(&format!("{} · session {session_id}", agent.model))
+    );
     let initial_rules = agent.executor.allow_rules();
     let mut sink = CliSink::new();
     agent
@@ -584,7 +609,7 @@ async fn run_agentic(cli: &Cli, prompt: String) -> Result<()> {
 struct CliAsk;
 impl flux_flow::compile::AskUser for CliAsk {
     fn ask(&self, question: &str) -> String {
-        eprint!("\n\x1b[36m? {question}\x1b[0m ");
+        eprint!("\n{} ", style::cyan(&format!("? {question}")));
         std::io::stderr().flush().ok();
         let mut line = String::new();
         let _ = std::io::stdin().read_line(&mut line);
@@ -613,7 +638,10 @@ async fn run_plan(cli: Cli) -> Result<()> {
     }
     let (mut engine, session_id, _spawner) = build_agent(&cli).await?;
     let cli_ask = CliAsk;
-    eprintln!("\x1b[2m[plan · {} · agentic]\x1b[0m", engine.model);
+    eprintln!(
+        "{}",
+        style::dim(&format!("plan · {} · agentic", engine.model))
+    );
 
     let compiled = match engine
         .compile_once(&session_id, &prompt, terminal_ask(&cli_ask))
@@ -642,26 +670,32 @@ async fn run_plan(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    // Interactive: show the plan + a risk line, then offer to run it.
+    // Interactive: show the highlighted plan + a risk badge, then offer to run it.
     let risk = flux_flow::runtime::plan_risk(&compiled.ast, engine.executor.registry());
-    println!("{}", flux_flow::render::render_pretty(&compiled.ast));
     eprintln!(
-        "\x1b[2m[risk: {} · {} op(s): {}]\x1b[0m",
-        risk.summary(),
-        risk.ops.len(),
-        risk.ops.join(", ")
+        "\n{}  {}{}",
+        style::bold("plan"),
+        risk_badge(&risk.summary()),
+        style::dim(&format!(" · {} op(s)", risk.ops.len()))
+    );
+    eprintln!(
+        "{}",
+        flux_flow::render::render_styled(&compiled.ast, &style::plan_palette())
     );
     if !compiled.diagnostics.is_empty() {
         print_diagnostics(&compiled.diagnostics);
-        eprintln!("\x1b[33m(plan references unknown operations — not running)\x1b[0m");
+        eprintln!(
+            "{}",
+            style::yellow("plan references unknown operations — not running")
+        );
         return Ok(());
     }
     if risk.ops.is_empty() {
-        eprintln!("\x1b[2m(empty plan — nothing to run)\x1b[0m");
+        eprintln!("{}", style::dim("empty plan — nothing to run"));
         return Ok(());
     }
     if !(cli.yes || confirm_plan(risk.ops.len())) {
-        eprintln!("\x1b[2m(not run)\x1b[0m");
+        eprintln!("{}", style::dim("not run"));
         return Ok(());
     }
 
@@ -678,7 +712,6 @@ async fn run_plan(cli: Cli) -> Result<()> {
             risk.ops.clone(),
             fallback,
         )));
-    eprintln!("\x1b[2m[run · session {session_id}]\x1b[0m");
     let mut sink = CliSink::new();
     let outcome = flux_flow::runtime::execute_flow(
         &engine.flow,
@@ -692,10 +725,7 @@ async fn run_plan(cli: Cli) -> Result<()> {
     if !outcome.result.trim().is_empty() {
         println!("{}", outcome.result);
     }
-    eprintln!(
-        "\x1b[2m[ran {} step(s) · values in ~/.flux/flow.db]\x1b[0m",
-        outcome.steps
-    );
+    sink.turn_end(None);
     Ok(())
 }
 
@@ -704,15 +734,21 @@ fn print_diagnostics(diags: &[flux_flow::analyze::Diagnostic]) {
     if diags.is_empty() {
         return;
     }
-    eprintln!("\x1b[33m[diagnostics — the plan references unknown operations]\x1b[0m");
+    eprintln!(
+        "{}",
+        style::yellow("diagnostics — the plan references unknown operations")
+    );
     for d in diags {
-        eprintln!("\x1b[2m  - {}\x1b[0m", d.message);
+        eprintln!("{}", style::dim(&format!("  - {}", d.message)));
     }
 }
 
 /// One stdin `y/N` confirmation for a whole compiled plan.
 fn confirm_plan(steps: usize) -> bool {
-    eprint!("\n\x1b[33mRun this {steps}-op plan?\x1b[0m [y/N]: ");
+    eprint!(
+        "\n{} [y/N]: ",
+        style::yellow(&format!("Run this {steps}-op plan?"))
+    );
     std::io::stderr().flush().ok();
     let mut line = String::new();
     if std::io::stdin().read_line(&mut line).is_err() {
@@ -757,8 +793,11 @@ async fn run_repl(cli: Cli) -> Result<()> {
     let (mut agent, mut session_id, spawner) = build_agent(&cli).await?;
     let initial_rules = agent.executor.allow_rules();
     eprintln!(
-        "\x1b[2mflux · {} · session {session_id} — /help, Ctrl-C interrupts a turn, Ctrl-D exits\x1b[0m",
-        agent.model
+        "{}",
+        style::dim(&format!(
+            "flux · {} · session {session_id} — /help, Ctrl-C interrupts a turn, Ctrl-D exits",
+            agent.model
+        ))
     );
 
     // reedline gives line editing, persistent history, and reverse-search. Because it reads in raw
@@ -803,13 +842,16 @@ async fn run_repl(cli: Cli) -> Result<()> {
                     plan_mode = !plan_mode;
                     pending_plan = None;
                     eprintln!(
-                        "\x1b[2mplan mode {} — {}\x1b[0m",
-                        if plan_mode { "on" } else { "off" },
-                        if plan_mode {
-                            "turns show a plan; `/run` to execute, or keep chatting to refine"
-                        } else {
-                            "turns run normally"
-                        }
+                        "{}",
+                        style::dim(&format!(
+                            "plan mode {} — {}",
+                            if plan_mode { "on" } else { "off" },
+                            if plan_mode {
+                                "turns show a plan; `/run` to execute, or keep chatting to refine"
+                            } else {
+                                "turns run normally"
+                            }
+                        ))
                     );
                 }
                 "run" => match pending_plan.take() {
@@ -822,7 +864,8 @@ async fn run_repl(cli: Cli) -> Result<()> {
                         .await;
                     }
                     None => eprintln!(
-                        "\x1b[2m(no pending plan — use /plan, then describe a task)\x1b[0m"
+                        "{}",
+                        style::dim("(no pending plan — use /plan, then describe a task)")
                     ),
                 },
                 "model" => {
@@ -849,7 +892,7 @@ async fn run_repl(cli: Cli) -> Result<()> {
                     if goal.is_empty() {
                         eprintln!("usage: /pd <goal>");
                     } else {
-                        eprintln!("\x1b[2mplan-and-dispatch (dependency waves)…\x1b[0m");
+                        eprintln!("{}", style::dim("plan-and-dispatch (dependency waves)…"));
                         // Interruptible: Ctrl-C cancels the token, which stops further waves and
                         // aborts the in-flight sub-agent turns.
                         let sp = spawner.clone();
@@ -871,7 +914,7 @@ async fn run_repl(cli: Cli) -> Result<()> {
                             };
                             match res {
                                 Ok(out) => println!("{out}"),
-                                Err(e) => eprintln!("\x1b[31merror:\x1b[0m {e}"),
+                                Err(e) => eprintln!("{} {e}", style::red("error:")),
                             }
                         })
                         .await;
@@ -959,11 +1002,12 @@ async fn run_repl(cli: Cli) -> Result<()> {
                 Ok(Some(ast)) => {
                     pending_plan = Some(ast);
                     eprintln!(
-                        "\x1b[2m(plan ready — `/run` to execute, or send a message to refine)\x1b[0m"
+                        "{}",
+                        style::dim("(plan ready — `/run` to execute, or send a message to refine)")
                     );
                 }
                 Ok(None) => {} // the model answered in prose; nothing to run
-                Err(e) => eprintln!("\x1b[31merror:\x1b[0m {e}"),
+                Err(e) => eprintln!("{} {e}", style::red("error:")),
             }
             continue;
         }
@@ -978,7 +1022,7 @@ async fn run_repl(cli: Cli) -> Result<()> {
                 .run_turn_cancellable(sid_ref, input, &mut sink, &c)
                 .await
             {
-                eprintln!("\x1b[31merror:\x1b[0m {e}");
+                eprintln!("{} {e}", style::red("error:"));
             }
         })
         .await;
@@ -1003,9 +1047,9 @@ async fn run_pending_plan(
             if !outcome.result.trim().is_empty() {
                 println!("{}", outcome.result);
             }
-            eprintln!("\x1b[2m[ran {} step(s)]\x1b[0m", outcome.steps);
+            sink.turn_end(None);
         }
-        Err(e) => eprintln!("\x1b[31merror:\x1b[0m {e}"),
+        Err(e) => eprintln!("{} {e}", style::red("error:")),
     }
 }
 
@@ -1027,7 +1071,7 @@ where
                 if !interrupting {
                     interrupting = true;
                     cancel.cancel();
-                    eprintln!("\n\x1b[2m(interrupting…)\x1b[0m");
+                    eprintln!("\n{}", style::dim("(interrupting…)"));
                 }
             }
         }
@@ -1049,13 +1093,13 @@ async fn run_goal(
         if cancel.is_cancelled() {
             break;
         }
-        eprintln!("\x1b[2m[goal {}/{}]\x1b[0m", i + 1, MAX);
+        eprintln!("{}", style::dim(&format!("[goal {}/{}]", i + 1, MAX)));
         let mut sink = GoalSink::default();
         if let Err(e) = agent
             .run_turn_cancellable(session_id, &next_input, &mut sink, &cancel)
             .await
         {
-            eprintln!("\x1b[31merror:\x1b[0m {e}");
+            eprintln!("{} {e}", style::red("error:"));
             return;
         }
         if cancel.is_cancelled() {
@@ -1074,13 +1118,13 @@ async fn run_goal(
         {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("\x1b[2m(evaluator error: {e})\x1b[0m");
+                eprintln!("{}", style::dim(&format!("(evaluator error: {e})")));
                 return;
             }
         };
         // Match only a leading verdict so "not satisfied"/"unsatisfied" don't false-positive.
         if verdict.trim().to_uppercase().starts_with("SATISFIED") {
-            eprintln!("\x1b[2m[goal satisfied]\x1b[0m");
+            eprintln!("{}", style::dim("[goal satisfied]"));
             return;
         }
         next_input = verdict
@@ -1089,7 +1133,7 @@ async fn run_goal(
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| goal.to_string());
     }
-    eprintln!("\x1b[2m[goal loop ended]\x1b[0m");
+    eprintln!("{}", style::dim("[goal loop ended]"));
 }
 
 /// `/loop <count> <task>`: run `task` up to `count` times (stops early on cancellation).
@@ -1104,13 +1148,13 @@ async fn run_loop(
         if cancel.is_cancelled() {
             break;
         }
-        eprintln!("\x1b[2m[loop {}/{}]\x1b[0m", i + 1, count);
+        eprintln!("{}", style::dim(&format!("[loop {}/{}]", i + 1, count)));
         let mut sink = CliSink::new();
         if let Err(e) = agent
             .run_turn_cancellable(session_id, task, &mut sink, &cancel)
             .await
         {
-            eprintln!("\x1b[31merror:\x1b[0m {e}");
+            eprintln!("{} {e}", style::red("error:"));
             return;
         }
     }
@@ -1127,6 +1171,11 @@ fn parse_loop_args(args: &str) -> (usize, String) {
     }
 }
 
+/// Whether tool output is shown in full (set by `-v`/`--verbose`, which exports `FLUX_VERBOSE`).
+fn verbose() -> bool {
+    std::env::var_os("FLUX_VERBOSE").is_some()
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() > n {
         let head: String = s.chars().take(n).collect();
@@ -1136,44 +1185,132 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-/// A multi-line preview of a tool result for the CLI: up to `MAX_LINES` lines (each width-capped),
-/// continuation lines indented under the header, with a trailing note when lines were elided. This
-/// affects only what the user sees — the model still receives the full, separately-capped result.
-/// (Single-line results render exactly as before.)
-fn tool_preview(s: &str) -> String {
-    const MAX_LINES: usize = 12;
-    const MAX_LINE_CHARS: usize = 200;
+/// A preview of a tool result for the CLI: continuation lines indented under the header, with a
+/// trailing note when lines were elided. `full` (from `-v`/`FLUX_VERBOSE`) disables the caps and shows
+/// everything. This affects only what the user sees — the model always receives the full result.
+fn tool_preview(s: &str, full: bool) -> String {
+    const MAX_LINES: usize = 40;
+    const MAX_LINE_CHARS: usize = 500;
     let lines: Vec<&str> = s.lines().collect();
     if lines.len() <= 1 {
-        return truncate(s, MAX_LINE_CHARS);
+        return if full {
+            s.to_string()
+        } else {
+            truncate(s, MAX_LINE_CHARS)
+        };
     }
-    let shown = lines.len().min(MAX_LINES);
+    let shown = if full {
+        lines.len()
+    } else {
+        lines.len().min(MAX_LINES)
+    };
     let mut out = String::new();
     for (i, line) in lines.iter().take(shown).enumerate() {
         if i > 0 {
             out.push_str("\n  ");
         }
-        out.push_str(&truncate(line.trim_end(), MAX_LINE_CHARS));
+        let line = line.trim_end();
+        out.push_str(&if full {
+            line.to_string()
+        } else {
+            truncate(line, MAX_LINE_CHARS)
+        });
     }
     let extra = lines.len() - shown;
     if extra > 0 {
         out.push_str(&format!(
-            "\n  … (+{extra} more line{})",
+            "\n  … (+{extra} more line{}; -v for full)",
             if extra == 1 { "" } else { "s" }
         ));
     }
     out
 }
 
-/// Renders streaming assistant text to stdout as live-rendered Markdown, and tool activity to stderr.
+/// Shared between [`CliSink`] and its spinner ticker task.
+struct SpinnerState {
+    active: bool,
+    label: String,
+    frame: usize,
+}
+
+/// Render a tool call as a concise, colored `op("arg", …)` label (the full args are in the shown plan;
+/// `-v` un-caps them here too).
+fn render_call_label(name: &str, input: &Value, verbose: bool) -> String {
+    let args = match input {
+        Value::Object(o) => o
+            .values()
+            .map(|v| short_arg(v, verbose))
+            .collect::<Vec<_>>()
+            .join(", "),
+        Value::Null => String::new(),
+        other => short_arg(other, verbose),
+    };
+    format!("{}({args})", style::cyan(name))
+}
+
+fn short_arg(v: &Value, verbose: bool) -> String {
+    let s = match v {
+        Value::String(s) if !verbose => format!("{:?}", truncate(s, 40)),
+        Value::String(s) => format!("{s:?}"),
+        other => other.to_string(),
+    };
+    style::dim(&s)
+}
+
+/// A concise result summary for the execution stream: `done` for empty output, the line(s) for a small
+/// result, or `N lines · -v for full` for a big one. `-v` shows everything.
+fn result_summary(content: &str, verbose: bool) -> String {
+    let content = content.trim();
+    if content.is_empty() {
+        return "done".to_string();
+    }
+    if verbose {
+        return tool_preview(content, true);
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    match lines.len() {
+        0 => "done".to_string(),
+        1 => truncate(content, 200),
+        n if n <= 6 => lines
+            .iter()
+            .map(|l| truncate(l.trim_end(), 200))
+            .collect::<Vec<_>>()
+            .join("\n    "),
+        n => format!("{n} lines · -v for full"),
+    }
+}
+
+/// Color a risk summary by its leading level (`low` green, `medium` yellow, else red).
+fn risk_badge(summary: &str) -> String {
+    match summary.split([' ', '·']).next().unwrap_or("").trim() {
+        "low" | "no-op" => style::green(summary),
+        "medium" => style::yellow(summary),
+        _ => style::red(summary),
+    }
+}
+
+/// Renders streaming assistant text to stdout as live-rendered Markdown, and tool activity to stderr,
+/// in the "Refined" style: a syntax-highlighted plan, colored `→`/`✓`/`✗` markers, a live spinner while
+/// each op runs, and a completion rule with timing. All color is tty/`NO_COLOR`/`--color`-aware.
 struct CliSink {
     live: markdown_terminal::LiveRenderer,
+    /// Show tool output in full (no truncation) — from `-v`/`FLUX_VERBOSE`.
+    verbose: bool,
+    width: usize,
+    stderr_tty: bool,
+    steps: usize,
+    turn_start: Option<std::time::Instant>,
+    /// The current op's `(label, start)`, set on `tool_call` and finalized on `tool_result`.
+    pending: Option<(String, std::time::Instant)>,
+    spinner: Option<(
+        Arc<std::sync::Mutex<SpinnerState>>,
+        tokio::task::JoinHandle<()>,
+    )>,
 }
 
 impl CliSink {
     fn new() -> Self {
-        use std::io::IsTerminal;
-        let tty = std::io::stdout().is_terminal();
+        let stdout_tty = std::io::stdout().is_terminal();
         let width = std::env::var("COLUMNS")
             .ok()
             .and_then(|c| c.parse::<usize>().ok())
@@ -1183,8 +1320,15 @@ impl CliSink {
             live: markdown_terminal::LiveRenderer::new(
                 markdown_terminal::Theme::auto(),
                 width,
-                tty,
+                stdout_tty,
             ),
+            verbose: verbose(),
+            width,
+            stderr_tty: std::io::stderr().is_terminal(),
+            steps: 0,
+            turn_start: None,
+            pending: None,
+            spinner: None,
         }
     }
 
@@ -1195,6 +1339,51 @@ impl CliSink {
             let _ = self.live.finish(&mut out);
         }
     }
+
+    fn use_spinner(&self) -> bool {
+        self.stderr_tty && style::enabled()
+    }
+
+    /// Start an animated spinner on the op's line (a background ticker rewriting it via `\r`).
+    fn start_spinner(&mut self, label: String) {
+        let state = Arc::new(std::sync::Mutex::new(SpinnerState {
+            active: true,
+            label,
+            frame: 0,
+        }));
+        let s = state.clone();
+        let task = tokio::spawn(async move {
+            const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            loop {
+                {
+                    // Hold the lock while drawing so `stop_spinner` can't interleave.
+                    let mut st = s.lock().unwrap();
+                    if !st.active {
+                        break;
+                    }
+                    let frame = FRAMES[st.frame % FRAMES.len()];
+                    st.frame += 1;
+                    eprint!("\r\x1b[K{} {}", style::cyan(&frame.to_string()), st.label);
+                    let _ = std::io::stderr().flush();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            }
+        });
+        self.spinner = Some((state, task));
+    }
+
+    /// Stop a running spinner and clear its line. Returns true if one was active.
+    fn stop_spinner(&mut self) -> bool {
+        if let Some((state, task)) = self.spinner.take() {
+            state.lock().unwrap().active = false;
+            eprint!("\r\x1b[K");
+            std::io::stderr().flush().ok();
+            task.abort();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl AgentSink for CliSink {
@@ -1203,32 +1392,57 @@ impl AgentSink for CliSink {
         let _ = self.live.push(t, &mut out);
     }
     fn thinking_delta(&mut self, t: &str) {
-        // Stream extended-thinking tokens dimmed on stderr so reasoning is observable in the REPL
-        // (was a silent no-op); kept off stdout so it doesn't pollute piped output.
-        eprint!("\x1b[2m{t}\x1b[0m");
+        // Stream extended-thinking tokens dimmed on stderr so reasoning is observable in the REPL.
+        eprint!("{}", style::dim(t));
         std::io::stderr().flush().ok();
     }
     fn tool_call(&mut self, name: &str, input: &Value) {
         self.commit();
-        eprintln!(
-            "\n\x1b[2m→ {name} {}\x1b[0m",
-            truncate(&input.to_string(), 120)
-        );
+        self.steps += 1;
+        if self.turn_start.is_none() {
+            self.turn_start = Some(std::time::Instant::now());
+        }
+        let label = render_call_label(name, input, self.verbose);
+        if self.use_spinner() {
+            self.start_spinner(label.clone());
+        } else {
+            eprintln!("\n{} {label}", style::blue("→"));
+        }
+        self.pending = Some((label, std::time::Instant::now()));
     }
-    fn tool_result(&mut self, name: &str, result: &ToolResult) {
-        let tag = if result.is_error { "✗" } else { "✓" };
-        eprintln!(
-            "\x1b[2m{tag} {name}: {}\x1b[0m",
-            tool_preview(result.content.trim())
-        );
+    fn tool_result(&mut self, _name: &str, result: &ToolResult) {
+        let (label, start) = self
+            .pending
+            .take()
+            .unwrap_or_else(|| (String::new(), std::time::Instant::now()));
+        // If a spinner ran, its line is cleared — reprint the call line so it stays in the scrollback.
+        if self.stop_spinner() {
+            eprintln!("\n{} {label}", style::blue("→"));
+        }
+        let elapsed = style::dim(&format!("· {}", style::fmt_elapsed(start.elapsed())));
+        let (mark, body) = if result.is_error {
+            (
+                style::red("✗"),
+                result_summary(&result.content, self.verbose),
+            )
+        } else {
+            (
+                style::green("✓"),
+                result_summary(&result.content, self.verbose),
+            )
+        };
+        eprintln!("  {mark} {body}  {elapsed}");
     }
     fn observation(&mut self, o: &flux_evidence::Observation) {
         self.commit();
         if o.kind == flux_evidence::KIND_DESTRUCTIVE {
-            eprintln!("\x1b[33m⚠ destructive operation flagged — approval required\x1b[0m");
+            eprintln!(
+                "{}",
+                style::yellow("⚠ destructive operation — approval required")
+            );
         } else if o.kind == "skill.activated" {
             if let Some(name) = o.data.get("skill").and_then(|v| v.as_str()) {
-                eprintln!("\x1b[2m✦ skill activated: {name}\x1b[0m");
+                eprintln!("{}", style::dim(&format!("✦ skill: {name}")));
             }
         } else if o.kind == "context.compacted" {
             let from = o
@@ -1241,18 +1455,29 @@ impl AgentSink for CliSink {
                 .get("to_messages")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            eprintln!("\x1b[2m⊙ context compacted ({from} → {to} messages)\x1b[0m");
+            eprintln!(
+                "{}",
+                style::dim(&format!("⊙ context compacted ({from} → {to} messages)"))
+            );
         } else if o.kind == "turn.cancelled" {
-            eprintln!("\x1b[2m⊘ turn cancelled\x1b[0m");
+            eprintln!("{}", style::dim("⊘ turn cancelled"));
         } else if o.kind == "flow.plan" {
-            // The compiled Flux-Lang plan about to execute — show it so the turn is auditable.
-            if let Some(plan) = o.data.get("plan").and_then(|v| v.as_str()) {
-                eprintln!("\x1b[2m{plan}\x1b[0m");
-            }
+            self.render_plan(o);
         }
     }
     fn turn_end(&mut self, usage: Option<Usage>) {
         self.commit();
+        self.stop_spinner();
+        if self.steps > 0 {
+            let elapsed = self
+                .turn_start
+                .map(|t| style::fmt_elapsed(t.elapsed()))
+                .unwrap_or_default();
+            let plural = if self.steps == 1 { "" } else { "s" };
+            let summary = format!("{} step{plural} · {elapsed}", self.steps);
+            let rule_len = self.width.saturating_sub(summary.chars().count() + 2);
+            eprintln!("{} {}", style::rule(rule_len), style::dim(&summary));
+        }
         if let Some(u) = usage {
             let cache = if u.cache_creation_input_tokens > 0 || u.cache_read_input_tokens > 0 {
                 format!(
@@ -1263,10 +1488,40 @@ impl AgentSink for CliSink {
                 String::new()
             };
             eprintln!(
-                "\x1b[2m[usage in={} out={}{cache}]\x1b[0m",
-                u.input_tokens, u.output_tokens
+                "{}",
+                style::dim(&format!(
+                    "usage in={} out={}{cache}",
+                    u.input_tokens, u.output_tokens
+                ))
             );
         }
+    }
+}
+
+impl CliSink {
+    /// Render a `flow.plan` observation: the syntax-highlighted plan tree + a risk badge header.
+    fn render_plan(&self, o: &flux_evidence::Observation) {
+        let rendered = o
+            .data
+            .get("plan_ast")
+            .and_then(|v| serde_json::from_value::<flux_flow::ast::DraftAst>(v.clone()).ok())
+            .map(|ast| flux_flow::render::render_styled(&ast, &style::plan_palette()))
+            .or_else(|| {
+                o.data
+                    .get("plan")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            });
+        let Some(rendered) = rendered else { return };
+        let risk = o.data.get("risk").and_then(|v| v.as_str()).unwrap_or("");
+        let ops = o.data.get("ops").and_then(|v| v.as_u64()).unwrap_or(0);
+        eprintln!(
+            "\n{}  {}{}",
+            style::bold("plan"),
+            risk_badge(risk),
+            style::dim(&format!(" · {ops} op(s)"))
+        );
+        eprintln!("{rendered}");
     }
 }
 
@@ -1284,16 +1539,18 @@ impl AgentSink for GoalSink {
     }
     fn tool_call(&mut self, name: &str, input: &Value) {
         eprintln!(
-            "\n\x1b[2m→ {name} {}\x1b[0m",
-            truncate(&input.to_string(), 120)
+            "\n{} {}",
+            style::blue("→"),
+            render_call_label(name, input, verbose())
         );
     }
-    fn tool_result(&mut self, name: &str, result: &ToolResult) {
-        let tag = if result.is_error { "✗" } else { "✓" };
-        eprintln!(
-            "\x1b[2m{tag} {name}: {}\x1b[0m",
-            tool_preview(result.content.trim())
-        );
+    fn tool_result(&mut self, _name: &str, result: &ToolResult) {
+        let mark = if result.is_error {
+            style::red("✗")
+        } else {
+            style::green("✓")
+        };
+        eprintln!("  {mark} {}", result_summary(&result.content, verbose()));
     }
     fn turn_end(&mut self, _usage: Option<Usage>) {
         println!();
@@ -1437,7 +1694,10 @@ impl Approver for StdinApprover {
         subjects: &[String],
         _intents: &IntentSet,
     ) -> ApprovalChoice {
-        eprint!("\n\x1b[33mapprove\x1b[0m `{tool}` {subjects:?}  [y]es / [a]lways / [N]o: ");
+        eprint!(
+            "\n{} `{tool}` {subjects:?}  [y]es / [a]lways / [N]o: ",
+            style::yellow("approve")
+        );
         std::io::stderr().flush().ok();
         let mut line = String::new();
         if std::io::stdin().read_line(&mut line).is_err() {
@@ -1465,6 +1725,11 @@ async fn main() -> Result<()> {
         return run_sessions();
     }
     let cli = Cli::parse();
+    style::init(cli.color);
+    // `-v`/`--verbose` exports `FLUX_VERBOSE` so the sinks (and any sub-process) show full output.
+    if cli.verbose {
+        std::env::set_var("FLUX_VERBOSE", "1");
+    }
     if let Some(addr) = cli.serve.clone() {
         run_serve(cli, addr).await
     } else if cli.tui {
@@ -1656,29 +1921,39 @@ mod tests {
 
     #[test]
     fn tool_preview_single_line_unchanged() {
-        assert_eq!(tool_preview("no matches"), "no matches");
+        assert_eq!(tool_preview("no matches", false), "no matches");
     }
 
     #[test]
-    fn tool_preview_shows_multiple_lines_and_counts_elided() {
-        // Regression (dogfood F3): multi-line tool output used to collapse to one 200-char line,
-        // hiding results (e.g. the `test result: ok` line). Now up to 12 lines are shown, with the
-        // remainder counted.
-        let many: String = (1..=20)
+    fn tool_preview_caps_lines_by_default_and_shows_all_when_full() {
+        // Default: up to 40 lines shown, the rest counted (with a `-v for full` hint).
+        let many: String = (1..=50)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let p = tool_preview(&many);
-        assert!(p.contains("line 12"), "12th line shown: {p}");
-        assert!(!p.contains("line 13"), "13th line elided: {p}");
-        assert!(p.contains("(+8 more lines)"), "elision note present: {p}");
+        let p = tool_preview(&many, false);
+        assert!(p.contains("line 40"), "40th line shown: {p}");
+        assert!(!p.contains("line 41"), "41st line elided: {p}");
+        assert!(
+            p.contains("(+10 more lines; -v for full)"),
+            "elision note: {p}"
+        );
         assert!(p.contains("\n  line 2"), "continuation lines indented: {p}");
+
+        // Full (`-v`): every line shown, no elision note.
+        let p = tool_preview(&many, true);
+        assert!(p.contains("line 50"), "all lines shown when full: {p}");
+        assert!(!p.contains("more lines"), "no elision note when full: {p}");
     }
 
     #[test]
-    fn tool_preview_caps_a_long_single_line() {
-        let p = tool_preview(&"x".repeat(500));
+    fn tool_preview_caps_a_long_single_line_unless_full() {
+        let p = tool_preview(&"x".repeat(600), false);
         assert!(p.ends_with('…'));
-        assert!(p.chars().count() <= 201);
+        assert!(p.chars().count() <= 501);
+        // Full: the whole line, untruncated.
+        let p = tool_preview(&"x".repeat(600), true);
+        assert_eq!(p.chars().count(), 600);
+        assert!(!p.ends_with('…'));
     }
 }

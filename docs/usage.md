@@ -24,7 +24,10 @@ flow
 ```
 
 The runtime executes the plan node by node through the safety envelope (permissions, approval, secret
-redaction), stores each result, and feeds it back so the model can plan the next step.
+redaction), stores each result as a named symbol, and feeds it back so the model can plan the next step.
+A later node reuses an earlier result by name — `$readme` to pass the whole value as an argument, or
+`{{readme}}` inside a string to embed it (e.g. in a sub-agent prompt); the runtime substitutes the
+stored value at execution.
 
 ## Two modes: normal and plan
 
@@ -117,11 +120,16 @@ deny  = []                                    # always-blocked tools
 ## Other surfaces
 
 ```bash
+flux -v "..."                    # show tool output in full (no truncation); also FLUX_VERBOSE=1
+flux --color always|auto|never   # colorize output (auto = a terminal, NO_COLOR unset)
 flux --tui                       # ratatui chat UI (in-UI approval modal)
 flux --serve 127.0.0.1:8787 --yes   # HTTP API daemon (REST + SSE)
 flux sessions                    # list recent sessions
 flux plugin ls                   # manage subprocess plugins (any-language ops)
 ```
+
+Plans and tool *inputs* always print in full; tool *output* (e.g. a large file read) is previewed by
+default and shown in full with `-v`.
 
 ## Tips
 

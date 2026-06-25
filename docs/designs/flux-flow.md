@@ -122,7 +122,8 @@ user_input + conversation + view(Session)
               Executor::dispatch per call node; bind/call/return + when/repeat control flow;
               per-op approval at dispatch (destructive escalates); !model ops use the ModelClient seam
             → ValueStore writes + RunEvent trace + live node status (sink)
-  → feed the plan's result back *ephemerally*; loop until the model answers in prose
+  → emit_plan carried a `reply` (plan completes the task) → show it, turn ends (ONE round)
+  → else feed the plan's result back *ephemerally* and loop (read→reason) until reply/prose
   → persist Session' + ONE assistant summary into the message log
 ```
 **Pure DAG:** the model has no directly-callable ops — *every* operation, reads included, is a node in
@@ -222,8 +223,13 @@ from *visibility* tiers.
 Besides security, **auditability is a core principle**: the execution graph and the `RunEvent` trace must
 read **as intuitively as Go or Rust**. v1 renders the parsed graph in CLI/TUI (ASCII DAG or indented
 tree) and lights up per-node status during execution — which doubles as the **progress UX** for planned
-flows (you watch nodes execute instead of streaming prose). No hidden control flow: every branch, effect,
-and approval is visible. Faithful *audit-replay* (reconstruct a past run from recorded outputs) is
+flows (you watch nodes execute instead of streaming prose). The `render` module is presentation-agnostic:
+`render_pretty` is plain, and `render_styled(ast, &Palette)` lets a surface syntax-highlight the tree (the
+CLI passes a tty/`NO_COLOR`/`--color`-aware palette; `Palette::PLAIN` keeps `-o pretty`, logs, and the
+non-CLI sinks plain). The CLI renders the highlighted plan + a color-coded risk badge, colored
+`→`/`✓`/`✗` markers, a live spinner per running op, and a completion rule with timing. No hidden control
+flow: every branch, effect, and approval is visible. Faithful *audit-replay* (reconstruct a past run from
+recorded outputs) is
 postponed; *re-run against live data* is the v1 feature. The **visual editor** is deferred to an IDE/web
 move.
 
@@ -285,9 +291,13 @@ Resolved in design (no longer open):
   runtime executes it and feeds the result back so it can plan the next step (the engine's multi-round
   loop). The planner is **session-aware** (`view(Session)` lets it reference existing `$symbols`) and is
   told to express control flow as `repeat`/`when` nodes, never shell loops, so the plan stays auditable.
-  Trade-off: read-then-act tasks take an extra round (a read is its own plan round); re-enabling
-  read-only research is a one-line revert. Verified live — `print hello 3×` plans `repeat max 3 { bash }`,
-  and `read README then answer` reads in round 1 and answers in round 2 from the fed-back content.
+  **Turn completion:** `emit_plan` takes an optional `reply` (a one-line closing message); when the plan
+  *completes* the request the model attaches it, and the engine runs the plan, shows `reply`, and ends —
+  **one round**, no extra "summarize" call. Omitting `reply` is the read→reason case (loop). Trade-off:
+  read-then-act tasks take an extra round (a read is its own plan round); re-enabling read-only research
+  is a one-line revert. Verified live — `print hello 3×` plans `repeat max 3 { bash }` and ends in one
+  round with `Printed "Hello, World!" 3 times.`; `read README then answer` reads in round 1 and answers
+  in round 2 from the fed-back content.
 - **The planner is the engine (one engine, no fallback).** `compile::compile_turn` plans a turn from the
   *conversation* and returns `TurnOutput::Plan` (a graph to execute) or `TurnOutput::Chat` (a prose
   answer); `FlowEngine` drives it every turn. **Two modes:** *normal* (plan + execute) is the default;
@@ -303,7 +313,13 @@ Resolved in design (no longer open):
   **destructive op still falls through to the fallback** (per-op confirm, or auto under `--yes`). **Arg
   mapping:** the AST keeps positional `Call.args`; at execution they map onto each op's named input by
   its JSON-Schema `required ++ optional` order, and the planner catalog renders the same `op(params)`
-  signature so the model emits args in that order.
+  signature so the model emits args in that order. **Symbol interpolation:** `eval_arg` substitutes
+  `{{symbol}}` / `{symbol}` tokens inside a string lit with the bound symbol's text (only bound symbols;
+  unbound tokens are left verbatim) — so a plan can embed a stored value into a larger string (e.g. a
+  `task` prompt). A standalone `$symbol` (a `var` node) passes the whole value as an argument.
+- **Auditable display.** The CLI shows plans and tool *inputs* in full (they're model-authored and
+  bounded); tool *output* gets a generous preview by default, with `-v`/`--verbose` (`FLUX_VERBOSE`)
+  removing all truncation — nothing about what runs is hidden when reviewing.
 - **Compact syntax.** The JSON AST is the canonical, persisted form; compact syntax is a *readable
   review projection* (rendered in CLI/TUI for auditability). A full public authoring grammar waits for
   the editor.

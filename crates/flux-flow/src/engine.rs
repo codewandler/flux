@@ -135,27 +135,31 @@ impl FlowEngine {
                 TurnOutput::Plan(compiled) => {
                     // Surface the compiled plan before running it — this is what executes, so the turn
                     // is auditable (and visibly the planner, not a free-form tool loop).
-                    sink.observation(&flux_evidence::Observation::new(
-                        "flow.plan",
-                        flux_evidence::Phase::Turn,
-                        serde_json::json!({ "plan": crate::render::render_pretty(&compiled.ast) }),
-                    ));
+                    sink.observation(&self.plan_observation(&compiled.ast));
                     match execute_flow(&self.flow, &self.executor, session_id, &compiled.ast, sink)
                         .await
                     {
                         Ok(outcome) => {
-                            let summary = if outcome.result.trim().is_empty() {
-                                format!("Executed a {}-step plan.", outcome.steps)
+                            // The plan carried a closing message ⇒ it completes the request: show it and
+                            // end the turn — one round, no extra "summarize" call.
+                            if let Some(reply) = compiled.reply {
+                                sink.text_delta(&reply);
+                                answer = Some(reply);
+                                break;
+                            }
+                            // No reply ⇒ the model needs to see the results before it can answer. Feed
+                            // them back and loop.
+                            let result = if outcome.result.trim().is_empty() {
+                                format!("(ran {} step(s), no textual output)", outcome.steps)
                             } else {
                                 outcome.result.clone()
                             };
                             working.push(Message::assistant(vec![ContentBlock::Text {
-                                text: format!("Executed a {}-step plan.", outcome.steps),
+                                text: format!("Ran a {}-step plan.", outcome.steps),
                             }]));
                             working.push(Message::user_text(format!(
-                                "[plan result]\n{summary}\n\nIf this completes the user's request, \
-                                 reply with a short final answer in prose now. Emit another plan ONLY \
-                                 if essential work genuinely remains — do not repeat work."
+                                "[results]\n{result}\n\nAnswer the user now, or emit another plan if \
+                                 more work is needed."
                             )));
                         }
                         // Feed the error back so the model can self-correct (model-in-the-loop),
@@ -247,11 +251,7 @@ impl FlowEngine {
         match out {
             TurnOutput::Plan(compiled) => {
                 let rendered = crate::render::render_pretty(&compiled.ast);
-                sink.observation(&flux_evidence::Observation::new(
-                    "flow.plan",
-                    flux_evidence::Phase::Turn,
-                    serde_json::json!({ "plan": rendered }),
-                ));
+                sink.observation(&self.plan_observation(&compiled.ast));
                 self.store.append_message(
                     session_id,
                     &Message::assistant(vec![ContentBlock::Text {
@@ -271,6 +271,22 @@ impl FlowEngine {
                 Ok(None)
             }
         }
+    }
+
+    /// The `flow.plan` observation surfaced before a plan executes: the plain-rendered tree (for any
+    /// sink), the AST (so a terminal surface can syntax-highlight it), and the risk preview (for a badge).
+    fn plan_observation(&self, ast: &crate::ast::DraftAst) -> flux_evidence::Observation {
+        let risk = crate::runtime::plan_risk(ast, self.executor.registry());
+        flux_evidence::Observation::new(
+            "flow.plan",
+            flux_evidence::Phase::Turn,
+            serde_json::json!({
+                "plan": crate::render::render_pretty(ast),
+                "plan_ast": serde_json::to_value(ast).unwrap_or(serde_json::Value::Null),
+                "risk": risk.summary(),
+                "ops": risk.ops.len(),
+            }),
+        )
     }
 
     /// The agent identity + project context + any skills whose triggers match this turn — the base the
@@ -500,13 +516,20 @@ mod tests {
         }
     }
 
-    /// One model turn that emits an `emit_plan` tool call carrying `ast`.
+    /// One model turn that emits an `emit_plan` tool call carrying `ast` (and an optional `reply`).
     fn emit_plan(ast: serde_json::Value) -> Vec<Chunk> {
+        emit_plan_reply(ast, None)
+    }
+    fn emit_plan_reply(ast: serde_json::Value, reply: Option<&str>) -> Vec<Chunk> {
+        let mut input = json!({ "ast": ast });
+        if let Some(r) = reply {
+            input["reply"] = json!(r);
+        }
         vec![
             Chunk::Block(ContentBlock::ToolUse {
                 id: "p1".into(),
                 name: "emit_plan".into(),
-                input: json!({ "ast": ast }),
+                input,
             }),
             Chunk::Done {
                 stop_reason: Some(StopReason::ToolUse),
@@ -598,6 +621,36 @@ mod tests {
             .content
             .iter()
             .all(|b| matches!(b, ContentBlock::Text { .. }))));
+    }
+
+    #[tokio::test]
+    async fn plan_with_reply_ends_in_one_round() {
+        let store = Arc::new(SessionStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let plan_ast = json!({
+            "body": [{
+                "kind": "bind", "name": "greeting",
+                "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "hi" }] }
+            }]
+        });
+        // Round 1 emits a plan WITH a closing reply → the turn ends after running it. The second
+        // response must never be consumed (no "summarize" round).
+        let responses = VecDeque::from(vec![
+            emit_plan_reply(plan_ast, Some("Echoed hi.")),
+            prose("SHOULD NOT BE REACHED"),
+        ]);
+        let engine = engine_with(responses, store.clone());
+        let mut sink = CollectSink::default();
+        engine.run_turn(&sid, "echo hi", &mut sink).await.unwrap();
+
+        assert_eq!(sink.tools, vec!["echo"], "the plan still executed");
+        let msgs = store.load_messages(&sid).unwrap();
+        assert_eq!(msgs.len(), 2, "user + the reply — one round");
+        assert!(msgs[1].text().contains("Echoed hi."));
+        assert!(
+            !msgs[1].text().contains("SHOULD NOT"),
+            "the second model round must not run"
+        );
     }
 
     #[tokio::test]

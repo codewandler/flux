@@ -365,13 +365,14 @@ async fn run_call(
     Ok(outcome)
 }
 
-/// Evaluate a call-argument expression to a concrete JSON value. `Lit` yields its raw JSON; `Var`
-/// resolves the symbol to its stored value and projects it to natural JSON (the runtime injects the
-/// value it owns — symbols-over-values, executed). Other node kinds are not valid argument positions
-/// in linear v1.
+/// Evaluate a call-argument expression to a concrete JSON value. `Lit` yields its raw JSON, with
+/// `{{symbol}}` tokens inside strings substituted by the resolved symbol's text (so a model can embed a
+/// stored value into a larger string — e.g. a `task` prompt). `Var` resolves a *standalone* symbol to
+/// its stored value as natural JSON. The runtime injects the value it owns — symbols-over-values,
+/// executed. Other node kinds are not valid argument positions in linear v1.
 fn eval_arg(node: &Node, store: &FlowStore, session_id: &str) -> Result<serde_json::Value> {
     match node {
-        Node::Lit { value } => Ok(value.clone()),
+        Node::Lit { value } => Ok(interpolate(value, store, session_id)),
         Node::Var { name } => {
             let vid = store
                 .resolve(session_id, name)?
@@ -386,6 +387,83 @@ fn eval_arg(node: &Node, store: &FlowStore, session_id: &str) -> Result<serde_js
             node_kind(other)
         ))),
     }
+}
+
+/// Substitute `{{symbol}}` tokens inside string literals with the resolved symbol's text value, so the
+/// model can embed a stored value into a larger string. Recurses through strings in arrays/objects;
+/// non-string scalars pass through. A token whose symbol isn't bound is left verbatim.
+fn interpolate(
+    value: &serde_json::Value,
+    store: &FlowStore,
+    session_id: &str,
+) -> serde_json::Value {
+    use serde_json::Value as J;
+    match value {
+        J::String(s) => J::String(interpolate_str(s, store, session_id)),
+        J::Array(a) => J::Array(
+            a.iter()
+                .map(|v| interpolate(v, store, session_id))
+                .collect(),
+        ),
+        J::Object(o) => J::Object(
+            o.iter()
+                .map(|(k, v)| (k.clone(), interpolate(v, store, session_id)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Replace each `{{name}}` (or `{name}`) in `s` with the text of the **bound** symbol `name`. Accepting
+/// both brace styles is robustness against the model's inconsistent templating; only a bound symbol is
+/// substituted, so an unbound token (or any other `{…}` text) is left exactly as written.
+fn interpolate_str(s: &str, store: &FlowStore, session_id: &str) -> String {
+    if !s.contains('{') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let at_brace = &rest[open..]; // starts with '{'
+        let (open_tok, close_tok): (&str, &str) = if at_brace.starts_with("{{") {
+            ("{{", "}}")
+        } else {
+            ("{", "}")
+        };
+        let inner = &at_brace[open_tok.len()..];
+        let Some(rel) = inner.find(close_tok) else {
+            // No closing brace — emit the remainder verbatim and stop.
+            out.push_str(at_brace);
+            return out;
+        };
+        let name = inner[..rel].trim();
+        match resolve_symbol_text(store, session_id, name) {
+            Some(text) => {
+                out.push_str(&text);
+                rest = &inner[rel + close_tok.len()..];
+            }
+            None => {
+                // Not a bound symbol — keep the open brace(s) and re-scan from just after them.
+                out.push_str(open_tok);
+                rest = inner;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The text of a bound symbol, or `None` if `name` is empty / unbound / unreadable.
+fn resolve_symbol_text(store: &FlowStore, session_id: &str, name: &str) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    let vid = store
+        .resolve(session_id, &SymbolName(name.to_string()))
+        .ok()??;
+    let value = store.get_value(&vid).ok()??;
+    Some(value_text(&value))
 }
 
 /// Map a call's positional argument *values* onto the op's named JSON input. A lone object argument
@@ -902,6 +980,44 @@ mod tests {
             json!(42)
         );
         assert!(eval_arg(&flow_var("missing"), &store, "sess").is_err());
+    }
+
+    #[test]
+    fn eval_arg_interpolates_curly_symbols_in_strings() {
+        let store = FlowStore::in_memory().unwrap();
+        let vid = store
+            .put_value("sess", &Value::String("the lines".into()))
+            .unwrap();
+        store
+            .bind(
+                "sess",
+                &SymbolName("hits".into()),
+                &vid,
+                None,
+                "the lines",
+                Visibility::Visible,
+            )
+            .unwrap();
+
+        // Both {{symbol}} and {symbol} inside a string lit resolve to the bound symbol's text.
+        assert_eq!(
+            eval_arg(&flow_lit(json!("reverse: {{hits}}")), &store, "sess").unwrap(),
+            json!("reverse: the lines")
+        );
+        assert_eq!(
+            eval_arg(&flow_lit(json!("reverse: {hits}")), &store, "sess").unwrap(),
+            json!("reverse: the lines")
+        );
+        // An unbound token (either style, or unrelated `{…}` text) is left verbatim (no silent loss).
+        assert_eq!(
+            eval_arg(&flow_lit(json!("x {{nope}} {also} y")), &store, "sess").unwrap(),
+            json!("x {{nope}} {also} y")
+        );
+        // Interpolation recurses into string fields of an object lit.
+        assert_eq!(
+            eval_arg(&flow_lit(json!({ "task": "do {{hits}}" })), &store, "sess").unwrap(),
+            json!({ "task": "do the lines" })
+        );
     }
 
     #[tokio::test]
