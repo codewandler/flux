@@ -1,0 +1,19 @@
+[package]
+name = "flux-flow"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Flux-Lang: compile an instruction into a typed, deterministic execution graph — the LLM plans, the runtime runs"
+
+[dependencies]
+flux-core.workspace = true
+flux-spec.workspace = true
+flux-policy.workspace = true
+flux-runtime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+flux-tools.workspace = true

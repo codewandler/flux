@@ -15,6 +15,7 @@ members = [
     "crates/flux-skill",
     "crates/flux-agent",
     "crates/flux-orchestrate",
+    "crates/flux-flow",
     "crates/flux-plugin",
     "crates/flux-hooks",
     "crates/flux-anthropic",
@@ -55,6 +56,7 @@ flux-agent = { path = "crates/flux-agent" }
 flux-context = { path = "crates/flux-context" }
 flux-skill = { path = "crates/flux-skill" }
 flux-orchestrate = { path = "crates/flux-orchestrate" }
+flux-flow = { path = "crates/flux-flow" }
 flux-plugin = { path = "crates/flux-plugin" }
 flux-hooks = { path = "crates/flux-hooks" }
 flux-auth = { path = "crates/flux-auth" }

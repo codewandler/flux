@@ -730,6 +730,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "flux-flow"
+version = "0.2.4"
+dependencies = [
+ "async-trait",
+ "flux-core",
+ "flux-policy",
+ "flux-runtime",
+ "flux-spec",
+ "flux-tools",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "flux-hooks"
 version = "0.2.4"
 dependencies = [
