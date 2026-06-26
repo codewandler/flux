@@ -38,6 +38,11 @@ pub struct RunResult {
     /// A short note when the run errored before/around grading (spawn failure, etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// A digest of what the agent actually did in this run (for terminal-bench, the tail of the
+    /// in-container session recording). The reviewer reads this to find in-container friction —
+    /// missing runtimes, blocking commands, skipped checks — that pass/fail alone can't reveal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
 }
 
 impl RunResult {
@@ -59,6 +64,7 @@ impl RunResult {
             flow_db: None,
             timed_out: false,
             note: Some(note.into()),
+            transcript: None,
         }
     }
 }
@@ -95,6 +101,9 @@ pub struct CaseOutcome {
     pub sessions: Vec<SessionRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// One trial's in-container session digest (what the agent actually did), for the reviewer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
 }
 
 impl CaseOutcome {
@@ -159,6 +168,7 @@ impl CaseOutcome {
             timed_out_any: runs.iter().any(|r| r.timed_out),
             sessions,
             note: runs.iter().find_map(|r| r.note.clone()),
+            transcript: runs.iter().find_map(|r| r.transcript.clone()),
         }
     }
 }
@@ -240,6 +250,7 @@ mod tests {
             flow_db: Some(db.into()),
             timed_out: false,
             note: None,
+            transcript: None,
         };
         let runs = vec![
             mk(true, 0, 2, "s_1", "/a/flow.db"),
@@ -275,6 +286,7 @@ mod tests {
             flow_db: None,
             timed_out: false,
             note: None,
+            transcript: None,
         };
         // not fully resolved (5/6), but partial credit captures the near-miss.
         let runs = vec![mk(false, 5, 6, &["test_negative_number"])];

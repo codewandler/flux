@@ -244,6 +244,7 @@ mod tests {
             flow_db: None,
             timed_out: false,
             note: None,
+            transcript: None,
         }
     }
 
@@ -327,6 +328,7 @@ mod tests {
                 timed_out_any: false,
                 sessions: vec![],
                 note: None,
+                transcript: None,
             }
         }
         // a passes 2/3, b passes 3/3 → weighted pass_rate = (0.667 + 1.0)/2 ≈ 0.833.

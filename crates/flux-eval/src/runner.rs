@@ -297,6 +297,9 @@ pub async fn run_local_task(spec: &TaskSpec, ctx: &RunContext<'_>) -> Result<Run
         flow_db: Some(flow_db),
         timed_out,
         note,
+        // The local adapter keeps the full RunEvent trace (flow_db) for deterministic mining, so it
+        // doesn't need a separate session digest here.
+        transcript: None,
     })
 }
 

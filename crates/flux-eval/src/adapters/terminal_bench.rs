@@ -174,6 +174,95 @@ fn parse_results(dir: &std::path::Path, task_id: &str) -> Option<ParsedTrial> {
     })
 }
 
+/// Strip ANSI/OSC escape sequences from a terminal byte stream so the digest is readable text.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                // CSI: ESC [ … final byte in @..~
+                chars.next();
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if ('@'..='~').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                // OSC: ESC ] … terminated by BEL or ESC \
+                chars.next();
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if n == '\u{7}' {
+                        break;
+                    }
+                    if n == '\u{1b}' {
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+/// Recursively find a file named `name` under `dir` (bounded depth — tb nests
+/// `<run>/<task>/<trial>/sessions/agent.cast`).
+fn find_file(dir: &std::path::Path, name: &str, depth: usize) -> Option<std::path::PathBuf> {
+    if depth == 0 {
+        return None;
+    }
+    let mut subdirs = Vec::new();
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            subdirs.push(p);
+        } else if p.file_name().and_then(|n| n.to_str()) == Some(name) {
+            return Some(p);
+        }
+    }
+    subdirs.into_iter().find_map(|d| find_file(&d, name, depth - 1))
+}
+
+/// Decode an asciinema v2 cast (JSONL: header line, then `[time, kind, data]`) into plain text — the
+/// `"o"` output events, ANSI stripped — and return the last `max_chars`, so the reviewer sees what the
+/// agent actually did in the container (commands it ran, errors like `node: not found`, timeouts).
+fn decode_cast_tail(path: &std::path::Path, max_chars: usize) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut out = String::new();
+    for line in content.lines().skip(1) {
+        if let Ok(Value::Array(ev)) = serde_json::from_str::<Value>(line) {
+            if ev.get(1).and_then(|v| v.as_str()) == Some("o") {
+                if let Some(s) = ev.get(2).and_then(|v| v.as_str()) {
+                    out.push_str(s);
+                }
+            }
+        }
+    }
+    let out = strip_ansi(&out);
+    let n = out.chars().count();
+    let tail: String = if n > max_chars {
+        out.chars().skip(n - max_chars).collect()
+    } else {
+        out
+    };
+    let tail = tail.trim().to_string();
+    (!tail.is_empty()).then_some(tail)
+}
+
 #[async_trait]
 impl BenchmarkAdapter for TerminalBenchAdapter {
     fn name(&self) -> &str {
@@ -307,6 +396,10 @@ impl BenchmarkAdapter for TerminalBenchAdapter {
                 Ok(r)
             }
             Ok(output) => {
+                // The agent's in-container session recording (the commands it ran, the errors it hit)
+                // — fed to the reviewer so it can diagnose in-container friction pass/fail can't show.
+                let transcript =
+                    find_file(&out, "agent.cast", 7).and_then(|p| decode_cast_tail(&p, 3000));
                 if let Some(p) = parse_results(&out, task_id) {
                     let tokens = if p.input + p.output > 0 {
                         Some(Usage {
@@ -333,6 +426,7 @@ impl BenchmarkAdapter for TerminalBenchAdapter {
                         flow_db: None,
                         timed_out: false,
                         note: p.failure,
+                        transcript,
                     })
                 } else {
                     // No parseable results — surface tb's tail for debugging.
@@ -344,14 +438,16 @@ impl BenchmarkAdapter for TerminalBenchAdapter {
                         .take(8)
                         .collect::<Vec<_>>()
                         .join(" | ");
-                    Ok(RunResult::failed(
+                    let mut r = RunResult::failed(
                         task_id,
                         wall_ms,
                         format!(
                             "tb run: no results.json parsed (exit {}): {tail}",
                             output.exit_code
                         ),
-                    ))
+                    );
+                    r.transcript = transcript;
+                    Ok(r)
                 }
             }
         }
@@ -427,6 +523,37 @@ mod tests {
         assert_eq!(p.checks_total, 6);
         assert_eq!(p.checks_passed, 5);
         assert_eq!(p.failed_checks, vec!["test_negative_number".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn decode_cast_tail_extracts_output_and_strips_ansi() {
+        let dir = std::env::temp_dir().join(format!("tb-cast-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cast = dir.join("agent.cast");
+        let lines = [
+            r#"{"version":2,"width":80,"height":24}"#,
+            r#"[0.1,"o","\u001b[32mnode: not found\u001b[0m\r\n"]"#,
+            r#"[0.2,"i","ignored keystrokes"]"#,
+            r#"[0.3,"o","python3 server.py\r\n"]"#,
+        ];
+        std::fs::write(&cast, lines.join("\n")).unwrap();
+        let t = decode_cast_tail(&cast, 1000).unwrap();
+        assert!(t.contains("node: not found"), "got: {t:?}");
+        assert!(t.contains("python3 server.py"));
+        assert!(!t.contains("ignored keystrokes")); // "i" (input) events are skipped
+        assert!(!t.contains('\u{1b}')); // ANSI stripped
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn find_file_locates_nested_cast() {
+        let dir = std::env::temp_dir().join(format!("tb-find-{}", std::process::id()));
+        let nested = dir.join("run/task/trial/sessions");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("agent.cast"), "x").unwrap();
+        assert!(find_file(&dir, "agent.cast", 7).is_some());
+        assert!(find_file(&dir, "missing.cast", 7).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 }
