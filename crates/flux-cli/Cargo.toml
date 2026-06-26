@@ -5,7 +5,7 @@ version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "the flux binary"
+description = "the flux binary — the LLM plans, the runtime runs: compile a request into a deterministic Flux-Lang plan and execute it through the safety envelope"
 
 [[bin]]
 name = "flux"
