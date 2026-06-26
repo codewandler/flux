@@ -146,15 +146,21 @@ fn check_node(node: &Node, registry: &OpRegistry, diags: &mut Vec<Diagnostic>) {
                 }
             }
         }
-        Node::Throttle { max, body, .. } => {
+        Node::Throttle { max, name, body, .. } => {
             if *max == 0 {
                 diags.push(Diagnostic::new("`throttle` requires a non-zero `max`"));
+            }
+            if name.is_empty() {
+                diags.push(Diagnostic::new("`throttle` requires a non-empty `name`"));
             }
             for n in body {
                 check_node(n, registry, diags);
             }
         }
-        Node::Debounce { body, .. } => {
+        Node::Debounce { name, body, .. } => {
+            if name.is_empty() {
+                diags.push(Diagnostic::new("`debounce` requires a non-empty `name`"));
+            }
             for n in body {
                 check_node(n, registry, diags);
             }
@@ -194,6 +200,15 @@ fn check_node(node: &Node, registry: &OpRegistry, diags: &mut Vec<Diagnostic>) {
         }
         Node::Fmt { .. } => {}
         Node::Jq { input, .. } => check_node(input, registry, diags),
+        Node::Parse { value, as_type } => {
+            const VALID: &[&str] = &["f64", "i64", "bool", "json", "string"];
+            if !VALID.contains(&as_type.as_str()) {
+                diags.push(Diagnostic::new(format!(
+                    "`parse` as_type must be one of f64/i64/bool/json/string, got `{as_type}`"
+                )));
+            }
+            check_node(value, registry, diags);
+        }
         Node::Await { .. }
         | Node::Peek { .. }
         | Node::Var { .. }

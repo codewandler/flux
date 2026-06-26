@@ -323,6 +323,7 @@ fn head(node: &Node, p: &Palette) -> String {
         Node::Var { name } => sym(p, &name.0),
         Node::Lit { value } => lit(value, p),
         Node::Thing { thing } => thing_str(thing, p),
+        Node::Parse { .. } => paint(p.keyword, "parse"),
     }
 }
 
@@ -359,7 +360,8 @@ fn expr(node: &Node, p: &Palette) -> String {
         | Node::Peek { .. }
         | Node::Expr { .. }
         | Node::Fmt { .. }
-        | Node::Jq { .. } => "…".to_string(),
+        | Node::Jq { .. }
+        | Node::Parse { .. } => "…".to_string(),
     }
 }
 

@@ -331,6 +331,10 @@ pub enum Node {
         until: Option<Box<Node>>,
         #[serde(default)]
         body: Vec<Node>,
+        /// Optional symbol bound to a [`Value::List`] of each iteration's last result.
+        /// Mirrors `each`'s `collect` field for counter-driven loops.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        collect: Option<SymbolName>,
     },
     /// Map a list value through a body (list-driven loop; `repeat` stays counter-driven). Each element
     /// is bound to `as`; an optional `collect` symbol gathers the per-iteration results into a list.
@@ -454,8 +458,11 @@ pub enum Node {
         bind: Option<SymbolName>,
     },
     /// Rate-limit body execution: at most `max` dispatches per `window_ms` sliding window.
-    /// The token bucket is tracked in-process; plan authors declare intent, runtime enforces.
+    /// The token bucket is tracked in the session store keyed by `name`; plan authors declare intent,
+    /// runtime enforces. `name` must be unique within a session to avoid bucket collisions.
     Throttle {
+        /// Stable bucket name — keyed in the session store so the limit persists across turns.
+        name: String,
         max: u32,
         window_ms: u64,
         #[serde(default)]
@@ -463,7 +470,10 @@ pub enum Node {
     },
     /// Coalesce rapid re-invocations: wait `wait_ms` after the last trigger before running body.
     /// In a `loop`/`watch` context the body only executes when things have settled.
+    /// `name` is used as a stable key so debounce state survives across turns.
     Debounce {
+        /// Stable key name for this debounce site.
+        name: String,
         wait_ms: u64,
         #[serde(default)]
         body: Vec<Node>,
@@ -515,6 +525,15 @@ pub enum Node {
     /// `"results[0].value"`) applied to the JSON content of `input` (a `Var` or `Lit` node).
     /// No IO, no approval gate. Example: `jq(".bitcoin.usd", $raw)`.
     Jq { path: String, input: Box<Node> },
+
+    /// Pure type coercion. Converts the string result of a `jq` or `fmt` node into a typed
+    /// value. `as_type` is one of `"f64"`, `"i64"`, `"bool"`, `"json"`, `"string"`.
+    /// No IO, no approval gate. Example: `parse(jq(".price", $raw), as: "f64")`.
+    Parse {
+        value: Box<Node>,
+        #[serde(rename = "as")]
+        as_type: String,
+    },
 }
 
 /// One branch of a [`Node::Parallel`] fan-out: a named sub-flow whose final result is bound to
