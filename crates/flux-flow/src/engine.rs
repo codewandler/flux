@@ -155,18 +155,10 @@ impl FlowEngine {
                         .await
                     {
                         Ok(outcome) => {
-                            // The plan carried a closing message ⇒ it completes the request: show it and
-                            // end the turn — one round, no extra "summarize" call.
-                            if let Some(reply) = compiled.reply {
-                                sink.text_delta(&reply);
-                                shown = true;
-                                answer = Some(reply);
-                                break;
-                            }
-                            // No reply ⇒ the model needs to see the results before it can answer. Feed
-                            // back the full transcript (EVERY read/call node's view), not just the last
-                            // node — otherwise a plan that reads N files surfaces only file N and the
-                            // model re-reads the rest every round (an infinite read loop).
+                            // Feed back the full transcript (EVERY read/call node's view), not just the
+                            // last node — otherwise a plan that reads N files surfaces only file N and the
+                            // model re-reads the rest every round (an infinite read loop). Both paths
+                            // below see these results: the grounded `complete` call, and the next round.
                             let result = if !outcome.transcript.trim().is_empty() {
                                 outcome.transcript.clone()
                             } else if !outcome.result.trim().is_empty() {
@@ -181,6 +173,25 @@ impl FlowEngine {
                                 "[results]\n{result}\n\nAnswer the user now, or emit another plan if \
                                  more work is needed."
                             )));
+                            // The plan carried a `complete` directive ⇒ it finishes the request. Render
+                            // the final message NOW, grounded in the results we just fed back (never a
+                            // pre-composed summary), then end the turn.
+                            if let Some(directive) = compiled.complete {
+                                let summary = crate::compile::render_completion(
+                                    &*self.provider,
+                                    &self.model,
+                                    &working,
+                                    &directive,
+                                    self.max_tokens,
+                                )
+                                .await?;
+                                sink.text_delta(&summary);
+                                shown = true;
+                                answer = Some(summary);
+                                break;
+                            }
+                            // No `complete` ⇒ keep looping: next round the model answers in prose (which
+                            // ends the turn) or emits another plan — the standard agent loop.
                         }
                         // Feed the error back so the model can self-correct (model-in-the-loop),
                         // bounded by max_iterations.
@@ -604,14 +615,15 @@ mod tests {
         }
     }
 
-    /// One model turn that emits an `emit_plan` tool call carrying `ast` (and an optional `reply`).
+    /// One model turn that emits an `emit_plan` tool call carrying `ast` (and an optional `complete`
+    /// directive whose `instructions` are the given string).
     fn emit_plan(ast: serde_json::Value) -> Vec<Chunk> {
-        emit_plan_reply(ast, None)
+        emit_plan_complete(ast, None)
     }
-    fn emit_plan_reply(ast: serde_json::Value, reply: Option<&str>) -> Vec<Chunk> {
+    fn emit_plan_complete(ast: serde_json::Value, complete: Option<&str>) -> Vec<Chunk> {
         let mut input = json!({ "ast": ast });
-        if let Some(r) = reply {
-            input["reply"] = json!(r);
+        if let Some(instructions) = complete {
+            input["complete"] = json!({ "instructions": instructions });
         }
         vec![
             Chunk::Block(ContentBlock::ToolUse {
@@ -737,7 +749,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_with_reply_ends_in_one_round() {
+    async fn plan_without_complete_loops_to_prose() {
         let store = Arc::new(SessionStore::in_memory().unwrap());
         let sid = store.create_session("mock").unwrap();
         let plan_ast = json!({
@@ -746,11 +758,36 @@ mod tests {
                 "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "hi" }] }
             }]
         });
-        // Round 1 emits a plan WITH a closing reply → the turn ends after running it. The second
-        // response must never be consumed (no "summarize" round).
+        // No `complete` ⇒ the standard agent loop: run the plan, feed results back, and the model ends
+        // the turn by answering in prose the next round.
+        let responses = VecDeque::from(vec![emit_plan(plan_ast), prose("Echoed hi.")]);
+        let engine = engine_with(responses, store.clone());
+        let mut sink = CollectSink::default();
+        engine.run_turn(&sid, "echo hi", &mut sink).await.unwrap();
+
+        assert_eq!(sink.tools, vec!["echo"], "the plan executed");
+        let msgs = store.load_messages(&sid).unwrap();
+        assert_eq!(msgs.len(), 2, "user + the prose answer");
+        assert!(msgs[1].text().contains("Echoed hi."));
+    }
+
+    #[tokio::test]
+    async fn plan_with_complete_renders_grounded_summary() {
+        let store = Arc::new(SessionStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let plan_ast = json!({
+            "body": [{
+                "kind": "bind", "name": "greeting",
+                "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "hi" }] }
+            }]
+        });
+        // Round 1 emits a plan WITH a `complete` directive. The engine runs the plan, then makes a
+        // grounded (no-tools) call to render the final message — which consumes the NEXT queued
+        // response. That response is the summary; it is what gets shown and persisted (proving the
+        // final text is produced post-execution, not pre-composed in the tool call).
         let responses = VecDeque::from(vec![
-            emit_plan_reply(plan_ast, Some("Echoed hi.")),
-            prose("SHOULD NOT BE REACHED"),
+            emit_plan_complete(plan_ast, Some("summarize what the plan did")),
+            prose("Ran echo and it returned hi."),
         ]);
         let engine = engine_with(responses, store.clone());
         let mut sink = CollectSink::default();
@@ -758,11 +795,14 @@ mod tests {
 
         assert_eq!(sink.tools, vec!["echo"], "the plan still executed");
         let msgs = store.load_messages(&sid).unwrap();
-        assert_eq!(msgs.len(), 2, "user + the reply — one round");
-        assert!(msgs[1].text().contains("Echoed hi."));
+        assert_eq!(msgs.len(), 2, "user + the grounded summary — one completion");
         assert!(
-            !msgs[1].text().contains("SHOULD NOT"),
-            "the second model round must not run"
+            msgs[1].text().contains("Ran echo and it returned hi."),
+            "the persisted answer is the grounded summary, not the directive"
+        );
+        assert!(
+            !msgs[1].text().contains("summarize what the plan did"),
+            "the directive instructions must not leak into the final message"
         );
     }
 

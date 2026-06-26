@@ -1910,8 +1910,8 @@ impl Provider for MockCliProvider {
             return Ok(Box::pin(s));
         }
 
-        // Safety net: after the (single) planning round the engine ends the turn (the plan carries a
-        // `reply`), so this branch shouldn't be hit — but if the provider is re-invoked, answer plainly.
+        // Second call: the plan (emitted on the first call with no `complete`) has run and its results
+        // were fed back, so the engine loops here — answer in prose, which ends the turn.
         if n > 0 {
             let chunks = vec![
                 Chunk::Block(ContentBlock::Text {
@@ -1927,52 +1927,43 @@ impl Provider for MockCliProvider {
         // Build a one-shot Flux-Lang plan (the engine is pure-DAG, so the model emits `emit_plan`).
         // `FLUX_MOCK_TOOL` calls any tool (input = `FLUX_MOCK_TOOL_INPUT`, passed as a lone object so
         // it maps straight to the tool's named input); `FLUX_MOCK_BASH` runs a `bash` command; the
-        // default writes `flux-mock.txt`. A `reply` makes the engine run the plan and stop in one round.
-        let (ast, reply): (serde_json::Value, String) =
-            if let Ok(tool) = std::env::var("FLUX_MOCK_TOOL") {
-                let input: serde_json::Value = std::env::var("FLUX_MOCK_TOOL_INPUT")
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_else(|| serde_json::json!({}));
-                (
-                    serde_json::json!({
-                        "body": [{
-                            "kind": "call", "op": tool,
-                            "args": [{ "kind": "lit", "value": input }]
-                        }]
-                    }),
-                    format!("Called `{tool}`."),
-                )
-            } else if let Ok(cmd) = std::env::var("FLUX_MOCK_BASH") {
-                (
-                    serde_json::json!({
-                        "body": [{
-                            "kind": "call", "op": "bash",
-                            "args": [{ "kind": "lit", "value": cmd }]
-                        }]
-                    }),
-                    format!("Ran `{cmd}`."),
-                )
-            } else {
-                (
-                    serde_json::json!({
-                        "body": [{
-                            "kind": "call", "op": "write",
-                            "args": [
-                                { "kind": "lit", "value": "flux-mock.txt" },
-                                { "kind": "lit", "value": "created by flux mock\n" }
-                            ]
-                        }]
-                    }),
-                    "Wrote flux-mock.txt.".to_string(),
-                )
-            };
+        // default writes `flux-mock.txt`. No `complete` ⇒ the engine loops, and the second call (above)
+        // ends the turn in prose.
+        let ast: serde_json::Value = if let Ok(tool) = std::env::var("FLUX_MOCK_TOOL") {
+            let input: serde_json::Value = std::env::var("FLUX_MOCK_TOOL_INPUT")
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            serde_json::json!({
+                "body": [{
+                    "kind": "call", "op": tool,
+                    "args": [{ "kind": "lit", "value": input }]
+                }]
+            })
+        } else if let Ok(cmd) = std::env::var("FLUX_MOCK_BASH") {
+            serde_json::json!({
+                "body": [{
+                    "kind": "call", "op": "bash",
+                    "args": [{ "kind": "lit", "value": cmd }]
+                }]
+            })
+        } else {
+            serde_json::json!({
+                "body": [{
+                    "kind": "call", "op": "write",
+                    "args": [
+                        { "kind": "lit", "value": "flux-mock.txt" },
+                        { "kind": "lit", "value": "created by flux mock\n" }
+                    ]
+                }]
+            })
+        };
 
         let chunks = vec![
             Chunk::Block(ContentBlock::ToolUse {
                 id: "plan1".into(),
                 name: "emit_plan".into(),
-                input: serde_json::json!({ "ast": ast, "reply": reply }),
+                input: serde_json::json!({ "ast": ast }),
             }),
             Chunk::Done {
                 stop_reason: Some(StopReason::ToolUse),

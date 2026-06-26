@@ -58,10 +58,24 @@ pub struct Compiled {
     pub ast: DraftAst,
     pub attempts: u32,
     pub diagnostics: Vec<Diagnostic>,
-    /// The model's one-line closing message, attached to `emit_plan` when this plan *completes* the
-    /// request. When set, the engine runs the plan, shows it, and ends the turn — no extra "summarize"
-    /// round. `None` means "I need to see the results first" → the engine loops (read→reason).
-    pub reply: Option<String>,
+    /// The model's completion signal, attached to `emit_plan` when this plan *completes* the request.
+    /// When set, the engine runs the plan and then writes the final user message from the *actual*
+    /// results (a grounded post-execution call) per the [`Completion`] instructions — never a
+    /// pre-composed summary. `None` means "keep going" → the engine loops, and the model ends the turn
+    /// by answering in prose once it has seen what it needs (the standard agent loop).
+    pub complete: Option<Completion>,
+}
+
+/// The model's turn-completion directive (the optional `complete` field of `emit_plan`). It carries
+/// *instructions* for the final message — rendered **after** the plan runs, against the real results —
+/// not the message text itself, so a closing summary can never promise output it hasn't seen.
+#[derive(Debug, Clone)]
+pub struct Completion {
+    /// Optional short human-facing context the model already knows (e.g. "Build green."), folded into
+    /// the grounded summary call as a hint.
+    pub primer: Option<String>,
+    /// What the final message should say, e.g. "summarize what changed and why".
+    pub instructions: String,
 }
 
 /// What the planner produced for a turn: an executable plan, or a plain-prose answer (a chat turn —
@@ -108,7 +122,7 @@ pub async fn compile(
                         ast,
                         attempts: attempt,
                         diagnostics: Vec::new(),
-                        reply: None,
+                        complete: None,
                     })
                 }
                 Err(diags) => {
@@ -117,7 +131,7 @@ pub async fn compile(
                             ast,
                             attempts: attempt,
                             diagnostics: diags,
-                            reply: None,
+                            complete: None,
                         });
                     }
                     last_err = join_diags(&diags);
@@ -208,7 +222,7 @@ pub async fn compile_turn(
                         ast,
                         attempts: step,
                         diagnostics: Vec::new(),
-                        reply: None,
+                        complete: None,
                     }));
                 }
             }
@@ -243,14 +257,10 @@ pub async fn compile_turn(
         for (id, name, input) in tool_uses {
             match name.as_str() {
                 "emit_plan" => {
-                    // The model's optional one-line closing message (captured before `input` is moved):
-                    // present ⇒ this plan completes the task, so the engine ends the turn after running it.
-                    let reply = input
-                        .get("reply")
-                        .and_then(|v| v.as_str())
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string);
+                    // The model's optional completion directive (captured before `input` is moved):
+                    // present ⇒ this plan completes the request, so the engine renders the final message
+                    // from the results after running. Absent ⇒ the engine loops (the model answers later).
+                    let complete = parse_completion(input.get("complete"));
                     let ast_val = input.get("ast").cloned().unwrap_or(input);
                     match serde_json::from_value::<DraftAst>(ast_val) {
                         Ok(ast) => {
@@ -265,7 +275,7 @@ pub async fn compile_turn(
                                         ast,
                                         attempts: step,
                                         diagnostics: Vec::new(),
-                                        reply,
+                                        complete,
                                     });
                                 }
                                 Err(diags) => {
@@ -280,7 +290,7 @@ pub async fn compile_turn(
                                             ast,
                                             attempts: step,
                                             diagnostics: diags,
-                                            reply,
+                                            complete,
                                         });
                                     } else {
                                         results.push(ContentBlock::tool_result_text(
@@ -374,6 +384,77 @@ async fn run_model(
         }
     }
     Ok(out)
+}
+
+/// Parse the optional `complete` field of an `emit_plan` call into a [`Completion`]. Lenient: accepts a
+/// bare string (`"summarize X"` → instructions, no primer) or an object (`{primer?, instructions}`).
+/// Anything without usable `instructions` ⇒ `None`, so the engine simply loops (the model answers in
+/// prose later) rather than completing on a malformed signal.
+fn parse_completion(value: Option<&serde_json::Value>) -> Option<Completion> {
+    let value = value?;
+    let nonempty = |s: &str| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+    match value {
+        serde_json::Value::String(s) => nonempty(s).map(|instructions| Completion {
+            primer: None,
+            instructions,
+        }),
+        serde_json::Value::Object(map) => {
+            let instructions = map.get("instructions").and_then(|v| v.as_str()).and_then(nonempty)?;
+            let primer = map.get("primer").and_then(|v| v.as_str()).and_then(nonempty);
+            Some(Completion {
+                primer,
+                instructions,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Render the turn's final user-facing message **after** the plan has run, grounded in its actual
+/// results. The engine calls this when a plan carried a [`Completion`]: `conversation` is the working
+/// log (already extended with the user's request and the fed-back `[results]`), so the model writes the
+/// summary from what really happened — never a pre-composed promise. No tools are offered, so this call
+/// cannot recurse into planning; it just produces prose.
+pub async fn render_completion(
+    provider: &dyn Provider,
+    model: &str,
+    conversation: &[Message],
+    directive: &Completion,
+    max_tokens: u32,
+) -> Result<String> {
+    let primer = directive
+        .primer
+        .as_deref()
+        .map(|p| format!(" Context you already know: {p}."))
+        .unwrap_or_default();
+    let system = format!(
+        "The plan has run and its results are in the conversation above. Write the final message to \
+         the user now, grounded in those actual results — do not predict or invent outcomes, and do \
+         not narrate the runtime mechanics.{primer}\n\nWrite the message per these instructions: \
+         {instructions}\n\nRespond with the message text only — no tool calls, no preamble.",
+        instructions = directive.instructions,
+    );
+    let req = Request {
+        model: model.to_string(),
+        system: Some(system),
+        messages: conversation.to_vec(),
+        tools: Vec::new(),
+        max_tokens,
+        temperature: None,
+        top_p: None,
+        stop_sequences: Vec::new(),
+        thinking: false,
+        effort: None,
+        metadata: serde_json::Map::new(),
+    };
+    let (mut blocks, acc_text, _stop) = stream_blocks(provider, req).await?;
+    if blocks.is_empty() && !acc_text.trim().is_empty() {
+        blocks.push(ContentBlock::Text { text: acc_text });
+    }
+    Ok(Message::assistant(blocks).text())
 }
 
 /// Stream a turn, collecting content blocks (tool_use, text), the accumulated text delta, and the
@@ -577,11 +658,14 @@ fn build_planner_prompt(ops: &OpRegistry, view: Option<&SessionView>, interactiv
         "You are Flux-Lang's planning agent. For the user's request, either call `emit_plan` with ONE \
 execution plan (a Flux-Lang flow AST) that accomplishes it, or — if the request needs no operations or is \
 ALREADY satisfied by results shown earlier in the conversation — answer directly in prose (do NOT emit a \
-plan, and do NOT repeat work already done).\n\nWhen a plan COMPLETES the request, pass a one-line \
-`reply` to `emit_plan` (your closing message to the user) — the runtime runs the plan, shows your \
-`reply`, and the turn ends; do NOT narrate what the runtime did. Omit `reply` only when you must SEE \
-the results before you can answer (e.g. you read a file to reason about it) — you'll get the results \
-and can answer or plan again.\n\nYou have NO directly-callable tools except `emit_plan`\
+plan, and do NOT repeat work already done).\n\nWhen a plan COMPLETES the request, attach `complete` to \
+`emit_plan` — NOT the finished message, but `instructions` for it (e.g. \"summarize what changed and \
+why\") plus an optional one-line `primer` of context you already know. The runtime runs the plan and \
+THEN writes your final message to the user from the ACTUAL results per your `instructions`, and the \
+turn ends. Never pre-write the closing summary yourself — you have not seen the results yet, so a \
+summary you compose now can only promise output you cannot have. Omit `complete` whenever you need to \
+SEE the results before you can answer or to keep working — you'll get the results back and can plan \
+again or answer directly in prose (answering in prose ends the turn).\n\nYou have NO directly-callable tools except `emit_plan`\
 {ask_line} — you cannot run `read`/`grep`/`bash`/etc. yourself. To gather information, put `read`/`grep`/\
 `glob` as NODES in a plan and emit it; the runtime executes the plan and gives you the results, so you \
 can plan the next step. Put the WHOLE task in one plan rather than many tiny plans.\n\nIMPORTANT — \
@@ -609,17 +693,30 @@ fn planner_tools(interactive: bool) -> Vec<ToolDef> {
     tools.push(ToolDef {
         name: "emit_plan".to_string(),
         description: "Emit the Flux-Lang flow AST to run (your only way to act). Pass the AST as `ast`. \
-                      If this plan completes the request, also pass `reply` — a one-line closing message \
-                      to the user — and the turn ends after running. Omit `reply` if you must see the \
-                      results before you can answer."
+                      If this plan completes the request, also pass `complete` — `instructions` for your \
+                      final message (the runtime writes it from the actual results and ends the turn), \
+                      NOT the message itself. Omit `complete` if you must see the results before you can \
+                      answer, or to keep working; then answer in prose once done."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "ast": { "type": "object", "description": "The flow AST (DraftAst) as JSON" },
-                "reply": {
-                    "type": "string",
-                    "description": "One-line closing message, ONLY if this plan completes the request"
+                "complete": {
+                    "type": "object",
+                    "description": "Attach ONLY when this plan completes the request. Instructions for the \
+                                    final message, rendered from the real results after the plan runs.",
+                    "properties": {
+                        "instructions": {
+                            "type": "string",
+                            "description": "What the final message should say, e.g. \"summarize what changed and why\""
+                        },
+                        "primer": {
+                            "type": "string",
+                            "description": "Optional one-line context you already know (e.g. \"Build green.\")"
+                        }
+                    },
+                    "required": ["instructions"]
                 }
             },
             "required": ["ast"]
@@ -935,46 +1032,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emit_plan_captures_optional_reply() {
+    async fn emit_plan_captures_optional_complete() {
         let reg = full_registry();
         let ops = OpRegistry::new(&reg);
+        let ast = serde_json::json!({
+            "body": [{ "kind": "call", "op": "read", "args": [{ "kind": "lit", "value": "x" }] }]
+        });
 
-        // `emit_plan` with a `reply` → captured on the Compiled (the engine ends the turn with it).
-        let with_reply = r#"{"ast":{"body":[{"kind":"call","op":"read","args":[{"kind":"lit","value":"x"}]}]},"reply":"all done"}"#;
+        // Object form: `{primer, instructions}` → captured on the Compiled.
         let p = mock(vec![tool_call(
             "emit_plan",
-            serde_json::from_str(with_reply).unwrap(),
+            serde_json::json!({
+                "ast": ast,
+                "complete": { "primer": "build green", "instructions": "summarize what changed" }
+            }),
         )]);
-        let out = plan(
-            &p,
-            "mock",
-            "do it",
-            &ops,
-            None,
-            None,
-            CompileOptions::default(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(out.reply.as_deref(), Some("all done"));
+        let out = plan(&p, "mock", "do it", &ops, None, None, CompileOptions::default())
+            .await
+            .unwrap();
+        let c = out.complete.expect("object complete captured");
+        assert_eq!(c.instructions, "summarize what changed");
+        assert_eq!(c.primer.as_deref(), Some("build green"));
 
-        // `emit_plan` without a `reply` → None (the engine loops to let the model answer).
+        // Bare-string form → instructions only, no primer (leniency).
+        let p = mock(vec![tool_call(
+            "emit_plan",
+            serde_json::json!({ "ast": ast, "complete": "all done" }),
+        )]);
+        let out = plan(&p, "mock", "do it", &ops, None, None, CompileOptions::default())
+            .await
+            .unwrap();
+        let c = out.complete.expect("string complete captured");
+        assert_eq!(c.instructions, "all done");
+        assert_eq!(c.primer, None);
+
+        // Absent → None (the engine loops to let the model answer in prose).
         let p = mock(vec![tool_call(
             "emit_plan",
             serde_json::from_str(VALID_AST).unwrap(),
         )]);
-        let out = plan(
-            &p,
-            "mock",
-            "do it",
-            &ops,
-            None,
-            None,
-            CompileOptions::default(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(out.reply, None);
+        let out = plan(&p, "mock", "do it", &ops, None, None, CompileOptions::default())
+            .await
+            .unwrap();
+        assert!(out.complete.is_none());
     }
 
     // ---- one-shot compile (with the view param) ----

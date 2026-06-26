@@ -122,8 +122,10 @@ user_input + conversation + view(Session)
               Executor::dispatch per call node; bind/call/return + when/repeat/each/seq/pipe/assert/memo/parallel;
               per-op approval at dispatch (destructive escalates); !model ops use the ModelClient seam
             → ValueStore writes + RunEvent trace + live node status (sink)
-  → emit_plan carried a `reply` (plan completes the task) → show it, turn ends (ONE round)
-  → else feed the plan's result back *ephemerally* and loop (read→reason) until reply/prose
+  → feed the plan's result back *ephemerally* and loop (read→reason); the model ends the turn by
+      answering in prose once it has seen what it needs (standard agent loop)
+  → emit_plan carried a `complete` directive (plan completes the task) → after running, render the
+      final message from the ACTUAL results via a grounded no-tools call, then end the turn
   → persist Session' + ONE assistant summary into the message log
 ```
 **Pure DAG:** the model has no directly-callable ops — *every* operation, reads included, is a node in
@@ -313,13 +315,16 @@ Resolved in design (no longer open):
   runtime executes it and feeds the result back so it can plan the next step (the engine's multi-round
   loop). The planner is **session-aware** (`view(Session)` lets it reference existing `$symbols`) and is
   told to express control flow as `repeat`/`when` nodes, never shell loops, so the plan stays auditable.
-  **Turn completion:** `emit_plan` takes an optional `reply` (a one-line closing message); when the plan
-  *completes* the request the model attaches it, and the engine runs the plan, shows `reply`, and ends —
-  **one round**, no extra "summarize" call. Omitting `reply` is the read→reason case (loop). Trade-off:
-  read-then-act tasks take an extra round (a read is its own plan round); re-enabling read-only research
-  is a one-line revert. Verified live — `print hello 3×` plans `repeat max 3 { bash }` and ends in one
-  round with `Printed "Hello, World!" 3 times.`; `read README then answer` reads in round 1 and answers
-  in round 2 from the fed-back content.
+  **Turn completion (loop to prose, optional grounded `complete`).** The engine is the standard agent
+  loop: it feeds each plan's results back and loops until the model **answers in prose**, so the final
+  message is always written *after* the model has seen results — a closing summary can never promise
+  output it hasn't observed. As a fast-path, `emit_plan` takes an optional `complete` directive — not a
+  pre-written message, but *instructions* for one (`{instructions, primer?}`). When the plan completes
+  the request the model attaches it; the engine runs the plan, then makes ONE lean **no-tools** call
+  (`compile::render_completion`) that writes the final message from the ACTUAL results per those
+  instructions, and ends — so the fast-path is still grounded, never pre-composed. (This replaces the
+  earlier pre-composed `reply`, which was an argument to `emit_plan` and therefore composed *before* the
+  plan ran — structurally unable to reflect results, so it could only promise a summary. See §11.)
 - **The planner is the engine (one engine, no fallback).** `compile::compile_turn` plans a turn from the
   *conversation* and returns `TurnOutput::Plan` (a graph to execute) or `TurnOutput::Chat` (a prose
   answer); `FlowEngine` drives it every turn. **Two modes:** *normal* (plan + execute) is the default;
