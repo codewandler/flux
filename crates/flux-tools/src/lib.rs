@@ -191,6 +191,12 @@ pub fn register_builtins(registry: &mut ToolRegistry) {
     registry.register(Arc::new(GrepTool));
     registry.register(Arc::new(GitStageTool));
     registry.register(Arc::new(GitCommitTool));
+    registry.register(Arc::new(GitStatusTool));
+    registry.register(Arc::new(GitDiffTool));
+    registry.register(Arc::new(GitLogTool));
+    registry.register(Arc::new(GitPushTool));
+    registry.register(Arc::new(GitCheckoutTool));
+    registry.register(Arc::new(GitUnstageTool));
 }
 
 // ---------------------------------------------------------------------------
@@ -1640,6 +1646,364 @@ impl Tool for GitCommitTool {
             )));
         }
         Ok(ToolResult::ok(body))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// git_status
+// ---------------------------------------------------------------------------
+
+pub struct GitStatusTool;
+
+#[async_trait]
+impl Tool for GitStatusTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_status".into(),
+            description: "Show the working tree status (like `git status --short`). Returns a list \
+                          of modified, staged, and untracked files."
+                .into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+            output_schema: None,
+            effects: vec![Effect::Process],
+            risk: Risk::Low,
+            idempotency: Idempotency::Idempotent,
+            access: vec![AccessKind::Process],
+        }
+    }
+
+    fn permission_subjects(&self, _params: &Value) -> Vec<String> {
+        vec!["git_status".to_string()]
+    }
+
+    fn intents(&self, _params: &Value) -> IntentSet {
+        let mut set = IntentSet::new();
+        set.push(Intent {
+            behavior: IntentBehavior::CommandExecution,
+            target: IntentTarget::Process { command: "git status --short".to_string() },
+            role: IntentRole::ProcessCommand,
+            certainty: IntentCertainty::Certain,
+        });
+        set
+    }
+
+    async fn execute(&self, ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
+        let argv = vec!["git".to_string(), "status".to_string(), "--short".to_string()];
+        let out = ctx.system.run(&argv, Duration::from_secs(30)).await?;
+        let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
+        if out.exit_code != 0 {
+            return Ok(ToolResult::error(format!("git status failed [exit {}]: {body}", out.exit_code)));
+        }
+        Ok(ToolResult::ok(if body.is_empty() { "nothing to commit, working tree clean".to_string() } else { body }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// git_diff
+// ---------------------------------------------------------------------------
+
+pub struct GitDiffTool;
+
+#[async_trait]
+impl Tool for GitDiffTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_diff".into(),
+            description: "Show unstaged changes (or staged changes with `staged: true`). Optional \
+                          `path` restricts the diff to a specific file."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Restrict diff to this file (optional)"},
+                    "staged": {"type": "boolean", "description": "Show staged (index) diff instead of unstaged"}
+                }
+            }),
+            output_schema: None,
+            effects: vec![Effect::Process],
+            risk: Risk::Low,
+            idempotency: Idempotency::Idempotent,
+            access: vec![AccessKind::Process],
+        }
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        params.get("path").and_then(|v| v.as_str())
+            .map(|s| vec![s.to_string()])
+            .unwrap_or_else(|| vec!["git_diff".to_string()])
+    }
+
+    fn intents(&self, _params: &Value) -> IntentSet {
+        let mut set = IntentSet::new();
+        set.push(Intent {
+            behavior: IntentBehavior::CommandExecution,
+            target: IntentTarget::Process { command: "git diff".to_string() },
+            role: IntentRole::ProcessCommand,
+            certainty: IntentCertainty::Certain,
+        });
+        set
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let staged = params.get("staged").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mut argv = vec!["git".to_string(), "diff".to_string()];
+        if staged { argv.push("--staged".to_string()); }
+        if let Some(p) = params.get("path").and_then(|v| v.as_str()) {
+            argv.push("--".to_string());
+            argv.push(p.to_string());
+        }
+        let out = ctx.system.run(&argv, Duration::from_secs(30)).await?;
+        let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
+        if out.exit_code != 0 {
+            return Ok(ToolResult::error(format!("git diff failed [exit {}]: {body}", out.exit_code)));
+        }
+        Ok(ToolResult::ok(if body.is_empty() { "no changes".to_string() } else { body }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// git_log
+// ---------------------------------------------------------------------------
+
+pub struct GitLogTool;
+
+#[async_trait]
+impl Tool for GitLogTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_log".into(),
+            description: "Show recent commits (hash + subject). Optional `limit` controls how many \
+                          entries are returned (default 10)."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Number of commits to show (default 10)"}
+                }
+            }),
+            output_schema: None,
+            effects: vec![Effect::Process],
+            risk: Risk::Low,
+            idempotency: Idempotency::Idempotent,
+            access: vec![AccessKind::Process],
+        }
+    }
+
+    fn permission_subjects(&self, _params: &Value) -> Vec<String> {
+        vec!["git_log".to_string()]
+    }
+
+    fn intents(&self, _params: &Value) -> IntentSet {
+        let mut set = IntentSet::new();
+        set.push(Intent {
+            behavior: IntentBehavior::CommandExecution,
+            target: IntentTarget::Process { command: "git log".to_string() },
+            role: IntentRole::ProcessCommand,
+            certainty: IntentCertainty::Certain,
+        });
+        set
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let limit = u64_arg(&params, "limit").unwrap_or(10);
+        let argv = vec![
+            "git".to_string(), "log".to_string(),
+            format!("-{limit}"),
+            "--oneline".to_string(),
+        ];
+        let out = ctx.system.run(&argv, Duration::from_secs(30)).await?;
+        let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
+        if out.exit_code != 0 {
+            return Ok(ToolResult::error(format!("git log failed [exit {}]: {body}", out.exit_code)));
+        }
+        Ok(ToolResult::ok(if body.is_empty() { "no commits".to_string() } else { body }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// git_push
+// ---------------------------------------------------------------------------
+
+pub struct GitPushTool;
+
+#[async_trait]
+impl Tool for GitPushTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_push".into(),
+            description: "Push the current branch to its upstream remote. Optional `remote` \
+                          (default `origin`) and `branch` (default current branch)."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "remote": {"type": "string", "description": "Remote name (default `origin`)"},
+                    "branch": {"type": "string", "description": "Branch to push (default current branch)"}
+                }
+            }),
+            output_schema: None,
+            effects: vec![Effect::Process, Effect::Network],
+            risk: Risk::Medium,
+            idempotency: Idempotency::NonIdempotent,
+            access: vec![AccessKind::Process],
+        }
+    }
+
+    fn permission_subjects(&self, _params: &Value) -> Vec<String> {
+        vec!["git_push".to_string()]
+    }
+
+    fn intents(&self, params: &Value) -> IntentSet {
+        let remote = params.get("remote").and_then(|v| v.as_str()).unwrap_or("origin");
+        let mut set = IntentSet::new();
+        set.push(Intent {
+            behavior: IntentBehavior::CommandExecution,
+            target: IntentTarget::Process { command: format!("git push {remote}") },
+            role: IntentRole::ProcessCommand,
+            certainty: IntentCertainty::Certain,
+        });
+        set
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let remote = params.get("remote").and_then(|v| v.as_str()).unwrap_or("origin").to_string();
+        let mut argv = vec!["git".to_string(), "push".to_string(), remote];
+        if let Some(b) = params.get("branch").and_then(|v| v.as_str()) {
+            argv.push(b.to_string());
+        }
+        let out = ctx.system.run(&argv, Duration::from_secs(60)).await?;
+        let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
+        if out.exit_code != 0 {
+            return Ok(ToolResult::error(format!("git push failed [exit {}]: {body}", out.exit_code)));
+        }
+        Ok(ToolResult::ok(if body.is_empty() { "pushed".to_string() } else { body }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// git_checkout
+// ---------------------------------------------------------------------------
+
+pub struct GitCheckoutTool;
+
+#[async_trait]
+impl Tool for GitCheckoutTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_checkout".into(),
+            description: "Switch to a branch or create a new one. Set `create: true` to create \
+                          the branch (equivalent to `git checkout -b`)."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "branch": {"type": "string", "description": "Branch name to switch to or create"},
+                    "create": {"type": "boolean", "description": "Create the branch if it doesn't exist"}
+                },
+                "required": ["branch"]
+            }),
+            output_schema: None,
+            effects: vec![Effect::Process, Effect::LocalSystem],
+            risk: Risk::Medium,
+            idempotency: Idempotency::NonIdempotent,
+            access: vec![AccessKind::Process],
+        }
+    }
+
+    fn permission_subjects(&self, _params: &Value) -> Vec<String> {
+        vec!["git_checkout".to_string()]
+    }
+
+    fn intents(&self, params: &Value) -> IntentSet {
+        let branch = params.get("branch").and_then(|v| v.as_str()).unwrap_or("");
+        let mut set = IntentSet::new();
+        set.push(Intent {
+            behavior: IntentBehavior::CommandExecution,
+            target: IntentTarget::Process { command: format!("git checkout {branch}") },
+            role: IntentRole::ProcessCommand,
+            certainty: IntentCertainty::Certain,
+        });
+        set
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let branch = str_param(&params, "branch", "git_checkout")?;
+        let create = params.get("create").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mut argv = vec!["git".to_string(), "checkout".to_string()];
+        if create { argv.push("-b".to_string()); }
+        argv.push(branch.to_string());
+        let out = ctx.system.run(&argv, Duration::from_secs(30)).await?;
+        let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
+        if out.exit_code != 0 {
+            return Ok(ToolResult::error(format!("git checkout failed [exit {}]: {body}", out.exit_code)));
+        }
+        Ok(ToolResult::ok(if body.is_empty() { format!("switched to {branch}") } else { body }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// git_unstage
+// ---------------------------------------------------------------------------
+
+pub struct GitUnstageTool;
+
+#[async_trait]
+impl Tool for GitUnstageTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_unstage".into(),
+            description: "Remove files from the git index (unstage) without losing working-tree \
+                          changes. `paths` is a list of workspace-relative paths to unstage."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Files to unstage"
+                    }
+                },
+                "required": ["paths"]
+            }),
+            output_schema: None,
+            effects: vec![Effect::Process, Effect::LocalSystem],
+            risk: Risk::Low,
+            idempotency: Idempotency::Idempotent,
+            access: vec![AccessKind::Process],
+        }
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        path_list(params)
+    }
+
+    fn intents(&self, params: &Value) -> IntentSet {
+        let mut set = IntentSet::new();
+        for p in path_list(params) {
+            set.push(Intent {
+                behavior: IntentBehavior::CommandExecution,
+                target: IntentTarget::Process { command: format!("git restore --staged {p}") },
+                role: IntentRole::ProcessCommand,
+                certainty: IntentCertainty::Certain,
+            });
+        }
+        set
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let paths = path_list(&params);
+        if paths.is_empty() {
+            return Err(Error::Other("git_unstage: `paths` must be a non-empty array".to_string()));
+        }
+        let mut argv = vec!["git".to_string(), "restore".to_string(), "--staged".to_string()];
+        argv.extend(paths);
+        let out = ctx.system.run(&argv, Duration::from_secs(30)).await?;
+        let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
+        if out.exit_code != 0 {
+            return Ok(ToolResult::error(format!("git unstage failed [exit {}]: {body}", out.exit_code)));
+        }
+        Ok(ToolResult::ok(if body.is_empty() { "unstaged".to_string() } else { body }))
     }
 }
 
