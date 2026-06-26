@@ -372,6 +372,9 @@ impl System {
         cmd.env_clear();
         const SAFE_ENV: &[&str] = &[
             "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "USER", "LOGNAME", "TMPDIR",
+            // Non-secret toolchain locations so `cargo`/`rustup` (and the new cargo_* tools) can
+            // resolve a toolchain even under an isolated HOME without `~/.rustup`.
+            "RUSTUP_HOME", "CARGO_HOME", "RUSTUP_TOOLCHAIN",
         ];
         for key in SAFE_ENV {
             if let Ok(val) = std::env::var(key) {

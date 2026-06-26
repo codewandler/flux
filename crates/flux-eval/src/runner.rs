@@ -120,6 +120,24 @@ fn load_events(flow_db: &Path, session_id: &str) -> Vec<RunEvent> {
         .unwrap_or_default()
 }
 
+/// Rust toolchain env to forward into the scrubbed child / grader: without `RUSTUP_HOME` (and the
+/// isolated `HOME` lacking `~/.rustup`), rustup reports "no default toolchain configured" and any
+/// `cargo` criterion fails spuriously. Reads the vars if set, else defaults to `$HOME/.{rustup,cargo}`.
+fn toolchain_env() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let home = std::env::var("HOME").ok();
+    for (key, sub) in [("RUSTUP_HOME", ".rustup"), ("CARGO_HOME", ".cargo")] {
+        if let Ok(v) = std::env::var(key) {
+            out.push((key.to_string(), v));
+        } else if let Some(def) = home.as_ref().map(|h| format!("{h}/{sub}")) {
+            if Path::new(&def).exists() {
+                out.push((key.to_string(), def));
+            }
+        }
+    }
+    out
+}
+
 /// Grade a criterion in the (already-finished) workspace. Reads/exec go through `sys`.
 async fn grade(c: &Criterion, sys: &System) -> Result<bool> {
     match c {
@@ -128,7 +146,10 @@ async fn grade(c: &Criterion, sys: &System) -> Result<bool> {
             if argv.is_empty() {
                 return Ok(false);
             }
-            let out = sys.run(&argv, Duration::from_secs(180)).await?;
+            // Forward the toolchain env so `cargo`/`rustup` criteria work in the scrubbed env.
+            let out = sys
+                .run_with_env(&argv, &toolchain_env(), Duration::from_secs(180))
+                .await?;
             Ok(out.exit_code == *expect_exit)
         }
         Criterion::FileContent {
@@ -199,6 +220,22 @@ pub async fn run_local_task(spec: &TaskSpec, ctx: &RunContext<'_>) -> Result<Run
     ];
     let mut env: Vec<(String, String)> =
         vec![("HOME".to_string(), home.to_string_lossy().to_string())];
+    // Forward provider credentials to the eval child. flux-system scrubs the env and we isolate HOME,
+    // so without this the child can't authenticate any real model. The child IS flux running a task —
+    // the harness trusts itself; the child's own bash/process tools still scrub their subprocess env,
+    // and the child's output is captured by the harness (never shown to a model).
+    for key in [
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "FLUX_SECRET",
+    ] {
+        if let Ok(val) = std::env::var(key) {
+            env.push((key.to_string(), val));
+        }
+    }
+    // Rust toolchain (so the child's own `cargo`/`rustup` tools work under the isolated HOME).
+    env.extend(toolchain_env());
     for (k, v) in &spec.env {
         env.push((k.clone(), v.clone()));
     }
