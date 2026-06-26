@@ -283,7 +283,12 @@ mod tests {
             format_result("grep", "no matches", false).as_deref(),
             Some("no matches")
         );
-        assert_eq!(format_result("bash", "anything", false), None);
+        // successful bash output collapses to a compact summary line
+        assert_eq!(
+            format_result("bash", "anything", false).as_deref(),
+            Some("exit 0 · 1 line")
+        );
+        assert_eq!(format_result("bash", "boom", true), None); // errors keep the generic preview
         assert_eq!(format_result("grep", "x", true), None); // errors keep the generic preview
     }
 

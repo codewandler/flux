@@ -1381,7 +1381,7 @@ mod tests {
         assert!(content.contains("→ bash"));
         assert!(content.contains("$ cargo test"));
         assert!(content.contains("✓")); // done badge
-        assert!(content.contains("182 passed")); // summary line
+        assert!(content.contains("exit 0 · 1 line")); // bash result collapses to a compact summary
     }
 
     #[test]
