@@ -7,25 +7,34 @@ the principles below.
 ## What flux is
 
 A Rust **agent SDK, harness, and coding agent** built as one Cargo workspace of small,
-strictly-layered crates. Every tool call — built-in, plugin, or sub-agent — passes through a single
-mandatory chain (**authorization → approval → guarded IO**), so the agent can edit code and run
-commands without being able to escape the workspace or leak secrets.
+strictly-layered crates. Its defining idea: **the LLM is not the runtime.** Instead of letting the
+model drive execution tool-by-tool, flux uses it as a **compiler front-end** — the model turns a
+request into a typed, readable execution **plan** (a Flux-Lang graph), and a deterministic Rust
+runtime executes that plan through one mandatory chain (**authorization → approval → guarded IO**).
+You see the plan before it runs, and the same plan can be re-run.
 
-## North star: safe by construction
+## North star: the LLM is not the runtime
 
-**The single property flux must get right above all else is non-bypassable safety.** There must be
-no tool, plugin, sub-agent, or surface path that reaches real filesystem / process / network IO
-without traversing the one envelope. Safety is the differentiator, not a feature — it is what makes a
-capable autonomous agent trustworthy enough to actually run.
+**The single property flux must get right above all else is that the model proposes and the runtime
+disposes.** Mainstream agents make the LLM the *runtime scheduler* — it picks each step live, and the
+whole transcript is re-sent every turn so it can choose the next move. That is slow, expensive,
+non-deterministic, and injectable. flux inverts it: the model is a compiler front-end that emits a
+typed execution graph; a deterministic Rust runtime resolves symbols to stored values and executes
+registered operations under policy. Everything else flux is proud of **falls out of that inversion**:
 
-Concretely, "safe by construction" means:
-- One choke point. All IO goes through `flux-system`; all tools go through `Executor::dispatch`.
-- Default-deny authorization (grants over subjects × resources × actions, gated by trust + scopes),
-  with a usable local default so the agent still works out of the box.
-- Destructive operations and policy-flagged effects are forced to human approval even under
-  permissive rules.
-- Secrets are redacted from model-visible output and never leave the machine.
-- A new bypass is a release blocker, and the no-bypass invariants are covered by tests.
+- **Determinism & repeatability** — a plan is an artifact; re-running it costs the fewest model calls.
+- **Token savings & speed** — raw tool outputs are stored as symbols, not re-sent every turn.
+- **Auditability** — a turn *is* a graph you read like Go or Rust before it runs, not a black box.
+- **Safety by construction** — every plan node lowers onto one envelope. All IO goes through
+  `flux-system`; all ops through `Executor::dispatch`. Default-deny authorization (grants over
+  subjects × resources × actions, gated by trust + scopes, with a usable local default so the agent
+  still works out of the box); destructive and policy-flagged effects forced to human approval even
+  under permissive rules; secrets redacted from model-visible output and never off the machine.
+
+Safety is no longer billed as *the* headline — it is one of the guarantees the architecture buys. It
+stays non-negotiable: the envelope is the one choke point that no tool, plugin, sub-agent, or surface
+path may route around, a new bypass is a release blocker, and the no-bypass invariants are covered by
+tests.
 
 ## Audience & priority
 
@@ -41,7 +50,11 @@ flux is built in this order, and ambiguity is resolved in favor of the earlier t
 
 ## Principles
 
-1. **Non-bypassable safety** (the north star, above) governs everything.
+1. **The LLM is not the runtime** (the north star, above) governs everything: a turn compiles to a
+   plan the runtime executes; the model never drives IO directly. **Non-bypassable safety** is the
+   hard invariant this buys — no tool, plugin, sub-agent, or surface path reaches real
+   filesystem / process / network IO without traversing the one envelope, and a bypass is a release
+   blocker.
 2. **Strict layering.** Crates are stratified L0 (pure contracts) → L6 (surfaces); a crate may
    depend only on its own layer or lower. This is enforced by a test, not a convention. It keeps the
    safety core small, auditable, and impossible to route around from a surface.
@@ -79,6 +92,7 @@ safety tests are the price of entry. See [AGENTS.md](../AGENTS.md) for the contr
 
 ## How success is measured
 
+- Every turn is an auditable plan a user can read before it runs, and the same plan re-runs deterministically.
 - A reviewer can trace *every* IO path to the envelope and find no bypass.
 - `flux` is a tool the author reaches for by default for real coding tasks.
 - A third party can build a safe agent on `flux-sdk` without touching the core.

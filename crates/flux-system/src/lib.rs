@@ -59,6 +59,20 @@ impl Workspace {
     /// Resolve a workspace-relative (or `@name/...`) path to an absolute path guaranteed to live
     /// inside the corresponding root. Rejects `..` escapes and symlink escapes.
     pub fn resolve(&self, input: &str) -> Result<PathBuf> {
+        // A path containing a control byte (newline, CR, NUL, tab, …) is virtually always a
+        // bug — typically an untrimmed command substitution flowing into the path, e.g.
+        // `echo …` whose trailing newline becomes part of the filename. Such a file gets
+        // created but is then unreadable by its apparent name: `glob` matches it via `*`,
+        // yet every literal `read`/`stat` misses the hidden byte and fails with ENOENT.
+        // Reject it loudly here instead of silently writing a poltergeist file.
+        if let Some(pos) = input.bytes().position(|b| b.is_ascii_control()) {
+            return Err(Error::Config(format!(
+                "path {input:?} contains a control byte (0x{:02x}) at offset {pos}; this is \
+                 almost always an untrimmed value such as a trailing newline from `echo`",
+                input.as_bytes()[pos]
+            )));
+        }
+
         let (base, rel) = self.base_for(input);
 
         let joined = if Path::new(rel).is_absolute() {
@@ -481,6 +495,21 @@ mod tests {
     async fn rejects_absolute_outside() {
         let (dir, sys) = temp_workspace();
         assert!(sys.read_file("/etc/passwd").await.is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn rejects_control_char_in_path() {
+        let (dir, sys) = temp_workspace();
+        // A trailing newline (the `echo`/untrimmed-substitution bug) must be rejected outright,
+        // not written as a file named `note.md\n` that `glob` sees but `read` can't open.
+        let err = sys.write_file("note.md\n", "x").await.unwrap_err();
+        assert!(matches!(err, Error::Config(_)));
+        assert!(sys.read_file("note.md\n").await.is_err());
+        // an embedded NUL is likewise refused
+        assert!(sys.write_file("a\0b.md", "x").await.is_err());
+        // the clean name is unaffected
+        sys.write_file("note.md", "x").await.unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 

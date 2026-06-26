@@ -19,7 +19,7 @@
 
 use futures::StreamExt;
 
-use flux_core::{Chunk, ContentBlock, Error, Message, Result};
+use flux_core::{Chunk, ContentBlock, Error, Message, Result, StopReason};
 use flux_provider::{Provider, Request, ToolDef};
 
 use crate::analyze::{analyze_flow, Diagnostic};
@@ -34,7 +34,9 @@ pub struct CompileOptions {
     pub max_attempts: u32,
     /// Agentic planner loop steps (research / ask / emit).
     pub max_steps: u32,
-    /// Token budget for each model call.
+    /// Token budget for each model call. The whole `emit_plan` AST must fit here, so it is generous —
+    /// too small a budget truncates large plans mid-tool-call (see the `max_tokens` guard in
+    /// [`compile_turn`]).
     pub max_tokens: u32,
 }
 
@@ -43,7 +45,7 @@ impl Default for CompileOptions {
         Self {
             max_attempts: 2,
             max_steps: 8,
-            max_tokens: 4096,
+            max_tokens: 16384,
         }
     }
 }
@@ -188,7 +190,7 @@ pub async fn compile_turn(
             metadata: serde_json::Map::new(),
         };
 
-        let (mut blocks, acc_text) = stream_blocks(provider, req).await?;
+        let (mut blocks, acc_text, stop_reason) = stream_blocks(provider, req).await?;
         if blocks.is_empty() && !acc_text.trim().is_empty() {
             blocks.push(ContentBlock::Text { text: acc_text });
         }
@@ -209,6 +211,17 @@ pub async fn compile_turn(
                         reply: None,
                     }));
                 }
+            }
+            // A `max_tokens` cutoff drops the in-flight `emit_plan` block — the provider never sends its
+            // `content_block_stop`, so only the model's preamble text survives. Don't mistake that
+            // truncation for a finished prose answer (which would silently end the turn with no work
+            // done); surface it so the user can raise the budget or narrow the request.
+            if stop_reason == Some(StopReason::MaxTokens) {
+                return Err(Error::Other(format!(
+                    "planner output was truncated at max_tokens ({}) before it finished the plan — \
+                     raise --max-tokens or split the request into smaller steps",
+                    opts.max_tokens
+                )));
             }
             // Otherwise prose is a chat answer (the engine surfaces it; the turn ends). A *truly empty*
             // turn (no blocks, no text) wasn't pushed, so just retry on the next step.
@@ -363,22 +376,27 @@ async fn run_model(
     Ok(out)
 }
 
-/// Stream a turn, collecting content blocks (tool_use, text) and the accumulated text delta.
+/// Stream a turn, collecting content blocks (tool_use, text), the accumulated text delta, and the
+/// terminating `stop_reason`. The stop_reason matters: a `max_tokens` cutoff mid-`emit_plan` drops the
+/// tool_use block (the provider never sends its `content_block_stop`), so the caller must distinguish a
+/// truncated turn from a finished prose answer.
 async fn stream_blocks(
     provider: &dyn Provider,
     req: Request,
-) -> Result<(Vec<ContentBlock>, String)> {
+) -> Result<(Vec<ContentBlock>, String, Option<StopReason>)> {
     let mut stream = provider.stream(req).await?;
     let mut blocks = Vec::new();
     let mut text = String::new();
+    let mut stop_reason = None;
     while let Some(chunk) = stream.next().await {
         match chunk? {
             Chunk::TextDelta(t) => text.push_str(&t),
             Chunk::Block(b) => blocks.push(b),
+            Chunk::Done { stop_reason: r } => stop_reason = r,
             _ => {}
         }
     }
-    Ok((blocks, text))
+    Ok((blocks, text, stop_reason))
 }
 
 /// Extract `(id, name, input)` for every tool_use block in a message.
@@ -849,6 +867,42 @@ mod tests {
             TurnOutput::Chat(t) => assert!(t.contains("explanation")),
             TurnOutput::Plan(_) => panic!("expected a chat answer, got a plan"),
         }
+    }
+
+    #[tokio::test]
+    async fn compile_turn_errors_on_max_tokens_truncation() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        // Regression: a large `emit_plan` cut off by `max_tokens` yields only the model's preamble text
+        // (the tool_use block never gets its `content_block_stop`, so the provider drops it) plus a
+        // `Done { MaxTokens }`. This must surface as an error — NOT a silent chat answer that ends the
+        // turn with the preamble and no work done.
+        let truncated = vec![
+            Chunk::TextDelta(
+                "Now I have everything I need. Let me implement it all in one go.".into(),
+            ),
+            Chunk::Done {
+                stop_reason: Some(flux_core::StopReason::MaxTokens),
+            },
+        ];
+        let p = mock(vec![truncated]);
+        let err = compile_turn(
+            &p,
+            "mock",
+            &[Message::user_text("implement all the nodes")],
+            None,
+            &ops,
+            None,
+            None,
+            CompileOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("truncated") && msg.contains("max_tokens"),
+            "expected a max_tokens truncation error, got: {msg}"
+        );
     }
 
     #[tokio::test]

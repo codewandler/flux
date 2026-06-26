@@ -37,9 +37,13 @@ use flux_system::{System, Workspace};
 use reedline::{FileBackedHistory, Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal};
 use std::borrow::Cow;
 
-/// flux — a Rust agent harness.
+/// flux — the LLM plans, the runtime runs.
 #[derive(Parser, Debug)]
-#[command(name = "flux", version, about = "flux — a Rust agent harness")]
+#[command(
+    name = "flux",
+    version,
+    about = "flux — the LLM plans, the runtime runs"
+)]
 struct Cli {
     /// The prompt (joined with spaces if given as multiple words).
     prompt: Vec<String>,
@@ -64,8 +68,9 @@ struct Cli {
     #[arg(long, value_enum, hide = true)]
     effort: Option<EffortArg>,
 
-    /// Maximum tokens to generate.
-    #[arg(long, default_value_t = 4096)]
+    /// Maximum tokens to generate. The planner must fit the entire `emit_plan` graph in this budget,
+    /// so it is generous by default; a turn truncated here fails loudly rather than silently stopping.
+    #[arg(long, default_value_t = 16384)]
     max_tokens: u32,
 
     /// (Hidden) Print token usage — only wired on the `-p` raw path.

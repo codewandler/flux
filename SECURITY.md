@@ -1,9 +1,10 @@
 # Security policy
 
-flux is a safety-focused agent harness: its central promise is that every tool call passes through a
-non-bypassable authorization → approval → guarded-IO chain. A vulnerability that lets the agent (or a
-plugin, hook, or sub-agent) escape the workspace, run an unapproved destructive operation, leak a
-secret, or otherwise bypass that envelope is treated as a serious security issue.
+flux compiles each request into a plan a deterministic runtime executes — and every operation in that
+plan passes through a non-bypassable authorization → approval → guarded-IO envelope. That envelope is
+flux's central security promise: a vulnerability that lets the agent (or a plugin, hook, or sub-agent)
+escape the workspace, run an unapproved destructive operation, leak a secret, or otherwise bypass it
+is treated as a serious security issue.
 
 ## Reporting a vulnerability
 

@@ -8,15 +8,16 @@
 [![Release](https://img.shields.io/github/v/release/codewandler/flux)](https://github.com/codewandler/flux/releases/latest)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-A Rust agent SDK, harness, and coding agent — **as easy to use as a zero-config REPL, as safe and
-durable as a policy-gated platform**, with first-class extensibility (JavaScript hooks + any-language
-subprocess plugins).
+**Stop using the LLM as your runtime.** flux compiles each request into a Flux-Lang plan (a small
+graph) and runs it through a safety envelope — determinism, token savings, auditability, and safety
+all fall out of the inversion. A Rust agent SDK, harness, and coding agent with first-class
+extensibility (JavaScript hooks + any-language subprocess plugins).
 
-flux is a single Cargo workspace of small, strictly-layered crates: pure contracts at the core, a
-mandatory safety envelope in the middle, and CLI / TUI / HTTP surfaces on top. Every tool call —
-built-in, plugin, or sub-agent — passes through the same **authorization → approval → guarded-IO**
-chain, so the agent can edit your code and run commands without being able to escape the workspace or
-leak secrets.
+flux is a single Cargo workspace of small, strictly-layered crates: pure contracts at the core, the
+flow engine + a mandatory safety envelope in the middle, and CLI / TUI / HTTP surfaces on top. The
+model has no direct tools — even a file read is a node in a plan you see before it runs, and every
+node passes through the same **authorization → approval → guarded-IO** chain, so the agent can edit
+your code and run commands without being able to escape the workspace or leak secrets.
 
 ---
 
@@ -135,7 +136,8 @@ actions   = ["workspace.write"]
 
 ## The safety model
 
-Every tool call traverses a non-bypassable chain:
+The runtime is the execution substrate every plan node lowers onto: each operation in a plan
+traverses one non-bypassable chain before it touches the real world.
 
 ```
 pre-tool hooks → authorization policy (default-deny) → permission rules → approval gate → guarded IO

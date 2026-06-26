@@ -8,8 +8,9 @@ Thanks for your interest in flux. Contributions — bug reports, fixes, features
   non-negotiable safety invariants, and where to make common changes). It applies to humans and
   agents alike.
 - Read **[docs/vision.md](docs/vision.md)** for the project's direction and principles. The headline:
-  **non-bypassable safety**, and **quality over quantity** — flux is deliberately small, correct, and
-  fully tested, not a sprawling feature pile.
+  **the LLM is not the runtime** (the model compiles a request into a plan the runtime executes, with
+  non-bypassable safety as the invariant that buys), and **quality over quantity** — flux is
+  deliberately small, correct, and fully tested, not a sprawling feature pile.
 
 ## The green gate (run before opening a PR)
 

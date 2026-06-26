@@ -79,7 +79,9 @@ before every release.
 
 ## Direction
 
-Priority is **personal coding agent → reusable SDK → multi-user platform**, with **non-bypassable
-safety** as the non-negotiable north star. See [vision.md](vision.md). The annotated original design
-& planning document (with full milestone-by-milestone detail) is retained outside the repo by the
-author; this roadmap is the in-repo canonical summary.
+The through-line is **the LLM is not the runtime**: the model is a compiler front-end that emits a
+Flux-Lang plan, and the deterministic engine runs it — **non-bypassable safety** is the hard
+invariant that buys. Priority is **personal coding agent → reusable SDK → multi-user platform**. See
+[vision.md](vision.md). The annotated original design & planning document (with full
+milestone-by-milestone detail) is retained outside the repo by the author; this roadmap is the
+in-repo canonical summary.

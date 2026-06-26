@@ -3,6 +3,13 @@
 How flux is built and why. This is the canonical design reference; [AGENTS.md](../AGENTS.md) is the
 day-to-day contributor contract, and [vision.md](vision.md) is the *why*.
 
+The shape follows one idea: **the LLM is not the runtime.** Every turn the model is a compiler
+front-end — it emits a typed Flux-Lang plan (a graph) or answers in prose; the deterministic
+`flux-flow` engine executes that plan, node by node, through the safety envelope below. The model has
+no directly-callable tools, so even a read is a plan node and a turn is always an auditable graph.
+Everything that follows — strict layers, the envelope, providers, sessions — is the substrate that
+inversion executes against.
+
 ## Shape: one workspace, strict layers
 
 flux is a single Cargo workspace. Crates are stratified into layers; **a crate may depend only on
@@ -27,9 +34,10 @@ envelope" structurally hard. Notable rules that fall out:
 - `flux-evidence`, `flux-skill`, and `flux-config` are pure L0 leaves on purpose, so runtime/agent
   crates may depend on them without a layering violation.
 
-## The safety envelope (the heart)
+## The safety envelope (the execution substrate)
 
-Every tool call traverses one non-bypassable chain in `flux-runtime::Executor::dispatch`:
+Every plan node lowers onto one non-bypassable chain in `flux-runtime::Executor::dispatch` — the
+substrate the flow engine executes against:
 
 ```
 pre-tool hooks → authorization policy (default-deny) → permission rules → approval gate → guarded IO

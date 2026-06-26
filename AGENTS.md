@@ -5,8 +5,10 @@ Guidance for agents (and humans) contributing to this repository. Read this befo
 ## What flux is
 
 A Rust agent SDK / harness / coding agent built as a Cargo **workspace of small, strictly-layered
-crates**. The core invariant: every tool call — built-in, plugin, or sub-agent — goes through one
-mandatory safety envelope (authorization → approval → guarded IO). Don't add code paths that bypass it.
+crates**. The defining idea: **the LLM is not the runtime** — the model is a compiler front-end that
+emits a typed Flux-Lang plan, and a deterministic runtime executes it. The core invariant that buys:
+every operation — built-in, plugin, or sub-agent — goes through one mandatory safety envelope
+(authorization → approval → guarded IO). Don't add code paths that bypass it.
 
 For the *why* and the direction, read [docs/vision.md](docs/vision.md); for the full design,
 [docs/architecture.md](docs/architecture.md); for status and what's next, [docs/roadmap.md](docs/roadmap.md).
@@ -14,9 +16,9 @@ Active execution plans live in [`.flux/plans/`](.flux/plans/) (local, gitignored
 [`markdown-rendering-and-m2-compliance.md`](.flux/plans/markdown-rendering-and-m2-compliance.md)
 (CLI markdown rendering, shipped in 0.2.4, + the markdown-library compliance push) and the separate
 `flux-flow-implementation.md` effort; read the relevant plan before continuing that work.
-The headline principle that governs review: **non-bypassable safety, and quality over quantity — flux
-is deliberately not a sprawling, bug-ridden codebase. Every behavioral change ships with a test, and
-the gate stays green.**
+The headline principle that governs review: **the LLM is not the runtime — with non-bypassable safety
+as the invariant that buys — and quality over quantity: flux is deliberately not a sprawling,
+bug-ridden codebase. Every behavioral change ships with a test, and the gate stays green.**
 
 ## The dev loop (run before you call a change done)
 
@@ -75,8 +77,8 @@ Rules that fall out of this:
 
 These were established (and several re-learned the hard way) during security review. Each is covered
 by a test; if you touch the relevant code, keep the test passing and add to it. **Non-bypassable
-safety is the project's north star** ([docs/vision.md](docs/vision.md)) — a regression here is a
-release blocker, not a nit.
+safety is the hard invariant the architecture buys** ([docs/vision.md](docs/vision.md)) — a
+regression here is a release blocker, not a nit.
 
 - **Session shape is always a valid provider history.** Every turn-termination path (normal stop,
   cancel, compaction, *max-iterations*) must leave the log free of: an empty assistant message, a

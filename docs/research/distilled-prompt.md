@@ -12,7 +12,14 @@ safety envelope. (This is a proposal — no code is changed by this doc.)
 
 ## Design constraints that make flux different
 
-Three facts about flux shape this prompt and make it *not* a clone of Claude Code or Codex:
+The deepest fact, before any of the three below: **the LLM is not the runtime.** flux uses the model
+as a *compiler front-end* — it emits a typed Flux-Lang plan (a graph) that a deterministic runtime
+executes, rather than calling tools live one at a time. Even a file read is a node in a plan, so a
+turn is always an auditable graph (a "pure DAG"). The prompt's job is to make the model a good
+*planner*, not a good *tool-caller*. (The live CLI engine has since moved to exactly this pure-DAG
+model; the three facts below still shape the persona/output contract layered on top of it.)
+
+Three further facts about flux shape this prompt and make it *not* a clone of Claude Code or Codex:
 
 1. **flux prints replies as raw, unrendered markdown.** `CliSink` writes text deltas straight to
    stdout (`crates/flux-cli/src/main.rs`), so `##` and `**` show up as literal clutter
