@@ -8,23 +8,21 @@
 [![Release](https://img.shields.io/github/v/release/codewandler/flux)](https://github.com/codewandler/flux/releases/latest)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-**Stop using the LLM as your runtime.** flux compiles each request into a Flux-Lang plan (a small
-graph) and runs it through a safety envelope — determinism, token savings, auditability, and safety
-all fall out of the inversion. A Rust agent SDK, harness, and coding agent with first-class
-extensibility (JavaScript hooks + any-language subprocess plugins).
+**The LLM is not your runtime.** Most coding agents let the model drive execution step by step — slow, expensive, and hard to audit. flux inverts that: the model compiles your request into a typed **Flux-Lang plan** (a small graph), and a deterministic Rust runtime executes it through one mandatory safety envelope. You see the plan before it runs. Every file read, shell command, and web fetch is a node in that graph, not a hidden black box.
 
-flux is a single Cargo workspace of small, strictly-layered crates: pure contracts at the core, the
-flow engine + a mandatory safety envelope in the middle, and CLI / TUI / HTTP surfaces on top. The
-model has no direct tools — even a file read is a node in a plan you see before it runs, and every
-node passes through the same **authorization → approval → guarded-IO** chain, so the agent can edit
-your code and run commands without being able to escape the workspace or leak secrets.
+What that buys you:
+- **Auditability** — a turn is a readable graph, not a stream of opaque tool calls
+- **Safety by construction** — a single non-bypassable chain (authorization → approval → guarded IO) covers every operation; no tool, plugin, or sub-agent can route around it
+- **Token efficiency** — tool outputs are stored as symbols, not re-sent on every turn
+- **Repeatability** — a plan is an artifact; re-running it costs zero extra model calls
+
+flux ships as a zero-config CLI/TUI for daily coding work, an embeddable Rust SDK, and an HTTP server — all built on the same strictly-layered crate workspace.
 
 ---
 
 ## Install
 
-**Prebuilt binary** — installs the `flux` binary into `~/.cargo/bin` (Linux, macOS, Windows; x86_64 +
-aarch64):
+**Prebuilt binary** — installs `flux` into `~/.cargo/bin` (Linux, macOS, Windows; x86_64 + aarch64):
 
 ```bash
 # Linux / macOS
@@ -50,65 +48,61 @@ Prebuilt binaries, installers, and checksums are attached to every
 
 ## Quickstart
 
-flux runs on **one engine**: the model turns your request into a typed execution **plan** (a small
-graph), and the runtime executes it through the safety envelope — you always see the plan before it
-runs. The model has no direct tools; even a file read is a node in a plan. See
-[`docs/usage.md`](docs/usage.md) for the full guide.
-
 ```bash
-# do it — the agent plans + runs (risky steps prompt for approval; --yes auto-approves)
+# Ask flux to do something — risky steps prompt for approval; --yes auto-approves
 flux "add a test for the parser"
 
-# plan mode — show the plan; on a terminal it then asks "run it? [y/N]"
+# Preview the plan before running it
 flux --plan "summarize README.md into SUMMARY.txt"
 
-# inspect a plan as data (prints the graph and exits, never runs)
+# Print the plan as JSON and exit (never runs)
 flux --plan -o json "print hello world 3 times"
 
-# interactive REPL (session auto-saved); /plan toggles plan mode, /run executes, /help for commands
+# Interactive REPL — session auto-saved; /help for slash commands
 flux
 flux -c                       # continue the most recent session
 
-# ratatui TUI with live streaming + in-UI approval modal
+# ratatui TUI with live token streaming and an in-UI approval modal
 flux --tui
 
 # HTTP daemon (REST + SSE streaming)
 flux --serve 127.0.0.1:8787 --yes
 ```
 
-No network or API keys are needed to try the machinery: `-m mock` runs a built-in offline provider
-through the full engine.
+No API key needed to try the engine: `-m mock` runs an offline provider through the full pipeline.
 
 ```bash
 flux --yes -m mock "summarise this repo"
 ```
 
+See [`docs/usage.md`](docs/usage.md) for the full guide.
+
 ---
 
 ## Providers & auth
 
-A provider is a **wire codec × credential** cell. Pick one with `-m <provider>/<model>` (bare aliases
-`opus`/`sonnet`/`haiku` resolve against Anthropic):
+A provider is a **wire codec × credential** cell. Select one with `-m <provider>/<model>`
+(bare aliases `opus`/`sonnet`/`haiku` resolve to Anthropic):
 
 | `-m` provider | Wire | Auth | Notes |
 |---|---|---|---|
 | `anthropic` | Anthropic Messages | `ANTHROPIC_API_KEY` | API key |
 | `claude` | Anthropic Messages | Claude subscription OAuth | imports `~/.claude/.credentials.json`; opt-in |
-| `openai` | OpenAI | `OPENAI_API_KEY` | API key |
+| `openai` | OpenAI Chat | `OPENAI_API_KEY` | API key |
 | `codex` | OpenAI Responses | ChatGPT/Codex OAuth | imports `~/.codex/auth.json`; opt-in |
 | `openrouter` | OpenAI Chat | `OPENROUTER_API_KEY` | API key |
 
 ```bash
-flux auth status                 # what's available and from where
+flux auth status                 # show what credentials are available and from where
 flux auth login claude           # PKCE login for the Claude subscription path
 flux -m claude/opus -p "hi"
 flux -m openrouter/anthropic/claude-sonnet-4.5 -p "hi"
 ```
 
-Thinking depth: `--think` toggles adaptive thinking; `--effort low|medium|high|xhigh|max` controls it.
+`--think` toggles adaptive thinking; `--effort low|medium|high|xhigh|max` controls depth.
 
-> The subscription paths (`claude`, `codex`) reuse your existing CLI credentials. They are opt-in and
-> never the default; the API-key paths are the supported way to run flux.
+> The subscription paths (`claude`, `codex`) reuse credentials from existing CLI tools. They are
+> opt-in and never the default; the API-key paths are the supported way to run flux.
 
 ---
 
@@ -117,82 +111,71 @@ Thinking depth: `--think` toggles adaptive thinking; `--effort low|medium|high|x
 Precedence: CLI flags > project `.flux/config.toml` > user `~/.flux/config.toml` > defaults.
 
 ```toml
-model = "claude/opus"            # default model (a -m flag overrides)
+model = "claude/opus"            # default model (-m overrides)
 allow_private_net = false        # let web_fetch / plugins reach loopback/private addresses
 
-[permissions]                    # rules: deny wins, then allow, otherwise prompt
+[permissions]                    # deny wins, then allow, otherwise prompt
 allow = ["read", "glob", "grep", "search", "Bash(git:*)"]
 deny  = ["Bash(rm:*)"]
 
-[[policy.grants]]                # optional fine-grained authorization grants (extends defaults)
+[[policy.grants]]                # optional fine-grained authorization grants
 subjects  = [{ kind = "user", id = "*" }]
 resources = [{ kind = "path", path = "src/**" }]
 actions   = ["workspace.write"]
 ```
 
-"Always-allow" choices from approval prompts are persisted back here automatically.
+"Always-allow" choices from approval prompts are saved back here automatically.
 
 ---
 
-## The safety model
+## Safety model
 
-The runtime is the execution substrate every plan node lowers onto: each operation in a plan
-traverses one non-bypassable chain before it touches the real world.
+Every plan node lowers onto one non-bypassable chain before it touches the real world:
 
 ```
 pre-tool hooks → authorization policy (default-deny) → permission rules → approval gate → guarded IO
 ```
 
-- **Policy** (pure, default-deny): grants over subjects × resources × actions, gated by trust and
-  scopes. A sensible local default keeps the agent working out of the box (read/write/network allowed,
-  process-exec requires approval).
-- **Destructive operations are forced to approval** even under a permissive allow-rule (`rm -rf`,
-  `git push --force`, `mkfs`, …).
-- **Guarded IO** is the only place real filesystem/process/network access happens — workspace-confined,
-  symlink/escape-rejecting, **argv-only** (no shell injection), with an SSRF-guarded fetch.
-- **Secrets** are scrubbed from tool output and logs.
-- **Evidence**: observations (tool calls, destructive markers, skill activations, compaction) are
-  recorded and surfaced as events.
+- **Policy** (pure, default-deny): grants over subjects × resources × actions, gated by trust and scopes. A sensible local default keeps the agent productive out of the box.
+- **Destructive operations are forced to approval** even under a permissive allow-rule (`rm -rf`, `git push --force`, …).
+- **Guarded IO** is the only place real filesystem/process/network access happens — workspace-confined, symlink/escape-rejecting, **argv-only** (no shell injection), SSRF-guarded fetch.
+- **Secrets** are registered with a redactor and scrubbed from all tool output and logs.
+- **Evidence** — tool calls, destructive markers, skill activations, and compaction are recorded as auditable events.
 
-Sub-agents inherit the same policy and refuse destructive operations.
+Sub-agents inherit the same policy and cannot approve destructive operations themselves.
 
 ---
 
 ## Capabilities
 
-- **Built-in tools:** `read`, `write`, `edit`, `bash`, `glob`, `grep`, `web_fetch` (SSRF-guarded),
-  `search` (auto-indexed workspace docs), `task` (delegate to a sub-agent role).
-- **Skills** (`.flux/skills/*.md` with `triggers:` frontmatter): matched per-turn against your input
-  and injected into that turn's prompt.
-- **Sub-agent roles** (`.flux/agents/<role>.md`): scout / planner / worker / reviewer / evaluator /
-  summarizer (built-in defaults; override with your own).
-- **Plugins** (`~/.flux/plugins/*.toml`): any-language subprocess binaries over a framed protocol;
-  their operations become policy-gated tools, and they call back to host capabilities
-  (`process.run` / `secret` / `http.do`) through the guarded boundary. A plugin gets **only** the
-  capabilities it declares in its manifest — the host grants an allow-list of runnable programs and
-  readable secret keys (and an `http` toggle) and checks every callback against it.
-  - `flux plugin add <name> <program> [args…] | ls | pin <name> <ver> | rollback <name>`
-- **Hooks** (`.flux/hooks/*.js`): pre-tool observe / modify / deny in JavaScript.
+**Built-in tools:** `read`, `write`, `edit`, `bash`, `glob`, `grep`, `web_fetch` (SSRF-guarded), `search` (auto-indexed workspace docs), `task` (delegate to a sub-agent role).
 
-### REPL / autopilot commands
+**Skills** (`.flux/skills/*.md` with `triggers:` frontmatter): matched per-turn against your input and injected into that turn's context.
+
+**Sub-agent roles** (`.flux/agents/<role>.md`): scout / planner / worker / reviewer / evaluator / summarizer — built-in defaults, overridable with your own markdown files.
+
+**Plugins** (`~/.flux/plugins/*.toml`): subprocess binaries in any language over a framed NDJSON protocol. Their operations become policy-gated tools; privileged IO is requested back from the host via declared capabilities. A plugin gets **only** what its manifest declares — runnable programs, readable secret keys, and HTTP access are all explicit allow-lists checked on every call.
+- `flux plugin add <name> <program> [args…] | ls | pin <name> <ver> | rollback <name>`
+
+**Hooks** (`.flux/hooks/*.js`): JavaScript pre-tool hooks that can observe, modify, or deny a call.
+
+### REPL slash commands
 
 ```
 /help  /tools  /session  /clear
-/plan               toggle plan mode (turns show a plan but don't run it)
-/run                execute the plan you reviewed in plan mode
+/plan               toggle plan mode — show the plan without running it
+/run                execute the plan you just reviewed
 /model <spec>       switch model/provider mid-session (e.g. /model opus)
-/sessions           list recent sessions; /resume <id> reattaches to one
+/sessions           list recent sessions; /resume <id> reattaches
 /pd <goal>          plan-and-dispatch: planner → parallel dependency waves of workers
 /goal <condition>   drive turns toward a goal, judged by an evaluator sub-agent
 /loop <n> <task>    run a task up to n times
-/exit               (Ctrl-C interrupts a running turn or command; Ctrl-D exits)
+/exit               (Ctrl-C interrupts a running turn; Ctrl-D exits)
 ```
 
-The REPL has line editing, persistent history, and reverse-search; `flux sessions` lists past
-sessions from the shell.
+The REPL has line editing, persistent history, and reverse-search. `flux sessions` lists past sessions from the shell.
 
-Long sessions are **compacted** automatically: older turns are summarized into a synthetic message once
-the session passes a budget (`FLUX_COMPACT_CHARS`, default 48k characters; `0` disables).
+Long sessions are **compacted** automatically: older turns are summarized once the session exceeds a budget (`FLUX_COMPACT_CHARS`, default 48 k characters; `0` disables).
 
 ---
 
@@ -207,9 +190,7 @@ the session passes a budget (`FLUX_COMPACT_CHARS`, default 48k characters; `0` d
 | `GET  /sessions/:id/stream?input=…` | **Server-Sent Events**: `text` / `tool` / `done` |
 | `POST /webhook` | external trigger → fresh session + one turn |
 
-The daemon auto-approves tool calls, so it is access-controlled: every route except `GET /health`
-requires `Authorization: Bearer $FLUX_SERVER_TOKEN`. A non-loopback bind without `FLUX_SERVER_TOKEN`
-set is refused; loopback may run tokenless for local use.
+Every route except `GET /health` requires `Authorization: Bearer $FLUX_SERVER_TOKEN`. A non-loopback bind without the token set is refused (the daemon auto-approves tools, so an open listener is RCE).
 
 ---
 
@@ -226,18 +207,19 @@ println!("{}", out.text);
 
 ## Architecture
 
-flux is a workspace of strictly-layered crates; inner crates never depend on outer ones (enforced by a
-test). See [docs/architecture.md](docs/architecture.md) for the full design and the safety envelope,
-[docs/vision.md](docs/vision.md) for the project's direction and principles, and
-[AGENTS.md](AGENTS.md) for the crate map and contributor guide.
+flux is a single Cargo workspace of strictly-layered crates — inner crates never depend on outer ones, enforced by a test. The layers:
 
-- **Contracts (pure):** core types, authorization policy, secrets, tool specs, config, evidence, skills
-- **Providers:** the provider abstraction + Anthropic/OpenAI clients + credentials
-- **Runtime:** the guarded IO boundary, the safety envelope, built-in tools, sessions, context
-- **Agent:** the agent loop + multi-agent orchestration
-- **Extensibility:** JavaScript hooks + subprocess plugins
-- **Capabilities:** browser/web, datasource/RAG, caller identity
-- **Surfaces:** the SDK, HTTP server, integrations, TUI, and the `flux` CLI
+| Layer | Role |
+|---|---|
+| **Contracts (L0)** | pure types, policy, secrets, tool specs, config, evidence, skills — no IO |
+| **Providers (L1)** | wire codec × credential cells; Anthropic, OpenAI, OpenRouter |
+| **Runtime (L2)** | guarded IO, the safety envelope, built-in tools, sessions, context |
+| **Agent (L3)** | the agent loop + multi-agent orchestration |
+| **Extensibility (L4)** | JavaScript hooks + subprocess plugins |
+| **Capabilities (L5)** | browser/web egress, datasource/RAG, caller identity |
+| **Surfaces (L6)** | SDK, HTTP server, integrations, TUI, the `flux` CLI |
+
+See [docs/architecture.md](docs/architecture.md) for the full design, [docs/vision.md](docs/vision.md) for the project's direction, and [AGENTS.md](AGENTS.md) for the contributor guide.
 
 ---
 
@@ -245,14 +227,12 @@ test). See [docs/architecture.md](docs/architecture.md) for the full design and 
 
 ```bash
 cargo test --workspace                                   # all tests
-cargo clippy --workspace --all-targets -- -D warnings    # lints
+cargo clippy --workspace --all-targets -- -D warnings    # lints (must be clean)
 cargo fmt --all --check                                  # formatting
 cargo test -p flux-codegate                              # architecture layering lint
 ```
 
-CI runs all of the above on every pull request. See [CHANGELOG.md](CHANGELOG.md) for release notes,
-[docs/roadmap.md](docs/roadmap.md) for status and what's next, and [AGENTS.md](AGENTS.md) if you're
-contributing (human or agent).
+CI runs all of the above on every pull request. See [CHANGELOG.md](CHANGELOG.md) for release notes and [docs/roadmap.md](docs/roadmap.md) for what's next.
 
 ## License
 
