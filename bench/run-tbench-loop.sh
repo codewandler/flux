@@ -21,11 +21,12 @@ model="${FLUX_IMPROVE_MODEL:-anthropic/claude-sonnet-4-6}"
 echo "→ worktree $wt on $branch (from HEAD)"
 git worktree add -b "$branch" "$wt" HEAD
 
-# Seed curated sub-agent roles (gitignored, so not in the fresh worktree).
-if [ -d .flux/agents ]; then
-  mkdir -p "$wt/.flux"
-  cp -r .flux/agents "$wt/.flux/agents"
-fi
+# Seed curated sub-agent roles into the worktree's runtime location (flux reads .flux/agents/).
+# bench/agents/ is tracked, so this works from a clean clone; .flux/agents/ (gitignored) overrides
+# for local experiments.
+mkdir -p "$wt/.flux/agents"
+[ -d bench/agents ] && cp bench/agents/*.md "$wt/.flux/agents/" 2>/dev/null || true
+[ -d .flux/agents ] && cp .flux/agents/*.md "$wt/.flux/agents/" 2>/dev/null || true
 
 export PATH="$HOME/.local/bin:$PATH"                 # tb / uv tools
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"   # pin toolchain for musl rebuilds under isolated HOME
