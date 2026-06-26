@@ -102,6 +102,9 @@ enum Entry {
     User(String),
     /// An assistant reply — plain while streaming, Markdown once done (cached per width).
     Assistant(Assistant),
+    /// Live extended-thinking tokens streamed during the planning phase, rendered as Markdown
+    /// once sealed (same `Assistant` widget, distinct entry so it doesn't merge with the reply).
+    Thinking(Assistant),
     /// A dispatched tool/op call + (once it returns) its result — rendered as one card.
     Tool(ToolEntry),
     /// An observation/notice (skill activation, destructive flag, error).
@@ -281,6 +284,46 @@ impl ChatState {
         self.push(Entry::User(text.into()));
     }
 
+    /// Open a fresh thinking entry for the upcoming planning call (called on `Planning(true)`).
+    fn begin_thinking(&mut self) {
+        // Only open a new thinking entry if there isn't already an open one.
+        if !matches!(self.entries.last(), Some(Entry::Thinking(a)) if !a.done) {
+            self.entries.push(Entry::Thinking(Assistant {
+                text: String::new(),
+                done: false,
+                cache: RefCell::new(None),
+            }));
+            self.assistant_open = false;
+        }
+    }
+
+    /// Append a thinking-token delta to the open thinking entry.
+    fn stream_thinking(&mut self, delta: &str) {
+        if let Some(Entry::Thinking(a)) = self.entries.last_mut() {
+            if !a.done {
+                a.text.push_str(delta);
+                return;
+            }
+        }
+        // No open thinking entry — open one on the fly.
+        self.entries.push(Entry::Thinking(Assistant {
+            text: delta.to_string(),
+            done: false,
+            cache: RefCell::new(None),
+        }));
+        self.assistant_open = false;
+    }
+
+    /// Seal the open thinking entry (called on `Planning(false)`).
+    fn end_thinking(&mut self) {
+        if let Some(Entry::Thinking(a)) = self.entries.last_mut() {
+            if !a.done {
+                a.text = a.text.trim_end().to_string();
+                a.done = true;
+            }
+        }
+    }
+
     /// Append a streamed assistant token, extending the live assistant message (or starting one).
     fn stream_text(&mut self, delta: &str) {
         if self.assistant_open {
@@ -458,6 +501,19 @@ impl ChatState {
                     }
                 }
                 Entry::Assistant(a) => out.extend(a.lines(width, t)),
+                Entry::Thinking(a) => {
+                    // Prefix the thinking block with a dimmed header line.
+                    if !a.text.is_empty() {
+                        out.push(Line::styled("🤔 thinking…".to_string(), t.muted_style()));
+                        out.extend(a.lines(width, t).into_iter().map(|mut l| {
+                            // Dim the whole thinking block so it reads as secondary content.
+                            for span in &mut l.spans {
+                                span.style = span.style.patch(t.muted_style());
+                            }
+                            l
+                        }));
+                    }
+                }
                 Entry::Tool(tool) => out.extend(self.tool_lines(tool, width)),
                 Entry::Notice { text, sev } => {
                     let style = match sev {
@@ -832,6 +888,8 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
 /// A UI event produced by the running turn (on a background task) for the event loop to render.
 enum UiEvent {
     Text(String),
+    /// A live thinking-token delta streamed during the planning phase.
+    Thinking(String),
     /// The planner is composing (`true`) / done (`false`) — drives the status line.
     Planning(bool),
     /// The compiled plan (`flow.plan` observation `data`).
@@ -867,6 +925,9 @@ struct ChannelSink {
 impl AgentSink for ChannelSink {
     fn text_delta(&mut self, t: &str) {
         let _ = self.tx.send(UiEvent::Text(t.to_string()));
+    }
+    fn thinking_delta(&mut self, t: &str) {
+        let _ = self.tx.send(UiEvent::Thinking(t.to_string()));
     }
     fn planning(&mut self, active: bool) {
         let _ = self.tx.send(UiEvent::Planning(active));
@@ -1013,12 +1074,18 @@ async fn event_loop(
         while let Ok(ev) = rx.try_recv() {
             match ev {
                 UiEvent::Text(t) => state.stream_text(&t),
+                UiEvent::Thinking(t) => state.stream_thinking(&t),
                 UiEvent::Planning(active) => {
-                    state.phase = if active {
-                        Phase::Planning
+                    if active {
+                        // Starting a new planning call: open a fresh thinking entry.
+                        state.begin_thinking();
+                        state.phase = Phase::Planning;
                     } else {
-                        Phase::Thinking
-                    };
+                        // Planning done: seal the thinking entry and move to Thinking phase
+                        // (the engine will emit text_delta or another Planning shortly).
+                        state.end_thinking();
+                        state.phase = Phase::Thinking;
+                    }
                 }
                 UiEvent::Plan(data) => state.push(Entry::Plan(data)),
                 UiEvent::ToolCall { name, input } => {
