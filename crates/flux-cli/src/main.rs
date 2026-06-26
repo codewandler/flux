@@ -1127,7 +1127,7 @@ async fn run_repl(cli: Cli) -> Result<()> {
                             };
                             match res {
                                 Ok(out) => println!("{out}"),
-                                Err(e) => eprintln!("{} {e}", style::red("error:")),
+                                Err(e) => eprintln!("{} {e:#}", style::red("error:")),
                             }
                         })
                         .await;
@@ -1254,7 +1254,7 @@ async fn run_repl(cli: Cli) -> Result<()> {
                     );
                 }
                 Ok(None) => {} // the model answered in prose; nothing to run
-                Err(e) => eprintln!("{} {e}", style::red("error:")),
+                Err(e) => eprintln!("{} {e:#}", style::red("error:")),
             }
             continue;
         }
@@ -1269,7 +1269,7 @@ async fn run_repl(cli: Cli) -> Result<()> {
                 .run_turn_cancellable(sid_ref, input, &mut sink, &c)
                 .await
             {
-                eprintln!("{} {e}", style::red("error:"));
+                eprintln!("{} {e:#}", style::red("error:"));
             }
         })
         .await;
@@ -1296,7 +1296,7 @@ async fn run_pending_plan(
             }
             sink.turn_end(None);
         }
-        Err(e) => eprintln!("{} {e}", style::red("error:")),
+        Err(e) => eprintln!("{} {e:#}", style::red("error:")),
     }
 }
 
@@ -1346,7 +1346,7 @@ async fn run_goal(
             .run_turn_cancellable(session_id, &next_input, &mut sink, &cancel)
             .await
         {
-            eprintln!("{} {e}", style::red("error:"));
+            eprintln!("{} {e:#}", style::red("error:"));
             return;
         }
         if cancel.is_cancelled() {
@@ -1401,7 +1401,7 @@ async fn run_loop(
             .run_turn_cancellable(session_id, task, &mut sink, &cancel)
             .await
         {
-            eprintln!("{} {e}", style::red("error:"));
+            eprintln!("{} {e:#}", style::red("error:"));
             return;
         }
     }
@@ -2021,7 +2021,7 @@ impl Approver for StdinApprover {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Install a colored error formatter so top-level anyhow errors use the same style as inline
-    // `eprintln!("{} {e}", style::red("error:"))` calls rather than a bare `Error: …` line.
+    // `eprintln!("{} {e:#}", style::red("error:"))` calls rather than a bare `Error: …` line.
     // We do this before `style::init` so even parse errors (before color flags are known) get color
     // when stderr is a tty — safe because `style::init` defaults to auto.
     style::init(style::ColorChoice::Auto);
@@ -2053,7 +2053,7 @@ async fn main() -> Result<()> {
         run_plan(cli)
             .await
             .map_err(|e| {
-                eprintln!("{} {e}", style::red("error:"));
+                eprintln!("{} {e:#}", style::red("error:"));
                 std::process::exit(1);
             })
             .unwrap_or(());
@@ -2063,7 +2063,7 @@ async fn main() -> Result<()> {
         run_repl(cli)
             .await
             .map_err(|e| {
-                eprintln!("{} {e}", style::red("error:"));
+                eprintln!("{} {e:#}", style::red("error:"));
                 std::process::exit(1);
             })
             .unwrap_or(());
@@ -2072,7 +2072,7 @@ async fn main() -> Result<()> {
         run_prompt(cli)
             .await
             .map_err(|e| {
-                eprintln!("{} {e}", style::red("error:"));
+                eprintln!("{} {e:#}", style::red("error:"));
                 std::process::exit(1);
             })
             .unwrap_or(());

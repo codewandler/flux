@@ -68,7 +68,10 @@ impl SessionStore {
     }
 
     fn init(conn: Connection) -> Result<Self> {
-        // Base schema — created on first open.
+        // Base schema — created on first open. The `idx_messages_session_role` index is created
+        // AFTER the migrations below, not here: on a pre-existing DB the `CREATE TABLE IF NOT
+        // EXISTS messages` is a no-op (so `role` isn't added by it), and indexing a not-yet-
+        // migrated `role` column would fail with "no such column: role".
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions (
                  id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,9 +85,7 @@ impl SessionStore {
                  role       TEXT NOT NULL DEFAULT '',
                  data       TEXT NOT NULL,
                  PRIMARY KEY (session_id, seq)
-             );
-             CREATE INDEX IF NOT EXISTS idx_messages_session_role
-                 ON messages (session_id, role);",
+             );",
         )
         .map_err(map_sql)?;
 
