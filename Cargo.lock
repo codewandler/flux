@@ -692,6 +692,7 @@ name = "flux-config"
 version = "0.2.4"
 dependencies = [
  "flux-core",
+ "flux-evidence",
  "flux-policy",
  "serde",
  "toml",
@@ -752,6 +753,7 @@ version = "0.2.4"
 dependencies = [
  "async-trait",
  "flux-core",
+ "flux-evidence",
  "flux-flow",
  "flux-orchestrate",
  "flux-runtime",
@@ -996,6 +998,7 @@ version = "0.2.4"
 dependencies = [
  "async-trait",
  "flux-core",
+ "flux-evidence",
  "flux-policy",
  "flux-runtime",
  "flux-spec",

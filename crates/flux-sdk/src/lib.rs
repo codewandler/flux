@@ -121,6 +121,8 @@ impl ClientBuilder {
             max_iterations: self.max_iterations,
             skills: Vec::new(),
             compact_threshold_chars: 0,
+            groups: Vec::new(),
+            cwd: std::path::PathBuf::from("."),
         };
         Ok(Client { agent, session_id })
     }

@@ -942,7 +942,11 @@ type Tui = Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
 /// Run the interactive TUI against `agent`/`session_id`. Requires a real terminal. Installs a modal
 /// approver unless `auto_approve` is set (i.e. `--yes` was passed), then always restores the
 /// terminal (raw mode + alternate screen + mouse capture) even on error.
-pub async fn run(mut agent: FlowEngine, session_id: String, auto_approve: bool) -> anyhow::Result<()> {
+pub async fn run(
+    mut agent: FlowEngine,
+    session_id: String,
+    auto_approve: bool,
+) -> anyhow::Result<()> {
     use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
     use crossterm::terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,

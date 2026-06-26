@@ -226,10 +226,22 @@ fn head(node: &Node, p: &Palette) -> String {
         },
         Node::Confirm { message, risk, .. } => {
             let r = risk.as_deref().unwrap_or("medium");
-            format!("{} [{r}] {}", paint(p.keyword, "confirm"), paint(p.string, message))
+            format!(
+                "{} [{r}] {}",
+                paint(p.keyword, "confirm"),
+                paint(p.string, message)
+            )
         }
-        Node::Loop { for_ms, every_ms, until, .. } => {
-            let base = format!("{} for {for_ms}ms every {every_ms}ms", paint(p.keyword, "loop"));
+        Node::Loop {
+            for_ms,
+            every_ms,
+            until,
+            ..
+        } => {
+            let base = format!(
+                "{} for {for_ms}ms every {every_ms}ms",
+                paint(p.keyword, "loop")
+            );
             match until {
                 Some(u) => format!("{base} until {}", expr(u, p)),
                 None => base,
@@ -241,32 +253,72 @@ fn head(node: &Node, p: &Palette) -> String {
             Some(b) => format!("{} = {} {source}", sym(p, &b.0), paint(p.keyword, "await")),
             None => format!("{} {source}", paint(p.keyword, "await")),
         },
-        Node::Race { timeout_ms, bind, .. } => match bind {
-            Some(b) => format!("{} timeout={timeout_ms}ms -> {}", paint(p.keyword, "race"), sym(p, &b.0)),
+        Node::Race {
+            timeout_ms, bind, ..
+        } => match bind {
+            Some(b) => format!(
+                "{} timeout={timeout_ms}ms -> {}",
+                paint(p.keyword, "race"),
+                sym(p, &b.0)
+            ),
             None => format!("{} timeout={timeout_ms}ms", paint(p.keyword, "race")),
         },
         Node::Throttle { max, window_ms, .. } => {
-            format!("{} max={max} window={window_ms}ms", paint(p.keyword, "throttle"))
+            format!(
+                "{} max={max} window={window_ms}ms",
+                paint(p.keyword, "throttle")
+            )
         }
         Node::Debounce { wait_ms, .. } => {
             format!("{} wait={wait_ms}ms", paint(p.keyword, "debounce"))
         }
         Node::Unless { cond, .. } => format!("{} {}", paint(p.keyword, "unless"), expr(cond, p)),
-        Node::Verify { cmd, expect, message } => {
+        Node::Verify {
+            cmd,
+            expect,
+            message,
+        } => {
             let msg = message.as_deref().unwrap_or("");
-            format!("{} {} contains {} {}", paint(p.keyword, "verify"), expr(cmd, p), expr(expect, p), paint(p.string, msg))
+            format!(
+                "{} {} contains {} {}",
+                paint(p.keyword, "verify"),
+                expr(cmd, p),
+                expr(expect, p),
+                paint(p.string, msg)
+            )
         }
         Node::Peek { name } => format!("{} {}", paint(p.keyword, "peek"), sym(p, &name.0)),
         Node::Expr { formula, vars } => {
             if vars.is_empty() {
-                format!("{} {}", paint(p.keyword, "expr"), paint(p.string, &format!("\"{formula}\"")))
+                format!(
+                    "{} {}",
+                    paint(p.keyword, "expr"),
+                    paint(p.string, &format!("\"{formula}\""))
+                )
             } else {
-                let vs: Vec<String> = vars.iter().map(|(k, v)| format!("{k}={}", expr(v, p))).collect();
-                format!("{} {} ({})", paint(p.keyword, "expr"), paint(p.string, &format!("\"{formula}\"")), vs.join(", "))
+                let vs: Vec<String> = vars
+                    .iter()
+                    .map(|(k, v)| format!("{k}={}", expr(v, p)))
+                    .collect();
+                format!(
+                    "{} {} ({})",
+                    paint(p.keyword, "expr"),
+                    paint(p.string, &format!("\"{formula}\"")),
+                    vs.join(", ")
+                )
             }
         }
-        Node::Fmt { template } => format!("{} {}", paint(p.keyword, "fmt"), paint(p.string, &format!("\"{template}\""))),
-        Node::Jq { path, input } => format!("{} {} {}", paint(p.keyword, "jq"), paint(p.string, &format!("\"{path}\"")), expr(input, p)),
+        Node::Fmt { template } => format!(
+            "{} {}",
+            paint(p.keyword, "fmt"),
+            paint(p.string, &format!("\"{template}\""))
+        ),
+        Node::Jq { path, input } => format!(
+            "{} {} {}",
+            paint(p.keyword, "jq"),
+            paint(p.string, &format!("\"{path}\"")),
+            expr(input, p)
+        ),
         Node::Return { value } => format!("{} {}", paint(p.keyword, "return"), expr(value, p)),
         Node::Var { name } => sym(p, &name.0),
         Node::Lit { value } => lit(value, p),

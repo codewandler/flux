@@ -5,6 +5,8 @@
 //! Every Flux-Lang operation is a `flux_runtime::Tool` under the hood, so it executes through
 //! `Executor::dispatch` like any other tool — the safety envelope is reused, not bypassed.
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -131,31 +133,57 @@ impl OpSignature {
 
 /// A read-only adapter presenting the existing [`ToolRegistry`] as a registry of operations the
 /// compiler can target. Existing tools *are* operations — no separate registration is required.
+///
+/// `advertised` optionally restricts the **catalog** (`op_names`/`signatures` — what the model is
+/// shown) to a precomputed allow-set of op names (evidence-gated surfacing; see
+/// [`flux_runtime::advertised_op_names`]). `None` means advertise everything. `get` is *never*
+/// filtered, so a pre-authored flow that references a hidden-group op still resolves and executes.
 pub struct OpRegistry<'a> {
     tools: &'a ToolRegistry,
+    advertised: Option<HashSet<String>>,
 }
 
 impl<'a> OpRegistry<'a> {
-    /// Wrap a tool registry.
+    /// Wrap a tool registry, advertising every op (no gating).
     pub fn new(tools: &'a ToolRegistry) -> Self {
-        Self { tools }
+        Self {
+            tools,
+            advertised: None,
+        }
     }
 
-    /// The names of every available operation.
+    /// Restrict the advertised catalog to `advertised` (the surfaced op names). Execution/resolution
+    /// via [`get`](Self::get) is unaffected.
+    pub fn with_advertised(mut self, advertised: HashSet<String>) -> Self {
+        self.advertised = Some(advertised);
+        self
+    }
+
+    fn is_advertised(&self, name: &str) -> bool {
+        self.advertised.as_ref().is_none_or(|a| a.contains(name))
+    }
+
+    /// The names of every **advertised** operation.
     pub fn op_names(&self) -> Vec<String> {
-        self.tools.names()
+        self.tools
+            .names()
+            .into_iter()
+            .filter(|n| self.is_advertised(n))
+            .collect()
     }
 
-    /// The signature of every available operation.
+    /// The signature of every **advertised** operation.
     pub fn signatures(&self) -> Vec<OpSignature> {
         self.tools
             .specs()
             .iter()
+            .filter(|s| self.is_advertised(&s.name))
             .map(OpSignature::from_spec)
             .collect()
     }
 
-    /// The signature of one operation, if registered.
+    /// The signature of one operation, if registered. Not filtered by surfacing — resolution must
+    /// succeed for any registered op a flow names.
     pub fn get(&self, name: &str) -> Option<OpSignature> {
         self.tools
             .get(name)
@@ -203,6 +231,21 @@ mod tests {
         assert!(!from_ops.is_empty(), "builtins should register some ops");
         assert_eq!(ops.signatures().len(), from_tools.len());
         assert!(ops.get("read").is_some());
+    }
+
+    #[test]
+    fn with_advertised_filters_catalog_but_not_get() {
+        let mut reg = ToolRegistry::new();
+        flux_tools::register_builtins(&mut reg);
+        // Advertise only `read`: the catalog shrinks to it, but a hidden op still resolves via `get`.
+        let allowed: HashSet<String> = ["read".to_string()].into_iter().collect();
+        let ops = OpRegistry::new(&reg).with_advertised(allowed);
+        assert_eq!(ops.op_names(), vec!["read".to_string()]);
+        assert_eq!(ops.signatures().len(), 1);
+        // `git_status` is not advertised…
+        assert!(!ops.op_names().contains(&"git_status".to_string()));
+        // …but still resolves for execution / pre-authored flows.
+        assert!(ops.get("git_status").is_some());
     }
 
     #[test]

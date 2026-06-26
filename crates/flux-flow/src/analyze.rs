@@ -141,21 +141,34 @@ fn check_node(node: &Node, registry: &OpRegistry, diags: &mut Vec<Diagnostic>) {
                         b.name.0
                     )));
                 }
-                for n in &b.body { check_node(n, registry, diags); }
+                for n in &b.body {
+                    check_node(n, registry, diags);
+                }
             }
         }
         Node::Throttle { max, body, .. } => {
             if *max == 0 {
                 diags.push(Diagnostic::new("`throttle` requires a non-zero `max`"));
             }
-            for n in body { check_node(n, registry, diags); }
+            for n in body {
+                check_node(n, registry, diags);
+            }
         }
         Node::Debounce { body, .. } => {
-            for n in body { check_node(n, registry, diags); }
+            for n in body {
+                check_node(n, registry, diags);
+            }
         }
-        Node::Loop { until, body, for_ms, .. } => {
+        Node::Loop {
+            until,
+            body,
+            for_ms,
+            ..
+        } => {
             if *for_ms == 0 {
-                diags.push(Diagnostic::new("`loop` requires a non-zero `for_ms` (unbounded loops are rejected)"));
+                diags.push(Diagnostic::new(
+                    "`loop` requires a non-zero `for_ms` (unbounded loops are rejected)",
+                ));
             }
             if let Some(u) = until {
                 check_node(u, registry, diags);

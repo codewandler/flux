@@ -364,9 +364,11 @@ fn provider_for(spec: &str) -> Result<Box<dyn Provider>> {
     if spec == "mock" || spec.starts_with("mock/") {
         Ok(Box::<MockCliProvider>::default())
     } else {
-        let (native, _model) = build_provider(spec).map_err(|e| anyhow::anyhow!(
+        let (native, _model) = build_provider(spec).map_err(|e| {
+            anyhow::anyhow!(
             "sub-agent provider: {e} (hint: the parent --model spec is forwarded to sub-agents)"
-        ))?;
+        )
+        })?;
         Ok(Box::new(native))
     }
 }
@@ -604,6 +606,29 @@ async fn build_agent(cli: &Cli) -> Result<(FlowEngine, String, Arc<dyn flux_runt
         serde_json::json!({ "tools": executor.registry().names() }),
     ));
 
+    // Evidence-gated tool groups: built-ins (git + language scaffolds) + the eval group, with
+    // `.flux/groups.toml` overrides merged on top. The engine re-probes signals each turn and
+    // advertises only the surfaced groups' ops; an empty manifest would disable gating.
+    let mut groups = flux_tools::groups::builtin_groups();
+    groups.push(flux_eval::eval_group());
+    let groups = flux_config::merge_groups(groups, flux_config::load_groups(&cwd));
+    // Record the current workspace signals as a startup observation (audit; per-turn resolution
+    // re-probes these live so groups can surface/un-surface as the workspace changes).
+    let signals: Vec<String> = flux_runtime::detect_signals(&cwd)
+        .iter()
+        .filter_map(|o| {
+            o.data
+                .get("signal")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .collect();
+    executor.observe(flux_evidence::Observation::new(
+        "project.signals",
+        flux_evidence::Phase::Startup,
+        serde_json::json!({ "signals": signals }),
+    ));
+
     let store = Arc::new(open_session_store()?);
     let session_id = if cli.continue_ || cli.resume {
         store
@@ -625,6 +650,8 @@ async fn build_agent(cli: &Cli) -> Result<(FlowEngine, String, Arc<dyn flux_runt
         max_iterations: 25,
         skills: load_skills(&cwd),
         compact_threshold_chars: compact_threshold(),
+        groups,
+        cwd: cwd.clone(),
     };
     Ok((agent, session_id, spawner))
 }
@@ -979,27 +1006,36 @@ async fn run_repl(cli: Cli) -> Result<()> {
                 "exit" | "quit" => break,
                 "help" => {
                     const CMDS: &[(&str, &str)] = &[
-                        ("/help",              "show this help"),
-                        ("/plan",              "toggle plan mode (show plan; /run to execute)"),
-                        ("/run",               "execute the pending plan from plan mode"),
-                        ("/tools",             "list available tools"),
-                        ("/model <spec>",      "switch model (e.g. opus, sonnet, openai/gpt-4o)"),
-                        ("/session",           "show current session id and model"),
-                        ("/sessions",          "list recent sessions with first-message preview"),
-                        ("/resume <id>",       "switch to a previous session"),
-                        ("/clear",             "start a new session"),
-                        ("/compact",           "summarise and compact the context window"),
-                        ("/pd <goal>",         "plan-and-dispatch: parallel dependency waves"),
-                        ("/goal <cond>",       "drive turns toward a goal; stop when satisfied"),
-                        ("/loop <n> <task>",   "repeat a task up to n times"),
-                        ("/exit",              "quit"),
+                        ("/help", "show this help"),
+                        ("/plan", "toggle plan mode (show plan; /run to execute)"),
+                        ("/run", "execute the pending plan from plan mode"),
+                        ("/tools", "list available tools"),
+                        (
+                            "/model <spec>",
+                            "switch model (e.g. opus, sonnet, openai/gpt-4o)",
+                        ),
+                        ("/session", "show current session id and model"),
+                        (
+                            "/sessions",
+                            "list recent sessions with first-message preview",
+                        ),
+                        ("/resume <id>", "switch to a previous session"),
+                        ("/clear", "start a new session"),
+                        ("/compact", "summarise and compact the context window"),
+                        ("/pd <goal>", "plan-and-dispatch: parallel dependency waves"),
+                        (
+                            "/goal <cond>",
+                            "drive turns toward a goal; stop when satisfied",
+                        ),
+                        ("/loop <n> <task>", "repeat a task up to n times"),
+                        ("/exit", "quit"),
                     ];
                     eprintln!("flux REPL commands:");
                     for (cmd, desc) in CMDS {
                         eprintln!("  {:<24} {}", cmd, desc);
                     }
                     eprintln!("  Ctrl-C  interrupt a running turn   Ctrl-D  exit");
-                },
+                }
                 "plan" => {
                     plan_mode = !plan_mode;
                     pending_plan = None;
@@ -1122,7 +1158,9 @@ async fn run_repl(cli: Cli) -> Result<()> {
                                         .find(|m| m.role == flux_core::Role::User)
                                         .and_then(|m| {
                                             m.content.into_iter().find_map(|b| match b {
-                                                flux_core::ContentBlock::Text { text } => Some(text),
+                                                flux_core::ContentBlock::Text { text } => {
+                                                    Some(text)
+                                                }
                                                 _ => None,
                                             })
                                         })
@@ -1471,7 +1509,11 @@ fn result_summary_for(content: &str, tool: &str, verbose: bool) -> String {
                 .map(|l| truncate(l.trim_end(), 120))
                 .collect::<Vec<_>>()
                 .join("\n    ");
-            return format!("{head}\n    … (+{} more match{}; -v for full)", n - 3, if n - 3 == 1 { "" } else { "es" });
+            return format!(
+                "{head}\n    … (+{} more match{}; -v for full)",
+                n - 3,
+                if n - 3 == 1 { "" } else { "es" }
+            );
         }
         "glob" if n > 5 => {
             let head = lines[..5]
@@ -1483,7 +1525,11 @@ fn result_summary_for(content: &str, tool: &str, verbose: bool) -> String {
         }
         "bash" if n > 1 => {
             // Show the last non-empty line as a quick exit hint.
-            let last = lines.iter().rev().find(|l| !l.trim().is_empty()).unwrap_or(&lines[n - 1]);
+            let last = lines
+                .iter()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or(&lines[n - 1]);
             let last = truncate(last.trim_end(), 160);
             return format!("{n} lines · last: {last}  (-v for full)");
         }
@@ -1706,18 +1752,19 @@ impl AgentSink for CliSink {
         if self.steps > 0 {
             let plural = if self.steps == 1 { "" } else { "s" };
             // Build the right-hand annotation: steps + timing + inline token counts.
-            let token_inline = usage.as_ref().map(|u| {
-                if u.cache_read_input_tokens > 0 {
-                    format!(
-                        " · in {} out {} $cache {}",
-                        u.input_tokens,
-                        u.output_tokens,
-                        u.cache_read_input_tokens
-                    )
-                } else {
-                    format!(" · in {} out {}", u.input_tokens, u.output_tokens)
-                }
-            }).unwrap_or_default();
+            let token_inline = usage
+                .as_ref()
+                .map(|u| {
+                    if u.cache_read_input_tokens > 0 {
+                        format!(
+                            " · in {} out {} $cache {}",
+                            u.input_tokens, u.output_tokens, u.cache_read_input_tokens
+                        )
+                    } else {
+                        format!(" · in {} out {}", u.input_tokens, u.output_tokens)
+                    }
+                })
+                .unwrap_or_default();
             let summary = format!("{} step{plural} · {elapsed}{token_inline}", self.steps);
             let rule_len = self.width.saturating_sub(summary.chars().count() + 2);
             eprintln!("{} {}", style::rule(rule_len), style::dim(&summary));
@@ -1986,23 +2033,32 @@ async fn main() -> Result<()> {
     } else if cli.tui {
         run_tui(cli).await
     } else if cli.plan {
-        run_plan(cli).await.map_err(|e| {
-            eprintln!("{} {e}", style::red("error:"));
-            std::process::exit(1);
-        }).unwrap_or(());
+        run_plan(cli)
+            .await
+            .map_err(|e| {
+                eprintln!("{} {e}", style::red("error:"));
+                std::process::exit(1);
+            })
+            .unwrap_or(());
         Ok(())
     } else if cli.prompt.is_empty() && !cli.print {
         // No prompt and not one-shot → interactive agentic REPL.
-        run_repl(cli).await.map_err(|e| {
-            eprintln!("{} {e}", style::red("error:"));
-            std::process::exit(1);
-        }).unwrap_or(());
+        run_repl(cli)
+            .await
+            .map_err(|e| {
+                eprintln!("{} {e}", style::red("error:"));
+                std::process::exit(1);
+            })
+            .unwrap_or(());
         Ok(())
     } else {
-        run_prompt(cli).await.map_err(|e| {
-            eprintln!("{} {e}", style::red("error:"));
-            std::process::exit(1);
-        }).unwrap_or(());
+        run_prompt(cli)
+            .await
+            .map_err(|e| {
+                eprintln!("{} {e}", style::red("error:"));
+                std::process::exit(1);
+            })
+            .unwrap_or(());
         Ok(())
     }
 }

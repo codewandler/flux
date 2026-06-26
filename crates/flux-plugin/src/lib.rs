@@ -584,6 +584,7 @@ impl PluginTool {
             risk: op.risk.unwrap_or(Risk::Medium),
             idempotency: Idempotency::NonIdempotent,
             access: Vec::new(),
+            group: None,
         };
         Self {
             host,

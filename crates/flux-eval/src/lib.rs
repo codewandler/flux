@@ -62,3 +62,21 @@ pub fn register_eval_ops(registry: &mut ToolRegistry) {
     registry.register(Arc::new(git::GitTagTool));
     registry.register(Arc::new(git::GitRevertTool));
 }
+
+/// The evidence-gated [`ToolGroup`](flux_evidence::ToolGroup) bundling every eval / self-improvement
+/// op. These are niche — relevant only when an eval workspace is present — so they are advertised to
+/// the model only once an `eval` signal is observed (a `.flux/evals/` directory). Membership is read
+/// back from [`register_eval_ops`] so the group can never drift from the registered ops.
+pub fn eval_group() -> flux_evidence::ToolGroup {
+    let mut reg = ToolRegistry::new();
+    register_eval_ops(&mut reg);
+    flux_evidence::ToolGroup {
+        name: "eval".into(),
+        description: "Evaluation & self-improvement operations (improve.flux).".into(),
+        tools: reg.names(),
+        surface_when: vec![flux_evidence::SignalMatch {
+            kind: flux_evidence::KIND_SIGNAL.into(),
+            signal: Some("eval".into()),
+        }],
+    }
+}

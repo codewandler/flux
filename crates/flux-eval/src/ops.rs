@@ -57,6 +57,7 @@ impl Tool for EvalRunTool {
             risk: Risk::Medium,
             idempotency: Idempotency::NonIdempotent,
             access: vec![AccessKind::Process],
+            group: None,
         }
     }
 
@@ -377,6 +378,7 @@ impl Tool for ChangeImplementTool {
             risk: Risk::Medium,
             idempotency: Idempotency::NonIdempotent,
             access: Vec::new(),
+            group: None,
         }
     }
 

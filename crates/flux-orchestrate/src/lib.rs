@@ -150,6 +150,9 @@ impl Spawner for LocalSpawner {
             max_iterations: self.max_iterations,
             skills: Vec::new(),
             compact_threshold_chars: 0,
+            // Sub-agents get an explicit scoped tool registry, so no evidence gating (empty manifest).
+            groups: Vec::new(),
+            cwd: std::path::PathBuf::from("."),
         };
 
         let mut sink = TextCollector::default();
@@ -352,6 +355,7 @@ impl Tool for TaskTool {
             risk: Risk::Medium,
             idempotency: Idempotency::NonIdempotent,
             access: Vec::new(),
+            group: None,
         }
     }
 

@@ -50,6 +50,12 @@ pub struct FlowEngine {
     /// When the persisted session exceeds this many (serialized) chars, older turns are summarized
     /// into one synthetic message before the next request. `0` disables compaction.
     pub compact_threshold_chars: usize,
+    /// Evidence-gated tool groups. Each turn the workspace is probed for signals (`detect_signals`)
+    /// and only ops whose group is surfaced are advertised in the op catalog. **Empty disables
+    /// gating** (every op advertised, as before surfacing existed).
+    pub groups: Vec<flux_evidence::ToolGroup>,
+    /// Workspace root, re-probed each turn for the surfacing signals above.
+    pub cwd: std::path::PathBuf,
 }
 
 impl FlowEngine {
@@ -84,9 +90,10 @@ impl FlowEngine {
         // Compact the persisted session if it has grown past the budget.
         self.maybe_compact(session_id, sink, cancel).await?;
 
-        // The full op catalog (a plan may use any op). Pure DAG: the model's only tool is `emit_plan`,
-        // so there is no research executor — reads are plan nodes, executed by the multi-round loop.
-        let ops = OpRegistry::new(self.executor.registry());
+        // The op catalog (a plan may use any *advertised* op). Pure DAG: the model's only tool is
+        // `emit_plan`, so there is no research executor — reads are plan nodes, executed by the
+        // multi-round loop. Evidence-gated surfacing happens inside `advertised_registry`.
+        let ops = self.advertised_registry(Some(sink));
         let opts = CompileOptions {
             max_tokens: self.max_tokens,
             ..CompileOptions::default()
@@ -214,7 +221,7 @@ impl FlowEngine {
         prompt: &str,
         ask: Option<&dyn crate::compile::AskUser>,
     ) -> Result<TurnOutput> {
-        let ops = OpRegistry::new(self.executor.registry());
+        let ops = self.advertised_registry(None);
         let view = self.flow.view(session_id)?;
         let view_ref = (!view.symbols.is_empty()).then_some(&view);
         let opts = CompileOptions {
@@ -246,7 +253,7 @@ impl FlowEngine {
         self.store
             .append_message(session_id, &Message::user_text(user_input))?;
         let base_system = self.base_system_with_skills(user_input, sink);
-        let ops = OpRegistry::new(self.executor.registry());
+        let ops = self.advertised_registry(Some(sink));
         let view = self.flow.view(session_id)?;
         let view_ref = (!view.symbols.is_empty()).then_some(&view);
         let opts = CompileOptions {
@@ -310,6 +317,43 @@ impl FlowEngine {
                 "ops": risk.ops.len(),
             }),
         )
+    }
+
+    /// Build the op catalog view for a turn, advertising only ops whose group is surfaced by the
+    /// current workspace signals (an empty `groups` manifest disables gating, advertising everything).
+    /// Execution is unaffected — `OpRegistry::get` still resolves any registered op, so a pre-authored
+    /// flow naming a hidden-group op keeps working. `sink`, when given, receives a `groups.active`
+    /// observation for visibility.
+    fn advertised_registry(&self, sink: Option<&mut dyn AgentSink>) -> OpRegistry<'_> {
+        let reg = self.executor.registry();
+        if self.groups.is_empty() {
+            return OpRegistry::new(reg);
+        }
+        let signals = flux_runtime::detect_signals(&self.cwd);
+        let active = flux_evidence::resolve_active_groups(&self.groups, &signals);
+        if let Some(sink) = sink {
+            self.record_active_groups(&active, sink);
+        }
+        let advertised = flux_runtime::advertised_op_names(&reg.specs(), &self.groups, &active);
+        OpRegistry::new(reg).with_advertised(advertised)
+    }
+
+    /// Record (audit + surface) which evidence-gated groups are active this turn, so the user can see
+    /// what the workspace surfaced. Mirrors the skill-activation observation pattern.
+    fn record_active_groups(
+        &self,
+        active: &std::collections::HashSet<String>,
+        sink: &mut dyn AgentSink,
+    ) {
+        let mut names: Vec<&str> = active.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        let obs = flux_evidence::Observation::new(
+            "groups.active",
+            flux_evidence::Phase::Turn,
+            serde_json::json!({ "groups": names }),
+        );
+        self.executor.observe(obs.clone());
+        sink.observation(&obs);
     }
 
     /// The agent identity + project context + any skills whose triggers match this turn — the base the
@@ -643,6 +687,8 @@ mod tests {
             max_iterations: 5,
             skills: Vec::new(),
             compact_threshold_chars: 0,
+            groups: Vec::new(),
+            cwd: dir,
         }
     }
 
@@ -743,14 +789,19 @@ mod tests {
         let store = Arc::new(SessionStore::in_memory().unwrap());
         let sid = store.create_session("fail").unwrap();
         let provider = Box::new(FailProvider {
-            err: Box::new(|| Error::Api {
+            err: Box::new(|| {
+                Error::Api {
                 status: 400,
                 message: r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}"#.into(),
+            }
             }),
         });
         let engine = engine_with_provider(provider, store.clone());
         let mut sink = CollectSink::default();
-        engine.run_turn(&sid, "do something", &mut sink).await.unwrap();
+        engine
+            .run_turn(&sid, "do something", &mut sink)
+            .await
+            .unwrap();
 
         // The failure was shown to the user, with the provider's message unwrapped from its JSON body.
         assert!(
@@ -773,12 +824,17 @@ mod tests {
         // An Anthropic-style error body collapses to its `error.message`.
         let api = Error::Api {
             status: 429,
-            message: r#"{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}"#.into(),
+            message:
+                r#"{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}"#
+                    .into(),
         };
         let rendered = planner_error(&api);
         assert!(rendered.contains("HTTP 429"));
         assert!(rendered.contains("rate limited"));
-        assert!(!rendered.contains('{'), "the raw JSON body is not shown: {rendered}");
+        assert!(
+            !rendered.contains('{'),
+            "the raw JSON body is not shown: {rendered}"
+        );
 
         // A non-JSON body falls back to the raw message.
         let plain = Error::Api {

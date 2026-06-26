@@ -9,6 +9,7 @@ description = "flux eval & self-improvement harness: benchmark adapters, session
 flux-core.workspace = true
 flux-spec.workspace = true
 flux-runtime.workspace = true
+flux-evidence.workspace = true
 flux-system.workspace = true
 flux-session.workspace = true
 flux-flow.workspace = true

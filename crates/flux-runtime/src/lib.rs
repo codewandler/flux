@@ -8,7 +8,7 @@
 mod perm;
 pub use perm::{Pattern, PermDecision, PermissionManager};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -250,6 +250,149 @@ impl ToolRegistry {
     pub fn names(&self) -> Vec<String> {
         self.tools.keys().cloned().collect()
     }
+
+    /// Specs for the ops that should be **advertised to the model** given the group manifest and the
+    /// active group set: core ops (in no group) always; a grouped op only when its group is active.
+    /// See [`is_advertised`]. An empty manifest with no group-tagged specs advertises everything.
+    pub fn active_specs(
+        &self,
+        groups: &[flux_evidence::ToolGroup],
+        active: &HashSet<String>,
+    ) -> Vec<ToolSpec> {
+        self.tools
+            .values()
+            .map(|t| t.spec())
+            .filter(|s| is_advertised(s, groups, active))
+            .collect()
+    }
+}
+
+/// `FLUX_SURFACE_ALL=1` (or `true`) disables evidence gating — every op is advertised, as before
+/// surfacing existed. An escape hatch for debugging and parity.
+pub fn surface_all_override() -> bool {
+    std::env::var("FLUX_SURFACE_ALL").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// The group an op effectively belongs to: a manifest group that lists it in `tools` wins (so config
+/// can (re)assign membership), otherwise the op's own [`ToolSpec::group`] tag. `None` ⇒ *core*.
+fn effective_group<'a>(
+    spec: &'a ToolSpec,
+    groups: &'a [flux_evidence::ToolGroup],
+) -> Option<&'a str> {
+    groups
+        .iter()
+        .find(|g| g.tools.iter().any(|t| t == &spec.name))
+        .map(|g| g.name.as_str())
+        .or(spec.group.as_deref())
+}
+
+/// Whether `spec` should be advertised to the model: core ops (no effective group) always; a grouped
+/// op only when its group is in `active`. `FLUX_SURFACE_ALL` forces everything on. Membership comes
+/// from the manifest's `tools` or the op's own [`ToolSpec::group`] tag (see [`effective_group`]).
+pub fn is_advertised(
+    spec: &ToolSpec,
+    groups: &[flux_evidence::ToolGroup],
+    active: &HashSet<String>,
+) -> bool {
+    surface_all_override()
+        || match effective_group(spec, groups) {
+            None => true,
+            Some(g) => active.contains(g),
+        }
+}
+
+/// The set of op names to advertise to the model — [`is_advertised`] applied across `specs`. Handy
+/// for filtering a name-keyed catalog (e.g. the Flux-Lang op catalog in `flux-flow`).
+pub fn advertised_op_names(
+    specs: &[ToolSpec],
+    groups: &[flux_evidence::ToolGroup],
+    active: &HashSet<String>,
+) -> HashSet<String> {
+    specs
+        .iter()
+        .filter(|s| is_advertised(s, groups, active))
+        .map(|s| s.name.clone())
+        .collect()
+}
+
+/// Probe `cwd` (walking up to the nearest marker) for the workspace signals currently true, as
+/// `project.signal` [`Observation`]s. Cheap enough to run every turn — a handful of `exists()`
+/// checks. The emitted `signal` strings are the contract that group `surface_when` matches against
+/// (see `flux-tools`' `builtin_groups`).
+pub fn detect_signals(cwd: &std::path::Path) -> Vec<Observation> {
+    let mut out = Vec::new();
+    let mut push = |sig: &str| {
+        out.push(Observation::new(
+            flux_evidence::KIND_SIGNAL,
+            Phase::Turn,
+            json!({ "signal": sig }),
+        ));
+    };
+    if find_up(cwd, |p| p.join(".git").exists()) {
+        push("git_repo");
+    }
+    if find_up(cwd, |p| p.join("go.mod").exists()) {
+        push("go");
+    }
+    if find_up(cwd, |p| p.join("Cargo.toml").exists()) {
+        push("rust");
+    }
+    if find_up(cwd, |p| p.join("package.json").exists()) {
+        push("node");
+    }
+    if find_up(cwd, |p| {
+        p.join("pyproject.toml").exists() || p.join("requirements.txt").exists()
+    }) {
+        push("python");
+    }
+    if find_up(cwd, |p| p.join(".flux").join("evals").is_dir()) {
+        push("eval");
+    }
+    out
+}
+
+/// Walk up from `start` to the filesystem root, returning true at the first ancestor satisfying
+/// `pred` — so a marker in any parent (e.g. running from a repo subdirectory or a git worktree,
+/// where `.git` is a *file*) is still found, matching how the rest of the system detects a repo.
+fn find_up(start: &std::path::Path, pred: impl Fn(&std::path::Path) -> bool) -> bool {
+    let mut dir = Some(start);
+    while let Some(d) = dir {
+        if pred(d) {
+            return true;
+        }
+        dir = d.parent();
+    }
+    false
+}
+
+/// Cap an oversized tool result for the model transcript: within `cap` chars it is returned
+/// unchanged; otherwise it is truncated to `cap` and a one-line notice is appended recording how much
+/// was dropped and pointing the model at a follow-up read for the exact bytes. Keeps a single huge
+/// `bash`/`read`/`grep` result from blowing the context budget. `cap == 0` disables trimming.
+pub fn trim_tool_output(content: String, cap: usize, label: &str) -> String {
+    if cap == 0 {
+        return content;
+    }
+    let total = content.chars().count();
+    if total <= cap {
+        return content;
+    }
+    let kept: String = content.chars().take(cap).collect();
+    let omitted = total - cap;
+    format!(
+        "{kept}\n…[{label} output truncated: {omitted} of {total} chars omitted — narrow the range \
+         or do a follow-up read for the full output]"
+    )
+}
+
+/// The per-result transcript cap (chars) for [`trim_tool_output`], from `FLUX_TOOL_OUTPUT_CAP`
+/// (default 20000). `0` disables per-result trimming. Mirrors the session-compaction knob but acts on
+/// a single tool/op result so one huge output can't blow the budget before compaction runs.
+pub fn tool_output_cap() -> usize {
+    std::env::var("FLUX_TOOL_OUTPUT_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20_000)
 }
 
 /// The user's response to an approval request.
@@ -1007,5 +1150,117 @@ mod tests {
         let ex = Executor::new(registry(), PermissionManager::new(), approver, test_ctx());
         let _ = ex.dispatch("echo", json!({"text": "a"})).await;
         assert_eq!(ex.allow_rules(), vec!["echo".to_string()]);
+    }
+
+    /// A tool standing in for a grouped op (e.g. a git op) in surfacing tests.
+    struct GitishTool;
+    #[async_trait]
+    impl Tool for GitishTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only("git_status", "git status", json!({"type": "object"}))
+        }
+        fn permission_subjects(&self, _p: &Value) -> Vec<String> {
+            Vec::new()
+        }
+        async fn execute(&self, _ctx: &ToolContext, _p: Value) -> Result<ToolResult> {
+            Ok(ToolResult::ok("clean"))
+        }
+    }
+
+    fn git_group() -> Vec<flux_evidence::ToolGroup> {
+        vec![flux_evidence::ToolGroup {
+            name: "git".into(),
+            tools: vec!["git_status".into()],
+            surface_when: vec![flux_evidence::SignalMatch {
+                kind: "project.signal".into(),
+                signal: Some("git_repo".into()),
+            }],
+            ..Default::default()
+        }]
+    }
+
+    #[test]
+    fn advertised_op_names_gates_grouped_ops() {
+        let specs = vec![
+            ToolSpec::read_only("read", "read", json!({"type": "object"})),
+            ToolSpec::read_only("git_status", "git status", json!({"type": "object"})),
+        ];
+        // Inactive group → only the core op is advertised.
+        let none = advertised_op_names(&specs, &git_group(), &HashSet::new());
+        assert!(none.contains("read") && !none.contains("git_status"));
+        // Active group → both.
+        let active: HashSet<String> = ["git".to_string()].into_iter().collect();
+        let both = advertised_op_names(&specs, &git_group(), &active);
+        assert!(both.contains("read") && both.contains("git_status"));
+        // Empty manifest, no group-tagged specs → everything (no gating).
+        let all_set = advertised_op_names(&specs, &[], &HashSet::new());
+        assert!(all_set.contains("read") && all_set.contains("git_status"));
+    }
+
+    #[test]
+    fn spec_group_tag_is_honored_without_a_manifest_tools_list() {
+        // A spec tagged via ToolSpec::with_group (the committed field) is gated even when the manifest
+        // group lists no `tools` (membership falls back to the spec's own tag).
+        let tagged =
+            ToolSpec::read_only("git_status", "s", json!({"type": "object"})).with_group("git");
+        let group = vec![flux_evidence::ToolGroup {
+            name: "git".into(),
+            surface_when: vec![flux_evidence::SignalMatch {
+                kind: "project.signal".into(),
+                signal: Some("git_repo".into()),
+            }],
+            ..Default::default()
+        }];
+        assert!(!is_advertised(&tagged, &group, &HashSet::new()));
+        let active: HashSet<String> = ["git".to_string()].into_iter().collect();
+        assert!(is_advertised(&tagged, &group, &active));
+    }
+
+    #[test]
+    fn active_specs_filters_by_group() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        reg.register(Arc::new(GitishTool));
+        // Group inactive → git op hidden, core op kept.
+        let hidden = reg.active_specs(&git_group(), &HashSet::new());
+        let names: Vec<&str> = hidden.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"echo") && !names.contains(&"git_status"));
+        // Group active → all specs (== specs()).
+        let active: HashSet<String> = ["git".to_string()].into_iter().collect();
+        assert_eq!(
+            reg.active_specs(&git_group(), &active).len(),
+            reg.specs().len()
+        );
+    }
+
+    #[test]
+    fn trim_tool_output_caps_and_annotates() {
+        // Under cap → unchanged.
+        assert_eq!(trim_tool_output("hello".into(), 100, "bash"), "hello");
+        // cap 0 → disabled.
+        let big = "x".repeat(50);
+        assert_eq!(trim_tool_output(big.clone(), 0, "bash"), big);
+        // Over cap → truncated + notice.
+        let out = trim_tool_output("x".repeat(50), 10, "bash");
+        assert!(out.starts_with(&"x".repeat(10)));
+        assert!(out.contains("truncated") && out.contains("40 of 50"));
+    }
+
+    #[test]
+    fn detect_signals_finds_markers_walking_up() {
+        let base = std::env::temp_dir().join(format!("flux-detect-{}", std::process::id()));
+        let sub = base.join("a").join("b");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(base.join(".git")).unwrap();
+        std::fs::write(base.join("go.mod"), "module x\n").unwrap();
+        let sigs = detect_signals(&sub);
+        let has = |s: &str| {
+            sigs.iter()
+                .any(|o| o.data.get("signal").and_then(|v| v.as_str()) == Some(s))
+        };
+        // Found from a nested subdirectory (walk-up).
+        assert!(has("git_repo") && has("go"));
+        assert!(!has("python"));
+        std::fs::remove_dir_all(&base).ok();
     }
 }

@@ -316,7 +316,9 @@ fn exec_body<'a>(
                                     let jv = eval_arg(v, store, session_id)?;
                                     let n = match &jv {
                                         serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
-                                        serde_json::Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
+                                        serde_json::Value::String(s) => {
+                                            s.parse::<f64>().unwrap_or(0.0)
+                                        }
                                         _ => 0.0,
                                     };
                                     Ok::<_, Error>((k.clone(), n))
@@ -326,7 +328,14 @@ fn exec_body<'a>(
                             let text = format_number(result);
                             let vid = store.put_value(session_id, &Value::String(text.clone()))?;
                             let ty_label = ty.as_ref().map(TypeRef::label);
-                            store.bind(session_id, name, &vid, ty_label.as_deref(), &summarize(&text), Visibility::Visible)?;
+                            store.bind(
+                                session_id,
+                                name,
+                                &vid,
+                                ty_label.as_deref(),
+                                &summarize(&text),
+                                Visibility::Visible,
+                            )?;
                             transcript.push(format!("[${} = expr {formula}]\n{text}", name.0));
                             last = text;
                             last_value = Some(vid);
@@ -336,7 +345,14 @@ fn exec_body<'a>(
                             let text = interpolate_str(template, store, session_id);
                             let vid = store.put_value(session_id, &Value::String(text.clone()))?;
                             let ty_label = ty.as_ref().map(TypeRef::label);
-                            store.bind(session_id, name, &vid, ty_label.as_deref(), &summarize(&text), Visibility::Visible)?;
+                            store.bind(
+                                session_id,
+                                name,
+                                &vid,
+                                ty_label.as_deref(),
+                                &summarize(&text),
+                                Visibility::Visible,
+                            )?;
                             transcript.push(format!("[${} = fmt]\n{text}", name.0));
                             last = text;
                             last_value = Some(vid);
@@ -351,7 +367,14 @@ fn exec_body<'a>(
                             };
                             let vid = store.put_value(session_id, &Value::String(text.clone()))?;
                             let ty_label = ty.as_ref().map(TypeRef::label);
-                            store.bind(session_id, name, &vid, ty_label.as_deref(), &summarize(&text), Visibility::Visible)?;
+                            store.bind(
+                                session_id,
+                                name,
+                                &vid,
+                                ty_label.as_deref(),
+                                &summarize(&text),
+                                Visibility::Visible,
+                            )?;
                             transcript.push(format!("[${} = jq {path}]\n{text}", name.0));
                             last = text;
                             last_value = Some(vid);
@@ -382,8 +405,14 @@ fn exec_body<'a>(
                     // The model reasons over intermediate results → feed the model-facing VIEW
                     // (line-numbered read, diff, …). Control flow (`when`/`return`) stays canonical.
                     // Record EVERY node's view in the transcript so the round feedback surfaces all of
-                    // a plan's reads, not just the last one.
-                    transcript.push(format!("[${} = {op}]\n{}", name.0, outcome.view));
+                    // a plan's reads, not just the last one. Oversized views are trimmed so one huge
+                    // result can't blow the round's context budget (the canonical value is untouched).
+                    let view = flux_runtime::trim_tool_output(
+                        outcome.view.clone(),
+                        flux_runtime::tool_output_cap(),
+                        op,
+                    );
+                    transcript.push(format!("[${} = {op}]\n{view}", name.0));
                     last = outcome.view;
                     last_value = outcome.value_id;
                 }
@@ -399,7 +428,13 @@ fn exec_body<'a>(
                     }
                     // The model reasons over intermediate results → feed the model-facing VIEW
                     // (line-numbered read, diff, …). Control flow (`when`/`return`) stays canonical.
-                    transcript.push(format!("[{op}]\n{}", outcome.view));
+                    // Oversized views are trimmed (canonical value untouched).
+                    let view = flux_runtime::trim_tool_output(
+                        outcome.view.clone(),
+                        flux_runtime::tool_output_cap(),
+                        op,
+                    );
+                    transcript.push(format!("[{op}]\n{view}"));
                     last = outcome.view;
                     last_value = outcome.value_id;
                 }
@@ -696,10 +731,20 @@ fn exec_body<'a>(
                             }
                         }
                         match exec_body(
-                            store, executor, session_id, rbody, &mut *sink, &mut *steps, &mut *transcript,
-                        ).await {
+                            store,
+                            executor,
+                            session_id,
+                            rbody,
+                            &mut *sink,
+                            &mut *steps,
+                            &mut *transcript,
+                        )
+                        .await
+                        {
                             Ok((blast, bvid, step)) => {
-                                if !blast.is_empty() { last = blast; }
+                                if !blast.is_empty() {
+                                    last = blast;
+                                }
                                 last_vid = bvid;
                                 if let Step::Return(v) = step {
                                     return Ok((last, v.clone(), Step::Return(v)));
@@ -714,7 +759,8 @@ fn exec_body<'a>(
                     }
                     if !succeeded {
                         return Err(Error::Other(format!(
-                            "`retry` exhausted {} attempt(s): {}", max, last_err
+                            "`retry` exhausted {} attempt(s): {}",
+                            max, last_err
                         )));
                     }
                     if let (Some(name), Some(vid)) = (bind, &last_vid) {
@@ -728,10 +774,20 @@ fn exec_body<'a>(
                     handler,
                 } => {
                     match exec_body(
-                        store, executor, session_id, tbody, &mut *sink, &mut *steps, &mut *transcript,
-                    ).await {
+                        store,
+                        executor,
+                        session_id,
+                        tbody,
+                        &mut *sink,
+                        &mut *steps,
+                        &mut *transcript,
+                    )
+                    .await
+                    {
                         Ok((blast, bvid, step)) => {
-                            if !blast.is_empty() { last = blast; }
+                            if !blast.is_empty() {
+                                last = blast;
+                            }
                             last_value = bvid;
                             if let Step::Return(v) = step {
                                 return Ok((last, v.clone(), Step::Return(v)));
@@ -739,13 +795,23 @@ fn exec_body<'a>(
                         }
                         Err(e) => {
                             if let Some(cname) = catch {
-                                let err_vid = store.put_value(session_id, &Value::String(e.to_string()))?;
+                                let err_vid =
+                                    store.put_value(session_id, &Value::String(e.to_string()))?;
                                 bind_existing(store, session_id, cname, &err_vid)?;
                             }
                             let (hblast, hvid, hstep) = exec_body(
-                                store, executor, session_id, handler, &mut *sink, &mut *steps, &mut *transcript,
-                            ).await?;
-                            if !hblast.is_empty() { last = hblast; }
+                                store,
+                                executor,
+                                session_id,
+                                handler,
+                                &mut *sink,
+                                &mut *steps,
+                                &mut *transcript,
+                            )
+                            .await?;
+                            if !hblast.is_empty() {
+                                last = hblast;
+                            }
                             last_value = hvid;
                             if let Step::Return(v) = hstep {
                                 return Ok((last, v.clone(), Step::Return(v)));
@@ -761,16 +827,26 @@ fn exec_body<'a>(
                     let intents = flux_spec::IntentSet::new();
                     let risk_tag = risk.as_deref().unwrap_or("medium");
                     let labelled = format!("[{risk_tag}] {message}");
-                    let choice = executor.approver().request("confirm", std::slice::from_ref(&labelled), &intents).await;
+                    let choice = executor
+                        .approver()
+                        .request("confirm", std::slice::from_ref(&labelled), &intents)
+                        .await;
                     if !matches!(choice, ApprovalChoice::Allow) {
-                        return Err(Error::Other(format!(
-                            "`confirm` denied: {}", message
-                        )));
+                        return Err(Error::Other(format!("`confirm` denied: {}", message)));
                     }
                     let (blast, bvid, step) = exec_body(
-                        store, executor, session_id, cbody, &mut *sink, &mut *steps, &mut *transcript,
-                    ).await?;
-                    if !blast.is_empty() { last = blast; }
+                        store,
+                        executor,
+                        session_id,
+                        cbody,
+                        &mut *sink,
+                        &mut *steps,
+                        &mut *transcript,
+                    )
+                    .await?;
+                    if !blast.is_empty() {
+                        last = blast;
+                    }
                     last_value = bvid;
                     if let Step::Return(v) = step {
                         return Ok((last, v.clone(), Step::Return(v)));
@@ -783,16 +859,28 @@ fn exec_body<'a>(
                     body: lbody,
                     bind,
                 } => {
-                    let deadline = std::time::Instant::now()
-                        + std::time::Duration::from_millis(*for_ms);
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(*for_ms);
                     let mut last_vid: Option<ValueId> = None;
                     loop {
-                        if std::time::Instant::now() >= deadline { break; }
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
                         match exec_body(
-                            store, executor, session_id, lbody, &mut *sink, &mut *steps, &mut *transcript,
-                        ).await {
+                            store,
+                            executor,
+                            session_id,
+                            lbody,
+                            &mut *sink,
+                            &mut *steps,
+                            &mut *transcript,
+                        )
+                        .await
+                        {
                             Ok((blast, bvid, step)) => {
-                                if !blast.is_empty() { last = blast; }
+                                if !blast.is_empty() {
+                                    last = blast;
+                                }
                                 last_vid = bvid;
                                 if let Step::Return(v) = step {
                                     return Ok((last, v.clone(), Step::Return(v)));
@@ -803,7 +891,9 @@ fn exec_body<'a>(
                             }
                         }
                         if let Some(u) = until {
-                            if eval_cond(store, executor, session_id, u, &mut *sink, &mut *steps).await? {
+                            if eval_cond(store, executor, session_id, u, &mut *sink, &mut *steps)
+                                .await?
+                            {
                                 break;
                             }
                         }
@@ -821,8 +911,8 @@ fn exec_body<'a>(
                     branches,
                     bind,
                 } => {
-                    let deadline = tokio::time::Instant::now()
-                        + std::time::Duration::from_millis(*timeout_ms);
+                    let deadline =
+                        tokio::time::Instant::now() + std::time::Duration::from_millis(*timeout_ms);
                     // Run branches sequentially; return the first success within the deadline.
                     let mut race_result: Option<(String, Option<ValueId>, Step)> = None;
                     for b in branches {
@@ -830,8 +920,16 @@ fn exec_body<'a>(
                             break;
                         }
                         match exec_body(
-                            store, executor, session_id, &b.body, &mut *sink, &mut *steps, &mut *transcript,
-                        ).await {
+                            store,
+                            executor,
+                            session_id,
+                            &b.body,
+                            &mut *sink,
+                            &mut *steps,
+                            &mut *transcript,
+                        )
+                        .await
+                        {
                             Ok((blast, bvid, step)) => {
                                 race_result = Some((blast, bvid, step));
                                 break;
@@ -840,9 +938,13 @@ fn exec_body<'a>(
                         }
                     }
                     let (blast, bvid, step) = race_result.ok_or_else(|| {
-                        Error::Other(format!("`race` timed out after {timeout_ms}ms with no successful branch"))
+                        Error::Other(format!(
+                            "`race` timed out after {timeout_ms}ms with no successful branch"
+                        ))
                     })?;
-                    if !blast.is_empty() { last = blast; }
+                    if !blast.is_empty() {
+                        last = blast;
+                    }
                     if let (Some(name), Some(vid)) = (bind, &bvid) {
                         bind_existing(store, session_id, name, vid)?;
                     }
@@ -858,18 +960,24 @@ fn exec_body<'a>(
                 } => {
                     // Token-bucket: track call timestamps in the value store as a synthetic key.
                     // Simple in-process approach: store call times as a JSON array in the store.
-                    let bucket_key = SymbolName(format!("__throttle_bucket_{session_id}_{max}_{window_ms}"));
+                    let bucket_key =
+                        SymbolName(format!("__throttle_bucket_{session_id}_{max}_{window_ms}"));
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
                     let window_start = now_ms.saturating_sub(*window_ms);
                     // Load existing timestamps.
-                    let mut times: Vec<u64> = if let Some(vid) = store.resolve(session_id, &bucket_key).ok().flatten() {
-                        if let Some(Value::String(s)) = store.get_value(&vid).ok().flatten() {
-                            serde_json::from_str::<Vec<u64>>(&s).unwrap_or_default()
-                        } else { vec![] }
-                    } else { vec![] };
+                    let mut times: Vec<u64> =
+                        if let Some(vid) = store.resolve(session_id, &bucket_key).ok().flatten() {
+                            if let Some(Value::String(s)) = store.get_value(&vid).ok().flatten() {
+                                serde_json::from_str::<Vec<u64>>(&s).unwrap_or_default()
+                            } else {
+                                vec![]
+                            }
+                        } else {
+                            vec![]
+                        };
                     // Evict expired entries.
                     times.retain(|&t| t >= window_start);
                     if times.len() >= *max as usize {
@@ -881,22 +989,29 @@ fn exec_body<'a>(
                     let times_json = serde_json::to_string(&times).unwrap_or_default();
                     let vid = store.put_value(session_id, &Value::String(times_json))?;
                     store.bind(session_id, &bucket_key, &vid, None, "", Visibility::Hidden)?;
-                    let (blast, bvid, step) = exec_body(
-                        store, executor, session_id, tbody, sink, steps, transcript,
-                    ).await?;
-                    if !blast.is_empty() { last = blast; }
+                    let (blast, bvid, step) =
+                        exec_body(store, executor, session_id, tbody, sink, steps, transcript)
+                            .await?;
+                    if !blast.is_empty() {
+                        last = blast;
+                    }
                     last_value = bvid;
                     if let Step::Return(v) = step {
                         return Ok((last, v.clone(), Step::Return(v)));
                     }
                 }
-                Node::Debounce { wait_ms, body: dbody } => {
+                Node::Debounce {
+                    wait_ms,
+                    body: dbody,
+                } => {
                     // Debounce: sleep for wait_ms then run body once.
                     tokio::time::sleep(std::time::Duration::from_millis(*wait_ms)).await;
-                    let (blast, bvid, step) = exec_body(
-                        store, executor, session_id, dbody, sink, steps, transcript,
-                    ).await?;
-                    if !blast.is_empty() { last = blast; }
+                    let (blast, bvid, step) =
+                        exec_body(store, executor, session_id, dbody, sink, steps, transcript)
+                            .await?;
+                    if !blast.is_empty() {
+                        last = blast;
+                    }
                     last_value = bvid;
                     if let Step::Return(v) = step {
                         return Ok((last, v.clone(), Step::Return(v)));
@@ -904,21 +1019,38 @@ fn exec_body<'a>(
                 }
                 Node::Unless { cond, body: ubody } => {
                     // Sugar for `when !cond`: run body only when condition is falsey.
-                    let take = !eval_cond(store, executor, session_id, cond, &mut *sink, &mut *steps).await?;
+                    let take =
+                        !eval_cond(store, executor, session_id, cond, &mut *sink, &mut *steps)
+                            .await?;
                     if take {
                         let (blast, bvid, step) = exec_body(
-                            store, executor, session_id, ubody, &mut *sink, &mut *steps, &mut *transcript,
-                        ).await?;
-                        if !blast.is_empty() { last = blast; last_value = bvid; }
+                            store,
+                            executor,
+                            session_id,
+                            ubody,
+                            &mut *sink,
+                            &mut *steps,
+                            &mut *transcript,
+                        )
+                        .await?;
+                        if !blast.is_empty() {
+                            last = blast;
+                            last_value = bvid;
+                        }
                         if let Step::Return(v) = step {
                             return Ok((last, v.clone(), Step::Return(v)));
                         }
                     }
                 }
-                Node::Verify { cmd, expect, message } => {
+                Node::Verify {
+                    cmd,
+                    expect,
+                    message,
+                } => {
                     // Run `cmd`, check output contains/matches `expect`; abort with `message` if not.
                     let (cmd_text, _) =
-                        eval_return(store, executor, session_id, cmd, &mut *sink, &mut *steps).await?;
+                        eval_return(store, executor, session_id, cmd, &mut *sink, &mut *steps)
+                            .await?;
                     let expect_val = eval_arg(expect, store, session_id)?;
                     let pattern = match &expect_val {
                         serde_json::Value::String(s) => s.clone(),
@@ -926,9 +1058,9 @@ fn exec_body<'a>(
                     };
                     let ok = cmd_text.contains(pattern.as_str());
                     if !ok {
-                        let detail = message.clone().unwrap_or_else(|| {
-                            format!("output did not contain {:?}", pattern)
-                        });
+                        let detail = message
+                            .clone()
+                            .unwrap_or_else(|| format!("output did not contain {:?}", pattern));
                         return Err(Error::Other(format!("verify failed: {detail}")));
                     }
                     transcript.push(format!("[verify ok] {pattern}"));
@@ -1265,10 +1397,7 @@ async fn eval_return(
 /// Evaluate a safe arithmetic formula string with named variable bindings.
 /// Supported: `+`, `-`, `*`, `/`, `round(x,n)`, `abs(x)`, `min(a,b)`, `max(a,b)`,
 /// numeric literals, variable names, and parentheses. No side effects.
-fn eval_expr_formula(
-    formula: &str,
-    vars: &std::collections::BTreeMap<String, f64>,
-) -> Result<f64> {
+fn eval_expr_formula(formula: &str, vars: &std::collections::BTreeMap<String, f64>) -> Result<f64> {
     eval_expr_tokens(&mut tokenize_expr(formula), vars)
         .ok_or_else(|| Error::Other(format!("invalid `expr` formula: {formula}")))
 }
@@ -1278,22 +1407,37 @@ fn tokenize_expr(s: &str) -> std::collections::VecDeque<String> {
     let mut chars = s.chars().peekable();
     while let Some(&c) = chars.peek() {
         match c {
-            ' ' | '\t' => { chars.next(); }
+            ' ' | '\t' => {
+                chars.next();
+            }
             '0'..='9' | '.' => {
                 let mut num = String::new();
                 while let Some(&d) = chars.peek() {
-                    if d.is_ascii_digit() || d == '.' { num.push(d); chars.next(); } else { break; }
+                    if d.is_ascii_digit() || d == '.' {
+                        num.push(d);
+                        chars.next();
+                    } else {
+                        break;
+                    }
                 }
                 tokens.push_back(num);
             }
             'a'..='z' | 'A'..='Z' | '_' => {
                 let mut ident = String::new();
                 while let Some(&d) = chars.peek() {
-                    if d.is_alphanumeric() || d == '_' { ident.push(d); chars.next(); } else { break; }
+                    if d.is_alphanumeric() || d == '_' {
+                        ident.push(d);
+                        chars.next();
+                    } else {
+                        break;
+                    }
                 }
                 tokens.push_back(ident);
             }
-            c => { tokens.push_back(c.to_string()); chars.next(); }
+            c => {
+                tokens.push_back(c.to_string());
+                chars.next();
+            }
         }
     }
     tokens
@@ -1306,31 +1450,56 @@ fn eval_expr_tokens(
     expr_add(tokens, vars)
 }
 
-fn expr_add(t: &mut std::collections::VecDeque<String>, v: &std::collections::BTreeMap<String, f64>) -> Option<f64> {
+fn expr_add(
+    t: &mut std::collections::VecDeque<String>,
+    v: &std::collections::BTreeMap<String, f64>,
+) -> Option<f64> {
     let mut lhs = expr_mul(t, v)?;
     loop {
         match t.front().map(|s| s.as_str()) {
-            Some("+") => { t.pop_front(); lhs += expr_mul(t, v)?; }
-            Some("-") => { t.pop_front(); lhs -= expr_mul(t, v)?; }
+            Some("+") => {
+                t.pop_front();
+                lhs += expr_mul(t, v)?;
+            }
+            Some("-") => {
+                t.pop_front();
+                lhs -= expr_mul(t, v)?;
+            }
             _ => break,
         }
     }
     Some(lhs)
 }
 
-fn expr_mul(t: &mut std::collections::VecDeque<String>, v: &std::collections::BTreeMap<String, f64>) -> Option<f64> {
+fn expr_mul(
+    t: &mut std::collections::VecDeque<String>,
+    v: &std::collections::BTreeMap<String, f64>,
+) -> Option<f64> {
     let mut lhs = expr_unary(t, v)?;
     loop {
         match t.front().map(|s| s.as_str()) {
-            Some("*") => { t.pop_front(); lhs *= expr_unary(t, v)?; }
-            Some("/") => { t.pop_front(); let r = expr_unary(t, v)?; if r == 0.0 { return None; } lhs /= r; }
+            Some("*") => {
+                t.pop_front();
+                lhs *= expr_unary(t, v)?;
+            }
+            Some("/") => {
+                t.pop_front();
+                let r = expr_unary(t, v)?;
+                if r == 0.0 {
+                    return None;
+                }
+                lhs /= r;
+            }
             _ => break,
         }
     }
     Some(lhs)
 }
 
-fn expr_unary(t: &mut std::collections::VecDeque<String>, v: &std::collections::BTreeMap<String, f64>) -> Option<f64> {
+fn expr_unary(
+    t: &mut std::collections::VecDeque<String>,
+    v: &std::collections::BTreeMap<String, f64>,
+) -> Option<f64> {
     if t.front().map(|s| s.as_str()) == Some("-") {
         t.pop_front();
         return Some(-expr_atom(t, v)?);
@@ -1338,49 +1507,78 @@ fn expr_unary(t: &mut std::collections::VecDeque<String>, v: &std::collections::
     expr_atom(t, v)
 }
 
-fn expr_atom(t: &mut std::collections::VecDeque<String>, v: &std::collections::BTreeMap<String, f64>) -> Option<f64> {
+fn expr_atom(
+    t: &mut std::collections::VecDeque<String>,
+    v: &std::collections::BTreeMap<String, f64>,
+) -> Option<f64> {
     let tok = t.pop_front()?;
     match tok.as_str() {
         "(" => {
             let val = expr_add(t, v)?;
-            if t.pop_front().as_deref() != Some(")") { return None; }
+            if t.pop_front().as_deref() != Some(")") {
+                return None;
+            }
             Some(val)
         }
         "round" => {
-            if t.pop_front().as_deref() != Some("(") { return None; }
+            if t.pop_front().as_deref() != Some("(") {
+                return None;
+            }
             let x = expr_add(t, v)?;
             let n = if t.front().map(|s| s.as_str()) == Some(",") {
                 t.pop_front();
                 expr_add(t, v)?.round() as i32
-            } else { 0 };
-            if t.pop_front().as_deref() != Some(")") { return None; }
+            } else {
+                0
+            };
+            if t.pop_front().as_deref() != Some(")") {
+                return None;
+            }
             let factor = 10f64.powi(n);
             Some((x * factor).round() / factor)
         }
         "abs" => {
-            if t.pop_front().as_deref() != Some("(") { return None; }
+            if t.pop_front().as_deref() != Some("(") {
+                return None;
+            }
             let x = expr_add(t, v)?;
-            if t.pop_front().as_deref() != Some(")") { return None; }
+            if t.pop_front().as_deref() != Some(")") {
+                return None;
+            }
             Some(x.abs())
         }
         "min" => {
-            if t.pop_front().as_deref() != Some("(") { return None; }
+            if t.pop_front().as_deref() != Some("(") {
+                return None;
+            }
             let a = expr_add(t, v)?;
-            if t.pop_front().as_deref() != Some(",") { return None; }
+            if t.pop_front().as_deref() != Some(",") {
+                return None;
+            }
             let b = expr_add(t, v)?;
-            if t.pop_front().as_deref() != Some(")") { return None; }
+            if t.pop_front().as_deref() != Some(")") {
+                return None;
+            }
             Some(a.min(b))
         }
         "max" => {
-            if t.pop_front().as_deref() != Some("(") { return None; }
+            if t.pop_front().as_deref() != Some("(") {
+                return None;
+            }
             let a = expr_add(t, v)?;
-            if t.pop_front().as_deref() != Some(",") { return None; }
+            if t.pop_front().as_deref() != Some(",") {
+                return None;
+            }
             let b = expr_add(t, v)?;
-            if t.pop_front().as_deref() != Some(")") { return None; }
+            if t.pop_front().as_deref() != Some(")") {
+                return None;
+            }
             Some(a.max(b))
         }
         s => {
-            if let Ok(n) = s.parse::<f64>() { return Some(n); }
+            if let Ok(n) = s.parse::<f64>() {
+                return Some(n);
+            }
             v.get(s).copied()
         }
     }
@@ -1408,29 +1606,31 @@ fn eval_jq_path(path: &str, value: &serde_json::Value) -> Result<serde_json::Val
     // Split on `.` and handle `[n]` inside each segment.
     for raw_seg in path.split('.') {
         let seg = raw_seg.trim();
-        if seg.is_empty() { continue; }
+        if seg.is_empty() {
+            continue;
+        }
         // Segment may be `key[0][1]` — split on `[`.
         let mut parts = seg.splitn(2, '[');
         let key = parts.next().unwrap_or("");
         if !key.is_empty() {
-            cur = cur.get(key).ok_or_else(|| {
-                Error::Other(format!("`jq` path: key `{key}` not found"))
-            })?;
+            cur = cur
+                .get(key)
+                .ok_or_else(|| Error::Other(format!("`jq` path: key `{key}` not found")))?;
         }
         if let Some(rest) = parts.next() {
             // rest is like `0]` or `0][1]`
             let mut bracket = format!("[{rest}");
             while bracket.contains('[') {
-                let end = bracket.find(']').ok_or_else(|| {
-                    Error::Other("`jq` path: unmatched `[`".to_string())
-                })?;
+                let end = bracket
+                    .find(']')
+                    .ok_or_else(|| Error::Other("`jq` path: unmatched `[`".to_string()))?;
                 let idx_str = bracket[1..end].trim();
-                let idx: usize = idx_str.parse().map_err(|_| {
-                    Error::Other(format!("`jq` path: invalid index `{idx_str}`"))
-                })?;
-                cur = cur.get(idx).ok_or_else(|| {
-                    Error::Other(format!("`jq` path: index {idx} out of bounds"))
-                })?;
+                let idx: usize = idx_str
+                    .parse()
+                    .map_err(|_| Error::Other(format!("`jq` path: invalid index `{idx_str}`")))?;
+                cur = cur
+                    .get(idx)
+                    .ok_or_else(|| Error::Other(format!("`jq` path: index {idx} out of bounds")))?;
                 bracket = bracket[end + 1..].to_string();
             }
         }
@@ -1622,9 +1822,16 @@ fn walk_node<'a>(node: &'a Node, f: &mut impl FnMut(&'a str, &'a [Node])) {
         Node::Throttle { body, .. } => walk_calls(body, f),
         Node::Debounce { body, .. } => walk_calls(body, f),
         Node::Unless { body, .. } => walk_calls(body, f),
-        Node::Verify { cmd, expect, .. } => { walk_node(cmd, f); walk_node(expect, f); }
+        Node::Verify { cmd, expect, .. } => {
+            walk_node(cmd, f);
+            walk_node(expect, f);
+        }
         Node::Peek { .. } => {}
-        Node::Expr { vars, .. } => { for v in vars.values() { walk_node(v, f); } }
+        Node::Expr { vars, .. } => {
+            for v in vars.values() {
+                walk_node(v, f);
+            }
+        }
         Node::Fmt { .. } => {}
         Node::Jq { input, .. } => walk_node(input, f),
         Node::Var { .. } | Node::Lit { .. } | Node::Thing { .. } | Node::Await { .. } => {}
@@ -2722,7 +2929,11 @@ mod tests {
             body: vec![Node::Confirm {
                 message: "dangerous action".into(),
                 risk: Some("high".into()),
-                body: vec![flow_bind("r", "echo", vec![flow_lit(json!("should not run"))])],
+                body: vec![flow_bind(
+                    "r",
+                    "echo",
+                    vec![flow_lit(json!("should not run"))],
+                )],
             }],
             ..Default::default()
         };

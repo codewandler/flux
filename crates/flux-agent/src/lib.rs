@@ -118,6 +118,11 @@ pub struct Agent {
     /// When the persisted session exceeds this many (serialized) chars, older turns are summarized
     /// into one synthetic message before the next request. `0` disables compaction.
     pub compact_threshold_chars: usize,
+    /// Evidence-gated tool groups. Each turn the workspace is probed for signals and only ops whose
+    /// group is surfaced are advertised to the model. **Empty disables gating** (every op advertised).
+    pub groups: Vec<flux_evidence::ToolGroup>,
+    /// Workspace root, re-probed each turn for the surfacing signals above.
+    pub cwd: std::path::PathBuf,
 }
 
 impl Agent {
@@ -168,10 +173,18 @@ impl Agent {
         // Compact the session if it has grown past the budget (summarize old turns).
         self.maybe_compact(session_id, sink, cancel).await?;
 
-        let tools: Vec<ToolDef> = self
-            .executor
-            .registry()
-            .specs()
+        // Evidence-gated surfacing: advertise only ops whose group the workspace surfaces this turn.
+        // An empty `groups` manifest disables gating (every registered op advertised, as before).
+        let specs = if self.groups.is_empty() {
+            self.executor.registry().specs()
+        } else {
+            let active = flux_evidence::resolve_active_groups(
+                &self.groups,
+                &flux_runtime::detect_signals(&self.cwd),
+            );
+            self.executor.registry().active_specs(&self.groups, &active)
+        };
+        let tools: Vec<ToolDef> = specs
             .into_iter()
             .map(|s| ToolDef {
                 name: s.name,
@@ -292,11 +305,14 @@ impl Agent {
                 }
                 seen = ev.all().len();
                 sink.tool_result(&name, &result);
-                results.push(ContentBlock::tool_result_text(
-                    id,
+                // Trim an oversized result before it enters the transcript so one huge tool output
+                // can't blow the context budget (the model is told to re-read for the full bytes).
+                let content = flux_runtime::trim_tool_output(
                     result.content,
-                    result.is_error,
-                ));
+                    flux_runtime::tool_output_cap(),
+                    &name,
+                );
+                results.push(ContentBlock::tool_result_text(id, content, result.is_error));
             }
             self.store
                 .append_message(session_id, &Message::user(results))?;
@@ -556,6 +572,8 @@ mod tests {
             max_iterations: 5,
             skills: Vec::new(),
             compact_threshold_chars: 0,
+            groups: Vec::new(),
+            cwd: std::path::PathBuf::from("."),
         };
 
         let mut sink = CollectSink::default();
@@ -627,6 +645,8 @@ mod tests {
             max_iterations: 1,
             skills: Vec::new(),
             compact_threshold_chars: 0,
+            groups: Vec::new(),
+            cwd: std::path::PathBuf::from("."),
         };
 
         let mut sink = CollectSink::default();
@@ -693,6 +713,8 @@ mod tests {
                 source: None,
             }],
             compact_threshold_chars: 0,
+            groups: Vec::new(),
+            cwd: std::path::PathBuf::from("."),
         };
 
         let mut sink = CollectSink::default();
@@ -772,6 +794,8 @@ mod tests {
             max_iterations: 2,
             skills: Vec::new(),
             compact_threshold_chars: 200, // tiny → compaction fires
+            groups: Vec::new(),
+            cwd: std::path::PathBuf::from("."),
         };
 
         let mut sink = CollectSink::default();
@@ -874,6 +898,8 @@ mod tests {
             max_iterations: 2,
             skills: Vec::new(),
             compact_threshold_chars: 100, // tiny → compaction fires this turn
+            groups: Vec::new(),
+            cwd: std::path::PathBuf::from("."),
         };
 
         let mut sink = CollectSink::default();
@@ -950,6 +976,8 @@ mod tests {
             max_iterations: 3,
             skills: Vec::new(),
             compact_threshold_chars: 0,
+            groups: Vec::new(),
+            cwd: std::path::PathBuf::from("."),
         };
 
         let cancel = CancellationToken::new();
@@ -1025,6 +1053,8 @@ mod tests {
             max_iterations: 3,
             skills: Vec::new(),
             compact_threshold_chars: 0,
+            groups: Vec::new(),
+            cwd: std::path::PathBuf::from("."),
         };
 
         let cancel = CancellationToken::new();

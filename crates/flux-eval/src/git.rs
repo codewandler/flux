@@ -99,6 +99,7 @@ impl Tool for GitTagTool {
             risk: Risk::Medium,
             idempotency: Idempotency::NonIdempotent,
             access: vec![AccessKind::Process, AccessKind::LocalSystem],
+            group: None,
         }
     }
 
@@ -150,6 +151,7 @@ impl Tool for GitRevertTool {
             risk: Risk::Destructive,
             idempotency: Idempotency::NonIdempotent,
             access: vec![AccessKind::Process, AccessKind::LocalSystem],
+            group: None,
         }
     }
 

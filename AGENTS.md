@@ -143,6 +143,20 @@ regression here is a release blocker, not a nit.
 - Ticket references go in a trailing `Refs:` line, not the title.
 - Don't discard uncommitted changes or run destructive `git` operations on files you didn't change.
 
+## Keeping flux-flow ops and DOCUMENTATION in sync
+
+Whenever you add, remove, or rename a node kind or registered op in `flux-flow`
+(i.e. touch `crates/flux-flow/src/ast.rs`, `runtime.rs`, or `analyze.rs` in a way
+that changes the public surface), you **must** update
+`crates/flux-flow/DOCUMENTATION.md` in the same commit. The doc is the canonical
+human + agent reference for the Flux-Lang AST; an outdated doc is a bug.
+
+- New node kind → add a section under the appropriate group (primitive, control-flow, …).
+- New op registered in `OpRegistry` → add a row to the "Registered ops quick reference" table.
+- Changed semantics → update the relevant section and the Key invariants list.
+- The skill prompt (`flux-flow` skill in `.flux/skills/` or inline in AGENTS.md) must also
+  reflect any new node kinds so the planning agent can emit them.
+
 ## Don't
 
 - Don't bypass the safety envelope or the guarded IO boundary.

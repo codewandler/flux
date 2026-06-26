@@ -690,6 +690,100 @@ appropriate turn.
 
 ---
 
+## Pure expression nodes (no IO, no approval gate)
+
+These three nodes are pure — they carry no `Effect`, bypass the `OpRegistry`, and
+never pause for approval. Use them wherever you would otherwise shell out to
+`bash` for arithmetic, string formatting, or JSON extraction.
+
+### `expr`
+
+Inline arithmetic over named variables. `formula` is a safe whitelist expression;
+the runtime evaluates it with a tiny recursive-descent parser — no `eval`, no shell.
+
+Supported operators and functions: `+`, `-`, `*`, `/`, `round(x, n)`, `abs(x)`,
+`min(a, b)`, `max(a, b)`.
+
+```json
+{"kind": "expr",
+ "formula": "price * 2",
+ "vars": {"price": {"kind": "var", "name": "price"}}}
+```
+
+**Fields**
+
+| field | type | required | description |
+|---|---|---|---|
+| `formula` | string | yes | the arithmetic expression |
+| `vars` | object | no | map of variable name → node (`Lit` or `Var`) |
+
+Variables not listed in `vars` are resolved from the session symbol table.
+Result is a `Value::Number` (or `Value::String` for string concatenation with `+`).
+
+---
+
+### `fmt`
+
+Pure string interpolation. `template` uses `{name}` (or `{{name}}`) placeholders
+substituted from bound session symbols — the same syntax as `Lit` string
+interpolation, but as a first-class node so the intent is explicit.
+
+```json
+{"kind": "fmt", "template": "BTC: {price} | Double: {doubled}"}
+```
+
+**Fields**
+
+| field | type | required | description |
+|---|---|---|---|
+| `template` | string | yes | the template string with `{name}` placeholders |
+
+Unbound placeholders are left verbatim (no silent data loss). Result is always
+a `Value::String`.
+
+---
+
+### `jq`
+
+Pure JSON path extraction. `path` is a dot-path string applied to the JSON
+content of `input`. Supports dot-notation (`.bitcoin.usd`), array indexing
+(`results[0].value`), and nested paths. No shell-out — parsed in-process.
+
+```json
+{"kind": "jq",
+ "path": ".bitcoin.usd",
+ "input": {"kind": "var", "name": "raw"}}
+```
+
+**Fields**
+
+| field | type | required | description |
+|---|---|---|---|
+| `path` | string | yes | dot-path (e.g. `.bitcoin.usd`, `results[0].value`) |
+| `input` | Node | yes | any node producing a JSON string or object (`Var` or `Lit`) |
+
+The extracted value is returned as the natural JSON type (`Number`, `String`,
+`Bool`, etc.). If the path does not exist the node errors.
+
+**The full BTC-double pattern in 4 nodes, 0 bash calls:**
+
+```json
+{"body": [
+  {"kind": "bind", "name": "raw",
+   "value": {"kind": "call", "op": "web_fetch",
+     "args": [{"kind": "lit", "value": "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"}]}},
+  {"kind": "bind", "name": "price",
+   "value": {"kind": "jq", "path": ".bitcoin.usd",
+     "input": {"kind": "var", "name": "raw"}}},
+  {"kind": "bind", "name": "doubled",
+   "value": {"kind": "expr", "formula": "price * 2",
+     "vars": {"price": {"kind": "var", "name": "price"}}}},
+  {"kind": "fmt", "template": "BTC: {price} | Double: {doubled}"}
+]}
+```
+
+---
+
 ## Registered ops quick reference
 
 Ops are passed by name to `call`. Arguments are positional in the order shown;

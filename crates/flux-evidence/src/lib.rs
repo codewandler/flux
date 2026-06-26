@@ -46,9 +46,21 @@ pub trait Observer: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Action {
-    ActivateSkill { name: String },
-    InjectContext { text: String },
-    Escalate { reason: String },
+    ActivateSkill {
+        name: String,
+    },
+    InjectContext {
+        text: String,
+    },
+    Escalate {
+        reason: String,
+    },
+    /// Surface an evidence-gated tool group into the model-facing op catalog (e.g. `"git"` once a
+    /// `git_repo` signal is observed). Produced by a group surfacer reaction; consumed by the
+    /// runtime's catalog filter.
+    SurfaceGroup {
+        name: String,
+    },
 }
 
 /// Turns an observation into zero or more actions.
@@ -58,6 +70,10 @@ pub trait Reaction: Send + Sync {
 
 /// The kind string recorded for a tool invocation that matches the destructive-command heuristic.
 pub const KIND_DESTRUCTIVE: &str = "destructive_command";
+
+/// The observation kind every workspace signal (a project marker such as a git repo or `go.mod`) is
+/// recorded under. Shared by the detector that emits signals and the groups that match on them.
+pub const KIND_SIGNAL: &str = "project.signal";
 
 /// A built-in reaction: a [`KIND_DESTRUCTIVE`] observation escalates the operation to human
 /// approval. The runtime consults this to force an approval prompt even under a permissive
@@ -110,6 +126,96 @@ impl EvidenceLog {
             .flat_map(|o| reaction.react(o))
             .collect()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Evidence-gated tool groups
+// ---------------------------------------------------------------------------
+
+/// A predicate over an [`Observation`]: matches when `kind` equals the observation's kind and — if
+/// `signal` is set — the observation's `data["signal"]` equals it. The data-driven analogue of
+/// fluxplane's evidence matcher.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignalMatch {
+    /// The observation kind to match. Defaults to [`KIND_SIGNAL`] so a config can write just
+    /// `{ signal = "go" }`.
+    #[serde(default = "default_signal_kind")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+}
+
+fn default_signal_kind() -> String {
+    KIND_SIGNAL.to_string()
+}
+
+impl SignalMatch {
+    pub fn matches(&self, obs: &Observation) -> bool {
+        obs.kind == self.kind
+            && match &self.signal {
+                None => true,
+                Some(want) => obs.data.get("signal").and_then(Value::as_str) == Some(want.as_str()),
+            }
+    }
+}
+
+/// An evidence-gated bundle of ops. The group **owns its membership** (`tools`): an op named here is
+/// advertised to the model only when the group is *active*. An empty `surface_when` means the group
+/// is always active (force-on, e.g. a user pins it on); otherwise it activates when the current
+/// signals satisfy any of its matches.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ToolGroup {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub surface_when: Vec<SignalMatch>,
+}
+
+/// A [`Reaction`] that surfaces any group whose `surface_when` matches an observation — keeping op
+/// surfacing inside the evidence backbone (reused via [`EvidenceLog::react_all`]). Force-on groups
+/// (empty `surface_when`) match no specific observation and are added by [`resolve_active_groups`].
+pub struct GroupSurfacer<'a>(pub &'a [ToolGroup]);
+
+impl Reaction for GroupSurfacer<'_> {
+    fn react(&self, observation: &Observation) -> Vec<Action> {
+        self.0
+            .iter()
+            .filter(|g| g.surface_when.iter().any(|m| m.matches(observation)))
+            .map(|g| Action::SurfaceGroup {
+                name: g.name.clone(),
+            })
+            .collect()
+    }
+}
+
+/// Resolve the set of *active* group names from the **current** turn's signal observations: a group
+/// is active when any of its `surface_when` matches, or when it is force-on (empty `surface_when`).
+///
+/// Evaluated against current signals (not the append-only historical log) so a group can both
+/// *surface* when evidence arrives and *un-surface* when it's gone — mirroring fluxplane's `Dynamic`
+/// per-turn re-derivation. Reuses [`GroupSurfacer`] + [`EvidenceLog::react_all`].
+pub fn resolve_active_groups(
+    groups: &[ToolGroup],
+    current: &[Observation],
+) -> std::collections::HashSet<String> {
+    let mut log = EvidenceLog::new();
+    log.extend(current.iter().cloned());
+    let mut active: std::collections::HashSet<String> = log
+        .react_all(&GroupSurfacer(groups))
+        .into_iter()
+        .filter_map(|a| match a {
+            Action::SurfaceGroup { name } => Some(name),
+            _ => None,
+        })
+        .collect();
+    // Force-on groups match no observation; add them explicitly.
+    for g in groups.iter().filter(|g| g.surface_when.is_empty()) {
+        active.insert(g.name.clone());
+    }
+    active
 }
 
 #[cfg(test)]
@@ -178,5 +284,70 @@ mod tests {
         let o = Observation::new("x", Phase::ToolFollowup, json!({"a": 1}));
         let s = serde_json::to_string(&o).unwrap();
         assert_eq!(serde_json::from_str::<Observation>(&s).unwrap(), o);
+    }
+
+    fn signal(name: &str) -> Observation {
+        Observation::new("project.signal", Phase::Turn, json!({ "signal": name }))
+    }
+
+    #[test]
+    fn surface_when_signal_gates_a_group() {
+        let groups = vec![ToolGroup {
+            name: "git".into(),
+            tools: vec!["git_status".into()],
+            surface_when: vec![SignalMatch {
+                kind: "project.signal".into(),
+                signal: Some("git_repo".into()),
+            }],
+            ..Default::default()
+        }];
+        // No signal → not active.
+        assert!(resolve_active_groups(&groups, &[]).is_empty());
+        // Matching signal → active.
+        let active = resolve_active_groups(&groups, &[signal("git_repo")]);
+        assert!(active.contains("git"));
+        // Different signal → not active (proves un-surfacing when evidence changes).
+        assert!(resolve_active_groups(&groups, &[signal("go")]).is_empty());
+    }
+
+    #[test]
+    fn empty_surface_when_is_force_on() {
+        let groups = vec![ToolGroup {
+            name: "pinned".into(),
+            tools: vec!["x".into()],
+            surface_when: vec![],
+            ..Default::default()
+        }];
+        assert!(resolve_active_groups(&groups, &[]).contains("pinned"));
+    }
+
+    #[test]
+    fn signal_match_requires_kind_and_value() {
+        let m = SignalMatch {
+            kind: "project.signal".into(),
+            signal: Some("go".into()),
+        };
+        assert!(m.matches(&signal("go")));
+        assert!(!m.matches(&signal("rust")));
+        assert!(!m.matches(&Observation::new(
+            "other",
+            Phase::Turn,
+            json!({"signal": "go"})
+        )));
+    }
+
+    #[test]
+    fn tool_group_roundtrips() {
+        let g = ToolGroup {
+            name: "git".into(),
+            description: "git ops".into(),
+            tools: vec!["git_status".into()],
+            surface_when: vec![SignalMatch {
+                kind: "project.signal".into(),
+                signal: Some("git_repo".into()),
+            }],
+        };
+        let s = serde_json::to_string(&g).unwrap();
+        assert_eq!(serde_json::from_str::<ToolGroup>(&s).unwrap(), g);
     }
 }

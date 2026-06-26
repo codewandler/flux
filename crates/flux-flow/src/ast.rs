@@ -508,10 +508,7 @@ pub enum Node {
     /// Pure JSON path extraction. `path` is a dot-path string (e.g. `".bitcoin.usd"` or
     /// `"results[0].value"`) applied to the JSON content of `input` (a `Var` or `Lit` node).
     /// No IO, no approval gate. Example: `jq(".bitcoin.usd", $raw)`.
-    Jq {
-        path: String,
-        input: Box<Node>,
-    },
+    Jq { path: String, input: Box<Node> },
 }
 
 /// One branch of a [`Node::Parallel`] fan-out: a named sub-flow whose final result is bound to

@@ -8,5 +8,6 @@ description = "flux configuration: load/merge .flux/config.toml (project + user)
 [dependencies]
 flux-core.workspace = true
 flux-policy.workspace = true
+flux-evidence.workspace = true
 serde.workspace = true
 toml.workspace = true

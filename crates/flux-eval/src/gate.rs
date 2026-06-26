@@ -60,6 +60,7 @@ impl Tool for GateCheckTool {
             risk: Risk::Medium,
             idempotency: Idempotency::Idempotent,
             access: vec![AccessKind::Process, AccessKind::LocalSystem],
+            group: None,
         }
     }
 

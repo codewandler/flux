@@ -119,6 +119,118 @@ pub fn persist_allow_rules(cwd: &Path, rules: &[String]) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Tool-group manifest (.flux/groups.toml)
+// ---------------------------------------------------------------------------
+
+/// The `.flux/groups.toml` manifest: a list of `[[group]]` entries declaring evidence-gated tool
+/// groups (name, optional membership `tools`, and `surface_when` signal matches).
+#[derive(Debug, Clone, Default, Deserialize)]
+struct GroupsManifest {
+    #[serde(default, rename = "group")]
+    groups: Vec<flux_evidence::ToolGroup>,
+}
+
+fn home_groups_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".flux").join("groups.toml"))
+}
+
+fn project_groups_path(cwd: &Path) -> PathBuf {
+    cwd.join(".flux").join("groups.toml")
+}
+
+/// Load user (`~/.flux/groups.toml`) then project (`<cwd>/.flux/groups.toml`) group definitions.
+/// A project entry overrides a user entry of the same `name`. Missing files are not an error; a
+/// malformed file is skipped (a warning is printed) rather than failing the session.
+pub fn load_groups(cwd: &Path) -> Vec<flux_evidence::ToolGroup> {
+    let mut out: Vec<flux_evidence::ToolGroup> = Vec::new();
+    let paths = home_groups_path()
+        .into_iter()
+        .chain(std::iter::once(project_groups_path(cwd)));
+    for p in paths {
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            continue; // missing file: fine
+        };
+        match toml::from_str::<GroupsManifest>(&text) {
+            Ok(m) => {
+                for g in m.groups {
+                    // Later file (project) overrides an earlier (user) group of the same name.
+                    if let Some(slot) = out.iter_mut().find(|e| e.name == g.name) {
+                        *slot = g;
+                    } else {
+                        out.push(g);
+                    }
+                }
+            }
+            Err(e) => eprintln!("(ignoring malformed {}: {e})", p.display()),
+        }
+    }
+    out
+}
+
+/// Merge built-in groups with config `overrides`: a config group with the same `name` replaces the
+/// built-in (so a project can retune surfacing or membership); new names are appended.
+pub fn merge_groups(
+    base: Vec<flux_evidence::ToolGroup>,
+    overrides: Vec<flux_evidence::ToolGroup>,
+) -> Vec<flux_evidence::ToolGroup> {
+    let mut out = base;
+    for g in overrides {
+        if let Some(slot) = out.iter_mut().find(|e| e.name == g.name) {
+            *slot = g;
+        } else {
+            out.push(g);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod groups_tests {
+    use super::*;
+
+    #[test]
+    fn load_and_merge_groups() {
+        let dir = std::env::temp_dir().join(format!("flux-cfg-groups-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".flux")).unwrap();
+        std::fs::write(
+            dir.join(".flux").join("groups.toml"),
+            r#"
+[[group]]
+name = "git"
+surface_when = [{ signal = "git_repo" }]
+
+[[group]]
+name = "custom"
+tools = ["my_op"]
+surface_when = [{ kind = "project.signal", signal = "custom" }]
+"#,
+        )
+        .unwrap();
+        // HOME points elsewhere so only the project file is read.
+        std::env::set_var("HOME", dir.join("nohome"));
+        let cfg = load_groups(&dir);
+        assert!(cfg
+            .iter()
+            .any(|g| g.name == "custom" && g.tools == vec!["my_op".to_string()]));
+        let git = cfg.iter().find(|g| g.name == "git").unwrap();
+        // `kind` defaulted to project.signal.
+        assert_eq!(git.surface_when[0].kind, "project.signal");
+
+        // merge: config "git" replaces a built-in "git"; "custom" is appended.
+        let base = vec![flux_evidence::ToolGroup {
+            name: "git".into(),
+            description: "builtin".into(),
+            ..Default::default()
+        }];
+        let merged = merge_groups(base, cfg);
+        let git = merged.iter().find(|g| g.name == "git").unwrap();
+        assert!(git.description.is_empty()); // replaced by config (no description)
+        assert!(merged.iter().any(|g| g.name == "custom"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
