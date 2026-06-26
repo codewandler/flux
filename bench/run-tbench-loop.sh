@@ -30,7 +30,10 @@ fi
 export PATH="$HOME/.local/bin:$PATH"                 # tb / uv tools
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"   # pin toolchain for musl rebuilds under isolated HOME
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
-improve_home="$wt/.improve-home"
+# HOME must live OUTSIDE the worktree: flux/tb write session + dataset-cache state under $HOME, and
+# anything untracked inside the worktree would make `git_snapshot` refuse the tree (dirty). Keep it a
+# sibling so each round starts from a pristine checkout.
+improve_home="$(dirname "$repo")/flux-improve-$ts-home"
 mkdir -p "$improve_home"
 
 cd "$wt"
@@ -45,4 +48,4 @@ echo "→ done on branch '$branch' ($wt)."
 git -C "$wt" --no-pager tag -l 'improve-tbench-*' || true
 echo "  audit:   cat '$improve_home/.flux/eval/improve-log.jsonl' 2>/dev/null || true"
 echo "  review:  git -C '$wt' log --oneline HEAD"
-echo "  discard: git worktree remove --force '$wt' && git branch -D '$branch'"
+echo "  discard: git worktree remove --force '$wt' && git branch -D '$branch' && rm -rf '$improve_home'"
