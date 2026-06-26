@@ -186,7 +186,7 @@ pub trait TokenSource: Send + Sync {
 }
 
 /// Default number of retries on transient transport/server errors.
-pub const DEFAULT_MAX_RETRIES: u32 = 3;
+pub const DEFAULT_MAX_RETRIES: u32 = 6;
 
 /// True if an HTTP status warrants a retry: rate limiting (429) or any server error (5xx).
 pub fn is_retryable_status(status: u16) -> bool {
