@@ -132,7 +132,11 @@ release blocker, not a nit.
 ## Commits
 
 - **Never commit without an explicit instruction to do so.**
-- Title in imperative mood; a blank line; then a bulleted body explaining what changed and why
+- Use **semantic commit** titles: `type(scope): short imperative description` where type is one
+  of `feat`, `fix`, `refactor`, `perf`, `test`, `docs`, `chore`, `style`. Scope is the primary
+  crate or surface affected (e.g. `cli`, `tools`, `runtime`, `agent`, `flow`). Example:
+  `feat(cli): expose /compact slash command in the REPL`.
+- A blank line after the title; then a bulleted body explaining **what** changed and **why**
   (title-only commits are not acceptable). Keep commits atomic.
 - Ticket references go in a trailing `Refs:` line, not the title.
 - Don't discard uncommitted changes or run destructive `git` operations on files you didn't change.
