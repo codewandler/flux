@@ -344,8 +344,14 @@ pub enum Node {
         #[serde(default)]
         body: Vec<Node>,
         /// Optional symbol bound to a [`Value::List`] of each iteration's result.
+        /// When `flat` is `true` the collected values are flattened one level
+        /// (each iteration must produce a list; the results are concatenated).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         collect: Option<SymbolName>,
+        /// If `true` and `collect` is set, flatten the per-iteration results
+        /// (each must be a list) into one combined list instead of a list-of-lists.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        flat: bool,
     },
     /// A boolean guard: aborts the flow with an error if the condition is falsey.
     Assert {
@@ -731,6 +737,7 @@ mod tests {
                         args: vec![Node::Var { name: "f".into() }],
                     }],
                     collect: Some("contents".into()),
+                    flat: false,
                 },
                 Node::Assert {
                     cond: Box::new(Node::Var {

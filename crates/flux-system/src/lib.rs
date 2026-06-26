@@ -65,6 +65,22 @@ impl Workspace {
         // created but is then unreadable by its apparent name: `glob` matches it via `*`,
         // yet every literal `read`/`stat` misses the hidden byte and fails with ENOENT.
         // Reject it loudly here instead of silently writing a poltergeist file.
+        // Expand a leading `~` to the home directory so callers can write
+        // `~/.flux/sessions.db` instead of needing the literal absolute path.
+        let input = if let Some(rest) = input.strip_prefix('~') {
+            // `~` alone or `~/...` — expand to $HOME.
+            if rest.is_empty() || rest.starts_with('/') {
+                let home = std::env::var("HOME").unwrap_or_default();
+                std::borrow::Cow::Owned(format!("{home}{rest}"))
+            } else {
+                // `~username/...` — not supported; leave as-is.
+                std::borrow::Cow::Borrowed(input)
+            }
+        } else {
+            std::borrow::Cow::Borrowed(input)
+        };
+        let input = input.as_ref();
+
         if let Some(pos) = input.bytes().position(|b| b.is_ascii_control()) {
             return Err(Error::Config(format!(
                 "path {input:?} contains a control byte (0x{:02x}) at offset {pos}; this is \
@@ -371,10 +387,21 @@ impl System {
         // set needed for programs to function.
         cmd.env_clear();
         const SAFE_ENV: &[&str] = &[
-            "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "USER", "LOGNAME", "TMPDIR",
+            "PATH",
+            "HOME",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "TERM",
+            "TZ",
+            "USER",
+            "LOGNAME",
+            "TMPDIR",
             // Non-secret toolchain locations so `cargo`/`rustup` (and the new cargo_* tools) can
             // resolve a toolchain even under an isolated HOME without `~/.rustup`.
-            "RUSTUP_HOME", "CARGO_HOME", "RUSTUP_TOOLCHAIN",
+            "RUSTUP_HOME",
+            "CARGO_HOME",
+            "RUSTUP_TOOLCHAIN",
         ];
         for key in SAFE_ENV {
             if let Ok(val) = std::env::var(key) {

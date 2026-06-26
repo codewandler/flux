@@ -523,6 +523,7 @@ mod tests {
                         }],
                     }],
                     collect: Some(SymbolName("all".into())),
+                    flat: false,
                 },
                 Node::Parallel {
                     branches: vec![AstBranch {

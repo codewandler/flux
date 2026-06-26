@@ -41,8 +41,17 @@ cd "$wt"
 echo "→ building flux in the worktree"
 cargo build --workspace
 
+# Run the loop with an ISOLATED HOME (a fresh ~/.flux session store): keeps the loop's sessions out of
+# your real store, and sidesteps any pending session-DB migration on it. Auth still works via the
+# inherited API key env. Pin the Rust toolchain so the worker's / gate's `cargo` resolves it under the
+# isolated HOME (else rustup reports "no default toolchain configured").
+improve_home="$wt/.improve-home"
+mkdir -p "$improve_home"
+export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+
 echo "→ running improve.flux (autonomous; model=$model)"
-./target/debug/flux flow run examples/improve.flux --yes -m "$model"
+HOME="$improve_home" ./target/debug/flux flow run examples/improve.flux --yes -m "$model"
 
 echo
 echo "→ done. Branch '$branch' in '$wt'."

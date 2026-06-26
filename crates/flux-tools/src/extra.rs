@@ -264,7 +264,18 @@ impl Tool for SqliteQueryTool {
             ));
         }
 
-        let db_path = db_path.to_string();
+        // Expand a leading `~` to the home directory (sqlite_query bypasses
+        // Workspace::resolve for absolute paths, so we handle it here).
+        let db_path = if let Some(rest) = db_path.strip_prefix('~') {
+            if rest.is_empty() || rest.starts_with('/') {
+                let home = std::env::var("HOME").unwrap_or_default();
+                format!("{home}{rest}")
+            } else {
+                db_path.to_string()
+            }
+        } else {
+            db_path.to_string()
+        };
         let sql = sql.to_string();
 
         // Open read-only and run the query on a blocking thread.
@@ -486,10 +497,43 @@ impl Tool for WebSearchTool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// home_dir
+// ---------------------------------------------------------------------------
+
+/// Returns the current user's home directory (`$HOME`). Zero args, read-only, pure.
+pub struct HomeDirTool;
+
+#[async_trait]
+impl Tool for HomeDirTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::read_only(
+            "home_dir",
+            "Return the current user's home directory path (value of $HOME). \
+             Use this to build absolute paths like `~/.flux/sessions.db` without shelling out.",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+    }
+
+    fn permission_subjects(&self, _params: &Value) -> Vec<String> {
+        vec![]
+    }
+
+    fn intents(&self, _params: &Value) -> IntentSet {
+        IntentSet::new()
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
+        let home = std::env::var("HOME").unwrap_or_else(|_| String::from("/home"));
+        Ok(ToolResult::ok(home))
+    }
+}
+
 /// Register all extra tools into a registry.
 pub fn register_extra(registry: &mut ToolRegistry) {
     registry.register(Arc::new(FileStatTool));
     registry.register(Arc::new(PathExistsTool));
     registry.register(Arc::new(SqliteQueryTool));
     registry.register(Arc::new(WebSearchTool));
+    registry.register(Arc::new(HomeDirTool));
 }

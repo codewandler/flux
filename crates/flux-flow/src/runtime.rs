@@ -506,6 +506,7 @@ fn exec_body<'a>(
                     item,
                     body: ebody,
                     collect,
+                    flat,
                 } => {
                     let list = eval_arg(source, store, session_id)?;
                     let serde_json::Value::Array(elems) = list else {
@@ -543,7 +544,21 @@ fn exec_body<'a>(
                             .iter()
                             .filter_map(|vid| store.get_value(vid).ok().flatten())
                             .collect();
-                        let list_vid = store.put_value(session_id, &Value::List(items))?;
+                        let list_val = if *flat {
+                            // Flatten one level: each item must be a Value::List;
+                            // non-list items are included as-is (graceful).
+                            let mut flat_items: Vec<Value> = Vec::new();
+                            for item in items {
+                                match item {
+                                    Value::List(inner) => flat_items.extend(inner),
+                                    other => flat_items.push(other),
+                                }
+                            }
+                            Value::List(flat_items)
+                        } else {
+                            Value::List(items)
+                        };
+                        let list_vid = store.put_value(session_id, &list_val)?;
                         bind_existing(store, session_id, cname, &list_vid)?;
                         last_value = Some(list_vid);
                     }
@@ -1264,6 +1279,19 @@ fn interpolate(
 /// both brace styles is robustness against the model's inconsistent templating; only a bound symbol is
 /// substituted, so an unbound token (or any other `{…}` text) is left exactly as written.
 fn interpolate_str(s: &str, store: &FlowStore, session_id: &str) -> String {
+    // Expand a leading `~/` (or bare `~`) to the home directory so fmt
+    // templates like `"~/.flux/foo"` work without shelling out.
+    let expanded: std::borrow::Cow<str> = if let Some(rest) = s.strip_prefix('~') {
+        if rest.is_empty() || rest.starts_with('/') {
+            let home = std::env::var("HOME").unwrap_or_default();
+            std::borrow::Cow::Owned(format!("{home}{rest}"))
+        } else {
+            std::borrow::Cow::Borrowed(s)
+        }
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    };
+    let s = expanded.as_ref();
     if !s.contains('{') {
         return s.to_string();
     }
@@ -2523,6 +2551,7 @@ mod tests {
                 item: SymbolName("f".into()),
                 body: vec![flow_bind("t", "echo", vec![flow_var("f")])],
                 collect: Some(SymbolName("all".into())),
+                flat: false,
             }],
             ..Default::default()
         };
@@ -2558,6 +2587,7 @@ mod tests {
                 item: SymbolName("f".into()),
                 body: vec![],
                 collect: None,
+                flat: false,
             }],
             ..Default::default()
         };
@@ -2781,6 +2811,7 @@ mod tests {
                         vec![flow_lit(json!("rm -rf build"))],
                     )],
                     collect: None,
+                    flat: false,
                 },
                 Node::Parallel {
                     branches: vec![crate::ast::Branch {
