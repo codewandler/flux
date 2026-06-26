@@ -968,6 +968,14 @@ fn exec_body<'a>(
                 } => {
                     // True first-wins concurrency: spawn each branch, drive with tokio::select!,
                     // cancel losers. Same BufferSink pattern as Node::Parallel.
+                    // A zero deadline can accommodate no work: `tokio::time::timeout` polls the
+                    // inner future before the (already-elapsed) timer, so an immediately-ready
+                    // branch would otherwise win a 0ms race. Short-circuit so the deadline holds.
+                    if *timeout_ms == 0 {
+                        return Err(FlowError::Runtime(format!(
+                            "`race` timed out after {timeout_ms}ms with no successful branch"
+                        )));
+                    }
                     let remaining = std::time::Duration::from_millis(*timeout_ms);
                     let race_result: Option<(String, Option<ValueId>, Step)> =
                         tokio::time::timeout(remaining, async {
@@ -1310,7 +1318,9 @@ fn eval_arg(node: &Node, store: &FlowStore, session_id: &str) -> Result<serde_js
             Ok(value.to_json())
         }
         other => Err(FlowError::Runtime(format!(
-            "unsupported call argument `{}` (only literals and $symbols are valid args in v1)",
+            "unsupported call argument `{}` — only `lit` and `var` ($symbol) nodes are valid call \
+             args. To use a computed string (fmt/expr/jq/parse), `bind` it to a symbol first, then \
+             pass that symbol as a `var` arg.",
             node_kind(other)
         ))),
     }
@@ -2052,7 +2062,7 @@ mod tests {
             &self,
             _ctx: &ToolContext,
             params: serde_json::Value,
-        ) -> Result<ToolResult> {
+        ) -> flux_core::Result<ToolResult> {
             Ok(ToolResult::ok(
                 params
                     .get("text")
@@ -2079,7 +2089,7 @@ mod tests {
             &self,
             _ctx: &ToolContext,
             _params: serde_json::Value,
-        ) -> Result<ToolResult> {
+        ) -> flux_core::Result<ToolResult> {
             Ok(ToolResult::ok_view("RAW", "VIEW"))
         }
     }
@@ -2496,6 +2506,7 @@ mod tests {
                 max: 3,
                 until: None,
                 body: vec![flow_bind("x", "echo", vec![flow_lit(json!("hi"))])],
+                collect: None,
             }],
             ..Default::default()
         };
@@ -2512,6 +2523,7 @@ mod tests {
                 max: 3,
                 until: Some(Box::new(flow_lit(json!(true)))),
                 body: vec![flow_bind("x", "echo", vec![flow_lit(json!("hi"))])],
+                collect: None,
             }],
             ..Default::default()
         };
@@ -2522,6 +2534,40 @@ mod tests {
         assert_eq!(
             outcome.steps, 1,
             "`until` true after iteration 1 breaks the loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_flow_repeat_collects_each_iterations_result() {
+        // repeat max 3 { $x = echo("hi") } collect $all → $all is the ordered list of results.
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        let ast = DraftAst {
+            body: vec![Node::Repeat {
+                max: 3,
+                until: None,
+                body: vec![flow_bind("x", "echo", vec![flow_lit(json!("hi"))])],
+                collect: Some(SymbolName("all".into())),
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(outcome.steps, 3, "repeat runs exactly max times");
+        // `collect` bound a list of every iteration's last result, in order.
+        let vid = store
+            .resolve("sess", &SymbolName("all".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.get_value(&vid).unwrap(),
+            Some(Value::List(vec![
+                Value::String("hi".into()),
+                Value::String("hi".into()),
+                Value::String("hi".into()),
+            ]))
         );
     }
 

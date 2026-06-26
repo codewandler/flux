@@ -691,7 +691,7 @@ express control flow as Flux-Lang nodes, NOT inside shell commands, so the plan 
 `repeat` node for loops and a `when` node for branches. Do NOT write shell loops/conditionals (`for`, \
 `while`, `if`, `&&`, `;`) inside a `bash` command — a `bash` op is ONE discrete command. E.g. \"print X \
 three times\" is `repeat max 3 {{ bash(\"echo X\") }}`, never `bash(\"for i in 1 2 3; do echo X; \
-done\")`.\n\nThe AST may use ANY operation from the catalog; prefer deterministic ops and reference \
+done\")`.\n\nWhen your plan edits code, fold the build/test into the SAME plan and wrap the fix in a `retry` so a compile error is repaired automatically rather than handed back to the user; before an `edit`, make sure its `old_string` actually occurs in the file (a no-op edit silently spins the loop). Decide ordinary implementation choices (a flag's default, a helper name) yourself — only stop to ask on genuinely destructive or ambiguous decisions.\n\nThe AST may use ANY operation from the catalog; prefer deterministic ops and reference \
 existing session symbols instead of re-fetching. To embed a stored symbol's value INSIDE a string \
 argument (e.g. a `task` prompt or a message), write `{{symbol_name}}` — the runtime substitutes the \
 value at execution; to pass a symbol's value as a whole argument, use it directly as a `var` node. Each \
@@ -980,6 +980,7 @@ mod tests {
             &ops,
             None,
             None,
+            None,
             CompileOptions::default(),
         )
         .await
@@ -1015,6 +1016,7 @@ mod tests {
             &ops,
             None,
             None,
+            None,
             CompileOptions::default(),
         )
         .await
@@ -1040,6 +1042,7 @@ mod tests {
             &[Message::user_text("read x")],
             None,
             &ops,
+            None,
             None,
             None,
             CompileOptions::default(),

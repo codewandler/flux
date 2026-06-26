@@ -240,6 +240,7 @@ Prefer `each` when iterating a known list; use `repeat` only for counter-driven 
 | `max` | u32 | yes | maximum iterations |
 | `until` | Node | no | stop-when-true guard, checked after each iteration |
 | `body` | Node[] | no | loop body |
+| `collect` | string | no | symbol bound to a `Value::List` of each iteration's last result (mirrors `each`) |
 
 ---
 
@@ -546,12 +547,13 @@ errors rather than blocking, so the plan stays responsive.
 
 | field | type | required | description |
 |---|---|---|---|
+| `name` | string | yes | unique bucket key; state is tracked per `name` and survives across turns |
 | `max` | u32 | yes | maximum calls in the window |
 | `window_ms` | u64 | yes | sliding window size in milliseconds |
 | `body` | Node[] | no | the rate-limited body |
 
-The bucket is keyed by `(session, max, window_ms, call-site)` so two `throttle` nodes
-with the same parameters in the same session do not share a bucket.
+The bucket is keyed by `(session, name)`, so two `throttle` nodes with distinct `name`s
+never share a bucket; reusing a `name` deliberately shares one bucket across nodes.
 
 ---
 
@@ -572,6 +574,7 @@ settled. In a single sequential flow it acts as a fixed delay before the body.
 
 | field | type | required | description |
 |---|---|---|---|
+| `name` | string | yes | stable key so debounce state survives across turns |
 | `wait_ms` | u64 | yes | settling delay in milliseconds |
 | `body` | Node[] | no | body that runs after the delay |
 
@@ -781,6 +784,29 @@ The extracted value is returned as the natural JSON type (`Number`, `String`,
   {"kind": "fmt", "template": "BTC: {price} | Double: {doubled}"}
 ]}
 ```
+
+---
+
+### `parse`
+
+Pure type coercion. Converts the string result of a `jq` or `fmt` node into a typed
+value. `as_type` (`as` in JSON) is one of `f64`, `i64`, `bool`, `json`, `string`.
+No IO, no approval gate.
+
+```json
+{"kind": "parse", "as": "f64",
+ "value": {"kind": "jq", "path": ".price", "input": {"kind": "var", "name": "raw"}}}
+```
+
+**Fields**
+
+| field | type | required | description |
+|---|---|---|---|
+| `value` | Node | yes | a node producing the string to coerce (typically `jq`/`fmt`) |
+| `as` | string | yes | target type: `f64`, `i64`, `bool`, `json`, or `string` |
+
+Coercion failures (`"abc"` → `f64`) error rather than silently defaulting. An unknown
+`as_type` passes the string through unchanged.
 
 ---
 
