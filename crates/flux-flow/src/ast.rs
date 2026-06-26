@@ -489,6 +489,29 @@ pub enum Node {
     Lit { value: serde_json::Value },
     /// A reference to an external thing.
     Thing { thing: ThingRef },
+
+    /// Pure inline arithmetic. `formula` is a safe whitelist expression (`+`, `-`, `*`, `/`,
+    /// `round(x,n)`, `abs`, `min(a,b)`, `max(a,b)`) over named variables. `vars` maps variable
+    /// names to node expressions (only `Lit` and `Var` are valid). No IO, no approval gate.
+    /// Example: `expr("price * 2", {"price": $btc})`.
+    Expr {
+        formula: String,
+        #[serde(default)]
+        vars: std::collections::BTreeMap<String, Box<Node>>,
+    },
+
+    /// Pure string interpolation. `template` is a string with `{name}` placeholders substituted
+    /// from already-bound session symbols (same `{name}`/`{{name}}` syntax as `Lit` interpolation).
+    /// No IO, no approval gate. Example: `fmt("BTC: {price} | Double: {doubled}")`.
+    Fmt { template: String },
+
+    /// Pure JSON path extraction. `path` is a dot-path string (e.g. `".bitcoin.usd"` or
+    /// `"results[0].value"`) applied to the JSON content of `input` (a `Var` or `Lit` node).
+    /// No IO, no approval gate. Example: `jq(".bitcoin.usd", $raw)`.
+    Jq {
+        path: String,
+        input: Box<Node>,
+    },
 }
 
 /// One branch of a [`Node::Parallel`] fan-out: a named sub-flow whose final result is bound to

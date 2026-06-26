@@ -164,7 +164,28 @@ fn check_node(node: &Node, registry: &OpRegistry, diags: &mut Vec<Diagnostic>) {
                 check_node(n, registry, diags);
             }
         }
-        Node::Await { .. } | Node::Var { .. } | Node::Lit { .. } | Node::Thing { .. } => {}
+        Node::Unless { cond, body } => {
+            check_node(cond, registry, diags);
+            for n in body {
+                check_node(n, registry, diags);
+            }
+        }
+        Node::Verify { cmd, expect, .. } => {
+            check_node(cmd, registry, diags);
+            check_node(expect, registry, diags);
+        }
+        Node::Expr { vars, .. } => {
+            for v in vars.values() {
+                check_node(v, registry, diags);
+            }
+        }
+        Node::Fmt { .. } => {}
+        Node::Jq { input, .. } => check_node(input, registry, diags),
+        Node::Await { .. }
+        | Node::Peek { .. }
+        | Node::Var { .. }
+        | Node::Lit { .. }
+        | Node::Thing { .. } => {}
     }
 }
 
@@ -193,6 +214,7 @@ fn node_contains_return(node: &Node) -> bool {
         Node::Race { branches, .. } => branches.iter().any(|b| body_contains_return(&b.body)),
         Node::Throttle { body, .. } => body_contains_return(body),
         Node::Debounce { body, .. } => body_contains_return(body),
+        Node::Expr { .. } | Node::Fmt { .. } | Node::Jq { .. } => false,
         _ => false,
     }
 }

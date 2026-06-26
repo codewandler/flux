@@ -152,6 +152,7 @@ fn children(node: &Node) -> Vec<Branch<'_>> {
         Node::Unless { body, .. } => body.iter().map(Branch::Node).collect(),
         Node::Verify { .. } => Vec::new(),
         Node::Peek { .. } => Vec::new(),
+        Node::Expr { .. } | Node::Fmt { .. } | Node::Jq { .. } => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -256,6 +257,16 @@ fn head(node: &Node, p: &Palette) -> String {
             format!("{} {} contains {} {}", paint(p.keyword, "verify"), expr(cmd, p), expr(expect, p), paint(p.string, msg))
         }
         Node::Peek { name } => format!("{} {}", paint(p.keyword, "peek"), sym(p, &name.0)),
+        Node::Expr { formula, vars } => {
+            if vars.is_empty() {
+                format!("{} {}", paint(p.keyword, "expr"), paint(p.string, &format!("\"{formula}\"")))
+            } else {
+                let vs: Vec<String> = vars.iter().map(|(k, v)| format!("{k}={}", expr(v, p))).collect();
+                format!("{} {} ({})", paint(p.keyword, "expr"), paint(p.string, &format!("\"{formula}\"")), vs.join(", "))
+            }
+        }
+        Node::Fmt { template } => format!("{} {}", paint(p.keyword, "fmt"), paint(p.string, &format!("\"{template}\""))),
+        Node::Jq { path, input } => format!("{} {} {}", paint(p.keyword, "jq"), paint(p.string, &format!("\"{path}\"")), expr(input, p)),
         Node::Return { value } => format!("{} {}", paint(p.keyword, "return"), expr(value, p)),
         Node::Var { name } => sym(p, &name.0),
         Node::Lit { value } => lit(value, p),
@@ -293,7 +304,10 @@ fn expr(node: &Node, p: &Palette) -> String {
         | Node::Debounce { .. }
         | Node::Unless { .. }
         | Node::Verify { .. }
-        | Node::Peek { .. } => "…".to_string(),
+        | Node::Peek { .. }
+        | Node::Expr { .. }
+        | Node::Fmt { .. }
+        | Node::Jq { .. } => "…".to_string(),
     }
 }
 

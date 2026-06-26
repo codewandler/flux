@@ -489,6 +489,9 @@ const AST_GRAMMAR: &str = r#"The AST is a JSON object: {"name"?:string, "params"
 - {"kind":"verify","cmd":Node,"expect":Node,"message"?:"<str>"}   run cmd (any node producing a string), check output contains expect; abort with message if not — use after edits/builds to self-check
 - {"kind":"peek","name":"<sym>"}   read the current in-session value of a named symbol without IO; returns empty string if not yet bound
 - {"kind":"memo","name":"<sym>","value":Node,"effect"?:"<effect>"}   like bind, but computed once per session (cached across turns) — for expensive deterministic work
+- {"kind":"expr","formula":"<arith>","vars"?:{"<name>":Node,...}}   pure arithmetic: `+`, `-`, `*`, `/`, `round(x,n)`, `abs(x)`, `min(a,b)`, `max(a,b)` — no IO, no approval; bind result with `bind`
+- {"kind":"fmt","template":"<str>"}   pure string interpolation: `{sym}` placeholders replaced from session symbols — no IO
+- {"kind":"jq","path":"<dotpath>","input":Node}   pure JSON path extraction: `.key`, `.key.nested`, `[0]` — applied to the input node's value; no IO
 - {"kind":"await","binding"?:"<sym>","source":"<source>"}
 - {"kind":"return","value":Node}
 - {"kind":"var","name":"<sym>"}

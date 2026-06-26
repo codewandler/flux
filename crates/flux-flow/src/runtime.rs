@@ -306,9 +306,62 @@ fn exec_body<'a>(
                 Node::Bind {
                     name, value, ty, ..
                 } => {
+                    // Pure nodes (expr/fmt/jq) may appear as a bind value without going through
+                    // execute_call — they are side-effect-free and need no dispatch envelope.
+                    match value.as_ref() {
+                        Node::Expr { formula, vars } => {
+                            let resolved: std::collections::BTreeMap<String, f64> = vars
+                                .iter()
+                                .map(|(k, v)| {
+                                    let jv = eval_arg(v, store, session_id)?;
+                                    let n = match &jv {
+                                        serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                                        serde_json::Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
+                                        _ => 0.0,
+                                    };
+                                    Ok::<_, Error>((k.clone(), n))
+                                })
+                                .collect::<Result<_>>()?;
+                            let result = eval_expr_formula(formula, &resolved)?;
+                            let text = format_number(result);
+                            let vid = store.put_value(session_id, &Value::String(text.clone()))?;
+                            let ty_label = ty.as_ref().map(TypeRef::label);
+                            store.bind(session_id, name, &vid, ty_label.as_deref(), &summarize(&text), Visibility::Visible)?;
+                            transcript.push(format!("[${} = expr {formula}]\n{text}", name.0));
+                            last = text;
+                            last_value = Some(vid);
+                            continue;
+                        }
+                        Node::Fmt { template } => {
+                            let text = interpolate_str(template, store, session_id);
+                            let vid = store.put_value(session_id, &Value::String(text.clone()))?;
+                            let ty_label = ty.as_ref().map(TypeRef::label);
+                            store.bind(session_id, name, &vid, ty_label.as_deref(), &summarize(&text), Visibility::Visible)?;
+                            transcript.push(format!("[${} = fmt]\n{text}", name.0));
+                            last = text;
+                            last_value = Some(vid);
+                            continue;
+                        }
+                        Node::Jq { path, input } => {
+                            let jv = eval_arg(input, store, session_id)?;
+                            let result = eval_jq_path(path, &jv)?;
+                            let text = match &result {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => serde_json::to_string(other).unwrap_or_default(),
+                            };
+                            let vid = store.put_value(session_id, &Value::String(text.clone()))?;
+                            let ty_label = ty.as_ref().map(TypeRef::label);
+                            store.bind(session_id, name, &vid, ty_label.as_deref(), &summarize(&text), Visibility::Visible)?;
+                            transcript.push(format!("[${} = jq {path}]\n{text}", name.0));
+                            last = text;
+                            last_value = Some(vid);
+                            continue;
+                        }
+                        _ => {}
+                    }
                     let Node::Call { op, args } = value.as_ref() else {
                         return Err(Error::Other(
-                            "execution can only bind the result of a `call`".to_string(),
+                            "execution can only bind the result of a `call`, `expr`, `fmt`, or `jq`".to_string(),
                         ));
                     };
                     let ty_label = ty.as_ref().map(TypeRef::label);
@@ -893,6 +946,48 @@ fn exec_body<'a>(
                     transcript.push(format!("[peek ${}]\n{text}", name.0));
                     last = text;
                 }
+                Node::Expr { formula, vars } => {
+                    // Pure arithmetic — no IO, no approval gate.
+                    let resolved: std::collections::BTreeMap<String, f64> = vars
+                        .iter()
+                        .map(|(k, v)| {
+                            let jv = eval_arg(v, store, session_id)?;
+                            let n = match &jv {
+                                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                                serde_json::Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
+                                _ => 0.0,
+                            };
+                            Ok::<_, Error>((k.clone(), n))
+                        })
+                        .collect::<Result<_>>()?;
+                    let result = eval_expr_formula(formula, &resolved)?;
+                    let text = format_number(result);
+                    let vid = store.put_value(session_id, &Value::String(text.clone()))?;
+                    transcript.push(format!("[expr {formula}]\n{text}"));
+                    last = text;
+                    last_value = Some(vid);
+                }
+                Node::Fmt { template } => {
+                    // Pure string interpolation — substitutes {sym} from session symbols.
+                    let text = interpolate_str(template, store, session_id);
+                    let vid = store.put_value(session_id, &Value::String(text.clone()))?;
+                    transcript.push(format!("[fmt]\n{text}"));
+                    last = text;
+                    last_value = Some(vid);
+                }
+                Node::Jq { path, input } => {
+                    // Pure JSON path extraction — no IO.
+                    let jv = eval_arg(input, store, session_id)?;
+                    let result = eval_jq_path(path, &jv)?;
+                    let text = match &result {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => serde_json::to_string(other).unwrap_or_default(),
+                    };
+                    let vid = store.put_value(session_id, &Value::String(text.clone()))?;
+                    transcript.push(format!("[jq {path}]\n{text}"));
+                    last = text;
+                    last_value = Some(vid);
+                }
                 Node::Await { .. } => {
                     return Err(Error::Other(
                         "`await` execution (cross-turn suspend/resume) lands in a later slice"
@@ -903,10 +998,6 @@ fn exec_body<'a>(
                     return Err(Error::Other(
                         "a bare value is not an executable statement".to_string(),
                     ));
-                }
-                Node::Unless { .. } | Node::Verify { .. } | Node::Peek { .. } => {
-                    // handled above — this arm is unreachable but satisfies exhaustiveness
-                    unreachable!()
                 }
             }
         }
@@ -1171,6 +1262,182 @@ async fn eval_return(
     }
 }
 
+/// Evaluate a safe arithmetic formula string with named variable bindings.
+/// Supported: `+`, `-`, `*`, `/`, `round(x,n)`, `abs(x)`, `min(a,b)`, `max(a,b)`,
+/// numeric literals, variable names, and parentheses. No side effects.
+fn eval_expr_formula(
+    formula: &str,
+    vars: &std::collections::BTreeMap<String, f64>,
+) -> Result<f64> {
+    eval_expr_tokens(&mut tokenize_expr(formula), vars)
+        .ok_or_else(|| Error::Other(format!("invalid `expr` formula: {formula}")))
+}
+
+fn tokenize_expr(s: &str) -> std::collections::VecDeque<String> {
+    let mut tokens = std::collections::VecDeque::new();
+    let mut chars = s.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        match c {
+            ' ' | '\t' => { chars.next(); }
+            '0'..='9' | '.' => {
+                let mut num = String::new();
+                while let Some(&d) = chars.peek() {
+                    if d.is_ascii_digit() || d == '.' { num.push(d); chars.next(); } else { break; }
+                }
+                tokens.push_back(num);
+            }
+            'a'..='z' | 'A'..='Z' | '_' => {
+                let mut ident = String::new();
+                while let Some(&d) = chars.peek() {
+                    if d.is_alphanumeric() || d == '_' { ident.push(d); chars.next(); } else { break; }
+                }
+                tokens.push_back(ident);
+            }
+            c => { tokens.push_back(c.to_string()); chars.next(); }
+        }
+    }
+    tokens
+}
+
+fn eval_expr_tokens(
+    tokens: &mut std::collections::VecDeque<String>,
+    vars: &std::collections::BTreeMap<String, f64>,
+) -> Option<f64> {
+    expr_add(tokens, vars)
+}
+
+fn expr_add(t: &mut std::collections::VecDeque<String>, v: &std::collections::BTreeMap<String, f64>) -> Option<f64> {
+    let mut lhs = expr_mul(t, v)?;
+    loop {
+        match t.front().map(|s| s.as_str()) {
+            Some("+") => { t.pop_front(); lhs += expr_mul(t, v)?; }
+            Some("-") => { t.pop_front(); lhs -= expr_mul(t, v)?; }
+            _ => break,
+        }
+    }
+    Some(lhs)
+}
+
+fn expr_mul(t: &mut std::collections::VecDeque<String>, v: &std::collections::BTreeMap<String, f64>) -> Option<f64> {
+    let mut lhs = expr_unary(t, v)?;
+    loop {
+        match t.front().map(|s| s.as_str()) {
+            Some("*") => { t.pop_front(); lhs *= expr_unary(t, v)?; }
+            Some("/") => { t.pop_front(); let r = expr_unary(t, v)?; if r == 0.0 { return None; } lhs /= r; }
+            _ => break,
+        }
+    }
+    Some(lhs)
+}
+
+fn expr_unary(t: &mut std::collections::VecDeque<String>, v: &std::collections::BTreeMap<String, f64>) -> Option<f64> {
+    if t.front().map(|s| s.as_str()) == Some("-") {
+        t.pop_front();
+        return Some(-expr_atom(t, v)?);
+    }
+    expr_atom(t, v)
+}
+
+fn expr_atom(t: &mut std::collections::VecDeque<String>, v: &std::collections::BTreeMap<String, f64>) -> Option<f64> {
+    let tok = t.pop_front()?;
+    match tok.as_str() {
+        "(" => {
+            let val = expr_add(t, v)?;
+            if t.pop_front().as_deref() != Some(")") { return None; }
+            Some(val)
+        }
+        "round" => {
+            if t.pop_front().as_deref() != Some("(") { return None; }
+            let x = expr_add(t, v)?;
+            let n = if t.front().map(|s| s.as_str()) == Some(",") {
+                t.pop_front();
+                expr_add(t, v)?.round() as i32
+            } else { 0 };
+            if t.pop_front().as_deref() != Some(")") { return None; }
+            let factor = 10f64.powi(n);
+            Some((x * factor).round() / factor)
+        }
+        "abs" => {
+            if t.pop_front().as_deref() != Some("(") { return None; }
+            let x = expr_add(t, v)?;
+            if t.pop_front().as_deref() != Some(")") { return None; }
+            Some(x.abs())
+        }
+        "min" => {
+            if t.pop_front().as_deref() != Some("(") { return None; }
+            let a = expr_add(t, v)?;
+            if t.pop_front().as_deref() != Some(",") { return None; }
+            let b = expr_add(t, v)?;
+            if t.pop_front().as_deref() != Some(")") { return None; }
+            Some(a.min(b))
+        }
+        "max" => {
+            if t.pop_front().as_deref() != Some("(") { return None; }
+            let a = expr_add(t, v)?;
+            if t.pop_front().as_deref() != Some(",") { return None; }
+            let b = expr_add(t, v)?;
+            if t.pop_front().as_deref() != Some(")") { return None; }
+            Some(a.max(b))
+        }
+        s => {
+            if let Ok(n) = s.parse::<f64>() { return Some(n); }
+            v.get(s).copied()
+        }
+    }
+}
+
+/// Format a float cleanly: integer results drop the decimal, fractional keep up to 2 places.
+fn format_number(n: f64) -> String {
+    if n.fract() == 0.0 && n.abs() < 1e15 {
+        format!("{}", n as i64)
+    } else {
+        // Up to 2 significant decimal places, strip trailing zeros.
+        let s = format!("{:.2}", n);
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
+/// Walk a dot-path (e.g. `".bitcoin.usd"` or `"results[0].price"`) into a JSON value.
+/// Path segments: `.key` (object field), `[n]` (array index). Leading `.` is optional.
+fn eval_jq_path(path: &str, value: &serde_json::Value) -> Result<serde_json::Value> {
+    let path = path.trim().trim_start_matches('.');
+    if path.is_empty() {
+        return Ok(value.clone());
+    }
+    let mut cur = value;
+    // Split on `.` and handle `[n]` inside each segment.
+    for raw_seg in path.split('.') {
+        let seg = raw_seg.trim();
+        if seg.is_empty() { continue; }
+        // Segment may be `key[0][1]` — split on `[`.
+        let mut parts = seg.splitn(2, '[');
+        let key = parts.next().unwrap_or("");
+        if !key.is_empty() {
+            cur = cur.get(key).ok_or_else(|| {
+                Error::Other(format!("`jq` path: key `{key}` not found"))
+            })?;
+        }
+        if let Some(rest) = parts.next() {
+            // rest is like `0]` or `0][1]`
+            let mut bracket = format!("[{rest}");
+            while bracket.contains('[') {
+                let end = bracket.find(']').ok_or_else(|| {
+                    Error::Other("`jq` path: unmatched `[`".to_string())
+                })?;
+                let idx_str = bracket[1..end].trim();
+                let idx: usize = idx_str.parse().map_err(|_| {
+                    Error::Other(format!("`jq` path: invalid index `{idx_str}`"))
+                })?;
+                cur = cur.get(idx).ok_or_else(|| {
+                    Error::Other(format!("`jq` path: index {idx} out of bounds"))
+                })?;
+                bracket = bracket[end + 1..].to_string();
+            }
+        }
+    }
+    Ok(cur.clone())
+}
+
 /// Render a stored value as text (a string value is itself; anything else is its compact JSON).
 fn value_text(v: &Value) -> String {
     match v {
@@ -1211,6 +1478,9 @@ fn node_kind(node: &Node) -> &'static str {
         Node::Unless { .. } => "unless",
         Node::Verify { .. } => "verify",
         Node::Peek { .. } => "peek",
+        Node::Expr { .. } => "expr",
+        Node::Fmt { .. } => "fmt",
+        Node::Jq { .. } => "jq",
         Node::Return { .. } => "return",
         Node::Var { .. } => "var",
         Node::Lit { .. } => "lit",
@@ -1354,6 +1624,9 @@ fn walk_node<'a>(node: &'a Node, f: &mut impl FnMut(&'a str, &'a [Node])) {
         Node::Unless { body, .. } => walk_calls(body, f),
         Node::Verify { cmd, expect, .. } => { walk_node(cmd, f); walk_node(expect, f); }
         Node::Peek { .. } => {}
+        Node::Expr { vars, .. } => { for v in vars.values() { walk_node(v, f); } }
+        Node::Fmt { .. } => {}
+        Node::Jq { input, .. } => walk_node(input, f),
         Node::Var { .. } | Node::Lit { .. } | Node::Thing { .. } | Node::Await { .. } => {}
     }
 }
