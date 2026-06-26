@@ -16,6 +16,7 @@ fn example_flows_validate_against_the_registry() {
 
     for path in [
         "../../examples/improve.flux",
+        "../../examples/improve-tbench.flux",
         "../../examples/eval-smoke.flux",
     ] {
         let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));

@@ -64,6 +64,13 @@ pub trait BenchmarkAdapter: Send + Sync {
         1.0
     }
 
+    /// Run once before the task loop (default no-op). The terminal-bench adapter uses this to rebuild
+    /// the static musl flux binary from the current source, so a candidate eval measures the worker's
+    /// edits rather than a stale binary.
+    async fn prepare(&self, _ctx: &RunContext<'_>) -> Result<()> {
+        Ok(())
+    }
+
     /// Run one task and return its result.
     async fn run_task(&self, task_id: &str, ctx: &RunContext<'_>) -> Result<RunResult>;
 }

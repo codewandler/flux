@@ -123,7 +123,7 @@ fn load_events(flow_db: &Path, session_id: &str) -> Vec<RunEvent> {
 /// Rust toolchain env to forward into the scrubbed child / grader: without `RUSTUP_HOME` (and the
 /// isolated `HOME` lacking `~/.rustup`), rustup reports "no default toolchain configured" and any
 /// `cargo` criterion fails spuriously. Reads the vars if set, else defaults to `$HOME/.{rustup,cargo}`.
-fn toolchain_env() -> Vec<(String, String)> {
+pub(crate) fn toolchain_env() -> Vec<(String, String)> {
     let mut out = Vec::new();
     let home = std::env::var("HOME").ok();
     for (key, sub) in [("RUSTUP_HOME", ".rustup"), ("CARGO_HOME", ".cargo")] {

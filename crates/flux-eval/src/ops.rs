@@ -127,6 +127,12 @@ impl Tool for EvalRunTool {
             .unwrap_or(1)
             .max(1) as usize;
 
+        // Per-eval setup (e.g. the terminal-bench adapter rebuilds the static musl binary so a
+        // candidate eval reflects the worker's edits).
+        if let Err(e) = adapter.prepare(&rc).await {
+            return Ok(ToolResult::error(format!("eval_run: adapter prepare failed: {e}")));
+        }
+
         let task_ids = adapter.list_tasks(&filter)?;
         let mut cases: Vec<CaseOutcome> = Vec::with_capacity(task_ids.len());
         for id in &task_ids {

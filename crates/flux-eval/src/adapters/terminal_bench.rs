@@ -34,6 +34,8 @@ pub struct TerminalBenchAdapter {
     agent_import_path: String,
     pythonpath: String,
     timeout_secs: u64,
+    /// Rebuild the static musl binary in `prepare()` (so a candidate eval measures the worker's edits).
+    rebuild: bool,
 }
 
 impl TerminalBenchAdapter {
@@ -71,7 +73,20 @@ impl TerminalBenchAdapter {
                 .get("timeout_secs")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1800),
+            rebuild: params.get("rebuild").and_then(|v| v.as_bool()).unwrap_or(false),
         })
+    }
+
+    /// Absolute path to the flux binary the container agent installs.
+    fn flux_binary_abs(&self) -> String {
+        let p = std::path::Path::new(&self.flux_binary);
+        if p.is_absolute() {
+            self.flux_binary.clone()
+        } else {
+            std::env::current_dir()
+                .map(|c| c.join(p).to_string_lossy().to_string())
+                .unwrap_or_else(|_| self.flux_binary.clone())
+        }
     }
 }
 
@@ -111,6 +126,41 @@ impl BenchmarkAdapter for TerminalBenchAdapter {
         "terminal-bench"
     }
 
+    async fn prepare(&self, _ctx: &RunContext<'_>) -> Result<()> {
+        if !self.rebuild {
+            return Ok(());
+        }
+        // Rebuild the static musl binary from the current (candidate) source so the container agent
+        // installs the worker's edits, not a stale binary.
+        let cwd = std::env::current_dir().map_err(|e| Error::Other(e.to_string()))?;
+        let sys = System::new(
+            Workspace::new(&cwd).map_err(|e| Error::Other(format!("musl rebuild workspace: {e}")))?,
+        );
+        let argv: Vec<String> = [
+            "cargo",
+            "build",
+            "--release",
+            "-p",
+            "flux-cli",
+            "--target",
+            "x86_64-unknown-linux-musl",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let out = sys
+            .run_with_env(&argv, &crate::runner::toolchain_env(), Duration::from_secs(1800))
+            .await?;
+        if out.exit_code != 0 {
+            let tail: String = out.stderr.lines().rev().take(6).collect::<Vec<_>>().join(" | ");
+            return Err(Error::Other(format!(
+                "musl rebuild failed (exit {}): {tail}",
+                out.exit_code
+            )));
+        }
+        Ok(())
+    }
+
     fn list_tasks(&self, filter: &Filter) -> Result<Vec<String>> {
         // terminal-bench is heavy (a Docker image per task), so we require explicit task ids rather
         // than auto-listing the whole dataset.
@@ -148,7 +198,7 @@ impl BenchmarkAdapter for TerminalBenchAdapter {
             "--model".into(),
             ctx.default_model.to_string(),
             "--agent-kwarg".into(),
-            format!("flux_binary={}", self.flux_binary),
+            format!("flux_binary={}", self.flux_binary_abs()),
             "--output-path".into(),
             out.to_string_lossy().to_string(),
             "--no-livestream".into(),
