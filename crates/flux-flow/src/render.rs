@@ -133,6 +133,22 @@ fn children(node: &Node) -> Vec<Branch<'_>> {
             .iter()
             .map(|b| Branch::Group(b.name.0.as_str(), &b.body))
             .collect(),
+        Node::Retry { body, .. } => body.iter().map(Branch::Node).collect(),
+        Node::Try { body, handler, .. } => {
+            let mut v: Vec<Branch> = body.iter().map(Branch::Node).collect();
+            if !handler.is_empty() {
+                v.push(Branch::Group("catch", handler));
+            }
+            v
+        }
+        Node::Confirm { body, .. } => body.iter().map(Branch::Node).collect(),
+        Node::Loop { body, .. } => body.iter().map(Branch::Node).collect(),
+        Node::Race { branches, .. } => branches
+            .iter()
+            .map(|b| Branch::Group(b.name.0.as_str(), &b.body))
+            .collect(),
+        Node::Throttle { body, .. } => body.iter().map(Branch::Node).collect(),
+        Node::Debounce { body, .. } => body.iter().map(Branch::Node).collect(),
         _ => Vec::new(),
     }
 }
@@ -196,12 +212,41 @@ fn head(node: &Node, p: &Palette) -> String {
             eff(effect, p)
         ),
         Node::Parallel { .. } => paint(p.keyword, "parallel"),
+        Node::Retry { max, backoff, .. } => {
+            let b = backoff.as_deref().unwrap_or("none");
+            format!("{} max {max} backoff={b}", paint(p.keyword, "retry"))
+        }
+        Node::Try { catch, .. } => match catch {
+            Some(c) => format!("{} catch ${}", paint(p.keyword, "try"), c.0),
+            None => paint(p.keyword, "try"),
+        },
+        Node::Confirm { message, risk, .. } => {
+            let r = risk.as_deref().unwrap_or("medium");
+            format!("{} [{r}] {}", paint(p.keyword, "confirm"), paint(p.string, message))
+        }
+        Node::Loop { for_ms, every_ms, until, .. } => {
+            let base = format!("{} for {for_ms}ms every {every_ms}ms", paint(p.keyword, "loop"));
+            match until {
+                Some(u) => format!("{base} until {}", expr(u, p)),
+                None => base,
+            }
+        }
         Node::Await {
             binding, source, ..
         } => match binding {
             Some(b) => format!("{} = {} {source}", sym(p, &b.0), paint(p.keyword, "await")),
             None => format!("{} {source}", paint(p.keyword, "await")),
         },
+        Node::Race { timeout_ms, bind, .. } => match bind {
+            Some(b) => format!("{} timeout={timeout_ms}ms -> {}", paint(p.keyword, "race"), sym(p, &b.0)),
+            None => format!("{} timeout={timeout_ms}ms", paint(p.keyword, "race")),
+        },
+        Node::Throttle { max, window_ms, .. } => {
+            format!("{} max={max} window={window_ms}ms", paint(p.keyword, "throttle"))
+        }
+        Node::Debounce { wait_ms, .. } => {
+            format!("{} wait={wait_ms}ms", paint(p.keyword, "debounce"))
+        }
         Node::Return { value } => format!("{} {}", paint(p.keyword, "return"), expr(value, p)),
         Node::Var { name } => sym(p, &name.0),
         Node::Lit { value } => lit(value, p),
@@ -229,7 +274,14 @@ fn expr(node: &Node, p: &Palette) -> String {
         | Node::Seq { .. }
         | Node::Memo { .. }
         | Node::Parallel { .. }
-        | Node::Await { .. } => "…".to_string(),
+        | Node::Await { .. }
+        | Node::Retry { .. }
+        | Node::Try { .. }
+        | Node::Confirm { .. }
+        | Node::Loop { .. }
+        | Node::Race { .. }
+        | Node::Throttle { .. }
+        | Node::Debounce { .. } => "…".to_string(),
     }
 }
 

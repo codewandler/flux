@@ -422,6 +422,12 @@ impl Executor {
         self.approver = approver;
     }
 
+    /// The current approver (used by flow nodes such as `confirm` that need to request approval
+    /// outside of a full tool dispatch).
+    pub fn approver(&self) -> &dyn Approver {
+        self.approver.as_ref()
+    }
+
     /// Enable the authorization-policy floor: every tool call's effects are evaluated against
     /// `policy` (default-deny) before the permission rules run.
     pub fn with_policy(mut self, policy: AuthorizationPolicy) -> Self {

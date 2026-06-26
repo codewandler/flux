@@ -117,6 +117,53 @@ fn check_node(node: &Node, registry: &OpRegistry, diags: &mut Vec<Diagnostic>) {
             }
         }
         Node::Return { value } => check_node(value, registry, diags),
+        Node::Retry { body, .. } => {
+            for n in body {
+                check_node(n, registry, diags);
+            }
+        }
+        Node::Try { body, handler, .. } => {
+            for n in body.iter().chain(handler) {
+                check_node(n, registry, diags);
+            }
+        }
+        Node::Confirm { body, .. } => {
+            for n in body {
+                check_node(n, registry, diags);
+            }
+        }
+        Node::Race { branches, .. } => {
+            let mut seen: HashSet<&str> = HashSet::new();
+            for b in branches {
+                if !seen.insert(b.name.0.as_str()) {
+                    diags.push(Diagnostic::new(format!(
+                        "duplicate `race` branch name `${}`",
+                        b.name.0
+                    )));
+                }
+                for n in &b.body { check_node(n, registry, diags); }
+            }
+        }
+        Node::Throttle { max, body, .. } => {
+            if *max == 0 {
+                diags.push(Diagnostic::new("`throttle` requires a non-zero `max`"));
+            }
+            for n in body { check_node(n, registry, diags); }
+        }
+        Node::Debounce { body, .. } => {
+            for n in body { check_node(n, registry, diags); }
+        }
+        Node::Loop { until, body, for_ms, .. } => {
+            if *for_ms == 0 {
+                diags.push(Diagnostic::new("`loop` requires a non-zero `for_ms` (unbounded loops are rejected)"));
+            }
+            if let Some(u) = until {
+                check_node(u, registry, diags);
+            }
+            for n in body {
+                check_node(n, registry, diags);
+            }
+        }
         Node::Await { .. } | Node::Var { .. } | Node::Lit { .. } | Node::Thing { .. } => {}
     }
 }
@@ -137,6 +184,15 @@ fn node_contains_return(node: &Node) -> bool {
         Node::Repeat { body, .. } => body_contains_return(body),
         Node::Each { body, .. } => body_contains_return(body),
         Node::Seq { body, .. } => body_contains_return(body),
+        Node::Retry { body, .. } => body_contains_return(body),
+        Node::Try { body, handler, .. } => {
+            body_contains_return(body) || body_contains_return(handler)
+        }
+        Node::Confirm { body, .. } => body_contains_return(body),
+        Node::Loop { body, .. } => body_contains_return(body),
+        Node::Race { branches, .. } => branches.iter().any(|b| body_contains_return(&b.body)),
+        Node::Throttle { body, .. } => body_contains_return(body),
+        Node::Debounce { body, .. } => body_contains_return(body),
         _ => false,
     }
 }

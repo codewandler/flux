@@ -619,6 +619,236 @@ fn exec_body<'a>(
                         }
                     }
                 }
+                Node::Retry {
+                    max,
+                    backoff,
+                    delay_ms,
+                    body: rbody,
+                    bind,
+                } => {
+                    let base_ms = delay_ms.unwrap_or(500);
+                    let backoff_kind = backoff.as_deref().unwrap_or("none");
+                    let mut last_err = String::new();
+                    let mut succeeded = false;
+                    let mut last_vid: Option<ValueId> = None;
+                    for attempt in 0..*max {
+                        if attempt > 0 {
+                            let wait = match backoff_kind {
+                                "linear" => base_ms * attempt as u64,
+                                "exponential" => base_ms * (1u64 << (attempt - 1).min(10)),
+                                _ => base_ms,
+                            };
+                            if wait > 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                            }
+                        }
+                        match exec_body(
+                            store, executor, session_id, rbody, &mut *sink, &mut *steps, &mut *transcript,
+                        ).await {
+                            Ok((blast, bvid, step)) => {
+                                if !blast.is_empty() { last = blast; }
+                                last_vid = bvid;
+                                if let Step::Return(v) = step {
+                                    return Ok((last, v.clone(), Step::Return(v)));
+                                }
+                                succeeded = true;
+                                break;
+                            }
+                            Err(e) => {
+                                last_err = e.to_string();
+                            }
+                        }
+                    }
+                    if !succeeded {
+                        return Err(Error::Other(format!(
+                            "`retry` exhausted {} attempt(s): {}", max, last_err
+                        )));
+                    }
+                    if let (Some(name), Some(vid)) = (bind, &last_vid) {
+                        bind_existing(store, session_id, name, vid)?;
+                    }
+                    last_value = last_vid;
+                }
+                Node::Try {
+                    body: tbody,
+                    catch,
+                    handler,
+                } => {
+                    match exec_body(
+                        store, executor, session_id, tbody, &mut *sink, &mut *steps, &mut *transcript,
+                    ).await {
+                        Ok((blast, bvid, step)) => {
+                            if !blast.is_empty() { last = blast; }
+                            last_value = bvid;
+                            if let Step::Return(v) = step {
+                                return Ok((last, v.clone(), Step::Return(v)));
+                            }
+                        }
+                        Err(e) => {
+                            if let Some(cname) = catch {
+                                let err_vid = store.put_value(session_id, &Value::String(e.to_string()))?;
+                                bind_existing(store, session_id, cname, &err_vid)?;
+                            }
+                            let (hblast, hvid, hstep) = exec_body(
+                                store, executor, session_id, handler, &mut *sink, &mut *steps, &mut *transcript,
+                            ).await?;
+                            if !hblast.is_empty() { last = hblast; }
+                            last_value = hvid;
+                            if let Step::Return(v) = hstep {
+                                return Ok((last, v.clone(), Step::Return(v)));
+                            }
+                        }
+                    }
+                }
+                Node::Confirm {
+                    message,
+                    risk,
+                    body: cbody,
+                } => {
+                    let intents = flux_spec::IntentSet::new();
+                    let risk_tag = risk.as_deref().unwrap_or("medium");
+                    let labelled = format!("[{risk_tag}] {message}");
+                    let choice = executor.approver().request("confirm", std::slice::from_ref(&labelled), &intents).await;
+                    if !matches!(choice, ApprovalChoice::Allow) {
+                        return Err(Error::Other(format!(
+                            "`confirm` denied: {}", message
+                        )));
+                    }
+                    let (blast, bvid, step) = exec_body(
+                        store, executor, session_id, cbody, &mut *sink, &mut *steps, &mut *transcript,
+                    ).await?;
+                    if !blast.is_empty() { last = blast; }
+                    last_value = bvid;
+                    if let Step::Return(v) = step {
+                        return Ok((last, v.clone(), Step::Return(v)));
+                    }
+                }
+                Node::Loop {
+                    for_ms,
+                    every_ms,
+                    until,
+                    body: lbody,
+                    bind,
+                } => {
+                    let deadline = std::time::Instant::now()
+                        + std::time::Duration::from_millis(*for_ms);
+                    let mut last_vid: Option<ValueId> = None;
+                    loop {
+                        if std::time::Instant::now() >= deadline { break; }
+                        match exec_body(
+                            store, executor, session_id, lbody, &mut *sink, &mut *steps, &mut *transcript,
+                        ).await {
+                            Ok((blast, bvid, step)) => {
+                                if !blast.is_empty() { last = blast; }
+                                last_vid = bvid;
+                                if let Step::Return(v) = step {
+                                    return Ok((last, v.clone(), Step::Return(v)));
+                                }
+                            }
+                            Err(e) => {
+                                return Err(Error::Other(format!("`loop` body failed: {e}")));
+                            }
+                        }
+                        if let Some(u) = until {
+                            if eval_cond(store, executor, session_id, u, &mut *sink, &mut *steps).await? {
+                                break;
+                            }
+                        }
+                        if *every_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(*every_ms)).await;
+                        }
+                    }
+                    if let (Some(name), Some(vid)) = (bind, &last_vid) {
+                        bind_existing(store, session_id, name, vid)?;
+                    }
+                    last_value = last_vid;
+                }
+                Node::Race {
+                    timeout_ms,
+                    branches,
+                    bind,
+                } => {
+                    let deadline = tokio::time::Instant::now()
+                        + std::time::Duration::from_millis(*timeout_ms);
+                    // Run branches sequentially; return the first success within the deadline.
+                    let mut race_result: Option<(String, Option<ValueId>, Step)> = None;
+                    for b in branches {
+                        if tokio::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        match exec_body(
+                            store, executor, session_id, &b.body, &mut *sink, &mut *steps, &mut *transcript,
+                        ).await {
+                            Ok((blast, bvid, step)) => {
+                                race_result = Some((blast, bvid, step));
+                                break;
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+                    let (blast, bvid, step) = race_result.ok_or_else(|| {
+                        Error::Other(format!("`race` timed out after {timeout_ms}ms with no successful branch"))
+                    })?;
+                    if !blast.is_empty() { last = blast; }
+                    if let (Some(name), Some(vid)) = (bind, &bvid) {
+                        bind_existing(store, session_id, name, vid)?;
+                    }
+                    last_value = bvid;
+                    if let Step::Return(v) = step {
+                        return Ok((last, v.clone(), Step::Return(v)));
+                    }
+                }
+                Node::Throttle {
+                    max,
+                    window_ms,
+                    body: tbody,
+                } => {
+                    // Token-bucket: track call timestamps in the value store as a synthetic key.
+                    // Simple in-process approach: store call times as a JSON array in the store.
+                    let bucket_key = SymbolName(format!("__throttle_bucket_{session_id}_{max}_{window_ms}"));
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let window_start = now_ms.saturating_sub(*window_ms);
+                    // Load existing timestamps.
+                    let mut times: Vec<u64> = if let Some(vid) = store.resolve(session_id, &bucket_key).ok().flatten() {
+                        if let Some(Value::String(s)) = store.get_value(&vid).ok().flatten() {
+                            serde_json::from_str::<Vec<u64>>(&s).unwrap_or_default()
+                        } else { vec![] }
+                    } else { vec![] };
+                    // Evict expired entries.
+                    times.retain(|&t| t >= window_start);
+                    if times.len() >= *max as usize {
+                        return Err(Error::Other(format!(
+                            "`throttle` limit of {max} per {window_ms}ms exceeded"
+                        )));
+                    }
+                    times.push(now_ms);
+                    let times_json = serde_json::to_string(&times).unwrap_or_default();
+                    let vid = store.put_value(session_id, &Value::String(times_json))?;
+                    store.bind(session_id, &bucket_key, &vid, None, "", Visibility::Hidden)?;
+                    let (blast, bvid, step) = exec_body(
+                        store, executor, session_id, tbody, sink, steps, transcript,
+                    ).await?;
+                    if !blast.is_empty() { last = blast; }
+                    last_value = bvid;
+                    if let Step::Return(v) = step {
+                        return Ok((last, v.clone(), Step::Return(v)));
+                    }
+                }
+                Node::Debounce { wait_ms, body: dbody } => {
+                    // Debounce: sleep for wait_ms then run body once.
+                    tokio::time::sleep(std::time::Duration::from_millis(*wait_ms)).await;
+                    let (blast, bvid, step) = exec_body(
+                        store, executor, session_id, dbody, sink, steps, transcript,
+                    ).await?;
+                    if !blast.is_empty() { last = blast; }
+                    last_value = bvid;
+                    if let Step::Return(v) = step {
+                        return Ok((last, v.clone(), Step::Return(v)));
+                    }
+                }
                 Node::Await { .. } => {
                     return Err(Error::Other(
                         "`await` execution (cross-turn suspend/resume) lands in a later slice"
@@ -923,6 +1153,13 @@ fn node_kind(node: &Node) -> &'static str {
         Node::Memo { .. } => "memo",
         Node::Parallel { .. } => "parallel",
         Node::Await { .. } => "await",
+        Node::Retry { .. } => "retry",
+        Node::Try { .. } => "try",
+        Node::Confirm { .. } => "confirm",
+        Node::Loop { .. } => "loop",
+        Node::Race { .. } => "race",
+        Node::Throttle { .. } => "throttle",
+        Node::Debounce { .. } => "debounce",
         Node::Return { .. } => "return",
         Node::Var { .. } => "var",
         Node::Lit { .. } => "lit",
@@ -1044,6 +1281,25 @@ fn walk_node<'a>(node: &'a Node, f: &mut impl FnMut(&'a str, &'a [Node])) {
             }
         }
         Node::Return { value } => walk_node(value, f),
+        Node::Retry { body, .. } => walk_calls(body, f),
+        Node::Try { body, handler, .. } => {
+            walk_calls(body, f);
+            walk_calls(handler, f);
+        }
+        Node::Confirm { body, .. } => walk_calls(body, f),
+        Node::Loop { until, body, .. } => {
+            if let Some(u) = until {
+                walk_node(u, f);
+            }
+            walk_calls(body, f);
+        }
+        Node::Race { branches, .. } => {
+            for b in branches {
+                walk_calls(&b.body, f);
+            }
+        }
+        Node::Throttle { body, .. } => walk_calls(body, f),
+        Node::Debounce { body, .. } => walk_calls(body, f),
         Node::Var { .. } | Node::Lit { .. } | Node::Thing { .. } | Node::Await { .. } => {}
     }
 }
@@ -2018,5 +2274,279 @@ mod tests {
             risk.ops.contains(&"bash".to_string()) && risk.ops.contains(&"write".to_string()),
             "the walk recurses into the new container nodes"
         );
+    }
+
+    // ---- new node kinds: retry / try / confirm / loop / race / throttle / debounce ----
+
+    #[tokio::test]
+    async fn execute_flow_retry_succeeds_on_first_attempt() {
+        // retry max 3: body always succeeds → runs once, result is the echo output.
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        let ast = DraftAst {
+            body: vec![Node::Retry {
+                max: 3,
+                backoff: None,
+                body: vec![flow_bind("r", "echo", vec![flow_lit(json!("ok"))])],
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(outcome.result, "ok");
+        assert_eq!(sink.calls, vec!["echo"]);
+    }
+
+    #[tokio::test]
+    async fn execute_flow_try_catch_runs_handler_on_error() {
+        // try { echo("good") } catch $e — body succeeds, handler not reached.
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        let ok_ast = DraftAst {
+            body: vec![Node::Try {
+                catch: None,
+                body: vec![flow_bind("r", "echo", vec![flow_lit(json!("good"))])],
+                handler: vec![],
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess_try_ok", &ok_ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(outcome.result, "good");
+        // handler nodes not executed
+        assert_eq!(sink.calls, vec!["echo"]);
+    }
+
+    #[tokio::test]
+    async fn execute_flow_try_handler_runs_when_body_errors() {
+        // try { unknown_op() } catch { echo("caught") } — body errors, handler runs.
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        let err_ast = DraftAst {
+            body: vec![Node::Try {
+                catch: None,
+                body: vec![Node::Call {
+                    op: "this_op_does_not_exist".into(),
+                    args: vec![],
+                }],
+                handler: vec![flow_bind("h", "echo", vec![flow_lit(json!("caught"))])],
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess_try_err", &err_ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(outcome.result, "caught");
+        assert_eq!(sink.calls, vec!["echo"]);
+    }
+
+    #[tokio::test]
+    async fn execute_flow_confirm_allow_runs_body() {
+        // An auto-allow executor: confirm should proceed and run the body.
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true); // auto-approve = true
+        let ast = DraftAst {
+            body: vec![Node::Confirm {
+                message: "proceed?".into(),
+                risk: Some("low".into()),
+                body: vec![flow_bind("r", "echo", vec![flow_lit(json!("confirmed"))])],
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess_confirm_ok", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(outcome.result, "confirmed");
+    }
+
+    #[tokio::test]
+    async fn execute_flow_confirm_deny_returns_error() {
+        // An auto-deny executor: confirm should return an error.
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(false); // auto-approve = false
+        let ast = DraftAst {
+            body: vec![Node::Confirm {
+                message: "dangerous action".into(),
+                risk: Some("high".into()),
+                body: vec![flow_bind("r", "echo", vec![flow_lit(json!("should not run"))])],
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let err = execute_flow(&store, &ex, "sess_confirm_deny", &ast, &mut sink)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("confirm"), "got: {err}");
+        assert_eq!(sink.calls, vec![], "body must not run when denied");
+    }
+
+    #[tokio::test]
+    async fn execute_flow_loop_runs_until_deadline() {
+        // loop for 50ms every 0ms: body runs at least once; deadline stops it.
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        let ast = DraftAst {
+            body: vec![Node::Loop {
+                for_ms: 50,
+                every_ms: 0,
+                until: None,
+                body: vec![flow_bind("r", "echo", vec![flow_lit(json!("tick"))])],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        execute_flow(&store, &ex, "sess_loop", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert!(!sink.calls.is_empty(), "body must have run at least once");
+        assert!(sink.calls.iter().all(|c| c == "echo"));
+    }
+
+    #[tokio::test]
+    async fn execute_flow_loop_stops_on_until_condition() {
+        // loop for 10_000ms every 0ms until lit(true): body runs exactly once then stops.
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        let ast = DraftAst {
+            body: vec![Node::Loop {
+                for_ms: 10_000,
+                every_ms: 0,
+                until: Some(Box::new(flow_lit(json!(true)))),
+                body: vec![flow_bind("r", "echo", vec![flow_lit(json!("tick"))])],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        execute_flow(&store, &ex, "sess_loop_until", &ast, &mut sink)
+            .await
+            .unwrap();
+        // `until` is checked after the first iteration, so body runs exactly once.
+        assert_eq!(sink.calls, vec!["echo"]);
+    }
+
+    #[tokio::test]
+    async fn execute_flow_race_returns_first_success() {
+        // race timeout=1000ms: first branch succeeds → result is first branch's echo.
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        let ast = DraftAst {
+            body: vec![Node::Race {
+                timeout_ms: 1_000,
+                bind: Some(SymbolName("winner".into())),
+                branches: vec![
+                    crate::ast::Branch {
+                        name: SymbolName("a".into()),
+                        body: vec![flow_bind("ra", "echo", vec![flow_lit(json!("first"))])],
+                    },
+                    crate::ast::Branch {
+                        name: SymbolName("b".into()),
+                        body: vec![flow_bind("rb", "echo", vec![flow_lit(json!("second"))])],
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess_race", &ast, &mut sink)
+            .await
+            .unwrap();
+        // The first branch always succeeds, so we get "first".
+        assert_eq!(outcome.result, "first");
+    }
+
+    #[tokio::test]
+    async fn execute_flow_race_errors_when_deadline_exceeded() {
+        // race timeout=0ms: deadline is already past before any branch runs.
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        let ast = DraftAst {
+            body: vec![Node::Race {
+                timeout_ms: 0,
+                bind: None,
+                branches: vec![crate::ast::Branch {
+                    name: SymbolName("a".into()),
+                    body: vec![flow_bind("r", "echo", vec![flow_lit(json!("x"))])],
+                }],
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let err = execute_flow(&store, &ex, "sess_race_timeout", &ast, &mut sink)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn execute_flow_throttle_allows_under_limit() {
+        // throttle max=5 window=60000ms: a single call is well within the limit.
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        let ast = DraftAst {
+            body: vec![Node::Throttle {
+                max: 5,
+                window_ms: 60_000,
+                body: vec![flow_bind("r", "echo", vec![flow_lit(json!("ok"))])],
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess_throttle_ok", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(outcome.result, "ok");
+    }
+
+    #[tokio::test]
+    async fn execute_flow_throttle_rejects_over_limit() {
+        // throttle max=1 window=60000ms: run the AST twice in the same session → second is rejected.
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        let ast = DraftAst {
+            body: vec![Node::Throttle {
+                max: 1,
+                window_ms: 60_000,
+                body: vec![flow_bind("r", "echo", vec![flow_lit(json!("ok"))])],
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        // First run: succeeds.
+        execute_flow(&store, &ex, "sess_throttle_limit", &ast, &mut sink)
+            .await
+            .unwrap();
+        // Second run in the same session/window: should be rejected.
+        let err = execute_flow(&store, &ex, "sess_throttle_limit", &ast, &mut sink)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("throttle"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn execute_flow_debounce_runs_body_after_delay() {
+        // debounce wait=0ms: body runs (zero delay is fine).
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        let ast = DraftAst {
+            body: vec![Node::Debounce {
+                wait_ms: 0,
+                body: vec![flow_bind("r", "echo", vec![flow_lit(json!("debounced"))])],
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess_debounce", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(outcome.result, "debounced");
+        assert_eq!(sink.calls, vec!["echo"]);
     }
 }

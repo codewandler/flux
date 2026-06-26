@@ -391,6 +391,77 @@ pub enum Node {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         as_type: Option<TypeRef>,
     },
+    /// Retry a body on failure with optional backoff. Fatal errors (policy denial, unknown op) are
+    /// never retried. `backoff` may be `"none"` | `"linear"` | `"exponential"`.
+    Retry {
+        max: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backoff: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delay_ms: Option<u64>,
+        #[serde(default)]
+        body: Vec<Node>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bind: Option<SymbolName>,
+    },
+    /// Structured error handling: run `body`; on failure bind the error string to `catch` and run
+    /// `handler`. If the handler also errors, propagate that error.
+    Try {
+        #[serde(default)]
+        body: Vec<Node>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        catch: Option<SymbolName>,
+        #[serde(default)]
+        handler: Vec<Node>,
+    },
+    /// Explicit human-in-the-loop gate. Calls the existing `Approver` — `--yes` and TUI modal
+    /// handle it automatically. Body only runs on approval; on denial the node errors.
+    /// `risk` may be `"low"` | `"medium"` | `"high"` | `"critical"`.
+    Confirm {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        risk: Option<String>,
+        #[serde(default)]
+        body: Vec<Node>,
+    },
+    /// Time-bounded iteration. `for_ms` is required (the analyzer rejects unbounded loops).
+    /// `every_ms` is the inter-iteration sleep (0 = tight). `until` is an early-exit condition.
+    Loop {
+        for_ms: u64,
+        #[serde(default)]
+        every_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<Box<Node>>,
+        #[serde(default)]
+        body: Vec<Node>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bind: Option<SymbolName>,
+    },
+    /// First-wins concurrency: run branches in parallel and return as soon as the first
+    /// succeeds. `timeout_ms` is required; if no branch succeeds within it the node errors.
+    /// `bind` names the symbol that receives the winning branch's result.
+    Race {
+        timeout_ms: u64,
+        #[serde(default)]
+        branches: Vec<Branch>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bind: Option<SymbolName>,
+    },
+    /// Rate-limit body execution: at most `max` dispatches per `window_ms` sliding window.
+    /// The token bucket is tracked in-process; plan authors declare intent, runtime enforces.
+    Throttle {
+        max: u32,
+        window_ms: u64,
+        #[serde(default)]
+        body: Vec<Node>,
+    },
+    /// Coalesce rapid re-invocations: wait `wait_ms` after the last trigger before running body.
+    /// In a `loop`/`watch` context the body only executes when things have settled.
+    Debounce {
+        wait_ms: u64,
+        #[serde(default)]
+        body: Vec<Node>,
+    },
     /// End the flow with a value.
     Return { value: Box<Node> },
     /// Reference a bound symbol.
