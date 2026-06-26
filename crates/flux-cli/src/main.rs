@@ -1520,6 +1520,22 @@ fn result_summary_for(content: &str, tool: &str, verbose: bool) -> String {
 
     // Tool-aware previews.
     match tool {
+        "read" | "read_many" => {
+            // Never dump raw file contents — show a digest: first 3 lines + count.
+            if n <= 3 {
+                return lines
+                    .iter()
+                    .map(|l| truncate(l.trim_end(), 120))
+                    .collect::<Vec<_>>()
+                    .join("\n    ");
+            }
+            let head = lines[..3]
+                .iter()
+                .map(|l| truncate(l.trim_end(), 120))
+                .collect::<Vec<_>>()
+                .join("\n    ");
+            return format!("{head}\n    … ({} more lines; -v for full)", n - 3);
+        }
         "grep" if n > 3 => {
             let head = lines[..3]
                 .iter()

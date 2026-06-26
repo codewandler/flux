@@ -113,6 +113,11 @@ pub fn format_result(name: &str, content: &str, is_error: bool) -> Option<String
             let n = content.lines().filter(|l| !l.trim().is_empty()).count();
             Some(format!("{n} match{}", if n == 1 { "" } else { "es" }))
         }
+        "read" | "read_many" => {
+            // Suppress the raw file dump; show a compact line count instead.
+            let n = content.lines().count();
+            Some(format!("{n} line{}", if n == 1 { "" } else { "s" }))
+        }
         _ => None,
     }
 }
