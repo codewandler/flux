@@ -1,26 +1,18 @@
 //! Render assistant Markdown to ratatui [`Text`].
 //!
-//! Pipeline: `markdown-stream` parses the text to a flat event stream, `markdown-terminal` renders
-//! those events to width-wrapped ANSI (the same renderer the CLI streams), and `ansi-to-tui` turns
-//! that ANSI into styled ratatui spans. The whole transcript is one wrapped `Paragraph`, so this
-//! pre-wraps to the transcript's inner width to keep line math honest. Only *finalized* assistant
-//! turns go through here — a streaming partial renders as plain text + a cursor (half-parsed
-//! Markdown flickers), which the caller handles.
+//! Pipeline: `markdown-stream` parses the text to a flat event stream and `markdown-ratatui` renders
+//! those events straight to styled ratatui spans — natively, with no ANSI round-trip. The whole
+//! transcript is one wrapped `Paragraph`, so this pre-wraps to the transcript's inner width (with
+//! list hanging indents baked in) to keep line math honest. Only *finalized* assistant turns go
+//! through here — a streaming partial renders as plain text + a cursor (half-parsed Markdown
+//! flickers), which the caller handles.
 
-use ansi_to_tui::IntoText;
 use ratatui::text::Text;
 
-/// Render `src` as GFM Markdown wrapped to `width` columns. Falls back to the raw text if the ANSI
-/// ever fails to parse, so a rendering quirk can never swallow the assistant's reply.
+/// Render `src` as GFM Markdown wrapped to `width` columns, styled natively to ratatui spans.
 pub fn render(src: &str, width: u16) -> Text<'static> {
     let events = markdown_stream::parse_gfm(src);
-    let ansi = markdown_terminal::render_with(
-        &events,
-        &markdown_terminal::Theme::default(),
-        width as usize,
-    );
-    ansi.into_text()
-        .unwrap_or_else(|_| Text::raw(src.to_string()))
+    markdown_ratatui::render_with(&events, &markdown_ratatui::Theme::default(), width as usize)
 }
 
 #[cfg(test)]

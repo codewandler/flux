@@ -48,4 +48,4 @@ async-trait.workspace = true
 serde_json.workspace = true
 serde_norway.workspace = true
 reedline = "0.48.0"
-markdown-terminal = { git = "https://github.com/codewandler/markdown", rev = "e3b765b6d11599ad279db8de96109d4cdf178b2a" }
+markdown-terminal = { git = "https://github.com/codewandler/markdown", rev = "35c6db54d7ab12814db738cc019592b83aab6e8a" }

@@ -21,10 +21,11 @@ tokio.workspace = true
 tokio-util.workspace = true
 async-trait.workspace = true
 
-# Markdown + ANSI rendering for the transcript. markdown-{stream,terminal} are pinned to the same
-# git rev flux-cli uses (so the workspace resolves a single copy); ansi-to-tui turns the ANSI that
-# markdown-terminal and the flux-flow plan tree emit into ratatui `Text`.
-markdown-stream = { git = "https://github.com/codewandler/markdown", rev = "e3b765b6d11599ad279db8de96109d4cdf178b2a" }
-markdown-terminal = { git = "https://github.com/codewandler/markdown", rev = "e3b765b6d11599ad279db8de96109d4cdf178b2a" }
+# Markdown rendering for the transcript: markdown-stream parses, markdown-ratatui renders the events
+# natively to ratatui `Text` (no ANSI round-trip). Pinned to the same codewandler/markdown rev
+# flux-cli uses so the workspace resolves a single markdown-stream. ansi-to-tui now only converts the
+# flux-flow plan-tree ANSI (see plan.rs).
+markdown-stream = { git = "https://github.com/codewandler/markdown", rev = "35c6db54d7ab12814db738cc019592b83aab6e8a" }
+markdown-ratatui = { git = "https://github.com/codewandler/markdown", rev = "35c6db54d7ab12814db738cc019592b83aab6e8a" }
 ansi-to-tui = "7"
 tui-textarea = "0.7"
