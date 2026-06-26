@@ -22,6 +22,9 @@
 
 pub mod adapter;
 pub mod adapters;
+pub mod aggregate;
+pub mod gate;
+pub mod git;
 pub mod metrics;
 pub mod ops;
 pub mod painpoint;
@@ -40,7 +43,22 @@ use flux_runtime::ToolRegistry;
 /// Wire this on the **top-level** registry only — these ops orchestrate eval runs and (later) mutate
 /// git, so they belong to the outer flow, never to a worker sub-agent's scoped toolset.
 pub fn register_eval_ops(registry: &mut ToolRegistry) {
+    // Eval substrate.
     registry.register(Arc::new(ops::EvalRunTool));
     registry.register(Arc::new(ops::EvalSessionsTool));
     registry.register(Arc::new(ops::PainpointsCollectTool));
+    registry.register(Arc::new(ops::EvalAdoptTool));
+    registry.register(Arc::new(ops::EvalScalarTool));
+    registry.register(Arc::new(ops::ScoreCompareTool));
+    // Aggregate → candidates + loop control.
+    registry.register(Arc::new(aggregate::ImprovementsAggregateTool));
+    registry.register(Arc::new(aggregate::CandidatesEmptyTool));
+    registry.register(Arc::new(aggregate::CandidatesAdvanceTool));
+    registry.register(Arc::new(ops::ChangeImplementTool));
+    // Keep/commit/revert loop. `git_commit`/`git_stage` are built-ins (flux-tools); we add only what
+    // they lack: a HEAD+clean snapshot, tagging, and a hard-reset revert.
+    registry.register(Arc::new(gate::GateCheckTool));
+    registry.register(Arc::new(git::GitSnapshotTool));
+    registry.register(Arc::new(git::GitTagTool));
+    registry.register(Arc::new(git::GitRevertTool));
 }

@@ -742,7 +742,7 @@ async fn run_flow(args: &[String]) -> Result<()> {
         // Always surface a closing summary so a direct `flux flow run` turn never ends silently.
         eprintln!(
             "{}",
-            style::dim(&format!("done \u00b7 {} step(s)", outcome.steps))
+            style::dim(&format!("done \u{00b7} {} step(s)", outcome.steps))
         );
     }
     sink.turn_end(None);

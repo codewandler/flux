@@ -653,6 +653,7 @@ dependencies = [
  "flux-core",
  "flux-credentials",
  "flux-datasource",
+ "flux-eval",
  "flux-evidence",
  "flux-flow",
  "flux-hooks",
@@ -743,6 +744,27 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "flux-eval"
+version = "0.2.4"
+dependencies = [
+ "async-trait",
+ "flux-core",
+ "flux-flow",
+ "flux-orchestrate",
+ "flux-runtime",
+ "flux-session",
+ "flux-spec",
+ "flux-system",
+ "flux-tools",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "toml",
 ]
 
 [[package]]

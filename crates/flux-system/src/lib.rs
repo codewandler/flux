@@ -341,6 +341,23 @@ impl System {
     /// Execute a command as an explicit argv (NO shell). `argv[0]` is the program; the working
     /// directory is the workspace root.
     pub async fn run(&self, argv: &[String], timeout: Duration) -> Result<ProcessOutput> {
+        self.run_with_env(argv, &[], timeout).await
+    }
+
+    /// Like [`run`](Self::run), but additionally sets the caller-chosen `env` entries on top of the
+    /// minimal allow-list (each `(key, value)` overrides or adds to the forwarded environment).
+    ///
+    /// This exists for **trusted in-process callers** (e.g. the eval harness) that must control a
+    /// child's environment — for instance to point a spawned `flux` at an isolated `HOME` so its
+    /// session store doesn't collide with the parent's. The argv-only, `env_clear`, and output-cap
+    /// guarantees of [`run`](Self::run) are unchanged; only the explicit, **non-model** entries in
+    /// `env` are added (model input never reaches this map — it is built by Rust callers).
+    pub async fn run_with_env(
+        &self,
+        argv: &[String],
+        env: &[(String, String)],
+        timeout: Duration,
+    ) -> Result<ProcessOutput> {
         let Some((program, args)) = argv.split_first() else {
             return Err(Error::Other("empty command".to_string()));
         };
@@ -360,6 +377,10 @@ impl System {
             if let Ok(val) = std::env::var(key) {
                 cmd.env(key, val);
             }
+        }
+        // Caller-chosen overrides (added after the allow-list so they win).
+        for (k, v) in env {
+            cmd.env(k, v);
         }
 
         let fut = cmd.output();
@@ -575,6 +596,38 @@ mod tests {
             out.stdout
         );
         assert!(!out.stdout.contains("FLUX_TEST_SECRET_ENVX"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn run_with_env_applies_caller_overrides() {
+        let (dir, sys) = temp_workspace();
+        // A caller-chosen entry is visible to the child even though it isn't in the allow-list, and
+        // overrides the forwarded value when the key collides (HOME).
+        let out = sys
+            .run_with_env(
+                &["env".to_string()],
+                &[
+                    (
+                        "FLUX_EVAL_MARKER".to_string(),
+                        "isolated-home-42".to_string(),
+                    ),
+                    ("HOME".to_string(), "/tmp/flux-eval-isolated".to_string()),
+                ],
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.stdout.contains("FLUX_EVAL_MARKER=isolated-home-42"),
+            "caller override not applied: {}",
+            out.stdout
+        );
+        assert!(
+            out.stdout.contains("HOME=/tmp/flux-eval-isolated"),
+            "HOME override not applied: {}",
+            out.stdout
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
