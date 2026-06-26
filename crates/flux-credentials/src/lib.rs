@@ -286,6 +286,7 @@ impl Refresher for AnthropicRefresher {
             .json(&serde_json::json!({
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
+                "client_id": ANTHROPIC_CLIENT_ID,
             }))
             .send()
             .await
