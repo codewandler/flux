@@ -462,8 +462,27 @@ pub enum Node {
         #[serde(default)]
         body: Vec<Node>,
     },
+    /// Negated conditional: run `body` only when `cond` is falsey. Sugar for `when !cond`;
+    /// the body may contain any nodes (reads, writes, sub-plans — anything).
+    Unless {
+        cond: Box<Node>,
+        #[serde(default)]
+        body: Vec<Node>,
+    },
+    /// Run a command and assert its output matches an expected pattern; abort the flow with a
+    /// structured error if it does not. `cmd` is any node that produces a string (typically a
+    /// `bash` call); `expect` is a substring or regex the output must contain.
+    Verify {
+        cmd: Box<Node>,
+        expect: Box<Node>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
     /// End the flow with a value.
     Return { value: Box<Node> },
+    /// Read the current in-session value of a named symbol without any filesystem IO.
+    /// Returns the symbol's stored value, or null if the symbol is not yet bound.
+    Peek { name: SymbolName },
     /// Reference a bound symbol.
     Var { name: SymbolName },
     /// A literal value (raw JSON, as written in the AST by the compiler front-end).

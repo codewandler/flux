@@ -485,6 +485,9 @@ const AST_GRAMMAR: &str = r#"The AST is a JSON object: {"name"?:string, "params"
 - {"kind":"pipe","steps":[Node,...],"bind"?:"<sym>"}   chain calls — each step's output is fed as the next step's FIRST argument; optional $<bind> captures the final result
 - {"kind":"seq","body":[Node,...],"bind"?:"<sym>"}   a sequential block; optional $<bind> captures its final result
 - {"kind":"assert","cond":Node,"message"?:"<str>"}   abort the flow if cond is falsey
+- {"kind":"unless","cond":Node,"body":[Node,...]}   run body only when cond is falsey (sugar for negated when; body may contain any nodes)
+- {"kind":"verify","cmd":Node,"expect":Node,"message"?:"<str>"}   run cmd (any node producing a string), check output contains expect; abort with message if not — use after edits/builds to self-check
+- {"kind":"peek","name":"<sym>"}   read the current in-session value of a named symbol without IO; returns empty string if not yet bound
 - {"kind":"memo","name":"<sym>","value":Node,"effect"?:"<effect>"}   like bind, but computed once per session (cached across turns) — for expensive deterministic work
 - {"kind":"await","binding"?:"<sym>","source":"<source>"}
 - {"kind":"return","value":Node}

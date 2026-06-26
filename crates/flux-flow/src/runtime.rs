@@ -849,6 +849,50 @@ fn exec_body<'a>(
                         return Ok((last, v.clone(), Step::Return(v)));
                     }
                 }
+                Node::Unless { cond, body: ubody } => {
+                    // Sugar for `when !cond`: run body only when condition is falsey.
+                    let take = !eval_cond(store, executor, session_id, cond, &mut *sink, &mut *steps).await?;
+                    if take {
+                        let (blast, bvid, step) = exec_body(
+                            store, executor, session_id, ubody, &mut *sink, &mut *steps, &mut *transcript,
+                        ).await?;
+                        if !blast.is_empty() { last = blast; last_value = bvid; }
+                        if let Step::Return(v) = step {
+                            return Ok((last, v.clone(), Step::Return(v)));
+                        }
+                    }
+                }
+                Node::Verify { cmd, expect, message } => {
+                    // Run `cmd`, check output contains/matches `expect`; abort with `message` if not.
+                    let (cmd_text, _) =
+                        eval_return(store, executor, session_id, cmd, &mut *sink, &mut *steps).await?;
+                    let expect_val = eval_arg(expect, store, session_id)?;
+                    let pattern = match &expect_val {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => serde_json::to_string(other).unwrap_or_default(),
+                    };
+                    let ok = cmd_text.contains(pattern.as_str());
+                    if !ok {
+                        let detail = message.clone().unwrap_or_else(|| {
+                            format!("output did not contain {:?}", pattern)
+                        });
+                        return Err(Error::Other(format!("verify failed: {detail}")));
+                    }
+                    transcript.push(format!("[verify ok] {pattern}"));
+                    last = format!("verify ok: {pattern}");
+                }
+                Node::Peek { name } => {
+                    // Read the current in-session value of a named symbol — zero IO.
+                    let text = match store.resolve(session_id, name)? {
+                        Some(vid) => store
+                            .get_value(&vid)?
+                            .map(|v| value_text(&v))
+                            .unwrap_or_default(),
+                        None => String::new(),
+                    };
+                    transcript.push(format!("[peek ${}]\n{text}", name.0));
+                    last = text;
+                }
                 Node::Await { .. } => {
                     return Err(Error::Other(
                         "`await` execution (cross-turn suspend/resume) lands in a later slice"
@@ -859,6 +903,10 @@ fn exec_body<'a>(
                     return Err(Error::Other(
                         "a bare value is not an executable statement".to_string(),
                     ));
+                }
+                Node::Unless { .. } | Node::Verify { .. } | Node::Peek { .. } => {
+                    // handled above — this arm is unreachable but satisfies exhaustiveness
+                    unreachable!()
                 }
             }
         }
@@ -1160,6 +1208,9 @@ fn node_kind(node: &Node) -> &'static str {
         Node::Race { .. } => "race",
         Node::Throttle { .. } => "throttle",
         Node::Debounce { .. } => "debounce",
+        Node::Unless { .. } => "unless",
+        Node::Verify { .. } => "verify",
+        Node::Peek { .. } => "peek",
         Node::Return { .. } => "return",
         Node::Var { .. } => "var",
         Node::Lit { .. } => "lit",
@@ -1300,6 +1351,9 @@ fn walk_node<'a>(node: &'a Node, f: &mut impl FnMut(&'a str, &'a [Node])) {
         }
         Node::Throttle { body, .. } => walk_calls(body, f),
         Node::Debounce { body, .. } => walk_calls(body, f),
+        Node::Unless { body, .. } => walk_calls(body, f),
+        Node::Verify { cmd, expect, .. } => { walk_node(cmd, f); walk_node(expect, f); }
+        Node::Peek { .. } => {}
         Node::Var { .. } | Node::Lit { .. } | Node::Thing { .. } | Node::Await { .. } => {}
     }
 }
@@ -2287,7 +2341,9 @@ mod tests {
             body: vec![Node::Retry {
                 max: 3,
                 backoff: None,
+                delay_ms: None,
                 body: vec![flow_bind("r", "echo", vec![flow_lit(json!("ok"))])],
+                bind: None,
             }],
             ..Default::default()
         };
@@ -2367,9 +2423,28 @@ mod tests {
 
     #[tokio::test]
     async fn execute_flow_confirm_deny_returns_error() {
-        // An auto-deny executor: confirm should return an error.
+        // A denying *approver* (with `echo` permitted, so the body would otherwise run): `confirm`
+        // must error and short-circuit before the body. (Using a perm-denied echo would test the
+        // wrong thing — the denial has to come from the confirm gate itself.)
+        struct DenyApprover;
+        #[async_trait]
+        impl Approver for DenyApprover {
+            async fn request(&self, _t: &str, _s: &[String], _i: &IntentSet) -> ApprovalChoice {
+                ApprovalChoice::Deny
+            }
+        }
+        let dir =
+            std::env::temp_dir().join(format!("flux-flow-rt-{}-confirmdeny", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        let ex = Executor::new(
+            reg,
+            PermissionManager::from_rules(&["echo".into()], &[]),
+            Arc::new(DenyApprover),
+            ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap()))),
+        );
         let store = FlowStore::in_memory().unwrap();
-        let ex = temp_executor(false); // auto-approve = false
         let ast = DraftAst {
             body: vec![Node::Confirm {
                 message: "dangerous action".into(),
@@ -2383,7 +2458,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("confirm"), "got: {err}");
-        assert_eq!(sink.calls, vec![], "body must not run when denied");
+        assert!(sink.calls.is_empty(), "body must not run when denied");
     }
 
     #[tokio::test]

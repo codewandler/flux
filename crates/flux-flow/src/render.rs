@@ -149,6 +149,9 @@ fn children(node: &Node) -> Vec<Branch<'_>> {
             .collect(),
         Node::Throttle { body, .. } => body.iter().map(Branch::Node).collect(),
         Node::Debounce { body, .. } => body.iter().map(Branch::Node).collect(),
+        Node::Unless { body, .. } => body.iter().map(Branch::Node).collect(),
+        Node::Verify { .. } => Vec::new(),
+        Node::Peek { .. } => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -247,6 +250,12 @@ fn head(node: &Node, p: &Palette) -> String {
         Node::Debounce { wait_ms, .. } => {
             format!("{} wait={wait_ms}ms", paint(p.keyword, "debounce"))
         }
+        Node::Unless { cond, .. } => format!("{} {}", paint(p.keyword, "unless"), expr(cond, p)),
+        Node::Verify { cmd, expect, message } => {
+            let msg = message.as_deref().unwrap_or("");
+            format!("{} {} contains {} {}", paint(p.keyword, "verify"), expr(cmd, p), expr(expect, p), paint(p.string, msg))
+        }
+        Node::Peek { name } => format!("{} {}", paint(p.keyword, "peek"), sym(p, &name.0)),
         Node::Return { value } => format!("{} {}", paint(p.keyword, "return"), expr(value, p)),
         Node::Var { name } => sym(p, &name.0),
         Node::Lit { value } => lit(value, p),
@@ -281,7 +290,10 @@ fn expr(node: &Node, p: &Palette) -> String {
         | Node::Loop { .. }
         | Node::Race { .. }
         | Node::Throttle { .. }
-        | Node::Debounce { .. } => "…".to_string(),
+        | Node::Debounce { .. }
+        | Node::Unless { .. }
+        | Node::Verify { .. }
+        | Node::Peek { .. } => "…".to_string(),
     }
 }
 
