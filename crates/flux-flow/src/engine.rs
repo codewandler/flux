@@ -125,6 +125,7 @@ impl FlowEngine {
                 &ops,
                 view_ref,
                 None,
+                Some(sink),
                 opts.clone(),
             )
             .await;
@@ -247,6 +248,7 @@ impl FlowEngine {
             &ops,
             view_ref,
             ask,
+            None,
             opts,
         )
         .await
@@ -281,6 +283,7 @@ impl FlowEngine {
             &ops,
             view_ref,
             None,
+            Some(sink),
             opts,
         )
         .await;

@@ -173,6 +173,10 @@ pub async fn compile_turn(
     ops: &OpRegistry<'_>,
     view: Option<&SessionView>,
     ask: Option<&dyn AskUser>,
+    // Optional sink for live thinking-token streaming during the planning call. When present,
+    // each ThinkingDelta chunk is forwarded via sink.thinking_delta so the surface can display
+    // reasoning in real time instead of showing a silent "composing plan\u2026" indicator.
+    mut thinking_sink: Option<&'_ mut dyn flux_agent::AgentSink>,
     opts: CompileOptions,
 ) -> Result<TurnOutput> {
     let steps = opts.max_steps.max(1);
@@ -188,6 +192,10 @@ pub async fn compile_turn(
     // node in the emitted graph, so a turn is always an auditable plan, never a free-form tool call.
     let tools = planner_tools(interactive);
     let mut messages = conversation.to_vec();
+    // Forward thinking-token deltas to the sink while we're in the planning phase, so both surfaces
+    // (CLI: dims them on stderr; TUI: streams them into a dedicated Thinking entry) can show reasoning
+    // live instead of silently waiting behind "composing plan\u2026".
+    let enable_thinking = thinking_sink.is_some();
 
     for step in 1..=steps {
         let req = Request {
@@ -199,12 +207,23 @@ pub async fn compile_turn(
             temperature: None,
             top_p: None,
             stop_sequences: Vec::new(),
-            thinking: false,
+            thinking: enable_thinking,
             effort: None,
             metadata: serde_json::Map::new(),
         };
 
-        let (mut blocks, acc_text, stop_reason) = stream_blocks(provider, req).await?;
+        // SAFETY: we reborrow through a raw pointer to break the loop-iteration
+        // lifetime cycle. `stream_blocks` is `await`ed to completion before the next
+        // iteration touches `thinking_sink`, so there is no actual aliasing.
+        let ts: Option<&mut dyn flux_agent::AgentSink> = thinking_sink
+            .as_mut()
+            .map(|s| unsafe { &mut *(*s as *mut dyn flux_agent::AgentSink) });
+        let (mut blocks, acc_text, stop_reason) = stream_blocks(
+            provider,
+            req,
+            ts,
+        )
+        .await?;
         if blocks.is_empty() && !acc_text.trim().is_empty() {
             blocks.push(ContentBlock::Text { text: acc_text });
         }
@@ -356,7 +375,7 @@ pub async fn plan(
     opts: CompileOptions,
 ) -> Result<Compiled> {
     let conversation = [Message::user_text(instruction)];
-    match compile_turn(provider, model, &conversation, None, ops, view, ask, opts).await? {
+    match compile_turn(provider, model, &conversation, None, ops, view, ask, None, opts).await? {
         TurnOutput::Plan(c) => Ok(c),
         TurnOutput::Chat(_) => Err(Error::Other(
             "the model answered without emitting a plan".to_string(),
@@ -456,7 +475,7 @@ pub async fn render_completion(
         effort: None,
         metadata: serde_json::Map::new(),
     };
-    let (mut blocks, acc_text, _stop) = stream_blocks(provider, req).await?;
+    let (mut blocks, acc_text, _stop) = stream_blocks(provider, req, None).await?;
     if blocks.is_empty() && !acc_text.trim().is_empty() {
         blocks.push(ContentBlock::Text { text: acc_text });
     }
@@ -467,9 +486,13 @@ pub async fn render_completion(
 /// terminating `stop_reason`. The stop_reason matters: a `max_tokens` cutoff mid-`emit_plan` drops the
 /// tool_use block (the provider never sends its `content_block_stop`), so the caller must distinguish a
 /// truncated turn from a finished prose answer.
+///
+/// `on_thinking` receives each incremental thinking-token delta as it arrives; pass `None` when the
+/// caller doesn't need live thinking output (e.g. the one-shot `compile` path).
 async fn stream_blocks(
     provider: &dyn Provider,
     req: Request,
+    mut on_thinking: Option<&mut dyn flux_agent::AgentSink>,
 ) -> Result<(Vec<ContentBlock>, String, Option<StopReason>)> {
     let mut stream = provider.stream(req).await?;
     let mut blocks = Vec::new();
@@ -477,6 +500,11 @@ async fn stream_blocks(
     let mut stop_reason = None;
     while let Some(chunk) = stream.next().await {
         match chunk? {
+            Chunk::ThinkingDelta(t) => {
+                if let Some(sink) = on_thinking.as_deref_mut() {
+                    sink.thinking_delta(&t);
+                }
+            }
             Chunk::TextDelta(t) => text.push_str(&t),
             Chunk::Block(b) => blocks.push(b),
             Chunk::Done { stop_reason: r } => stop_reason = r,
