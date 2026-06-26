@@ -17,6 +17,7 @@
             "dataset": "terminal-bench-core==0.1.1",
             "model": "anthropic/claude-sonnet-4-6",
             "flux_binary": "target/x86_64-unknown-linux-musl/release/flux",
+            "agent_timeout_secs": 180,
             "rebuild": true
           } }
         ]
@@ -98,6 +99,7 @@
                     "dataset": "terminal-bench-core==0.1.1",
                     "model": "anthropic/claude-sonnet-4-6",
                     "flux_binary": "target/x86_64-unknown-linux-musl/release/flux",
+                    "agent_timeout_secs": 180,
                     "rebuild": true
                   } }
                 ]

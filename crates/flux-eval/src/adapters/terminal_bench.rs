@@ -34,6 +34,8 @@ pub struct TerminalBenchAdapter {
     agent_import_path: String,
     pythonpath: String,
     timeout_secs: u64,
+    /// Per-task in-container agent timeout (tb `--global-agent-timeout-sec`) — bounds each flux run.
+    agent_timeout_secs: u64,
     /// Rebuild the static musl binary in `prepare()` (so a candidate eval measures the worker's edits).
     rebuild: bool,
 }
@@ -73,6 +75,10 @@ impl TerminalBenchAdapter {
                 .get("timeout_secs")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1800),
+            agent_timeout_secs: params
+                .get("agent_timeout_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(600),
             rebuild: params.get("rebuild").and_then(|v| v.as_bool()).unwrap_or(false),
         })
     }
@@ -201,6 +207,8 @@ impl BenchmarkAdapter for TerminalBenchAdapter {
             format!("flux_binary={}", self.flux_binary_abs()),
             "--output-path".into(),
             out.to_string_lossy().to_string(),
+            "--global-agent-timeout-sec".into(),
+            self.agent_timeout_secs.to_string(),
             "--no-livestream".into(),
         ];
 
