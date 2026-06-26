@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
 use flux_agent::AgentSink;
-use flux_core::{Error, Result};
+use flux_core::{Error, Result, Usage};
 use flux_runtime::{ApprovalChoice, Approver, Executor, ToolRegistry, ToolResult};
 use flux_spec::{IntentSet, Risk};
 
@@ -63,6 +63,22 @@ fn summarize(content: &str) -> String {
     } else {
         line.to_string()
     }
+}
+
+/// Bind an already-stored value id to a session symbol, deriving the one-line summary from its text.
+/// Used by `seq`/`each`/`pipe`/`parallel` to bind a block's result (the value already exists in the
+/// store; only the symbol mapping is new).
+fn bind_existing(
+    store: &FlowStore,
+    session_id: &str,
+    name: &SymbolName,
+    vid: &ValueId,
+) -> Result<()> {
+    let summary = store
+        .get_value(vid)?
+        .map(|v| summarize(&value_text(&v)))
+        .unwrap_or_default();
+    store.bind(session_id, name, vid, None, &summary, Visibility::Visible)
 }
 
 /// Execute one registered operation through the envelope, store its result as an immutable value,
@@ -163,9 +179,73 @@ enum Step {
     Return(Option<ValueId>),
 }
 
-/// A boxed, borrowed future producing `(last_text, control)` — the recursion-safe shape `exec_body`
-/// returns so `when`/`repeat` can recurse into nested bodies.
-type BodyFuture<'a> = Pin<Box<dyn Future<Output = Result<(String, Step)>> + Send + 'a>>;
+/// A boxed, borrowed future producing `(last_text, last_value, control)` — the recursion-safe shape
+/// `exec_body` returns so `when`/`repeat`/`each`/`seq`/`parallel` can recurse into nested bodies. The
+/// `last_value` is the value id the body's final op produced (so `seq`/`each`/`parallel` can bind it).
+type BodyFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(String, Option<ValueId>, Step)>> + Send + 'a>>;
+
+/// A recorded [`AgentSink`] call, buffered so a `parallel` branch's output can be replayed into the
+/// real sink after the concurrent join (rather than interleaving on a shared `&mut` sink).
+enum SinkEvent {
+    Text(String),
+    Thinking(String),
+    Planning(bool),
+    ToolCall(String, serde_json::Value),
+    ToolResult(String, ToolResult),
+    Observation(flux_evidence::Observation),
+    TurnEnd(Option<Usage>),
+}
+
+/// A buffering sink for one `parallel` branch: it records the sink calls the branch makes, then
+/// [`replay`](BufferSink::replay)s them — in order — into the real sink once all branches have joined.
+#[derive(Default)]
+struct BufferSink {
+    events: Vec<SinkEvent>,
+}
+
+impl BufferSink {
+    /// Drain the recorded events into `sink`, preserving their order within the branch.
+    fn replay(self, sink: &mut dyn AgentSink) {
+        for ev in self.events {
+            match ev {
+                SinkEvent::Text(t) => sink.text_delta(&t),
+                SinkEvent::Thinking(t) => sink.thinking_delta(&t),
+                SinkEvent::Planning(a) => sink.planning(a),
+                SinkEvent::ToolCall(n, i) => sink.tool_call(&n, &i),
+                SinkEvent::ToolResult(n, r) => sink.tool_result(&n, &r),
+                SinkEvent::Observation(o) => sink.observation(&o),
+                SinkEvent::TurnEnd(u) => sink.turn_end(u),
+            }
+        }
+    }
+}
+
+impl AgentSink for BufferSink {
+    fn text_delta(&mut self, text: &str) {
+        self.events.push(SinkEvent::Text(text.to_string()));
+    }
+    fn thinking_delta(&mut self, text: &str) {
+        self.events.push(SinkEvent::Thinking(text.to_string()));
+    }
+    fn planning(&mut self, active: bool) {
+        self.events.push(SinkEvent::Planning(active));
+    }
+    fn tool_call(&mut self, name: &str, input: &serde_json::Value) {
+        self.events
+            .push(SinkEvent::ToolCall(name.to_string(), input.clone()));
+    }
+    fn tool_result(&mut self, name: &str, result: &ToolResult) {
+        self.events
+            .push(SinkEvent::ToolResult(name.to_string(), result.clone()));
+    }
+    fn observation(&mut self, o: &flux_evidence::Observation) {
+        self.events.push(SinkEvent::Observation(o.clone()));
+    }
+    fn turn_end(&mut self, usage: Option<Usage>) {
+        self.events.push(SinkEvent::TurnEnd(usage));
+    }
+}
 
 /// Execute a compiled flow's body, dispatching each operation through the same [`execute_call`]
 /// envelope. Handles `bind` / `call` / `return` plus `when` (typed branch) and `repeat` (bounded
@@ -180,7 +260,7 @@ pub async fn execute_flow(
 ) -> Result<FlowOutcome> {
     let mut steps = 0usize;
     let mut transcript: Vec<String> = Vec::new();
-    let (last, step) = exec_body(
+    let (last, _last_value, step) = exec_body(
         store,
         executor,
         session_id,
@@ -218,6 +298,9 @@ fn exec_body<'a>(
 ) -> BodyFuture<'a> {
     Box::pin(async move {
         let mut last = String::new();
+        // The value id the body's most recent op produced — so `seq`/`each`/`parallel`/`pipe` can
+        // bind a block's result without the caller threading a separate accumulator.
+        let mut last_value: Option<ValueId> = None;
         for node in body {
             match node {
                 Node::Bind {
@@ -249,6 +332,7 @@ fn exec_body<'a>(
                     // a plan's reads, not just the last one.
                     transcript.push(format!("[${} = {op}]\n{}", name.0, outcome.view));
                     last = outcome.view;
+                    last_value = outcome.value_id;
                 }
                 Node::Call { op, args } => {
                     let outcome =
@@ -264,11 +348,12 @@ fn exec_body<'a>(
                     // (line-numbered read, diff, …). Control flow (`when`/`return`) stays canonical.
                     transcript.push(format!("[{op}]\n{}", outcome.view));
                     last = outcome.view;
+                    last_value = outcome.value_id;
                 }
                 Node::Return { value } => {
                     let (content, vid) =
                         eval_return(store, executor, session_id, value, sink, steps).await?;
-                    return Ok((content, Step::Return(vid)));
+                    return Ok((content, vid.clone(), Step::Return(vid)));
                 }
                 Node::When {
                     cond,
@@ -277,7 +362,7 @@ fn exec_body<'a>(
                 } => {
                     let take = eval_cond(store, executor, session_id, cond, sink, steps).await?;
                     let branch = if take { then } else { otherwise };
-                    let (blast, step) = exec_body(
+                    let (blast, bvid, step) = exec_body(
                         store,
                         executor,
                         session_id,
@@ -289,9 +374,10 @@ fn exec_body<'a>(
                     .await?;
                     if !blast.is_empty() {
                         last = blast;
+                        last_value = bvid;
                     }
                     if let Step::Return(v) = step {
-                        return Ok((last, Step::Return(v)));
+                        return Ok((last, v.clone(), Step::Return(v)));
                     }
                 }
                 Node::Repeat {
@@ -300,7 +386,7 @@ fn exec_body<'a>(
                     body: rbody,
                 } => {
                     for _ in 0..*max {
-                        let (blast, step) = exec_body(
+                        let (blast, bvid, step) = exec_body(
                             store,
                             executor,
                             session_id,
@@ -312,9 +398,10 @@ fn exec_body<'a>(
                         .await?;
                         if !blast.is_empty() {
                             last = blast;
+                            last_value = bvid;
                         }
                         if let Step::Return(v) = step {
-                            return Ok((last, Step::Return(v)));
+                            return Ok((last, v.clone(), Step::Return(v)));
                         }
                         // `until` is a *stop-when-true* guard, evaluated after each iteration.
                         if let Some(u) = until {
@@ -323,6 +410,212 @@ fn exec_body<'a>(
                             {
                                 break;
                             }
+                        }
+                    }
+                }
+                Node::Each {
+                    source,
+                    item,
+                    body: ebody,
+                    collect,
+                } => {
+                    let list = eval_arg(source, store, session_id)?;
+                    let serde_json::Value::Array(elems) = list else {
+                        return Err(Error::Other(
+                            "`each` source must evaluate to a list".to_string(),
+                        ));
+                    };
+                    let mut collected: Vec<ValueId> = Vec::new();
+                    for elem in &elems {
+                        let vid = store.put_value(session_id, &Value::from_json(elem))?;
+                        bind_existing(store, session_id, item, &vid)?;
+                        let (blast, bvid, step) = exec_body(
+                            store,
+                            executor,
+                            session_id,
+                            ebody,
+                            &mut *sink,
+                            &mut *steps,
+                            &mut *transcript,
+                        )
+                        .await?;
+                        if !blast.is_empty() {
+                            last = blast;
+                        }
+                        if let Some(v) = bvid {
+                            collected.push(v.clone());
+                            last_value = Some(v);
+                        }
+                        if let Step::Return(v) = step {
+                            return Ok((last, v.clone(), Step::Return(v)));
+                        }
+                    }
+                    if let Some(cname) = collect {
+                        let items: Vec<Value> = collected
+                            .iter()
+                            .filter_map(|vid| store.get_value(vid).ok().flatten())
+                            .collect();
+                        let list_vid = store.put_value(session_id, &Value::List(items))?;
+                        bind_existing(store, session_id, cname, &list_vid)?;
+                        last_value = Some(list_vid);
+                    }
+                }
+                Node::Assert { cond, message } => {
+                    let ok = eval_cond(store, executor, session_id, cond, &mut *sink, &mut *steps)
+                        .await?;
+                    if !ok {
+                        let detail = message
+                            .clone()
+                            .unwrap_or_else(|| "condition is false".to_string());
+                        return Err(Error::Other(format!("assertion failed: {detail}")));
+                    }
+                }
+                Node::Pipe {
+                    steps: psteps,
+                    bind,
+                } => {
+                    let mut prev: Option<ValueId> = None;
+                    for step in psteps {
+                        let Node::Call { op, args } = step else {
+                            return Err(Error::Other(
+                                "`pipe` steps must be `call` nodes".to_string(),
+                            ));
+                        };
+                        // Splice the previous step's result as this step's first argument.
+                        let synth_args: Vec<Node> = match &prev {
+                            Some(pvid) => {
+                                let pjson = store
+                                    .get_value(pvid)?
+                                    .ok_or_else(|| {
+                                        Error::Other("dangling value in `pipe`".to_string())
+                                    })?
+                                    .to_json();
+                                let mut a = Vec::with_capacity(args.len() + 1);
+                                a.push(Node::Lit { value: pjson });
+                                a.extend(args.iter().cloned());
+                                a
+                            }
+                            None => args.clone(),
+                        };
+                        let outcome = run_call(
+                            store,
+                            executor,
+                            session_id,
+                            op,
+                            &synth_args,
+                            None,
+                            &mut *sink,
+                        )
+                        .await?;
+                        *steps += 1;
+                        if outcome.is_error {
+                            return Err(Error::Other(format!(
+                                "pipe step `{op}` failed: {}",
+                                outcome.content
+                            )));
+                        }
+                        transcript.push(format!("[pipe {op}]\n{}", outcome.view));
+                        last = outcome.view;
+                        prev = outcome.value_id;
+                    }
+                    if let Some(name) = bind {
+                        if let Some(vid) = &prev {
+                            bind_existing(store, session_id, name, vid)?;
+                        }
+                    }
+                    last_value = prev;
+                }
+                Node::Seq { body: sbody, bind } => {
+                    let (blast, bvid, step) = exec_body(
+                        store,
+                        executor,
+                        session_id,
+                        sbody,
+                        &mut *sink,
+                        &mut *steps,
+                        &mut *transcript,
+                    )
+                    .await?;
+                    if !blast.is_empty() {
+                        last = blast;
+                    }
+                    last_value = bvid.clone();
+                    if let Step::Return(v) = step {
+                        return Ok((last, v.clone(), Step::Return(v)));
+                    }
+                    if let (Some(name), Some(vid)) = (bind, &bvid) {
+                        bind_existing(store, session_id, name, vid)?;
+                    }
+                }
+                Node::Memo {
+                    name, value, ty, ..
+                } => {
+                    let Node::Call { op, args } = value.as_ref() else {
+                        return Err(Error::Other(
+                            "`memo` can only bind the result of a `call`".to_string(),
+                        ));
+                    };
+                    // Pinned across turns: if the symbol is already resolved for this session, reuse
+                    // the cached value and skip execution (compute-once-per-session, keyed on name).
+                    if let Some(existing) = store.resolve(session_id, name)? {
+                        let text = store
+                            .get_value(&existing)?
+                            .map(|v| value_text(&v))
+                            .unwrap_or_default();
+                        transcript.push(format!("[${} = memo {op} (cached)]\n{text}", name.0));
+                        if !text.is_empty() {
+                            last = text;
+                        }
+                        last_value = Some(existing);
+                        continue;
+                    }
+                    let ty_label = ty.as_ref().map(TypeRef::label);
+                    let bspec = BindSpec {
+                        name,
+                        ty: ty_label.as_deref(),
+                        visibility: Visibility::Visible,
+                    };
+                    let outcome =
+                        run_call(store, executor, session_id, op, args, Some(bspec), sink).await?;
+                    *steps += 1;
+                    if outcome.is_error {
+                        return Err(Error::Other(format!(
+                            "step `{op}` failed: {}",
+                            outcome.content
+                        )));
+                    }
+                    transcript.push(format!("[${} = memo {op}]\n{}", name.0, outcome.view));
+                    last = outcome.view;
+                    last_value = outcome.value_id;
+                }
+                Node::Parallel { branches } => {
+                    // Run each branch concurrently, each writing to its own buffering sink; after the
+                    // join, replay the buffers into the real sink in branch order so concurrent output
+                    // doesn't interleave. Every op still dispatches through the same envelope.
+                    let futs = branches.iter().map(|b| async move {
+                        let mut buf = BufferSink::default();
+                        let mut s = 0usize;
+                        let mut tr: Vec<String> = Vec::new();
+                        let (text, lv, step) = exec_body(
+                            store, executor, session_id, &b.body, &mut buf, &mut s, &mut tr,
+                        )
+                        .await?;
+                        Ok::<_, Error>((b, buf, s, tr, text, lv, step))
+                    });
+                    let results = futures::future::try_join_all(futs).await?;
+                    for (b, buf, s, tr, text, lv, step) in results {
+                        if let Step::Return(_) = step {
+                            return Err(Error::Other(
+                                "`return` is not allowed inside a `parallel` branch".to_string(),
+                            ));
+                        }
+                        buf.replay(&mut *sink);
+                        *steps += s;
+                        transcript.extend(tr);
+                        if let Some(vid) = lv {
+                            bind_existing(store, session_id, &b.name, &vid)?;
+                            last = text;
+                            last_value = Some(vid);
                         }
                     }
                 }
@@ -339,7 +632,7 @@ fn exec_body<'a>(
                 }
             }
         }
-        Ok((last, Step::Next))
+        Ok((last, last_value, Step::Next))
     })
 }
 
@@ -623,6 +916,12 @@ fn node_kind(node: &Node) -> &'static str {
         Node::Bind { .. } => "bind",
         Node::When { .. } => "when",
         Node::Repeat { .. } => "repeat",
+        Node::Each { .. } => "each",
+        Node::Assert { .. } => "assert",
+        Node::Pipe { .. } => "pipe",
+        Node::Seq { .. } => "seq",
+        Node::Memo { .. } => "memo",
+        Node::Parallel { .. } => "parallel",
         Node::Await { .. } => "await",
         Node::Return { .. } => "return",
         Node::Var { .. } => "var",
@@ -730,6 +1029,19 @@ fn walk_node<'a>(node: &'a Node, f: &mut impl FnMut(&'a str, &'a [Node])) {
                 walk_node(u, f);
             }
             walk_calls(body, f);
+        }
+        Node::Each { source, body, .. } => {
+            walk_node(source, f);
+            walk_calls(body, f);
+        }
+        Node::Assert { cond, .. } => walk_node(cond, f),
+        Node::Pipe { steps, .. } => walk_calls(steps, f),
+        Node::Seq { body, .. } => walk_calls(body, f),
+        Node::Memo { value, .. } => walk_node(value, f),
+        Node::Parallel { branches } => {
+            for b in branches {
+                walk_calls(&b.body, f);
+            }
         }
         Node::Return { value } => walk_node(value, f),
         Node::Var { .. } | Node::Lit { .. } | Node::Thing { .. } | Node::Await { .. } => {}
@@ -1193,7 +1505,10 @@ mod tests {
         let outcome = execute_flow(&store, &ex, "sess", &ast, &mut sink)
             .await
             .unwrap();
-        assert_eq!(outcome.result, "beta", "result is still the LAST node's view");
+        assert_eq!(
+            outcome.result, "beta",
+            "result is still the LAST node's view"
+        );
         assert!(
             outcome.transcript.contains("alpha") && outcome.transcript.contains("beta"),
             "transcript must carry BOTH nodes, got: {}",
@@ -1402,6 +1717,306 @@ mod tests {
         assert!(
             fallback.hit.load(Ordering::Relaxed),
             "a destructive op must still escalate to the fallback"
+        );
+    }
+
+    // ---- expanded node kinds (each / assert / pipe / seq / memo / parallel) ----
+
+    #[tokio::test]
+    async fn execute_flow_each_iterates_list_and_collects() {
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        // each $f in ["a","b"] { $t = echo($f) } collect $all
+        let ast = DraftAst {
+            body: vec![Node::Each {
+                source: Box::new(flow_lit(json!(["a", "b"]))),
+                item: SymbolName("f".into()),
+                body: vec![flow_bind("t", "echo", vec![flow_var("f")])],
+                collect: Some(SymbolName("all".into())),
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(outcome.steps, 2, "body runs once per element");
+        assert_eq!(sink.calls, vec!["echo", "echo"]);
+        // echo echoes $f, so the last iteration's view is "b".
+        assert_eq!(outcome.result, "b");
+        // `collect` bound a list of the per-iteration results, in order.
+        let vid = store
+            .resolve("sess", &SymbolName("all".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.get_value(&vid).unwrap(),
+            Some(Value::List(vec![
+                Value::String("a".into()),
+                Value::String("b".into()),
+            ]))
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_flow_each_rejects_a_non_list_source() {
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        let ast = DraftAst {
+            body: vec![Node::Each {
+                source: Box::new(flow_lit(json!("not a list"))),
+                item: SymbolName("f".into()),
+                body: vec![],
+                collect: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let err = execute_flow(&store, &ex, "sess", &ast, &mut sink)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("list"));
+    }
+
+    #[tokio::test]
+    async fn execute_flow_assert_passes_when_true_and_aborts_when_false() {
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        let ok = DraftAst {
+            body: vec![Node::Assert {
+                cond: Box::new(flow_lit(json!(true))),
+                message: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        assert!(execute_flow(&store, &ex, "sess", &ok, &mut sink)
+            .await
+            .is_ok());
+
+        let bad = DraftAst {
+            body: vec![Node::Assert {
+                cond: Box::new(flow_lit(json!(false))),
+                message: Some("nope".into()),
+            }],
+            ..Default::default()
+        };
+        let err = execute_flow(&store, &ex, "sess", &bad, &mut sink)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("assertion failed"));
+        assert!(err.to_string().contains("nope"));
+    }
+
+    #[tokio::test]
+    async fn execute_flow_pipe_feeds_output_as_next_first_arg() {
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        // pipe { echo("alpha"); echo() } -> $out  (the 2nd echo gets "alpha" as its first arg)
+        let ast = DraftAst {
+            body: vec![Node::Pipe {
+                steps: vec![
+                    Node::Call {
+                        op: "echo".into(),
+                        args: vec![flow_lit(json!("alpha"))],
+                    },
+                    Node::Call {
+                        op: "echo".into(),
+                        args: vec![],
+                    },
+                ],
+                bind: Some(SymbolName("out".into())),
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(outcome.steps, 2);
+        assert_eq!(
+            outcome.result, "alpha",
+            "the second step received the first's output as its first argument"
+        );
+        let vid = store
+            .resolve("sess", &SymbolName("out".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.get_value(&vid).unwrap(),
+            Some(Value::String("alpha".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_flow_seq_runs_body_and_binds_last() {
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        // seq { echo("one"); $two = echo("two") } -> $last
+        let ast = DraftAst {
+            body: vec![Node::Seq {
+                body: vec![
+                    Node::Call {
+                        op: "echo".into(),
+                        args: vec![flow_lit(json!("one"))],
+                    },
+                    flow_bind("two", "echo", vec![flow_lit(json!("two"))]),
+                ],
+                bind: Some(SymbolName("last".into())),
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(outcome.steps, 2);
+        let vid = store
+            .resolve("sess", &SymbolName("last".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.get_value(&vid).unwrap(),
+            Some(Value::String("two".into())),
+            "`bind` captures the block's final value"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_flow_memo_computes_once_per_session() {
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        let ast = DraftAst {
+            body: vec![Node::Memo {
+                name: SymbolName("survey".into()),
+                value: Box::new(Node::Call {
+                    op: "echo".into(),
+                    args: vec![flow_lit(json!("expensive"))],
+                }),
+                ty: None,
+                effect: None,
+            }],
+            ..Default::default()
+        };
+        // First run dispatches and binds.
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(outcome.steps, 1, "first memo run dispatches");
+        assert_eq!(sink.calls, vec!["echo"]);
+
+        // Second run on the SAME session+symbol reuses the cache — no dispatch.
+        let mut sink2 = CollectSink::default();
+        let outcome2 = execute_flow(&store, &ex, "sess", &ast, &mut sink2)
+            .await
+            .unwrap();
+        assert_eq!(outcome2.steps, 0, "a memo hit skips execution");
+        assert!(sink2.calls.is_empty(), "no op dispatched on a memo hit");
+        assert_eq!(outcome2.result, "expensive", "the cached value is reused");
+
+        // A different session is a fresh memo.
+        let mut sink3 = CollectSink::default();
+        let outcome3 = execute_flow(&store, &ex, "other", &ast, &mut sink3)
+            .await
+            .unwrap();
+        assert_eq!(outcome3.steps, 1, "a different session recomputes");
+    }
+
+    #[tokio::test]
+    async fn execute_flow_parallel_runs_branches_and_binds_names() {
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        let ast = DraftAst {
+            body: vec![Node::Parallel {
+                branches: vec![
+                    crate::ast::Branch {
+                        name: SymbolName("left".into()),
+                        body: vec![Node::Call {
+                            op: "echo".into(),
+                            args: vec![flow_lit(json!("L"))],
+                        }],
+                    },
+                    crate::ast::Branch {
+                        name: SymbolName("right".into()),
+                        body: vec![Node::Call {
+                            op: "echo".into(),
+                            args: vec![flow_lit(json!("R"))],
+                        }],
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(outcome.steps, 2, "both branches' ops dispatched");
+        // Each branch bound its result to its name.
+        let l = store
+            .resolve("sess", &SymbolName("left".into()))
+            .unwrap()
+            .unwrap();
+        let r = store
+            .resolve("sess", &SymbolName("right".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.get_value(&l).unwrap(),
+            Some(Value::String("L".into()))
+        );
+        assert_eq!(
+            store.get_value(&r).unwrap(),
+            Some(Value::String("R".into()))
+        );
+        // The branches' buffered sink events were replayed into the real sink.
+        assert_eq!(sink.calls.len(), 2, "both branch tool-calls replayed");
+        assert!(sink.calls.iter().all(|c| c == "echo"));
+    }
+
+    #[test]
+    fn plan_risk_walks_each_and_parallel_bodies() {
+        let mut reg = ToolRegistry::new();
+        flux_tools::register_builtins(&mut reg);
+        // A destructive bash nested in `each` + a mutating write nested in a `parallel` branch.
+        let ast = DraftAst {
+            body: vec![
+                Node::Each {
+                    source: Box::new(flow_lit(json!(["x"]))),
+                    item: SymbolName("f".into()),
+                    body: vec![flow_bind(
+                        "d",
+                        "bash",
+                        vec![flow_lit(json!("rm -rf build"))],
+                    )],
+                    collect: None,
+                },
+                Node::Parallel {
+                    branches: vec![crate::ast::Branch {
+                        name: SymbolName("w".into()),
+                        body: vec![flow_bind(
+                            "o",
+                            "write",
+                            vec![flow_lit(json!("out.txt")), flow_lit(json!("data"))],
+                        )],
+                    }],
+                },
+            ],
+            ..Default::default()
+        };
+        let risk = plan_risk(&ast, &reg);
+        assert!(
+            risk.destructive,
+            "rm -rf inside `each` is seen by the risk walk"
+        );
+        assert!(
+            risk.mutating,
+            "write inside a `parallel` branch is seen by the walk"
+        );
+        assert!(
+            risk.ops.contains(&"bash".to_string()) && risk.ops.contains(&"write".to_string()),
+            "the walk recurses into the new container nodes"
         );
     }
 }

@@ -2,6 +2,8 @@
 //! milestones add full name / type / effect / bounded-loop checking over the whole AST, lowering a
 //! [`DraftAst`](crate::ast::DraftAst) into a typed [`HirFlow`](crate::ast::HirFlow).
 
+use std::collections::HashSet;
+
 use crate::ast::{DraftAst, Node};
 use crate::registry::OpRegistry;
 
@@ -74,8 +76,68 @@ fn check_node(node: &Node, registry: &OpRegistry, diags: &mut Vec<Diagnostic>) {
                 check_node(n, registry, diags);
             }
         }
+        Node::Each { source, body, .. } => {
+            check_node(source, registry, diags);
+            for n in body {
+                check_node(n, registry, diags);
+            }
+        }
+        Node::Assert { cond, .. } => check_node(cond, registry, diags),
+        Node::Pipe { steps, .. } => {
+            for s in steps {
+                if !matches!(s, Node::Call { .. }) {
+                    diags.push(Diagnostic::new("`pipe` steps must be `call` nodes"));
+                }
+                check_node(s, registry, diags);
+            }
+        }
+        Node::Seq { body, .. } => {
+            for n in body {
+                check_node(n, registry, diags);
+            }
+        }
+        Node::Memo { value, .. } => check_node(value, registry, diags),
+        Node::Parallel { branches } => {
+            let mut seen: HashSet<&str> = HashSet::new();
+            for b in branches {
+                if !seen.insert(b.name.0.as_str()) {
+                    diags.push(Diagnostic::new(format!(
+                        "duplicate `parallel` branch name `${}`",
+                        b.name.0
+                    )));
+                }
+                if body_contains_return(&b.body) {
+                    diags.push(Diagnostic::new(
+                        "`return` is not allowed inside a `parallel` branch",
+                    ));
+                }
+                for n in &b.body {
+                    check_node(n, registry, diags);
+                }
+            }
+        }
         Node::Return { value } => check_node(value, registry, diags),
         Node::Await { .. } | Node::Var { .. } | Node::Lit { .. } | Node::Thing { .. } => {}
+    }
+}
+
+/// Whether any statement in `body` is (or reaches, through nested control flow) a `return`. Used to
+/// reject `return` inside a `parallel` branch, where which branch's return should win is ambiguous.
+/// A nested `parallel`'s own branches are validated separately, so their returns don't count here.
+fn body_contains_return(body: &[Node]) -> bool {
+    body.iter().any(node_contains_return)
+}
+
+fn node_contains_return(node: &Node) -> bool {
+    match node {
+        Node::Return { .. } => true,
+        Node::When {
+            then, otherwise, ..
+        } => body_contains_return(then) || body_contains_return(otherwise),
+        Node::Repeat { body, .. } => body_contains_return(body),
+        Node::Each { body, .. } => body_contains_return(body),
+        Node::Seq { body, .. } => body_contains_return(body),
+        _ => false,
     }
 }
 
@@ -123,5 +185,102 @@ mod tests {
             ..Default::default()
         };
         assert!(analyze_flow(&bad, &ops).is_err());
+    }
+
+    #[test]
+    fn analyze_validates_nested_calls_in_new_containers() {
+        use crate::ast::{Branch, DraftAst, Node};
+        let mut reg = ToolRegistry::new();
+        flux_tools::register_builtins(&mut reg);
+        let ops = OpRegistry::new(&reg);
+
+        // An unknown op reached only through `each`/`parallel` bodies is still caught.
+        let bad = DraftAst {
+            body: vec![
+                Node::Each {
+                    source: Box::new(Node::Lit {
+                        value: serde_json::json!([1]),
+                    }),
+                    item: "x".into(),
+                    body: vec![Node::Call {
+                        op: "nope.each".into(),
+                        args: vec![],
+                    }],
+                    collect: None,
+                },
+                Node::Parallel {
+                    branches: vec![Branch {
+                        name: "b".into(),
+                        body: vec![Node::Call {
+                            op: "nope.par".into(),
+                            args: vec![],
+                        }],
+                    }],
+                },
+            ],
+            ..Default::default()
+        };
+        let diags = analyze_flow(&bad, &ops).unwrap_err();
+        assert_eq!(diags.len(), 2, "both nested unknown ops are reported");
+    }
+
+    #[test]
+    fn analyze_rejects_pipe_with_a_non_call_step() {
+        use crate::ast::{DraftAst, Node};
+        let mut reg = ToolRegistry::new();
+        flux_tools::register_builtins(&mut reg);
+        let ops = OpRegistry::new(&reg);
+
+        let bad = DraftAst {
+            body: vec![Node::Pipe {
+                steps: vec![Node::Lit {
+                    value: serde_json::json!("x"),
+                }],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        let diags = analyze_flow(&bad, &ops).unwrap_err();
+        assert!(diags.iter().any(|d| d.message.contains("pipe")));
+    }
+
+    #[test]
+    fn analyze_rejects_parallel_return_and_duplicate_branch_names() {
+        use crate::ast::{Branch, DraftAst, Node};
+        let mut reg = ToolRegistry::new();
+        flux_tools::register_builtins(&mut reg);
+        let ops = OpRegistry::new(&reg);
+
+        let bad = DraftAst {
+            body: vec![Node::Parallel {
+                branches: vec![
+                    Branch {
+                        name: "dup".into(),
+                        body: vec![Node::Return {
+                            value: Box::new(Node::Lit {
+                                value: serde_json::json!(1),
+                            }),
+                        }],
+                    },
+                    Branch {
+                        name: "dup".into(),
+                        body: vec![Node::Call {
+                            op: "read".into(),
+                            args: vec![],
+                        }],
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+        let diags = analyze_flow(&bad, &ops).unwrap_err();
+        assert!(
+            diags.iter().any(|d| d.message.contains("return")),
+            "a return inside a parallel branch is rejected"
+        );
+        assert!(
+            diags.iter().any(|d| d.message.contains("duplicate")),
+            "a duplicate branch name is rejected"
+        );
     }
 }

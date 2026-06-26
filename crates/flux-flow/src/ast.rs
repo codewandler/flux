@@ -214,6 +214,26 @@ impl Value {
             Value::Ref(id) => J::String(id.0.clone()),
         }
     }
+
+    /// Build a [`Value`] from *natural* JSON — the inverse of [`Value::to_json`]. Used when iterating
+    /// a list (`each`) to store each element as a `Value`, and when gathering per-iteration results.
+    /// A non-finite or otherwise-unrepresentable number becomes [`Value::Null`].
+    pub fn from_json(v: &serde_json::Value) -> Self {
+        use serde_json::Value as J;
+        match v {
+            J::Null => Value::Null,
+            J::Bool(b) => Value::Bool(*b),
+            J::Number(n) => n.as_f64().map(Value::Number).unwrap_or(Value::Null),
+            J::String(s) => Value::String(s.clone()),
+            J::Array(items) => Value::List(items.iter().map(Value::from_json).collect()),
+            J::Object(fields) => Value::Struct(
+                fields
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Value::from_json(v)))
+                    .collect(),
+            ),
+        }
+    }
 }
 
 /// The kind of an addressable external object.
@@ -312,6 +332,57 @@ pub enum Node {
         #[serde(default)]
         body: Vec<Node>,
     },
+    /// Map a list value through a body (list-driven loop; `repeat` stays counter-driven). Each element
+    /// is bound to `as`; an optional `collect` symbol gathers the per-iteration results into a list.
+    Each {
+        /// The list to iterate (an expression yielding a [`Value::List`]).
+        #[serde(rename = "in")]
+        source: Box<Node>,
+        /// The symbol bound to each element inside the body.
+        #[serde(rename = "as")]
+        item: SymbolName,
+        #[serde(default)]
+        body: Vec<Node>,
+        /// Optional symbol bound to a [`Value::List`] of each iteration's result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        collect: Option<SymbolName>,
+    },
+    /// A boolean guard: aborts the flow with an error if the condition is falsey.
+    Assert {
+        cond: Box<Node>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// A chain of calls where each step's output is fed as the first argument of the next.
+    Pipe {
+        #[serde(default)]
+        steps: Vec<Node>,
+        /// Optional symbol bound to the chain's final result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bind: Option<SymbolName>,
+    },
+    /// A sequential block; runs its body in order. Optionally binds the block's final result.
+    Seq {
+        #[serde(default)]
+        body: Vec<Node>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bind: Option<SymbolName>,
+    },
+    /// Like `bind`, but pinned across turns: if the symbol is already resolved for this session, skip
+    /// execution and reuse the cached value (compute-once-per-session, keyed on symbol name).
+    Memo {
+        name: SymbolName,
+        value: Box<Node>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ty: Option<TypeRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effect: Option<FlowEffect>,
+    },
+    /// Concurrent fan-out: run independent branches, binding each branch's result to its name.
+    Parallel {
+        #[serde(default)]
+        branches: Vec<Branch>,
+    },
     /// Pause until an external event/input arrives.
     Await {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -328,6 +399,16 @@ pub enum Node {
     Lit { value: serde_json::Value },
     /// A reference to an external thing.
     Thing { thing: ThingRef },
+}
+
+/// One branch of a [`Node::Parallel`] fan-out: a named sub-flow whose final result is bound to
+/// `name` after the branch completes. Branches should bind distinct names (the analyzer rejects
+/// duplicates).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Branch {
+    pub name: SymbolName,
+    #[serde(default)]
+    pub body: Vec<Node>,
 }
 
 /// The Draft AST: an optionally-named, parameterized flow with a body. May contain unresolved
@@ -522,6 +603,107 @@ mod tests {
         let json = serde_json::to_value(&ast).unwrap();
         let back: DraftAst = serde_json::from_value(json).unwrap();
         assert_eq!(ast, back);
+    }
+
+    /// The expanded node kinds (`each`/`assert`/`pipe`/`seq`/`memo`/`parallel`) round-trip through
+    /// JSON, including the `in`/`as` field renames and the `parallel` branch list.
+    #[test]
+    fn expanded_nodes_json_round_trip() {
+        let ast = DraftAst {
+            body: vec![
+                Node::Each {
+                    source: Box::new(Node::Lit {
+                        value: serde_json::json!(["a", "b"]),
+                    }),
+                    item: "f".into(),
+                    body: vec![Node::Call {
+                        op: "read".into(),
+                        args: vec![Node::Var { name: "f".into() }],
+                    }],
+                    collect: Some("contents".into()),
+                },
+                Node::Assert {
+                    cond: Box::new(Node::Var {
+                        name: "contents".into(),
+                    }),
+                    message: Some("must be non-empty".into()),
+                },
+                Node::Pipe {
+                    steps: vec![
+                        Node::Call {
+                            op: "read".into(),
+                            args: vec![Node::Lit {
+                                value: serde_json::json!("x"),
+                            }],
+                        },
+                        Node::Call {
+                            op: "grep".into(),
+                            args: vec![Node::Lit {
+                                value: serde_json::json!("todo"),
+                            }],
+                        },
+                    ],
+                    bind: Some("hits".into()),
+                },
+                Node::Seq {
+                    body: vec![Node::Call {
+                        op: "read".into(),
+                        args: vec![],
+                    }],
+                    bind: None,
+                },
+                Node::Memo {
+                    name: "survey".into(),
+                    value: Box::new(Node::Call {
+                        op: "read".into(),
+                        args: vec![],
+                    }),
+                    ty: Some(TypeRef::String),
+                    effect: Some(FlowEffect::Read),
+                },
+                Node::Parallel {
+                    branches: vec![
+                        Branch {
+                            name: "left".into(),
+                            body: vec![Node::Call {
+                                op: "read".into(),
+                                args: vec![Node::Lit {
+                                    value: serde_json::json!("l"),
+                                }],
+                            }],
+                        },
+                        Branch {
+                            name: "right".into(),
+                            body: vec![Node::Call {
+                                op: "read".into(),
+                                args: vec![Node::Lit {
+                                    value: serde_json::json!("r"),
+                                }],
+                            }],
+                        },
+                    ],
+                },
+            ],
+            ..Default::default()
+        };
+
+        let json = serde_json::to_value(&ast).unwrap();
+        // The `in`/`as` renames are honored on the wire.
+        assert_eq!(json["body"][0]["kind"], "each");
+        assert_eq!(json["body"][0]["in"]["kind"], "lit");
+        assert_eq!(json["body"][0]["as"], "f");
+        assert_eq!(json["body"][5]["kind"], "parallel");
+        assert_eq!(json["body"][5]["branches"][0]["name"], "left");
+
+        let back: DraftAst = serde_json::from_value(json).unwrap();
+        assert_eq!(ast, back);
+    }
+
+    /// `Value::from_json` is the inverse of `to_json` (round-trips natural JSON through the value model).
+    #[test]
+    fn value_from_json_round_trips() {
+        let j = serde_json::json!({"a": "x", "b": [1.0, true, null]});
+        assert_eq!(Value::from_json(&j).to_json(), j);
     }
 
     /// `Value::to_json` produces the natural JSON shape (a string is a JSON string, not the tagged

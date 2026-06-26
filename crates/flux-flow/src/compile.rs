@@ -461,16 +461,31 @@ const AST_GRAMMAR: &str = r#"The AST is a JSON object: {"name"?:string, "params"
 - {"kind":"call","op":"<op>","args":[Node,...]}
 - {"kind":"bind","name":"<sym>","value":Node,"effect"?:"<effect>"}
 - {"kind":"when","cond":Node,"then":[Node,...],"otherwise":[Node,...]}
-- {"kind":"repeat","max":<int>,"until"?:Node,"body":[Node,...]}
+- {"kind":"repeat","max":<int>,"until"?:Node,"body":[Node,...]}   counter-driven loop
+- {"kind":"each","in":Node,"as":"<sym>","body":[Node,...],"collect"?:"<sym>"}   iterate a list value, binding each element to $<as>; optional $<collect> gathers per-iteration results into a list
+- {"kind":"parallel","branches":[{"name":"<sym>","body":[Node,...]},...]}   run independent branches concurrently; each branch's result binds to its $name (use distinct names; no `return` inside a branch)
+- {"kind":"pipe","steps":[Node,...],"bind"?:"<sym>"}   chain calls — each step's output is fed as the next step's FIRST argument; optional $<bind> captures the final result
+- {"kind":"seq","body":[Node,...],"bind"?:"<sym>"}   a sequential block; optional $<bind> captures its final result
+- {"kind":"assert","cond":Node,"message"?:"<str>"}   abort the flow if cond is falsey
+- {"kind":"memo","name":"<sym>","value":Node,"effect"?:"<effect>"}   like bind, but computed once per session (cached across turns) — for expensive deterministic work
 - {"kind":"await","binding"?:"<sym>","source":"<source>"}
 - {"kind":"return","value":Node}
 - {"kind":"var","name":"<sym>"}
 - {"kind":"lit","value":<any JSON>}
 
+Prefer `each` over `repeat` for list iteration; prefer `parallel` for independent reads/calls that don't depend on each other.
+
 Example for "read the readme then grep it for TODO":
 {"body":[
   {"kind":"bind","name":"readme","value":{"kind":"call","op":"read","args":[{"kind":"lit","value":"README.md"}]}},
   {"kind":"bind","name":"hits","value":{"kind":"call","op":"grep","args":[{"kind":"lit","value":"TODO"}]}}
+]}
+
+Example for "read a.rs, b.rs and c.rs and summarise each":
+{"body":[
+  {"kind":"each","in":{"kind":"lit","value":["a.rs","b.rs","c.rs"]},"as":"f","body":[
+    {"kind":"bind","name":"text","value":{"kind":"call","op":"read","args":[{"kind":"var","name":"f"}]}}
+  ],"collect":"all"}
 ]}"#;
 
 fn ops_catalog(ops: &OpRegistry) -> String {

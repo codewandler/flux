@@ -98,7 +98,7 @@ first-class, latency-preserving fast path so the coding agent never feels slower
 | `optimize` | `HirFlow → PhysicalPlan`: dependency graph, parallel grouping, fence insertion, cache keys, report |
 | `registry` | `OpSpec` (`fn lower() -> ToolSpec`), `OpRegistry` over `ToolRegistry`, `ThingResolver` + `ModelClient` traits |
 | `state` | `SymbolTable` (visibility tiers), `ValueStore` (immutable, versioned, **budgeted**), `ThingStore`, `view(Session)`, **flow persistence** |
-| `runtime` | interpreter (`bind/call/when/repeat/await/return`); thing-resolution at exec; emits `RunEvent` + bridging `Observation`; await/resume; re-run |
+| `runtime` | interpreter (`bind/call/when/repeat/each/seq/pipe/assert/memo/parallel/return`; `parallel` via structured `try_join_all`); thing-resolution at exec; emits `RunEvent` + bridging `Observation`; await/resume; re-run |
 | `compile` | `compile_turn(NL, view, registry, llm) -> DraftAst`; **prompt-and-parse** (no forced structured output); analyze→repair loop; **determinism-biased prompt** |
 | `engine` | turn spine: incremental fast-path vs. planned compile; execute; risk-gated approval; update session |
 | `render` | pure projections of the graph + trace for CLI/TUI (ASCII DAG / indented tree) + per-node live status |
@@ -119,7 +119,7 @@ user_input + conversation + view(Session)
                                analyze→repair on invalid AST; emit_plan, or answer in prose)
   → [Chat]  persist ONE assistant message; turn ends
   → [Plan]  render the plan (auditable) → analyze → risk(graph) → execute_flow:
-              Executor::dispatch per call node; bind/call/return + when/repeat control flow;
+              Executor::dispatch per call node; bind/call/return + when/repeat/each/seq/pipe/assert/memo/parallel;
               per-op approval at dispatch (destructive escalates); !model ops use the ModelClient seam
             → ValueStore writes + RunEvent trace + live node status (sink)
   → emit_plan carried a `reply` (plan completes the task) → show it, turn ends (ONE round)
@@ -328,7 +328,15 @@ Resolved in design (no longer open):
   The interpreter (`runtime::execute_flow`) walks the body — `bind`/`call`/`return` plus `when` (typed
   branch) and `repeat` (bounded loop, optional `until`; a `when`/`repeat` *condition* is a node's
   truthiness) — resolving each `$symbol` arg to its stored `Value` (`Value::to_json`, natural form) and
-  dispatching through the same `Executor::dispatch` envelope (no new bypass). `await` (cross-turn
+  dispatching through the same `Executor::dispatch` envelope (no new bypass). The AST also has
+  **container/sugar nodes**: `each` (list-driven loop, binding each element to `$as`, optional
+  `collect`), `seq` (a sequential block, optional `bind`), `pipe` (chain calls, each output spliced as
+  the next step's first arg), `assert` (abort if a condition is falsey), `memo` (a `bind` computed once
+  per session — cached across turns by symbol name), and `parallel` (run independent branches
+  concurrently via `futures::try_join_all`, each branch buffering its sink output and binding its result
+  to its `$name`; a `return` inside a branch is rejected). Author-written `parallel` is distinct from
+  the optimizer-derived `Stage::Parallel` (M6) — the explicit node is an authoring affordance, the
+  optimizer can still derive concurrency from sequential ops later. `await` (cross-turn
   suspend/resume) is the next slice; the engine loop covers iteration meanwhile. `plan_risk` previews
   risk; the default path gates per-op at dispatch (destructive escalates), and `--plan` adds a custom
   `PlanApprover { approved, fallback }` — a non-destructive approved op runs without a prompt, a

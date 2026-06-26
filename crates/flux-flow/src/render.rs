@@ -78,11 +78,12 @@ pub fn render_styled(ast: &DraftAst, p: &Palette) -> String {
     out
 }
 
-/// A child in the render tree: a real node, or the `else` arm of a `when` (whose children are the
-/// otherwise-nodes).
+/// A child in the render tree: a real node, the `else` arm of a `when` (whose children are the
+/// otherwise-nodes), or a labeled group (a `parallel` branch: the `$name:` header over its body).
 enum Branch<'a> {
     Node(&'a Node),
     Else(&'a [Node]),
+    Group(&'a str, &'a [Node]),
 }
 
 fn render_branches(branches: &[Branch], prefix: &str, p: &Palette, out: &mut String) {
@@ -94,6 +95,10 @@ fn render_branches(branches: &[Branch], prefix: &str, p: &Palette, out: &mut Str
             Branch::Node(node) => (head(node, p), children(node)),
             Branch::Else(nodes) => (
                 paint(p.keyword, "else"),
+                nodes.iter().map(Branch::Node).collect(),
+            ),
+            Branch::Group(name, nodes) => (
+                format!("{}:", sym(p, name)),
                 nodes.iter().map(Branch::Node).collect(),
             ),
         };
@@ -121,6 +126,13 @@ fn children(node: &Node) -> Vec<Branch<'_>> {
             v
         }
         Node::Repeat { body, .. } => body.iter().map(Branch::Node).collect(),
+        Node::Each { body, .. } => body.iter().map(Branch::Node).collect(),
+        Node::Seq { body, .. } => body.iter().map(Branch::Node).collect(),
+        Node::Pipe { steps, .. } => steps.iter().map(Branch::Node).collect(),
+        Node::Parallel { branches } => branches
+            .iter()
+            .map(|b| Branch::Group(b.name.0.as_str(), &b.body))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -144,6 +156,46 @@ fn head(node: &Node, p: &Palette) -> String {
             ),
             None => format!("{} max {max}", paint(p.keyword, "repeat")),
         },
+        Node::Each {
+            source,
+            item,
+            collect,
+            ..
+        } => {
+            let base = format!(
+                "{} {} {} {}",
+                paint(p.keyword, "each"),
+                sym(p, &item.0),
+                paint(p.keyword, "in"),
+                expr(source, p)
+            );
+            match collect {
+                Some(c) => format!("{base} -> {}", sym(p, &c.0)),
+                None => base,
+            }
+        }
+        Node::Assert { cond, .. } => format!("{} {}", paint(p.keyword, "assert"), expr(cond, p)),
+        Node::Pipe { bind, .. } => match bind {
+            Some(b) => format!("{} -> {}", paint(p.keyword, "pipe"), sym(p, &b.0)),
+            None => paint(p.keyword, "pipe"),
+        },
+        Node::Seq { bind, .. } => match bind {
+            Some(b) => format!("{} -> {}", paint(p.keyword, "seq"), sym(p, &b.0)),
+            None => paint(p.keyword, "seq"),
+        },
+        Node::Memo {
+            name,
+            value,
+            effect,
+            ..
+        } => format!(
+            "{} = {} {}{}",
+            sym(p, &name.0),
+            paint(p.keyword, "memo"),
+            expr(value, p),
+            eff(effect, p)
+        ),
+        Node::Parallel { .. } => paint(p.keyword, "parallel"),
         Node::Await {
             binding, source, ..
         } => match binding {
@@ -169,7 +221,15 @@ fn expr(node: &Node, p: &Palette) -> String {
         Node::Thing { thing } => thing_str(thing, p),
         Node::Bind { name, .. } => sym(p, &name.0),
         Node::Return { value } => format!("{} {}", paint(p.keyword, "return"), expr(value, p)),
-        Node::When { .. } | Node::Repeat { .. } | Node::Await { .. } => "…".to_string(),
+        Node::When { .. }
+        | Node::Repeat { .. }
+        | Node::Each { .. }
+        | Node::Assert { .. }
+        | Node::Pipe { .. }
+        | Node::Seq { .. }
+        | Node::Memo { .. }
+        | Node::Parallel { .. }
+        | Node::Await { .. } => "…".to_string(),
     }
 }
 
@@ -314,6 +374,47 @@ mod tests {
         let s = render_pretty(&ast);
         assert!(s.contains(&"x".repeat(200)), "full literal must appear");
         assert!(!s.contains('…'), "no truncation marker");
+    }
+
+    #[test]
+    fn renders_each_and_parallel_trees() {
+        use crate::ast::Branch as AstBranch;
+        let ast = DraftAst {
+            body: vec![
+                Node::Each {
+                    source: Box::new(Node::Lit {
+                        value: serde_json::json!(["a", "b"]),
+                    }),
+                    item: SymbolName("f".into()),
+                    body: vec![Node::Call {
+                        op: "read".into(),
+                        args: vec![Node::Var {
+                            name: SymbolName("f".into()),
+                        }],
+                    }],
+                    collect: Some(SymbolName("all".into())),
+                },
+                Node::Parallel {
+                    branches: vec![AstBranch {
+                        name: SymbolName("left".into()),
+                        body: vec![Node::Call {
+                            op: "read".into(),
+                            args: vec![Node::Lit {
+                                value: serde_json::json!("l"),
+                            }],
+                        }],
+                    }],
+                },
+            ],
+            ..Default::default()
+        };
+        let s = render_pretty(&ast);
+        // `each` shows its iteration variable, source, and collect target; its body is a child.
+        assert!(s.contains("each $f in [\"a\",\"b\"] -> $all"), "got: {s}");
+        assert!(s.contains("read($f)"));
+        // `parallel` shows each branch as a labeled `$name:` group with its body underneath.
+        assert!(s.contains("parallel"));
+        assert!(s.contains("$left:"), "got: {s}");
     }
 
     #[test]
