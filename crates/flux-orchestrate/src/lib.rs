@@ -121,7 +121,10 @@ impl Spawner for LocalSpawner {
 
         // Scoped toolset; sub-agents run autonomously under the policy-bounded headless approver
         // (auto-approve scoped, policy-permitted calls; refuse destructive ones).
-        let registry = self.base_registry.subset(role.tools.as_deref());
+        // `task` is always excluded: sub-agents are leaves and must never spawn further sub-agents
+        // (that causes unbounded recursion — each sub-agent calls task → more sub-agents → …).
+        let mut registry = self.base_registry.subset(role.tools.as_deref());
+        registry.remove("task");
         let mut executor = Executor::new(
             registry,
             PermissionManager::new(),
