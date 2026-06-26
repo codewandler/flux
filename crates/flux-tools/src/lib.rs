@@ -2945,8 +2945,6 @@ mod tests {
                 "glob",
                 "grep",
                 "home_dir",
-                "glob",
-                "grep",
                 "patch",
                 "path_exists",
                 "read",
