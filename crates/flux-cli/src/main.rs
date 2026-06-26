@@ -977,11 +977,29 @@ async fn run_repl(cli: Cli) -> Result<()> {
         if let Some(rest) = input.strip_prefix('/') {
             match rest.split_whitespace().next().unwrap_or("") {
                 "exit" | "quit" => break,
-                "help" => eprintln!(
-                    "commands: /help  /plan  /run  /tools  /model <spec>  /session  /sessions  \
-                     /resume <id>  /clear  /pd <goal>  /goal <cond>  /loop <n> <task>  /exit\n\
-                     /plan toggles plan mode (turns show a plan, don't run it); /run executes it."
-                ),
+                "help" => {
+                    const CMDS: &[(&str, &str)] = &[
+                        ("/help",              "show this help"),
+                        ("/plan",              "toggle plan mode (show plan; /run to execute)"),
+                        ("/run",               "execute the pending plan from plan mode"),
+                        ("/tools",             "list available tools"),
+                        ("/model <spec>",      "switch model (e.g. opus, sonnet, openai/gpt-4o)"),
+                        ("/session",           "show current session id and model"),
+                        ("/sessions",          "list recent sessions with first-message preview"),
+                        ("/resume <id>",       "switch to a previous session"),
+                        ("/clear",             "start a new session"),
+                        ("/compact",           "summarise and compact the context window"),
+                        ("/pd <goal>",         "plan-and-dispatch: parallel dependency waves"),
+                        ("/goal <cond>",       "drive turns toward a goal; stop when satisfied"),
+                        ("/loop <n> <task>",   "repeat a task up to n times"),
+                        ("/exit",              "quit"),
+                    ];
+                    eprintln!("flux REPL commands:");
+                    for (cmd, desc) in CMDS {
+                        eprintln!("  {:<24} {}", cmd, desc);
+                    }
+                    eprintln!("  Ctrl-C  interrupt a running turn   Ctrl-D  exit");
+                },
                 "plan" => {
                     plan_mode = !plan_mode;
                     pending_plan = None;
@@ -1092,10 +1110,31 @@ async fn run_repl(cli: Cli) -> Result<()> {
                 "session" => eprintln!("session {session_id} · model {}", agent.model),
                 "sessions" => match agent.store.list(30) {
                     Ok(list) if !list.is_empty() => {
-                        for s in list {
+                        for s in &list {
                             let here = if s.id == session_id { "*" } else { " " };
+                            // Try to load the first user message as a human-readable preview.
+                            let preview = agent
+                                .store
+                                .load_messages(&s.id)
+                                .ok()
+                                .and_then(|msgs| {
+                                    msgs.into_iter()
+                                        .find(|m| m.role == flux_core::Role::User)
+                                        .and_then(|m| {
+                                            m.content.into_iter().find_map(|b| match b {
+                                                flux_core::ContentBlock::Text { text } => Some(text),
+                                                _ => None,
+                                            })
+                                        })
+                                })
+                                .map(|t| {
+                                    let t = t.trim().replace('\n', " ");
+                                    let t: String = t.chars().take(50).collect();
+                                    format!("  {}", style::dim(&t))
+                                })
+                                .unwrap_or_default();
                             eprintln!(
-                                "{here} {}  {:>3} msg  {:<20} {}",
+                                "{here} {}  {:>3} msg  {:<20} {}{preview}",
                                 s.id,
                                 s.messages,
                                 s.model,
@@ -1390,7 +1429,8 @@ struct SpinnerState {
 /// a readable argument — `bash → $ cargo test`, `read → foo.rs:100-180`, `grep → "needle" in src/`. The
 /// arg is capped unless `-v`; the full plan is always shown separately (the `flow.plan` tree).
 fn render_call_label(name: &str, input: &Value, verbose: bool) -> String {
-    const GUTTER: usize = 7;
+    // Column width: wide enough for the longest built-in op name (`web_fetch` = 9).
+    const GUTTER: usize = 10;
     const ARG_CAP: usize = 120;
     let call = flux_tui::toolview::format_call(name, input);
     let verb = style::cyan(&call.verb);
@@ -1406,9 +1446,13 @@ fn render_call_label(name: &str, input: &Value, verbose: bool) -> String {
     format!("{verb}{}{arg}", " ".repeat(pad))
 }
 
-/// A concise result summary for the execution stream: `done` for empty output, the line(s) for a small
-/// result, or `N lines · -v for full` for a big one. `-v` shows everything.
-fn result_summary(content: &str, verbose: bool) -> String {
+/// A concise result summary for the execution stream: `done` for empty output, the line(s) for a
+/// small result, or a tool-aware summary for larger results. `-v` shows everything.
+///
+/// For `grep` and `glob` results the first few matches are shown rather than a bare line count;
+/// for `bash` the last non-empty line is used as a quick exit hint. Pass `tool` as `""` for the
+/// generic (tool-unaware) path.
+fn result_summary_for(content: &str, tool: &str, verbose: bool) -> String {
     let content = content.trim();
     if content.is_empty() {
         return "done".to_string();
@@ -1417,15 +1461,44 @@ fn result_summary(content: &str, verbose: bool) -> String {
         return tool_preview(content, true);
     }
     let lines: Vec<&str> = content.lines().collect();
-    match lines.len() {
+    let n = lines.len();
+
+    // Tool-aware previews.
+    match tool {
+        "grep" if n > 3 => {
+            let head = lines[..3]
+                .iter()
+                .map(|l| truncate(l.trim_end(), 120))
+                .collect::<Vec<_>>()
+                .join("\n    ");
+            return format!("{head}\n    … (+{} more match{}; -v for full)", n - 3, if n - 3 == 1 { "" } else { "es" });
+        }
+        "glob" if n > 5 => {
+            let head = lines[..5]
+                .iter()
+                .map(|l| truncate(l.trim_end(), 120))
+                .collect::<Vec<_>>()
+                .join("\n    ");
+            return format!("{head}\n    … (+{} more; -v for full)", n - 5);
+        }
+        "bash" if n > 1 => {
+            // Show the last non-empty line as a quick exit hint.
+            let last = lines.iter().rev().find(|l| !l.trim().is_empty()).unwrap_or(&lines[n - 1]);
+            let last = truncate(last.trim_end(), 160);
+            return format!("{n} lines · last: {last}  (-v for full)");
+        }
+        _ => {}
+    }
+
+    match n {
         0 => "done".to_string(),
         1 => truncate(content, 200),
-        n if n <= 6 => lines
+        _ if n <= 6 => lines
             .iter()
             .map(|l| truncate(l.trim_end(), 200))
             .collect::<Vec<_>>()
             .join("\n    "),
-        n => format!("{n} lines · -v for full"),
+        _ => format!("{n} lines · -v for full"),
     }
 }
 
@@ -1582,7 +1655,7 @@ impl AgentSink for CliSink {
         }
         let elapsed = style::dim(&format!("· {}", style::fmt_elapsed(start.elapsed())));
         let body = flux_tui::toolview::format_result(name, &result.content, result.is_error)
-            .unwrap_or_else(|| result_summary(&result.content, self.verbose));
+            .unwrap_or_else(|| result_summary_for(&result.content, name, self.verbose));
         let mark = if result.is_error {
             style::red("✗")
         } else {
@@ -1625,32 +1698,46 @@ impl AgentSink for CliSink {
     fn turn_end(&mut self, usage: Option<Usage>) {
         self.commit();
         self.stop_spinner();
+        let elapsed = self
+            .turn_start
+            .map(|t| style::fmt_elapsed(t.elapsed()))
+            .unwrap_or_default();
+        // Always print a rule so the turn boundary is visible even for prose-only replies.
         if self.steps > 0 {
-            let elapsed = self
-                .turn_start
-                .map(|t| style::fmt_elapsed(t.elapsed()))
-                .unwrap_or_default();
             let plural = if self.steps == 1 { "" } else { "s" };
-            let summary = format!("{} step{plural} · {elapsed}", self.steps);
+            // Build the right-hand annotation: steps + timing + inline token counts.
+            let token_inline = usage.as_ref().map(|u| {
+                if u.cache_read_input_tokens > 0 {
+                    format!(
+                        " · in {} out {} $cache {}",
+                        u.input_tokens,
+                        u.output_tokens,
+                        u.cache_read_input_tokens
+                    )
+                } else {
+                    format!(" · in {} out {}", u.input_tokens, u.output_tokens)
+                }
+            }).unwrap_or_default();
+            let summary = format!("{} step{plural} · {elapsed}{token_inline}", self.steps);
             let rule_len = self.width.saturating_sub(summary.chars().count() + 2);
             eprintln!("{} {}", style::rule(rule_len), style::dim(&summary));
-        }
-        if let Some(u) = usage {
-            let cache = if u.cache_creation_input_tokens > 0 || u.cache_read_input_tokens > 0 {
-                format!(
-                    " cache_w={} cache_r={}",
-                    u.cache_creation_input_tokens, u.cache_read_input_tokens
-                )
-            } else {
-                String::new()
-            };
-            eprintln!(
-                "{}",
-                style::dim(&format!(
-                    "usage in={} out={}{cache}",
-                    u.input_tokens, u.output_tokens
-                ))
-            );
+        } else {
+            // Prose-only turn: print a minimal rule with just elapsed so the boundary is clear.
+            let summary = format!("· {elapsed}");
+            let rule_len = self.width.saturating_sub(summary.chars().count() + 2);
+            eprintln!("{} {}", style::rule(rule_len), style::dim(&summary));
+            // Still print cache savings if present (useful feedback even for chat turns).
+            if let Some(u) = &usage {
+                if u.cache_read_input_tokens > 0 {
+                    eprintln!(
+                        "{}",
+                        style::dim(&format!(
+                            "in {} out {} $cache {}",
+                            u.input_tokens, u.output_tokens, u.cache_read_input_tokens
+                        ))
+                    );
+                }
+            }
         }
     }
 }
@@ -1708,7 +1795,7 @@ impl AgentSink for GoalSink {
             style::green("✓")
         };
         let body = flux_tui::toolview::format_result(name, &result.content, result.is_error)
-            .unwrap_or_else(|| result_summary(&result.content, verbose()));
+            .unwrap_or_else(|| result_summary_for(&result.content, name, verbose()));
         eprintln!("  {mark} {body}");
     }
     fn turn_end(&mut self, _usage: Option<Usage>) {
@@ -1826,9 +1913,33 @@ impl Approver for StdinApprover {
         subjects: &[String],
         _intents: &IntentSet,
     ) -> ApprovalChoice {
+        // Format subjects as a human-readable list (not Debug), with paths trimmed to the last two
+        // components so long absolute paths don't swamp the prompt.
+        let subjects_fmt = if subjects.is_empty() {
+            String::new()
+        } else {
+            let formatted: Vec<String> = subjects
+                .iter()
+                .map(|s| {
+                    let p = std::path::Path::new(s);
+                    let trimmed = p
+                        .components()
+                        .rev()
+                        .take(2)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<std::path::PathBuf>();
+                    style::yellow(&trimmed.display().to_string())
+                })
+                .collect();
+            format!(" {}", formatted.join(", "))
+        };
         eprint!(
-            "\n{} `{tool}` {subjects:?}  [y]es / [a]lways / [N]o: ",
-            style::yellow("approve")
+            "\n{} `{}`{}  [y]es / [a]lways / [N]o: ",
+            style::yellow("approve"),
+            style::bold(tool),
+            subjects_fmt
         );
         std::io::stderr().flush().ok();
         let mut line = String::new();
@@ -1845,6 +1956,11 @@ impl Approver for StdinApprover {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install a colored error formatter so top-level anyhow errors use the same style as inline
+    // `eprintln!("{} {e}", style::red("error:"))` calls rather than a bare `Error: …` line.
+    // We do this before `style::init` so even parse errors (before color flags are known) get color
+    // when stderr is a tty — safe because `style::init` defaults to auto.
+    style::init(style::ColorChoice::Auto);
     // `flux auth …` is a distinct mode; everything else is the prompt runner.
     let argv: Vec<String> = std::env::args().collect();
     if argv.get(1).map(|s| s == "auth").unwrap_or(false) {
@@ -1870,12 +1986,24 @@ async fn main() -> Result<()> {
     } else if cli.tui {
         run_tui(cli).await
     } else if cli.plan {
-        run_plan(cli).await
+        run_plan(cli).await.map_err(|e| {
+            eprintln!("{} {e}", style::red("error:"));
+            std::process::exit(1);
+        }).unwrap_or(());
+        Ok(())
     } else if cli.prompt.is_empty() && !cli.print {
         // No prompt and not one-shot → interactive agentic REPL.
-        run_repl(cli).await
+        run_repl(cli).await.map_err(|e| {
+            eprintln!("{} {e}", style::red("error:"));
+            std::process::exit(1);
+        }).unwrap_or(());
+        Ok(())
     } else {
-        run_prompt(cli).await
+        run_prompt(cli).await.map_err(|e| {
+            eprintln!("{} {e}", style::red("error:"));
+            std::process::exit(1);
+        }).unwrap_or(());
+        Ok(())
     }
 }
 
