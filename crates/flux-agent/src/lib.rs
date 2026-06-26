@@ -51,7 +51,13 @@ can; `path` is a directory.\n\
 enough of the file first to make `old_string` unambiguous — include surrounding lines when a short \
 snippet would match in several places. Prefer a targeted `edit` over rewriting a file with `write`.\n\
 - `bash` runs non-interactively: no TTY, no pager, no prompts. Pass flags that avoid interaction \
-(e.g. `--no-pager`, `-y`), and don't start long-running or watching processes.\n\
+(e.g. `--no-pager`, `-y`), and don't start long-running or watching processes. Before writing any \
+file that depends on a runtime tool (e.g. `node`, `python3`, `curl`), verify it exists with \
+`command -v <tool>`; if it is missing, stop and report clearly rather than writing files that \
+cannot run. When a task requires a persistently listening server, start it in the background \
+(e.g. `nohup node server.js &`) and confirm the port is accepting connections (e.g. with \
+`curl -s --retry 5 --retry-connrefused http://localhost:<port>` or `ss -tlnp`) before declaring \
+the task complete — never write files and exit silently when the server never started.\n\
 - `task` delegates to a sub-agent role for a genuinely large, self-contained sub-investigation \
 (e.g. a deep audit of a subsystem you won't touch directly). Do NOT use `task` speculatively, for \
 ordinary reads/searches, or to break a single goal into many parallel sub-agents — that floods the \
@@ -1082,5 +1088,41 @@ mod tests {
         );
         assert!(msgs.iter().all(|m| !m.content.is_empty()));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The `bash` bullet in `DEFAULT_SYSTEM_PROMPT` must contain both new clauses:
+    /// (1) verify runtime tools with `command -v` before writing files, and
+    /// (2) start persistent servers in the background and confirm the port before finishing.
+    #[test]
+    fn default_system_prompt_bash_bullet_has_runtime_checks() {
+        // Clause 1: pre-flight check for required runtime tools.
+        assert!(
+            DEFAULT_SYSTEM_PROMPT.contains("command -v"),
+            "bash bullet must instruct the agent to verify runtime tools with `command -v`"
+        );
+        assert!(
+            DEFAULT_SYSTEM_PROMPT
+                .contains("stop and report clearly rather than writing files that"),
+            "bash bullet must tell the agent to stop and report when a required tool is missing"
+        );
+
+        // Clause 2: background server start + port-readiness confirmation.
+        assert!(
+            DEFAULT_SYSTEM_PROMPT.contains("nohup") && DEFAULT_SYSTEM_PROMPT.contains("&"),
+            "bash bullet must show a background-server example (e.g. `nohup node server.js &`)"
+        );
+        assert!(
+            DEFAULT_SYSTEM_PROMPT.contains("--retry-connrefused"),
+            "bash bullet must mention --retry-connrefused as a port-readiness probe"
+        );
+        assert!(
+            DEFAULT_SYSTEM_PROMPT.contains("ss -tlnp"),
+            "bash bullet must mention `ss -tlnp` as an alternative port-readiness probe"
+        );
+        assert!(
+            DEFAULT_SYSTEM_PROMPT
+                .contains("never write files and exit silently when the server never started"),
+            "bash bullet must forbid writing files and exiting silently when the server never started"
+        );
     }
 }
