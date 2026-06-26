@@ -8,3 +8,7 @@
 
 # IDE
 /.idea/
+
+# Python (terminal-bench agent shim)
+__pycache__/
+*.pyc

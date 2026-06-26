@@ -85,10 +85,12 @@ impl Tool for EvalRunTool {
                 })?;
                 Box::new(LocalAdapter::from_dir("local", dir)?)
             }
+            "terminal-bench" => {
+                Box::new(crate::adapters::TerminalBenchAdapter::from_params(&params)?)
+            }
             other => {
                 return Ok(ToolResult::error(format!(
-                    "eval_run: adapter {other:?} is not available yet \
-                     (terminal-bench / swebench-lite land at M5)"
+                    "eval_run: adapter {other:?} is not available yet (swebench-lite lands later)"
                 )))
             }
         };
