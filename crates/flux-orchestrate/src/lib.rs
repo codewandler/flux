@@ -82,7 +82,10 @@ impl LocalSpawner {
             system,
             default_model: default_model.into(),
             max_tokens,
-            max_iterations: 15,
+            // Sub-agents that explore *and* act (a planner grounding a task in files, a worker that
+            // reads/edits/then runs the dev-gate) need more than a handful of tool turns. 15 cut them
+            // off mid-task before they could emit their result; 30 gives real headroom.
+            max_iterations: 30,
             auth: None,
         }
     }
