@@ -320,20 +320,34 @@ fn fmt_age(created_at_ms: i64) -> String {
 }
 
 /// `flux sessions` — list recent sessions (newest first).
+/// `flux sessions --prune` — delete all zero-message (abandoned) sessions.
 fn run_sessions() -> Result<()> {
+    let argv: Vec<String> = std::env::args().collect();
+    let prune = argv.get(2).map(|s| s == "--prune").unwrap_or(false);
     let store = open_session_store()?;
+    if prune {
+        let n = store.prune_empty()?;
+        if n == 0 {
+            eprintln!("no empty sessions to prune");
+        } else {
+            eprintln!("pruned {n} empty session{}", if n == 1 { "" } else { "s" });
+        }
+        return Ok(());
+    }
     let sessions = store.list(30)?;
     if sessions.is_empty() {
         eprintln!("no sessions yet — start one with `flux` or `flux --agent`");
         return Ok(());
     }
-    for s in sessions {
+    for s in &sessions {
+        let active_ts = if s.updated_at_ms > s.created_at_ms {
+            format!("active {}", fmt_age(s.updated_at_ms))
+        } else {
+            fmt_age(s.created_at_ms)
+        };
         println!(
             "{}  {:>3} msg  {:<22} {}",
-            s.id,
-            s.messages,
-            s.model,
-            fmt_age(s.created_at_ms)
+            s.id, s.messages, s.model, active_ts
         );
     }
     Ok(())
@@ -1019,6 +1033,7 @@ async fn run_repl(cli: Cli) -> Result<()> {
                             "/sessions",
                             "list recent sessions with first-message preview",
                         ),
+                        ("/sessions --prune", "delete all empty (0-message) sessions"),
                         ("/resume <id>", "switch to a previous session"),
                         ("/clear", "start a new session"),
                         ("/compact", "summarise and compact the context window"),
@@ -1171,12 +1186,14 @@ async fn run_repl(cli: Cli) -> Result<()> {
                                     format!("  {}", style::dim(&t))
                                 })
                                 .unwrap_or_default();
+                            let active_ts = if s.updated_at_ms > s.created_at_ms {
+                                format!("active {}", fmt_age(s.updated_at_ms))
+                            } else {
+                                fmt_age(s.created_at_ms)
+                            };
                             eprintln!(
                                 "{here} {}  {:>3} msg  {:<20} {}{preview}",
-                                s.id,
-                                s.messages,
-                                s.model,
-                                fmt_age(s.created_at_ms)
+                                s.id, s.messages, s.model, active_ts
                             );
                         }
                     }

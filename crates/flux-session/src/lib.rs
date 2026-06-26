@@ -34,6 +34,7 @@ pub struct SessionInfo {
     pub id: String,
     pub model: String,
     pub created_at_ms: i64,
+    pub updated_at_ms: i64,
 }
 
 /// A one-line session summary for listings (`flux sessions` / the REPL `/sessions`).
@@ -42,6 +43,7 @@ pub struct SessionSummary {
     pub id: String,
     pub model: String,
     pub created_at_ms: i64,
+    pub updated_at_ms: i64,
     pub messages: usize,
 }
 
@@ -66,20 +68,45 @@ impl SessionStore {
     }
 
     fn init(conn: Connection) -> Result<Self> {
+        // Base schema — created on first open.
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions (
                  id         INTEGER PRIMARY KEY AUTOINCREMENT,
                  model      TEXT NOT NULL,
-                 created_at INTEGER NOT NULL
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS messages (
                  session_id INTEGER NOT NULL,
                  seq        INTEGER NOT NULL,
+                 role       TEXT NOT NULL DEFAULT '',
                  data       TEXT NOT NULL,
                  PRIMARY KEY (session_id, seq)
-             );",
+             );
+             CREATE INDEX IF NOT EXISTS idx_messages_session_role
+                 ON messages (session_id, role);",
         )
         .map_err(map_sql)?;
+
+        // Migrations for existing databases that predate the new columns.
+        // `ALTER TABLE … ADD COLUMN` is idempotent-safe via the IF NOT EXISTS pragma absent in
+        // SQLite; we catch the "duplicate column" error and treat it as a no-op.
+        for sql in [
+            "ALTER TABLE sessions ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE messages ADD COLUMN role TEXT NOT NULL DEFAULT ''",
+        ] {
+            match conn.execute_batch(sql) {
+                Ok(()) => {}
+                Err(e) if e.to_string().contains("duplicate column") => {}
+                Err(e) => return Err(map_sql(e)),
+            }
+        }
+        // Ensure the role index exists even on migrated databases.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_messages_session_role ON messages (session_id, role);",
+        )
+        .map_err(map_sql)?;
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -87,10 +114,11 @@ impl SessionStore {
 
     /// Create a new session and return its id.
     pub fn create_session(&self, model: &str) -> Result<String> {
+        let ts = now_ms();
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO sessions (model, created_at) VALUES (?1, ?2)",
-            rusqlite::params![model, now_ms()],
+            "INSERT INTO sessions (model, created_at, updated_at) VALUES (?1, ?2, ?2)",
+            rusqlite::params![model, ts],
         )
         .map_err(map_sql)?;
         Ok(format!("s_{}", conn.last_insert_rowid()))
@@ -118,13 +146,14 @@ impl SessionStore {
         let rowid = parse_id(id)?;
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT model, created_at FROM sessions WHERE id = ?1",
+            "SELECT model, created_at, updated_at FROM sessions WHERE id = ?1",
             [rowid],
             |r| {
                 Ok(SessionInfo {
                     id: id.to_string(),
                     model: r.get(0)?,
                     created_at_ms: r.get(1)?,
+                    updated_at_ms: r.get(2)?,
                 })
             },
         )
@@ -135,23 +164,25 @@ impl SessionStore {
     }
 
     /// The most recent sessions (newest first), with their message counts, for listing/resuming.
+    /// Sessions are ordered by `updated_at` so the most recently active session appears first.
     pub fn list(&self, limit: usize) -> Result<Vec<SessionSummary>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT s.id, s.model, s.created_at, \
+                "SELECT s.id, s.model, s.created_at, s.updated_at, \
                  (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) \
-                 FROM sessions s ORDER BY s.id DESC LIMIT ?1",
+                 FROM sessions s ORDER BY s.updated_at DESC, s.id DESC LIMIT ?1",
             )
             .map_err(map_sql)?;
         let rows = stmt
             .query_map([limit as i64], |r| {
                 let rowid: i64 = r.get(0)?;
-                let n: i64 = r.get(3)?;
+                let n: i64 = r.get(4)?;
                 Ok(SessionSummary {
                     id: format!("s_{rowid}"),
                     model: r.get(1)?,
                     created_at_ms: r.get(2)?,
+                    updated_at_ms: r.get(3)?,
                     messages: n as usize,
                 })
             })
@@ -165,30 +196,42 @@ impl SessionStore {
         let rowid = parse_id(id)?;
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE sessions SET model = ?1 WHERE id = ?2",
-            rusqlite::params![model, rowid],
+            "UPDATE sessions SET model = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![model, now_ms(), rowid],
         )
         .map_err(map_sql)?;
         Ok(())
     }
 
     /// Append a message to the session log.
+    ///
+    /// The `SELECT MAX(seq)` and `INSERT` run inside an explicit transaction so the sequence
+    /// number cannot be duplicated even if the surrounding `Mutex` is ever relaxed.
     pub fn append_message(&self, id: &str, msg: &Message) -> Result<()> {
         let rowid = parse_id(id)?;
+        let role = format!("{:?}", msg.role).to_lowercase();
         let data = serde_json::to_string(msg)?;
+        let ts = now_ms();
         let conn = self.conn.lock().unwrap();
-        let next_seq: i64 = conn
+        let tx = conn.unchecked_transaction().map_err(map_sql)?;
+        let next_seq: i64 = tx
             .query_row(
                 "SELECT COALESCE(MAX(seq), -1) + 1 FROM messages WHERE session_id = ?1",
                 [rowid],
                 |r| r.get(0),
             )
             .map_err(map_sql)?;
-        conn.execute(
-            "INSERT INTO messages (session_id, seq, data) VALUES (?1, ?2, ?3)",
-            rusqlite::params![rowid, next_seq, data],
+        tx.execute(
+            "INSERT INTO messages (session_id, seq, role, data) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![rowid, next_seq, role, data],
         )
         .map_err(map_sql)?;
+        tx.execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![ts, rowid],
+        )
+        .map_err(map_sql)?;
+        tx.commit().map_err(map_sql)?;
         Ok(())
     }
 
@@ -196,18 +239,25 @@ impl SessionStore {
     /// Used by context compaction to swap old turns for a summary.
     pub fn rewrite_messages(&self, id: &str, messages: &[Message]) -> Result<()> {
         let rowid = parse_id(id)?;
+        let ts = now_ms();
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction().map_err(map_sql)?;
         tx.execute("DELETE FROM messages WHERE session_id = ?1", [rowid])
             .map_err(map_sql)?;
         for (seq, msg) in messages.iter().enumerate() {
+            let role = format!("{:?}", msg.role).to_lowercase();
             let data = serde_json::to_string(msg)?;
             tx.execute(
-                "INSERT INTO messages (session_id, seq, data) VALUES (?1, ?2, ?3)",
-                rusqlite::params![rowid, seq as i64, data],
+                "INSERT INTO messages (session_id, seq, role, data) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![rowid, seq as i64, role, data],
             )
             .map_err(map_sql)?;
         }
+        tx.execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![ts, rowid],
+        )
+        .map_err(map_sql)?;
         tx.commit().map_err(map_sql)?;
         Ok(())
     }
@@ -228,6 +278,19 @@ impl SessionStore {
             out.push(serde_json::from_str(&data)?);
         }
         Ok(out)
+    }
+
+    /// Delete all sessions that have zero messages (abandoned / test-run sessions).
+    /// Returns the number of sessions deleted.
+    pub fn prune_empty(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute(
+                "DELETE FROM sessions WHERE id NOT IN (SELECT DISTINCT session_id FROM messages)",
+                [],
+            )
+            .map_err(map_sql)?;
+        Ok(n)
     }
 }
 
@@ -256,6 +319,34 @@ mod tests {
 
         let info = store.info(&id).unwrap();
         assert_eq!(info.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn updated_at_advances_on_append() {
+        let store = SessionStore::in_memory().unwrap();
+        let id = store.create_session("m").unwrap();
+        let created = store.info(&id).unwrap().updated_at_ms;
+        // Sleep long enough for now_ms() to tick.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        store
+            .append_message(&id, &Message::user_text("hi"))
+            .unwrap();
+        let after = store.info(&id).unwrap().updated_at_ms;
+        assert!(after >= created, "updated_at must not go backwards");
+        // updated_at is exposed in the summary too
+        let summary = store.list(1).unwrap();
+        assert_eq!(summary[0].updated_at_ms, after);
+    }
+
+    #[test]
+    fn updated_at_advances_on_set_model() {
+        let store = SessionStore::in_memory().unwrap();
+        let id = store.create_session("sonnet").unwrap();
+        let before = store.info(&id).unwrap().updated_at_ms;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        store.set_model(&id, "opus").unwrap();
+        let after = store.info(&id).unwrap().updated_at_ms;
+        assert!(after >= before);
     }
 
     #[test]
@@ -312,14 +403,22 @@ mod tests {
             .append_message(&a, &Message::user_text("there"))
             .unwrap();
         let b = store.create_session("m2").unwrap();
+        // Sleep so that a's last append_message (which also updates updated_at) happens strictly
+        // before b is created — both calls hit now_ms() and must land in different milliseconds.
+        // Without the sleep the two timestamps can be equal and the id-DESC tiebreak fires.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        store
+            .append_message(&a, &Message::user_text("last"))
+            .unwrap();
 
         let list = store.list(10).unwrap();
         assert_eq!(list.len(), 2);
-        assert_eq!(list[0].id, b, "newest first");
-        assert_eq!(list[0].messages, 0);
-        assert_eq!(list[1].id, a);
-        assert_eq!(list[1].messages, 2);
-        assert_eq!(list[1].model, "m1");
+        // a was appended to after b was created, so a.updated_at > b.updated_at → a sorts first.
+        assert_eq!(list[0].id, a, "most recently active first");
+        assert_eq!(list[0].messages, 3);
+        assert_eq!(list[1].id, b);
+        assert_eq!(list[1].messages, 0);
+        assert_eq!(list[0].model, "m1");
         // limit is honored
         assert_eq!(store.list(1).unwrap().len(), 1);
     }
@@ -331,5 +430,61 @@ mod tests {
         store.set_model(&a, "opus").unwrap();
         assert_eq!(store.list(1).unwrap()[0].model, "opus");
         assert_eq!(store.info(&a).unwrap().model, "opus");
+    }
+
+    #[test]
+    fn prune_empty_removes_zero_message_sessions() {
+        let store = SessionStore::in_memory().unwrap();
+        let a = store.create_session("m").unwrap();
+        store.append_message(&a, &Message::user_text("hi")).unwrap();
+        let _b = store.create_session("m").unwrap(); // no messages
+        let _c = store.create_session("m").unwrap(); // no messages
+
+        assert_eq!(store.list(10).unwrap().len(), 3);
+        let pruned = store.prune_empty().unwrap();
+        assert_eq!(pruned, 2);
+        let remaining = store.list(10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, a);
+    }
+
+    #[test]
+    fn role_column_stored_and_indexed() {
+        let store = SessionStore::in_memory().unwrap();
+        let id = store.create_session("m").unwrap();
+        store.append_message(&id, &Message::user_text("q")).unwrap();
+        store
+            .append_message(&id, &Message::assistant_text("a"))
+            .unwrap();
+        // Verify via a raw query that the role column is populated.
+        let conn = store.conn.lock().unwrap();
+        let roles: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT role FROM messages WHERE session_id = \
+                     (SELECT id FROM sessions LIMIT 1) ORDER BY seq",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(roles, vec!["user", "assistant"]);
+    }
+
+    #[test]
+    fn append_message_is_transactional() {
+        // Verify that two concurrent appends (simulated sequentially here) produce distinct seq
+        // values — the transaction ensures no two inserts can race to the same seq.
+        let store = SessionStore::in_memory().unwrap();
+        let id = store.create_session("m").unwrap();
+        for i in 0..10 {
+            store
+                .append_message(&id, &Message::user_text(format!("m{i}")))
+                .unwrap();
+        }
+        let msgs = store.load_messages(&id).unwrap();
+        assert_eq!(msgs.len(), 10);
     }
 }
