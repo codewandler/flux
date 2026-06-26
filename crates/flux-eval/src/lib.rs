@@ -61,6 +61,8 @@ pub fn register_eval_ops(registry: &mut ToolRegistry) {
     registry.register(Arc::new(git::GitSnapshotTool));
     registry.register(Arc::new(git::GitTagTool));
     registry.register(Arc::new(git::GitRevertTool));
+    // Integrity: restore grader/suite/CI after the worker runs (anti-gaming).
+    registry.register(Arc::new(git::GuardProtectedTool));
 }
 
 /// The evidence-gated [`ToolGroup`](flux_evidence::ToolGroup) bundling every eval / self-improvement

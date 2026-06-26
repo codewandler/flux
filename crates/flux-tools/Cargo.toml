@@ -18,6 +18,9 @@ async-trait.workspace = true
 regex.workspace = true
 similar.workspace = true
 futures.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

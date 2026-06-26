@@ -47,7 +47,13 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
         ToolGroup {
             name: "rust".into(),
             description: "Rust toolchain operations.".into(),
-            tools: Vec::new(),
+            tools: names(&[
+                "cargo_check",
+                "cargo_build",
+                "cargo_test",
+                "cargo_clippy",
+                "cargo_fmt",
+            ]),
             surface_when: when("rust"),
         },
         ToolGroup {

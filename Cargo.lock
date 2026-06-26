@@ -1005,6 +1005,8 @@ dependencies = [
  "flux-system",
  "futures",
  "regex",
+ "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "similar",

@@ -107,6 +107,9 @@ regression here is a release blocker, not a nit.
 - **Add a built-in tool:** implement `flux_runtime::Tool` (spec + `permission_subjects` + `intents` +
   `execute`) in `flux-tools`, do IO via `ctx.system`, and register it in `register_builtins`. Declare
   accurate `effects` so the policy layer gates it (`Effect::Write` → `workspace.write`, etc.).
+  New tools with a `group` field are only surfaced when that group's signal is detected (e.g. `"rust"`
+  group tools appear only in Rust workspaces). Add the op to the group's `tools` list in `groups.rs`
+  and to the `builtins_register` test's expected name list.
 - **Add a provider:** a provider = `WireCodec` × `Credential` composed by `NativeProvider`
   (`flux-provider`). Add the codec/credential in `flux-anthropic` or `flux-openai`; wire model routing in
   `flux-cli`'s `build_provider`.
@@ -150,6 +153,11 @@ Whenever you add, remove, or rename a node kind or registered op in `flux-flow`
 that changes the public surface), you **must** update
 `crates/flux-flow/DOCUMENTATION.md` in the same commit. The doc is the canonical
 human + agent reference for the Flux-Lang AST; an outdated doc is a bug.
+
+The same applies when new built-in tools are added to `flux-tools`: update the
+"Registered ops quick reference" table in `DOCUMENTATION.md` and the op catalog
+in this file (the `emit_plan` system prompt section). The planning agent uses both
+to decide which ops are available.
 
 - New node kind → add a section under the appropriate group (primitive, control-flow, …).
 - New op registered in `OpRegistry` → add a row to the "Registered ops quick reference" table.

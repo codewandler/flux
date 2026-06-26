@@ -19,6 +19,26 @@ use crate::util::{arg, json_result, str_field};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Paths the self-improvement loop must protect from the worker: the grader (`flux-eval`), the suite,
+/// the loop flows + scripts, and CI. If the worker could edit these it could "win" by gaming its own
+/// measurement. [`GuardProtectedTool`] restores them from the round snapshot before scoring.
+const PROTECTED: &[&str] = &[
+    "crates/flux-eval",
+    "suites",
+    "scripts",
+    ".github",
+    "examples/improve.flux",
+    "examples/eval-smoke.flux",
+];
+/// Protected directories (for removing untracked files the worker may have added under them).
+const PROTECTED_DIRS: &[&str] = &["crates/flux-eval", "suites", "scripts", ".github"];
+
+fn is_protected(path: &str) -> bool {
+    PROTECTED
+        .iter()
+        .any(|e| path == *e || path.starts_with(&format!("{e}/")))
+}
+
 /// Run `git <args>` in the workspace, returning trimmed stdout (or an error with stderr on failure).
 async fn git(ctx: &ToolContext, args: &[&str]) -> Result<String> {
     let mut argv = vec!["git".to_string()];
@@ -181,5 +201,166 @@ impl Tool for GitRevertTool {
             &json!({ "reset_to": head }),
             format!("reverted to {}", short(head)),
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// guard_protected
+// ---------------------------------------------------------------------------
+
+/// `guard_protected(snapshot)` — the loop's integrity enforcer. After the worker edits flux, restore
+/// the protected paths (grader/suite/loop-flows/scripts/CI) to the round snapshot, so the agent cannot
+/// "win" by editing its own measurement. Sub-agents run with empty permissions + an auto-allow approver
+/// (they CAN write anywhere non-destructively), so this top-level op — which the worker doesn't control
+/// — is the real enforcement. Returns `{tampered, restored:[…]}`.
+pub struct GuardProtectedTool;
+
+#[async_trait]
+impl Tool for GuardProtectedTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "guard_protected".into(),
+            description: "Restore the grader/suite/loop/CI paths to the round snapshot after the worker \
+                          runs, so the agent cannot game its own measurement. Returns {tampered, restored}."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "snapshot": {"type": "string", "description": "a git_snapshot result (JSON)"} },
+                "required": ["snapshot"]
+            }),
+            output_schema: None,
+            effects: vec![Effect::Process, Effect::LocalSystem],
+            risk: Risk::Medium,
+            idempotency: Idempotency::NonIdempotent,
+            access: vec![AccessKind::Process, AccessKind::LocalSystem],
+            group: None,
+        }
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let snap = arg(&params, "snapshot");
+        let head = snap
+            .get("head")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Other("guard_protected: snapshot has no `head`".to_string()))?;
+
+        // Detect protected-path changes (tracked diffs + untracked additions).
+        let changed = git(ctx, &["diff", "--name-only", head]).await?;
+        let untracked = git(ctx, &["ls-files", "--others", "--exclude-standard"]).await?;
+        let mut restored: Vec<String> = changed
+            .lines()
+            .chain(untracked.lines())
+            .map(|s| s.trim().to_string())
+            .filter(|p| !p.is_empty() && is_protected(p))
+            .collect();
+        restored.sort();
+        restored.dedup();
+        let tampered = !restored.is_empty();
+
+        if tampered {
+            // Restore tracked protected paths to the snapshot, then remove any untracked files the
+            // worker added under protected dirs — pinning grader/suite/CI to the committed versions.
+            let mut checkout: Vec<&str> = vec!["checkout", head, "--"];
+            checkout.extend(PROTECTED.iter().copied());
+            git(ctx, &checkout).await?;
+            let mut clean: Vec<&str> = vec!["clean", "-fd", "--"];
+            clean.extend(PROTECTED_DIRS.iter().copied());
+            git(ctx, &clean).await?;
+        }
+
+        let view = if tampered {
+            format!(
+                "⚠ tampering reverted: restored {} protected path(s)",
+                restored.len()
+            )
+        } else {
+            "protected paths intact".to_string()
+        };
+        json_result(&json!({ "tampered": tampered, "restored": restored }), view)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use flux_system::{System, Workspace};
+
+    static N: AtomicU64 = AtomicU64::new(0);
+
+    fn sh(dir: &std::path::Path, args: &[&str]) {
+        let ok = Command::new(args[0])
+            .args(&args[1..])
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "command failed: {args:?}");
+    }
+
+    #[tokio::test]
+    async fn guard_protected_restores_grader_and_suite_tampering() {
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("flux-guard-test-{}-{n}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("crates/flux-eval/src")).unwrap();
+        std::fs::create_dir_all(dir.join("suites")).unwrap();
+        // A committed grader file + suite file + an unrelated source file.
+        std::fs::write(
+            dir.join("crates/flux-eval/src/score.rs"),
+            "pub const A: u8 = 1;\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("suites/t.toml"), "id = \"t\"\n").unwrap();
+        std::fs::write(dir.join("src.rs"), "fn main() {}\n").unwrap();
+        sh(&dir, &["git", "init", "-q"]);
+        sh(&dir, &["git", "config", "user.email", "a@b.c"]);
+        sh(&dir, &["git", "config", "user.name", "t"]);
+        sh(&dir, &["git", "add", "-A"]);
+        sh(&dir, &["git", "commit", "-qm", "init"]);
+
+        let ctx = ToolContext::new(std::sync::Arc::new(System::new(
+            Workspace::new(&dir).unwrap(),
+        )));
+        let head = git(&ctx, &["rev-parse", "HEAD"]).await.unwrap();
+
+        // Worker "tampers": edits the grader + suite, adds an untracked grader file, and edits an
+        // allowed source file.
+        std::fs::write(
+            dir.join("crates/flux-eval/src/score.rs"),
+            "pub const A: u8 = 99;\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("suites/t.toml"), "id = \"gamed\"\n").unwrap();
+        std::fs::write(dir.join("crates/flux-eval/src/cheat.rs"), "// sneaky\n").unwrap();
+        std::fs::write(dir.join("src.rs"), "fn main() { /* legit */ }\n").unwrap();
+
+        let out = GuardProtectedTool
+            .execute(
+                &ctx,
+                json!({ "snapshot": json!({"head": head}).to_string() }),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(out.content.contains("\"tampered\":true"), "{}", out.content);
+
+        // Protected paths restored to the snapshot; untracked grader file removed.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("crates/flux-eval/src/score.rs")).unwrap(),
+            "pub const A: u8 = 1;\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("suites/t.toml")).unwrap(),
+            "id = \"t\"\n"
+        );
+        assert!(!dir.join("crates/flux-eval/src/cheat.rs").exists());
+        // The allowed (non-protected) edit survives.
+        assert!(std::fs::read_to_string(dir.join("src.rs"))
+            .unwrap()
+            .contains("legit"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

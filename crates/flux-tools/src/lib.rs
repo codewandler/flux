@@ -7,6 +7,8 @@
 
 use std::time::Duration;
 
+pub mod cargo;
+pub mod extra;
 pub mod groups;
 
 use async_trait::async_trait;
@@ -15,6 +17,7 @@ use serde_json::{json, Value};
 use flux_core::{Error, Result};
 use flux_policy::wildcard_match;
 use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
+
 use flux_spec::{
     AccessKind, Effect, Idempotency, Intent, IntentBehavior, IntentCertainty, IntentRole,
     IntentSet, IntentTarget, Risk, ToolSpec,
@@ -182,6 +185,8 @@ fn unified_diff(path: &str, before: &str, after: &str) -> String {
 
 /// Register all built-in tools into a registry.
 pub fn register_builtins(registry: &mut ToolRegistry) {
+    cargo::register_cargo(registry);
+    extra::register_extra(registry);
     registry.register(Arc::new(ReadTool));
     registry.register(Arc::new(ReadManyTool));
     registry.register(Arc::new(WriteTool));
@@ -2922,7 +2927,13 @@ mod tests {
             vec![
                 "append",
                 "bash",
+                "cargo_build",
+                "cargo_check",
+                "cargo_clippy",
+                "cargo_fmt",
+                "cargo_test",
                 "edit",
+                "file_stat",
                 "git_checkout",
                 "git_commit",
                 "git_diff",
@@ -2934,8 +2945,11 @@ mod tests {
                 "glob",
                 "grep",
                 "patch",
+                "path_exists",
                 "read",
                 "read_many",
+                "sqlite_query",
+                "web_search",
                 "write"
             ]
         );
