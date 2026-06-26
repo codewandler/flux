@@ -54,6 +54,78 @@ impl RunResult {
     }
 }
 
+/// A session reference (one trial's stores), for later mining.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionRef {
+    pub id: String,
+    /// The RunEvent store (flow.db) — the mining source.
+    pub flow_db: String,
+    pub task_id: String,
+}
+
+/// A task's outcome aggregated over `trials` runs — pass-rate over noise, mean metrics, and every
+/// trial's session ref (so mining sees all trials). This is what scoring + the report use.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CaseOutcome {
+    pub task_id: String,
+    pub trials: u32,
+    pub passes: u32,
+    /// `passes / trials` — the per-task signal that absorbs single-run model noise.
+    pub pass_rate: f64,
+    pub mean_tool_errors: f64,
+    pub mean_iterations: f64,
+    pub mean_tokens: f64,
+    pub mean_wall_ms: f64,
+    pub timed_out_any: bool,
+    pub sessions: Vec<SessionRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl CaseOutcome {
+    /// Aggregate one task's trial results.
+    pub fn from_trials(task_id: &str, runs: &[RunResult]) -> Self {
+        let trials = runs.len() as u32;
+        let n = (trials.max(1)) as f64;
+        let passes = runs.iter().filter(|r| r.passed).count() as u32;
+        let sum_errors: u64 = runs.iter().map(|r| r.tool_errors as u64).sum();
+        let sum_iters: u64 = runs.iter().map(|r| r.iterations as u64).sum();
+        let sum_wall: u64 = runs.iter().map(|r| r.wall_ms).sum();
+        let sum_tokens: f64 = runs
+            .iter()
+            .filter_map(|r| r.tokens.as_ref().map(|u| u.total() as f64))
+            .sum();
+        let sessions = runs
+            .iter()
+            .filter_map(|r| match (&r.session_id, &r.flow_db) {
+                (Some(id), Some(db)) => Some(SessionRef {
+                    id: id.clone(),
+                    flow_db: db.to_string_lossy().to_string(),
+                    task_id: task_id.to_string(),
+                }),
+                _ => None,
+            })
+            .collect();
+        CaseOutcome {
+            task_id: task_id.to_string(),
+            trials,
+            passes,
+            pass_rate: if trials > 0 {
+                passes as f64 / trials as f64
+            } else {
+                0.0
+            },
+            mean_tool_errors: sum_errors as f64 / n,
+            mean_iterations: sum_iters as f64 / n,
+            mean_tokens: sum_tokens / n,
+            mean_wall_ms: sum_wall as f64 / n,
+            timed_out_any: runs.iter().any(|r| r.timed_out),
+            sessions,
+            note: runs.iter().find_map(|r| r.note.clone()),
+        }
+    }
+}
+
 /// Turn count: assistant messages in the replayed conversation.
 pub fn iterations_from_messages(messages: &[Message]) -> u32 {
     messages
@@ -111,5 +183,35 @@ mod tests {
             },
         ];
         assert_eq!(metrics_from_events(&events), (2, 1));
+    }
+
+    #[test]
+    fn case_outcome_aggregates_trials() {
+        let mk = |passed, errors, iters, id: &str, db: &str| RunResult {
+            task_id: "t".into(),
+            passed,
+            iterations: iters,
+            tool_calls: iters,
+            tool_errors: errors,
+            tokens: None,
+            wall_ms: 10,
+            session_id: Some(id.into()),
+            session_db: None,
+            flow_db: Some(db.into()),
+            timed_out: false,
+            note: None,
+        };
+        let runs = vec![
+            mk(true, 0, 2, "s_1", "/a/flow.db"),
+            mk(false, 1, 4, "s_2", "/b/flow.db"),
+        ];
+        let c = CaseOutcome::from_trials("t", &runs);
+        assert_eq!(c.trials, 2);
+        assert_eq!(c.passes, 1);
+        assert!((c.pass_rate - 0.5).abs() < 1e-9);
+        assert!((c.mean_tool_errors - 0.5).abs() < 1e-9);
+        assert_eq!(c.sessions.len(), 2);
+        assert_eq!(c.sessions[0].id, "s_1");
+        assert_eq!(c.sessions[0].flow_db, "/a/flow.db");
     }
 }

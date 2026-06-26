@@ -5,18 +5,20 @@
 //! slower-but-correct one. The improvement loop adopts a candidate only when [`SuiteScore::is_better`]
 //! holds (and, separately, the dev-gate is green).
 
-use crate::metrics::RunResult;
+use crate::metrics::{CaseOutcome, RunResult};
 
 /// An aggregate score over a suite run.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct SuiteScore {
-    /// Σ(weightᵢ·passedᵢ) / Σ(weightᵢ), in `[0,1]`.
+    /// Weighted mean of per-task pass-rates, in `[0,1]`.
     pub pass_rate: f64,
     pub total: u32,
+    /// Tasks that passed every trial.
     pub passed: u32,
     pub total_weight: f64,
     pub mean_tool_errors: f64,
     pub mean_iterations: f64,
+    pub mean_tokens: f64,
     pub mean_wall_ms: f64,
 }
 
@@ -30,6 +32,7 @@ impl SuiteScore {
         let mut sum_tool_errors = 0u64;
         let mut sum_iterations = 0u64;
         let mut sum_wall_ms = 0u64;
+        let mut sum_tokens = 0.0;
         let mut passed = 0u32;
         for r in results {
             let w = weight_of(&r.task_id);
@@ -41,6 +44,7 @@ impl SuiteScore {
             sum_tool_errors += r.tool_errors as u64;
             sum_iterations += r.iterations as u64;
             sum_wall_ms += r.wall_ms;
+            sum_tokens += r.tokens.as_ref().map(|u| u.total() as f64).unwrap_or(0.0);
         }
         SuiteScore {
             pass_rate: if total_weight > 0.0 {
@@ -61,7 +65,44 @@ impl SuiteScore {
             } else {
                 0.0
             },
+            mean_tokens: if n > 0.0 { sum_tokens / n } else { 0.0 },
             mean_wall_ms: if n > 0.0 { sum_wall_ms as f64 / n } else { 0.0 },
+        }
+    }
+
+    /// Aggregate per-task [`CaseOutcome`]s (multi-trial). `pass_rate` is the weighted mean of per-task
+    /// pass-rates; `passed` counts tasks that passed every trial; means are over tasks.
+    pub fn from_cases(cases: &[CaseOutcome], weight_of: impl Fn(&str) -> f64) -> Self {
+        let n = cases.len() as f64;
+        let mut total_weight = 0.0;
+        let mut weighted_pass = 0.0;
+        let (mut e, mut it, mut tok, mut wall) = (0.0, 0.0, 0.0, 0.0);
+        let mut passed = 0u32;
+        for c in cases {
+            let w = weight_of(&c.task_id);
+            total_weight += w;
+            weighted_pass += w * c.pass_rate;
+            e += c.mean_tool_errors;
+            it += c.mean_iterations;
+            tok += c.mean_tokens;
+            wall += c.mean_wall_ms;
+            if c.pass_rate >= 1.0 - 1e-9 {
+                passed += 1;
+            }
+        }
+        SuiteScore {
+            pass_rate: if total_weight > 0.0 {
+                weighted_pass / total_weight
+            } else {
+                0.0
+            },
+            total: cases.len() as u32,
+            passed,
+            total_weight,
+            mean_tool_errors: if n > 0.0 { e / n } else { 0.0 },
+            mean_iterations: if n > 0.0 { it / n } else { 0.0 },
+            mean_tokens: if n > 0.0 { tok / n } else { 0.0 },
+            mean_wall_ms: if n > 0.0 { wall / n } else { 0.0 },
         }
     }
 
@@ -88,8 +129,15 @@ impl SuiteScore {
         if self.mean_tool_errors > baseline.mean_tool_errors + EPS {
             return false;
         }
-        // equal tool-errors too
-        self.mean_iterations + EPS < baseline.mean_iterations
+        // equal tool-errors → fewer iterations
+        if self.mean_iterations + EPS < baseline.mean_iterations {
+            return true;
+        }
+        if self.mean_iterations > baseline.mean_iterations + EPS {
+            return false;
+        }
+        // equal iterations too → fewer tokens (cost)
+        self.mean_tokens + EPS < baseline.mean_tokens
     }
 }
 
@@ -119,7 +167,18 @@ pub fn report_is_better(candidate: &serde_json::Value, baseline: &serde_json::Va
     if ce > be + EPS {
         return false;
     }
-    f(candidate, "mean_iterations") + EPS < f(baseline, "mean_iterations")
+    let (ci, bi) = (
+        f(candidate, "mean_iterations"),
+        f(baseline, "mean_iterations"),
+    );
+    if ci + EPS < bi {
+        return true;
+    }
+    if ci > bi + EPS {
+        return false;
+    }
+    // equal iterations → fewer tokens (cost)
+    f(candidate, "mean_tokens") + EPS < f(baseline, "mean_tokens")
 }
 
 #[cfg(test)]
@@ -190,5 +249,36 @@ mod tests {
         assert!(report_is_better(&tie_fewer_errors, &base));
         assert!(!report_is_better(&worse, &base));
         assert!(!report_is_better(&base, &base));
+    }
+
+    #[test]
+    fn from_cases_uses_per_task_pass_rate_and_tokens_tiebreak() {
+        use crate::metrics::CaseOutcome;
+        fn case(id: &str, passes: u32, trials: u32) -> CaseOutcome {
+            CaseOutcome {
+                task_id: id.into(),
+                trials,
+                passes,
+                pass_rate: passes as f64 / trials as f64,
+                mean_tool_errors: 0.0,
+                mean_iterations: 1.0,
+                mean_tokens: 0.0,
+                mean_wall_ms: 1.0,
+                timed_out_any: false,
+                sessions: vec![],
+                note: None,
+            }
+        }
+        // a passes 2/3, b passes 3/3 → weighted pass_rate = (0.667 + 1.0)/2 ≈ 0.833.
+        let s = SuiteScore::from_cases(&[case("a", 2, 3), case("b", 3, 3)], |_| 1.0);
+        assert!((s.pass_rate - 0.8333).abs() < 1e-3, "{}", s.pass_rate);
+        assert_eq!(s.total, 2);
+        assert_eq!(s.passed, 1); // only b passed all trials
+
+        // tokens break a full tie (same pass-rate / errors / iters).
+        let cheap = serde_json::json!({"pass_rate":1.0,"mean_tool_errors":0.0,"mean_iterations":1.0,"mean_tokens":100.0});
+        let dear = serde_json::json!({"pass_rate":1.0,"mean_tool_errors":0.0,"mean_iterations":1.0,"mean_tokens":200.0});
+        assert!(report_is_better(&cheap, &dear));
+        assert!(!report_is_better(&dear, &cheap));
     }
 }

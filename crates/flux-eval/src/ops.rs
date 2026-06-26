@@ -6,6 +6,7 @@
 //! `content` string (what a flow binds to a `$symbol`); consumer ops parse their input back out.
 
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -18,7 +19,7 @@ use flux_spec::{AccessKind, Effect, Idempotency, Risk, ToolSpec};
 
 use crate::adapter::{BenchmarkAdapter, Filter, RunContext};
 use crate::adapters::LocalAdapter;
-use crate::metrics::RunResult;
+use crate::metrics::{CaseOutcome, RunResult};
 use crate::painpoint;
 use crate::score::{report_is_better, SuiteScore};
 use crate::util::{arg, json_result, str_field};
@@ -117,35 +118,49 @@ impl Tool for EvalRunTool {
             cancel: &cancel,
         };
 
+        // Trials per task: >1 averages out single-run model noise so a "win" is real, not luck.
+        let trials = params
+            .get("trials")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+            .max(1) as usize;
+
         let task_ids = adapter.list_tasks(&filter)?;
-        let mut results: Vec<RunResult> = Vec::with_capacity(task_ids.len());
+        let mut cases: Vec<CaseOutcome> = Vec::with_capacity(task_ids.len());
         for id in &task_ids {
-            let r = match adapter.run_task(id, &rc).await {
-                Ok(r) => r,
-                Err(e) => RunResult::failed(id, 0, e.to_string()),
-            };
-            results.push(r);
+            let mut runs: Vec<RunResult> = Vec::with_capacity(trials);
+            for _ in 0..trials {
+                let r = match adapter.run_task(id, &rc).await {
+                    Ok(r) => r,
+                    Err(e) => RunResult::failed(id, 0, e.to_string()),
+                };
+                runs.push(r);
+            }
+            cases.push(CaseOutcome::from_trials(id, &runs));
         }
 
-        let score = SuiteScore::from_results(&results, |id| adapter.weight_of(id));
-        let cases = serde_json::to_value(&results).map_err(|e| Error::Other(e.to_string()))?;
+        let score = SuiteScore::from_cases(&cases, |id| adapter.weight_of(id));
+        let cases_json = serde_json::to_value(&cases).map_err(|e| Error::Other(e.to_string()))?;
         let report = json!({
             "adapter": adapter.name(),
+            "trials": trials,
             "pass_rate": score.pass_rate,
             "scalar": score.scalar(),
             "total": score.total,
             "passed": score.passed,
             "mean_tool_errors": score.mean_tool_errors,
             "mean_iterations": score.mean_iterations,
+            "mean_tokens": score.mean_tokens,
             "mean_wall_ms": score.mean_wall_ms,
-            "cases": cases,
+            "cases": cases_json,
         });
         let view = format!(
-            "eval[{}] {}/{} passed · score {} · mean_iters {:.1} · mean_errors {:.1}",
+            "eval[{}] {}/{} tasks pass-all · score {} · {} trial(s) · mean_iters {:.1} · mean_errors {:.1}",
             adapter.name(),
             score.passed,
             score.total,
             score.scalar(),
+            trials,
             score.mean_iterations,
             score.mean_tool_errors,
         );
@@ -182,13 +197,16 @@ impl Tool for EvalSessionsTool {
             .get("cases")
             .and_then(|v| v.as_array())
             .unwrap_or(&empty);
+        // Each case carries every trial's session ref; flatten them. The mining source is the
+        // RunEvent trace (flow.db), not the message log.
         let sessions: Vec<Value> = cases
             .iter()
-            .filter_map(|c| {
-                let id = c.get("session_id").and_then(|v| v.as_str())?;
-                // The mining source is the RunEvent trace (flow.db), not the message log.
-                let db = c.get("flow_db").and_then(|v| v.as_str())?;
-                let task_id = c.get("task_id").and_then(|v| v.as_str()).unwrap_or(id);
+            .filter_map(|c| c.get("sessions").and_then(|v| v.as_array()))
+            .flatten()
+            .filter_map(|s| {
+                let id = s.get("id").and_then(|v| v.as_str())?;
+                let db = s.get("flow_db").and_then(|v| v.as_str())?;
+                let task_id = s.get("task_id").and_then(|v| v.as_str()).unwrap_or(id);
                 Some(json!({ "id": id, "db": db, "task_id": task_id }))
             })
             .collect();
@@ -241,6 +259,119 @@ impl Tool for PainpointsCollectTool {
         let view = format!("{} pain-point(s) mined", all.len());
         let content = serde_json::to_string(&all).map_err(|e| Error::Other(e.to_string()))?;
         Ok(ToolResult::ok_view(content, view))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sessions_digest
+// ---------------------------------------------------------------------------
+
+/// `sessions_digest(sessions)` — render each session's RunEvent trace into a compact transcript, so the
+/// reviewer reasons over *what the agent did*, not just pass/fail. Returns plain text (for `{{digest}}`).
+pub struct SessionsDigestTool;
+
+#[async_trait]
+impl Tool for SessionsDigestTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::read_only(
+            "sessions_digest",
+            "Render each session's RunEvent trace into a compact transcript for review.",
+            json!({
+                "type": "object",
+                "properties": { "sessions": {"type": "string", "description": "session references (JSON array)"} },
+                "required": ["sessions"]
+            }),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        const MAX_CHARS: usize = 8000;
+        let sessions = arg(&params, "sessions");
+        let empty = Vec::new();
+        let arr = sessions.as_array().unwrap_or(&empty);
+        let mut out = String::new();
+        let mut n = 0;
+        for s in arr {
+            let (Some(id), Some(db)) = (
+                s.get("id").and_then(|v| v.as_str()),
+                s.get("db").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let task_id = s.get("task_id").and_then(|v| v.as_str()).unwrap_or(id);
+            let Ok(store) = FlowStore::open(db) else {
+                continue;
+            };
+            let events = store.events(id).unwrap_or_default();
+            out.push_str(&format!(
+                "## {task_id} (session {id})\n{}\n",
+                crate::transcript::render_run_trace(&events, 40)
+            ));
+            n += 1;
+            if out.len() >= MAX_CHARS {
+                out.push_str("\n… (digest truncated)\n");
+                break;
+            }
+        }
+        Ok(ToolResult::ok_view(
+            out,
+            format!("digest of {n} session(s)"),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// improve_log
+// ---------------------------------------------------------------------------
+
+/// `improve_log(record)` — append a timestamped round record to `.flux/eval/improve-log.jsonl` so a
+/// human can audit what the loop tried, whether the grader was tampered with, and the gate outcome.
+pub struct ImproveLogTool;
+
+#[async_trait]
+impl Tool for ImproveLogTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "improve_log".into(),
+            description:
+                "Append a timestamped round record to .flux/eval/improve-log.jsonl (audit trail)."
+                    .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "record": {"type": "object", "description": "round record (any JSON object)"} },
+                "required": ["record"]
+            }),
+            output_schema: None,
+            effects: vec![Effect::Write, Effect::Filesystem],
+            risk: Risk::Low,
+            idempotency: Idempotency::NonIdempotent,
+            access: vec![AccessKind::Filesystem],
+            group: None,
+        }
+    }
+
+    fn permission_subjects(&self, _params: &Value) -> Vec<String> {
+        vec![".flux/eval/improve-log.jsonl".to_string()]
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let record = arg(&params, "record");
+        let ts_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let entry = json!({ "ts_ms": ts_ms, "round": record });
+        let line = format!(
+            "{}\n",
+            serde_json::to_string(&entry).map_err(|e| Error::Other(e.to_string()))?
+        );
+        ctx.system
+            .append_file(".flux/eval/improve-log.jsonl", &line)
+            .await?;
+        Ok(ToolResult::ok_view(
+            line.trim().to_string(),
+            "logged round to .flux/eval/improve-log.jsonl",
+        ))
     }
 }
 
@@ -370,7 +501,10 @@ impl Tool for ChangeImplementTool {
                 .into(),
             input_schema: json!({
                 "type": "object",
-                "properties": { "tasks": {"type": "string", "description": "tasks to implement (JSON array)"} },
+                "properties": {
+                    "tasks": {"type": "string", "description": "tasks to implement (JSON array)"},
+                    "limit": {"type": "integer", "description": "cap on tasks implemented this round (0 = all)"}
+                },
                 "required": ["tasks"]
             }),
             output_schema: None,
@@ -383,7 +517,12 @@ impl Tool for ChangeImplementTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let tasks = crate::aggregate::extract_array(&arg(&params, "tasks"));
+        let mut tasks = crate::aggregate::extract_array(&arg(&params, "tasks"));
+        // Blast-radius cap: implement at most `limit` tasks this round (0 = all).
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        if limit > 0 && tasks.len() > limit {
+            tasks.truncate(limit);
+        }
         let Some(spawner) = &ctx.spawner else {
             return Ok(ToolResult::error(
                 "change_implement: no sub-agent spawner configured",
@@ -434,25 +573,34 @@ mod tests {
     }
 
     #[test]
-    fn eval_sessions_projects_refs_from_a_report() {
+    fn eval_sessions_flattens_trial_refs_from_cases() {
+        // A multi-trial report: each case carries a `sessions` array (one ref per trial).
         let report = json!({
             "cases": [
-                {"task_id": "t/a", "session_id": "s_1", "flow_db": "/tmp/x/.flux/flow.db", "pass": true},
-                {"task_id": "t/b", "session_id": null, "flow_db": null, "pass": false}
+                { "task_id": "t/a", "pass_rate": 0.5, "sessions": [
+                    {"id": "s_1", "flow_db": "/tmp/a1/.flux/flow.db", "task_id": "t/a"},
+                    {"id": "s_2", "flow_db": "/tmp/a2/.flux/flow.db", "task_id": "t/a"}
+                ]},
+                { "task_id": "t/b", "pass_rate": 0.0, "sessions": [] }
             ]
         });
-        let params = json!({ "report": report.to_string() });
-        let report_v = arg(&params, "report");
-        let cases = report_v.get("cases").and_then(|v| v.as_array()).unwrap();
+        let report_v = arg(&json!({ "report": report.to_string() }), "report");
+        let empty = Vec::new();
+        let cases = report_v
+            .get("cases")
+            .and_then(|v| v.as_array())
+            .unwrap_or(&empty);
         let refs: Vec<_> = cases
             .iter()
-            .filter_map(|c| {
-                let id = c.get("session_id").and_then(|v| v.as_str())?;
-                let db = c.get("flow_db").and_then(|v| v.as_str())?;
+            .filter_map(|c| c.get("sessions").and_then(|v| v.as_array()))
+            .flatten()
+            .filter_map(|s| {
+                let id = s.get("id").and_then(|v| v.as_str())?;
+                let db = s.get("flow_db").and_then(|v| v.as_str())?;
                 Some((id.to_string(), db.to_string()))
             })
             .collect();
-        assert_eq!(refs.len(), 1);
+        assert_eq!(refs.len(), 2);
         assert_eq!(refs[0].0, "s_1");
     }
 }

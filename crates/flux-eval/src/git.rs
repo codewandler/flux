@@ -30,9 +30,6 @@ const PROTECTED: &[&str] = &[
     "examples/improve.flux",
     "examples/eval-smoke.flux",
 ];
-/// Protected directories (for removing untracked files the worker may have added under them).
-const PROTECTED_DIRS: &[&str] = &["crates/flux-eval", "suites", "scripts", ".github"];
-
 fn is_protected(path: &str) -> bool {
     PROTECTED
         .iter()
@@ -244,27 +241,36 @@ impl Tool for GuardProtectedTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| Error::Other("guard_protected: snapshot has no `head`".to_string()))?;
 
-        // Detect protected-path changes (tracked diffs + untracked additions).
+        // Detect protected-path changes: tracked diffs (exist in `head` → restore via checkout) vs
+        // untracked additions (not in `head` → remove). Only touch paths that actually changed, so a
+        // missing protected path (e.g. no `.github` in this repo) is never a spurious pathspec error.
         let changed = git(ctx, &["diff", "--name-only", head]).await?;
         let untracked = git(ctx, &["ls-files", "--others", "--exclude-standard"]).await?;
-        let mut restored: Vec<String> = changed
+        let tracked: Vec<String> = changed
             .lines()
-            .chain(untracked.lines())
             .map(|s| s.trim().to_string())
             .filter(|p| !p.is_empty() && is_protected(p))
             .collect();
+        let added: Vec<String> = untracked
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|p| !p.is_empty() && is_protected(p))
+            .collect();
+        let mut restored: Vec<String> = tracked.iter().chain(added.iter()).cloned().collect();
         restored.sort();
         restored.dedup();
         let tampered = !restored.is_empty();
 
-        if tampered {
-            // Restore tracked protected paths to the snapshot, then remove any untracked files the
-            // worker added under protected dirs — pinning grader/suite/CI to the committed versions.
+        if !tracked.is_empty() {
+            // Restore modified/deleted protected files to the snapshot.
             let mut checkout: Vec<&str> = vec!["checkout", head, "--"];
-            checkout.extend(PROTECTED.iter().copied());
+            checkout.extend(tracked.iter().map(String::as_str));
             git(ctx, &checkout).await?;
+        }
+        if !added.is_empty() {
+            // Remove untracked files the worker added under protected paths.
             let mut clean: Vec<&str> = vec!["clean", "-fd", "--"];
-            clean.extend(PROTECTED_DIRS.iter().copied());
+            clean.extend(added.iter().map(String::as_str));
             git(ctx, &clean).await?;
         }
 

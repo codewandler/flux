@@ -31,6 +31,7 @@ pub mod painpoint;
 pub mod runner;
 pub mod score;
 pub mod spec;
+pub mod transcript;
 pub mod util;
 
 use std::sync::Arc;
@@ -46,7 +47,9 @@ pub fn register_eval_ops(registry: &mut ToolRegistry) {
     // Eval substrate.
     registry.register(Arc::new(ops::EvalRunTool));
     registry.register(Arc::new(ops::EvalSessionsTool));
+    registry.register(Arc::new(ops::SessionsDigestTool));
     registry.register(Arc::new(ops::PainpointsCollectTool));
+    registry.register(Arc::new(ops::ImproveLogTool));
     registry.register(Arc::new(ops::EvalAdoptTool));
     registry.register(Arc::new(ops::EvalScalarTool));
     registry.register(Arc::new(ops::ScoreCompareTool));

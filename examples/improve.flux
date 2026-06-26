@@ -10,7 +10,7 @@
         "kind": "call",
         "op": "eval_run",
         "args": [
-          { "kind": "lit", "value": { "adapter": "local", "dir": "suites", "flux_bin": "target/debug/flux" } }
+          { "kind": "lit", "value": { "adapter": "local", "dir": "suites", "flux_bin": "target/debug/flux", "trials": 3 } }
         ]
       }
     },
@@ -18,6 +18,11 @@
       "kind": "bind",
       "name": "sessions",
       "value": { "kind": "call", "op": "eval_sessions", "args": [ { "kind": "var", "name": "baseline" } ] }
+    },
+    {
+      "kind": "bind",
+      "name": "digest",
+      "value": { "kind": "call", "op": "sessions_digest", "args": [ { "kind": "var", "name": "sessions" } ] }
     },
     {
       "kind": "parallel",
@@ -36,7 +41,7 @@
               "op": "task",
               "args": [
                 { "kind": "lit", "value": "reviewer" },
-                { "kind": "lit", "value": "Review these flux eval results for failure modes and missing capabilities. Eval report (per-case pass/fail + metrics):\n{{baseline}}\n\nReturn ONLY a JSON array of findings." }
+                { "kind": "lit", "value": "Review these flux eval sessions for failure modes and missing capabilities. Each session is a transcript of the agent's operations (→ op, ✓ ok, ✗ error):\n{{digest}}\n\nReturn ONLY a JSON array of findings." }
               ]
             }
           ]
@@ -65,7 +70,7 @@
             "op": "task",
             "args": [
               { "kind": "lit", "value": "planner" },
-              { "kind": "lit", "value": "Turn these improvement candidates into a JSON array of concrete, safe, verifiable engineering tasks for the flux codebase. Candidates:\n{{candidates}}\n\nReturn ONLY the JSON array of tasks." }
+              { "kind": "lit", "value": "Turn these improvement candidates into AT MOST 2 concrete, small, safe, verifiable engineering tasks for the flux codebase (harness-level fixes: tool specs, tool output/views, system prompt, or a new tool). Do NOT touch crates/flux-eval, suites/, or CI. Candidates:\n{{candidates}}\n\nReturn ONLY the JSON array of tasks." }
             ]
           }
         },
@@ -77,7 +82,12 @@
         {
           "kind": "bind",
           "name": "implemented",
-          "value": { "kind": "call", "op": "change_implement", "args": [ { "kind": "var", "name": "tasks" } ] }
+          "value": { "kind": "call", "op": "change_implement", "args": [ { "kind": "var", "name": "tasks" }, { "kind": "lit", "value": 2 } ] }
+        },
+        {
+          "kind": "bind",
+          "name": "guard",
+          "value": { "kind": "call", "op": "guard_protected", "args": [ { "kind": "var", "name": "snapshot" } ] }
         },
         {
           "kind": "bind",
@@ -95,7 +105,7 @@
                 "kind": "call",
                 "op": "eval_run",
                 "args": [
-                  { "kind": "lit", "value": { "adapter": "local", "dir": "suites", "flux_bin": "target/debug/flux" } }
+                  { "kind": "lit", "value": { "adapter": "local", "dir": "suites", "flux_bin": "target/debug/flux", "trials": 3 } }
                 ]
               }
             },
@@ -128,6 +138,13 @@
           ],
           "otherwise": [
             { "kind": "call", "op": "git_revert", "args": [ { "kind": "var", "name": "snapshot" } ] }
+          ]
+        },
+        {
+          "kind": "call",
+          "op": "improve_log",
+          "args": [
+            { "kind": "lit", "value": { "guard": "{{guard}}", "gate": "{{gate}}", "tasks": "{{tasks}}" } }
           ]
         },
         {
