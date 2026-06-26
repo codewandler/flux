@@ -227,6 +227,7 @@ fn node_contains_return(node: &Node) -> bool {
         Node::Race { branches, .. } => branches.iter().any(|b| body_contains_return(&b.body)),
         Node::Throttle { body, .. } => body_contains_return(body),
         Node::Debounce { body, .. } => body_contains_return(body),
+        Node::Unless { body, .. } => body_contains_return(body),
         Node::Expr { .. } | Node::Fmt { .. } | Node::Jq { .. } => false,
         _ => false,
     }
@@ -298,6 +299,7 @@ mod tests {
                         args: vec![],
                     }],
                     collect: None,
+                    flat: false,
                 },
                 Node::Parallel {
                     branches: vec![Branch {
@@ -333,6 +335,41 @@ mod tests {
         };
         let diags = analyze_flow(&bad, &ops).unwrap_err();
         assert!(diags.iter().any(|d| d.message.contains("pipe")));
+    }
+
+    #[test]
+    fn analyze_rejects_parallel_return_inside_unless() {
+        use crate::ast::{Branch, DraftAst, Node};
+        let mut reg = ToolRegistry::new();
+        flux_tools::register_builtins(&mut reg);
+        let ops = OpRegistry::new(&reg);
+
+        // A `return` nested inside an `unless` body that lives inside a `parallel`
+        // branch must still be detected — the bug was that `node_contains_return`
+        // had no arm for `Node::Unless`, so it fell through to `_ => false`.
+        let bad = DraftAst {
+            body: vec![Node::Parallel {
+                branches: vec![Branch {
+                    name: "b".into(),
+                    body: vec![Node::Unless {
+                        cond: Box::new(Node::Lit {
+                            value: serde_json::json!(false),
+                        }),
+                        body: vec![Node::Return {
+                            value: Box::new(Node::Lit {
+                                value: serde_json::json!(1),
+                            }),
+                        }],
+                    }],
+                }],
+            }],
+            ..Default::default()
+        };
+        let diags = analyze_flow(&bad, &ops).unwrap_err();
+        assert!(
+            diags.iter().any(|d| d.message.contains("return")),
+            "a return nested inside unless inside a parallel branch must be rejected"
+        );
     }
 
     #[test]
