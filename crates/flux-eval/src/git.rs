@@ -19,15 +19,16 @@ use crate::util::{arg, json_result, str_field};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Paths the self-improvement loop must protect from the worker: the grader (`flux-eval`), the suite,
-/// the loop flows + scripts, and CI. If the worker could edit these it could "win" by gaming its own
-/// measurement. [`GuardProtectedTool`] restores them from the round snapshot before scoring.
+/// Paths the self-improvement loop must protect from the worker: the grader (`flux-eval`), the
+/// terminal-bench harness + sub-agent roles (`bench/`), the loop flows + scripts, and CI. If the
+/// worker could edit these it could "win" by gaming its own measurement. [`GuardProtectedTool`]
+/// restores them from the round snapshot before scoring.
 const PROTECTED: &[&str] = &[
     "crates/flux-eval",
-    "suites",
+    "bench",
     "scripts",
     ".github",
-    "examples/improve.flux",
+    "examples/improve-tbench.flux",
     "examples/eval-smoke.flux",
 ];
 fn is_protected(path: &str) -> bool {
@@ -307,19 +308,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guard_protected_restores_grader_and_suite_tampering() {
+    async fn guard_protected_restores_grader_and_loop_tampering() {
         let n = N.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("flux-guard-test-{}-{n}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(dir.join("crates/flux-eval/src")).unwrap();
-        std::fs::create_dir_all(dir.join("suites")).unwrap();
-        // A committed grader file + suite file + an unrelated source file.
+        std::fs::create_dir_all(dir.join("bench/agents")).unwrap();
+        // A committed grader file + loop-harness file + an unrelated source file.
         std::fs::write(
             dir.join("crates/flux-eval/src/score.rs"),
             "pub const A: u8 = 1;\n",
         )
         .unwrap();
-        std::fs::write(dir.join("suites/t.toml"), "id = \"t\"\n").unwrap();
+        std::fs::write(dir.join("bench/agents/worker.md"), "role: worker\n").unwrap();
         std::fs::write(dir.join("src.rs"), "fn main() {}\n").unwrap();
         sh(&dir, &["git", "init", "-q"]);
         sh(&dir, &["git", "config", "user.email", "a@b.c"]);
@@ -332,14 +333,14 @@ mod tests {
         )));
         let head = git(&ctx, &["rev-parse", "HEAD"]).await.unwrap();
 
-        // Worker "tampers": edits the grader + suite, adds an untracked grader file, and edits an
-        // allowed source file.
+        // Worker "tampers": edits the grader + loop harness, adds an untracked grader file, and edits
+        // an allowed source file.
         std::fs::write(
             dir.join("crates/flux-eval/src/score.rs"),
             "pub const A: u8 = 99;\n",
         )
         .unwrap();
-        std::fs::write(dir.join("suites/t.toml"), "id = \"gamed\"\n").unwrap();
+        std::fs::write(dir.join("bench/agents/worker.md"), "role: gamed\n").unwrap();
         std::fs::write(dir.join("crates/flux-eval/src/cheat.rs"), "// sneaky\n").unwrap();
         std::fs::write(dir.join("src.rs"), "fn main() { /* legit */ }\n").unwrap();
 
@@ -359,8 +360,8 @@ mod tests {
             "pub const A: u8 = 1;\n"
         );
         assert_eq!(
-            std::fs::read_to_string(dir.join("suites/t.toml")).unwrap(),
-            "id = \"t\"\n"
+            std::fs::read_to_string(dir.join("bench/agents/worker.md")).unwrap(),
+            "role: worker\n"
         );
         assert!(!dir.join("crates/flux-eval/src/cheat.rs").exists());
         // The allowed (non-protected) edit survives.

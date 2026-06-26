@@ -1,6 +1,6 @@
 //! Pin the checked-in example flows to the live op set: every op a flow calls must exist in a registry
 //! built from `register_builtins` + `register_eval_ops` + the `task` tool, and the AST must
-//! deserialize. This fails CI if `improve.flux` (or the smoke flow) drifts from the registered ops.
+//! deserialize. This fails CI if a checked-in flow drifts from the registered ops.
 
 use std::sync::Arc;
 
@@ -15,7 +15,6 @@ fn example_flows_validate_against_the_registry() {
     let ops = flux_flow::registry::OpRegistry::new(&reg);
 
     for path in [
-        "../../examples/improve.flux",
         "../../examples/improve-tbench.flux",
         "../../examples/eval-smoke.flux",
     ] {

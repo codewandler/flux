@@ -1,7 +1,7 @@
 //! `flux-eval` — flux's eval & self-improvement harness.
 //!
-//! This crate is the substrate behind `improve.flux`: it runs flux against benchmark tasks, mines
-//! the resulting sessions for pain-points, and scores suites — and it exposes those capabilities as
+//! This crate is the substrate behind the improve flows (`improve-tbench.flux`): it runs flux against benchmark tasks, mines
+//! the resulting sessions for pain-points, and scores the results — and it exposes those capabilities as
 //! Flux-Lang **ops** (`flux_runtime::Tool`s) so the self-improvement workflow can be authored as a
 //! Flux-Lang graph rather than a bespoke Rust program.
 //!
@@ -13,12 +13,12 @@
 //! ## Modules
 //! - [`spec`] — the normalized benchmark task format ([`spec::TaskSpec`] / [`spec::Criterion`]).
 //! - [`adapter`] — the [`adapter::BenchmarkAdapter`] trait the runner drives.
-//! - [`adapters`] — concrete adapters (`local`/`mock` now; terminal-bench + SWE-bench Lite at M5).
+//! - [`adapters`] — concrete adapters (offline `mock` fixture + `terminal-bench`; SWE-bench Lite later).
 //! - [`metrics`] — [`metrics::RunResult`] + post-hoc extraction from a run's session store.
 //! - [`score`] — [`score::SuiteScore`] + the lexicographic `is_better` comparison.
 //! - [`runner`] — run one local task (materialize workspace → run flux → grade criterion).
 //! - [`painpoint`] — deterministic pain-point mining over a session's message log.
-//! - [`ops`] — the Flux-Lang `Tool` wrappers `improve.flux` calls.
+//! - [`ops`] — the Flux-Lang `Tool` wrappers the improve flows call.
 
 pub mod adapter;
 pub mod adapters;
@@ -64,7 +64,7 @@ pub fn register_eval_ops(registry: &mut ToolRegistry) {
     registry.register(Arc::new(git::GitSnapshotTool));
     registry.register(Arc::new(git::GitTagTool));
     registry.register(Arc::new(git::GitRevertTool));
-    // Integrity: restore grader/suite/CI after the worker runs (anti-gaming).
+    // Integrity: restore grader/harness/CI after the worker runs (anti-gaming).
     registry.register(Arc::new(git::GuardProtectedTool));
 }
 
@@ -77,7 +77,7 @@ pub fn eval_group() -> flux_evidence::ToolGroup {
     register_eval_ops(&mut reg);
     flux_evidence::ToolGroup {
         name: "eval".into(),
-        description: "Evaluation & self-improvement operations (improve.flux).".into(),
+        description: "Evaluation & self-improvement operations (improve-tbench.flux).".into(),
         tools: reg.names(),
         surface_when: vec![flux_evidence::SignalMatch {
             kind: flux_evidence::KIND_SIGNAL.into(),

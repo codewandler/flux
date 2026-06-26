@@ -38,17 +38,16 @@ impl Tool for EvalRunTool {
             name: "eval_run".into(),
             description: "Run a benchmark suite against the flux binary and return a JSON report \
                           {adapter, pass_rate, scalar, total, passed, mean_*, cases:[…]}. \
-                          `adapter` is \"mock\" (offline, built-in) or \"local\" (load *.toml from \
-                          `dir`); external adapters land at M5."
+                          `adapter` is \"mock\" (offline test fixture) or \"terminal-bench\" (the real \
+                          Docker benchmark); swebench-lite lands later."
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "adapter": {"type": "string", "description": "mock | local | terminal-bench | swebench-lite"},
+                    "adapter": {"type": "string", "description": "mock | terminal-bench | swebench-lite"},
                     "tasks": {"type": "array", "items": {"type": "string"}, "description": "restrict to these task ids"},
                     "limit": {"type": "integer", "description": "cap the number of tasks (0 = all)"},
                     "model": {"type": "string", "description": "default model when a task doesn't override"},
-                    "dir": {"type": "string", "description": "suite directory for the `local` adapter"},
                     "flux_bin": {"type": "string", "description": "path to the flux binary under test (default: current binary)"}
                 },
                 "required": ["adapter"]
@@ -79,12 +78,6 @@ impl Tool for EvalRunTool {
 
         let adapter: Box<dyn BenchmarkAdapter> = match adapter_name.as_str() {
             "mock" => Box::new(LocalAdapter::mock()),
-            "local" => {
-                let dir = str_field(&params, "dir").ok_or_else(|| {
-                    Error::Other("eval_run: the `local` adapter requires a `dir`".to_string())
-                })?;
-                Box::new(LocalAdapter::from_dir("local", dir)?)
-            }
             "terminal-bench" => {
                 Box::new(crate::adapters::TerminalBenchAdapter::from_params(&params)?)
             }

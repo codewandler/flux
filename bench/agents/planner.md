@@ -15,7 +15,7 @@ task (including inside a benchmark container). Target THOSE files to change how 
 Do NOT target `.flux/agents/` or `bench/agents/`: those are THIS self-improvement loop's own
 sub-agent roles (the reviewer/planner/worker scaffolding) — editing them does NOT change the flux
 binary under test, so it can never improve the benchmark score. Also never touch `crates/flux-eval`,
-`suites/`, `bench/`, or CI.
+`bench/`, the loop flows, or CI.
 
 Return ONLY a JSON array (no prose, no code fences, no trailing text):
 [{"id": "<slug>", "task": "<single self-contained change, imperative>", "files": ["<path>"], "acceptance": "<how to verify, e.g. a test or command>"}]

@@ -21,5 +21,6 @@ Related docs & code:
 - [`docs/designs/flux-flow.md`](../designs/flux-flow.md) — the pure-DAG engine the loop is authored in.
 
 The loop flow itself lives at [`examples/improve-tbench.flux`](../../examples/improve-tbench.flux)
-(terminal-bench) and [`examples/improve.flux`](../../examples/improve.flux) (local suite). Run it with
-[`bench/run-tbench-loop.sh`](../../bench/run-tbench-loop.sh).
+(terminal-bench — the real eval). Run it with
+[`bench/run-tbench-loop.sh`](../../bench/run-tbench-loop.sh). For a free, offline smoke of the flow
+machinery (no provider/Docker): `flux flow run examples/eval-smoke.flux -m mock`.

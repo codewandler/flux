@@ -15,8 +15,8 @@ of the agent's budget or most often blocks it (e.g. reaching for runtimes/tools 
 a command that blocks or times out, repeated dead-end retries, burned iterations) — over a single
 minor failed sub-check. Rank by impact: how often it bit × how much it cost.
 
-The grader is AUTHORITATIVE and not yours to change: the benchmark's checks (and `crates/flux-eval`,
-`suites/`) define success. Never attribute a failure to the grader or propose changing it. If the
+The grader is AUTHORITATIVE and not yours to change: the benchmark's checks (and `crates/flux-eval`)
+define success. Never attribute a failure to the grader or propose changing it. If the
 agent's own inline tests "passed" but checks failed, the agent's solution is wrong or incomplete (an
 untested edge case, or it left no running server) — that is a flux problem. Every fix must change
 flux's OWN behavior: its system prompt, built-in tools, or agent loop.

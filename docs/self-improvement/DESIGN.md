@@ -34,7 +34,7 @@ in `crates/flux-eval/src/ops.rs`. A round runs:
  4. task("planner", …)       turn candidates into ≤2 concrete, small, safe code tasks
  5. git_snapshot             capture clean HEAD (refuses a dirty tree → round starts from known state)
  6. change_implement         a "worker" sub-agent implements the tasks (blast radius capped)
- 7. guard_protected          restore any tampered grader/suite/CI path (INTEGRITY)
+ 7. guard_protected          restore any tampered grader/harness/CI path (INTEGRITY)
  8. gate_check               cargo build · test · clippy · fmt --check — must be green to proceed
  9. eval_run (candidate)     rebuild the musl binary from candidate source, re-eval same subset
 10. score_compare            strict, lexicographic improvement?
@@ -58,7 +58,7 @@ recursion. That means integrity can't rely on the sub-agent being polite — it'
 paths** before the candidate is ever graded:
 
 ```
-crates/flux-eval   suites/   bench/   scripts/   .github/   the loop flows
+crates/flux-eval   bench/   scripts/   .github/   examples/improve-tbench.flux   examples/eval-smoke.flux
 ```
 
 A worker that edits the grader has its edit reverted, not rewarded. This fired live: in an early run
@@ -80,9 +80,9 @@ it — and `guard_protected` rolled it back before the candidate eval, so the ta
 
 - The **planner** is instructed to target flux's *shipped* harness (its system prompt
   `crates/flux-agent/src/lib.rs`, its built-in tools `crates/flux-tools`, its agent loop
-  `crates/flux-agent`) and explicitly **not** to touch `crates/flux-eval`, `suites/`, `bench/`, or CI —
-  nor the loop's own `.flux/agents/` / `bench/agents/` roles (editing those changes the scaffolding,
-  not the binary under test, so it could never legitimately move the score).
+  `crates/flux-agent`) and explicitly **not** to touch `crates/flux-eval`, `bench/`, the loop flows,
+  or CI — nor the loop's own `.flux/agents/` / `bench/agents/` roles (editing those changes the
+  scaffolding, not the binary under test, so it could never legitimately move the score).
 - The **reviewer** works only from the report + the in-container transcript + its own knowledge — it
   never reads or edits the benchmark — so its fixes target real harness friction.
 - PROTECTED (above) is the backstop if either sub-agent strays.
@@ -119,14 +119,15 @@ Three roles, tracked in `bench/agents/` and seeded into the worktree's `.flux/ag
 
 A `BenchmarkAdapter` trait keeps benchmarks behind one seam:
 
-- **local** — task specs in `suites/`, graded by `cargo test` / file checks, run in-process via
-  flux-flow (so the RunEvent trace is available for deterministic mining via `painpoints_collect`).
-- **terminal-bench** — shells out to `tb run` with flux as a custom agent
+- **terminal-bench** (the real eval) — shells out to `tb run` with flux as a custom agent
   (`bench/terminal_bench/flux_agent.py`); a static musl flux binary is installed into each task
   container, and `prepare()` rebuilds it from the *candidate* source so the eval measures the worker's
   edits. The in-container session is recorded (asciinema casts), and the tail of `agent.cast` is fed
   back to the reviewer as the per-case transcript. Grading is terminal-bench's own (authoritative).
-- **mock** — offline, deterministic; used by tests and `examples/eval-smoke.flux -m mock`.
+- **mock** — an offline, deterministic CI fixture (`LocalAdapter::mock`); used by tests and
+  `examples/eval-smoke.flux -m mock` to exercise the loop machinery with no provider or Docker. It is
+  **not** a benchmark — just the offline smoke slice.
+- **SWE-bench Lite** — a future real adapter behind the same trait.
 
 ## Auditability & observation
 
@@ -149,38 +150,28 @@ Observation tooling (in `bench/`, no extra deps):
 - **`bench/replay-agent.sh`** — after a run, replays any saved `agent.cast` / `tests.cast` (via
   `asciinema play`, or by decoding the cast with python3 — no asciinema needed).
 
-## Two loops: local and terminal-bench
+## The loop + the offline smoke
 
-The same machinery (same ops, same invariants, same keep/revert logic) runs in two configurations,
-each with its own flow file and runner script:
+There is one real self-improvement loop — **terminal-bench** (`examples/improve-tbench.flux`, runner
+`bench/run-tbench-loop.sh`). For free, provider-less, Docker-less validation of the *flow machinery*
+(op wiring, mining, aggregation), there is a mock smoke:
+`flux flow run examples/eval-smoke.flux -m mock`. The smoke is a CI fixture, not an evaluation.
 
-| | **Local** | **Terminal-bench** |
-|---|---|---|
-| Flow | `examples/improve.flux` | `examples/improve-tbench.flux` |
-| Runner | `scripts/improve.sh` | `bench/run-tbench-loop.sh` |
-| Tasks | `suites/` (specs graded by `cargo test` / file checks) | tb tasks in Docker, tb's own grader |
-| Execution | in-process via flux-flow | shelled out to `tb run` per task |
-| Network | offline-capable (model aside) | needs Docker + the tb dataset |
-| Mining | **deterministic** `painpoints_collect` over the RunEvent trace **and** LLM review | LLM review over the per-case transcript (RunEvent trace is stuck in the container) |
-| Tag | `improve-<score>-<sha>` | `improve-tbench-<score>` |
-
-Use the **local** loop for fast, cheap iteration on the machinery itself; use **terminal-bench** for
-realistic, container-isolated proof. A mock smoke test needs no provider and no Docker:
-`flux flow run examples/eval-smoke.flux -m mock`.
+(There is no toy "local suite" loop — the former `suites/` + `examples/improve.flux` +
+`scripts/improve.sh` were removed; real benchmarks go through adapters, not checked-in TOML tasks.)
 
 ## Running it
 
 ```sh
-bash bench/run-tbench-loop.sh   # terminal-bench
-bash scripts/improve.sh         # local suite
+bash bench/run-tbench-loop.sh                    # the real self-improvement loop (terminal-bench)
+flux flow run examples/eval-smoke.flux -m mock   # offline smoke of the flow machinery (no provider/Docker)
 ```
 
-Both create an isolated worktree from HEAD on a dedicated branch (`improve-tbench/<ts>` or
-`improve/<ts>`), seed the sub-agent roles, build flux, and run the flow. `main` is never touched; the
-worktree is left in place for inspection (the script prints the discard command). Both refuse to start
-on a dirty tree, and both put `HOME` **outside** the worktree (or in a dedicated `.improve-home`) so
-`git_snapshot` always sees a clean tree — untracked files inside the worktree would make a round refuse
-to start.
+`run-tbench-loop.sh` creates an isolated worktree from HEAD on a dedicated branch
+(`improve-tbench/<ts>`), seeds the sub-agent roles, builds flux, and runs the flow. `main` is never
+touched; the worktree is left in place for inspection (the script prints the discard command). It
+refuses to start on a dirty tree, and it puts `HOME` **outside** the worktree so `git_snapshot` always
+sees a clean tree — untracked files inside the worktree would make a round refuse to start.
 
 **Requires:** a provider key (`ANTHROPIC_API_KEY` or `flux auth login`). Terminal-bench additionally
 needs `tb` on PATH, Docker, and the `x86_64-unknown-linux-musl` target.
@@ -215,13 +206,13 @@ The loop is implemented in the L3 crate `flux-eval`, driven by the flux-flow eng
 - `crates/flux-eval/src/score.rs` — `SuiteScore`, the lexicographic comparison, partial credit.
 - `crates/flux-eval/src/metrics.rs` — `RunResult` / `CaseOutcome` (pass, sub-checks, transcript).
 - `crates/flux-eval/src/adapter.rs` — the `BenchmarkAdapter` trait.
-- `crates/flux-eval/src/adapters/{local,terminal_bench,mock}.rs` — the three adapters. The
-  terminal-bench adapter's `prepare()` rebuilds the static musl binary from *candidate* source so the
-  eval measures the worker's edits.
+- `crates/flux-eval/src/adapters/{local,terminal_bench}.rs` — `local.rs` is the offline `mock`
+  fixture; `terminal_bench.rs` is the real adapter, whose `prepare()` rebuilds the static musl binary
+  from *candidate* source so the eval measures the worker's edits.
 - `bench/terminal_bench/flux_agent.py` — the terminal-bench custom-agent shim.
 - `crates/flux-agent/src/lib.rs` — flux's shipped `DEFAULT_SYSTEM_PROMPT` (a frequent, legitimate
   improvement target); `crates/flux-tools` — its built-in tools.
-- Loop flows: `examples/improve-tbench.flux` (terminal-bench), `examples/improve.flux` (local).
+- Loop flow: `examples/improve-tbench.flux`. Offline smoke: `examples/eval-smoke.flux`.
   Sub-agent roles: `bench/agents/` (tracked) → seeded into `.flux/agents/` (gitignored) by the runner.
 
 The local implementation plan lives under `.flux/plans/` (gitignored).

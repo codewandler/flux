@@ -62,7 +62,7 @@
             "op": "task",
             "args": [
               { "kind": "lit", "value": "planner" },
-              { "kind": "lit", "value": "Turn these flux-harness improvement candidates into AT MOST 2 concrete, small, safe engineering tasks for the flux codebase (tool specs, tool output/views, system prompt, a new tool, or an agent-loop efficiency fix). Do NOT touch crates/flux-eval, suites/, bench/, or CI. Candidates:\n{{candidates}}\n\nReturn ONLY the JSON array of tasks." }
+              { "kind": "lit", "value": "Turn these flux-harness improvement candidates into AT MOST 2 concrete, small, safe engineering tasks for the flux codebase (tool specs, tool output/views, system prompt, a new tool, or an agent-loop efficiency fix). Do NOT touch crates/flux-eval, bench/, the loop flows, or CI. Candidates:\n{{candidates}}\n\nReturn ONLY the JSON array of tasks." }
             ]
           }
         },

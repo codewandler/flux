@@ -518,7 +518,7 @@ async fn build_agent(cli: &Cli) -> Result<(FlowEngine, String, Arc<dyn flux_runt
     }
     registry.register(Arc::new(TaskTool));
 
-    // Eval / self-improvement ops (the ones `improve.flux` orchestrates). Registered on the
+    // Eval / self-improvement ops (the ones the improve flows orchestrate). Registered on the
     // top-level registry only — never on `sub_registry`, so worker sub-agents can't run eval/git ops.
     flux_eval::register_eval_ops(&mut registry);
 
@@ -689,7 +689,7 @@ async fn run_agentic(cli: &Cli, prompt: String) -> Result<()> {
 
 /// `flux flow run <file.flux> [--yes] [-m <model>]` — load a checked-in Flux-Lang graph (JSON
 /// `DraftAst`) and execute it directly, **skipping the NL→plan compile**. This is the thin slice of
-/// flow persistence that makes `improve.flux` runnable; full `.flux/flows` save/load is flux-flow M6.
+/// flow persistence that makes the improve flows runnable; full `.flux/flows` save/load is flux-flow M6.
 /// The file is validated against the live op registry (`analyze_flow`) before anything runs, and it
 /// executes through the same `Executor::dispatch` envelope as every other turn (destructive ops still
 /// escalate; `--yes` auto-approves).

@@ -1,8 +1,8 @@
-//! The `local` adapter: a set of [`TaskSpec`]s run by driving flux in a temp workspace.
+//! The offline `mock` adapter: a set of [`TaskSpec`]s run by driving flux in a temp workspace.
 //!
 //! Its built-in `mock` suite ([`LocalAdapter::mock`]) needs no network or credentials — it drives the
-//! offline `-m mock` provider — so the whole eval/improvement loop has a CI-able, deterministic
-//! offline slice. Real local suites load from a directory of TOML task files ([`LocalAdapter::from_dir`]).
+//! offline `-m mock` provider — so the eval/improvement machinery has a CI-able, deterministic offline
+//! slice (`examples/eval-smoke.flux`). Real benchmarks run through the terminal-bench adapter.
 
 use async_trait::async_trait;
 
@@ -26,30 +26,6 @@ impl LocalAdapter {
             name: name.into(),
             tasks,
         }
-    }
-
-    /// Load a suite from a directory of `*.toml` task files (recursively).
-    pub fn from_dir(name: impl Into<String>, dir: impl AsRef<std::path::Path>) -> Result<Self> {
-        let mut tasks = Vec::new();
-        let mut stack = vec![dir.as_ref().to_path_buf()];
-        while let Some(d) = stack.pop() {
-            let rd = std::fs::read_dir(&d)
-                .map_err(|e| Error::Other(format!("read suite dir {}: {e}", d.display())))?;
-            for entry in rd {
-                let path = entry.map_err(|e| Error::Other(e.to_string()))?.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.extension().and_then(|s| s.to_str()) == Some("toml") {
-                    let txt = std::fs::read_to_string(&path)
-                        .map_err(|e| Error::Other(format!("read {}: {e}", path.display())))?;
-                    let spec: TaskSpec = toml::from_str(&txt)
-                        .map_err(|e| Error::Other(format!("parse {}: {e}", path.display())))?;
-                    tasks.push(spec);
-                }
-            }
-        }
-        tasks.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(Self::new(name, tasks))
     }
 
     /// The built-in offline suite (drives `-m mock`; no network). Two passing tasks and one
@@ -175,20 +151,6 @@ mod tests {
         assert_eq!(ids.len(), 4);
         assert!(ids.contains(&"mock/write-file".to_string()));
         assert!(ids.contains(&"mock/bash-fail".to_string()));
-    }
-
-    #[test]
-    fn checked_in_suite_parses() {
-        // The repo's `suites/` must load (every task TOML parses). Path is relative to the crate dir.
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../suites");
-        let suite =
-            LocalAdapter::from_dir("local", &dir).unwrap_or_else(|e| panic!("load suites/: {e}"));
-        let ids = suite.list_tasks(&Filter::default()).unwrap();
-        assert!(
-            ids.iter().any(|id| id == "coding/fix-add"),
-            "expected coding/fix-add in {ids:?}"
-        );
-        assert!(ids.iter().any(|id| id == "shell/count-todos"));
     }
 
     #[test]

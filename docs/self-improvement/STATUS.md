@@ -37,9 +37,9 @@ What's been built, so a continuer knows the terrain. All landed on `main` unless
   the mock adapter, and `flux-cli --output json` + `flow run <file>`.
 - **M2 — mining substrate.** flux-flow Usage capture + deterministic pain-point mining
   (`painpoints_collect`). _Token/cost capture is only partly done — see [Known gaps](#known-gaps), #12._
-- **M3 — review → aggregate → derive.** Authored `improve.flux` + a fixture test that validates the
-  flow.
-- **M4 — keep/commit loop.** The loop ops (`git_*`, `gate_check`, `score_compare`) + `scripts/improve.sh`
+- **M3 — review → aggregate → derive.** Authored the review→aggregate→derive flow + a fixture test
+  that validates the checked-in flows against the live op set.
+- **M4 — keep/commit loop.** The loop ops (`git_*`, `gate_check`, `score_compare`) + the runner script
   + the safety model (dirty-tree refusal, isolated worktree, revert only at top level).
 - **M5a — terminal-bench integration.** `tb` install + custom-agent API pin, the Python shim, the
   static musl binary, the `TerminalBenchAdapter`, a one-task Docker smoke, and headroom confirmed
@@ -50,9 +50,14 @@ What's been built, so a continuer knows the terrain. All landed on `main` unless
 - **Phase B — validity.** Multi-trial eval + strict keep margin.
 - **Phase C — signal + audit.** Transcript-fed review + per-round `improve-log.jsonl`. _(Token/cost
   signal deferred to #12.)_
-- **Phase D — breadth + docs.** Minimal suite breadth, tracked sub-agent roles, design docs.
+- **Phase D — roles + docs.** Tracked sub-agent roles + design docs. (The "suite breadth" of this
+  phase was the toy local suites, since removed — see below.)
 - **Phase E — live validation.** The runs in the journey below; bugs found + fixed.
 - **Partial credit + trials=2 + the kept-gain proof run** — the most recent work (below).
+- **Removed the toy local-suite path** — deleted `suites/`, `examples/improve.flux`, and
+  `scripts/improve.sh`. Terminal-bench is now the single real eval; the `mock` adapter remains only as
+  the offline smoke fixture (`examples/eval-smoke.flux`). `PROTECTED` was corrected to guard the real
+  loop (`bench/`, `examples/improve-tbench.flux`) instead of the deleted toy paths.
 
 The open chapters are in [Known gaps](#known-gaps) and [Suggested next steps](#suggested-next-steps).
 
@@ -176,8 +181,9 @@ was valid and the revert was correct — the loop did not reward a plausible-but
 - **In-container metrics.** flux's RunEvent trace lives inside the container, so `mean_iterations` /
   `mean_tokens` read 0 for terminal-bench; extract `~/.flux/flow.db` from the container for
   deterministic mining.
-- **Breadth.** More local suites and a larger terminal-bench subset; a held-out scoring slice to guard
-  against overfitting the chosen tasks. A SWE-bench Lite adapter behind the same trait.
+- **Breadth.** A larger terminal-bench subset and a second real benchmark (SWE-bench Lite behind the
+  same `BenchmarkAdapter` trait); a held-out scoring slice to guard against overfitting the chosen
+  tasks.
 
 ## Suggested next steps
 
