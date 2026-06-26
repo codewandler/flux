@@ -577,6 +577,93 @@ settled. In a single sequential flow it acts as a fixed delay before the body.
 
 ---
 
+## Guard nodes
+
+### `unless`
+
+Negated conditional: run `body` only when `cond` is falsey. Sugar for `when !cond`;
+the body may contain **any** nodes — reads, writes, sub-agents, nested control flow.
+
+```json
+{"kind": "unless",
+ "cond": {"kind": "var", "name": "already_done"},
+ "body": [
+   {"kind": "call", "op": "bash", "args": [{"kind": "lit", "value": "make build"}]}
+ ]}
+```
+
+**Fields**
+
+| field | type | required | description |
+|---|---|---|---|
+| `cond` | Node | yes | any expression — the body runs when this is falsey |
+| `body` | Node[] | no | any nodes to run when condition is falsey |
+
+Identical truthiness rules as `when` (see below). Prefer `unless` over `when` with an
+empty `then` for readability.
+
+---
+
+### `verify`
+
+Self-checking primitive: run `cmd` (any node that produces a string — typically a
+`bash` call), then check that its output contains the `expect` pattern. If the check
+fails the flow aborts with a structured error. Use this after edits or builds to
+guard against silent failures.
+
+```json
+{"kind": "verify",
+ "cmd": {"kind": "call", "op": "bash", "args": [{"kind": "lit", "value": "cargo build --workspace 2>&1"}]},
+ "expect": {"kind": "lit", "value": "Compiling"},
+ "message": "cargo build failed"}
+```
+
+**Fields**
+
+| field | type | required | description |
+|---|---|---|---|
+| `cmd` | Node | yes | any node producing a string; typically a `bash` call |
+| `expect` | Node | yes | substring (or regex) the output must contain |
+| `message` | string | no | human-readable error shown on failure |
+
+The check is a substring/regex search in the command's output. If `expect` is not
+found the flow aborts with `"verify failed: {message — expected '{pattern}', got '{output}'}"`.
+Wrap `verify` in a `try` if you want to handle failure gracefully rather than aborting.
+
+---
+
+### `peek`
+
+Read the current in-session value of a named symbol without any filesystem IO. Returns
+the symbol's stored value if bound, or an empty string if not yet bound. Use with
+`when`/`unless` to branch on whether prior work was already done in this session.
+
+```json
+{"kind": "peek", "name": "survey"}
+```
+
+**Fields**
+
+| field | type | required | description |
+|---|---|---|---|
+| `name` | string | yes | the symbol name to look up (no leading `$`) |
+
+Pairs naturally with `unless` for "skip if already computed" patterns:
+
+```json
+{"kind": "unless",
+ "cond": {"kind": "peek", "name": "survey"},
+ "body": [
+   {"kind": "bind", "name": "survey",
+    "value": {"kind": "call", "op": "read", "args": [{"kind": "lit", "value": "big.log"}]}}
+ ]}
+```
+
+Note: for caching expensive work **across turns**, prefer `memo` — it uses the session
+store and survives turn boundaries. `peek` is for within-plan conditional checks.
+
+---
+
 ## Cross-turn suspend node
 
 ### `await`
@@ -616,9 +703,10 @@ optional arguments are in `[brackets]`.
 | `search` | `query[, limit]` | Low | Search the indexed datasource |
 | `web_fetch` | `url` | Low | Fetch an HTTP(S) URL |
 | `write` | `path, content` | Medium | Write (create/overwrite) a file |
-| `edit` | `path, old_string, new_string[, replace_all]` | Medium | Replace a string in a file (must match exactly once unless `replace_all`) |
-| `patch` | `path, edits` | Medium | Apply multiple line-anchored edits in one call |
-| `append` | `path, content` | Low | Append to a file |
+| `edit` | `path, old_string, new_string[, replace_all]` | Medium | Replace a string in a file (must match exactly once unless `replace_all`); if the exact text isn't found, progressively looser matching is tried (trailing whitespace → indentation drift → first/last-line anchor) and the result reports which strategy matched |
+| `patch` | `path, edits` | Medium | Apply several line-anchored edits in one call; each edit is `{op, line, end_line?, text?}` where op is `insert_before`, `insert_after`, `replace_range`, or `delete_range`; ALL line numbers refer to the original file |
+| `append` | `path, content` | Low | Append to a file (creates it and parent dirs if absent); lower-risk than `write` |
+| `read_many` | `paths` | Low | Read several files at once (each section headed `==> path <==`); prefer single `read` when you need to embed a file's text into a later string |
 | `task` | `role, task` | Medium | Delegate to a sub-agent role |
 | `bash` | `command[, timeout_secs]` | High | Run a shell command |
 
