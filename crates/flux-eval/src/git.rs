@@ -313,14 +313,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("flux-guard-test-{}-{n}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(dir.join("crates/flux-eval/src")).unwrap();
-        std::fs::create_dir_all(dir.join("bench/agents")).unwrap();
+        std::fs::create_dir_all(dir.join("bench")).unwrap();
         // A committed grader file + loop-harness file + an unrelated source file.
         std::fs::write(
             dir.join("crates/flux-eval/src/score.rs"),
             "pub const A: u8 = 1;\n",
         )
         .unwrap();
-        std::fs::write(dir.join("bench/agents/worker.md"), "role: worker\n").unwrap();
+        std::fs::write(dir.join("bench/run-tbench-loop.sh"), "echo run\n").unwrap();
         std::fs::write(dir.join("src.rs"), "fn main() {}\n").unwrap();
         sh(&dir, &["git", "init", "-q"]);
         sh(&dir, &["git", "config", "user.email", "a@b.c"]);
@@ -340,7 +340,7 @@ mod tests {
             "pub const A: u8 = 99;\n",
         )
         .unwrap();
-        std::fs::write(dir.join("bench/agents/worker.md"), "role: gamed\n").unwrap();
+        std::fs::write(dir.join("bench/run-tbench-loop.sh"), "echo gamed\n").unwrap();
         std::fs::write(dir.join("crates/flux-eval/src/cheat.rs"), "// sneaky\n").unwrap();
         std::fs::write(dir.join("src.rs"), "fn main() { /* legit */ }\n").unwrap();
 
@@ -360,8 +360,8 @@ mod tests {
             "pub const A: u8 = 1;\n"
         );
         assert_eq!(
-            std::fs::read_to_string(dir.join("bench/agents/worker.md")).unwrap(),
-            "role: worker\n"
+            std::fs::read_to_string(dir.join("bench/run-tbench-loop.sh")).unwrap(),
+            "echo run\n"
         );
         assert!(!dir.join("crates/flux-eval/src/cheat.rs").exists());
         // The allowed (non-protected) edit survives.

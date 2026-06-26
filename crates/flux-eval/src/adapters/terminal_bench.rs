@@ -1,6 +1,6 @@
 //! The `terminal-bench` adapter: real headroom for the self-improvement loop.
 //!
-//! flux is registered as a terminal-bench *custom agent* ([`bench/terminal_bench/flux_agent.py`]),
+//! flux is registered as a terminal-bench *custom agent* ([`crates/flux-eval/terminal_bench/flux_agent.py`]),
 //! and `tb run` drives the Docker containers + grades (authoritative). This adapter shells out to
 //! `tb run` for one task (one attempt) and parses its `results.json` into a [`RunResult`], so the
 //! existing trials → [`CaseOutcome`](crate::metrics::CaseOutcome) → score path is unchanged.
@@ -73,7 +73,7 @@ impl TerminalBenchAdapter {
                 .unwrap_or("flux_agent:FluxAgent")
                 .to_string(),
             pythonpath: str_field(params, "pythonpath")
-                .unwrap_or("bench/terminal_bench")
+                .unwrap_or("crates/flux-eval/terminal_bench")
                 .to_string(),
             timeout_secs: params
                 .get("timeout_secs")

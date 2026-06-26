@@ -22,10 +22,10 @@ echo "→ worktree $wt on $branch (from HEAD)"
 git worktree add -b "$branch" "$wt" HEAD
 
 # Seed curated sub-agent roles into the worktree's runtime location (flux reads .flux/agents/).
-# bench/agents/ is tracked, so this works from a clean clone; .flux/agents/ (gitignored) overrides
-# for local experiments.
+# crates/flux-eval/agents/ is tracked, so this works from a clean clone; .flux/agents/ (gitignored)
+# overrides for local experiments.
 mkdir -p "$wt/.flux/agents"
-[ -d bench/agents ] && cp bench/agents/*.md "$wt/.flux/agents/" 2>/dev/null || true
+[ -d crates/flux-eval/agents ] && cp crates/flux-eval/agents/*.md "$wt/.flux/agents/" 2>/dev/null || true
 [ -d .flux/agents ] && cp .flux/agents/*.md "$wt/.flux/agents/" 2>/dev/null || true
 
 export PATH="$HOME/.local/bin:$PATH"                 # tb / uv tools

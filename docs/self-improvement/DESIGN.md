@@ -81,7 +81,7 @@ it — and `guard_protected` rolled it back before the candidate eval, so the ta
 - The **planner** is instructed to target flux's *shipped* harness (its system prompt
   `crates/flux-agent/src/lib.rs`, its built-in tools `crates/flux-tools`, its agent loop
   `crates/flux-agent`) and explicitly **not** to touch `crates/flux-eval`, `bench/`, the loop flows,
-  or CI — nor the loop's own `.flux/agents/` / `bench/agents/` roles (editing those changes the
+  or CI — nor the loop's own `.flux/agents/` / `crates/flux-eval/agents/` roles (editing those changes the
   scaffolding, not the binary under test, so it could never legitimately move the score).
 - The **reviewer** works only from the report + the in-container transcript + its own knowledge — it
   never reads or edits the benchmark — so its fixes target real harness friction.
@@ -103,7 +103,7 @@ actually drove the keep. See STATUS → known gaps.
 
 ## The sub-agent roles
 
-Three roles, tracked in `bench/agents/` and seeded into the worktree's `.flux/agents/` by the runner
+Three roles, tracked in `crates/flux-eval/agents/` and seeded into the worktree's `.flux/agents/` by the runner
 (the gitignored `.flux/agents/` overrides for local experiments):
 
 - **reviewer** (`tools: []`) — reasons *only* from the eval report + per-case transcript handed to it
@@ -120,7 +120,7 @@ Three roles, tracked in `bench/agents/` and seeded into the worktree's `.flux/ag
 A `BenchmarkAdapter` trait keeps benchmarks behind one seam:
 
 - **terminal-bench** (the real eval) — shells out to `tb run` with flux as a custom agent
-  (`bench/terminal_bench/flux_agent.py`); a static musl flux binary is installed into each task
+  (`crates/flux-eval/terminal_bench/flux_agent.py`); a static musl flux binary is installed into each task
   container, and `prepare()` rebuilds it from the *candidate* source so the eval measures the worker's
   edits. The in-container session is recorded (asciinema casts), and the tail of `agent.cast` is fed
   back to the reviewer as the per-case transcript. Grading is terminal-bench's own (authoritative).
@@ -183,8 +183,8 @@ on hard tasks is not guaranteed — a correct revert is a successful run of the 
 - **Install:** terminal-bench's `tb` CLI (via `uv`/`pip`); dataset pinned to
   `terminal-bench-core==0.1.1` in the flow.
 - **flux as a custom agent:** `tb run --agent-import-path flux_agent:FluxAgent`. The shim
-  `bench/terminal_bench/flux_agent.py` (imported via `PYTHONPATH`) copies the static flux binary into
-  each task container in `perform_task`; `bench/terminal_bench/flux-setup.sh` then verifies it
+  `crates/flux-eval/terminal_bench/flux_agent.py` (imported via `PYTHONPATH`) copies the static flux binary
+  into each task container in `perform_task`; `crates/flux-eval/terminal_bench/flux-setup.sh` then verifies it
   (`flux --version`, emitting `INSTALL_FAIL_STATUS` on failure, which tb treats as an install failure).
 - **The binary:** the portable build is the static musl one,
   `target/x86_64-unknown-linux-musl/release/flux` (`cargo build --release --target
@@ -209,10 +209,10 @@ The loop is implemented in the L3 crate `flux-eval`, driven by the flux-flow eng
 - `crates/flux-eval/src/adapters/{local,terminal_bench}.rs` — `local.rs` is the offline `mock`
   fixture; `terminal_bench.rs` is the real adapter, whose `prepare()` rebuilds the static musl binary
   from *candidate* source so the eval measures the worker's edits.
-- `bench/terminal_bench/flux_agent.py` — the terminal-bench custom-agent shim.
+- `crates/flux-eval/terminal_bench/flux_agent.py` — the terminal-bench custom-agent shim (+ `flux-setup.sh`).
 - `crates/flux-agent/src/lib.rs` — flux's shipped `DEFAULT_SYSTEM_PROMPT` (a frequent, legitimate
   improvement target); `crates/flux-tools` — its built-in tools.
 - Loop flow: `examples/improve-tbench.flux`. Offline smoke: `examples/eval-smoke.flux`.
-  Sub-agent roles: `bench/agents/` (tracked) → seeded into `.flux/agents/` (gitignored) by the runner.
+  Sub-agent roles: `crates/flux-eval/agents/` (tracked) → seeded into `.flux/agents/` (gitignored) by the runner.
 
 The local implementation plan lives under `.flux/plans/` (gitignored).

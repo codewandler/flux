@@ -12,7 +12,7 @@ task (including inside a benchmark container). Target THOSE files to change how 
 - its built-in tools and their specs/output — `crates/flux-tools`;
 - its agent loop — `crates/flux-agent`.
 
-Do NOT target `.flux/agents/` or `bench/agents/`: those are THIS self-improvement loop's own
+Do NOT target `.flux/agents/` or `crates/flux-eval/agents/`: those are THIS self-improvement loop's own
 sub-agent roles (the reviewer/planner/worker scaffolding) — editing them does NOT change the flux
 binary under test, so it can never improve the benchmark score. Also never touch `crates/flux-eval`,
 `bench/`, the loop flows, or CI.

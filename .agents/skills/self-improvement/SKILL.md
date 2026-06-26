@@ -98,8 +98,8 @@ environment & integration".
   `scripts/`, `.github/`, `examples/improve-tbench.flux`, and `examples/eval-smoke.flux` are restored
   by `guard_protected` if touched (see the `PROTECTED` list in `crates/flux-eval/src/git.rs`). To
   *improve flux*, change its **shipped harness**: `crates/flux-agent` (`DEFAULT_SYSTEM_PROMPT`),
-  `crates/flux-tools`, the agent loop. Do **not** "improve" `.flux/agents/` or `bench/agents/` — those
-  are the loop's own scaffolding and editing them can't move the real score.
+  `crates/flux-tools`, the agent loop. Do **not** "improve" `.flux/agents/` or `crates/flux-eval/agents/` —
+  those are the loop's own scaffolding and editing them can't move the real score.
 - **The `task` tool is excluded from sub-agent registries** to prevent unbounded recursion. If you add
   or rewire sub-agents, keep it that way.
 - **The tag scalar is cosmetic-buggy:** `round(pass_rate*1000)`, so a partial-credit-only gain tags as
@@ -124,7 +124,7 @@ held-out slice, a SWE-bench Lite adapter behind the same `BenchmarkAdapter` trai
 - Loop ops: `crates/flux-eval/src/ops.rs` · scoring: `score.rs` · adapters: `adapters/{local,terminal_bench}.rs` (`local.rs` = offline mock fixture)
 - Flow: `examples/improve-tbench.flux` (the real loop) · offline smoke: `examples/eval-smoke.flux`
 - Runner: `bench/run-tbench-loop.sh` · observe: `bench/watch-agent.sh`, `bench/replay-agent.sh`
-- Sub-agent roles: `bench/agents/{reviewer,planner,worker}.md` (tracked) → seeded into `.flux/agents/`
+- Sub-agent roles: `crates/flux-eval/agents/{reviewer,planner,worker}.md` (tracked) → seeded into `.flux/agents/`
 - Improvement target: `crates/flux-agent/src/lib.rs` (`DEFAULT_SYSTEM_PROMPT`), `crates/flux-tools`
 - Audit: `<home>/.flux/eval/improve-log.jsonl`, git tags `improve-*`, asciinema casts, `flow.db` trace
 - Reference example of a real kept gain: commit `3c86874` on branch `improve-tbench/20260626-203839`

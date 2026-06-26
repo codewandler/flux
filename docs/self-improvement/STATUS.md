@@ -144,7 +144,7 @@ was valid and the revert was correct — the loop did not reward a plausible-but
   progress instead of only binary pass/fail (`2199477`).
 - **trials = 2** in `improve-tbench.flux`, plus a **per-decision audit log** appended to
   `.flux/eval/improve-log.jsonl` each round (`81fe021`).
-- **Tracked sub-agent roles** in `bench/agents/`, seeded into the worktree by the runner (`4930bf9`).
+- **Tracked sub-agent roles** in `crates/flux-eval/agents/`, seeded into the worktree by the runner (`4930bf9`).
 - **Observability** — `bench/watch-agent.sh` (live in-container pane) + `bench/replay-agent.sh`
   (asciinema cast replay, no API) (`7499649`).
 - **Design docs** — first written as `docs/designs/flux-eval.md` (`4930bf9`), now consolidated into
