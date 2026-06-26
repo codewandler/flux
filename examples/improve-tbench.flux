@@ -13,7 +13,7 @@
           { "kind": "lit", "value": {
             "adapter": "terminal-bench",
             "tasks": ["chess-best-move", "fibonacci-server"],
-            "trials": 1,
+            "trials": 2,
             "dataset": "terminal-bench-core==0.1.1",
             "model": "anthropic/claude-sonnet-4-6",
             "flux_binary": "target/x86_64-unknown-linux-musl/release/flux",
@@ -25,13 +25,18 @@
     },
     {
       "kind": "bind",
+      "name": "base_score",
+      "value": { "kind": "call", "op": "eval_scalar", "args": [ { "kind": "var", "name": "baseline" } ] }
+    },
+    {
+      "kind": "bind",
       "name": "reviewed",
       "value": {
         "kind": "call",
         "op": "task",
         "args": [
           { "kind": "lit", "value": "reviewer" },
-          { "kind": "lit", "value": "These are flux's terminal-bench results. Each failing case names a task and a failure_mode (e.g. agent_timeout = flux ran out of time, often a harness inefficiency/loop; a plain failure = wrong output). Identify flux HARNESS improvements (tools, tool output/views, system prompt, a new tool, or an agent-loop efficiency fix) that would help flux pass more. Results:\n{{baseline}}\n\nReturn ONLY a JSON array: [{\"area\":..,\"symptom\":..,\"suggested_fix\":..,\"severity\":1-5}]." }
+          { "kind": "lit", "value": "These are flux's terminal-bench results. Each failing case names a task, a failure_mode, and (when partial) which sub-checks failed (failed_checks). Identify flux HARNESS improvements (tools, tool output/views, system prompt, a new tool, or an agent-loop efficiency fix) that would help flux pass more. Results:\n{{baseline}}\n\nReturn ONLY a JSON array: [{\"area\":..,\"symptom\":..,\"suggested_fix\":..,\"severity\":1-5}]." }
         ]
       }
     },
@@ -95,7 +100,7 @@
                   { "kind": "lit", "value": {
                     "adapter": "terminal-bench",
                     "tasks": ["chess-best-move", "fibonacci-server"],
-                    "trials": 1,
+                    "trials": 2,
                     "dataset": "terminal-bench-core==0.1.1",
                     "model": "anthropic/claude-sonnet-4-6",
                     "flux_binary": "target/x86_64-unknown-linux-musl/release/flux",
@@ -104,6 +109,11 @@
                   } }
                 ]
               }
+            },
+            {
+              "kind": "bind",
+              "name": "cand_score",
+              "value": { "kind": "call", "op": "eval_scalar", "args": [ { "kind": "var", "name": "candidate" } ] }
             },
             {
               "kind": "when",
@@ -115,12 +125,14 @@
               "then": [
                 { "kind": "call", "op": "git_stage", "args": [ { "kind": "lit", "value": ["."] } ] },
                 { "kind": "call", "op": "git_commit", "args": [ { "kind": "lit", "value": "improve: adopt candidate (terminal-bench gain)" } ] },
+                { "kind": "call", "op": "git_tag", "args": [ { "kind": "lit", "value": "improve-tbench-{{cand_score}}" } ] },
                 {
-                  "kind": "bind",
-                  "name": "score",
-                  "value": { "kind": "call", "op": "eval_scalar", "args": [ { "kind": "var", "name": "candidate" } ] }
+                  "kind": "call",
+                  "op": "improve_log",
+                  "args": [
+                    { "kind": "lit", "value": { "bench": "terminal-bench", "decision": "kept", "reason": "candidate_beat_baseline", "base_score": "{{base_score}}", "cand_score": "{{cand_score}}", "tag": "improve-tbench-{{cand_score}}", "guard": "{{guard}}", "gate": "{{gate}}", "tasks": "{{tasks}}" } }
+                  ]
                 },
-                { "kind": "call", "op": "git_tag", "args": [ { "kind": "lit", "value": "improve-tbench-{{score}}" } ] },
                 {
                   "kind": "bind",
                   "name": "baseline",
@@ -128,19 +140,26 @@
                 }
               ],
               "otherwise": [
-                { "kind": "call", "op": "git_revert", "args": [ { "kind": "var", "name": "snapshot" } ] }
+                { "kind": "call", "op": "git_revert", "args": [ { "kind": "var", "name": "snapshot" } ] },
+                {
+                  "kind": "call",
+                  "op": "improve_log",
+                  "args": [
+                    { "kind": "lit", "value": { "bench": "terminal-bench", "decision": "reverted", "reason": "no_improvement", "base_score": "{{base_score}}", "cand_score": "{{cand_score}}", "guard": "{{guard}}", "gate": "{{gate}}", "tasks": "{{tasks}}" } }
+                  ]
+                }
               ]
             }
           ],
           "otherwise": [
-            { "kind": "call", "op": "git_revert", "args": [ { "kind": "var", "name": "snapshot" } ] }
-          ]
-        },
-        {
-          "kind": "call",
-          "op": "improve_log",
-          "args": [
-            { "kind": "lit", "value": { "bench": "terminal-bench", "guard": "{{guard}}", "gate": "{{gate}}", "tasks": "{{tasks}}" } }
+            { "kind": "call", "op": "git_revert", "args": [ { "kind": "var", "name": "snapshot" } ] },
+            {
+              "kind": "call",
+              "op": "improve_log",
+              "args": [
+                { "kind": "lit", "value": { "bench": "terminal-bench", "decision": "reverted", "reason": "gate_failed", "base_score": "{{base_score}}", "guard": "{{guard}}", "gate": "{{gate}}", "tasks": "{{tasks}}" } }
+              ]
+            }
           ]
         },
         {
