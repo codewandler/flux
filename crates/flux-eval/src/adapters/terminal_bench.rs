@@ -234,7 +234,9 @@ fn find_file(dir: &std::path::Path, name: &str, depth: usize) -> Option<std::pat
             return Some(p);
         }
     }
-    subdirs.into_iter().find_map(|d| find_file(&d, name, depth - 1))
+    subdirs
+        .into_iter()
+        .find_map(|d| find_file(&d, name, depth - 1))
 }
 
 /// Decode an asciinema v2 cast (JSONL: header line, then `[time, kind, data]`) into plain text — the
