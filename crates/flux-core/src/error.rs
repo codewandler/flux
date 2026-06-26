@@ -40,4 +40,12 @@ pub enum Error {
     /// Anything else.
     #[error("{0}")]
     Other(String),
+
+    /// An assertion node failed its condition.
+    #[error("assertion failed: {0}")]
+    AssertFailed(String),
+
+    /// A `confirm` node was denied by the approver.
+    #[error("confirm denied: {0}")]
+    ConfirmDenied(String),
 }
