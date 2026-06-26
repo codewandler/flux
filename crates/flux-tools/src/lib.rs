@@ -189,6 +189,8 @@ pub fn register_builtins(registry: &mut ToolRegistry) {
     registry.register(Arc::new(BashTool));
     registry.register(Arc::new(GlobTool));
     registry.register(Arc::new(GrepTool));
+    registry.register(Arc::new(GitStageTool));
+    registry.register(Arc::new(GitCommitTool));
 }
 
 // ---------------------------------------------------------------------------
@@ -1491,6 +1493,157 @@ impl Tool for PatchTool {
 }
 
 // ---------------------------------------------------------------------------
+// git_stage
+// ---------------------------------------------------------------------------
+
+pub struct GitStageTool;
+
+#[async_trait]
+impl Tool for GitStageTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_stage".into(),
+            description: "Stage specific workspace files for the next git commit (`git add`). \
+                          Pass a list of workspace-relative paths."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Workspace-relative paths to stage"
+                    }
+                },
+                "required": ["paths"]
+            }),
+            output_schema: None,
+            effects: vec![Effect::Process, Effect::LocalSystem],
+            risk: Risk::Medium,
+            idempotency: Idempotency::Idempotent,
+            access: vec![AccessKind::Process],
+        }
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        path_list(params)
+    }
+
+    fn intents(&self, params: &Value) -> IntentSet {
+        let mut set = IntentSet::new();
+        for p in path_list(params) {
+            set.push(Intent {
+                behavior: IntentBehavior::FilesystemRead,
+                target: IntentTarget::Path { path: p },
+                role: IntentRole::ReadTarget,
+                certainty: IntentCertainty::Certain,
+            });
+        }
+        set
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let paths = path_list(&params);
+        if paths.is_empty() {
+            return Err(Error::Other(
+                "git_stage: `paths` must be a non-empty array of strings".to_string(),
+            ));
+        }
+        let mut argv = vec!["git".to_string(), "add".to_string(), "--".to_string()];
+        argv.extend(paths);
+        let out = ctx.system.run(&argv, Duration::from_secs(30)).await?;
+        let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
+        if out.exit_code != 0 {
+            return Ok(ToolResult::error(format!(
+                "git add failed [exit {}]: {body}",
+                out.exit_code
+            )));
+        }
+        Ok(ToolResult::ok(if body.is_empty() {
+            "staged".to_string()
+        } else {
+            body
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// git_commit
+// ---------------------------------------------------------------------------
+
+pub struct GitCommitTool;
+
+#[async_trait]
+impl Tool for GitCommitTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_commit".into(),
+            description: "Create a git commit with the staged changes. `message` is the commit \
+                          title (required); `body` is an optional multi-line description appended \
+                          after a blank line."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "Commit title"},
+                    "body": {"type": "string", "description": "Optional commit body (appended after a blank line)"}
+                },
+                "required": ["message"]
+            }),
+            output_schema: None,
+            effects: vec![Effect::Process, Effect::LocalSystem],
+            risk: Risk::Medium,
+            idempotency: Idempotency::NonIdempotent,
+            access: vec![AccessKind::Process],
+        }
+    }
+
+    fn permission_subjects(&self, _params: &Value) -> Vec<String> {
+        vec!["git_commit".to_string()]
+    }
+
+    fn intents(&self, params: &Value) -> IntentSet {
+        let mut set = IntentSet::new();
+        let msg = params
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        set.push(Intent {
+            behavior: IntentBehavior::CommandExecution,
+            target: IntentTarget::Process {
+                command: format!("git commit -m {msg:?}"),
+            },
+            role: IntentRole::ProcessCommand,
+            certainty: IntentCertainty::Certain,
+        });
+        set
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let message = str_param(&params, "message", "git_commit")?;
+        let full_message = match params.get("body").and_then(|v| v.as_str()) {
+            Some(b) if !b.trim().is_empty() => format!("{message}\n\n{b}"),
+            _ => message.to_string(),
+        };
+        let argv = vec![
+            "git".to_string(),
+            "commit".to_string(),
+            "-m".to_string(),
+            full_message,
+        ];
+        let out = ctx.system.run(&argv, Duration::from_secs(30)).await?;
+        let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
+        if out.exit_code != 0 {
+            return Ok(ToolResult::error(format!(
+                "git commit failed [exit {}]: {body}",
+                out.exit_code
+            )));
+        }
+        Ok(ToolResult::ok(body))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // flux_reload (dev mode only)
 // ---------------------------------------------------------------------------
 
@@ -2307,6 +2460,8 @@ mod tests {
                 "append",
                 "bash",
                 "edit",
+                "git_commit",
+                "git_stage",
                 "glob",
                 "grep",
                 "patch",
