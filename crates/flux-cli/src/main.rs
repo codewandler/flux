@@ -678,7 +678,7 @@ async fn run_agentic(cli: &Cli, prompt: String) -> Result<()> {
         style::dim(&format!("{} · session {session_id}", agent.model))
     );
     let initial_rules = agent.executor.allow_rules();
-    let mut sink = CliSink::new();
+    let mut sink = CliSink::new(agent.max_iterations);
     agent
         .run_turn(&session_id, &prompt, &mut sink)
         .await
@@ -767,7 +767,7 @@ async fn run_flow(args: &[String]) -> Result<()> {
             fallback,
         )));
 
-    let mut sink = CliSink::new();
+    let mut sink = CliSink::new(0);
     let outcome = flux_flow::runtime::execute_flow(
         &engine.flow,
         &engine.executor,
@@ -897,7 +897,7 @@ async fn run_plan(cli: Cli) -> Result<()> {
             risk.ops.clone(),
             fallback,
         )));
-    let mut sink = CliSink::new();
+    let mut sink = CliSink::new(0);
     let outcome = flux_flow::runtime::execute_flow(
         &engine.flow,
         &engine.executor,
@@ -1225,7 +1225,7 @@ async fn run_repl(cli: Cli) -> Result<()> {
                 "compact" => {
                     eprintln!("{}", style::dim("compacting context…"));
                     let cancel = tokio_util::sync::CancellationToken::new();
-                    let mut sink = CliSink::new();
+                    let mut sink = CliSink::new(0);
                     match agent.maybe_compact(&session_id, &mut sink, &cancel).await {
                         Ok(()) => eprintln!("{}", style::dim("context compacted")),
                         Err(e) => eprintln!("{} {e}", style::red("compact error:")),
@@ -1244,7 +1244,7 @@ async fn run_repl(cli: Cli) -> Result<()> {
         }
         // Plan mode: compile + show a plan, store it for `/run`, but DON'T execute. Refine by chatting.
         if plan_mode {
-            let mut sink = CliSink::new();
+            let mut sink = CliSink::new(0);
             match agent.plan_turn(&session_id, input, &mut sink).await {
                 Ok(Some(ast)) => {
                     pending_plan = Some(ast);
@@ -1264,7 +1264,7 @@ async fn run_repl(cli: Cli) -> Result<()> {
         let agent_ref = &agent;
         let sid_ref = session_id.as_str();
         run_interruptible(move |c| async move {
-            let mut sink = CliSink::new();
+            let mut sink = CliSink::new(agent_ref.max_iterations);
             if let Err(e) = agent_ref
                 .run_turn_cancellable(sid_ref, input, &mut sink, &c)
                 .await
@@ -1286,7 +1286,7 @@ async fn run_pending_plan(
     ast: &flux_flow::ast::DraftAst,
     _cancel: &tokio_util::sync::CancellationToken,
 ) {
-    let mut sink = CliSink::new();
+    let mut sink = CliSink::new(0);
     match flux_flow::runtime::execute_flow(&agent.flow, &agent.executor, session_id, ast, &mut sink)
         .await
     {
@@ -1396,7 +1396,7 @@ async fn run_loop(
             break;
         }
         eprintln!("{}", style::dim(&format!("[loop {}/{}]", i + 1, count)));
-        let mut sink = CliSink::new();
+        let mut sink = CliSink::new(0);
         if let Err(e) = agent
             .run_turn_cancellable(session_id, task, &mut sink, &cancel)
             .await
@@ -1607,10 +1607,14 @@ struct CliSink {
         Arc<std::sync::Mutex<SpinnerState>>,
         tokio::task::JoinHandle<()>,
     )>,
+    /// Iteration counter: how many tool round-trips have completed this turn.
+    iter: usize,
+    /// Max iterations cap (threaded from `Agent::max_iterations` for display).
+    max_iter: usize,
 }
 
 impl CliSink {
-    fn new() -> Self {
+    fn new(max_iter: usize) -> Self {
         let stdout_tty = std::io::stdout().is_terminal();
         let width = std::env::var("COLUMNS")
             .ok()
@@ -1630,6 +1634,8 @@ impl CliSink {
             turn_start: None,
             pending: None,
             spinner: None,
+            iter: 0,
+            max_iter,
         }
     }
 
@@ -1653,6 +1659,7 @@ impl CliSink {
             frame: 0,
         }));
         let s = state.clone();
+        let start = std::time::Instant::now();
         let task = tokio::spawn(async move {
             const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
             loop {
@@ -1664,7 +1671,8 @@ impl CliSink {
                     }
                     let frame = FRAMES[st.frame % FRAMES.len()];
                     st.frame += 1;
-                    eprint!("\r\x1b[K{} {}", style::cyan(&frame.to_string()), st.label);
+                    let elapsed = style::fmt_elapsed(start.elapsed());
+                    eprint!("\r\x1b[K{} {}  {}", style::cyan(&frame.to_string()), st.label, style::dim(&elapsed));
                     let _ = std::io::stderr().flush();
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(80)).await;
@@ -1712,10 +1720,17 @@ impl AgentSink for CliSink {
     fn tool_call(&mut self, name: &str, input: &Value) {
         self.commit();
         self.steps += 1;
+        self.iter += 1;
         if self.turn_start.is_none() {
             self.turn_start = Some(std::time::Instant::now());
         }
-        let label = render_call_label(name, input, self.verbose);
+        let base_label = render_call_label(name, input, self.verbose);
+        // Prefix with [N/max] iteration counter when a cap is known.
+        let label = if self.max_iter > 0 {
+            format!("[{}/{}] {base_label}", self.iter, self.max_iter)
+        } else {
+            base_label
+        };
         if self.use_spinner() {
             self.start_spinner(label.clone());
         } else {
@@ -1802,22 +1817,23 @@ impl AgentSink for CliSink {
             let rule_len = self.width.saturating_sub(summary.chars().count() + 2);
             eprintln!("{} {}", style::rule(rule_len), style::dim(&summary));
         } else {
-            // Prose-only turn: print a minimal rule with just elapsed so the boundary is clear.
-            let summary = format!("· {elapsed}");
+            // Prose-only turn: print a minimal rule with elapsed + token stats.
+            let token_inline = usage
+                .as_ref()
+                .map(|u| {
+                    if u.cache_read_input_tokens > 0 {
+                        format!(
+                            " · in {} out {} $cache {}",
+                            u.input_tokens, u.output_tokens, u.cache_read_input_tokens
+                        )
+                    } else {
+                        format!(" · in {} out {}", u.input_tokens, u.output_tokens)
+                    }
+                })
+                .unwrap_or_default();
+            let summary = format!("· {elapsed}{token_inline}");
             let rule_len = self.width.saturating_sub(summary.chars().count() + 2);
             eprintln!("{} {}", style::rule(rule_len), style::dim(&summary));
-            // Still print cache savings if present (useful feedback even for chat turns).
-            if let Some(u) = &usage {
-                if u.cache_read_input_tokens > 0 {
-                    eprintln!(
-                        "{}",
-                        style::dim(&format!(
-                            "in {} out {} $cache {}",
-                            u.input_tokens, u.output_tokens, u.cache_read_input_tokens
-                        ))
-                    );
-                }
-            }
         }
     }
 }
@@ -1878,16 +1894,25 @@ impl AgentSink for GoalSink {
             .unwrap_or_else(|| result_summary_for(&result.content, name, verbose()));
         eprintln!("  {mark} {body}");
     }
-    fn turn_end(&mut self, _usage: Option<Usage>) {
+    fn turn_end(&mut self, usage: Option<Usage>) {
         println!();
+        if let Some(u) = usage {
+            let stats = if u.cache_read_input_tokens > 0 {
+                format!("in {} out {} $cache {}", u.input_tokens, u.output_tokens, u.cache_read_input_tokens)
+            } else {
+                format!("in {} out {}", u.input_tokens, u.output_tokens)
+            };
+            eprintln!("{}", style::dim(&stats));
+        }
     }
 }
 
-/// A built-in offline provider (`-m mock`): emits a one-shot `emit_plan` plan that writes
-/// `flux-mock.txt` (or runs `FLUX_MOCK_BASH` / calls `FLUX_MOCK_TOOL`), with a closing `reply` so the
-/// engine runs it in a single round and stops. Because the engine is pure-DAG (the model's only tool
-/// is `emit_plan`), the mock must emit a *plan*, not a raw tool call. Lets the Flux-Lang engine be
-/// exercised end-to-end with no network — used by the eval harness's offline slice and smoke tests.
+/// A built-in offline provider (`-m mock`): the first call emits a one-shot `emit_plan` plan that
+/// writes `flux-mock.txt` (or runs `FLUX_MOCK_BASH` / calls `FLUX_MOCK_TOOL`); the engine runs it,
+/// feeds the results back, and loops, so the second call answers in prose and the turn ends (the
+/// standard loop-to-prose). Because the engine is pure-DAG (the model's only tool is `emit_plan`), the
+/// mock must emit a *plan*, not a raw tool call. Lets the Flux-Lang engine be exercised end-to-end with
+/// no network — used by the eval harness's offline slice and smoke tests.
 #[derive(Default)]
 struct MockCliProvider {
     calls: AtomicUsize,
