@@ -556,43 +556,6 @@ fn join_diags(diags: &[Diagnostic]) -> String {
 // ---------------------------------------------------------------------------
 
 /// The Node grammar + a worked example (literal JSON; no format escaping).
-const AST_GRAMMAR: &str = r#"The AST is a JSON object: {"name"?:string, "params"?:[{"name":string,"ty":type}], "returns"?:type, "body":[Node,...]}. A Node is tagged by "kind":
-- {"kind":"call","op":"<op>","args":[Node,...]}
-- {"kind":"bind","name":"<sym>","value":Node,"effect"?:"<effect>"}
-- {"kind":"when","cond":Node,"then":[Node,...],"otherwise":[Node,...]}
-- {"kind":"repeat","max":<int>,"until"?:Node,"body":[Node,...]}   counter-driven loop
-- {"kind":"each","in":Node,"as":"<sym>","body":[Node,...],"collect"?:"<sym>"}   iterate a list value, binding each element to $<as>; optional $<collect> gathers per-iteration results into a list
-- {"kind":"parallel","branches":[{"name":"<sym>","body":[Node,...]},...]}   run independent branches concurrently; each branch's result binds to its $name (use distinct names; no `return` inside a branch)
-- {"kind":"pipe","steps":[Node,...],"bind"?:"<sym>"}   chain calls — each step's output is fed as the next step's FIRST argument; optional $<bind> captures the final result
-- {"kind":"seq","body":[Node,...],"bind"?:"<sym>"}   a sequential block; optional $<bind> captures its final result
-- {"kind":"assert","cond":Node,"message"?:"<str>"}   abort the flow if cond is falsey
-- {"kind":"unless","cond":Node,"body":[Node,...]}   run body only when cond is falsey (sugar for negated when; body may contain any nodes)
-- {"kind":"verify","cmd":Node,"expect":Node,"message"?:"<str>"}   run cmd (any node producing a string), check output contains expect; abort with message if not — use after edits/builds to self-check
-- {"kind":"peek","name":"<sym>"}   read the current in-session value of a named symbol without IO; returns empty string if not yet bound
-- {"kind":"memo","name":"<sym>","value":Node,"effect"?:"<effect>"}   like bind, but computed once per session (cached across turns) — for expensive deterministic work
-- {"kind":"expr","formula":"<arith>","vars"?:{"<name>":Node,...}}   pure arithmetic: `+`, `-`, `*`, `/`, `round(x,n)`, `abs(x)`, `min(a,b)`, `max(a,b)` — no IO, no approval; bind result with `bind`
-- {"kind":"fmt","template":"<str>"}   pure string interpolation: `{sym}` placeholders replaced from session symbols — no IO
-- {"kind":"jq","path":"<dotpath>","input":Node}   pure JSON path extraction: `.key`, `.key.nested`, `[0]` — applied to the input node's value; no IO
-- {"kind":"await","binding"?:"<sym>","source":"<source>"}
-- {"kind":"return","value":Node}
-- {"kind":"var","name":"<sym>"}
-- {"kind":"lit","value":<any JSON>}
-
-Prefer `each` over `repeat` for list iteration; prefer `parallel` for independent reads/calls that don't depend on each other.
-
-Example for "read the readme then grep it for TODO":
-{"body":[
-  {"kind":"bind","name":"readme","value":{"kind":"call","op":"read","args":[{"kind":"lit","value":"README.md"}]}},
-  {"kind":"bind","name":"hits","value":{"kind":"call","op":"grep","args":[{"kind":"lit","value":"TODO"}]}}
-]}
-
-Example for "read a.rs, b.rs and c.rs and summarise each":
-{"body":[
-  {"kind":"each","in":{"kind":"lit","value":["a.rs","b.rs","c.rs"]},"as":"f","body":[
-    {"kind":"bind","name":"text","value":{"kind":"call","op":"read","args":[{"kind":"var","name":"f"}]}}
-  ],"collect":"all"}
-]}"#;
-
 fn ops_catalog(ops: &OpRegistry) -> String {
     let mut s = String::new();
     for sig in ops.signatures() {
@@ -634,6 +597,27 @@ fn symbols_block(view: Option<&SessionView>) -> String {
     }
 }
 
+/// The planner grammar: top-level AST shape + node kinds auto-generated from `Node` in `ast.rs`
+/// via `build.rs` -- never edit by hand.
+fn ast_grammar() -> String {
+    format!(
+        "The AST is a JSON object: {{\"name\"?:string, \"params\"?:[{{\"name\":string,\"ty\":type}}], \"returns\"?:type, \"body\":[Node,...]}}. A Node is tagged by \"kind\":\n\
+{node_kinds}Prefer `each` over `repeat` for list iteration; prefer `parallel` for independent reads/calls that don't depend on each other.\n\
+\nExample for \"read the readme then grep it for TODO\":\n\
+{{\"body\":[\n\
+  {{\"kind\":\"bind\",\"name\":\"readme\",\"value\":{{\"kind\":\"call\",\"op\":\"read\",\"args\":[{{\"kind\":\"lit\",\"value\":\"README.md\"}}]}}}},\n\
+  {{\"kind\":\"bind\",\"name\":\"hits\",\"value\":{{\"kind\":\"call\",\"op\":\"grep\",\"args\":[{{\"kind\":\"lit\",\"value\":\"TODO\"}}]}}}}\n\
+]}}\n\
+\nExample for \"read a.rs, b.rs and c.rs and summarise each\":\n\
+{{\"body\":[\n\
+  {{\"kind\":\"each\",\"in\":{{\"kind\":\"lit\",\"value\":[\"a.rs\",\"b.rs\",\"c.rs\"]}},\"as\":\"f\",\"body\":[\n\
+    {{\"kind\":\"bind\",\"name\":\"text\",\"value\":{{\"kind\":\"call\",\"op\":\"read\",\"args\":[{{\"kind\":\"var\",\"name\":\"f\"}}]}}}}\n\
+  ],\"collect\":\"all\"}}\n\
+]}}",
+        node_kinds = crate::NODE_KIND_CATALOG,
+    )
+}
+
 fn build_oneshot_prompt(instruction: &str, ops: &OpRegistry, view: Option<&SessionView>) -> String {
     format!(
         "You are Flux-Lang's compiler front-end. Convert the user's instruction into a Flux-Lang flow \
@@ -644,7 +628,7 @@ positional in that parameter order ([optional] params come last).\n\nOperation c
 Instruction: {instruction}\n",
         catalog = ops_catalog(ops),
         symbols = symbols_block(view),
-        grammar = AST_GRAMMAR,
+        grammar = ast_grammar(),
     )
 }
 
@@ -681,7 +665,7 @@ op is shown as `name(params)`; a call's `args` are positional in that parameter 
 params come last).\n\nOperation catalog (for the AST):\n{catalog}{symbols}\n{grammar}\n",
         catalog = ops_catalog(ops),
         symbols = symbols_block(view),
-        grammar = AST_GRAMMAR,
+        grammar = ast_grammar(),
     )
 }
 
