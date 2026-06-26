@@ -97,6 +97,10 @@ impl FlowEngine {
         // persisted (below); the ephemeral rounds never touch the session log.
         let mut working = self.store.load_messages(session_id)?;
         let mut answer: Option<String> = None;
+        // Whether `answer` was already streamed to the sink during the loop (a chat turn or a plan's
+        // closing reply). Terminal answers that were NOT streamed — a compile/provider failure or the
+        // max-iterations fallback — are surfaced after the loop so a turn never ends silently.
+        let mut shown = false;
 
         for _ in 0..self.max_iterations {
             if cancel.is_cancelled() {
@@ -121,9 +125,10 @@ impl FlowEngine {
             let out = match compiled {
                 Ok(out) => out,
                 // No fallback (one engine): a turn the planner can't compile fails cleanly, surfaced as
-                // the assistant's answer so the session shape stays valid.
+                // the assistant's answer so the session shape stays valid — and shown to the user (below)
+                // so a provider failure (credit exhausted, auth, rate limit, transport) is never silent.
                 Err(e) => {
-                    answer = Some(format!("I couldn't produce a plan: {e}"));
+                    answer = Some(format!("I couldn't produce a plan — {}", planner_error(&e)));
                     break;
                 }
             };
@@ -131,6 +136,7 @@ impl FlowEngine {
             match out {
                 TurnOutput::Chat(text) => {
                     sink.text_delta(&text);
+                    shown = true;
                     answer = Some(text);
                     break;
                 }
@@ -146,15 +152,20 @@ impl FlowEngine {
                             // end the turn — one round, no extra "summarize" call.
                             if let Some(reply) = compiled.reply {
                                 sink.text_delta(&reply);
+                                shown = true;
                                 answer = Some(reply);
                                 break;
                             }
                             // No reply ⇒ the model needs to see the results before it can answer. Feed
-                            // them back and loop.
-                            let result = if outcome.result.trim().is_empty() {
-                                format!("(ran {} step(s), no textual output)", outcome.steps)
-                            } else {
+                            // back the full transcript (EVERY read/call node's view), not just the last
+                            // node — otherwise a plan that reads N files surfaces only file N and the
+                            // model re-reads the rest every round (an infinite read loop).
+                            let result = if !outcome.transcript.trim().is_empty() {
+                                outcome.transcript.clone()
+                            } else if !outcome.result.trim().is_empty() {
                                 outcome.result.clone()
+                            } else {
+                                format!("(ran {} step(s), no textual output)", outcome.steps)
                             };
                             working.push(Message::assistant(vec![ContentBlock::Text {
                                 text: format!("Ran a {}-step plan.", outcome.steps),
@@ -186,6 +197,11 @@ impl FlowEngine {
                 self.max_iterations
             )
         });
+        // A compile/provider failure or the max-iterations fallback never streamed anything — emit it
+        // here so the turn shows *why* it ended instead of returning to the prompt in silence.
+        if !shown {
+            sink.text_delta(&answer);
+        }
         self.finish_turn(session_id, sink, &answer, false)
     }
 
@@ -251,7 +267,9 @@ impl FlowEngine {
         )
         .await;
         sink.planning(false);
-        let out = out?;
+        // Surface a provider failure (credit, auth, rate limit, transport) with a readable message
+        // rather than the raw API JSON body — the REPL prints this `error:` line directly.
+        let out = out.map_err(|e| flux_core::Error::Other(planner_error(&e)))?;
 
         match out {
             TurnOutput::Plan(compiled) => {
@@ -440,6 +458,27 @@ fn has_tool_result(msg: &Message) -> bool {
         .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
 }
 
+/// Render a planner failure for the user. A provider API error carries the raw JSON response body;
+/// unwrap it to `error.message` so a credit/billing/auth/rate-limit failure reads as a plain sentence
+/// instead of a JSON dump. Every other error uses its own `Display`.
+pub fn planner_error(e: &flux_core::Error) -> String {
+    if let flux_core::Error::Api { status, message } = e {
+        let detail = serde_json::from_str::<serde_json::Value>(message)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|err| err.get("message"))
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string)
+            })
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| message.clone());
+        format!("the model provider returned an error (HTTP {status}): {detail}")
+    } else {
+        e.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,7 +488,7 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
 
-    use flux_core::StopReason;
+    use flux_core::{Error, StopReason};
     use flux_provider::{ChunkStream, Request};
     use flux_runtime::{
         AllowApprover, PermissionManager, Tool, ToolContext, ToolRegistry, ToolResult,
@@ -552,7 +591,32 @@ mod tests {
         ]
     }
 
+    /// A provider whose every `stream()` fails — simulates a provider/API failure (e.g. credit
+    /// exhausted) so the engine's error-surfacing path is exercised.
+    struct FailProvider {
+        err: Box<dyn Fn() -> Error + Send + Sync>,
+    }
+
+    #[async_trait]
+    impl Provider for FailProvider {
+        fn name(&self) -> &str {
+            "fail"
+        }
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            Err((self.err)())
+        }
+    }
+
     fn engine_with(responses: VecDeque<Vec<Chunk>>, store: Arc<SessionStore>) -> FlowEngine {
+        engine_with_provider(
+            Box::new(MockProvider {
+                responses: Mutex::new(responses),
+            }),
+            store,
+        )
+    }
+
+    fn engine_with_provider(provider: Box<dyn Provider>, store: Arc<SessionStore>) -> FlowEngine {
         let dir = std::env::temp_dir().join(format!(
             "flux-flow-engine-{}-{}",
             std::process::id(),
@@ -569,9 +633,7 @@ mod tests {
             ToolContext::new(system),
         );
         FlowEngine {
-            provider: Box::new(MockProvider {
-                responses: Mutex::new(responses),
-            }),
+            provider,
             executor,
             store,
             flow: FlowStore::in_memory().unwrap(),
@@ -672,5 +734,60 @@ mod tests {
         let msgs = store.load_messages(&sid).unwrap();
         assert_eq!(msgs.len(), 2);
         assert!(msgs.iter().all(|m| !m.content.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn provider_error_is_surfaced_not_silent() {
+        // A provider/API failure during planning (e.g. credit exhausted) must reach the user — the
+        // turn used to store the answer but never emit it, ending the turn in silence.
+        let store = Arc::new(SessionStore::in_memory().unwrap());
+        let sid = store.create_session("fail").unwrap();
+        let provider = Box::new(FailProvider {
+            err: Box::new(|| Error::Api {
+                status: 400,
+                message: r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}"#.into(),
+            }),
+        });
+        let engine = engine_with_provider(provider, store.clone());
+        let mut sink = CollectSink::default();
+        engine.run_turn(&sid, "do something", &mut sink).await.unwrap();
+
+        // The failure was shown to the user, with the provider's message unwrapped from its JSON body.
+        assert!(
+            sink.text.contains("credit balance is too low"),
+            "the credit error must be surfaced to the user, got: {:?}",
+            sink.text
+        );
+        assert!(sink.text.contains("HTTP 400"), "the status is shown too");
+
+        // The session stays a valid user → assistant alternation (no bricked session on the next turn).
+        let msgs = store.load_messages(&sid).unwrap();
+        assert_eq!(msgs.len(), 2, "user + one assistant message");
+        assert_eq!(msgs[0].role, flux_core::Role::User);
+        assert_eq!(msgs[1].role, flux_core::Role::Assistant);
+        assert!(msgs[1].text().contains("credit balance is too low"));
+    }
+
+    #[test]
+    fn planner_error_unwraps_api_json_and_passes_through_others() {
+        // An Anthropic-style error body collapses to its `error.message`.
+        let api = Error::Api {
+            status: 429,
+            message: r#"{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}"#.into(),
+        };
+        let rendered = planner_error(&api);
+        assert!(rendered.contains("HTTP 429"));
+        assert!(rendered.contains("rate limited"));
+        assert!(!rendered.contains('{'), "the raw JSON body is not shown: {rendered}");
+
+        // A non-JSON body falls back to the raw message.
+        let plain = Error::Api {
+            status: 500,
+            message: "upstream exploded".into(),
+        };
+        assert!(planner_error(&plain).contains("upstream exploded"));
+
+        // Non-API errors use their own Display.
+        assert_eq!(planner_error(&Error::Other("boom".into())), "boom");
     }
 }
