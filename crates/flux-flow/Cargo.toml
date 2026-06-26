@@ -25,6 +25,9 @@ futures.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 
+[build-dependencies]
+syn = { workspace = true }
+
 [dev-dependencies]
 flux-tools.workspace = true
 flux-system.workspace = true

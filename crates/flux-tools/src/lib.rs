@@ -217,15 +217,24 @@ impl Tool for ReadTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::read_only(
             "read",
-            "Read a UTF-8 file from the workspace (raw text, safe to embed via `{{symbol}}`; you see a \
-             line-numbered view). Optional `offset`/`limit` select a line range. Refuses binary files \
-             and, for a very large file read whole, returns guidance to request a range instead.",
+            "Read one UTF-8 file, a list of files, or a glob pattern. \
+             A string `path` with `*` or `?` is auto-expanded as a glob; an array reads each \
+             listed file. Single-file reads return a line-numbered view; multi-file reads return \
+             sections headed `==> path <==`. Optional `offset`/`limit` apply only to single-file \
+             reads. Refuses binary files and, for a very large file read whole, returns guidance \
+             to request a range instead.",
             json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Workspace-relative path"},
-                    "offset": {"type": "integer", "description": "0-based first line"},
-                    "limit": {"type": "integer", "description": "Max lines to return"}
+                    "path": {
+                        "description": "A single workspace-relative path (string), an array of paths, or a glob pattern (string containing * or ?)",
+                        "oneOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}}
+                        ]
+                    },
+                    "offset": {"type": "integer", "description": "0-based first line (single-file only)"},
+                    "limit": {"type": "integer", "description": "Max lines to return (single-file only)"}
                 },
                 "required": ["path"]
             }),
@@ -234,21 +243,15 @@ impl Tool for ReadTool {
     }
 
     fn permission_subjects(&self, params: &Value) -> Vec<String> {
-        params
-            .get("path")
-            .and_then(|v| v.as_str())
-            .map(|s| vec![s.to_string()])
-            .unwrap_or_default()
+        read_path_list(params)
     }
 
     fn intents(&self, params: &Value) -> IntentSet {
         let mut set = IntentSet::new();
-        if let Some(p) = params.get("path").and_then(|v| v.as_str()) {
+        for p in read_path_list(params) {
             set.push(Intent {
                 behavior: IntentBehavior::FilesystemRead,
-                target: IntentTarget::Path {
-                    path: p.to_string(),
-                },
+                target: IntentTarget::Path { path: p },
                 role: IntentRole::ReadTarget,
                 certainty: IntentCertainty::Certain,
             });
@@ -257,12 +260,36 @@ impl Tool for ReadTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let path = str_param(&params, "path", "read")?;
+        // Resolve the `path` param into a list of concrete paths.
+        let paths = resolve_read_paths(ctx, &params).await?;
+
+        // Multi-file path: use the same `read_section` machinery as `read_many`.
+        if paths.len() != 1 {
+            if paths.is_empty() {
+                return Err(Error::Other(
+                    "read: glob pattern matched no files".to_string(),
+                ));
+            }
+            let sections =
+                futures::future::join_all(paths.iter().map(|p| read_section(ctx, p))).await;
+            let mut canonical = Vec::with_capacity(sections.len());
+            let mut view = Vec::with_capacity(sections.len());
+            for (c, v) in sections {
+                canonical.push(c);
+                view.push(v);
+            }
+            return Ok(ToolResult::ok_view(
+                canonical.join("\n\n"),
+                view.join("\n\n"),
+            ));
+        }
+
+        // Single-file path (offset/limit paging applies here only).
+        let path = &paths[0];
         let bytes = ctx.system.read_file_bytes(path).await?;
         let total_bytes = bytes.len();
         let content = match decode_text(path, bytes) {
             Decoded::Text(s) => s,
-            // Binary → error; too-large guidance is handled below (this path is binary/bad-UTF-8 only).
             Decoded::Guard { message, is_error } => {
                 return Ok(if is_error {
                     ToolResult::error(message)
@@ -1198,8 +1225,9 @@ impl Tool for ReadManyTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::read_only(
             "read_many",
-            "Read several files at once to survey them (each section is headed `==> path <==`). \
-             For embedding one file's text into a later string, read it singly with `read` instead.",
+            "Read several files at once (each section is headed `==> path <==`). Prefer `read` \
+             with an array or glob pattern — `read_many` is a legacy alias kept for backward \
+             compatibility.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1252,6 +1280,47 @@ impl Tool for ReadManyTool {
             canonical.join("\n\n"),
             view.join("\n\n"),
         ))
+    }
+}
+
+/// Resolve the `path` param of `ReadTool` into a list of concrete workspace paths.
+/// Accepts three shapes:
+///   - a single string without glob metacharacters → `[path]`
+///   - a single string containing `*` or `?`        → glob-expanded list
+///   - a JSON array of strings                      → the array as-is
+async fn resolve_read_paths(ctx: &ToolContext, params: &Value) -> Result<Vec<String>> {
+    match params.get("path") {
+        Some(Value::Array(arr)) => {
+            let paths = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            Ok(paths)
+        }
+        Some(Value::String(s)) if s.contains('*') || s.contains('?') => {
+            // Treat as a glob pattern: walk the workspace and filter by wildcard.
+            let mut files = ctx.system.walk_files(".", WALK_FILE_CAP).await.unwrap_or_default();
+            files.retain(|f| wildcard_match(s, f));
+            files.truncate(DEFAULT_GLOB_LIMIT);
+            Ok(files)
+        }
+        Some(Value::String(s)) => Ok(vec![s.clone()]),
+        _ => Err(Error::Other(
+            "read: `path` must be a string or an array of strings".to_string(),
+        )),
+    }
+}
+
+/// Extract the `path` param of `ReadTool` as a flat string list (for permission_subjects /
+/// intents — best-effort, glob patterns are left unexpanded at spec time).
+fn read_path_list(params: &Value) -> Vec<String> {
+    match params.get("path") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        Some(Value::String(s)) => vec![s.clone()],
+        _ => vec![],
     }
 }
 

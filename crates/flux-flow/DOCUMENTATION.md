@@ -791,7 +791,7 @@ optional arguments are in `[brackets]`.
 
 | op | signature | risk | description |
 |---|---|---|---|
-| `read` | `path[, limit, offset]` | Low | Read a UTF-8 file (line-numbered view); guidance returned for large files — use offset/limit |
+| `read` | `path[, limit, offset]` | Low | Read one file (string path), a list of files (JSON array), or a glob pattern (string with `*`/`?`). Single-file: line-numbered view, paging via `offset`/`limit`. Multi-file/glob: sections headed `==> path <==`. Guidance returned for over-cap files. |
 | `grep` | `pattern[, glob, literal, max_results, path]` | Low | Search by regex (supports `\b`, lookaheads); use `literal: true` for plain substring |
 | `glob` | `pattern[, path]` | Low | List files matching a glob pattern (`*` crosses `/`) |
 | `search` | `query[, limit]` | Low | Search the indexed datasource |

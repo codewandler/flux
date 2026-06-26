@@ -29,3 +29,7 @@ pub mod runtime;
 pub mod state;
 
 pub use error::{FlowError, Result};
+
+/// The auto-generated node-kind catalog: a markdown table of every `Node` variant and its
+/// doc-comment, produced at build time from `src/ast.rs` by `build.rs`. Never edit by hand.
+pub const NODE_KIND_CATALOG: &str = include_str!(concat!(env!("OUT_DIR"), "/node_kinds.rs"));
