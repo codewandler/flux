@@ -282,6 +282,11 @@ pub async fn run_local_task(spec: &TaskSpec, ctx: &RunContext<'_>) -> Result<Run
     Ok(RunResult {
         task_id: spec.id.clone(),
         passed,
+        // The local adapter grades a task as a single pass/fail (no sub-checks); partial credit
+        // falls back to this binary outcome in aggregation.
+        checks_passed: 0,
+        checks_total: 0,
+        failed_checks: Vec::new(),
         iterations,
         tool_calls,
         tool_errors,

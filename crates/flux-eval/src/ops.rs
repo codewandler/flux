@@ -155,6 +155,7 @@ impl Tool for EvalRunTool {
             "adapter": adapter.name(),
             "trials": trials,
             "pass_rate": score.pass_rate,
+            "mean_check_pass_rate": score.mean_check_pass_rate,
             "scalar": score.scalar(),
             "total": score.total,
             "passed": score.passed,
@@ -165,10 +166,11 @@ impl Tool for EvalRunTool {
             "cases": cases_json,
         });
         let view = format!(
-            "eval[{}] {}/{} tasks pass-all · score {} · {} trial(s) · mean_iters {:.1} · mean_errors {:.1}",
+            "eval[{}] {}/{} tasks pass-all · checks {:.0}% · score {} · {} trial(s) · mean_iters {:.1} · mean_errors {:.1}",
             adapter.name(),
             score.passed,
             score.total,
+            score.mean_check_pass_rate * 100.0,
             score.scalar(),
             trials,
             score.mean_iterations,

@@ -14,6 +14,12 @@ use flux_flow::ast::RunEvent;
 pub struct RunResult {
     pub task_id: String,
     pub passed: bool,
+    /// Sub-checks passed this trial (e.g. terminal-bench `parser_results`) — enables partial credit.
+    pub checks_passed: u32,
+    /// Total sub-checks (0 when the adapter reports only a binary pass/fail).
+    pub checks_total: u32,
+    /// Names of failed sub-checks, surfaced to the reviewer (e.g. `test_negative_number`).
+    pub failed_checks: Vec<String>,
     /// Turns (assistant messages in the log) — a proxy for plan rounds.
     pub iterations: u32,
     /// Op invocations (`StepStarted` events).
@@ -40,6 +46,9 @@ impl RunResult {
         Self {
             task_id: task_id.into(),
             passed: false,
+            checks_passed: 0,
+            checks_total: 0,
+            failed_checks: Vec::new(),
             iterations: 0,
             tool_calls: 0,
             tool_errors: 0,
@@ -72,6 +81,12 @@ pub struct CaseOutcome {
     pub passes: u32,
     /// `passes / trials` — the per-task signal that absorbs single-run model noise.
     pub pass_rate: f64,
+    /// Mean fraction of sub-checks passed across trials (partial credit). Falls back to `pass_rate`
+    /// when the adapter reports no sub-checks, so binary-only adapters are unaffected.
+    pub mean_check_pass_rate: f64,
+    /// Union of failed sub-check names across trials (deduped) — concrete signal for the reviewer.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failed_checks: Vec<String>,
     pub mean_tool_errors: f64,
     pub mean_iterations: f64,
     pub mean_tokens: f64,
@@ -88,6 +103,26 @@ impl CaseOutcome {
         let trials = runs.len() as u32;
         let n = (trials.max(1)) as f64;
         let passes = runs.iter().filter(|r| r.passed).count() as u32;
+        // Per-trial sub-check rate; when an adapter reports no sub-checks, fall back to binary pass/fail
+        // so partial credit never changes behaviour for binary-only adapters.
+        let check_rate = |r: &RunResult| -> f64 {
+            if r.checks_total > 0 {
+                r.checks_passed as f64 / r.checks_total as f64
+            } else if r.passed {
+                1.0
+            } else {
+                0.0
+            }
+        };
+        let sum_check_rate: f64 = runs.iter().map(check_rate).sum();
+        let mut failed_checks: Vec<String> = Vec::new();
+        for r in runs {
+            for c in &r.failed_checks {
+                if !failed_checks.contains(c) {
+                    failed_checks.push(c.clone());
+                }
+            }
+        }
         let sum_errors: u64 = runs.iter().map(|r| r.tool_errors as u64).sum();
         let sum_iters: u64 = runs.iter().map(|r| r.iterations as u64).sum();
         let sum_wall: u64 = runs.iter().map(|r| r.wall_ms).sum();
@@ -115,6 +150,8 @@ impl CaseOutcome {
             } else {
                 0.0
             },
+            mean_check_pass_rate: sum_check_rate / n,
+            failed_checks,
             mean_tool_errors: sum_errors as f64 / n,
             mean_iterations: sum_iters as f64 / n,
             mean_tokens: sum_tokens / n,
@@ -190,6 +227,9 @@ mod tests {
         let mk = |passed, errors, iters, id: &str, db: &str| RunResult {
             task_id: "t".into(),
             passed,
+            checks_passed: 0,
+            checks_total: 0,
+            failed_checks: Vec::new(),
             iterations: iters,
             tool_calls: iters,
             tool_errors: errors,
@@ -209,9 +249,39 @@ mod tests {
         assert_eq!(c.trials, 2);
         assert_eq!(c.passes, 1);
         assert!((c.pass_rate - 0.5).abs() < 1e-9);
+        // with no sub-checks reported, partial credit falls back to the binary pass-rate.
+        assert!((c.mean_check_pass_rate - 0.5).abs() < 1e-9);
         assert!((c.mean_tool_errors - 0.5).abs() < 1e-9);
         assert_eq!(c.sessions.len(), 2);
         assert_eq!(c.sessions[0].id, "s_1");
         assert_eq!(c.sessions[0].flow_db, "/a/flow.db");
+    }
+
+    #[test]
+    fn case_outcome_partial_credit_from_subchecks() {
+        let mk = |passed, cp: u32, ct: u32, failed: &[&str]| RunResult {
+            task_id: "t".into(),
+            passed,
+            checks_passed: cp,
+            checks_total: ct,
+            failed_checks: failed.iter().map(|s| s.to_string()).collect(),
+            iterations: 1,
+            tool_calls: 1,
+            tool_errors: 0,
+            tokens: None,
+            wall_ms: 10,
+            session_id: None,
+            session_db: None,
+            flow_db: None,
+            timed_out: false,
+            note: None,
+        };
+        // not fully resolved (5/6), but partial credit captures the near-miss.
+        let runs = vec![mk(false, 5, 6, &["test_negative_number"])];
+        let c = CaseOutcome::from_trials("t", &runs);
+        assert_eq!(c.passes, 0);
+        assert!((c.pass_rate - 0.0).abs() < 1e-9);
+        assert!((c.mean_check_pass_rate - 5.0 / 6.0).abs() < 1e-9);
+        assert_eq!(c.failed_checks, vec!["test_negative_number".to_string()]);
     }
 }

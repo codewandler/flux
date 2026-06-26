@@ -12,6 +12,9 @@ use crate::metrics::{CaseOutcome, RunResult};
 pub struct SuiteScore {
     /// Weighted mean of per-task pass-rates, in `[0,1]`.
     pub pass_rate: f64,
+    /// Weighted mean of per-task sub-check pass-rates (partial credit), in `[0,1]`. Equals
+    /// `pass_rate` for binary-only adapters; finer-grained for adapters that report sub-checks.
+    pub mean_check_pass_rate: f64,
     pub total: u32,
     /// Tasks that passed every trial.
     pub passed: u32,
@@ -29,6 +32,7 @@ impl SuiteScore {
         let n = results.len() as f64;
         let mut total_weight = 0.0;
         let mut weighted_pass = 0.0;
+        let mut weighted_check = 0.0;
         let mut sum_tool_errors = 0u64;
         let mut sum_iterations = 0u64;
         let mut sum_wall_ms = 0u64;
@@ -41,6 +45,14 @@ impl SuiteScore {
                 weighted_pass += w;
                 passed += 1;
             }
+            let cr = if r.checks_total > 0 {
+                r.checks_passed as f64 / r.checks_total as f64
+            } else if r.passed {
+                1.0
+            } else {
+                0.0
+            };
+            weighted_check += w * cr;
             sum_tool_errors += r.tool_errors as u64;
             sum_iterations += r.iterations as u64;
             sum_wall_ms += r.wall_ms;
@@ -49,6 +61,11 @@ impl SuiteScore {
         SuiteScore {
             pass_rate: if total_weight > 0.0 {
                 weighted_pass / total_weight
+            } else {
+                0.0
+            },
+            mean_check_pass_rate: if total_weight > 0.0 {
+                weighted_check / total_weight
             } else {
                 0.0
             },
@@ -76,12 +93,14 @@ impl SuiteScore {
         let n = cases.len() as f64;
         let mut total_weight = 0.0;
         let mut weighted_pass = 0.0;
+        let mut weighted_check = 0.0;
         let (mut e, mut it, mut tok, mut wall) = (0.0, 0.0, 0.0, 0.0);
         let mut passed = 0u32;
         for c in cases {
             let w = weight_of(&c.task_id);
             total_weight += w;
             weighted_pass += w * c.pass_rate;
+            weighted_check += w * c.mean_check_pass_rate;
             e += c.mean_tool_errors;
             it += c.mean_iterations;
             tok += c.mean_tokens;
@@ -93,6 +112,11 @@ impl SuiteScore {
         SuiteScore {
             pass_rate: if total_weight > 0.0 {
                 weighted_pass / total_weight
+            } else {
+                0.0
+            },
+            mean_check_pass_rate: if total_weight > 0.0 {
+                weighted_check / total_weight
             } else {
                 0.0
             },
@@ -111,9 +135,9 @@ impl SuiteScore {
         (self.pass_rate * 1000.0).round() as u32
     }
 
-    /// Is `self` strictly better than `baseline`? Lexicographic: higher pass-rate wins; on a tie,
-    /// fewer mean tool-errors; on a further tie, fewer mean iterations. A small epsilon absorbs
-    /// float noise on the rate comparison.
+    /// Is `self` strictly better than `baseline`? Lexicographic: higher full-pass-rate wins; on a tie,
+    /// higher sub-check pass-rate (partial progress); then fewer mean tool-errors; then fewer mean
+    /// iterations; then fewer tokens. A small epsilon absorbs float noise on the rate comparisons.
     pub fn is_better(&self, baseline: &SuiteScore) -> bool {
         const EPS: f64 = 1e-9;
         if self.pass_rate > baseline.pass_rate + EPS {
@@ -122,7 +146,14 @@ impl SuiteScore {
         if self.pass_rate + EPS < baseline.pass_rate {
             return false;
         }
-        // equal pass-rate
+        // equal full-pass-rate → more sub-checks passing (partial progress toward a full pass)
+        if self.mean_check_pass_rate > baseline.mean_check_pass_rate + EPS {
+            return true;
+        }
+        if self.mean_check_pass_rate + EPS < baseline.mean_check_pass_rate {
+            return false;
+        }
+        // equal partial credit → fewer tool-errors
         if self.mean_tool_errors + EPS < baseline.mean_tool_errors {
             return true;
         }
@@ -157,6 +188,17 @@ pub fn report_is_better(candidate: &serde_json::Value, baseline: &serde_json::Va
     if cp + EPS < bp {
         return false;
     }
+    // equal full-pass-rate → more sub-checks passing (partial progress)
+    let (cc, bc) = (
+        f(candidate, "mean_check_pass_rate"),
+        f(baseline, "mean_check_pass_rate"),
+    );
+    if cc > bc + EPS {
+        return true;
+    }
+    if cc + EPS < bc {
+        return false;
+    }
     let (ce, be) = (
         f(candidate, "mean_tool_errors"),
         f(baseline, "mean_tool_errors"),
@@ -189,6 +231,9 @@ mod tests {
         RunResult {
             task_id: id.into(),
             passed,
+            checks_passed: 0,
+            checks_total: 0,
+            failed_checks: Vec::new(),
             iterations,
             tool_calls: iterations,
             tool_errors,
@@ -236,6 +281,19 @@ mod tests {
     }
 
     #[test]
+    fn partial_credit_breaks_a_full_pass_tie() {
+        // Same full-pass-rate (both 0), but the candidate passes more sub-checks → strictly better.
+        let base = serde_json::json!({"pass_rate": 0.0, "mean_check_pass_rate": 0.50});
+        let partial = serde_json::json!({"pass_rate": 0.0, "mean_check_pass_rate": 0.83});
+        assert!(report_is_better(&partial, &base));
+        assert!(!report_is_better(&base, &partial));
+        // but a real full-pass regression is never masked by better partial credit.
+        let regressed = serde_json::json!({"pass_rate": 0.0, "mean_check_pass_rate": 1.0});
+        let full = serde_json::json!({"pass_rate": 1.0, "mean_check_pass_rate": 1.0});
+        assert!(!report_is_better(&regressed, &full));
+    }
+
+    #[test]
     fn report_is_better_compares_report_json() {
         let base =
             serde_json::json!({"pass_rate": 0.5, "mean_tool_errors": 2.0, "mean_iterations": 4.0});
@@ -260,6 +318,8 @@ mod tests {
                 trials,
                 passes,
                 pass_rate: passes as f64 / trials as f64,
+                mean_check_pass_rate: passes as f64 / trials as f64,
+                failed_checks: Vec::new(),
                 mean_tool_errors: 0.0,
                 mean_iterations: 1.0,
                 mean_tokens: 0.0,

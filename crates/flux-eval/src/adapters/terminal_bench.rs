@@ -103,8 +103,20 @@ impl TerminalBenchAdapter {
     }
 }
 
-/// Read tb's `results.json` (a `BenchmarkResults`) and pull this task's trial outcome.
-fn parse_results(dir: &std::path::Path, task_id: &str) -> Option<(bool, u64, u64, Option<String>)> {
+/// One parsed terminal-bench trial: pass-all, token counts, failure mode, and per-sub-check detail.
+struct ParsedTrial {
+    resolved: bool,
+    input: u64,
+    output: u64,
+    failure: Option<String>,
+    checks_passed: u32,
+    checks_total: u32,
+    failed_checks: Vec<String>,
+}
+
+/// Read tb's `results.json` (a `BenchmarkResults`) and pull this task's trial outcome, including the
+/// per-sub-check `parser_results` map (for partial credit + a concrete failure breakdown).
+fn parse_results(dir: &std::path::Path, task_id: &str) -> Option<ParsedTrial> {
     // tb writes `<output>/<run-id>/results.json`; search a couple of levels for it.
     let mut candidates = vec![dir.join("results.json")];
     if let Ok(rd) = std::fs::read_dir(dir) {
@@ -139,7 +151,27 @@ fn parse_results(dir: &std::path::Path, task_id: &str) -> Option<(bool, u64, u64
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty() && *s != "none" && *s != "unset")
         .map(String::from);
-    Some((resolved, input, output, failure))
+    // Per-sub-check detail: `parser_results` maps each check name to "passed"/"failed".
+    let (mut checks_passed, mut checks_total, mut failed_checks) = (0u32, 0u32, Vec::new());
+    if let Some(pr) = entry.get("parser_results").and_then(|v| v.as_object()) {
+        for (name, status) in pr {
+            checks_total += 1;
+            if status.as_str() == Some("passed") {
+                checks_passed += 1;
+            } else {
+                failed_checks.push(name.clone());
+            }
+        }
+    }
+    Some(ParsedTrial {
+        resolved,
+        input,
+        output,
+        failure,
+        checks_passed,
+        checks_total,
+        failed_checks,
+    })
 }
 
 #[async_trait]
@@ -275,11 +307,11 @@ impl BenchmarkAdapter for TerminalBenchAdapter {
                 Ok(r)
             }
             Ok(output) => {
-                if let Some((resolved, input, output_tok, failure)) = parse_results(&out, task_id) {
-                    let tokens = if input + output_tok > 0 {
+                if let Some(p) = parse_results(&out, task_id) {
+                    let tokens = if p.input + p.output > 0 {
                         Some(Usage {
-                            input_tokens: input,
-                            output_tokens: output_tok,
+                            input_tokens: p.input,
+                            output_tokens: p.output,
                             ..Default::default()
                         })
                     } else {
@@ -287,7 +319,10 @@ impl BenchmarkAdapter for TerminalBenchAdapter {
                     };
                     Ok(RunResult {
                         task_id: task_id.to_string(),
-                        passed: resolved,
+                        passed: p.resolved,
+                        checks_passed: p.checks_passed,
+                        checks_total: p.checks_total,
+                        failed_checks: p.failed_checks,
                         iterations: 0,
                         tool_calls: 0,
                         tool_errors: 0,
@@ -297,7 +332,7 @@ impl BenchmarkAdapter for TerminalBenchAdapter {
                         session_db: None,
                         flow_db: None,
                         timed_out: false,
-                        note: failure,
+                        note: p.failure,
                     })
                 } else {
                     // No parseable results — surface tb's tail for debugging.
@@ -355,11 +390,43 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let (resolved, input, output, failure) = parse_results(&dir, "hello-world").unwrap();
-        assert!(resolved);
-        assert_eq!(input, 1200);
-        assert_eq!(output, 300);
-        assert!(failure.is_none());
+        let p = parse_results(&dir, "hello-world").unwrap();
+        assert!(p.resolved);
+        assert_eq!(p.input, 1200);
+        assert_eq!(p.output, 300);
+        assert!(p.failure.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_results_extracts_parser_results_partial_credit() {
+        let dir = std::env::temp_dir().join(format!("tb-parse-sub-{}", std::process::id()));
+        let run = dir.join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        // A near-miss like today's fibonacci-server candidate: 5 of 6 sub-checks pass.
+        std::fs::write(
+            run.join("results.json"),
+            serde_json::json!({
+                "results": [
+                    {"task_id": "fibonacci-server", "is_resolved": false,
+                     "parser_results": {
+                         "test_server_running": "passed",
+                         "test_fibonacci_endpoint_small_numbers": "passed",
+                         "test_fibonacci_large_number": "passed",
+                         "test_missing_parameter": "passed",
+                         "test_non_integer_parameter": "passed",
+                         "test_negative_number": "failed"
+                     }}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let p = parse_results(&dir, "fibonacci-server").unwrap();
+        assert!(!p.resolved);
+        assert_eq!(p.checks_total, 6);
+        assert_eq!(p.checks_passed, 5);
+        assert_eq!(p.failed_checks, vec!["test_negative_number".to_string()]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
