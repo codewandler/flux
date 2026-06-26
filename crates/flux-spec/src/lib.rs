@@ -69,6 +69,11 @@ pub struct ToolSpec {
     pub idempotency: Idempotency,
     #[serde(default)]
     pub access: Vec<AccessKind>,
+    /// The evidence-gated tool group this op belongs to. `None` means *core* — always advertised to
+    /// the model. A named group is only surfaced into the model-facing catalog when the workspace
+    /// shows evidence the group is relevant (see `flux-runtime`'s group resolver).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 impl ToolSpec {
@@ -87,6 +92,7 @@ impl ToolSpec {
             risk: Risk::Low,
             idempotency: Idempotency::Idempotent,
             access: Vec::new(),
+            group: None,
         }
     }
 
@@ -102,6 +108,13 @@ impl ToolSpec {
 
     pub fn with_access(mut self, access: Vec<AccessKind>) -> Self {
         self.access = access;
+        self
+    }
+
+    /// Assign this op to an evidence-gated tool group (e.g. `"git"`). Ungrouped ops are *core* and
+    /// always advertised; a grouped op only appears in the catalog when its group is surfaced.
+    pub fn with_group(mut self, group: impl Into<String>) -> Self {
+        self.group = Some(group.into());
         self
     }
 

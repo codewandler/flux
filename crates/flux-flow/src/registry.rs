@@ -50,6 +50,7 @@ impl OpSpec {
             risk: self.risk,
             idempotency: self.idempotency,
             access: Vec::new(),
+            group: None,
         }
     }
 }
