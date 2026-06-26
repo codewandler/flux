@@ -12,14 +12,18 @@ fn main() {
     let file: syn::File = syn::parse_str(&ast_src).expect("parse src/ast.rs");
 
     // Find the `Node` enum.
-    let node_enum = file.items.iter().find_map(|item| {
-        if let syn::Item::Enum(e) = item {
-            if e.ident == "Node" {
-                return Some(e);
+    let node_enum = file
+        .items
+        .iter()
+        .find_map(|item| {
+            if let syn::Item::Enum(e) = item {
+                if e.ident == "Node" {
+                    return Some(e);
+                }
             }
-        }
-        None
-    }).expect("Node enum not found in src/ast.rs");
+            None
+        })
+        .expect("Node enum not found in src/ast.rs");
 
     // Build a markdown table row per variant.
     let mut rows = String::new();
@@ -29,24 +33,28 @@ fn main() {
         // The serde rename_all = snake_case rule: convert CamelCase to snake_case.
         let kind = to_snake_case(&variant.ident.to_string());
         // Collect doc-comment lines.
-        let doc: String = variant.attrs.iter().filter_map(|a| {
-            if a.path().is_ident("doc") {
-                if let syn::Meta::NameValue(nv) = &a.meta {
-                    if let syn::Expr::Lit(el) = &nv.value {
-                        if let syn::Lit::Str(s) = &el.lit {
-                            return Some(s.value().trim().to_string());
+        let doc: String = variant
+            .attrs
+            .iter()
+            .filter_map(|a| {
+                if a.path().is_ident("doc") {
+                    if let syn::Meta::NameValue(nv) = &a.meta {
+                        if let syn::Expr::Lit(el) = &nv.value {
+                            if let syn::Lit::Str(s) = &el.lit {
+                                return Some(s.value().trim().to_string());
+                            }
                         }
                     }
                 }
-            }
-            None
-        }).collect::<Vec<_>>().join(" ");
+                None
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
         rows.push_str(&format!("| `{kind}` | {doc} |\n"));
     }
 
     let out_dir = env::var("OUT_DIR").unwrap();
-    fs::write(Path::new(&out_dir).join("node_kinds.rs"), rows)
-        .expect("write node_kinds.rs");
+    fs::write(Path::new(&out_dir).join("node_kinds.rs"), rows).expect("write node_kinds.rs");
 }
 
 /// Convert `CamelCase` to `snake_case` (mirrors serde's rename_all = snake_case).

@@ -130,7 +130,9 @@ impl Tool for EvalRunTool {
         // Per-eval setup (e.g. the terminal-bench adapter rebuilds the static musl binary so a
         // candidate eval reflects the worker's edits).
         if let Err(e) = adapter.prepare(&rc).await {
-            return Ok(ToolResult::error(format!("eval_run: adapter prepare failed: {e}")));
+            return Ok(ToolResult::error(format!(
+                "eval_run: adapter prepare failed: {e}"
+            )));
         }
 
         let task_ids = adapter.list_tasks(&filter)?;

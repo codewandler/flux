@@ -1299,7 +1299,11 @@ async fn resolve_read_paths(ctx: &ToolContext, params: &Value) -> Result<Vec<Str
         }
         Some(Value::String(s)) if s.contains('*') || s.contains('?') => {
             // Treat as a glob pattern: walk the workspace and filter by wildcard.
-            let mut files = ctx.system.walk_files(".", WALK_FILE_CAP).await.unwrap_or_default();
+            let mut files = ctx
+                .system
+                .walk_files(".", WALK_FILE_CAP)
+                .await
+                .unwrap_or_default();
             files.retain(|f| wildcard_match(s, f));
             files.truncate(DEFAULT_GLOB_LIMIT);
             Ok(files)

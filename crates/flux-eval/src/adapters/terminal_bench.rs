@@ -48,7 +48,11 @@ impl TerminalBenchAdapter {
         let tasks: Vec<String> = params
             .get("tasks")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let flux_binary = str_field(params, "flux_binary")
             .ok_or_else(|| {
@@ -79,7 +83,10 @@ impl TerminalBenchAdapter {
                 .get("agent_timeout_secs")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(600),
-            rebuild: params.get("rebuild").and_then(|v| v.as_bool()).unwrap_or(false),
+            rebuild: params
+                .get("rebuild")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         })
     }
 
@@ -115,9 +122,18 @@ fn parse_results(dir: &std::path::Path, task_id: &str) -> Option<(bool, u64, u64
         .iter()
         .find(|r| r.get("task_id").and_then(|v| v.as_str()) == Some(task_id))
         .or_else(|| results.first())?;
-    let resolved = entry.get("is_resolved").and_then(|v| v.as_bool()).unwrap_or(false);
-    let input = entry.get("total_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-    let output = entry.get("total_output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let resolved = entry
+        .get("is_resolved")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let input = entry
+        .get("total_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let output = entry
+        .get("total_output_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let failure = entry
         .get("failure_mode")
         .and_then(|v| v.as_str())
@@ -140,7 +156,8 @@ impl BenchmarkAdapter for TerminalBenchAdapter {
         // installs the worker's edits, not a stale binary.
         let cwd = std::env::current_dir().map_err(|e| Error::Other(e.to_string()))?;
         let sys = System::new(
-            Workspace::new(&cwd).map_err(|e| Error::Other(format!("musl rebuild workspace: {e}")))?,
+            Workspace::new(&cwd)
+                .map_err(|e| Error::Other(format!("musl rebuild workspace: {e}")))?,
         );
         let argv: Vec<String> = [
             "cargo",
@@ -155,10 +172,20 @@ impl BenchmarkAdapter for TerminalBenchAdapter {
         .map(|s| s.to_string())
         .collect();
         let out = sys
-            .run_with_env(&argv, &crate::runner::toolchain_env(), Duration::from_secs(1800))
+            .run_with_env(
+                &argv,
+                &crate::runner::toolchain_env(),
+                Duration::from_secs(1800),
+            )
             .await?;
         if out.exit_code != 0 {
-            let tail: String = out.stderr.lines().rev().take(6).collect::<Vec<_>>().join(" | ");
+            let tail: String = out
+                .stderr
+                .lines()
+                .rev()
+                .take(6)
+                .collect::<Vec<_>>()
+                .join(" | ");
             return Err(Error::Other(format!(
                 "musl rebuild failed (exit {}): {tail}",
                 out.exit_code
@@ -285,7 +312,10 @@ impl BenchmarkAdapter for TerminalBenchAdapter {
                     Ok(RunResult::failed(
                         task_id,
                         wall_ms,
-                        format!("tb run: no results.json parsed (exit {}): {tail}", output.exit_code),
+                        format!(
+                            "tb run: no results.json parsed (exit {}): {tail}",
+                            output.exit_code
+                        ),
                     ))
                 }
             }

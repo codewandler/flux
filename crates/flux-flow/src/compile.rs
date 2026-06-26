@@ -402,8 +402,14 @@ fn parse_completion(value: Option<&serde_json::Value>) -> Option<Completion> {
             instructions,
         }),
         serde_json::Value::Object(map) => {
-            let instructions = map.get("instructions").and_then(|v| v.as_str()).and_then(nonempty)?;
-            let primer = map.get("primer").and_then(|v| v.as_str()).and_then(nonempty);
+            let instructions = map
+                .get("instructions")
+                .and_then(|v| v.as_str())
+                .and_then(nonempty)?;
+            let primer = map
+                .get("primer")
+                .and_then(|v| v.as_str())
+                .and_then(nonempty);
             Some(Completion {
                 primer,
                 instructions,
@@ -1031,9 +1037,17 @@ mod tests {
                 "complete": { "primer": "build green", "instructions": "summarize what changed" }
             }),
         )]);
-        let out = plan(&p, "mock", "do it", &ops, None, None, CompileOptions::default())
-            .await
-            .unwrap();
+        let out = plan(
+            &p,
+            "mock",
+            "do it",
+            &ops,
+            None,
+            None,
+            CompileOptions::default(),
+        )
+        .await
+        .unwrap();
         let c = out.complete.expect("object complete captured");
         assert_eq!(c.instructions, "summarize what changed");
         assert_eq!(c.primer.as_deref(), Some("build green"));
@@ -1043,9 +1057,17 @@ mod tests {
             "emit_plan",
             serde_json::json!({ "ast": ast, "complete": "all done" }),
         )]);
-        let out = plan(&p, "mock", "do it", &ops, None, None, CompileOptions::default())
-            .await
-            .unwrap();
+        let out = plan(
+            &p,
+            "mock",
+            "do it",
+            &ops,
+            None,
+            None,
+            CompileOptions::default(),
+        )
+        .await
+        .unwrap();
         let c = out.complete.expect("string complete captured");
         assert_eq!(c.instructions, "all done");
         assert_eq!(c.primer, None);
@@ -1055,9 +1077,17 @@ mod tests {
             "emit_plan",
             serde_json::from_str(VALID_AST).unwrap(),
         )]);
-        let out = plan(&p, "mock", "do it", &ops, None, None, CompileOptions::default())
-            .await
-            .unwrap();
+        let out = plan(
+            &p,
+            "mock",
+            "do it",
+            &ops,
+            None,
+            None,
+            CompileOptions::default(),
+        )
+        .await
+        .unwrap();
         assert!(out.complete.is_none());
     }
 

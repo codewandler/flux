@@ -61,7 +61,11 @@ pub fn format_call(name: &str, input: &Value) -> Call {
             _ => String::new(),
         },
         "patch" => match (s("path"), input.get("edits").and_then(|e| e.as_array())) {
-            (Some(p), Some(edits)) => format!("{p} ({} edit{})", edits.len(), if edits.len() == 1 { "" } else { "s" }),
+            (Some(p), Some(edits)) => format!(
+                "{p} ({} edit{})",
+                edits.len(),
+                if edits.len() == 1 { "" } else { "s" }
+            ),
             (Some(p), None) => p,
             _ => String::new(),
         },
@@ -134,7 +138,10 @@ pub fn format_result(name: &str, content: &str, is_error: bool) -> Option<String
             if n == 0 {
                 Some("ok".to_string())
             } else {
-                Some(format!("exit 0 · {n} line{}", if n == 1 { "" } else { "s" }))
+                Some(format!(
+                    "exit 0 · {n} line{}",
+                    if n == 1 { "" } else { "s" }
+                ))
             }
         }
         _ => None,

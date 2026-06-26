@@ -1672,7 +1672,12 @@ impl CliSink {
                     let frame = FRAMES[st.frame % FRAMES.len()];
                     st.frame += 1;
                     let elapsed = style::fmt_elapsed(start.elapsed());
-                    eprint!("\r\x1b[K{} {}  {}", style::cyan(&frame.to_string()), st.label, style::dim(&elapsed));
+                    eprint!(
+                        "\r\x1b[K{} {}  {}",
+                        style::cyan(&frame.to_string()),
+                        st.label,
+                        style::dim(&elapsed)
+                    );
                     let _ = std::io::stderr().flush();
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(80)).await;
@@ -1898,7 +1903,10 @@ impl AgentSink for GoalSink {
         println!();
         if let Some(u) = usage {
             let stats = if u.cache_read_input_tokens > 0 {
-                format!("in {} out {} $cache {}", u.input_tokens, u.output_tokens, u.cache_read_input_tokens)
+                format!(
+                    "in {} out {} $cache {}",
+                    u.input_tokens, u.output_tokens, u.cache_read_input_tokens
+                )
             } else {
                 format!("in {} out {}", u.input_tokens, u.output_tokens)
             };

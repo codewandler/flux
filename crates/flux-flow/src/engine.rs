@@ -795,7 +795,11 @@ mod tests {
 
         assert_eq!(sink.tools, vec!["echo"], "the plan still executed");
         let msgs = store.load_messages(&sid).unwrap();
-        assert_eq!(msgs.len(), 2, "user + the grounded summary — one completion");
+        assert_eq!(
+            msgs.len(),
+            2,
+            "user + the grounded summary — one completion"
+        );
         assert!(
             msgs[1].text().contains("Ran echo and it returned hi."),
             "the persisted answer is the grounded summary, not the directive"
