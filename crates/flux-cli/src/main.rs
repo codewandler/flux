@@ -502,6 +502,10 @@ async fn build_agent(cli: &Cli) -> Result<(FlowEngine, String, Arc<dyn flux_runt
     }
     registry.register(Arc::new(TaskTool));
 
+    // Eval / self-improvement ops (the ones `improve.flux` orchestrates). Registered on the
+    // top-level registry only — never on `sub_registry`, so worker sub-agents can't run eval/git ops.
+    flux_eval::register_eval_ops(&mut registry);
+
     // Guarded web access (policy-gated as network egress; private/loopback per config).
     registry.register(Arc::new(
         flux_browser::WebFetchTool::default().allow_private(cfg.allow_private_net),
@@ -639,6 +643,109 @@ async fn run_agentic(cli: &Cli, prompt: String) -> Result<()> {
         .await
         .context("agent turn")?;
     persist_new_rules(&initial_rules, &agent.executor.allow_rules());
+    Ok(())
+}
+
+/// `flux flow run <file.flux> [--yes] [-m <model>]` — load a checked-in Flux-Lang graph (JSON
+/// `DraftAst`) and execute it directly, **skipping the NL→plan compile**. This is the thin slice of
+/// flow persistence that makes `improve.flux` runnable; full `.flux/flows` save/load is flux-flow M6.
+/// The file is validated against the live op registry (`analyze_flow`) before anything runs, and it
+/// executes through the same `Executor::dispatch` envelope as every other turn (destructive ops still
+/// escalate; `--yes` auto-approves).
+async fn run_flow(args: &[String]) -> Result<()> {
+    let mut iter = args.iter();
+    if iter.next().map(|s| s.as_str()) != Some("run") {
+        bail!("usage: flux flow run <file.flux> [--yes] [-m <model>]");
+    }
+    let mut file: Option<String> = None;
+    let mut yes = false;
+    let mut model: Option<String> = None;
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "--yes" | "-y" => yes = true,
+            "-m" | "--model" => {
+                model = Some(
+                    iter.next()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("`-m` needs a model spec"))?,
+                )
+            }
+            other if !other.starts_with('-') && file.is_none() => file = Some(other.to_string()),
+            other => bail!("flow run: unexpected argument {other:?}"),
+        }
+    }
+    let file = file
+        .ok_or_else(|| anyhow::anyhow!("usage: flux flow run <file.flux> [--yes] [-m <model>]"))?;
+
+    // Synthesize a Cli for build_agent from the parsed flags (reuses all the agent wiring).
+    let mut synth: Vec<String> = vec!["flux".to_string()];
+    if yes {
+        synth.push("--yes".to_string());
+    }
+    if let Some(m) = &model {
+        synth.push("-m".to_string());
+        synth.push(m.clone());
+    }
+    let cli = Cli::parse_from(&synth);
+    style::init(cli.color);
+
+    let src = std::fs::read_to_string(&file).with_context(|| format!("read flow {file}"))?;
+    let ast: flux_flow::ast::DraftAst = serde_json::from_str(&src)
+        .with_context(|| format!("parse {file} as a Flux-Lang DraftAst (JSON)"))?;
+
+    let (mut engine, session_id, _spawner) = build_agent(&cli).await?;
+    eprintln!(
+        "{}",
+        style::dim(&format!("flow · {} · session {session_id}", engine.model))
+    );
+
+    // Validate against the live op registry before running anything.
+    let oreg = flux_flow::registry::OpRegistry::new(engine.executor.registry());
+    if let Err(diags) = flux_flow::analyze::analyze_flow(&ast, &oreg) {
+        print_diagnostics(&diags);
+        bail!("flow validation failed — see diagnostics above");
+    }
+
+    // Risk preview + per-op approval (same envelope as a real turn).
+    let risk = flux_flow::runtime::plan_risk(&ast, engine.executor.registry());
+    eprintln!(
+        "\n{}  {}{}",
+        style::bold("flow"),
+        risk_badge(&risk.summary()),
+        style::dim(&format!(" · {} op(s)", risk.ops.len()))
+    );
+    let fallback: Arc<dyn Approver> = if cli.yes {
+        Arc::new(AllowApprover)
+    } else {
+        Arc::new(StdinApprover)
+    };
+    engine
+        .executor
+        .set_approver(Arc::new(flux_flow::runtime::PlanApprover::new(
+            risk.ops.clone(),
+            fallback,
+        )));
+
+    let mut sink = CliSink::new();
+    let outcome = flux_flow::runtime::execute_flow(
+        &engine.flow,
+        &engine.executor,
+        &session_id,
+        &ast,
+        &mut sink,
+    )
+    .await
+    .context("execute flow")?;
+    if !outcome.result.trim().is_empty() {
+        println!("{}", outcome.result);
+    } else {
+        // Always surface a closing summary so a direct `flux flow run` turn never ends silently.
+        eprintln!(
+            "{}",
+            style::dim(&format!("done \u00b7 {} step(s)", outcome.steps))
+        );
+    }
+    sink.turn_end(None);
     Ok(())
 }
 
@@ -1609,9 +1716,11 @@ impl AgentSink for GoalSink {
     }
 }
 
-/// A built-in offline provider (`-m mock`): call 1 writes `flux-mock.txt` via the `write` tool,
-/// call 2 returns a summary and stops. Lets the agentic loop be exercised end-to-end with no
-/// network — useful for `flux --agent --yes -m mock` smoke tests.
+/// A built-in offline provider (`-m mock`): emits a one-shot `emit_plan` plan that writes
+/// `flux-mock.txt` (or runs `FLUX_MOCK_BASH` / calls `FLUX_MOCK_TOOL`), with a closing `reply` so the
+/// engine runs it in a single round and stops. Because the engine is pure-DAG (the model's only tool
+/// is `emit_plan`), the mock must emit a *plan*, not a raw tool call. Lets the Flux-Lang engine be
+/// exercised end-to-end with no network — used by the eval harness's offline slice and smoke tests.
 #[derive(Default)]
 struct MockCliProvider {
     calls: AtomicUsize,
@@ -1634,103 +1743,74 @@ impl Provider for MockCliProvider {
             return Ok(Box::pin(s));
         }
 
-        // Test hook: `FLUX_MOCK_TOOL=<name>` (+ optional `FLUX_MOCK_TOOL_INPUT=<json>`) makes call 1
-        // emit a tool call for any registered tool — used to exercise tools end-to-end via the CLI.
-        if let Ok(tool) = std::env::var("FLUX_MOCK_TOOL") {
-            let input: serde_json::Value = std::env::var("FLUX_MOCK_TOOL_INPUT")
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_else(|| serde_json::json!({}));
-            let chunks = if n == 0 {
-                vec![
-                    Chunk::TextDelta(format!("Calling `{tool}`.")),
-                    Chunk::Block(ContentBlock::Text {
-                        text: format!("Calling `{tool}`."),
-                    }),
-                    Chunk::Block(ContentBlock::ToolUse {
-                        id: "t1".into(),
-                        name: tool,
-                        input,
-                    }),
-                    Chunk::Done {
-                        stop_reason: Some(StopReason::ToolUse),
-                    },
-                ]
-            } else {
-                vec![
-                    Chunk::TextDelta("Finished.".into()),
-                    Chunk::Block(ContentBlock::Text {
-                        text: "Finished.".into(),
-                    }),
-                    Chunk::Done {
-                        stop_reason: Some(StopReason::EndTurn),
-                    },
-                ]
-            };
-            return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
-        }
-
-        // Test hook: `FLUX_MOCK_BASH=<cmd>` makes call 1 emit a `bash` tool call with that command
-        // (used to exercise the destructive-command approval gate end-to-end via the CLI).
-        if let Ok(cmd) = std::env::var("FLUX_MOCK_BASH") {
-            let chunks = if n == 0 {
-                vec![
-                    Chunk::TextDelta(format!("Running `{cmd}`.")),
-                    Chunk::Block(ContentBlock::Text {
-                        text: format!("Running `{cmd}`."),
-                    }),
-                    Chunk::Block(ContentBlock::ToolUse {
-                        id: "b1".into(),
-                        name: "bash".into(),
-                        input: serde_json::json!({ "command": cmd }),
-                    }),
-                    Chunk::Done {
-                        stop_reason: Some(StopReason::ToolUse),
-                    },
-                ]
-            } else {
-                vec![
-                    Chunk::TextDelta("Finished.".into()),
-                    Chunk::Block(ContentBlock::Text {
-                        text: "Finished.".into(),
-                    }),
-                    Chunk::Done {
-                        stop_reason: Some(StopReason::EndTurn),
-                    },
-                ]
-            };
-            return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
-        }
-
-        let chunks = if n == 0 {
-            vec![
-                Chunk::TextDelta("I'll create the file.".into()),
+        // Safety net: after the (single) planning round the engine ends the turn (the plan carries a
+        // `reply`), so this branch shouldn't be hit — but if the provider is re-invoked, answer plainly.
+        if n > 0 {
+            let chunks = vec![
                 Chunk::Block(ContentBlock::Text {
-                    text: "I'll create the file.".into(),
-                }),
-                Chunk::Block(ContentBlock::ToolUse {
-                    id: "m1".into(),
-                    name: "write".into(),
-                    input: serde_json::json!({
-                        "path": "flux-mock.txt",
-                        "content": "created by flux mock\n"
-                    }),
-                }),
-                Chunk::Done {
-                    stop_reason: Some(StopReason::ToolUse),
-                },
-            ]
-        } else {
-            vec![
-                Chunk::TextDelta("Done — wrote flux-mock.txt.".into()),
-                Chunk::Block(ContentBlock::Text {
-                    text: "Done — wrote flux-mock.txt.".into(),
+                    text: "Finished.".into(),
                 }),
                 Chunk::Done {
                     stop_reason: Some(StopReason::EndTurn),
                 },
-            ]
-        };
+            ];
+            return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+        }
+
+        // Build a one-shot Flux-Lang plan (the engine is pure-DAG, so the model emits `emit_plan`).
+        // `FLUX_MOCK_TOOL` calls any tool (input = `FLUX_MOCK_TOOL_INPUT`, passed as a lone object so
+        // it maps straight to the tool's named input); `FLUX_MOCK_BASH` runs a `bash` command; the
+        // default writes `flux-mock.txt`. A `reply` makes the engine run the plan and stop in one round.
+        let (ast, reply): (serde_json::Value, String) =
+            if let Ok(tool) = std::env::var("FLUX_MOCK_TOOL") {
+                let input: serde_json::Value = std::env::var("FLUX_MOCK_TOOL_INPUT")
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                (
+                    serde_json::json!({
+                        "body": [{
+                            "kind": "call", "op": tool,
+                            "args": [{ "kind": "lit", "value": input }]
+                        }]
+                    }),
+                    format!("Called `{tool}`."),
+                )
+            } else if let Ok(cmd) = std::env::var("FLUX_MOCK_BASH") {
+                (
+                    serde_json::json!({
+                        "body": [{
+                            "kind": "call", "op": "bash",
+                            "args": [{ "kind": "lit", "value": cmd }]
+                        }]
+                    }),
+                    format!("Ran `{cmd}`."),
+                )
+            } else {
+                (
+                    serde_json::json!({
+                        "body": [{
+                            "kind": "call", "op": "write",
+                            "args": [
+                                { "kind": "lit", "value": "flux-mock.txt" },
+                                { "kind": "lit", "value": "created by flux mock\n" }
+                            ]
+                        }]
+                    }),
+                    "Wrote flux-mock.txt.".to_string(),
+                )
+            };
+
+        let chunks = vec![
+            Chunk::Block(ContentBlock::ToolUse {
+                id: "plan1".into(),
+                name: "emit_plan".into(),
+                input: serde_json::json!({ "ast": ast, "reply": reply }),
+            }),
+            Chunk::Done {
+                stop_reason: Some(StopReason::ToolUse),
+            },
+        ];
         Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
     }
 }
@@ -1775,6 +1855,9 @@ async fn main() -> Result<()> {
     }
     if argv.get(1).map(|s| s == "sessions").unwrap_or(false) {
         return run_sessions();
+    }
+    if argv.get(1).map(|s| s == "flow").unwrap_or(false) {
+        return run_flow(&argv[2..]).await;
     }
     let cli = Cli::parse();
     style::init(cli.color);
