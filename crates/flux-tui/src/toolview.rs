@@ -55,6 +55,16 @@ pub fn format_call(name: &str, input: &Value) -> Call {
         }
         "web_fetch" => s("url").unwrap_or_default(),
         "search" => format!("{:?}", s("query").unwrap_or_default()),
+        "append" => match (s("path"), input.get("content").and_then(Value::as_str)) {
+            (Some(p), Some(c)) => format!("{p} (+{} bytes)", c.len()),
+            (Some(p), None) => p,
+            _ => String::new(),
+        },
+        "patch" => match (s("path"), input.get("edits").and_then(|e| e.as_array())) {
+            (Some(p), Some(edits)) => format!("{p} ({} edit{})", edits.len(), if edits.len() == 1 { "" } else { "s" }),
+            (Some(p), None) => p,
+            _ => String::new(),
+        },
         "task" => match (s("role"), s("task")) {
             (Some(r), Some(t)) => format!("{r}: {t}"),
             (Some(r), None) => r,
@@ -117,6 +127,15 @@ pub fn format_result(name: &str, content: &str, is_error: bool) -> Option<String
             // Suppress the raw file dump; show a compact line count instead.
             let n = content.lines().count();
             Some(format!("{n} line{}", if n == 1 { "" } else { "s" }))
+        }
+        "bash" => {
+            // For successful bash calls collapse output to a line count so the card stays compact.
+            let n = content.lines().filter(|l| !l.trim().is_empty()).count();
+            if n == 0 {
+                Some("ok".to_string())
+            } else {
+                Some(format!("exit 0 · {n} line{}", if n == 1 { "" } else { "s" }))
+            }
         }
         _ => None,
     }
