@@ -80,7 +80,13 @@ change.
 - Tests: a **build→append→budget-shrink** trace with drops recorded (so `ctx` isn't a glorified struct
   literal); a `need`→`gaps`→`repeat until $open.empty` loop (ops + existing nodes, no new machinery).
 
-## P3 — SDK lifecycle surface (`flux-sdk`)
+## P3 — SDK lifecycle surface (`flux-sdk`) — ✅ DONE
+- **Shipped:** `flux-sdk/src/flow.rs` — `assemble_registry(provider, model)` (builtins + `CognitionPack`),
+  `FlowClient` (compile→analyze→execute), `register_op`/`register_pack`/`register_prelude`, artifact
+  re-exports. **Cognition pack wired into the live CLI** (`flux-cli` `build_agent`) — the model ops are
+  now advertised on the real path (resolves the Wave-1 dead-crate finding). `optimize` deferred (needs
+  node-id plan lowering). Classic agent-loop client kept as the simple front door.
+
 - Keep `ClientBuilder`/`Client` (agent-loop) as the simple front door.
 - Add: `OpRegistry` + `register_op`/`register_pack`/`register_prelude`; re-expose `compile_turn`,
   `analyze`, `execute` (reuse flux-flow adapters — no new envelope); `optimize` stub.

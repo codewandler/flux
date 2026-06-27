@@ -66,12 +66,12 @@ update it in the same commit as the behaviour it describes.
 
 | PRD § | Requirement | Status | Evidence / note |
 |---|---|---|---|
-| 17.1 | `compile_turn(text, view, registry, llm) -> DraftAst` | 🟡 | exists in `flux-flow/src/compile.rs`; not surfaced via `flux-sdk` |
-| 17.2 | `analyze(ast, session, registry, policy) -> HirFlow` | 🟡 | name/grammar/loop only (see Analyzer) |
-| 17.3 | `optimize(hir) -> PhysicalPlan` | ⬜ | — |
-| 17.4 | `execute(plan, session, runtime) -> ExecutionResult` | ✅ | `execute_flow` (`flux-flow/src/runtime.rs`) |
-| 17.5 | `register_op` | ✅ | `ToolRegistry`; `OpCatalog` |
-| 17 | **`flux-sdk` exposes the lifecycle** (not the agent loop) | 🟡 | current SDK (~190 lines) wraps the classic agent loop → redesigned in `flux-lang-evolution.md` §7 |
+| 17.1 | `compile_turn(text, view, registry, llm) -> DraftAst` | ✅ | surfaced via `flux-sdk` `FlowClient::compile` (delegates to `flux-flow/src/compile.rs`) |
+| 17.2 | `analyze(ast, session, registry, policy) -> HirFlow` | 🟡 → ✅ | `analyze::lower` produces a typed `HirFlow` (effects + arity; full type inference later); `FlowClient::analyze` |
+| 17.3 | `optimize(hir) -> PhysicalPlan` | ⬜ | needs node-id'd plan lowering (deferred) |
+| 17.4 | `execute(plan, session, runtime) -> ExecutionResult` | ✅ | `FlowClient::execute` over `execute_flow` |
+| 17.5 | `register_op` / `register_pack` / `register_prelude` | ✅ | `flux-sdk` `flow` module |
+| 17 | **`flux-sdk` exposes the lifecycle** (not the agent loop) | ✅ (P3) | `FlowClient` (`flux-sdk/src/flow.rs`): assemble registry (builtins + **cognition pack**) + compile→analyze→execute + artifact helpers; classic loop kept as the simple front door |
 
 ## UI editor model (PRD §16)
 
@@ -106,7 +106,7 @@ update it in the same commit as the behaviour it describes.
 | Cognition op-pack + domain-wrapper convention | ✅ | pure: `flux-tools/src/cognition.rs`; model-backed: `flux-cognition` (L3) |
 | `=`/`do`/`+=` marker syntax; optional `goal` header | ⬜ | evolution §5 (P5 text parser) |
 | Multi-agent `Program` layer (agents/channels/triggers/journeys) + `flux-app` host | ⬜ | evolution §6 + appendix (P5c + flux-app) |
-| Real `flux-sdk` lifecycle surface (`OpRegistry`/packs/prelude + `FlowClient` + artifact APIs) | ⬜ | evolution §7 (P3) |
+| Real `flux-sdk` lifecycle surface (`OpRegistry`/packs/prelude + `FlowClient` + artifact APIs) | ✅ | `flux-sdk/src/flow.rs`; cognition pack wired into the CLI registry too (`flux-cli` `build_agent`) |
 
 ## Key design decisions (resolved this round)
 
