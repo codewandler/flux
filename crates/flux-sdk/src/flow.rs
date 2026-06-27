@@ -12,7 +12,13 @@
 //! `ai.judge`, `ai.reason`, `synth`, `ai.rewrite`) reachable as named ops a plan can call — the
 //! pack stops being a dead crate the moment a registry is assembled this way.
 //!
+//! To author the plan in Rust instead of compiling it from natural language, build a
+//! [`flux_lang::ast::DraftAst`] with the [`crate::dsl`], then [`FlowClient::analyze`] and
+//! [`FlowClient::execute`] it directly (skipping `compile`). Runnable, no-API-key examples for both
+//! paths: `examples/flow_compile.rs` (NL→AST) and `examples/dsl_loops.rs` (Rust DSL).
+//!
 //! ```ignore
+//! // Runnable hermetic version: `cargo run -p flux-sdk --example flow_compile`.
 //! # async fn ex() -> flux_core::Result<()> {
 //! use std::sync::Arc;
 //! use flux_sdk::flow::FlowClient;

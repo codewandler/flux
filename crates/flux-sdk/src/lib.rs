@@ -4,7 +4,13 @@
 //! [`Client`]. You supply a [`Provider`] (from `flux-anthropic`/`flux-openai`) and a workspace
 //! root; the SDK wires the rest.
 //!
+//! There are three front doors: [`Client`] (this classic agent loop), [`FlowClient`] (the Flux-Lang
+//! `compile → analyze → execute` lifecycle, NL→AST), and the [`dsl`] (author the AST in Rust). Each
+//! has a runnable, no-API-key example: `examples/client_basic.rs`, `examples/flow_compile.rs`, and
+//! `examples/dsl_loops.rs` respectively.
+//!
 //! ```ignore
+//! // Runnable hermetic version: `cargo run -p flux-sdk --example client_basic`.
 //! # async fn ex() -> flux_core::Result<()> {
 //! use flux_sdk::Client;
 //! let provider = Box::new(flux_anthropic::anthropic_from_env()?);
@@ -17,6 +23,12 @@
 pub mod flow;
 
 pub use flow::{assemble_registry, ExecutionResult, FlowClient, FlowClientBuilder};
+
+/// The Rust **embedded DSL** for authoring flows — builder primitives that compile to the Flux-Lang
+/// AST. Build a [`flux_lang::ast::DraftAst`] with `dsl::Flow`/`dsl::Block` (loops and control-flow are
+/// first-class), then drive it through [`FlowClient::analyze`] + [`FlowClient::execute`]. Re-exported
+/// from `flux-lang` so consumers can stay inside `flux_sdk`. See `examples/dsl_loops.rs`.
+pub use flux_lang::dsl;
 
 use std::path::PathBuf;
 use std::sync::Arc;
