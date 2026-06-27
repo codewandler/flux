@@ -40,7 +40,7 @@ review pass (findings fixed before commit).
 | 8 | Constructs beyond v1 (`each`/`parallel`/`race`/`try`/`retry`/`confirm`/`loop`/`throttle`/…) | ✅ | `src/ast.rs`, `src/runtime.rs` |
 | 8 | `await` pause/resume | 🟡 | node exists; interpreter rejects it (cross-turn suspend unbuilt) |
 | 1, 8 | Compact **text parser** (text → AST) | ✅ | `src/parse.rs` + `src/format.rs`; `parse(format(ast)) == ast` (native subset + `@json` fallback; round-trip + real-example tests) |
-| 8, 16 | Pretty-printer / renderer (AST → readable) | ✅ | `src/render.rs` (one-way) — round-trip blocked on the parser |
+| 8, 16 | Pretty-printer / renderer (AST → readable) | ✅ | `src/render.rs` is intentionally one-way (lossy display tree); the round-trippable text surface is `format`/`parse` (row above) |
 | 20.1 | AST serializable + versioned (JSON wire) | ✅ | serde on `ast.rs`; `examples/*.flux` are JSON |
 
 ## Analyzer & lowering (PRD §10.2, §15)

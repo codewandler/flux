@@ -1,5 +1,14 @@
 # Design review — flux-lang evolution
 
+> **Scope / status (read first).** This is the **original, pre-build** design review; its inline code
+> observations (the `{"type":"object"}` placeholder, "optimizer/HIR are stubs", `OpSignature` carries
+> "no types", "+3 nodes") describe the tree **at review time**. All five findings were resolved — see
+> the **Resolutions** section below — and the build has since landed **P0–P5 + flux-app** (`OpSpec::lower`
+> emits a real schema; `OpSignature` carries `param_types`; the optimizer and typed HIR are built; the
+> shipped node delta is **+2**). Live status is in [`STATUS.md`](STATUS.md); the later build-time review
+> rounds (the Wave-1 dead-crate finding, review #2/#3) are tracked there and in
+> [`evolution-impl-plan.md`](evolution-impl-plan.md).
+
 **Reviewing:** [`docs/designs/flux-lang-evolution.md`](../../../docs/designs/flux-lang-evolution.md)
 (+ [`evolution-impl-plan.md`](evolution-impl-plan.md) and [`STATUS.md`](STATUS.md)).
 **Verdict:** sound direction, honest framing, strictly additive. Two seams need to be resolved on paper

@@ -102,9 +102,7 @@ change.
   expressions remains.
 
 ## P5 — parallel tracks (prioritize later)
-- **P5a — ✅ DONE.** Text syntax (`src/parse.rs` + `src/format.rs`): canonical compact form, `=`/`do`/`+=` markers, indentation blocks, `ctx`/`ctx_append` native; `@json` fallback for the rest; `parse(format(ast)) == ast` for every DraftAst (round-trip + real-example tests).
-- Text display modes + `parse.rs`/`format.rs` (PRD items 1–2): `=`/`do`/`+=` markers, `ctx`/`need`/
-  `query` blocks, optional `goal` header; round-trip `parse(format(ast)) == ast`. **⬜ remaining.**
+- **P5a — ✅ DONE.** Text syntax (`src/parse.rs` + `src/format.rs`): canonical compact form, `=`/`do`/`+=` markers, indentation blocks, `ctx`/`ctx_append` native; `@json` fallback for the rest; `parse(format(ast)) == ast` for every DraftAst (round-trip + real-example tests). Remaining sub-items (optional): a second *token-efficient* display mode, native `need`/`query` block grammar (today `@json`), and wiring a `fluxlang compile` CLI subcommand onto `parse`.
 - **P5b — ✅ DONE.** Optimizer (`src/optimize.rs`: independent read-only binds batch into Parallel stages, side-effects fenced) + `runtime::execute_plan` + `flux-sdk` `optimize`/`execute_optimized`.
 - **P5c + FLUX-APP — ✅ DONE.** Multi-agent `Program` layer (`flux-lang/src/program.rs` decls + module
   loader) + the orchestration op-pack (`emit`/`send`/`spawn`; `ask` MVP) + the **`flux-app`** L6 runtime

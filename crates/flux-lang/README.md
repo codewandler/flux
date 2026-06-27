@@ -60,18 +60,25 @@ Closest familiar relatives: a **Temporal / Step-Functions**-style deterministic 
 rather than a wired graph; an **SSA IR** for the value model; a **build system** for the content-hash
 caching / dead-step elimination the optimizer targets.
 
-> *Today* the interpreter runs the AST **sequentially** (`parallel`/`race` are the explicit concurrency
-> escape hatches); the data-dependency DAG is the basis for the **planned** optimizer (parallelize
-> independent ops, cache by input hash, drop dead steps — PRD §15), not a claim that execution is already
-> graph-scheduled.
+> *By default* the interpreter runs the AST **sequentially** (`parallel`/`race` are the explicit
+> concurrency escape hatches). The data-dependency DAG is the basis for the optimizer (`optimize.rs`):
+> it batches independent read-only binds into parallel stages and fences side-effects, and
+> `runtime::execute_plan` runs the resulting `PhysicalPlan`. Cache-by-input-hash / dead-step elimination
+> (PRD §15) are still ahead.
 
 ## What's in the crate
 
 | Module | Role |
 |---|---|
 | `ast` | the typed AST (`Node`, `Value`, `TypeRef`, `FlowEffect`, …) — all derive `JsonSchema` |
-| `render` | render an AST as a human-readable execution tree |
-| `analyze` | validate a flow against an abstract op catalog (`OpCatalog`) |
+| `opspec` | the typed op spec/signature + the abstract `OpCatalog` seam |
+| `prelude` | the artifact-type ontology (`Claim`/`Evidence`/`Need`/`Ctx`/`Verdict`/…) ops declare I/O against |
+| `analyze` | validate a flow against an `OpCatalog`; `lower` → typed HIR (effects + arity + arg type-checking) |
+| `optimize` | the read-parallelizing optimizer → `PhysicalPlan` (run by `runtime::execute_plan`) |
+| `parse` / `format` | the round-trippable `.flux` **text syntax** (`parse(format(ast)) == ast`) |
+| `program` | the multi-agent `Program` layer (agents/channels/triggers/journeys) + module loader |
+| `effects` | lower semantic `FlowEffect`s onto host effects + policy actions |
+| `render` | render an AST as a human-readable (one-way) execution tree |
 | `schema` | the single source of truth: the AST's JSON Schema + the node-kind catalog |
 | `skill` | the generated language skill an LLM reads to author Flux-Lang |
 | `runtime` | the **reference interpreter** — runs a flow against injected `host`/`store`/`sink` traits |

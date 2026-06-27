@@ -53,7 +53,7 @@ registry.
 
 | op | kind | signature | description |
 |---|---|---|---|
-| `need` | pure | `ask[, require, done_when]` | Build a `Need` artifact (an explicit statement of missing info) |
+| `need` | pure | `ask, require[, done_when]` | Build a `Need` artifact (an explicit statement of missing info) |
 | `gaps` | pure | `claims, need` | Report a `Need`'s still-unmet `require` fields given some claims |
 | `compare` | pure | `a, b` | `{ added, removed, common }` over two arrays |
 | `dedupe` | pure | `items[, by]` | Remove duplicates (whole-value, or by a field), first-seen order |
@@ -70,3 +70,18 @@ registry.
 
 The model-backed ops carry a `Network` effect and require provider access (an LLM call is network
 egress); the pure ops carry no effect and never pause for approval.
+
+## Orchestration ops (the `flux-app` host only)
+
+These are registered **only by the `flux-app` runtime host** (`flux run app.flux`), not the base engine
+— a journey uses them to drive the event bus / channels. They add **no** new language node kinds.
+
+| op | signature | description |
+|---|---|---|
+| `emit` | `event[, payload]` | Publish an event to the bus (fires any matching trigger's journey) |
+| `send` | `channel, message` | Send a message to a named channel (a `cli` channel prints to stdout) |
+| `ask` | `channel, message` | Send + return a correlation id (full request/response reply parking is a TODO) |
+| `spawn` | `run[, input]` | Run a named journey to completion and return its result |
+
+All four are Medium-risk / non-idempotent (`emit`/`spawn` fan out to other journeys, gated separately at
+their own dispatch). See [`flux-lang-evolution.md`](../../../docs/designs/flux-lang-evolution.md) §6.

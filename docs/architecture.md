@@ -22,10 +22,10 @@ the *surfaces* (CLI/TUI/server/SDK).
 | **L0 contracts** (pure) | `flux-core` `flux-policy` `flux-secret` `flux-spec` `flux-config` `flux-evidence` `flux-skill` `flux-lang` | types, authorization, secrets, tool specs, config, evidence, skills, the Flux-Lang language + reference interpreter (effects injected via traits) |
 | **L1 providers** | `flux-provider` `flux-credentials` `flux-anthropic` `flux-openai` | the `Provider` abstraction + clients + credential store |
 | **L2 runtime** | `flux-system` `flux-runtime` `flux-tools` `flux-session` `flux-context` | guarded IO, the safety envelope, built-in tools, sessions, context |
-| **L3 agent** | `flux-agent` `flux-orchestrate` `flux-flow` `flux-eval` | the agent loop + multi-agent orchestration + the Flux-Lang engine + the eval harness |
+| **L3 agent** | `flux-agent` `flux-orchestrate` `flux-flow` `flux-eval` `flux-cognition` | the agent loop + multi-agent orchestration + the Flux-Lang engine + the eval harness + the model-op cognition pack |
 | **L4 extensibility** | `flux-hooks` `flux-plugin` | JS hooks + subprocess plugins |
 | **L5 capabilities** | `flux-browser` `flux-datasource` `flux-auth` | web egress, datasource/RAG, caller identity |
-| **L6 surfaces** | `flux-sdk` `flux-server` `flux-integrations` `flux-tui` `flux-cli` | SDK, HTTP server, integrations, TUI, the `flux` binary |
+| **L6 surfaces** | `flux-sdk` `flux-server` `flux-integrations` `flux-tui` `flux-cli` `flux-app` | SDK, HTTP server, integrations, TUI, the `flux` binary, the multi-agent program runtime host (`flux run app.flux`) |
 
 Why this matters: it keeps the safety core (L0–L2) small and auditable, and makes "route around the
 envelope" structurally hard. Notable rules that fall out:
@@ -113,7 +113,11 @@ A "provider" conflates two orthogonal axes, modeled separately and composed by `
 
 ## Surfaces
 
-- **`flux-sdk`** — high-level `Client` (run/stream, sessions).
+- **`flux-sdk`** — high-level `Client` (run/stream, sessions) **and `FlowClient`**, the Flux-Lang
+  lifecycle surface (compile→analyze→execute, `optimize`/`execute_optimized`, register op-packs/prelude).
+- **`flux-app`** — the L6 runtime host that runs a multi-agent `.flux` **Program** (event bus, triggers,
+  journeys; orchestration ops `emit`/`send`/`ask`/`spawn`), driven by `flux run app.flux`,
+  deny-destructive by default.
 - **`flux-server`** — axum HTTP API + SSE streaming; bearer-token authenticated (no open listener).
 - **`flux-tui`** — ratatui chat with live streaming + an in-TUI approval modal.
 - **`flux-cli`** — the `flux` binary: REPL, `-p` one-shot, `--agent`, `--serve`, slash commands,

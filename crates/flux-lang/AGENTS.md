@@ -6,8 +6,10 @@ envelope, layering lint) still apply.
 
 ## What this crate is
 
-`flux-lang` is the **language**: the AST, its renderer/analyzer/schema, the generated skill, and a
-**reference interpreter** that runs a flow against *injected* effect traits. It is an **L0 leaf** — it
+`flux-lang` is the **language**: the AST, its renderer, the round-trippable **text syntax**
+(`parse`/`format`), the analyzer (`lower` → typed HIR with arg type-checking), the **optimizer**
+(`optimize` → `PhysicalPlan`), the artifact **prelude**, the multi-agent **`program`** layer, the
+schema/skill SSOT, and a **reference interpreter** that runs a flow against *injected* effect traits. It is an **L0 leaf** — it
 depends only on other L0 contracts (`flux-core`, `flux-spec`, `flux-policy`, `flux-evidence`) plus
 external crates (`serde`, `schemars`, `tokio`, …). It must **not** depend on `flux-runtime`,
 `flux-agent`, `flux-session`, a provider, or any concrete tool. The `flux-flow` engine (L3) adapts its
@@ -79,6 +81,6 @@ and keep it in sync with your change (design + status + plan move together):
 **Local WIP plans** — under `.flux/plans/` (gitignored, author's machine only): `ast-node-expansion.md`
 (superseded), `flow-new-primitives.md`, `flux-flow-implementation.md`.
 
-Near-term roadmap (per the PRD): the two writable display modes (a human-readable form and a
-token-efficient form for future fine-tuning) and `fluxlang compile` (text → AST), which the renderer and
-JSON wire form already anticipate.
+Near-term roadmap (per the PRD): the text↔AST layer (`parse`/`format`) is **built and round-trips**;
+what remains is a second, token-efficient display mode (for future fine-tuning) and wiring a
+`fluxlang compile` CLI subcommand onto `parse`.

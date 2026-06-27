@@ -2,7 +2,30 @@
 
 This document is the authoritative specification for the Flux-Lang text syntax: the
 human-writable, editor-friendly form of a flow. It covers grammar, every node kind,
-the relationship to the JSON wire format, and the intended toolchain.
+the relationship to the JSON wire format, and the toolchain.
+
+---
+
+## Implementation status (read first)
+
+The text syntax **is built**: `flux_lang::parse::parse(&str) -> Result<DraftAst>` (one flow) and
+`flux_lang::format::format(&DraftAst) -> String`, with `parse(format(ast)) == ast` for **every**
+`DraftAst`. But `format`/`parse` give a **native** surface to a *subset* of node kinds and fall back to a
+single-line `@json <compact-json>` escape for the rest — so the round-trip always holds while the
+hand-written grammar stays small.
+
+- **Native text** (markers `=` bind · `do <op> <args>` effectful call · `+=` `ctx_append`): `bind`,
+  `call` (bare `do …` or inline `op(…)`), `var` (`$x`), `lit` (JSON), `return`, `when`/`else`, `unless`,
+  `each`, `repeat`, `seq`, and the context-pack nodes **`ctx`** / **`ctx_append`**. Flow header carries
+  optional `name`/`params`/`returns`; a leading `goal "…"` line is accepted and ignored (not part of the
+  AST/round-trip).
+- **`@json` escape** (everything else, today): `parallel`, `race`, `try`, `retry`, `confirm`, `loop`,
+  `throttle`, `debounce`, `assert`, `verify`, `pipe`, `memo`, `await`, `peek`, `thing`, `expr`, `fmt`,
+  `jq`, `parse`.
+- **Aspirational** (described below as the *target* language, **not** yet parsed): multiple flows per
+  file, file-scope `type`/union declarations, and the `block`/`watch` spellings (the implemented nodes
+  are `seq` and `loop`). The AST type is **`DraftAst`** (this doc historically said `FlowAst`, which does
+  not exist).
 
 ---
 
@@ -872,19 +895,20 @@ flow improve -> EvalReport
 
 ---
 
-## Toolchain plan
+## Toolchain
 
-- `parse.rs` — `parse(src: &str) -> Result<Vec<FlowAst>, ParseError>` and
-  `parse_one(src: &str) -> Result<FlowAst, ParseError>`. Hand-written
-  recursive-descent, indentation-sensitive. `ParseError` carries line + column +
-  message.
-- `format.rs` — `format(ast: &FlowAst) -> String`. Canonical pretty-printer, always
-  2-space indentation. Separate from `render.rs` (terminal display).
+- `parse.rs` — `parse(src: &str) -> Result<DraftAst>` (a single flow). Hand-written, indentation-sensitive
+  recursive descent; malformed input returns `FlowError::Parse` (never panics). Accepts both the canonical
+  `do <op> <args>` and inline `op(args)` call forms, and reads the `@json` escape back.
+- `format.rs` — `format(ast: &DraftAst) -> String`. Canonical emitter, always 2-space indentation,
+  brace-free indentation blocks; emits `@json` for nodes without a native form. Separate from `render.rs`
+  (a lossy one-way terminal display tree).
 
-Round-trip invariant: `parse(format(ast)) == ast` for all valid `FlowAst` values.
+Round-trip invariant (**holds today**): `parse(&format(&ast)) == ast` for every `DraftAst`.
 
-The CLI accepts `.flux` file arguments directly (`flux run my-flow.flux`) and stores
-extracted flows as `.flux` files alongside the JSON cache.
+`flux run <app.flux>` runs a multi-agent program through the `flux-app` host (see
+[`../../../docs/designs/flux-lang-evolution.md`](../../../docs/designs/flux-lang-evolution.md) §6); a
+`fluxlang compile` subcommand onto `parse` is the one remaining toolchain step.
 
 ---
 

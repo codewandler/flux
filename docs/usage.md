@@ -132,9 +132,15 @@ flux -v "..."                    # show tool output in full (no truncation); als
 flux --color always|auto|never   # colorize output (auto = a terminal, NO_COLOR unset)
 flux --tui                       # ratatui chat UI (in-UI approval modal)
 flux --serve 127.0.0.1:8787 --yes   # HTTP API daemon (REST + SSE)
+flux run app.flux                # run a multi-agent program (event bus + triggers + journeys); deny-destructive unless --yes
 flux sessions                    # list recent sessions
 flux plugin ls                   # manage subprocess plugins (any-language ops)
 ```
+
+A **multi-agent program** is a `.flux` file declaring agents / channels / triggers / journeys (see
+`crates/flux-app/examples/hello.flux` and [`designs/flux-lang-evolution.md`](designs/flux-lang-evolution.md) §6).
+To **embed** flux as a library, use `flux-sdk`'s `FlowClient` for the Flux-Lang compile→analyze→execute
+lifecycle (`crates/flux-sdk/src/flow.rs`).
 
 Plans and tool *inputs* always print in full; tool *output* (e.g. a large file read) is previewed by
 default and shown in full with `-v`.

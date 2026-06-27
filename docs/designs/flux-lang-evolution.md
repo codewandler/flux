@@ -1,7 +1,13 @@
 # Design: flux-lang evolution — agent-cognition AST, language, and SDK
 
-**Status:** Draft design · **Layers:** `flux-lang` (L0 language core), `flux-flow` (L3 engine),
-`flux-sdk` (L6) · **Owner:** Timo Friedl
+**Status:** **✅ Shipped (P0–P5 + flux-app)** — this remains the *design of record* (kept forward-looking),
+but the phasing in §8 is built and live. The artifact **prelude**, `ctx`/`ctx_append` nodes, op-input
+JSON Schema, typed HIR (`analyze::lower`), the **text parser** (`parse`/`format`), the **optimizer**
+(`optimize` + `PhysicalPlan` execution), the **`flux-cognition`** (L3) pack, the **Program** layer +
+**`flux-app`** (L6) host (`flux run app.flux`), and the **`flux-sdk` `FlowClient`** all exist. Where a
+section below says "deferred / not built / out of scope," read it as the gap *at design time* — live
+status is in [`STATUS.md`](../../crates/flux-lang/docs/STATUS.md). · **Layers:** `flux-lang` (L0),
+`flux-flow` (L3), `flux-cognition` (L3), `flux-app` (L6), `flux-sdk` (L6) · **Owner:** Timo Friedl
 
 This is the forward design for **flux-lang as an agent *working* language**: the AST extensions, the
 language/syntax surface, and a real SDK. It builds on the immutable PRD
@@ -446,7 +452,14 @@ with a test that fails before the change.
 
 ---
 
-## Appendix — deferred runtime host (`flux-app`)
+## Appendix — runtime host (`flux-app`) — ✅ shipped
+
+> **Status: shipped.** Implemented as the L6 **`flux-app`** crate: an event bus (`bus.rs`), channels
+> (`channel.rs` — the `cli` channel today), journeys executed under the real `Executor` envelope
+> (`app.rs`), and orchestration ops `emit`/`send`/`spawn` (+ `ask` MVP) as an op-pack (`ops.rs`). Run via
+> `flux run app.flux`; **deny-destructive by default** (`--yes` opts into allow-all). The scheduler and
+> HTTP/Slack channels remain future work. The "does not exist yet" framing below is the original design
+> rationale, kept for context.
 
 Executing a `Program` long-running (the "phone-troubleshooting" story) needs infrastructure that does
 **not** exist yet: an in-process **event bus** (tokio broadcast + oneshot correlation), a **scheduler**

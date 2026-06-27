@@ -1,8 +1,9 @@
 //! `fluxlang` — the Flux-Lang command-line surface.
 //!
 //! Inspect the language without the engine: print its skill, its JSON Schema, or render a JSON AST as
-//! a human-readable tree. Parsing a writable text syntax (`fluxlang compile`) is on the roadmap (see
-//! `docs/PRD.md`); today `render` is one-way (JSON AST → tree).
+//! a human-readable tree. The round-trippable text syntax exists in the library (`flux_lang::parse` /
+//! `flux_lang::format`); wiring a `fluxlang compile` subcommand onto it is the one remaining step. Note
+//! `render` is intentionally one-way (a lossy display tree), distinct from `format`/`parse`.
 //!
 //! Built only with `--features cli` (keeps `clap` off the library's dependency graph).
 

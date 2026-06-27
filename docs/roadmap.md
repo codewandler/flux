@@ -1,7 +1,7 @@
 # flux — roadmap & status
 
-Status as of **0.2.1 (2026-06-25)**: public + installable at
-[codewandler/flux](https://github.com/codewandler/flux); 29 crates, **177 tests**, a permanently green
+Status as of **0.2.4 (2026-06-25)**: public + installable at
+[codewandler/flux](https://github.com/codewandler/flux); 34 crates, **450+ tests**, a permanently green
 gate (tests, clippy `-D warnings`, fmt, the `flux-codegate` layering lint). See
 [CHANGELOG.md](../CHANGELOG.md) for the released history and [architecture.md](architecture.md) for the
 design.
@@ -64,10 +64,15 @@ before every release.
   issues, and fix the top biters. Validates the daily-driver claim on real tasks.
 - **SDK + crates.io** (tier 2) — stabilize and document the `flux-sdk` public API with runnable
   examples, then publish the crates so others can embed flux as a library.
-- **flux-lang evolution** (design) — an agent-cognition AST (`ctx`/`need` + an artifact ontology + a
-  cognition op-pack), a real flux-lang SDK lifecycle surface, and PRD conformance tracking. See
+- **flux-lang evolution — ✅ shipped** (P0–P5 + flux-app): the agent-cognition layer landed — the
+  artifact **prelude** (11 `Named` types), `ctx`/`ctx_append` context-pack nodes (31 node kinds),
+  op-input JSON Schema, typed HIR with arg type-checking (`analyze::lower`), the **text parser**
+  (`parse`/`format`) and **optimizer** (`optimize` + `PhysicalPlan` execution); the **`flux-cognition`**
+  (L3) model-op pack and **`flux-app`** (L6) multi-agent runtime host (`flux run app.flux`,
+  deny-destructive by default); and the **`flux-sdk` `FlowClient`** lifecycle. See
   [designs/flux-lang-evolution.md](designs/flux-lang-evolution.md) and the
-  [PRD status RTM](../crates/flux-lang/docs/STATUS.md).
+  [PRD status RTM](../crates/flux-lang/docs/STATUS.md). Remaining: a token-efficient display mode and
+  deeper optimizer passes.
 
 **Environment-gated (need a live key or external infra):**
 - **Homebrew tap** — an auto-updating `brew install codewandler/tap/flux` formula via cargo-dist

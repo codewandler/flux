@@ -35,8 +35,11 @@ the runtime executes top-to-bottom.
 Every `kind` and its one-line summary. This table is the single source of truth for the node
 surface: it is generated from the `Node` enum's doc-comments in `flux-lang` (`crates/flux-lang/src/ast.rs`)
 via `flux_lang::schema::node_kind_catalog()` — do not edit it by hand. Regenerate with
-`UPDATE=1 cargo test -p flux-flow --test skill_docs_in_sync`. The detailed per-node sections that
+`UPDATE=1 cargo test -p flux-lang --test skill_in_sync`. The detailed per-node sections that
 follow are hand-written.
+
+> These nodes also have a writable **text form** — see [`syntax.md`](syntax.md) (`format`/`parse`); this
+> reference covers the JSON wire shape.
 
 <!-- BEGIN generated:node-kinds -->
 | kind | description |
