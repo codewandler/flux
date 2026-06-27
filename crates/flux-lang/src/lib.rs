@@ -7,6 +7,8 @@
 //! - [`ast`] — the Draft AST the model emits, the typed HIR, the physical plan, the value model, the
 //!   semantic [`ast::FlowEffect`]s, and the run-event trace.
 //! - [`render`] — the AST pretty-printer (human-auditable projections).
+//! - [`format`] / [`parse`] — the canonical compact **text syntax** (the round-trippable `.flux`
+//!   surface): `parse(&format(&ast)) == ast` for every `DraftAst`. Distinct from `render` (one-way).
 //! - [`analyze`] — the validator, working against an abstract [`opspec::OpCatalog`] (no knowledge of
 //!   any concrete tool registry).
 //! - [`opspec`] — the typed operation spec/signature and the [`opspec::OpCatalog`] seam.
@@ -26,8 +28,10 @@ pub mod analyze;
 pub mod ast;
 pub mod effects;
 pub mod error;
+pub mod format;
 pub mod host;
 pub mod opspec;
+pub mod parse;
 pub mod prelude;
 pub mod program;
 pub mod render;
