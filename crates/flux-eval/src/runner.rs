@@ -138,8 +138,10 @@ pub(crate) fn toolchain_env() -> Vec<(String, String)> {
     out
 }
 
-/// Grade a criterion in the (already-finished) workspace. Reads/exec go through `sys`.
-async fn grade(c: &Criterion, sys: &System) -> Result<bool> {
+/// Grade a criterion in the (already-finished) workspace. Reads/exec go through `sys`. Public so the
+/// `grade` op (and any evidence-based flow) can reuse the exact same pass/fail check the eval harness
+/// uses — one grading implementation, no divergence.
+pub async fn grade(c: &Criterion, sys: &System) -> Result<bool> {
     match c {
         Criterion::Command { run, expect_exit } => {
             let argv: Vec<String> = run.split_whitespace().map(String::from).collect();

@@ -9,10 +9,12 @@ use std::time::Duration;
 
 pub mod cargo;
 pub mod cognition;
+pub mod evidence;
 pub mod extra;
 pub mod groups;
 pub mod reflect;
 
+pub use evidence::register_evidence;
 pub use reflect::register_reflect;
 
 use async_trait::async_trait;
@@ -209,6 +211,9 @@ pub fn register_builtins(registry: &mut ToolRegistry) {
     registry.register(Arc::new(GitCheckoutTool));
     registry.register(Arc::new(GitUnstageTool));
     cognition::register_cognition(registry);
+    // Evidence primitives (`observe`/`evidence`): general-purpose audit ops any flow may use to emit and
+    // read its own runtime observations — the foundation of an evidence-based model-in-the-loop.
+    evidence::register_evidence(registry);
 }
 
 // ---------------------------------------------------------------------------
@@ -3014,6 +3019,7 @@ mod tests {
                 "compare",
                 "dedupe",
                 "edit",
+                "evidence",
                 "file_stat",
                 "gaps",
                 "git_checkout",
@@ -3028,7 +3034,9 @@ mod tests {
                 "grep",
                 "home_dir",
                 "merge",
+                "metrics",
                 "need",
+                "observe",
                 "patch",
                 "path_exists",
                 "read",

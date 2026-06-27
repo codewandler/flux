@@ -439,6 +439,53 @@ impl Tool for EvalScalarTool {
 }
 
 // ---------------------------------------------------------------------------
+// grade
+// ---------------------------------------------------------------------------
+
+/// `grade(criterion) -> "true"|"false"` — evaluate a verifiable pass/fail [`Criterion`] against the
+/// CURRENT workspace, reusing the eval harness's own [`runner::grade`](crate::runner::grade) so a flow's
+/// graded stop-condition uses the exact same check the benchmark does (no divergence). The criterion is
+/// a `{kind: "command"|"file_content"|"all", …}` object; the string boolean is read by a `when`
+/// condition's truthiness — `when grade(@json{…}) -> $done = true` is the evidence-based early stop.
+pub struct GradeTool;
+
+#[async_trait]
+impl Tool for GradeTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::read_only(
+            "grade",
+            "Evaluate a pass/fail criterion against the current workspace; returns \"true\" or \
+             \"false\". `criterion` is {kind: \"command\"|\"file_content\"|\"all\", …} — the same check \
+             the eval harness uses. A `command` criterion runs a check command (e.g. `cargo test`).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "criterion": {
+                        "type": "object",
+                        "description": "a Criterion: {kind:\"command\",run,expect_exit?} | \
+                                        {kind:\"file_content\",path,equals?/contains?/regex?} | \
+                                        {kind:\"all\",of:[…]}"
+                    }
+                },
+                "required": ["criterion"]
+            }),
+        )
+        // A `command` criterion shells out to a checker, so be honest about the process effect.
+        .with_effects(vec![Effect::Read, Effect::Process])
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let criterion: crate::spec::Criterion =
+            serde_json::from_value(arg(&params, "criterion"))
+                .map_err(|e| Error::Other(format!("grade: invalid criterion: {e}")))?;
+        let pass = crate::runner::grade(&criterion, ctx.system.as_ref()).await?;
+        Ok(ToolResult::ok(
+            if pass { "true" } else { "false" }.to_string(),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // score_compare
 // ---------------------------------------------------------------------------
 
@@ -575,6 +622,38 @@ mod tests {
         assert_eq!(PainpointsCollectTool.spec().name, "painpoints_collect");
         assert_eq!(EvalAdoptTool.spec().name, "eval_adopt");
         assert_eq!(ScoreCompareTool.spec().name, "score_compare");
+        assert_eq!(GradeTool.spec().name, "grade");
+    }
+
+    /// The `grade` op wraps `runner::grade`, returning the `"true"`/`"false"` string a `when` reads.
+    #[tokio::test]
+    async fn grade_op_checks_a_file_content_criterion() {
+        use flux_system::{System, Workspace};
+        use std::sync::Arc;
+
+        let dir = std::env::temp_dir().join(format!("flux-grade-op-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("out.txt"), "hello world").unwrap();
+        let ctx = ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap())));
+
+        let pass = GradeTool
+            .execute(
+                &ctx,
+                json!({ "criterion": { "kind": "file_content", "path": "out.txt", "contains": "hello" } }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pass.content, "true", "matching criterion grades true");
+
+        let fail = GradeTool
+            .execute(
+                &ctx,
+                json!({ "criterion": { "kind": "file_content", "path": "out.txt", "contains": "nope" } }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fail.content, "false", "non-matching criterion grades false");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

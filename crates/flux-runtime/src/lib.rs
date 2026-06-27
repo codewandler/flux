@@ -125,6 +125,11 @@ pub struct ToolContext {
     /// model-in-the-loop run — the ops then return a clear error rather than silently doing nothing.
     pub loop_host: Option<Arc<dyn LoopHost>>,
     pub read_times: Arc<Mutex<HashMap<String, std::time::SystemTime>>>,
+    /// The append-only evidence log, shared (an `Arc<Mutex<…>>`) so the dispatcher's `tool_call`
+    /// markers, externally-recorded observations ([`Executor::observe`]), flow-emitted `observe(…)`
+    /// ops, and any sibling run that re-enters this same context all write to **one** audit trail.
+    /// Lives here (not Executor-private) so the `observe`/`evidence` ops can read and append to it.
+    pub evidence: Arc<Mutex<EvidenceLog>>,
 }
 
 impl ToolContext {
@@ -135,6 +140,7 @@ impl ToolContext {
             spawner: None,
             loop_host: None,
             read_times: Arc::new(Mutex::new(HashMap::new())),
+            evidence: Arc::new(Mutex::new(EvidenceLog::new())),
         }
     }
 
@@ -550,15 +556,15 @@ fn effect_requests(spec: &ToolSpec, subjects: &[String]) -> Vec<(Action, Resourc
 pub struct Executor {
     registry: ToolRegistry,
     perms: Mutex<PermissionManager>,
-    approver: Arc<dyn Approver>,
+    /// Interior-mutable so a surface can swap the approver (e.g. the TUI's modal) even when the executor
+    /// is shared as an `Arc<Executor>` — which it is once the reflexive loop host re-enters it.
+    approver: Mutex<Arc<dyn Approver>>,
     ctx: ToolContext,
     hooks: Vec<Arc<dyn PreToolHook>>,
     /// The authorization floor. `None` disables the policy layer (permission rules only).
     policy: Option<AuthorizationPolicy>,
     caller: Caller,
     trust: Trust,
-    /// Append-only audit trail of observations made during dispatch.
-    evidence: Mutex<EvidenceLog>,
 }
 
 impl Executor {
@@ -571,13 +577,12 @@ impl Executor {
         Self {
             registry,
             perms: Mutex::new(perms),
-            approver,
+            approver: Mutex::new(approver),
             ctx,
             hooks: Vec::new(),
             policy: None,
             caller: default_local_caller(),
             trust: default_local_trust(),
-            evidence: Mutex::new(EvidenceLog::new()),
         }
     }
 
@@ -589,8 +594,8 @@ impl Executor {
 
     /// Replace the approval handler (e.g. a surface installing its own interactive approver before
     /// driving turns — the TUI swaps in a modal approver).
-    pub fn set_approver(&mut self, approver: Arc<dyn Approver>) {
-        self.approver = approver;
+    pub fn set_approver(&self, approver: Arc<dyn Approver>) {
+        *self.approver.lock().unwrap() = approver;
     }
 
     /// Install the reflexive [`LoopHost`] capability onto this executor's [`ToolContext`], so the
@@ -602,9 +607,9 @@ impl Executor {
     }
 
     /// The current approver (used by flow nodes such as `confirm` that need to request approval
-    /// outside of a full tool dispatch).
-    pub fn approver(&self) -> &dyn Approver {
-        self.approver.as_ref()
+    /// outside of a full tool dispatch). Returns a clone of the `Arc` (the approver is interior-mutable).
+    pub fn approver(&self) -> Arc<dyn Approver> {
+        self.approver.lock().unwrap().clone()
     }
 
     /// Enable the authorization-policy floor: every tool call's effects are evaluated against
@@ -638,14 +643,15 @@ impl Executor {
         self.perms.lock().unwrap().allow_rules()
     }
 
-    /// Record an externally-derived observation (e.g. a startup toolchain scan) into the log.
+    /// Record an externally-derived observation (e.g. a startup toolchain scan) into the shared log.
     pub fn observe(&self, observation: Observation) {
-        self.evidence.lock().unwrap().record(observation);
+        self.ctx.evidence.lock().unwrap().record(observation);
     }
 
-    /// A snapshot of the evidence log accumulated so far.
+    /// A snapshot of the evidence log accumulated so far (shared with the context, so flow-emitted
+    /// `observe(…)` observations are part of this same trail).
     pub fn evidence(&self) -> EvidenceLog {
-        self.evidence.lock().unwrap().clone()
+        self.ctx.evidence.lock().unwrap().clone()
     }
 
     /// Run a tool call through the full safety envelope.
@@ -719,7 +725,7 @@ impl Executor {
         let escalate = observations
             .iter()
             .any(|o| !DestructiveEscalation.react(o).is_empty());
-        self.evidence.lock().unwrap().extend(observations);
+        self.ctx.evidence.lock().unwrap().extend(observations);
 
         // 4. Approval gate. Destructive operations — and any effect the policy marked
         //    `requires_approval` — are forced to approval even under a permissive allow-rule;
@@ -732,7 +738,8 @@ impl Executor {
             || policy_requires_approval
             || unscoped_write;
         if force_approval || perm != PermDecision::Allow {
-            match self.approver.request(name, &subjects, &intents).await {
+            let approver = self.approver.lock().unwrap().clone();
+            match approver.request(name, &subjects, &intents).await {
                 ApprovalChoice::Allow => {}
                 ApprovalChoice::AllowAlways(rule) => {
                     self.perms.lock().unwrap().add_allow(&rule);
@@ -745,7 +752,7 @@ impl Executor {
 
         // 5. System boundary: the only place real IO happens. Redact secrets from the result —
         //    both the success content and any error — before it reaches the model or the logs.
-        match tool.execute(&self.ctx, params).await {
+        let result = match tool.execute(&self.ctx, params).await {
             Ok(mut r) => {
                 // Redact BOTH faces: the view can carry file content / diffs that include secrets.
                 r.content = self.ctx.redactor.redact(&r.content);
@@ -753,7 +760,18 @@ impl Executor {
                 r
             }
             Err(e) => ToolResult::error(self.ctx.redactor.redact(&e.to_string())),
+        };
+        // 6. Record a `tool_error` observation on a failed call (an op that ran and errored), so
+        //    `metrics()`/`evidence` give a model-in-the-loop the failure signal to retry/stop on. The
+        //    matching `tool_call` was already recorded above, so the shared log carries both.
+        if result.is_error {
+            self.ctx.evidence.lock().unwrap().record(Observation::new(
+                "tool_error",
+                Phase::Turn,
+                json!({ "tool": name }),
+            ));
         }
+        result
     }
 }
 

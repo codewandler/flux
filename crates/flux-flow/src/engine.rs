@@ -27,7 +27,7 @@ use flux_events::EventStore;
 use flux_provider::{Provider, Request};
 use flux_runtime::Executor;
 
-use crate::ast::{DraftAst, RunEvent};
+use crate::ast::DraftAst;
 use crate::compile::{compile_turn, CompileOptions, TurnOutput};
 use crate::registry::OpRegistry;
 use crate::runtime::execute_flow;
@@ -36,10 +36,19 @@ use crate::state::FlowStore;
 /// flux-flow's turn engine: a provider, the tool executor (safety envelope), the unified event store
 /// (conversation + run trace + turn telemetry), and flux-flow's own value/symbol/suspension store.
 pub struct FlowEngine {
-    pub provider: Box<dyn Provider>,
-    pub executor: Executor,
+    /// Shared with the loop host so the planner and `maybe_compact` use one provider instance.
+    pub provider: Arc<dyn Provider>,
+    /// Shared (`Arc`): the loop host re-enters this same executor for `run_plan`, so the inner runs share
+    /// one perms/approver/evidence/context with the outer agent loop.
+    pub executor: Arc<Executor>,
     pub events: Arc<EventStore>,
-    pub flow: FlowStore,
+    /// Shared (`Arc`) with the loop host: inner runs bind symbols / trace into the same session store.
+    pub flow: Arc<FlowStore>,
+    /// The agent loop itself, written in flux-lang (`assets/agent-loop.flux`): plan → match → run_plan →
+    /// feed back → repeat-until-prose. The bootstrap runs THIS each turn — there is no Rust turn loop.
+    pub agent_loop: DraftAst,
+    /// The installed reflexive host; `set_turn` points it at the current session + sink before each run.
+    pub loop_host: Arc<crate::loop_host::EngineLoopHost>,
     pub model: String,
     pub system_prompt: String,
     pub max_tokens: u32,
@@ -59,6 +68,62 @@ pub struct FlowEngine {
 }
 
 impl FlowEngine {
+    /// Assemble an engine: wrap the store/provider in `Arc`, install the reflexive [`EngineLoopHost`] on
+    /// the executor (so `plan`/`run_plan` re-enter it), and load the built-in `agent-loop.flux`. This is
+    /// the one place the executor⇄host cycle is tied — a plain struct literal can't express it. A
+    /// `.flux/agent-loop.flux` in the workspace overrides the built-in loop (parsed if present + valid).
+    #[allow(clippy::too_many_arguments)]
+    pub fn assemble(
+        provider: Arc<dyn Provider>,
+        executor: Executor,
+        events: Arc<EventStore>,
+        flow: FlowStore,
+        model: String,
+        system_prompt: String,
+        max_tokens: u32,
+        max_iterations: usize,
+        skills: Vec<flux_skill::Skill>,
+        compact_threshold_chars: usize,
+        groups: Vec<flux_evidence::ToolGroup>,
+        cwd: std::path::PathBuf,
+    ) -> Result<Self> {
+        let flow = Arc::new(flow);
+        let opts = CompileOptions {
+            max_tokens,
+            ..Default::default()
+        };
+        // A throwaway initial session/sink; `set_turn` points the host at the real ones each turn.
+        let init_sink: Arc<std::sync::Mutex<dyn AgentSink>> =
+            Arc::new(std::sync::Mutex::new(NullSink));
+        let (executor, loop_host) = crate::loop_host::EngineLoopHost::install(
+            executor,
+            provider.clone(),
+            model.clone(),
+            Some(system_prompt.clone()),
+            flow.clone(),
+            String::new(),
+            init_sink,
+            opts,
+        );
+        let agent_loop = load_agent_loop(&cwd)?;
+        Ok(FlowEngine {
+            provider,
+            executor,
+            events,
+            flow,
+            agent_loop,
+            loop_host,
+            model,
+            system_prompt,
+            max_tokens,
+            max_iterations,
+            skills,
+            compact_threshold_chars,
+            groups,
+            cwd,
+        })
+    }
+
     /// Run one user turn to completion, uninterruptible.
     pub async fn run_turn(
         &self,
@@ -103,199 +168,70 @@ impl FlowEngine {
         // Compact the persisted session if it has grown past the budget.
         self.maybe_compact(session_id, sink, cancel).await?;
 
-        // The op catalog (a plan may use any *advertised* op). Pure DAG: the model's only tool is
-        // `emit_plan`, so there is no research executor — reads are plan nodes, executed by the
-        // multi-round loop. Evidence-gated surfacing happens inside `advertised_registry`.
-        let ops = self.advertised_registry(Some(sink));
-        let opts = CompileOptions {
-            max_tokens: self.max_tokens,
-            ..CompileOptions::default()
+        // Drive the flux-lang agent loop (`agent_loop`) through an OWNED channel sink — the `'static`
+        // loop host holds it for reentrant `run_plan` — draining its events onto the borrowed `sink`
+        // LIVE (inner ops stream as they happen; the loop-machinery ops are filtered, see `drain_event`).
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::loop_host::SinkEvent>();
+        let channel: Arc<std::sync::Mutex<dyn AgentSink>> = Arc::new(std::sync::Mutex::new(
+            crate::loop_host::ChannelSink::new(tx),
+        ));
+        self.loop_host
+            .set_turn(session_id.to_string(), Some(base_system), channel.clone());
+
+        let mut outer = crate::loop_host::SharedSink::new(channel.clone());
+        let flow_fut = execute_flow(
+            &self.flow,
+            &self.executor,
+            session_id,
+            &self.agent_loop,
+            &mut outer,
+        );
+        tokio::pin!(flow_fut);
+
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    while let Ok(ev) = rx.try_recv() { drain_event(ev, sink); }
+                    let _ = self.events.end_turn(session_id, turn_id, "cancelled", 0, "(turn cancelled)");
+                    return self.finish_turn(session_id, sink, "(turn cancelled)", true);
+                }
+                maybe = rx.recv() => {
+                    if let Some(ev) = maybe { drain_event(ev, sink); }
+                }
+                res = &mut flow_fut => {
+                    while let Ok(ev) = rx.try_recv() { drain_event(ev, sink); }
+                    break res;
+                }
+            }
         };
 
-        // Working conversation: seeded from the clean persisted log, then extended *ephemerally* with
-        // each plan's results so the model can iterate within one turn. Only ONE assistant summary is
-        // persisted (below); the ephemeral rounds never touch the session log.
-        let mut working = self.events.conversation(session_id)?;
-        let mut answer: Option<String> = None;
-        // Whether `answer` was already streamed to the sink during the loop (a chat turn or a plan's
-        // closing reply). Terminal answers that were NOT streamed — a compile/provider failure or the
-        // max-iterations fallback — are surfaced after the loop so a turn never ends silently.
-        let mut shown = false;
-        // Telemetry: iteration counter (1-based) and the outcome tag written to `turn_log` at the end.
-        let mut iteration: u32 = 0;
-        let mut turn_outcome = "max_iter";
-
-        for _ in 0..self.max_iterations {
-            if cancel.is_cancelled() {
-                let _ = self.events.end_turn(
-                    session_id,
-                    turn_id,
-                    "cancelled",
-                    iteration,
-                    "(turn cancelled)",
-                );
-                return self.finish_turn(session_id, sink, "(turn cancelled)", true);
-            }
-            iteration += 1;
-            let view = self.flow.view(session_id)?;
-            let view_ref = (!view.symbols.is_empty()).then_some(&view);
-
-            sink.planning(true);
-            let compiled = compile_turn(
-                &*self.provider,
-                &self.model,
-                &working,
-                Some(&base_system),
-                &ops,
-                view_ref,
-                None,
-                Some(sink),
-                opts.clone(),
-            )
-            .await;
-            sink.planning(false);
-            let out = match compiled {
-                Ok(out) => out,
-                // No fallback (one engine): a turn the planner can't compile fails cleanly, surfaced as
-                // the assistant's answer so the session shape stays valid — and shown to the user (below)
-                // so a provider failure (credit exhausted, auth, rate limit, transport) is never silent.
-                Err(e) => {
-                    let err_str = e.to_string();
-                    let _ = self.events.record_plan_attempt(
-                        session_id,
-                        turn_id,
-                        iteration,
-                        "compile_error",
-                        Some(err_str.as_str()),
-                    );
-                    let _ = self.events.record_run_event(
-                        session_id,
-                        &RunEvent::CompileError {
-                            step: iteration,
-                            error: err_str,
-                        },
-                    );
-                    turn_outcome = "compile_error";
-                    answer = Some(format!("I couldn't produce a plan — {}", planner_error(&e)));
-                    break;
-                }
-            };
-
-            match out {
-                TurnOutput::Chat(text) => {
-                    let _ = self
-                        .events
-                        .record_plan_attempt(session_id, turn_id, iteration, "chat", None);
-                    turn_outcome = "chat";
-                    sink.text_delta(&text);
-                    shown = true;
-                    answer = Some(text);
-                    break;
-                }
-                TurnOutput::Plan(compiled) => {
-                    let _ = self
-                        .events
-                        .record_plan_attempt(session_id, turn_id, iteration, "accepted", None);
-                    let _ = self.events.record_run_event(
-                        session_id,
-                        &RunEvent::PlanAccepted {
-                            step: iteration,
-                            ops: compiled.ast.body.len(),
-                        },
-                    );
-                    // Surface the compiled plan before running it — this is what executes, so the turn
-                    // is auditable (and visibly the planner, not a free-form tool loop).
-                    sink.observation(&self.plan_observation(&compiled.ast));
-                    match execute_flow(&self.flow, &self.executor, session_id, &compiled.ast, sink)
-                        .await
-                    {
-                        Ok(outcome) => {
-                            // The flow suspended on a top-level `await`: persist the resume point and end
-                            // the turn — the user's next message resumes it (handled at the top of
-                            // `run_turn`). The pre-await output already streamed through the sink.
-                            if let Some(susp) = &outcome.suspension {
-                                self.flow.save_suspension(
-                                    session_id,
-                                    &compiled.ast.body,
-                                    susp.node,
-                                    &susp.source,
-                                )?;
-                                let hint = "(awaiting your input — reply to continue the flow)";
-                                sink.text_delta(hint);
-                                turn_outcome = "suspended";
-                                answer = Some(hint.to_string());
-                                shown = true;
-                                break;
-                            }
-                            // Feed back the full transcript (EVERY read/call node's view), not just the
-                            // last node — otherwise a plan that reads N files surfaces only file N and the
-                            // model re-reads the rest every round (an infinite read loop). Both paths
-                            // below see these results: the grounded `complete` call, and the next round.
-                            let result = if !outcome.transcript.trim().is_empty() {
-                                outcome.transcript.clone()
-                            } else if !outcome.result.trim().is_empty() {
-                                outcome.result.clone()
-                            } else {
-                                format!("(ran {} step(s), no textual output)", outcome.steps)
-                            };
-                            working.push(Message::assistant(vec![ContentBlock::Text {
-                                text: format!("Ran a {}-step plan.", outcome.steps),
-                            }]));
-                            working.push(Message::user_text(format!(
-                                "[results]\n{result}\n\nAnswer the user now, or emit another plan if \
-                                 more work is needed."
-                            )));
-                            // The plan carried a `complete` directive ⇒ it finishes the request. Render
-                            // the final message NOW, grounded in the results we just fed back (never a
-                            // pre-composed summary), then end the turn.
-                            if let Some(directive) = compiled.complete {
-                                let summary = crate::compile::render_completion(
-                                    &*self.provider,
-                                    &self.model,
-                                    &working,
-                                    &directive,
-                                    self.max_tokens,
-                                )
-                                .await?;
-                                sink.text_delta(&summary);
-                                shown = true;
-                                turn_outcome = "plan";
-                                answer = Some(summary);
-                                break;
-                            }
-                            // No `complete` ⇒ keep looping: next round the model answers in prose (which
-                            // ends the turn) or emits another plan — the standard agent loop.
-                        }
-                        // Feed the error back so the model can self-correct (model-in-the-loop),
-                        // bounded by max_iterations.
-                        Err(e) => {
-                            working.push(Message::assistant(vec![ContentBlock::Text {
-                                text: "A plan step failed.".to_string(),
-                            }]));
-                            working.push(Message::user_text(format!(
-                                "[plan error]\n{e}\n\nAdjust and try another plan, or give your final \
-                                 answer in prose."
-                            )));
-                        }
-                    }
+        // The loop returns `$answer` — the model's prose, grounded in the fed-back results (the `chat`
+        // case). On failure (e.g. the planner errored, surfaced through the op envelope) we surface it as
+        // the answer so the session shape stays valid and the turn never ends in silence.
+        let (answer, tag) = match outcome {
+            Ok(o) => {
+                let a = o.result.trim().to_string();
+                if a.is_empty() {
+                    (
+                        format!(
+                            "Reached the maximum of {} plan iterations for this turn; stopping.",
+                            self.max_iterations
+                        ),
+                        "max_iter",
+                    )
+                } else {
+                    (a, "ok")
                 }
             }
-        }
-
-        let answer = answer.unwrap_or_else(|| {
-            format!(
-                "Reached the maximum of {} plan iterations for this turn; stopping.",
-                self.max_iterations
-            )
-        });
-        // A compile/provider failure or the max-iterations fallback never streamed anything — emit it
-        // here so the turn shows *why* it ended instead of returning to the prompt in silence.
-        if !shown {
-            sink.text_delta(&answer);
-        }
+            Err(e) => (format!("I couldn't complete the turn — {e}"), "error"),
+        };
+        // The loop binds `$answer` but does not stream it (a `jq`/`fmt` bind is silent), so emit it now.
+        sink.text_delta(&answer);
+        let iterations = self.executor.evidence().by_kind("turn.iteration").count() as u32;
         let _ = self
             .events
-            .end_turn(session_id, turn_id, turn_outcome, iteration, &answer);
+            .end_turn(session_id, turn_id, tag, iterations, &answer);
         self.finish_turn(session_id, sink, &answer, false)
     }
 
@@ -651,6 +587,42 @@ fn has_tool_result(msg: &Message) -> bool {
         .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
 }
 
+/// Load the agent loop: a `.flux/agent-loop.flux` in the workspace overrides the built-in (so a project
+/// can shape its own loop), otherwise the compiled-in `agent-loop.flux`. Parsed as a [`DraftAst`].
+fn load_agent_loop(cwd: &std::path::Path) -> Result<DraftAst> {
+    const BUILTIN: &str = include_str!("../assets/agent-loop.flux");
+    let override_path = cwd.join(".flux").join("agent-loop.flux");
+    let src = std::fs::read_to_string(&override_path).unwrap_or_else(|_| BUILTIN.to_string());
+    serde_json::from_str(&src)
+        .map_err(|e| flux_core::Error::Other(format!("agent-loop.flux: invalid AST: {e}")))
+}
+
+/// The loop-machinery ops a turn dispatches to *drive* the loop (not to do the user's work). Their
+/// tool-call/result events are filtered out of the user-facing sink so the surface shows the actual
+/// operations (`read`/`edit`/`bash`/…) the inner `run_plan` performs, not the plumbing.
+const MACHINERY_OPS: &[&str] = &[
+    "plan", "run_plan", "observe", "evidence", "metrics", "grade",
+];
+
+/// Drain one captured sink event onto the real sink, dropping the loop-machinery tool calls/results.
+fn drain_event(ev: crate::loop_host::SinkEvent, sink: &mut dyn AgentSink) {
+    use crate::loop_host::SinkEvent;
+    let machinery = match &ev {
+        SinkEvent::ToolCall(name, _) | SinkEvent::ToolResult(name, _) => {
+            MACHINERY_OPS.contains(&name.as_str())
+        }
+        _ => false,
+    };
+    if !machinery {
+        ev.apply(sink);
+    }
+}
+
+/// A sink that discards everything — the engine's initial loop-host sink, replaced by `set_turn` before
+/// the first real turn.
+struct NullSink;
+impl AgentSink for NullSink {}
+
 /// Render a planner failure for the user. A provider API error carries the raw JSON response body;
 /// unwrap it to `error.message` so a credit/billing/auth/rate-limit failure reads as a plain sentence
 /// instead of a JSON dump. Every other error uses its own `Display`.
@@ -820,26 +792,39 @@ mod tests {
         let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(EchoTool));
+        // The flux-lang agent loop calls these — register them so a turn can run.
+        flux_tools::register_reflect(&mut registry);
+        flux_tools::register_evidence(&mut registry);
         let executor = Executor::new(
             registry,
-            PermissionManager::from_rules(&["echo".into()], &[]),
+            PermissionManager::from_rules(
+                &[
+                    "echo".into(),
+                    "plan".into(),
+                    "run_plan".into(),
+                    "observe".into(),
+                ],
+                &[],
+            ),
             Arc::new(AllowApprover),
             ToolContext::new(system),
         );
-        FlowEngine {
-            provider,
+        let flow = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        FlowEngine::assemble(
+            Arc::from(provider),
             executor,
-            flow: FlowStore::in_memory_with_events(events.clone()).unwrap(),
             events,
-            model: "mock".into(),
-            system_prompt: "test".into(),
-            max_tokens: 1024,
-            max_iterations: 5,
-            skills: Vec::new(),
-            compact_threshold_chars: 0,
-            groups: Vec::new(),
-            cwd: dir,
-        }
+            flow,
+            "mock".into(),
+            "test".into(),
+            1024,
+            5,
+            Vec::new(),
+            0,
+            Vec::new(),
+            dir,
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -909,62 +894,54 @@ mod tests {
         assert!(msgs[1].text().contains("Echoed hi."));
     }
 
-    /// A plan that `await`s suspends the flow across the turn boundary: turn 1 runs the prefix and
-    /// stops at the await; turn 2's message resumes it (binding the awaited value, running the
-    /// remainder) without re-running the prefix or recompiling.
+    /// Reified await (post-cutover; see the design's turn-boundary section): a top-level `await` inside a
+    /// plan no longer suspends the *turn*. `run_plan` reifies it as `Outcome` data — the inner run halts
+    /// at the await (the prefix ran; the post-await steps did not) and the flux-lang loop carries on. The
+    /// turn completes normally and the next round answers in prose. Cross-turn await/resume is
+    /// intentionally out of scope for the self-hosted loop.
     #[tokio::test]
-    async fn await_suspends_a_turn_then_the_next_message_resumes_it() {
+    async fn await_inside_a_plan_is_reified_not_a_turn_suspension() {
         let store = Arc::new(EventStore::in_memory().unwrap());
         let sid = store.create_session("mock").unwrap();
 
-        // Prefix echo, then await the user's name, then echo a greeting interpolating it.
+        // Pre-await echo, then await, then a post-await echo that must NOT run (the await halts the run).
         let plan_ast = json!({
             "body": [
-                { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "your name?" }] },
+                { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "before await" }] },
                 { "kind": "await", "binding": "name", "source": "user_input" },
-                { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "Hello {name}" }] }
+                { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "after await" }] }
             ]
         });
-        // Only ONE provider response is needed — the resume turn bypasses the planner entirely.
-        let responses = VecDeque::from(vec![emit_plan(plan_ast)]);
+        // Round 1 emits the awaiting plan; round 2 answers in prose (the loop continues past the await).
+        let responses = VecDeque::from(vec![emit_plan(plan_ast), prose("All set.")]);
         let engine = engine_with(responses, store.clone());
 
-        // Turn 1: the prefix echo runs, then the flow suspends at the await.
-        let mut sink1 = CollectSink::default();
-        engine.run_turn(&sid, "greet me", &mut sink1).await.unwrap();
+        let mut sink = CollectSink::default();
+        engine.run_turn(&sid, "greet me", &mut sink).await.unwrap();
+
+        // Only the pre-await echo ran; the post-await echo did not (the inner run stopped at the await).
         assert_eq!(
-            sink1.tools,
+            sink.tools,
             vec!["echo"],
-            "only the prefix echo ran before the await"
+            "only the pre-await echo ran: {:?}",
+            sink.tools
+        );
+        // The turn completed normally with the prose answer — it did NOT suspend across the turn boundary.
+        assert!(
+            sink.text.contains("All set."),
+            "the loop answered after the reified await: {:?}",
+            sink.text
         );
         assert!(
-            sink1.text.contains("awaiting"),
-            "the turn ends prompting for input"
+            engine.flow.take_suspension(&sid).unwrap().is_none(),
+            "no turn-level suspension is persisted"
         );
-
-        // Turn 2: the reply resumes the flow — the prefix is NOT re-run, the awaited value binds, and
-        // the post-await echo (interpolating it) runs to completion.
-        let mut sink2 = CollectSink::default();
-        engine.run_turn(&sid, "Ada", &mut sink2).await.unwrap();
+        let msgs = store.conversation(&sid).unwrap();
         assert_eq!(
-            sink2.tools,
-            vec!["echo"],
-            "only the post-await echo ran (prefix not replayed)"
+            msgs.len(),
+            2,
+            "user + one assistant answer (valid session shape)"
         );
-        assert!(
-            sink2.text.contains("Hello Ada"),
-            "the awaited reply flowed into the resumed flow: {:?}",
-            sink2.text
-        );
-        let name = engine
-            .flow
-            .resolve(&sid, &SymbolName("name".into()))
-            .unwrap()
-            .and_then(|id| engine.flow.get_value(&id).unwrap());
-        assert_eq!(name, Some(crate::ast::Value::String("Ada".into())));
-
-        // The suspension was consumed — a third turn would compile fresh, not resume.
-        assert!(engine.flow.take_suspension(&sid).unwrap().is_none());
     }
 
     #[tokio::test]

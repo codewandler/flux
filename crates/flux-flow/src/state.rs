@@ -229,6 +229,13 @@ impl FlowStore {
         self.events.run_trace(session_id)
     }
 
+    /// The persisted conversation for a session — the `user → assistant` message log projected from the
+    /// unified event store. Used by the reflexive `plan` op to seed the planner's working conversation
+    /// with the real history (the loop-carried `$feedback` is layered on top, ephemerally).
+    pub fn conversation(&self, session_id: &str) -> Result<Vec<flux_core::Message>> {
+        self.events.conversation(session_id)
+    }
+
     /// Persist a flow suspended on a top-level `await`: its body, the suspended node index, and the
     /// awaited input `source`. One pending suspension per session — a new one replaces any prior.
     /// Resumed (and cleared) by [`take_suspension`] when the awaited input arrives next turn.

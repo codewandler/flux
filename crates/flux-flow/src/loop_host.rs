@@ -42,35 +42,44 @@ use crate::state::FlowStore;
 /// a plan that recursively runs plans is stopped here rather than blowing the stack.
 const MAX_REENTRY_DEPTH: u32 = 16;
 
-/// The engine-side reflexive host. Holds everything the two ops need that a `ToolContext` does not carry:
-/// the planner (provider + model), the live sink, the shared session/store, and a `Weak` back to the
-/// executor it re-enters. Installed onto that executor's context per model-in-the-loop run.
+/// The per-turn state the reflexive ops need: which session to run in, the project/identity prompt to
+/// seed the planner with, and the live sink. Swapped each turn via [`EngineLoopHost::set_turn`] so a
+/// single host (installed once at engine construction) serves every turn — the session and sink vary,
+/// the planner and executor do not.
+struct TurnCtx {
+    session_id: String,
+    base_system: Option<String>,
+    sink: Arc<Mutex<dyn AgentSink>>,
+}
+
+/// The engine-side reflexive host. Holds the stable machinery the two ops need that a `ToolContext`
+/// does not carry — the planner (provider + model), the shared store, a `Weak` back to the executor it
+/// re-enters — plus the per-turn [`TurnCtx`] (session + sink), updated each turn.
 pub struct EngineLoopHost {
     /// Back-reference to the executor whose context holds THIS host. `run_plan` re-enters it so the inner
     /// run shares the SAME perms + approver + evidence + context — no envelope divergence. `Weak` breaks
     /// the executor ⇄ host cycle.
     executor: Weak<Executor>,
-    provider: Arc<dyn Provider>,
-    model: String,
-    /// The agent identity / project context prepended to the planner prompt (as in `engine.rs`).
-    base_system: Option<String>,
+    /// The planner, interior-mutable so the REPL `/model` command can swap it on the shared host.
+    provider: Mutex<Arc<dyn Provider>>,
+    model: Mutex<String>,
     /// Shared with the outer flow run: inner values/symbols/trace land in the SAME session.
     store: Arc<FlowStore>,
-    session_id: String,
-    /// The live sink shared by the outer turn and every inner run (sub-steps stream live, not buffered).
-    sink: Arc<Mutex<dyn AgentSink>>,
     /// Active reentry depth, guarding against runaway `run_plan` recursion.
     depth: AtomicU32,
     opts: CompileOptions,
+    /// Per-turn session + sink, set by [`set_turn`](Self::set_turn) before each run.
+    turn: Mutex<TurnCtx>,
 }
 
 impl EngineLoopHost {
-    /// Wire the reflexive capability onto `executor` and return it as a shared `Arc<Executor>` to drive
-    /// the outer flow with. `store`/`session_id` are shared with the outer run; `sink` is the shared live
-    /// surface (build the outer flow's sink with [`SharedSink::new`] over the **same** handle).
+    /// Wire the reflexive capability onto `executor`, returning the shared `Arc<Executor>` to drive flows
+    /// with **and** the host handle (to [`set_turn`](Self::set_turn) before each run). `store` is shared
+    /// with the runs; the initial `session_id`/`sink`/`base_system` seed the first turn.
     ///
     /// Construction is cyclic: the host re-enters this very executor, so it can only be wired in *after*
-    /// the executor exists — [`Arc::new_cyclic`] hands us the `Weak<Executor>` to close the loop.
+    /// the executor exists — [`Arc::new_cyclic`] hands us the `Weak<Executor>` to close the loop. The
+    /// host is captured out of the constructor through a slot so the caller gets both halves.
     #[allow(clippy::too_many_arguments)]
     pub fn install(
         mut executor: Executor,
@@ -81,22 +90,51 @@ impl EngineLoopHost {
         session_id: String,
         sink: Arc<Mutex<dyn AgentSink>>,
         opts: CompileOptions,
-    ) -> Arc<Executor> {
-        Arc::new_cyclic(|weak: &Weak<Executor>| {
+    ) -> (Arc<Executor>, Arc<EngineLoopHost>) {
+        let slot: Arc<Mutex<Option<Arc<EngineLoopHost>>>> = Arc::new(Mutex::new(None));
+        let slot2 = slot.clone();
+        let executor = Arc::new_cyclic(move |weak: &Weak<Executor>| {
             let host = Arc::new(EngineLoopHost {
                 executor: weak.clone(),
-                provider,
-                model,
-                base_system,
+                provider: Mutex::new(provider),
+                model: Mutex::new(model),
                 store,
-                session_id,
-                sink,
                 depth: AtomicU32::new(0),
                 opts,
+                turn: Mutex::new(TurnCtx {
+                    session_id,
+                    base_system,
+                    sink,
+                }),
             });
+            *slot2.lock().unwrap() = Some(host.clone());
             executor.set_loop_host(host);
             executor
-        })
+        });
+        let host = slot.lock().unwrap().take().expect("host captured");
+        (executor, host)
+    }
+
+    /// Point the host at a new turn: the session to run in, the planner's base system prompt (project
+    /// context + matched skills), and the live sink. Called by the engine bootstrap before each turn.
+    pub fn set_turn(
+        &self,
+        session_id: String,
+        base_system: Option<String>,
+        sink: Arc<Mutex<dyn AgentSink>>,
+    ) {
+        *self.turn.lock().unwrap() = TurnCtx {
+            session_id,
+            base_system,
+            sink,
+        };
+    }
+
+    /// Swap the planner (provider + model) — the REPL `/model` command, applied to the shared host so
+    /// subsequent `plan` calls use the new model.
+    pub fn set_model(&self, provider: Arc<dyn Provider>, model: String) {
+        *self.provider.lock().unwrap() = provider;
+        *self.model.lock().unwrap() = model;
     }
 
     fn executor(&self) -> Result<Arc<Executor>> {
@@ -108,32 +146,53 @@ impl EngineLoopHost {
 
 #[async_trait]
 impl LoopHost for EngineLoopHost {
-    /// Re-enter the planner. `input.feedback` (the working conversation seed) becomes the planner's
-    /// message; the returned `Plan` is `{kind: "plan", ast, complete}` for an emitted graph or
-    /// `{kind: "chat", text}` for a prose answer. (P4 will assemble the working conversation from the
-    /// persisted log; for now the feedback string is the seed.)
+    /// Re-enter the planner over the **working conversation**: the persisted session log (the real
+    /// `user → assistant` history, including the user's request) plus the loop-carried `$feedback` —
+    /// last iteration's results — appended as an ephemeral turn. The feedback accretes across `repeat`
+    /// iterations via last-writer-wins symbol rebinding (no new machinery), so each `plan` sees what the
+    /// prior `run_plan` produced without any of it being persisted. Returns a `Plan`:
+    /// `{kind: "plan", ast, complete}` for an emitted graph or `{kind: "chat", text}` for a prose answer.
     async fn plan(&self, input: Value) -> Result<Value> {
         let feedback = input
             .get("feedback")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let conversation = vec![Message::user_text(feedback)];
+        // Snapshot the per-turn session + base system (drop the lock before the model call).
+        let (session_id, base_system) = {
+            let t = self.turn.lock().unwrap();
+            (t.session_id.clone(), t.base_system.clone())
+        };
+        // Working conversation = persisted history + the loop-carried feedback (ephemeral). This is
+        // engine.rs's `working` vector, relocated into the op so the loop itself stays in flux-lang.
+        let mut conversation = self.store.conversation(&session_id).unwrap_or_default();
+        if !feedback.trim().is_empty() {
+            conversation.push(Message::user_text(feedback));
+        }
+        // Degenerate case (no history, no feedback): still hand the planner a turn to act on.
+        if conversation.is_empty() {
+            conversation.push(Message::user_text(""));
+        }
 
         let executor = self.executor()?;
         let ops = OpRegistry::new(executor.registry());
+        let provider = self.provider.lock().unwrap().clone();
+        let model = self.model.lock().unwrap().clone();
         let out = compile_turn(
-            &*self.provider,
-            &self.model,
+            &*provider,
+            &model,
             &conversation,
-            self.base_system.as_deref(),
+            base_system.as_deref(),
             &ops,
             None,
             None,
             None,
             self.opts.clone(),
         )
-        .await?;
+        .await
+        // Surface a provider failure (credit/auth/rate-limit/transport) as a readable sentence — the
+        // error flows out through the op envelope and becomes the turn's answer, never raw JSON.
+        .map_err(|e| Error::Other(crate::engine::planner_error(&e)))?;
 
         let plan = match out {
             TurnOutput::Plan(c) => serde_json::json!({
@@ -174,13 +233,17 @@ impl LoopHost for EngineLoopHost {
         let ast: DraftAst = serde_json::from_value(ast_val)
             .map_err(|e| Error::Other(format!("run_plan: invalid plan ast: {e}")))?;
 
+        let (session_id, sink) = {
+            let t = self.turn.lock().unwrap();
+            (t.session_id.clone(), t.sink.clone())
+        };
         let executor = self.executor()?;
         // A fresh proxy over the shared sink: the inner run streams live, interleaved under the outer op.
-        let mut sink = SharedSink(self.sink.clone());
+        let mut sink = SharedSink(sink);
         let outcome = execute_flow(
             self.store.as_ref(),
             executor.as_ref(),
-            &self.session_id,
+            &session_id,
             &ast,
             &mut sink,
         )
@@ -243,6 +306,75 @@ impl AgentSink for SharedSink {
     }
     fn turn_end(&mut self, usage: Option<flux_core::Usage>) {
         self.0.lock().unwrap().turn_end(usage);
+    }
+}
+
+/// One captured [`AgentSink`] call, forwarded over a channel. The agent-loop bootstrap drives the loop
+/// flow through an owned, shareable [`ChannelSink`] (so the `'static` loop host can hold it for reentrant
+/// `run_plan`), and drains these events onto its **borrowed** `&mut dyn AgentSink` *concurrently* with the
+/// run — live streaming, no buffer-then-replay, and `run_turn`'s signature is untouched (the mpsc proxy
+/// the design called for).
+pub enum SinkEvent {
+    Text(String),
+    Thinking(String),
+    Planning(bool),
+    ToolCall(String, Value),
+    ToolResult(String, ToolResult),
+    Observation(flux_evidence::Observation),
+    TurnEnd(Option<flux_core::Usage>),
+}
+
+impl SinkEvent {
+    /// Replay this captured call onto a real sink (called by the bootstrap's drain loop).
+    pub fn apply(self, sink: &mut dyn AgentSink) {
+        match self {
+            SinkEvent::Text(t) => sink.text_delta(&t),
+            SinkEvent::Thinking(t) => sink.thinking_delta(&t),
+            SinkEvent::Planning(a) => sink.planning(a),
+            SinkEvent::ToolCall(n, i) => sink.tool_call(&n, &i),
+            SinkEvent::ToolResult(n, r) => sink.tool_result(&n, &r),
+            SinkEvent::Observation(o) => sink.observation(&o),
+            SinkEvent::TurnEnd(u) => sink.turn_end(u),
+        }
+    }
+}
+
+/// An [`AgentSink`] that forwards every call as a [`SinkEvent`] over an unbounded channel. Owned and
+/// cheap to share (just the sender behind the `Arc<Mutex<…>>`); the bootstrap drains the receiver onto
+/// the real sink as events arrive.
+pub struct ChannelSink(tokio::sync::mpsc::UnboundedSender<SinkEvent>);
+
+impl ChannelSink {
+    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<SinkEvent>) -> Self {
+        Self(tx)
+    }
+}
+
+impl AgentSink for ChannelSink {
+    fn text_delta(&mut self, t: &str) {
+        let _ = self.0.send(SinkEvent::Text(t.to_string()));
+    }
+    fn thinking_delta(&mut self, t: &str) {
+        let _ = self.0.send(SinkEvent::Thinking(t.to_string()));
+    }
+    fn planning(&mut self, active: bool) {
+        let _ = self.0.send(SinkEvent::Planning(active));
+    }
+    fn tool_call(&mut self, name: &str, input: &Value) {
+        let _ = self
+            .0
+            .send(SinkEvent::ToolCall(name.to_string(), input.clone()));
+    }
+    fn tool_result(&mut self, name: &str, result: &ToolResult) {
+        let _ = self
+            .0
+            .send(SinkEvent::ToolResult(name.to_string(), result.clone()));
+    }
+    fn observation(&mut self, o: &flux_evidence::Observation) {
+        let _ = self.0.send(SinkEvent::Observation(o.clone()));
+    }
+    fn turn_end(&mut self, usage: Option<flux_core::Usage>) {
+        let _ = self.0.send(SinkEvent::TurnEnd(usage));
     }
 }
 
@@ -376,7 +508,7 @@ mod tests {
         let store = Arc::new(FlowStore::in_memory().unwrap());
 
         // Wire the reflexive capability onto the executor (shares the same envelope + session + sink).
-        let executor = EngineLoopHost::install(
+        let (executor, _host) = EngineLoopHost::install(
             executor,
             provider,
             "mock".into(),
@@ -444,5 +576,135 @@ mod tests {
             .unwrap()
             .and_then(|id| store.get_value(&id).unwrap());
         assert_eq!(g, Some(crate::ast::Value::String("hi".into())));
+
+        // One audit trail across the reentry: the INNER run's `tool_call` markers land in the SAME
+        // shared evidence log as the outer ops — because `run_plan` re-enters the same executor/context.
+        let calls: Vec<String> = executor
+            .evidence()
+            .by_kind("tool_call")
+            .filter_map(|o| {
+                o.data
+                    .get("tool")
+                    .and_then(|t| t.as_str())
+                    .map(String::from)
+            })
+            .collect();
+        assert!(
+            calls.contains(&"echo".to_string()) && calls.contains(&"run_plan".to_string()),
+            "inner + outer tool calls share one evidence log: {calls:?}"
+        );
+    }
+
+    /// A provider that records the conversation each `stream()` call saw, then replays a canned response.
+    struct RecordingProvider {
+        responses: Mutex<VecDeque<Vec<Chunk>>>,
+        seen: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Provider for RecordingProvider {
+        fn name(&self) -> &str {
+            "rec"
+        }
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            let convo = req
+                .messages
+                .iter()
+                .map(|m| m.text().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.seen.lock().unwrap().push(convo);
+            let chunks = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default();
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    /// P4: the loop-carried working conversation. A 2-round `repeat` rebinds `$feedback` to the last
+    /// `run_plan` Outcome each iteration (last-writer-wins symbol rebinding, no new machinery); round 2's
+    /// `plan` therefore sees round 1's transcript in the conversation handed to the planner.
+    #[tokio::test]
+    async fn loop_carried_feedback_lets_round_two_see_round_one() {
+        let rec_sink = Recorder::default();
+        let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(rec_sink.clone())));
+
+        let dir = std::env::temp_dir().join(format!("flux-loop-feedback-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        flux_tools::register_reflect(&mut reg);
+        let executor = Executor::new(
+            reg,
+            PermissionManager::from_rules(&["echo".into(), "plan".into(), "run_plan".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(system),
+        );
+
+        // Round 1 emits a plan echoing a unique marker; round 2 echoes another.
+        let r1 = json!({ "body": [{ "kind": "call", "op": "echo",
+            "args": [{ "kind": "lit", "value": "ROUND1-MARKER" }] }] });
+        let r2 = json!({ "body": [{ "kind": "call", "op": "echo",
+            "args": [{ "kind": "lit", "value": "ROUND2-DONE" }] }] });
+        let provider = Arc::new(RecordingProvider {
+            responses: Mutex::new(VecDeque::from(vec![emit_plan(r1), emit_plan(r2)])),
+            seen: Mutex::new(Vec::new()),
+        });
+
+        let store = Arc::new(FlowStore::in_memory().unwrap());
+        let (executor, _host) = EngineLoopHost::install(
+            executor,
+            provider.clone(),
+            "rec".into(),
+            None,
+            store.clone(),
+            "sess".into(),
+            shared.clone(),
+            CompileOptions::default(),
+        );
+
+        // $feedback = ""; repeat 2 { $p = plan($feedback); $r = run_plan($p); $feedback = fmt("{r}") }
+        // (`bind` only accepts call/expr/fmt/jq/parse/thing, so the loop-carry copies $r via `fmt`.)
+        let loop_ast: DraftAst = serde_json::from_value(json!({
+            "body": [
+                { "kind": "bind", "name": "feedback", "value": { "kind": "fmt", "template": "" } },
+                { "kind": "repeat", "max": 2, "body": [
+                    { "kind": "bind", "name": "p", "value": { "kind": "call", "op": "plan",
+                        "args": [{ "kind": "var", "name": "feedback" }] } },
+                    { "kind": "bind", "name": "r", "value": { "kind": "call", "op": "run_plan",
+                        "args": [{ "kind": "var", "name": "p" }] } },
+                    { "kind": "bind", "name": "feedback", "value": { "kind": "fmt", "template": "{r}" } }
+                ]}
+            ]
+        }))
+        .unwrap();
+
+        let mut outer = SharedSink::new(shared.clone());
+        execute_flow(
+            store.as_ref(),
+            executor.as_ref(),
+            "sess",
+            &loop_ast,
+            &mut outer,
+        )
+        .await
+        .unwrap();
+
+        let seen = provider.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "the planner was consulted twice");
+        assert!(
+            !seen[0].contains("ROUND1-MARKER"),
+            "round 1's planner saw an empty working conversation: {:?}",
+            seen[0]
+        );
+        assert!(
+            seen[1].contains("ROUND1-MARKER"),
+            "round 2's planner saw round 1's transcript via loop-carried $feedback: {:?}",
+            seen[1]
+        );
     }
 }

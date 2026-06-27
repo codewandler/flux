@@ -53,6 +53,7 @@ pub fn register_eval_ops(registry: &mut ToolRegistry) {
     registry.register(Arc::new(ops::EvalAdoptTool));
     registry.register(Arc::new(ops::EvalScalarTool));
     registry.register(Arc::new(ops::ScoreCompareTool));
+    registry.register(Arc::new(ops::GradeTool));
     // Aggregate → candidates + loop control.
     registry.register(Arc::new(aggregate::ImprovementsAggregateTool));
     registry.register(Arc::new(aggregate::CandidatesEmptyTool));

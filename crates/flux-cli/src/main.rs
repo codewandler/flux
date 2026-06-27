@@ -694,20 +694,24 @@ async fn build_agent(cli: &Cli) -> Result<(FlowEngine, String, Arc<dyn flux_runt
         events.create_session(&model).context("create session")?
     };
 
-    let agent = FlowEngine {
-        provider,
+    let flow = open_flow_store(events.clone())?;
+    // Assemble the engine: this installs the reflexive loop host on the executor and loads the flux-lang
+    // `agent-loop.flux` (the turn loop is flux-lang, not Rust).
+    let agent = FlowEngine::assemble(
+        Arc::from(provider),
         executor,
-        flow: open_flow_store(events.clone())?,
         events,
+        flow,
         model,
         system_prompt,
-        max_tokens: cli.max_tokens,
-        max_iterations: 25,
-        skills: load_skills(&cwd),
-        compact_threshold_chars: compact_threshold(),
+        cli.max_tokens,
+        25,
+        load_skills(&cwd),
+        compact_threshold(),
         groups,
-        cwd: cwd.clone(),
-    };
+        cwd.clone(),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok((agent, session_id, spawner))
 }
 
@@ -796,7 +800,8 @@ pub(crate) async fn run_draft_ast(cli: &Cli, ast: &flux_flow::ast::DraftAst) -> 
         bail!("flow validation failed — see diagnostics above");
     }
 
-    // Risk preview + per-op approval (same envelope as a real turn).
+    // Risk preview (informational; every op still gates at dispatch through the engine's approver,
+    // which `build_agent` set from `--yes`).
     let risk = flux_flow::runtime::plan_risk(ast, engine.executor.registry());
     eprintln!(
         "\n{}  {}{}",
@@ -804,53 +809,28 @@ pub(crate) async fn run_draft_ast(cli: &Cli, ast: &flux_flow::ast::DraftAst) -> 
         risk_badge(&risk.summary()),
         style::dim(&format!(" · {} op(s)", risk.ops.len()))
     );
-    let fallback: Arc<dyn Approver> = if cli.yes {
-        Arc::new(AllowApprover)
-    } else {
-        Arc::new(StdinApprover)
-    };
 
-    // Take the engine apart to install the reflexive loop host on the SAME executor: a flow may call
-    // `plan`/`run_plan`, which re-enter the planner/interpreter through this executor + session. The
-    // sink is shared (an `Arc<Mutex<…>>`) so the outer flow and any inner `run_plan` stream live onto
-    // one surface, sub-steps interleaved.
-    let FlowEngine {
-        mut executor,
-        flow,
-        provider,
-        model,
-        system_prompt,
-        max_tokens,
-        ..
-    } = engine;
-    executor.set_approver(Arc::new(flux_flow::runtime::PlanApprover::new(
-        risk.ops.clone(),
-        fallback,
-    )));
-
-    let store = Arc::new(flow);
-    let provider: Arc<dyn Provider> = Arc::from(provider);
+    // Point the engine's installed loop host at this run's session + sink (a flow may call
+    // `plan`/`run_plan`, which re-enter the planner/interpreter through this same executor). The sink is
+    // shared so the outer flow and any inner `run_plan` stream live onto one surface, sub-steps interleaved.
     let shared: Arc<std::sync::Mutex<dyn AgentSink>> =
         Arc::new(std::sync::Mutex::new(CliSink::new(0)));
-    let executor = flux_flow::loop_host::EngineLoopHost::install(
-        executor,
-        provider,
-        model,
-        Some(system_prompt),
-        store.clone(),
+    engine.loop_host.set_turn(
         session_id.clone(),
+        Some(engine.system_prompt.clone()),
         shared.clone(),
-        flux_flow::compile::CompileOptions {
-            max_tokens,
-            ..Default::default()
-        },
     );
 
     let mut sink = flux_flow::loop_host::SharedSink::new(shared.clone());
-    let outcome =
-        flux_flow::runtime::execute_flow(store.as_ref(), executor.as_ref(), &session_id, ast, &mut sink)
-            .await
-            .context("execute flow")?;
+    let outcome = flux_flow::runtime::execute_flow(
+        engine.flow.as_ref(),
+        engine.executor.as_ref(),
+        &session_id,
+        ast,
+        &mut sink,
+    )
+    .await
+    .context("execute flow")?;
     if !outcome.result.trim().is_empty() {
         println!("{}", outcome.result);
     } else {
@@ -895,7 +875,7 @@ async fn run_plan(cli: Cli) -> Result<()> {
             "--plan needs a prompt, e.g. `flux --plan \"summarize the README into SUMMARY.txt\"`"
         );
     }
-    let (mut engine, session_id, _spawner) = build_agent(&cli).await?;
+    let (engine, session_id, _spawner) = build_agent(&cli).await?;
     let cli_ask = CliAsk;
     eprintln!(
         "{}",
@@ -1165,8 +1145,11 @@ async fn run_repl(cli: Cli) -> Result<()> {
                     } else {
                         match build_provider(spec) {
                             Ok((native, model)) => {
-                                agent.provider = Box::new(native);
-                                agent.model = model;
+                                let provider: Arc<dyn Provider> = Arc::new(native);
+                                agent.provider = provider.clone();
+                                agent.model = model.clone();
+                                // The loop host holds its own planner handle — swap it too.
+                                agent.loop_host.set_model(provider, model);
                                 let _ = agent.events.set_model(&session_id, &agent.model);
                                 eprintln!("switched to {}", agent.model);
                             }

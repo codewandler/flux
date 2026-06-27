@@ -600,7 +600,10 @@ fn exec_body<'a>(
                             continue;
                         }
                         Node::Jq { path, input } => {
-                            let jv = eval_arg(input, store, session_id)?;
+                            // Op results are stored as JSON *strings* (the canonical `content`), so a
+                            // string input that is really JSON is parsed first — this is what lets a flow
+                            // pull `.kind`/`.transcript` out of a `plan`/`run_plan` result.
+                            let jv = jq_parse_input(eval_arg(input, store, session_id)?);
                             let result = eval_jq_path(path, &jv)?;
                             let text = match &result {
                                 serde_json::Value::String(s) => s.clone(),
@@ -2272,6 +2275,20 @@ fn coerce_parse(value: &serde_json::Value, as_type: &str) -> Result<String> {
         }
         _ => Ok(s), // "string" or unknown — pass through
     }
+}
+
+/// If `value` is a string that parses as a JSON object or array, return the parsed value; otherwise
+/// return it unchanged. Op results are stored as JSON strings, so this lets `jq` introspect them (a
+/// bare scalar string is left alone, so `jq` over real text still behaves).
+fn jq_parse_input(value: serde_json::Value) -> serde_json::Value {
+    if let serde_json::Value::String(s) = &value {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+            if parsed.is_object() || parsed.is_array() {
+                return parsed;
+            }
+        }
+    }
+    value
 }
 
 fn eval_jq_path(path: &str, value: &serde_json::Value) -> Result<serde_json::Value> {
