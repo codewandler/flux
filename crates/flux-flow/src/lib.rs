@@ -27,5 +27,7 @@ pub mod state;
 // Facade: the language core + reference interpreter live in `flux-lang`. Re-export them so the
 // language surface stays available from the engine crate (no consumer churn) and
 // `crate::{ast,render,analyze,host,store,…}` resolve inside the engine modules.
-pub use flux_lang::{analyze, ast, effects, error, host, opspec, render, schema, sink, store};
+pub use flux_lang::{
+    analyze, ast, effects, error, host, opspec, prelude, program, render, schema, sink, store,
+};
 pub use flux_lang::{FlowError, Result};

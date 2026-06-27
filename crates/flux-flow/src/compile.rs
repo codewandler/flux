@@ -644,6 +644,7 @@ fn ast_grammar() -> String {
     format!(
         "The AST is a JSON object: {{\"name\"?:string, \"params\"?:[{{\"name\":string,\"ty\":type}}], \"returns\"?:type, \"body\":[Node,...]}}. A Node is tagged by \"kind\":\n\
 {node_kinds}Prefer `each` over `repeat` for list iteration; prefer `parallel` for independent reads/calls that don't depend on each other.\n\
+\nArtifact types (the `Named` types ops produce/consume — use as a `ty`/`returns` or in a `ctx`/`need`): {artifact_types}.\n\
 \nExample for \"read the readme then grep it for TODO\":\n\
 {{\"body\":[\n\
   {{\"kind\":\"bind\",\"name\":\"readme\",\"value\":{{\"kind\":\"call\",\"op\":\"read\",\"args\":[{{\"kind\":\"lit\",\"value\":\"README.md\"}}]}}}},\n\
@@ -656,6 +657,7 @@ fn ast_grammar() -> String {
   ],\"collect\":\"all\"}}\n\
 ]}}",
         node_kinds = crate::schema::node_kind_catalog(),
+        artifact_types = crate::prelude::PRELUDE_TYPES.join(", "),
     )
 }
 
