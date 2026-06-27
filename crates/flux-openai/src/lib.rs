@@ -22,6 +22,7 @@ use flux_provider::{
 
 const OPENAI_CHAT_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
 const OPENROUTER_ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
+const OLLAMA_CHAT_ENDPOINT: &str = "http://localhost:11434/v1/chat/completions";
 
 // ---------------------------------------------------------------------------
 // Chat Completions wire codec
@@ -418,6 +419,36 @@ pub fn openrouter_api(
             endpoint: OPENROUTER_ENDPOINT.to_string(),
             secret: Secret::ApiKey(api_key.into()),
             extra,
+            send_account_id: false,
+        }),
+    )
+}
+
+/// `ollama` — a local [Ollama](https://ollama.com) server, which speaks the OpenAI Chat
+/// Completions wire (so it reuses [`OpenAiChat`] verbatim). Ollama requires no credential; the
+/// Bearer token is a placeholder it ignores. The endpoint defaults to `localhost:11434` and
+/// honours `OLLAMA_HOST` (e.g. `http://192.168.1.10:11434` for a remote box). A scheme is added
+/// if the host is bare, and a trailing `/v1/chat/completions` is appended.
+pub fn ollama_api() -> NativeProvider {
+    let endpoint = match std::env::var("OLLAMA_HOST") {
+        Ok(h) if !h.trim().is_empty() => {
+            let h = h.trim().trim_end_matches('/');
+            let h = if h.contains("://") {
+                h.to_string()
+            } else {
+                format!("http://{h}")
+            };
+            format!("{h}/v1/chat/completions")
+        }
+        _ => OLLAMA_CHAT_ENDPOINT.to_string(),
+    };
+    NativeProvider::new(
+        "ollama",
+        Arc::new(OpenAiChat),
+        Arc::new(OpenAiCred {
+            endpoint,
+            secret: Secret::ApiKey("ollama".to_string()),
+            extra: Vec::new(),
             send_account_id: false,
         }),
     )

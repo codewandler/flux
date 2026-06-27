@@ -26,7 +26,7 @@ use flux_core::{Chunk, ContentBlock, StopReason, Usage};
 use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
 use flux_flow::state::FlowStore;
-use flux_openai::{openai_from_env, openrouter_from_env};
+use flux_openai::{ollama_api, openai_from_env, openrouter_from_env};
 use flux_orchestrate::{LocalSpawner, ProviderFactory, Role, RoleRegistry, TaskTool};
 use flux_provider::{ChunkStream, Effort, NativeProvider, Provider, Request};
 use flux_runtime::{
@@ -60,8 +60,9 @@ struct Cli {
     print: bool,
 
     /// Fully-qualified `provider/model` spec. Provider must be one of:
-    ///   `anthropic` (API key), `claude` (OAuth/subscription), `openai`, `codex`, `openrouter`.
-    /// Short aliases `sonnet`, `opus`, `haiku` are convenience shorthands for `anthropic/<model>`.
+    ///   `anthropic` (API key), `claude` (OAuth/subscription), `openai`, `codex`, `openrouter`,
+    ///   `ollama` (local). Short aliases `sonnet`, `opus`, `haiku` are shorthands for
+    ///   `anthropic/<model>`.
     /// Examples: `claude/claude-sonnet-4-6`, `openai/gpt-4o`, `openrouter/anthropic/claude-sonnet-4-5`.
     /// Overrides `model` in `.flux/config.toml`; falls back to `sonnet` (= `anthropic/claude-sonnet-4-6`).
     #[arg(short = 'm', long)]
@@ -201,11 +202,13 @@ fn persist_new_rules(initial: &[String], current: &[String]) {
     }
 }
 
-const KNOWN_PROVIDERS: &[&str] = &["anthropic", "claude", "openai", "codex", "openrouter"];
+const KNOWN_PROVIDERS: &[&str] =
+    &["anthropic", "claude", "openai", "codex", "openrouter", "ollama"];
 
 /// Parse a fully-qualified `provider/model` spec and build the matching provider from environment
 /// credentials. Provider must be an explicit prefix (`anthropic/`, `claude/`, `openai/`, `codex/`,
-/// `openrouter/`). Bare short aliases (`sonnet`, `opus`, `haiku`) are implicitly `anthropic/<alias>`.
+/// `openrouter/`, `ollama/`). Bare short aliases (`sonnet`, `opus`, `haiku`) are implicitly
+/// `anthropic/<alias>`.
 /// Any other bare string (no `/`) is an error — use `anthropic/` or `claude/` to disambiguate.
 fn build_provider(spec: &str) -> Result<(NativeProvider, String)> {
     let (provider, model) = match spec.split_once('/') {
@@ -231,6 +234,7 @@ fn build_provider(spec: &str) -> Result<(NativeProvider, String)> {
         "anthropic" => anthropic_from_env().context("anthropic provider")?,
         "openai" => openai_from_env().context("openai provider")?,
         "openrouter" => openrouter_from_env().context("openrouter provider")?,
+        "ollama" => ollama_api(),
         "claude" => {
             let ts = flux_credentials::claude_token_source().context("claude provider")?;
             flux_anthropic::claude_oauth(ts)
