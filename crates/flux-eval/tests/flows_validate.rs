@@ -17,6 +17,9 @@ fn example_flows_validate_against_the_registry() {
     for path in [
         "../../examples/improve-tbench.flux",
         "../../examples/eval-smoke.flux",
+        // Exercises the P1+P2 surface end-to-end: ctx/ctx_append nodes + the pure cognition ops
+        // (need/gaps/sort/top/cite) + a Named artifact-type hint — all against the live registry.
+        "../../examples/cognition-research.flux",
     ] {
         let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         let ast: flux_flow::ast::DraftAst =
