@@ -11,6 +11,27 @@ update it in the same commit as the behaviour it describes.
 > Note: the implementation has intentionally grown **beyond** the PRD's "deliberately small" v1 node set
 > (PRD §4/§8 list ~7 constructs; `ast.rs` ships **31**). That is a superset, not a regression.
 
+## Evolution build status (P0–P5 + flux-app)
+
+The forward design ([`flux-lang-evolution.md`](../../../docs/designs/flux-lang-evolution.md)) phases, as built:
+
+| Phase | Scope | Status |
+|---|---|---|
+| **P0** | op-input JSON Schema (`OpSpec`→named schema) | ✅ |
+| **P1a** | v1-core artifact prelude (11 `Named` types + SSOT) | ✅ |
+| **P1b** | cognition op-pack — pure (`flux-tools`) + model-backed (`flux-cognition` L3); **wired into the live CLI + SDK** | ✅ |
+| **P2** | `ctx`/`ctx_append` nodes + budget-at-node-eval (priority-prefix shrink) | ✅ |
+| **P3** | `flux-sdk` lifecycle surface (`FlowClient` + register packs/prelude) | ✅ |
+| **P4** | typed HIR (`analyze::lower`: effect gathering + call arity) | 🟡 (type inference deferred) |
+| **P5c** | multi-agent `Program` layer (`program.rs` + module loader) | ✅ |
+| **flux-app** | L6 runtime host (event bus, triggers, journeys, orchestration ops) + `flux run app.flux` (safe-by-default) | ✅ |
+| **P5a** | text syntax (`parse.rs`/`format.rs`, marker syntax, round-trip) | 🟡 in progress |
+| **P5b** | optimizer + `PhysicalPlan` execution | ⬜ (needs node-id plan lowering) |
+| — | full type inference; control-flow primitives (§5.1); `ask` reply-correlation | ⬜ |
+
+Each landed phase shipped behind the full dev loop (build/test/clippy/fmt/codegate) and an adversarial
+review pass (findings fixed before commit).
+
 ## Language & AST (PRD §8, §10.1)
 
 | PRD § | Requirement | Status | Evidence / note |
