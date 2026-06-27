@@ -113,7 +113,7 @@ review pass (findings fixed before commit).
 | Item | Status |
 |---|---|
 | 1. Two writable display modes (human + token-efficient) | 🟡 (canonical text form built — `format`/`parse`; a token-efficient variant later) |
-| 2. `fluxlang compile` (text → AST) | 🟡 (`parse` built; the `fluxlang` CLI subcommand can surface it) |
+| 2. `fluxlang compile` (text → AST) | ✅ (`fluxlang compile` wired onto `parse`; `bin/fluxlang.rs`) |
 | 3. Richer `analyze` (type + effect checking → typed HIR) | ✅ |
 | 4. Op-input JSON Schema from `OpSpec` | ✅ (P0; `opspec.rs`) |
 
