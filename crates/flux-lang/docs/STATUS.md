@@ -26,8 +26,8 @@ The forward design ([`flux-lang-evolution.md`](../../../docs/designs/flux-lang-e
 | **P5c** | multi-agent `Program` layer (`program.rs` + module loader) | ✅ |
 | **flux-app** | L6 runtime host (event bus, triggers, journeys, orchestration ops) + `flux run app.flux` (safe-by-default) | ✅ |
 | **P5a** | text syntax (`parse.rs`/`format.rs`, marker syntax, round-trip) | ✅ |
-| **P5b** | optimizer + `PhysicalPlan` execution | ⬜ (needs node-id plan lowering) |
-| — | full type inference; control-flow primitives (§5.1); `ask` reply-correlation | ⬜ |
+| **P5b** | optimizer (parallelize independent reads) + `PhysicalPlan` execution | ✅ |
+| — | full type inference; control-flow primitives (§5.1); `ask` reply-correlation | 🟡 (type inference next) |
 
 Each landed phase shipped behind the full dev loop (build/test/clippy/fmt/codegate) and an adversarial
 review pass (findings fixed before commit).
@@ -51,7 +51,7 @@ review pass (findings fixed before commit).
 | 8 | Bounded-loop checking | ✅ | `src/analyze.rs` |
 | 10.2 | **Type checking** + `DraftAst → HirFlow` lowering | 🟡 | `analyze::lower` produces a real `HirFlow` (validated body + **gathered effects** + **call arity**); full type inference over expressions still deferred |
 | 12 | Effect gathering | ✅ | `src/effects.rs`; effects collected on `HirFlow` |
-| 10.3, 15 | **Optimizer** (parallelize/cache/CSE/…) + `PhysicalPlan` execution | ⬜ | `Stage` types exist (`ast.rs`); nothing executes them |
+| 10.3, 15 | **Optimizer** (parallelize independent reads) + `PhysicalPlan` execution | ✅ (P5b) | `src/optimize.rs` (read-only batching + fences) + `runtime::execute_plan`; `flux-sdk` `optimize`/`execute_optimized` |
 
 ## Runtime, store & events (PRD §9, §14.3, §19, §20.2–20.3)
 
@@ -89,7 +89,7 @@ review pass (findings fixed before commit).
 |---|---|---|---|
 | 17.1 | `compile_turn(text, view, registry, llm) -> DraftAst` | ✅ | surfaced via `flux-sdk` `FlowClient::compile` (delegates to `flux-flow/src/compile.rs`) |
 | 17.2 | `analyze(ast, session, registry, policy) -> HirFlow` | 🟡 → ✅ | `analyze::lower` produces a typed `HirFlow` (effects + arity; full type inference later); `FlowClient::analyze` |
-| 17.3 | `optimize(hir) -> PhysicalPlan` | ⬜ | needs node-id'd plan lowering (deferred) |
+| 17.3 | `optimize(hir) -> PhysicalPlan` | ✅ (P5b) | `flux-sdk` `FlowClient::optimize` → `flux_lang::optimize` |
 | 17.4 | `execute(plan, session, runtime) -> ExecutionResult` | ✅ | `FlowClient::execute` over `execute_flow` |
 | 17.5 | `register_op` / `register_pack` / `register_prelude` | ✅ | `flux-sdk` `flow` module |
 | 17 | **`flux-sdk` exposes the lifecycle** (not the agent loop) | ✅ (P3) | `FlowClient` (`flux-sdk/src/flow.rs`): assemble registry (builtins + **cognition pack**) + compile→analyze→execute + artifact helpers; classic loop kept as the simple front door |
