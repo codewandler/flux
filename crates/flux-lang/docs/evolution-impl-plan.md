@@ -113,6 +113,40 @@ change.
   `fallback`/`timeout`/`budget` (tier 1) and `checkpoint`/`compensate`/`once`/`scope` (tier 2); each
   adopted node goes through the node-kind SSOT + docs-sync gates.
 
+## P6 — capability batch: await + Tier-1 control-flow + polish — 🚧 IN PROGRESS
+The next batch (directions 1 + 4 + 2). Each sub-phase ships behind the full dev loop + an adversarial
+review, then commits; `STATUS.md` rows flip as each lands.
+
+### P6a — `await` cross-turn suspend/resume (keystone)
+- **Design: persist-continuation, top-level await only (v1)** — avoids re-running side effects; matches
+  the existing `Stage::Await { node: NodeId }` scaffolding; defers Tier-2 `checkpoint`/`once`.
+- `flux-lang`: `Step::Suspend { source, binding, as_type }`; `FlowOutcome.suspension: Option<Suspension>`
+  (run id, top-level cursor, source, binding, as_type); `exec_body` `Node::Await` arm (resume-input present
+  → bind+continue; else emit `RunEvent::Awaiting` + return `Step::Suspend`); handle `Stage::Await` in
+  `execute_plan`; new `resume_flow(plan, cursor, resume_input, …)`; generate/track `RunId`.
+- `flux-flow`: persist the suspension (plan + cursor + run id + source) in a `suspensions` table; at turn
+  start resume a pending suspension with the incoming message instead of compiling fresh; clear on done.
+- `analyze`: enforce top-level-position await (reject nested in `repeat`/`when`/`each`/`parallel` — v1).
+- Tests: suspend (outcome set, `Awaiting` emitted, no later side-effects), resume (continues from cursor,
+  earlier side-effects NOT re-run), flux-flow cross-turn REPL path, analyzer nested-await rejection.
+
+### P6b — Tier-1 control-flow primitives (5 nodes, design §5.1)
+- Adopt `match` (exhaustive multi-way), `route` (`!model` selector, fixed analyzer-validated cases),
+  `fallback` (first-success), `timeout` (wall-clock bound), `budget` (cost cap; **v1 = model-call/node
+  count**, token/money later). **Defer Tier-2** (`checkpoint`/`compensate`/`once`/`scope`).
+- Each node threads the full add-a-node checklist (`ast`/`runtime`/`analyze`/`render`/`format`/`parse`/
+  flux-flow `walk_node`/`optimize`) + SSOT regen. `route` stays L0-pure (selector is an op `Call`; runtime
+  matches the returned label to a fixed case). Separable → worktree agents, cherry-pick, reconcile SSOT once.
+- Tests: per-node interpreter + analyzer + text round-trip; node-kind catalog drift green.
+
+### P6c — polish to truly-done
+- `fluxlang compile` subcommand (text → JSON AST, mirrors `Render`).
+- Token-efficient display mode (`FormatOptions`/`format_compact`, **display-only** in v1).
+- Thing resolver: execute `Node::Thing` via an injected `ThingResolver` + a default deterministic resolver
+  for unambiguous selectors (`File`→path, `Url`→url, `Repo`/`Dataset` by id).
+- Focus aliases: deterministic resolver for fixed forms ("the/last `<type>`", "those `<plural>`") →
+  most-recent matching symbol by type+recency (no model). Softest item; droppable.
+
 ## Cross-cutting gates
 - Node-kind SSOT (+3) and the new prelude-type catalog must stay green (drift tests).
 - Keep `flux-lang` L0-pure (no L1+ deps); cognition model-ops live in a registrable pack, not in the
