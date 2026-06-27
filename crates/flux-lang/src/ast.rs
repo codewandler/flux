@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -17,7 +18,7 @@ use serde::{Deserialize, Serialize};
 macro_rules! string_id {
     ($($(#[$m:meta])* $name:ident),* $(,)?) => {$(
         $(#[$m])*
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
         #[serde(transparent)]
         pub struct $name(pub String);
 
@@ -61,7 +62,7 @@ pub struct NodeId(pub u32);
 
 /// A (deliberately small) type reference. The analyzer checks op signatures against these; richer
 /// structural typing can grow here later.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TypeRef {
     /// The top type — matches anything (used before inference).
@@ -94,7 +95,7 @@ impl TypeRef {
 /// [`flux_spec::Effect`] (Read/Write/Network/…): a `FlowEffect` expresses execution *meaning*
 /// (this op sends mail, costs money, touches a calendar) and lowers onto the host effect + a policy
 /// action via [`FlowEffect::lower`](crate). Policy decides allow / deny / require-approval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowEffect {
     /// No effect — deterministic, side-effect free.
@@ -237,7 +238,7 @@ impl Value {
 }
 
 /// The kind of an addressable external object.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ThingKind {
     Context,
@@ -255,7 +256,7 @@ pub enum ThingKind {
 }
 
 /// How a thing is addressed before resolution.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Selector {
     Id(String),
@@ -266,7 +267,7 @@ pub enum Selector {
 }
 
 /// An unresolved reference to an external object.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ThingRef {
     pub kind: ThingKind,
     pub selector: Selector,
@@ -290,7 +291,7 @@ pub struct ResolvedThing {
 // ---------------------------------------------------------------------------
 
 /// A typed flow parameter (`$ticket: Ticket`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Param {
     pub name: SymbolName,
     pub ty: TypeRef,
@@ -298,7 +299,7 @@ pub struct Param {
 
 /// A node in the Draft AST the LLM emits. Expressions and statements share one enum; the analyzer
 /// enforces where each may appear.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Node {
     /// Invoke a registered operation with argument expressions.
@@ -539,7 +540,7 @@ pub enum Node {
 /// One branch of a [`Node::Parallel`] fan-out: a named sub-flow whose final result is bound to
 /// `name` after the branch completes. Branches should bind distinct names (the analyzer rejects
 /// duplicates).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Branch {
     pub name: SymbolName,
     #[serde(default)]
@@ -548,7 +549,7 @@ pub struct Branch {
 
 /// The Draft AST: an optionally-named, parameterized flow with a body. May contain unresolved
 /// symbols and thing references until the analyzer runs.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct DraftAst {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,

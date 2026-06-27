@@ -218,12 +218,7 @@ pub async fn compile_turn(
         let ts: Option<&mut dyn flux_agent::AgentSink> = thinking_sink
             .as_mut()
             .map(|s| unsafe { &mut *(*s as *mut dyn flux_agent::AgentSink) });
-        let (mut blocks, acc_text, stop_reason) = stream_blocks(
-            provider,
-            req,
-            ts,
-        )
-        .await?;
+        let (mut blocks, acc_text, stop_reason) = stream_blocks(provider, req, ts).await?;
         if blocks.is_empty() && !acc_text.trim().is_empty() {
             blocks.push(ContentBlock::Text { text: acc_text });
         }
@@ -375,7 +370,19 @@ pub async fn plan(
     opts: CompileOptions,
 ) -> Result<Compiled> {
     let conversation = [Message::user_text(instruction)];
-    match compile_turn(provider, model, &conversation, None, ops, view, ask, None, opts).await? {
+    match compile_turn(
+        provider,
+        model,
+        &conversation,
+        None,
+        ops,
+        view,
+        ask,
+        None,
+        opts,
+    )
+    .await?
+    {
         TurnOutput::Plan(c) => Ok(c),
         TurnOutput::Chat(_) => Err(Error::Other(
             "the model answered without emitting a plan".to_string(),
@@ -632,7 +639,7 @@ fn symbols_block(view: Option<&SessionView>) -> String {
 }
 
 /// The planner grammar: top-level AST shape + node kinds auto-generated from `Node` in `ast.rs`
-/// via `build.rs` -- never edit by hand.
+/// via the derived JSON schema (`crate::schema`) -- never edit by hand.
 fn ast_grammar() -> String {
     format!(
         "The AST is a JSON object: {{\"name\"?:string, \"params\"?:[{{\"name\":string,\"ty\":type}}], \"returns\"?:type, \"body\":[Node,...]}}. A Node is tagged by \"kind\":\n\
@@ -648,7 +655,7 @@ fn ast_grammar() -> String {
     {{\"kind\":\"bind\",\"name\":\"text\",\"value\":{{\"kind\":\"call\",\"op\":\"read\",\"args\":[{{\"kind\":\"var\",\"name\":\"f\"}}]}}}}\n\
   ],\"collect\":\"all\"}}\n\
 ]}}",
-        node_kinds = crate::NODE_KIND_CATALOG,
+        node_kinds = crate::schema::node_kind_catalog(),
     )
 }
 

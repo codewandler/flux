@@ -7,7 +7,7 @@ description: >-
   Original, standalone Product Requirements Document for Flux-Lang, authored independently of the
   existing flux ecosystem and preserved here verbatim as the source design. For how Flux-Lang is
   integrated into flux (the "LLM is not the runtime" execution engine, crate layout, safety reuse,
-  and build plan), see flux-flow.md in this directory.
+  and build plan), see [`docs/designs/flux-flow.md`](../../../docs/designs/flux-flow.md).
 ---
 
 # Product Requirements Document: Flux-Lang Module
@@ -17,6 +17,28 @@ description: >-
 **Status:** Draft PRD  
 **Target implementation:** Rust module/crate  
 **Last updated:** 2026-06-25
+
+## 0. Status & Roadmap
+
+**Status (shipped).** Flux-Lang is now its own **L0 crate** (`crates/flux-lang`): the typed AST, the
+renderer, the analyzer (against an abstract op catalog), a schemars-driven JSON Schema and the
+generated language skill, a `fluxlang` CLI (`skill`/`schema`/`render`), and a **reference interpreter**
+that runs a flow against injected `host`/`store`/`sink` traits. The `flux-flow` engine adapts its safety
+envelope onto those traits. The rest of this document is the original source-of-record design.
+
+**Roadmap (near-term), in priority order:**
+
+1. **Two writable display modes.** Flux-Lang authoring is JSON-on-the-wire today; next is a pair of
+   round-trippable concrete syntaxes:
+   - a **human-readable** form (see [`syntax.md`](syntax.md)) people can read and write, and
+   - a **token-efficient low-level** form optimized for model context — the form we may later
+     **fine-tune a dedicated model** to emit natively.
+2. **`fluxlang compile`** — a parser (text → AST) with **auto-detection** across the input forms
+   (JSON / human / token-efficient), complementing the existing one-way renderer.
+3. **Richer `analyze`** — type and effect checking over the whole flow (the analyzer is name/grammar/
+   bounded-loop today), lowering `DraftAst` → typed `HirFlow`.
+4. **Op-input schema** — project `OpSpec`'s typed, named inputs to a real JSON Schema (today
+   `OpSpec::lower()` ships a placeholder `{"type":"object"}`).
 
 ## 1. Executive Summary
 

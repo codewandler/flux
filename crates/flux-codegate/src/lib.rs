@@ -6,9 +6,11 @@
 //! any unclassified crate). Run via `cargo test -p flux-codegate`.
 //!
 //! Note the deliberate placements that keep the deep decisions honest: `flux-evidence`, `flux-skill`,
-//! and `flux-config` are **pure contract (L0) leaves** (no IO, no flux deps beyond other L0), so the
-//! runtime/agent layers may depend on them; and `flux-auth` is L5, so `flux-runtime` (L2) must NOT
-//! depend on it — surfaces resolve identity and pass `(Caller, Trust)` in.
+//! `flux-config`, and `flux-lang` are **L0 leaves** (no flux deps beyond other L0), so the
+//! runtime/agent layers may depend on them. `flux-lang` is the Flux-Lang language **and its reference
+//! interpreter**: its L0-purity means "no L1+ flux deps; all effects (op dispatch, value store,
+//! observation sink) injected via traits" — not "no async/IO" (it uses tokio). And `flux-auth` is L5,
+//! so `flux-runtime` (L2) must NOT depend on it — surfaces resolve identity and pass `(Caller, Trust)` in.
 
 /// The layer of a flux crate (0 = innermost contracts, 6 = outermost surfaces), or `None` if the
 /// crate is unknown (which the lint treats as a failure — new crates must be classified here).
@@ -16,7 +18,7 @@ pub fn layer(name: &str) -> Option<u8> {
     Some(match name {
         // L0 — pure contracts: no IO, no flux deps except other L0. Safe for anything to use.
         "flux-core" | "flux-policy" | "flux-secret" | "flux-spec" | "flux-config"
-        | "flux-evidence" | "flux-skill" => 0,
+        | "flux-evidence" | "flux-skill" | "flux-lang" => 0,
         // L1 — providers + credentials
         "flux-provider" | "flux-credentials" | "flux-anthropic" | "flux-openai" => 1,
         // L2 — runtime: execution + guarded IO + the safety envelope

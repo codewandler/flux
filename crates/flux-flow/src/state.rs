@@ -33,39 +33,40 @@ fn value_rowid(id: &ValueId) -> Result<i64> {
         .ok_or_else(|| Error::Other(format!("invalid value id: {:?}", id.0)))
 }
 
-/// One symbol as projected into the model-facing view: a name, a one-line summary, an optional type
-/// hint, and its visibility. The raw value is never included — only the runtime dereferences it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SymbolView {
-    pub name: SymbolName,
-    pub ty: Option<String>,
-    pub summary: String,
-    pub visibility: Visibility,
-}
+/// The model-facing session-projection types live in the language crate ([`flux_lang::store`]);
+/// re-exported so `flux_flow::state::{SessionView, SymbolView}` paths are unchanged.
+pub use flux_lang::store::{SessionView, SymbolView};
 
-/// The compact, policy-filtered projection of a session's symbols — what the model sees instead of
-/// re-sent raw outputs.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct SessionView {
-    pub symbols: Vec<SymbolView>,
-}
-
-impl SessionView {
-    /// Render the view as compact lines, e.g. `$draft: Draft = Renewal follow-up`.
-    pub fn render(&self) -> String {
-        let mut out = String::new();
-        for s in &self.symbols {
-            out.push('$');
-            out.push_str(&s.name.0);
-            if let Some(ty) = &s.ty {
-                out.push_str(": ");
-                out.push_str(ty);
-            }
-            out.push_str(" = ");
-            out.push_str(&s.summary);
-            out.push('\n');
-        }
-        out
+/// flux-flow's durable [`FlowStore`] is the engine's [`ValueStore`](flux_lang::store::ValueStore):
+/// the interpreter (in `flux-lang`) reads and writes session state through this trait, with the SQLite
+/// implementation staying here. Methods forward to the inherent ones (inherent methods win in
+/// `self.method()` resolution, so there is no recursion).
+impl flux_lang::store::ValueStore for FlowStore {
+    fn put_value(&self, session_id: &str, value: &Value) -> Result<ValueId> {
+        self.put_value(session_id, value)
+    }
+    fn get_value(&self, id: &ValueId) -> Result<Option<Value>> {
+        self.get_value(id)
+    }
+    fn bind(
+        &self,
+        session_id: &str,
+        name: &SymbolName,
+        vid: &ValueId,
+        ty: Option<&str>,
+        summary: &str,
+        visibility: Visibility,
+    ) -> Result<()> {
+        self.bind(session_id, name, vid, ty, summary, visibility)
+    }
+    fn resolve(&self, session_id: &str, name: &SymbolName) -> Result<Option<ValueId>> {
+        self.resolve(session_id, name)
+    }
+    fn append_event(&self, session_id: &str, event: &RunEvent) -> Result<()> {
+        self.append_event(session_id, event)
+    }
+    fn view(&self, session_id: &str) -> Result<SessionView> {
+        self.view(session_id)
     }
 }
 

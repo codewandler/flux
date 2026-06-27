@@ -1,8 +1,9 @@
 # Design: flux-flow (Flux-Lang)
 
-**Status:** Draft design · **Layer:** new L3 crate `flux-flow` · **Owner:** Timo Friedl
+**Status:** Draft design · **Layers:** `flux-lang` (L0 language core) + `flux-flow` (L3 engine) · **Owner:** Timo Friedl
 
-Canonical design reference for **Flux-Lang**, delivered as the `flux-flow` crate.
+Canonical design reference for **Flux-Lang**, delivered as two crates: the pure `flux-lang` language
+core and the `flux-flow` engine that compiles and runs it.
 [architecture.md](../architecture.md) is the existing system design; [vision.md](../vision.md) is the
 *why*. The implementation plan is a local working doc under `.flux/` (gitignored, not committed):
 `.flux/plans/flux-flow-implementation.md`.
@@ -82,32 +83,57 @@ first-class, latency-preserving fast path so the coding agent never feels slower
 
 ## 5. Architecture
 
-### 5.1 One crate, modules inside
+### 5.1 Two crates: `flux-lang` (L0 language) + `flux-flow` (L3 engine)
 
-`flux-flow` is a single crate at **layer L3** (it sits beside `flux-agent`). L3 is forced by two modules:
-`compile` needs a `Provider` (L1) and `runtime` needs `flux-runtime`/`flux-system` (L2). Classify
-`"flux-flow" => 3` in `flux-codegate`'s `layer()` map. Deps (own layer or lower): `flux-core`,
-`flux-spec`, `flux-policy`, `flux-evidence`, `flux-secret` (L0); `flux-provider` (L1); `flux-runtime`,
-`flux-system`, `flux-session`, `flux-context` (L2).
+The language and the engine are separated along the hard L0/L3 boundary the layering rule motivates —
+the L0-purity of the language is enforced by a **crate wall**, not just module discipline:
 
-| Module | Role |
+- **`flux-lang` (L0)** — the language **and its reference interpreter**: `ast`, `render`, `analyze`,
+  `effects`, `opspec`, `schema`, the `skill` generator + the `fluxlang` CLI, and `runtime` (the
+  interpreter) running a flow against *injected* effect traits. It knows nothing about concrete tools or
+  the engine — the analyzer validates against an abstract `opspec::OpCatalog`, ops dispatch through
+  `host::OpHost`, values live in `store::ValueStore`, observations stream to `sink::FlowSink`. Deps are
+  L0 only (`flux-core`, `flux-spec`, `flux-policy`, `flux-evidence`) + external (`serde`/`schemars`/
+  `tokio`/`futures`/`async-trait`/`sha2`). Its L0 purity now means *"no L1+ flux deps; all effects
+  injected via traits"*, not *"no async"*.
+- **`flux-flow` (L3)** — the engine: `compile` (needs a `Provider`, L1), the SQLite `state` store, the
+  `engine` turn loop, and the **adapters** (in `registry`/`runtime`/`state`) that implement flux-lang's
+  traits over the real `Executor` / `FlowStore` / `AgentSink`. It depends on `flux-lang` and
+  **re-exports it as a facade**, so `flux_flow::{ast, render, analyze, runtime, …}` keep resolving for
+  every consumer (zero churn). `plan_risk` / `PlanApprover` stay here — they need `ToolRegistry` and
+  `Tool::intents` (literal-arg destructive detection), which the language-level `OpCatalog` doesn't carry.
+
+Classify `"flux-lang" => 0` and `"flux-flow" => 3` in `flux-codegate`'s `layer()` map. `flux-flow` deps
+(own layer or lower): `flux-lang`, `flux-core`, `flux-spec` (L0); `flux-provider` (L1); `flux-runtime`,
+`flux-session` (L2); `flux-agent`, `flux-evidence`, `flux-skill`.
+
+| Crate · Module | Role |
 |---|---|
-| `ast` | pure types: `DraftAst`, `HirFlow`, `PhysicalPlan`/`Stage`, `Value`, `Binding`, `ThingRef`, `TypeRef`, `FlowEffect`, `RunEvent`, ids |
-| `parse` | parser + pretty-printer + JSON-AST schema |
-| `analyze` | name/type/effect/bounded-loop checks → `HirFlow` or diagnostics (pure; no IO imports) |
-| `optimize` | `HirFlow → PhysicalPlan`: dependency graph, parallel grouping, fence insertion, cache keys, report |
-| `registry` | `OpSpec` (`fn lower() -> ToolSpec`), `OpRegistry` over `ToolRegistry`, `ThingResolver` + `ModelClient` traits |
-| `state` | `SymbolTable` (visibility tiers), `ValueStore` (immutable, versioned, **budgeted**), `ThingStore`, `view(Session)`, **flow persistence** |
-| `runtime` | interpreter (`bind/call/when/repeat/each/seq/pipe/assert/memo/parallel/return`; `parallel` via structured `try_join_all`); thing-resolution at exec; emits `RunEvent` + bridging `Observation`; await/resume; re-run |
-| `compile` | `compile_turn(NL, view, registry, llm) -> DraftAst`; **prompt-and-parse** (no forced structured output); analyze→repair loop; **determinism-biased prompt** |
-| `engine` | turn spine: incremental fast-path vs. planned compile; execute; risk-gated approval; update session |
-| `render` | pure projections of the graph + trace for CLI/TUI (ASCII DAG / indented tree) + per-node live status |
+| `flux-lang::ast` | pure types: `DraftAst`, `HirFlow`, `PhysicalPlan`/`Stage`, `Value`, `ThingRef`, `TypeRef`, `FlowEffect`, `RunEvent`, ids — all derive `schemars::JsonSchema` |
+| `flux-lang::render` | pure projections of the graph + trace (ASCII DAG / indented tree) + per-node live status |
+| `flux-lang::analyze` | name/grammar/bounded-loop checks against an abstract `OpCatalog` → diagnostics (pure; no IO) |
+| `flux-lang::effects` | `FlowEffect → (flux_spec::Effect, Option<policy::Action>)` lowering |
+| `flux-lang::opspec` | `OpSpec` (`fn lower() -> ToolSpec`), `OpSignature`, the `OpCatalog` seam |
+| `flux-lang::schema` | single source of truth: derived `ast_schema()` + `node_kind_catalog()` driving the planner prompt and the generated skill/docs |
+| `flux-lang::runtime` | the **reference interpreter** (`bind/call/when/repeat/each/seq/pipe/assert/memo/parallel/race/retry/try/confirm/loop/return`) over injected traits; emits `RunEvent` + `Observation` |
+| `flux-lang::host` / `store` / `sink` | the L0 trait seams: `OpHost` (dispatch + approval + trim), `ValueStore` (+ in-memory `MemStore`), `FlowSink` |
+| `flux-lang::skill` | the generated language skill (`render()`); the `fluxlang` CLI (`skill`/`schema`/`render`) builds on it |
+| `flux-flow::registry` | `OpRegistry` over `ToolRegistry` (impl `OpCatalog` via **unfiltered** lookup), `ThingResolver` + `ModelClient` seams |
+| `flux-flow::state` | `FlowStore` (SQLite, **budgeted**) **impl `flux_lang::store::ValueStore`**; `view(Session)`; flow persistence |
+| `flux-flow::runtime` | adapters (`ExecutorHost`, `SinkBridge`) + thin `execute_flow`/`execute_call` wrappers (original signatures) + `plan_risk`/`PlanApprover` |
+| `flux-flow::compile` | `compile_turn(NL, view, registry, llm) -> DraftAst`; **prompt-and-parse** (no forced structured output); analyze→repair loop |
+| `flux-flow::engine` | turn spine: incremental fast-path vs. planned compile; execute; risk-gated approval; update session |
 
-Op packs and resolver impls that need L5 capabilities (`flux-datasource`, `flux-browser`) and the
-fluxplane/plugin op packs are registered **externally** (e.g. in `flux-cli`); L3 cannot depend on L5, and
-ops are embedder-registered anyway. The L0-purity a crate wall would otherwise enforce for
-`ast`/`parse`/`analyze`/`optimize` becomes a **module discipline** (no IO imports), guarded by a unit
-test on those modules' import set.
+The node-kind grammar in the planner prompt is generated from the `Node` doc-comments via
+`flux_lang::schema::node_kind_catalog()` (schemars-derived; no build-time `syn` parsing). The same
+generator feeds the `generated:node-kinds` tables in `crates/flux-lang/docs/reference.md`, the
+`flux-lang` language skill, and the `flux-flow` engine skill — CI-checked by
+`cargo test -p flux-lang --test skill_in_sync` and `cargo test -p flux-flow --test skill_docs_in_sync`.
+Op packs and
+resolver impls that need L5 capabilities (`flux-datasource`, `flux-browser`) and the fluxplane/plugin op
+packs are registered **externally** (e.g. in `flux-cli`); L3 cannot depend on L5, and ops are
+embedder-registered anyway. (A text→AST parser is deferred — the renderer exists; the AST is produced
+as JSON by the model today.)
 
 ### 5.2 The pipeline (one loop)
 

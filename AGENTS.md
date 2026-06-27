@@ -34,7 +34,7 @@ Crates are stratified into layers (0 = innermost contracts, 6 = outermost surfac
 
 | Layer | Crates | Role |
 |---|---|---|
-| **L0 contracts** (pure, no IO) | `flux-core` `flux-policy` `flux-secret` `flux-spec` `flux-config` `flux-evidence` `flux-skill` | types, authorization, secrets, tool specs, config, evidence, skills |
+| **L0 contracts** (pure, no IO¹) | `flux-core` `flux-policy` `flux-secret` `flux-spec` `flux-config` `flux-evidence` `flux-skill` `flux-lang` | types, authorization, secrets, tool specs, config, evidence, skills, the Flux-Lang language + reference interpreter |
 | **L1 providers** | `flux-provider` `flux-credentials` `flux-anthropic` `flux-openai` | the `Provider` abstraction + clients + credential store |
 | **L2 runtime** | `flux-system` `flux-runtime` `flux-tools` `flux-session` `flux-context` | guarded IO, the safety envelope, built-in tools, sessions, context |
 | **L3 agent** | `flux-agent` `flux-orchestrate` | the agent loop + multi-agent orchestration |
@@ -44,8 +44,10 @@ Crates are stratified into layers (0 = innermost contracts, 6 = outermost surfac
 
 Key rules:
 - **`flux-runtime` (L2) must not depend on `flux-auth` (L5).** Surfaces resolve identity (`LocalIdentity` / `OidcIdentity`) into a `(Caller, Trust)` and inject it via `Executor::with_identity`.
-- `flux-evidence`, `flux-skill`, and `flux-config` are pure L0 leaves — no IO, no flux deps beyond other L0 — so runtime/agent crates may depend on them without a layering violation.
+- `flux-evidence`, `flux-skill`, `flux-config`, and `flux-lang` are L0 leaves — no flux deps beyond other L0 — so runtime/agent crates may depend on them without a layering violation. `flux-flow` (L3, the Flux-Lang engine) builds on `flux-lang` and re-exports it as a facade.
 - **If you add a crate, classify it in `flux-codegate`'s `layer()` map** or the lint fails.
+
+> ¹ `flux-lang` is the language **and its reference interpreter**, so it uses `tokio`/async; its L0-purity means "no L1+ flux deps; all effects (op dispatch, value store, observation sink) injected via traits", not "no async". Every other L0 crate is genuinely IO-free.
 
 ---
 
@@ -102,16 +104,17 @@ Each invariant below was established (and several re-learned the hard way) durin
 
 ---
 
-## Keeping flux-flow ops and DOCUMENTATION in sync
+## Keeping the Flux-Lang language and its docs in sync
 
-Whenever you add, remove, or rename a node kind or registered op in `flux-flow` (i.e. touch `crates/flux-flow/src/ast.rs`, `runtime.rs`, or `analyze.rs` in a way that changes the public surface), you **must** update `crates/flux-flow/DOCUMENTATION.md` in the same commit. The doc is the canonical human + agent reference for the Flux-Lang AST; an outdated doc is a bug.
+The Flux-Lang **language + reference interpreter** lives in **`flux-lang`** (L0: `crates/flux-lang/src/` — `ast.rs`, `render.rs`, `analyze.rs`, `schema.rs`, `runtime.rs` behind injected `host`/`store`/`sink` traits, plus the `fluxlang` CLI and `skill.rs`). `flux-flow` is the L3 **engine** (compile/engine/state + the `Executor`/`FlowStore`/`AgentSink` adapters and the thin `execute_flow`/`plan_risk` wrappers) and re-exports `flux-lang` as a facade, so `flux_flow::{ast, render, analyze, host, store, runtime, …}` still resolve. The language's own docs live in `crates/flux-lang/docs/` (`reference.md`, `syntax.md`, `PRD.md`) + `crates/flux-lang/{README,AGENTS}.md`; the engine's ops live in `crates/flux-flow/docs/ops-reference.md`.
 
-The same applies when new built-in tools are added to `flux-tools`: update the "Registered ops quick reference" table in `DOCUMENTATION.md` and the op catalog in the `emit_plan` system prompt.
+**The node-kind tables are a single source of truth and are auto-generated — do not hand-edit them.** The `Node` enum's doc-comments in `crates/flux-lang/src/ast.rs` flow through `flux_lang::schema::node_kind_catalog()` into (a) the `emit_plan` planner prompt, (b) the "Node kinds at a glance" table in `crates/flux-lang/docs/reference.md`, (c) the `## Node kinds` table in the **flux-lang** language skill (`crates/flux-lang/skill/SKILL.md`), and (d) the same table in the **flux-flow** engine skill (`.flux/skills/flux-flow/SKILL.md`). The generated blocks are fenced by `<!-- BEGIN/END generated:node-kinds -->`; two tests fail on drift: `cargo test -p flux-lang --test skill_in_sync` (the language skill + reference) and `cargo test -p flux-flow --test skill_docs_in_sync` (the engine skill). After adding/renaming a node kind or editing a variant doc-comment, regenerate with `UPDATE=1` on both: `UPDATE=1 cargo test -p flux-lang --test skill_in_sync` and `UPDATE=1 cargo test -p flux-flow --test skill_docs_in_sync`.
 
-- New node kind → add a section under the appropriate group (primitive, control-flow, …).
-- New op registered in `OpRegistry` → add a row to the "Registered ops quick reference" table.
-- Changed semantics → update the relevant section and the Key invariants list.
-- The skill prompt (`flux-flow` skill in `.flux/skills/` or inline in AGENTS.md) must also reflect any new node kinds so the planning agent can emit them.
+What still needs manual updates in the same commit:
+
+- **New node kind** → write its doc-comment on the `Node` variant (the summary tables regenerate), and add a detailed hand-written section under the appropriate group in `crates/flux-lang/docs/reference.md` (primitive, control-flow, …) plus an example in the skill if helpful.
+- **Changed semantics** → update the relevant prose section and the Key invariants list in `crates/flux-lang/docs/reference.md`.
+- **New built-in tool in `flux-tools`** → the op catalog the model sees is built dynamically from the live `ToolRegistry`, so the prompt needs nothing; but update the hand-written tables in `crates/flux-flow/docs/ops-reference.md` and the engine skill's "Registered ops" table.
 
 ---
 

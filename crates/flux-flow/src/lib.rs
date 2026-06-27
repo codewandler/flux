@@ -12,24 +12,20 @@
 //! envelope rather than replacing it. Every operation lowers to a [`flux_spec::ToolSpec`] and runs
 //! through `Executor::dispatch`, so there is no new bypass surface.
 //!
-//! See `docs/designs/flux-flow.md` for the full design. Modules: the pure [`ast`] contracts, the
-//! [`registry`] adapter over the existing tool registry, flux-flow's own [`state`] store (values,
-//! symbols, run-event trace), the [`analyze`] validator, the [`compile`] front-end (natural language
-//! → AST), the [`render`] pretty-printer, the [`runtime`] interpreter, and the [`engine`] turn loop.
+//! The pure **language** half — the AST, renderer, analyzer, effect/op contracts, and the
+//! schema/skill single source of truth — lives in the L0 [`flux_lang`] crate and is re-exported here
+//! as a facade, so `flux_flow::{ast, render, analyze, …}` keep resolving. This crate owns only the
+//! **engine**: the [`compile`] front-end (natural language → AST), the [`registry`] adapter over the
+//! real tool registry, the [`runtime`] interpreter, the [`engine`] turn loop, and the [`state`] store.
 
-pub mod analyze;
-pub mod ast;
 pub mod compile;
-mod effects;
 pub mod engine;
-mod error;
 pub mod registry;
-pub mod render;
 pub mod runtime;
 pub mod state;
 
-pub use error::{FlowError, Result};
-
-/// The auto-generated node-kind catalog: a markdown table of every `Node` variant and its
-/// doc-comment, produced at build time from `src/ast.rs` by `build.rs`. Never edit by hand.
-pub const NODE_KIND_CATALOG: &str = include_str!(concat!(env!("OUT_DIR"), "/node_kinds.rs"));
+// Facade: the language core + reference interpreter live in `flux-lang`. Re-export them so the
+// language surface stays available from the engine crate (no consumer churn) and
+// `crate::{ast,render,analyze,host,store,…}` resolve inside the engine modules.
+pub use flux_lang::{analyze, ast, effects, error, host, opspec, render, schema, sink, store};
+pub use flux_lang::{FlowError, Result};

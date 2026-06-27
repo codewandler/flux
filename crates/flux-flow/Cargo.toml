@@ -6,27 +6,22 @@ license.workspace = true
 description = "Flux-Lang: compile an instruction into a typed, deterministic execution graph — the LLM plans, the runtime runs"
 
 [dependencies]
+flux-lang.workspace = true
 flux-core.workspace = true
 flux-spec.workspace = true
-flux-policy.workspace = true
 flux-runtime.workspace = true
 flux-provider.workspace = true
 flux-session.workspace = true
 flux-agent.workspace = true
 flux-evidence.workspace = true
 flux-skill.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 async-trait.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true
 futures.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-
-[build-dependencies]
-syn = { workspace = true }
 
 [dev-dependencies]
 flux-tools.workspace = true

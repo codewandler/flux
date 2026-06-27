@@ -1,9 +1,14 @@
-# Flux-Flow — Node Reference
+# Flux-Lang — Node Reference
 
 This document covers every node kind in the Flux-Lang AST, from the primitive expression
 nodes up through control-flow, concurrency, error-handling, and the timing/rate
 primitives. Nodes are grouped from innermost (values / expressions) to outermost (full
 statements and flow-level constructs).
+
+The "Node kinds at a glance" table below is generated from the `Node` doc-comments in
+`crates/flux-lang/src/ast.rs` (via `flux_lang::schema::node_kind_catalog()`) — do not edit it by hand;
+regenerate with `UPDATE=1 cargo test -p flux-lang --test skill_in_sync`. The operations a `call`
+targets are an engine concern — see [`flux-flow/docs/ops-reference.md`](../../flux-flow/docs/ops-reference.md).
 
 ---
 
@@ -22,6 +27,50 @@ A flow is a JSON object:
 
 `params` and `returns` are optional; `body` is the ordered list of statement nodes
 the runtime executes top-to-bottom.
+
+---
+
+## Node kinds at a glance
+
+Every `kind` and its one-line summary. This table is the single source of truth for the node
+surface: it is generated from the `Node` enum's doc-comments in `flux-lang` (`crates/flux-lang/src/ast.rs`)
+via `flux_lang::schema::node_kind_catalog()` — do not edit it by hand. Regenerate with
+`UPDATE=1 cargo test -p flux-flow --test skill_docs_in_sync`. The detailed per-node sections that
+follow are hand-written.
+
+<!-- BEGIN generated:node-kinds -->
+| kind | description |
+|---|---|
+| `call` | Invoke a registered operation with argument expressions. |
+| `bind` | Bind the result of an expression to a symbol. |
+| `when` | Conditional control flow. |
+| `repeat` | A bounded loop (`max` is required; the analyzer rejects unbounded loops). |
+| `each` | Map a list value through a body (list-driven loop; `repeat` stays counter-driven). Each element is bound to `as`; an optional `collect` symbol gathers the per-iteration results into a list. |
+| `assert` | A boolean guard: aborts the flow with an error if the condition is falsey. |
+| `pipe` | A chain of calls where each step's output is fed as the first argument of the next. |
+| `seq` | A sequential block; runs its body in order. Optionally binds the block's final result. |
+| `memo` | Like `bind`, but pinned across turns: if the symbol is already resolved for this session, skip execution and reuse the cached value (compute-once-per-session, keyed on symbol name). |
+| `parallel` | Concurrent fan-out: run independent branches, binding each branch's result to its name. |
+| `await` | Pause until an external event/input arrives. |
+| `retry` | Retry a body on failure with optional backoff. Fatal errors (policy denial, unknown op) are never retried. `backoff` may be `"none"` | `"linear"` | `"exponential"`. |
+| `try` | Structured error handling: run `body`; on failure bind the error string to `catch` and run `handler`. If the handler also errors, propagate that error. |
+| `confirm` | Explicit human-in-the-loop gate. Calls the existing `Approver` — `--yes` and TUI modal handle it automatically. Body only runs on approval; on denial the node errors. `risk` may be `"low"` | `"medium"` | `"high"` | `"critical"`. |
+| `loop` | Time-bounded iteration. `for_ms` is required (the analyzer rejects unbounded loops). `every_ms` is the inter-iteration sleep (0 = tight). `until` is an early-exit condition. |
+| `race` | First-wins concurrency: run branches in parallel and return as soon as the first succeeds. `timeout_ms` is required; if no branch succeeds within it the node errors. `bind` names the symbol that receives the winning branch's result. |
+| `throttle` | Rate-limit body execution: at most `max` dispatches per `window_ms` sliding window. The token bucket is tracked in the session store keyed by `name`; plan authors declare intent, runtime enforces. `name` must be unique within a session to avoid bucket collisions. |
+| `debounce` | Coalesce rapid re-invocations: wait `wait_ms` after the last trigger before running body. In a `loop`/`watch` context the body only executes when things have settled. `name` is used as a stable key so debounce state survives across turns. |
+| `unless` | Negated conditional: run `body` only when `cond` is falsey. Sugar for `when !cond`; the body may contain any nodes (reads, writes, sub-plans — anything). |
+| `verify` | Run a command and assert its output matches an expected pattern; abort the flow with a structured error if it does not. `cmd` is any node that produces a string (typically a `bash` call); `expect` is a substring or regex the output must contain. |
+| `return` | End the flow with a value. |
+| `peek` | Read the current in-session value of a named symbol without any filesystem IO. Returns the symbol's stored value, or null if the symbol is not yet bound. |
+| `var` | Reference a bound symbol. |
+| `lit` | A literal value (raw JSON, as written in the AST by the compiler front-end). |
+| `thing` | A reference to an external thing. |
+| `expr` | Pure inline arithmetic. `formula` is a safe whitelist expression (`+`, `-`, `*`, `/`, `round(x,n)`, `abs`, `min(a,b)`, `max(a,b)`) over named variables. `vars` maps variable names to node expressions (only `Lit` and `Var` are valid). No IO, no approval gate. Example: `expr("price * 2", {"price": $btc})`. |
+| `fmt` | Pure string interpolation. `template` is a string with `{name}` placeholders substituted from already-bound session symbols (same `{name}`/`{{name}}` syntax as `Lit` interpolation). No IO, no approval gate. Example: `fmt("BTC: {price} | Double: {doubled}")`. |
+| `jq` | Pure JSON path extraction. `path` is a dot-path string (e.g. `".bitcoin.usd"` or `"results[0].value"`) applied to the JSON content of `input` (a `Var` or `Lit` node). No IO, no approval gate. Example: `jq(".bitcoin.usd", $raw)`. |
+| `parse` | Pure type coercion. Converts the string result of a `jq` or `fmt` node into a typed value. `as_type` is one of `"f64"`, `"i64"`, `"bool"`, `"json"`, `"string"`. No IO, no approval gate. Example: `parse(jq(".price", $raw), as: "f64")`. |
+<!-- END generated:node-kinds -->
 
 ---
 
@@ -807,48 +856,6 @@ No IO, no approval gate.
 
 Coercion failures (`"abc"` → `f64`) error rather than silently defaulting. An unknown
 `as_type` passes the string through unchanged.
-
----
-
-## Registered ops quick reference
-
-Ops are passed by name to `call`. Arguments are positional in the order shown;
-optional arguments are in `[brackets]`.
-
-| op | signature | risk | description |
-|---|---|---|---|
-| `read` | `path[, limit, offset]` | Low | Read one file (string path), a list of files (JSON array), or a glob pattern (string with `*`/`?`). Single-file: line-numbered view, paging via `offset`/`limit`. Multi-file/glob: sections headed `==> path <==`. Guidance returned for over-cap files. |
-| `grep` | `pattern[, glob, literal, max_results, path]` | Low | Search by regex (supports `\b`, lookaheads); use `literal: true` for plain substring |
-| `glob` | `pattern[, path]` | Low | List files matching a glob pattern (`*` crosses `/`) |
-| `search` | `query[, limit]` | Low | Search the indexed datasource |
-| `web_fetch` | `url` | Low | Fetch an HTTP(S) URL |
-| `write` | `path, content` | Medium | Write (create/overwrite) a file |
-| `edit` | `path, old_string, new_string[, replace_all]` | Medium | Replace a string in a file (must match exactly once unless `replace_all`); if the exact text isn't found, progressively looser matching is tried (trailing whitespace → indentation drift → first/last-line anchor) and the result reports which strategy matched |
-| `patch` | `path, edits` | Medium | Apply several line-anchored edits in one call; each edit is `{op, line, end_line?, text?}` where op is `insert_before`, `insert_after`, `replace_range`, or `delete_range`; ALL line numbers refer to the original file |
-| `append` | `path, content` | Low | Append to a file (creates it and parent dirs if absent); lower-risk than `write` |
-| `read_many` | `paths` | Low | Read several files at once (each section headed `==> path <==`); prefer single `read` when you need to embed a file's text into a later string |
-| `task` | `role, task` | Medium | Delegate to a sub-agent role |
-| `bash` | `command[, timeout_secs]` | High | Run a shell command |
-| `file_stat` | `path` | Low | File metadata: size, line count, mtime (replaces `wc -l`, `stat`, `ls -la`) |
-| `path_exists` | `path` | Low | Returns `"true"`/`"false"` — use with `when`/`unless` to branch on file presence |
-| `sqlite_query` | `db, sql[, params]` | Low | Read-only SQLite query (SELECT/PRAGMA only) |
-| `web_search` | `query[, max_results]` | Low | Tavily web search — requires `TAVILY_API_KEY` env var |
-| `cargo_check` | `[package, args]` | Medium | `cargo check` (type-check only, no codegen) |
-| `cargo_build` | `[package, release, args]` | Medium | `cargo build` |
-| `cargo_test` | `[package, filter, args]` | Medium | `cargo test` |
-| `cargo_clippy` | `[package, args]` | Medium | `cargo clippy` |
-| `cargo_fmt` | `[package, check]` | Medium | `cargo fmt` (pass `check: true` to only verify) |
-| `git_stage` | `paths` | Medium | Stage files (`git add`) |
-| `git_commit` | `message[, body]` | Medium | Create a commit |
-| `git_status` | | Low | Working tree status |
-| `git_diff` | `[path, staged]` | Low | Show unstaged (or staged) diff |
-| `git_log` | `[limit]` | Low | Recent commits |
-| `git_push` | `[branch, remote]` | Medium | Push to remote |
-| `git_checkout` | `branch[, create]` | Medium | Switch/create branch |
-| `git_unstage` | `paths` | Low | Unstage files |
-
-`write`, `edit`, `patch`, `append`, `task`, `bash`, and the `cargo_*` ops may pause for user approval
-(controlled by the safety envelope and the active permission rules).
 
 ---
 

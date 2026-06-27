@@ -1,0 +1,1974 @@
+//! The reference interpreter: execute a compiled Flux-Lang flow against an injected execution host.
+//! `execute_call` dispatches one op (store the result as an immutable value, optionally bind a symbol,
+//! trace it); `execute_flow` walks a whole graph — `bind` / `call` / `return` plus `when` (typed
+//! branch) and `repeat` (bounded loop) — resolving each `$symbol` argument to the value the store
+//! owns (`await` cross-turn suspend/resume is the next slice).
+//!
+//! All effects are injected as L0 traits: operations dispatch through [`OpHost`], values live in a
+//! [`ValueStore`], and observations stream to a [`FlowSink`]. The language has no dependency on any
+//! concrete runtime, provider, or tool — the engine adapts its safety envelope onto these traits, so
+//! every op still runs through the same gate as any other tool (no new bypass surface).
+
+use std::future::Future;
+use std::pin::Pin;
+
+use sha2::{Digest, Sha256};
+
+use flux_core::{Error, Usage};
+use flux_spec::IntentSet;
+
+use crate::ast::{
+    DraftAst, Node, RunEvent, StepId, SymbolName, TypeRef, Value, ValueId, Visibility,
+};
+use crate::host::{ApprovalChoice, OpHost, OpOutcome};
+use crate::opspec::OpCatalog;
+use crate::sink::FlowSink;
+use crate::store::ValueStore;
+use crate::{FlowError, Result};
+
+/// How to bind a single op's result to a session symbol.
+pub struct BindSpec<'a> {
+    pub name: &'a SymbolName,
+    pub ty: Option<&'a str>,
+    pub visibility: Visibility,
+}
+
+/// The outcome of executing a single operation.
+#[derive(Debug, Clone)]
+pub struct CallOutcome {
+    /// The stored value id, or `None` if the op errored (nothing is bound on error).
+    pub value_id: Option<ValueId>,
+    pub is_error: bool,
+    /// The canonical value: bound to the symbol, spliced into `{{interpolation}}`, used for control
+    /// flow (`when`/`return`). Deterministic execution works with this.
+    pub content: String,
+    /// The model-facing rendering (line-numbered read, diff, …). Equals `content` when the op set no
+    /// distinct view. Surfaced to the sink/observation, never bound or interpolated.
+    pub view: String,
+}
+
+fn sha256_hex(s: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// A one-line, length-bounded summary of a value for the symbol table (never the raw bytes).
+fn summarize(content: &str) -> String {
+    let line = content.lines().next().unwrap_or("").trim();
+    if line.chars().count() > 80 {
+        let head: String = line.chars().take(77).collect();
+        format!("{head}...")
+    } else {
+        line.to_string()
+    }
+}
+
+/// Bind an already-stored value id to a session symbol, deriving the one-line summary from its text.
+/// Used by `seq`/`each`/`pipe`/`parallel` to bind a block's result (the value already exists in the
+/// store; only the symbol mapping is new).
+fn bind_existing(
+    store: &dyn ValueStore,
+    session_id: &str,
+    name: &SymbolName,
+    vid: &ValueId,
+) -> Result<()> {
+    let summary = store
+        .get_value(vid)?
+        .map(|v| summarize(&value_text(&v)))
+        .unwrap_or_default();
+    store
+        .bind(session_id, name, vid, None, &summary, Visibility::Visible)
+        .map_err(FlowError::Core)
+}
+
+/// Execute one registered operation through the envelope, store its result as an immutable value,
+/// optionally bind it to a symbol, and append the run-event trace.
+pub async fn execute_call(
+    store: &dyn ValueStore,
+    executor: &dyn OpHost,
+    session_id: &str,
+    op: &str,
+    input: serde_json::Value,
+    bind: Option<BindSpec<'_>>,
+) -> Result<CallOutcome> {
+    let input_hash = sha256_hex(&serde_json::to_string(&input).unwrap_or_default());
+    let step = StepId(format!("step_{}", &input_hash[..16]));
+
+    store.append_event(
+        session_id,
+        &RunEvent::StepStarted {
+            step: step.clone(),
+            op: op.to_string(),
+            input_hash,
+        },
+    )?;
+
+    let result = executor.dispatch(op, input).await;
+    // The model-facing view (line numbers, diff, guidance); falls back to canonical content.
+    let view = result.view().to_string();
+
+    if result.is_error {
+        store.append_event(
+            session_id,
+            &RunEvent::StepFailed {
+                step,
+                error: result.content.clone(),
+            },
+        )?;
+        return Ok(CallOutcome {
+            value_id: None,
+            is_error: true,
+            content: result.content,
+            view,
+        });
+    }
+
+    // Bind/store the CANONICAL content (so `{{symbol}}` interpolation stays clean) — never the view.
+    let value_id = store.put_value(session_id, &Value::String(result.content.clone()))?;
+    store.append_event(
+        session_id,
+        &RunEvent::StepSucceeded {
+            step,
+            output: value_id.clone(),
+        },
+    )?;
+    if let Some(b) = bind {
+        store.bind(
+            session_id,
+            b.name,
+            &value_id,
+            b.ty,
+            &summarize(&result.content),
+            b.visibility,
+        )?;
+    }
+
+    Ok(CallOutcome {
+        value_id: Some(value_id),
+        is_error: false,
+        content: result.content,
+        view,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Flow execution (linear v1)
+// ---------------------------------------------------------------------------
+
+/// The outcome of executing a whole flow.
+#[derive(Debug, Clone)]
+pub struct FlowOutcome {
+    /// The value id the flow returned (only an explicit `return` sets this).
+    pub returned: Option<ValueId>,
+    /// The flow's result rendered as text (for display) — the *last* node's view. This is what a
+    /// one-shot CLI prints and what an explicit `return` carries.
+    pub result: String,
+    /// The model-facing transcript: every read/call node's view, labeled and concatenated. The engine
+    /// feeds THIS back between rounds so the model sees *all* of a plan's reads — not just the last —
+    /// which is what lets "read N files, then answer" converge instead of re-reading every round.
+    pub transcript: String,
+    /// How many operations were dispatched.
+    pub steps: usize,
+}
+
+/// Whether body execution should keep going or unwind because a `return` fired.
+enum Step {
+    /// Keep executing the rest of the body.
+    Next,
+    /// A `return` executed — unwind the whole flow with this value.
+    Return(Option<ValueId>),
+}
+
+/// A boxed, borrowed future producing `(last_text, last_value, control)` — the recursion-safe shape
+/// `exec_body` returns so `when`/`repeat`/`each`/`seq`/`parallel` can recurse into nested bodies. The
+/// `last_value` is the value id the body's final op produced (so `seq`/`each`/`parallel` can bind it).
+type BodyFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(String, Option<ValueId>, Step)>> + Send + 'a>>;
+
+/// A recorded [`AgentSink`] call, buffered so a `parallel` branch's output can be replayed into the
+/// real sink after the concurrent join (rather than interleaving on a shared `&mut` sink).
+enum SinkEvent {
+    Text(String),
+    Thinking(String),
+    Planning(bool),
+    ToolCall(String, serde_json::Value),
+    ToolResult(String, OpOutcome),
+    Observation(flux_evidence::Observation),
+    TurnEnd(Option<Usage>),
+}
+
+/// A buffering sink for one `parallel` branch: it records the sink calls the branch makes, then
+/// [`replay`](BufferSink::replay)s them — in order — into the real sink once all branches have joined.
+#[derive(Default)]
+struct BufferSink {
+    events: Vec<SinkEvent>,
+}
+
+impl BufferSink {
+    /// Drain the recorded events into `sink`, preserving their order within the branch.
+    fn replay(self, sink: &mut dyn FlowSink) {
+        for ev in self.events {
+            match ev {
+                SinkEvent::Text(t) => sink.text_delta(&t),
+                SinkEvent::Thinking(t) => sink.thinking_delta(&t),
+                SinkEvent::Planning(a) => sink.planning(a),
+                SinkEvent::ToolCall(n, i) => sink.tool_call(&n, &i),
+                SinkEvent::ToolResult(n, r) => sink.tool_result(&n, &r),
+                SinkEvent::Observation(o) => sink.observation(&o),
+                SinkEvent::TurnEnd(u) => sink.turn_end(u),
+            }
+        }
+    }
+}
+
+impl FlowSink for BufferSink {
+    fn text_delta(&mut self, text: &str) {
+        self.events.push(SinkEvent::Text(text.to_string()));
+    }
+    fn thinking_delta(&mut self, text: &str) {
+        self.events.push(SinkEvent::Thinking(text.to_string()));
+    }
+    fn planning(&mut self, active: bool) {
+        self.events.push(SinkEvent::Planning(active));
+    }
+    fn tool_call(&mut self, name: &str, input: &serde_json::Value) {
+        self.events
+            .push(SinkEvent::ToolCall(name.to_string(), input.clone()));
+    }
+    fn tool_result(&mut self, name: &str, result: &OpOutcome) {
+        self.events
+            .push(SinkEvent::ToolResult(name.to_string(), result.clone()));
+    }
+    fn observation(&mut self, o: &flux_evidence::Observation) {
+        self.events.push(SinkEvent::Observation(o.clone()));
+    }
+    fn turn_end(&mut self, usage: Option<Usage>) {
+        self.events.push(SinkEvent::TurnEnd(usage));
+    }
+}
+
+/// Execute a compiled flow's body, dispatching each operation through the same [`execute_call`]
+/// envelope. Handles `bind` / `call` / `return` plus `when` (typed branch) and `repeat` (bounded
+/// loop). `await` (cross-turn suspend/resume) still returns a clear error — the engine loop covers
+/// iteration for now. Every op still goes through [`Executor::dispatch`] — no new bypass surface.
+pub async fn execute_flow(
+    store: &dyn ValueStore,
+    executor: &dyn OpHost,
+    session_id: &str,
+    ast: &DraftAst,
+    sink: &mut dyn FlowSink,
+) -> Result<FlowOutcome> {
+    let mut steps = 0usize;
+    let mut transcript: Vec<String> = Vec::new();
+    let (last, _last_value, step) = exec_body(
+        store,
+        executor,
+        session_id,
+        &ast.body,
+        sink,
+        &mut steps,
+        &mut transcript,
+    )
+    .await?;
+    let returned = match step {
+        Step::Return(vid) => vid,
+        Step::Next => None,
+    };
+    if let Some(vid) = &returned {
+        store.append_event(session_id, &RunEvent::FlowReturned { value: vid.clone() })?;
+    }
+    Ok(FlowOutcome {
+        returned,
+        result: last,
+        transcript: transcript.join("\n\n"),
+        steps,
+    })
+}
+
+/// Execute a sequence of nodes, returning the last produced text and whether a `return` unwound the
+/// flow. Boxed because `when`/`repeat` recurse into nested bodies (async recursion needs indirection).
+fn exec_body<'a>(
+    store: &'a dyn ValueStore,
+    executor: &'a dyn OpHost,
+    session_id: &'a str,
+    body: &'a [Node],
+    sink: &'a mut dyn FlowSink,
+    steps: &'a mut usize,
+    transcript: &'a mut Vec<String>,
+) -> BodyFuture<'a> {
+    Box::pin(async move {
+        let mut last = String::new();
+        // The value id the body's most recent op produced — so `seq`/`each`/`parallel`/`pipe` can
+        // bind a block's result without the caller threading a separate accumulator.
+        let mut last_value: Option<ValueId> = None;
+        for node in body {
+            match node {
+                Node::Bind {
+                    name, value, ty, ..
+                } => {
+                    // Pure nodes (expr/fmt/jq) may appear as a bind value without going through
+                    // execute_call — they are side-effect-free and need no dispatch envelope.
+                    match value.as_ref() {
+                        Node::Expr { formula, vars } => {
+                            let resolved: std::collections::BTreeMap<String, f64> = vars
+                                .iter()
+                                .map(|(k, v)| {
+                                    let jv = eval_arg(v, store, session_id)?;
+                                    let n = match &jv {
+                                        serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                                        serde_json::Value::String(s) => {
+                                            s.parse::<f64>().unwrap_or(0.0)
+                                        }
+                                        _ => 0.0,
+                                    };
+                                    Ok::<_, crate::FlowError>((k.clone(), n))
+                                })
+                                .collect::<Result<_>>()?;
+                            let result = eval_expr_formula(formula, &resolved)?;
+                            let text = format_number(result);
+                            let vid = store.put_value(session_id, &Value::String(text.clone()))?;
+                            let ty_label = ty.as_ref().map(TypeRef::label);
+                            store.bind(
+                                session_id,
+                                name,
+                                &vid,
+                                ty_label.as_deref(),
+                                &summarize(&text),
+                                Visibility::Visible,
+                            )?;
+                            transcript.push(format!("[${} = expr {formula}]\n{text}", name.0));
+                            last = text;
+                            last_value = Some(vid);
+                            continue;
+                        }
+                        Node::Fmt { template } => {
+                            let text = interpolate_str(template, store, session_id);
+                            let vid = store.put_value(session_id, &Value::String(text.clone()))?;
+                            let ty_label = ty.as_ref().map(TypeRef::label);
+                            store.bind(
+                                session_id,
+                                name,
+                                &vid,
+                                ty_label.as_deref(),
+                                &summarize(&text),
+                                Visibility::Visible,
+                            )?;
+                            transcript.push(format!("[${} = fmt]\n{text}", name.0));
+                            last = text;
+                            last_value = Some(vid);
+                            continue;
+                        }
+                        Node::Jq { path, input } => {
+                            let jv = eval_arg(input, store, session_id)?;
+                            let result = eval_jq_path(path, &jv)?;
+                            let text = match &result {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => serde_json::to_string(other).unwrap_or_default(),
+                            };
+                            let vid = store.put_value(session_id, &Value::String(text.clone()))?;
+                            let ty_label = ty.as_ref().map(TypeRef::label);
+                            store.bind(
+                                session_id,
+                                name,
+                                &vid,
+                                ty_label.as_deref(),
+                                &summarize(&text),
+                                Visibility::Visible,
+                            )?;
+                            transcript.push(format!("[${} = jq {path}]\n{text}", name.0));
+                            last = text;
+                            last_value = Some(vid);
+                            continue;
+                        }
+                        Node::Parse {
+                            value: inner,
+                            as_type,
+                        } => {
+                            let jv = eval_arg(inner, store, session_id)?;
+                            let text = coerce_parse(&jv, as_type)?;
+                            let vid = store.put_value(session_id, &Value::String(text.clone()))?;
+                            let ty_label = ty.as_ref().map(TypeRef::label);
+                            store.bind(
+                                session_id,
+                                name,
+                                &vid,
+                                ty_label.as_deref(),
+                                &summarize(&text),
+                                Visibility::Visible,
+                            )?;
+                            transcript.push(format!("[${} = parse {as_type}]\n{text}", name.0));
+                            last = text;
+                            last_value = Some(vid);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    let Node::Call { op, args } = value.as_ref() else {
+                        return Err(crate::FlowError::Runtime(
+                            "execution can only bind the result of a `call`, `expr`, `fmt`, `jq`, or `parse`".to_string(),
+                        ));
+                    };
+                    let ty_label = ty.as_ref().map(TypeRef::label);
+                    let bind = BindSpec {
+                        name,
+                        ty: ty_label.as_deref(),
+                        visibility: Visibility::Visible,
+                    };
+                    let outcome =
+                        run_call(store, executor, session_id, op, args, Some(bind), sink).await?;
+                    *steps += 1;
+                    if outcome.is_error {
+                        return Err(crate::FlowError::Runtime(format!(
+                            "step `{op}` failed: {}",
+                            outcome.content
+                        )));
+                    }
+                    // The model reasons over intermediate results → feed the model-facing VIEW
+                    // (line-numbered read, diff, …). Control flow (`when`/`return`) stays canonical.
+                    // Record EVERY node's view in the transcript so the round feedback surfaces all of
+                    // a plan's reads, not just the last one. Oversized views are trimmed so one huge
+                    // result can't blow the round's context budget (the canonical value is untouched).
+                    let view = executor.trim_output(outcome.view.clone(), op);
+                    transcript.push(format!("[${} = {op}]\n{view}", name.0));
+                    last = outcome.view;
+                    last_value = outcome.value_id;
+                }
+                Node::Call { op, args } => {
+                    let outcome =
+                        run_call(store, executor, session_id, op, args, None, sink).await?;
+                    *steps += 1;
+                    if outcome.is_error {
+                        return Err(crate::FlowError::Runtime(format!(
+                            "step `{op}` failed: {}",
+                            outcome.content
+                        )));
+                    }
+                    // The model reasons over intermediate results → feed the model-facing VIEW
+                    // (line-numbered read, diff, …). Control flow (`when`/`return`) stays canonical.
+                    // Oversized views are trimmed (canonical value untouched).
+                    let view = executor.trim_output(outcome.view.clone(), op);
+                    transcript.push(format!("[{op}]\n{view}"));
+                    last = outcome.view;
+                    last_value = outcome.value_id;
+                }
+                Node::Return { value } => {
+                    let (content, vid) =
+                        eval_return(store, executor, session_id, value, sink, steps).await?;
+                    return Ok((content, vid.clone(), Step::Return(vid)));
+                }
+                Node::When {
+                    cond,
+                    then,
+                    otherwise,
+                } => {
+                    let take = eval_cond(store, executor, session_id, cond, sink, steps).await?;
+                    let branch = if take { then } else { otherwise };
+                    let (blast, bvid, step) = exec_body(
+                        store,
+                        executor,
+                        session_id,
+                        branch,
+                        &mut *sink,
+                        &mut *steps,
+                        &mut *transcript,
+                    )
+                    .await?;
+                    if !blast.is_empty() {
+                        last = blast;
+                        last_value = bvid;
+                    }
+                    if let Step::Return(v) = step {
+                        return Ok((last, v.clone(), Step::Return(v)));
+                    }
+                }
+                Node::Repeat {
+                    max,
+                    until,
+                    body: rbody,
+                    collect,
+                } => {
+                    let mut repeat_collected: Vec<ValueId> = Vec::new();
+                    for _ in 0..*max {
+                        let (blast, bvid, step) = exec_body(
+                            store,
+                            executor,
+                            session_id,
+                            rbody,
+                            &mut *sink,
+                            &mut *steps,
+                            &mut *transcript,
+                        )
+                        .await?;
+                        if !blast.is_empty() {
+                            last = blast;
+                        }
+                        if let Some(v) = bvid {
+                            if collect.is_some() {
+                                repeat_collected.push(v.clone());
+                            }
+                            last_value = Some(v);
+                        }
+                        if let Step::Return(v) = step {
+                            return Ok((last, v.clone(), Step::Return(v)));
+                        }
+                        // `until` is a *stop-when-true* guard, evaluated after each iteration.
+                        if let Some(u) = until {
+                            if eval_cond(store, executor, session_id, u, &mut *sink, &mut *steps)
+                                .await?
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(cname) = collect {
+                        let items: Vec<Value> = repeat_collected
+                            .iter()
+                            .filter_map(|vid| store.get_value(vid).ok().flatten())
+                            .collect();
+                        let list_val = Value::List(items);
+                        let list_vid = store.put_value(session_id, &list_val)?;
+                        bind_existing(store, session_id, cname, &list_vid)?;
+                        last_value = Some(list_vid);
+                    }
+                }
+                Node::Each {
+                    source,
+                    item,
+                    body: ebody,
+                    collect,
+                    flat,
+                } => {
+                    let list = eval_arg(source, store, session_id)?;
+                    let serde_json::Value::Array(elems) = list else {
+                        return Err(crate::FlowError::Runtime(
+                            "`each` source must evaluate to a list".to_string(),
+                        ));
+                    };
+                    let mut collected: Vec<ValueId> = Vec::new();
+                    for elem in &elems {
+                        let vid = store.put_value(session_id, &Value::from_json(elem))?;
+                        bind_existing(store, session_id, item, &vid)?;
+                        let (blast, bvid, step) = exec_body(
+                            store,
+                            executor,
+                            session_id,
+                            ebody,
+                            &mut *sink,
+                            &mut *steps,
+                            &mut *transcript,
+                        )
+                        .await?;
+                        if !blast.is_empty() {
+                            last = blast;
+                        }
+                        if let Some(v) = bvid {
+                            collected.push(v.clone());
+                            last_value = Some(v);
+                        }
+                        if let Step::Return(v) = step {
+                            return Ok((last, v.clone(), Step::Return(v)));
+                        }
+                    }
+                    if let Some(cname) = collect {
+                        let items: Vec<Value> = collected
+                            .iter()
+                            .filter_map(|vid| store.get_value(vid).ok().flatten())
+                            .collect();
+                        let list_val = if *flat {
+                            // Flatten one level: each item must be a Value::List;
+                            // non-list items are included as-is (graceful).
+                            let mut flat_items: Vec<Value> = Vec::new();
+                            for item in items {
+                                match item {
+                                    Value::List(inner) => flat_items.extend(inner),
+                                    other => flat_items.push(other),
+                                }
+                            }
+                            Value::List(flat_items)
+                        } else {
+                            Value::List(items)
+                        };
+                        let list_vid = store.put_value(session_id, &list_val)?;
+                        bind_existing(store, session_id, cname, &list_vid)?;
+                        last_value = Some(list_vid);
+                    }
+                }
+                Node::Assert { cond, message } => {
+                    let ok = eval_cond(store, executor, session_id, cond, &mut *sink, &mut *steps)
+                        .await?;
+                    if !ok {
+                        let detail = message
+                            .clone()
+                            .unwrap_or_else(|| "condition is false".to_string());
+                        return Err(FlowError::Core(Error::AssertFailed(detail)));
+                    }
+                }
+                Node::Pipe {
+                    steps: psteps,
+                    bind,
+                } => {
+                    let mut prev: Option<ValueId> = None;
+                    for step in psteps {
+                        let Node::Call { op, args } = step else {
+                            return Err(FlowError::Runtime(
+                                "`pipe` steps must be `call` nodes".to_string(),
+                            ));
+                        };
+                        // Splice the previous step's result as this step's first argument.
+                        let synth_args: Vec<Node> = match &prev {
+                            Some(pvid) => {
+                                let pjson = store
+                                    .get_value(pvid)?
+                                    .ok_or_else(|| {
+                                        Error::Other("dangling value in `pipe`".to_string())
+                                    })?
+                                    .to_json();
+                                let mut a = Vec::with_capacity(args.len() + 1);
+                                a.push(Node::Lit { value: pjson });
+                                a.extend(args.iter().cloned());
+                                a
+                            }
+                            None => args.clone(),
+                        };
+                        let outcome = run_call(
+                            store,
+                            executor,
+                            session_id,
+                            op,
+                            &synth_args,
+                            None,
+                            &mut *sink,
+                        )
+                        .await?;
+                        *steps += 1;
+                        if outcome.is_error {
+                            return Err(FlowError::Runtime(format!(
+                                "pipe step `{op}` failed: {}",
+                                outcome.content
+                            )));
+                        }
+                        transcript.push(format!("[pipe {op}]\n{}", outcome.view));
+                        last = outcome.view;
+                        prev = outcome.value_id;
+                    }
+                    if let Some(name) = bind {
+                        if let Some(vid) = &prev {
+                            bind_existing(store, session_id, name, vid)?;
+                        }
+                    }
+                    last_value = prev;
+                }
+                Node::Seq { body: sbody, bind } => {
+                    let (blast, bvid, step) = exec_body(
+                        store,
+                        executor,
+                        session_id,
+                        sbody,
+                        &mut *sink,
+                        &mut *steps,
+                        &mut *transcript,
+                    )
+                    .await?;
+                    if !blast.is_empty() {
+                        last = blast;
+                    }
+                    last_value = bvid.clone();
+                    if let Step::Return(v) = step {
+                        return Ok((last, v.clone(), Step::Return(v)));
+                    }
+                    if let (Some(name), Some(vid)) = (bind, &bvid) {
+                        bind_existing(store, session_id, name, vid)?;
+                    }
+                }
+                Node::Memo {
+                    name, value, ty, ..
+                } => {
+                    let Node::Call { op, args } = value.as_ref() else {
+                        return Err(FlowError::Runtime(
+                            "`memo` can only bind the result of a `call`".to_string(),
+                        ));
+                    };
+                    // Pinned across turns: if the symbol is already resolved for this session, reuse
+                    // the cached value and skip execution (compute-once-per-session, keyed on name).
+                    if let Some(existing) = store.resolve(session_id, name)? {
+                        let text = store
+                            .get_value(&existing)?
+                            .map(|v| value_text(&v))
+                            .unwrap_or_default();
+                        transcript.push(format!("[${} = memo {op} (cached)]\n{text}", name.0));
+                        if !text.is_empty() {
+                            last = text;
+                        }
+                        last_value = Some(existing);
+                        continue;
+                    }
+                    let ty_label = ty.as_ref().map(TypeRef::label);
+                    let bspec = BindSpec {
+                        name,
+                        ty: ty_label.as_deref(),
+                        visibility: Visibility::Visible,
+                    };
+                    let outcome =
+                        run_call(store, executor, session_id, op, args, Some(bspec), sink).await?;
+                    *steps += 1;
+                    if outcome.is_error {
+                        return Err(FlowError::Runtime(format!(
+                            "step `{op}` failed: {}",
+                            outcome.content
+                        )));
+                    }
+                    transcript.push(format!("[${} = memo {op}]\n{}", name.0, outcome.view));
+                    last = outcome.view;
+                    last_value = outcome.value_id;
+                }
+                Node::Parallel { branches } => {
+                    // Run each branch concurrently, each writing to its own buffering sink; after the
+                    // join, replay the buffers into the real sink in branch order so concurrent output
+                    // doesn't interleave. Every op still dispatches through the same envelope.
+                    let futs = branches.iter().map(|b| async move {
+                        let mut buf = BufferSink::default();
+                        let mut s = 0usize;
+                        let mut tr: Vec<String> = Vec::new();
+                        let (text, lv, step) = exec_body(
+                            store, executor, session_id, &b.body, &mut buf, &mut s, &mut tr,
+                        )
+                        .await?;
+                        Ok::<_, FlowError>((b, buf, s, tr, text, lv, step))
+                    });
+                    let results = futures::future::try_join_all(futs).await?;
+                    for (b, buf, s, tr, text, lv, step) in results {
+                        if let Step::Return(_) = step {
+                            return Err(FlowError::Runtime(
+                                "`return` is not allowed inside a `parallel` branch".to_string(),
+                            ));
+                        }
+                        buf.replay(&mut *sink);
+                        *steps += s;
+                        transcript.extend(tr);
+                        if let Some(vid) = lv {
+                            bind_existing(store, session_id, &b.name, &vid)?;
+                            last = text;
+                            last_value = Some(vid);
+                        }
+                    }
+                }
+                Node::Retry {
+                    max,
+                    backoff,
+                    delay_ms,
+                    body: rbody,
+                    bind,
+                } => {
+                    let base_ms = delay_ms.unwrap_or(500);
+                    let backoff_kind = backoff.as_deref().unwrap_or("none");
+                    let mut last_err = String::new();
+                    let mut succeeded = false;
+                    let mut last_vid: Option<ValueId> = None;
+                    for attempt in 0..*max {
+                        if attempt > 0 {
+                            let wait = match backoff_kind {
+                                "linear" => base_ms * attempt as u64,
+                                "exponential" => base_ms * (1u64 << (attempt - 1).min(10)),
+                                _ => base_ms,
+                            };
+                            if wait > 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                            }
+                        }
+                        match exec_body(
+                            store,
+                            executor,
+                            session_id,
+                            rbody,
+                            &mut *sink,
+                            &mut *steps,
+                            &mut *transcript,
+                        )
+                        .await
+                        {
+                            Ok((blast, bvid, step)) => {
+                                if !blast.is_empty() {
+                                    last = blast;
+                                }
+                                last_vid = bvid;
+                                if let Step::Return(v) = step {
+                                    return Ok((last, v.clone(), Step::Return(v)));
+                                }
+                                succeeded = true;
+                                break;
+                            }
+                            Err(e) => {
+                                // Fatal errors must not be retried — propagate immediately.
+                                if matches!(
+                                    e,
+                                    FlowError::Core(Error::AssertFailed(_))
+                                        | FlowError::Core(Error::ConfirmDenied(_))
+                                ) {
+                                    return Err(e);
+                                }
+                                last_err = e.to_string();
+                            }
+                        }
+                    }
+                    if !succeeded {
+                        return Err(FlowError::Runtime(format!(
+                            "`retry` exhausted {} attempt(s): {}",
+                            max, last_err
+                        )));
+                    }
+                    if let (Some(name), Some(vid)) = (bind, &last_vid) {
+                        bind_existing(store, session_id, name, vid)?;
+                    }
+                    last_value = last_vid;
+                }
+                Node::Try {
+                    body: tbody,
+                    catch,
+                    handler,
+                } => {
+                    match exec_body(
+                        store,
+                        executor,
+                        session_id,
+                        tbody,
+                        &mut *sink,
+                        &mut *steps,
+                        &mut *transcript,
+                    )
+                    .await
+                    {
+                        Ok((blast, bvid, step)) => {
+                            if !blast.is_empty() {
+                                last = blast;
+                            }
+                            last_value = bvid;
+                            if let Step::Return(v) = step {
+                                return Ok((last, v.clone(), Step::Return(v)));
+                            }
+                        }
+                        Err(e) => {
+                            if let Some(cname) = catch {
+                                let err_vid =
+                                    store.put_value(session_id, &Value::String(e.to_string()))?;
+                                bind_existing(store, session_id, cname, &err_vid)?;
+                            }
+                            let (hblast, hvid, hstep) = exec_body(
+                                store,
+                                executor,
+                                session_id,
+                                handler,
+                                &mut *sink,
+                                &mut *steps,
+                                &mut *transcript,
+                            )
+                            .await?;
+                            if !hblast.is_empty() {
+                                last = hblast;
+                            }
+                            last_value = hvid;
+                            if let Step::Return(v) = hstep {
+                                return Ok((last, v.clone(), Step::Return(v)));
+                            }
+                        }
+                    }
+                }
+                Node::Confirm {
+                    message,
+                    risk,
+                    body: cbody,
+                } => {
+                    let intents = IntentSet::new();
+                    let risk_tag = risk.as_deref().unwrap_or("medium");
+                    let labelled = format!("[{risk_tag}] {message}");
+                    let choice = executor.request_approval(&labelled, &intents).await;
+                    if !matches!(choice, ApprovalChoice::Allow) {
+                        return Err(FlowError::Core(Error::ConfirmDenied(message.clone())));
+                    }
+                    let (blast, bvid, step) = exec_body(
+                        store,
+                        executor,
+                        session_id,
+                        cbody,
+                        &mut *sink,
+                        &mut *steps,
+                        &mut *transcript,
+                    )
+                    .await?;
+                    if !blast.is_empty() {
+                        last = blast;
+                    }
+                    last_value = bvid;
+                    if let Step::Return(v) = step {
+                        return Ok((last, v.clone(), Step::Return(v)));
+                    }
+                }
+                Node::Loop {
+                    for_ms,
+                    every_ms,
+                    until,
+                    body: lbody,
+                    bind,
+                } => {
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(*for_ms);
+                    let mut last_vid: Option<ValueId> = None;
+                    loop {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        match exec_body(
+                            store,
+                            executor,
+                            session_id,
+                            lbody,
+                            &mut *sink,
+                            &mut *steps,
+                            &mut *transcript,
+                        )
+                        .await
+                        {
+                            Ok((blast, bvid, step)) => {
+                                if !blast.is_empty() {
+                                    last = blast;
+                                }
+                                last_vid = bvid;
+                                if let Step::Return(v) = step {
+                                    return Ok((last, v.clone(), Step::Return(v)));
+                                }
+                            }
+                            Err(e) => {
+                                return Err(FlowError::Runtime(format!("`loop` body failed: {e}")));
+                            }
+                        }
+                        if let Some(u) = until {
+                            if eval_cond(store, executor, session_id, u, &mut *sink, &mut *steps)
+                                .await?
+                            {
+                                break;
+                            }
+                        }
+                        if *every_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(*every_ms)).await;
+                        }
+                    }
+                    if let (Some(name), Some(vid)) = (bind, &last_vid) {
+                        bind_existing(store, session_id, name, vid)?;
+                    }
+                    last_value = last_vid;
+                }
+                Node::Race {
+                    timeout_ms,
+                    branches,
+                    bind,
+                } => {
+                    // True first-wins concurrency: spawn each branch, drive with tokio::select!,
+                    // cancel losers. Same BufferSink pattern as Node::Parallel.
+                    // A zero deadline can accommodate no work: `tokio::time::timeout` polls the
+                    // inner future before the (already-elapsed) timer, so an immediately-ready
+                    // branch would otherwise win a 0ms race. Short-circuit so the deadline holds.
+                    if *timeout_ms == 0 {
+                        return Err(FlowError::Runtime(format!(
+                            "`race` timed out after {timeout_ms}ms with no successful branch"
+                        )));
+                    }
+                    let remaining = std::time::Duration::from_millis(*timeout_ms);
+                    let race_result: Option<(String, Option<ValueId>, Step)> =
+                        tokio::time::timeout(remaining, async {
+                            // We can't use macro select! over a dynamic list, so we poll branches
+                            // as ordered futures but with a shared deadline enforced by the outer
+                            // timeout — meaning we truly give each branch a chance concurrently
+                            // by joining them and taking the first Ok.
+                            let futs: Vec<_> = branches
+                                .iter()
+                                .map(|b| {
+                                    let body = &b.body;
+                                    Box::pin(async move {
+                                        let mut buf = BufferSink::default();
+                                        let mut s = 0usize;
+                                        let mut tr: Vec<String> = Vec::new();
+                                        exec_body(
+                                            store, executor, session_id, body, &mut buf, &mut s,
+                                            &mut tr,
+                                        )
+                                        .await
+                                        .map(|(text, lv, step)| (text, lv, step, buf, s, tr))
+                                    })
+                                })
+                                .collect();
+                            // Race: futures::future::select_ok returns first success
+                            futures::future::select_ok(futs).await.ok()
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|((text, lv, step, buf, s, tr), _rest)| {
+                            buf.replay(&mut *sink);
+                            *steps += s;
+                            transcript.extend(tr);
+                            (text, lv, step)
+                        });
+                    let (blast, bvid, step) = race_result.ok_or_else(|| {
+                        FlowError::Runtime(format!(
+                            "`race` timed out after {timeout_ms}ms with no successful branch"
+                        ))
+                    })?;
+                    if !blast.is_empty() {
+                        last = blast;
+                    }
+                    if let (Some(name), Some(vid)) = (bind, &bvid) {
+                        bind_existing(store, session_id, name, vid)?;
+                    }
+                    last_value = bvid;
+                    if let Step::Return(v) = step {
+                        return Ok((last, v.clone(), Step::Return(v)));
+                    }
+                }
+                Node::Throttle {
+                    name: tname,
+                    max,
+                    window_ms,
+                    body: tbody,
+                } => {
+                    // Token-bucket: track call timestamps in the session store keyed by `name`.
+                    // Keying on `name` means the bucket persists correctly across turns and
+                    // different throttle nodes with different names never share a bucket.
+                    let bucket_key = SymbolName(format!("__throttle_bucket_{tname}"));
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let window_start = now_ms.saturating_sub(*window_ms);
+                    // Load existing timestamps.
+                    let mut times: Vec<u64> =
+                        if let Some(vid) = store.resolve(session_id, &bucket_key).ok().flatten() {
+                            if let Some(Value::String(s)) = store.get_value(&vid).ok().flatten() {
+                                serde_json::from_str::<Vec<u64>>(&s).unwrap_or_default()
+                            } else {
+                                vec![]
+                            }
+                        } else {
+                            vec![]
+                        };
+                    // Evict expired entries.
+                    times.retain(|&t| t >= window_start);
+                    if times.len() >= *max as usize {
+                        return Err(FlowError::Runtime(format!(
+                            "`throttle` limit of {max} per {window_ms}ms exceeded"
+                        )));
+                    }
+                    times.push(now_ms);
+                    let times_json = serde_json::to_string(&times).unwrap_or_default();
+                    let vid = store.put_value(session_id, &Value::String(times_json))?;
+                    store.bind(session_id, &bucket_key, &vid, None, "", Visibility::Hidden)?;
+                    let (blast, bvid, step) =
+                        exec_body(store, executor, session_id, tbody, sink, steps, transcript)
+                            .await?;
+                    if !blast.is_empty() {
+                        last = blast;
+                    }
+                    last_value = bvid;
+                    if let Step::Return(v) = step {
+                        return Ok((last, v.clone(), Step::Return(v)));
+                    }
+                }
+                Node::Debounce {
+                    name: _dname,
+                    wait_ms,
+                    body: dbody,
+                } => {
+                    // Debounce: sleep for wait_ms then run body once.
+                    // `name` is a stable key (used for future cross-turn debounce state);
+                    // currently the settling delay is implemented as a fixed sleep.
+                    tokio::time::sleep(std::time::Duration::from_millis(*wait_ms)).await;
+                    let (blast, bvid, step) =
+                        exec_body(store, executor, session_id, dbody, sink, steps, transcript)
+                            .await?;
+                    if !blast.is_empty() {
+                        last = blast;
+                    }
+                    last_value = bvid;
+                    if let Step::Return(v) = step {
+                        return Ok((last, v.clone(), Step::Return(v)));
+                    }
+                }
+                Node::Unless { cond, body: ubody } => {
+                    // Sugar for `when !cond`: run body only when condition is falsey.
+                    let take =
+                        !eval_cond(store, executor, session_id, cond, &mut *sink, &mut *steps)
+                            .await?;
+                    if take {
+                        let (blast, bvid, step) = exec_body(
+                            store,
+                            executor,
+                            session_id,
+                            ubody,
+                            &mut *sink,
+                            &mut *steps,
+                            &mut *transcript,
+                        )
+                        .await?;
+                        if !blast.is_empty() {
+                            last = blast;
+                            last_value = bvid;
+                        }
+                        if let Step::Return(v) = step {
+                            return Ok((last, v.clone(), Step::Return(v)));
+                        }
+                    }
+                }
+                Node::Verify {
+                    cmd,
+                    expect,
+                    message,
+                } => {
+                    // Run `cmd`, check output contains/matches `expect`; abort with `message` if not.
+                    let (cmd_text, _) =
+                        eval_return(store, executor, session_id, cmd, &mut *sink, &mut *steps)
+                            .await?;
+                    let expect_val = eval_arg(expect, store, session_id)?;
+                    let pattern = match &expect_val {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => serde_json::to_string(other).unwrap_or_default(),
+                    };
+                    let ok = cmd_text.contains(pattern.as_str());
+                    if !ok {
+                        let detail = message
+                            .clone()
+                            .unwrap_or_else(|| format!("output did not contain {:?}", pattern));
+                        return Err(FlowError::Runtime(format!("verify failed: {detail}")));
+                    }
+                    transcript.push(format!("[verify ok] {pattern}"));
+                    last = format!("verify ok: {pattern}");
+                }
+                Node::Peek { name } => {
+                    // Read the current in-session value of a named symbol — zero IO.
+                    let text = match store.resolve(session_id, name)? {
+                        Some(vid) => store
+                            .get_value(&vid)?
+                            .map(|v| value_text(&v))
+                            .unwrap_or_default(),
+                        None => String::new(),
+                    };
+                    transcript.push(format!("[peek ${}]\n{text}", name.0));
+                    last = text;
+                }
+                Node::Expr { formula, vars } => {
+                    // Pure arithmetic — no IO, no approval gate.
+                    let resolved: std::collections::BTreeMap<String, f64> = vars
+                        .iter()
+                        .map(|(k, v)| {
+                            let jv = eval_arg(v, store, session_id)?;
+                            let n = match &jv {
+                                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                                serde_json::Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
+                                _ => 0.0,
+                            };
+                            Ok::<_, crate::FlowError>((k.clone(), n))
+                        })
+                        .collect::<Result<_>>()?;
+                    let result = eval_expr_formula(formula, &resolved)?;
+                    let text = format_number(result);
+                    let vid = store.put_value(session_id, &Value::String(text.clone()))?;
+                    transcript.push(format!("[expr {formula}]\n{text}"));
+                    last = text;
+                    last_value = Some(vid);
+                }
+                Node::Fmt { template } => {
+                    // Pure string interpolation — substitutes {sym} from session symbols.
+                    let text = interpolate_str(template, store, session_id);
+                    let vid = store.put_value(session_id, &Value::String(text.clone()))?;
+                    transcript.push(format!("[fmt]\n{text}"));
+                    last = text;
+                    last_value = Some(vid);
+                }
+                Node::Jq { path, input } => {
+                    // Pure JSON path extraction — no IO.
+                    let jv = eval_arg(input, store, session_id)?;
+                    let result = eval_jq_path(path, &jv)?;
+                    let text = match &result {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => serde_json::to_string(other).unwrap_or_default(),
+                    };
+                    let vid = store.put_value(session_id, &Value::String(text.clone()))?;
+                    transcript.push(format!("[jq {path}]\n{text}"));
+                    last = text;
+                    last_value = Some(vid);
+                }
+                Node::Parse {
+                    value: inner,
+                    as_type,
+                } => {
+                    // Pure type coercion — no IO.
+                    let jv = eval_arg(inner, store, session_id)?;
+                    let text = coerce_parse(&jv, as_type)?;
+                    let vid = store.put_value(session_id, &Value::String(text.clone()))?;
+                    transcript.push(format!("[parse {as_type}]\n{text}"));
+                    last = text;
+                    last_value = Some(vid);
+                }
+                Node::Await { .. } => {
+                    return Err(FlowError::Runtime(
+                        "`await` execution (cross-turn suspend/resume) lands in a later slice"
+                            .to_string(),
+                    ));
+                }
+                Node::Var { .. } | Node::Lit { .. } | Node::Thing { .. } => {
+                    return Err(FlowError::Runtime(
+                        "a bare value is not an executable statement".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok((last, last_value, Step::Next))
+    })
+}
+
+/// Evaluate a `when` / `repeat-until` condition to a boolean. `lit`/`var` are resolved without side
+/// effects; a `call` executes (its content's truthiness is the result). An errored call is falsey.
+async fn eval_cond(
+    store: &dyn ValueStore,
+    executor: &dyn OpHost,
+    session_id: &str,
+    node: &Node,
+    sink: &mut dyn FlowSink,
+    steps: &mut usize,
+) -> Result<bool> {
+    match node {
+        Node::Call { op, args } => {
+            let outcome = run_call(store, executor, session_id, op, args, None, sink).await?;
+            *steps += 1;
+            if outcome.is_error {
+                return Ok(false);
+            }
+            Ok(json_truthy(&serde_json::Value::String(outcome.content)))
+        }
+        Node::Lit { .. } | Node::Var { .. } => Ok(json_truthy(&eval_arg(node, store, session_id)?)),
+        other => Err(FlowError::Runtime(format!(
+            "unsupported condition `{}`",
+            node_kind(other)
+        ))),
+    }
+}
+
+/// JSON truthiness for conditions: null/false/0/empty are falsey; a string is truthy unless it is
+/// empty, `"false"`, or `"0"` (so a tool's textual `"false"` output reads as false).
+fn json_truthy(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+        serde_json::Value::String(s) => {
+            let t = s.trim();
+            !t.is_empty() && !t.eq_ignore_ascii_case("false") && t != "0"
+        }
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Object(o) => !o.is_empty(),
+    }
+}
+
+/// Evaluate a call's arguments, map them to the op's named input, surface the call/result to the
+/// sink, and dispatch through [`execute_call`].
+async fn run_call(
+    store: &dyn ValueStore,
+    executor: &dyn OpHost,
+    session_id: &str,
+    op: &str,
+    args: &[Node],
+    bind: Option<BindSpec<'_>>,
+    sink: &mut dyn FlowSink,
+) -> Result<CallOutcome> {
+    let arg_values = args
+        .iter()
+        .map(|a| eval_arg(a, store, session_id))
+        .collect::<Result<Vec<_>>>()?;
+    let input = map_args_to_input(op, arg_values, executor.catalog())?;
+    sink.tool_call(op, &input);
+    let outcome = execute_call(store, executor, session_id, op, input, bind).await?;
+    // Surface the model-facing VIEW (numbered read, diff, …) to the sink — what the model/user sees.
+    // The canonical `outcome.content` remains what control flow and interpolation use.
+    sink.tool_result(
+        op,
+        &OpOutcome {
+            content: outcome.view.clone(),
+            view: None,
+            is_error: outcome.is_error,
+        },
+    );
+    Ok(outcome)
+}
+
+/// Evaluate a call-argument expression to a concrete JSON value. `Lit` yields its raw JSON, with
+/// `{{symbol}}` tokens inside strings substituted by the resolved symbol's text (so a model can embed a
+/// stored value into a larger string — e.g. a `task` prompt). `Var` resolves a *standalone* symbol to
+/// its stored value as natural JSON. The runtime injects the value it owns — symbols-over-values,
+/// executed. Other node kinds are not valid argument positions in linear v1.
+fn eval_arg(node: &Node, store: &dyn ValueStore, session_id: &str) -> Result<serde_json::Value> {
+    match node {
+        Node::Lit { value } => Ok(interpolate(value, store, session_id)),
+        Node::Var { name } => {
+            let vid = store
+                .resolve(session_id, name)?
+                .ok_or_else(|| Error::Other(format!("unbound symbol ${}", name.0)))?;
+            let value = store
+                .get_value(&vid)?
+                .ok_or_else(|| Error::Other(format!("dangling value for ${}", name.0)))?;
+            Ok(value.to_json())
+        }
+        other => Err(FlowError::Runtime(format!(
+            "unsupported call argument `{}` — only `lit` and `var` ($symbol) nodes are valid call \
+             args. To use a computed string (fmt/expr/jq/parse), `bind` it to a symbol first, then \
+             pass that symbol as a `var` arg.",
+            node_kind(other)
+        ))),
+    }
+}
+
+/// Substitute `{{symbol}}` tokens inside string literals with the resolved symbol's text value, so the
+/// model can embed a stored value into a larger string. Recurses through strings in arrays/objects;
+/// non-string scalars pass through. A token whose symbol isn't bound is left verbatim.
+fn interpolate(
+    value: &serde_json::Value,
+    store: &dyn ValueStore,
+    session_id: &str,
+) -> serde_json::Value {
+    use serde_json::Value as J;
+    match value {
+        J::String(s) => J::String(interpolate_str(s, store, session_id)),
+        J::Array(a) => J::Array(
+            a.iter()
+                .map(|v| interpolate(v, store, session_id))
+                .collect(),
+        ),
+        J::Object(o) => J::Object(
+            o.iter()
+                .map(|(k, v)| (k.clone(), interpolate(v, store, session_id)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Replace each `{{name}}` (or `{name}`) in `s` with the text of the **bound** symbol `name`. Accepting
+/// both brace styles is robustness against the model's inconsistent templating; only a bound symbol is
+/// substituted, so an unbound token (or any other `{…}` text) is left exactly as written.
+fn interpolate_str(s: &str, store: &dyn ValueStore, session_id: &str) -> String {
+    // Expand a leading `~/` (or bare `~`) to the home directory so fmt
+    // templates like `"~/.flux/foo"` work without shelling out.
+    let expanded: std::borrow::Cow<str> = if let Some(rest) = s.strip_prefix('~') {
+        if rest.is_empty() || rest.starts_with('/') {
+            let home = std::env::var("HOME").unwrap_or_default();
+            std::borrow::Cow::Owned(format!("{home}{rest}"))
+        } else {
+            std::borrow::Cow::Borrowed(s)
+        }
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    };
+    let s = expanded.as_ref();
+    if !s.contains('{') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let at_brace = &rest[open..]; // starts with '{'
+        let (open_tok, close_tok): (&str, &str) = if at_brace.starts_with("{{") {
+            ("{{", "}}")
+        } else {
+            ("{", "}")
+        };
+        let inner = &at_brace[open_tok.len()..];
+        let Some(rel) = inner.find(close_tok) else {
+            // No closing brace — emit the remainder verbatim and stop.
+            out.push_str(at_brace);
+            return out;
+        };
+        let name = inner[..rel].trim();
+        match resolve_symbol_text(store, session_id, name) {
+            Some(text) => {
+                out.push_str(&text);
+                rest = &inner[rel + close_tok.len()..];
+            }
+            None => {
+                // Not a bound symbol — keep the open brace(s) and re-scan from just after them.
+                out.push_str(open_tok);
+                rest = inner;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The text of a bound symbol, or `None` if `name` is empty / unbound / unreadable.
+fn resolve_symbol_text(store: &dyn ValueStore, session_id: &str, name: &str) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    let vid = store
+        .resolve(session_id, &SymbolName(name.to_string()))
+        .ok()??;
+    let value = store.get_value(&vid).ok()??;
+    Some(value_text(&value))
+}
+
+/// Map a call's positional argument *values* onto the op's named JSON input. A lone object argument
+/// is taken as the whole named input; otherwise the values bind to the op's parameters in
+/// `required ++ optional` order (from its [`OpSignature`](crate::opspec::OpSignature)). The AST stays
+/// positional — this is the one place positional args become the named object a tool expects.
+fn map_args_to_input(
+    op: &str,
+    args: Vec<serde_json::Value>,
+    catalog: &dyn OpCatalog,
+) -> Result<serde_json::Value> {
+    let sig = catalog
+        .lookup(op)
+        .ok_or_else(|| Error::Other(format!("unknown op `{op}`")))?;
+
+    // A lone object argument is already the named input map — pass it straight through.
+    if let [serde_json::Value::Object(_)] = args.as_slice() {
+        return Ok(args.into_iter().next().unwrap());
+    }
+
+    let order: Vec<String> = sig
+        .required_params
+        .into_iter()
+        .chain(sig.optional_params)
+        .collect();
+    let mut input = serde_json::Map::new();
+    for (i, val) in args.into_iter().enumerate() {
+        match order.get(i) {
+            Some(name) => {
+                input.insert(name.clone(), val);
+            }
+            None => {
+                return Err(FlowError::Runtime(format!(
+                    "op `{op}` accepts {} parameter(s) but {} argument(s) were supplied",
+                    order.len(),
+                    i + 1
+                )))
+            }
+        }
+    }
+    Ok(serde_json::Value::Object(input))
+}
+
+/// Evaluate a `return` expression to `(text, value_id)`: `var` → the symbol's stored value; `call`
+/// → execute it and use its output; `lit` → store the literal as the flow's return value.
+async fn eval_return(
+    store: &dyn ValueStore,
+    executor: &dyn OpHost,
+    session_id: &str,
+    value: &Node,
+    sink: &mut dyn FlowSink,
+    steps: &mut usize,
+) -> Result<(String, Option<ValueId>)> {
+    match value {
+        Node::Var { name } => {
+            let vid = store
+                .resolve(session_id, name)?
+                .ok_or_else(|| Error::Other(format!("return of unbound symbol ${}", name.0)))?;
+            let value = store
+                .get_value(&vid)?
+                .ok_or_else(|| Error::Other(format!("dangling value for ${}", name.0)))?;
+            Ok((value_text(&value), Some(vid)))
+        }
+        Node::Lit { value } => {
+            let text = lit_text(value);
+            let vid = store.put_value(session_id, &Value::String(text.clone()))?;
+            Ok((text, Some(vid)))
+        }
+        Node::Call { op, args } => {
+            let outcome = run_call(store, executor, session_id, op, args, None, sink).await?;
+            *steps += 1;
+            if outcome.is_error {
+                return Err(FlowError::Runtime(format!(
+                    "return step `{op}` failed: {}",
+                    outcome.content
+                )));
+            }
+            Ok((outcome.content, outcome.value_id))
+        }
+        other => Err(FlowError::Runtime(format!(
+            "unsupported return expression `{}`",
+            node_kind(other)
+        ))),
+    }
+}
+
+/// Evaluate a safe arithmetic formula string with named variable bindings.
+/// Supported: `+`, `-`, `*`, `/`, `round(x,n)`, `abs(x)`, `min(a,b)`, `max(a,b)`,
+/// numeric literals, variable names, and parentheses. No side effects.
+fn eval_expr_formula(formula: &str, vars: &std::collections::BTreeMap<String, f64>) -> Result<f64> {
+    eval_expr_tokens(&mut tokenize_expr(formula), vars)
+        .ok_or_else(|| FlowError::Runtime(format!("invalid `expr` formula: {formula}")))
+}
+
+fn tokenize_expr(s: &str) -> std::collections::VecDeque<String> {
+    let mut tokens = std::collections::VecDeque::new();
+    let mut chars = s.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        match c {
+            ' ' | '\t' => {
+                chars.next();
+            }
+            '0'..='9' | '.' => {
+                let mut num = String::new();
+                while let Some(&d) = chars.peek() {
+                    if d.is_ascii_digit() || d == '.' {
+                        num.push(d);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                tokens.push_back(num);
+            }
+            'a'..='z' | 'A'..='Z' | '_' => {
+                let mut ident = String::new();
+                while let Some(&d) = chars.peek() {
+                    if d.is_alphanumeric() || d == '_' {
+                        ident.push(d);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                tokens.push_back(ident);
+            }
+            c => {
+                tokens.push_back(c.to_string());
+                chars.next();
+            }
+        }
+    }
+    tokens
+}
+
+fn eval_expr_tokens(
+    tokens: &mut std::collections::VecDeque<String>,
+    vars: &std::collections::BTreeMap<String, f64>,
+) -> Option<f64> {
+    expr_add(tokens, vars)
+}
+
+fn expr_add(
+    t: &mut std::collections::VecDeque<String>,
+    v: &std::collections::BTreeMap<String, f64>,
+) -> Option<f64> {
+    let mut lhs = expr_mul(t, v)?;
+    loop {
+        match t.front().map(|s| s.as_str()) {
+            Some("+") => {
+                t.pop_front();
+                lhs += expr_mul(t, v)?;
+            }
+            Some("-") => {
+                t.pop_front();
+                lhs -= expr_mul(t, v)?;
+            }
+            _ => break,
+        }
+    }
+    Some(lhs)
+}
+
+fn expr_mul(
+    t: &mut std::collections::VecDeque<String>,
+    v: &std::collections::BTreeMap<String, f64>,
+) -> Option<f64> {
+    let mut lhs = expr_unary(t, v)?;
+    loop {
+        match t.front().map(|s| s.as_str()) {
+            Some("*") => {
+                t.pop_front();
+                lhs *= expr_unary(t, v)?;
+            }
+            Some("/") => {
+                t.pop_front();
+                let r = expr_unary(t, v)?;
+                if r == 0.0 {
+                    return None;
+                }
+                lhs /= r;
+            }
+            _ => break,
+        }
+    }
+    Some(lhs)
+}
+
+fn expr_unary(
+    t: &mut std::collections::VecDeque<String>,
+    v: &std::collections::BTreeMap<String, f64>,
+) -> Option<f64> {
+    if t.front().map(|s| s.as_str()) == Some("-") {
+        t.pop_front();
+        return Some(-expr_atom(t, v)?);
+    }
+    expr_atom(t, v)
+}
+
+fn expr_atom(
+    t: &mut std::collections::VecDeque<String>,
+    v: &std::collections::BTreeMap<String, f64>,
+) -> Option<f64> {
+    let tok = t.pop_front()?;
+    match tok.as_str() {
+        "(" => {
+            let val = expr_add(t, v)?;
+            if t.pop_front().as_deref() != Some(")") {
+                return None;
+            }
+            Some(val)
+        }
+        "round" => {
+            if t.pop_front().as_deref() != Some("(") {
+                return None;
+            }
+            let x = expr_add(t, v)?;
+            let n = if t.front().map(|s| s.as_str()) == Some(",") {
+                t.pop_front();
+                expr_add(t, v)?.round() as i32
+            } else {
+                0
+            };
+            if t.pop_front().as_deref() != Some(")") {
+                return None;
+            }
+            let factor = 10f64.powi(n);
+            Some((x * factor).round() / factor)
+        }
+        "abs" => {
+            if t.pop_front().as_deref() != Some("(") {
+                return None;
+            }
+            let x = expr_add(t, v)?;
+            if t.pop_front().as_deref() != Some(")") {
+                return None;
+            }
+            Some(x.abs())
+        }
+        "min" => {
+            if t.pop_front().as_deref() != Some("(") {
+                return None;
+            }
+            let a = expr_add(t, v)?;
+            if t.pop_front().as_deref() != Some(",") {
+                return None;
+            }
+            let b = expr_add(t, v)?;
+            if t.pop_front().as_deref() != Some(")") {
+                return None;
+            }
+            Some(a.min(b))
+        }
+        "max" => {
+            if t.pop_front().as_deref() != Some("(") {
+                return None;
+            }
+            let a = expr_add(t, v)?;
+            if t.pop_front().as_deref() != Some(",") {
+                return None;
+            }
+            let b = expr_add(t, v)?;
+            if t.pop_front().as_deref() != Some(")") {
+                return None;
+            }
+            Some(a.max(b))
+        }
+        s => {
+            if let Ok(n) = s.parse::<f64>() {
+                return Some(n);
+            }
+            v.get(s).copied()
+        }
+    }
+}
+
+/// Format a float cleanly: integer results drop the decimal, fractional keep up to 2 places.
+fn format_number(n: f64) -> String {
+    if n.fract() == 0.0 && n.abs() < 1e15 {
+        format!("{}", n as i64)
+    } else {
+        // Up to 2 significant decimal places, strip trailing zeros.
+        let s = format!("{:.2}", n);
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
+/// Walk a dot-path (e.g. `".bitcoin.usd"` or `"results[0].price"`) into a JSON value.
+/// Path segments: `.key` (object field), `[n]` (array index). Leading `.` is optional.
+fn coerce_parse(value: &serde_json::Value, as_type: &str) -> Result<String> {
+    let s = match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    };
+    match as_type {
+        "f64" => {
+            let n: f64 = s
+                .trim()
+                .parse()
+                .map_err(|_| FlowError::Runtime(format!("parse: cannot coerce {:?} to f64", s)))?;
+            Ok(format_number(n))
+        }
+        "i64" => {
+            let n: i64 = s
+                .trim()
+                .parse()
+                .map_err(|_| FlowError::Runtime(format!("parse: cannot coerce {:?} to i64", s)))?;
+            Ok(n.to_string())
+        }
+        "bool" => {
+            let t = s.trim();
+            Ok((t == "true" || t == "1").to_string())
+        }
+        "json" => {
+            // validate it parses as JSON, return canonical form
+            let v: serde_json::Value = serde_json::from_str(&s)
+                .map_err(|e| FlowError::Runtime(format!("parse: invalid JSON: {e}")))?;
+            Ok(serde_json::to_string(&v).unwrap_or_default())
+        }
+        _ => Ok(s), // "string" or unknown — pass through
+    }
+}
+
+fn eval_jq_path(path: &str, value: &serde_json::Value) -> Result<serde_json::Value> {
+    let path = path.trim().trim_start_matches('.');
+    if path.is_empty() {
+        return Ok(value.clone());
+    }
+    let mut cur = value;
+    // Split on `.` and handle `[n]` inside each segment.
+    for raw_seg in path.split('.') {
+        let seg = raw_seg.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        // Segment may be `key[0][1]` — split on `[`.
+        let mut parts = seg.splitn(2, '[');
+        let key = parts.next().unwrap_or("");
+        if !key.is_empty() {
+            cur = cur
+                .get(key)
+                .ok_or_else(|| Error::Other(format!("`jq` path: key `{key}` not found")))?;
+        }
+        if let Some(rest) = parts.next() {
+            // rest is like `0]` or `0][1]`
+            let mut bracket = format!("[{rest}");
+            while bracket.contains('[') {
+                let end = bracket
+                    .find(']')
+                    .ok_or_else(|| Error::Other("`jq` path: unmatched `[`".to_string()))?;
+                let idx_str = bracket[1..end].trim();
+                let idx: usize = idx_str
+                    .parse()
+                    .map_err(|_| Error::Other(format!("`jq` path: invalid index `{idx_str}`")))?;
+                cur = cur
+                    .get(idx)
+                    .ok_or_else(|| Error::Other(format!("`jq` path: index {idx} out of bounds")))?;
+                bracket = bracket[end + 1..].to_string();
+            }
+        }
+    }
+    Ok(cur.clone())
+}
+
+/// Render a stored value as text (a string value is itself; anything else is its compact JSON).
+fn value_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => serde_json::to_string(&other.to_json()).unwrap_or_default(),
+    }
+}
+
+/// Render a literal JSON value as text (a JSON string is itself; anything else is compact JSON).
+fn lit_text(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// The node-kind tag (for error messages).
+fn node_kind(node: &Node) -> &'static str {
+    match node {
+        Node::Call { .. } => "call",
+        Node::Bind { .. } => "bind",
+        Node::When { .. } => "when",
+        Node::Repeat { .. } => "repeat",
+        Node::Each { .. } => "each",
+        Node::Assert { .. } => "assert",
+        Node::Pipe { .. } => "pipe",
+        Node::Seq { .. } => "seq",
+        Node::Memo { .. } => "memo",
+        Node::Parallel { .. } => "parallel",
+        Node::Await { .. } => "await",
+        Node::Retry { .. } => "retry",
+        Node::Try { .. } => "try",
+        Node::Confirm { .. } => "confirm",
+        Node::Loop { .. } => "loop",
+        Node::Race { .. } => "race",
+        Node::Throttle { .. } => "throttle",
+        Node::Debounce { .. } => "debounce",
+        Node::Unless { .. } => "unless",
+        Node::Verify { .. } => "verify",
+        Node::Peek { .. } => "peek",
+        Node::Expr { .. } => "expr",
+        Node::Fmt { .. } => "fmt",
+        Node::Jq { .. } => "jq",
+        Node::Return { .. } => "return",
+        Node::Var { .. } => "var",
+        Node::Lit { .. } => "lit",
+        Node::Thing { .. } => "thing",
+        Node::Parse { .. } => "parse",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    use crate::ast::{Node, SymbolName, Value, Visibility};
+    use crate::opspec::{OpCatalog, OpSignature};
+    use crate::store::MemStore;
+
+    /// A minimal in-memory catalog for arg-mapping tests (no runtime/tools dependency).
+    struct MockCatalog(Vec<OpSignature>);
+    impl OpCatalog for MockCatalog {
+        fn lookup(&self, name: &str) -> Option<OpSignature> {
+            self.0.iter().find(|s| s.name == name).cloned()
+        }
+    }
+    fn sig(name: &str, required: &[&str], optional: &[&str]) -> OpSignature {
+        OpSignature {
+            name: name.into(),
+            description: String::new(),
+            effects: Vec::new(),
+            risk: flux_spec::Risk::Low,
+            idempotency: flux_spec::Idempotency::Idempotent,
+            required_params: required.iter().map(|s| s.to_string()).collect(),
+            optional_params: optional.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+    fn catalog() -> MockCatalog {
+        MockCatalog(vec![
+            sig("read", &["path"], &["offset", "limit"]),
+            sig("write", &["path", "content"], &[]),
+            sig("edit", &["path", "old_string", "new_string"], &[]),
+        ])
+    }
+    fn flow_lit(v: serde_json::Value) -> Node {
+        Node::Lit { value: v }
+    }
+    fn flow_var(name: &str) -> Node {
+        Node::Var {
+            name: SymbolName(name.into()),
+        }
+    }
+
+    #[test]
+    fn map_args_maps_positional_to_required_param_names() {
+        let ops = catalog();
+
+        // read("README.md") → {"path": "README.md"}
+        let input = map_args_to_input("read", vec![json!("README.md")], &ops).unwrap();
+        assert_eq!(input, json!({ "path": "README.md" }));
+
+        // write("out.txt", "hi") → required order {path, content}
+        let input = map_args_to_input("write", vec![json!("out.txt"), json!("hi")], &ops).unwrap();
+        assert_eq!(input, json!({ "path": "out.txt", "content": "hi" }));
+
+        // edit(path, old, new) → all three required params, in order
+        let input =
+            map_args_to_input("edit", vec![json!("f"), json!("a"), json!("b")], &ops).unwrap();
+        assert_eq!(
+            input,
+            json!({ "path": "f", "old_string": "a", "new_string": "b" })
+        );
+
+        // A lone object argument passes straight through as the named input.
+        let input =
+            map_args_to_input("write", vec![json!({ "path": "x", "content": "y" })], &ops).unwrap();
+        assert_eq!(input, json!({ "path": "x", "content": "y" }));
+
+        // More args than the op has params (read takes 3: path, offset, limit) is a clear error.
+        assert!(map_args_to_input(
+            "read",
+            vec![json!("a"), json!("b"), json!("c"), json!("d")],
+            &ops
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn eval_arg_resolves_a_var_to_its_stored_value() {
+        let store = MemStore::new();
+        let vid = store
+            .put_value("sess", &Value::String("hello".into()))
+            .unwrap();
+        store
+            .bind(
+                "sess",
+                &SymbolName("greeting".into()),
+                &vid,
+                None,
+                "hello",
+                Visibility::Visible,
+            )
+            .unwrap();
+
+        // A $symbol resolves to the natural JSON of its stored value.
+        assert_eq!(
+            eval_arg(&flow_var("greeting"), &store, "sess").unwrap(),
+            json!("hello")
+        );
+        // A literal is returned verbatim; an unbound symbol is a clear error.
+        assert_eq!(
+            eval_arg(&flow_lit(json!(42)), &store, "sess").unwrap(),
+            json!(42)
+        );
+        assert!(eval_arg(&flow_var("missing"), &store, "sess").is_err());
+    }
+
+    #[test]
+    fn eval_arg_interpolates_curly_symbols_in_strings() {
+        let store = MemStore::new();
+        let vid = store
+            .put_value("sess", &Value::String("the lines".into()))
+            .unwrap();
+        store
+            .bind(
+                "sess",
+                &SymbolName("hits".into()),
+                &vid,
+                None,
+                "the lines",
+                Visibility::Visible,
+            )
+            .unwrap();
+
+        // Both {{symbol}} and {symbol} inside a string lit resolve to the bound symbol's text.
+        assert_eq!(
+            eval_arg(&flow_lit(json!("reverse: {{hits}}")), &store, "sess").unwrap(),
+            json!("reverse: the lines")
+        );
+        assert_eq!(
+            eval_arg(&flow_lit(json!("reverse: {hits}")), &store, "sess").unwrap(),
+            json!("reverse: the lines")
+        );
+        // An unbound token (either style, or unrelated `{…}` text) is left verbatim.
+        assert_eq!(
+            eval_arg(&flow_lit(json!("x {{nope}} {also} y")), &store, "sess").unwrap(),
+            json!("x {{nope}} {also} y")
+        );
+        // Interpolation recurses into string fields of an object lit.
+        assert_eq!(
+            eval_arg(&flow_lit(json!({ "task": "do {{hits}}" })), &store, "sess").unwrap(),
+            json!({ "task": "do the lines" })
+        );
+    }
+}

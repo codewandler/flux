@@ -19,10 +19,10 @@ the *surfaces* (CLI/TUI/server/SDK).
 
 | Layer | Crates | Role |
 |---|---|---|
-| **L0 contracts** (pure, no IO) | `flux-core` `flux-policy` `flux-secret` `flux-spec` `flux-config` `flux-evidence` `flux-skill` | types, authorization, secrets, tool specs, config, evidence, skills |
+| **L0 contracts** (pure) | `flux-core` `flux-policy` `flux-secret` `flux-spec` `flux-config` `flux-evidence` `flux-skill` `flux-lang` | types, authorization, secrets, tool specs, config, evidence, skills, the Flux-Lang language + reference interpreter (effects injected via traits) |
 | **L1 providers** | `flux-provider` `flux-credentials` `flux-anthropic` `flux-openai` | the `Provider` abstraction + clients + credential store |
 | **L2 runtime** | `flux-system` `flux-runtime` `flux-tools` `flux-session` `flux-context` | guarded IO, the safety envelope, built-in tools, sessions, context |
-| **L3 agent** | `flux-agent` `flux-orchestrate` | the agent loop + multi-agent orchestration |
+| **L3 agent** | `flux-agent` `flux-orchestrate` `flux-flow` `flux-eval` | the agent loop + multi-agent orchestration + the Flux-Lang engine + the eval harness |
 | **L4 extensibility** | `flux-hooks` `flux-plugin` | JS hooks + subprocess plugins |
 | **L5 capabilities** | `flux-browser` `flux-datasource` `flux-auth` | web egress, datasource/RAG, caller identity |
 | **L6 surfaces** | `flux-sdk` `flux-server` `flux-integrations` `flux-tui` `flux-cli` | SDK, HTTP server, integrations, TUI, the `flux` binary |
@@ -31,8 +31,11 @@ Why this matters: it keeps the safety core (L0–L2) small and auditable, and ma
 envelope" structurally hard. Notable rules that fall out:
 - **`flux-runtime` (L2) does not depend on `flux-auth` (L5).** Surfaces resolve identity
   (`LocalIdentity` / `OidcIdentity`) into a `(Caller, Trust)` and inject it via `Executor::with_identity`.
-- `flux-evidence`, `flux-skill`, and `flux-config` are pure L0 leaves on purpose, so runtime/agent
-  crates may depend on them without a layering violation.
+- `flux-evidence`, `flux-skill`, `flux-config`, and `flux-lang` are L0 leaves on purpose, so
+  runtime/agent crates may depend on them without a layering violation. `flux-lang` is the language
+  **and its reference interpreter** — it uses async but takes all effects (op dispatch, value store,
+  observation sink) as injected traits, so it has no L1+ flux dependency. The L3 `flux-flow` engine
+  adapts its safety envelope onto those traits and re-exports `flux-lang` as a facade.
 
 ## The safety envelope (the execution substrate)
 
