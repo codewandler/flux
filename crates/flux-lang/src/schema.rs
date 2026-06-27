@@ -93,6 +93,11 @@ mod tests {
             "parse",
             "ctx",
             "ctx_append",
+            "match",
+            "route",
+            "fallback",
+            "timeout",
+            "budget",
         ] {
             assert!(
                 catalog.contains(&format!("| `{kind}` |")),
@@ -100,10 +105,10 @@ mod tests {
             );
         }
 
-        // 31 variants + 2 header lines, and no description bleeds onto its own line (newlines collapsed).
+        // 36 variants + 2 header lines, and no description bleeds onto its own line (newlines collapsed).
         assert_eq!(
             catalog.lines().count(),
-            31 + 2,
+            36 + 2,
             "every variant is exactly one row"
         );
     }

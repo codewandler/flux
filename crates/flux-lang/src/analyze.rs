@@ -214,6 +214,35 @@ fn type_check_body(
                     type_check_body(&b.body, ops, &mut scope.clone(), diags);
                 }
             }
+            Node::Timeout { body, .. } | Node::Budget { body, .. } => {
+                type_check_body(body, ops, &mut scope.clone(), diags)
+            }
+            Node::Fallback { branches, .. } => {
+                for b in branches {
+                    type_check_body(&b.body, ops, &mut scope.clone(), diags);
+                }
+            }
+            Node::Match { cases, default, .. } => {
+                // The subject is a literal/bound symbol (enforced by `check_node`), so there's no call
+                // to type-check here — only the case + default bodies.
+                for c in cases {
+                    type_check_body(&c.body, ops, &mut scope.clone(), diags);
+                }
+                type_check_body(default, ops, &mut scope.clone(), diags);
+            }
+            Node::Route {
+                selector,
+                cases,
+                default,
+            } => {
+                if let Node::Call { op, args } = selector.as_ref() {
+                    check_call_types(op, args, ops, scope, diags);
+                }
+                for c in cases {
+                    type_check_body(&c.body, ops, &mut scope.clone(), diags);
+                }
+                type_check_body(default, ops, &mut scope.clone(), diags);
+            }
             _ => {}
         }
     }
@@ -328,6 +357,35 @@ fn for_each_node(body: &[Node], f: &mut impl FnMut(&Node)) {
                     for_each_node(std::slice::from_ref(v), f);
                 }
             }
+            Node::Match {
+                subject,
+                cases,
+                default,
+            } => {
+                for_each_node(std::slice::from_ref(subject), f);
+                for c in cases {
+                    for_each_node(std::slice::from_ref(&c.value), f);
+                    for_each_node(&c.body, f);
+                }
+                for_each_node(default, f);
+            }
+            Node::Route {
+                selector,
+                cases,
+                default,
+            } => {
+                for_each_node(std::slice::from_ref(selector), f);
+                for c in cases {
+                    for_each_node(&c.body, f);
+                }
+                for_each_node(default, f);
+            }
+            Node::Fallback { branches, .. } => {
+                for b in branches {
+                    for_each_node(&b.body, f);
+                }
+            }
+            Node::Timeout { body, .. } | Node::Budget { body, .. } => for_each_node(body, f),
             // Leaf nodes (no nested node bodies).
             Node::Await { .. }
             | Node::Peek { .. }
@@ -528,6 +586,92 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, diags: &mut Vec<Diagnostic>) {
                 ));
             }
         }
+        Node::Match {
+            subject,
+            cases,
+            default,
+        } => {
+            // The interpreter compares the subject by JSON equality, so it must be a value the
+            // interpreter can resolve without dispatch — a literal or a bound symbol. To branch on an
+            // op's result, bind it first (`$s = call(); match $s {…}`) or use `route`.
+            if !matches!(subject.as_ref(), Node::Lit { .. } | Node::Var { .. }) {
+                diags.push(Diagnostic::new(
+                    "`match` subject must be a literal or a bound symbol (`$x`); bind a call result first, or use `route` to branch on an op",
+                ));
+            }
+            check_node(subject, ops, diags);
+            if cases.is_empty() {
+                diags.push(Diagnostic::new("`match` requires at least one case"));
+            }
+            for c in cases {
+                if !matches!(c.value, Node::Lit { .. } | Node::Var { .. }) {
+                    diags.push(Diagnostic::new(
+                        "`match` case values must be literals or bound symbols",
+                    ));
+                }
+                check_node(&c.value, ops, diags);
+                for n in &c.body {
+                    check_node(n, ops, diags);
+                }
+            }
+            for n in default {
+                check_node(n, ops, diags);
+            }
+        }
+        Node::Route {
+            selector,
+            cases,
+            default,
+        } => {
+            check_node(selector, ops, diags);
+            if cases.is_empty() {
+                diags.push(Diagnostic::new("`route` requires at least one case"));
+            }
+            let mut seen: HashSet<&str> = HashSet::new();
+            for c in cases {
+                if c.label.is_empty() {
+                    diags.push(Diagnostic::new("`route` case labels must be non-empty"));
+                }
+                if !seen.insert(c.label.as_str()) {
+                    diags.push(Diagnostic::new(format!(
+                        "duplicate `route` case label `{}`",
+                        c.label
+                    )));
+                }
+                for n in &c.body {
+                    check_node(n, ops, diags);
+                }
+            }
+            for n in default {
+                check_node(n, ops, diags);
+            }
+        }
+        Node::Fallback { branches, .. } => {
+            if branches.is_empty() {
+                diags.push(Diagnostic::new("`fallback` requires at least one branch"));
+            }
+            for b in branches {
+                for n in &b.body {
+                    check_node(n, ops, diags);
+                }
+            }
+        }
+        Node::Timeout { ms, body, .. } => {
+            if *ms == 0 {
+                diags.push(Diagnostic::new("`timeout` requires a non-zero `ms`"));
+            }
+            for n in body {
+                check_node(n, ops, diags);
+            }
+        }
+        Node::Budget { limit, body, .. } => {
+            if *limit == 0 {
+                diags.push(Diagnostic::new("`budget` requires a non-zero `limit`"));
+            }
+            for n in body {
+                check_node(n, ops, diags);
+            }
+        }
         Node::Await { .. }
         | Node::Peek { .. }
         | Node::Var { .. }
@@ -563,6 +707,14 @@ fn node_contains_return(node: &Node) -> bool {
         Node::Throttle { body, .. } => body_contains_return(body),
         Node::Debounce { body, .. } => body_contains_return(body),
         Node::Unless { body, .. } => body_contains_return(body),
+        Node::Match { cases, default, .. } => {
+            cases.iter().any(|c| body_contains_return(&c.body)) || body_contains_return(default)
+        }
+        Node::Route { cases, default, .. } => {
+            cases.iter().any(|c| body_contains_return(&c.body)) || body_contains_return(default)
+        }
+        Node::Fallback { branches, .. } => branches.iter().any(|b| body_contains_return(&b.body)),
+        Node::Timeout { body, .. } | Node::Budget { body, .. } => body_contains_return(body),
         Node::Expr { .. } | Node::Fmt { .. } | Node::Jq { .. } => false,
         _ => false,
     }
@@ -683,6 +835,140 @@ mod tests {
         };
         let err = lower(&over, &ops).unwrap_err();
         assert!(err.iter().any(|d| d.message.contains("at most 1 argument")));
+    }
+
+    /// The P6b control-flow primitives carry their own structural guard-rails, and `return` inside a
+    /// `parallel` branch is still rejected when it hides inside one of them.
+    #[test]
+    fn control_flow_primitives_are_validated() {
+        use crate::ast::{Branch, FallbackBranch, MatchCase, RouteCase, SymbolName};
+        let ops = catalog();
+        let lit = |v: &str| Node::Lit {
+            value: serde_json::json!(v),
+        };
+        let has = |ast: &DraftAst, needle: &str| {
+            lower(ast, &ops)
+                .err()
+                .is_some_and(|ds| ds.iter().any(|d| d.message.contains(needle)))
+        };
+        let wrap = |n: Node| DraftAst {
+            body: vec![n],
+            ..Default::default()
+        };
+
+        // match / route require at least one case.
+        assert!(has(
+            &wrap(Node::Match {
+                subject: Box::new(lit("x")),
+                cases: vec![],
+                default: vec![],
+            }),
+            "`match` requires at least one case"
+        ));
+        assert!(has(
+            &wrap(Node::Route {
+                selector: Box::new(lit("x")),
+                cases: vec![],
+                default: vec![],
+            }),
+            "`route` requires at least one case"
+        ));
+
+        // route case labels must be non-empty and distinct.
+        assert!(has(
+            &wrap(Node::Route {
+                selector: Box::new(lit("x")),
+                cases: vec![
+                    RouteCase {
+                        label: "a".into(),
+                        body: vec![]
+                    },
+                    RouteCase {
+                        label: "a".into(),
+                        body: vec![]
+                    },
+                ],
+                default: vec![],
+            }),
+            "duplicate `route` case label"
+        ));
+
+        // timeout / budget reject a zero bound.
+        assert!(has(
+            &wrap(Node::Timeout {
+                ms: 0,
+                body: vec![],
+                bind: None,
+            }),
+            "`timeout` requires a non-zero `ms`"
+        ));
+        assert!(has(
+            &wrap(Node::Budget {
+                limit: 0,
+                body: vec![],
+                bind: None,
+            }),
+            "`budget` requires a non-zero `limit`"
+        ));
+
+        // a `return` buried in a match case inside a parallel branch is still rejected.
+        let parallel_with_buried_return = wrap(Node::Parallel {
+            branches: vec![Branch {
+                name: SymbolName("b".into()),
+                body: vec![Node::Match {
+                    subject: Box::new(lit("x")),
+                    cases: vec![MatchCase {
+                        value: lit("x"),
+                        body: vec![Node::Return {
+                            value: Box::new(lit("v")),
+                        }],
+                    }],
+                    default: vec![],
+                }],
+            }],
+        });
+        assert!(has(
+            &parallel_with_buried_return,
+            "`return` is not allowed inside a `parallel` branch"
+        ));
+
+        // a `match` subject must be a value (literal/symbol), not an inline call — the interpreter
+        // can't dispatch it; the author binds the result first or uses `route`.
+        assert!(has(
+            &wrap(Node::Match {
+                subject: Box::new(Node::Call {
+                    op: "read".into(),
+                    args: vec![lit("a")],
+                }),
+                cases: vec![MatchCase {
+                    value: lit("x"),
+                    body: vec![],
+                }],
+                default: vec![],
+            }),
+            "`match` subject must be a literal or a bound symbol"
+        ));
+
+        // an empty `fallback` is rejected (symmetry with match/route).
+        assert!(has(
+            &wrap(Node::Fallback {
+                branches: vec![],
+                bind: None,
+            }),
+            "`fallback` requires at least one branch"
+        ));
+
+        // a well-formed fallback analyzes clean.
+        let ok = wrap(Node::Fallback {
+            branches: vec![FallbackBranch {
+                body: vec![Node::Call {
+                    op: "read".into(),
+                    args: vec![lit("a")],
+                }],
+            }],
+            bind: None,
+        });
+        assert!(lower(&ok, &ops).is_ok());
     }
 
     /// A catalog with a typed op `dbl(n: Number)` for the argument type-checker.

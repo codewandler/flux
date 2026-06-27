@@ -1326,6 +1326,248 @@ fn exec_body<'a>(
                     last = text;
                     last_value = Some(vid);
                 }
+                Node::Match {
+                    subject,
+                    cases,
+                    default,
+                } => {
+                    let subj = eval_arg(subject, store, session_id)?;
+                    let mut branch: Option<&[Node]> = None;
+                    for case in cases {
+                        if eval_arg(&case.value, store, session_id)? == subj {
+                            branch = Some(&case.body);
+                            break;
+                        }
+                    }
+                    let branch = match branch {
+                        Some(b) => b,
+                        None if !default.is_empty() => default.as_slice(),
+                        None => {
+                            return Err(FlowError::Runtime(format!(
+                                "`match` had no case for `{}` and no default",
+                                serde_json::to_string(&subj).unwrap_or_default()
+                            )));
+                        }
+                    };
+                    let (blast, bvid, step) = exec_body(
+                        store,
+                        executor,
+                        session_id,
+                        branch,
+                        &mut *sink,
+                        &mut *steps,
+                        &mut *transcript,
+                    )
+                    .await?;
+                    if !blast.is_empty() {
+                        last = blast;
+                        last_value = bvid;
+                    }
+                    if let Step::Return(v) = step {
+                        return Ok((last, v.clone(), Step::Return(v)));
+                    }
+                }
+                Node::Route {
+                    selector,
+                    cases,
+                    default,
+                } => {
+                    // Resolve the selector to a label. A `call` selector dispatches (the `!model` op);
+                    // a var/lit resolves without dispatch. The model picks *which* declared case runs.
+                    let label = match selector.as_ref() {
+                        Node::Call { op, args } => {
+                            let outcome =
+                                run_call(store, executor, session_id, op, args, None, sink).await?;
+                            *steps += 1;
+                            if outcome.is_error {
+                                return Err(FlowError::Runtime(format!(
+                                    "`route` selector `{op}` failed: {}",
+                                    outcome.content
+                                )));
+                            }
+                            outcome.content.trim().to_string()
+                        }
+                        other => match eval_arg(other, store, session_id)? {
+                            serde_json::Value::String(s) => s,
+                            v => serde_json::to_string(&v).unwrap_or_default(),
+                        },
+                    };
+                    let branch = cases
+                        .iter()
+                        .find(|c| c.label == label)
+                        .map(|c| c.body.as_slice());
+                    let branch = match branch {
+                        Some(b) => b,
+                        None if !default.is_empty() => default.as_slice(),
+                        None => {
+                            return Err(FlowError::Runtime(format!(
+                                "`route` selector returned `{label}`, which matches no case and there is no default"
+                            )));
+                        }
+                    };
+                    let (blast, bvid, step) = exec_body(
+                        store,
+                        executor,
+                        session_id,
+                        branch,
+                        &mut *sink,
+                        &mut *steps,
+                        &mut *transcript,
+                    )
+                    .await?;
+                    if !blast.is_empty() {
+                        last = blast;
+                        last_value = bvid;
+                    }
+                    if let Step::Return(v) = step {
+                        return Ok((last, v.clone(), Step::Return(v)));
+                    }
+                }
+                Node::Fallback { branches, bind } => {
+                    // Try each branch in order; the first non-empty success wins. An empty success is
+                    // kept only as a last resort; if every branch errors, the last error propagates.
+                    let mut win: Option<(String, Option<ValueId>)> = None;
+                    let mut last_err: Option<FlowError> = None;
+                    for b in branches {
+                        match exec_body(
+                            store,
+                            executor,
+                            session_id,
+                            &b.body,
+                            &mut *sink,
+                            &mut *steps,
+                            &mut *transcript,
+                        )
+                        .await
+                        {
+                            Ok((blast, bvid, step)) => {
+                                if let Step::Return(v) = step {
+                                    let l = if blast.is_empty() {
+                                        last.clone()
+                                    } else {
+                                        blast
+                                    };
+                                    return Ok((l, v.clone(), Step::Return(v)));
+                                }
+                                if !blast.is_empty() {
+                                    win = Some((blast, bvid));
+                                    break;
+                                }
+                                if win.is_none() {
+                                    win = Some((blast, bvid));
+                                }
+                            }
+                            Err(e) => last_err = Some(e),
+                        }
+                    }
+                    match win {
+                        Some((blast, bvid)) => {
+                            if !blast.is_empty() {
+                                last = blast;
+                            }
+                            if let (Some(name), Some(vid)) = (bind, &bvid) {
+                                bind_existing(store, session_id, name, vid)?;
+                            }
+                            last_value = bvid;
+                        }
+                        None => {
+                            if let Some(e) = last_err {
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+                Node::Timeout {
+                    ms,
+                    body: tbody,
+                    bind,
+                } => {
+                    if *ms == 0 {
+                        return Err(FlowError::Runtime(
+                            "`timeout` of 0ms cannot complete any work".to_string(),
+                        ));
+                    }
+                    let dur = std::time::Duration::from_millis(*ms);
+                    // Buffer only the *sink* so a partial run discarded on timeout doesn't tear the
+                    // live output. Thread the real `steps`/`transcript` in, so dispatches that DID
+                    // complete before the deadline stay counted (an enclosing `budget` must see them)
+                    // and audited (the run trace must not silently omit side effects that happened).
+                    let res = tokio::time::timeout(dur, async {
+                        let mut buf = BufferSink::default();
+                        exec_body(
+                            store,
+                            executor,
+                            session_id,
+                            tbody,
+                            &mut buf,
+                            &mut *steps,
+                            &mut *transcript,
+                        )
+                        .await
+                        .map(|(text, lv, step)| (text, lv, step, buf))
+                    })
+                    .await;
+                    match res {
+                        Ok(Ok((text, lv, step, buf))) => {
+                            buf.replay(&mut *sink);
+                            if !text.is_empty() {
+                                last = text;
+                            }
+                            if let (Some(name), Some(vid)) = (bind, &lv) {
+                                bind_existing(store, session_id, name, vid)?;
+                            }
+                            last_value = lv;
+                            if let Step::Return(v) = step {
+                                return Ok((last, v.clone(), Step::Return(v)));
+                            }
+                        }
+                        Ok(Err(e)) => return Err(e),
+                        Err(_) => {
+                            return Err(FlowError::Runtime(format!("`timeout` exceeded {ms}ms")));
+                        }
+                    }
+                }
+                Node::Budget {
+                    limit,
+                    body: bbody,
+                    bind,
+                } => {
+                    // Cost cap: allow at most `limit` op dispatches in this scope, checked at each
+                    // statement boundary (a single statement may still overshoot — documented v1).
+                    let start = *steps;
+                    let cap = *limit as usize;
+                    let mut bvid: Option<ValueId> = None;
+                    for stmt in bbody {
+                        if (*steps).saturating_sub(start) >= cap {
+                            return Err(FlowError::Runtime(format!(
+                                "`budget` exceeded: at most {cap} op dispatch(es) allowed in this scope"
+                            )));
+                        }
+                        let (blast, svid, step) = exec_body(
+                            store,
+                            executor,
+                            session_id,
+                            std::slice::from_ref(stmt),
+                            &mut *sink,
+                            &mut *steps,
+                            &mut *transcript,
+                        )
+                        .await?;
+                        if !blast.is_empty() {
+                            last = blast;
+                        }
+                        if let Some(v) = svid {
+                            last_value = Some(v.clone());
+                            bvid = Some(v);
+                        }
+                        if let Step::Return(v) = step {
+                            return Ok((last, v.clone(), Step::Return(v)));
+                        }
+                    }
+                    if let (Some(name), Some(vid)) = (bind, &bvid) {
+                        bind_existing(store, session_id, name, vid)?;
+                    }
+                }
                 Node::Await { .. } => {
                     return Err(FlowError::Runtime(
                         "`await` execution (cross-turn suspend/resume) lands in a later slice"
@@ -2127,6 +2369,11 @@ fn node_kind(node: &Node) -> &'static str {
         Node::Parse { .. } => "parse",
         Node::Ctx { .. } => "ctx",
         Node::CtxAppend { .. } => "ctx_append",
+        Node::Match { .. } => "match",
+        Node::Route { .. } => "route",
+        Node::Fallback { .. } => "fallback",
+        Node::Timeout { .. } => "timeout",
+        Node::Budget { .. } => "budget",
     }
 }
 
@@ -2470,6 +2717,293 @@ mod tests {
             assert!(vp.is_some(), "symbol ${sym} should be bound by the plan");
             assert_eq!(vp, vf, "symbol ${sym} differs: plan vs linear execution");
         }
+    }
+
+    // ---- P6b: Tier-1 control-flow primitives (match/route/fallback/timeout/budget) ----
+
+    use crate::ast::{FallbackBranch, MatchCase, RouteCase};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    struct CfCat;
+    impl OpCatalog for CfCat {
+        fn lookup(&self, name: &str) -> Option<OpSignature> {
+            let mk = |req: &[&str]| {
+                Some(OpSignature {
+                    name: name.into(),
+                    description: String::new(),
+                    effects: vec![flux_spec::Effect::Read],
+                    risk: flux_spec::Risk::Low,
+                    idempotency: flux_spec::Idempotency::Idempotent,
+                    required_params: req.iter().map(|s| s.to_string()).collect(),
+                    optional_params: Vec::new(),
+                    param_types: Default::default(),
+                })
+            };
+            match name {
+                "pick" => mk(&["label"]),
+                "echo" => mk(&["v"]),
+                "boom" | "slow" => mk(&[]),
+                _ => None,
+            }
+        }
+    }
+
+    /// A host that records the (op, first-arg) of each dispatch so a test can assert *which* branch
+    /// ran. `pick` echoes its `label` (a `route` selector), `echo` echoes its `v`, `boom` errors, and
+    /// `slow` sleeps before succeeding (to exercise `timeout`).
+    struct CfHost {
+        cat: CfCat,
+        log: Mutex<Vec<String>>,
+        calls: AtomicUsize,
+    }
+    impl CfHost {
+        fn new() -> Self {
+            CfHost {
+                cat: CfCat,
+                log: Mutex::new(Vec::new()),
+                calls: AtomicUsize::new(0),
+            }
+        }
+        fn marks(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+    #[async_trait::async_trait]
+    impl OpHost for CfHost {
+        async fn dispatch(&self, op: &str, input: serde_json::Value) -> OpOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let arg = |k: &str| {
+                input
+                    .get(k)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let (mark, out) = match op {
+                "pick" => (
+                    format!("pick={}", arg("label")),
+                    OpOutcome::ok(arg("label")),
+                ),
+                "echo" => (arg("v"), OpOutcome::ok(arg("v"))),
+                "boom" => ("boom".to_string(), OpOutcome::error("boom failed")),
+                "slow" => {
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    ("slow".to_string(), OpOutcome::ok("slow done"))
+                }
+                other => (other.to_string(), OpOutcome::ok(other.to_string())),
+            };
+            self.log.lock().unwrap().push(mark);
+            out
+        }
+        fn catalog(&self) -> &dyn OpCatalog {
+            &self.cat
+        }
+        async fn request_approval(
+            &self,
+            _label: &str,
+            _intents: &flux_spec::IntentSet,
+        ) -> ApprovalChoice {
+            ApprovalChoice::Allow
+        }
+        fn trim_output(&self, view: String, _op: &str) -> String {
+            view
+        }
+    }
+
+    fn call(op: &str, args: Vec<Node>) -> Node {
+        Node::Call {
+            op: op.into(),
+            args,
+        }
+    }
+    fn echo(v: &str) -> Node {
+        call("echo", vec![flow_lit(json!(v))])
+    }
+    async fn run(host: &CfHost, body: Vec<Node>) -> Result<FlowOutcome> {
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body,
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        execute_flow(&store, host, "s", &ast, &mut sink).await
+    }
+
+    #[tokio::test]
+    async fn match_runs_first_equal_case_then_default_then_errors() {
+        // subject "b" runs case "b".
+        let host = CfHost::new();
+        let body = vec![Node::Match {
+            subject: Box::new(flow_lit(json!("b"))),
+            cases: vec![
+                MatchCase {
+                    value: flow_lit(json!("a")),
+                    body: vec![echo("A")],
+                },
+                MatchCase {
+                    value: flow_lit(json!("b")),
+                    body: vec![echo("B")],
+                },
+            ],
+            default: vec![echo("D")],
+        }];
+        run(&host, body).await.unwrap();
+        assert_eq!(host.marks(), vec!["B"], "the equal case runs, nothing else");
+
+        // unmatched subject falls to default.
+        let host = CfHost::new();
+        let body = vec![Node::Match {
+            subject: Box::new(flow_lit(json!("z"))),
+            cases: vec![MatchCase {
+                value: flow_lit(json!("a")),
+                body: vec![echo("A")],
+            }],
+            default: vec![echo("D")],
+        }];
+        run(&host, body).await.unwrap();
+        assert_eq!(host.marks(), vec!["D"], "no case matched → default");
+
+        // unmatched with no default is an error (the exhaustiveness guard-rail).
+        let host = CfHost::new();
+        let body = vec![Node::Match {
+            subject: Box::new(flow_lit(json!("z"))),
+            cases: vec![MatchCase {
+                value: flow_lit(json!("a")),
+                body: vec![echo("A")],
+            }],
+            default: vec![],
+        }];
+        assert!(run(&host, body).await.is_err());
+        assert!(
+            host.marks().is_empty(),
+            "no branch ran on an unmatched match"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_selector_label_picks_the_declared_case() {
+        // selector pick("b") → "b" → case "b" runs.
+        let host = CfHost::new();
+        let body = vec![Node::Route {
+            selector: Box::new(call("pick", vec![flow_lit(json!("b"))])),
+            cases: vec![
+                RouteCase {
+                    label: "a".into(),
+                    body: vec![echo("A")],
+                },
+                RouteCase {
+                    label: "b".into(),
+                    body: vec![echo("B")],
+                },
+            ],
+            default: vec![],
+        }];
+        run(&host, body).await.unwrap();
+        assert_eq!(host.marks(), vec!["pick=b", "B"]);
+
+        // a label matching no case with no default is an error.
+        let host = CfHost::new();
+        let body = vec![Node::Route {
+            selector: Box::new(call("pick", vec![flow_lit(json!("zzz"))])),
+            cases: vec![RouteCase {
+                label: "a".into(),
+                body: vec![echo("A")],
+            }],
+            default: vec![],
+        }];
+        assert!(run(&host, body).await.is_err());
+        assert_eq!(host.marks(), vec!["pick=zzz"], "no case body ran");
+    }
+
+    #[tokio::test]
+    async fn fallback_takes_the_first_success_else_propagates() {
+        // first branch errors (boom), second succeeds (echo) → second wins.
+        let host = CfHost::new();
+        let body = vec![Node::Fallback {
+            branches: vec![
+                FallbackBranch {
+                    body: vec![call("boom", vec![])],
+                },
+                FallbackBranch {
+                    body: vec![echo("ok")],
+                },
+            ],
+            bind: Some(SymbolName("out".into())),
+        }];
+        run(&host, body).await.unwrap();
+        assert_eq!(host.marks(), vec!["boom", "ok"]);
+
+        // every branch errors → the last error propagates.
+        let host = CfHost::new();
+        let body = vec![Node::Fallback {
+            branches: vec![
+                FallbackBranch {
+                    body: vec![call("boom", vec![])],
+                },
+                FallbackBranch {
+                    body: vec![call("boom", vec![])],
+                },
+            ],
+            bind: None,
+        }];
+        assert!(run(&host, body).await.is_err());
+        assert_eq!(host.marks(), vec!["boom", "boom"]);
+    }
+
+    #[tokio::test]
+    async fn timeout_bounds_the_wall_clock() {
+        // fast body finishes inside the deadline; its dispatch is threaded into the real step count
+        // and transcript (not a discarded local) so an enclosing `budget`/audit sees the work.
+        let host = CfHost::new();
+        let body = vec![Node::Timeout {
+            ms: 1000,
+            body: vec![echo("a"), echo("b")],
+            bind: None,
+        }];
+        let out = run(&host, body).await.unwrap();
+        assert_eq!(host.marks(), vec!["a", "b"]);
+        assert_eq!(out.steps, 2, "timeout body's dispatches count toward steps");
+        assert!(
+            out.transcript.contains("echo"),
+            "body work is in the transcript"
+        );
+
+        // a body slower than the deadline errors.
+        let host = CfHost::new();
+        let body = vec![Node::Timeout {
+            ms: 20,
+            body: vec![call("slow", vec![])],
+            bind: None,
+        }];
+        assert!(run(&host, body).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn budget_caps_dispatches_at_statement_boundaries() {
+        // limit 5 comfortably fits two dispatches.
+        let host = CfHost::new();
+        let body = vec![Node::Budget {
+            limit: 5,
+            body: vec![echo("one"), echo("two")],
+            bind: None,
+        }];
+        run(&host, body).await.unwrap();
+        assert_eq!(host.marks(), vec!["one", "two"]);
+
+        // limit 1 allows the first statement, then rejects the second before it dispatches.
+        let host = CfHost::new();
+        let body = vec![Node::Budget {
+            limit: 1,
+            body: vec![echo("one"), echo("two")],
+            bind: None,
+        }];
+        assert!(run(&host, body).await.is_err());
+        assert_eq!(
+            host.marks(),
+            vec!["one"],
+            "the over-budget statement never ran"
+        );
     }
 
     #[test]

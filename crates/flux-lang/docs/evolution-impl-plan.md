@@ -130,14 +130,22 @@ review, then commits; `STATUS.md` rows flip as each lands.
 - Tests: suspend (outcome set, `Awaiting` emitted, no later side-effects), resume (continues from cursor,
   earlier side-effects NOT re-run), flux-flow cross-turn REPL path, analyzer nested-await rejection.
 
-### P6b — Tier-1 control-flow primitives (5 nodes, design §5.1)
-- Adopt `match` (exhaustive multi-way), `route` (`!model` selector, fixed analyzer-validated cases),
-  `fallback` (first-success), `timeout` (wall-clock bound), `budget` (cost cap; **v1 = model-call/node
-  count**, token/money later). **Defer Tier-2** (`checkpoint`/`compensate`/`once`/`scope`).
-- Each node threads the full add-a-node checklist (`ast`/`runtime`/`analyze`/`render`/`format`/`parse`/
-  flux-flow `walk_node`/`optimize`) + SSOT regen. `route` stays L0-pure (selector is an op `Call`; runtime
-  matches the returned label to a fixed case). Separable → worktree agents, cherry-pick, reconcile SSOT once.
-- Tests: per-node interpreter + analyzer + text round-trip; node-kind catalog drift green.
+### P6b — Tier-1 control-flow primitives (5 nodes, design §5.1) — ✅ DONE
+- **Shipped:** `match` (exhaustive multi-way; subject = literal/symbol, JSON-equality), `route` (`!model`
+  selector op → label → fixed analyzer-validated case; L0-pure), `fallback` (first-non-empty-success),
+  `timeout` (wall-clock bound; sink buffered, real steps/transcript threaded so pre-deadline work stays
+  counted+audited), `budget` (dispatch cap, checked at statement boundaries). **Tier-2 deferred**.
+- Threaded the full add-a-node checklist (`ast` +5 variants +3 case structs / `runtime` exec+node_kind /
+  `analyze` for_each_node+check_node+node_contains_return+type_check / `render` head+expr+children /
+  flux-flow `walk_node`) + SSOT regen (36 node kinds). `optimize.rs` needed **no change** (the 5 are
+  sequential barriers, never `readonly_bind`s). format/parse round-trip via the `@json` escape.
+- Implemented in one coherent pass (the 5 share every exhaustive-match site, so parallel worktrees would
+  conflict). Adversarial review fixed: match-subject must be a value (was analyze-pass/runtime-fail);
+  timeout step/transcript accounting on a completed-then-timed-out body; fallback `≥1 branch` guard.
+- Tests: per-node interpreter (`runtime.rs`), analyzer guard-rails (`analyze.rs`), text round-trip
+  (`tests/text_roundtrip.rs`); node-kind catalog drift green.
+- **Note for native grammar:** `parse.rs` already uses a `budget` keyword for `ctx`'s char-budget; resolve
+  the collision before adding native (non-`@json`) syntax for `Node::Budget`.
 
 ### P6c — polish to truly-done
 - `fluxlang compile` subcommand (text → JSON AST, mirrors `Render`).

@@ -561,6 +561,68 @@ pub enum Node {
         #[serde(default)]
         add: Vec<SymbolName>,
     },
+
+    /// Multi-way **exhaustive** branch: evaluate `subject` (a literal or bound symbol), then run the
+    /// body of the first `case` whose `value` equals it — by JSON equality, so a *string* subject does
+    /// not equal a *numeric* literal. If none match, run `default`. A deterministic replacement for
+    /// chains of `when`. To branch on an op's result, bind it first (`$s = call(); match $s {…}`) or
+    /// use `route`. The analyzer requires at least one case; at runtime an unmatched subject with no
+    /// `default` is an error — the exhaustiveness guard-rail.
+    Match {
+        subject: Box<Node>,
+        #[serde(default)]
+        cases: Vec<MatchCase>,
+        #[serde(default)]
+        default: Vec<Node>,
+    },
+
+    /// Model-routed branch — the signature *bounded non-determinism* primitive. Run `selector`
+    /// (typically a `!model` op) to produce a label, then run the `case` whose `label` it names. The
+    /// cases are fixed and analyzer-validated: the model chooses *which* declared branch runs, never
+    /// *what*. Falls back to `default` when the label matches no case (an error if `default` is empty).
+    Route {
+        selector: Box<Node>,
+        #[serde(default)]
+        cases: Vec<RouteCase>,
+        #[serde(default)]
+        default: Vec<Node>,
+    },
+
+    /// Ordered "first that succeeds wins" selector: run each branch in `branches` in turn; the first
+    /// that completes without error and yields a non-empty result wins and becomes the node's result.
+    /// On a branch error (or empty result) the next is tried — so a *side-effecting* branch that
+    /// returns empty will still fall through and the next branch also runs (attempts stream live, as
+    /// in `try`/`retry`). If every branch errors, the last error propagates. Lighter than `try` for
+    /// graceful degradation (cheap path → else expensive path). `bind` names the winning result.
+    Fallback {
+        #[serde(default)]
+        branches: Vec<FallbackBranch>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bind: Option<SymbolName>,
+    },
+
+    /// Bound the wall-clock of a sub-flow: run `body` with a `ms` deadline. If it does not finish in
+    /// time the node errors (an enclosing `try`/`retry` may catch it). A general reliability
+    /// guard-rail you can wrap around anything. `bind` names the body's result.
+    Timeout {
+        ms: u64,
+        #[serde(default)]
+        body: Vec<Node>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bind: Option<SymbolName>,
+    },
+
+    /// Cap the cost of a scope: run `body` but allow at most `limit` op dispatches within it (checked
+    /// at statement boundaries — the body stops before a statement that would exceed the cap, and the
+    /// node errors). A first-class cost guard-rail; v1 counts dispatches (token/money budgets are a
+    /// later refinement). `bind` names the body's result.
+    Budget {
+        limit: u32,
+        #[serde(default)]
+        body: Vec<Node>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bind: Option<SymbolName>,
+    },
 }
 
 /// One branch of a [`Node::Parallel`] fan-out: a named sub-flow whose final result is bound to
@@ -569,6 +631,29 @@ pub enum Node {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Branch {
     pub name: SymbolName,
+    #[serde(default)]
+    pub body: Vec<Node>,
+}
+
+/// One arm of a [`Node::Match`]: run `body` when the subject equals `value` (by JSON equality).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct MatchCase {
+    pub value: Node,
+    #[serde(default)]
+    pub body: Vec<Node>,
+}
+
+/// One arm of a [`Node::Route`]: run `body` when the selector yields the string `label`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RouteCase {
+    pub label: String,
+    #[serde(default)]
+    pub body: Vec<Node>,
+}
+
+/// One branch of a [`Node::Fallback`]: a body tried in declared order until one succeeds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct FallbackBranch {
     #[serde(default)]
     pub body: Vec<Node>,
 }

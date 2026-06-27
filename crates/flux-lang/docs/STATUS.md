@@ -9,7 +9,7 @@ update it in the same commit as the behaviour it describes.
 [`docs/designs/flux-lang-evolution.md`](../../../docs/designs/flux-lang-evolution.md)).
 
 > Note: the implementation has intentionally grown **beyond** the PRD's "deliberately small" v1 node set
-> (PRD §4/§8 list ~7 constructs; `ast.rs` ships **31**). That is a superset, not a regression.
+> (PRD §4/§8 list ~7 constructs; `ast.rs` ships **36**). That is a superset, not a regression.
 
 ## Evolution build status (P0–P5 + flux-app)
 
@@ -27,7 +27,9 @@ The forward design ([`flux-lang-evolution.md`](../../../docs/designs/flux-lang-e
 | **flux-app** | L6 runtime host (event bus, triggers, journeys, orchestration ops) + `flux run app.flux` (safe-by-default) | ✅ |
 | **P5a** | text syntax (`parse.rs`/`format.rs`, marker syntax, round-trip) | ✅ |
 | **P5b** | optimizer (parallelize independent reads) + `PhysicalPlan` execution | ✅ |
-| — | control-flow primitives (§5.1, proposed); `ask` reply-correlation (flux-app MVP) | ⬜ (optional) |
+| **P6b** | Tier-1 control-flow primitives (`match`/`route`/`fallback`/`timeout`/`budget`) | ✅ |
+| — | P6a `await` cross-turn suspend/resume; P6c polish (compact format, thing resolver, focus aliases) | 🚧 |
+| — | Tier-2 control-flow (`checkpoint`/`compensate`/`once`/`scope`); `ask` reply-correlation (flux-app MVP) | ⬜ (optional) |
 
 Each landed phase shipped behind the full dev loop (build/test/clippy/fmt/codegate) and an adversarial
 review pass (findings fixed before commit).
@@ -36,7 +38,7 @@ review pass (findings fixed before commit).
 
 | PRD § | Requirement | Status | Evidence / note |
 |---|---|---|---|
-| 8, 10.1 | Draft AST + core node kinds (`flow`/bind/call/thing/branch/repeat/await/return/effect) | ✅ | `src/ast.rs` — 31 `Node` kinds |
+| 8, 10.1 | Draft AST + core node kinds (`flow`/bind/call/thing/branch/repeat/await/return/effect) | ✅ | `src/ast.rs` — 36 `Node` kinds |
 | 8 | Constructs beyond v1 (`each`/`parallel`/`race`/`try`/`retry`/`confirm`/`loop`/`throttle`/…) | ✅ | `src/ast.rs`, `src/runtime.rs` |
 | 8 | `await` pause/resume | 🟡 | node exists; interpreter rejects it (cross-turn suspend unbuilt) |
 | 1, 8 | Compact **text parser** (text → AST) | ✅ | `src/parse.rs` + `src/format.rs`; `parse(format(ast)) == ast` (native subset + `@json` fallback; round-trip + real-example tests) |

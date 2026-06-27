@@ -150,6 +150,31 @@ fn children(node: &Node) -> Vec<Branch<'_>> {
         Node::Throttle { body, .. } => body.iter().map(Branch::Node).collect(),
         Node::Debounce { body, .. } => body.iter().map(Branch::Node).collect(),
         Node::Unless { body, .. } => body.iter().map(Branch::Node).collect(),
+        Node::Match { cases, default, .. } => {
+            let mut v: Vec<Branch> = cases
+                .iter()
+                .flat_map(|c| c.body.iter().map(Branch::Node))
+                .collect();
+            v.extend(default.iter().map(Branch::Node));
+            v
+        }
+        Node::Route { cases, default, .. } => {
+            let mut v: Vec<Branch> = cases
+                .iter()
+                .map(|c| Branch::Group(c.label.as_str(), &c.body))
+                .collect();
+            if !default.is_empty() {
+                v.push(Branch::Else(default));
+            }
+            v
+        }
+        Node::Fallback { branches, .. } => branches
+            .iter()
+            .flat_map(|b| b.body.iter().map(Branch::Node))
+            .collect(),
+        Node::Timeout { body, .. } | Node::Budget { body, .. } => {
+            body.iter().map(Branch::Node).collect()
+        }
         Node::Verify { .. } => Vec::new(),
         Node::Peek { .. } => Vec::new(),
         Node::Expr { .. } | Node::Fmt { .. } | Node::Jq { .. } => Vec::new(),
@@ -329,6 +354,24 @@ fn head(node: &Node, p: &Palette) -> String {
             None => format!("{} {}", paint(p.keyword, "ctx"), sym(p, &name.0)),
         },
         Node::CtxAppend { ctx, .. } => format!("{} += …", sym(p, &ctx.0)),
+        Node::Match { subject, .. } => {
+            format!("{} {}", paint(p.keyword, "match"), expr(subject, p))
+        }
+        Node::Route { selector, .. } => {
+            format!("{} {}", paint(p.keyword, "route"), expr(selector, p))
+        }
+        Node::Fallback { bind, .. } => match bind {
+            Some(b) => format!("{} -> {}", paint(p.keyword, "fallback"), sym(p, &b.0)),
+            None => paint(p.keyword, "fallback"),
+        },
+        Node::Timeout { ms, bind, .. } => match bind {
+            Some(b) => format!("{} {ms}ms -> {}", paint(p.keyword, "timeout"), sym(p, &b.0)),
+            None => format!("{} {ms}ms", paint(p.keyword, "timeout")),
+        },
+        Node::Budget { limit, bind, .. } => match bind {
+            Some(b) => format!("{} {limit} -> {}", paint(p.keyword, "budget"), sym(p, &b.0)),
+            None => format!("{} {limit}", paint(p.keyword, "budget")),
+        },
     }
 }
 
@@ -368,7 +411,12 @@ fn expr(node: &Node, p: &Palette) -> String {
         | Node::Jq { .. }
         | Node::Parse { .. }
         | Node::Ctx { .. }
-        | Node::CtxAppend { .. } => "…".to_string(),
+        | Node::CtxAppend { .. }
+        | Node::Match { .. }
+        | Node::Route { .. }
+        | Node::Fallback { .. }
+        | Node::Timeout { .. }
+        | Node::Budget { .. } => "…".to_string(),
     }
 }
 

@@ -319,6 +319,35 @@ fn walk_node<'a>(node: &'a Node, f: &mut impl FnMut(&'a str, &'a [Node])) {
         }
         Node::Fmt { .. } => {}
         Node::Jq { input, .. } => walk_node(input, f),
+        Node::Match {
+            subject,
+            cases,
+            default,
+        } => {
+            walk_node(subject, f);
+            for c in cases {
+                walk_node(&c.value, f);
+                walk_calls(&c.body, f);
+            }
+            walk_calls(default, f);
+        }
+        Node::Route {
+            selector,
+            cases,
+            default,
+        } => {
+            walk_node(selector, f);
+            for c in cases {
+                walk_calls(&c.body, f);
+            }
+            walk_calls(default, f);
+        }
+        Node::Fallback { branches, .. } => {
+            for b in branches {
+                walk_calls(&b.body, f);
+            }
+        }
+        Node::Timeout { body, .. } | Node::Budget { body, .. } => walk_calls(body, f),
         Node::Var { .. }
         | Node::Lit { .. }
         | Node::Thing { .. }
