@@ -25,7 +25,7 @@ The forward design ([`flux-lang-evolution.md`](../../../docs/designs/flux-lang-e
 | **P4** | typed HIR (`analyze::lower`: effect gathering + call arity) | 🟡 (type inference deferred) |
 | **P5c** | multi-agent `Program` layer (`program.rs` + module loader) | ✅ |
 | **flux-app** | L6 runtime host (event bus, triggers, journeys, orchestration ops) + `flux run app.flux` (safe-by-default) | ✅ |
-| **P5a** | text syntax (`parse.rs`/`format.rs`, marker syntax, round-trip) | 🟡 in progress |
+| **P5a** | text syntax (`parse.rs`/`format.rs`, marker syntax, round-trip) | ✅ |
 | **P5b** | optimizer + `PhysicalPlan` execution | ⬜ (needs node-id plan lowering) |
 | — | full type inference; control-flow primitives (§5.1); `ask` reply-correlation | ⬜ |
 
@@ -39,7 +39,7 @@ review pass (findings fixed before commit).
 | 8, 10.1 | Draft AST + core node kinds (`flow`/bind/call/thing/branch/repeat/await/return/effect) | ✅ | `src/ast.rs` — 31 `Node` kinds |
 | 8 | Constructs beyond v1 (`each`/`parallel`/`race`/`try`/`retry`/`confirm`/`loop`/`throttle`/…) | ✅ | `src/ast.rs`, `src/runtime.rs` |
 | 8 | `await` pause/resume | 🟡 | node exists; interpreter rejects it (cross-turn suspend unbuilt) |
-| 1, 8 | Compact **text parser** (text → AST, auto-detect forms) | ⬜ | `parse.rs`/`format.rs` are a "Toolchain plan" in `syntax.md` |
+| 1, 8 | Compact **text parser** (text → AST) | ✅ | `src/parse.rs` + `src/format.rs`; `parse(format(ast)) == ast` (native subset + `@json` fallback; round-trip + real-example tests) |
 | 8, 16 | Pretty-printer / renderer (AST → readable) | ✅ | `src/render.rs` (one-way) — round-trip blocked on the parser |
 | 20.1 | AST serializable + versioned (JSON wire) | ✅ | serde on `ast.rs`; `examples/*.flux` are JSON |
 
@@ -112,8 +112,8 @@ review pass (findings fixed before commit).
 
 | Item | Status |
 |---|---|
-| 1. Two writable display modes (human + token-efficient) | ⬜ (grammar designed; parser deferred) |
-| 2. `fluxlang compile` (text → AST, auto-detect) | ⬜ |
+| 1. Two writable display modes (human + token-efficient) | 🟡 (canonical text form built — `format`/`parse`; a token-efficient variant later) |
+| 2. `fluxlang compile` (text → AST) | 🟡 (`parse` built; the `fluxlang` CLI subcommand can surface it) |
 | 3. Richer `analyze` (type + effect checking → typed HIR) | 🟡 |
 | 4. Op-input JSON Schema from `OpSpec` | ✅ (P0; `opspec.rs`) |
 
@@ -125,7 +125,7 @@ review pass (findings fixed before commit).
 | First-class context packs (`ctx`/`ctx_append`; budget enforced at **node evaluation**, eager, char heuristic, priority-prefix shrink) | ✅ | `src/ast.rs`, `src/runtime.rs` (`build_ctx`/`append_ctx`) |
 | Needs & gaps — **two pure ops** (`need`/`gaps`, not nodes) | ✅ | `flux-tools/src/cognition.rs` |
 | Cognition op-pack + domain-wrapper convention | ✅ | pure: `flux-tools/src/cognition.rs`; model-backed: `flux-cognition` (L3) |
-| `=`/`do`/`+=` marker syntax; optional `goal` header | ⬜ | evolution §5 (P5 text parser) |
+| `=`/`do`/`+=` marker syntax | ✅ | `src/parse.rs`/`src/format.rs` (`goal` header tolerated; not in the AST/round-trip) |
 | Multi-agent `Program` layer (agents/channels/triggers/journeys) | ✅ | `flux-lang/src/program.rs` (L0 decls + module loader) |
 | `flux-app` L6 runtime host — event bus, triggers, journeys, orchestration ops (`emit`/`send`/`spawn`; `ask` MVP), `flux run app.flux` | ✅ | `crates/flux-app/` + `flux-cli` `run_app_cmd`. **Safe default: destructive ops denied** (orchestration + read pre-allowed); `--yes` opts into allow-all |
 | Real `flux-sdk` lifecycle surface (`OpRegistry`/packs/prelude + `FlowClient` + artifact APIs) | ✅ | `flux-sdk/src/flow.rs`; cognition pack wired into the CLI registry too (`flux-cli` `build_agent`) |

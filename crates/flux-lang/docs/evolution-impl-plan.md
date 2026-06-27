@@ -102,6 +102,7 @@ change.
   expressions remains.
 
 ## P5 — parallel tracks (prioritize later)
+- **P5a — ✅ DONE.** Text syntax (`src/parse.rs` + `src/format.rs`): canonical compact form, `=`/`do`/`+=` markers, indentation blocks, `ctx`/`ctx_append` native; `@json` fallback for the rest; `parse(format(ast)) == ast` for every DraftAst (round-trip + real-example tests).
 - Text display modes + `parse.rs`/`format.rs` (PRD items 1–2): `=`/`do`/`+=` markers, `ctx`/`need`/
   `query` blocks, optional `goal` header; round-trip `parse(format(ast)) == ast`. **⬜ remaining.**
 - Optimizer + `PhysicalPlan` execution (PRD §15). **⬜ remaining (needs node-id'd plan lowering).**
