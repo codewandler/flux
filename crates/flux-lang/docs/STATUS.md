@@ -22,12 +22,12 @@ The forward design ([`flux-lang-evolution.md`](../../../docs/designs/flux-lang-e
 | **P1b** | cognition op-pack — pure (`flux-tools`) + model-backed (`flux-cognition` L3); **wired into the live CLI + SDK** | ✅ |
 | **P2** | `ctx`/`ctx_append` nodes + budget-at-node-eval (priority-prefix shrink) | ✅ |
 | **P3** | `flux-sdk` lifecycle surface (`FlowClient` + register packs/prelude) | ✅ |
-| **P4** | typed HIR (`analyze::lower`: effect gathering + call arity) | 🟡 (type inference deferred) |
+| **P4** | typed HIR (`analyze::lower`: effects + call arity + **arg type-checking**) | ✅ |
 | **P5c** | multi-agent `Program` layer (`program.rs` + module loader) | ✅ |
 | **flux-app** | L6 runtime host (event bus, triggers, journeys, orchestration ops) + `flux run app.flux` (safe-by-default) | ✅ |
 | **P5a** | text syntax (`parse.rs`/`format.rs`, marker syntax, round-trip) | ✅ |
 | **P5b** | optimizer (parallelize independent reads) + `PhysicalPlan` execution | ✅ |
-| — | full type inference; control-flow primitives (§5.1); `ask` reply-correlation | 🟡 (type inference next) |
+| — | control-flow primitives (§5.1, proposed); `ask` reply-correlation (flux-app MVP) | ⬜ (optional) |
 
 Each landed phase shipped behind the full dev loop (build/test/clippy/fmt/codegate) and an adversarial
 review pass (findings fixed before commit).
@@ -49,7 +49,7 @@ review pass (findings fixed before commit).
 |---|---|---|---|
 | 10.2, 20.1 | Name resolution + unknown-op rejection | ✅ | `src/analyze.rs` |
 | 8 | Bounded-loop checking | ✅ | `src/analyze.rs` |
-| 10.2 | **Type checking** + `DraftAst → HirFlow` lowering | 🟡 | `analyze::lower` produces a real `HirFlow` (validated body + **gathered effects** + **call arity**); full type inference over expressions still deferred |
+| 10.2 | **Type checking** + `DraftAst → HirFlow` lowering | ✅ (P4) | `analyze::lower`: validated body + **gathered effects** + **call arity** + **argument type-checking** against op param types (lenient on Any/Named) |
 | 12 | Effect gathering | ✅ | `src/effects.rs`; effects collected on `HirFlow` |
 | 10.3, 15 | **Optimizer** (parallelize independent reads) + `PhysicalPlan` execution | ✅ (P5b) | `src/optimize.rs` (read-only batching + fences) + `runtime::execute_plan`; `flux-sdk` `optimize`/`execute_optimized` |
 
@@ -88,7 +88,7 @@ review pass (findings fixed before commit).
 | PRD § | Requirement | Status | Evidence / note |
 |---|---|---|---|
 | 17.1 | `compile_turn(text, view, registry, llm) -> DraftAst` | ✅ | surfaced via `flux-sdk` `FlowClient::compile` (delegates to `flux-flow/src/compile.rs`) |
-| 17.2 | `analyze(ast, session, registry, policy) -> HirFlow` | 🟡 → ✅ | `analyze::lower` produces a typed `HirFlow` (effects + arity; full type inference later); `FlowClient::analyze` |
+| 17.2 | `analyze(ast, session, registry, policy) -> HirFlow` | ✅ | `analyze::lower`: effects + arity + **arg type-checking**; `FlowClient::analyze`/`optimize` |
 | 17.3 | `optimize(hir) -> PhysicalPlan` | ✅ (P5b) | `flux-sdk` `FlowClient::optimize` → `flux_lang::optimize` |
 | 17.4 | `execute(plan, session, runtime) -> ExecutionResult` | ✅ | `FlowClient::execute` over `execute_flow` |
 | 17.5 | `register_op` / `register_pack` / `register_prelude` | ✅ | `flux-sdk` `flow` module |
@@ -114,7 +114,7 @@ review pass (findings fixed before commit).
 |---|---|
 | 1. Two writable display modes (human + token-efficient) | 🟡 (canonical text form built — `format`/`parse`; a token-efficient variant later) |
 | 2. `fluxlang compile` (text → AST) | 🟡 (`parse` built; the `fluxlang` CLI subcommand can surface it) |
-| 3. Richer `analyze` (type + effect checking → typed HIR) | 🟡 |
+| 3. Richer `analyze` (type + effect checking → typed HIR) | ✅ |
 | 4. Op-input JSON Schema from `OpSpec` | ✅ (P0; `opspec.rs`) |
 
 ## Beyond the PRD — this design's additions (➕)
