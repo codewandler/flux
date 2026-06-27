@@ -518,6 +518,23 @@ async fn build_agent(cli: &Cli) -> Result<(FlowEngine, String, Arc<dyn flux_runt
     }
     registry.register(Arc::new(TaskTool));
 
+    // Model-backed cognition ops (ai.extract/rank/judge/reason, synth, ai.rewrite): the L3
+    // CognitionPack, advertised on the real CLI path so a plan can call the model as a typed op.
+    // `CognitionPack` needs an `Arc<dyn Provider>`, but `provider` is moved into the `FlowEngine`
+    // below, so build a sibling provider instance from the same spec for the pack to own (for
+    // `mock` this is a fresh, hermetic `MockCliProvider`). If the sibling can't be built we skip the
+    // pack rather than fail startup — the rest of the agent is unaffected.
+    match provider_for(&model_spec) {
+        Ok(cog_provider) => {
+            flux_cognition::CognitionPack::new(Arc::from(cog_provider), model.clone())
+                .register(&mut registry);
+        }
+        Err(e) => eprintln!(
+            "{}",
+            style::dim(&format!("(cognition pack not wired: {e})"))
+        ),
+    }
+
     // Eval / self-improvement ops (the ones the improve flows orchestrate). Registered on the
     // top-level registry only — never on `sub_registry`, so worker sub-agents can't run eval/git ops.
     flux_eval::register_eval_ops(&mut registry);

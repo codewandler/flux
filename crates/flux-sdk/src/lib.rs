@@ -14,6 +14,10 @@
 //! # Ok(()) }
 //! ```
 
+pub mod flow;
+
+pub use flow::{assemble_registry, ExecutionResult, FlowClient, FlowClientBuilder};
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
