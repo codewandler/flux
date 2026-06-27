@@ -1,0 +1,14 @@
+[package]
+name = "flux-events"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "flux unified append-only event store: one ordered log projected into conversations, run traces, and turn metrics (SQLite/WAL)"
+
+[dependencies]
+flux-core.workspace = true
+flux-lang.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+ulid.workspace = true

@@ -805,6 +805,18 @@ pub enum RunEvent {
         dropped: Vec<String>,
         budget: u64,
     },
+    /// The planner failed to parse or validate the model's raw output as a plan. `error` is the
+    /// parse/analyze diagnostic — the s_159 failure class, now persistable for post-mortem inspection.
+    CompileError {
+        step: u32,
+        error: String,
+    },
+    /// The planner accepted a valid plan from the model at `step`. `ops` is the count of
+    /// top-level body nodes, used as a rough size signal in the run trace.
+    PlanAccepted {
+        step: u32,
+        ops: usize,
+    },
 }
 
 #[cfg(test)]

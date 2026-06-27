@@ -25,8 +25,8 @@ use tokio_util::sync::CancellationToken;
 
 use flux_agent::AgentSink;
 
-use crate::Shared;
 use super::Collect;
+use crate::Shared;
 
 // ── Agent Card ────────────────────────────────────────────────────────────────
 
@@ -169,7 +169,7 @@ async fn send(engine: Shared, id: Option<Value>, params: Option<Value>) -> Json<
         Some(t) => t,
         None => return rpc_err(id, -32602, "No text found in message parts"),
     };
-    let session_id = match engine.store.create_session(&engine.model) {
+    let session_id = match engine.events.create_session(&engine.model) {
         Ok(s) => s,
         Err(e) => return rpc_err(id, -32603, format!("Session error: {e}")),
     };
@@ -200,7 +200,7 @@ async fn subscribe(
     // cleanup pass (e.g. `DELETE FROM sessions WHERE created_at_ms < now - 3_600_000`) on a
     // background timer in `serve_on`, or expire them inside `SessionStore::create_session`.
     let session_id = engine
-        .store
+        .events
         .create_session(&engine.model)
         .map_err(|e| e.to_string())?;
 
@@ -272,7 +272,12 @@ impl AgentSink for StreamSink {
         // event. Sending `self.acc.clone()` on every token is O(N²) in response length.
         if self
             .tx
-            .send(sse_update(&self.task_id, "working", Some(agent_message(t)), false))
+            .send(sse_update(
+                &self.task_id,
+                "working",
+                Some(agent_message(t)),
+                false,
+            ))
             .is_err()
         {
             // Receiver gone — client disconnected; stop doing work as soon as possible.

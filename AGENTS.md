@@ -36,7 +36,7 @@ Crates are stratified into layers (0 = innermost contracts, 6 = outermost surfac
 |---|---|---|
 | **L0 contracts** (pure, no IO¹) | `flux-core` `flux-policy` `flux-secret` `flux-spec` `flux-config` `flux-evidence` `flux-skill` `flux-lang` | types, authorization, secrets, tool specs, config, evidence, skills, the Flux-Lang language + reference interpreter |
 | **L1 providers** | `flux-provider` `flux-credentials` `flux-anthropic` `flux-openai` | the `Provider` abstraction + clients + credential store |
-| **L2 runtime** | `flux-system` `flux-runtime` `flux-tools` `flux-session` `flux-context` | guarded IO, the safety envelope, built-in tools, sessions, context |
+| **L2 runtime** | `flux-system` `flux-runtime` `flux-tools` `flux-events` `flux-context` | guarded IO, the safety envelope, built-in tools, the event store, context |
 | **L3 agent** | `flux-agent` `flux-orchestrate` `flux-flow` `flux-eval` `flux-cognition` | the agent loop + multi-agent orchestration + the Flux-Lang engine + the eval harness + the model-op cognition pack |
 | **L4 extensibility** | `flux-hooks` `flux-plugin` | JS hooks + subprocess plugins |
 | **L5 capabilities** | `flux-browser` `flux-datasource` `flux-auth` | web, datasource/RAG, caller identity |

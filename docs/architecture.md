@@ -21,7 +21,7 @@ the *surfaces* (CLI/TUI/server/SDK).
 |---|---|---|
 | **L0 contracts** (pure) | `flux-core` `flux-policy` `flux-secret` `flux-spec` `flux-config` `flux-evidence` `flux-skill` `flux-lang` | types, authorization, secrets, tool specs, config, evidence, skills, the Flux-Lang language + reference interpreter (effects injected via traits) |
 | **L1 providers** | `flux-provider` `flux-credentials` `flux-anthropic` `flux-openai` | the `Provider` abstraction + clients + credential store |
-| **L2 runtime** | `flux-system` `flux-runtime` `flux-tools` `flux-session` `flux-context` | guarded IO, the safety envelope, built-in tools, sessions, context |
+| **L2 runtime** | `flux-system` `flux-runtime` `flux-tools` `flux-events` `flux-context` | guarded IO, the safety envelope, built-in tools, the event store, context |
 | **L3 agent** | `flux-agent` `flux-orchestrate` `flux-flow` `flux-eval` `flux-cognition` | the agent loop + multi-agent orchestration + the Flux-Lang engine + the eval harness + the model-op cognition pack |
 | **L4 extensibility** | `flux-hooks` `flux-plugin` | JS hooks + subprocess plugins |
 | **L5 capabilities** | `flux-browser` `flux-datasource` `flux-auth` | web egress, datasource/RAG, caller identity |
@@ -96,8 +96,10 @@ A "provider" conflates two orthogonal axes, modeled separately and composed by `
   user-after-user sequence. The cancel, compaction, and max-iteration exit paths each append a final
   assistant/synthetic-result so the next turn isn't poisoned. (This is a recurring bug class — treat
   any new turn-termination path as suspect.)
-- **`flux-session`** is an event-sourced SQLite (WAL) log, resumable, with a transactional
-  `rewrite_messages` used by compaction.
+- **`flux-events`** is a unified append-only event store (SQLite/WAL): one ordered log holds
+  conversation messages, the flow run-trace, and per-turn telemetry. The "conversations view" is a
+  *projection* over the log (replay message-kind events), and compaction is an append-only `Compacted`
+  snapshot the projection resets to — history is never deleted. Turn events are just one event kind.
 - **`flux-context`** projects an ordered provider chain (system / files / skills / task) under token
   budgets; long sessions compact older turns into a synthetic summary.
 

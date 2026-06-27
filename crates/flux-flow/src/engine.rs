@@ -23,22 +23,22 @@ use tokio_util::sync::CancellationToken;
 
 use flux_agent::AgentSink;
 use flux_core::{Chunk, ContentBlock, Message, Result};
+use flux_events::EventStore;
 use flux_provider::{Provider, Request};
 use flux_runtime::Executor;
-use flux_session::SessionStore;
 
-use crate::ast::DraftAst;
+use crate::ast::{DraftAst, RunEvent};
 use crate::compile::{compile_turn, CompileOptions, TurnOutput};
 use crate::registry::OpRegistry;
 use crate::runtime::execute_flow;
 use crate::state::FlowStore;
 
-/// flux-flow's turn engine: a provider, the tool executor (safety envelope), the session message
-/// store, and flux-flow's own value/symbol/trace store.
+/// flux-flow's turn engine: a provider, the tool executor (safety envelope), the unified event store
+/// (conversation + run trace + turn telemetry), and flux-flow's own value/symbol/suspension store.
 pub struct FlowEngine {
     pub provider: Box<dyn Provider>,
     pub executor: Executor,
-    pub store: Arc<SessionStore>,
+    pub events: Arc<EventStore>,
     pub flow: FlowStore,
     pub model: String,
     pub system_prompt: String,
@@ -88,8 +88,13 @@ impl FlowEngine {
                 .await;
         }
 
-        self.store
-            .append_message(session_id, &Message::user_text(user_input))?;
+        self.events
+            .record_message(session_id, &Message::user_text(user_input))?;
+        // Non-fatal: a DB hiccup must never prevent a turn from running.
+        let turn_id = self
+            .events
+            .begin_turn(session_id, user_input, &self.model)
+            .unwrap_or(-1);
 
         // Agent identity + project context + any skills whose triggers match this turn — prepended to
         // the planner's own instructions inside `compile_turn`.
@@ -110,17 +115,28 @@ impl FlowEngine {
         // Working conversation: seeded from the clean persisted log, then extended *ephemerally* with
         // each plan's results so the model can iterate within one turn. Only ONE assistant summary is
         // persisted (below); the ephemeral rounds never touch the session log.
-        let mut working = self.store.load_messages(session_id)?;
+        let mut working = self.events.conversation(session_id)?;
         let mut answer: Option<String> = None;
         // Whether `answer` was already streamed to the sink during the loop (a chat turn or a plan's
         // closing reply). Terminal answers that were NOT streamed — a compile/provider failure or the
         // max-iterations fallback — are surfaced after the loop so a turn never ends silently.
         let mut shown = false;
+        // Telemetry: iteration counter (1-based) and the outcome tag written to `turn_log` at the end.
+        let mut iteration: u32 = 0;
+        let mut turn_outcome = "max_iter";
 
         for _ in 0..self.max_iterations {
             if cancel.is_cancelled() {
+                let _ = self.events.end_turn(
+                    session_id,
+                    turn_id,
+                    "cancelled",
+                    iteration,
+                    "(turn cancelled)",
+                );
                 return self.finish_turn(session_id, sink, "(turn cancelled)", true);
             }
+            iteration += 1;
             let view = self.flow.view(session_id)?;
             let view_ref = (!view.symbols.is_empty()).then_some(&view);
 
@@ -144,6 +160,22 @@ impl FlowEngine {
                 // the assistant's answer so the session shape stays valid — and shown to the user (below)
                 // so a provider failure (credit exhausted, auth, rate limit, transport) is never silent.
                 Err(e) => {
+                    let err_str = e.to_string();
+                    let _ = self.events.record_plan_attempt(
+                        session_id,
+                        turn_id,
+                        iteration,
+                        "compile_error",
+                        Some(err_str.as_str()),
+                    );
+                    let _ = self.events.record_run_event(
+                        session_id,
+                        &RunEvent::CompileError {
+                            step: iteration,
+                            error: err_str,
+                        },
+                    );
+                    turn_outcome = "compile_error";
                     answer = Some(format!("I couldn't produce a plan — {}", planner_error(&e)));
                     break;
                 }
@@ -151,12 +183,26 @@ impl FlowEngine {
 
             match out {
                 TurnOutput::Chat(text) => {
+                    let _ = self
+                        .events
+                        .record_plan_attempt(session_id, turn_id, iteration, "chat", None);
+                    turn_outcome = "chat";
                     sink.text_delta(&text);
                     shown = true;
                     answer = Some(text);
                     break;
                 }
                 TurnOutput::Plan(compiled) => {
+                    let _ = self
+                        .events
+                        .record_plan_attempt(session_id, turn_id, iteration, "accepted", None);
+                    let _ = self.events.record_run_event(
+                        session_id,
+                        &RunEvent::PlanAccepted {
+                            step: iteration,
+                            ops: compiled.ast.body.len(),
+                        },
+                    );
                     // Surface the compiled plan before running it — this is what executes, so the turn
                     // is auditable (and visibly the planner, not a free-form tool loop).
                     sink.observation(&self.plan_observation(&compiled.ast));
@@ -176,6 +222,7 @@ impl FlowEngine {
                                 )?;
                                 let hint = "(awaiting your input — reply to continue the flow)";
                                 sink.text_delta(hint);
+                                turn_outcome = "suspended";
                                 answer = Some(hint.to_string());
                                 shown = true;
                                 break;
@@ -212,6 +259,7 @@ impl FlowEngine {
                                 .await?;
                                 sink.text_delta(&summary);
                                 shown = true;
+                                turn_outcome = "plan";
                                 answer = Some(summary);
                                 break;
                             }
@@ -245,6 +293,9 @@ impl FlowEngine {
         if !shown {
             sink.text_delta(&answer);
         }
+        let _ = self
+            .events
+            .end_turn(session_id, turn_id, turn_outcome, iteration, &answer);
         self.finish_turn(session_id, sink, &answer, false)
     }
 
@@ -287,8 +338,8 @@ impl FlowEngine {
         user_input: &str,
         sink: &mut dyn AgentSink,
     ) -> Result<Option<DraftAst>> {
-        self.store
-            .append_message(session_id, &Message::user_text(user_input))?;
+        self.events
+            .record_message(session_id, &Message::user_text(user_input))?;
         let base_system = self.base_system_with_skills(user_input, sink);
         let ops = self.advertised_registry(Some(sink));
         let view = self.flow.view(session_id)?;
@@ -297,7 +348,7 @@ impl FlowEngine {
             max_tokens: self.max_tokens,
             ..CompileOptions::default()
         };
-        let conversation = self.store.load_messages(session_id)?;
+        let conversation = self.events.conversation(session_id)?;
         sink.planning(true);
         let out = compile_turn(
             &*self.provider,
@@ -320,7 +371,7 @@ impl FlowEngine {
             TurnOutput::Plan(compiled) => {
                 let rendered = crate::render::render_pretty(&compiled.ast);
                 sink.observation(&self.plan_observation(&compiled.ast));
-                self.store.append_message(
+                self.events.record_message(
                     session_id,
                     &Message::assistant(vec![ContentBlock::Text {
                         text: format!("Proposed plan:\n{rendered}"),
@@ -331,7 +382,7 @@ impl FlowEngine {
             }
             TurnOutput::Chat(text) => {
                 sink.text_delta(&text);
-                self.store.append_message(
+                self.events.record_message(
                     session_id,
                     &Message::assistant(vec![ContentBlock::Text { text }]),
                 )?;
@@ -434,7 +485,7 @@ impl FlowEngine {
             self.executor.observe(obs.clone());
             sink.observation(&obs);
         }
-        self.store.append_message(
+        self.events.record_message(
             session_id,
             &Message::assistant(vec![ContentBlock::Text {
                 text: answer.to_string(),
@@ -463,8 +514,8 @@ impl FlowEngine {
         node: flux_lang::ast::NodeId,
         sink: &mut dyn AgentSink,
     ) -> Result<()> {
-        self.store
-            .append_message(session_id, &Message::user_text(user_input))?;
+        self.events
+            .record_message(session_id, &Message::user_text(user_input))?;
         let input = flux_lang::ast::Value::String(user_input.to_string());
         let outcome = match crate::runtime::resume_flow(
             &self.flow,
@@ -517,7 +568,7 @@ impl FlowEngine {
         if self.compact_threshold_chars == 0 {
             return Ok(());
         }
-        let messages = self.store.load_messages(session_id)?;
+        let messages = self.events.conversation(session_id)?;
         if messages.len() < 4 {
             return Ok(());
         }
@@ -576,7 +627,7 @@ impl FlowEngine {
         ))];
         new_msgs.extend(recent.iter().cloned());
         let to = new_msgs.len();
-        self.store.rewrite_messages(session_id, &new_msgs)?;
+        self.events.record_compaction(session_id, &new_msgs)?;
 
         let obs = flux_evidence::Observation::new(
             "context.compacted",
@@ -750,20 +801,20 @@ mod tests {
         }
     }
 
-    fn engine_with(responses: VecDeque<Vec<Chunk>>, store: Arc<SessionStore>) -> FlowEngine {
+    fn engine_with(responses: VecDeque<Vec<Chunk>>, events: Arc<EventStore>) -> FlowEngine {
         engine_with_provider(
             Box::new(MockProvider {
                 responses: Mutex::new(responses),
             }),
-            store,
+            events,
         )
     }
 
-    fn engine_with_provider(provider: Box<dyn Provider>, store: Arc<SessionStore>) -> FlowEngine {
+    fn engine_with_provider(provider: Box<dyn Provider>, events: Arc<EventStore>) -> FlowEngine {
         let dir = std::env::temp_dir().join(format!(
             "flux-flow-engine-{}-{}",
             std::process::id(),
-            store.latest_session_id().ok().flatten().unwrap_or_default()
+            events.latest_session().ok().flatten().unwrap_or_default()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
@@ -778,8 +829,8 @@ mod tests {
         FlowEngine {
             provider,
             executor,
-            store,
-            flow: FlowStore::in_memory().unwrap(),
+            flow: FlowStore::in_memory_with_events(events.clone()).unwrap(),
+            events,
             model: "mock".into(),
             system_prompt: "test".into(),
             max_tokens: 1024,
@@ -793,7 +844,7 @@ mod tests {
 
     #[tokio::test]
     async fn engine_plans_executes_and_keeps_session_shape() {
-        let store = Arc::new(SessionStore::in_memory().unwrap());
+        let store = Arc::new(EventStore::in_memory().unwrap());
         let sid = store.create_session("mock").unwrap();
 
         // Round 1: the model emits a plan binding $greeting = echo("hi"). Round 2: it answers in prose.
@@ -822,7 +873,7 @@ mod tests {
         assert!(!engine.flow.events(&sid).unwrap().is_empty());
 
         // Session log is pure user/assistant-text alternation: user input, then ONE assistant summary.
-        let msgs = store.load_messages(&sid).unwrap();
+        let msgs = store.conversation(&sid).unwrap();
         assert_eq!(msgs.len(), 2, "user + one assistant summary");
         assert!(msgs.iter().all(|m| !m.content.is_empty()));
         assert_eq!(msgs[0].role, flux_core::Role::User);
@@ -837,7 +888,7 @@ mod tests {
 
     #[tokio::test]
     async fn plan_without_complete_loops_to_prose() {
-        let store = Arc::new(SessionStore::in_memory().unwrap());
+        let store = Arc::new(EventStore::in_memory().unwrap());
         let sid = store.create_session("mock").unwrap();
         let plan_ast = json!({
             "body": [{
@@ -853,7 +904,7 @@ mod tests {
         engine.run_turn(&sid, "echo hi", &mut sink).await.unwrap();
 
         assert_eq!(sink.tools, vec!["echo"], "the plan executed");
-        let msgs = store.load_messages(&sid).unwrap();
+        let msgs = store.conversation(&sid).unwrap();
         assert_eq!(msgs.len(), 2, "user + the prose answer");
         assert!(msgs[1].text().contains("Echoed hi."));
     }
@@ -863,7 +914,7 @@ mod tests {
     /// remainder) without re-running the prefix or recompiling.
     #[tokio::test]
     async fn await_suspends_a_turn_then_the_next_message_resumes_it() {
-        let store = Arc::new(SessionStore::in_memory().unwrap());
+        let store = Arc::new(EventStore::in_memory().unwrap());
         let sid = store.create_session("mock").unwrap();
 
         // Prefix echo, then await the user's name, then echo a greeting interpolating it.
@@ -918,7 +969,7 @@ mod tests {
 
     #[tokio::test]
     async fn plan_with_complete_renders_grounded_summary() {
-        let store = Arc::new(SessionStore::in_memory().unwrap());
+        let store = Arc::new(EventStore::in_memory().unwrap());
         let sid = store.create_session("mock").unwrap();
         let plan_ast = json!({
             "body": [{
@@ -939,7 +990,7 @@ mod tests {
         engine.run_turn(&sid, "echo hi", &mut sink).await.unwrap();
 
         assert_eq!(sink.tools, vec!["echo"], "the plan still executed");
-        let msgs = store.load_messages(&sid).unwrap();
+        let msgs = store.conversation(&sid).unwrap();
         assert_eq!(
             msgs.len(),
             2,
@@ -957,7 +1008,7 @@ mod tests {
 
     #[tokio::test]
     async fn text_only_turn_answers_in_prose() {
-        let store = Arc::new(SessionStore::in_memory().unwrap());
+        let store = Arc::new(EventStore::in_memory().unwrap());
         let sid = store.create_session("mock").unwrap();
         let responses = VecDeque::from(vec![prose("Here's the explanation.")]);
         let engine = engine_with(responses, store.clone());
@@ -966,7 +1017,7 @@ mod tests {
 
         assert!(sink.tools.is_empty(), "a chat turn runs no ops");
         assert!(sink.text.contains("explanation"));
-        let msgs = store.load_messages(&sid).unwrap();
+        let msgs = store.conversation(&sid).unwrap();
         assert_eq!(msgs.len(), 2);
         assert!(msgs.iter().all(|m| !m.content.is_empty()));
     }
@@ -975,7 +1026,7 @@ mod tests {
     async fn provider_error_is_surfaced_not_silent() {
         // A provider/API failure during planning (e.g. credit exhausted) must reach the user — the
         // turn used to store the answer but never emit it, ending the turn in silence.
-        let store = Arc::new(SessionStore::in_memory().unwrap());
+        let store = Arc::new(EventStore::in_memory().unwrap());
         let sid = store.create_session("fail").unwrap();
         let provider = Box::new(FailProvider {
             err: Box::new(|| {
@@ -1001,7 +1052,7 @@ mod tests {
         assert!(sink.text.contains("HTTP 400"), "the status is shown too");
 
         // The session stays a valid user → assistant alternation (no bricked session on the next turn).
-        let msgs = store.load_messages(&sid).unwrap();
+        let msgs = store.conversation(&sid).unwrap();
         assert_eq!(msgs.len(), 2, "user + one assistant message");
         assert_eq!(msgs[0].role, flux_core::Role::User);
         assert_eq!(msgs[1].role, flux_core::Role::Assistant);

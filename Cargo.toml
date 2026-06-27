@@ -10,7 +10,7 @@ members = [
     "crates/flux-system",
     "crates/flux-runtime",
     "crates/flux-tools",
-    "crates/flux-session",
+    "crates/flux-events",
     "crates/flux-context",
     "crates/flux-skill",
     "crates/flux-agent",
@@ -60,7 +60,7 @@ flux-config = { path = "crates/flux-config" }
 flux-system = { path = "crates/flux-system", version = "0.2.4" }
 flux-runtime = { path = "crates/flux-runtime", version = "0.2.4" }
 flux-tools = { path = "crates/flux-tools", version = "0.2.4" }
-flux-session = { path = "crates/flux-session", version = "0.2.4" }
+flux-events = { path = "crates/flux-events", version = "0.2.4" }
 flux-agent = { path = "crates/flux-agent", version = "0.2.4" }
 flux-context = { path = "crates/flux-context" }
 flux-skill = { path = "crates/flux-skill", version = "0.2.4" }
@@ -111,6 +111,7 @@ regex = "1"
 similar = "2"
 rand = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
+ulid = "1"
 rquickjs = "0.6"
 axum = "0.7"
 url = "2"

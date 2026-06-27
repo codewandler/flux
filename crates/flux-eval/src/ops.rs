@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use flux_core::{Error, Result};
-use flux_flow::state::FlowStore;
+use flux_events::EventStore;
 use flux_runtime::{Tool, ToolContext, ToolResult};
 use flux_spec::{AccessKind, Effect, Idempotency, Risk, ToolSpec};
 
@@ -255,10 +255,10 @@ impl Tool for PainpointsCollectTool {
                 continue;
             };
             let task_id = s.get("task_id").and_then(|v| v.as_str()).unwrap_or(id);
-            let Ok(store) = FlowStore::open(db) else {
+            let Ok(store) = EventStore::open(db) else {
                 continue;
             };
-            let events = store.events(id).unwrap_or_default();
+            let events = store.run_trace(id).unwrap_or_default();
             all.extend(painpoint::mine(task_id, &events));
         }
         let view = format!("{} pain-point(s) mined", all.len());
@@ -304,10 +304,10 @@ impl Tool for SessionsDigestTool {
                 continue;
             };
             let task_id = s.get("task_id").and_then(|v| v.as_str()).unwrap_or(id);
-            let Ok(store) = FlowStore::open(db) else {
+            let Ok(store) = EventStore::open(db) else {
                 continue;
             };
-            let events = store.events(id).unwrap_or_default();
+            let events = store.run_trace(id).unwrap_or_default();
             out.push_str(&format!(
                 "## {task_id} (session {id})\n{}\n",
                 crate::transcript::render_run_trace(&events, 40)

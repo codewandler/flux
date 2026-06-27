@@ -17,7 +17,7 @@ flux-provider.workspace = true
 flux-runtime.workspace = true
 flux-system.workspace = true
 flux-tools.workspace = true
-flux-session.workspace = true
+flux-events.workspace = true
 flux-agent.workspace = true
 # Flux-Lang lifecycle surface: the L0 language (artifact prelude), the L3 engine (compile/analyze/
 # execute), and the L3 model-op pack wired into the assembled registry.

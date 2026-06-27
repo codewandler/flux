@@ -39,12 +39,12 @@ use std::sync::Arc;
 
 use flux_agent::{Agent, AgentSink, DEFAULT_SYSTEM_PROMPT};
 use flux_core::{Result, Usage};
+use flux_events::EventStore;
 use flux_provider::Provider;
 use flux_runtime::{
     AllowApprover, Approver, DenyApprover, Executor, PermissionManager, ToolContext, ToolRegistry,
     ToolResult,
 };
-use flux_session::SessionStore;
 use flux_system::{System, Workspace};
 
 /// The result of one `Client::run` turn.
@@ -134,7 +134,7 @@ impl ClientBuilder {
         };
         let executor = Executor::new(registry, perms, approver, ToolContext::new(system));
 
-        let store = Arc::new(SessionStore::in_memory()?);
+        let store = Arc::new(EventStore::in_memory()?);
         let session_id = store.create_session(&self.model)?;
 
         let agent = Agent {

@@ -590,10 +590,10 @@ version = "0.2.4"
 dependencies = [
  "async-trait",
  "flux-core",
+ "flux-events",
  "flux-evidence",
  "flux-provider",
  "flux-runtime",
- "flux-session",
  "flux-skill",
  "flux-spec",
  "flux-system",
@@ -684,6 +684,7 @@ dependencies = [
  "flux-credentials",
  "flux-datasource",
  "flux-eval",
+ "flux-events",
  "flux-evidence",
  "flux-flow",
  "flux-hooks",
@@ -696,7 +697,6 @@ dependencies = [
  "flux-sdk",
  "flux-secret",
  "flux-server",
- "flux-session",
  "flux-skill",
  "flux-spec",
  "flux-system",
@@ -801,11 +801,11 @@ version = "0.2.4"
 dependencies = [
  "async-trait",
  "flux-core",
+ "flux-events",
  "flux-evidence",
  "flux-flow",
  "flux-orchestrate",
  "flux-runtime",
- "flux-session",
  "flux-spec",
  "flux-system",
  "flux-tools",
@@ -815,6 +815,18 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+]
+
+[[package]]
+name = "flux-events"
+version = "0.2.4"
+dependencies = [
+ "flux-core",
+ "flux-lang",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "ulid",
 ]
 
 [[package]]
@@ -832,11 +844,11 @@ dependencies = [
  "async-trait",
  "flux-agent",
  "flux-core",
+ "flux-events",
  "flux-evidence",
  "flux-lang",
  "flux-provider",
  "flux-runtime",
- "flux-session",
  "flux-skill",
  "flux-spec",
  "flux-system",
@@ -911,10 +923,10 @@ dependencies = [
  "async-trait",
  "flux-agent",
  "flux-core",
+ "flux-events",
  "flux-policy",
  "flux-provider",
  "flux-runtime",
- "flux-session",
  "flux-spec",
  "flux-system",
  "futures",
@@ -989,11 +1001,11 @@ dependencies = [
  "flux-agent",
  "flux-cognition",
  "flux-core",
+ "flux-events",
  "flux-flow",
  "flux-lang",
  "flux-provider",
  "flux-runtime",
- "flux-session",
  "flux-spec",
  "flux-system",
  "flux-tools",
@@ -1028,15 +1040,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower",
-]
-
-[[package]]
-name = "flux-session"
-version = "0.2.4"
-dependencies = [
- "flux-core",
- "rusqlite",
- "serde_json",
 ]
 
 [[package]]
@@ -2814,6 +2817,16 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "ulid"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "470dbf6591da1b39d43c14523b2b469c86879a53e8b758c8e090a470fe7b1fbe"
+dependencies = [
+ "rand 0.9.4",
+ "web-time",
+]
 
 [[package]]
 name = "unicase"

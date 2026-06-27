@@ -13,11 +13,10 @@ use std::time::{Duration, Instant};
 use regex::Regex;
 
 use flux_core::{Error, Message, Result};
-use flux_session::SessionStore;
+use flux_events::EventStore;
 use flux_system::{System, Workspace};
 
 use flux_flow::ast::RunEvent;
-use flux_flow::state::FlowStore;
 
 use crate::adapter::RunContext;
 use crate::metrics::{iterations_from_messages, metrics_from_events, RunResult};
@@ -100,23 +99,24 @@ fn load_latest_session(db: &Path) -> Option<(Option<String>, Vec<Message>)> {
     if !db.exists() {
         return None;
     }
-    let store = SessionStore::open(db).ok()?;
-    let id = store.latest_session_id().ok().flatten();
+    let store = EventStore::open(db).ok()?;
+    let id = store.latest_session().ok().flatten();
     let msgs = match &id {
-        Some(i) => store.load_messages(i).unwrap_or_default(),
+        Some(i) => store.conversation(i).unwrap_or_default(),
         None => Vec::new(),
     };
     Some((id, msgs))
 }
 
-/// Load a session's RunEvent trace from an isolated flow store (the source of tool-call/error signal).
-fn load_events(flow_db: &Path, session_id: &str) -> Vec<RunEvent> {
-    if !flow_db.exists() {
+/// Load a session's RunEvent trace from the isolated unified event store (the source of
+/// tool-call/error signal).
+fn load_events(events_db: &Path, session_id: &str) -> Vec<RunEvent> {
+    if !events_db.exists() {
         return Vec::new();
     }
-    FlowStore::open(flow_db)
+    EventStore::open(events_db)
         .ok()
-        .and_then(|s| s.events(session_id).ok())
+        .and_then(|s| s.run_trace(session_id).ok())
         .unwrap_or_default()
 }
 
@@ -255,12 +255,12 @@ pub async fn run_local_task(spec: &TaskSpec, ctx: &RunContext<'_>) -> Result<Run
         note = Some(msg);
     }
 
-    let session_db = home.join(".flux").join("sessions.db");
-    let flow_db = home.join(".flux").join("flow.db");
-    let (session_id, messages) = load_latest_session(&session_db).unwrap_or((None, Vec::new()));
+    // Messages and the RunEvent trace now share one unified log (`~/.flux/events.db`).
+    let events_db = home.join(".flux").join("events.db");
+    let (session_id, messages) = load_latest_session(&events_db).unwrap_or((None, Vec::new()));
     let iterations = iterations_from_messages(&messages);
     let events = match &session_id {
-        Some(id) => load_events(&flow_db, id),
+        Some(id) => load_events(&events_db, id),
         None => Vec::new(),
     };
     let (tool_calls, tool_errors) = metrics_from_events(&events);
@@ -293,8 +293,8 @@ pub async fn run_local_task(spec: &TaskSpec, ctx: &RunContext<'_>) -> Result<Run
         tokens: None,
         wall_ms,
         session_id,
-        session_db: Some(session_db),
-        flow_db: Some(flow_db),
+        session_db: Some(events_db.clone()),
+        flow_db: Some(events_db),
         timed_out,
         note,
         // The local adapter keeps the full RunEvent trace (flow_db) for deterministic mining, so it

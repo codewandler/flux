@@ -23,6 +23,7 @@ use flux_agent::{AgentSink, DEFAULT_SYSTEM_PROMPT};
 use flux_anthropic::anthropic_from_env;
 use flux_context::{EnvContext, GitContext, ProjectFiles, Projector, RepoSignal};
 use flux_core::{Chunk, ContentBlock, StopReason, Usage};
+use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
 use flux_flow::state::FlowStore;
 use flux_openai::{openai_from_env, openrouter_from_env};
@@ -32,7 +33,6 @@ use flux_runtime::{
     AllowApprover, ApprovalChoice, Approver, Executor, PermissionManager, ToolContext,
     ToolRegistry, ToolResult,
 };
-use flux_session::SessionStore;
 use flux_spec::IntentSet;
 use flux_system::{System, Workspace};
 use reedline::{FileBackedHistory, Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal};
@@ -325,7 +325,7 @@ fn fmt_age(created_at_ms: i64) -> String {
 fn run_sessions() -> Result<()> {
     let argv: Vec<String> = std::env::args().collect();
     let prune = argv.get(2).map(|s| s == "--prune").unwrap_or(false);
-    let store = open_session_store()?;
+    let store = open_event_store()?;
     if prune {
         let n = store.prune_empty()?;
         if n == 0 {
@@ -354,24 +354,25 @@ fn run_sessions() -> Result<()> {
     Ok(())
 }
 
-/// Open the session store under `~/.flux/sessions.db`.
-fn open_session_store() -> Result<SessionStore> {
+/// Open the unified event store under `~/.flux/events.db` (conversation + run trace + turn telemetry).
+fn open_event_store() -> Result<EventStore> {
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
     let dir = home.join(".flux");
     std::fs::create_dir_all(&dir)?;
-    SessionStore::open(dir.join("sessions.db")).context("open session store")
+    EventStore::open(dir.join("events.db")).context("open event store")
 }
 
-/// Open flux-flow's own store under `~/.flux/flow.db` (values, symbols, run-event trace).
-fn open_flow_store() -> Result<FlowStore> {
+/// Open flux-flow's own store under `~/.flux/flow.db` (values, symbols, suspensions). Run-trace
+/// events are forwarded to the shared `events` log.
+fn open_flow_store(events: Arc<EventStore>) -> Result<FlowStore> {
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
     let dir = home.join(".flux");
     std::fs::create_dir_all(&dir)?;
-    FlowStore::open(dir.join("flow.db")).context("open flow store")
+    FlowStore::open(dir.join("flow.db"), events).context("open flow store")
 }
 
 /// Build a fresh boxed provider for a model spec (used by the sub-agent factory).
@@ -661,21 +662,21 @@ async fn build_agent(cli: &Cli) -> Result<(FlowEngine, String, Arc<dyn flux_runt
         serde_json::json!({ "signals": signals }),
     ));
 
-    let store = Arc::new(open_session_store()?);
+    let events = Arc::new(open_event_store()?);
     let session_id = if cli.continue_ || cli.resume {
-        store
-            .latest_session_id()
+        events
+            .latest_session()
             .context("latest session")?
             .ok_or_else(|| anyhow::anyhow!("no session to resume"))?
     } else {
-        store.create_session(&model).context("create session")?
+        events.create_session(&model).context("create session")?
     };
 
     let agent = FlowEngine {
         provider,
         executor,
-        store,
-        flow: open_flow_store()?,
+        flow: open_flow_store(events.clone())?,
+        events,
         model,
         system_prompt,
         max_tokens: cli.max_tokens,
@@ -1119,7 +1120,7 @@ async fn run_repl(cli: Cli) -> Result<()> {
                             Ok((native, model)) => {
                                 agent.provider = Box::new(native);
                                 agent.model = model;
-                                let _ = agent.store.set_model(&session_id, &agent.model);
+                                let _ = agent.events.set_model(&session_id, &agent.model);
                                 eprintln!("switched to {}", agent.model);
                             }
                             Err(e) => eprintln!("cannot switch model: {e}"),
@@ -1185,14 +1186,14 @@ async fn run_repl(cli: Cli) -> Result<()> {
                     eprintln!("tools: {}", names.join(", "));
                 }
                 "session" => eprintln!("session {session_id} · model {}", agent.model),
-                "sessions" => match agent.store.list(30) {
+                "sessions" => match agent.events.list(30) {
                     Ok(list) if !list.is_empty() => {
                         for s in &list {
                             let here = if s.id == session_id { "*" } else { " " };
                             // Try to load the first user message as a human-readable preview.
                             let preview = agent
-                                .store
-                                .load_messages(&s.id)
+                                .events
+                                .conversation(&s.id)
                                 .ok()
                                 .and_then(|msgs| {
                                     msgs.into_iter()
@@ -1231,11 +1232,11 @@ async fn run_repl(cli: Cli) -> Result<()> {
                     if id.is_empty() {
                         eprintln!("usage: /resume <session_id>  (see /sessions)");
                     } else {
-                        match agent.store.info(id) {
+                        match agent.events.info(id) {
                             Ok(info) => {
                                 let n = agent
-                                    .store
-                                    .load_messages(&info.id)
+                                    .events
+                                    .conversation(&info.id)
                                     .map(|m| m.len())
                                     .unwrap_or(0);
                                 session_id = info.id;
@@ -1259,7 +1260,7 @@ async fn run_repl(cli: Cli) -> Result<()> {
                 }
                 "clear" => {
                     session_id = agent
-                        .store
+                        .events
                         .create_session(&agent.model)
                         .context("new session")?;
                     eprintln!("started new session {session_id}");

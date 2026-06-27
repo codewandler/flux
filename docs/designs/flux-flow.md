@@ -27,8 +27,8 @@ This is flux's existing safety thesis pushed up one layer. The envelope
 (`flux_runtime::Executor::dispatch`) already makes *tool execution* non-bypassable; Flux-Lang makes
 *orchestration* analyzer-validated and effect-typed, reusing that exact envelope as its execution
 substrate. flux already owns most of the machinery — the policy engine (`flux-policy`), the
-operation/registry model (`flux_runtime::Tool` + `flux_spec::ToolSpec`), event-sourced sessions
-(`flux-session`), and an effects→policy bridge (`effect_requests`). What is new is the language layer
+operation/registry model (`flux_runtime::Tool` + `flux_spec::ToolSpec`), a unified append-only event
+store (`flux-events`), and an effects→policy bridge (`effect_requests`). What is new is the language layer
 (AST/HIR/plan), a typed symbol table + value store, things/resolution, and graph rendering.
 
 ## 2. What flux is now
@@ -105,7 +105,7 @@ the L0-purity of the language is enforced by a **crate wall**, not just module d
 
 Classify `"flux-lang" => 0` and `"flux-flow" => 3` in `flux-codegate`'s `layer()` map. `flux-flow` deps
 (own layer or lower): `flux-lang`, `flux-core`, `flux-spec` (L0); `flux-provider` (L1); `flux-runtime`,
-`flux-session` (L2); `flux-agent`, `flux-evidence`, `flux-skill`.
+`flux-events` (L2); `flux-agent`, `flux-evidence`, `flux-skill`.
 
 | Crate · Module | Role |
 |---|---|

@@ -12,7 +12,7 @@ envelope, layering lint) still apply.
 schema/skill SSOT, and a **reference interpreter** that runs a flow against *injected* effect traits. It is an **L0 leaf** — it
 depends only on other L0 contracts (`flux-core`, `flux-spec`, `flux-policy`, `flux-evidence`) plus
 external crates (`serde`, `schemars`, `tokio`, …). It must **not** depend on `flux-runtime`,
-`flux-agent`, `flux-session`, a provider, or any concrete tool. The `flux-flow` engine (L3) adapts its
+`flux-agent`, `flux-events`, a provider, or any concrete tool. The `flux-flow` engine (L3) adapts its
 safety envelope onto this crate's traits.
 
 ## The trait seam (don't break it)

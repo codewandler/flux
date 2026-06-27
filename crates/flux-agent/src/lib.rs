@@ -13,9 +13,9 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use flux_core::{Chunk, ContentBlock, Message, Result, Usage};
+use flux_events::EventStore;
 use flux_provider::{Provider, Request, ToolDef};
 use flux_runtime::{Executor, ToolResult};
-use flux_session::SessionStore;
 
 /// The default system prompt: the coding-agent contract (approach, tool discipline, the guarded
 /// envelope, safety/git rules, and output style). Per-turn context (environment, git state, repo
@@ -109,11 +109,12 @@ pub trait AgentSink: Send {
     fn turn_end(&mut self, _usage: Option<Usage>) {}
 }
 
-/// The agent: a provider, a tool executor (safety envelope), and a session store.
+/// The agent: a provider, a tool executor (safety envelope), and the event store (its conversation
+/// is a projection of the log).
 pub struct Agent {
     pub provider: Box<dyn Provider>,
     pub executor: Executor,
-    pub store: Arc<SessionStore>,
+    pub store: Arc<EventStore>,
     pub model: String,
     pub system_prompt: String,
     pub max_tokens: u32,
@@ -155,7 +156,7 @@ impl Agent {
         cancel: &CancellationToken,
     ) -> Result<()> {
         self.store
-            .append_message(session_id, &Message::user_text(user_input))?;
+            .record_message(session_id, &Message::user_text(user_input))?;
 
         // Skill activation: any skill whose triggers match this turn's input contributes its body
         // to the system prompt for this turn (and is recorded/surfaced as evidence).
@@ -203,7 +204,7 @@ impl Agent {
             if cancel.is_cancelled() {
                 return self.finish_cancelled(session_id, sink, None);
             }
-            let messages = self.store.load_messages(session_id)?;
+            let messages = self.store.conversation(session_id)?;
             let req = Request {
                 model: self.model.clone(),
                 system: Some(system_prompt.clone()),
@@ -254,7 +255,7 @@ impl Agent {
             let assistant = Message::assistant(blocks);
             let has_content = !assistant.content.is_empty();
             if has_content {
-                self.store.append_message(session_id, &assistant)?;
+                self.store.record_message(session_id, &assistant)?;
             }
 
             if cancelled {
@@ -269,7 +270,7 @@ impl Agent {
                             })
                             .collect();
                         self.store
-                            .append_message(session_id, &Message::user(results))?;
+                            .record_message(session_id, &Message::user(results))?;
                     }
                 }
                 return self.finish_cancelled(session_id, sink, usage);
@@ -321,7 +322,7 @@ impl Agent {
                 results.push(ContentBlock::tool_result_text(id, content, result.is_error));
             }
             self.store
-                .append_message(session_id, &Message::user(results))?;
+                .record_message(session_id, &Message::user(results))?;
             if cancelled_tools {
                 return self.finish_cancelled(session_id, sink, None);
             }
@@ -336,7 +337,7 @@ impl Agent {
             self.max_iterations
         );
         sink.text_delta(&note);
-        self.store.append_message(
+        self.store.record_message(
             session_id,
             &Message::assistant(vec![ContentBlock::Text { text: note }]),
         )?;
@@ -374,7 +375,7 @@ impl Agent {
         if self.compact_threshold_chars == 0 {
             return Ok(());
         }
-        let messages = self.store.load_messages(session_id)?;
+        let messages = self.store.conversation(session_id)?;
         if messages.len() < 4 {
             return Ok(());
         }
@@ -437,7 +438,7 @@ impl Agent {
         ))];
         new_msgs.extend(recent.iter().cloned());
         let to = new_msgs.len();
-        self.store.rewrite_messages(session_id, &new_msgs)?;
+        self.store.record_compaction(session_id, &new_msgs)?;
 
         let obs = flux_evidence::Observation::new(
             "context.compacted",
@@ -540,7 +541,7 @@ mod tests {
             ToolContext::new(system.clone()),
         );
 
-        let store = Arc::new(SessionStore::in_memory().unwrap());
+        let store = Arc::new(EventStore::in_memory().unwrap());
         let sid = store.create_session("mock").unwrap();
 
         // Turn 1: model calls `write`. Turn 2: model returns text and stops.
@@ -593,7 +594,7 @@ mod tests {
         assert_eq!(sink.tools, vec!["write"]);
         assert!(sink.text.contains("Created hello.txt"));
         // Persisted: user, assistant(tool_use), user(tool_result), assistant(text) = 4 messages.
-        assert_eq!(store.load_messages(&sid).unwrap().len(), 4);
+        assert_eq!(store.conversation(&sid).unwrap().len(), 4);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -613,7 +614,7 @@ mod tests {
             Arc::new(DenyApprover),
             ToolContext::new(system.clone()),
         );
-        let store = Arc::new(SessionStore::in_memory().unwrap());
+        let store = Arc::new(EventStore::in_memory().unwrap());
         let sid = store.create_session("mock").unwrap();
 
         // Turn 1: the model keeps calling a tool (would loop forever); max_iterations=1 cuts it off.
@@ -658,7 +659,7 @@ mod tests {
         let mut sink = CollectSink::default();
         agent.run_turn(&sid, "do it", &mut sink).await.unwrap();
 
-        let msgs = store.load_messages(&sid).unwrap();
+        let msgs = store.conversation(&sid).unwrap();
         // The log must end on an assistant message, not a dangling user(tool_result).
         assert_eq!(
             msgs.last().unwrap().role,
@@ -689,7 +690,7 @@ mod tests {
             Arc::new(DenyApprover),
             ToolContext::new(system),
         );
-        let store = Arc::new(SessionStore::in_memory().unwrap());
+        let store = Arc::new(EventStore::in_memory().unwrap());
         let sid = store.create_session("mock").unwrap();
 
         // One text-only turn.
@@ -776,18 +777,18 @@ mod tests {
             Arc::new(DenyApprover),
             ToolContext::new(system),
         );
-        let store = Arc::new(SessionStore::in_memory().unwrap());
+        let store = Arc::new(EventStore::in_memory().unwrap());
         let sid = store.create_session("mock").unwrap();
         // Seed a long history so the budget is exceeded.
         for i in 0..20 {
             store
-                .append_message(
+                .record_message(
                     &sid,
                     &Message::user_text(format!("a fairly long message number {i} with padding")),
                 )
                 .unwrap();
         }
-        let before = store.load_messages(&sid).unwrap().len();
+        let before = store.conversation(&sid).unwrap().len();
         assert!(before >= 20);
 
         let agent = Agent {
@@ -808,7 +809,7 @@ mod tests {
         agent.run_turn(&sid, "continue", &mut sink).await.unwrap();
 
         // The session was compacted (summary + recent + this turn's messages ≪ the original 20+).
-        let after = store.load_messages(&sid).unwrap().len();
+        let after = store.conversation(&sid).unwrap().len();
         assert!(
             after < before,
             "expected compaction to shrink the log ({after} !< {before})"
@@ -823,7 +824,7 @@ mod tests {
         );
         // The synthetic summary message is present.
         assert!(store
-            .load_messages(&sid)
+            .conversation(&sid)
             .unwrap()
             .iter()
             .any(|m| m.text().contains("summary of earlier conversation")));
@@ -861,20 +862,20 @@ mod tests {
             Arc::new(DenyApprover),
             ToolContext::new(system),
         );
-        let store = Arc::new(SessionStore::in_memory().unwrap());
+        let store = Arc::new(EventStore::in_memory().unwrap());
         let sid = store.create_session("mock").unwrap();
         // Padding to exceed the budget, then a tool_use/tool_result pair as the most recent turn —
         // the boundary that would orphan the tool_result if compaction split it.
         for i in 0..10 {
             store
-                .append_message(
+                .record_message(
                     &sid,
                     &Message::user_text(format!("padding message number {i} ......")),
                 )
                 .unwrap();
         }
         store
-            .append_message(
+            .record_message(
                 &sid,
                 &Message::assistant(vec![ContentBlock::ToolUse {
                     id: "t1".into(),
@@ -884,7 +885,7 @@ mod tests {
             )
             .unwrap();
         store
-            .append_message(
+            .record_message(
                 &sid,
                 &Message::user(vec![ContentBlock::tool_result_text(
                     "t1".to_string(),
@@ -921,7 +922,7 @@ mod tests {
         );
 
         // No tool_result may reference a tool_use that compaction summarized away.
-        let msgs = store.load_messages(&sid).unwrap();
+        let msgs = store.conversation(&sid).unwrap();
         let tool_use_ids: std::collections::HashSet<String> = msgs
             .iter()
             .flat_map(|m| m.content.iter())
@@ -970,7 +971,7 @@ mod tests {
             Arc::new(DenyApprover),
             ToolContext::new(system),
         );
-        let store = Arc::new(SessionStore::in_memory().unwrap());
+        let store = Arc::new(EventStore::in_memory().unwrap());
         let sid = store.create_session("mock").unwrap();
         let agent = Agent {
             provider: Box::new(BlockingProvider),
@@ -1010,7 +1011,7 @@ mod tests {
         );
         // R1: the streamed-but-uncompleted text is persisted as a non-empty assistant message —
         // no empty content array (which would 400 the next request).
-        let msgs = agent.store.load_messages(&sid).unwrap();
+        let msgs = agent.store.conversation(&sid).unwrap();
         assert!(
             msgs.iter().all(|m| !m.content.is_empty()),
             "no empty message may be persisted"
@@ -1047,7 +1048,7 @@ mod tests {
             Arc::new(DenyApprover),
             ToolContext::new(system),
         );
-        let store = Arc::new(SessionStore::in_memory().unwrap());
+        let store = Arc::new(EventStore::in_memory().unwrap());
         let sid = store.create_session("mock").unwrap();
         let agent = Agent {
             provider: Box::new(PendProvider),
@@ -1080,7 +1081,7 @@ mod tests {
         .unwrap();
 
         // Only the user message persisted — no empty assistant message.
-        let msgs = agent.store.load_messages(&sid).unwrap();
+        let msgs = agent.store.conversation(&sid).unwrap();
         assert_eq!(
             msgs.len(),
             1,

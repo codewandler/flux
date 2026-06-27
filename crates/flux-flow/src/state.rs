@@ -1,18 +1,23 @@
 //! flux-flow's own durable store: the immutable value store, the session symbol table, and the
-//! run-event trace. It is deliberately separate from `flux-session` (which owns the provider message
-//! log) — flux-flow keeps its execution facts in its own SQLite database, so the message-log
-//! invariants are never entangled with flow state.
+//! suspended-flow latch — the *mutable*, non-log-shaped execution state.
+//!
+//! Run-event traces no longer live here: they are appended to the unified [`EventStore`] (one ordered
+//! log shared with the conversation and turn telemetry), which `FlowStore` forwards to through its
+//! [`append_event`](FlowStore::append_event) impl and reads back via [`events`](FlowStore::events).
+//! What stays is genuinely not log-shaped: values (content-addressed blobs), symbols (a
+//! last-writer-wins pointer table), and the one-shot suspension latch.
 //!
 //! Values are append-only and versioned: a revision creates a new [`ValueId`] and the old version
 //! stays addressable. A symbol points at its *current* value; the symbol table is the model-facing
 //! projection mechanism, and only visible/pinned symbols appear in [`FlowStore::view`].
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
 
 use flux_core::{Error, Result};
+use flux_events::EventStore;
 
 use crate::ast::{Node, NodeId, RunEvent, SymbolName, Value, ValueId, Visibility};
 
@@ -70,26 +75,36 @@ impl flux_lang::store::ValueStore for FlowStore {
     }
 }
 
-/// flux-flow's own SQLite store for values, symbols, and the run-event trace.
+/// flux-flow's own SQLite store for values, symbols, and the suspension latch. Run-event traces are
+/// forwarded to the shared [`EventStore`] rather than stored here.
 pub struct FlowStore {
     conn: Mutex<Connection>,
+    /// The unified event log this store forwards run-trace events to (and reads them back from).
+    events: Arc<EventStore>,
 }
 
 impl FlowStore {
-    /// Open (creating if needed) a store at `path`, with WAL enabled.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    /// Open (creating if needed) a store at `path`, with WAL enabled. Run-trace events are forwarded
+    /// to the shared `events` log.
+    pub fn open(path: impl AsRef<Path>, events: Arc<EventStore>) -> Result<Self> {
         let conn = Connection::open(path).map_err(map_sql)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(map_sql)?;
-        Self::init(conn)
+        Self::init(conn, events)
     }
 
-    /// An in-memory store (for tests).
+    /// An in-memory store (for tests), with its own throwaway event log.
     pub fn in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory().map_err(map_sql)?)
+        Self::in_memory_with_events(Arc::new(EventStore::in_memory()?))
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    /// An in-memory store sharing a given event log — so the engine's run trace, message log, and turn
+    /// telemetry all land in one place even in tests.
+    pub fn in_memory_with_events(events: Arc<EventStore>) -> Result<Self> {
+        Self::init(Connection::open_in_memory().map_err(map_sql)?, events)
+    }
+
+    fn init(conn: Connection, events: Arc<EventStore>) -> Result<Self> {
         // `values` is a SQL keyword, so the value store table is `values_store`.
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS values_store (
@@ -109,12 +124,6 @@ impl FlowStore {
                  updated_at INTEGER NOT NULL,
                  PRIMARY KEY (session_id, name)
              );
-             CREATE TABLE IF NOT EXISTS run_events (
-                 session_id TEXT NOT NULL,
-                 seq        INTEGER NOT NULL,
-                 data       TEXT NOT NULL,
-                 PRIMARY KEY (session_id, seq)
-             );
              CREATE TABLE IF NOT EXISTS suspensions (
                  session_id TEXT PRIMARY KEY,
                  body       TEXT NOT NULL,
@@ -126,6 +135,7 @@ impl FlowStore {
         .map_err(map_sql)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            events,
         })
     }
 
@@ -209,39 +219,14 @@ impl FlowStore {
         }
     }
 
-    /// Append a run-event to the session's trace.
+    /// Append a run-event to the session's trace (forwarded to the unified event log).
     pub fn append_event(&self, session_id: &str, event: &RunEvent) -> Result<()> {
-        let data = serde_json::to_string(event)?;
-        let conn = self.conn.lock().unwrap();
-        let seq: i64 = conn
-            .query_row(
-                "SELECT COALESCE(MAX(seq), -1) + 1 FROM run_events WHERE session_id = ?1",
-                [session_id],
-                |r| r.get(0),
-            )
-            .map_err(map_sql)?;
-        conn.execute(
-            "INSERT INTO run_events (session_id, seq, data) VALUES (?1, ?2, ?3)",
-            rusqlite::params![session_id, seq, data],
-        )
-        .map_err(map_sql)?;
-        Ok(())
+        self.events.record_run_event(session_id, event)
     }
 
-    /// Load the run-event trace for a session.
+    /// Load the run-event trace for a session (projected from the unified event log).
     pub fn events(&self, session_id: &str) -> Result<Vec<RunEvent>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT data FROM run_events WHERE session_id = ?1 ORDER BY seq")
-            .map_err(map_sql)?;
-        let rows = stmt
-            .query_map([session_id], |r| r.get::<_, String>(0))
-            .map_err(map_sql)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(serde_json::from_str(&row.map_err(map_sql)?)?);
-        }
-        Ok(out)
+        self.events.run_trace(session_id)
     }
 
     /// Persist a flow suspended on a top-level `await`: its body, the suspended node index, and the

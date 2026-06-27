@@ -6,7 +6,7 @@
 //! Flux-Lang graph rather than a bespoke Rust program.
 //!
 //! Layering: this is an L3 crate. It depends only on L0–L2 (`flux-core`, `flux-spec`, `flux-runtime`,
-//! `flux-system`, `flux-session`) and runs the flux binary **as a subprocess** — the only honest way
+//! `flux-system`, `flux-events`) and runs the flux binary **as a subprocess** — the only honest way
 //! to measure the *rebuilt* binary inside the improvement loop. Model-driven steps (review, derive,
 //! implement) are not ops here; the flow expresses them with the existing `task` sub-agent op.
 //!

@@ -118,7 +118,7 @@ fn err500(e: impl std::fmt::Display) -> (StatusCode, String) {
 }
 
 async fn create_session(State(agent): State<Shared>) -> Result<Json<Value>, (StatusCode, String)> {
-    let id = agent.store.create_session(&agent.model).map_err(err500)?;
+    let id = agent.events.create_session(&agent.model).map_err(err500)?;
     Ok(Json(json!({ "id": id, "model": agent.model })))
 }
 
@@ -127,7 +127,7 @@ async fn get_session(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let info = agent
-        .store
+        .events
         .info(&id)
         .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
     Ok(Json(json!({
@@ -209,7 +209,7 @@ async fn webhook(
     State(agent): State<Shared>,
     Json(req): Json<MessageRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let session_id = agent.store.create_session(&agent.model).map_err(err500)?;
+    let session_id = agent.events.create_session(&agent.model).map_err(err500)?;
     let mut sink = Collect::default();
     agent
         .run_turn(&session_id, &req.input, &mut sink)

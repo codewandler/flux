@@ -16,13 +16,13 @@ use serde_json::{json, Value};
 
 use flux_agent::{Agent, AgentSink};
 use flux_core::{Error, Result, Usage};
+use flux_events::EventStore;
 use flux_policy::{AuthorizationPolicy, Caller, Trust};
 use flux_provider::Provider;
 use flux_runtime::{
     ApprovalChoice, Approver, Executor, PermissionManager, Spawner, Tool, ToolContext,
     ToolRegistry, ToolResult,
 };
-use flux_session::SessionStore;
 use flux_spec::{Idempotency, IntentSet, Risk, ToolSpec};
 use flux_system::System;
 use tokio_util::sync::CancellationToken;
@@ -140,7 +140,7 @@ impl Spawner for LocalSpawner {
                 .with_identity(caller.clone(), trust.clone());
         }
 
-        let store = Arc::new(SessionStore::in_memory()?);
+        let store = Arc::new(EventStore::in_memory()?);
         let session_id = store.create_session(&model)?;
 
         let agent = Agent {
