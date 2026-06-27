@@ -18,9 +18,17 @@ graph), and a deterministic engine runs it through a non-bypassable safety envel
 All three examples are hermetic (a mock provider) and run with no API key:
 
 ```sh
-cargo run -p flux-sdk --example dsl_loops
-cargo run -p flux-sdk --example client_basic
-cargo run -p flux-sdk --example flow_compile
+cargo run -p flux-sdk --example dsl_loops      # build loops/control-flow with the DSL, execute them
+cargo run -p flux-sdk --example client_basic   # the classic agent loop
+cargo run -p flux-sdk --example flow_compile   # NL → AST → execute
+```
+
+Two **domain** examples show the DSL on real tasks, with the model/datasource adapters mocked (registered
+stub ops) so they run with no API key:
+
+```sh
+cargo run -p flux-sdk --example intent_routing # classify an utterance, then `route` to a handler
+cargo run -p flux-sdk --example faq_lookup     # KB lookup + `fallback` escalation → a typed `Answer`
 ```
 
 ## Quick start — the Rust DSL

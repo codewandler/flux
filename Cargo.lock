@@ -993,6 +993,7 @@ dependencies = [
  "flux-provider",
  "flux-runtime",
  "flux-session",
+ "flux-spec",
  "flux-system",
  "flux-tools",
  "futures",

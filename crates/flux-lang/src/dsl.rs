@@ -45,11 +45,10 @@
 
 use serde_json::Value as Json;
 
-use crate::ast::{
-    Branch, DraftAst, FallbackBranch, FlowEffect, MatchCase, Node, Param, RouteCase, SymbolName,
-};
-// Re-exported so an author can stay inside `flux_lang::dsl::*` for the whole flow.
-pub use crate::ast::{Selector, ThingKind, ThingRef, TypeRef};
+use crate::ast::{Branch, FallbackBranch, FlowEffect, MatchCase, Param, RouteCase, SymbolName};
+// Re-exported so an author can stay inside `flux_lang::dsl::*` for the whole flow — including the
+// output type (`DraftAst`) and the raw `Node` (for the `Block::add` escape hatch).
+pub use crate::ast::{DraftAst, Node, Selector, ThingKind, ThingRef, TypeRef};
 
 /// Run a body-building closure against a fresh [`Block`] and return the accumulated nodes.
 fn body_of(build: impl FnOnce(&mut Block)) -> Vec<Node> {

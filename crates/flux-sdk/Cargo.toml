@@ -31,3 +31,6 @@ serde_json.workspace = true
 [dev-dependencies]
 tokio.workspace = true
 futures.workspace = true
+# Examples register mock adapter ops (impl flux_runtime::Tool), whose `spec()` returns a flux_spec
+# ToolSpec. Dev-only — not in the publish closure.
+flux-spec.workspace = true
