@@ -130,18 +130,51 @@ fn is_side_effecting(node: &Node, ops: &dyn OpCatalog) -> bool {
     }
 }
 
-/// Collect the `Var` names read anywhere in `nodes` (call args, nested calls, jq/parse inputs).
+/// Collect the symbols read anywhere in `nodes` — explicit `Var` names AND the `{name}`/`{{name}}`
+/// interpolation tokens inside `lit` string args (a `lit` string is interpolated from bound symbols
+/// at `eval_arg` time, so it reads them). Over-approximating is sound: extra reads only *suppress*
+/// batching, never wrongly permit it.
 fn collect_var_reads(nodes: &[Node], acc: &mut BTreeSet<String>) {
     for n in nodes {
         match n {
             Node::Var { name } => {
                 acc.insert(name.0.clone());
             }
+            Node::Lit { value } => collect_interp_reads(value, acc),
             Node::Call { args, .. } => collect_var_reads(args, acc),
             Node::Jq { input, .. } => collect_var_reads(std::slice::from_ref(input), acc),
             Node::Parse { value, .. } => collect_var_reads(std::slice::from_ref(value), acc),
             _ => {}
         }
+    }
+}
+
+/// Collect interpolation tokens (`{name}` / `{{name}}`) from a literal value, recursing into arrays
+/// and objects (the interpolator recurses the same way). Mirrors `runtime::interpolate_str`'s scan so
+/// no interpolated read is missed.
+fn collect_interp_reads(value: &serde_json::Value, acc: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::String(s) => {
+            let mut rest = s.as_str();
+            while let Some(open) = rest.find('{') {
+                let at = &rest[open..];
+                let (o, c): (&str, &str) = if at.starts_with("{{") {
+                    ("{{", "}}")
+                } else {
+                    ("{", "}")
+                };
+                let inner = &at[o.len()..];
+                let Some(close) = inner.find(c) else { break };
+                let name = inner[..close].trim();
+                if !name.is_empty() {
+                    acc.insert(name.to_string());
+                }
+                rest = &inner[close + c.len()..];
+            }
+        }
+        serde_json::Value::Array(a) => a.iter().for_each(|x| collect_interp_reads(x, acc)),
+        serde_json::Value::Object(m) => m.values().for_each(|x| collect_interp_reads(x, acc)),
+        _ => {}
     }
 }
 
@@ -239,6 +272,26 @@ mod tests {
                 Stage::ApprovalFence(NodeId(1)),
                 Stage::Sequential(NodeId(2)),
             ]
+        );
+    }
+
+    #[test]
+    fn interpolation_reads_in_a_lit_arg_break_the_batch() {
+        // $a = read "config"; $b = read "{{a}}/sub" — b reads `a` via interpolation, so the two must
+        // NOT parallelize (the soundness bug: missing the implicit interpolation read).
+        let stages = plan(vec![
+            bind("a", "read", vec![lit("config")]),
+            bind(
+                "b",
+                "read",
+                vec![Node::Lit {
+                    value: serde_json::json!("{{a}}/sub"),
+                }],
+            ),
+        ]);
+        assert_eq!(
+            stages,
+            vec![Stage::Sequential(NodeId(0)), Stage::Sequential(NodeId(1))]
         );
     }
 
