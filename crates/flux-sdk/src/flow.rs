@@ -107,6 +107,7 @@ impl Default for FlowClientBuilder {
 }
 
 impl FlowClientBuilder {
+    /// Set the model id the planner + every op call uses.
     pub fn model(mut self, m: impl Into<String>) -> Self {
         self.model = m.into();
         self
@@ -116,6 +117,7 @@ impl FlowClientBuilder {
         self.allow.push(rule.into());
         self
     }
+    /// Add a permission deny rule (takes precedence over allow rules).
     pub fn deny(mut self, rule: impl Into<String>) -> Self {
         self.deny.push(rule.into());
         self
@@ -187,6 +189,7 @@ pub struct FlowClient {
 }
 
 impl FlowClient {
+    /// Start building a [`FlowClient`].
     pub fn builder() -> FlowClientBuilder {
         FlowClientBuilder::default()
     }

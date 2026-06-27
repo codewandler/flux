@@ -19,6 +19,7 @@
 //! println!("{}", out.text);
 //! # Ok(()) }
 //! ```
+#![warn(missing_docs)]
 
 pub mod flow;
 
@@ -46,8 +47,11 @@ use flux_system::{System, Workspace};
 /// The result of one `Client::run` turn.
 #[derive(Debug, Default, Clone)]
 pub struct TurnOutput {
+    /// The assistant's final text for the turn.
     pub text: String,
+    /// The names of the tools invoked during the turn, in call order.
     pub tool_calls: Vec<String>,
+    /// Token usage for the turn, if the provider reported it.
     pub usage: Option<Usage>,
 }
 
@@ -78,18 +82,22 @@ impl Default for ClientBuilder {
 }
 
 impl ClientBuilder {
+    /// Set the model id every turn uses.
     pub fn model(mut self, m: impl Into<String>) -> Self {
         self.model = m.into();
         self
     }
+    /// Override the system prompt (defaults to the agent's built-in prompt).
     pub fn system_prompt(mut self, s: impl Into<String>) -> Self {
         self.system_prompt = Some(s.into());
         self
     }
+    /// Cap the max output tokens per model call.
     pub fn max_tokens(mut self, n: u32) -> Self {
         self.max_tokens = n;
         self
     }
+    /// Cap the agent loop's tool-calling iterations per turn.
     pub fn max_iterations(mut self, n: usize) -> Self {
         self.max_iterations = n;
         self
@@ -99,6 +107,7 @@ impl ClientBuilder {
         self.allow.push(rule.into());
         self
     }
+    /// Add a permission deny rule (takes precedence over allow rules).
     pub fn deny(mut self, rule: impl Into<String>) -> Self {
         self.deny.push(rule.into());
         self
@@ -151,10 +160,12 @@ pub struct Client {
 }
 
 impl Client {
+    /// Start building a [`Client`].
     pub fn builder() -> ClientBuilder {
         ClientBuilder::default()
     }
 
+    /// The id of the in-memory session this client's turns are recorded against.
     pub fn session_id(&self) -> &str {
         &self.session_id
     }

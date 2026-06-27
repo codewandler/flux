@@ -3,7 +3,13 @@ name = "flux-sdk"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "flux high-level library API: build a tool-enabled, policy-gated agent and run turns"
+readme = "README.md"
+documentation = "https://docs.rs/flux-sdk"
+keywords = ["agent", "llm", "ai", "tools", "flux"]
+categories = ["development-tools", "api-bindings"]
 
 [dependencies]
 flux-core.workspace = true

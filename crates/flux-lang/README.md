@@ -71,6 +71,7 @@ caching / dead-step elimination the optimizer targets.
 | Module | Role |
 |---|---|
 | `ast` | the typed AST (`Node`, `Value`, `TypeRef`, `FlowEffect`, …) — all derive `JsonSchema` |
+| `dsl` | a Rust **embedded DSL** (`Flow`/`Block` + expression constructors) that compiles to the AST — author flows natively in Rust; loops + control-flow are first-class |
 | `opspec` | the typed op spec/signature + the abstract `OpCatalog` seam |
 | `prelude` | the artifact-type ontology (`Claim`/`Evidence`/`Need`/`Ctx`/`Verdict`/…) ops declare I/O against |
 | `analyze` | validate a flow against an `OpCatalog`; `lower` → typed HIR (effects + arity + arg type-checking) |
@@ -87,6 +88,32 @@ caching / dead-step elimination the optimizer targets.
 It is an **L0 leaf**: it depends only on other pure contracts (`flux-core`, `flux-spec`, `flux-policy`,
 `flux-evidence`) — no provider, no concrete runtime, no tools. All effects are injected via traits, so
 an embedder (the `flux-flow` engine) adapts its safety envelope onto `OpHost`/`ValueStore`/`FlowSink`.
+
+## Authoring flows in Rust (the `dsl`)
+
+Besides the text syntax and an LLM-emitted AST, a flow can be built natively in Rust with the `dsl`
+builder primitives — they compile to the same `DraftAst`. Loops (`each`/`repeat`/`loop_for`/`race`) and
+control-flow (`match`/`route`/`fallback`/`timeout`/`budget`) are first-class:
+
+```rust
+use flux_lang::dsl::*;
+
+let flow = Flow::named("scan")
+    .param("files", TypeRef::List(Box::new(TypeRef::String)))
+    .body(|b| {
+        b.each("f", var("files"), |e| {
+            e.collect("contents");
+            e.body(|b| { b.call("read", [var("f")]); });
+        });
+        b.ret(var("contents"));
+    })
+    .build();
+
+assert_eq!(flow.body.len(), 2); // the `each` loop + the `return`
+```
+
+The DSL is a *construction* convenience, not a type-checker: validate the built flow with `analyze`
+before running it (see `flux-sdk`'s `FlowClient` for a runnable build → analyze → execute path).
 
 ## The `fluxlang` CLI
 

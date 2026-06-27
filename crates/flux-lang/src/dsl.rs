@@ -41,6 +41,7 @@
 //! assert_eq!(flow.name.as_deref(), Some("scan"));
 //! assert_eq!(flow.body.len(), 2); // the `each` loop + the `return`
 //! ```
+#![warn(missing_docs)]
 
 use serde_json::Value as Json;
 
