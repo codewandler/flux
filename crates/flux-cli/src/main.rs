@@ -2093,6 +2093,9 @@ async fn main() -> Result<()> {
     if argv.get(1).map(|s| s == "sessions").unwrap_or(false) {
         return run_sessions();
     }
+    if argv.get(1).map(|s| s == "run").unwrap_or(false) {
+        return run_app_cmd(&argv[2..]).await;
+    }
     if argv.get(1).map(|s| s == "flow").unwrap_or(false) {
         return run_flow(&argv[2..]).await;
     }
@@ -2135,6 +2138,60 @@ async fn main() -> Result<()> {
             .unwrap_or(());
         Ok(())
     }
+}
+
+/// `flux run <app.flux>` — load and run a multi-agent flux **Program** through the `flux-app` host
+/// (event bus + triggers + journeys). A bare single-flow file is accepted too. The provider is
+/// best-effort: a program built only from pure ops runs without credentials; model-backed ops need a
+/// resolvable `provider/model` (defaulting like the prompt path) and degrade with a clear note.
+async fn run_app_cmd(args: &[String]) -> Result<()> {
+    use std::path::Path;
+
+    let mut path: Option<&str> = None;
+    let mut model_spec: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-m" | "--model" => {
+                model_spec = args.get(i + 1).cloned();
+                i += 2;
+            }
+            // The app host runs non-interactively (auto-approves the orchestration verbs); `--yes`
+            // is accepted for symmetry with the prompt path.
+            "-y" | "--yes" => i += 1,
+            s if !s.starts_with('-') && path.is_none() => {
+                path = Some(s);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    let path =
+        path.ok_or_else(|| anyhow::anyhow!("usage: flux run <app.flux> [-m provider/model]"))?;
+    let spec = model_spec.unwrap_or_else(|| "anthropic/claude-sonnet-4-6".to_string());
+
+    // Best-effort: a pure-op program runs without a provider; model ops need one.
+    let provider: Option<std::sync::Arc<dyn Provider>> = match provider_for(&spec) {
+        Ok(p) => Some(std::sync::Arc::from(p)),
+        Err(e) => {
+            eprintln!(
+                "{}",
+                style::dim(&format!(
+                    "(no provider for `{spec}`: {e}; model-backed cognition ops will be unavailable)"
+                ))
+            );
+            None
+        }
+    };
+    let model = spec
+        .split_once('/')
+        .map(|(_, m)| m)
+        .unwrap_or(&spec)
+        .to_string();
+
+    flux_app::run_program_file(Path::new(path), provider, model)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Launch the HTTP API daemon.
