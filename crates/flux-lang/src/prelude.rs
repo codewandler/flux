@@ -167,6 +167,20 @@ pub struct TestResult {
     pub summary: String,
 }
 
+/// A judge step's structured decision: the chosen outcome, the reasons behind it, and the evidence it
+/// weighed. Consumed by the `ai.judge` cognition op.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Verdict {
+    /// The chosen outcome (e.g. `supported`, `refuted`, `uncertain`).
+    pub choice: String,
+    /// The reasons behind the choice.
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    /// The evidence weighed in reaching the verdict.
+    #[serde(default)]
+    pub evidence: Vec<Evidence>,
+}
+
 /// A synthetic root referencing every v1-core prelude type, so a single `schema_for!` emits all of
 /// their definitions under one `$defs` map (the shape [`prelude_schema`] returns).
 #[derive(JsonSchema)]
@@ -182,6 +196,7 @@ struct PreludeRoot {
     blocked: Blocked,
     patch: Patch,
     test_result: TestResult,
+    verdict: Verdict,
 }
 
 /// The v1-core prelude type names, in catalog order. The schema `$defs` map may carry additional
@@ -197,6 +212,7 @@ pub const PRELUDE_TYPES: &[&str] = &[
     "Blocked",
     "Patch",
     "TestResult",
+    "Verdict",
 ];
 
 /// The `#/$defs` schema map of every prelude type (plus their referenced definitions) — the

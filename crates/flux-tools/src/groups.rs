@@ -68,6 +68,18 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
             tools: Vec::new(),
             surface_when: when("python"),
         },
+        ToolGroup {
+            name: "cognition".into(),
+            description: "Pure cognition helpers: needs/gaps, and list shaping (compare, dedupe, \
+                          sort, top, merge, cite)."
+                .into(),
+            tools: names(&[
+                "need", "gaps", "compare", "dedupe", "sort", "top", "merge", "cite",
+            ]),
+            // Force-on (empty predicate): these deterministic helpers are useful in any session, so
+            // they are always advertised rather than gated on a workspace signal.
+            surface_when: Vec::new(),
+        },
     ]
 }
 

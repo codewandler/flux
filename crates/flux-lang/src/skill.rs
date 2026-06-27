@@ -14,6 +14,10 @@ pub fn render() -> String {
     s.push_str(&crate::schema::node_kind_catalog());
     s.push_str("<!-- END generated:node-kinds -->\n");
     s.push_str(BODY);
+    s.push_str(PRELUDE);
+    s.push_str("<!-- BEGIN generated:prelude-types -->\n");
+    s.push_str(&crate::prelude::prelude_type_catalog());
+    s.push_str("<!-- END generated:prelude-types -->\n");
     s
 }
 
@@ -139,6 +143,27 @@ In a `pipe`, each step's output becomes the next step's first argument.
   {"kind": "return", "value": {"kind": "fmt", "template": "BTC: {usd}"}}
 ]}
 ```
+
+**Context pack (ctx / ctx_append):**
+```json
+{"body": [
+  {"kind": "ctx", "name": "debug", "purpose": "smallest likely bug",
+   "include": ["src", "failures", "claims"], "exclude": ["generated"], "budget": 9000},
+  {"kind": "ctx_append", "ctx": "debug", "add": ["more_src"]}
+]}
+```
+A `ctx` selects existing symbols (`include` minus `exclude`) into a budgeted pack — shrunk by
+visibility then declared order to `budget` chars, with any drops recorded in the trace. `ctx_append`
+accretes more symbols into it. Both are pure (no IO).
+"##;
+
+const PRELUDE: &str = r##"
+## Artifact types (prelude)
+
+An opt-in stdlib of `Named` type schemas an agent task manipulates — claims, evidence, needs, context
+packs, patches, and structured returns. They are ordinary `Struct` values whose `Named` type names one
+of these schemas; ops declare their inputs/outputs in these terms.
+
 "##;
 
 #[cfg(test)]

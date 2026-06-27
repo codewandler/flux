@@ -249,12 +249,23 @@ impl Tool for GapsTool {
         let unmet: Vec<String> = require
             .into_iter()
             .filter(|field| {
+                if field.is_empty() {
+                    return false; // an empty require field is vacuously covered (malformed input)
+                }
                 let needle = field.to_lowercase();
                 let covered = claims.iter().any(|c| {
                     let text_hit = claim_text(c)
                         .map(|t| t.to_lowercase().contains(&needle))
                         .unwrap_or(false);
-                    let field_hit = c.get(field.as_str()).map(is_truthy).unwrap_or(false);
+                    // Field-presence check is case-insensitive too (mirrors the text path): a claim
+                    // with a truthy key equal to `field` (ignoring case) covers it.
+                    let field_hit = c
+                        .as_object()
+                        .map(|o| {
+                            o.iter()
+                                .any(|(k, v)| k.eq_ignore_ascii_case(field) && is_truthy(v))
+                        })
+                        .unwrap_or(false);
                     text_hit || field_hit
                 });
                 !covered

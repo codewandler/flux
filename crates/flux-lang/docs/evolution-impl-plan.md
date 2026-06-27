@@ -23,7 +23,12 @@ change.
   `type_ref_to_schema_projects_each_variant` (flux-lang `opspec.rs`); `map_args_binds_through_a_lowered_opspec_schema`
   (flux-lang `runtime.rs`) — proves OpSpec → lower → `from_spec` → positional bind end-to-end.
 
-## P1 — v1-core prelude types + cognition op-pack
+## P1 — v1-core prelude types + cognition op-pack — ✅ DONE
+- **Shipped:** prelude in `flux-lang/src/prelude.rs` (11 v1-core types incl. `Verdict`, `prelude_schema()`
+  `$defs` + `prelude_type_catalog()` SSOT + reference/skill blocks). Pure ops (`need`/`gaps`/`compare`/
+  `dedupe`/`sort`/`top`/`merge`/`cite`) in `flux-tools/src/cognition.rs` under a force-on `cognition`
+  group. Model-backed pack (`ai.*`/`synth`) in the new **`flux-cognition`** L3 crate. NOTE: wiring the
+  model pack into a live registry (provider+model) is **P3** — it is a dead crate until then.
 - **Builds on P0:** each cognition op declares its inputs as typed, named `OpSpec`/`Param`s, so it gets a
   faithful planner signature + `properties`/`required` for free — no hand-written JSON. The `Named` prelude
   types resolve the `#/$defs/<name>` `$ref`s P0's `type_ref_to_schema` already emits.
@@ -52,7 +57,12 @@ change.
 - Tests: prelude schema round-trip; a cognition op's `OpSpec` lowers to the expected named schema (reusing
   the P0 projector); `gaps`/`compare` purity.
 
-## P2 — `ctx` / `ctx_append` nodes (+2)
+## P2 — `ctx` / `ctx_append` nodes (+2) — ✅ DONE
+- **Shipped:** `Node::Ctx`/`Node::CtxAppend` (29→31), `build_ctx`/`append_ctx` enforce the budget at
+  node-eval (char heuristic, **priority-prefix** shrink so pinned is never dropped for a plainer member,
+  `RunEvent::CtxShrunk` records drops, immutable append). `ValueStore::binding()` accessor (default over
+  `view()`). SSOT/docs regenerated; tests cover budget shrink, no-budget keep-all, unbound tolerance, and
+  append eviction.
 - `ast.rs`: **2** new `Node` variants (`ctx`, `ctx_append`) with doc-comments (so the node-kind SSOT
   regenerates). Frozen 29 stay. (`need`/`gaps` are pure ops from P1, not nodes.)
 - `runtime.rs`: interpret `ctx` (resolve include/exclude → members, apply the declared `budget`) and

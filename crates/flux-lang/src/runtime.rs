@@ -1840,6 +1840,16 @@ fn build_ctx(
     budget: Option<u64>,
     transcript: &mut Vec<String>,
 ) -> Result<ValueId> {
+    // Dedup members (first-seen order): a symbol listed twice must not double-charge the budget.
+    let members: Vec<SymbolName> = {
+        let mut seen = std::collections::HashSet::new();
+        members
+            .iter()
+            .filter(|s| seen.insert(s.0.clone()))
+            .cloned()
+            .collect()
+    };
+
     // Char size + visibility rank per member. An unbound member contributes nothing (a pack tolerates
     // a not-yet-resolved reference rather than erroring).
     let sizes: Vec<usize> = members
@@ -1848,7 +1858,7 @@ fn build_ctx(
             Ok(match store.resolve(session_id, sym)? {
                 Some(vid) => store
                     .get_value(&vid)?
-                    .map(|v| v.to_json().to_string().len())
+                    .map(|v| v.to_json().to_string().chars().count())
                     .unwrap_or(0),
                 None => 0,
             })
@@ -1866,7 +1876,10 @@ fn build_ctx(
 
     let mut keep = vec![true; members.len()];
     if let Some(b) = budget {
-        // Priority order: higher visibility tier first; stable sort preserves declared order in a tier.
+        // Shrink by visibility tier then declared order, dropping the lowest-priority tail: keep a
+        // priority-ordered *prefix* so a pinned member is never dropped to make room for a plainer one
+        // (stable sort preserves declared order within a tier; the first member that doesn't fit stops
+        // the pack — no rank inversion).
         let mut order: Vec<usize> = (0..members.len()).collect();
         order.sort_by_key(|&i| std::cmp::Reverse(ranks[i]));
         keep = vec![false; members.len()];
@@ -1875,6 +1888,8 @@ fn build_ctx(
             if running + sizes[i] <= b as usize {
                 running += sizes[i];
                 keep[i] = true;
+            } else {
+                break;
             }
         }
     }
@@ -2147,6 +2162,120 @@ mod tests {
         assert!(
             m2.iter().any(|v| matches!(v, Value::String(s) if s == "d")),
             "the appended member is present"
+        );
+    }
+
+    /// With no budget a pack keeps every member (an unbound one too — tolerated, sized 0) and records
+    /// neither a shrink event nor a `budget` field.
+    #[test]
+    fn ctx_without_budget_keeps_all_including_unbound() {
+        let store = MemStore::new();
+        let sid = "s";
+        let vid = store
+            .put_value(sid, &Value::String("hello".into()))
+            .unwrap();
+        store
+            .bind(
+                sid,
+                &SymbolName("a".into()),
+                &vid,
+                None,
+                "hello",
+                Visibility::Visible,
+            )
+            .unwrap();
+        let mut transcript = Vec::new();
+        // `b` is never bound — must be tolerated, not error.
+        let members = vec![SymbolName("a".into()), SymbolName("b".into())];
+        let cvid = build_ctx(
+            &store,
+            sid,
+            &SymbolName("pack".into()),
+            &None,
+            &members,
+            None,
+            &mut transcript,
+        )
+        .unwrap();
+        let Some(Value::Struct(fields)) = store.get_value(&cvid).unwrap() else {
+            panic!("ctx is a struct")
+        };
+        let Value::List(kept) = &fields["members"] else {
+            panic!("members list")
+        };
+        assert_eq!(
+            kept.len(),
+            2,
+            "no budget keeps every member, unbound included"
+        );
+        assert!(!fields.contains_key("budget"), "no budget field when None");
+        assert!(
+            !store
+                .events(sid)
+                .iter()
+                .any(|e| matches!(e, RunEvent::CtxShrunk { .. })),
+            "no shrink event without a budget"
+        );
+    }
+
+    /// Appending a higher-priority member re-budgets the pack and can evict a previously-kept,
+    /// lower-priority member (priority-prefix semantics — no rank inversion).
+    #[test]
+    fn ctx_append_re_budgets_and_can_evict() {
+        let store = MemStore::new();
+        let sid = "s";
+        let put = |name: &str, val: String, vis: Visibility| {
+            let vid = store.put_value(sid, &Value::String(val.clone())).unwrap();
+            store
+                .bind(sid, &SymbolName(name.into()), &vid, None, &val, vis)
+                .unwrap();
+        };
+        put("keep", "z".repeat(40), Visibility::Pinned); // ~42 chars
+        put("low", "y".repeat(40), Visibility::Visible); // ~42 chars
+        let mut t = Vec::new();
+        let members = vec![SymbolName("keep".into()), SymbolName("low".into())];
+        build_ctx(
+            &store,
+            sid,
+            &SymbolName("p".into()),
+            &None,
+            &members,
+            Some(100),
+            &mut t,
+        )
+        .unwrap();
+
+        // A higher-priority (pinned) member that overflows the budget evicts the lower-priority `low`.
+        put("big", "q".repeat(50), Visibility::Pinned); // ~52 chars
+        let v2 = append_ctx(
+            &store,
+            sid,
+            &SymbolName("p".into()),
+            &[SymbolName("big".into())],
+            &mut t,
+        )
+        .unwrap();
+        let Some(Value::Struct(f2)) = store.get_value(&v2).unwrap() else {
+            panic!("ctx is a struct")
+        };
+        let Value::List(m2) = &f2["members"] else {
+            panic!("members list")
+        };
+        let kept: Vec<String> = m2
+            .iter()
+            .filter_map(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(kept.contains(&"keep".to_string()), "pinned member retained");
+        assert!(
+            kept.contains(&"big".to_string()),
+            "appended pinned member kept"
+        );
+        assert!(
+            !kept.contains(&"low".to_string()),
+            "lower-priority member evicted on re-budget (no rank inversion)"
         );
     }
 

@@ -153,3 +153,37 @@ In a `pipe`, each step's output becomes the next step's first argument.
   {"kind": "return", "value": {"kind": "fmt", "template": "BTC: {usd}"}}
 ]}
 ```
+
+**Context pack (ctx / ctx_append):**
+```json
+{"body": [
+  {"kind": "ctx", "name": "debug", "purpose": "smallest likely bug",
+   "include": ["src", "failures", "claims"], "exclude": ["generated"], "budget": 9000},
+  {"kind": "ctx_append", "ctx": "debug", "add": ["more_src"]}
+]}
+```
+A `ctx` selects existing symbols (`include` minus `exclude`) into a budgeted pack — shrunk by
+visibility then declared order to `budget` chars, with any drops recorded in the trace. `ctx_append`
+accretes more symbols into it. Both are pure (no IO).
+
+## Artifact types (prelude)
+
+An opt-in stdlib of `Named` type schemas an agent task manipulates — claims, evidence, needs, context
+packs, patches, and structured returns. They are ordinary `Struct` values whose `Named` type names one
+of these schemas; ops declare their inputs/outputs in these terms.
+
+<!-- BEGIN generated:prelude-types -->
+| type | description |
+|---|---|
+| `Span` | A cited region inside a source document — the proof pointer a `Claim` or `Evidence` points at. |
+| `Claim` | A factual assertion extracted from a source, carrying its provenance span and a confidence score. |
+| `Evidence` | A claim together with the supporting spans that ground it — the audited unit of support. |
+| `Need` | An explicit statement of missing information: what to ask, which fields are required to satisfy it, and the condition under which it is considered met. Produced by the pure `need` op; its complement `gaps` reports the still-unmet `require` fields. |
+| `Ctx` | A bounded, intentionally-budgeted bundle of context — the value produced by the `ctx`/`ctx_append` nodes. `members` are the symbol references selected into the pack; `budget` is the char/token cap the runtime shrinks the pack to at node evaluation. |
+| `Query` | A structured retrieval request over one or more datasources — the input to the `query`/`Search.run` ops. |
+| `Answer` | A structured, evidence-bearing **successful** return from an agent task. |
+| `Blocked` | A structured return signalling the task **could not** be completed, with the open gaps that blocked it. Same shape as [`Answer`] but a distinct type so callers can branch on success vs. blockage. |
+| `Patch` | A proposed code change — a concrete unified diff plus the path it applies to. |
+| `TestResult` | The outcome of running a test command. |
+| `Verdict` | A judge step's structured decision: the chosen outcome, the reasons behind it, and the evidence it weighed. Consumed by the `ai.judge` cognition op. |
+<!-- END generated:prelude-types -->

@@ -43,3 +43,30 @@ optional arguments are in `[brackets]`.
 
 `write`, `edit`, `patch`, `append`, `task`, `bash`, and the `cargo_*` ops may pause for user approval
 (controlled by the safety envelope and the active permission rules).
+
+## Cognition ops
+
+The cognition pack (group `cognition`). **Pure** ops are deterministic, no-IO data shaping (always
+advertised). **Model-backed** ops do one structured model call — they live in the `flux-cognition`
+crate and are only advertised once a host registers `CognitionPack::new(provider, model)` into the
+registry.
+
+| op | kind | signature | description |
+|---|---|---|---|
+| `need` | pure | `ask[, require, done_when]` | Build a `Need` artifact (an explicit statement of missing info) |
+| `gaps` | pure | `claims, need` | Report a `Need`'s still-unmet `require` fields given some claims |
+| `compare` | pure | `a, b` | `{ added, removed, common }` over two arrays |
+| `dedupe` | pure | `items[, by]` | Remove duplicates (whole-value, or by a field), first-seen order |
+| `sort` | pure | `items[, by, order]` | Stable sort by a field (or natural); `order` = `asc`/`desc` |
+| `top` | pure | `items, n` | The first `n` items |
+| `merge` | pure | `lists` | Concatenate an array-of-arrays into one array |
+| `cite` | pure | `claims` | A markdown citation list, one line per claim |
+| `ai.extract` | model | `from[, ask, schema]` | Extract typed items (e.g. `Claim[]`) from free text |
+| `ai.rank` | model | `items[, by]` | Reorder items by a natural-language criterion |
+| `ai.judge` | model | `claim[, evidence]` | Adjudicate a claim → `Verdict` `{ choice, reasons }` |
+| `ai.reason` | model | `ask[, ctx]` | Free-form reasoning over a context pack |
+| `synth` | model | `claims[, format, cite]` | Synthesize a cited `Answer` from claims |
+| `ai.rewrite` | model | `text[, style]` | Rewrite text in a requested style |
+
+The model-backed ops carry a `Network` effect and require provider access (an LLM call is network
+egress); the pure ops carry no effect and never pause for approval.

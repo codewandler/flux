@@ -87,7 +87,7 @@ impl OpKind {
                  through for the caller to parse.",
                 vec![
                     required("from", TypeRef::String),
-                    required("ask", TypeRef::String),
+                    optional("ask", TypeRef::String),
                     optional("schema", TypeRef::String),
                 ],
                 TypeRef::List(Box::new(TypeRef::Named("Claim".into()))),
@@ -98,7 +98,7 @@ impl OpKind {
                  a JSON array, best-first.",
                 vec![
                     required("items", TypeRef::List(Box::new(TypeRef::Any))),
-                    required("by", TypeRef::String),
+                    optional("by", TypeRef::String),
                 ],
                 TypeRef::List(Box::new(TypeRef::Any)),
             ),
@@ -108,7 +108,7 @@ impl OpKind {
                  `{ choice, reasons }`.",
                 vec![
                     required("claim", TypeRef::Named("Claim".into())),
-                    required("evidence", TypeRef::Named("Evidence".into())),
+                    optional("evidence", TypeRef::Named("Evidence".into())),
                 ],
                 TypeRef::Named("Verdict".into()),
             ),
@@ -116,7 +116,7 @@ impl OpKind {
                 "ai.reason",
                 "Free-form reasoning over a context pack. Returns the model's answer as text.",
                 vec![
-                    required("ctx", TypeRef::Named("Context".into())),
+                    optional("ctx", TypeRef::Named("Ctx".into())),
                     required("ask", TypeRef::String),
                 ],
                 TypeRef::String,
@@ -137,7 +137,7 @@ impl OpKind {
                 "Rewrite text in a requested style, preserving meaning. Returns the rewritten text.",
                 vec![
                     required("text", TypeRef::String),
-                    required("style", TypeRef::String),
+                    optional("style", TypeRef::String),
                 ],
                 TypeRef::String,
             ),
@@ -474,8 +474,39 @@ mod tests {
         let props = &spec.input_schema["properties"];
         assert_eq!(props["from"], json!({ "type": "string" }));
         assert_eq!(props["ask"], json!({ "type": "string" }));
-        // `from` and `ask` are required; `schema` is optional.
-        assert_eq!(spec.input_schema["required"], json!(["from", "ask"]));
+        // Only the primary input `from` is required (matches what `execute` actually requires);
+        // `ask`/`schema` are read leniently, so they are optional in the schema.
+        assert_eq!(spec.input_schema["required"], json!(["from"]));
+    }
+
+    /// Every artifact-typed `#/$defs/<Name>` ref a cognition op declares must name a real prelude
+    /// type — guards against the `Context`/`Verdict` drift class (a ref with no schema to resolve).
+    #[test]
+    fn cognition_op_refs_resolve_against_the_prelude() {
+        let (_pack, reg) = pack("noop");
+        let prelude: std::collections::HashSet<&str> =
+            flux_lang::prelude::PRELUDE_TYPES.iter().copied().collect();
+        for op in [
+            "ai.extract",
+            "ai.rank",
+            "ai.judge",
+            "ai.reason",
+            "synth",
+            "ai.rewrite",
+        ] {
+            let spec = reg.get(op).unwrap().spec();
+            let s = serde_json::to_string(&spec.input_schema).unwrap();
+            for frag in s.split("#/$defs/").skip(1) {
+                let name: String = frag
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                assert!(
+                    prelude.contains(name.as_str()),
+                    "op `{op}` references unknown prelude type `{name}`"
+                );
+            }
+        }
     }
 
     #[test]

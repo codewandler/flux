@@ -9,13 +9,13 @@ update it in the same commit as the behaviour it describes.
 [`docs/designs/flux-lang-evolution.md`](../../../docs/designs/flux-lang-evolution.md)).
 
 > Note: the implementation has intentionally grown **beyond** the PRD's "deliberately small" v1 node set
-> (PRD §4/§8 list ~7 constructs; `ast.rs` ships **29**). That is a superset, not a regression.
+> (PRD §4/§8 list ~7 constructs; `ast.rs` ships **31**). That is a superset, not a regression.
 
 ## Language & AST (PRD §8, §10.1)
 
 | PRD § | Requirement | Status | Evidence / note |
 |---|---|---|---|
-| 8, 10.1 | Draft AST + core node kinds (`flow`/bind/call/thing/branch/repeat/await/return/effect) | ✅ | `src/ast.rs` — 29 `Node` kinds |
+| 8, 10.1 | Draft AST + core node kinds (`flow`/bind/call/thing/branch/repeat/await/return/effect) | ✅ | `src/ast.rs` — 31 `Node` kinds |
 | 8 | Constructs beyond v1 (`each`/`parallel`/`race`/`try`/`retry`/`confirm`/`loop`/`throttle`/…) | ✅ | `src/ast.rs`, `src/runtime.rs` |
 | 8 | `await` pause/resume | 🟡 | node exists; interpreter rejects it (cross-turn suspend unbuilt) |
 | 1, 8 | Compact **text parser** (text → AST, auto-detect forms) | ⬜ | `parse.rs`/`format.rs` are a "Toolchain plan" in `syntax.md` |
@@ -60,7 +60,7 @@ update it in the same commit as the behaviour it describes.
 |---|---|---|---|
 | 13 | Symbolic session view (no full outputs/secrets/log to model) | ✅ | `SessionView` projection in `state.rs` |
 | 13 | Per-step dependency slice | 🟡 | implicit/global today |
-| 13 | **Explicit, budgeted context packs** (`ctx`/`ctx_append`) | ➕ | designed in `flux-lang-evolution.md` §3.2 |
+| 13 | **Explicit, budgeted context packs** (`ctx`/`ctx_append`) | ✅ (➕) | built: `src/ast.rs` (`Ctx`/`CtxAppend`), `src/runtime.rs` (`build_ctx`/`append_ctx`, budget@node-eval, `CtxShrunk` trace) |
 
 ## Public API & SDK (PRD §17)
 
@@ -83,9 +83,9 @@ update it in the same commit as the behaviour it describes.
 
 | PRD § | Requirement | Status | Evidence / note |
 |---|---|---|---|
-| 7.1 | Slot-filling pack | ⬜ | superseded conceptually by first-class `need` (➕) |
-| 7.2 | KB / FAQ (evidence + grounding) pack | ⬜ | superseded conceptually by the artifact ontology + `synth` (➕) |
-| 11 | **Cognition op-pack** (`ai.extract`/`rank`/`judge`/`synth`/`gaps`) | ➕ | designed in `flux-lang-evolution.md` §3.4 |
+| 7.1 | Slot-filling pack | ✅ (➕) | `need`/`gaps` pure ops in `flux-tools/src/cognition.rs` |
+| 7.2 | KB / FAQ (evidence + grounding) pack | ✅ (➕) | artifact ontology (`prelude.rs`) + `synth`/`ai.*` in `flux-cognition` |
+| 11 | **Cognition op-pack** (`ai.extract`/`rank`/`judge`/`synth`/`gaps`) | ✅ (➕) | pure ops in `flux-tools/src/cognition.rs`; model-backed in `flux-cognition` (L3) |
 
 ## Near-term roadmap (PRD §0)
 
@@ -98,15 +98,15 @@ update it in the same commit as the behaviour it describes.
 
 ## Beyond the PRD — this design's additions (➕)
 
-| Addition | Where |
-|---|---|
-| Artifact-type ontology (`Span`/`Claim`/`Evidence`/`Need`/`Hypothesis`/`Patch`/`TestResult`/`Ctx`/`Decision`/`Query`/`Answer`; reuses `Thing` for handles; **new**, distinct from `flux-evidence::Observation`) | evolution §3.1 |
-| First-class context packs (`ctx`/`ctx_append`; budget enforced at **node evaluation**, eager, heuristic counter v1) | evolution §3.2 |
-| Needs & gaps — **two pure ops** (`need`/`gaps`, not nodes) | evolution §3.3 |
-| Cognition op-pack + domain-wrapper convention | evolution §3.4 |
-| `=`/`do`/`+=` marker syntax; optional `goal` header | evolution §5 |
-| Multi-agent `Program` layer (agents/channels/triggers/journeys) + deferred `flux-app` host | evolution §6 + appendix |
-| Real `flux-sdk` lifecycle surface (`OpRegistry`/packs/prelude + `FlowClient` + artifact APIs) | evolution §7 |
+| Addition | Status | Where / evidence |
+|---|---|---|
+| Artifact-type ontology (v1-core: `Span`/`Claim`/`Evidence`/`Need`/`Ctx`/`Query`/`Answer`/`Blocked`/`Patch`/`TestResult`/`Verdict`; reuses `Thing`; **new**, distinct from `flux-evidence::Observation`) | ✅ | `src/prelude.rs` (+ `$defs` via `prelude_schema()`; SSOT `prelude_type_catalog()`) |
+| First-class context packs (`ctx`/`ctx_append`; budget enforced at **node evaluation**, eager, char heuristic, priority-prefix shrink) | ✅ | `src/ast.rs`, `src/runtime.rs` (`build_ctx`/`append_ctx`) |
+| Needs & gaps — **two pure ops** (`need`/`gaps`, not nodes) | ✅ | `flux-tools/src/cognition.rs` |
+| Cognition op-pack + domain-wrapper convention | ✅ | pure: `flux-tools/src/cognition.rs`; model-backed: `flux-cognition` (L3) |
+| `=`/`do`/`+=` marker syntax; optional `goal` header | ⬜ | evolution §5 (P5 text parser) |
+| Multi-agent `Program` layer (agents/channels/triggers/journeys) + `flux-app` host | ⬜ | evolution §6 + appendix (P5c + flux-app) |
+| Real `flux-sdk` lifecycle surface (`OpRegistry`/packs/prelude + `FlowClient` + artifact APIs) | ⬜ | evolution §7 (P3) |
 
 ## Key design decisions (resolved this round)
 

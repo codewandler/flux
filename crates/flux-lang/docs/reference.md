@@ -100,6 +100,7 @@ This table is generated from the prelude struct doc-comments via
 | `Blocked` | A structured return signalling the task **could not** be completed, with the open gaps that blocked it. Same shape as [`Answer`] but a distinct type so callers can branch on success vs. blockage. |
 | `Patch` | A proposed code change — a concrete unified diff plus the path it applies to. |
 | `TestResult` | The outcome of running a test command. |
+| `Verdict` | A judge step's structured decision: the chosen outcome, the reasons behind it, and the evidence it weighed. Consumed by the `ai.judge` cognition op. |
 <!-- END generated:prelude-types -->
 
 ---
