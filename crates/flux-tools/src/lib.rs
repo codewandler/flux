@@ -11,6 +11,9 @@ pub mod cargo;
 pub mod cognition;
 pub mod extra;
 pub mod groups;
+pub mod reflect;
+
+pub use reflect::register_reflect;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};

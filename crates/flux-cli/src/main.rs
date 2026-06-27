@@ -202,8 +202,14 @@ fn persist_new_rules(initial: &[String], current: &[String]) {
     }
 }
 
-const KNOWN_PROVIDERS: &[&str] =
-    &["anthropic", "claude", "openai", "codex", "openrouter", "ollama"];
+const KNOWN_PROVIDERS: &[&str] = &[
+    "anthropic",
+    "claude",
+    "openai",
+    "codex",
+    "openrouter",
+    "ollama",
+];
 
 /// Parse a fully-qualified `provider/model` spec and build the matching provider from environment
 /// credentials. Provider must be an explicit prefix (`anthropic/`, `claude/`, `openai/`, `codex/`,
@@ -551,6 +557,12 @@ async fn build_agent(cli: &Cli) -> Result<(FlowEngine, String, Arc<dyn flux_runt
     // top-level registry only — never on `sub_registry`, so worker sub-agents can't run eval/git ops.
     flux_eval::register_eval_ops(&mut registry);
 
+    // Reflexive ops (`plan`/`run_plan`): registered so a pre-authored flow (`flux flow run`, and the
+    // agent loop in flux-lang) can call them, but tagged to the never-surfaced `reflect` group so they
+    // stay OUT of the model-facing catalog in ordinary turns. They are only functional when a `LoopHost`
+    // is installed (per reflexive run — see `run_draft_ast`); without it they return a clear error.
+    flux_tools::register_reflect(&mut registry);
+
     // Guarded web access (policy-gated as network egress; private/loopback per config).
     registry.register(Arc::new(
         flux_browser::WebFetchTool::default().allow_private(cfg.allow_private_net),
@@ -771,7 +783,7 @@ async fn run_flow(args: &[String]) -> Result<()> {
 /// against the live op registry, previews risk + installs the per-op approver, runs it, and prints the
 /// outcome. The only inputs are the synthesized `Cli` (model/`--yes`) and the AST itself.
 pub(crate) async fn run_draft_ast(cli: &Cli, ast: &flux_flow::ast::DraftAst) -> Result<()> {
-    let (mut engine, session_id, _spawner) = build_agent(cli).await?;
+    let (engine, session_id, _spawner) = build_agent(cli).await?;
     eprintln!(
         "{}",
         style::dim(&format!("flow · {} · session {session_id}", engine.model))
@@ -797,23 +809,48 @@ pub(crate) async fn run_draft_ast(cli: &Cli, ast: &flux_flow::ast::DraftAst) -> 
     } else {
         Arc::new(StdinApprover)
     };
-    engine
-        .executor
-        .set_approver(Arc::new(flux_flow::runtime::PlanApprover::new(
-            risk.ops.clone(),
-            fallback,
-        )));
 
-    let mut sink = CliSink::new(0);
-    let outcome = flux_flow::runtime::execute_flow(
-        &engine.flow,
-        &engine.executor,
-        &session_id,
-        ast,
-        &mut sink,
-    )
-    .await
-    .context("execute flow")?;
+    // Take the engine apart to install the reflexive loop host on the SAME executor: a flow may call
+    // `plan`/`run_plan`, which re-enter the planner/interpreter through this executor + session. The
+    // sink is shared (an `Arc<Mutex<…>>`) so the outer flow and any inner `run_plan` stream live onto
+    // one surface, sub-steps interleaved.
+    let FlowEngine {
+        mut executor,
+        flow,
+        provider,
+        model,
+        system_prompt,
+        max_tokens,
+        ..
+    } = engine;
+    executor.set_approver(Arc::new(flux_flow::runtime::PlanApprover::new(
+        risk.ops.clone(),
+        fallback,
+    )));
+
+    let store = Arc::new(flow);
+    let provider: Arc<dyn Provider> = Arc::from(provider);
+    let shared: Arc<std::sync::Mutex<dyn AgentSink>> =
+        Arc::new(std::sync::Mutex::new(CliSink::new(0)));
+    let executor = flux_flow::loop_host::EngineLoopHost::install(
+        executor,
+        provider,
+        model,
+        Some(system_prompt),
+        store.clone(),
+        session_id.clone(),
+        shared.clone(),
+        flux_flow::compile::CompileOptions {
+            max_tokens,
+            ..Default::default()
+        },
+    );
+
+    let mut sink = flux_flow::loop_host::SharedSink::new(shared.clone());
+    let outcome =
+        flux_flow::runtime::execute_flow(store.as_ref(), executor.as_ref(), &session_id, ast, &mut sink)
+            .await
+            .context("execute flow")?;
     if !outcome.result.trim().is_empty() {
         println!("{}", outcome.result);
     } else {
@@ -823,7 +860,7 @@ pub(crate) async fn run_draft_ast(cli: &Cli, ast: &flux_flow::ast::DraftAst) -> 
             style::dim(&format!("done \u{00b7} {} step(s)", outcome.steps))
         );
     }
-    sink.turn_end(None);
+    shared.lock().unwrap().turn_end(None);
     Ok(())
 }
 

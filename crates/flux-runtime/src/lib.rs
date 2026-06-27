@@ -94,6 +94,24 @@ pub trait Spawner: Send + Sync {
     ) -> flux_core::Result<String>;
 }
 
+/// The reflexive capability: re-enter the planner and the interpreter from *within* a flow. Defined
+/// here (L2) and injected into [`ToolContext`] so the `plan`/`run_plan` ops can delegate without
+/// `flux-runtime` depending on the engine — the same seam as [`Spawner`]. The engine (L3) installs a
+/// concrete `LoopHost` per turn, wired to the live provider + session + sink. This is what lets the
+/// agent loop be written in flux-lang: "ask the planner" and "run a plan" become ordinary gated ops
+/// that traverse [`Executor::dispatch`] like any other — the LLM stays the planner, never the runtime.
+#[async_trait]
+pub trait LoopHost: Send + Sync {
+    /// Re-enter the planner (the model) to produce a plan from `input` (the working feedback /
+    /// conversation) → a `Plan` artifact (`{kind: "chat"|"plan"|"error", text?, ast?, complete?}`) as
+    /// JSON. Wraps the engine's compile step.
+    async fn plan(&self, input: serde_json::Value) -> flux_core::Result<serde_json::Value>;
+    /// Re-enter the interpreter to run an emitted plan in the CURRENT session → an `Outcome` artifact
+    /// (`{transcript, result, steps, suspension?}`) as JSON. Bounded by a reentry-depth cap. Wraps the
+    /// engine's execute step.
+    async fn run_plan(&self, plan: serde_json::Value) -> flux_core::Result<serde_json::Value>;
+}
+
 /// What a tool is given at execution time: the guarded IO surface, the secret redactor, an optional
 /// sub-agent spawner, and the per-session read-set (file → mtime at last read) used by the
 /// read-before-write guard. The read-set is shared (an `Arc<Mutex<…>>`) so every op in a session sees
@@ -103,6 +121,9 @@ pub struct ToolContext {
     pub system: Arc<System>,
     pub redactor: Redactor,
     pub spawner: Option<Arc<dyn Spawner>>,
+    /// The reflexive capability (`plan`/`run_plan`), installed per turn by the engine. `None` outside a
+    /// model-in-the-loop run — the ops then return a clear error rather than silently doing nothing.
+    pub loop_host: Option<Arc<dyn LoopHost>>,
     pub read_times: Arc<Mutex<HashMap<String, std::time::SystemTime>>>,
 }
 
@@ -112,6 +133,7 @@ impl ToolContext {
             system,
             redactor: Redactor::new(),
             spawner: None,
+            loop_host: None,
             read_times: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -131,6 +153,12 @@ impl ToolContext {
 
     pub fn with_spawner(mut self, spawner: Arc<dyn Spawner>) -> Self {
         self.spawner = Some(spawner);
+        self
+    }
+
+    /// Install the reflexive capability (the engine does this per turn before running the loop).
+    pub fn with_loop_host(mut self, loop_host: Arc<dyn LoopHost>) -> Self {
+        self.loop_host = Some(loop_host);
         self
     }
 
@@ -563,6 +591,14 @@ impl Executor {
     /// driving turns — the TUI swaps in a modal approver).
     pub fn set_approver(&mut self, approver: Arc<dyn Approver>) {
         self.approver = approver;
+    }
+
+    /// Install the reflexive [`LoopHost`] capability onto this executor's [`ToolContext`], so the
+    /// `plan`/`run_plan` ops dispatched through it can re-enter the planner/interpreter. Done by the
+    /// engine once per turn, after the executor is built (the host holds a `Weak` back to this same
+    /// executor, so it can only be wired in afterwards). Mirrors [`set_approver`](Self::set_approver).
+    pub fn set_loop_host(&mut self, loop_host: Arc<dyn LoopHost>) {
+        self.ctx.loop_host = Some(loop_host);
     }
 
     /// The current approver (used by flow nodes such as `confirm` that need to request approval

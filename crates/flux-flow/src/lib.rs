@@ -20,6 +20,7 @@
 
 pub mod compile;
 pub mod engine;
+pub mod loop_host;
 pub mod registry;
 pub mod runtime;
 pub mod state;
