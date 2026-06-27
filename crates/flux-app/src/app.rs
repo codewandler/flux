@@ -25,7 +25,9 @@ use flux_flow::state::FlowStore;
 use flux_lang::ast::{SymbolName, Value as FluxValue, Visibility};
 use flux_lang::program::Program;
 use flux_provider::Provider;
-use flux_runtime::{AllowApprover, Executor, PermissionManager, ToolContext, ToolRegistry};
+use flux_runtime::{
+    AllowApprover, Approver, DenyApprover, Executor, PermissionManager, ToolContext, ToolRegistry,
+};
 use flux_system::{System, Workspace};
 
 use crate::bus::{Bus, Event};
@@ -64,8 +66,20 @@ impl App {
         provider: Option<Arc<dyn Provider>>,
         model: impl Into<String>,
     ) -> Self {
+        Self::with_options(program, provider, model, false)
+    }
+
+    /// Build a host, choosing the approval posture. `auto_approve = false` (the safe default) **denies**
+    /// any op outside the pre-allowed orchestration + read-only set; `true` (the CLI's `--yes`) runs
+    /// allow-all for trusted, pre-authored programs.
+    pub fn with_options(
+        program: Program,
+        provider: Option<Arc<dyn Provider>>,
+        model: impl Into<String>,
+        auto_approve: bool,
+    ) -> Self {
         App {
-            engine: Engine::new(program, provider, model.into()),
+            engine: Engine::new(program, provider, model.into(), auto_approve),
         }
     }
 
@@ -128,10 +142,18 @@ pub(crate) struct Engine {
     depth: AtomicU32,
     /// Monotonic counter giving each journey run a distinct session id.
     runs: AtomicU64,
+    /// When true, journeys run under an allow-all approver (`--yes`); otherwise destructive ops
+    /// outside the pre-allowed safe set are **denied** (the safe headless default).
+    auto_approve: bool,
 }
 
 impl Engine {
-    fn new(program: Program, provider: Option<Arc<dyn Provider>>, model: String) -> Arc<Self> {
+    fn new(
+        program: Program,
+        provider: Option<Arc<dyn Provider>>,
+        model: String,
+        auto_approve: bool,
+    ) -> Arc<Self> {
         let bus = Bus::new();
         let channels = Arc::new(program.channels.clone());
         // `new_cyclic`: the `spawn` op needs a back-reference to the engine it re-enters, but the
@@ -150,6 +172,7 @@ impl Engine {
                 bus,
                 depth: AtomicU32::new(0),
                 runs: AtomicU64::new(0),
+                auto_approve,
             }
         })
     }
@@ -222,7 +245,7 @@ impl Engine {
         let store = FlowStore::in_memory().map_err(other)?;
         let session_id = format!("{name}#{}", self.runs.fetch_add(1, Ordering::SeqCst));
         seed_payload(&store, &session_id, payload)?;
-        let executor = build_executor(self.registry.clone())?;
+        let executor = build_executor(self.registry.clone(), self.auto_approve)?;
 
         let outcome = flux_flow::runtime::execute_flow(&store, &executor, &session_id, &ast, sink)
             .await
@@ -245,16 +268,20 @@ impl JourneyHost for Engine {
 }
 
 /// Build the execution envelope for a journey: a guarded [`System`] rooted at the current working
-/// directory, an [`AllowApprover`] (the host is non-interactive — it runs trusted, pre-authored
-/// programs), and the shared op registry. Every op still dispatches through this `Executor`, so
-/// permission rules and effect gating apply exactly as in the interactive engine.
-fn build_executor(registry: ToolRegistry) -> Result<Executor> {
+/// directory, the shared op registry, and an approver chosen by `auto_approve`. Every op dispatches
+/// through this `Executor`, so permission rules and effect gating apply exactly as in the interactive
+/// engine.
+///
+/// **Safe headless default (`auto_approve = false`):** the orchestration verbs + read-only builtins are
+/// pre-allowed (they run without prompting); anything else (`bash`, `write`, `git_*`, …) falls to a
+/// [`DenyApprover`] and is **denied** — there is no human at a prompt, so destructive ops in an
+/// untrusted program cannot execute. `auto_approve = true` (the CLI's `--yes`) swaps in an
+/// [`AllowApprover`] for trusted, pre-authored programs.
+fn build_executor(registry: ToolRegistry, auto_approve: bool) -> Result<Executor> {
     let root = std::env::current_dir().map_err(other)?;
     let workspace = Workspace::new(&root).map_err(other)?;
     let system = Arc::new(System::new(workspace));
     let ctx = ToolContext::new(system);
-    // Pre-allow the orchestration verbs + read-only builtins; anything else falls to the approver,
-    // which auto-allows (a headless host). Tightening this is a deployment concern, not an MVP one.
     let allow: Vec<String> = [
         "emit", "send", "ask", "spawn", "read", "glob", "grep", "search",
     ]
@@ -262,7 +289,12 @@ fn build_executor(registry: ToolRegistry) -> Result<Executor> {
     .map(String::from)
     .collect();
     let perms = PermissionManager::from_rules(&allow, &[]);
-    Ok(Executor::new(registry, perms, Arc::new(AllowApprover), ctx))
+    let approver: Arc<dyn Approver> = if auto_approve {
+        Arc::new(AllowApprover)
+    } else {
+        Arc::new(DenyApprover)
+    };
+    Ok(Executor::new(registry, perms, approver, ctx))
 }
 
 /// Seed an event's payload into the journey's session so the flow can read it: the whole payload binds

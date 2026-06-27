@@ -23,6 +23,7 @@ pub async fn run_program_file(
     path: &Path,
     provider: Option<Arc<dyn Provider>>,
     model: impl Into<String>,
+    auto_approve: bool,
 ) -> Result<()> {
     let src = std::fs::read_to_string(path)?;
     let program = match Module::parse_str(&src).map_err(|e| Error::Other(e.to_string()))? {
@@ -32,7 +33,7 @@ pub async fn run_program_file(
             ..Default::default()
         },
     };
-    let app = App::new(program, provider, model);
+    let app = App::with_options(program, provider, model, auto_approve);
     // Fire the one-shot startup event so any `{on:"startup"}` trigger runs before we read input.
     app.deliver("startup", json!({})).await?;
     run_stdin(app).await

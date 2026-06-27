@@ -674,6 +674,7 @@ dependencies = [
  "clap",
  "flux-agent",
  "flux-anthropic",
+ "flux-app",
  "flux-auth",
  "flux-browser",
  "flux-cognition",

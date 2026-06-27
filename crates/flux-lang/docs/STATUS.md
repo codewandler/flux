@@ -28,7 +28,7 @@ update it in the same commit as the behaviour it describes.
 |---|---|---|---|
 | 10.2, 20.1 | Name resolution + unknown-op rejection | ✅ | `src/analyze.rs` |
 | 8 | Bounded-loop checking | ✅ | `src/analyze.rs` |
-| 10.2 | **Type checking** + `DraftAst → HirFlow` lowering | 🟡 | `HirFlow` is a stub (carries body + gathered effects only) |
+| 10.2 | **Type checking** + `DraftAst → HirFlow` lowering | 🟡 | `analyze::lower` produces a real `HirFlow` (validated body + **gathered effects** + **call arity**); full type inference over expressions still deferred |
 | 12 | Effect gathering | ✅ | `src/effects.rs`; effects collected on `HirFlow` |
 | 10.3, 15 | **Optimizer** (parallelize/cache/CSE/…) + `PhysicalPlan` execution | ⬜ | `Stage` types exist (`ast.rs`); nothing executes them |
 
@@ -105,7 +105,8 @@ update it in the same commit as the behaviour it describes.
 | Needs & gaps — **two pure ops** (`need`/`gaps`, not nodes) | ✅ | `flux-tools/src/cognition.rs` |
 | Cognition op-pack + domain-wrapper convention | ✅ | pure: `flux-tools/src/cognition.rs`; model-backed: `flux-cognition` (L3) |
 | `=`/`do`/`+=` marker syntax; optional `goal` header | ⬜ | evolution §5 (P5 text parser) |
-| Multi-agent `Program` layer (agents/channels/triggers/journeys) + `flux-app` host | ⬜ | evolution §6 + appendix (P5c + flux-app) |
+| Multi-agent `Program` layer (agents/channels/triggers/journeys) | ✅ | `flux-lang/src/program.rs` (L0 decls + module loader) |
+| `flux-app` L6 runtime host — event bus, triggers, journeys, orchestration ops (`emit`/`send`/`spawn`; `ask` MVP), `flux run app.flux` | ✅ | `crates/flux-app/` + `flux-cli` `run_app_cmd`. **Safe default: destructive ops denied** (orchestration + read pre-allowed); `--yes` opts into allow-all |
 | Real `flux-sdk` lifecycle surface (`OpRegistry`/packs/prelude + `FlowClient` + artifact APIs) | ✅ | `flux-sdk/src/flow.rs`; cognition pack wired into the CLI registry too (`flux-cli` `build_agent`) |
 
 ## Key design decisions (resolved this round)

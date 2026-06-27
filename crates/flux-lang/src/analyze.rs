@@ -165,13 +165,17 @@ fn for_each_node(body: &[Node], f: &mut impl FnMut(&Node)) {
             Node::Call { args, .. } => for_each_node(args, f),
             Node::Jq { input, .. } => for_each_node(std::slice::from_ref(input), f),
             Node::Parse { value, .. } => for_each_node(std::slice::from_ref(value), f),
+            Node::Expr { vars, .. } => {
+                for v in vars.values() {
+                    for_each_node(std::slice::from_ref(v), f);
+                }
+            }
             // Leaf nodes (no nested node bodies).
             Node::Await { .. }
             | Node::Peek { .. }
             | Node::Var { .. }
             | Node::Lit { .. }
             | Node::Thing { .. }
-            | Node::Expr { .. }
             | Node::Fmt { .. }
             | Node::Ctx { .. }
             | Node::CtxAppend { .. } => {}
@@ -191,7 +195,9 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, diags: &mut Vec<Diagnostic>) {
                     let lone_object =
                         matches!(args.as_slice(), [Node::Lit { value }] if value.is_object());
                     let max = sig.required_params.len() + sig.optional_params.len();
-                    if !lone_object && args.len() > max {
+                    // `max == 0` ops are skipped: a single arg may *resolve* to the whole-input object
+                    // at runtime (exempt there), and the runtime still rejects a true 0-param overflow.
+                    if !lone_object && max > 0 && args.len() > max {
                         diags.push(Diagnostic::new(format!(
                             "op `{op}` accepts at most {max} argument(s) but {} were supplied",
                             args.len()

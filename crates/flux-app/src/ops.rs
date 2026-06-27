@@ -12,7 +12,7 @@ use serde_json::Value;
 use flux_core::Result;
 use flux_lang::program::ChannelDecl;
 use flux_runtime::{Tool, ToolContext, ToolResult};
-use flux_spec::ToolSpec;
+use flux_spec::{Idempotency, Risk, ToolSpec};
 
 use crate::bus::Bus;
 
@@ -42,9 +42,22 @@ pub(crate) fn register(
     registry.register(Arc::new(SpawnOp { host }));
 }
 
-/// A reasonable spec for a pure in-process orchestration verb: no host effects, low risk.
+/// A spec for an in-process orchestration verb. The op itself does no host IO (so it declares no host
+/// effects), but it is **not** an inert read: `emit`/`spawn` fan out to other journeys whose ops are
+/// gated separately at their own dispatch. Marked Medium-risk + non-idempotent so a `plan_risk` pass
+/// doesn't mistake an orchestration verb for a side-effect-free read.
 fn orchestration_spec(name: &str, description: &str, schema: Value) -> ToolSpec {
-    ToolSpec::read_only(name, description, schema).with_effects(Vec::new())
+    ToolSpec {
+        name: name.into(),
+        description: description.into(),
+        input_schema: schema,
+        output_schema: None,
+        effects: Vec::new(),
+        risk: Risk::Medium,
+        idempotency: Idempotency::NonIdempotent,
+        access: Vec::new(),
+        group: Some("orchestration".into()),
+    }
 }
 
 /// Read a required string param, or `None` if absent/non-string (callers map `None` to an error

@@ -2093,7 +2093,15 @@ async fn main() -> Result<()> {
     if argv.get(1).map(|s| s == "sessions").unwrap_or(false) {
         return run_sessions();
     }
-    if argv.get(1).map(|s| s == "run").unwrap_or(false) {
+    // `flux run <app.flux>` runs a multi-agent program — but only when the next arg actually looks
+    // like a program file (a `.flux` path or an existing file), so a normal prompt opening with the
+    // word "run" (e.g. `flux run the tests`) still falls through to the agent.
+    if argv.get(1).map(|s| s == "run").unwrap_or(false)
+        && argv
+            .get(2)
+            .map(|p| p.ends_with(".flux") || std::path::Path::new(p).is_file())
+            .unwrap_or(false)
+    {
         return run_app_cmd(&argv[2..]).await;
     }
     if argv.get(1).map(|s| s == "flow").unwrap_or(false) {
@@ -2149,6 +2157,7 @@ async fn run_app_cmd(args: &[String]) -> Result<()> {
 
     let mut path: Option<&str> = None;
     let mut model_spec: Option<String> = None;
+    let mut auto_approve = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -2156,9 +2165,12 @@ async fn run_app_cmd(args: &[String]) -> Result<()> {
                 model_spec = args.get(i + 1).cloned();
                 i += 2;
             }
-            // The app host runs non-interactively (auto-approves the orchestration verbs); `--yes`
-            // is accepted for symmetry with the prompt path.
-            "-y" | "--yes" => i += 1,
+            // By default destructive ops in the program are DENIED (no human at a prompt); `--yes`
+            // opts into allow-all for a trusted, pre-authored program.
+            "-y" | "--yes" => {
+                auto_approve = true;
+                i += 1;
+            }
             s if !s.starts_with('-') && path.is_none() => {
                 path = Some(s);
                 i += 1;
@@ -2166,30 +2178,33 @@ async fn run_app_cmd(args: &[String]) -> Result<()> {
             _ => i += 1,
         }
     }
-    let path =
-        path.ok_or_else(|| anyhow::anyhow!("usage: flux run <app.flux> [-m provider/model]"))?;
+    let path = path
+        .ok_or_else(|| anyhow::anyhow!("usage: flux run <app.flux> [-m provider/model] [--yes]"))?;
     let spec = model_spec.unwrap_or_else(|| "anthropic/claude-sonnet-4-6".to_string());
 
-    // Best-effort: a pure-op program runs without a provider; model ops need one.
-    let provider: Option<std::sync::Arc<dyn Provider>> = match provider_for(&spec) {
-        Ok(p) => Some(std::sync::Arc::from(p)),
+    // Best-effort: a pure-op program runs without a provider. `build_provider` resolves the model
+    // alias (`-m opus`/`sonnet`/…) to a real id, so the cognition pack gets a valid model.
+    let (provider, model): (Option<std::sync::Arc<dyn Provider>>, String) = match build_provider(
+        &spec,
+    ) {
+        Ok((native, resolved)) => (Some(std::sync::Arc::new(native)), resolved),
         Err(e) => {
             eprintln!(
-                "{}",
-                style::dim(&format!(
-                    "(no provider for `{spec}`: {e}; model-backed cognition ops will be unavailable)"
-                ))
-            );
-            None
+                    "{}",
+                    style::dim(&format!(
+                        "(no provider for `{spec}`: {e}; model-backed cognition ops will be unavailable)"
+                    ))
+                );
+            let m = spec
+                .split_once('/')
+                .map(|(_, m)| m)
+                .unwrap_or(&spec)
+                .to_string();
+            (None, m)
         }
     };
-    let model = spec
-        .split_once('/')
-        .map(|(_, m)| m)
-        .unwrap_or(&spec)
-        .to_string();
 
-    flux_app::run_program_file(Path::new(path), provider, model)
+    flux_app::run_program_file(Path::new(path), provider, model, auto_approve)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))
 }

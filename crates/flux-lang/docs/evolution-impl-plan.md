@@ -95,16 +95,21 @@ change.
 - `FlowClient` façade (provider + packs + compile→analyze→execute → structured artifacts).
 - Runnable example + doctest; feeds the roadmap "SDK + crates.io" tier.
 
-## P4 — richer analyze (typed HIR)
-- `DraftAst → HirFlow` with type + effect checking (PRD item 3 / §10.2). Turns several STATUS rows 🟡→✅.
+## P4 — richer analyze (typed HIR) — 🟡 (effects + arity DONE; type inference deferred)
+- **Shipped:** `analyze::lower(ast, ops) -> HirFlow` runs the whole-flow validation, gathers the
+  semantic effect set (declared bind/memo effects ∪ host-op effects mapped to `FlowEffect`), and adds a
+  **call-arity** check (`for_each_node` traversal covers all 31 kinds). Full type inference over
+  expressions remains.
 
 ## P5 — parallel tracks (prioritize later)
 - Text display modes + `parse.rs`/`format.rs` (PRD items 1–2): `=`/`do`/`+=` markers, `ctx`/`need`/
-  `query` blocks, optional `goal` header; round-trip `parse(format(ast)) == ast`.
-- Optimizer + `PhysicalPlan` execution (PRD §15).
-- Multi-agent `Program` layer (`program.rs` decls + orchestration op-pack) → then the deferred
-  **`flux-app`** L6 runtime host (event bus / scheduler / channels / supervisor); register in
-  `flux-codegate` `layer()`; `flux run app.flux`.
+  `query` blocks, optional `goal` header; round-trip `parse(format(ast)) == ast`. **⬜ remaining.**
+- Optimizer + `PhysicalPlan` execution (PRD §15). **⬜ remaining (needs node-id'd plan lowering).**
+- **P5c + FLUX-APP — ✅ DONE.** Multi-agent `Program` layer (`flux-lang/src/program.rs` decls + module
+  loader) + the orchestration op-pack (`emit`/`send`/`spawn`; `ask` MVP) + the **`flux-app`** L6 runtime
+  host (event bus / supervisor / channels; `flux-codegate` `layer() => 6`) + `flux run app.flux` wired in
+  `flux-cli`. Journeys execute on the interpreter under the real `Executor` envelope; **safe default =
+  destructive ops denied**, `--yes` opts into allow-all.
 - **Candidate control-flow primitives** (design §5.1): evaluate + selectively adopt `match`/`route`/
   `fallback`/`timeout`/`budget` (tier 1) and `checkpoint`/`compensate`/`once`/`scope` (tier 2); each
   adopted node goes through the node-kind SSOT + docs-sync gates.
