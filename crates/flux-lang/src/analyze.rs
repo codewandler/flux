@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 
-use crate::ast::{DraftAst, Node};
+use crate::ast::{DraftAst, FlowEffect, HirFlow, Node};
 use crate::opspec::OpCatalog;
 
 /// A single analyzer diagnostic, suitable for UI display or feeding back into the compile/repair
@@ -46,12 +46,158 @@ pub fn analyze_flow(ast: &DraftAst, ops: &dyn OpCatalog) -> Result<(), Vec<Diagn
     }
 }
 
+/// Lower a `DraftAst` to a typed [`HirFlow`]: run the whole-flow analysis (op resolution, grammar,
+/// bounded loops, call arity) and gather the flow's semantic effect set. Full type inference over
+/// expressions is a later milestone; today the HIR carries the validated body plus the gathered
+/// effects an authorizer/optimizer reasons over.
+pub fn lower(ast: &DraftAst, ops: &dyn OpCatalog) -> Result<HirFlow, Vec<Diagnostic>> {
+    analyze_flow(ast, ops)?;
+    Ok(HirFlow {
+        name: ast.name.clone(),
+        params: ast.params.clone(),
+        returns: ast.returns.clone(),
+        body: ast.body.clone(),
+        effects: gather_effects(&ast.body, ops),
+    })
+}
+
+/// The semantic effects a flow declares or implies: each `bind`/`memo`'s declared `effect`, plus the
+/// effects implied by the host ops it `call`s (mapped from their host-resource [`Effect`]s). Deduped,
+/// in first-seen order.
+fn gather_effects(body: &[Node], ops: &dyn OpCatalog) -> Vec<FlowEffect> {
+    let mut acc: Vec<FlowEffect> = Vec::new();
+    let push = |e: FlowEffect, acc: &mut Vec<FlowEffect>| {
+        if !acc.contains(&e) {
+            acc.push(e);
+        }
+    };
+    for_each_node(body, &mut |node| match node {
+        Node::Bind {
+            effect: Some(e), ..
+        }
+        | Node::Memo {
+            effect: Some(e), ..
+        } => push(*e, &mut acc),
+        Node::Call { op, .. } => {
+            if let Some(sig) = ops.lookup(op) {
+                for e in sig.effects {
+                    if let Some(f) = host_effect_to_flow(e) {
+                        push(f, &mut acc);
+                    }
+                }
+            }
+        }
+        _ => {}
+    });
+    acc
+}
+
+/// Map a host-resource [`Effect`] back to a representative semantic [`FlowEffect`] for HIR effect
+/// gathering. Host effects with no clean semantic counterpart (process/browser/local) are skipped.
+fn host_effect_to_flow(e: flux_spec::Effect) -> Option<FlowEffect> {
+    use flux_spec::Effect;
+    match e {
+        Effect::Read => Some(FlowEffect::Read),
+        Effect::Write | Effect::Filesystem => Some(FlowEffect::WriteFile),
+        Effect::Network => Some(FlowEffect::Network),
+        Effect::Process | Effect::Browser | Effect::LocalSystem => None,
+    }
+}
+
+/// Visit every node in `body` and all its nested bodies (depth-first, pre-order), invoking `f` on
+/// each. A single generic traversal reused for effect gathering and future HIR passes.
+fn for_each_node(body: &[Node], f: &mut impl FnMut(&Node)) {
+    for node in body {
+        f(node);
+        match node {
+            Node::Bind { value, .. } | Node::Memo { value, .. } => {
+                for_each_node(std::slice::from_ref(value), f)
+            }
+            Node::When {
+                cond,
+                then,
+                otherwise,
+            } => {
+                for_each_node(std::slice::from_ref(cond), f);
+                for_each_node(then, f);
+                for_each_node(otherwise, f);
+            }
+            Node::Unless { cond, body } => {
+                for_each_node(std::slice::from_ref(cond), f);
+                for_each_node(body, f);
+            }
+            Node::Repeat { until, body, .. } | Node::Loop { until, body, .. } => {
+                if let Some(u) = until {
+                    for_each_node(std::slice::from_ref(u), f);
+                }
+                for_each_node(body, f);
+            }
+            Node::Each { source, body, .. } => {
+                for_each_node(std::slice::from_ref(source), f);
+                for_each_node(body, f);
+            }
+            Node::Assert { cond, .. } => for_each_node(std::slice::from_ref(cond), f),
+            Node::Pipe { steps, .. } => for_each_node(steps, f),
+            Node::Seq { body, .. }
+            | Node::Retry { body, .. }
+            | Node::Confirm { body, .. }
+            | Node::Throttle { body, .. }
+            | Node::Debounce { body, .. } => for_each_node(body, f),
+            Node::Try { body, handler, .. } => {
+                for_each_node(body, f);
+                for_each_node(handler, f);
+            }
+            Node::Parallel { branches } => {
+                for b in branches {
+                    for_each_node(&b.body, f);
+                }
+            }
+            Node::Race { branches, .. } => {
+                for b in branches {
+                    for_each_node(&b.body, f);
+                }
+            }
+            Node::Verify { cmd, expect, .. } => {
+                for_each_node(std::slice::from_ref(cmd), f);
+                for_each_node(std::slice::from_ref(expect), f);
+            }
+            Node::Return { value } => for_each_node(std::slice::from_ref(value), f),
+            Node::Call { args, .. } => for_each_node(args, f),
+            Node::Jq { input, .. } => for_each_node(std::slice::from_ref(input), f),
+            Node::Parse { value, .. } => for_each_node(std::slice::from_ref(value), f),
+            // Leaf nodes (no nested node bodies).
+            Node::Await { .. }
+            | Node::Peek { .. }
+            | Node::Var { .. }
+            | Node::Lit { .. }
+            | Node::Thing { .. }
+            | Node::Expr { .. }
+            | Node::Fmt { .. }
+            | Node::Ctx { .. }
+            | Node::CtxAppend { .. } => {}
+        }
+    }
+}
+
 /// Recursively validate the operations in a node and its children.
 fn check_node(node: &Node, ops: &dyn OpCatalog, diags: &mut Vec<Diagnostic>) {
     match node {
         Node::Call { op, args } => {
-            if let Err(mut e) = analyze_call(op, ops) {
-                diags.append(&mut e);
+            match ops.lookup(op) {
+                None => diags.push(Diagnostic::new(format!("unknown operation: `{op}`"))),
+                Some(sig) => {
+                    // Arity: positional args bind to `required ++ optional`; a lone object argument
+                    // is the whole named input, so it is exempt (matches `runtime::map_args_to_input`).
+                    let lone_object =
+                        matches!(args.as_slice(), [Node::Lit { value }] if value.is_object());
+                    let max = sig.required_params.len() + sig.optional_params.len();
+                    if !lone_object && args.len() > max {
+                        diags.push(Diagnostic::new(format!(
+                            "op `{op}` accepts at most {max} argument(s) but {} were supplied",
+                            args.len()
+                        )));
+                    }
+                }
             }
             for a in args {
                 check_node(a, ops, diags);
@@ -287,6 +433,90 @@ mod tests {
     /// The handful of op names the analyzer tests reference.
     fn catalog() -> MockCatalog {
         MockCatalog(vec!["read".into(), "grep".into(), "write".into()])
+    }
+
+    /// A richer catalog whose ops carry effects + params, for the HIR lowering / arity tests.
+    struct TypedCatalog;
+    impl OpCatalog for TypedCatalog {
+        fn lookup(&self, name: &str) -> Option<OpSignature> {
+            let sig = |effects, required: &[&str], optional: &[&str]| OpSignature {
+                name: name.into(),
+                description: String::new(),
+                effects,
+                risk: flux_spec::Risk::Low,
+                idempotency: flux_spec::Idempotency::Idempotent,
+                required_params: required.iter().map(|s| s.to_string()).collect(),
+                optional_params: optional.iter().map(|s| s.to_string()).collect(),
+            };
+            match name {
+                "read" => Some(sig(vec![flux_spec::Effect::Read], &["path"], &[])),
+                "write" => Some(sig(
+                    vec![flux_spec::Effect::Write, flux_spec::Effect::Filesystem],
+                    &["path", "content"],
+                    &[],
+                )),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn lower_gathers_effects_and_arity_is_checked() {
+        use crate::ast::{Node, TypeRef};
+        let ops = TypedCatalog;
+
+        let ast = DraftAst {
+            body: vec![
+                Node::Bind {
+                    name: "x".into(),
+                    value: Box::new(Node::Call {
+                        op: "read".into(),
+                        args: vec![Node::Lit {
+                            value: serde_json::json!("a"),
+                        }],
+                    }),
+                    ty: None,
+                    // a declared semantic effect is gathered verbatim
+                    effect: Some(FlowEffect::Model),
+                },
+                Node::Call {
+                    op: "write".into(),
+                    args: vec![
+                        Node::Lit {
+                            value: serde_json::json!("p"),
+                        },
+                        Node::Lit {
+                            value: serde_json::json!("c"),
+                        },
+                    ],
+                },
+            ],
+            ..Default::default()
+        };
+        let hir: HirFlow = lower(&ast, &ops).unwrap();
+        // Read (from `read`) + WriteFile (from `write`) + Model (declared) — deduped.
+        assert!(hir.effects.contains(&FlowEffect::Read));
+        assert!(hir.effects.contains(&FlowEffect::WriteFile));
+        assert!(hir.effects.contains(&FlowEffect::Model));
+        let _ = TypeRef::Any;
+
+        // Too many positional args for `read` (1 param) is rejected at analysis.
+        let over = DraftAst {
+            body: vec![Node::Call {
+                op: "read".into(),
+                args: vec![
+                    Node::Lit {
+                        value: serde_json::json!("a"),
+                    },
+                    Node::Lit {
+                        value: serde_json::json!("b"),
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+        let err = lower(&over, &ops).unwrap_err();
+        assert!(err.iter().any(|d| d.message.contains("at most 1 argument")));
     }
 
     #[test]
