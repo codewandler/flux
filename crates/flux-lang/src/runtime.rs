@@ -18,7 +18,8 @@ use flux_core::{Error, Usage};
 use flux_spec::IntentSet;
 
 use crate::ast::{
-    DraftAst, Node, RunEvent, StepId, SymbolName, TypeRef, Value, ValueId, Visibility,
+    DraftAst, Node, PhysicalPlan, RunEvent, Stage, StepId, SymbolName, TypeRef, Value, ValueId,
+    Visibility,
 };
 use crate::host::{ApprovalChoice, OpHost, OpOutcome};
 use crate::opspec::OpCatalog;
@@ -275,6 +276,101 @@ pub async fn execute_flow(
         Step::Return(vid) => vid,
         Step::Next => None,
     };
+    if let Some(vid) = &returned {
+        store.append_event(session_id, &RunEvent::FlowReturned { value: vid.clone() })?;
+    }
+    Ok(FlowOutcome {
+        returned,
+        result: last,
+        transcript: transcript.join("\n\n"),
+        steps,
+    })
+}
+
+/// Execute a [`PhysicalPlan`] (from [`crate::optimize::optimize`]) over a flow's top-level `body`,
+/// reusing the interpreter per node. `Sequential`/`ApprovalFence` run one node in place;
+/// `Parallel` runs its nodes concurrently — each on a buffering sink, replayed into the real sink in
+/// stage order so output never interleaves. The result is equivalent to [`execute_flow`] for any plan
+/// the optimizer emits (it only batches provably-independent read-only nodes).
+pub async fn execute_plan(
+    store: &dyn ValueStore,
+    executor: &dyn OpHost,
+    session_id: &str,
+    body: &[Node],
+    plan: &PhysicalPlan,
+    sink: &mut dyn FlowSink,
+) -> Result<FlowOutcome> {
+    let mut steps = 0usize;
+    let mut transcript: Vec<String> = Vec::new();
+    let mut last = String::new();
+    let mut returned: Option<ValueId> = None;
+
+    let node_at = |id: &crate::ast::NodeId| -> Result<&Node> {
+        body.get(id.0 as usize).ok_or_else(|| {
+            FlowError::Runtime(format!("plan references node {} out of range", id.0))
+        })
+    };
+
+    'stages: for stage in &plan.stages {
+        match stage {
+            Stage::Sequential(id) | Stage::ApprovalFence(id) => {
+                let node = node_at(id)?;
+                let (text, _lv, step) = exec_body(
+                    store,
+                    executor,
+                    session_id,
+                    std::slice::from_ref(node),
+                    sink,
+                    &mut steps,
+                    &mut transcript,
+                )
+                .await?;
+                last = text;
+                if let Step::Return(vid) = step {
+                    returned = vid;
+                    break 'stages;
+                }
+            }
+            Stage::Parallel(ids) => {
+                let futs = ids.iter().map(|id| async move {
+                    let node = node_at(id)?;
+                    let mut buf = BufferSink::default();
+                    let mut s = 0usize;
+                    let mut tr: Vec<String> = Vec::new();
+                    let (text, _lv, step) = exec_body(
+                        store,
+                        executor,
+                        session_id,
+                        std::slice::from_ref(node),
+                        &mut buf,
+                        &mut s,
+                        &mut tr,
+                    )
+                    .await?;
+                    Ok::<_, FlowError>((buf, s, tr, text, step))
+                });
+                let results = futures::future::try_join_all(futs).await?;
+                for (buf, s, tr, text, step) in results {
+                    if let Step::Return(_) = step {
+                        return Err(FlowError::Runtime(
+                            "`return` is not allowed inside a parallel stage".to_string(),
+                        ));
+                    }
+                    buf.replay(&mut *sink);
+                    steps += s;
+                    transcript.extend(tr);
+                    last = text;
+                }
+            }
+            Stage::Branch(_) | Stage::Repeat(_) | Stage::Await(_) => {
+                return Err(FlowError::Runtime(
+                    "execute_plan v1 supports only sequential/parallel/approval_fence stages"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
     if let Some(vid) = &returned {
         store.append_event(session_id, &RunEvent::FlowReturned { value: vid.clone() })?;
     }
@@ -2277,6 +2373,101 @@ mod tests {
             !kept.contains(&"low".to_string()),
             "lower-priority member evicted on re-budget (no rank inversion)"
         );
+    }
+
+    /// A `PhysicalPlan` (Parallel independent reads, then a dependent read) executes to the **same**
+    /// store state as running the flow linearly through `execute_flow`.
+    #[tokio::test]
+    async fn execute_plan_matches_execute_flow() {
+        use crate::ast::{NodeId, PhysicalPlan, Stage};
+
+        struct EchoCat;
+        impl OpCatalog for EchoCat {
+            fn lookup(&self, name: &str) -> Option<OpSignature> {
+                (name == "read").then(|| OpSignature {
+                    name: "read".into(),
+                    description: String::new(),
+                    effects: vec![flux_spec::Effect::Read],
+                    risk: flux_spec::Risk::Low,
+                    idempotency: flux_spec::Idempotency::Idempotent,
+                    required_params: vec!["path".into()],
+                    optional_params: Vec::new(),
+                })
+            }
+        }
+        struct EchoHost(EchoCat);
+        #[async_trait::async_trait]
+        impl OpHost for EchoHost {
+            async fn dispatch(&self, op: &str, input: serde_json::Value) -> OpOutcome {
+                OpOutcome::ok(format!("{op}({input})"))
+            }
+            fn catalog(&self) -> &dyn OpCatalog {
+                &self.0
+            }
+            async fn request_approval(
+                &self,
+                _label: &str,
+                _intents: &flux_spec::IntentSet,
+            ) -> ApprovalChoice {
+                ApprovalChoice::Allow
+            }
+            fn trim_output(&self, view: String, _op: &str) -> String {
+                view
+            }
+        }
+
+        let bind_read = |name: &str, arg: Node| Node::Bind {
+            name: SymbolName(name.into()),
+            value: Box::new(Node::Call {
+                op: "read".into(),
+                args: vec![arg],
+            }),
+            ty: None,
+            effect: None,
+        };
+        // $a = read "x"; $b = read "y" (independent); $c = read $a (depends on a).
+        let body = vec![
+            bind_read("a", flow_lit(json!("x"))),
+            bind_read("b", flow_lit(json!("y"))),
+            bind_read("c", flow_var("a")),
+        ];
+        let plan = PhysicalPlan {
+            stages: vec![
+                Stage::Parallel(vec![NodeId(0), NodeId(1)]),
+                Stage::Sequential(NodeId(2)),
+            ],
+        };
+
+        let host = EchoHost(EchoCat);
+
+        let store_plan = MemStore::new();
+        let mut sink = BufferSink::default();
+        execute_plan(&store_plan, &host, "s", &body, &plan, &mut sink)
+            .await
+            .unwrap();
+
+        let store_flow = MemStore::new();
+        let ast = DraftAst {
+            body: body.clone(),
+            ..Default::default()
+        };
+        let mut sink2 = BufferSink::default();
+        execute_flow(&store_flow, &host, "s", &ast, &mut sink2)
+            .await
+            .unwrap();
+
+        for sym in ["a", "b", "c"] {
+            let vp = store_plan
+                .resolve("s", &SymbolName(sym.into()))
+                .unwrap()
+                .and_then(|id| store_plan.get_value(&id).unwrap());
+            let vf = store_flow
+                .resolve("s", &SymbolName(sym.into()))
+                .unwrap()
+                .and_then(|id| store_flow.get_value(&id).unwrap());
+            assert!(vp.is_some(), "symbol ${sym} should be bound by the plan");
+            assert_eq!(vp, vf, "symbol ${sym} differs: plan vs linear execution");
+        }
     }
 
     #[test]

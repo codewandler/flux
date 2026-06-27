@@ -157,6 +157,22 @@ pub async fn execute_flow(
     flux_lang::runtime::execute_flow(store, &host, session_id, ast, &mut bridge).await
 }
 
+/// Execute an optimizer [`flux_lang::ast::PhysicalPlan`] over a flow's top-level `body` — the engine
+/// wrapper over [`flux_lang::runtime::execute_plan`], adapting the executor/sink onto the
+/// interpreter's traits exactly as [`execute_flow`] does.
+pub async fn execute_plan(
+    store: &FlowStore,
+    executor: &Executor,
+    session_id: &str,
+    body: &[flux_lang::ast::Node],
+    plan: &flux_lang::ast::PhysicalPlan,
+    sink: &mut dyn AgentSink,
+) -> Result<FlowOutcome> {
+    let host = ExecutorHost::new(executor);
+    let mut bridge = SinkBridge { inner: sink };
+    flux_lang::runtime::execute_plan(store, &host, session_id, body, plan, &mut bridge).await
+}
+
 // ---------------------------------------------------------------------------
 // Plan risk + whole-plan approval
 // ---------------------------------------------------------------------------

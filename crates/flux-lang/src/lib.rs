@@ -31,6 +31,7 @@ pub mod error;
 pub mod format;
 pub mod host;
 pub mod opspec;
+pub mod optimize;
 pub mod parse;
 pub mod prelude;
 pub mod program;

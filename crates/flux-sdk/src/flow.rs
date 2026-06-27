@@ -277,6 +277,45 @@ impl FlowClient {
         })
     }
 
+    /// Lower an AST to an optimizer [`PhysicalPlan`]: `analyze::lower` (validate + gather effects)
+    /// then the scheduler, which batches independent read-only nodes into parallel stages and fences
+    /// side-effects. `Err` carries the analysis [`Diagnostic`]s.
+    pub fn optimize(
+        &self,
+        ast: &DraftAst,
+    ) -> std::result::Result<flux_flow::ast::PhysicalPlan, Vec<Diagnostic>> {
+        let ops = OpRegistry::new(&self.registry);
+        let hir = flux_flow::analyze::lower(ast, &ops)?;
+        Ok(flux_flow::optimize::optimize(&hir, &ops))
+    }
+
+    /// Execute an AST through the optimizer: `optimize` then run the resulting [`PhysicalPlan`] (so
+    /// independent read-only nodes run concurrently). Equivalent results to [`Self::execute`], same
+    /// envelope.
+    pub async fn execute_optimized(&self, ast: &DraftAst) -> Result<ExecutionResult> {
+        let plan = self
+            .optimize(ast)
+            .map_err(|d| Error::Other(format!("analyze: {}", join_diags(&d))))?;
+        let executor = self.build_executor();
+        let mut sink = ExecSink::default();
+        let outcome = flux_flow::runtime::execute_plan(
+            &self.store,
+            &executor,
+            &self.session_id,
+            &ast.body,
+            &plan,
+            &mut sink,
+        )
+        .await
+        .map_err(|e| Error::Other(e.to_string()))?;
+        Ok(ExecutionResult {
+            result: outcome.result,
+            transcript: outcome.transcript,
+            steps: outcome.steps,
+            tool_calls: sink.tool_calls,
+        })
+    }
+
     /// The convenience pipeline: `compile` → `analyze` → `execute`. A failed analysis aborts before
     /// any side effect (the AST referenced an op the registry doesn't have).
     pub async fn run(&self, text: &str) -> Result<ExecutionResult> {
