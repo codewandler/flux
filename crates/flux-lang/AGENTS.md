@@ -56,8 +56,29 @@ cargo fmt --all
 The `fluxlang` binary is gated behind the `cli` feature (so library consumers don't pull `clap`); build
 or test it with `--features cli`.
 
-## Roadmap
+## Design & planning docs
 
-See [`docs/PRD.md`](docs/PRD.md). Near-term: the two writable display modes (a human-readable form and a
+The full map of flux-lang design / spec / plan docs — read the relevant one before changing behaviour,
+and keep it in sync with your change (design + status + plan move together):
+
+**Language spec & reference**
+- [`docs/PRD.md`](docs/PRD.md) — the immutable, source-of-record PRD (**don't edit**; track progress in `STATUS.md`).
+- [`docs/reference.md`](docs/reference.md) — every node kind, fields, semantics (node table generated).
+- [`docs/syntax.md`](docs/syntax.md) — the writable text-syntax spec.
+- [`README.md`](README.md) — what the execution layer *is* (and isn't) + the crate overview.
+
+**Forward design — the evolution**
+- [`../../docs/designs/flux-lang-evolution.md`](../../docs/designs/flux-lang-evolution.md) — the agent-cognition AST (`ctx`/`need` + artifact ontology), language/syntax, candidate control-flow primitives, the multi-agent `Program` layer, and the SDK.
+- [`docs/design-review.md`](docs/design-review.md) — the design review of that doc.
+- [`docs/STATUS.md`](docs/STATUS.md) — PRD conformance matrix (built vs. planned, with evidence).
+- [`docs/evolution-impl-plan.md`](docs/evolution-impl-plan.md) — the phased build plan for the evolution.
+
+**Engine (L3, builds on this crate)**
+- [`../../docs/designs/flux-flow.md`](../../docs/designs/flux-flow.md) — the flux-flow engine design.
+
+**Local WIP plans** — under `.flux/plans/` (gitignored, author's machine only): `ast-node-expansion.md`
+(superseded), `flow-new-primitives.md`, `flux-flow-implementation.md`.
+
+Near-term roadmap (per the PRD): the two writable display modes (a human-readable form and a
 token-efficient form for future fine-tuning) and `fluxlang compile` (text → AST), which the renderer and
 JSON wire form already anticipate.

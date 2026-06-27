@@ -97,6 +97,7 @@ Each invariant below was established (and several re-learned the hard way) durin
 ## Commits
 
 - **Never commit without an explicit instruction to do so.**
+- **Stay on the current branch.** Don't create feature branches or git worktrees as a matter of course — do the work in place on the checked-out branch. Only create a branch or worktree when the user explicitly asks for one.
 - Use **semantic commit** titles: `type(scope): short imperative description` where type is one of `feat`, `fix`, `refactor`, `perf`, `test`, `docs`, `chore`, `style`. Scope is the primary crate or surface (e.g. `cli`, `tools`, `runtime`, `agent`, `flow`). Example: `feat(cli): expose /compact slash command in the REPL`.
 - A blank line after the title; then a bulleted body explaining **what** changed and **why** — title-only commits are not acceptable.
 - Ticket references go in a trailing `Refs:` line, not the title.
@@ -106,7 +107,7 @@ Each invariant below was established (and several re-learned the hard way) durin
 
 ## Keeping the Flux-Lang language and its docs in sync
 
-The Flux-Lang **language + reference interpreter** lives in **`flux-lang`** (L0: `crates/flux-lang/src/` — `ast.rs`, `render.rs`, `analyze.rs`, `schema.rs`, `runtime.rs` behind injected `host`/`store`/`sink` traits, plus the `fluxlang` CLI and `skill.rs`). `flux-flow` is the L3 **engine** (compile/engine/state + the `Executor`/`FlowStore`/`AgentSink` adapters and the thin `execute_flow`/`plan_risk` wrappers) and re-exports `flux-lang` as a facade, so `flux_flow::{ast, render, analyze, host, store, runtime, …}` still resolve. The language's own docs live in `crates/flux-lang/docs/` (`reference.md`, `syntax.md`, `PRD.md`) + `crates/flux-lang/{README,AGENTS}.md`; the engine's ops live in `crates/flux-flow/docs/ops-reference.md`.
+The Flux-Lang **language + reference interpreter** lives in **`flux-lang`** (L0: `crates/flux-lang/src/` — `ast.rs`, `render.rs`, `analyze.rs`, `schema.rs`, `runtime.rs` behind injected `host`/`store`/`sink` traits, plus the `fluxlang` CLI and `skill.rs`). `flux-flow` is the L3 **engine** (compile/engine/state + the `Executor`/`FlowStore`/`AgentSink` adapters and the thin `execute_flow`/`plan_risk` wrappers) and re-exports `flux-lang` as a facade, so `flux_flow::{ast, render, analyze, host, store, runtime, …}` still resolve. The language's own docs live in `crates/flux-lang/docs/` (`reference.md`, `syntax.md`, `PRD.md`, `STATUS.md`, `evolution-impl-plan.md`, `design-review.md`) + `crates/flux-lang/{README,AGENTS}.md` + the forward design `docs/designs/flux-lang-evolution.md`; the engine's ops live in `crates/flux-flow/docs/ops-reference.md`. See [`crates/flux-lang/AGENTS.md`](crates/flux-lang/AGENTS.md) for the full flux-lang design/plan docs map.
 
 **The node-kind tables are a single source of truth and are auto-generated — do not hand-edit them.** The `Node` enum's doc-comments in `crates/flux-lang/src/ast.rs` flow through `flux_lang::schema::node_kind_catalog()` into (a) the `emit_plan` planner prompt, (b) the "Node kinds at a glance" table in `crates/flux-lang/docs/reference.md`, (c) the `## Node kinds` table in the **flux-lang** language skill (`crates/flux-lang/skill/SKILL.md`), and (d) the same table in the **flux-flow** engine skill (`.flux/skills/flux-flow/SKILL.md`). The generated blocks are fenced by `<!-- BEGIN/END generated:node-kinds -->`; two tests fail on drift: `cargo test -p flux-lang --test skill_in_sync` (the language skill + reference) and `cargo test -p flux-flow --test skill_docs_in_sync` (the engine skill). After adding/renaming a node kind or editing a variant doc-comment, regenerate with `UPDATE=1` on both: `UPDATE=1 cargo test -p flux-lang --test skill_in_sync` and `UPDATE=1 cargo test -p flux-flow --test skill_docs_in_sync`.
 
@@ -124,3 +125,4 @@ What still needs manual updates in the same commit:
 - Don't introduce an inner→outer crate dependency (the layering lint will fail).
 - Don't log or surface secret values; don't build shell command strings from model input.
 - Don't leave `clippy -D warnings` or `fmt` dirty.
+- Don't create new branches or git worktrees unless the user explicitly asks — work on the current branch.
