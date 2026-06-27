@@ -95,7 +95,7 @@ change.
 - `FlowClient` façade (provider + packs + compile→analyze→execute → structured artifacts).
 - Runnable example + doctest; feeds the roadmap "SDK + crates.io" tier.
 
-## P4 — richer analyze (typed HIR) — 🟡 (effects + arity DONE; type inference deferred)
+## P4 — richer analyze (typed HIR) — ✅ DONE
 - **Shipped:** `analyze::lower(ast, ops) -> HirFlow` runs the whole-flow validation, gathers the
   semantic effect set (declared bind/memo effects ∪ host-op effects mapped to `FlowEffect`), and adds a
   **call-arity** check (`for_each_node` traversal covers all 31 kinds). Full type inference over
