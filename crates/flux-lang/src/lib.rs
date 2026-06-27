@@ -12,6 +12,8 @@
 //! - [`opspec`] — the typed operation spec/signature and the [`opspec::OpCatalog`] seam.
 //! - [`prelude`] — the artifact-type ontology (claims, evidence, needs, context packs, …) ops declare
 //!   their I/O against; a stdlib of `Named` schemas, not a `Value` change.
+//! - [`program`] — the multi-agent `Program` layer (agents/channels/triggers/journeys) + the
+//!   key-sniffing module loader; pure-data decls the L6 `flux-app` host runs.
 //! - [`effects`] — lowering of semantic effects onto host [`flux_spec::Effect`] + policy actions.
 //! - [`schema`] — the single source of truth: a derived JSON Schema and the node-kind catalog that
 //!   drives the planner prompt and the generated skill/docs.
@@ -27,6 +29,7 @@ pub mod error;
 pub mod host;
 pub mod opspec;
 pub mod prelude;
+pub mod program;
 pub mod render;
 pub mod runtime;
 pub mod schema;
