@@ -1,0 +1,22 @@
+[package]
+name = "flux-cognition"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "flux-cognition: an L3, provider-injected pack of model-backed cognition ops (ai.extract/rank/judge/reason, synth, ai.rewrite)"
+
+[dependencies]
+flux-core.workspace = true
+flux-spec.workspace = true
+flux-runtime.workspace = true
+flux-provider.workspace = true
+flux-lang.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+flux-system.workspace = true
+tokio.workspace = true

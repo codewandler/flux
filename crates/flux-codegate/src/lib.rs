@@ -23,8 +23,8 @@ pub fn layer(name: &str) -> Option<u8> {
         "flux-provider" | "flux-credentials" | "flux-anthropic" | "flux-openai" => 1,
         // L2 — runtime: execution + guarded IO + the safety envelope
         "flux-system" | "flux-runtime" | "flux-tools" | "flux-session" | "flux-context" => 2,
-        // L3 — agent + orchestration + eval/self-improvement harness
-        "flux-agent" | "flux-orchestrate" | "flux-flow" | "flux-eval" => 3,
+        // L3 — agent + orchestration + eval/self-improvement harness + cognition ops
+        "flux-agent" | "flux-orchestrate" | "flux-flow" | "flux-eval" | "flux-cognition" => 3,
         // L4 — extensibility
         "flux-hooks" | "flux-plugin" => 4,
         // L5 — heavy capabilities
