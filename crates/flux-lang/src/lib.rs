@@ -10,6 +10,8 @@
 //! - [`analyze`] — the validator, working against an abstract [`opspec::OpCatalog`] (no knowledge of
 //!   any concrete tool registry).
 //! - [`opspec`] — the typed operation spec/signature and the [`opspec::OpCatalog`] seam.
+//! - [`prelude`] — the artifact-type ontology (claims, evidence, needs, context packs, …) ops declare
+//!   their I/O against; a stdlib of `Named` schemas, not a `Value` change.
 //! - [`effects`] — lowering of semantic effects onto host [`flux_spec::Effect`] + policy actions.
 //! - [`schema`] — the single source of truth: a derived JSON Schema and the node-kind catalog that
 //!   drives the planner prompt and the generated skill/docs.
@@ -24,6 +26,7 @@ pub mod effects;
 pub mod error;
 pub mod host;
 pub mod opspec;
+pub mod prelude;
 pub mod render;
 pub mod runtime;
 pub mod schema;

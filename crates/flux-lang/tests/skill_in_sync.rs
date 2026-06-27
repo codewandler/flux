@@ -9,6 +9,8 @@ use std::path::PathBuf;
 
 const BEGIN: &str = "<!-- BEGIN generated:node-kinds -->";
 const END: &str = "<!-- END generated:node-kinds -->";
+const BEGIN_PRELUDE: &str = "<!-- BEGIN generated:prelude-types -->";
+const END_PRELUDE: &str = "<!-- END generated:prelude-types -->";
 
 fn crate_path(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
@@ -69,6 +71,41 @@ fn reference_node_kinds_block_is_in_sync() {
     assert_eq!(
         content, expected,
         "docs/reference.md node-kinds block is out of date — regenerate with \
+         `UPDATE=1 cargo test -p flux-lang --test skill_in_sync`"
+    );
+}
+
+#[test]
+fn reference_prelude_types_block_is_in_sync() {
+    let path = crate_path("docs/reference.md");
+    let block = format!(
+        "{BEGIN_PRELUDE}\n{}{END_PRELUDE}",
+        flux_lang::prelude::prelude_type_catalog()
+    );
+
+    let content =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let start = content.find(BEGIN_PRELUDE).unwrap_or_else(|| {
+        panic!(
+            "{} is missing the generated:prelude-types markers",
+            path.display()
+        )
+    });
+    let end = content[start..]
+        .find(END_PRELUDE)
+        .expect("END marker after BEGIN")
+        + start
+        + END_PRELUDE.len();
+    let expected = format!("{}{}{}", &content[..start], block, &content[end..]);
+
+    if update() {
+        std::fs::write(&path, &expected)
+            .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        return;
+    }
+    assert_eq!(
+        content, expected,
+        "docs/reference.md prelude-types block is out of date — regenerate with \
          `UPDATE=1 cargo test -p flux-lang --test skill_in_sync`"
     );
 }

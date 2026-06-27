@@ -74,6 +74,34 @@ follow are hand-written.
 
 ---
 
+## Artifact types (prelude)
+
+The opt-in artifact ontology an agent task manipulates — claims, evidence, needs, context packs,
+patches, and structured returns — registered as `Named` type schemas (`flux_lang::prelude`). These are
+**not** new `Value` variants: every artifact is an ordinary `Struct` value whose `Named` type names one
+of these schemas, so an op's `Named("Claim")` input lowers to a `#/$defs/Claim` `$ref`.
+
+This table is generated from the prelude struct doc-comments via
+`flux_lang::prelude::prelude_type_catalog()` — do not edit it by hand; regenerate with
+`UPDATE=1 cargo test -p flux-lang --test skill_in_sync`.
+
+<!-- BEGIN generated:prelude-types -->
+| type | description |
+|---|---|
+| `Span` | A cited region inside a source document — the proof pointer a `Claim` or `Evidence` points at. |
+| `Claim` | A factual assertion extracted from a source, carrying its provenance span and a confidence score. |
+| `Evidence` | A claim together with the supporting spans that ground it — the audited unit of support. |
+| `Need` | An explicit statement of missing information: what to ask, which fields are required to satisfy it, and the condition under which it is considered met. Produced by the pure `need` op; its complement `gaps` reports the still-unmet `require` fields. |
+| `Ctx` | A bounded, intentionally-budgeted bundle of context — the value produced by the `ctx`/`ctx_append` nodes. `members` are the symbol references selected into the pack; `budget` is the char/token cap the runtime shrinks the pack to at node evaluation. |
+| `Query` | A structured retrieval request over one or more datasources — the input to the `query`/`Search.run` ops. |
+| `Answer` | A structured, evidence-bearing **successful** return from an agent task. |
+| `Blocked` | A structured return signalling the task **could not** be completed, with the open gaps that blocked it. Same shape as [`Answer`] but a distinct type so callers can branch on success vs. blockage. |
+| `Patch` | A proposed code change — a concrete unified diff plus the path it applies to. |
+| `TestResult` | The outcome of running a test command. |
+<!-- END generated:prelude-types -->
+
+---
+
 ## Primitive / expression nodes
 
 These produce a value without side effects and appear in argument position, conditions,
