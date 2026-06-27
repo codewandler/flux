@@ -64,6 +64,10 @@ before every release.
   issues, and fix the top biters. Validates the daily-driver claim on real tasks.
 - **SDK + crates.io** (tier 2) — stabilize and document the `flux-sdk` public API with runnable
   examples, then publish the crates so others can embed flux as a library.
+- **flux-lang evolution** (design) — an agent-cognition AST (`ctx`/`need` + an artifact ontology + a
+  cognition op-pack), a real flux-lang SDK lifecycle surface, and PRD conformance tracking. See
+  [designs/flux-lang-evolution.md](designs/flux-lang-evolution.md) and the
+  [PRD status RTM](../crates/flux-lang/docs/STATUS.md).
 
 **Environment-gated (need a live key or external infra):**
 - **Homebrew tap** — an auto-updating `brew install codewandler/tap/flux` formula via cargo-dist
