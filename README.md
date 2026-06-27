@@ -194,6 +194,33 @@ Every route except `GET /health` requires `Authorization: Bearer $FLUX_SERVER_TO
 
 ---
 
+## Presets (prebuilt flows)
+
+`flux preset` exposes the [`flux_sdk::recipes`](crates/flux-sdk/src/recipes) cookbook — reusable,
+parameterized Flux-Lang flows (loops, retry/timeout/budget, fallback, fan-out, dispatch, and a nested
+`retry { timeout { fallback {…} } }`) — straight from the binary. Name a preset, fill its op-name slots
+and input with `key=value` arguments, then **scaffold** the flow (default) or **run** it (`--run`) through
+the same envelope as every other turn.
+
+```sh
+flux preset list                                   # the cookbook
+flux preset help retry_with_backoff                # a preset's keys + whether it runs offline
+
+# scaffold (print the flow; -o json is the form `flux flow run <file>` ingests):
+flux preset map_each item=f source='["README.md","Cargo.toml"]' op=read collect=out
+flux preset retry_with_backoff max=3 backoff=exponential delay_ms=200 op=read input='"README.md"' bind=r -o json
+
+# run it (reads real files through the envelope; --yes auto-approves):
+flux preset map_each item=f source='["README.md"]' op=read collect=out --run --yes
+```
+
+Recipes are op-agnostic templates, so a preset runs offline whenever its ops resolve in the live registry
+(the built-ins: `read`/`grep`/`glob`/`write`/…). The model-flavored presets (`route_intent`,
+`answer_with_fallback`) need a provider (`-m provider/model`) and are scaffold-by-default; without one,
+`--run` fails fast at analysis with a precise "unknown operation" diagnostic.
+
+---
+
 ## Library use (`flux-sdk`)
 
 ```rust

@@ -693,6 +693,7 @@ dependencies = [
  "flux-policy",
  "flux-provider",
  "flux-runtime",
+ "flux-sdk",
  "flux-secret",
  "flux-server",
  "flux-session",

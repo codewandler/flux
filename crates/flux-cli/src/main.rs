@@ -4,6 +4,7 @@
 //! interactive REPL and TUI land in M2; this establishes the end-to-end path
 //! (CLI → provider → stream → render).
 
+mod preset;
 mod style;
 
 use std::io::{IsTerminal, Write};
@@ -751,7 +752,15 @@ async fn run_flow(args: &[String]) -> Result<()> {
     let ast: flux_flow::ast::DraftAst = serde_json::from_str(&src)
         .with_context(|| format!("parse {file} as a Flux-Lang DraftAst (JSON)"))?;
 
-    let (mut engine, session_id, _spawner) = build_agent(&cli).await?;
+    run_draft_ast(&cli, &ast).await
+}
+
+/// Execute a pre-built `DraftAst` through the full envelope — the shared core behind both
+/// `flux flow run <file.flux>` and `flux preset <name> --run`. Builds the agent, validates the flow
+/// against the live op registry, previews risk + installs the per-op approver, runs it, and prints the
+/// outcome. The only inputs are the synthesized `Cli` (model/`--yes`) and the AST itself.
+pub(crate) async fn run_draft_ast(cli: &Cli, ast: &flux_flow::ast::DraftAst) -> Result<()> {
+    let (mut engine, session_id, _spawner) = build_agent(cli).await?;
     eprintln!(
         "{}",
         style::dim(&format!("flow · {} · session {session_id}", engine.model))
@@ -759,13 +768,13 @@ async fn run_flow(args: &[String]) -> Result<()> {
 
     // Validate against the live op registry before running anything.
     let oreg = flux_flow::registry::OpRegistry::new(engine.executor.registry());
-    if let Err(diags) = flux_flow::analyze::analyze_flow(&ast, &oreg) {
+    if let Err(diags) = flux_flow::analyze::analyze_flow(ast, &oreg) {
         print_diagnostics(&diags);
         bail!("flow validation failed — see diagnostics above");
     }
 
     // Risk preview + per-op approval (same envelope as a real turn).
-    let risk = flux_flow::runtime::plan_risk(&ast, engine.executor.registry());
+    let risk = flux_flow::runtime::plan_risk(ast, engine.executor.registry());
     eprintln!(
         "\n{}  {}{}",
         style::bold("flow"),
@@ -789,7 +798,7 @@ async fn run_flow(args: &[String]) -> Result<()> {
         &engine.flow,
         &engine.executor,
         &session_id,
-        &ast,
+        ast,
         &mut sink,
     )
     .await
@@ -797,7 +806,7 @@ async fn run_flow(args: &[String]) -> Result<()> {
     if !outcome.result.trim().is_empty() {
         println!("{}", outcome.result);
     } else {
-        // Always surface a closing summary so a direct `flux flow run` turn never ends silently.
+        // Always surface a closing summary so a direct flow turn never ends silently.
         eprintln!(
             "{}",
             style::dim(&format!("done \u{00b7} {} step(s)", outcome.steps))
@@ -2106,6 +2115,9 @@ async fn main() -> Result<()> {
     }
     if argv.get(1).map(|s| s == "flow").unwrap_or(false) {
         return run_flow(&argv[2..]).await;
+    }
+    if argv.get(1).map(|s| s == "preset").unwrap_or(false) {
+        return preset::run_preset(&argv[2..]).await;
     }
     let cli = Cli::parse();
     style::init(cli.color);
