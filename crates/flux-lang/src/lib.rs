@@ -26,6 +26,7 @@
 
 pub mod analyze;
 pub mod ast;
+pub mod dsl;
 pub mod effects;
 pub mod error;
 pub mod format;

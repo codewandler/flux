@@ -196,7 +196,10 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
             body,
             collect,
             flat,
-        } => {
+        } if !(*flat && collect.is_none()) => {
+            // The native `each … -> flat $c` surface can only spell `flat` next to a `collect` target.
+            // A `flat: true, collect: None` node (degenerate, but a valid AST shape) has no native form,
+            // so this guard lets it fall through to the `@json` escape below — preserving round-trip.
             out.push_str(&ind);
             out.push_str("each $");
             out.push_str(&item.0);
