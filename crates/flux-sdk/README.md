@@ -81,10 +81,29 @@ println!("{}", out.text);
 # Ok(()) }
 ```
 
-## A real consumer
+## Recipes
 
-[`flux-recipes`](../flux-recipes) is the first in-repo crate that depends on `flux-sdk`: a cookbook of
-reusable DSL flow recipes (routing, lookup, the loop family) that consume exactly this public surface.
+`flux_sdk::recipes` is a cookbook of reusable, parameterized flow builders on top of the DSL — hand any of
+them to a `FlowClient` to `analyze` + `execute`:
+
+| Module | Recipe(s) |
+|---|---|
+| `recipes::routing` | `route_intent` — classify once, then dispatch deterministically |
+| `recipes::lookup` | `answer_with_fallback` — graceful degradation into a typed `Answer` |
+| `recipes::batch` | `map_each`, `repeat_until`, `poll_for`, `race_first` — the loop family |
+
+```rust,ignore
+use flux_sdk::recipes::routing::route_intent;
+use flux_sdk::dsl::lit;
+
+let flow = route_intent(
+    "intent.classify",
+    lit("I'd like to book a flight"),
+    &[("book", "booking.create")],
+    "support.ticket",
+);
+// client.analyze(&flow)?; client.execute(&flow).await?;
+```
 
 ## Providers
 

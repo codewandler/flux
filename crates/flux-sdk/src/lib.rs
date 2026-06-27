@@ -7,7 +7,8 @@
 //! There are three front doors: [`Client`] (this classic agent loop), [`FlowClient`] (the Flux-Lang
 //! `compile → analyze → execute` lifecycle, NL→AST), and the [`dsl`] (author the AST in Rust). Each
 //! has a runnable, no-API-key example: `examples/client_basic.rs`, `examples/flow_compile.rs`, and
-//! `examples/dsl_loops.rs` respectively.
+//! `examples/dsl_loops.rs` respectively. On top of the DSL, [`recipes`] is a cookbook of reusable,
+//! parameterized flow builders (routing, lookup, the loop family, resilience).
 //!
 //! ```ignore
 //! // Runnable hermetic version: `cargo run -p flux-sdk --example client_basic`.
@@ -30,6 +31,8 @@ pub use flow::{assemble_registry, ExecutionResult, FlowClient, FlowClientBuilder
 /// first-class), then drive it through [`FlowClient::analyze`] + [`FlowClient::execute`]. Re-exported
 /// from `flux-lang` so consumers can stay inside `flux_sdk`. See `examples/dsl_loops.rs`.
 pub use flux_lang::dsl;
+
+pub mod recipes;
 
 use std::path::PathBuf;
 use std::sync::Arc;
