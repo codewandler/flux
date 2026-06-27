@@ -11,7 +11,7 @@ update it in the same commit as the behaviour it describes.
 > Note: the implementation has intentionally grown **beyond** the PRD's "deliberately small" v1 node set
 > (PRD §4/§8 list ~7 constructs; `ast.rs` ships **36**). That is a superset, not a regression.
 
-## Evolution build status (P0–P5 + flux-app)
+## Evolution build status (P0–P6 + flux-app)
 
 The forward design ([`flux-lang-evolution.md`](../../../docs/designs/flux-lang-evolution.md)) phases, as built:
 

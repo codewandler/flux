@@ -1,11 +1,14 @@
 # Design: flux-lang evolution — agent-cognition AST, language, and SDK
 
-**Status:** **✅ Shipped (P0–P5 + flux-app)** — this remains the *design of record* (kept forward-looking),
+**Status:** **✅ Shipped (P0–P6 + flux-app)** — this remains the *design of record* (kept forward-looking),
 but the phasing in §8 is built and live. The artifact **prelude**, `ctx`/`ctx_append` nodes, op-input
 JSON Schema, typed HIR (`analyze::lower`), the **text parser** (`parse`/`format`), the **optimizer**
 (`optimize` + `PhysicalPlan` execution), the **`flux-cognition`** (L3) pack, the **Program** layer +
-**`flux-app`** (L6) host (`flux run app.flux`), and the **`flux-sdk` `FlowClient`** all exist. Where a
-section below says "deferred / not built / out of scope," read it as the gap *at design time* — live
+**`flux-app`** (L6) host (`flux run app.flux`), and the **`flux-sdk` `FlowClient`** all exist. **P6** then
+added **`await` cross-turn suspend/resume** (`run_top_level`/`resume_flow` + the engine `suspensions`
+table), the **Tier-1 control-flow primitives** from §5.1 (`match`/`route`/`fallback`/`timeout`/`budget`),
+and polish (`fluxlang compile`, the token-efficient `format_compact`, a deterministic thing resolver). Where
+a section below says "deferred / not built / out of scope," read it as the gap *at design time* — live
 status is in [`STATUS.md`](../../crates/flux-lang/docs/STATUS.md). · **Layers:** `flux-lang` (L0),
 `flux-flow` (L3), `flux-cognition` (L3), `flux-app` (L6), `flux-sdk` (L6) · **Owner:** Timo Friedl
 
@@ -63,7 +66,7 @@ verb (`extract`/`infer`/`judge`/`synth`) into language syntax — is dropped: th
 
 Verified against the tree (full matrix in `STATUS.md`):
 
-- **Shipped:** the typed AST (`crates/flux-lang/src/ast.rs`, **29 node kinds** — already well beyond the
+- **Shipped:** the typed AST (`crates/flux-lang/src/ast.rs`, **36 node kinds** — already well beyond the
   PRD's "deliberately small" v1 list), the reference interpreter (`runtime.rs`) over injected
   `OpHost`/`ValueStore`/`FlowSink`, the SQLite value/symbol store with visibility tiers
   (`flux-flow/src/state.rs`), the effects→policy bridge (`effects.rs`) on the one envelope, the NL→AST
@@ -339,7 +342,10 @@ has a target; it is **not** built this round.
   coding flow reads exactly as today. These markers are a *display* concern — the JSON wire format and
   the v1 authoring path are unaffected.
 
-### 5.1 Candidate control-flow primitives (proposed)
+### 5.1 Candidate control-flow primitives (Tier-1 adopted in P6b)
+
+> **Status:** the **Tier-1** set below — `match`, `route`, `fallback`, `timeout`, `budget` — is **built**
+> (P6b; see `STATUS.md`). **Tier-2** (`checkpoint`/`compensate`/`once`/`scope`) remains proposed.
 
 Flux-Lang already has a broad control set (`when`/`unless`, `repeat`/`each`/`loop`, `seq`/`pipe`,
 `parallel`/`race`, `try`/`retry`/`confirm`, `assert`/`verify`, `return`, `await`, `memo`/`throttle`/

@@ -98,7 +98,7 @@ change.
 ## P4 — richer analyze (typed HIR) — ✅ DONE
 - **Shipped:** `analyze::lower(ast, ops) -> HirFlow` runs the whole-flow validation, gathers the
   semantic effect set (declared bind/memo effects ∪ host-op effects mapped to `FlowEffect`), and adds a
-  **call-arity** check (`for_each_node` traversal covers all 31 kinds). Full type inference over
+  **call-arity** check (`for_each_node` traversal covers all 36 kinds). Full type inference over
   expressions remains.
 
 ## P5 — parallel tracks (prioritize later)

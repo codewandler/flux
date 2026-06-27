@@ -21,7 +21,8 @@ hand-written grammar stays small.
   AST/round-trip).
 - **`@json` escape** (everything else, today): `parallel`, `race`, `try`, `retry`, `confirm`, `loop`,
   `throttle`, `debounce`, `assert`, `verify`, `pipe`, `memo`, `await`, `peek`, `thing`, `expr`, `fmt`,
-  `jq`, `parse`.
+  `jq`, `parse`, and the Tier-1 control-flow nodes `match`, `route`, `fallback`, `timeout`, `budget`
+  (built P6b; no native grammar yet — they round-trip through `@json`).
 - **Aspirational** (described below as the *target* language, **not** yet parsed): multiple flows per
   file, file-scope `type`/union declarations, and the `block`/`watch` spellings (the implemented nodes
   are `seq` and `loop`). The AST type is **`DraftAst`** (this doc historically said `FlowAst`, which does
@@ -713,10 +714,13 @@ $push   = await("github.push")
 $result = await("human.reply")
 ```
 
-The event source is a string label. Type annotations do not apply to `await`
-expressions — the type of the received value is determined at runtime.
+The event source is a string label. The optional `as` type is coerced leniently onto the received value.
 
-`await` is specified but not yet implemented in the runtime (planned).
+**Implemented (P6a):** a **top-level** `await` suspends the flow for cross-turn resume — the interpreter
+records the suspend point (`FlowOutcome.suspension` + a `RunEvent::Awaiting` trace), and the engine
+persists it (a `suspensions` table) and resumes via `resume_flow` when the awaited input arrives next
+turn; the already-run prefix is **not** re-executed. `await` is **top-level only** in v1 (the analyzer
+rejects it nested inside `when`/`repeat`/`each`/… ), and the optimized `execute_plan` path does not suspend.
 
 ---
 

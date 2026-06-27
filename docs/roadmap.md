@@ -64,15 +64,17 @@ before every release.
   issues, and fix the top biters. Validates the daily-driver claim on real tasks.
 - **SDK + crates.io** (tier 2) — stabilize and document the `flux-sdk` public API with runnable
   examples, then publish the crates so others can embed flux as a library.
-- **flux-lang evolution — ✅ shipped** (P0–P5 + flux-app): the agent-cognition layer landed — the
-  artifact **prelude** (11 `Named` types), `ctx`/`ctx_append` context-pack nodes (31 node kinds),
+- **flux-lang evolution — ✅ shipped** (P0–P6 + flux-app): the agent-cognition layer landed — the
+  artifact **prelude** (11 `Named` types), `ctx`/`ctx_append` context-pack nodes (36 node kinds),
   op-input JSON Schema, typed HIR with arg type-checking (`analyze::lower`), the **text parser**
   (`parse`/`format`) and **optimizer** (`optimize` + `PhysicalPlan` execution); the **`flux-cognition`**
   (L3) model-op pack and **`flux-app`** (L6) multi-agent runtime host (`flux run app.flux`,
-  deny-destructive by default); and the **`flux-sdk` `FlowClient`** lifecycle. See
-  [designs/flux-lang-evolution.md](designs/flux-lang-evolution.md) and the
-  [PRD status RTM](../crates/flux-lang/docs/STATUS.md). Remaining: a token-efficient display mode and
-  deeper optimizer passes.
+  deny-destructive by default); and the **`flux-sdk` `FlowClient`** lifecycle. **P6** added **`await`
+  cross-turn suspend/resume**, the **Tier-1 control-flow primitives** (`match`/`route`/`fallback`/
+  `timeout`/`budget`), and polish (`fluxlang compile`, token-efficient `format_compact`, a deterministic
+  thing resolver). See [designs/flux-lang-evolution.md](designs/flux-lang-evolution.md) and the
+  [PRD status RTM](../crates/flux-lang/docs/STATUS.md). Remaining: Tier-2 control-flow
+  (`checkpoint`/`compensate`/`once`/`scope`) and deeper optimizer passes.
 
 **Environment-gated (need a live key or external infra):**
 - **Homebrew tap** — an auto-updating `brew install codewandler/tap/flux` formula via cargo-dist
