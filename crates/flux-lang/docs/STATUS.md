@@ -49,7 +49,7 @@ update it in the same commit as the behaviour it describes.
 | PRD § | Requirement | Status | Evidence / note |
 |---|---|---|---|
 | 11 | Op registry + `OpSpec` + handler trait (effects/retry/idempotency/approval/cache) | ✅ | `src/opspec.rs`; `OpHost`/`OpCatalog` seams |
-| 11 | **Op-input JSON Schema** from `OpSpec` | 🟡 → **P0** | `OpSpec::lower()` placeholder `{"type":"object"}` (`opspec.rs:46`); front-loaded as P0 (cross-cutting prereq for the prelude/pack) |
+| 11 | **Op-input JSON Schema** from `OpSpec` | ✅ (P0) | `OpSpec`'s typed, **named** `inputs: Vec<Param>` project to a real object schema (`properties`/`required`) via `OpSpec::lower()`/`input_schema()` (`opspec.rs`); `schema_params`/`OpSignature` read it back. Tests: `opspec_lowers_typed_inputs_to_a_named_json_schema`, `required_param_order_is_preserved_through_lowering`, `map_args_binds_through_a_lowered_opspec_schema` |
 | 12, 14.2 | Effects first-class; policy allow/deny/approval before side effects | ✅ | `src/effects.rs` → `flux-policy`; `Executor::dispatch` |
 | 14.1 | Prompt-injection resistance (analyzer-validated AST; external content is data) | ✅ | one envelope; no-bypass tests in `flux-runtime` |
 | 14.2 | Dangerous effects (Delete/Money) denied by default | ✅ | default-deny policy |
@@ -94,7 +94,7 @@ update it in the same commit as the behaviour it describes.
 | 1. Two writable display modes (human + token-efficient) | ⬜ (grammar designed; parser deferred) |
 | 2. `fluxlang compile` (text → AST, auto-detect) | ⬜ |
 | 3. Richer `analyze` (type + effect checking → typed HIR) | 🟡 |
-| 4. Op-input JSON Schema from `OpSpec` | 🟡 |
+| 4. Op-input JSON Schema from `OpSpec` | ✅ (P0; `opspec.rs`) |
 
 ## Beyond the PRD — this design's additions (➕)
 
@@ -121,7 +121,12 @@ update it in the same commit as the behaviour it describes.
   already-bounded pack. Heuristic char-based counter in v1. No type-carrying op signatures needed. (§3.2)
 - **`need`/`gaps` are pure ops, not nodes** (review #2): `need` only builds a `Need` value and the loop is
   ordinary control flow, so it stays symmetric with `gaps`. (§3.3)
-- **Op-input JSON Schema is P0** (review #3): the cross-cutting `OpSpec::lower()` rework ships first, ahead
-  of the prelude/pack. (§8)
+- **Op-input JSON Schema (P0) — done.** The cross-cutting `OpSpec::lower()` rework shipped first, ahead of
+  the prelude/pack (review #3). `OpSpec.inputs` became `Vec<Param>` (`Param { name, type, optional }`) so
+  the typed inputs project to a faithful JSON Schema object: **required-param order is preserved** (the
+  `required` array; load-bearing for positional binding), optional params carry no order guarantee (object
+  keys are unordered — `serde_json` has no `preserve_order`), matching hand-written op schemas. `Named`
+  types render as `#/$defs/<name>` `$ref`s, forward-compatible with the P1 prelude. Existing flux-tools ops
+  are unaffected (they register hand-written `ToolSpec`s, not via `OpSpec`). (§3.4, §8; `opspec.rs`)
 - **Additive AST.** **+2** node kinds (`ctx`/`ctx_append`); no `Value`/`TypeRef`/effect change;
   backward-compatible (existing JSON flows unaffected).

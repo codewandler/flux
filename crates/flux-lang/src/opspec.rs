@@ -12,14 +12,30 @@ use flux_spec::{Effect, Idempotency, Risk, ToolSpec};
 
 use crate::ast::{FlowEffect, TypeRef};
 
+/// A single named input parameter of an [`OpSpec`]: a `name`, its [`TypeRef`], and whether it may be
+/// omitted. Naming the param here — rather than leaving `inputs` positional — is what lets
+/// [`OpSpec::lower`] project a faithful JSON Schema whose `properties`/`required` the planner catalog
+/// and [`schema_params`] read back to recover the op's positional binding order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Param {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub ty: TypeRef,
+    /// When true, the param is omitted from the schema's `required` array (it still appears in
+    /// `properties`). Optional params carry no inter-param order guarantee — JSON object keys are
+    /// unordered.
+    #[serde(default)]
+    pub optional: bool,
+}
+
 /// The typed specification of a Flux-Lang operation. Carries richer language metadata than a
-/// [`ToolSpec`] (typed I/O, semantic effects) and lowers onto one via [`OpSpec::lower`].
+/// [`ToolSpec`] (typed, *named* I/O, semantic effects) and lowers onto one via [`OpSpec::lower`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpSpec {
     pub name: String,
     pub description: String,
     #[serde(default)]
-    pub inputs: Vec<TypeRef>,
+    pub inputs: Vec<Param>,
     pub output: TypeRef,
     #[serde(default)]
     pub effects: Vec<FlowEffect>,
@@ -29,8 +45,8 @@ pub struct OpSpec {
 
 impl OpSpec {
     /// Lower to a host [`ToolSpec`] so the op can be registered and dispatched through the existing
-    /// envelope. Semantic effects collapse to their host-resource [`Effect`]s (deduped); the typed
-    /// signature is not yet projected to JSON Schema (a generic object schema is used for now).
+    /// envelope. Semantic effects collapse to their host-resource [`Effect`]s (deduped); the typed,
+    /// named [`inputs`](Self::inputs) project to a real JSON Schema object via [`Self::input_schema`].
     pub fn lower(&self) -> ToolSpec {
         let mut effects: Vec<Effect> = Vec::new();
         for e in &self.effects {
@@ -43,7 +59,7 @@ impl OpSpec {
         ToolSpec {
             name: self.name.clone(),
             description: self.description.clone(),
-            input_schema: serde_json::json!({ "type": "object" }),
+            input_schema: self.input_schema(),
             output_schema: None,
             effects,
             risk: self.risk,
@@ -51,6 +67,45 @@ impl OpSpec {
             access: Vec::new(),
             group: None,
         }
+    }
+
+    /// Project the named, typed [`inputs`](Self::inputs) onto a JSON Schema object: every param
+    /// becomes a `properties` entry (its [`TypeRef`] via [`type_ref_to_schema`]), and every
+    /// non-`optional` param is listed in `required` **in declared order** — the array preserves order,
+    /// so [`schema_params`] reads it back to recover the op's positional binding order. Optional params
+    /// carry no order guarantee (JSON object keys are unordered), matching hand-written op schemas.
+    pub fn input_schema(&self) -> serde_json::Value {
+        let mut properties = serde_json::Map::new();
+        let mut required: Vec<serde_json::Value> = Vec::new();
+        for p in &self.inputs {
+            properties.insert(p.name.clone(), type_ref_to_schema(&p.ty));
+            if !p.optional {
+                required.push(serde_json::Value::String(p.name.clone()));
+            }
+        }
+        serde_json::json!({
+            "type": "object",
+            "properties": serde_json::Value::Object(properties),
+            "required": serde_json::Value::Array(required),
+        })
+    }
+}
+
+/// Project a [`TypeRef`] onto a JSON Schema fragment. A `Named` type renders as a `$ref` into
+/// `#/$defs/<name>` — forward-compatible with the registered-type definitions (the prelude) a later
+/// phase adds; an as-yet-unresolved `$ref` is still a stable, valid schema node. `Any` is the
+/// unconstrained schema (`{}`), matching "the top type."
+fn type_ref_to_schema(ty: &TypeRef) -> serde_json::Value {
+    match ty {
+        TypeRef::Any => serde_json::json!({}),
+        TypeRef::Bool => serde_json::json!({ "type": "boolean" }),
+        TypeRef::Number => serde_json::json!({ "type": "number" }),
+        TypeRef::String => serde_json::json!({ "type": "string" }),
+        TypeRef::List(inner) => serde_json::json!({
+            "type": "array",
+            "items": type_ref_to_schema(inner),
+        }),
+        TypeRef::Named(name) => serde_json::json!({ "$ref": format!("#/$defs/{name}") }),
     }
 }
 
@@ -143,13 +198,24 @@ pub trait OpCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
-    #[test]
-    fn opspec_lowers_preserving_name_risk_and_host_effects() {
-        let spec = OpSpec {
+    fn kb_search() -> OpSpec {
+        OpSpec {
             name: "kb.search".into(),
             description: "search the knowledge base".into(),
-            inputs: vec![TypeRef::String],
+            inputs: vec![
+                Param {
+                    name: "query".into(),
+                    ty: TypeRef::String,
+                    optional: false,
+                },
+                Param {
+                    name: "limit".into(),
+                    ty: TypeRef::Number,
+                    optional: true,
+                },
+            ],
             output: TypeRef::Named("List".into()),
             effects: vec![
                 FlowEffect::Read,
@@ -158,8 +224,12 @@ mod tests {
             ],
             risk: Risk::Low,
             idempotency: Idempotency::Idempotent,
-        };
-        let tool = spec.lower();
+        }
+    }
+
+    #[test]
+    fn opspec_lowers_preserving_name_risk_and_host_effects() {
+        let tool = kb_search().lower();
 
         assert_eq!(tool.name, "kb.search");
         assert_eq!(tool.risk, Risk::Low);
@@ -172,6 +242,88 @@ mod tests {
                 .filter(|e| **e == Effect::Network)
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn opspec_lowers_typed_inputs_to_a_named_json_schema() {
+        let tool = kb_search().lower();
+        let schema = &tool.input_schema;
+
+        // No longer the `{"type":"object"}` placeholder — a real object schema with named props.
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["query"], json!({ "type": "string" }));
+        assert_eq!(schema["properties"]["limit"], json!({ "type": "number" }));
+        // Only the non-optional param is required.
+        assert_eq!(schema["required"], json!(["query"]));
+
+        // Round-trip: the lowered schema reads back to the declared params. Required order is
+        // load-bearing (positional binding); `query` is required, `limit` optional.
+        let (required, optional) = schema_params(schema);
+        assert_eq!(required, vec!["query"]);
+        assert_eq!(optional, vec!["limit"]);
+
+        // And the planner-catalog signature renders names, not a generic object.
+        let sig = OpSignature::from_spec(&tool);
+        assert_eq!(sig.param_signature(), "query[, limit]");
+    }
+
+    #[test]
+    fn required_param_order_is_preserved_through_lowering() {
+        // Required params bind positionally, so their order must survive the round-trip exactly
+        // (the `required` array preserves order even though object keys are unordered).
+        let spec = OpSpec {
+            name: "edit".into(),
+            description: "edit a file".into(),
+            inputs: vec![
+                Param {
+                    name: "path".into(),
+                    ty: TypeRef::String,
+                    optional: false,
+                },
+                Param {
+                    name: "old".into(),
+                    ty: TypeRef::String,
+                    optional: false,
+                },
+                Param {
+                    name: "new".into(),
+                    ty: TypeRef::String,
+                    optional: false,
+                },
+            ],
+            output: TypeRef::Any,
+            effects: Vec::new(),
+            risk: Risk::Low,
+            idempotency: Idempotency::Idempotent,
+        };
+        let (required, optional) = schema_params(&spec.lower().input_schema);
+        assert_eq!(required, vec!["path", "old", "new"]);
+        assert!(optional.is_empty());
+    }
+
+    #[test]
+    fn type_ref_to_schema_projects_each_variant() {
+        assert_eq!(type_ref_to_schema(&TypeRef::Any), json!({}));
+        assert_eq!(
+            type_ref_to_schema(&TypeRef::Bool),
+            json!({ "type": "boolean" })
+        );
+        assert_eq!(
+            type_ref_to_schema(&TypeRef::Number),
+            json!({ "type": "number" })
+        );
+        assert_eq!(
+            type_ref_to_schema(&TypeRef::String),
+            json!({ "type": "string" })
+        );
+        assert_eq!(
+            type_ref_to_schema(&TypeRef::List(Box::new(TypeRef::String))),
+            json!({ "type": "array", "items": { "type": "string" } })
+        );
+        assert_eq!(
+            type_ref_to_schema(&TypeRef::Named("Claim".into())),
+            json!({ "$ref": "#/$defs/Claim" })
         );
     }
 }

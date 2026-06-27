@@ -7,14 +7,26 @@ sync on every change (the "keep design + plan in sync" rule). Each phase ships b
 (`cargo build/test`, `clippy -D warnings`, `fmt`, `flux-codegate`) with a test that fails before the
 change.
 
-## P0 — op-input JSON Schema (cross-cutting prerequisite)
-- `opspec.rs`: make `OpSpec::lower()` emit a real JSON Schema from typed named inputs (kill the
-  `{"type":"object"}` placeholder at `:46`); have `schema_params` / `OpSignature::from_spec`
-  (`opspec.rs:62-113`) consume it. Touches **every** op and the planner catalog, so it ships first, on its
-  own — the foundation P1's `ai.extract { schema }` and the prelude depend on.
-- Tests: op-input schema for a representative op; existing ops' planner-catalog signatures unchanged.
+## P0 — op-input JSON Schema (cross-cutting prerequisite) — ✅ DONE
+- **Done in `opspec.rs`.** `OpSpec.inputs` changed from positional `Vec<TypeRef>` to **named**
+  `Vec<Param>` (`Param { name, type, optional }`) — the crux, since `OpSpec` carried no param names but
+  every downstream consumer (`schema_params`, `OpSignature::from_spec`, `param_signature`,
+  `runtime::map_args_to_input`, the planner catalog) is name-keyed. `OpSpec::lower()` now projects a real
+  object schema via `input_schema()` (killing the `{"type":"object"}` placeholder); a `type_ref_to_schema`
+  helper maps each `TypeRef` variant (`Named → #/$defs/<name>` `$ref`, forward-compat with the P1 prelude).
+- **Ordering contract:** required-param order is preserved (the `required` JSON array; load-bearing for
+  positional binding); optional params have no order guarantee (`serde_json` has no `preserve_order` →
+  object keys alphabetize), exactly as hand-written op schemas already behave.
+- **No live-path risk:** `OpSpec` was test-only; real flux-tools ops register hand-written `ToolSpec`s, so
+  their planner signatures are unchanged (`flux-flow` tests + `skill_docs_in_sync` stayed green).
+- Tests: `opspec_lowers_typed_inputs_to_a_named_json_schema`, `required_param_order_is_preserved_through_lowering`,
+  `type_ref_to_schema_projects_each_variant` (flux-lang `opspec.rs`); `map_args_binds_through_a_lowered_opspec_schema`
+  (flux-lang `runtime.rs`) — proves OpSpec → lower → `from_spec` → positional bind end-to-end.
 
 ## P1 — v1-core prelude types + cognition op-pack
+- **Builds on P0:** each cognition op declares its inputs as typed, named `OpSpec`/`Param`s, so it gets a
+  faithful planner signature + `properties`/`required` for free — no hand-written JSON. The `Named` prelude
+  types resolve the `#/$defs/<name>` `$ref`s P0's `type_ref_to_schema` already emits.
 - `flux-lang`: new `prelude` module — register the **v1-core** subset as `Named` type schemas:
   `Span/Claim/Evidence/Need/Ctx/Query/Answer/Blocked` + the coding types `Patch/TestResult` (handles reuse
   the existing `Thing`/`ThingRef` — no `Ref` type; `Value` already has a `Ref` variant). **Grow on demand**
@@ -37,7 +49,8 @@ change.
   Both coexist. (Future direction: some IO/LLM ops may later become language primitives — **not yet**;
   v1 keeps them as registered ops.)
 - Add `flux-flow/docs/ops-reference.md` rows + engine-skill table for the new ops.
-- Tests: prelude schema round-trip; op-input schema for a representative op; `gaps`/`compare` purity.
+- Tests: prelude schema round-trip; a cognition op's `OpSpec` lowers to the expected named schema (reusing
+  the P0 projector); `gaps`/`compare` purity.
 
 ## P2 — `ctx` / `ctx_append` nodes (+2)
 - `ast.rs`: **2** new `Node` variants (`ctx`, `ctx_append`) with doc-comments (so the node-kind SSOT

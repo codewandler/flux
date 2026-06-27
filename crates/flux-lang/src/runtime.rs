@@ -1905,6 +1905,35 @@ mod tests {
     }
 
     #[test]
+    fn map_args_binds_through_a_lowered_opspec_schema() {
+        use crate::ast::TypeRef;
+        use crate::opspec::{OpSpec, Param};
+
+        // End-to-end P0 path: a typed, *named* OpSpec lowers to a real input schema, and an
+        // OpSignature derived from that lowered ToolSpec recovers the param names — so positional
+        // call args bind to the right slots without any hand-written signature.
+        let req = |name: &str| Param {
+            name: name.into(),
+            ty: TypeRef::String,
+            optional: false,
+        };
+        let spec = OpSpec {
+            name: "edit".into(),
+            description: "edit a file".into(),
+            inputs: vec![req("path"), req("old"), req("new")],
+            output: TypeRef::Any,
+            effects: Vec::new(),
+            risk: flux_spec::Risk::Low,
+            idempotency: flux_spec::Idempotency::Idempotent,
+        };
+        let ops = MockCatalog(vec![OpSignature::from_spec(&spec.lower())]);
+
+        let input =
+            map_args_to_input("edit", vec![json!("f"), json!("a"), json!("b")], &ops).unwrap();
+        assert_eq!(input, json!({ "path": "f", "old": "a", "new": "b" }));
+    }
+
+    #[test]
     fn eval_arg_resolves_a_var_to_its_stored_value() {
         let store = MemStore::new();
         let vid = store
