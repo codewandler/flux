@@ -34,6 +34,7 @@ members = [
     "crates/flux-cli",
     "crates/flux-codegate",
     "crates/flux-cognition",
+    "crates/flux-app",
 ]
 
 [workspace.package]
@@ -77,6 +78,7 @@ flux-anthropic = { path = "crates/flux-anthropic" }
 flux-openai = { path = "crates/flux-openai" }
 flux-credentials = { path = "crates/flux-credentials" }
 flux-cognition = { path = "crates/flux-cognition" }
+flux-app = { path = "crates/flux-app" }
 
 # external
 serde = { version = "1", features = ["derive"] }

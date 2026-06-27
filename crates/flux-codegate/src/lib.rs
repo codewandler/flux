@@ -31,7 +31,7 @@ pub fn layer(name: &str) -> Option<u8> {
         "flux-browser" | "flux-datasource" | "flux-auth" => 5,
         // L6 — surfaces / apps (and this lint crate itself)
         "flux-sdk" | "flux-server" | "flux-integrations" | "flux-tui" | "flux-cli"
-        | "flux-codegate" => 6,
+        | "flux-codegate" | "flux-app" => 6,
         _ => return None,
     })
 }

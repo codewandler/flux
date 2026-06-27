@@ -1,0 +1,27 @@
+[package]
+name = "flux-app"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "flux-app: the L6 runtime host that runs a multi-agent flux Program (event bus + triggers + journeys)"
+
+[dependencies]
+flux-core.workspace = true
+flux-spec.workspace = true
+flux-lang.workspace = true
+flux-flow.workspace = true
+flux-runtime.workspace = true
+flux-tools.workspace = true
+flux-provider.workspace = true
+flux-evidence.workspace = true
+flux-agent.workspace = true
+flux-system.workspace = true
+flux-cognition.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-std", "io-util"] }
+futures.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

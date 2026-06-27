@@ -622,6 +622,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "flux-app"
+version = "0.2.4"
+dependencies = [
+ "async-trait",
+ "flux-agent",
+ "flux-cognition",
+ "flux-core",
+ "flux-evidence",
+ "flux-flow",
+ "flux-lang",
+ "flux-provider",
+ "flux-runtime",
+ "flux-spec",
+ "flux-system",
+ "flux-tools",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "flux-auth"
 version = "0.2.4"
 dependencies = [
