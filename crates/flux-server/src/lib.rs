@@ -2,13 +2,17 @@
 //! or remotely (`flux --serve <addr>`).
 //!
 //! Routes:
-//! - `GET  /health` → `ok`
-//! - `POST /sessions` → `{ id, model }`
-//! - `GET  /sessions/:id` → session info
-//! - `POST /sessions/:id/messages` `{ "input": "..." }` → `{ text, tool_calls, usage }`
+//! - `GET  /health`                       → `ok`
+//! - `GET  /.well-known/agent.json`       → A2A agent card (discovery)
+//! - `POST /a2a`                          → A2A JSON-RPC 2.0 (`tasks/send`, `tasks/sendSubscribe`)
+//! - `POST /sessions`                     → `{ id, model }`
+//! - `GET  /sessions/:id`                 → session info
+//! - `POST /sessions/:id/messages`        → `{ text, tool_calls, usage }`
 //!
 //! The agent runs tools through the same safety envelope as the CLI; build it with auto-approve
 //! since HTTP requests have no interactive approver.
+
+mod a2a;
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -34,7 +38,10 @@ type Shared = Arc<FlowEngine>;
 /// only permits that for a loopback bind).
 pub async fn serve(addr: &str, agent: FlowEngine, token: Option<String>) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    eprintln!("flux server listening on http://{}", listener.local_addr()?);
+    let addr = listener.local_addr()?;
+    eprintln!("flux server listening on http://{addr}");
+    eprintln!("  A2A agent card:  http://{addr}/.well-known/agent.json");
+    eprintln!("  A2A endpoint:    http://{addr}/a2a");
     serve_on(listener, agent, token).await
 }
 
@@ -49,39 +56,46 @@ pub async fn serve_on(
 }
 
 fn router(state: Shared, token: Option<String>) -> Router {
-    Router::new()
+    // Auth-exempt routes — registered outside the middleware layer so path-string comparison
+    // cannot be bypassed by percent-encoding or double-slash tricks.
+    let exempt = Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/.well-known/agent.json", get(a2a::agent_card));
+
+    // Every other route requires a valid Bearer token when one is configured.
+    let protected = Router::new()
+        .route("/a2a", post(a2a::a2a_handler))
         .route("/sessions", post(create_session))
         .route("/sessions/:id", get(get_session))
         .route("/sessions/:id/messages", post(post_message))
         .route("/sessions/:id/stream", get(stream_message))
         .route("/webhook", post(webhook))
-        // Auth runs for every matched route; the handler exempts `/health`.
         .route_layer(middleware::from_fn_with_state(
             Arc::new(token),
             require_auth,
-        ))
-        .with_state(state)
+        ));
+
+    exempt.merge(protected).with_state(state)
 }
 
-/// Bearer-token gate. With no configured token this is a pass-through; otherwise every path except
-/// `/health` must present a matching `Authorization: Bearer` header (compared in constant time).
+/// Bearer-token gate. With no configured token this is a pass-through; otherwise the request
+/// must present a matching `Authorization: Bearer` header (compared in constant time).
+/// Exempt routes (`/health`, `/.well-known/agent.json`) are registered outside this middleware's
+/// scope in [`router`] — no path-string bypass is possible.
 async fn require_auth(
     State(token): State<Arc<Option<String>>>,
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
     if let Some(expected) = token.as_ref() {
-        if req.uri().path() != "/health" {
-            let presented = req
-                .headers()
-                .get(axum::http::header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.strip_prefix("Bearer "))
-                .unwrap_or("");
-            if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
-                return Err(StatusCode::UNAUTHORIZED);
-            }
+        let presented = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("");
+        if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+            return Err(StatusCode::UNAUTHORIZED);
         }
     }
     Ok(next.run(req).await)
@@ -209,10 +223,10 @@ async fn webhook(
 }
 
 #[derive(Default)]
-struct Collect {
-    text: String,
-    tools: Vec<String>,
-    usage: Option<Usage>,
+pub(crate) struct Collect {
+    pub(crate) text: String,
+    pub(crate) tools: Vec<String>,
+    pub(crate) usage: Option<Usage>,
 }
 
 impl AgentSink for Collect {
@@ -244,14 +258,19 @@ mod tests {
 
     /// Build a tiny router carrying only the auth layer over a `/health` and a protected route, so
     /// the gate can be exercised without standing up a full `Agent`.
+    /// Mirror the split-router structure from [`router`]: exempt routes outside the middleware,
+    /// protected routes inside.
     fn guarded_app(token: Option<String>) -> Router {
-        Router::new()
+        let exempt = Router::new()
             .route("/health", get(|| async { "ok" }))
+            .route("/.well-known/agent.json", get(|| async { Json(json!({})) }));
+        let protected = Router::new()
             .route("/protected", get(|| async { "data" }))
             .route_layer(middleware::from_fn_with_state(
                 Arc::new(token),
                 require_auth,
-            ))
+            ));
+        exempt.merge(protected)
     }
 
     async fn status(app: Router, path: &str, auth: Option<&str>) -> StatusCode {
@@ -282,8 +301,12 @@ mod tests {
             status(app(), "/protected", Some("Bearer s3cr3t")).await,
             StatusCode::OK
         );
-        // /health is exempt even without a token (liveness probes).
+        // /health and /.well-known/agent.json are exempt (liveness probes / A2A discovery).
         assert_eq!(status(app(), "/health", None).await, StatusCode::OK);
+        assert_eq!(
+            status(app(), "/.well-known/agent.json", None).await,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
