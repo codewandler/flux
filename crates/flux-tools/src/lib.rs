@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 pub mod cargo;
+pub mod cognition;
 pub mod extra;
 pub mod groups;
 
@@ -204,6 +205,7 @@ pub fn register_builtins(registry: &mut ToolRegistry) {
     registry.register(Arc::new(GitPushTool));
     registry.register(Arc::new(GitCheckoutTool));
     registry.register(Arc::new(GitUnstageTool));
+    cognition::register_cognition(registry);
 }
 
 // ---------------------------------------------------------------------------
@@ -3005,8 +3007,12 @@ mod tests {
                 "cargo_clippy",
                 "cargo_fmt",
                 "cargo_test",
+                "cite",
+                "compare",
+                "dedupe",
                 "edit",
                 "file_stat",
+                "gaps",
                 "git_checkout",
                 "git_commit",
                 "git_diff",
@@ -3018,11 +3024,15 @@ mod tests {
                 "glob",
                 "grep",
                 "home_dir",
+                "merge",
+                "need",
                 "patch",
                 "path_exists",
                 "read",
                 "read_many",
+                "sort",
                 "sqlite_query",
+                "top",
                 "web_search",
                 "write"
             ]
