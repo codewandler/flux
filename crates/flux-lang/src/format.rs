@@ -24,7 +24,21 @@
 use crate::ast::{DraftAst, FlowEffect, Node, SymbolName};
 
 /// Render a [`DraftAst`] as canonical Flux-Lang text. Always 2-space indentation; deterministic.
+/// Round-trips: `parse(&format(&ast)) == ast`.
 pub fn format(ast: &DraftAst) -> String {
+    format_with(ast, "  ")
+}
+
+/// Render a [`DraftAst`] in the **token-efficient** display variant: the same markers as [`format`]
+/// but single-space block indentation (≈half the indentation characters on nested plans). For cheap
+/// model-facing *display* of a plan. **Display-only:** [`crate::parse`] expects canonical two-space
+/// indentation, so this surface does not round-trip — use [`format`] for the writable, parseable form.
+pub fn format_compact(ast: &DraftAst) -> String {
+    format_with(ast, " ")
+}
+
+/// Shared renderer: `indent` is the per-level indentation unit (`"  "` canonical, `" "` compact).
+fn format_with(ast: &DraftAst, indent: &str) -> String {
     let mut out = String::new();
     out.push_str("flow");
     if let Some(name) = &ast.name {
@@ -47,7 +61,7 @@ pub fn format(ast: &DraftAst) -> String {
     }
     out.push('\n');
 
-    fmt_body(&ast.body, 1, &mut out);
+    fmt_body(&ast.body, 1, indent, &mut out);
     out
 }
 
@@ -70,13 +84,13 @@ fn fmt_expr(node: &Node) -> String {
     }
 }
 
-fn indent_of(level: usize) -> String {
-    "  ".repeat(level)
+fn indent_of(level: usize, unit: &str) -> String {
+    unit.repeat(level)
 }
 
-fn fmt_body(body: &[Node], level: usize, out: &mut String) {
+fn fmt_body(body: &[Node], level: usize, indent: &str, out: &mut String) {
     for n in body {
-        fmt_stmt(n, level, out);
+        fmt_stmt(n, level, indent, out);
     }
 }
 
@@ -87,8 +101,8 @@ fn join_syms(syms: &[SymbolName]) -> String {
         .join(", ")
 }
 
-fn fmt_stmt(node: &Node, level: usize, out: &mut String) {
-    let ind = indent_of(level);
+fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
+    let ind = indent_of(level, indent);
     match node {
         Node::Bind {
             name,
@@ -162,11 +176,11 @@ fn fmt_stmt(node: &Node, level: usize, out: &mut String) {
             out.push_str("when ");
             out.push_str(&fmt_expr(cond));
             out.push('\n');
-            fmt_body(then, level + 1, out);
+            fmt_body(then, level + 1, indent, out);
             if !otherwise.is_empty() {
                 out.push_str(&ind);
                 out.push_str("else\n");
-                fmt_body(otherwise, level + 1, out);
+                fmt_body(otherwise, level + 1, indent, out);
             }
         }
         Node::Unless { cond, body } => {
@@ -174,7 +188,7 @@ fn fmt_stmt(node: &Node, level: usize, out: &mut String) {
             out.push_str("unless ");
             out.push_str(&fmt_expr(cond));
             out.push('\n');
-            fmt_body(body, level + 1, out);
+            fmt_body(body, level + 1, indent, out);
         }
         Node::Each {
             source,
@@ -197,7 +211,7 @@ fn fmt_stmt(node: &Node, level: usize, out: &mut String) {
                 out.push_str(&c.0);
             }
             out.push('\n');
-            fmt_body(body, level + 1, out);
+            fmt_body(body, level + 1, indent, out);
         }
         Node::Repeat {
             max,
@@ -214,12 +228,12 @@ fn fmt_stmt(node: &Node, level: usize, out: &mut String) {
             }
             out.push('\n');
             if let Some(u) = until {
-                out.push_str(&indent_of(level + 1));
+                out.push_str(&indent_of(level + 1, indent));
                 out.push_str("until ");
                 out.push_str(&fmt_expr(u));
                 out.push('\n');
             }
-            fmt_body(body, level + 1, out);
+            fmt_body(body, level + 1, indent, out);
         }
         Node::Seq { body, bind } => {
             out.push_str(&ind);
@@ -229,7 +243,7 @@ fn fmt_stmt(node: &Node, level: usize, out: &mut String) {
                 out.push_str(&b.0);
             }
             out.push('\n');
-            fmt_body(body, level + 1, out);
+            fmt_body(body, level + 1, indent, out);
         }
         Node::Ctx {
             name,
@@ -242,7 +256,7 @@ fn fmt_stmt(node: &Node, level: usize, out: &mut String) {
             out.push_str("ctx $");
             out.push_str(&name.0);
             out.push('\n');
-            let ind1 = indent_of(level + 1);
+            let ind1 = indent_of(level + 1, indent);
             if let Some(p) = purpose {
                 out.push_str(&ind1);
                 out.push_str("purpose ");
@@ -299,6 +313,40 @@ pub(crate) fn effect_tag(e: FlowEffect) -> &'static str {
 mod tests {
     use super::*;
     use crate::ast::{Param, Selector, ThingKind, ThingRef, TypeRef};
+
+    #[test]
+    fn compact_uses_single_space_indent_display_only() {
+        // A nested plan: `when $x` with a body, so indentation is exercised.
+        let ast = DraftAst {
+            body: vec![Node::When {
+                cond: Box::new(Node::Var { name: "x".into() }),
+                then: vec![Node::Call {
+                    op: "echo".into(),
+                    args: vec![Node::Lit {
+                        value: serde_json::json!("hi"),
+                    }],
+                }],
+                otherwise: vec![],
+            }],
+            ..Default::default()
+        };
+        let canonical = format(&ast);
+        let compact = format_compact(&ast);
+        // Level-1 `when` is indented two spaces canonically, one space compactly — fewer chars.
+        assert!(
+            canonical.contains("\n  when $x\n"),
+            "canonical: {canonical}"
+        );
+        assert!(compact.contains("\n when $x\n"), "compact: {compact}");
+        assert!(
+            compact.len() < canonical.len(),
+            "compact is shorter ({} vs {})",
+            compact.len(),
+            canonical.len()
+        );
+        // The canonical form remains the round-trippable one (compact is display-only).
+        assert_eq!(crate::parse::parse(&canonical).unwrap(), ast);
+    }
 
     #[test]
     fn formats_header_and_bind() {

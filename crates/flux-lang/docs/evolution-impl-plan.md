@@ -158,13 +158,19 @@ review, then commits; `STATUS.md` rows flip as each lands.
 - **Note for native grammar:** `parse.rs` already uses a `budget` keyword for `ctx`'s char-budget; resolve
   the collision before adding native (non-`@json`) syntax for `Node::Budget`.
 
-### P6c — polish to truly-done
-- `fluxlang compile` subcommand (text → JSON AST, mirrors `Render`).
-- Token-efficient display mode (`FormatOptions`/`format_compact`, **display-only** in v1).
-- Thing resolver: execute `Node::Thing` via an injected `ThingResolver` + a default deterministic resolver
-  for unambiguous selectors (`File`→path, `Url`→url, `Repo`/`Dataset` by id).
-- Focus aliases: deterministic resolver for fixed forms ("the/last `<type>`", "those `<plural>`") →
-  most-recent matching symbol by type+recency (no model). Softest item; droppable.
+### P6c — polish to truly-done — ✅ DONE (focus aliases deferred)
+- **`fluxlang compile`** (P6c.1): text → JSON AST, mirrors `Render` (`bin/fluxlang.rs`). ✅
+- **Token-efficient display** (P6c.2): `format::format_compact` — single-space block indentation,
+  **display-only** (the parser is 2-space-sensitive, so it does not round-trip; `format` stays the
+  writable form). ✅
+- **Thing resolver** (P6c.3): `OpHost::resolve_thing` + `default_resolve_thing` (`host.rs`) resolve the
+  self-identifying selectors (`Id`/`Key`, `File`-by-`Path`, `Url`) deterministically; `Node::Thing` binds
+  the resolved value with a `ThingResolved` trace. `Name`/`Query` error pending a host resolver override
+  (the injected `ThingResolver` for ambiguous lookups is the follow-up). ✅
+- **Focus aliases** (P6c.4): **deferred** (the plan flagged it droppable). Rationale: the planner emits
+  explicit `$symbol` names, not NL aliases — there is **no runtime consumer** for "the draft"/"those
+  results", so a most-recent-by-type resolver would be dead code. Revisit when a surface needs NL focus
+  resolution. Recorded in `STATUS.md` (§9.3).
 
 ## Cross-cutting gates
 - Node-kind SSOT (+3) and the new prelude-type catalog must stay green (drift tests).

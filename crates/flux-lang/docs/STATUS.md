@@ -29,7 +29,7 @@ The forward design ([`flux-lang-evolution.md`](../../../docs/designs/flux-lang-e
 | **P5b** | optimizer (parallelize independent reads) + `PhysicalPlan` execution | ✅ |
 | **P6a** | `await` cross-turn suspend/resume (`run_top_level`/`resume_flow` + engine `suspensions` table) | ✅ |
 | **P6b** | Tier-1 control-flow primitives (`match`/`route`/`fallback`/`timeout`/`budget`) | ✅ |
-| — | P6c polish (compact format, thing resolver, focus aliases) | 🚧 |
+| **P6c** | polish: `fluxlang compile`, token-efficient `format_compact`, deterministic thing resolver (focus aliases deferred — no consumer) | ✅ |
 | — | Tier-2 control-flow (`checkpoint`/`compensate`/`once`/`scope`); `ask` reply-correlation (flux-app MVP) | ⬜ (optional) |
 
 Each landed phase shipped behind the full dev loop (build/test/clippy/fmt/codegate) and an adversarial
@@ -63,8 +63,8 @@ review pass (findings fixed before commit).
 | 19, 20.3 | Interpreter (bind/call/when/repeat/return + more) | ✅ | `src/runtime.rs` |
 | 9.2, 20.2 | Immutable value store; outputs stored as values by id | ✅ | `flux-flow/src/state.rs` (`FlowStore`, SQLite) |
 | 9.3 | Symbol table + visibility tiers (visible/hidden/pinned/expired/private) | ✅ | `state.rs`; `Visibility` |
-| 9.3 | Focus aliases ("the draft", "those results") | 🟡 | symbol resolution present; explicit focus set thin |
-| 9.1 | Thing references + deterministic resolver | 🟡 | `ThingRef`/`Thing` node in AST; resolver interface thin |
+| 9.3 | Focus aliases ("the draft", "those results") | 🟡 (deferred) | the planner emits explicit `$symbol` names, not NL aliases — no runtime consumer exists, so a resolver would be dead code; revisit when a surface needs NL focus resolution |
+| 9.1 | Thing references + deterministic resolver | ✅ (P6c) | `OpHost::resolve_thing` + `default_resolve_thing` (`host.rs`): self-identifying selectors (`Id`/`Key`, `File` by `Path`, `Url`) resolve deterministically (confidence 1.0, no IO, `ThingResolved` trace); `Node::Thing` binds the resolved value. `Name`/`Query` selectors error pending a host resolver (a `ThingResolver` override is the follow-up) |
 | 14.3, 20.3 | Immutable replayable run trace (`RunEvent`) | ✅ | `RunEvent` in `ast.rs`; appended by `FlowStore` |
 | 20.2 | Old value versions remain addressable (audit/undo) | ✅ | value-id revisions in `state.rs` |
 
@@ -115,7 +115,7 @@ review pass (findings fixed before commit).
 
 | Item | Status |
 |---|---|
-| 1. Two writable display modes (human + token-efficient) | 🟡 (canonical text form built — `format`/`parse`; a token-efficient variant later) |
+| 1. Two writable display modes (human + token-efficient) | ✅ (canonical round-trippable `format`/`parse` + the token-efficient display-only `format_compact`; the human box-tree is `render`) |
 | 2. `fluxlang compile` (text → AST) | ✅ (`fluxlang compile` wired onto `parse`; `bin/fluxlang.rs`) |
 | 3. Richer `analyze` (type + effect checking → typed HIR) | ✅ |
 | 4. Op-input JSON Schema from `OpSpec` | ✅ (P0; `opspec.rs`) |

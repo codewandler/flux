@@ -642,11 +642,42 @@ fn exec_body<'a>(
                             last_value = Some(vid);
                             continue;
                         }
+                        Node::Thing { thing } => {
+                            // Resolve the external reference to an exact identity through the host's
+                            // resolver (the deterministic default handles self-identifying selectors),
+                            // record it in the run trace, and bind the resolved `Thing` value.
+                            let resolved = executor
+                                .resolve_thing(thing)
+                                .await
+                                .map_err(crate::FlowError::Runtime)?;
+                            store.append_event(
+                                session_id,
+                                &RunEvent::ThingResolved {
+                                    thing: thing.clone(),
+                                    resolved: resolved.clone(),
+                                },
+                            )?;
+                            let display = resolved.display.clone();
+                            let vid = store.put_value(session_id, &Value::Thing(resolved))?;
+                            let ty_label = ty.as_ref().map(TypeRef::label);
+                            store.bind(
+                                session_id,
+                                name,
+                                &vid,
+                                ty_label.as_deref(),
+                                &summarize(&display),
+                                Visibility::Visible,
+                            )?;
+                            transcript.push(format!("[${} = thing]\n{display}", name.0));
+                            last = display;
+                            last_value = Some(vid);
+                            continue;
+                        }
                         _ => {}
                     }
                     let Node::Call { op, args } = value.as_ref() else {
                         return Err(crate::FlowError::Runtime(
-                            "execution can only bind the result of a `call`, `expr`, `fmt`, `jq`, or `parse`".to_string(),
+                            "execution can only bind the result of a `call`, `expr`, `fmt`, `jq`, `parse`, or a `thing` reference".to_string(),
                         ));
                     };
                     let ty_label = ty.as_ref().map(TypeRef::label);
@@ -3259,6 +3290,73 @@ mod tests {
             .unwrap()
             .and_then(|id| store.get_value(&id).unwrap());
         assert_eq!(n, Some(Value::Number(42.0)), "a numeric reply is coerced");
+    }
+
+    // ---- P6c: thing resolution ----
+
+    #[tokio::test]
+    async fn thing_bind_resolves_self_identifying_selectors_else_errors() {
+        use crate::ast::{Selector, ThingKind, ThingRef};
+        let host = CfHost::new(); // uses the default deterministic `resolve_thing`
+        let store = MemStore::new();
+
+        // A File addressed by Path resolves deterministically and binds a `Thing` value.
+        let ast = DraftAst {
+            body: vec![Node::Bind {
+                name: SymbolName("f".into()),
+                value: Box::new(Node::Thing {
+                    thing: ThingRef {
+                        kind: ThingKind::File,
+                        selector: Selector::Path("README.md".into()),
+                    },
+                }),
+                ty: None,
+                effect: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        match store
+            .resolve("s", &SymbolName("f".into()))
+            .unwrap()
+            .and_then(|id| store.get_value(&id).unwrap())
+        {
+            Some(Value::Thing(rt)) => {
+                assert_eq!(rt.display, "README.md");
+                assert_eq!(rt.confidence, 1.0);
+            }
+            other => panic!("expected a resolved Thing, got {other:?}"),
+        }
+        assert!(
+            store
+                .events("s")
+                .iter()
+                .any(|e| matches!(e, RunEvent::ThingResolved { .. })),
+            "a ThingResolved event was recorded"
+        );
+
+        // A Person by Name is ambiguous — no deterministic resolution → runtime error.
+        let amb = DraftAst {
+            body: vec![Node::Bind {
+                name: SymbolName("p".into()),
+                value: Box::new(Node::Thing {
+                    thing: ThingRef {
+                        kind: ThingKind::Person,
+                        selector: Selector::Name("Ada".into()),
+                    },
+                }),
+                ty: None,
+                effect: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink2 = BufferSink::default();
+        assert!(execute_flow(&store, &host, "s2", &amb, &mut sink2)
+            .await
+            .is_err());
     }
 
     #[test]

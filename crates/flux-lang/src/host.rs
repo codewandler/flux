@@ -7,6 +7,7 @@ use async_trait::async_trait;
 
 use flux_spec::IntentSet;
 
+use crate::ast::{ResolvedThing, Selector, ThingId, ThingRef};
 use crate::opspec::OpCatalog;
 
 /// The result of dispatching one operation — the language-level mirror of the host's tool result.
@@ -71,4 +72,39 @@ pub trait OpHost: Send + Sync {
     /// Trim an op's model-facing view to the host's output budget — applied when building the
     /// round transcript so one huge result can't blow the context budget.
     fn trim_output(&self, view: String, op: &str) -> String;
+
+    /// Resolve an external [`ThingRef`] to an exact identity. The default resolves only the
+    /// **unambiguous, self-identifying** selectors deterministically ([`default_resolve_thing`]); a
+    /// host overrides this to consult a real resolver (search / directory lookup) for `Name`/`Query`
+    /// selectors. The error string surfaces to the flow as a runtime error.
+    async fn resolve_thing(&self, thing: &ThingRef) -> std::result::Result<ResolvedThing, String> {
+        default_resolve_thing(thing)
+    }
+}
+
+/// Deterministically resolve the **self-identifying** thing selectors — an explicit `Id`/`Key`, a
+/// `File` by `Path`, or a `Url` — to a [`ResolvedThing`] with full confidence and no IO. `Name`/`Query`
+/// selectors (which require a search or directory lookup) return an error so a host resolver can take
+/// over. This is the PRD §9.1 "deterministic resolver" floor: the same `ThingRef` always resolves to
+/// the same identity, runnable before any side effect.
+pub fn default_resolve_thing(thing: &ThingRef) -> std::result::Result<ResolvedThing, String> {
+    let id = match (&thing.kind, &thing.selector) {
+        (_, Selector::Id(s)) | (_, Selector::Key(s)) => s.clone(),
+        (crate::ast::ThingKind::File, Selector::Path(p)) => p.clone(),
+        (crate::ast::ThingKind::Url, Selector::Path(u))
+        | (crate::ast::ThingKind::Url, Selector::Name(u)) => u.clone(),
+        _ => {
+            return Err(format!(
+                "no deterministic resolution for a {:?} by {:?} — a Name/Query selector needs a host resolver",
+                thing.kind, thing.selector
+            ));
+        }
+    };
+    Ok(ResolvedThing {
+        id: ThingId(id.clone()),
+        kind: thing.kind.clone(),
+        display: id,
+        source: "deterministic".to_string(),
+        confidence: 1.0,
+    })
 }
