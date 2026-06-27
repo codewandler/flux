@@ -85,3 +85,25 @@ These are registered **only by the `flux-app` runtime host** (`flux run app.flux
 
 All four are Medium-risk / non-idempotent (`emit`/`spawn` fan out to other journeys, gated separately at
 their own dispatch). See [`flux-lang-evolution.md`](../../../docs/designs/flux-lang-evolution.md) §6.
+
+## Agent-loop ops (the self-hosted turn loop)
+
+The turn loop is itself a Flux-Lang flow — `crates/flux-flow/assets/agent-loop.flux` — and these ops are
+what let it call the model and run plans reflexively. They are how flux-lang self-hosts the agent loop:
+`plan` re-enters the planner, `run_plan` re-enters the interpreter (over the same session + envelope), and
+the evidence ops let the loop emit and read its own runtime observations and grade outcomes. Every one
+still dispatches through the same `Executor` envelope — no bypass.
+
+| op | signature | description |
+|---|---|---|
+| `plan` | `[feedback]` | Ask the model to emit a plan from the working conversation → a `Plan` `{kind: "plan"\|"chat"\|"error", text?, ast?, complete?}` (JSON). The model stays the planner; this wraps the compile step. |
+| `run_plan` | `plan` | Execute an emitted plan in the **current** session → an `Outcome` `{transcript, result, steps, suspension?}`. Re-validated and run through the same approval+IO envelope; bounded by a reentry-depth cap. |
+| `observe` | `kind[, data]` | Append an observation to the run's shared evidence log (the same log the runtime records `tool_call` markers into). |
+| `evidence` | `[kind]` | Read observations back as a JSON array (filtered by `kind`, or the whole log) — so a flow can branch on what has happened so far. |
+| `metrics` | | Summary counts from the evidence log: `{tool_calls, tool_errors, iterations}`. |
+| `grade` | `criterion` | Evaluate a verifiable pass/fail `Criterion` (`command`/`file_content`/`all`) against the workspace → `"true"`/`"false"`, reusing the eval harness's own grader (`flux-eval`). |
+
+**Visibility:** `plan`/`run_plan` are tagged to a never-surfaced `reflect` group, so the model never sees
+them in its catalog — only a pre-authored flow (the agent loop, or `flux flow run`) can call them, and only
+when a `LoopHost` is installed (the engine installs one per turn). `observe`/`evidence`/`metrics` are
+ordinary builtins; `grade` is in the evidence-gated `eval` group.

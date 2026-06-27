@@ -8,8 +8,10 @@
 //! - `$pack += $a, $b` — a **context append** (`+=`).
 //!
 //! # Supported node kinds (native text form)
-//! `bind`, `call`, `var`, `lit`, `return`, `when`/`unless`, `each`, `repeat`, `seq`, `ctx` and
-//! `ctx_append`. Blocks are **2-space indentation** delimited (no braces, no `end`).
+//! `bind`, `call`, `var`, `lit`, `return`, `when`/`unless`, `each`, `repeat`, `seq`, `ctx`,
+//! `ctx_append`, `match`, `route`, `fallback`, `loop`, `timeout`, `budget`, `fmt` (inline `fmt("…")`),
+//! and `jq` field-access sugar (inline `$var.path`, simple dotted paths only). Blocks are **2-space
+//! indentation** delimited (no braces, no `end`).
 //!
 //! # The `@json` fallback
 //! Any node *not* in the supported set (and any supported node appearing in an inline position the
@@ -80,8 +82,36 @@ fn fmt_expr(node: &Node) -> String {
             let a: Vec<String> = args.iter().map(fmt_expr).collect();
             format!("{}({})", op, a.join(", "))
         }
+        // `fmt("template")` — the string-interpolation node.
+        Node::Fmt { template } => {
+            format!(
+                "fmt({})",
+                compact(&serde_json::Value::String(template.clone()))
+            )
+        }
+        // Field-access sugar: a `jq` over a plain `$var` with a simple dotted path renders as
+        // `$var.path` (parse re-derives the same `Jq`). Bracket paths or non-`Var` inputs can't be
+        // spelled this way, so they fall through to `@json` — keeping the round-trip total.
+        Node::Jq { path, input }
+            if is_field_path(path) && matches!(input.as_ref(), Node::Var { .. }) =>
+        {
+            match input.as_ref() {
+                Node::Var { name } => format!("${}{}", name.0, path),
+                _ => unreachable!("guard checked Var"),
+            }
+        }
         other => format!("@json {}", compact(other)),
     }
+}
+
+/// Whether a `jq` path is a simple dotted field path (`.kind`, `.a.b`) — the only shape the `$var.path`
+/// surface can spell. Excludes array indices (`[0]`) and the empty path, which use `@json`.
+fn is_field_path(path: &str) -> bool {
+    path.starts_with('.')
+        && path.len() > 1
+        && path[1..]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
 }
 
 fn indent_of(level: usize, unit: &str) -> String {
@@ -284,6 +314,114 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
                 out.push_str(&join_syms(exclude));
                 out.push('\n');
             }
+        }
+        Node::Match {
+            subject,
+            cases,
+            default,
+        } => {
+            out.push_str(&ind);
+            out.push_str("match ");
+            out.push_str(&fmt_expr(subject));
+            out.push('\n');
+            let ind1 = indent_of(level + 1, indent);
+            for c in cases {
+                out.push_str(&ind1);
+                out.push_str("case ");
+                out.push_str(&fmt_expr(&c.value));
+                out.push('\n');
+                fmt_body(&c.body, level + 2, indent, out);
+            }
+            if !default.is_empty() {
+                out.push_str(&ind1);
+                out.push_str("default\n");
+                fmt_body(default, level + 2, indent, out);
+            }
+        }
+        Node::Route {
+            selector,
+            cases,
+            default,
+        } => {
+            out.push_str(&ind);
+            out.push_str("route ");
+            out.push_str(&fmt_expr(selector));
+            out.push('\n');
+            let ind1 = indent_of(level + 1, indent);
+            for c in cases {
+                out.push_str(&ind1);
+                out.push_str("case ");
+                out.push_str(&compact(&serde_json::Value::String(c.label.clone())));
+                out.push('\n');
+                fmt_body(&c.body, level + 2, indent, out);
+            }
+            if !default.is_empty() {
+                out.push_str(&ind1);
+                out.push_str("default\n");
+                fmt_body(default, level + 2, indent, out);
+            }
+        }
+        Node::Fallback { branches, bind } => {
+            out.push_str(&ind);
+            out.push_str("fallback");
+            if let Some(b) = bind {
+                out.push_str(" -> $");
+                out.push_str(&b.0);
+            }
+            out.push('\n');
+            let ind1 = indent_of(level + 1, indent);
+            for br in branches {
+                out.push_str(&ind1);
+                out.push_str("branch\n");
+                fmt_body(&br.body, level + 2, indent, out);
+            }
+        }
+        Node::Loop {
+            for_ms,
+            every_ms,
+            until,
+            body,
+            bind,
+        } => {
+            out.push_str(&ind);
+            out.push_str("loop for ");
+            out.push_str(&for_ms.to_string());
+            out.push_str(" every ");
+            out.push_str(&every_ms.to_string());
+            if let Some(b) = bind {
+                out.push_str(" -> $");
+                out.push_str(&b.0);
+            }
+            out.push('\n');
+            if let Some(u) = until {
+                out.push_str(&indent_of(level + 1, indent));
+                out.push_str("until ");
+                out.push_str(&fmt_expr(u));
+                out.push('\n');
+            }
+            fmt_body(body, level + 1, indent, out);
+        }
+        Node::Timeout { ms, body, bind } => {
+            out.push_str(&ind);
+            out.push_str("timeout ");
+            out.push_str(&ms.to_string());
+            if let Some(b) = bind {
+                out.push_str(" -> $");
+                out.push_str(&b.0);
+            }
+            out.push('\n');
+            fmt_body(body, level + 1, indent, out);
+        }
+        Node::Budget { limit, body, bind } => {
+            out.push_str(&ind);
+            out.push_str("budget ");
+            out.push_str(&limit.to_string());
+            if let Some(b) = bind {
+                out.push_str(" -> $");
+                out.push_str(&b.0);
+            }
+            out.push('\n');
+            fmt_body(body, level + 1, indent, out);
         }
         // Every other node kind round-trips through the single-line `@json` escape.
         other => {

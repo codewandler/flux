@@ -320,8 +320,21 @@ re-enter history (the don't-re-send win), which structurally removes the session
 (no persisted tool_use/tool_result pairs). The quality bar still holds — a fixed head-to-head dogfood
 suite (multi-file edits, read→fix loops, an incident runbook, a Slack/kubectl flow) must show no
 regression in success rate, turn count, and p95 latency before this is trusted; `docs/vision.md` reflects
-the new claim. (The legacy `flux-agent::Agent` loop remains in-tree as dead code, no surface uses it, to
-be removed.)
+the new claim. (The classic `flux-agent::Agent` loop is still the engine behind the SDK's `flux_sdk::Client`
+front door — a separate path; unifying the SDK onto `FlowEngine`/`FlowClient` is future work.)
+
+**The loop is itself Flux-Lang.** That "compile → execute → feed back → repeat" orchestration is no longer
+Rust — it is `crates/flux-flow/assets/agent-loop.flux`, a Flux-Lang flow. `run_turn_cancellable` is now a
+thin bootstrap: it records the user message, points the loop host at this turn's session + sink, and runs
+the flow. The flow drives the turn with three reflexive ops that re-enter the engine through the *same*
+`Executor::dispatch` envelope (no bypass, recursively): `plan(feedback)` re-enters the planner (the model
+emits the graph), `run_plan(plan)` re-enters the interpreter over the same session, and
+`observe`/`evidence`/`grade`/`metrics` let the loop emit and read its own runtime evidence and grade
+outcomes — the "evidence-based model-in-the-loop." The thesis turns reflexive: *the loop you run is also a
+plan you can read.* A workspace may override the built-in with `.flux/agent-loop.flux`. The Rust loop is
+deleted, not flag-gated. (Intentionally out of scope, per the turn-boundary model: an `await` inside a
+plan is reified as `Outcome` data rather than suspending the turn across messages.) See
+`flux-flow/docs/ops-reference.md` § "Agent-loop ops".
 
 ## 12. Resolved decisions & deferred details
 

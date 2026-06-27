@@ -87,10 +87,17 @@ A "provider" conflates two orthogonal axes, modeled separately and composed by `
 
 ## Agent loop, sessions, context
 
-- **`flux-agent`** runs the turn loop: build context → stream from the provider → collect tool calls →
-  dispatch through the envelope → persist → repeat, until the model stops or `max_iterations`. The
-  loop is cancellable (a `CancellationToken` threaded through `run_turn_cancellable`, `Spawner::spawn`,
-  and the orchestration functions).
+- **The turn loop is itself Flux-Lang.** `flux-flow`'s `FlowEngine::run_turn_cancellable` is a thin Rust
+  *bootstrap* that runs `crates/flux-flow/assets/agent-loop.flux` — the loop logic lives in flux-lang, not
+  Rust. Each turn that flow does: `plan` (re-enter the planner → a typed graph or a prose answer) →
+  `match` on the result → `run_plan` (execute the graph through the same envelope) → feed the transcript
+  back as `$feedback` → repeat until the model answers in prose. The reflexive ops `plan`/`run_plan` and
+  the evidence ops `observe`/`evidence`/`grade`/`metrics` are what let the loop call the model and reason
+  over its own runtime evidence (see `flux-flow/docs/ops-reference.md`). A workspace can override the loop
+  with its own `.flux/agent-loop.flux`. The loop is cancellable (a `CancellationToken`). This is the
+  CLI/server/TUI turn loop; `flux-agent` provides the `AgentSink` streaming trait plus its **classic**
+  provider-native `Agent` loop, which the SDK's `flux_sdk::Client` front door still uses (`flux_sdk::FlowClient`
+  is the flow-based SDK door).
 - **Session shape is a hard invariant.** The persisted message log must always be a valid
   provider history: never an empty assistant message, never a split tool_use/tool_result pair, never a
   user-after-user sequence. The cancel, compaction, and max-iteration exit paths each append a final

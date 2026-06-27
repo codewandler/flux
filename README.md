@@ -246,6 +246,8 @@ flux is a single Cargo workspace of strictly-layered crates — inner crates nev
 | **Capabilities (L5)** | browser/web egress, datasource/RAG, caller identity |
 | **Surfaces (L6)** | SDK, HTTP server, integrations, TUI, the `flux` CLI |
 
+The thesis runs all the way down: the agent's **turn loop is itself written in Flux-Lang** (`agent-loop.flux`) — the model compiles each step into a typed plan the runtime executes, and even the loop that orchestrates those steps is a plan you can read, gated by the same safety envelope.
+
 See [docs/architecture.md](docs/architecture.md) for the full design, [docs/vision.md](docs/vision.md) for the project's direction, and [AGENTS.md](AGENTS.md) for the contributor guide.
 
 ---

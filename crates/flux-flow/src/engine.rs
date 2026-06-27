@@ -135,9 +135,10 @@ impl FlowEngine {
             .await
     }
 
-    /// Run one user turn, abortable via `cancel` (checked between plan rounds). Every termination path
-    /// persists exactly one assistant message, so the session stays a valid `user → assistant`
-    /// alternation.
+    /// Run one user turn, abortable via `cancel`: the token races the whole agent-loop future in the
+    /// `select!` below, so a Ctrl-C mid-op returns at once and drops the in-flight op (aborting its IO)
+    /// rather than waiting for it to finish. Every termination path persists exactly one assistant
+    /// message, so the session stays a valid `user → assistant` alternation.
     pub async fn run_turn_cancellable(
         &self,
         session_id: &str,
@@ -268,11 +269,14 @@ impl FlowEngine {
     /// A plan-mode turn (the REPL `/plan` toggle): compile ONE plan from the conversation, render it,
     /// and persist it as the assistant turn (so a refinement sees it) — but DO NOT execute. Returns the
     /// AST for the caller to hold and run later (`/run`); a chat answer is surfaced and returns `None`.
+    /// Abortable via `cancel`: a Ctrl-C mid-compose drops the in-flight planner request and returns
+    /// `Ok(None)` (nothing to run).
     pub async fn plan_turn(
         &self,
         session_id: &str,
         user_input: &str,
         sink: &mut dyn AgentSink,
+        cancel: &CancellationToken,
     ) -> Result<Option<DraftAst>> {
         self.events
             .record_message(session_id, &Message::user_text(user_input))?;
@@ -286,19 +290,35 @@ impl FlowEngine {
         };
         let conversation = self.events.conversation(session_id)?;
         sink.planning(true);
-        let out = compile_turn(
-            &*self.provider,
-            &self.model,
-            &conversation,
-            Some(&base_system),
-            &ops,
-            view_ref,
-            None,
-            Some(sink),
-            opts,
-        )
-        .await;
+        // Race the planner call against `cancel` so Ctrl-C mid-compose drops the in-flight request
+        // (dropping the future aborts its HTTP) instead of blocking until the plan lands. The future
+        // borrows `sink`, so scope it in a block: its drop at the block's end releases the borrow
+        // before we touch `sink` again. `None` => cancelled.
+        let out = {
+            let fut = compile_turn(
+                &*self.provider,
+                &self.model,
+                &conversation,
+                Some(&base_system),
+                &ops,
+                view_ref,
+                None,
+                Some(sink),
+                opts,
+            );
+            tokio::pin!(fut);
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                res = &mut fut => Some(res),
+            }
+        };
         sink.planning(false);
+        let Some(out) = out else {
+            // Cancelled mid-compose: nothing to run; end the turn cleanly.
+            sink.turn_end(None);
+            return Ok(None);
+        };
         // Surface a provider failure (credit, auth, rate limit, transport) with a readable message
         // rather than the raw API JSON body — the REPL prints this `error:` line directly.
         let out = out.map_err(|e| flux_core::Error::Other(planner_error(&e)))?;
@@ -593,8 +613,10 @@ fn load_agent_loop(cwd: &std::path::Path) -> Result<DraftAst> {
     const BUILTIN: &str = include_str!("../assets/agent-loop.flux");
     let override_path = cwd.join(".flux").join("agent-loop.flux");
     let src = std::fs::read_to_string(&override_path).unwrap_or_else(|_| BUILTIN.to_string());
-    serde_json::from_str(&src)
-        .map_err(|e| flux_core::Error::Other(format!("agent-loop.flux: invalid AST: {e}")))
+    // The loop is written in readable Flux-Lang text (it round-trips through `format`/`parse`), so parse
+    // it through the language surface rather than the JSON wire form.
+    flux_lang::parse::parse(&src)
+        .map_err(|e| flux_core::Error::Other(format!("agent-loop.flux: invalid flow: {e}")))
 }
 
 /// The loop-machinery ops a turn dispatches to *drive* the loop (not to do the user's work). Their
@@ -825,6 +847,24 @@ mod tests {
             dir,
         )
         .unwrap()
+    }
+
+    /// The built-in `agent-loop.flux` is readable Flux-Lang text: it parses, formats back to a stable
+    /// (idempotent) text, and uses NO `@json` escape — every construct it uses has a native surface.
+    #[test]
+    fn builtin_agent_loop_is_readable_and_round_trips() {
+        const SRC: &str = include_str!("../assets/agent-loop.flux");
+        let ast = flux_lang::parse::parse(SRC).expect("agent-loop.flux parses");
+        let formatted = flux_lang::format::format(&ast);
+        assert!(
+            !formatted.contains("@json"),
+            "the loop must be fully readable (no @json):\n{formatted}"
+        );
+        let reparsed = flux_lang::parse::parse(&formatted).expect("formatted loop re-parses");
+        assert_eq!(
+            ast, reparsed,
+            "agent-loop.flux round-trips through format/parse"
+        );
     }
 
     #[tokio::test]

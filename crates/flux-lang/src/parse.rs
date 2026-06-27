@@ -350,6 +350,24 @@ fn parse_stmt(lines: &[Line], indent: usize) -> Result<(Node, usize)> {
     if let Some(rest) = kw(t, "repeat") {
         return parse_repeat(rest, lines, indent);
     }
+    if let Some(rest) = kw(t, "match") {
+        return parse_match(rest, lines, indent);
+    }
+    if let Some(rest) = kw(t, "route") {
+        return parse_route(rest, lines, indent);
+    }
+    if let Some(rest) = kw(t, "fallback") {
+        return parse_fallback(rest, lines, indent);
+    }
+    if let Some(rest) = kw(t, "loop") {
+        return parse_loop(rest, lines, indent);
+    }
+    if let Some(rest) = kw(t, "timeout") {
+        return parse_timeout(rest, lines, indent);
+    }
+    if let Some(rest) = kw(t, "budget") {
+        return parse_budget(rest, lines, indent);
+    }
     if let Some(rest) = kw(t, "seq") {
         return parse_seq(rest, lines, indent);
     }
@@ -501,6 +519,175 @@ fn parse_repeat(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usiz
         },
         1 + region.len(),
     ))
+}
+
+/// Take a leading unsigned-integer token, returning `(value, rest)`.
+fn take_u64(s: &str) -> Result<(u64, &str)> {
+    let (digits, rest) = take_while(s.trim_start(), |c| c.is_ascii_digit());
+    let n = digits
+        .parse::<u64>()
+        .map_err(|_| perr(&format!("expected a number, got: `{s}`")))?;
+    Ok((n, rest))
+}
+
+/// Parse an optional `-> $bind` header tail (returns `None` for an empty remainder).
+fn parse_optional_arrow_bind(r: &str, ctx: &str) -> Result<Option<SymbolName>> {
+    let r = r.trim_start();
+    if r.is_empty() {
+        Ok(None)
+    } else if let Some(a) = r.strip_prefix("->") {
+        Ok(Some(parse_arrow_sym(a, ctx)?))
+    } else {
+        Err(perr(&format!("unexpected text in `{ctx}` header: `{r}`")))
+    }
+}
+
+/// If `region`'s first line is `until <cond>`, split it off (the `repeat`/`loop` guard), returning the
+/// optional condition and the remaining body region.
+fn split_until(region: &[Line]) -> Result<(Option<Box<Node>>, &[Line])> {
+    match region.first() {
+        Some(first) => match kw(&first.text, "until") {
+            Some(u) => {
+                let uexpr = parse_full_expr(u, "until condition")?;
+                Ok((Some(Box::new(uexpr)), &region[1..]))
+            }
+            None => Ok((None, region)),
+        },
+        None => Ok((None, region)),
+    }
+}
+
+/// Parse the arms of a `match`/`route`/`fallback` block: each arm is a header line at the region's base
+/// indent (`<arm_kw> …` or `default`) followed by its indented body. Returns each arm's header-remainder
+/// + body, plus the `default` body. `default` for a `fallback` is rejected by its caller.
+#[allow(clippy::type_complexity)]
+fn parse_arms(region: &[Line], arm_kw: &str) -> Result<(Vec<(String, Vec<Node>)>, Vec<Node>)> {
+    let mut arms: Vec<(String, Vec<Node>)> = Vec::new();
+    let mut default: Vec<Node> = Vec::new();
+    if region.is_empty() {
+        return Ok((arms, default));
+    }
+    let arm_indent = region[0].indent;
+    let mut i = 0;
+    while i < region.len() {
+        if region[i].indent != arm_indent {
+            return Err(perr(&format!(
+                "unexpected indentation in `{arm_kw}` arms: `{}`",
+                region[i].text
+            )));
+        }
+        let t = region[i].text.as_str();
+        let body_region = child_region(&region[i..], arm_indent);
+        let (body, _) = parse_stmts(body_region, arm_indent)?;
+        if t == "default" {
+            default = body;
+        } else if let Some(hdr) = kw(t, arm_kw) {
+            arms.push((hdr.to_string(), body));
+        } else {
+            return Err(perr(&format!(
+                "expected `{arm_kw}` or `default`, got: `{t}`"
+            )));
+        }
+        i += 1 + body_region.len();
+    }
+    Ok((arms, default))
+}
+
+fn parse_match(subject_str: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
+    let subject = parse_full_expr(subject_str, "match subject")?;
+    let region = child_region(lines, indent);
+    let (arms, default) = parse_arms(region, "case")?;
+    let mut cases = Vec::with_capacity(arms.len());
+    for (value_str, body) in arms {
+        let value = parse_full_expr(&value_str, "case value")?;
+        cases.push(crate::ast::MatchCase { value, body });
+    }
+    Ok((
+        Node::Match {
+            subject: Box::new(subject),
+            cases,
+            default,
+        },
+        1 + region.len(),
+    ))
+}
+
+fn parse_route(selector_str: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
+    let selector = parse_full_expr(selector_str, "route selector")?;
+    let region = child_region(lines, indent);
+    let (arms, default) = parse_arms(region, "case")?;
+    let mut cases = Vec::with_capacity(arms.len());
+    for (label_str, body) in arms {
+        let label = match parse_full_expr(&label_str, "route case label")? {
+            Node::Lit {
+                value: serde_json::Value::String(s),
+            } => s,
+            _ => return Err(perr("a `route` `case` label must be a string literal")),
+        };
+        cases.push(crate::ast::RouteCase { label, body });
+    }
+    Ok((
+        Node::Route {
+            selector: Box::new(selector),
+            cases,
+            default,
+        },
+        1 + region.len(),
+    ))
+}
+
+fn parse_fallback(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
+    let bind = parse_optional_arrow_bind(rest, "fallback")?;
+    let region = child_region(lines, indent);
+    let (arms, default) = parse_arms(region, "branch")?;
+    if !default.is_empty() {
+        return Err(perr("`fallback` has no `default` arm — use `branch` only"));
+    }
+    let branches = arms
+        .into_iter()
+        .map(|(_, body)| crate::ast::FallbackBranch { body })
+        .collect();
+    Ok((Node::Fallback { branches, bind }, 1 + region.len()))
+}
+
+fn parse_loop(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
+    let r = kw(rest.trim_start(), "for").ok_or_else(|| perr("`loop` expects `for <ms>`"))?;
+    let (for_ms, r) = take_u64(r)?;
+    let r = kw(r.trim_start(), "every").ok_or_else(|| perr("`loop` expects `every <ms>`"))?;
+    let (every_ms, r) = take_u64(r)?;
+    let bind = parse_optional_arrow_bind(r, "loop")?;
+    let region = child_region(lines, indent);
+    let (until, body_region) = split_until(region)?;
+    let (body, _) = parse_stmts(body_region, indent)?;
+    Ok((
+        Node::Loop {
+            for_ms,
+            every_ms,
+            until,
+            body,
+            bind,
+        },
+        1 + region.len(),
+    ))
+}
+
+fn parse_timeout(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
+    let (ms, r) = take_u64(rest.trim_start())?;
+    let bind = parse_optional_arrow_bind(r, "timeout")?;
+    let region = child_region(lines, indent);
+    let (body, _) = parse_stmts(region, indent)?;
+    Ok((Node::Timeout { ms, body, bind }, 1 + region.len()))
+}
+
+fn parse_budget(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
+    let (digits, r) = take_while(rest.trim_start(), |c| c.is_ascii_digit());
+    let limit: u32 = digits
+        .parse()
+        .map_err(|_| perr("`budget` expects a numeric limit"))?;
+    let bind = parse_optional_arrow_bind(r, "budget")?;
+    let region = child_region(lines, indent);
+    let (body, _) = parse_stmts(region, indent)?;
+    Ok((Node::Budget { limit, body, bind }, 1 + region.len()))
 }
 
 fn parse_seq(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
@@ -688,6 +875,23 @@ fn parse_expr(s: &str) -> Result<(Node, &str)> {
             if name.is_empty() {
                 return Err(perr("empty symbol after `$`"));
             }
+            // Field-access sugar: `$plan.kind` lowers to `jq(".kind", $plan)`. `is_var_char` admits `.`,
+            // so the whole `plan.kind` is taken as one token; split on the first `.` to recover the
+            // symbol + the jq path. The formatter only emits this sugar for simple dotted paths, so it
+            // round-trips; anything else (array indices, non-Var input) goes through `@json`.
+            if let Some(dot) = name.find('.') {
+                let (var, path) = name.split_at(dot); // `path` keeps the leading `.`
+                if var.is_empty() {
+                    return Err(perr("field access needs a symbol before `.`"));
+                }
+                return Ok((
+                    Node::Jq {
+                        path: path.to_string(),
+                        input: Box::new(Node::Var { name: var.into() }),
+                    },
+                    rest,
+                ));
+            }
             Ok((Node::Var { name: name.into() }, rest))
         }
         '@' => {
@@ -712,6 +916,20 @@ fn parse_expr(s: &str) -> Result<(Node, &str)> {
             let rest_trim = rest.trim_start();
             if let Some(args_str) = rest_trim.strip_prefix('(') {
                 let (args, rest2) = parse_call_args(args_str)?;
+                // `fmt("template")` is the `Fmt` node, not a call to an op named `fmt` (there is none).
+                if ident == "fmt" {
+                    return match args.as_slice() {
+                        [Node::Lit {
+                            value: serde_json::Value::String(t),
+                        }] => Ok((
+                            Node::Fmt {
+                                template: t.clone(),
+                            },
+                            rest2,
+                        )),
+                        _ => Err(perr("fmt(...) takes a single string-literal template")),
+                    };
+                }
                 Ok((
                     Node::Call {
                         op: ident.to_string(),
@@ -883,7 +1101,7 @@ fn effect_from_tag(tag: &str) -> Option<FlowEffect> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{Branch, Selector, ThingKind, ThingRef};
+    use crate::ast::{Branch, FallbackBranch, MatchCase, RouteCase, Selector, ThingKind, ThingRef};
     use crate::format::format;
 
     /// The headline invariant. Every curated AST round-trips exactly through the text surface.
@@ -906,6 +1124,176 @@ mod tests {
             op: op.into(),
             args,
         }
+    }
+    fn bind(name: &str, value: Node) -> Node {
+        Node::Bind {
+            name: name.into(),
+            value: Box::new(value),
+            ty: None,
+            effect: None,
+        }
+    }
+    fn jq(path: &str, input: Node) -> Node {
+        Node::Jq {
+            path: path.into(),
+            input: Box::new(input),
+        }
+    }
+    fn s(v: &str) -> serde_json::Value {
+        serde_json::Value::String(v.into())
+    }
+
+    // ---- P6: new native text forms ----
+
+    #[test]
+    fn field_access_sugar_round_trips_and_is_native() {
+        // `$plan.kind` <-> jq(".kind", $plan); nested `$o.a.b` too.
+        let ast = DraftAst {
+            body: vec![
+                bind("k", jq(".kind", var("plan"))),
+                bind("d", jq(".a.b", var("o"))),
+            ],
+            ..Default::default()
+        };
+        let text = format(&ast);
+        assert!(text.contains("$k = $plan.kind"), "field sugar: {text}");
+        assert!(text.contains("$d = $o.a.b"), "nested field sugar: {text}");
+        assert!(!text.contains("@json"), "no json fallback: {text}");
+        assert_round_trips(&ast);
+    }
+
+    #[test]
+    fn fmt_inline_round_trips_and_is_native() {
+        let ast = DraftAst {
+            body: vec![bind(
+                "msg",
+                Node::Fmt {
+                    template: "hi {name}".into(),
+                },
+            )],
+            ..Default::default()
+        };
+        let text = format(&ast);
+        assert!(
+            text.contains(r#"$msg = fmt("hi {name}")"#),
+            "fmt inline: {text}"
+        );
+        assert!(!text.contains("@json"), "{text}");
+        assert_round_trips(&ast);
+    }
+
+    #[test]
+    fn jq_falls_back_to_json_when_unspellable() {
+        // Non-Var input → @json (still round-trips).
+        let over_call = DraftAst {
+            body: vec![bind("y", jq(".kind", call("get_plan", vec![])))],
+            ..Default::default()
+        };
+        assert!(format(&over_call).contains("@json"), "non-var jq → json");
+        assert_round_trips(&over_call);
+        // Bracket path → @json (the `$var.path` surface only spells simple dotted paths).
+        let bracket = DraftAst {
+            body: vec![bind("z", jq(".items[0]", var("o")))],
+            ..Default::default()
+        };
+        assert!(format(&bracket).contains("@json"), "bracket path → json");
+        assert_round_trips(&bracket);
+    }
+
+    #[test]
+    fn match_and_route_round_trip_natively() {
+        let m = DraftAst {
+            body: vec![Node::Match {
+                subject: Box::new(jq(".kind", var("plan"))),
+                cases: vec![
+                    MatchCase {
+                        value: lit(s("chat")),
+                        body: vec![bind("a", jq(".text", var("plan")))],
+                    },
+                    MatchCase {
+                        value: lit(s("error")),
+                        body: vec![call("echo", vec![lit(s("err"))])],
+                    },
+                ],
+                default: vec![bind("r", call("run_plan", vec![var("plan")]))],
+            }],
+            ..Default::default()
+        };
+        let text = format(&m);
+        assert!(text.contains("match $plan.kind"), "{text}");
+        assert!(text.contains("case \"chat\""), "{text}");
+        assert!(text.contains("default"), "{text}");
+        assert!(!text.contains("@json"), "match native: {text}");
+        assert_round_trips(&m);
+
+        let r = DraftAst {
+            body: vec![Node::Route {
+                selector: Box::new(call("classify", vec![var("x")])),
+                cases: vec![
+                    RouteCase {
+                        label: "bug".into(),
+                        body: vec![call("echo", vec![lit(s("b"))])],
+                    },
+                    RouteCase {
+                        label: "feat".into(),
+                        body: vec![call("echo", vec![lit(s("f"))])],
+                    },
+                ],
+                default: vec![call("echo", vec![lit(s("x"))])],
+            }],
+            ..Default::default()
+        };
+        let rt = format(&r);
+        assert!(rt.contains("route classify($x)"), "{rt}");
+        assert!(rt.contains("case \"bug\""), "{rt}");
+        assert!(!rt.contains("@json"), "route native: {rt}");
+        assert_round_trips(&r);
+    }
+
+    #[test]
+    fn fallback_loop_timeout_budget_round_trip_natively() {
+        let ast = DraftAst {
+            body: vec![
+                Node::Fallback {
+                    branches: vec![
+                        FallbackBranch {
+                            body: vec![call("a", vec![])],
+                        },
+                        FallbackBranch {
+                            body: vec![call("b", vec![])],
+                        },
+                    ],
+                    bind: Some("win".into()),
+                },
+                Node::Loop {
+                    for_ms: 1000,
+                    every_ms: 100,
+                    until: Some(Box::new(var("done"))),
+                    body: vec![call("poll", vec![])],
+                    bind: Some("ticks".into()),
+                },
+                Node::Timeout {
+                    ms: 5000,
+                    body: vec![call("slow", vec![])],
+                    bind: None,
+                },
+                Node::Budget {
+                    limit: 10,
+                    body: vec![call("spend", vec![])],
+                    bind: Some("used".into()),
+                },
+            ],
+            ..Default::default()
+        };
+        let text = format(&ast);
+        assert!(text.contains("fallback -> $win"), "{text}");
+        assert!(text.contains("branch"), "{text}");
+        assert!(text.contains("loop for 1000 every 100 -> $ticks"), "{text}");
+        assert!(text.contains("until $done"), "{text}");
+        assert!(text.contains("timeout 5000"), "{text}");
+        assert!(text.contains("budget 10 -> $used"), "{text}");
+        assert!(!text.contains("@json"), "all native: {text}");
+        assert_round_trips(&ast);
     }
 
     #[test]

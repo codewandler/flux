@@ -46,6 +46,7 @@ Key rules:
 - **`flux-runtime` (L2) must not depend on `flux-auth` (L5).** Surfaces resolve identity (`LocalIdentity` / `OidcIdentity`) into a `(Caller, Trust)` and inject it via `Executor::with_identity`.
 - `flux-evidence`, `flux-skill`, `flux-config`, and `flux-lang` are L0 leaves — no flux deps beyond other L0 — so runtime/agent crates may depend on them without a layering violation. `flux-flow` (L3, the Flux-Lang engine) builds on `flux-lang` and re-exports it as a facade.
 - **If you add a crate, classify it in `flux-codegate`'s `layer()` map** or the lint fails.
+- **The CLI/server/TUI turn loop is itself Flux-Lang** — `crates/flux-flow::FlowEngine` runs `crates/flux-flow/assets/agent-loop.flux`, driven by the reflexive `plan`/`run_plan` ops and the evidence ops (`observe`/`evidence`/`grade`/`metrics`). `FlowEngine::run_turn_cancellable` is a thin bootstrap, not the loop. Those ops are documented in `crates/flux-flow/docs/ops-reference.md`. (The SDK's `flux_sdk::Client` still drives the classic provider-native `flux-agent::Agent` loop — a separate front door; `FlowClient` is the flow-based one.)
 
 > ¹ `flux-lang` is the language **and its reference interpreter**, so it uses `tokio`/async; its L0-purity means "no L1+ flux deps; all effects (op dispatch, value store, observation sink) injected via traits", not "no async". Every other L0 crate is genuinely IO-free.
 
