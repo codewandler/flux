@@ -2155,6 +2155,7 @@ mod tests {
             idempotency: flux_spec::Idempotency::Idempotent,
             required_params: required.iter().map(|s| s.to_string()).collect(),
             optional_params: optional.iter().map(|s| s.to_string()).collect(),
+            param_types: Default::default(),
         }
     }
     fn catalog() -> MockCatalog {
@@ -2392,6 +2393,7 @@ mod tests {
                     idempotency: flux_spec::Idempotency::Idempotent,
                     required_params: vec!["path".into()],
                     optional_params: Vec::new(),
+                    param_types: Default::default(),
                 })
             }
         }

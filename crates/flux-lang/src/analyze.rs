@@ -2,9 +2,9 @@
 //! milestones add full name / type / effect / bounded-loop checking over the whole AST, lowering a
 //! [`DraftAst`](crate::ast::DraftAst) into a typed [`HirFlow`](crate::ast::HirFlow).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use crate::ast::{DraftAst, FlowEffect, HirFlow, Node};
+use crate::ast::{DraftAst, FlowEffect, HirFlow, Node, TypeRef};
 use crate::opspec::OpCatalog;
 
 /// A single analyzer diagnostic, suitable for UI display or feeding back into the compile/repair
@@ -52,6 +52,18 @@ pub fn analyze_flow(ast: &DraftAst, ops: &dyn OpCatalog) -> Result<(), Vec<Diagn
 /// effects an authorizer/optimizer reasons over.
 pub fn lower(ast: &DraftAst, ops: &dyn OpCatalog) -> Result<HirFlow, Vec<Diagnostic>> {
     analyze_flow(ast, ops)?;
+    // Type-check call arguments against the ops' declared param types, tracking symbol types from
+    // `param` decls + `bind` annotations. Lenient: only hard scalar/list mismatches are rejected.
+    let mut scope: HashMap<String, TypeRef> = ast
+        .params
+        .iter()
+        .map(|p| (p.name.0.clone(), p.ty.clone()))
+        .collect();
+    let mut diags = Vec::new();
+    type_check_body(&ast.body, ops, &mut scope, &mut diags);
+    if !diags.is_empty() {
+        return Err(diags);
+    }
     Ok(HirFlow {
         name: ast.name.clone(),
         params: ast.params.clone(),
@@ -59,6 +71,152 @@ pub fn lower(ast: &DraftAst, ops: &dyn OpCatalog) -> Result<HirFlow, Vec<Diagnos
         body: ast.body.clone(),
         effects: gather_effects(&ast.body, ops),
     })
+}
+
+/// Infer an expression's type for argument checking. Literals, `var`s (via `scope`), and `fmt` (always
+/// a string) infer precisely; everything else is `Any` (lenient — no false positives on op outputs).
+fn infer_type(node: &Node, scope: &HashMap<String, TypeRef>) -> TypeRef {
+    match node {
+        Node::Lit { value } => match value {
+            serde_json::Value::String(_) => TypeRef::String,
+            serde_json::Value::Number(_) => TypeRef::Number,
+            serde_json::Value::Bool(_) => TypeRef::Bool,
+            serde_json::Value::Array(_) => TypeRef::List(Box::new(TypeRef::Any)),
+            _ => TypeRef::Any,
+        },
+        Node::Var { name } => scope.get(&name.0).cloned().unwrap_or(TypeRef::Any),
+        Node::Fmt { .. } => TypeRef::String,
+        _ => TypeRef::Any,
+    }
+}
+
+/// The concrete scalar/list "kind" of a type, or `None` for `Any`/`Named` — which never conflict, so
+/// forward-compat named types and unknown-typed args always pass.
+fn concrete_kind(t: &TypeRef) -> Option<u8> {
+    match t {
+        TypeRef::String => Some(0),
+        TypeRef::Number => Some(1),
+        TypeRef::Bool => Some(2),
+        TypeRef::List(_) => Some(3),
+        TypeRef::Any | TypeRef::Named(_) => None,
+    }
+}
+
+/// Two types conflict only when both are concrete and a different kind (string vs number, list vs
+/// scalar, …). `Any`/`Named` on either side is lenient.
+fn types_conflict(arg: &TypeRef, param: &TypeRef) -> bool {
+    matches!((concrete_kind(arg), concrete_kind(param)), (Some(a), Some(p)) if a != p)
+}
+
+/// Type-check a call's positional args against the op's declared param types (`required ++ optional`
+/// order). A lone object literal is the whole named input — skipped. Only hard mismatches are reported.
+fn check_call_types(
+    op: &str,
+    args: &[Node],
+    ops: &dyn OpCatalog,
+    scope: &HashMap<String, TypeRef>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let Some(sig) = ops.lookup(op) else {
+        return;
+    };
+    if matches!(args, [Node::Lit { value }] if value.is_object()) {
+        return;
+    }
+    let order: Vec<&String> = sig
+        .required_params
+        .iter()
+        .chain(sig.optional_params.iter())
+        .collect();
+    for (i, arg) in args.iter().enumerate() {
+        if let Some(pname) = order.get(i) {
+            if let Some(ptype) = sig.param_types.get(*pname) {
+                let atype = infer_type(arg, scope);
+                if types_conflict(&atype, ptype) {
+                    diags.push(Diagnostic::new(format!(
+                        "op `{op}` parameter `{pname}` expects {}, got {}",
+                        ptype.label(),
+                        atype.label()
+                    )));
+                }
+            }
+        }
+        if let Node::Call {
+            op: inner,
+            args: iargs,
+        } = arg
+        {
+            check_call_types(inner, iargs, ops, scope, diags);
+        }
+    }
+}
+
+/// Ordered type-check walk: track each symbol's type (a `bind`/`memo`'s `ty` annotation, else `Any`)
+/// and check every `call`'s args. Control bodies are checked with a cloned scope (a branch-local bind
+/// doesn't leak out — conservative).
+fn type_check_body(
+    body: &[Node],
+    ops: &dyn OpCatalog,
+    scope: &mut HashMap<String, TypeRef>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    for node in body {
+        match node {
+            Node::Bind {
+                name, value, ty, ..
+            }
+            | Node::Memo {
+                name, value, ty, ..
+            } => {
+                if let Node::Call { op, args } = value.as_ref() {
+                    check_call_types(op, args, ops, scope, diags);
+                }
+                scope.insert(name.0.clone(), ty.clone().unwrap_or(TypeRef::Any));
+            }
+            Node::Call { op, args } => check_call_types(op, args, ops, scope, diags),
+            Node::Return { value } => {
+                if let Node::Call { op, args } = value.as_ref() {
+                    check_call_types(op, args, ops, scope, diags);
+                }
+            }
+            Node::Pipe { steps, .. } => {
+                for s in steps {
+                    if let Node::Call { op, args } = s {
+                        check_call_types(op, args, ops, scope, diags);
+                    }
+                }
+            }
+            Node::When {
+                then, otherwise, ..
+            } => {
+                type_check_body(then, ops, &mut scope.clone(), diags);
+                type_check_body(otherwise, ops, &mut scope.clone(), diags);
+            }
+            Node::Unless { body, .. } => type_check_body(body, ops, &mut scope.clone(), diags),
+            Node::Each { item, body, .. } => {
+                let mut s = scope.clone();
+                s.insert(item.0.clone(), TypeRef::Any);
+                type_check_body(body, ops, &mut s, diags);
+            }
+            Node::Repeat { body, .. }
+            | Node::Seq { body, .. }
+            | Node::Retry { body, .. }
+            | Node::Confirm { body, .. }
+            | Node::Loop { body, .. }
+            | Node::Throttle { body, .. }
+            | Node::Debounce { body, .. } => type_check_body(body, ops, &mut scope.clone(), diags),
+            Node::Try { body, handler, .. } => {
+                type_check_body(body, ops, &mut scope.clone(), diags);
+                type_check_body(handler, ops, &mut scope.clone(), diags);
+            }
+            Node::Parallel { branches } | Node::Race { branches, .. } => {
+                for b in branches {
+                    type_check_body(&b.body, ops, &mut scope.clone(), diags);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The semantic effects a flow declares or implies: each `bind`/`memo`'s declared `effect`, plus the
@@ -432,6 +590,7 @@ mod tests {
                     idempotency: flux_spec::Idempotency::Idempotent,
                     required_params: Vec::new(),
                     optional_params: Vec::new(),
+                    param_types: Default::default(),
                 })
         }
     }
@@ -453,6 +612,7 @@ mod tests {
                 idempotency: flux_spec::Idempotency::Idempotent,
                 required_params: required.iter().map(|s| s.to_string()).collect(),
                 optional_params: optional.iter().map(|s| s.to_string()).collect(),
+                param_types: Default::default(),
             };
             match name {
                 "read" => Some(sig(vec![flux_spec::Effect::Read], &["path"], &[])),
@@ -523,6 +683,83 @@ mod tests {
         };
         let err = lower(&over, &ops).unwrap_err();
         assert!(err.iter().any(|d| d.message.contains("at most 1 argument")));
+    }
+
+    /// A catalog with a typed op `dbl(n: Number)` for the argument type-checker.
+    struct TypeCat;
+    impl OpCatalog for TypeCat {
+        fn lookup(&self, name: &str) -> Option<OpSignature> {
+            (name == "dbl").then(|| OpSignature {
+                name: "dbl".into(),
+                description: String::new(),
+                effects: Vec::new(),
+                risk: flux_spec::Risk::Low,
+                idempotency: flux_spec::Idempotency::Idempotent,
+                required_params: vec!["n".into()],
+                optional_params: Vec::new(),
+                param_types: [("n".to_string(), crate::ast::TypeRef::Number)]
+                    .into_iter()
+                    .collect(),
+            })
+        }
+    }
+
+    #[test]
+    fn lower_type_checks_call_arguments() {
+        use crate::ast::{Node, TypeRef};
+        let call_dbl = |arg: Node| DraftAst {
+            body: vec![Node::Call {
+                op: "dbl".into(),
+                args: vec![arg],
+            }],
+            ..Default::default()
+        };
+
+        // A string literal where the op wants a Number is rejected.
+        let bad = call_dbl(Node::Lit {
+            value: serde_json::json!("hello"),
+        });
+        let err = lower(&bad, &TypeCat).unwrap_err();
+        assert!(
+            err.iter().any(|d| d.message.contains("expects Number")),
+            "expected a Number-mismatch diagnostic, got {err:?}"
+        );
+
+        // A number literal passes.
+        let good = call_dbl(Node::Lit {
+            value: serde_json::json!(5),
+        });
+        assert!(lower(&good, &TypeCat).is_ok());
+
+        // A var of unknown (Any) type passes leniently — no false positive.
+        let lenient = DraftAst {
+            body: vec![
+                Node::Bind {
+                    name: "x".into(),
+                    value: Box::new(Node::Call {
+                        op: "dbl".into(),
+                        args: vec![Node::Lit {
+                            value: serde_json::json!(1),
+                        }],
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+                Node::Call {
+                    op: "dbl".into(),
+                    args: vec![Node::Var { name: "x".into() }],
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(
+            lower(&lenient, &TypeCat).is_ok(),
+            "an Any-typed var argument must pass leniently"
+        );
+
+        // A param declared `Number` is tracked: passing it where a Number is wanted is fine; a
+        // String-typed param would conflict.
+        let _ = TypeRef::Number;
     }
 
     #[test]

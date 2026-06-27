@@ -135,6 +135,28 @@ pub fn schema_params(schema: &serde_json::Value) -> (Vec<String>, Vec<String>) {
     (required, optional)
 }
 
+/// Recover a [`TypeRef`] from one JSON-Schema property — the inverse of [`type_ref_to_schema`], used
+/// to populate an [`OpSignature`]'s `param_types`. Unknown/untyped shapes become [`TypeRef::Any`].
+fn schema_prop_type(prop: &serde_json::Value) -> TypeRef {
+    if let Some(r) = prop.get("$ref").and_then(|v| v.as_str()) {
+        let name = r.rsplit('/').next().unwrap_or(r);
+        return TypeRef::Named(name.to_string());
+    }
+    match prop.get("type").and_then(|v| v.as_str()) {
+        Some("string") => TypeRef::String,
+        Some("number") | Some("integer") => TypeRef::Number,
+        Some("boolean") => TypeRef::Bool,
+        Some("array") => {
+            let item = prop
+                .get("items")
+                .map(schema_prop_type)
+                .unwrap_or(TypeRef::Any);
+            TypeRef::List(Box::new(item))
+        }
+        _ => TypeRef::Any,
+    }
+}
+
 /// The compiler/analyzer's view of an available operation, derived from a registered [`ToolSpec`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpSignature {
@@ -150,12 +172,26 @@ pub struct OpSignature {
     /// Optional input parameters (bound after the required ones).
     #[serde(default)]
     pub optional_params: Vec<String>,
+    /// The declared type of each named param (parsed from the op's input schema), for the analyzer's
+    /// argument type-checking. Empty when the schema is untyped (a param absent here is `Any`).
+    #[serde(default)]
+    pub param_types: std::collections::BTreeMap<String, TypeRef>,
 }
 
 impl OpSignature {
     /// Derive an op signature from a registered tool spec.
     pub fn from_spec(spec: &ToolSpec) -> Self {
         let (required_params, optional_params) = schema_params(&spec.input_schema);
+        let mut param_types = std::collections::BTreeMap::new();
+        if let Some(props) = spec
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+        {
+            for (name, prop) in props {
+                param_types.insert(name.clone(), schema_prop_type(prop));
+            }
+        }
         Self {
             name: spec.name.clone(),
             description: spec.description.clone(),
@@ -164,6 +200,7 @@ impl OpSignature {
             idempotency: spec.idempotency,
             required_params,
             optional_params,
+            param_types,
         }
     }
 

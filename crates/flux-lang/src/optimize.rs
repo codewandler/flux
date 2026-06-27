@@ -162,6 +162,7 @@ mod tests {
                 idempotency: flux_spec::Idempotency::Idempotent,
                 required_params: vec!["x".into()],
                 optional_params: Vec::new(),
+                param_types: Default::default(),
             };
             match name {
                 "read" => Some(mk(vec![Effect::Read])),
