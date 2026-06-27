@@ -62,8 +62,18 @@ before every release.
 **Candidate phases (vision tail, in priority order):**
 - **Dogfood & harden** (tier 1) — drive flux's agentic mode on real coding work, capture friction as
   issues, and fix the top biters. Validates the daily-driver claim on real tasks.
-- **SDK + crates.io** (tier 2) — stabilize and document the `flux-sdk` public API with runnable
-  examples, then publish the crates so others can embed flux as a library.
+- **SDK + crates.io** (tier 2) — **P7 landed the bulk:** a **Rust eDSL** (`flux_lang::dsl`, re-exported
+  as `flux_sdk::dsl`) whose builder primitives compile to the Flux-Lang AST — loops
+  (`each`/`repeat`/`loop_for`/`race`) and control-flow (`match`/`route`/`fallback`/`timeout`/`budget`)
+  first-class, all 36 node kinds covered (drift-guarded by `dsl_covers_every_node_kind`), authored in
+  Rust then run through the existing `FlowClient` lifecycle. The public API is **stabilized**
+  (`#![warn(missing_docs)]`, crate READMEs, three runnable no-API-key examples, crates.io metadata) and
+  **publish-prepped** (the 16-crate closure carries versions; topo order + runbook in
+  [`crates/flux-sdk/PUBLISHING.md`](../crates/flux-sdk/PUBLISHING.md); `cargo package` validated).
+  **Blocked on a name decision before publishing:** the crate name `flux-core` is already taken on
+  crates.io by an unrelated project — the namespace must be vanity-prefixed (`codewandler-flux-*`) or
+  `flux-core` renamed (see the runbook §1). The real `cargo publish` is left to the maintainer (token +
+  irreversible).
 - **flux-lang evolution — ✅ shipped** (P0–P6 + flux-app): the agent-cognition layer landed — the
   artifact **prelude** (11 `Named` types), `ctx`/`ctx_append` context-pack nodes (36 node kinds),
   op-input JSON Schema, typed HIR with arg type-checking (`analyze::lower`), the **text parser**
