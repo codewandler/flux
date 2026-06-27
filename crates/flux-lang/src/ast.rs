@@ -535,6 +535,32 @@ pub enum Node {
         #[serde(rename = "as")]
         as_type: String,
     },
+
+    /// Build a bounded, budgeted **context pack** from existing symbols. Resolves `include` (minus
+    /// `exclude`) to its members, then — when `budget` is set — shrinks the pack *at evaluation* by
+    /// visibility tier then declared order until within the char budget, recording any dropped members
+    /// in the run trace. Produces a `Ctx` value bound to `name`. Pure: it selects and labels existing
+    /// values, performing no IO (the load-bearing elevation of PRD §13 explicit context management).
+    Ctx {
+        name: SymbolName,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        purpose: Option<String>,
+        #[serde(default)]
+        include: Vec<SymbolName>,
+        #[serde(default)]
+        exclude: Vec<SymbolName>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget: Option<u64>,
+    },
+
+    /// Accrete more symbols into an existing context pack (the `+=` marker). Immutably rebinds `ctx`
+    /// to a *new* `Ctx` value (preserving the audit chain `$pack@1 → @2`) with `add` appended, then
+    /// re-applies the pack's budget. Pure.
+    CtxAppend {
+        ctx: SymbolName,
+        #[serde(default)]
+        add: Vec<SymbolName>,
+    },
 }
 
 /// One branch of a [`Node::Parallel`] fan-out: a named sub-flow whose final result is bound to
@@ -682,6 +708,17 @@ pub enum RunEvent {
     },
     FlowReturned {
         value: ValueId,
+    },
+    /// A `ctx`/`ctx_append` pack was budgeted at evaluation: `kept` members were retained and
+    /// `dropped` members removed to fit `budget` (chars, v1 heuristic). The replayable record of an
+    /// intentional context shrink.
+    CtxShrunk {
+        ctx: String,
+        #[serde(default)]
+        kept: Vec<String>,
+        #[serde(default)]
+        dropped: Vec<String>,
+        budget: u64,
     },
 }
 

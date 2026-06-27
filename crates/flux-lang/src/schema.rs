@@ -62,9 +62,37 @@ mod tests {
 
         // Every kind the planner relies on must have a row.
         for kind in [
-            "call", "bind", "when", "repeat", "each", "assert", "pipe", "seq", "memo", "parallel",
-            "await", "retry", "try", "confirm", "loop", "race", "throttle", "debounce", "unless",
-            "verify", "return", "peek", "var", "lit", "thing", "expr", "fmt", "jq", "parse",
+            "call",
+            "bind",
+            "when",
+            "repeat",
+            "each",
+            "assert",
+            "pipe",
+            "seq",
+            "memo",
+            "parallel",
+            "await",
+            "retry",
+            "try",
+            "confirm",
+            "loop",
+            "race",
+            "throttle",
+            "debounce",
+            "unless",
+            "verify",
+            "return",
+            "peek",
+            "var",
+            "lit",
+            "thing",
+            "expr",
+            "fmt",
+            "jq",
+            "parse",
+            "ctx",
+            "ctx_append",
         ] {
             assert!(
                 catalog.contains(&format!("| `{kind}` |")),
@@ -72,10 +100,10 @@ mod tests {
             );
         }
 
-        // 29 variants + 2 header lines, and no description bleeds onto its own line (newlines collapsed).
+        // 31 variants + 2 header lines, and no description bleeds onto its own line (newlines collapsed).
         assert_eq!(
             catalog.lines().count(),
-            29 + 2,
+            31 + 2,
             "every variant is exactly one row"
         );
     }

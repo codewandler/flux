@@ -452,6 +452,29 @@ fn exec_body<'a>(
                     last = outcome.view;
                     last_value = outcome.value_id;
                 }
+                Node::Ctx {
+                    name,
+                    purpose,
+                    include,
+                    exclude,
+                    budget,
+                } => {
+                    let members: Vec<SymbolName> = include
+                        .iter()
+                        .filter(|s| !exclude.contains(s))
+                        .cloned()
+                        .collect();
+                    let vid = build_ctx(
+                        store, session_id, name, purpose, &members, *budget, transcript,
+                    )?;
+                    last = format!("ctx {}", name.0);
+                    last_value = Some(vid);
+                }
+                Node::CtxAppend { ctx, add } => {
+                    let vid = append_ctx(store, session_id, ctx, add, transcript)?;
+                    last = format!("ctx += {}", ctx.0);
+                    last_value = Some(vid);
+                }
                 Node::Return { value } => {
                     let (content, vid) =
                         eval_return(store, executor, session_id, value, sink, steps).await?;
@@ -1792,6 +1815,173 @@ fn lit_text(v: &serde_json::Value) -> String {
     }
 }
 
+/// The visibility keep-priority: pinned context is retained over plain/hidden when a pack is budgeted.
+fn vis_keep_rank(v: Visibility) -> u8 {
+    match v {
+        Visibility::Pinned => 4,
+        Visibility::Visible => 3,
+        Visibility::Hidden => 2,
+        Visibility::Expired => 1,
+        Visibility::Private => 0,
+    }
+}
+
+/// Resolve a context pack's `members` (already exclude-filtered, in declared order) to a budgeted
+/// `Ctx` value bound to `name`. When `budget` is set the pack is shrunk **at evaluation**: members are
+/// kept in priority order (visibility tier, then declared order) while their cumulative char size fits
+/// the budget; the rest are dropped and recorded as a [`RunEvent::CtxShrunk`]. The interpreter stays
+/// op-agnostic — consuming ops just read the already-bounded member list.
+fn build_ctx(
+    store: &dyn ValueStore,
+    session_id: &str,
+    name: &SymbolName,
+    purpose: &Option<String>,
+    members: &[SymbolName],
+    budget: Option<u64>,
+    transcript: &mut Vec<String>,
+) -> Result<ValueId> {
+    // Char size + visibility rank per member. An unbound member contributes nothing (a pack tolerates
+    // a not-yet-resolved reference rather than erroring).
+    let sizes: Vec<usize> = members
+        .iter()
+        .map(|sym| -> Result<usize> {
+            Ok(match store.resolve(session_id, sym)? {
+                Some(vid) => store
+                    .get_value(&vid)?
+                    .map(|v| v.to_json().to_string().len())
+                    .unwrap_or(0),
+                None => 0,
+            })
+        })
+        .collect::<Result<_>>()?;
+    let ranks: Vec<u8> = members
+        .iter()
+        .map(|sym| -> Result<u8> {
+            Ok(store
+                .binding(session_id, sym)?
+                .map(|b| vis_keep_rank(b.visibility))
+                .unwrap_or(vis_keep_rank(Visibility::Visible)))
+        })
+        .collect::<Result<_>>()?;
+
+    let mut keep = vec![true; members.len()];
+    if let Some(b) = budget {
+        // Priority order: higher visibility tier first; stable sort preserves declared order in a tier.
+        let mut order: Vec<usize> = (0..members.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(ranks[i]));
+        keep = vec![false; members.len()];
+        let mut running = 0usize;
+        for &i in &order {
+            if running + sizes[i] <= b as usize {
+                running += sizes[i];
+                keep[i] = true;
+            }
+        }
+    }
+
+    // Kept/dropped reported in original declared order.
+    let mut kept: Vec<String> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+    for (i, sym) in members.iter().enumerate() {
+        if keep[i] {
+            kept.push(sym.0.clone());
+        } else {
+            dropped.push(sym.0.clone());
+        }
+    }
+
+    if let Some(b) = budget {
+        store.append_event(
+            session_id,
+            &RunEvent::CtxShrunk {
+                ctx: name.0.clone(),
+                kept: kept.clone(),
+                dropped: dropped.clone(),
+                budget: b,
+            },
+        )?;
+        if !dropped.is_empty() {
+            transcript.push(format!(
+                "[ctx {}] budget {b} chars — kept {:?}, dropped {:?}",
+                name.0, kept, dropped
+            ));
+        }
+    }
+
+    let mut fields: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    fields.insert("name".to_string(), Value::String(name.0.clone()));
+    if let Some(p) = purpose {
+        fields.insert("purpose".to_string(), Value::String(p.clone()));
+    }
+    fields.insert(
+        "members".to_string(),
+        Value::List(kept.iter().cloned().map(Value::String).collect()),
+    );
+    if let Some(b) = budget {
+        fields.insert("budget".to_string(), Value::Number(b as f64));
+    }
+    let vid = store.put_value(session_id, &Value::Struct(fields))?;
+    let summary = match budget {
+        Some(b) => format!("Ctx({} members, budget {b})", kept.len()),
+        None => format!("Ctx({} members)", kept.len()),
+    };
+    store.bind(
+        session_id,
+        name,
+        &vid,
+        Some("Ctx"),
+        &summary,
+        Visibility::Visible,
+    )?;
+    Ok(vid)
+}
+
+/// Accrete `add` into the existing pack bound to `ctx`, immutably rebinding it to a new `Ctx` value
+/// (the prior value stays addressable — the audit chain) with the budget re-applied.
+fn append_ctx(
+    store: &dyn ValueStore,
+    session_id: &str,
+    ctx: &SymbolName,
+    add: &[SymbolName],
+    transcript: &mut Vec<String>,
+) -> Result<ValueId> {
+    let vid = store.resolve(session_id, ctx)?.ok_or_else(|| {
+        crate::FlowError::Runtime(format!("ctx_append: unknown context pack `{}`", ctx.0))
+    })?;
+    let Some(Value::Struct(fields)) = store.get_value(&vid)? else {
+        return Err(crate::FlowError::Runtime(format!(
+            "ctx_append: `{}` is not a context pack",
+            ctx.0
+        )));
+    };
+    let mut members: Vec<SymbolName> = match fields.get("members") {
+        Some(Value::List(items)) => items
+            .iter()
+            .filter_map(|v| match v {
+                Value::String(s) => Some(SymbolName(s.clone())),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let purpose = match fields.get("purpose") {
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => None,
+    };
+    let budget = match fields.get("budget") {
+        Some(Value::Number(n)) => Some(*n as u64),
+        _ => None,
+    };
+    for a in add {
+        if !members.contains(a) {
+            members.push(a.clone());
+        }
+    }
+    build_ctx(
+        store, session_id, ctx, &purpose, &members, budget, transcript,
+    )
+}
+
 /// The node-kind tag (for error messages).
 fn node_kind(node: &Node) -> &'static str {
     match node {
@@ -1824,6 +2014,8 @@ fn node_kind(node: &Node) -> &'static str {
         Node::Lit { .. } => "lit",
         Node::Thing { .. } => "thing",
         Node::Parse { .. } => "parse",
+        Node::Ctx { .. } => "ctx",
+        Node::CtxAppend { .. } => "ctx_append",
     }
 }
 
@@ -1832,7 +2024,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    use crate::ast::{Node, SymbolName, Value, Visibility};
+    use crate::ast::{Node, RunEvent, SymbolName, Value, Visibility};
     use crate::opspec::{OpCatalog, OpSignature};
     use crate::store::MemStore;
 
@@ -1868,6 +2060,94 @@ mod tests {
         Node::Var {
             name: SymbolName(name.into()),
         }
+    }
+
+    /// `ctx` budgets a pack at evaluation: it shrinks by visibility then declared order, keeps pinned
+    /// context, records the drop as a `CtxShrunk` event, and `ctx_append` rebinds immutably.
+    #[test]
+    fn ctx_budgets_by_visibility_and_appends_immutably() {
+        let store = MemStore::new();
+        let sid = "s";
+        let put = |name: &str, val: String, vis: Visibility| {
+            let vid = store.put_value(sid, &Value::String(val.clone())).unwrap();
+            store
+                .bind(sid, &SymbolName(name.into()), &vid, None, &val, vis)
+                .unwrap();
+        };
+        // Each value serializes to ~42 chars ("xxxx…" + quotes); budget 100 fits exactly two.
+        put("a", "x".repeat(40), Visibility::Visible);
+        put("b", "y".repeat(40), Visibility::Visible);
+        put("c", "z".repeat(40), Visibility::Pinned);
+
+        let mut transcript = Vec::new();
+        let members = vec![
+            SymbolName("a".into()),
+            SymbolName("b".into()),
+            SymbolName("c".into()),
+        ];
+        let vid = build_ctx(
+            &store,
+            sid,
+            &SymbolName("pack".into()),
+            &Some("debug".into()),
+            &members,
+            Some(100),
+            &mut transcript,
+        )
+        .unwrap();
+
+        let Some(Value::Struct(fields)) = store.get_value(&vid).unwrap() else {
+            panic!("ctx produced a struct value")
+        };
+        let Value::List(kept_vals) = &fields["members"] else {
+            panic!("members is a list")
+        };
+        let kept: Vec<String> = kept_vals
+            .iter()
+            .filter_map(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kept.len(), 2, "budget kept exactly two of three members");
+        assert!(kept.contains(&"c".to_string()), "pinned member is retained");
+
+        // The shrink is recorded in the run trace with the dropped member.
+        let dropped = store
+            .events(sid)
+            .into_iter()
+            .find_map(|e| match e {
+                RunEvent::CtxShrunk { dropped, .. } => Some(dropped),
+                _ => None,
+            })
+            .expect("a CtxShrunk event was recorded");
+        assert_eq!(
+            dropped,
+            vec!["b".to_string()],
+            "the lowest-priority member dropped"
+        );
+
+        // ctx_append accretes a new (small) member and rebinds to a fresh value id (immutable chain).
+        put("d", "small".into(), Visibility::Visible);
+        let vid2 = append_ctx(
+            &store,
+            sid,
+            &SymbolName("pack".into()),
+            &[SymbolName("d".into())],
+            &mut transcript,
+        )
+        .unwrap();
+        assert_ne!(vid, vid2, "append rebinds to a new value id");
+        let Some(Value::Struct(f2)) = store.get_value(&vid2).unwrap() else {
+            panic!("appended ctx is a struct")
+        };
+        let Value::List(m2) = &f2["members"] else {
+            panic!("members list")
+        };
+        assert!(
+            m2.iter().any(|v| matches!(v, Value::String(s) if s == "d")),
+            "the appended member is present"
+        );
     }
 
     #[test]

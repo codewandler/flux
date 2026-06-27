@@ -211,11 +211,19 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, diags: &mut Vec<Diagnostic>) {
             }
             check_node(value, ops, diags);
         }
+        Node::Ctx { budget, .. } => {
+            if matches!(budget, Some(0)) {
+                diags.push(Diagnostic::new(
+                    "`ctx` budget must be non-zero (a 0-char budget drops every member)",
+                ));
+            }
+        }
         Node::Await { .. }
         | Node::Peek { .. }
         | Node::Var { .. }
         | Node::Lit { .. }
-        | Node::Thing { .. } => {}
+        | Node::Thing { .. }
+        | Node::CtxAppend { .. } => {}
     }
 }
 

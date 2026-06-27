@@ -70,6 +70,8 @@ follow are hand-written.
 | `fmt` | Pure string interpolation. `template` is a string with `{name}` placeholders substituted from already-bound session symbols (same `{name}`/`{{name}}` syntax as `Lit` interpolation). No IO, no approval gate. Example: `fmt("BTC: {price} | Double: {doubled}")`. |
 | `jq` | Pure JSON path extraction. `path` is a dot-path string (e.g. `".bitcoin.usd"` or `"results[0].value"`) applied to the JSON content of `input` (a `Var` or `Lit` node). No IO, no approval gate. Example: `jq(".bitcoin.usd", $raw)`. |
 | `parse` | Pure type coercion. Converts the string result of a `jq` or `fmt` node into a typed value. `as_type` is one of `"f64"`, `"i64"`, `"bool"`, `"json"`, `"string"`. No IO, no approval gate. Example: `parse(jq(".price", $raw), as: "f64")`. |
+| `ctx` | Build a bounded, budgeted **context pack** from existing symbols. Resolves `include` (minus `exclude`) to its members, then — when `budget` is set — shrinks the pack *at evaluation* by visibility tier then declared order until within the char budget, recording any dropped members in the run trace. Produces a `Ctx` value bound to `name`. Pure: it selects and labels existing values, performing no IO (the load-bearing elevation of PRD §13 explicit context management). |
+| `ctx_append` | Accrete more symbols into an existing context pack (the `+=` marker). Immutably rebinds `ctx` to a *new* `Ctx` value (preserving the audit chain `$pack@1 → @2`) with `add` appended, then re-applies the pack's budget. Pure. |
 <!-- END generated:node-kinds -->
 
 ---
@@ -884,6 +886,58 @@ No IO, no approval gate.
 
 Coercion failures (`"abc"` → `f64`) error rather than silently defaulting. An unknown
 `as_type` passes the string through unchanged.
+
+---
+
+## Context-pack nodes
+
+These two nodes elevate PRD §13 explicit context management to a first-class, budgeted artifact. Both
+are **pure** (they select and label existing values — no IO) and produce a `Ctx` value (see the prelude).
+
+### `ctx`
+
+Build a bounded context pack from existing symbols. Resolves `include` (minus `exclude`) to its
+members; when `budget` is set, the pack is shrunk **at evaluation** — members are kept in priority order
+(visibility tier, then declared order) while their cumulative char size fits the budget, and any dropped
+members are recorded as a `ctx_shrunk` run event. Binds a `Ctx` value to `name`.
+
+```json
+{"kind": "ctx", "name": "auth_debug",
+ "purpose": "explain failing refresh-token tests",
+ "include": ["src", "fails", "claims_high_conf"],
+ "exclude": ["generated"],
+ "budget": 9000}
+```
+
+**Fields**
+
+| field | type | required | description |
+|---|---|---|---|
+| `name` | string | yes | symbol the resulting `Ctx` binds to |
+| `purpose` | string | no | why the pack exists (seeds audit + any model prompt) |
+| `include` | string[] | no | symbol names selected into the pack |
+| `exclude` | string[] | no | symbol names removed from `include` |
+| `budget` | u64 | no | char budget (v1 heuristic); the analyzer rejects a `0` budget |
+
+The budget counter is a **char-based heuristic** in v1 (no provider tokenizer in L0); members are sized
+by their stored value's JSON length. An unbound member contributes nothing rather than erroring.
+
+### `ctx_append`
+
+Accrete more symbols into an existing pack (the `+=` marker). Immutably rebinds `ctx` to a **new** `Ctx`
+value (the prior value stays addressable — the audit chain `$pack@1 → @2`) with `add` appended, then
+re-applies the pack's budget.
+
+```json
+{"kind": "ctx_append", "ctx": "auth_debug", "add": ["more_src"]}
+```
+
+**Fields**
+
+| field | type | required | description |
+|---|---|---|---|
+| `ctx` | string | yes | the existing pack to append to |
+| `add` | string[] | no | symbol names to add to the pack |
 
 ---
 

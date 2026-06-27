@@ -324,6 +324,11 @@ fn head(node: &Node, p: &Palette) -> String {
         Node::Lit { value } => lit(value, p),
         Node::Thing { thing } => thing_str(thing, p),
         Node::Parse { .. } => paint(p.keyword, "parse"),
+        Node::Ctx { name, budget, .. } => match budget {
+            Some(b) => format!("{} {} budget {b}", paint(p.keyword, "ctx"), sym(p, &name.0)),
+            None => format!("{} {}", paint(p.keyword, "ctx"), sym(p, &name.0)),
+        },
+        Node::CtxAppend { ctx, .. } => format!("{} += …", sym(p, &ctx.0)),
     }
 }
 
@@ -361,7 +366,9 @@ fn expr(node: &Node, p: &Palette) -> String {
         | Node::Expr { .. }
         | Node::Fmt { .. }
         | Node::Jq { .. }
-        | Node::Parse { .. } => "…".to_string(),
+        | Node::Parse { .. }
+        | Node::Ctx { .. }
+        | Node::CtxAppend { .. } => "…".to_string(),
     }
 }
 

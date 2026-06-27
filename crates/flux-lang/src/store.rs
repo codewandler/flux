@@ -73,6 +73,16 @@ pub trait ValueStore: Send + Sync {
     fn append_event(&self, session_id: &str, event: &RunEvent) -> Result<()>;
     /// The model-facing projection of the session's symbols.
     fn view(&self, session_id: &str) -> Result<SessionView>;
+    /// The binding metadata (type hint, summary, visibility) for one symbol, if bound. The
+    /// `ctx`/`ctx_append` budget reads visibility through this to shrink a pack by tier. The default
+    /// derives it from [`view`](Self::view); a store may override for efficiency.
+    fn binding(&self, session_id: &str, name: &SymbolName) -> Result<Option<SymbolView>> {
+        Ok(self
+            .view(session_id)?
+            .symbols
+            .into_iter()
+            .find(|s| &s.name == name))
+    }
 }
 
 /// A simple in-memory [`ValueStore`] — no persistence, no budgeting, no event retention beyond the

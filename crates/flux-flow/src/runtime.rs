@@ -307,7 +307,9 @@ fn walk_node<'a>(node: &'a Node, f: &mut impl FnMut(&'a str, &'a [Node])) {
         | Node::Lit { .. }
         | Node::Thing { .. }
         | Node::Await { .. }
-        | Node::Parse { .. } => {}
+        | Node::Parse { .. }
+        | Node::Ctx { .. }
+        | Node::CtxAppend { .. } => {}
     }
 }
 
