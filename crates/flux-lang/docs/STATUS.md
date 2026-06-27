@@ -27,8 +27,9 @@ The forward design ([`flux-lang-evolution.md`](../../../docs/designs/flux-lang-e
 | **flux-app** | L6 runtime host (event bus, triggers, journeys, orchestration ops) + `flux run app.flux` (safe-by-default) | ✅ |
 | **P5a** | text syntax (`parse.rs`/`format.rs`, marker syntax, round-trip) | ✅ |
 | **P5b** | optimizer (parallelize independent reads) + `PhysicalPlan` execution | ✅ |
+| **P6a** | `await` cross-turn suspend/resume (`run_top_level`/`resume_flow` + engine `suspensions` table) | ✅ |
 | **P6b** | Tier-1 control-flow primitives (`match`/`route`/`fallback`/`timeout`/`budget`) | ✅ |
-| — | P6a `await` cross-turn suspend/resume; P6c polish (compact format, thing resolver, focus aliases) | 🚧 |
+| — | P6c polish (compact format, thing resolver, focus aliases) | 🚧 |
 | — | Tier-2 control-flow (`checkpoint`/`compensate`/`once`/`scope`); `ask` reply-correlation (flux-app MVP) | ⬜ (optional) |
 
 Each landed phase shipped behind the full dev loop (build/test/clippy/fmt/codegate) and an adversarial
@@ -40,7 +41,7 @@ review pass (findings fixed before commit).
 |---|---|---|---|
 | 8, 10.1 | Draft AST + core node kinds (`flow`/bind/call/thing/branch/repeat/await/return/effect) | ✅ | `src/ast.rs` — 36 `Node` kinds |
 | 8 | Constructs beyond v1 (`each`/`parallel`/`race`/`try`/`retry`/`confirm`/`loop`/`throttle`/…) | ✅ | `src/ast.rs`, `src/runtime.rs` |
-| 8 | `await` pause/resume | 🟡 | node exists; interpreter rejects it (cross-turn suspend unbuilt) |
+| 8 | `await` pause/resume | ✅ (P6a) | cross-turn suspend/resume: a top-level `await` suspends (`FlowOutcome.suspension`, `RunEvent::Awaiting`); the engine persists it (`suspensions` table) and resumes next turn via `resume_flow` — the prefix is not re-run. Top-level-only in v1 (analyzer-enforced) |
 | 1, 8 | Compact **text parser** (text → AST) | ✅ | `src/parse.rs` + `src/format.rs`; `parse(format(ast)) == ast` (native subset + `@json` fallback; round-trip + real-example tests) |
 | 8, 16 | Pretty-printer / renderer (AST → readable) | ✅ | `src/render.rs` is intentionally one-way (lossy display tree); the round-trippable text surface is `format`/`parse` (row above) |
 | 20.1 | AST serializable + versioned (JSON wire) | ✅ | serde on `ast.rs`; `examples/*.flux` are JSON |

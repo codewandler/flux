@@ -171,6 +171,22 @@ pub struct FlowOutcome {
     pub transcript: String,
     /// How many operations were dispatched.
     pub steps: usize,
+    /// Set when the flow **suspended** on a top-level `await` instead of completing. The engine
+    /// persists this (with the flow body) and calls [`resume_flow`] once a value for the awaited
+    /// `source` arrives; `None` on a normal completion or `return`.
+    pub suspension: Option<Suspension>,
+}
+
+/// A suspended flow's resume point: the top-level `await` node it stopped at and the external input it
+/// waits for. The engine persists this alongside the flow body and, when a value for `source` arrives,
+/// calls [`resume_flow`] with the same body + this node so execution continues from the *next*
+/// statement — the already-run prefix (and its side effects) is never re-executed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Suspension {
+    /// The top-level index of the `await` that suspended the flow.
+    pub node: crate::ast::NodeId,
+    /// The external input the flow is waiting for (the `await`'s `source`).
+    pub source: String,
 }
 
 /// Whether body execution should keep going or unwind because a `return` fired.
@@ -250,9 +266,10 @@ impl FlowSink for BufferSink {
 }
 
 /// Execute a compiled flow's body, dispatching each operation through the same [`execute_call`]
-/// envelope. Handles `bind` / `call` / `return` plus `when` (typed branch) and `repeat` (bounded
-/// loop). `await` (cross-turn suspend/resume) still returns a clear error — the engine loop covers
-/// iteration for now. Every op still goes through [`Executor::dispatch`] — no new bypass surface.
+/// envelope. Handles `bind` / `call` / `return` plus the control-flow nodes. A top-level `await`
+/// **suspends** the flow (returning [`FlowOutcome::suspension`]); the engine persists it and calls
+/// [`resume_flow`] when the awaited input arrives. Every op still goes through
+/// [`Executor::dispatch`] — no new bypass surface.
 pub async fn execute_flow(
     store: &dyn ValueStore,
     executor: &dyn OpHost,
@@ -260,31 +277,155 @@ pub async fn execute_flow(
     ast: &DraftAst,
     sink: &mut dyn FlowSink,
 ) -> Result<FlowOutcome> {
-    let mut steps = 0usize;
-    let mut transcript: Vec<String> = Vec::new();
-    let (last, _last_value, step) = exec_body(
+    run_top_level(store, executor, session_id, &ast.body, 0, None, sink).await
+}
+
+/// Resume a flow suspended on a top-level `await` (see [`FlowOutcome::suspension`]). Binds `input` to
+/// the `await` at index `at` (the suspended node) and continues from the *next* top-level statement —
+/// the already-executed prefix and its side effects are not re-run, because the earlier symbols are
+/// already durable in the store. The flow may suspend again on a later `await`.
+pub async fn resume_flow(
+    store: &dyn ValueStore,
+    executor: &dyn OpHost,
+    session_id: &str,
+    body: &[Node],
+    at: crate::ast::NodeId,
+    input: Value,
+    sink: &mut dyn FlowSink,
+) -> Result<FlowOutcome> {
+    run_top_level(
         store,
         executor,
         session_id,
-        &ast.body,
+        body,
+        at.0 as usize,
+        Some(input),
         sink,
-        &mut steps,
-        &mut transcript,
     )
-    .await?;
-    let returned = match step {
-        Step::Return(vid) => vid,
-        Step::Next => None,
-    };
-    if let Some(vid) = &returned {
-        store.append_event(session_id, &RunEvent::FlowReturned { value: vid.clone() })?;
+    .await
+}
+
+/// The top-level statement driver shared by [`execute_flow`] (fresh, `start = 0`) and [`resume_flow`]
+/// (`start` = the suspended `await`'s index, with `resume` = the value to bind there). It walks the
+/// flow's top-level statements: a top-level `await` **suspends** the flow (records `Awaiting`, returns
+/// `FlowOutcome.suspension`); every other node runs through [`exec_body`] exactly as before. Because
+/// `await` is a top-level-only statement (the analyzer enforces it), a suspend can only originate here,
+/// at a known index — nested bodies never produce one.
+async fn run_top_level(
+    store: &dyn ValueStore,
+    executor: &dyn OpHost,
+    session_id: &str,
+    body: &[Node],
+    start: usize,
+    resume: Option<Value>,
+    sink: &mut dyn FlowSink,
+) -> Result<FlowOutcome> {
+    let mut steps = 0usize;
+    let mut transcript: Vec<String> = Vec::new();
+    let mut last = String::new();
+    let mut i = start;
+
+    // Resuming: bind the awaited value to the suspended `await`'s binding, then advance past it.
+    if let Some(value) = resume {
+        let Some(Node::Await {
+            binding, as_type, ..
+        }) = body.get(start)
+        else {
+            return Err(FlowError::Runtime(
+                "resume cursor does not point at an `await` node".to_string(),
+            ));
+        };
+        let coerced = coerce_await_input(value, as_type);
+        let vid = store.put_value(session_id, &coerced)?;
+        let text = value_text(&coerced);
+        if let Some(b) = binding {
+            let ty_label = as_type.as_ref().map(TypeRef::label);
+            store.bind(
+                session_id,
+                b,
+                &vid,
+                ty_label.as_deref(),
+                &summarize(&text),
+                Visibility::Visible,
+            )?;
+        }
+        last = text;
+        i = start + 1;
     }
+
+    while i < body.len() {
+        if let Node::Await { source, .. } = &body[i] {
+            let node = crate::ast::NodeId(i as u32);
+            store.append_event(
+                session_id,
+                &RunEvent::Awaiting {
+                    run: crate::ast::RunId(format!("{session_id}:{i}")),
+                    node,
+                },
+            )?;
+            return Ok(FlowOutcome {
+                returned: None,
+                result: last,
+                transcript: transcript.join("\n\n"),
+                steps,
+                suspension: Some(Suspension {
+                    node,
+                    source: source.clone(),
+                }),
+            });
+        }
+        let (blast, _bvid, step) = exec_body(
+            store,
+            executor,
+            session_id,
+            std::slice::from_ref(&body[i]),
+            sink,
+            &mut steps,
+            &mut transcript,
+        )
+        .await?;
+        if !blast.is_empty() {
+            last = blast;
+        }
+        if let Step::Return(vid) = step {
+            if let Some(v) = &vid {
+                store.append_event(session_id, &RunEvent::FlowReturned { value: v.clone() })?;
+            }
+            return Ok(FlowOutcome {
+                returned: vid,
+                result: last,
+                transcript: transcript.join("\n\n"),
+                steps,
+                suspension: None,
+            });
+        }
+        i += 1;
+    }
+
     Ok(FlowOutcome {
-        returned,
+        returned: None,
         result: last,
         transcript: transcript.join("\n\n"),
         steps,
+        suspension: None,
     })
+}
+
+/// Coerce a resume `input` against the `await`'s declared `as_type` — lenient, like the type checker:
+/// a string reply is parsed to a number/bool when the await asked for one; everything else is kept
+/// verbatim (no hard failures — an un-coercible value flows through as-is).
+fn coerce_await_input(input: Value, as_type: &Option<TypeRef>) -> Value {
+    match (as_type, &input) {
+        (Some(TypeRef::Number), Value::String(s)) => {
+            s.trim().parse::<f64>().map(Value::Number).unwrap_or(input)
+        }
+        (Some(TypeRef::Bool), Value::String(s)) => match s.trim() {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            _ => input,
+        },
+        _ => input,
+    }
 }
 
 /// Execute a [`PhysicalPlan`] (from [`crate::optimize::optimize`]) over a flow's top-level `body`,
@@ -379,6 +520,9 @@ pub async fn execute_plan(
         result: last,
         transcript: transcript.join("\n\n"),
         steps,
+        // The optimized plan path does not suspend: the optimizer never emits `Stage::Await`, and a
+        // top-level `await` reaching `exec_body` errors. Cross-turn suspend goes through `execute_flow`.
+        suspension: None,
     })
 }
 
@@ -1569,8 +1713,11 @@ fn exec_body<'a>(
                     }
                 }
                 Node::Await { .. } => {
+                    // Top-level awaits are intercepted by `run_top_level` (which suspends the flow);
+                    // reaching here means an `await` was nested or run via the optimized plan path,
+                    // neither of which can suspend in v1. The analyzer rejects the nested case.
                     return Err(FlowError::Runtime(
-                        "`await` execution (cross-turn suspend/resume) lands in a later slice"
+                        "`await` must be a top-level flow statement (it suspends the whole flow for cross-turn resume; it cannot be nested or run in the optimized plan path)"
                             .to_string(),
                     ));
                 }
@@ -3004,6 +3151,114 @@ mod tests {
             vec!["one"],
             "the over-budget statement never ran"
         );
+    }
+
+    // ---- P6a: await cross-turn suspend/resume ----
+
+    fn await_node(binding: Option<&str>, source: &str, as_type: Option<TypeRef>) -> Node {
+        Node::Await {
+            binding: binding.map(|b| SymbolName(b.into())),
+            source: source.into(),
+            as_type,
+        }
+    }
+
+    #[tokio::test]
+    async fn await_suspends_then_resumes_without_rerunning_the_prefix() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let body = vec![
+            echo("a"),
+            await_node(Some("reply"), "user_input", None),
+            echo("b"),
+        ];
+        let ast = DraftAst {
+            body: body.clone(),
+            ..Default::default()
+        };
+
+        // First turn: the prefix runs, then the flow suspends at the await — nothing past it runs.
+        let mut sink = BufferSink::default();
+        let out = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(host.marks(), vec!["a"], "only the prefix ran");
+        let susp = out.suspension.expect("flow suspended on the await");
+        assert_eq!(susp.node, crate::ast::NodeId(1));
+        assert_eq!(susp.source, "user_input");
+        assert!(out.returned.is_none());
+        assert!(
+            store
+                .events("s")
+                .iter()
+                .any(|e| matches!(e, RunEvent::Awaiting { .. })),
+            "an Awaiting event was recorded"
+        );
+
+        // Second turn: resume with the reply. The prefix is NOT re-run, the awaited value is bound,
+        // and execution continues from the next statement to completion.
+        let mut sink2 = BufferSink::default();
+        let out2 = resume_flow(
+            &store,
+            &host,
+            "s",
+            &body,
+            susp.node,
+            Value::String("hi".into()),
+            &mut sink2,
+        )
+        .await
+        .unwrap();
+        assert!(out2.suspension.is_none(), "the resumed flow completed");
+        assert_eq!(
+            host.marks(),
+            vec!["a", "b"],
+            "prefix not re-run; only echo b added"
+        );
+        let reply = store
+            .resolve("s", &SymbolName("reply".into()))
+            .unwrap()
+            .and_then(|id| store.get_value(&id).unwrap());
+        assert_eq!(
+            reply,
+            Some(Value::String("hi".into())),
+            "awaited value bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_coerces_input_to_the_await_type() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let body = vec![await_node(Some("n"), "num", Some(TypeRef::Number))];
+        let ast = DraftAst {
+            body: body.clone(),
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let susp = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap()
+            .suspension
+            .unwrap();
+
+        let mut sink2 = BufferSink::default();
+        resume_flow(
+            &store,
+            &host,
+            "s",
+            &body,
+            susp.node,
+            Value::String("42".into()),
+            &mut sink2,
+        )
+        .await
+        .unwrap();
+        let n = store
+            .resolve("s", &SymbolName("n".into()))
+            .unwrap()
+            .and_then(|id| store.get_value(&id).unwrap());
+        assert_eq!(n, Some(Value::Number(42.0)), "a numeric reply is coerced");
     }
 
     #[test]

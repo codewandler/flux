@@ -117,18 +117,29 @@ change.
 The next batch (directions 1 + 4 + 2). Each sub-phase ships behind the full dev loop + an adversarial
 review, then commits; `STATUS.md` rows flip as each lands.
 
-### P6a — `await` cross-turn suspend/resume (keystone)
-- **Design: persist-continuation, top-level await only (v1)** — avoids re-running side effects; matches
-  the existing `Stage::Await { node: NodeId }` scaffolding; defers Tier-2 `checkpoint`/`once`.
-- `flux-lang`: `Step::Suspend { source, binding, as_type }`; `FlowOutcome.suspension: Option<Suspension>`
-  (run id, top-level cursor, source, binding, as_type); `exec_body` `Node::Await` arm (resume-input present
-  → bind+continue; else emit `RunEvent::Awaiting` + return `Step::Suspend`); handle `Stage::Await` in
-  `execute_plan`; new `resume_flow(plan, cursor, resume_input, …)`; generate/track `RunId`.
-- `flux-flow`: persist the suspension (plan + cursor + run id + source) in a `suspensions` table; at turn
-  start resume a pending suspension with the incoming message instead of compiling fresh; clear on done.
-- `analyze`: enforce top-level-position await (reject nested in `repeat`/`when`/`each`/`parallel` — v1).
-- Tests: suspend (outcome set, `Awaiting` emitted, no later side-effects), resume (continues from cursor,
-  earlier side-effects NOT re-run), flux-flow cross-turn REPL path, analyzer nested-await rejection.
+### P6a — `await` cross-turn suspend/resume (keystone) — ✅ DONE
+- **Design: persist-continuation, top-level await only (v1)** — avoids re-running side effects; defers
+  Tier-2 `checkpoint`/`once`. Cleaner than the original sketch: **no `Step::Suspend` variant** — await is
+  intercepted by a top-level statement driver (`run_top_level`), not inside `exec_body`'s generic loop, so
+  a suspend can only originate at a known top-level index. `exec_body`'s await arm stays an error (defends
+  the nested / optimized-path cases the analyzer also rejects).
+- **`flux-lang`:** `FlowOutcome.suspension: Option<Suspension { node, source }>`; `run_top_level` (shared by
+  `execute_flow` and `resume_flow`) walks top-level statements — a top-level `await` records
+  `RunEvent::Awaiting` and returns the suspension; `resume_flow(body, at, input, …)` binds `input` at `at`
+  (lenient `as_type` coerce) and continues from `at+1`. `RunId` derived deterministically per session+node.
+- **`flux-flow`:** `suspensions` table (`save_suspension`/`take_suspension`, one-shot, replace-on-resave,
+  corrupt-body → graceful discard); engine `run_turn` resumes a pending suspension with the incoming
+  message (bypassing the planner) and persists+ends the turn on suspend; `resume_flow` wrapper.
+- **`analyze`:** `check_await_position` rejects `await` nested anywhere but top level (reuses `for_each_node`).
+- **Adversarial review (keystone):** core confirmed sound (side-effect-once, symbol durability across the
+  turn, multi-await, analyzer exhaustiveness, engine routes via `execute_flow` not `execute_plan`). Fixed:
+  SDK `execute` now surfaces a suspension as an error (was silently dropping the remainder); corrupt
+  persisted body recovers instead of wedging. **Accepted v1 limitations** (documented): a post-await op
+  failure isn't retryable (no per-statement checkpoint); a pending await captures the next message with no
+  escape/TTL (a REPL `/cancel` is the natural home); the optimized `execute_plan` path doesn't suspend.
+- Tests: flux-lang suspend+resume (no prefix re-run, `Awaiting` emitted, `as_type` coercion), analyzer
+  nested-await rejection, flux-flow `save`/`take` round-trip, and the **end-to-end engine two-turn resume**
+  (`await_suspends_a_turn_then_the_next_message_resumes_it`).
 
 ### P6b — Tier-1 control-flow primitives (5 nodes, design §5.1) — ✅ DONE
 - **Shipped:** `match` (exhaustive multi-way; subject = literal/symbol, JSON-equality), `route` (`!model`

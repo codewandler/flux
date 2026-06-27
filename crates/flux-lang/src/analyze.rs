@@ -39,10 +39,35 @@ pub fn analyze_flow(ast: &DraftAst, ops: &dyn OpCatalog) -> Result<(), Vec<Diagn
     for node in &ast.body {
         check_node(node, ops, &mut diags);
     }
+    check_await_position(&ast.body, &mut diags);
     if diags.is_empty() {
         Ok(())
     } else {
         Err(diags)
+    }
+}
+
+/// `await` may only appear as a **top-level** flow statement: it suspends the whole flow for cross-turn
+/// resume (the interpreter records the top-level index and continues from the next statement on resume).
+/// Nesting one inside a `when`/`repeat`/`each`/`parallel`/… body has no well-defined resume point in v1,
+/// so it is rejected here (a clear analysis error rather than a runtime failure deep in `exec_body`).
+fn check_await_position(body: &[Node], diags: &mut Vec<Diagnostic>) {
+    for node in body {
+        // A top-level `await` is fine; flag any `await` hiding inside a non-`await` statement's subtree.
+        if matches!(node, Node::Await { .. }) {
+            continue;
+        }
+        let mut nested = false;
+        for_each_node(std::slice::from_ref(node), &mut |n| {
+            if matches!(n, Node::Await { .. }) {
+                nested = true;
+            }
+        });
+        if nested {
+            diags.push(Diagnostic::new(
+                "`await` must be a top-level flow statement — it suspends the whole flow and cannot be nested (v1)",
+            ));
+        }
     }
 }
 
@@ -969,6 +994,45 @@ mod tests {
             bind: None,
         });
         assert!(lower(&ok, &ops).is_ok());
+    }
+
+    /// `await` suspends the *whole* flow, so it is only valid as a top-level statement; nesting one is
+    /// an analysis error (a clean diagnostic, not a runtime failure).
+    #[test]
+    fn await_must_be_a_top_level_statement() {
+        let ops = catalog();
+        let await_node = || Node::Await {
+            binding: None,
+            source: "user_input".into(),
+            as_type: None,
+        };
+        let lit = || Node::Lit {
+            value: serde_json::json!("x"),
+        };
+
+        // nested inside a `when` → rejected.
+        let nested = DraftAst {
+            body: vec![Node::When {
+                cond: Box::new(lit()),
+                then: vec![await_node()],
+                otherwise: vec![],
+            }],
+            ..Default::default()
+        };
+        let err = analyze_flow(&nested, &ops).unwrap_err();
+        assert!(
+            err.iter().any(|d| d
+                .message
+                .contains("`await` must be a top-level flow statement")),
+            "nested await is rejected"
+        );
+
+        // a top-level await analyzes clean.
+        let top = DraftAst {
+            body: vec![await_node()],
+            ..Default::default()
+        };
+        assert!(analyze_flow(&top, &ops).is_ok());
     }
 
     /// A catalog with a typed op `dbl(n: Number)` for the argument type-checker.

@@ -269,6 +269,16 @@ impl FlowClient {
         let outcome = execute_flow(&self.store, &executor, &self.session_id, ast, &mut sink)
             .await
             .map_err(|e| Error::Other(e.to_string()))?;
+        // A top-level `await` suspends the flow mid-execution. This one-shot path has no resume hook,
+        // so surface it as an error rather than silently returning a half-run flow (the prefix's side
+        // effects fired, the remainder never will) — cross-turn `await` flows belong on the engine.
+        if let Some(susp) = &outcome.suspension {
+            return Err(Error::Other(format!(
+                "flow suspended on a top-level `await` (source `{}`); the one-shot SDK `execute` path \
+                 does not support cross-turn resume — drive await flows through the engine instead",
+                susp.source
+            )));
+        }
         Ok(ExecutionResult {
             result: outcome.result,
             transcript: outcome.transcript,

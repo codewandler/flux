@@ -80,6 +80,14 @@ impl FlowEngine {
         sink: &mut dyn AgentSink,
         cancel: &CancellationToken,
     ) -> Result<()> {
+        // If a flow is suspended on a top-level `await`, THIS turn's message is the awaited input:
+        // resume the persisted flow instead of compiling a fresh plan. (`take_suspension` clears it.)
+        if let Some((body, node, _source)) = self.flow.take_suspension(session_id)? {
+            return self
+                .resume_suspended(session_id, user_input, body, node, sink)
+                .await;
+        }
+
         self.store
             .append_message(session_id, &Message::user_text(user_input))?;
 
@@ -156,6 +164,22 @@ impl FlowEngine {
                         .await
                     {
                         Ok(outcome) => {
+                            // The flow suspended on a top-level `await`: persist the resume point and end
+                            // the turn — the user's next message resumes it (handled at the top of
+                            // `run_turn`). The pre-await output already streamed through the sink.
+                            if let Some(susp) = &outcome.suspension {
+                                self.flow.save_suspension(
+                                    session_id,
+                                    &compiled.ast.body,
+                                    susp.node,
+                                    &susp.source,
+                                )?;
+                                let hint = "(awaiting your input — reply to continue the flow)";
+                                sink.text_delta(hint);
+                                answer = Some(hint.to_string());
+                                shown = true;
+                                break;
+                            }
                             // Feed back the full transcript (EVERY read/call node's view), not just the
                             // last node — otherwise a plan that reads N files surfaces only file N and the
                             // model re-reads the rest every round (an infinite read loop). Both paths
@@ -418,6 +442,66 @@ impl FlowEngine {
         )?;
         sink.turn_end(None);
         Ok(())
+    }
+
+    /// Resume a flow suspended on a top-level `await`, with this turn's message as the awaited input.
+    /// Continues from the next statement (the prefix and its side effects are not re-run); the flow may
+    /// suspend again on a later `await` (persist + wait) or complete (surface its result). Bypasses the
+    /// planner entirely — a resume is deterministic continuation, not a fresh compile.
+    ///
+    /// v1 limitations (accepted; refinements later): (1) the suspension is taken (deleted) before the
+    /// remainder runs, so if a post-await op *fails*, the unfinished flow is not retryable (its earlier
+    /// side effects stay committed) — per-statement resume checkpoints would fix this. (2) Once a flow
+    /// is awaiting, the next message is *always* consumed as the input — there is no escape sentinel or
+    /// TTL, so the user can't redirect to a new request without first answering (a REPL `/cancel` is the
+    /// natural home for an escape, above the engine).
+    async fn resume_suspended(
+        &self,
+        session_id: &str,
+        user_input: &str,
+        body: Vec<flux_lang::ast::Node>,
+        node: flux_lang::ast::NodeId,
+        sink: &mut dyn AgentSink,
+    ) -> Result<()> {
+        self.store
+            .append_message(session_id, &Message::user_text(user_input))?;
+        let input = flux_lang::ast::Value::String(user_input.to_string());
+        let outcome = match crate::runtime::resume_flow(
+            &self.flow,
+            &self.executor,
+            session_id,
+            &body,
+            node,
+            input,
+            sink,
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                let msg = format!("The resumed flow failed — {e}");
+                sink.text_delta(&msg);
+                return self.finish_turn(session_id, sink, &msg, true);
+            }
+        };
+
+        // Suspended again on a later `await`: persist the new resume point and wait for more input.
+        if let Some(susp) = &outcome.suspension {
+            self.flow
+                .save_suspension(session_id, &body, susp.node, &susp.source)?;
+            let hint = "(awaiting your input — reply to continue the flow)";
+            sink.text_delta(hint);
+            return self.finish_turn(session_id, sink, hint, false);
+        }
+
+        // Completed: the flow's own output is the answer (a model-grounded summary is a later refinement).
+        let answer = if !outcome.result.trim().is_empty() {
+            outcome.result.trim().to_string()
+        } else {
+            format!("Resumed and completed ({} step(s)).", outcome.steps)
+        };
+        sink.text_delta(&answer);
+        self.finish_turn(session_id, sink, &answer, false)
     }
 
     /// If the session has grown past `compact_threshold_chars`, summarize everything but the most
@@ -772,6 +856,64 @@ mod tests {
         let msgs = store.load_messages(&sid).unwrap();
         assert_eq!(msgs.len(), 2, "user + the prose answer");
         assert!(msgs[1].text().contains("Echoed hi."));
+    }
+
+    /// A plan that `await`s suspends the flow across the turn boundary: turn 1 runs the prefix and
+    /// stops at the await; turn 2's message resumes it (binding the awaited value, running the
+    /// remainder) without re-running the prefix or recompiling.
+    #[tokio::test]
+    async fn await_suspends_a_turn_then_the_next_message_resumes_it() {
+        let store = Arc::new(SessionStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+
+        // Prefix echo, then await the user's name, then echo a greeting interpolating it.
+        let plan_ast = json!({
+            "body": [
+                { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "your name?" }] },
+                { "kind": "await", "binding": "name", "source": "user_input" },
+                { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "Hello {name}" }] }
+            ]
+        });
+        // Only ONE provider response is needed — the resume turn bypasses the planner entirely.
+        let responses = VecDeque::from(vec![emit_plan(plan_ast)]);
+        let engine = engine_with(responses, store.clone());
+
+        // Turn 1: the prefix echo runs, then the flow suspends at the await.
+        let mut sink1 = CollectSink::default();
+        engine.run_turn(&sid, "greet me", &mut sink1).await.unwrap();
+        assert_eq!(
+            sink1.tools,
+            vec!["echo"],
+            "only the prefix echo ran before the await"
+        );
+        assert!(
+            sink1.text.contains("awaiting"),
+            "the turn ends prompting for input"
+        );
+
+        // Turn 2: the reply resumes the flow — the prefix is NOT re-run, the awaited value binds, and
+        // the post-await echo (interpolating it) runs to completion.
+        let mut sink2 = CollectSink::default();
+        engine.run_turn(&sid, "Ada", &mut sink2).await.unwrap();
+        assert_eq!(
+            sink2.tools,
+            vec!["echo"],
+            "only the post-await echo ran (prefix not replayed)"
+        );
+        assert!(
+            sink2.text.contains("Hello Ada"),
+            "the awaited reply flowed into the resumed flow: {:?}",
+            sink2.text
+        );
+        let name = engine
+            .flow
+            .resolve(&sid, &SymbolName("name".into()))
+            .unwrap()
+            .and_then(|id| engine.flow.get_value(&id).unwrap());
+        assert_eq!(name, Some(crate::ast::Value::String("Ada".into())));
+
+        // The suspension was consumed — a third turn would compile fresh, not resume.
+        assert!(engine.flow.take_suspension(&sid).unwrap().is_none());
     }
 
     #[tokio::test]

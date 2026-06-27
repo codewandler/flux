@@ -14,7 +14,7 @@ use rusqlite::Connection;
 
 use flux_core::{Error, Result};
 
-use crate::ast::{RunEvent, SymbolName, Value, ValueId, Visibility};
+use crate::ast::{Node, NodeId, RunEvent, SymbolName, Value, ValueId, Visibility};
 
 fn map_sql<E: std::fmt::Display>(e: E) -> Error {
     Error::Other(format!("flow store: {e}"))
@@ -114,6 +114,13 @@ impl FlowStore {
                  seq        INTEGER NOT NULL,
                  data       TEXT NOT NULL,
                  PRIMARY KEY (session_id, seq)
+             );
+             CREATE TABLE IF NOT EXISTS suspensions (
+                 session_id TEXT PRIMARY KEY,
+                 body       TEXT NOT NULL,
+                 node       INTEGER NOT NULL,
+                 source     TEXT NOT NULL,
+                 created_at INTEGER NOT NULL
              );",
         )
         .map_err(map_sql)?;
@@ -237,6 +244,62 @@ impl FlowStore {
         Ok(out)
     }
 
+    /// Persist a flow suspended on a top-level `await`: its body, the suspended node index, and the
+    /// awaited input `source`. One pending suspension per session — a new one replaces any prior.
+    /// Resumed (and cleared) by [`take_suspension`] when the awaited input arrives next turn.
+    pub fn save_suspension(
+        &self,
+        session_id: &str,
+        body: &[Node],
+        node: NodeId,
+        source: &str,
+    ) -> Result<()> {
+        let body_json = serde_json::to_string(body)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO suspensions (session_id, body, node, source, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![session_id, body_json, node.0, source, now_ms()],
+        )
+        .map_err(map_sql)?;
+        Ok(())
+    }
+
+    /// Take (load **and** remove) a session's pending suspension, if any — a one-shot resume point.
+    /// Returns the persisted flow body, the suspended `await` node, and the awaited source.
+    pub fn take_suspension(&self, session_id: &str) -> Result<Option<(Vec<Node>, NodeId, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn.query_row(
+            "SELECT body, node, source FROM suspensions WHERE session_id = ?1",
+            [session_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        );
+        match row {
+            Ok((body_json, node, source)) => {
+                // One-shot: clear the row regardless. A body that no longer deserializes (e.g. AST
+                // schema drift across an upgrade) is discarded and reported as "no suspension" so the
+                // turn recovers with a fresh compile rather than hard-erroring on every future turn.
+                conn.execute(
+                    "DELETE FROM suspensions WHERE session_id = ?1",
+                    [session_id],
+                )
+                .map_err(map_sql)?;
+                match serde_json::from_str::<Vec<Node>>(&body_json) {
+                    Ok(body) => Ok(Some((body, NodeId(node as u32), source))),
+                    Err(_) => Ok(None),
+                }
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(map_sql(e)),
+        }
+    }
+
     /// Total stored value bytes for a session (the budget-accounting surface; eviction lands later).
     pub fn total_value_bytes(&self, session_id: &str) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
@@ -289,6 +352,33 @@ impl FlowStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suspensions_round_trip_take_once_and_replace() {
+        let s = FlowStore::in_memory().unwrap();
+        let body = vec![Node::Await {
+            binding: Some(SymbolName("x".into())),
+            source: "user_input".into(),
+            as_type: None,
+        }];
+        assert!(
+            s.take_suspension("sess").unwrap().is_none(),
+            "none initially"
+        );
+
+        s.save_suspension("sess", &body, NodeId(3), "user_input")
+            .unwrap();
+        // A second save replaces the first (one pending suspension per session).
+        s.save_suspension("sess", &body, NodeId(5), "other")
+            .unwrap();
+
+        let (got_body, node, source) = s.take_suspension("sess").unwrap().expect("a suspension");
+        assert_eq!(node, NodeId(5), "latest save wins");
+        assert_eq!(source, "other");
+        assert_eq!(got_body, body);
+        // Taking is one-shot — it's cleared.
+        assert!(s.take_suspension("sess").unwrap().is_none(), "consumed");
+    }
 
     #[test]
     fn values_are_versioned_and_old_versions_stay_addressable() {

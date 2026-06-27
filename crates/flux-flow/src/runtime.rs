@@ -27,7 +27,7 @@ use crate::state::FlowStore;
 use crate::Result;
 
 /// The interpreter's public types, re-exported so `flux_flow::runtime::{…}` paths are unchanged.
-pub use flux_lang::runtime::{BindSpec, CallOutcome, FlowOutcome};
+pub use flux_lang::runtime::{BindSpec, CallOutcome, FlowOutcome, Suspension};
 
 // ---------------------------------------------------------------------------
 // Adapters: the engine's envelope → the interpreter's injected traits
@@ -155,6 +155,23 @@ pub async fn execute_flow(
     let host = ExecutorHost::new(executor);
     let mut bridge = SinkBridge { inner: sink };
     flux_lang::runtime::execute_flow(store, &host, session_id, ast, &mut bridge).await
+}
+
+/// Resume a flow suspended on a top-level `await` — the engine wrapper over
+/// [`flux_lang::runtime::resume_flow`]. Binds `input` to the suspended `await` at `at` and continues
+/// from the next statement (the prefix is not re-run); the flow may suspend again or complete.
+pub async fn resume_flow(
+    store: &FlowStore,
+    executor: &Executor,
+    session_id: &str,
+    body: &[flux_lang::ast::Node],
+    at: flux_lang::ast::NodeId,
+    input: flux_lang::ast::Value,
+    sink: &mut dyn AgentSink,
+) -> Result<FlowOutcome> {
+    let host = ExecutorHost::new(executor);
+    let mut bridge = SinkBridge { inner: sink };
+    flux_lang::runtime::resume_flow(store, &host, session_id, body, at, input, &mut bridge).await
 }
 
 /// Execute an optimizer [`flux_lang::ast::PhysicalPlan`] over a flow's top-level `body` — the engine
@@ -857,22 +874,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_flow_still_errors_on_await() {
+    async fn execute_flow_suspends_on_a_top_level_await_and_resumes() {
         let store = FlowStore::in_memory().unwrap();
         let ex = temp_executor(true);
         let ast = DraftAst {
             body: vec![Node::Await {
-                binding: None,
+                binding: Some(crate::ast::SymbolName("x".into())),
                 source: "input".into(),
                 as_type: None,
             }],
             ..Default::default()
         };
+
+        // A top-level `await` now suspends the flow (it no longer errors).
         let mut sink = CollectSink::default();
-        let err = execute_flow(&store, &ex, "sess", &ast, &mut sink)
+        let out = execute_flow(&store, &ex, "sess", &ast, &mut sink)
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("await"));
+            .unwrap();
+        let susp = out.suspension.expect("a top-level await suspends the flow");
+        assert_eq!(susp.source, "input");
+        assert_eq!(susp.node, crate::ast::NodeId(0));
+
+        // resume_flow binds the awaited value and completes.
+        let mut sink2 = CollectSink::default();
+        let out2 = resume_flow(
+            &store,
+            &ex,
+            "sess",
+            &ast.body,
+            susp.node,
+            Value::String("hi".into()),
+            &mut sink2,
+        )
+        .await
+        .unwrap();
+        assert!(out2.suspension.is_none());
+        let x = store
+            .resolve("sess", &crate::ast::SymbolName("x".into()))
+            .unwrap()
+            .and_then(|id| store.get_value(&id).unwrap());
+        assert_eq!(x, Some(Value::String("hi".into())));
     }
 
     #[test]
