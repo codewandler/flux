@@ -2,6 +2,7 @@
 //! real `FlowClient` with mocked adapter ops (registered stub `Tool`s) and a never-called provider —
 //! hermetic, no API key. These assert the recipes wire to the runtime semantics they document.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -9,7 +10,7 @@ use flux_core::Result;
 use flux_provider::{ChunkStream, Provider, Request};
 use flux_runtime::{Tool, ToolContext, ToolResult};
 use flux_sdk::dsl::*;
-use flux_sdk::recipes::{batch, lookup, routing};
+use flux_sdk::recipes::{batch, compose, dispatch, fanout, lookup, resilience, routing};
 use flux_sdk::{ExecutionResult, FlowClient};
 use flux_spec::ToolSpec;
 use serde_json::{json, Value};
@@ -83,6 +84,103 @@ async fn run(client: &FlowClient, flow: &DraftAst) -> ExecutionResult {
         panic!("analyze failed: {d:?}");
     }
     client.execute(flow).await.expect("execute")
+}
+
+/// Analyze then execute, surfacing an error from either stage — for failure-path tests.
+async fn try_run(client: &FlowClient, flow: &DraftAst) -> Result<ExecutionResult> {
+    client
+        .analyze(flow)
+        .map_err(|d| flux_core::Error::Other(format!("analyze: {d:?}")))?;
+    client.execute(flow).await
+}
+
+/// A stateful op that fails its first `fails_before` calls (erroring tool result), then succeeds with
+/// `ok`. `fails_before = usize::MAX` always fails. Drives `retry`/`try`.
+struct FlakyOp {
+    name: &'static str,
+    param: &'static str,
+    fails_before: usize,
+    calls: AtomicUsize,
+    ok: &'static str,
+}
+
+#[async_trait]
+impl Tool for FlakyOp {
+    fn spec(&self) -> ToolSpec {
+        let mut props = serde_json::Map::new();
+        props.insert(self.param.to_string(), json!({ "type": "string" }));
+        ToolSpec::read_only(
+            self.name,
+            "flaky mock adapter",
+            json!({ "type": "object", "properties": props, "required": [self.param] }),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if n < self.fails_before {
+            Ok(ToolResult::error(format!(
+                "transient failure (attempt {n})"
+            )))
+        } else {
+            Ok(ToolResult::ok(self.ok))
+        }
+    }
+}
+
+fn flaky(
+    name: &'static str,
+    param: &'static str,
+    fails_before: usize,
+    ok: &'static str,
+) -> Arc<dyn Tool> {
+    Arc::new(FlakyOp {
+        name,
+        param,
+        fails_before,
+        calls: AtomicUsize::new(0),
+        ok,
+    })
+}
+
+/// An op that sleeps `sleep_ms` before succeeding — drives a real `timeout` deadline.
+struct SlowOp {
+    name: &'static str,
+    param: &'static str,
+    sleep_ms: u64,
+    out: &'static str,
+}
+
+#[async_trait]
+impl Tool for SlowOp {
+    fn spec(&self) -> ToolSpec {
+        let mut props = serde_json::Map::new();
+        props.insert(self.param.to_string(), json!({ "type": "string" }));
+        ToolSpec::read_only(
+            self.name,
+            "slow mock adapter",
+            json!({ "type": "object", "properties": props, "required": [self.param] }),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
+        tokio::time::sleep(std::time::Duration::from_millis(self.sleep_ms)).await;
+        Ok(ToolResult::ok(self.out))
+    }
+}
+
+fn slow(
+    name: &'static str,
+    param: &'static str,
+    sleep_ms: u64,
+    out: &'static str,
+) -> Arc<dyn Tool> {
+    Arc::new(SlowOp {
+        name,
+        param,
+        sleep_ms,
+        out,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -277,4 +375,212 @@ async fn race_first_returns_a_winning_branch() {
     let out = run(&client, &flow).await;
 
     assert_eq!(out.result, "WON");
+}
+
+// ---------------------------------------------------------------------------
+// resilience::retry_with_backoff
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn retry_succeeds_on_first_attempt() {
+    let client = make_client(vec![flaky("work", "input", 0, "done")]);
+    let flow = resilience::retry_with_backoff(3, "none", 0, "work", lit("x"), "out");
+    let out = run(&client, &flow).await;
+    assert_eq!(out.tool_calls, vec!["work"]);
+    assert_eq!(out.result, "done");
+}
+
+#[tokio::test]
+async fn retry_recovers_after_transient_failures() {
+    // Fails twice, then succeeds → three attempts in total.
+    let client = make_client(vec![flaky("work", "input", 2, "done")]);
+    let flow = resilience::retry_with_backoff(5, "none", 0, "work", lit("x"), "out");
+    let out = run(&client, &flow).await;
+    assert_eq!(out.tool_calls.len(), 3);
+    assert_eq!(out.result, "done");
+}
+
+#[tokio::test]
+async fn retry_exhausts_and_errors() {
+    let client = make_client(vec![flaky("work", "input", usize::MAX, "done")]);
+    let flow = resilience::retry_with_backoff(2, "none", 0, "work", lit("x"), "out");
+    assert!(
+        try_run(&client, &flow).await.is_err(),
+        "retry should exhaust"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// resilience::with_timeout
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn with_timeout_completes_within_budget() {
+    let client = make_client(vec![op("quick", "input", |_| "ok".to_string())]);
+    let flow = resilience::with_timeout(1_000, "quick", lit("x"), "out");
+    let out = run(&client, &flow).await;
+    assert_eq!(out.result, "ok");
+}
+
+#[tokio::test]
+async fn with_timeout_fires_on_a_slow_op() {
+    let client = make_client(vec![slow("slow_op", "input", 50, "late")]);
+    let flow = resilience::with_timeout(5, "slow_op", lit("x"), "out");
+    assert!(
+        try_run(&client, &flow).await.is_err(),
+        "timeout should fire"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// resilience::with_budget
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn with_budget_allows_within_limit() {
+    let client = make_client(vec![op("step", "input", |_| "done".to_string())]);
+    let flow = resilience::with_budget(1, "step", lit("x"), "out");
+    let out = run(&client, &flow).await;
+    assert_eq!(out.result, "done");
+}
+
+#[tokio::test]
+async fn with_budget_zero_does_not_succeed() {
+    let client = make_client(vec![op("step", "input", |_| "done".to_string())]);
+    let flow = resilience::with_budget(0, "step", lit("x"), "out");
+    assert!(
+        try_run(&client, &flow).await.is_err(),
+        "budget 0 must not succeed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// resilience::try_catch
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn try_catch_passes_through_on_success() {
+    let client = make_client(vec![
+        op("body", "input", |_| "ok".to_string()),
+        op("handle", "err", |_| "handled".to_string()),
+    ]);
+    let flow = resilience::try_catch("body", lit("x"), "err", "handle");
+    let out = run(&client, &flow).await;
+    assert_eq!(out.tool_calls, vec!["body"]);
+    assert_eq!(out.result, "ok");
+}
+
+#[tokio::test]
+async fn try_catch_recovers_on_failure() {
+    let client = make_client(vec![
+        flaky("body", "input", usize::MAX, "unused"), // always errors
+        op("handle", "err", |e| format!("handled: {e}")),
+    ]);
+    let flow = resilience::try_catch("body", lit("x"), "err", "handle");
+    let out = run(&client, &flow).await;
+    assert_eq!(out.tool_calls, vec!["body", "handle"]);
+    assert!(
+        out.result.starts_with("handled:"),
+        "handler saw the error: {}",
+        out.result
+    );
+}
+
+// ---------------------------------------------------------------------------
+// fanout::parallel_all
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn parallel_all_runs_every_branch() {
+    let client = make_client(vec![
+        op("a", "input", |_| "ra".to_string()),
+        op("b", "input", |_| "rb".to_string()),
+        op("c", "input", |_| "rc".to_string()),
+    ]);
+    let flow = fanout::parallel_all(&["a", "b", "c"], lit("x"));
+    let out = run(&client, &flow).await;
+    // Output replays in branch order, so this is deterministic.
+    assert_eq!(out.tool_calls, vec!["a", "b", "c"]);
+    assert_eq!(out.result, "rc"); // the last branch's value
+}
+
+// ---------------------------------------------------------------------------
+// dispatch::match_value
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn match_value_dispatches_on_the_bound_subject() {
+    fn status(i: &str) -> String {
+        if i.contains("paid") {
+            "paid".to_string()
+        } else {
+            "open".to_string()
+        }
+    }
+    let make = || {
+        make_client(vec![
+            op("status", "input", status),
+            op("ship", "input", |_| "shipped".to_string()),
+            op("hold", "input", |_| "on hold".to_string()),
+        ])
+    };
+
+    // A matching subject routes to its handler.
+    let client = make();
+    let flow = dispatch::match_value("status", lit("order is paid"), &[("paid", "ship")], "hold");
+    let out = run(&client, &flow).await;
+    assert_eq!(out.tool_calls, vec!["status", "ship"]);
+    assert_eq!(out.result, "shipped");
+
+    // No matching case falls through to the default.
+    let client = make();
+    let flow = dispatch::match_value("status", lit("order is open"), &[("paid", "ship")], "hold");
+    let out = run(&client, &flow).await;
+    assert_eq!(out.tool_calls, vec!["status", "hold"]);
+    assert_eq!(out.result, "on hold");
+}
+
+// ---------------------------------------------------------------------------
+// compose::resilient_call
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn resilient_call_prefers_primary_then_degrades() {
+    fn primary(i: &str) -> String {
+        if i.contains("ok") {
+            "primary-result".to_string()
+        } else {
+            String::new() // empty → fallback degrades to backup
+        }
+    }
+    let make = || {
+        make_client(vec![
+            op("primary", "input", primary),
+            op("backup", "input", |_| "backup-result".to_string()),
+        ])
+    };
+
+    // Primary returns non-empty → fallback wins on primary, retry succeeds first attempt.
+    let client = make();
+    let flow = compose::resilient_call(
+        3,
+        "none",
+        0,
+        1_000,
+        "primary",
+        "backup",
+        lit("ok please"),
+        "out",
+    );
+    let out = run(&client, &flow).await;
+    assert_eq!(out.tool_calls, vec!["primary"]);
+    assert_eq!(out.result, "primary-result");
+
+    // Primary empty → fallback degrades to backup.
+    let client = make();
+    let flow =
+        compose::resilient_call(3, "none", 0, 1_000, "primary", "backup", lit("nope"), "out");
+    let out = run(&client, &flow).await;
+    assert_eq!(out.tool_calls, vec!["primary", "backup"]);
+    assert_eq!(out.result, "backup-result");
 }

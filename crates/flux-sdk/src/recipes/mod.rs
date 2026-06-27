@@ -19,6 +19,10 @@
 //! | [`routing`] | `route` | [`routing::route_intent`] — classify once, then dispatch deterministically |
 //! | [`lookup`] | `fallback` + `Answer` | [`lookup::answer_with_fallback`] — graceful degradation into a typed answer |
 //! | [`batch`] | `each` / `repeat` / `loop` / `race` | [`batch::map_each`], [`batch::repeat_until`], [`batch::poll_for`], [`batch::race_first`] |
+//! | [`resilience`] | `retry` / `timeout` / `budget` / `try` | [`resilience::retry_with_backoff`], [`resilience::with_timeout`], [`resilience::with_budget`], [`resilience::try_catch`] |
+//! | [`fanout`] | `parallel` | [`fanout::parallel_all`] — run ops concurrently |
+//! | [`dispatch`] | `match` | [`dispatch::match_value`] — dispatch on a computed value |
+//! | [`compose`] | nested | [`compose::resilient_call`] — `retry { timeout { fallback {…} } }` |
 //!
 //! ```no_run
 //! use flux_sdk::dsl::*;
@@ -35,5 +39,9 @@
 //! ```
 
 pub mod batch;
+pub mod compose;
+pub mod dispatch;
+pub mod fanout;
 pub mod lookup;
+pub mod resilience;
 pub mod routing;

@@ -91,6 +91,10 @@ them to a `FlowClient` to `analyze` + `execute`:
 | `recipes::routing` | `route_intent` — classify once, then dispatch deterministically |
 | `recipes::lookup` | `answer_with_fallback` — graceful degradation into a typed `Answer` |
 | `recipes::batch` | `map_each`, `repeat_until`, `poll_for`, `race_first` — the loop family |
+| `recipes::resilience` | `retry_with_backoff`, `with_timeout`, `with_budget`, `try_catch` |
+| `recipes::fanout` | `parallel_all` — run ops concurrently |
+| `recipes::dispatch` | `match_value` — dispatch on a computed value |
+| `recipes::compose` | `resilient_call` — `retry { timeout { fallback {…} } }`, nested |
 
 ```rust,ignore
 use flux_sdk::recipes::routing::route_intent;
