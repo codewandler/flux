@@ -51,7 +51,9 @@ the work, gating risky steps as they come.
 
 ```bash
 # Normal: plan + run (prompts to approve risky/destructive steps; Ctrl-C interrupts)
-flux "rename every TODO comment in src/ to FIXME"
+flux run "rename every TODO comment in src/ to FIXME"
+# (a bare first word — `flux rename …` — is refused; `run` or any flag-led form like the ones
+#  below is what launches a turn, so a stray word never starts the agent)
 
 # Run unattended (auto-approve every step — for headless/trusted use)
 flux --yes "delete the *.tmp files in build/"

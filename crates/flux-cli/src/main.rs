@@ -43,10 +43,16 @@ use std::borrow::Cow;
 #[command(
     name = "flux",
     version,
-    about = "flux — the LLM plans, the runtime runs"
+    about = "flux — the LLM plans, the runtime runs",
+    long_about = "flux — the LLM plans, the runtime runs.\n\n\
+        Run the agent with `flux run <prompt>`; with no prompt, `flux` opens the interactive REPL. \
+        A bare `flux <word>` is NOT run as a prompt (so a stray word or a shell completion probe \
+        can't launch an autonomous turn). Other entry points: `flux sessions`, `flux completion \
+        <shell>`, `flux auth`, `flux run <app.flux>`."
 )]
 struct Cli {
-    /// The prompt (joined with spaces if given as multiple words).
+    /// The prompt for a one-shot agent turn. Invoke via `flux run <prompt>` (or the headless `-p`);
+    /// a bare `flux <prompt>` is refused so accidental words don't start a turn.
     prompt: Vec<String>,
 
     /// (Hidden) Non-interactive print mode — a bare prompt is already one-shot, so this is a no-op alias.
@@ -2103,16 +2109,12 @@ async fn main() -> Result<()> {
     if argv.get(1).map(|s| s == "sessions").unwrap_or(false) {
         return run_sessions();
     }
-    // `flux run <app.flux>` runs a multi-agent program — but only when the next arg actually looks
-    // like a program file (a `.flux` path or an existing file), so a normal prompt opening with the
-    // word "run" (e.g. `flux run the tests`) still falls through to the agent.
-    if argv.get(1).map(|s| s == "run").unwrap_or(false)
-        && argv
-            .get(2)
-            .map(|p| p.ends_with(".flux") || std::path::Path::new(p).is_file())
-            .unwrap_or(false)
-    {
-        return run_app_cmd(&argv[2..]).await;
+    // Shell completions. Intercepted before any agent path and printed with ZERO side effects — a
+    // shell sources this while you type (fish's bundled `flux.fish` runs `flux completion fish`), so
+    // it must never start a turn. (A bare prompt "completion fish" used to do exactly that, freezing
+    // the shell mid-keystroke.)
+    if argv.get(1).map(|s| s == "completion").unwrap_or(false) {
+        return run_completion(&argv[2..]);
     }
     if argv.get(1).map(|s| s == "flow").unwrap_or(false) {
         return run_flow(&argv[2..]).await;
@@ -2120,7 +2122,26 @@ async fn main() -> Result<()> {
     if argv.get(1).map(|s| s == "preset").unwrap_or(false) {
         return preset::run_preset(&argv[2..]).await;
     }
-    let cli = Cli::parse();
+    // `flux run …` is the explicit agent/program entry. `flux run <app.flux>` runs a multi-agent
+    // program; `flux run <prompt…>` runs a one-shot agent turn on the prompt. A *bare* prompt
+    // (`flux fix the bug`) is refused below — the agent fires only through `run` (or the headless
+    // `-p` path used by scripts/eval), so a stray word, or a shell completion probe, never launches
+    // an autonomous turn.
+    let via_run = argv.get(1).map(|s| s == "run").unwrap_or(false);
+    if via_run
+        && argv
+            .get(2)
+            .map(|p| p.ends_with(".flux") || std::path::Path::new(p).is_file())
+            .unwrap_or(false)
+    {
+        return run_app_cmd(&argv[2..]).await;
+    }
+    let cli = if via_run {
+        // Parse the flags/prompt that follow `run`, so `flux run -m opus "do X"` works.
+        Cli::parse_from(std::iter::once(argv[0].clone()).chain(argv.iter().skip(2).cloned()))
+    } else {
+        Cli::parse()
+    };
     style::init(cli.color);
     // `-v`/`--verbose` exports `FLUX_VERBOSE` so the sinks (and any sub-process) show full output.
     if cli.verbose {
@@ -2150,6 +2171,19 @@ async fn main() -> Result<()> {
             .unwrap_or(());
         Ok(())
     } else {
+        // A one-shot agent prompt. The agent fires through `flux run <prompt>` or any flag-led
+        // invocation (`flux -m … "…"`, the headless `-p` used by scripts/eval). But a *bare first
+        // word* (`flux fix the bug`, or a shell completion probe like `flux completion fish`) is
+        // refused with a pointer to `run`, so a stray word can never launch an autonomous turn.
+        let bare_word = !via_run && argv.get(1).map(|s| !s.starts_with('-')).unwrap_or(false);
+        if bare_word {
+            eprintln!(
+                "{} `{}` is not a flux command. To run the agent on a prompt, use: `flux run <prompt>`",
+                style::red("error:"),
+                cli.prompt.join(" "),
+            );
+            std::process::exit(2);
+        }
         run_prompt(cli)
             .await
             .map_err(|e| {
@@ -2159,6 +2193,29 @@ async fn main() -> Result<()> {
             .unwrap_or(());
         Ok(())
     }
+}
+
+/// `flux completion <shell>` — print a shell completion script to stdout and exit. Pure output, no
+/// side effects: a shell sources this as you type, so it must never touch the network or start a
+/// turn. Supports bash/zsh/fish/powershell/elvish; defaults to fish.
+fn run_completion(args: &[String]) -> Result<()> {
+    use clap::CommandFactory;
+    use clap_complete::Shell;
+    let shell = match args.first().map(String::as_str) {
+        Some("bash") => Shell::Bash,
+        Some("zsh") => Shell::Zsh,
+        Some("powershell" | "pwsh") => Shell::PowerShell,
+        Some("elvish") => Shell::Elvish,
+        Some("fish") | None => Shell::Fish,
+        Some(other) => {
+            eprintln!(
+                "flux completion: unsupported shell {other:?} (bash|zsh|fish|powershell|elvish)"
+            );
+            return Ok(());
+        }
+    };
+    clap_complete::generate(shell, &mut Cli::command(), "flux", &mut std::io::stdout());
+    Ok(())
 }
 
 /// `flux run <app.flux>` — load and run a multi-agent flux **Program** through the `flux-app` host

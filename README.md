@@ -50,7 +50,7 @@ Prebuilt binaries, installers, and checksums are attached to every
 
 ```bash
 # Ask flux to do something — risky steps prompt for approval; --yes auto-approves
-flux "add a test for the parser"
+flux run "add a test for the parser"
 
 # Preview the plan before running it
 flux --plan "summarize README.md into SUMMARY.txt"
