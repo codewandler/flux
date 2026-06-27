@@ -81,6 +81,11 @@ println!("{}", out.text);
 # Ok(()) }
 ```
 
+## A real consumer
+
+[`flux-recipes`](../flux-recipes) is the first in-repo crate that depends on `flux-sdk`: a cookbook of
+reusable DSL flow recipes (routing, lookup, the loop family) that consume exactly this public surface.
+
 ## Providers
 
 `flux-sdk` is provider-agnostic — pass any `flux_provider::Provider`. The concrete backends

@@ -35,6 +35,7 @@ members = [
     "crates/flux-codegate",
     "crates/flux-cognition",
     "crates/flux-app",
+    "crates/flux-recipes",
 ]
 
 [workspace.package]

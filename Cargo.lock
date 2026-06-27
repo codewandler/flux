@@ -964,6 +964,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "flux-recipes"
+version = "0.2.4"
+dependencies = [
+ "async-trait",
+ "flux-core",
+ "flux-provider",
+ "flux-runtime",
+ "flux-sdk",
+ "flux-spec",
+ "futures",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "flux-runtime"
 version = "0.2.4"
 dependencies = [

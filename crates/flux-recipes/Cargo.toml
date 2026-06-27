@@ -1,0 +1,25 @@
+[package]
+name = "flux-recipes"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "flux-recipes: reusable Flux-Lang flow recipes authored with the Rust DSL (routing, lookup, loops)"
+readme = "README.md"
+
+[dependencies]
+# The first real in-repo consumer of flux-sdk. `flux-sdk.workspace = true` resolves to its path dep —
+# this crate is intentionally NOT in the publish closure (it's a leaf consumer, nobody depends on it).
+flux-sdk.workspace = true
+# Recipe builders construct `lit(json!(...))` inputs/defaults.
+serde_json.workspace = true
+
+[dev-dependencies]
+# Integration tests register mock adapter ops (impl flux_runtime::Tool) and drive them through a
+# FlowClient with a stub provider — no API key. Dev-only; not part of the publish closure.
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+flux-core.workspace = true
+flux-provider.workspace = true
+flux-runtime.workspace = true
+flux-spec.workspace = true
