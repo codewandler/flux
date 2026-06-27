@@ -50,4 +50,5 @@ echo '<json-ast>' | cargo run -p flux-lang --features cli --bin fluxlang -- rend
 - [`docs/reference.md`](docs/reference.md) — every node kind, fields, semantics (node table generated).
 - [`docs/syntax.md`](docs/syntax.md) — the writable text-syntax spec.
 - [`docs/PRD.md`](docs/PRD.md) — design rationale, scope, and roadmap (the two display modes + parser).
+- [`examples/call-routing.flux`](examples/call-routing.flux) — a worked text-syntax example (a model-backed intent step plus deterministic routing).
 - [`AGENTS.md`](AGENTS.md) — contributor contract for this crate.
