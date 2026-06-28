@@ -795,6 +795,20 @@ mod tests {
         }
     }
 
+    /// A provider whose stream emits nothing and never completes — only cancellation can end a call to
+    /// it. Used to prove the compose paths abort promptly on Ctrl-C (mirrors flux-agent's test).
+    struct BlockingProvider;
+
+    #[async_trait]
+    impl Provider for BlockingProvider {
+        fn name(&self) -> &str {
+            "blocking"
+        }
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            Ok(Box::pin(futures::stream::pending::<Result<Chunk>>()))
+        }
+    }
+
     fn engine_with(responses: VecDeque<Vec<Chunk>>, events: Arc<EventStore>) -> FlowEngine {
         engine_with_provider(
             Box::new(MockProvider {
@@ -932,6 +946,36 @@ mod tests {
         let msgs = store.conversation(&sid).unwrap();
         assert_eq!(msgs.len(), 2, "user + the prose answer");
         assert!(msgs[1].text().contains("Echoed hi."));
+    }
+
+    /// `/plan` (plan_turn) is interruptible: a Ctrl-C mid-compose cancels the in-flight planner call
+    /// and returns promptly with `Ok(None)` (nothing to run), rather than blocking until the model
+    /// replies. Without the `select!` on `cancel`, this would hang on the never-completing stream.
+    #[tokio::test]
+    async fn plan_turn_aborts_an_in_flight_compose() {
+        use std::time::Duration;
+
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("blocking").unwrap();
+        let engine = engine_with_provider(Box::new(BlockingProvider), store.clone());
+
+        let cancel = CancellationToken::new();
+        let c2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            c2.cancel();
+        });
+
+        let mut sink = CollectSink::default();
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.plan_turn(&sid, "compose a plan", &mut sink, &cancel),
+        )
+        .await
+        .expect("plan_turn did not return after cancellation")
+        .unwrap();
+
+        assert!(out.is_none(), "a cancelled compose yields no plan to run");
     }
 
     /// Reified await (post-cutover; see the design's turn-boundary section): a top-level `await` inside a

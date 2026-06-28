@@ -1300,18 +1300,32 @@ async fn run_repl(cli: Cli) -> Result<()> {
             continue;
         }
         // Plan mode: compile + show a plan, store it for `/run`, but DON'T execute. Refine by chatting.
+        // Interruptible: the first Ctrl-C drops the in-flight compose and returns to the prompt.
         if plan_mode {
-            let mut sink = CliSink::new(0);
-            match agent.plan_turn(&session_id, input, &mut sink).await {
-                Ok(Some(ast)) => {
-                    pending_plan = Some(ast);
-                    eprintln!(
-                        "{}",
-                        style::dim("(plan ready — `/run` to execute, or send a message to refine)")
-                    );
+            let agent_ref = &agent;
+            let sid_ref = session_id.as_str();
+            let mut new_plan: Option<flux_flow::ast::DraftAst> = None;
+            let plan_slot = &mut new_plan;
+            run_interruptible(move |c| async move {
+                let mut sink = CliSink::new(0);
+                match agent_ref.plan_turn(sid_ref, input, &mut sink, &c).await {
+                    Ok(Some(ast)) => {
+                        *plan_slot = Some(ast);
+                        eprintln!(
+                            "{}",
+                            style::dim(
+                                "(plan ready — `/run` to execute, or send a message to refine)"
+                            )
+                        );
+                    }
+                    Ok(None) => {} // prose answer, or the compose was cancelled — nothing to run
+                    Err(e) => eprintln!("{} {e:#}", style::red("error:")),
                 }
-                Ok(None) => {} // the model answered in prose; nothing to run
-                Err(e) => eprintln!("{} {e:#}", style::red("error:")),
+            })
+            .await;
+            // Only replace a prior pending plan when a fresh one was produced (prose/cancel keep it).
+            if let Some(ast) = new_plan {
+                pending_plan = Some(ast);
             }
             continue;
         }
@@ -1341,19 +1355,40 @@ async fn run_pending_plan(
     agent: &FlowEngine,
     session_id: &str,
     ast: &flux_flow::ast::DraftAst,
-    _cancel: &tokio_util::sync::CancellationToken,
+    cancel: &tokio_util::sync::CancellationToken,
 ) {
     let mut sink = CliSink::new(0);
-    match flux_flow::runtime::execute_flow(&agent.flow, &agent.executor, session_id, ast, &mut sink)
-        .await
-    {
-        Ok(outcome) => {
-            if !outcome.result.trim().is_empty() {
-                println!("{}", outcome.result);
+    // Race execution against `cancel`: `execute_flow` has no cancellation of its own, so Ctrl-C is
+    // honored by dropping the in-flight flow future (which aborts the current op's IO). The future
+    // borrows `sink`, so scope it in a block and read its result out as owned data; `None` => cancelled.
+    let result: Option<Result<String, String>> = {
+        let fut = flux_flow::runtime::execute_flow(
+            &agent.flow,
+            &agent.executor,
+            session_id,
+            ast,
+            &mut sink,
+        );
+        tokio::pin!(fut);
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            res = &mut fut => Some(res.map(|o| o.result).map_err(|e| format!("{e:#}"))),
+        }
+    };
+    match result {
+        Some(Ok(out)) => {
+            if !out.trim().is_empty() {
+                println!("{out}");
             }
             sink.turn_end(None);
         }
-        Err(e) => eprintln!("{} {e:#}", style::red("error:")),
+        Some(Err(e)) => eprintln!("{} {e}", style::red("error:")),
+        None => {
+            // Cancelled: stop the in-flight op's spinner and return to the prompt.
+            sink.turn_end(None);
+            eprintln!("{}", style::dim("(cancelled)"));
+        }
     }
 }
 
