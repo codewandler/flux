@@ -104,21 +104,25 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
 
+    // `COLOR` is a process-global, and cargo runs unit tests concurrently in one process — so the
+    // disabled- and enabled-color assertions must live in ONE test. Splitting them lets the two tests
+    // race on the global (one flips it to `true` mid-way through the other's `== "x"` checks), which is
+    // the source of the historical `helpers_noop_when_disabled` flake. Keep them in a single test.
     #[test]
-    fn helpers_noop_when_disabled() {
+    fn helpers_track_the_color_toggle() {
+        // Disabled: every helper is a no-op passthrough.
         COLOR.store(false, Ordering::Relaxed);
         assert_eq!(dim("x"), "x");
         assert_eq!(cyan("x"), "x");
         assert!(!rule(20).contains('\x1b'));
         assert!(matches!(plan_palette().op, ("", "")));
-    }
 
-    #[test]
-    fn helpers_wrap_when_enabled() {
+        // Enabled: helpers wrap with ANSI codes.
         COLOR.store(true, Ordering::Relaxed);
         assert_eq!(green("ok"), "\x1b[32mok\x1b[0m");
         assert!(plan_palette().op.0.contains("36"));
-        COLOR.store(false, Ordering::Relaxed); // reset for other tests
+
+        COLOR.store(false, Ordering::Relaxed); // reset the global for color-reading code elsewhere
     }
 
     #[test]
