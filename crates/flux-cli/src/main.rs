@@ -100,6 +100,12 @@ struct Cli {
     #[arg(short = 'v', long)]
     verbose: bool,
 
+    /// Reveal the agent loop: stream the loop-machinery ops (`plan`/`run_plan`/`observe`/…) that are
+    /// filtered from the surface by default, so you can watch each turn iterate. Also enabled by
+    /// `FLUX_SHOW_LOOP`. See `flux loop show` for the loop itself and `/evidence` for the audit trail.
+    #[arg(long)]
+    show_loop: bool,
+
     /// When to colorize output: auto (a terminal, `NO_COLOR` unset), always, or never.
     #[arg(long, value_enum, default_value_t)]
     color: style::ColorChoice,
@@ -378,6 +384,67 @@ fn run_sessions() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `flux loop [show|eject]` — inspect and customize the flux-lang agent loop that drives every turn.
+///
+/// The loop is real Flux-Lang (`assets/agent-loop.flux`): `plan → match → run_plan → observe`,
+/// repeated until the model answers in prose. `show` prints the active loop (a workspace
+/// `.flux/agent-loop.flux` override if present, else the built-in); `eject` writes the built-in to
+/// `.flux/agent-loop.flux` so it can be edited (the engine honors the override on the next turn).
+fn run_loop_cmd(args: &[String]) -> Result<()> {
+    use flux_flow::engine::{agent_loop_source, builtin_agent_loop, load_agent_loop, LoopSource};
+
+    let cwd = std::env::current_dir().context("current dir")?;
+    match args.first().map(String::as_str) {
+        // Default to `show`.
+        None | Some("show") => {
+            let (source, text) = agent_loop_source(&cwd);
+            match &source {
+                LoopSource::Builtin => {
+                    eprintln!("{} built-in (compiled-in default)", style::bold("source:"));
+                }
+                LoopSource::Override(path) => {
+                    eprintln!("{} {}", style::bold("source:"), path.display());
+                    // The engine errors on a bad override rather than silently using the built-in, so
+                    // surface a parse failure here too instead of pretending the override is live.
+                    if let Err(e) = load_agent_loop(&cwd) {
+                        eprintln!("{} {e}", style::red("invalid override:"));
+                    }
+                }
+            }
+            eprintln!();
+            // The loop text goes to stdout so `flux loop show` is pipeable.
+            print!("{text}");
+            if !text.ends_with('\n') {
+                println!();
+            }
+            Ok(())
+        }
+        Some("eject") | Some("init") => {
+            let force = args.iter().any(|a| a == "--force" || a == "-f");
+            let dir = cwd.join(".flux");
+            let path = dir.join("agent-loop.flux");
+            if path.exists() && !force {
+                bail!(
+                    "{} already exists — edit it directly, or pass --force to overwrite with the built-in",
+                    path.display()
+                );
+            }
+            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+            std::fs::write(&path, builtin_agent_loop())
+                .with_context(|| format!("write {}", path.display()))?;
+            eprintln!(
+                "{} {} — edit it to customize the loop (the engine uses it on the next turn)",
+                style::green("wrote"),
+                path.display()
+            );
+            Ok(())
+        }
+        Some(other) => {
+            bail!("unknown `flux loop` command: {other}\nusage: flux loop [show|eject [--force]]");
+        }
+    }
 }
 
 /// Open the unified event store under `~/.flux/events.db` (conversation + run trace + turn telemetry).
@@ -1096,6 +1163,10 @@ async fn run_repl(cli: Cli) -> Result<()> {
                         ("/shell", "toggle the generic bash op (off by default)"),
                         ("/tools", "list available tools"),
                         (
+                            "/evidence",
+                            "show the audit trail this session has recorded",
+                        ),
+                        (
                             "/model <spec>",
                             "switch model (e.g. opus, sonnet, openai/gpt-4o)",
                         ),
@@ -1251,6 +1322,12 @@ async fn run_repl(cli: Cli) -> Result<()> {
                     let mut names = agent.executor.registry().names();
                     names.sort();
                     eprintln!("tools: {}", names.join(", "));
+                }
+                "evidence" => {
+                    // The audit trail the loop and the dispatcher have recorded this session: tool
+                    // calls/errors, per-iteration markers, and any flow-emitted observations. This is
+                    // the same shared log the `observe`/`evidence`/grading ops read.
+                    eprintln!("{}", format_evidence(&agent.executor.evidence()));
                 }
                 "session" => eprintln!("session {session_id} · model {}", agent.model),
                 "sessions" => match agent.events.list(30) {
@@ -1614,10 +1691,76 @@ struct SpinnerState {
 /// Render an op call as a concise, colored *semantic* label: the cyan op name padded to a gutter, then
 /// a readable argument — `bash → $ cargo test`, `read → foo.rs:100-180`, `grep → "needle" in src/`. The
 /// arg is capped unless `-v`; the full plan is always shown separately (the `flow.plan` tree).
+/// Render the session's evidence log for `/evidence`: a one-line summary plus one line per
+/// observation (phase, kind, compact data), flagging `tool_error` rows. Returns the empty-state
+/// message when nothing has been recorded yet. Reads the same shared log the `observe`/`evidence`/
+/// grading ops write.
+fn format_evidence(log: &flux_evidence::EvidenceLog) -> String {
+    let obs = log.all();
+    if obs.is_empty() {
+        return "no evidence recorded yet — run a turn first".to_string();
+    }
+    let errors = obs.iter().filter(|o| o.kind == "tool_error").count();
+    let iters = obs.iter().filter(|o| o.kind == "turn.iteration").count();
+    let mut out = format!(
+        "evidence: {} observation{}, {iters} iteration{}, {errors} error{}",
+        obs.len(),
+        if obs.len() == 1 { "" } else { "s" },
+        if iters == 1 { "" } else { "s" },
+        if errors == 1 { "" } else { "s" },
+    );
+    for o in obs {
+        // Pad before coloring — `{:<N}` counts ANSI bytes, so styling a padded column would break
+        // alignment.
+        let phase = format!("{:<9}", format!("{:?}", o.phase).to_lowercase());
+        let mark = if o.kind == "tool_error" {
+            style::red("!")
+        } else {
+            " ".to_string()
+        };
+        let data = if o.data.is_null() {
+            String::new()
+        } else {
+            truncate(&o.data.to_string(), 100)
+        };
+        out.push_str(&format!(
+            "\n  {mark} {} {:<16} {}",
+            style::dim(&phase),
+            o.kind,
+            style::dim(&data)
+        ));
+    }
+    out
+}
+
+/// A compact, readable label for a loop-machinery op (`plan`/`run_plan`/`observe`/…) shown when
+/// `--show-loop` reveals the loop. Returns `None` for ordinary ops (which fall through to the normal
+/// label path). These ops carry large inputs, so the label deliberately omits the payload.
+fn loop_machinery_label(name: &str, input: &Value) -> Option<String> {
+    let (verb, note) = match name {
+        "plan" => ("plan", "ask the model"),
+        "run_plan" => ("run plan", "execute the emitted graph"),
+        "observe" => {
+            let kind = input.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            return Some(format!("{}  {}", style::cyan("observe"), style::dim(kind)));
+        }
+        "evidence" => ("evidence", "read the audit trail"),
+        "metrics" => ("metrics", "calls / errors / iterations"),
+        "grade" => ("grade", "check a criterion"),
+        _ => return None,
+    };
+    Some(format!("{}  {}", style::cyan(verb), style::dim(note)))
+}
+
 fn render_call_label(name: &str, input: &Value, verbose: bool) -> String {
     // Column width: wide enough for the longest built-in op name (`web_fetch` = 9).
     const GUTTER: usize = 10;
     const ARG_CAP: usize = 120;
+    // The loop machinery (revealed by `--show-loop`) carries large inputs — a plan AST, a transcript.
+    // Give those a compact, readable label so the stream reads as loop iterations, not a payload dump.
+    if let Some(label) = loop_machinery_label(name, input) {
+        return label;
+    }
     let call = flux_tui::toolview::format_call(name, input);
     let verb = style::cyan(&call.verb);
     if call.arg.is_empty() {
@@ -2310,6 +2453,11 @@ async fn main() -> Result<()> {
     if argv.get(1).map(|s| s == "preset").unwrap_or(false) {
         return preset::run_preset(&argv[2..]).await;
     }
+    // `flux loop` shows/scaffolds the flux-lang agent loop that drives every turn — no side effects,
+    // so it sits beside the other read-only subcommands and never starts a turn.
+    if argv.get(1).map(|s| s == "loop").unwrap_or(false) {
+        return run_loop_cmd(&argv[2..]);
+    }
     // `flux run …` is the explicit agent/program entry. `flux run <app.flux>` runs a multi-agent
     // program; `flux run <prompt…>` runs a one-shot agent turn on the prompt. A *bare* prompt
     // (`flux fix the bug`) is refused below — the agent fires only through `run` (or the headless
@@ -2334,6 +2482,10 @@ async fn main() -> Result<()> {
     // `-v`/`--verbose` exports `FLUX_VERBOSE` so the sinks (and any sub-process) show full output.
     if cli.verbose {
         std::env::set_var("FLUX_VERBOSE", "1");
+    }
+    // `--show-loop` exports `FLUX_SHOW_LOOP` so the engine's drain reveals the loop machinery.
+    if cli.show_loop {
+        std::env::set_var("FLUX_SHOW_LOOP", "1");
     }
     if let Some(addr) = cli.serve.clone() {
         run_serve(cli, addr).await
@@ -2635,12 +2787,67 @@ async fn run_prompt(cli: Cli) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{tool_preview, truncate};
+    use super::{format_evidence, loop_machinery_label, tool_preview, truncate};
+    use serde_json::json;
 
     #[test]
     fn truncate_caps_with_ellipsis() {
         assert_eq!(truncate("hello", 10), "hello");
         assert_eq!(truncate("hello", 3), "hel…");
+    }
+
+    #[test]
+    fn format_evidence_empty_is_a_hint() {
+        let log = flux_evidence::EvidenceLog::new();
+        assert!(format_evidence(&log).contains("no evidence recorded yet"));
+    }
+
+    #[test]
+    fn format_evidence_summarizes_and_lists_observations() {
+        use flux_evidence::{EvidenceLog, Observation, Phase};
+        let mut log = EvidenceLog::new();
+        log.record(Observation::new(
+            "tool_call",
+            Phase::Turn,
+            json!({"tool": "read"}),
+        ));
+        log.record(Observation::new(
+            "tool_error",
+            Phase::Turn,
+            json!({"tool": "cargo_test"}),
+        ));
+        log.record(Observation::new(
+            "turn.iteration",
+            Phase::Turn,
+            json!({"steps": 3}),
+        ));
+
+        let out = format_evidence(&log);
+        // Summary line counts observations, iterations, and errors (correctly pluralized).
+        assert!(out.contains("3 observations"), "{out}");
+        assert!(out.contains("1 iteration,"), "singular iteration: {out}");
+        assert!(out.contains("1 error"), "{out}");
+        // Each observation kind is listed verbatim (the kind column is not colored).
+        assert!(out.contains("tool_call"), "{out}");
+        assert!(out.contains("tool_error"), "{out}");
+        assert!(out.contains("turn.iteration"), "{out}");
+    }
+
+    #[test]
+    fn loop_machinery_label_only_relabels_machinery_ops() {
+        assert!(loop_machinery_label("plan", &json!({}))
+            .unwrap()
+            .contains("ask the model"));
+        assert!(loop_machinery_label("run_plan", &json!({}))
+            .unwrap()
+            .contains("run plan"));
+        // `observe` surfaces its kind; ordinary ops fall through (None) to the normal label path.
+        assert!(
+            loop_machinery_label("observe", &json!({"kind": "turn.iteration"}))
+                .unwrap()
+                .contains("turn.iteration")
+        );
+        assert!(loop_machinery_label("read", &json!({"file": "x"})).is_none());
     }
 
     #[test]

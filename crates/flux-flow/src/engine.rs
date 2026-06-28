@@ -193,19 +193,21 @@ impl FlowEngine {
         );
         tokio::pin!(flow_fut);
 
+        // Reveal the loop machinery on the surface when `--show-loop`/`FLUX_SHOW_LOOP` is set.
+        let reveal = show_loop();
         let outcome = loop {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
-                    while let Ok(ev) = rx.try_recv() { drain_event(ev, sink); }
+                    while let Ok(ev) = rx.try_recv() { drain_event(ev, sink, reveal); }
                     let _ = self.events.end_turn(session_id, turn_id, "cancelled", 0, "(turn cancelled)");
                     return self.finish_turn(session_id, sink, "(turn cancelled)", true);
                 }
                 maybe = rx.recv() => {
-                    if let Some(ev) = maybe { drain_event(ev, sink); }
+                    if let Some(ev) = maybe { drain_event(ev, sink, reveal); }
                 }
                 res = &mut flow_fut => {
-                    while let Ok(ev) = rx.try_recv() { drain_event(ev, sink); }
+                    while let Ok(ev) = rx.try_recv() { drain_event(ev, sink, reveal); }
                     break res;
                 }
             }
@@ -611,12 +613,37 @@ fn has_tool_result(msg: &Message) -> bool {
         .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
 }
 
+/// Where the active agent loop came from — what [`agent_loop_source`] resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoopSource {
+    /// The compiled-in default (`assets/agent-loop.flux`).
+    Builtin,
+    /// A workspace override read from this path (`.flux/agent-loop.flux`).
+    Override(std::path::PathBuf),
+}
+
+/// The compiled-in default agent loop, as readable Flux-Lang text. This is the loop every turn runs
+/// unless a workspace overrides it; surfaced by `flux loop show`.
+pub fn builtin_agent_loop() -> &'static str {
+    include_str!("../assets/agent-loop.flux")
+}
+
+/// Resolve the active agent loop's source + text: a readable `.flux/agent-loop.flux` override if the
+/// workspace has one, otherwise the built-in. Reads the file but does not parse it (see
+/// [`load_agent_loop`]); an unreadable override falls back to the built-in, matching the engine.
+pub fn agent_loop_source(cwd: &std::path::Path) -> (LoopSource, String) {
+    let override_path = cwd.join(".flux").join("agent-loop.flux");
+    match std::fs::read_to_string(&override_path) {
+        Ok(src) => (LoopSource::Override(override_path), src),
+        Err(_) => (LoopSource::Builtin, builtin_agent_loop().to_string()),
+    }
+}
+
 /// Load the agent loop: a `.flux/agent-loop.flux` in the workspace overrides the built-in (so a project
 /// can shape its own loop), otherwise the compiled-in `agent-loop.flux`. Parsed as a [`DraftAst`].
-fn load_agent_loop(cwd: &std::path::Path) -> Result<DraftAst> {
-    const BUILTIN: &str = include_str!("../assets/agent-loop.flux");
-    let override_path = cwd.join(".flux").join("agent-loop.flux");
-    let src = std::fs::read_to_string(&override_path).unwrap_or_else(|_| BUILTIN.to_string());
+/// `Err` if an override exists but is not valid Flux-Lang — `flux loop show` surfaces that.
+pub fn load_agent_loop(cwd: &std::path::Path) -> Result<DraftAst> {
+    let (_source, src) = agent_loop_source(cwd);
     // The loop is written in readable Flux-Lang text (it round-trips through `format`/`parse`), so parse
     // it through the language surface rather than the JSON wire form.
     flux_lang::parse::parse(&src)
@@ -630,8 +657,17 @@ const MACHINERY_OPS: &[&str] = &[
     "plan", "run_plan", "observe", "evidence", "metrics", "grade",
 ];
 
-/// Drain one captured sink event onto the real sink, dropping the loop-machinery tool calls/results.
-fn drain_event(ev: crate::loop_host::SinkEvent, sink: &mut dyn AgentSink) {
+/// Whether the loop-machinery ops are revealed on the surface — the CLI `--show-loop`, exported as
+/// `FLUX_SHOW_LOOP` so the engine reads it without new plumbing. When set, the user watches the loop
+/// iterate (`plan → run_plan → observe`) instead of only the work the inner plan performs.
+pub fn show_loop() -> bool {
+    std::env::var_os("FLUX_SHOW_LOOP").is_some()
+}
+
+/// Drain one captured sink event onto the real sink. By default the loop-machinery tool calls/results
+/// are dropped (the surface shows real work, not plumbing); `reveal` keeps them so `--show-loop` can
+/// stream the loop's own iterations.
+fn drain_event(ev: crate::loop_host::SinkEvent, sink: &mut dyn AgentSink, reveal: bool) {
     use crate::loop_host::SinkEvent;
     let machinery = match &ev {
         SinkEvent::ToolCall(name, _) | SinkEvent::ToolResult(name, _) => {
@@ -639,7 +675,7 @@ fn drain_event(ev: crate::loop_host::SinkEvent, sink: &mut dyn AgentSink) {
         }
         _ => false,
     };
-    if !machinery {
+    if reveal || !machinery {
         ev.apply(sink);
     }
 }
@@ -883,6 +919,56 @@ mod tests {
             ast, reparsed,
             "agent-loop.flux round-trips through format/parse"
         );
+    }
+
+    /// `drain_event` hides the loop machinery by default and reveals it under `--show-loop`: a `plan`
+    /// tool-call is dropped when `reveal=false`, kept when `reveal=true`, while real work (`read`)
+    /// always streams.
+    #[test]
+    fn drain_event_hides_machinery_unless_revealed() {
+        use crate::loop_host::SinkEvent;
+        let plan_call = || SinkEvent::ToolCall("plan".into(), json!({}));
+        let read_call = || SinkEvent::ToolCall("read".into(), json!({}));
+
+        let mut hidden = CollectSink::default();
+        drain_event(plan_call(), &mut hidden, false);
+        drain_event(read_call(), &mut hidden, false);
+        assert_eq!(hidden.tools, vec!["read"], "machinery filtered by default");
+
+        let mut revealed = CollectSink::default();
+        drain_event(plan_call(), &mut revealed, true);
+        drain_event(read_call(), &mut revealed, true);
+        assert_eq!(
+            revealed.tools,
+            vec!["plan", "read"],
+            "--show-loop reveals the machinery too"
+        );
+    }
+
+    /// `agent_loop_source` returns the built-in when no override exists, and the override (with its
+    /// path + text) when the workspace has one.
+    #[test]
+    fn agent_loop_source_picks_override_over_builtin() {
+        let dir = std::env::temp_dir().join(format!("flux-loop-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (source, text) = agent_loop_source(&dir);
+        assert_eq!(source, LoopSource::Builtin);
+        assert_eq!(text, builtin_agent_loop());
+
+        let override_path = dir.join(".flux").join("agent-loop.flux");
+        std::fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &override_path,
+            "flow agent-loop -> string\n  return \"hi\"\n",
+        )
+        .unwrap();
+        let (source, text) = agent_loop_source(&dir);
+        assert_eq!(source, LoopSource::Override(override_path));
+        assert!(text.contains("return \"hi\""));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
