@@ -73,7 +73,7 @@ before every release.
     `/shell`). Session-data analysis drove the dedicated-op coverage that makes default-off viable:
     `expr` extended with comparison/boolean/string ops, `now`/`cwd`/`sys_info`, `len`/`first`/`last`/
     `filter`, and the `go`/`node`/`python`/`make` toolchain ops. See
-    [designs/bash-replacement.md](designs/bash-replacement.md).
+    [archive/designs/bash-replacement.md](archive/designs/bash-replacement.md).
   - **The flux-lang agent loop is now observable.** The self-hosted loop (`agent-loop.flux`) shipped
     transparent (zero surface change); these make it visible: `flux run --show-loop` reveals the
     `plan → run_plan → observe` machinery live, the REPL `/evidence` prints the audit trail, and
@@ -128,6 +128,25 @@ before every release.
 **Deferred behind existing seams (add on concrete demand):**
 - A `deno_core` / `rustyscript` hook backend (async / TypeScript / npm) behind the `PreToolHook` seam.
 - A `chromiumoxide` CDP browser tool (navigate/screenshot; needs Chrome) behind the `flux-browser` surface.
+
+## Known divergences / decisions pending
+
+Drift made visible, so it stops being silent. Each maps to a story on the
+[board](stories/README.md):
+
+- **Two turn loops.** The CLI/TUI/server run the pure-DAG `FlowEngine`, but the SDK's
+  `flux_sdk::Client` still drives the classic `flux-agent::Agent` loop. Unify onto
+  `FlowEngine`/`FlowClient` and retire `flux-agent::Agent` (ref
+  [designs/flux-flow.md](designs/flux-flow.md) §11). → [A-01](stories/A-01-unify-flowengine.md).
+- **Crate consolidation phases 2–4** (33 → ~28–29). → [C-01](stories/C-01-crate-consolidation.md).
+- **crates.io publish** blocked on the `flux-core` name (needs a vanity prefix); deferred.
+- **Self-improvement headline gain** still lacks a trials ≥ 3, grader-confirmed result.
+  → [I-01](stories/I-01-headline-gain.md).
+
+## Backlog (product improvements)
+
+- **Load skills from a user/global dir** (e.g. `~/.flux/skills`) in addition to the project
+  `.flux/skills`, so global skills needn't be copied per-project. → [L-01](stories/L-01-global-skills.md).
 
 ## Direction
 

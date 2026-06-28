@@ -4,6 +4,17 @@ This file is the contributor contract for both human developers and AI agents. *
 
 ---
 
+## Start here (every session)
+
+1. **Product** — flux is a deterministic agent platform on one thesis (*the LLM is not the runtime*) with three co-equal pillars: the **Agent**, the **Language** (Flux-Lang), and the **Improvement** loop. If you don't already hold this, skim [docs/README.md](docs/README.md) and [docs/vision.md](docs/vision.md).
+2. **What to work on** — open the board: **[docs/stories/README.md](docs/stories/README.md)**. Take the top `ready` story by priority, unless the user named a specific story.
+3. **The contract** — read that story file (`docs/stories/<id>-*.md`); its **Goal + Acceptance** define what "done" means.
+4. **Do the work** — non-trivial design goes in [docs/designs/](docs/designs/); implement; satisfy Acceptance with a **failing-first test**; run the dev loop below until the gate is green.
+5. **On done** — set the story's `status: done`, remove its row from the board, add a CHANGELOG entry, and keep design/plan docs in sync.
+6. **New or unscoped work?** Create a story first from [docs/stories/_TEMPLATE.md](docs/stories/_TEMPLATE.md) so the next agent inherits the context.
+
+---
+
 ## What flux is
 
 A Rust **agent SDK, harness, and coding agent** built as one Cargo workspace of small, strictly-layered crates. The defining idea: **the LLM is not the runtime.** The model is a compiler front-end that emits a typed Flux-Lang plan (a graph); a deterministic runtime executes that plan through one mandatory safety envelope — authorization → approval → guarded IO. Every operation, whether a file read, a shell command, a sub-agent call, or a plugin operation, traverses that envelope. **There are no bypass paths. Don't add one.**

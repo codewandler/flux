@@ -52,7 +52,7 @@ Markdown rendering in the CLI — the highest-frequency dogfood readability gap 
 ## [0.2.3] — 2026-06-25
 
 Dogfood-driven fixes — surfaced by driving flux's own agentic mode on real coding tasks (see
-[docs/dogfood-notes.md](docs/dogfood-notes.md)). flux completed every task; the friction was in the
+[docs/archive/notes/dogfood-notes.md](docs/archive/notes/dogfood-notes.md)). flux completed every task; the friction was in the
 tooling/UX layer.
 
 ### Fixed

@@ -13,6 +13,22 @@ request into a typed, readable execution **plan** (a Flux-Lang graph), and a det
 runtime executes that plan through one mandatory chain (**authorization → approval → guarded IO**).
 You see the plan before it runs, and the same plan can be re-run.
 
+## Three pillars
+
+flux is one platform on that thesis, with three **co-equal** pillars. The safety core, providers,
+tools, and orchestration are shared machinery beneath them:
+
+1. **The Agent** — a zero-config personal coding agent (CLI/TUI), an embeddable Rust SDK, and a
+   deployable HTTP server. The pillar most users touch; its internal surface priority is set out in
+   *Audience & priority* below.
+2. **The Language (Flux-Lang)** — the typed plan format the agent compiles into. It is
+   **machine-generated** (emitted from natural language as JSON or native text), **human-readable**
+   (you audit every plan before it runs), and **lightly human-editable** (nudge a plan, not author
+   one from scratch). It is deliberately *not* a hand-written general-purpose language.
+3. **The Improvement Loop** — the eval + self-improvement harness (`flux-eval`), kept inside the repo
+   because it is used directly to make flux better at real coding work; the closer to the code, the
+   better.
+
 ## North star: the LLM is not the runtime
 
 **The single property flux must get right above all else is that the model proposes and the runtime
@@ -36,9 +52,9 @@ stays non-negotiable: the envelope is the one choke point that no tool, plugin, 
 path may route around, a new bypass is a release blocker, and the no-bypass invariants are covered by
 tests.
 
-## Audience & priority
+## Audience & priority (within the Agent pillar)
 
-flux is built in this order, and ambiguity is resolved in favor of the earlier tier:
+The Agent pillar ships in this order, and ambiguity is resolved in favor of the earlier tier:
 
 1. **Personal coding agent** — a zero-config CLI/TUI that is a credible daily driver for real coding
    work on your own machine. This comes first; if a platform feature would compromise the local

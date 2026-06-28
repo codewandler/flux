@@ -23,7 +23,7 @@ Three further facts about flux shape this prompt and make it *not* a clone of Cl
 
 1. **flux prints replies as raw, unrendered markdown.** `CliSink` writes text deltas straight to
    stdout (`crates/flux-cli/src/main.rs`), so `##` and `**` show up as literal clutter
-   ([dogfood-notes.md](../dogfood-notes.md) F2). Where the whole field says *"use GitHub-flavored
+   ([dogfood-notes.md](../notes/dogfood-notes.md) F2). Where the whole field says *"use GitHub-flavored
    markdown"* (Claude Code) or *"the CLI will style your plain text"* (Codex), flux must say the
    opposite: **keep the final message plain.**
 2. **flux's tools have specific shapes the model must respect.** `grep` matches a **literal
@@ -147,5 +147,5 @@ Every section earns its place from a proven technique in the corpus, retargeted 
 Replace the `DEFAULT_SYSTEM_PROMPT` literal at `crates/flux-agent/src/lib.rs:22`. The prompt is
 written to sit *above* the runtime-injected environment/git/repo/skill blocks, so no other change to
 the `Projector` is needed. Worth pairing with a dogfood batch (the same protocol as
-[dogfood-notes.md](../dogfood-notes.md)) to confirm the envelope-awareness section actually cuts the
+[dogfood-notes.md](../notes/dogfood-notes.md)) to confirm the envelope-awareness section actually cuts the
 wasted approval/redaction retries it targets.

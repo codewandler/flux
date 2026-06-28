@@ -37,6 +37,67 @@ envelope" structurally hard. Notable rules that fall out:
   observation sink) as injected traits, so it has no L1+ flux dependency. The L3 `flux-flow` engine
   adapts its safety envelope onto those traits and re-exports `flux-lang` as a facade.
 
+## Crate map by pillar
+
+The layer table above is the *dependency* view (what may depend on what). Here is the same workspace
+grouped by **which pillar each crate serves** — the three pillars ([docs map](README.md)) plus the
+shared machinery beneath them. "Disposition" flags a planned move; see
+[designs/crate-consolidation.md](designs/crate-consolidation.md) and the
+[story board](stories/README.md).
+
+### Shared core & safety (machinery beneath all three pillars)
+| Crate | Layer | Role | Disposition |
+|---|---|---|---|
+| `flux-core` | L0 | content / message / streaming types, core errors | — |
+| `flux-spec` | L0 | tool specs, effects, risk, intents | — |
+| `flux-policy` | L0 | authorization engine (default-deny grants) | — |
+| `flux-secret` | L0 | secret refs + redaction | — |
+| `flux-evidence` | L0 | observations / evidence log | — |
+| `flux-config` | L0 | `.flux/config.toml` loading + precedence | — |
+| `flux-skill` | L0 | skill defs + trigger matching | — |
+| `flux-provider` | L1 | the `Provider` abstraction (published) | — |
+| `flux-providers` | L1 | concrete clients (anthropic / openai / openrouter / ollama) | — |
+| `flux-credentials` | L1 | credential store (PKCE, token import) | — |
+| `flux-system` | L2 | guarded IO — the *only* real fs / proc / net | — |
+| `flux-runtime` | L2 | `Executor::dispatch` — the safety envelope | absorbs `flux-context` (consolidation P4) |
+| `flux-tools` | L2 | built-in tools (read / write / edit / grep / …) | — |
+| `flux-events` | L2 | append-only event store (SQLite) | — |
+| `flux-context` | L2 | context projector + compaction | → fold into `flux-runtime` (P4) |
+| `flux-codegate` | infra | the layering lint (enforces L0→L6) | — |
+
+### Agent pillar
+| Crate | Layer | Role | Disposition |
+|---|---|---|---|
+| `flux-flow` | L3 | the FlowEngine: compile NL→plan, execute the DAG, session store | — |
+| `flux-agent` | L3 | the *classic* provider-native loop (SDK door only) | retire → [A-01](stories/A-01-unify-flowengine.md) |
+| `flux-orchestrate` | L3 | sub-agents + multi-agent orchestration | — |
+| `flux-cognition` | L3 | model-backed ops (`ai.extract` / `rank` / `judge` / …) | — |
+
+### Language pillar
+| Crate | Layer | Role | Disposition |
+|---|---|---|---|
+| `flux-lang` | L0 | the Flux-Lang language: AST, analyzer, reference interpreter, schema (effects injected via traits) | — |
+
+### Improvement pillar
+| Crate | Layer | Role | Disposition |
+|---|---|---|---|
+| `flux-eval` | L3 | benchmark adapters, task mining, the self-improvement harness | — |
+
+### Surfaces & extensions (deliver the Agent pillar)
+| Crate | Layer | Role | Disposition |
+|---|---|---|---|
+| `flux-cli` | L6 | the `flux` binary (REPL, one-shot, subcommands) | — |
+| `flux-tui` | L6 | ratatui chat UI | — |
+| `flux-server` | L6 | axum HTTP API + SSE (bearer-auth) | — |
+| `flux-sdk` | L6 | embeddable API (`Client` + `FlowClient`, DSL, recipes) | — |
+| `flux-app` | L6 | multi-agent Program runtime host (`flux run app.flux`) | — |
+| `flux-integrations` | L6 | Slack parsing + webhook | orphan → fold or remove (P4) |
+| `flux-plugin` | L4 | subprocess plugins (NDJSON, capability-gated) | absorbs `flux-hooks` (P2) |
+| `flux-hooks` | L4 | JS pre-tool hooks | → merge into `flux-plugin` (P2) |
+| `flux-browser` | L5 | `web_fetch` (SSRF-guarded); CDP browser deferred | → `flux-capabilities` (P3) |
+| `flux-datasource` | L5 | keyword index + search; RAG deferred | → `flux-capabilities` (P3) |
+| `flux-auth` | L5 | caller identity (`LocalIdentity`; OIDC seam) | thin seam — keep |
+
 ## The safety envelope (the execution substrate)
 
 Every plan node lowers onto one non-bypassable chain in `flux-runtime::Executor::dispatch` — the

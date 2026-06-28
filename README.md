@@ -16,7 +16,13 @@ What that buys you:
 - **Token efficiency** — tool outputs are stored as symbols, not re-sent on every turn
 - **Repeatability** — a plan is an artifact; re-running it costs zero extra model calls
 
-flux ships as a zero-config CLI/TUI for daily coding work, an embeddable Rust SDK, and an HTTP server — all built on the same strictly-layered crate workspace.
+flux is one platform on that thesis, with three **co-equal pillars**:
+
+1. **The Agent** — a zero-config CLI/TUI coding agent, an embeddable Rust SDK, and an HTTP server. What most people touch.
+2. **The Language (Flux-Lang)** — the typed plan format the agent compiles into: machine-generated, human-readable, lightly human-editable. Not a language you hand-write from scratch.
+3. **The Improvement Loop** — an eval + self-improvement harness (`flux-eval`) kept in-repo because it's used directly to make flux better at real coding work.
+
+All three live in one strictly-layered Cargo workspace. New here? [`docs/README.md`](docs/README.md) is the full map.
 
 ---
 
