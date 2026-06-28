@@ -52,6 +52,24 @@ struct TurnCtx {
     sink: Arc<Mutex<dyn AgentSink>>,
 }
 
+/// Retry-breaker thresholds. Without a guard the agent loop can replay a byte-identical failing (or
+/// no-progress) `run_plan` round all the way to the iteration cap (~25), burning ~140 s for nothing.
+/// We count consecutive identical `run_plan` transcripts and act: escalate the feedback, then stop.
+const STALL_ESCALATE: u32 = 2; // 2nd identical round → inject a stronger "stop repeating" directive
+const STALL_STOP: u32 = 4; // 4th identical round → end the turn honestly instead of looping
+
+/// Per-turn loop-guard state for the retry-breaker. Reset each turn in [`EngineLoopHost::set_turn`].
+#[derive(Default)]
+struct LoopGuard {
+    /// The previous `run_plan` transcript — an unchanged, non-empty one means the round made no progress.
+    last_transcript: Option<String>,
+    /// Consecutive count of that identical transcript.
+    stall: u32,
+    /// Armed once the stall reaches [`STALL_STOP`]: the honest message the next `plan` returns (as a
+    /// `chat`) to terminate the loop via the flow's existing `case "chat"`.
+    force_stop: Option<String>,
+}
+
 /// The engine-side reflexive host. Holds the stable machinery the two ops need that a `ToolContext`
 /// does not carry — the planner (provider + model), the shared store, a `Weak` back to the executor it
 /// re-enters — plus the per-turn [`TurnCtx`] (session + sink), updated each turn.
@@ -70,6 +88,8 @@ pub struct EngineLoopHost {
     opts: CompileOptions,
     /// Per-turn session + sink, set by [`set_turn`](Self::set_turn) before each run.
     turn: Mutex<TurnCtx>,
+    /// Retry-breaker state, reset per turn — stops a stalled loop from replaying to the cap.
+    guard: Mutex<LoopGuard>,
 }
 
 impl EngineLoopHost {
@@ -106,6 +126,7 @@ impl EngineLoopHost {
                     base_system,
                     sink,
                 }),
+                guard: Mutex::new(LoopGuard::default()),
             });
             *slot2.lock().unwrap() = Some(host.clone());
             executor.set_loop_host(host);
@@ -128,6 +149,8 @@ impl EngineLoopHost {
             base_system,
             sink,
         };
+        // Fresh turn → reset the retry-breaker so a prior turn's stall never bleeds in.
+        *self.guard.lock().unwrap() = LoopGuard::default();
     }
 
     /// Swap the planner (provider + model) — the REPL `/model` command, applied to the shared host so
@@ -142,6 +165,43 @@ impl EngineLoopHost {
             .upgrade()
             .ok_or_else(|| Error::Other("loop host: the executor is no longer alive".into()))
     }
+
+    /// Retry-breaker: fold one `run_plan` transcript into the loop-guard. An unchanged (non-empty)
+    /// transcript means the round made no progress; on repeats we escalate the fed-back directive,
+    /// and once the stall persists we arm a hard stop (the next `plan` ends the turn). Returns the
+    /// transcript to feed back — augmented with an explicit directive when the loop is repeating.
+    fn guard_transcript(&self, transcript: String) -> String {
+        let mut g = self.guard.lock().unwrap();
+        let stalled = !transcript.trim().is_empty()
+            && g.last_transcript.as_deref() == Some(transcript.as_str());
+        if stalled {
+            g.stall += 1;
+        } else {
+            // New (or empty) transcript = progress: reset the counter and remember this round.
+            g.stall = 1;
+            g.last_transcript = Some(transcript.clone());
+        }
+        let stall = g.stall;
+        if stall >= STALL_STOP {
+            g.force_stop = Some(format!(
+                "Stopping: the last step made no progress — it ran {stall}× in a row with an \
+                 identical result, so I could not complete this turn."
+            ));
+            return format!(
+                "[loop-guard] STOP — this exact step has repeated {stall}× with no change; the turn \
+                 will now end.\n{transcript}"
+            );
+        }
+        if stall >= STALL_ESCALATE {
+            return format!(
+                "[loop-guard] You have produced this EXACT same step and result {stall}× in a row — \
+                 it is NOT making progress. Do not repeat it: change the call (e.g. supply the \
+                 missing argument) or take a different approach; if you cannot, answer in prose.\n\
+                 {transcript}"
+            );
+        }
+        transcript
+    }
 }
 
 #[async_trait]
@@ -153,6 +213,12 @@ impl LoopHost for EngineLoopHost {
     /// prior `run_plan` produced without any of it being persisted. Returns a `Plan`:
     /// `{kind: "plan", ast, complete}` for an emitted graph or `{kind: "chat", text}` for a prose answer.
     async fn plan(&self, input: Value) -> Result<Value> {
+        // Retry-breaker hard stop: a prior `run_plan` flagged a stalled loop. End the turn honestly
+        // as a prose answer (the flow's `case "chat"` terminates the loop) instead of re-planning.
+        let force_stop = self.guard.lock().unwrap().force_stop.take();
+        if let Some(msg) = force_stop {
+            return Ok(serde_json::json!({ "kind": "chat", "text": msg }));
+        }
         let feedback = input
             .get("feedback")
             .and_then(|v| v.as_str())
@@ -297,18 +363,26 @@ impl LoopHost for EngineLoopHost {
             // the outcome transcript so the loop re-plans (model-in-the-loop self-correction), exactly as
             // the old Rust loop did — rather than letting it abort the whole turn.
             Err(e) => {
+                let transcript = self.guard_transcript(format!(
+                    "[plan error] {e}\nAdjust and emit another plan, or answer in prose."
+                ));
                 return Ok(serde_json::json!({
-                    "transcript": format!(
-                        "[plan error] {e}\nAdjust and emit another plan, or answer in prose."
-                    ),
+                    "transcript": transcript,
                     "result": "",
                     "steps": 0,
                 }));
             }
         };
 
+        // A suspension means the turn is awaiting input — real progress, not a stall — so skip the
+        // retry-breaker and feed back the raw transcript.
+        let transcript = if outcome.suspension.is_some() {
+            outcome.transcript.clone()
+        } else {
+            self.guard_transcript(outcome.transcript.clone())
+        };
         let mut out = serde_json::json!({
-            "transcript": outcome.transcript,
+            "transcript": transcript,
             "result": outcome.result,
             "steps": outcome.steps,
         });
@@ -527,6 +601,64 @@ mod tests {
                 stop_reason: Some(StopReason::ToolUse),
             },
         ]
+    }
+
+    /// Build a minimal host (no canned plans needed) for exercising the retry-breaker directly.
+    fn guard_test_host() -> Arc<EngineLoopHost> {
+        let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(Recorder::default())));
+        let dir = std::env::temp_dir().join(format!("flux-loop-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let mut reg = ToolRegistry::new();
+        flux_tools::register_reflect(&mut reg);
+        let executor = Executor::new(
+            reg,
+            PermissionManager::from_rules(&["plan".into(), "run_plan".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(system),
+        );
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider {
+            responses: Mutex::new(VecDeque::new()),
+        });
+        let store = Arc::new(FlowStore::in_memory().unwrap());
+        let (_executor, host) = EngineLoopHost::install(
+            executor,
+            provider,
+            "mock".into(),
+            None,
+            store,
+            "sess".into(),
+            shared,
+            CompileOptions::default(),
+        );
+        host
+    }
+
+    /// Fix 2: an identical `run_plan` transcript repeating means the loop is not progressing. The
+    /// retry-breaker stays quiet on the first occurrence, escalates the fed-back directive on repeats,
+    /// and arms a hard stop once the stall persists — so a stuck loop ends in a few rounds, not 25.
+    #[tokio::test]
+    async fn retry_breaker_escalates_then_arms_a_hard_stop() {
+        let host = guard_test_host();
+        let stuck = "[plan error] python_run: provide either `script` or `module`".to_string();
+        // Round 1 (stall=1): first sighting — not flagged.
+        assert!(!host.guard_transcript(stuck.clone()).contains("loop-guard"));
+        // Round 2 (stall=2 = STALL_ESCALATE): escalate, no stop yet.
+        let r2 = host.guard_transcript(stuck.clone());
+        assert!(r2.contains("[loop-guard]") && r2.contains("NOT making progress"));
+        assert!(host.guard.lock().unwrap().force_stop.is_none());
+        // Round 3 (stall=3): still escalating.
+        assert!(host
+            .guard_transcript(stuck.clone())
+            .contains("[loop-guard]"));
+        assert!(host.guard.lock().unwrap().force_stop.is_none());
+        // Round 4 (stall=4 = STALL_STOP): hard stop armed — the next `plan` will end the turn.
+        assert!(host.guard_transcript(stuck.clone()).contains("STOP"));
+        assert!(host.guard.lock().unwrap().force_stop.is_some());
+        // A changed transcript = progress: the counter resets and nothing is flagged.
+        assert!(!host
+            .guard_transcript("a different result".into())
+            .contains("loop-guard"));
     }
 
     /// The keystone: `plan` re-enters the planner (the mock emits a one-node echo plan), `run_plan`
