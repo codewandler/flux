@@ -627,6 +627,59 @@ pub enum Node {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bind: Option<SymbolName>,
     },
+
+    /// RAII-style **acquire → use → release** with guaranteed cleanup. Optionally run `acquire`
+    /// first (binding its result to `bind`, so `body` and `finally` can name the resource), then run
+    /// `body`; `finally` **always** runs afterward — on normal completion, an early `return`, or an
+    /// error — so a lock is freed / a handle closed / a temp removed no matter how the body exits.
+    /// The body's result, `return`, or error then propagates; a `finally` failure surfaces only when
+    /// the body itself succeeded (it never masks the body's own error). If `acquire` errors the
+    /// resource was never taken, so `finally` does not run. The deterministic resource-lifecycle
+    /// guard-rail (RAII for flows).
+    Scope {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        acquire: Option<Box<Node>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bind: Option<SymbolName>,
+        #[serde(default)]
+        body: Vec<Node>,
+        #[serde(default)]
+        finally: Vec<Node>,
+    },
+
+    /// Saga / **compensating transaction**: run each `step` in order; after a step's `body` succeeds,
+    /// its `undo` is registered. If a *later* step fails, the runtime unwinds by running the registered
+    /// `undo` bodies in **reverse** order (best-effort — an `undo` failure is recorded but does not stop
+    /// the unwind), then propagates the original error. The strongest guard-rail for non-transactional
+    /// external side effects (charge→refund, create→delete, reserve→release): partial work is rolled
+    /// back rather than left dangling. A `return` inside a step is a successful early exit and does not
+    /// compensate (use `scope` for guaranteed cleanup on every exit).
+    Saga {
+        #[serde(default)]
+        steps: Vec<SagaStep>,
+    },
+
+    /// **At-most-once side effect** across re-runs — an effect-level `memo`. `label` is an explicit
+    /// idempotency key: the first time the body runs to success in a session its result is recorded
+    /// durably; later re-runs in the same session skip the body and reuse the stored result. A failed
+    /// body records nothing and is retried. `bind` optionally names the body's result. Safety under
+    /// re-execution (`send_email`/`charge` never fire twice). With no durable store wired (a throwaway
+    /// interpreter) it degrades to running every time. Requires a non-empty literal label.
+    Once {
+        label: String,
+        #[serde(default)]
+        body: Vec<Node>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bind: Option<SymbolName>,
+    },
+
+    /// **Durable resume point** for long-running / resumable flows. A **top-level-only** marker (like
+    /// `await`): the first time a run reaches it, the position is recorded durably; a later re-run of
+    /// the *same* flow in the *same* session fast-forwards past the already-completed prefix (its
+    /// symbols are still durably bound and its side effects are not repeated) and continues from here.
+    /// `label` is a human-readable name for the phase it closes. Pairs with `once` for finer-grained
+    /// idempotency; a no-op when no durable store is wired. Requires a non-empty literal label.
+    Checkpoint { label: String },
 }
 
 /// One branch of a [`Node::Parallel`] fan-out: a named sub-flow whose final result is bound to
@@ -660,6 +713,17 @@ pub struct RouteCase {
 pub struct FallbackBranch {
     #[serde(default)]
     pub body: Vec<Node>,
+}
+
+/// One step of a [`Node::Saga`]: a `body` of forward work plus the `undo` that compensates it if a
+/// *later* step fails. `undo` may be empty — an irreversible or read-only step registers no
+/// compensation and is simply skipped during an unwind.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SagaStep {
+    #[serde(default)]
+    pub body: Vec<Node>,
+    #[serde(default)]
+    pub undo: Vec<Node>,
 }
 
 /// The Draft AST: an optionally-named, parameterized flow with a body. May contain unresolved
@@ -820,6 +884,23 @@ pub enum RunEvent {
     PlanAccepted {
         step: u32,
         ops: usize,
+    },
+    /// An effect-level `once` block completed **successfully** — recorded so that a re-run in the
+    /// same session skips the side effect and reuses `value`. `label` is the idempotency key. The
+    /// durable, append-only basis for the at-most-once-on-success guarantee.
+    OnceCompleted {
+        label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<ValueId>,
+        #[serde(default)]
+        summary: String,
+    },
+    /// A `checkpoint` was reached at top-level index `node` for the flow identified by `flow_key` —
+    /// the durable resume cursor a re-run of the same flow fast-forwards to. Append-only.
+    CheckpointReached {
+        flow_key: String,
+        label: String,
+        node: NodeId,
     },
 }
 

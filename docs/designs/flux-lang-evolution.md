@@ -373,17 +373,38 @@ through the node-kind SSOT + docs-sync gates (AGENTS.md).
   or money (`budget tokens 10k { … }`). Ties to the `ctx` budget (§3.2) and `throttle`; a first-class
   cost guard-rail.
 
-**Tier 2 — durability & side-effect safety (workflow-engine depth; add on demand):**
+**Tier 2 — durability & side-effect safety (workflow-engine depth) — ✅ shipped (P7):**
 
-- **`checkpoint`** (node) — a durable resume point so a re-run continues from the last completed step
-  (pairs with `await`/`memo`); the backbone of long-running/resumable flows.
-- **`compensate` / saga** (node) — register a compensating action for a completed side-effect; if a later
-  step fails, the runtime unwinds by running compensations in reverse. The strongest "guard-railed side
-  effects" tool for non-transactional external systems.
-- **`once` / idempotency-key** (decorator) — a side-effect runs at most once across re-runs (an
-  effect-level `memo`). Safety under re-execution.
 - **`scope` / `with`** (node) — acquire → use → release (a lock, a transaction, a temp resource) with
-  guaranteed cleanup on early `return` or error. RAII for flows.
+  guaranteed cleanup on early `return` or error. RAII for flows. `Node::Scope { acquire?, bind?, body,
+  finally }`; `finally` always runs, the body's result/return/error then propagates (a cleanup failure
+  surfaces only on the success path). Intra-run, no persistence.
+- **`compensate` / saga** (node, keyword `saga`) — register a compensating action for a completed
+  side-effect; if a later step fails, the runtime unwinds by running compensations in reverse (LIFO,
+  best-effort), then propagates the original error. `Node::Saga { steps: [{ body, undo }] }`. The
+  strongest "guard-railed side effects" tool for non-transactional external systems. Intra-run.
+- **`once` / idempotency-key** (node) — a side-effect runs at most once **on success** across re-runs in
+  a session (an effect-level `memo`). `Node::Once { label, body, bind? }`; the explicit `label` is the
+  idempotency key. A failed body records nothing and is retried.
+- **`checkpoint`** (node, **top-level-only** like `await`) — a durable resume point so a re-run of the
+  *same* flow in the *same* session fast-forwards past the completed prefix (its symbols are already
+  durably bound and its side effects are not repeated). `Node::Checkpoint { label }`; the backbone of
+  long-running/resumable flows. Pairs with `once` for finer-grained idempotency.
+
+**Durability seam.** `once`/`checkpoint` need durable, cross-run state. They reach it through a narrow
+`DurableStore` capability — `ValueStore::as_durable() -> Option<&dyn DurableStore>`, default `None`
+(mirroring the engine's other optional host seams). The language ships an in-memory impl on `MemStore`;
+the engine implements it on `FlowStore` by **folding over the append-only run-event log** (new
+`RunEvent::{OnceCompleted, CheckpointReached}` variants) — history is never rewritten. State is scoped by
+`(session_id, flow_key)`, where `flow_key` is the flow's declared name or a content hash of its body;
+`once` keys session-wide on its label, `checkpoint` requires a stable `flow_key` (so it targets authored
+named flows, not the re-planned agent loop). When no durable store is wired, `once` runs every time and
+`checkpoint` is a no-op — deterministic degradation.
+
+**Deferred (v1):** `checkpoint`∘`await` fast-forward *across* a live suspension latch (treated as
+independent mechanisms); `once` exactly-once across a crash *between* the side effect and the record
+(v1 is at-most-once-on-success); optimized-plan (`execute_plan`) support for the new nodes — they run
+through `execute_flow`.
 
 **Better as pure ops, not nodes** (keep the language small): `default`/`coalesce` (null-fallback) and the
 collection transforms `map`/`filter`/`reduce`/`sort`/`dedupe`/`top` (these overlap the pure cognition

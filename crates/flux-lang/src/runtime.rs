@@ -54,6 +54,19 @@ fn sha256_hex(s: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
+/// The durable identity of a flow for `checkpoint` scoping: its declared name if any, else a stable
+/// content hash of its top-level body. Scopes a flow's durable resume state to the same logical flow
+/// across re-runs without colliding with a different flow in the same session.
+fn flow_key(name: Option<&str>, body: &[Node]) -> String {
+    match name {
+        Some(n) if !n.trim().is_empty() => n.to_string(),
+        _ => format!(
+            "h:{}",
+            &sha256_hex(&serde_json::to_string(body).unwrap_or_default())[..16]
+        ),
+    }
+}
+
 /// A one-line, length-bounded summary of a value for the symbol table (never the raw bytes).
 fn summarize(content: &str) -> String {
     let line = content.lines().next().unwrap_or("").trim();
@@ -277,7 +290,8 @@ pub async fn execute_flow(
     ast: &DraftAst,
     sink: &mut dyn FlowSink,
 ) -> Result<FlowOutcome> {
-    run_top_level(store, executor, session_id, &ast.body, 0, None, sink).await
+    let fk = flow_key(ast.name.as_deref(), &ast.body);
+    run_top_level(store, executor, session_id, &ast.body, 0, None, &fk, sink).await
 }
 
 /// Resume a flow suspended on a top-level `await` (see [`FlowOutcome::suspension`]). Binds `input` to
@@ -293,6 +307,7 @@ pub async fn resume_flow(
     input: Value,
     sink: &mut dyn FlowSink,
 ) -> Result<FlowOutcome> {
+    let fk = flow_key(None, body);
     run_top_level(
         store,
         executor,
@@ -300,6 +315,7 @@ pub async fn resume_flow(
         body,
         at.0 as usize,
         Some(input),
+        &fk,
         sink,
     )
     .await
@@ -311,6 +327,7 @@ pub async fn resume_flow(
 /// `FlowOutcome.suspension`); every other node runs through [`exec_body`] exactly as before. Because
 /// `await` is a top-level-only statement (the analyzer enforces it), a suspend can only originate here,
 /// at a known index — nested bodies never produce one.
+#[allow(clippy::too_many_arguments)]
 async fn run_top_level(
     store: &dyn ValueStore,
     executor: &dyn OpHost,
@@ -318,12 +335,14 @@ async fn run_top_level(
     body: &[Node],
     start: usize,
     resume: Option<Value>,
+    flow_key: &str,
     sink: &mut dyn FlowSink,
 ) -> Result<FlowOutcome> {
     let mut steps = 0usize;
     let mut transcript: Vec<String> = Vec::new();
     let mut last = String::new();
     let mut i = start;
+    let is_fresh = resume.is_none();
 
     // Resuming: bind the awaited value to the suspended `await`'s binding, then advance past it.
     if let Some(value) = resume {
@@ -353,7 +372,27 @@ async fn run_top_level(
         i = start + 1;
     }
 
+    // Fresh run: if a prior run checkpointed this flow in this session, fast-forward past the
+    // completed prefix. The prefix's symbols are already durably bound and its side effects are not
+    // repeated — the durable resume point. (A resume from `await` keeps its own cursor.)
+    if is_fresh {
+        if let Some(d) = store.as_durable() {
+            if let Some(cp) = d.checkpoint_resume(session_id, flow_key)? {
+                i = i.max((cp.0 as usize + 1).min(body.len()));
+            }
+        }
+    }
+
     while i < body.len() {
+        if let Node::Checkpoint { label } = &body[i] {
+            // Record the durable resume cursor, then continue past it.
+            if let Some(d) = store.as_durable() {
+                d.checkpoint_record(session_id, flow_key, label, crate::ast::NodeId(i as u32))?;
+            }
+            transcript.push(format!("[checkpoint {label}]"));
+            i += 1;
+            continue;
+        }
         if let Node::Await { source, .. } = &body[i] {
             let node = crate::ast::NodeId(i as u32);
             store.append_event(
@@ -1720,12 +1759,196 @@ fn exec_body<'a>(
                         bind_existing(store, session_id, name, vid)?;
                     }
                 }
+                Node::Scope {
+                    acquire,
+                    bind,
+                    body: sbody,
+                    finally,
+                } => {
+                    // RAII: acquire (bind the resource) → run body → ALWAYS run finally → propagate.
+                    // If `acquire` fails the resource was never taken, so `finally` does not run (the
+                    // `?` propagates before we reach the body/finally).
+                    if let Some(acq) = acquire {
+                        let (_, avid, astep) = exec_body(
+                            store,
+                            executor,
+                            session_id,
+                            std::slice::from_ref(acq.as_ref()),
+                            &mut *sink,
+                            &mut *steps,
+                            &mut *transcript,
+                        )
+                        .await?;
+                        if let Step::Return(v) = astep {
+                            return Ok((last, v.clone(), Step::Return(v)));
+                        }
+                        if let (Some(name), Some(vid)) = (bind, &avid) {
+                            bind_existing(store, session_id, name, vid)?;
+                        }
+                    }
+                    // Run the body, capturing its outcome so `finally` runs no matter what.
+                    let body_res = exec_body(
+                        store,
+                        executor,
+                        session_id,
+                        sbody,
+                        &mut *sink,
+                        &mut *steps,
+                        &mut *transcript,
+                    )
+                    .await;
+                    // Guaranteed cleanup: `finally` always runs — on success, `return`, or error.
+                    let fin_res = exec_body(
+                        store,
+                        executor,
+                        session_id,
+                        finally,
+                        &mut *sink,
+                        &mut *steps,
+                        &mut *transcript,
+                    )
+                    .await;
+                    match body_res {
+                        Ok((blast, bvid, step)) => {
+                            // Body succeeded: a cleanup failure is now the operative error.
+                            fin_res?;
+                            if !blast.is_empty() {
+                                last = blast;
+                            }
+                            last_value = bvid;
+                            if let Step::Return(v) = step {
+                                return Ok((last, v.clone(), Step::Return(v)));
+                            }
+                        }
+                        // Body failed: cleanup already ran (best-effort); the body error is primary.
+                        Err(be) => return Err(be),
+                    }
+                }
+                Node::Saga { steps: ssteps } => {
+                    // Run each step in order; after a step succeeds, register its `undo`. If a later
+                    // step fails, run the registered undos in reverse (LIFO, best-effort) then propagate.
+                    let mut comps: Vec<&[Node]> = Vec::new();
+                    let mut saga_last = String::new();
+                    let mut saga_vid: Option<ValueId> = None;
+                    let mut failure: Option<FlowError> = None;
+                    for step in ssteps {
+                        match exec_body(
+                            store,
+                            executor,
+                            session_id,
+                            &step.body,
+                            &mut *sink,
+                            &mut *steps,
+                            &mut *transcript,
+                        )
+                        .await
+                        {
+                            Ok((blast, bvid, stp)) => {
+                                if !blast.is_empty() {
+                                    saga_last = blast;
+                                }
+                                if bvid.is_some() {
+                                    saga_vid = bvid;
+                                }
+                                // A `return` in a step is a successful early exit — no compensation.
+                                if let Step::Return(v) = stp {
+                                    return Ok((saga_last, v.clone(), Step::Return(v)));
+                                }
+                                if !step.undo.is_empty() {
+                                    comps.push(&step.undo);
+                                }
+                            }
+                            Err(be) => {
+                                failure = Some(be);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(be) = failure {
+                        // Unwind: compensate completed steps in reverse order, best-effort.
+                        for undo in comps.iter().rev() {
+                            if let Err(ue) = exec_body(
+                                store,
+                                executor,
+                                session_id,
+                                undo,
+                                &mut *sink,
+                                &mut *steps,
+                                &mut *transcript,
+                            )
+                            .await
+                            {
+                                transcript.push(format!("[saga compensation failed: {ue}]"));
+                            }
+                        }
+                        return Err(be);
+                    }
+                    if !saga_last.is_empty() {
+                        last = saga_last;
+                    }
+                    last_value = saga_vid;
+                }
+                Node::Once {
+                    label,
+                    body: obody,
+                    bind,
+                } => {
+                    // Effect-level memo: if a prior run in this session recorded this label's success,
+                    // skip the side effect and reuse the stored value. Keyed on (session, label).
+                    if let Some(d) = store.as_durable() {
+                        if let Some(rec) = d.once_lookup(session_id, label)? {
+                            if let (Some(name), Some(vid)) = (bind, &rec.value) {
+                                bind_existing(store, session_id, name, vid)?;
+                            }
+                            transcript.push(format!("[once {label} (skipped, already done)]"));
+                            if !rec.summary.is_empty() {
+                                last = rec.summary;
+                            }
+                            last_value = rec.value;
+                            continue;
+                        }
+                    }
+                    // First run (or no durable store): run the body. An error propagates via `?`
+                    // *before* we record, so a failed `once` leaves no record and is retried.
+                    let (blast, bvid, step) = exec_body(
+                        store,
+                        executor,
+                        session_id,
+                        obody,
+                        &mut *sink,
+                        &mut *steps,
+                        &mut *transcript,
+                    )
+                    .await?;
+                    if let (Some(name), Some(vid)) = (bind, &bvid) {
+                        bind_existing(store, session_id, name, vid)?;
+                    }
+                    if let Some(d) = store.as_durable() {
+                        d.once_complete(session_id, label, bvid.as_ref(), &blast)?;
+                    }
+                    if !blast.is_empty() {
+                        last = blast;
+                    }
+                    last_value = bvid;
+                    if let Step::Return(v) = step {
+                        return Ok((last, v.clone(), Step::Return(v)));
+                    }
+                }
                 Node::Await { .. } => {
                     // Top-level awaits are intercepted by `run_top_level` (which suspends the flow);
                     // reaching here means an `await` was nested or run via the optimized plan path,
                     // neither of which can suspend in v1. The analyzer rejects the nested case.
                     return Err(FlowError::Runtime(
                         "`await` must be a top-level flow statement (it suspends the whole flow for cross-turn resume; it cannot be nested or run in the optimized plan path)"
+                            .to_string(),
+                    ));
+                }
+                Node::Checkpoint { .. } => {
+                    // Like `await`, a checkpoint is intercepted at the top level by `run_top_level`;
+                    // reaching it here means it was nested (the analyzer rejects that) or run via the
+                    // optimized plan path, neither of which has a stable resume cursor in v1.
+                    return Err(FlowError::Runtime(
+                        "`checkpoint` must be a top-level flow statement (it is a durable resume cursor; it cannot be nested or run in the optimized plan path)"
                             .to_string(),
                     ));
                 }
@@ -2757,6 +2980,10 @@ fn node_kind(node: &Node) -> &'static str {
         Node::Try { .. } => "try",
         Node::Confirm { .. } => "confirm",
         Node::Loop { .. } => "loop",
+        Node::Scope { .. } => "scope",
+        Node::Saga { .. } => "saga",
+        Node::Once { .. } => "once",
+        Node::Checkpoint { .. } => "checkpoint",
         Node::Race { .. } => "race",
         Node::Throttle { .. } => "throttle",
         Node::Debounce { .. } => "debounce",
@@ -3123,6 +3350,101 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn optimized_plan_drops_a_dead_read_yet_matches_the_result() {
+        use crate::ast::HirFlow;
+
+        struct ROCat;
+        impl OpCatalog for ROCat {
+            fn lookup(&self, name: &str) -> Option<OpSignature> {
+                (name == "read").then(|| OpSignature {
+                    name: "read".into(),
+                    description: String::new(),
+                    effects: vec![flux_spec::Effect::Read],
+                    risk: flux_spec::Risk::Low,
+                    idempotency: flux_spec::Idempotency::Idempotent,
+                    required_params: vec!["path".into()],
+                    optional_params: Vec::new(),
+                    param_types: Default::default(),
+                })
+            }
+        }
+        struct ROHost(ROCat);
+        #[async_trait::async_trait]
+        impl OpHost for ROHost {
+            async fn dispatch(&self, op: &str, input: serde_json::Value) -> OpOutcome {
+                OpOutcome::ok(format!("{op}({input})"))
+            }
+            fn catalog(&self) -> &dyn OpCatalog {
+                &self.0
+            }
+            async fn request_approval(
+                &self,
+                _l: &str,
+                _i: &flux_spec::IntentSet,
+            ) -> ApprovalChoice {
+                ApprovalChoice::Allow
+            }
+            fn trim_output(&self, view: String, _op: &str) -> String {
+                view
+            }
+        }
+
+        let bind_read = |name: &str, arg: Node| Node::Bind {
+            name: SymbolName(name.into()),
+            value: Box::new(Node::Call {
+                op: "read".into(),
+                args: vec![arg],
+            }),
+            ty: None,
+            effect: None,
+        };
+        // $dead = read "x" (never used); $r = read "y" (the flow's result).
+        let body = vec![
+            bind_read("dead", flow_lit(json!("x"))),
+            bind_read("r", flow_lit(json!("y"))),
+        ];
+        let host = ROHost(ROCat);
+
+        let hir = HirFlow {
+            body: body.clone(),
+            ..Default::default()
+        };
+        let plan = crate::optimize::optimize(&hir, host.catalog());
+
+        let store_plan = MemStore::new();
+        let mut sink = BufferSink::default();
+        let out_plan = execute_plan(&store_plan, &host, "s", &body, &plan, &mut sink)
+            .await
+            .unwrap();
+
+        let store_flow = MemStore::new();
+        let ast = DraftAst {
+            body: body.clone(),
+            ..Default::default()
+        };
+        let mut sink2 = BufferSink::default();
+        let out_flow = execute_flow(&store_flow, &host, "s", &ast, &mut sink2)
+            .await
+            .unwrap();
+
+        // Same observable result despite the dropped step.
+        assert_eq!(out_plan.result, out_flow.result);
+        // The dead read was eliminated: it never ran in the optimized plan, so `$dead` is unbound
+        // there — while `execute_flow`, which runs every node, does bind it.
+        assert!(
+            store_plan
+                .resolve("s", &SymbolName("dead".into()))
+                .unwrap()
+                .is_none(),
+            "the dead read is eliminated from the optimized plan"
+        );
+        assert!(store_flow
+            .resolve("s", &SymbolName("dead".into()))
+            .unwrap()
+            .is_some());
+    }
+
     // ---- P6b: Tier-1 control-flow primitives (match/route/fallback/timeout/budget) ----
 
     use crate::ast::{FallbackBranch, MatchCase, RouteCase};
@@ -3353,6 +3675,269 @@ mod tests {
         }];
         assert!(run(&host, body).await.is_err());
         assert_eq!(host.marks(), vec!["boom", "boom"]);
+    }
+
+    #[tokio::test]
+    async fn scope_runs_finally_on_success_return_and_error() {
+        // (1) Normal completion: body runs, then finally.
+        let host = CfHost::new();
+        let body = vec![Node::Scope {
+            acquire: None,
+            bind: None,
+            body: vec![echo("body")],
+            finally: vec![echo("cleanup")],
+        }];
+        run(&host, body).await.unwrap();
+        assert_eq!(host.marks(), vec!["body", "cleanup"]);
+
+        // (2) An early `return` inside the body still runs finally.
+        let host = CfHost::new();
+        let body = vec![Node::Scope {
+            acquire: None,
+            bind: None,
+            body: vec![
+                echo("body"),
+                Node::Return {
+                    value: Box::new(flow_lit(json!("done"))),
+                },
+                echo("unreached"),
+            ],
+            finally: vec![echo("cleanup")],
+        }];
+        run(&host, body).await.unwrap();
+        assert_eq!(
+            host.marks(),
+            vec!["body", "cleanup"],
+            "return unwinds the body but finally still runs (and the post-return op does not)"
+        );
+
+        // (3) An error in the body still runs finally, then propagates.
+        let host = CfHost::new();
+        let body = vec![Node::Scope {
+            acquire: None,
+            bind: None,
+            body: vec![call("boom", vec![])],
+            finally: vec![echo("cleanup")],
+        }];
+        assert!(run(&host, body).await.is_err());
+        assert_eq!(
+            host.marks(),
+            vec!["boom", "cleanup"],
+            "cleanup runs even when the body errors"
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_acquire_runs_first_and_binds_the_resource() {
+        // acquire → use → release ordering; binding the resource to $h must not error.
+        let host = CfHost::new();
+        let body = vec![Node::Scope {
+            acquire: Some(Box::new(echo("acq"))),
+            bind: Some(SymbolName("h".into())),
+            body: vec![echo("body")],
+            finally: vec![echo("cleanup")],
+        }];
+        run(&host, body).await.unwrap();
+        assert_eq!(host.marks(), vec!["acq", "body", "cleanup"]);
+    }
+
+    #[tokio::test]
+    async fn saga_unwinds_completed_steps_in_reverse_on_failure() {
+        use crate::ast::SagaStep;
+
+        // step1 ok (undo r1), step2 ok (undo r2), step3 BOOMS → undo r2 then undo r1, original error.
+        let host = CfHost::new();
+        let body = vec![Node::Saga {
+            steps: vec![
+                SagaStep {
+                    body: vec![echo("s1")],
+                    undo: vec![echo("r1")],
+                },
+                SagaStep {
+                    body: vec![echo("s2")],
+                    undo: vec![echo("r2")],
+                },
+                SagaStep {
+                    body: vec![call("boom", vec![])],
+                    undo: vec![echo("r3")],
+                },
+            ],
+        }];
+        assert!(run(&host, body).await.is_err());
+        assert_eq!(
+            host.marks(),
+            vec!["s1", "s2", "boom", "r2", "r1"],
+            "compensations run in reverse for the steps that completed; the failed step's undo is not run"
+        );
+
+        // all steps succeed → no compensation runs.
+        let host = CfHost::new();
+        let body = vec![Node::Saga {
+            steps: vec![
+                SagaStep {
+                    body: vec![echo("s1")],
+                    undo: vec![echo("r1")],
+                },
+                SagaStep {
+                    body: vec![echo("s2")],
+                    undo: vec![echo("r2")],
+                },
+            ],
+        }];
+        run(&host, body).await.unwrap();
+        assert_eq!(host.marks(), vec!["s1", "s2"], "no failure → no unwind");
+    }
+
+    #[tokio::test]
+    async fn once_runs_the_body_at_most_once_across_runs() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![Node::Once {
+                label: "welcome".into(),
+                body: vec![echo("sent")],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+
+        // First run: the body executes.
+        execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(host.marks(), vec!["sent"]);
+
+        // Second run, SAME store + session: the durable record skips the side effect.
+        execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            host.marks(),
+            vec!["sent"],
+            "the side effect did not fire again"
+        );
+    }
+
+    #[tokio::test]
+    async fn once_failure_is_not_recorded_and_retries() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![Node::Once {
+                label: "x".into(),
+                body: vec![call("boom", vec![])],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        assert!(execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .is_err());
+        // Nothing was recorded, so a re-run tries (and fails) again.
+        assert!(execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .is_err());
+        assert_eq!(
+            host.marks(),
+            vec!["boom", "boom"],
+            "a failed once is retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn once_without_a_durable_store_runs_every_time() {
+        use crate::ast::ValueId;
+        use crate::store::{SessionView, ValueStore};
+        use flux_core::Result;
+
+        // A store whose `as_durable()` is `None` (the default) degrades `once` to "run every time".
+        struct NoDurable(MemStore);
+        impl ValueStore for NoDurable {
+            fn put_value(&self, s: &str, v: &Value) -> Result<ValueId> {
+                self.0.put_value(s, v)
+            }
+            fn get_value(&self, id: &ValueId) -> Result<Option<Value>> {
+                self.0.get_value(id)
+            }
+            fn bind(
+                &self,
+                s: &str,
+                n: &SymbolName,
+                vid: &ValueId,
+                ty: Option<&str>,
+                summary: &str,
+                vis: Visibility,
+            ) -> Result<()> {
+                self.0.bind(s, n, vid, ty, summary, vis)
+            }
+            fn resolve(&self, s: &str, n: &SymbolName) -> Result<Option<ValueId>> {
+                self.0.resolve(s, n)
+            }
+            fn append_event(&self, s: &str, e: &RunEvent) -> Result<()> {
+                self.0.append_event(s, e)
+            }
+            fn view(&self, s: &str) -> Result<SessionView> {
+                self.0.view(s)
+            }
+            // as_durable() keeps the trait default → None.
+        }
+
+        let host = CfHost::new();
+        let store = NoDurable(MemStore::new());
+        let ast = DraftAst {
+            body: vec![Node::Once {
+                label: "welcome".into(),
+                body: vec![echo("sent")],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            host.marks(),
+            vec!["sent", "sent"],
+            "no durable store → once runs each time"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_fast_forwards_past_the_completed_prefix_on_rerun() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            name: Some("phased".into()),
+            body: vec![
+                echo("step1"),
+                Node::Checkpoint { label: "p1".into() },
+                echo("step2"),
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+
+        // First run: both steps execute; the checkpoint records the resume cursor after step1.
+        execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(host.marks(), vec!["step1", "step2"]);
+
+        // Second run, SAME store + session: fast-forward past the checkpoint → only step2 re-runs.
+        execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            host.marks(),
+            vec!["step1", "step2", "step2"],
+            "the pre-checkpoint prefix is not re-executed"
+        );
     }
 
     #[tokio::test]

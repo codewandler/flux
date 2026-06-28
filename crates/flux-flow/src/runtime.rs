@@ -366,10 +366,30 @@ fn walk_node<'a>(node: &'a Node, f: &mut impl FnMut(&'a str, &'a [Node])) {
             }
         }
         Node::Timeout { body, .. } | Node::Budget { body, .. } => walk_calls(body, f),
+        Node::Scope {
+            acquire,
+            body,
+            finally,
+            ..
+        } => {
+            if let Some(acq) = acquire {
+                walk_node(acq, f);
+            }
+            walk_calls(body, f);
+            walk_calls(finally, f);
+        }
+        Node::Saga { steps } => {
+            for step in steps {
+                walk_calls(&step.body, f);
+                walk_calls(&step.undo, f);
+            }
+        }
+        Node::Once { body, .. } => walk_calls(body, f),
         Node::Var { .. }
         | Node::Lit { .. }
         | Node::Thing { .. }
         | Node::Await { .. }
+        | Node::Checkpoint { .. }
         | Node::Parse { .. }
         | Node::Ctx { .. }
         | Node::CtxAppend { .. } => {}

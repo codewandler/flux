@@ -97,8 +97,12 @@ before every release.
   cross-turn suspend/resume**, the **Tier-1 control-flow primitives** (`match`/`route`/`fallback`/
   `timeout`/`budget`), and polish (`fluxlang compile`, token-efficient `format_compact`, a deterministic
   thing resolver). See [designs/flux-lang-evolution.md](designs/flux-lang-evolution.md) and the
-  [PRD status RTM](../crates/flux-lang/docs/STATUS.md). Remaining: Tier-2 control-flow
-  (`checkpoint`/`compensate`/`once`/`scope`) and deeper optimizer passes.
+  [PRD status RTM](../crates/flux-lang/docs/STATUS.md). **P7** added the **Tier-2 control-flow
+  primitives** — `scope` (RAII cleanup), `saga`/`compensate` (reverse-order unwind), `once`
+  (at-most-once side effect), `checkpoint` (durable resume point) — on a narrow `DurableStore` seam
+  (`FlowStore` folds them out of the append-only event log), plus a **dead-step optimizer pass**
+  (drop read-only binds whose result is never used). Remaining (optional): deeper optimizer passes
+  (CSE, predicate pushdown), `checkpoint`∘`await` composition.
 
 **Environment-gated (need a live key or external infra):**
 - **Homebrew tap** — an auto-updating `brew install codewandler/tap/flux` formula via cargo-dist

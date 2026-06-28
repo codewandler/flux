@@ -40,6 +40,7 @@ pub fn analyze_flow(ast: &DraftAst, ops: &dyn OpCatalog) -> Result<(), Vec<Diagn
         check_node(node, ops, &mut diags);
     }
     check_await_position(&ast.body, &mut diags);
+    check_checkpoint_position(&ast.body, &mut diags);
     if diags.is_empty() {
         Ok(())
     } else {
@@ -66,6 +67,28 @@ fn check_await_position(body: &[Node], diags: &mut Vec<Diagnostic>) {
         if nested {
             diags.push(Diagnostic::new(
                 "`await` must be a top-level flow statement — it suspends the whole flow and cannot be nested (v1)",
+            ));
+        }
+    }
+}
+
+/// `checkpoint` may only appear as a **top-level** flow statement: it is a durable resume cursor keyed
+/// on a top-level index, so a `checkpoint` nested inside a `when`/`repeat`/`scope`/… body has no stable
+/// resume point. Rejected here (mirrors [`check_await_position`]).
+fn check_checkpoint_position(body: &[Node], diags: &mut Vec<Diagnostic>) {
+    for node in body {
+        if matches!(node, Node::Checkpoint { .. }) {
+            continue;
+        }
+        let mut nested = false;
+        for_each_node(std::slice::from_ref(node), &mut |n| {
+            if matches!(n, Node::Checkpoint { .. }) {
+                nested = true;
+            }
+        });
+        if nested {
+            diags.push(Diagnostic::new(
+                "`checkpoint` must be a top-level flow statement — it is a durable resume cursor and cannot be nested (v1)",
             ));
         }
     }
@@ -242,6 +265,17 @@ fn type_check_body(
             Node::Timeout { body, .. } | Node::Budget { body, .. } => {
                 type_check_body(body, ops, &mut scope.clone(), diags)
             }
+            Node::Scope { body, finally, .. } => {
+                type_check_body(body, ops, &mut scope.clone(), diags);
+                type_check_body(finally, ops, &mut scope.clone(), diags);
+            }
+            Node::Saga { steps } => {
+                for step in steps {
+                    type_check_body(&step.body, ops, &mut scope.clone(), diags);
+                    type_check_body(&step.undo, ops, &mut scope.clone(), diags);
+                }
+            }
+            Node::Once { body, .. } => type_check_body(body, ops, &mut scope.clone(), diags),
             Node::Fallback { branches, .. } => {
                 for b in branches {
                     type_check_body(&b.body, ops, &mut scope.clone(), diags);
@@ -318,7 +352,7 @@ fn host_effect_to_flow(e: flux_spec::Effect) -> Option<FlowEffect> {
 
 /// Visit every node in `body` and all its nested bodies (depth-first, pre-order), invoking `f` on
 /// each. A single generic traversal reused for effect gathering and future HIR passes.
-fn for_each_node(body: &[Node], f: &mut impl FnMut(&Node)) {
+pub(crate) fn for_each_node(body: &[Node], f: &mut impl FnMut(&Node)) {
     for node in body {
         f(node);
         match node {
@@ -411,8 +445,28 @@ fn for_each_node(body: &[Node], f: &mut impl FnMut(&Node)) {
                 }
             }
             Node::Timeout { body, .. } | Node::Budget { body, .. } => for_each_node(body, f),
+            Node::Scope {
+                acquire,
+                body,
+                finally,
+                ..
+            } => {
+                if let Some(acq) = acquire {
+                    for_each_node(std::slice::from_ref(acq.as_ref()), f);
+                }
+                for_each_node(body, f);
+                for_each_node(finally, f);
+            }
+            Node::Saga { steps } => {
+                for step in steps {
+                    for_each_node(&step.body, f);
+                    for_each_node(&step.undo, f);
+                }
+            }
+            Node::Once { body, .. } => for_each_node(body, f),
             // Leaf nodes (no nested node bodies).
             Node::Await { .. }
+            | Node::Checkpoint { .. }
             | Node::Peek { .. }
             | Node::Var { .. }
             | Node::Lit { .. }
@@ -697,6 +751,59 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, diags: &mut Vec<Diagnostic>) {
                 check_node(n, ops, diags);
             }
         }
+        Node::Scope {
+            acquire,
+            bind,
+            body,
+            finally,
+        } => {
+            // `bind` names the *acquired resource*, so it only makes sense with an `acquire`.
+            if bind.is_some() && acquire.is_none() {
+                diags.push(Diagnostic::new(
+                    "`scope` binds the acquired resource — `-> $name` requires an `acquire`",
+                ));
+            }
+            if let Some(acq) = acquire {
+                check_node(acq, ops, diags);
+            }
+            for n in body {
+                check_node(n, ops, diags);
+            }
+            for n in finally {
+                check_node(n, ops, diags);
+            }
+        }
+        Node::Saga { steps } => {
+            if steps.is_empty() {
+                diags.push(Diagnostic::new("`saga` requires at least one step"));
+            }
+            for step in steps {
+                for n in &step.body {
+                    check_node(n, ops, diags);
+                }
+                for n in &step.undo {
+                    check_node(n, ops, diags);
+                }
+            }
+        }
+        Node::Once { label, body, .. } => {
+            // The label is the durable idempotency key, so it must be a fixed, auditable string.
+            if label.trim().is_empty() {
+                diags.push(Diagnostic::new(
+                    "`once` requires a non-empty label (its durable idempotency key)",
+                ));
+            }
+            for n in body {
+                check_node(n, ops, diags);
+            }
+        }
+        Node::Checkpoint { label } => {
+            if label.trim().is_empty() {
+                diags.push(Diagnostic::new(
+                    "`checkpoint` requires a non-empty label (its durable resume key)",
+                ));
+            }
+        }
         Node::Await { .. }
         | Node::Peek { .. }
         | Node::Var { .. }
@@ -740,6 +847,13 @@ fn node_contains_return(node: &Node) -> bool {
         }
         Node::Fallback { branches, .. } => branches.iter().any(|b| body_contains_return(&b.body)),
         Node::Timeout { body, .. } | Node::Budget { body, .. } => body_contains_return(body),
+        Node::Scope { body, finally, .. } => {
+            body_contains_return(body) || body_contains_return(finally)
+        }
+        Node::Saga { steps } => steps
+            .iter()
+            .any(|s| body_contains_return(&s.body) || body_contains_return(&s.undo)),
+        Node::Once { body, .. } => body_contains_return(body),
         Node::Expr { .. } | Node::Fmt { .. } | Node::Jq { .. } => false,
         _ => false,
     }
@@ -1033,6 +1147,43 @@ mod tests {
             ..Default::default()
         };
         assert!(analyze_flow(&top, &ops).is_ok());
+    }
+
+    #[test]
+    fn checkpoint_must_be_a_top_level_statement() {
+        let ops = catalog();
+        let cp = || Node::Checkpoint { label: "p1".into() };
+
+        // nested inside a `repeat` → rejected (no stable resume cursor).
+        let nested = DraftAst {
+            body: vec![Node::Repeat {
+                max: 2,
+                until: None,
+                body: vec![cp()],
+                collect: None,
+            }],
+            ..Default::default()
+        };
+        let err = analyze_flow(&nested, &ops).unwrap_err();
+        assert!(
+            err.iter().any(|d| d
+                .message
+                .contains("`checkpoint` must be a top-level flow statement")),
+            "nested checkpoint is rejected"
+        );
+
+        // a top-level checkpoint analyzes clean; an empty label is rejected.
+        let top = DraftAst {
+            body: vec![cp()],
+            ..Default::default()
+        };
+        assert!(analyze_flow(&top, &ops).is_ok());
+
+        let empty = DraftAst {
+            body: vec![Node::Checkpoint { label: "".into() }],
+            ..Default::default()
+        };
+        assert!(analyze_flow(&empty, &ops).is_err());
     }
 
     /// A catalog with a typed op `dbl(n: Number)` for the argument type-checker.

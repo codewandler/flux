@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use flux_core::Result;
 
-use crate::ast::{RunEvent, SymbolName, Value, ValueId, Visibility};
+use crate::ast::{NodeId, RunEvent, SymbolName, Value, ValueId, Visibility};
 
 /// One symbol as projected into the model-facing view: a name, a one-line summary, an optional type
 /// hint, and its visibility. The raw value is never included — only the runtime dereferences it.
@@ -83,6 +83,56 @@ pub trait ValueStore: Send + Sync {
             .into_iter()
             .find(|s| &s.name == name))
     }
+
+    /// The durable, cross-run keyed state this store backs, if any. Default `None` — a store with no
+    /// durability (a throwaway/standalone interpreter) makes `once` run every time and `checkpoint`
+    /// a no-op. The engine's persistent store overrides this to return `Some(self)`, mirroring the
+    /// optional-capability shape of the engine's other host seams.
+    fn as_durable(&self) -> Option<&dyn DurableStore> {
+        None
+    }
+}
+
+/// A completed `once` (effect-level memo) record: the value the body bound (if any) plus a one-line
+/// summary, so a re-run can skip the side effect and rebind the value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnceRecord {
+    pub value: Option<ValueId>,
+    pub summary: String,
+}
+
+/// Durable, cross-run keyed state for the side-effect-safety primitives. Keyed by
+/// `(session_id, label)` — the label is the explicit idempotency key (matching `memo`/`await`, which
+/// key on explicit `name`/`source` strings). Both the engine's persistent store and the in-memory
+/// [`MemStore`] implement this by folding over their append-only run-event log, so history is never
+/// rewritten ([[event-store-unification]] in spirit).
+pub trait DurableStore: Send + Sync {
+    /// The recorded completion for `(session, label)`, if a prior run finished the `once` body
+    /// successfully. `Some` means "already done — skip the side effect and reuse the value".
+    fn once_lookup(&self, session_id: &str, label: &str) -> Result<Option<OnceRecord>>;
+    /// Record a `once` block that completed **successfully**. Append-only; only ever called on
+    /// success, so a failed body leaves no record and a later re-run retries.
+    fn once_complete(
+        &self,
+        session_id: &str,
+        label: &str,
+        value: Option<&ValueId>,
+        summary: &str,
+    ) -> Result<()>;
+
+    /// The furthest top-level index a `checkpoint` reached for `(session, flow_key)` on a prior run.
+    /// A fresh re-run fast-forwards past it — the prefix's symbols are already durably bound and its
+    /// side effects are not repeated. `None` means no checkpoint has been recorded for this flow yet.
+    fn checkpoint_resume(&self, session_id: &str, flow_key: &str) -> Result<Option<NodeId>>;
+    /// Record that a `checkpoint` was reached at top-level `index` for `(session, flow_key)`.
+    /// Append-only.
+    fn checkpoint_record(
+        &self,
+        session_id: &str,
+        flow_key: &str,
+        label: &str,
+        index: NodeId,
+    ) -> Result<()>;
 }
 
 /// A simple in-memory [`ValueStore`] — no persistence, no budgeting, no event retention beyond the
@@ -188,5 +238,75 @@ impl ValueStore for MemStore {
             })
             .collect();
         Ok(SessionView { symbols })
+    }
+
+    fn as_durable(&self) -> Option<&dyn DurableStore> {
+        Some(self)
+    }
+}
+
+/// In-memory durability: fold over the session's retained run-events (the same append-only basis the
+/// engine's persistent store uses), so the standalone interpreter exercises the `once` durable path.
+impl DurableStore for MemStore {
+    fn once_lookup(&self, session_id: &str, label: &str) -> Result<Option<OnceRecord>> {
+        Ok(self
+            .events(session_id)
+            .into_iter()
+            .rev()
+            .find_map(|e| match e {
+                RunEvent::OnceCompleted {
+                    label: l,
+                    value,
+                    summary,
+                } if l == label => Some(OnceRecord { value, summary }),
+                _ => None,
+            }))
+    }
+
+    fn once_complete(
+        &self,
+        session_id: &str,
+        label: &str,
+        value: Option<&ValueId>,
+        summary: &str,
+    ) -> Result<()> {
+        self.append_event(
+            session_id,
+            &RunEvent::OnceCompleted {
+                label: label.to_string(),
+                value: value.cloned(),
+                summary: summary.to_string(),
+            },
+        )
+    }
+
+    fn checkpoint_resume(&self, session_id: &str, flow_key: &str) -> Result<Option<NodeId>> {
+        Ok(self
+            .events(session_id)
+            .into_iter()
+            .rev()
+            .find_map(|e| match e {
+                RunEvent::CheckpointReached {
+                    flow_key: f, node, ..
+                } if f == flow_key => Some(node),
+                _ => None,
+            }))
+    }
+
+    fn checkpoint_record(
+        &self,
+        session_id: &str,
+        flow_key: &str,
+        label: &str,
+        index: NodeId,
+    ) -> Result<()> {
+        self.append_event(
+            session_id,
+            &RunEvent::CheckpointReached {
+                flow_key: flow_key.to_string(),
+                label: label.to_string(),
+                node: index,
+            },
+        )
     }
 }

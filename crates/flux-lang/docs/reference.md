@@ -80,6 +80,10 @@ follow are hand-written.
 | `fallback` | Ordered "first that succeeds wins" selector: run each branch in `branches` in turn; the first that completes without error and yields a non-empty result wins and becomes the node's result. On a branch error (or empty result) the next is tried — so a *side-effecting* branch that returns empty will still fall through and the next branch also runs (attempts stream live, as in `try`/`retry`). If every branch errors, the last error propagates. Lighter than `try` for graceful degradation (cheap path → else expensive path). `bind` names the winning result. |
 | `timeout` | Bound the wall-clock of a sub-flow: run `body` with a `ms` deadline. If it does not finish in time the node errors (an enclosing `try`/`retry` may catch it). A general reliability guard-rail you can wrap around anything. `bind` names the body's result. |
 | `budget` | Cap the cost of a scope: run `body` but allow at most `limit` op dispatches within it (checked at statement boundaries — the body stops before a statement that would exceed the cap, and the node errors). A first-class cost guard-rail; v1 counts dispatches (token/money budgets are a later refinement). `bind` names the body's result. |
+| `scope` | RAII-style **acquire → use → release** with guaranteed cleanup. Optionally run `acquire` first (binding its result to `bind`, so `body` and `finally` can name the resource), then run `body`; `finally` **always** runs afterward — on normal completion, an early `return`, or an error — so a lock is freed / a handle closed / a temp removed no matter how the body exits. The body's result, `return`, or error then propagates; a `finally` failure surfaces only when the body itself succeeded (it never masks the body's own error). If `acquire` errors the resource was never taken, so `finally` does not run. The deterministic resource-lifecycle guard-rail (RAII for flows). |
+| `saga` | Saga / **compensating transaction**: run each `step` in order; after a step's `body` succeeds, its `undo` is registered. If a *later* step fails, the runtime unwinds by running the registered `undo` bodies in **reverse** order (best-effort — an `undo` failure is recorded but does not stop the unwind), then propagates the original error. The strongest guard-rail for non-transactional external side effects (charge→refund, create→delete, reserve→release): partial work is rolled back rather than left dangling. A `return` inside a step is a successful early exit and does not compensate (use `scope` for guaranteed cleanup on every exit). |
+| `once` | **At-most-once side effect** across re-runs — an effect-level `memo`. `label` is an explicit idempotency key: the first time the body runs to success in a session its result is recorded durably; later re-runs in the same session skip the body and reuse the stored result. A failed body records nothing and is retried. `bind` optionally names the body's result. Safety under re-execution (`send_email`/`charge` never fire twice). With no durable store wired (a throwaway interpreter) it degrades to running every time. Requires a non-empty literal label. |
+| `checkpoint` | **Durable resume point** for long-running / resumable flows. A **top-level-only** marker (like `await`): the first time a run reaches it, the position is recorded durably; a later re-run of the *same* flow in the *same* session fast-forwards past the already-completed prefix (its symbols are still durably bound and its side effects are not repeated) and continues from here. `label` is a human-readable name for the phase it closes. Pairs with `once` for finer-grained idempotency; a no-op when no durable store is wired. Requires a non-empty literal label. |
 <!-- END generated:node-kinds -->
 
 ---
@@ -778,6 +782,68 @@ appropriate turn.
 > **Status:** `await` is defined in the AST and accepted by the analyzer, but
 > cross-turn execution is not yet implemented. Emitting an `await` node in a plan
 > currently returns a clear error. Full suspend/resume lands in a future slice.
+
+---
+
+## Durability & side-effect-safety nodes (Tier 2)
+
+Four nodes give workflow-engine depth: deterministic resource cleanup, transactional
+unwinding, and durable idempotency / resume. The first two are **intra-run**; the last two
+need durable state and reach it through an optional `DurableStore` capability on the value
+store — when none is wired (a throwaway interpreter), `once` runs every time and `checkpoint`
+is a no-op. Durable state is scoped to `(session_id, flow_key)`, where `flow_key` is the
+flow's declared name (or a hash of its body), and is folded out of the append-only run-event
+log — history is never rewritten.
+
+### `scope`
+
+RAII acquire → use → release. Optionally run `acquire` (binding its result to `bind`), then
+`body`; `finally` **always** runs afterward — on normal completion, an early `return`, or an
+error — so a lock is freed / handle closed / temp removed no matter how the body exits. The
+body's result/return/error then propagates; a `finally` failure surfaces only when the body
+itself succeeded.
+
+```json
+{"kind": "scope", "acquire": {"kind": "call", "op": "lock.get", "args": [{"kind": "lit", "value": "f"}]},
+ "bind": "h", "body": [ ... ], "finally": [{"kind": "call", "op": "lock.release", "args": [{"kind": "var", "name": "h"}]}]}
+```
+
+### `saga`
+
+A compensating transaction. Run each `step.body` in order; after a step succeeds its
+`step.undo` is registered. If a *later* step fails, the runtime runs the registered undos in
+**reverse** order (best-effort — an undo failure is recorded but does not stop the unwind),
+then propagates the original error. A `return` inside a step is a successful early exit and
+does not compensate.
+
+```json
+{"kind": "saga", "steps": [
+  {"body": [{"kind": "call", "op": "charge", "args": []}], "undo": [{"kind": "call", "op": "refund", "args": []}]},
+  {"body": [{"kind": "call", "op": "ship", "args": []}]}
+]}
+```
+
+### `once`
+
+At-most-once side effect across re-runs in a session (an effect-level `memo`). The explicit
+`label` is the idempotency key: the first time the body runs **to success** its result is
+recorded durably; later re-runs skip the body and reuse the stored value. A failed body
+records nothing and is retried. `bind` optionally names the result.
+
+```json
+{"kind": "once", "label": "send-welcome", "body": [{"kind": "call", "op": "send_email", "args": []}]}
+```
+
+### `checkpoint`
+
+A durable resume point — **top-level only**, like `await`. The first time a run reaches it the
+position is recorded; a later re-run of the *same* flow in the *same* session fast-forwards
+past the already-completed prefix (its symbols are still durably bound and its side effects are
+not repeated) and continues from here. Targets authored, named flows. Pairs with `once`.
+
+```json
+{"kind": "checkpoint", "label": "phase-1"}
+```
 
 ---
 

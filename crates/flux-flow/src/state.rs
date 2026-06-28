@@ -73,6 +73,79 @@ impl flux_lang::store::ValueStore for FlowStore {
     fn view(&self, session_id: &str) -> Result<SessionView> {
         self.view(session_id)
     }
+    fn as_durable(&self) -> Option<&dyn flux_lang::store::DurableStore> {
+        Some(self)
+    }
+}
+
+/// The engine's durable backend for the `once` at-most-once primitive: completions are folded out of
+/// the append-only run-event log (the same log `await`/run-trace use), so history is never rewritten.
+impl flux_lang::store::DurableStore for FlowStore {
+    fn once_lookup(
+        &self,
+        session_id: &str,
+        label: &str,
+    ) -> Result<Option<flux_lang::store::OnceRecord>> {
+        Ok(self
+            .events(session_id)?
+            .into_iter()
+            .rev()
+            .find_map(|e| match e {
+                RunEvent::OnceCompleted {
+                    label: l,
+                    value,
+                    summary,
+                } if l == label => Some(flux_lang::store::OnceRecord { value, summary }),
+                _ => None,
+            }))
+    }
+
+    fn once_complete(
+        &self,
+        session_id: &str,
+        label: &str,
+        value: Option<&ValueId>,
+        summary: &str,
+    ) -> Result<()> {
+        self.append_event(
+            session_id,
+            &RunEvent::OnceCompleted {
+                label: label.to_string(),
+                value: value.cloned(),
+                summary: summary.to_string(),
+            },
+        )
+    }
+
+    fn checkpoint_resume(&self, session_id: &str, flow_key: &str) -> Result<Option<NodeId>> {
+        Ok(self
+            .events(session_id)?
+            .into_iter()
+            .rev()
+            .find_map(|e| match e {
+                RunEvent::CheckpointReached {
+                    flow_key: f, node, ..
+                } if f == flow_key => Some(node),
+                _ => None,
+            }))
+    }
+
+    fn checkpoint_record(
+        &self,
+        session_id: &str,
+        flow_key: &str,
+        label: &str,
+        index: NodeId,
+    ) -> Result<()> {
+        self.append_event(
+            session_id,
+            &RunEvent::CheckpointReached {
+                flow_key: flow_key.to_string(),
+                label: label.to_string(),
+                node: index,
+            },
+        )
+    }
 }
 
 /// flux-flow's own SQLite store for values, symbols, and the suspension latch. Run-event traces are
@@ -424,6 +497,52 @@ mod tests {
         assert_eq!(s.resolve("sess", &draft).unwrap(), Some(v2));
         // the superseded value is still retrievable
         assert_eq!(s.get_value(&v1).unwrap(), Some(Value::String("v1".into())));
+    }
+
+    #[test]
+    fn flowstore_once_records_and_reads_back_durably() {
+        use flux_lang::store::DurableStore;
+        let s = FlowStore::in_memory().unwrap();
+        // No record yet → the body would run.
+        assert!(s.once_lookup("sess", "welcome").unwrap().is_none());
+        // Record a completion (with a bound value), then it reads back from the event log.
+        let v = s.put_value("sess", &Value::String("ok".into())).unwrap();
+        s.once_complete("sess", "welcome", Some(&v), "sent")
+            .unwrap();
+        let rec = s
+            .once_lookup("sess", "welcome")
+            .unwrap()
+            .expect("completion recorded");
+        assert_eq!(rec.summary, "sent");
+        assert_eq!(rec.value, Some(v));
+        // A different label is independent; a different session is too.
+        assert!(s.once_lookup("sess", "other").unwrap().is_none());
+        assert!(s.once_lookup("other", "welcome").unwrap().is_none());
+    }
+
+    #[test]
+    fn flowstore_checkpoint_records_and_resumes_durably() {
+        use flux_lang::store::DurableStore;
+        let s = FlowStore::in_memory().unwrap();
+        // No checkpoint yet for this flow.
+        assert!(s.checkpoint_resume("sess", "phased").unwrap().is_none());
+        // Record reaching the checkpoint at top-level index 1.
+        s.checkpoint_record("sess", "phased", "p1", NodeId(1))
+            .unwrap();
+        assert_eq!(
+            s.checkpoint_resume("sess", "phased").unwrap(),
+            Some(NodeId(1))
+        );
+        // A later checkpoint advances the resume cursor (latest wins).
+        s.checkpoint_record("sess", "phased", "p2", NodeId(4))
+            .unwrap();
+        assert_eq!(
+            s.checkpoint_resume("sess", "phased").unwrap(),
+            Some(NodeId(4))
+        );
+        // Scoped per flow_key and per session.
+        assert!(s.checkpoint_resume("sess", "other").unwrap().is_none());
+        assert!(s.checkpoint_resume("other", "phased").unwrap().is_none());
     }
 
     #[test]

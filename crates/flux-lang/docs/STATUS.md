@@ -30,7 +30,8 @@ The forward design ([`flux-lang-evolution.md`](../../../docs/designs/flux-lang-e
 | **P6a** | `await` cross-turn suspend/resume (`run_top_level`/`resume_flow` + engine `suspensions` table) | ✅ |
 | **P6b** | Tier-1 control-flow primitives (`match`/`route`/`fallback`/`timeout`/`budget`) | ✅ |
 | **P6c** | polish: `fluxlang compile`, token-efficient `format_compact`, deterministic thing resolver (focus aliases deferred — no consumer) | ✅ |
-| — | Tier-2 control-flow (`checkpoint`/`compensate`/`once`/`scope`); `ask` reply-correlation (flux-app MVP) | ⬜ (optional) |
+| **P7** | Tier-2 control-flow (`scope`/`saga`/`once`/`checkpoint`) + `DurableStore` seam (`FlowStore` event-log folds) + dead-step optimizer pass | ✅ |
+| — | `ask` reply-correlation (flux-app MVP); `checkpoint`∘`await` composition; `once` crash-exactly-once | ⬜ (optional) |
 
 Each landed phase shipped behind the full dev loop (build/test/clippy/fmt/codegate) and an adversarial
 review pass (findings fixed before commit).

@@ -45,7 +45,9 @@
 
 use serde_json::Value as Json;
 
-use crate::ast::{Branch, FallbackBranch, FlowEffect, MatchCase, Param, RouteCase, SymbolName};
+use crate::ast::{
+    Branch, FallbackBranch, FlowEffect, MatchCase, Param, RouteCase, SagaStep, SymbolName,
+};
 // Re-exported so an author can stay inside `flux_lang::dsl::*` for the whole flow — including the
 // output type (`DraftAst`) and the raw `Node` (for the `Block::add` escape hatch).
 pub use crate::ast::{DraftAst, Node, Selector, ThingKind, ThingRef, TypeRef};
@@ -709,6 +711,51 @@ impl Block {
         })
     }
 
+    /// `scope: acquire … / body / finally …` — RAII acquire→use→release with guaranteed cleanup.
+    /// Configure the optional `acquire` (+ bind), the `body`, and the `finally` on the [`ScopeBuilder`].
+    pub fn scope(&mut self, build: impl FnOnce(&mut ScopeBuilder)) -> &mut Self {
+        let mut s = ScopeBuilder::default();
+        build(&mut s);
+        self.add(Node::Scope {
+            acquire: s.acquire.map(Box::new),
+            bind: s.bind,
+            body: s.body,
+            finally: s.finally,
+        })
+    }
+
+    /// `saga: step … undo … / step …` — a compensating transaction that unwinds completed steps in
+    /// reverse if a later one fails. Configure the steps on the [`SagaBuilder`].
+    pub fn saga(&mut self, build: impl FnOnce(&mut SagaBuilder)) -> &mut Self {
+        let mut s = SagaBuilder::default();
+        build(&mut s);
+        self.add(Node::Saga { steps: s.steps })
+    }
+
+    /// `once "label": …` — run the body at most once across re-runs (an effect-level memo, keyed on
+    /// the idempotency `label`). Configure the body on the [`WrapBuilder`].
+    pub fn once(
+        &mut self,
+        label: impl Into<String>,
+        build: impl FnOnce(&mut WrapBuilder),
+    ) -> &mut Self {
+        let mut w = WrapBuilder::default();
+        build(&mut w);
+        self.add(Node::Once {
+            label: label.into(),
+            body: w.body,
+            bind: w.bind,
+        })
+    }
+
+    /// `checkpoint "label"` — a durable, top-level resume point; a re-run of the same flow in the
+    /// same session fast-forwards past the completed prefix.
+    pub fn checkpoint(&mut self, label: impl Into<String>) -> &mut Self {
+        self.add(Node::Checkpoint {
+            label: label.into(),
+        })
+    }
+
     /// Consume the block, yielding its accumulated statements.
     pub fn into_body(self) -> Vec<Node> {
         self.body
@@ -718,6 +765,74 @@ impl Block {
 // ===========================================================================
 // Per-node builders (for nodes with optional modifiers)
 // ===========================================================================
+
+/// Configures a [`Block::scope`]: an optional resource `acquire` (+ bind), the `body`, and the
+/// `finally` cleanup that always runs.
+#[derive(Debug, Default, Clone)]
+pub struct ScopeBuilder {
+    acquire: Option<Node>,
+    bind: Option<SymbolName>,
+    body: Vec<Node>,
+    finally: Vec<Node>,
+}
+
+impl ScopeBuilder {
+    /// Acquire a resource by running `node`, binding its result to `name` for `body`/`finally`.
+    pub fn acquire(&mut self, name: impl Into<SymbolName>, node: Node) -> &mut Self {
+        self.acquire = Some(node);
+        self.bind = Some(name.into());
+        self
+    }
+    /// The body that uses the acquired resource.
+    pub fn body(&mut self, build: impl FnOnce(&mut Block)) -> &mut Self {
+        self.body = body_of(build);
+        self
+    }
+    /// The cleanup that always runs — on success, an early `return`, or an error.
+    pub fn finally(&mut self, build: impl FnOnce(&mut Block)) -> &mut Self {
+        self.finally = body_of(build);
+        self
+    }
+}
+
+/// Configures a [`Block::saga`]: an ordered list of compensable steps.
+#[derive(Debug, Default, Clone)]
+pub struct SagaBuilder {
+    steps: Vec<SagaStep>,
+}
+
+impl SagaBuilder {
+    /// Add a step — its forward `body` and an optional compensating `undo` (via [`SagaStepBuilder`]).
+    pub fn step(&mut self, build: impl FnOnce(&mut SagaStepBuilder)) -> &mut Self {
+        let mut s = SagaStepBuilder::default();
+        build(&mut s);
+        self.steps.push(SagaStep {
+            body: s.body,
+            undo: s.undo,
+        });
+        self
+    }
+}
+
+/// Configures one [`SagaBuilder::step`]: the forward `body` and the compensating `undo`.
+#[derive(Debug, Default, Clone)]
+pub struct SagaStepBuilder {
+    body: Vec<Node>,
+    undo: Vec<Node>,
+}
+
+impl SagaStepBuilder {
+    /// The forward work this step performs.
+    pub fn body(&mut self, build: impl FnOnce(&mut Block)) -> &mut Self {
+        self.body = body_of(build);
+        self
+    }
+    /// The compensation, run (in reverse order) if a *later* step fails.
+    pub fn undo(&mut self, build: impl FnOnce(&mut Block)) -> &mut Self {
+        self.undo = body_of(build);
+        self
+    }
+}
 
 /// Configures a [`Block::each`] loop: its body plus the optional `collect`/`flat` modifiers.
 #[derive(Debug, Default, Clone)]
@@ -1457,6 +1572,39 @@ mod tests {
                     });
                 });
             }),
+            one(|b| {
+                b.scope(|s| {
+                    s.acquire("h", call("lock", []));
+                    s.body(|b| {
+                        b.call("n", []);
+                    });
+                    s.finally(|b| {
+                        b.call("release", []);
+                    });
+                });
+            }),
+            one(|b| {
+                b.saga(|s| {
+                    s.step(|st| {
+                        st.body(|b| {
+                            b.call("charge", []);
+                        });
+                        st.undo(|b| {
+                            b.call("refund", []);
+                        });
+                    });
+                });
+            }),
+            one(|b| {
+                b.once("send-welcome", |w| {
+                    w.body(|b| {
+                        b.call("send_email", []);
+                    });
+                });
+            }),
+            one(|b| {
+                b.checkpoint("phase-1");
+            }),
         ];
 
         let built: std::collections::BTreeSet<String> = nodes.iter().map(kind_of).collect();
@@ -1472,6 +1620,6 @@ mod tests {
             catalog.difference(&built).collect::<Vec<_>>(),
             built.difference(&catalog).collect::<Vec<_>>(),
         );
-        assert_eq!(built.len(), 36, "expected all 36 node kinds");
+        assert_eq!(built.len(), 40, "expected all 40 node kinds");
     }
 }

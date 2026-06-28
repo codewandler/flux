@@ -23,7 +23,20 @@ pub fn optimize(hir: &HirFlow, ops: &dyn OpCatalog) -> PhysicalPlan {
     let mut stages: Vec<Stage> = Vec::new();
     let mut batch = Batch::default();
 
+    // Dead-step elimination: a read-only `bind` whose symbol is read nowhere in the flow has no
+    // observable effect, so drop it from the schedule. The flow's final top-level statement is never
+    // dropped — its value is the flow result (`execute_plan` returns the last stage's text). Single
+    // pass (not iterated to a fixpoint): dropping a step may free a *prior* step, which a later pass
+    // would catch; keeping it is sound, just less optimal.
+    let mut live = BTreeSet::new();
+    collect_reads_deep(&hir.body, &mut live);
+    let last = hir.body.len().saturating_sub(1);
+    let is_dead = |i: usize, node: &Node| i != last && is_dead_readonly_bind(node, ops, &live);
+
     for (i, node) in hir.body.iter().enumerate() {
+        if is_dead(i, node) {
+            continue;
+        }
         match readonly_bind(node, ops) {
             // A read-only bind joins the current batch when independent of it, else starts a fresh one.
             Some((reads, write)) => {
@@ -154,28 +167,76 @@ fn collect_var_reads(nodes: &[Node], acc: &mut BTreeSet<String>) {
 /// no interpolated read is missed.
 fn collect_interp_reads(value: &serde_json::Value, acc: &mut BTreeSet<String>) {
     match value {
-        serde_json::Value::String(s) => {
-            let mut rest = s.as_str();
-            while let Some(open) = rest.find('{') {
-                let at = &rest[open..];
-                let (o, c): (&str, &str) = if at.starts_with("{{") {
-                    ("{{", "}}")
-                } else {
-                    ("{", "}")
-                };
-                let inner = &at[o.len()..];
-                let Some(close) = inner.find(c) else { break };
-                let name = inner[..close].trim();
-                if !name.is_empty() {
-                    acc.insert(name.to_string());
-                }
-                rest = &inner[close + c.len()..];
-            }
-        }
+        serde_json::Value::String(s) => collect_interp_reads_str(s, acc),
         serde_json::Value::Array(a) => a.iter().for_each(|x| collect_interp_reads(x, acc)),
         serde_json::Value::Object(m) => m.values().for_each(|x| collect_interp_reads(x, acc)),
         _ => {}
     }
+}
+
+/// Collect interpolation tokens (`{name}` / `{{name}}`) from a single string (a `lit` string or an
+/// inline `fmt` template).
+fn collect_interp_reads_str(s: &str, acc: &mut BTreeSet<String>) {
+    let mut rest = s;
+    while let Some(open) = rest.find('{') {
+        let at = &rest[open..];
+        let (o, c): (&str, &str) = if at.starts_with("{{") {
+            ("{{", "}}")
+        } else {
+            ("{", "}")
+        };
+        let inner = &at[o.len()..];
+        let Some(close) = inner.find(c) else { break };
+        let name = inner[..close].trim();
+        if !name.is_empty() {
+            acc.insert(name.to_string());
+        }
+        rest = &inner[close + c.len()..];
+    }
+}
+
+/// The **global liveness read-set**: every symbol read anywhere in `body`, recursing through all
+/// sub-expressions and every nested statement body (via the analyzer's exhaustive [`for_each_node`]
+/// visitor, so a new node kind can't silently hide a read site). Collects the leaf read sites — a
+/// `var`/`peek` reference, the `{name}` tokens inside a `lit` string or `fmt` template, and the
+/// members a `ctx`/`ctx_append` pack pulls in. Powers dead-step elimination: a read-only bind whose
+/// symbol is absent here is provably unused.
+fn collect_reads_deep(body: &[Node], acc: &mut BTreeSet<String>) {
+    crate::analyze::for_each_node(body, &mut |n| match n {
+        Node::Var { name } | Node::Peek { name } => {
+            acc.insert(name.0.clone());
+        }
+        Node::Lit { value } => collect_interp_reads(value, acc),
+        Node::Fmt { template } => collect_interp_reads_str(template, acc),
+        Node::Ctx {
+            include, exclude, ..
+        } => {
+            for s in include.iter().chain(exclude.iter()) {
+                acc.insert(s.0.clone());
+            }
+        }
+        Node::CtxAppend { ctx, add } => {
+            acc.insert(ctx.0.clone());
+            for s in add {
+                acc.insert(s.0.clone());
+            }
+        }
+        // Every other node's reads are reached as nested `var`/`lit`/… nodes the visitor descends into.
+        _ => {}
+    });
+}
+
+/// Whether `node` is a read-only `bind`-of-`call` whose bound symbol is read nowhere in the flow — a
+/// dead step the optimizer drops. Restricted to plain `bind` (a `memo` may be read in a later turn,
+/// which a single flow's body cannot see) and to read-only ops (dropping must remove no side effect).
+fn is_dead_readonly_bind(node: &Node, ops: &dyn OpCatalog, live: &BTreeSet<String>) -> bool {
+    let Node::Bind { name, value, .. } = node else {
+        return false;
+    };
+    let Node::Call { op, .. } = value.as_ref() else {
+        return false;
+    };
+    is_readonly_op(op, ops) && !live.contains(&name.0)
 }
 
 #[cfg(test)]
@@ -236,12 +297,20 @@ mod tests {
 
     #[test]
     fn independent_reads_batch_into_one_parallel_stage() {
-        // $a = read "x"; $b = read "y"  — independent reads → one Parallel stage.
+        // $a = read "x"; $b = read "y" — independent reads → one Parallel stage. `$r` consumes both
+        // (so they are live) and is the flow result.
         let stages = plan(vec![
             bind("a", "read", vec![lit("x")]),
             bind("b", "read", vec![lit("y")]),
+            bind("r", "read", vec![lit("{{a}}{{b}}")]),
         ]);
-        assert_eq!(stages, vec![Stage::Parallel(vec![NodeId(0), NodeId(1)])]);
+        assert_eq!(
+            stages,
+            vec![
+                Stage::Parallel(vec![NodeId(0), NodeId(1)]),
+                Stage::Sequential(NodeId(2)),
+            ]
+        );
     }
 
     #[test]
@@ -259,11 +328,12 @@ mod tests {
 
     #[test]
     fn a_write_fences_and_breaks_the_batch() {
-        // $a = read "x"; $b = write "y"; $c = read "z"  → [seq a] [fence b] [seq c].
+        // $a = read "x"; $b = write "y"; $c = read "{{a}}"  → [seq a] [fence b] [seq c]. `$c` reads
+        // `$a` (keeping it live) and is the result.
         let stages = plan(vec![
             bind("a", "read", vec![lit("x")]),
             bind("b", "write", vec![lit("y")]),
-            bind("c", "read", vec![lit("z")]),
+            bind("c", "read", vec![lit("{{a}}")]),
         ]);
         assert_eq!(
             stages,
@@ -297,14 +367,75 @@ mod tests {
 
     #[test]
     fn write_after_write_to_the_same_symbol_is_not_parallelized() {
-        // two pure binds to the SAME symbol must not parallelize (WAW hazard).
+        // two pure binds to the SAME symbol must not parallelize (WAW hazard). The second reads `$a`
+        // (keeping the first live) and is the result.
         let stages = plan(vec![
             bind("a", "pure", vec![lit("x")]),
-            bind("a", "pure", vec![lit("y")]),
+            bind("a", "pure", vec![lit("{{a}}")]),
         ]);
         assert_eq!(
             stages,
             vec![Stage::Sequential(NodeId(0)), Stage::Sequential(NodeId(1))]
         );
+    }
+
+    #[test]
+    fn a_dead_read_bind_is_dropped() {
+        // $dead = read "x" (never used); $used = read "y"; $r = read $used (the result).
+        // The dead read is eliminated; the live nodes keep their original indices.
+        let stages = plan(vec![
+            bind("dead", "read", vec![lit("x")]),
+            bind("used", "read", vec![lit("y")]),
+            bind("r", "read", vec![var("used")]),
+        ]);
+        assert_eq!(
+            stages,
+            vec![Stage::Sequential(NodeId(1)), Stage::Sequential(NodeId(2))],
+            "node 0 (dead) is gone; nodes 1 and 2 (live, dependent) stay sequential"
+        );
+    }
+
+    #[test]
+    fn a_read_used_only_by_interpolation_is_kept() {
+        // $cfg = read "x"; $b = read "{{cfg}}/p" — cfg is read via interpolation, so it is NOT dead.
+        let stages = plan(vec![
+            bind("cfg", "read", vec![lit("x")]),
+            bind(
+                "b",
+                "read",
+                vec![Node::Lit {
+                    value: serde_json::json!("{{cfg}}/p"),
+                }],
+            ),
+        ]);
+        assert_eq!(
+            stages,
+            vec![Stage::Sequential(NodeId(0)), Stage::Sequential(NodeId(1))],
+            "cfg is live via interpolation and is not eliminated"
+        );
+    }
+
+    #[test]
+    fn an_unused_write_is_never_dropped() {
+        // $w = write "x" (unused); $r = read "y" (result). A write is a side effect, never eliminated.
+        let stages = plan(vec![
+            bind("w", "write", vec![lit("x")]),
+            bind("r", "read", vec![lit("y")]),
+        ]);
+        assert_eq!(
+            stages,
+            vec![
+                Stage::ApprovalFence(NodeId(0)),
+                Stage::Sequential(NodeId(1))
+            ],
+            "only read-only binds are eligible for elimination; the write stays (fenced)"
+        );
+    }
+
+    #[test]
+    fn the_final_statement_is_never_dropped_even_if_unread() {
+        // a single unread read is the flow's result, so it must survive.
+        let stages = plan(vec![bind("a", "read", vec![lit("x")])]);
+        assert_eq!(stages, vec![Stage::Sequential(NodeId(0))]);
     }
 }

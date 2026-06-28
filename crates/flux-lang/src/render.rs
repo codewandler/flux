@@ -175,6 +175,24 @@ fn children(node: &Node) -> Vec<Branch<'_>> {
         Node::Timeout { body, .. } | Node::Budget { body, .. } => {
             body.iter().map(Branch::Node).collect()
         }
+        Node::Scope { body, finally, .. } => {
+            let mut v: Vec<Branch> = body.iter().map(Branch::Node).collect();
+            if !finally.is_empty() {
+                v.push(Branch::Group("finally", finally));
+            }
+            v
+        }
+        Node::Saga { steps } => {
+            let mut v: Vec<Branch> = Vec::new();
+            for step in steps {
+                v.extend(step.body.iter().map(Branch::Node));
+                if !step.undo.is_empty() {
+                    v.push(Branch::Group("undo", &step.undo));
+                }
+            }
+            v
+        }
+        Node::Once { body, .. } => body.iter().map(Branch::Node).collect(),
         Node::Verify { .. } => Vec::new(),
         Node::Peek { .. } => Vec::new(),
         Node::Expr { .. } | Node::Fmt { .. } | Node::Jq { .. } => Vec::new(),
@@ -372,6 +390,16 @@ fn head(node: &Node, p: &Palette) -> String {
             Some(b) => format!("{} {limit} -> {}", paint(p.keyword, "budget"), sym(p, &b.0)),
             None => format!("{} {limit}", paint(p.keyword, "budget")),
         },
+        Node::Scope { bind, .. } => match bind {
+            Some(b) => format!("{} -> {}", paint(p.keyword, "scope"), sym(p, &b.0)),
+            None => paint(p.keyword, "scope"),
+        },
+        Node::Saga { steps } => format!("{} ({} steps)", paint(p.keyword, "saga"), steps.len()),
+        Node::Once { label, bind, .. } => match bind {
+            Some(b) => format!("{} {label:?} -> {}", paint(p.keyword, "once"), sym(p, &b.0)),
+            None => format!("{} {label:?}", paint(p.keyword, "once")),
+        },
+        Node::Checkpoint { label } => format!("{} {label:?}", paint(p.keyword, "checkpoint")),
     }
 }
 
@@ -416,7 +444,11 @@ fn expr(node: &Node, p: &Palette) -> String {
         | Node::Route { .. }
         | Node::Fallback { .. }
         | Node::Timeout { .. }
-        | Node::Budget { .. } => "…".to_string(),
+        | Node::Budget { .. }
+        | Node::Scope { .. }
+        | Node::Saga { .. }
+        | Node::Once { .. }
+        | Node::Checkpoint { .. } => "…".to_string(),
     }
 }
 
