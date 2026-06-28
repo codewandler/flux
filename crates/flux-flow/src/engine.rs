@@ -421,20 +421,22 @@ impl FlowEngine {
     /// planner prompt is appended to (shared by `run_turn` and `plan_turn`).
     fn base_system_with_skills(&self, user_input: &str, sink: &mut dyn AgentSink) -> String {
         let mut base_system = self.system_prompt.clone();
-        for skill in &self.skills {
-            if skill.matches(user_input) {
-                base_system.push_str(&format!(
-                    "\n\n<skill name=\"{}\">\n{}\n</skill>",
-                    skill.name, skill.body
-                ));
-                let obs = flux_evidence::Observation::new(
-                    "skill.activated",
-                    flux_evidence::Phase::Turn,
-                    serde_json::json!({ "skill": skill.name }),
-                );
-                self.executor.observe(obs.clone());
-                sink.observation(&obs);
-            }
+        for skill in flux_skill::active_for(
+            &self.skills,
+            user_input,
+            flux_skill::ActivationLimits::default(),
+        ) {
+            base_system.push_str(&format!(
+                "\n\n<skill name=\"{}\">\n{}\n</skill>",
+                skill.name, skill.body
+            ));
+            let obs = flux_evidence::Observation::new(
+                "skill.activated",
+                flux_evidence::Phase::Turn,
+                serde_json::json!({ "skill": skill.name }),
+            );
+            self.executor.observe(obs.clone());
+            sink.observation(&obs);
         }
         base_system
     }

@@ -7,3 +7,5 @@ description = "flux skills: markdown + frontmatter knowledge packs with triggers
 
 [dependencies]
 serde.workspace = true
+serde_norway.workspace = true
+flux-markdown.workspace = true

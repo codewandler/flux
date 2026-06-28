@@ -1,19 +1,23 @@
-//! Render assistant Markdown to ratatui [`Text`].
+//! Markdown rendering — thin wrappers over the `codewandler/markdown` crates.
 //!
-//! Delegates to [`flux_markdown::render`] (which wraps `markdown-stream` + `markdown-ratatui`). The
-//! whole transcript is one wrapped `Paragraph`, so the renderer pre-wraps to the transcript's inner
-//! width (with list hanging indents baked in) to keep line math honest. Only *finalized* assistant
-//! turns go through here — a streaming partial renders as plain text + a cursor (half-parsed Markdown
-//! flickers), which the caller handles.
-
-use ratatui::text::Text;
+//! These exist so the rest of flux depends on `flux-markdown` rather than the external crates
+//! directly. They are feature-gated (`ratatui`, `terminal`) and add no logic of their own.
 
 /// Render `src` as GFM Markdown wrapped to `width` columns, styled natively to ratatui spans.
-pub fn render(src: &str, width: u16) -> Text<'static> {
-    flux_markdown::render::render(src, width)
+///
+/// Pipeline: `markdown-stream` parses to a flat event stream and `markdown-ratatui` renders those
+/// events straight to styled spans (no ANSI round-trip).
+#[cfg(feature = "ratatui")]
+pub fn render(src: &str, width: u16) -> ratatui::text::Text<'static> {
+    let events = markdown_stream::parse_gfm(src);
+    markdown_ratatui::render_with(&events, &markdown_ratatui::Theme::default(), width as usize)
 }
 
-#[cfg(test)]
+/// Live (incremental) markdown rendering to a terminal, re-exported for flux-cli's streaming sink.
+#[cfg(feature = "terminal")]
+pub use markdown_terminal::{LiveRenderer, Theme};
+
+#[cfg(all(test, feature = "ratatui"))]
 mod tests {
     use super::*;
 
@@ -31,7 +35,6 @@ mod tests {
             flat.contains("one") && flat.contains("two"),
             "list items present"
         );
-        // markdown produces styled spans (bold), not one flat span
         assert!(
             text.lines.iter().any(|l| l.spans.len() > 1),
             "styled spans produced"

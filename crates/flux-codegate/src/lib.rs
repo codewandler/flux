@@ -18,7 +18,7 @@ pub fn layer(name: &str) -> Option<u8> {
     Some(match name {
         // L0 — pure contracts: no IO, no flux deps except other L0. Safe for anything to use.
         "flux-core" | "flux-policy" | "flux-secret" | "flux-spec" | "flux-config"
-        | "flux-evidence" | "flux-skill" | "flux-lang" => 0,
+        | "flux-evidence" | "flux-skill" | "flux-lang" | "flux-markdown" => 0,
         // L1 — the provider abstraction, the concrete providers (Anthropic/OpenAI/OpenRouter/
         // Ollama + the shared Messages protocol core, all in `flux-providers`), and credentials
         "flux-provider" | "flux-providers" | "flux-credentials" => 1,

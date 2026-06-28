@@ -495,22 +495,11 @@ fn compact_threshold() -> usize {
         .unwrap_or(48_000)
 }
 
-/// Discover skills from `.flux/skills` (project) and `~/.flux/skills` (user). Their triggers gate
-/// per-turn activation in the agent loop.
+/// Discover skills from the project's `.flux/skills` plus the user/global dirs (`~/.flux/skills`,
+/// `~/.agents/skills`, `~/.claude/skills`), project winning on a name clash. Activation (triggers or
+/// a description fallback) gates which bodies are injected per turn.
 fn load_skills(cwd: &std::path::Path) -> Vec<flux_skill::Skill> {
-    let mut dirs = vec![cwd.join(".flux").join("skills")];
-    if let Some(home) = std::env::var_os("HOME") {
-        let user = std::path::PathBuf::from(home).join(".flux").join("skills");
-        if !dirs.contains(&user) {
-            dirs.push(user); // avoid scanning the same dir twice when HOME == project root
-        }
-    }
-    // De-duplicate by skill name (project dir is scanned first → wins on a name clash).
-    let mut seen = std::collections::HashSet::new();
-    flux_skill::discover(&dirs)
-        .into_iter()
-        .filter(|s| seen.insert(s.name.clone()))
-        .collect()
+    flux_skill::discover_merged(&flux_skill::default_skill_dirs(cwd))
 }
 
 /// The plugin descriptor directory `~/.flux/plugins` (None if `HOME` is unset).
@@ -2081,7 +2070,7 @@ fn risk_badge(summary: &str) -> String {
 /// in the "Refined" style: a syntax-highlighted plan, colored `→`/`✓`/`✗` markers, a live spinner while
 /// each op runs, and a completion rule with timing. All color is tty/`NO_COLOR`/`--color`-aware.
 struct CliSink {
-    live: markdown_terminal::LiveRenderer,
+    live: flux_markdown::render::LiveRenderer,
     /// Show tool output in full (no truncation) — from `-v`/`FLUX_VERBOSE`.
     verbose: bool,
     width: usize,
@@ -2109,8 +2098,8 @@ impl CliSink {
             .filter(|&w| w >= 20)
             .unwrap_or(80);
         CliSink {
-            live: markdown_terminal::LiveRenderer::new(
-                markdown_terminal::Theme::auto(),
+            live: flux_markdown::render::LiveRenderer::new(
+                flux_markdown::render::Theme::auto(),
                 width,
                 stdout_tty,
             ),

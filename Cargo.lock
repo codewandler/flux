@@ -681,6 +681,7 @@ dependencies = [
  "flux-evidence",
  "flux-flow",
  "flux-hooks",
+ "flux-markdown",
  "flux-orchestrate",
  "flux-plugin",
  "flux-policy",
@@ -696,7 +697,6 @@ dependencies = [
  "flux-tools",
  "flux-tui",
  "futures",
- "markdown-terminal",
  "reedline",
  "serde_json",
  "serde_norway",
@@ -893,6 +893,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "flux-markdown"
+version = "0.2.4"
+dependencies = [
+ "markdown-ratatui",
+ "markdown-stream",
+ "markdown-terminal",
+ "ratatui",
+ "serde",
+ "serde_norway",
+]
+
+[[package]]
 name = "flux-orchestrate"
 version = "0.2.4"
 dependencies = [
@@ -900,6 +912,7 @@ dependencies = [
  "flux-agent",
  "flux-core",
  "flux-events",
+ "flux-markdown",
  "flux-policy",
  "flux-provider",
  "flux-runtime",
@@ -908,6 +921,7 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
+ "serde_norway",
  "tokio",
  "tokio-util",
 ]
@@ -1039,7 +1053,9 @@ dependencies = [
 name = "flux-skill"
 version = "0.2.4"
 dependencies = [
+ "flux-markdown",
  "serde",
+ "serde_norway",
 ]
 
 [[package]]
@@ -1092,10 +1108,9 @@ dependencies = [
  "flux-core",
  "flux-evidence",
  "flux-flow",
+ "flux-markdown",
  "flux-runtime",
  "flux-spec",
- "markdown-ratatui",
- "markdown-stream",
  "ratatui",
  "serde_json",
  "tokio",

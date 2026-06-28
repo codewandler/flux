@@ -34,6 +34,7 @@ members = [
     "crates/flux-codegate",
     "crates/flux-cognition",
     "crates/flux-app",
+    "crates/flux-markdown",
 ]
 
 [workspace.package]
@@ -82,6 +83,7 @@ flux-providers = { path = "crates/flux-providers" }
 flux-credentials = { path = "crates/flux-credentials" }
 flux-cognition = { path = "crates/flux-cognition", version = "0.2.4" }
 flux-app = { path = "crates/flux-app" }
+flux-markdown = { path = "crates/flux-markdown" }
 
 # external
 serde = { version = "1", features = ["derive"] }

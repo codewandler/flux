@@ -1,0 +1,25 @@
+[package]
+name = "flux-markdown"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Frontmatter parsing/validation and (feature-gated) markdown rendering wrappers for flux"
+
+[dependencies]
+serde.workspace = true
+serde_norway.workspace = true
+
+# Rendering wrappers — off by default so the L0 frontmatter half stays lean. These wrap the
+# codewandler/markdown crates (pinned to the same rev flux-tui/flux-cli use so the workspace resolves
+# a single markdown-stream). `ratatui` is the workspace ratatui so the re-exported `Text` type-aligns.
+ratatui = { workspace = true, optional = true }
+markdown-stream = { git = "https://github.com/codewandler/markdown", rev = "35c6db54d7ab12814db738cc019592b83aab6e8a", optional = true }
+markdown-ratatui = { git = "https://github.com/codewandler/markdown", rev = "35c6db54d7ab12814db738cc019592b83aab6e8a", optional = true }
+markdown-terminal = { git = "https://github.com/codewandler/markdown", rev = "35c6db54d7ab12814db738cc019592b83aab6e8a", optional = true }
+
+[features]
+default = []
+# Native render to ratatui `Text` (used by flux-tui).
+ratatui = ["dep:ratatui", "dep:markdown-stream", "dep:markdown-ratatui"]
+# Live streaming render to a terminal (used by flux-cli's CliSink).
+terminal = ["dep:markdown-terminal"]

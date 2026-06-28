@@ -23,65 +23,35 @@ pub struct Role {
     pub prompt: String,
 }
 
-fn unquote(s: &str) -> String {
-    s.trim().trim_matches(|c| c == '"' || c == '\'').to_string()
-}
-
-fn parse_list(v: &str) -> Vec<String> {
-    v.trim()
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .split(',')
-        .map(unquote)
-        .filter(|p| !p.is_empty())
-        .collect()
-}
-
-fn split_frontmatter(content: &str) -> (String, String) {
-    let t = content.trim_start_matches('\u{feff}');
-    if let Some(rest) = t.strip_prefix("---") {
-        if let Some(end) = rest.find("\n---") {
-            let fm = rest[..end].trim_start_matches(['\r', '\n']).to_string();
-            let body = rest[end + 4..]
-                .split_once('\n')
-                .map(|x| x.1)
-                .unwrap_or("")
-                .to_string();
-            return (fm, body);
-        }
-    }
-    (String::new(), content.to_string())
+/// Role frontmatter (all fields optional → lenient parsing). `tools` distinguishes a missing key
+/// (`None` → inherit all) from an explicit `tools: []` (`Some([])` → grant none).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RoleFrontmatter {
+    name: String,
+    description: String,
+    model: Option<String>,
+    tools: Option<Vec<String>>,
 }
 
 /// Parse role markdown. `name_fallback` is used when frontmatter omits `name`.
 pub fn parse_role(content: &str, name_fallback: &str) -> Role {
-    let (fm, body) = split_frontmatter(content);
-    let mut name = String::new();
-    let mut description = String::new();
-    let mut model = None;
-    let mut tools = None;
-    for line in fm.lines() {
-        if let Some((k, v)) = line.split_once(':') {
-            match k.trim() {
-                "name" => name = unquote(v),
-                "description" => description = unquote(v),
-                "model" => {
-                    let m = unquote(v);
-                    model = (!m.is_empty()).then_some(m);
-                }
-                "tools" => tools = Some(parse_list(v)),
-                _ => {}
-            }
-        }
-    }
-    if name.is_empty() {
-        name = name_fallback.to_string();
-    }
+    let (fm, body) = flux_markdown::split_frontmatter(content);
+    let meta: RoleFrontmatter = fm
+        .map(|y| serde_norway::from_str(y).unwrap_or_default())
+        .unwrap_or_default();
+
+    let name = if meta.name.is_empty() {
+        name_fallback.to_string()
+    } else {
+        meta.name
+    };
     Role {
         name,
-        description,
-        model,
-        tools,
+        description: meta.description,
+        // an empty `model:` (null/blank) inherits the parent's model
+        model: meta.model.filter(|m| !m.is_empty()),
+        tools: meta.tools,
         prompt: body.trim().to_string(),
     }
 }
