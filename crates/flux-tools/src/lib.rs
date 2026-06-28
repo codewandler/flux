@@ -13,6 +13,7 @@ pub mod evidence;
 pub mod extra;
 pub mod groups;
 pub mod reflect;
+pub mod toolchains;
 
 pub use evidence::register_evidence;
 pub use reflect::register_reflect;
@@ -192,6 +193,7 @@ fn unified_diff(path: &str, before: &str, after: &str) -> String {
 /// Register all built-in tools into a registry.
 pub fn register_builtins(registry: &mut ToolRegistry) {
     cargo::register_cargo(registry);
+    toolchains::register_toolchains(registry);
     extra::register_extra(registry);
     registry.register(Arc::new(ReadTool));
     registry.register(Arc::new(ReadManyTool));
@@ -893,8 +895,10 @@ impl Tool for BashTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "bash".into(),
-            description: "Run a shell command (via `sh -c`) in the workspace root. Gated by \
-                          permission rules and approval."
+            description: "Run a shell command (via `sh -c`) in the workspace root. The generic \
+                          escape hatch — off by default; opt in via the `shell` group (config \
+                          `enable_shell = true` or `FLUX_ENABLE_BASH=1`). Prefer the dedicated ops. \
+                          Gated by permission rules and approval."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -909,7 +913,8 @@ impl Tool for BashTool {
             risk: Risk::High,
             idempotency: Idempotency::NonIdempotent,
             access: vec![AccessKind::Process, AccessKind::LocalSystem],
-            group: None,
+            // The `shell` group (off by default) owns bash so it is not a core always-advertised op.
+            group: Some("shell".into()),
         }
     }
 
@@ -3017,10 +3022,13 @@ mod tests {
                 "cargo_test",
                 "cite",
                 "compare",
+                "cwd",
                 "dedupe",
                 "edit",
                 "evidence",
                 "file_stat",
+                "filter",
+                "first",
                 "gaps",
                 "git_checkout",
                 "git_commit",
@@ -3031,22 +3039,67 @@ mod tests {
                 "git_status",
                 "git_unstage",
                 "glob",
+                "go_build",
+                "go_test",
+                "go_vet",
                 "grep",
                 "home_dir",
+                "last",
+                "len",
+                "make",
                 "merge",
                 "metrics",
                 "need",
+                "node_run",
+                "now",
+                "npm",
                 "observe",
                 "patch",
                 "path_exists",
+                "pytest",
+                "python_run",
                 "read",
                 "read_many",
                 "sort",
                 "sqlite_query",
+                "sys_info",
                 "top",
                 "web_search",
                 "write"
             ]
+        );
+    }
+
+    #[test]
+    fn bash_is_off_by_default_and_opts_in_via_shell_signal() {
+        let groups = crate::groups::builtin_groups();
+        let bash = BashTool.spec();
+        assert_eq!(
+            bash.group.as_deref(),
+            Some("shell"),
+            "bash belongs to the shell group"
+        );
+
+        // Default: no `shell` signal → group inactive → bash NOT advertised to the model.
+        let off = flux_evidence::resolve_active_groups(&groups, &[]);
+        assert!(!off.contains("shell"));
+        assert!(
+            !flux_runtime::is_advertised(&bash, &groups, &off),
+            "bash must be hidden from the catalog by default"
+        );
+
+        // Opt-in: a `shell` signal observation (what `detect_signals` emits when FLUX_ENABLE_BASH /
+        // enable_shell is set) activates the group → bash is advertised.
+        let sig = flux_evidence::Observation::new(
+            flux_evidence::KIND_SIGNAL,
+            flux_evidence::Phase::Turn,
+            json!({"signal": "shell"}),
+        );
+        let on = flux_evidence::resolve_active_groups(&groups, std::slice::from_ref(&sig));
+        assert!(on.contains("shell"));
+        assert!(
+            flux_runtime::is_advertised(&bash, &groups, &on),
+            "bash is advertised once shell is opted in"
         );
     }
 

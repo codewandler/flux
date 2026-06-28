@@ -5,7 +5,7 @@
 //! `Risk::Low`, and `Idempotency::Idempotent`, so the runtime's policy/approval gates never fire for
 //! them. They give the model a small, deterministic toolbox for shaping evidence: declaring what a
 //! task `need`s, finding the `gaps` against gathered claims, and `compare`/`dedupe`/`sort`/`top`/
-//! `merge`/`cite` over lists of values.
+//! `merge`/`cite`/`len`/`first`/`last`/`filter` over lists of values.
 //!
 //! Every op is robust to missing optional params and wrong-typed input: it returns a clear
 //! [`Error::Other`] rather than panicking.
@@ -29,6 +29,10 @@ pub fn register_cognition(registry: &mut ToolRegistry) {
     registry.register(Arc::new(TopTool));
     registry.register(Arc::new(MergeTool));
     registry.register(Arc::new(CiteTool));
+    registry.register(Arc::new(LenTool));
+    registry.register(Arc::new(FirstTool));
+    registry.register(Arc::new(LastTool));
+    registry.register(Arc::new(FilterTool));
 }
 
 // ---------------------------------------------------------------------------
@@ -499,6 +503,147 @@ impl Tool for MergeTool {
 }
 
 // ---------------------------------------------------------------------------
+// len
+// ---------------------------------------------------------------------------
+
+pub struct LenTool;
+
+#[async_trait]
+impl Tool for LenTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "len",
+            "Return the number of items in an array (or the character count of a string). \
+             Use with `when`/`expr` to branch on list size without shelling out.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "items": {"description": "An array (length) or a string (character count)"}
+                },
+                "required": ["items"]
+            }),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        match params.get("items") {
+            Some(Value::Array(a)) => Ok(ToolResult::ok(a.len().to_string())),
+            Some(Value::String(s)) => Ok(ToolResult::ok(s.chars().count().to_string())),
+            None | Some(Value::Null) => {
+                Err(Error::Other("len: required param `items` missing".into()))
+            }
+            Some(_) => Err(Error::Other(
+                "len: param `items` must be an array or a string".into(),
+            )),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// first / last
+// ---------------------------------------------------------------------------
+
+pub struct FirstTool;
+
+#[async_trait]
+impl Tool for FirstTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "first",
+            "Return the first item of an array (or `null` if the array is empty).",
+            json!({
+                "type": "object",
+                "properties": {"items": {"type": "array", "items": {}}},
+                "required": ["items"]
+            }),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let items = arr_param(&params, "items", "first")?;
+        let v = items.into_iter().next().unwrap_or(Value::Null);
+        Ok(ToolResult::ok(serde_json::to_string(&v)?))
+    }
+}
+
+pub struct LastTool;
+
+#[async_trait]
+impl Tool for LastTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "last",
+            "Return the last item of an array (or `null` if the array is empty).",
+            json!({
+                "type": "object",
+                "properties": {"items": {"type": "array", "items": {}}},
+                "required": ["items"]
+            }),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let items = arr_param(&params, "items", "last")?;
+        let v = items.into_iter().next_back().unwrap_or(Value::Null);
+        Ok(ToolResult::ok(serde_json::to_string(&v)?))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// filter
+// ---------------------------------------------------------------------------
+
+pub struct FilterTool;
+
+#[async_trait]
+impl Tool for FilterTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "filter",
+            "Keep array items that satisfy a predicate. With `by`, the object field of that name is \
+             inspected (otherwise the item itself). With `equals`, an item is kept when the inspected \
+             value equals it; without `equals`, when the inspected value is truthy.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "items": {"type": "array", "items": {}},
+                    "by": {"type": "string", "description": "Optional object field to inspect"},
+                    "equals": {"description": "Optional value to match (default: keep truthy)"}
+                },
+                "required": ["items"]
+            }),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let items = arr_or_empty(&params, "items", "filter")?;
+        let by = match params.get("by") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(_) => return Err(Error::Other("filter: param `by` must be a string".into())),
+        };
+        let equals = match params.get("equals") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(v.clone()),
+        };
+        let out: Vec<Value> = items
+            .into_iter()
+            .filter(|it| {
+                let probe = match &by {
+                    Some(f) => it.get(f.as_str()).cloned().unwrap_or(Value::Null),
+                    None => it.clone(),
+                };
+                match &equals {
+                    Some(eq) => &probe == eq,
+                    None => is_truthy(&probe),
+                }
+            })
+            .collect();
+        Ok(ToolResult::ok(serde_json::to_string(&out)?))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // cite
 // ---------------------------------------------------------------------------
 
@@ -604,15 +749,109 @@ mod tests {
     }
 
     #[test]
-    fn registers_all_eight_named_ops() {
+    fn registers_all_named_ops() {
         let mut reg = ToolRegistry::new();
         register_cognition(&mut reg);
         let mut names = reg.names();
         names.sort();
         assert_eq!(
             names,
-            vec!["cite", "compare", "dedupe", "gaps", "merge", "need", "sort", "top"]
+            vec![
+                "cite", "compare", "dedupe", "filter", "first", "gaps", "last", "len", "merge",
+                "need", "sort", "top"
+            ]
         );
+    }
+
+    #[tokio::test]
+    async fn len_counts_arrays_and_strings() {
+        let c = ctx();
+        assert_eq!(
+            LenTool
+                .execute(&c, json!({"items": [1, 2, 3]}))
+                .await
+                .unwrap()
+                .content,
+            "3"
+        );
+        assert_eq!(
+            LenTool
+                .execute(&c, json!({"items": "hello"}))
+                .await
+                .unwrap()
+                .content,
+            "5"
+        );
+        let err = LenTool
+            .execute(&c, json!({"items": 42}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("array or a string"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn first_and_last_pick_ends_or_null() {
+        let c = ctx();
+        assert_eq!(
+            FirstTool
+                .execute(&c, json!({"items": [1, 2, 3]}))
+                .await
+                .unwrap()
+                .content,
+            "1"
+        );
+        assert_eq!(
+            LastTool
+                .execute(&c, json!({"items": [1, 2, 3]}))
+                .await
+                .unwrap()
+                .content,
+            "3"
+        );
+        // Empty list yields null, not an error.
+        assert_eq!(
+            FirstTool
+                .execute(&c, json!({"items": []}))
+                .await
+                .unwrap()
+                .content,
+            "null"
+        );
+    }
+
+    #[tokio::test]
+    async fn filter_by_truthy_and_by_equals() {
+        let c = ctx();
+        // Keep items whose `active` field is truthy.
+        let r = FilterTool
+            .execute(
+                &c,
+                json!({"items": [{"id": 1, "active": true}, {"id": 2, "active": false}], "by": "active"}),
+            )
+            .await
+            .unwrap();
+        let out: Vec<Value> = serde_json::from_str(&r.content).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["id"], 1);
+
+        // Keep items whose `status` field equals "ok".
+        let r2 = FilterTool
+            .execute(
+                &c,
+                json!({"items": [{"status": "ok"}, {"status": "fail"}], "by": "status", "equals": "ok"}),
+            )
+            .await
+            .unwrap();
+        let out2: Vec<Value> = serde_json::from_str(&r2.content).unwrap();
+        assert_eq!(out2, json!([{"status": "ok"}]).as_array().unwrap().clone());
+
+        // Bare truthy filter over scalars.
+        let r3 = FilterTool
+            .execute(&c, json!({"items": [0, 1, "", "x", false, true]}))
+            .await
+            .unwrap();
+        assert_eq!(r3.content, "[1,\"x\",true]");
     }
 
     #[tokio::test]

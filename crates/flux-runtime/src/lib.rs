@@ -308,6 +308,13 @@ pub fn surface_all_override() -> bool {
     std::env::var("FLUX_SURFACE_ALL").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
+/// Whether the generic `bash` op is opted in: `FLUX_ENABLE_BASH=1` (or `true`). The CLI sets this
+/// from config `enable_shell` and the `/shell` toggle; [`detect_signals`] turns it into the `shell`
+/// signal that surfaces the off-by-default `shell` group.
+pub fn shell_opt_in() -> bool {
+    std::env::var("FLUX_ENABLE_BASH").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
 /// The group an op effectively belongs to: a manifest group that lists it in `tools` wins (so config
 /// can (re)assign membership), otherwise the op's own [`ToolSpec::group`] tag. `None` ⇒ *core*.
 fn effective_group<'a>(
@@ -380,8 +387,19 @@ pub fn detect_signals(cwd: &std::path::Path) -> Vec<Observation> {
     }) {
         push("python");
     }
+    if find_up(cwd, |p| {
+        p.join("Makefile").exists() || p.join("makefile").exists()
+    }) {
+        push("make");
+    }
     if find_up(cwd, |p| p.join(".flux").join("evals").is_dir()) {
         push("eval");
+    }
+    // `shell` is an explicit opt-in, not a filesystem marker: it surfaces the off-by-default `shell`
+    // group (the generic `bash` op). The CLI sets `FLUX_ENABLE_BASH` from config `enable_shell`, the
+    // `/shell` toggle, or the user exports it directly.
+    if shell_opt_in() {
+        push("shell");
     }
     out
 }

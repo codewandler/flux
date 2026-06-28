@@ -41,7 +41,7 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
         ToolGroup {
             name: "go".into(),
             description: "Go toolchain operations.".into(),
-            tools: Vec::new(),
+            tools: names(&["go_build", "go_test", "go_vet"]),
             surface_when: when("go"),
         },
         ToolGroup {
@@ -59,22 +59,39 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
         ToolGroup {
             name: "node".into(),
             description: "Node.js toolchain operations.".into(),
-            tools: Vec::new(),
+            tools: names(&["npm", "node_run"]),
             surface_when: when("node"),
         },
         ToolGroup {
             name: "python".into(),
             description: "Python toolchain operations.".into(),
-            tools: Vec::new(),
+            tools: names(&["python_run", "pytest"]),
             surface_when: when("python"),
+        },
+        ToolGroup {
+            name: "make".into(),
+            description: "Make build automation.".into(),
+            tools: names(&["make"]),
+            surface_when: when("make"),
+        },
+        ToolGroup {
+            name: "shell".into(),
+            description: "The generic `bash` escape hatch — off by default. Opt in with \
+                          `enable_shell = true` in config or `FLUX_ENABLE_BASH=1` (which inject the \
+                          `shell` signal). Prefer the dedicated ops; reach for `bash` only when no op \
+                          covers the need."
+                .into(),
+            tools: names(&["bash"]),
+            surface_when: when("shell"),
         },
         ToolGroup {
             name: "cognition".into(),
             description: "Pure cognition helpers: needs/gaps, and list shaping (compare, dedupe, \
-                          sort, top, merge, cite)."
+                          sort, top, merge, cite, len, first, last, filter)."
                 .into(),
             tools: names(&[
-                "need", "gaps", "compare", "dedupe", "sort", "top", "merge", "cite",
+                "need", "gaps", "compare", "dedupe", "sort", "top", "merge", "cite", "len",
+                "first", "last", "filter",
             ]),
             // Force-on (empty predicate): these deterministic helpers are useful in any session, so
             // they are always advertised rather than gated on a workspace signal.
@@ -93,5 +110,24 @@ mod tests {
         let git = g.iter().find(|g| g.name == "git").unwrap();
         assert!(git.tools.contains(&"git_status".to_string()));
         assert_eq!(git.surface_when[0].signal.as_deref(), Some("git_repo"));
+    }
+
+    #[test]
+    fn toolchain_groups_carry_their_ops_and_signals() {
+        let g = builtin_groups();
+        let by = |name: &str| g.iter().find(|g| g.name == name).unwrap();
+        for (group, op, signal) in [
+            ("go", "go_build", "go"),
+            ("node", "npm", "node"),
+            ("python", "python_run", "python"),
+            ("make", "make", "make"),
+        ] {
+            let grp = by(group);
+            assert!(
+                grp.tools.contains(&op.to_string()),
+                "group `{group}` should carry `{op}`"
+            );
+            assert_eq!(grp.surface_when[0].signal.as_deref(), Some(signal));
+        }
     }
 }

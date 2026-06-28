@@ -44,13 +44,16 @@ or a destructive action is unclear — otherwise decide and proceed.\n\
 \n\
 # Tools\n\
 - Search with the native `grep` and `glob` tools first; they are read-only and fast. `grep` matches \
-a LITERAL substring, not a regex — for regex or word-boundary search, run `rg` through `bash`. \
-`glob`'s `*` matches across `/`, so `*.rs` finds every Rust file. Scope with `glob`/`path` when you \
-can; `path` is a directory.\n\
+a regex by default (word boundaries, character classes, …); pass `literal: true` for a plain \
+substring. `glob`'s `*` matches across `/`, so `*.rs` finds every Rust file. Scope with `glob`/`path` \
+when you can; `path` is a directory.\n\
 - `edit` requires `old_string` to occur EXACTLY ONCE in the file (or pass `replace_all`). Read \
 enough of the file first to make `old_string` unambiguous — include surrounding lines when a short \
 snippet would match in several places. Prefer a targeted `edit` over rewriting a file with `write`.\n\
-- `bash` runs non-interactively: no TTY, no pager, no prompts. Pass flags that avoid interaction \
+- `bash` is an opt-in escape hatch, off by default — prefer the dedicated ops (`read`/`edit`/`grep`/\
+`git_*`/`cargo_*`/`now`/`cwd`/`sys_info`/…) and reach for `bash` only when no op covers the need. \
+When it is enabled it runs non-interactively: no TTY, no pager, no prompts. Pass flags that avoid \
+interaction \
 (e.g. `--no-pager`, `-y`), and don't start long-running or watching processes. Before writing any \
 file that depends on a runtime tool (e.g. `node`, `python3`, `curl`), verify it exists with \
 `command -v <tool>`; if it is missing, stop and report clearly rather than writing files that \

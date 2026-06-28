@@ -34,6 +34,11 @@ pub struct Config {
     /// Allow the guarded web tool to reach private/loopback addresses (off by default).
     #[serde(default)]
     pub allow_private_net: bool,
+    /// Opt into the generic `bash` op (the `shell` group). Off by default — the agent works through
+    /// the dedicated ops; setting this surfaces `bash` as an escape hatch. The CLI exports
+    /// `FLUX_ENABLE_BASH` from this so the runtime's `shell` signal fires.
+    #[serde(default)]
+    pub enable_shell: bool,
     #[serde(default)]
     pub permissions: Permissions,
     /// Extra authorization grants, layered onto the built-in local defaults.
@@ -68,6 +73,7 @@ fn merge(user: Config, project: Config) -> Config {
     Config {
         model: project.model.or(user.model),
         allow_private_net: user.allow_private_net || project.allow_private_net,
+        enable_shell: user.enable_shell || project.enable_shell,
         permissions: Permissions {
             allow: [user.permissions.allow, project.permissions.allow].concat(),
             deny: [user.permissions.deny, project.permissions.deny].concat(),

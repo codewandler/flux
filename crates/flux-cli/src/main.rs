@@ -483,6 +483,12 @@ async fn build_agent(cli: &Cli) -> Result<(FlowEngine, String, Arc<dyn flux_runt
     // Guarded system rooted at the current directory; layered config loaded from it.
     let cwd = std::env::current_dir().context("current dir")?;
     let cfg = flux_config::load(&cwd).context("load .flux/config.toml")?;
+    // Opt into the generic `bash` op when config enables it — exported as the env signal the runtime's
+    // off-by-default `shell` group surfaces on. A user who set `FLUX_ENABLE_BASH` directly is honored
+    // too (we only ever turn it on here, never off).
+    if cfg.enable_shell {
+        std::env::set_var("FLUX_ENABLE_BASH", "1");
+    }
     let model_spec = resolve_model_spec(&cli.model, &cfg);
 
     // The built-in `mock` provider lets the full agentic loop be exercised offline via the CLI.
@@ -1087,6 +1093,7 @@ async fn run_repl(cli: Cli) -> Result<()> {
                         ("/help", "show this help"),
                         ("/plan", "toggle plan mode (show plan; /run to execute)"),
                         ("/run", "execute the pending plan from plan mode"),
+                        ("/shell", "toggle the generic bash op (off by default)"),
                         ("/tools", "list available tools"),
                         (
                             "/model <spec>",
@@ -1145,6 +1152,26 @@ async fn run_repl(cli: Cli) -> Result<()> {
                         style::dim("(no pending plan — use /plan, then describe a task)")
                     ),
                 },
+                "shell" => {
+                    // Toggle the generic `bash` op for the session by flipping the env signal the
+                    // runtime's `shell` group surfaces on; it takes effect from the next turn (the
+                    // advertised catalog is recomputed per turn from `detect_signals`).
+                    let currently_on = std::env::var("FLUX_ENABLE_BASH")
+                        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+                    if currently_on {
+                        std::env::remove_var("FLUX_ENABLE_BASH");
+                    } else {
+                        std::env::set_var("FLUX_ENABLE_BASH", "1");
+                    }
+                    eprintln!(
+                        "{}",
+                        style::dim(&format!(
+                            "shell (bash) {} — the generic `bash` op is {} the catalog from the next turn",
+                            if currently_on { "off" } else { "on" },
+                            if currently_on { "hidden from" } else { "in" }
+                        ))
+                    );
+                }
                 "model" => {
                     let spec = rest.strip_prefix("model").unwrap_or("").trim();
                     if spec.is_empty() {

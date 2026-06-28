@@ -27,11 +27,22 @@ optional arguments are in `[brackets]`.
 | `path_exists` | `path` | Low | Returns `"true"`/`"false"` — use with `when`/`unless` to branch on file presence |
 | `sqlite_query` | `db, sql[, params]` | Low | Read-only SQLite query (SELECT/PRAGMA only) |
 | `web_search` | `query[, max_results]` | Low | Tavily web search — requires `TAVILY_API_KEY` env var |
+| `now` | | Low | Current wall-clock time: unix seconds + UTC string (replaces `date`) |
+| `cwd` | | Low | Absolute path of the workspace root (replaces `pwd`) |
+| `sys_info` | | Low | Host metadata: os, arch, family, hostname (replaces `uname`) |
 | `cargo_check` | `[package, args]` | Medium | `cargo check` (type-check only, no codegen) |
 | `cargo_build` | `[package, release, args]` | Medium | `cargo build` |
 | `cargo_test` | `[package, filter, args]` | Medium | `cargo test` |
 | `cargo_clippy` | `[package, args]` | Medium | `cargo clippy` |
 | `cargo_fmt` | `[package, check]` | Medium | `cargo fmt` (pass `check: true` to only verify) |
+| `python_run` | `[script, module, args]` | Medium | Run a Python script or `-m module` (python group) |
+| `pytest` | `[path, args]` | Medium | Run `pytest` (python group) |
+| `npm` | `args` | Medium | Run an `npm` command, e.g. `["run","build"]` (node group) |
+| `node_run` | `script[, args]` | Medium | Run a JavaScript file with `node` (node group) |
+| `go_build` | `[package, args]` | Medium | `go build` (default `./...`; go group) |
+| `go_test` | `[package, args]` | Medium | `go test` (default `./...`; go group) |
+| `go_vet` | `[package, args]` | Medium | `go vet` (default `./...`; go group) |
+| `make` | `[target, args]` | Medium | Run `make` (make group; surfaces on a `Makefile`) |
 | `git_stage` | `paths` | Medium | Stage files (`git add`) |
 | `git_commit` | `message[, body]` | Medium | Create a commit |
 | `git_status` | | Low | Working tree status |
@@ -41,8 +52,9 @@ optional arguments are in `[brackets]`.
 | `git_checkout` | `branch[, create]` | Medium | Switch/create branch |
 | `git_unstage` | `paths` | Low | Unstage files |
 
-`write`, `edit`, `patch`, `append`, `task`, `bash`, and the `cargo_*` ops may pause for user approval
-(controlled by the safety envelope and the active permission rules).
+`write`, `edit`, `patch`, `append`, `task`, `bash`, and the toolchain ops (`cargo_*`, `go_*`,
+`python_run`, `pytest`, `npm`, `node_run`, `make`) may pause for user approval (controlled by the
+safety envelope and the active permission rules).
 
 ## Cognition ops
 
@@ -61,6 +73,10 @@ registry.
 | `top` | pure | `items, n` | The first `n` items |
 | `merge` | pure | `lists` | Concatenate an array-of-arrays into one array |
 | `cite` | pure | `claims` | A markdown citation list, one line per claim |
+| `len` | pure | `items` | Count of an array's items (or a string's characters) |
+| `first` | pure | `items` | The first item of an array (or `null`) |
+| `last` | pure | `items` | The last item of an array (or `null`) |
+| `filter` | pure | `items[, by, equals]` | Keep items where a field/value is truthy (or equals a value) |
 | `ai.extract` | model | `from[, ask, schema]` | Extract typed items (e.g. `Claim[]`) from free text |
 | `ai.rank` | model | `items[, by]` | Reorder items by a natural-language criterion |
 | `ai.judge` | model | `claim[, evidence]` | Adjudicate a claim → `Verdict` `{ choice, reasons }` |

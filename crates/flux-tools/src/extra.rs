@@ -1,12 +1,17 @@
-//! Extra built-in tools: file_stat, path_exists, sqlite_query, web_search.
+//! Extra built-in tools: file_stat, path_exists, sqlite_query, web_search, home_dir, now, cwd,
+//! sys_info.
 //!
 //! - `file_stat`    — file metadata (size, line count, mtime, mode). Risk: Low.
 //! - `path_exists`  — pure filesystem probe. Risk: Low.
 //! - `sqlite_query` — read-only SQLite query (no INSERT/UPDATE/DELETE/DROP/ALTER). Risk: Low.
 //! - `web_search`   — Tavily web search API. Risk: Low, goes through guard_url.
+//! - `home_dir`     — the user's home directory. Risk: Low.
+//! - `now`          — current wall-clock time (unix seconds + UTC). Replaces `date`. Risk: Low.
+//! - `cwd`          — the workspace root path. Replaces `pwd`. Risk: Low.
+//! - `sys_info`     — OS / arch / host metadata. Replaces `uname`. Risk: Low.
 
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -529,6 +534,143 @@ impl Tool for HomeDirTool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// now
+// ---------------------------------------------------------------------------
+
+/// Format unix seconds as a civil UTC timestamp (`YYYY-MM-DD HH:MM:SS UTC`) without a date crate.
+/// Uses Howard Hinnant's `civil_from_days` algorithm, valid across the full proleptic Gregorian range.
+fn format_unix_utc(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (hour, min, sec) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {hour:02}:{min:02}:{sec:02} UTC")
+}
+
+/// Returns the current wall-clock time. Zero args, read-only, no approval gate.
+pub struct NowTool;
+
+#[async_trait]
+impl Tool for NowTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::read_only(
+            "now",
+            "Return the current wall-clock time: unix seconds and a UTC timestamp \
+             (`YYYY-MM-DD HH:MM:SS UTC`). Replaces shelling out to `date`.",
+            json!({"type": "object", "properties": {}}),
+        )
+    }
+
+    fn permission_subjects(&self, _params: &Value) -> Vec<String> {
+        vec![]
+    }
+
+    fn intents(&self, _params: &Value) -> IntentSet {
+        IntentSet::new()
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let utc = format_unix_utc(secs);
+        let content = json!({"unix": secs, "utc": utc}).to_string();
+        let view = format!("{utc} (unix {secs})");
+        Ok(ToolResult::ok_view(content, view))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cwd
+// ---------------------------------------------------------------------------
+
+/// Returns the workspace root directory. Zero args, read-only, no approval gate.
+pub struct CwdTool;
+
+#[async_trait]
+impl Tool for CwdTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::read_only(
+            "cwd",
+            "Return the absolute path of the workspace root (the agent's working directory). \
+             Replaces shelling out to `pwd`.",
+            json!({"type": "object", "properties": {}}),
+        )
+    }
+
+    fn permission_subjects(&self, _params: &Value) -> Vec<String> {
+        vec![]
+    }
+
+    fn intents(&self, _params: &Value) -> IntentSet {
+        IntentSet::new()
+    }
+
+    async fn execute(&self, ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
+        Ok(ToolResult::ok(
+            ctx.system.workspace().root().display().to_string(),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sys_info
+// ---------------------------------------------------------------------------
+
+/// Returns OS / architecture / host metadata. Zero args, read-only, no approval gate.
+pub struct SysInfoTool;
+
+#[async_trait]
+impl Tool for SysInfoTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::read_only(
+            "sys_info",
+            "Return host metadata: operating system, CPU architecture, OS family, and hostname \
+             (best-effort). Replaces shelling out to `uname`.",
+            json!({"type": "object", "properties": {}}),
+        )
+    }
+
+    fn permission_subjects(&self, _params: &Value) -> Vec<String> {
+        vec![]
+    }
+
+    fn intents(&self, _params: &Value) -> IntentSet {
+        IntentSet::new()
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
+        let os = std::env::consts::OS;
+        let arch = std::env::consts::ARCH;
+        let family = std::env::consts::FAMILY;
+        let hostname = std::env::var("HOSTNAME")
+            .ok()
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
+        let content = json!({
+            "os": os,
+            "arch": arch,
+            "family": family,
+            "hostname": hostname,
+        })
+        .to_string();
+        let view = format!("os: {os}\narch: {arch}\nfamily: {family}\nhostname: {hostname}");
+        Ok(ToolResult::ok_view(content, view))
+    }
+}
+
 /// Register all extra tools into a registry.
 pub fn register_extra(registry: &mut ToolRegistry) {
     registry.register(Arc::new(FileStatTool));
@@ -536,4 +678,24 @@ pub fn register_extra(registry: &mut ToolRegistry) {
     registry.register(Arc::new(SqliteQueryTool));
     registry.register(Arc::new(WebSearchTool));
     registry.register(Arc::new(HomeDirTool));
+    registry.register(Arc::new(NowTool));
+    registry.register(Arc::new(CwdTool));
+    registry.register(Arc::new(SysInfoTool));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_unix_utc_is_correct() {
+        assert_eq!(format_unix_utc(0), "1970-01-01 00:00:00 UTC");
+        // 2021-01-01 00:00:00 UTC = 1_609_459_200
+        assert_eq!(format_unix_utc(1_609_459_200), "2021-01-01 00:00:00 UTC");
+        // A time-of-day in the middle of a day: 2021-01-01 12:34:56 UTC
+        assert_eq!(
+            format_unix_utc(1_609_459_200 + 12 * 3600 + 34 * 60 + 56),
+            "2021-01-01 12:34:56 UTC"
+        );
+    }
 }
