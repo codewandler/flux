@@ -69,7 +69,7 @@ follow are hand-written.
 | `var` | Reference a bound symbol. |
 | `lit` | A literal value (raw JSON, as written in the AST by the compiler front-end). |
 | `thing` | A reference to an external thing. |
-| `expr` | Pure inline arithmetic. `formula` is a safe whitelist expression (`+`, `-`, `*`, `/`, `round(x,n)`, `abs`, `min(a,b)`, `max(a,b)`) over named variables. `vars` maps variable names to node expressions (only `Lit` and `Var` are valid). No IO, no approval gate. Example: `expr("price * 2", {"price": $btc})`. |
+| `expr` | Pure inline computation. `formula` is a safe whitelist expression over named variables: arithmetic (`+ - * /`, `round(x,n)`, `abs`, `min(a,b)`, `max(a,b)`), comparison (`== != < <= > >=`), boolean (`&& || !`, `true`/`false`), string functions (`len/lower/upper/trim/replace/repeat/reverse/contains/concat`), and string literals (`'…'`/`"…"`). `+` adds when both sides are numeric and concatenates otherwise. Because it yields a bool, an `expr` is also a valid `when`/`unless`/`until`/`assert` condition. `vars` maps variable names to node expressions (only `Lit` and `Var` are valid). No IO, no approval gate. Examples: `expr("price * 2", {"price": $btc})`, `expr("status == 'ok' && n > 0", …)`. |
 | `fmt` | Pure string interpolation. `template` is a string with `{name}` placeholders substituted from already-bound session symbols (same `{name}`/`{{name}}` syntax as `Lit` interpolation). No IO, no approval gate. Example: `fmt("BTC: {price} | Double: {doubled}")`. |
 | `jq` | Pure JSON path extraction. `path` is a dot-path string (e.g. `".bitcoin.usd"` or `"results[0].value"`) applied to the JSON content of `input` (a `Var` or `Lit` node). No IO, no approval gate. Example: `jq(".bitcoin.usd", $raw)`. |
 | `parse` | Pure type coercion. Converts the string result of a `jq` or `fmt` node into a typed value. `as_type` is one of `"f64"`, `"i64"`, `"bool"`, `"json"`, `"string"`. No IO, no approval gate. Example: `parse(jq(".price", $raw), as: "f64")`. |
@@ -279,7 +279,7 @@ as expected).
 
 | field | type | required | description |
 |---|---|---|---|
-| `cond` | Node | yes | `lit` / `var` / `call` — the condition |
+| `cond` | Node | yes | `lit` / `var` / `call` / `expr` — the condition |
 | `then` | Node[] | no | body when condition is truthy |
 | `otherwise` | Node[] | no | body when condition is falsey |
 
@@ -300,7 +300,7 @@ writing `when ... return Err(...)` manually.
 
 | field | type | required | description |
 |---|---|---|---|
-| `cond` | Node | yes | `lit` / `var` / `call` |
+| `cond` | Node | yes | `lit` / `var` / `call` / `expr` |
 | `message` | string | no | error detail shown on failure |
 
 ---
@@ -789,27 +789,37 @@ never pause for approval. Use them wherever you would otherwise shell out to
 
 ### `expr`
 
-Inline arithmetic over named variables. `formula` is a safe whitelist expression;
+Inline computation over named variables. `formula` is a safe whitelist expression;
 the runtime evaluates it with a tiny recursive-descent parser — no `eval`, no shell.
 
-Supported operators and functions: `+`, `-`, `*`, `/`, `round(x, n)`, `abs(x)`,
-`min(a, b)`, `max(a, b)`.
+Supported, by precedence (lowest to highest):
+
+- **boolean** `||`, `&&`, unary `!`, and the literals `true` / `false`
+- **comparison** `==`, `!=`, `<`, `<=`, `>`, `>=` (numeric when both sides are numeric, else
+  lexicographic) — these yield a bool, so an `expr` is also a valid condition (see below)
+- **arithmetic** `+`, `-`, `*`, `/` (`+` concatenates when either side is non-numeric text)
+- **functions** `round(x, n)`, `abs(x)`, `min(a, b)`, `max(a, b)`, `len(s)`, `lower(s)`,
+  `upper(s)`, `trim(s)`, `replace(s, from, to)`, `repeat(s, n)`, `reverse(s)`,
+  `contains(s, sub)`, `concat(a, b, …)`
+- **atoms** numbers, single/double-quoted string literals, variables, and parentheses
 
 ```json
 {"kind": "expr",
- "formula": "price * 2",
- "vars": {"price": {"kind": "var", "name": "price"}}}
+ "formula": "status == 'ok' && price * 2 > 100",
+ "vars": {"status": {"kind": "var", "name": "status"},
+          "price": {"kind": "var", "name": "price"}}}
 ```
 
 **Fields**
 
 | field | type | required | description |
 |---|---|---|---|
-| `formula` | string | yes | the arithmetic expression |
+| `formula` | string | yes | the expression |
 | `vars` | object | no | map of variable name → node (`Lit` or `Var`) |
 
-Variables not listed in `vars` are resolved from the session symbol table.
-Result is a `Value::Number` (or `Value::String` for string concatenation with `+`).
+Every variable referenced in `formula` must appear in `vars`. The result is a number, string, or
+bool; when used as a `when` / `unless` / `until` / `assert` condition it is taken as truthy/falsey
+(empty string, `"false"`, `"0"`, `0`, and `false` are falsey).
 
 ---
 

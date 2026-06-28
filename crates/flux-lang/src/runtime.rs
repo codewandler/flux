@@ -551,22 +551,8 @@ fn exec_body<'a>(
                     // execute_call — they are side-effect-free and need no dispatch envelope.
                     match value.as_ref() {
                         Node::Expr { formula, vars } => {
-                            let resolved: std::collections::BTreeMap<String, f64> = vars
-                                .iter()
-                                .map(|(k, v)| {
-                                    let jv = eval_arg(v, store, session_id)?;
-                                    let n = match &jv {
-                                        serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
-                                        serde_json::Value::String(s) => {
-                                            s.parse::<f64>().unwrap_or(0.0)
-                                        }
-                                        _ => 0.0,
-                                    };
-                                    Ok::<_, crate::FlowError>((k.clone(), n))
-                                })
-                                .collect::<Result<_>>()?;
-                            let result = eval_expr_formula(formula, &resolved)?;
-                            let text = format_number(result);
+                            let resolved = resolve_expr_vars(vars, store, session_id)?;
+                            let text = eval_expr_value(formula, &resolved)?.as_text();
                             let vid = store.put_value(session_id, &Value::String(text.clone()))?;
                             let ty_label = ty.as_ref().map(TypeRef::label);
                             store.bind(
@@ -1451,21 +1437,9 @@ fn exec_body<'a>(
                     last = text;
                 }
                 Node::Expr { formula, vars } => {
-                    // Pure arithmetic — no IO, no approval gate.
-                    let resolved: std::collections::BTreeMap<String, f64> = vars
-                        .iter()
-                        .map(|(k, v)| {
-                            let jv = eval_arg(v, store, session_id)?;
-                            let n = match &jv {
-                                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
-                                serde_json::Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
-                                _ => 0.0,
-                            };
-                            Ok::<_, crate::FlowError>((k.clone(), n))
-                        })
-                        .collect::<Result<_>>()?;
-                    let result = eval_expr_formula(formula, &resolved)?;
-                    let text = format_number(result);
+                    // Pure computation — no IO, no approval gate.
+                    let resolved = resolve_expr_vars(vars, store, session_id)?;
+                    let text = eval_expr_value(formula, &resolved)?.as_text();
                     let vid = store.put_value(session_id, &Value::String(text.clone()))?;
                     transcript.push(format!("[expr {formula}]\n{text}"));
                     last = text;
@@ -1786,6 +1760,12 @@ async fn eval_cond(
             Ok(json_truthy(&serde_json::Value::String(outcome.content)))
         }
         Node::Lit { .. } | Node::Var { .. } => Ok(json_truthy(&eval_arg(node, store, session_id)?)),
+        // A pure `expr` predicate (`x == 2`, `len(s) > 0 && done`) evaluates with no IO — this is what
+        // lets `when`/`unless`/`until`/`assert` express boolean logic without shelling out to bash.
+        Node::Expr { formula, vars } => {
+            let resolved = resolve_expr_vars(vars, store, session_id)?;
+            Ok(eval_expr_value(formula, &resolved)?.truthy())
+        }
         other => Err(FlowError::Runtime(format!(
             "unsupported condition `{}`",
             node_kind(other)
@@ -2040,20 +2020,108 @@ async fn eval_return(
     }
 }
 
-/// Evaluate a safe arithmetic formula string with named variable bindings.
-/// Supported: `+`, `-`, `*`, `/`, `round(x,n)`, `abs(x)`, `min(a,b)`, `max(a,b)`,
-/// numeric literals, variable names, and parentheses. No side effects.
-fn eval_expr_formula(formula: &str, vars: &std::collections::BTreeMap<String, f64>) -> Result<f64> {
-    eval_expr_tokens(&mut tokenize_expr(formula), vars)
-        .ok_or_else(|| FlowError::Runtime(format!("invalid `expr` formula: {formula}")))
+/// A value produced by the `expr` evaluator: number, string, or bool. Arithmetic, comparison,
+/// boolean, and string functions all flow through this typed value, with lenient numeric coercion
+/// for backward compatibility (a numeric string participates in arithmetic as the number it spells).
+#[derive(Clone, Debug, PartialEq)]
+enum ExprVal {
+    Num(f64),
+    Str(String),
+    Bool(bool),
 }
 
-fn tokenize_expr(s: &str) -> std::collections::VecDeque<String> {
+impl ExprVal {
+    /// Coerce to a number where it makes sense: bools are 0/1, numeric strings parse. Returns `None`
+    /// for non-numeric strings, so arithmetic on them is a clean error rather than a silent 0.
+    fn as_num(&self) -> Option<f64> {
+        match self {
+            ExprVal::Num(n) => Some(*n),
+            ExprVal::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            ExprVal::Str(s) => s.trim().parse::<f64>().ok(),
+        }
+    }
+
+    /// Render to canonical text — the form stored and printed (numbers via [`format_number`]).
+    fn as_text(&self) -> String {
+        match self {
+            ExprVal::Num(n) => format_number(*n),
+            ExprVal::Str(s) => s.clone(),
+            ExprVal::Bool(b) => b.to_string(),
+        }
+    }
+
+    /// Truthiness, matching [`json_truthy`] for strings so `expr` conditions read consistently.
+    fn truthy(&self) -> bool {
+        match self {
+            ExprVal::Num(n) => *n != 0.0,
+            ExprVal::Bool(b) => *b,
+            ExprVal::Str(s) => {
+                let t = s.trim();
+                !t.is_empty() && !t.eq_ignore_ascii_case("false") && t != "0"
+            }
+        }
+    }
+
+    fn from_json(v: &serde_json::Value) -> ExprVal {
+        match v {
+            serde_json::Value::Number(n) => ExprVal::Num(n.as_f64().unwrap_or(0.0)),
+            serde_json::Value::Bool(b) => ExprVal::Bool(*b),
+            serde_json::Value::String(s) => ExprVal::Str(s.clone()),
+            serde_json::Value::Null => ExprVal::Str(String::new()),
+            other => ExprVal::Str(other.to_string()),
+        }
+    }
+}
+
+/// Resolve an `expr` node's `vars` map (only `Lit`/`Var` nodes) to typed [`ExprVal`]s.
+fn resolve_expr_vars(
+    vars: &std::collections::BTreeMap<String, Box<Node>>,
+    store: &dyn ValueStore,
+    session_id: &str,
+) -> Result<std::collections::BTreeMap<String, ExprVal>> {
+    vars.iter()
+        .map(|(k, v)| {
+            Ok((
+                k.clone(),
+                ExprVal::from_json(&eval_arg(v, store, session_id)?),
+            ))
+        })
+        .collect()
+}
+
+/// Evaluate a safe `expr` formula to a typed value. Supports arithmetic (`+ - * /`, with
+/// `round(x,n)`/`abs(x)`/`min(a,b)`/`max(a,b)`), comparison (`== != < <= > >=`), boolean
+/// (`&& || !`, `true`/`false`), string functions (`len/lower/upper/trim/replace/repeat/reverse/
+/// contains/concat`), single/double-quoted string literals, parentheses, and named variables.
+/// `+` adds when both sides are numeric and concatenates otherwise. No side effects.
+fn eval_expr_value(
+    formula: &str,
+    vars: &std::collections::BTreeMap<String, ExprVal>,
+) -> Result<ExprVal> {
+    let mut toks = tokenize_expr(formula);
+    match expr_or(&mut toks, vars) {
+        Some(v) if toks.is_empty() => Ok(v),
+        _ => Err(FlowError::Runtime(format!(
+            "invalid `expr` formula: {formula}"
+        ))),
+    }
+}
+
+/// A lexical token of an `expr` formula.
+#[derive(Clone, Debug, PartialEq)]
+enum Tok {
+    Num(f64),
+    Str(String),
+    Ident(String),
+    Op(String),
+}
+
+fn tokenize_expr(s: &str) -> std::collections::VecDeque<Tok> {
     let mut tokens = std::collections::VecDeque::new();
     let mut chars = s.chars().peekable();
     while let Some(&c) = chars.peek() {
         match c {
-            ' ' | '\t' => {
+            ' ' | '\t' | '\n' | '\r' => {
                 chars.next();
             }
             '0'..='9' | '.' => {
@@ -2066,7 +2134,10 @@ fn tokenize_expr(s: &str) -> std::collections::VecDeque<String> {
                         break;
                     }
                 }
-                tokens.push_back(num);
+                match num.parse::<f64>() {
+                    Ok(n) => tokens.push_back(Tok::Num(n)),
+                    Err(_) => tokens.push_back(Tok::Op(num)), // malformed → fails to parse later
+                }
             }
             'a'..='z' | 'A'..='Z' | '_' => {
                 let mut ident = String::new();
@@ -2078,10 +2149,47 @@ fn tokenize_expr(s: &str) -> std::collections::VecDeque<String> {
                         break;
                     }
                 }
-                tokens.push_back(ident);
+                tokens.push_back(Tok::Ident(ident));
             }
-            c => {
-                tokens.push_back(c.to_string());
+            '\'' | '"' => {
+                let quote = c;
+                chars.next();
+                let mut lit = String::new();
+                while let Some(d) = chars.next() {
+                    if d == quote {
+                        break;
+                    }
+                    if d == '\\' {
+                        if let Some(e) = chars.next() {
+                            lit.push(match e {
+                                'n' => '\n',
+                                't' => '\t',
+                                other => other,
+                            });
+                        }
+                    } else {
+                        lit.push(d);
+                    }
+                }
+                tokens.push_back(Tok::Str(lit));
+            }
+            '=' | '!' | '<' | '>' | '&' | '|' => {
+                chars.next();
+                let mut op = c.to_string();
+                if let Some(&d) = chars.peek() {
+                    let two = matches!(
+                        (c, d),
+                        ('=', '=') | ('!', '=') | ('<', '=') | ('>', '=') | ('&', '&') | ('|', '|')
+                    );
+                    if two {
+                        op.push(d);
+                        chars.next();
+                    }
+                }
+                tokens.push_back(Tok::Op(op));
+            }
+            _ => {
+                tokens.push_back(Tok::Op(c.to_string()));
                 chars.next();
             }
         }
@@ -2089,27 +2197,102 @@ fn tokenize_expr(s: &str) -> std::collections::VecDeque<String> {
     tokens
 }
 
-fn eval_expr_tokens(
-    tokens: &mut std::collections::VecDeque<String>,
-    vars: &std::collections::BTreeMap<String, f64>,
-) -> Option<f64> {
-    expr_add(tokens, vars)
+fn peek_op(t: &std::collections::VecDeque<Tok>) -> Option<&str> {
+    match t.front() {
+        Some(Tok::Op(s)) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+fn expr_or(
+    t: &mut std::collections::VecDeque<Tok>,
+    v: &std::collections::BTreeMap<String, ExprVal>,
+) -> Option<ExprVal> {
+    let mut lhs = expr_and(t, v)?;
+    while peek_op(t) == Some("||") {
+        t.pop_front();
+        let rhs = expr_and(t, v)?;
+        lhs = ExprVal::Bool(lhs.truthy() || rhs.truthy());
+    }
+    Some(lhs)
+}
+
+fn expr_and(
+    t: &mut std::collections::VecDeque<Tok>,
+    v: &std::collections::BTreeMap<String, ExprVal>,
+) -> Option<ExprVal> {
+    let mut lhs = expr_cmp(t, v)?;
+    while peek_op(t) == Some("&&") {
+        t.pop_front();
+        let rhs = expr_cmp(t, v)?;
+        lhs = ExprVal::Bool(lhs.truthy() && rhs.truthy());
+    }
+    Some(lhs)
+}
+
+fn expr_cmp(
+    t: &mut std::collections::VecDeque<Tok>,
+    v: &std::collections::BTreeMap<String, ExprVal>,
+) -> Option<ExprVal> {
+    let lhs = expr_add(t, v)?;
+    if let Some(op) = peek_op(t) {
+        if matches!(op, "==" | "!=" | "<" | "<=" | ">" | ">=") {
+            let op = op.to_string();
+            t.pop_front();
+            let rhs = expr_add(t, v)?;
+            return Some(ExprVal::Bool(expr_compare(&lhs, &rhs, &op)?));
+        }
+    }
+    Some(lhs)
+}
+
+/// Compare two values: numerically when both coerce to numbers, else lexicographically by text.
+fn expr_compare(a: &ExprVal, b: &ExprVal, op: &str) -> Option<bool> {
+    let res = match (a.as_num(), b.as_num()) {
+        (Some(x), Some(y)) => match op {
+            "==" => x == y,
+            "!=" => x != y,
+            "<" => x < y,
+            "<=" => x <= y,
+            ">" => x > y,
+            ">=" => x >= y,
+            _ => return None,
+        },
+        _ => {
+            let (x, y) = (a.as_text(), b.as_text());
+            match op {
+                "==" => x == y,
+                "!=" => x != y,
+                "<" => x < y,
+                "<=" => x <= y,
+                ">" => x > y,
+                ">=" => x >= y,
+                _ => return None,
+            }
+        }
+    };
+    Some(res)
 }
 
 fn expr_add(
-    t: &mut std::collections::VecDeque<String>,
-    v: &std::collections::BTreeMap<String, f64>,
-) -> Option<f64> {
+    t: &mut std::collections::VecDeque<Tok>,
+    v: &std::collections::BTreeMap<String, ExprVal>,
+) -> Option<ExprVal> {
     let mut lhs = expr_mul(t, v)?;
     loop {
-        match t.front().map(|s| s.as_str()) {
+        match peek_op(t) {
             Some("+") => {
                 t.pop_front();
-                lhs += expr_mul(t, v)?;
+                let rhs = expr_mul(t, v)?;
+                lhs = match (lhs.as_num(), rhs.as_num()) {
+                    (Some(x), Some(y)) => ExprVal::Num(x + y),
+                    _ => ExprVal::Str(format!("{}{}", lhs.as_text(), rhs.as_text())),
+                };
             }
             Some("-") => {
                 t.pop_front();
-                lhs -= expr_mul(t, v)?;
+                let rhs = expr_mul(t, v)?;
+                lhs = ExprVal::Num(lhs.as_num()? - rhs.as_num()?);
             }
             _ => break,
         }
@@ -2118,23 +2301,24 @@ fn expr_add(
 }
 
 fn expr_mul(
-    t: &mut std::collections::VecDeque<String>,
-    v: &std::collections::BTreeMap<String, f64>,
-) -> Option<f64> {
+    t: &mut std::collections::VecDeque<Tok>,
+    v: &std::collections::BTreeMap<String, ExprVal>,
+) -> Option<ExprVal> {
     let mut lhs = expr_unary(t, v)?;
     loop {
-        match t.front().map(|s| s.as_str()) {
+        match peek_op(t) {
             Some("*") => {
                 t.pop_front();
-                lhs *= expr_unary(t, v)?;
+                let r = expr_unary(t, v)?;
+                lhs = ExprVal::Num(lhs.as_num()? * r.as_num()?);
             }
             Some("/") => {
                 t.pop_front();
-                let r = expr_unary(t, v)?;
+                let r = expr_unary(t, v)?.as_num()?;
                 if r == 0.0 {
                     return None;
                 }
-                lhs /= r;
+                lhs = ExprVal::Num(lhs.as_num()? / r);
             }
             _ => break,
         }
@@ -2143,90 +2327,115 @@ fn expr_mul(
 }
 
 fn expr_unary(
-    t: &mut std::collections::VecDeque<String>,
-    v: &std::collections::BTreeMap<String, f64>,
-) -> Option<f64> {
-    if t.front().map(|s| s.as_str()) == Some("-") {
-        t.pop_front();
-        return Some(-expr_atom(t, v)?);
+    t: &mut std::collections::VecDeque<Tok>,
+    v: &std::collections::BTreeMap<String, ExprVal>,
+) -> Option<ExprVal> {
+    match peek_op(t) {
+        Some("-") => {
+            t.pop_front();
+            Some(ExprVal::Num(-expr_unary(t, v)?.as_num()?))
+        }
+        Some("!") => {
+            t.pop_front();
+            Some(ExprVal::Bool(!expr_unary(t, v)?.truthy()))
+        }
+        _ => expr_atom(t, v),
     }
-    expr_atom(t, v)
 }
 
 fn expr_atom(
-    t: &mut std::collections::VecDeque<String>,
-    v: &std::collections::BTreeMap<String, f64>,
-) -> Option<f64> {
-    let tok = t.pop_front()?;
-    match tok.as_str() {
-        "(" => {
-            let val = expr_add(t, v)?;
-            if t.pop_front().as_deref() != Some(")") {
-                return None;
+    t: &mut std::collections::VecDeque<Tok>,
+    v: &std::collections::BTreeMap<String, ExprVal>,
+) -> Option<ExprVal> {
+    match t.pop_front()? {
+        Tok::Num(n) => Some(ExprVal::Num(n)),
+        Tok::Str(s) => Some(ExprVal::Str(s)),
+        Tok::Op(op) if op == "(" => {
+            let val = expr_or(t, v)?;
+            match t.pop_front() {
+                Some(Tok::Op(ref c)) if c == ")" => Some(val),
+                _ => None,
             }
-            Some(val)
         }
-        "round" => {
-            if t.pop_front().as_deref() != Some("(") {
-                return None;
-            }
-            let x = expr_add(t, v)?;
-            let n = if t.front().map(|s| s.as_str()) == Some(",") {
-                t.pop_front();
-                expr_add(t, v)?.round() as i32
+        Tok::Op(_) => None,
+        Tok::Ident(name) => {
+            if matches!(t.front(), Some(Tok::Op(s)) if s == "(") {
+                t.pop_front(); // consume "("
+                let args = expr_call_args(t, v)?;
+                expr_call_fn(&name, &args)
             } else {
-                0
-            };
-            if t.pop_front().as_deref() != Some(")") {
-                return None;
+                match name.as_str() {
+                    "true" => Some(ExprVal::Bool(true)),
+                    "false" => Some(ExprVal::Bool(false)),
+                    _ => v.get(&name).cloned(),
+                }
             }
-            let factor = 10f64.powi(n);
-            Some((x * factor).round() / factor)
         }
-        "abs" => {
-            if t.pop_front().as_deref() != Some("(") {
-                return None;
-            }
-            let x = expr_add(t, v)?;
-            if t.pop_front().as_deref() != Some(")") {
-                return None;
-            }
-            Some(x.abs())
+    }
+}
+
+/// Parse a comma-separated argument list up to and including the closing `)`.
+fn expr_call_args(
+    t: &mut std::collections::VecDeque<Tok>,
+    v: &std::collections::BTreeMap<String, ExprVal>,
+) -> Option<Vec<ExprVal>> {
+    let mut args = Vec::new();
+    if matches!(t.front(), Some(Tok::Op(s)) if s == ")") {
+        t.pop_front();
+        return Some(args);
+    }
+    loop {
+        args.push(expr_or(t, v)?);
+        match t.pop_front() {
+            Some(Tok::Op(ref c)) if c == "," => continue,
+            Some(Tok::Op(ref c)) if c == ")" => break,
+            _ => return None,
         }
-        "min" => {
-            if t.pop_front().as_deref() != Some("(") {
-                return None;
-            }
-            let a = expr_add(t, v)?;
-            if t.pop_front().as_deref() != Some(",") {
-                return None;
-            }
-            let b = expr_add(t, v)?;
-            if t.pop_front().as_deref() != Some(")") {
-                return None;
-            }
-            Some(a.min(b))
+    }
+    Some(args)
+}
+
+/// Apply a built-in `expr` function to its evaluated arguments.
+fn expr_call_fn(name: &str, args: &[ExprVal]) -> Option<ExprVal> {
+    match name {
+        "round" => {
+            let x = args.first()?.as_num()?;
+            let n = args.get(1).and_then(|a| a.as_num()).unwrap_or(0.0) as i32;
+            let f = 10f64.powi(n);
+            Some(ExprVal::Num((x * f).round() / f))
         }
-        "max" => {
-            if t.pop_front().as_deref() != Some("(") {
+        "abs" => Some(ExprVal::Num(args.first()?.as_num()?.abs())),
+        "min" => Some(ExprVal::Num(
+            args.first()?.as_num()?.min(args.get(1)?.as_num()?),
+        )),
+        "max" => Some(ExprVal::Num(
+            args.first()?.as_num()?.max(args.get(1)?.as_num()?),
+        )),
+        "len" => Some(ExprVal::Num(args.first()?.as_text().chars().count() as f64)),
+        "lower" => Some(ExprVal::Str(args.first()?.as_text().to_lowercase())),
+        "upper" => Some(ExprVal::Str(args.first()?.as_text().to_uppercase())),
+        "trim" => Some(ExprVal::Str(args.first()?.as_text().trim().to_string())),
+        "reverse" => Some(ExprVal::Str(
+            args.first()?.as_text().chars().rev().collect(),
+        )),
+        "contains" => Some(ExprVal::Bool(
+            args.first()?.as_text().contains(&args.get(1)?.as_text()),
+        )),
+        "replace" => Some(ExprVal::Str(
+            args.first()?
+                .as_text()
+                .replace(&args.get(1)?.as_text(), &args.get(2)?.as_text()),
+        )),
+        "repeat" => {
+            let s = args.first()?.as_text();
+            let n = args.get(1)?.as_num()?;
+            if !(0.0..=100_000.0).contains(&n) || s.len().saturating_mul(n as usize) > 1_000_000 {
                 return None;
             }
-            let a = expr_add(t, v)?;
-            if t.pop_front().as_deref() != Some(",") {
-                return None;
-            }
-            let b = expr_add(t, v)?;
-            if t.pop_front().as_deref() != Some(")") {
-                return None;
-            }
-            Some(a.max(b))
+            Some(ExprVal::Str(s.repeat(n as usize)))
         }
-        s => {
-            if let Ok(n) = s.parse::<f64>() {
-                return Some(n);
-            }
-            v.get(s).copied()
-        }
+        "concat" => Some(ExprVal::Str(args.iter().map(|a| a.as_text()).collect())),
+        _ => None,
     }
 }
 
@@ -3505,5 +3714,94 @@ mod tests {
             eval_arg(&flow_lit(json!({ "task": "do {{hits}}" })), &store, "sess").unwrap(),
             json!({ "task": "do the lines" })
         );
+    }
+
+    // --- expr evaluator ------------------------------------------------------
+
+    fn ev(formula: &str, vars: &[(&str, ExprVal)]) -> ExprVal {
+        let map: std::collections::BTreeMap<String, ExprVal> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        eval_expr_value(formula, &map).unwrap()
+    }
+
+    #[test]
+    fn expr_arithmetic_is_backward_compatible() {
+        // Numeric vars, a numeric string var (coerced), and the existing functions still work.
+        assert_eq!(
+            ev("price * 2", &[("price", ExprVal::Num(21.0))]),
+            ExprVal::Num(42.0)
+        );
+        assert_eq!(
+            ev("price * 2", &[("price", ExprVal::Str("59557.985".into()))]),
+            ExprVal::Num(119115.97)
+        );
+        assert_eq!(ev("round(3.456, 2)", &[]), ExprVal::Num(3.46));
+        assert_eq!(ev("max(min(5, 9), 1)", &[]), ExprVal::Num(5.0));
+        assert_eq!(ev("-(2 + 3) * 2", &[]), ExprVal::Num(-10.0));
+        // Division by zero is a clean error, not a panic.
+        let map = std::collections::BTreeMap::new();
+        assert!(eval_expr_value("1 / 0", &map).is_err());
+    }
+
+    #[test]
+    fn expr_comparison_and_boolean_return_bools() {
+        assert_eq!(ev("2 == 2", &[]), ExprVal::Bool(true));
+        assert_eq!(ev("3 != 2", &[]), ExprVal::Bool(true));
+        assert_eq!(ev("3 < 2", &[]), ExprVal::Bool(false));
+        assert_eq!(ev("3 >= 3", &[]), ExprVal::Bool(true));
+        assert_eq!(ev("'ok' == 'ok'", &[]), ExprVal::Bool(true));
+        assert_eq!(ev("'a' < 'b'", &[]), ExprVal::Bool(true));
+        assert_eq!(ev("true && false", &[]), ExprVal::Bool(false));
+        assert_eq!(ev("true || false", &[]), ExprVal::Bool(true));
+        assert_eq!(ev("!false", &[]), ExprVal::Bool(true));
+        // Compose with vars and precedence: && binds tighter than ||.
+        assert_eq!(
+            ev(
+                "status == 'ok' && count > 0",
+                &[
+                    ("status", ExprVal::Str("ok".into())),
+                    ("count", ExprVal::Num(3.0)),
+                ]
+            ),
+            ExprVal::Bool(true)
+        );
+    }
+
+    #[test]
+    fn expr_string_functions() {
+        assert_eq!(ev("upper('hi')", &[]), ExprVal::Str("HI".into()));
+        assert_eq!(ev("lower('HI')", &[]), ExprVal::Str("hi".into()));
+        assert_eq!(ev("trim('  x  ')", &[]), ExprVal::Str("x".into()));
+        assert_eq!(ev("len('hello')", &[]), ExprVal::Num(5.0));
+        assert_eq!(ev("reverse('abc')", &[]), ExprVal::Str("cba".into()));
+        assert_eq!(
+            ev("replace('a-b-c', '-', '_')", &[]),
+            ExprVal::Str("a_b_c".into())
+        );
+        assert_eq!(ev("repeat('ab', 3)", &[]), ExprVal::Str("ababab".into()));
+        assert_eq!(ev("contains('hello', 'ell')", &[]), ExprVal::Bool(true));
+        assert_eq!(ev("concat('a', 'b', 'c')", &[]), ExprVal::Str("abc".into()));
+        // `+` concatenates when either side is non-numeric text.
+        assert_eq!(
+            ev("'v' + n", &[("n", ExprVal::Num(2.0))]),
+            ExprVal::Str("v2".into())
+        );
+        // An out-of-bounds repeat is rejected rather than allocating unboundedly.
+        let map: std::collections::BTreeMap<String, ExprVal> = Default::default();
+        assert!(eval_expr_value("repeat('x', 9999999)", &map).is_err());
+    }
+
+    #[test]
+    fn expr_value_truthiness_matches_json() {
+        assert!(ExprVal::Bool(true).truthy());
+        assert!(!ExprVal::Bool(false).truthy());
+        assert!(ExprVal::Num(1.0).truthy());
+        assert!(!ExprVal::Num(0.0).truthy());
+        assert!(ExprVal::Str("yes".into()).truthy());
+        assert!(!ExprVal::Str("false".into()).truthy());
+        assert!(!ExprVal::Str("0".into()).truthy());
+        assert!(!ExprVal::Str("  ".into()).truthy());
     }
 }
