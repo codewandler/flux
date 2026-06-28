@@ -1,8 +1,0 @@
-.gradle/
-build/
-.idea/
-.kotlin/
-*.iml
-
-# IntelliJ Platform Gradle plugin working dir (locks + machine-specific local-IDE descriptors)
-.intellijPlatform/
