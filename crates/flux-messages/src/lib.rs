@@ -202,9 +202,16 @@ fn close_unbalanced_json(s: &str) -> Option<String> {
 /// Per-index accumulator for a content block being streamed.
 enum BlockAcc {
     Text(String),
-    Thinking { thinking: String, signature: String },
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
     RedactedThinking(String),
-    ToolUse { id: String, name: String, json: String },
+    ToolUse {
+        id: String,
+        name: String,
+        json: String,
+    },
 }
 
 impl BlockAcc {
@@ -260,7 +267,9 @@ pub fn map_messages_stream(byte_stream: ByteStream) -> ChunkStream {
     Box::pin(map_messages_stream_inner(byte_stream))
 }
 
-fn map_messages_stream_inner(byte_stream: ByteStream) -> impl futures::Stream<Item = Result<Chunk>> {
+fn map_messages_stream_inner(
+    byte_stream: ByteStream,
+) -> impl futures::Stream<Item = Result<Chunk>> {
     try_stream! {
         let mut events = byte_stream.eventsource();
         let mut blocks: HashMap<usize, BlockAcc> = HashMap::new();
@@ -429,10 +438,8 @@ mod tests {
     fn extra_body_is_merged_at_top_level() {
         let req = Request::new("z-ai/glm-4.6", "hi");
         let mut q = MessagesQuirks::default();
-        q.extra_body.insert(
-            "provider".into(),
-            json!({ "require_parameters": true }),
-        );
+        q.extra_body
+            .insert("provider".into(), json!({ "require_parameters": true }));
         let body = build_messages_body(&req, &q).unwrap();
         assert_eq!(body["provider"]["require_parameters"], true);
     }
@@ -585,16 +592,25 @@ mod tests {
     #[test]
     fn parse_tool_input_handles_model_json_quirks() {
         // Clean.
-        assert_eq!(parse_tool_input(r#"{"path":"a.txt"}"#).unwrap()["path"], "a.txt");
+        assert_eq!(
+            parse_tool_input(r#"{"path":"a.txt"}"#).unwrap()["path"],
+            "a.txt"
+        );
         // Trailing junk (deepseek-v4-flash): the extra brace is ignored.
-        assert_eq!(parse_tool_input(r#"{"path":"a.txt"}}"#).unwrap()["path"], "a.txt");
+        assert_eq!(
+            parse_tool_input(r#"{"path":"a.txt"}}"#).unwrap()["path"],
+            "a.txt"
+        );
         // Truncated object (glm-5.2): the missing final brace is repaired.
         assert_eq!(
             parse_tool_input(r#"{"ast":{"body":[]}"#).unwrap()["ast"]["body"],
             json!([])
         );
         // Truncated mid-string: closed best-effort (keeps the partial value).
-        assert_eq!(parse_tool_input(r#"{"path":"a.tx"#).unwrap()["path"], "a.tx");
+        assert_eq!(
+            parse_tool_input(r#"{"path":"a.tx"#).unwrap()["path"],
+            "a.tx"
+        );
         // Genuinely broken (a missing value, not just unbalanced) still errors.
         assert!(parse_tool_input(r#"{"path": }"#).is_err());
     }

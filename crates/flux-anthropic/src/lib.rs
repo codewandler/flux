@@ -180,6 +180,9 @@ mod tests {
     #[test]
     fn wire_headers_carry_the_anthropic_version() {
         let headers = AnthropicMessages.wire_headers();
-        assert_eq!(headers, vec![("anthropic-version", "2023-06-01".to_string())]);
+        assert_eq!(
+            headers,
+            vec![("anthropic-version", "2023-06-01".to_string())]
+        );
     }
 }

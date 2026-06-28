@@ -1010,7 +1010,8 @@ mod tests {
         assert_eq!(calls[0].2["content"], "X");
 
         // A GLM numeric parameter is coerced to a JSON number; a path stays a string.
-        let numeric = "<tool_call><function=git_log> <parameter=limit>15</parameter></function></tool_call>";
+        let numeric =
+            "<tool_call><function=git_log> <parameter=limit>15</parameter></function></tool_call>";
         let calls = parse_inline_tool_calls(numeric);
         assert_eq!(calls[0].2["limit"], 15);
     }
