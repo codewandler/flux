@@ -106,6 +106,24 @@ fn args_prop() -> Value {
 // python: python_run, pytest
 // ---------------------------------------------------------------------------
 
+/// The most-recently-modified `.py` file in the workspace root, or `None` if there is none. Backs
+/// `python_run`'s zero-arg default so a bare `python_run` after `write solution.py` just runs it.
+async fn newest_py(ctx: &ToolContext) -> Option<String> {
+    let names = ctx.system.list_dir(".").await.ok()?;
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for name in names {
+        if !name.ends_with(".py") {
+            continue;
+        }
+        if let Ok(mtime) = ctx.system.file_mtime(&name).await {
+            if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
+                best = Some((mtime, name));
+            }
+        }
+    }
+    best.map(|(_, name)| name)
+}
+
 pub struct PythonRunTool;
 
 #[async_trait]
@@ -114,6 +132,7 @@ impl Tool for PythonRunTool {
         proc_spec(
             "python_run",
             "Run Python: a script file (`script`) or a module (`module`, like `python -m`). \
+             If neither is given, runs the most-recently-modified `.py` in the workspace. \
              Optional `args` are passed through. Uses `python3`.",
             json!({
                 "type": "object",
@@ -148,9 +167,16 @@ impl Tool for PythonRunTool {
             argv.push(m.to_string());
         } else if let Some(s) = params.get("script").and_then(|v| v.as_str()) {
             argv.push(s.to_string());
+        } else if let Some(script) = newest_py(ctx).await {
+            // DWIM: neither `script` nor `module` was given. Default to the most-recently-modified
+            // `.py` in the workspace — the common "write `solution.py`, then run it" shape, where the
+            // model sometimes omits the path. Only error when there is genuinely nothing to run.
+            argv.push(script);
         } else {
             return Ok(ToolResult::error(
-                "python_run: provide either `script` (a .py file) or `module` (for -m)".to_string(),
+                "python_run: provide either `script` (a .py file) or `module` (for -m) — no `.py` \
+                 file was found in the workspace to default to"
+                    .to_string(),
             ));
         }
         push_args(&mut argv, &params);
@@ -499,5 +525,29 @@ mod tests {
         assert_eq!(group_of("node_run"), "node");
         assert_eq!(group_of("go_build"), "go");
         assert_eq!(group_of("make"), "make");
+    }
+
+    /// Fix 1 (DWIM): a zero-arg `python_run` defaults to a `.py` in the workspace. `newest_py` finds
+    /// the script (ignoring non-`.py` files) and returns `None` when there is nothing to run — the
+    /// case that keeps `python_run`'s honest "provide script/module" error.
+    #[tokio::test]
+    async fn newest_py_resolves_the_sole_script_else_none() {
+        use std::sync::Arc;
+
+        use flux_runtime::ToolContext;
+        use flux_system::{System, Workspace};
+
+        let dir = std::env::temp_dir().join(format!("flux-newest-py-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap())));
+
+        // No `.py` → None, so `python_run` keeps its honest error.
+        assert_eq!(newest_py(&ctx).await, None);
+
+        // A non-`.py` file is ignored; the sole `.py` becomes the DWIM default.
+        std::fs::write(dir.join("notes.txt"), "x").unwrap();
+        std::fs::write(dir.join("solution.py"), "print(42)\n").unwrap();
+        assert_eq!(newest_py(&ctx).await.as_deref(), Some("solution.py"));
     }
 }

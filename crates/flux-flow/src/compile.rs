@@ -1141,7 +1141,8 @@ mod tests {
     async fn oneshot_compiles_and_repairs() {
         let reg = full_registry();
         let ops = OpRegistry::new(&reg);
-        let good = "```json\n{\"body\":[{\"kind\":\"call\",\"op\":\"read\",\"args\":[]}]}\n```";
+        let good =
+            "```json\n{\"body\":[{\"kind\":\"call\",\"op\":\"read\",\"args\":[{\"kind\":\"lit\",\"value\":\"README.md\"}]}]}\n```";
         let p = mock(vec![text_chunk("no json"), text_chunk(good)]);
         let out = compile(&p, "mock", "read it", &ops, None, CompileOptions::default())
             .await

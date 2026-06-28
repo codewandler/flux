@@ -498,6 +498,19 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, diags: &mut Vec<Diagnostic>) {
                             args.len()
                         )));
                     }
+                    // Too few: a call with NO args can never bind a required param (zero args cannot
+                    // be the lone whole-input object). Surface it at compile time so the planner
+                    // re-plans, instead of failing at runtime mid-execution after side effects.
+                    if args.is_empty() && !sig.required_params.is_empty() {
+                        diags.push(Diagnostic::new(format!(
+                            "op `{op}` requires argument(s) {} but none were supplied",
+                            sig.required_params
+                                .iter()
+                                .map(|p| format!("`{p}`"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )));
+                    }
                 }
             }
             for a in args {
@@ -974,6 +987,29 @@ mod tests {
         };
         let err = lower(&over, &ops).unwrap_err();
         assert!(err.iter().any(|d| d.message.contains("at most 1 argument")));
+    }
+
+    /// A required-param op called with NO args is rejected at analysis — the `python_run`-class
+    /// mistake. Zero args can never bind a required input, so it must surface as a compile error
+    /// (re-plannable) rather than failing at runtime after side effects.
+    #[test]
+    fn required_op_with_no_args_is_rejected() {
+        use crate::ast::Node;
+        let ops = TypedCatalog;
+        let empty = DraftAst {
+            body: vec![Node::Call {
+                op: "read".into(),
+                args: vec![],
+            }],
+            ..Default::default()
+        };
+        let err = lower(&empty, &ops).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("requires argument(s)") && d.message.contains("`path`")),
+            "expected a missing-required-arg diagnostic, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 
     /// The P6b control-flow primitives carry their own structural guard-rails, and `return` inside a
