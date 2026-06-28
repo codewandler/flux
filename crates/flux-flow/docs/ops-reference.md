@@ -123,3 +123,8 @@ still dispatches through the same `Executor` envelope — no bypass.
 them in its catalog — only a pre-authored flow (the agent loop, or `flux flow run`) can call them, and only
 when a `LoopHost` is installed (the engine installs one per turn). `observe`/`evidence`/`metrics` are
 ordinary builtins; `grade` is in the evidence-gated `eval` group.
+
+On the **user-facing** surface these machinery ops are filtered out by default so the turn shows real
+work, not plumbing. `flux run --show-loop` (or `FLUX_SHOW_LOOP=1`) reveals them so you can watch the
+loop iterate; the REPL `/evidence` command prints the evidence log they write; and `flux loop
+show`/`eject` reads or scaffolds the loop itself. See [docs/agent-loop.md](../../../docs/agent-loop.md).

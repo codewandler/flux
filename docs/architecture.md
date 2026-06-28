@@ -97,7 +97,9 @@ A "provider" conflates two orthogonal axes, modeled separately and composed by `
   with its own `.flux/agent-loop.flux`. The loop is cancellable (a `CancellationToken`). This is the
   CLI/server/TUI turn loop; `flux-agent` provides the `AgentSink` streaming trait plus its **classic**
   provider-native `Agent` loop, which the SDK's `flux_sdk::Client` front door still uses (`flux_sdk::FlowClient`
-  is the flow-based SDK door).
+  is the flow-based SDK door). The loop is filtered from the surface by default; watch it with
+  `flux run --show-loop`, inspect its evidence with the REPL `/evidence`, and read or scaffold it with
+  `flux loop show`/`eject` — see [the agent-loop guide](agent-loop.md).
 - **Session shape is a hard invariant.** The persisted message log must always be a valid
   provider history: never an empty assistant message, never a split tool_use/tool_result pair, never a
   user-after-user sequence. The cancel, compaction, and max-iteration exit paths each append a final
