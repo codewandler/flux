@@ -262,6 +262,12 @@ impl LoopHost for EngineLoopHost {
         // tells `dispatch` to skip the gate). `always` trusts all plans for the session. On rejection we
         // feed a stop-signal back so the model ends the turn in prose rather than re-planning forever.
         let _scope = if risk.mutating {
+            // Let the surface drain + render the plan tree (the observation above) BEFORE we print the
+            // approval prompt and — on a TTY — switch to raw mode for the keypress. A CLI renders the
+            // observation asynchronously (drained off an mpsc as the loop yields); without this yield the
+            // prompt can print ahead of the tree, and the tree can render under raw mode (no `\n`→`\r\n`),
+            // staircasing it. Yielding here parks us so the drain runs in cooked mode first.
+            tokio::task::yield_now().await;
             match executor.approve_plan(&risk.summary(), risk.ops.len()).await {
                 Some(scope) => Some(scope),
                 None => {
