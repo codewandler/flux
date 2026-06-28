@@ -677,6 +677,7 @@ dependencies = [
  "async-trait",
  "clap",
  "clap_complete",
+ "crossterm 0.28.1",
  "flux-agent",
  "flux-anthropic",
  "flux-app",
