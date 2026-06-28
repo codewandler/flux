@@ -183,6 +183,11 @@ impl FlowEngine {
         self.loop_host
             .set_turn(session_id.to_string(), Some(base_system), channel.clone());
 
+        // Per-turn iteration count: snapshot the cumulative `turn.iteration` evidence now so we can
+        // report only THIS turn's rounds. The executor (and its evidence log) is shared and persists
+        // across turns, so an unscoped count grows monotonically over a long-lived `flux --serve`.
+        let iter_base = self.executor.evidence().by_kind("turn.iteration").count();
+
         let mut outer = crate::loop_host::SharedSink::new(channel.clone());
         let flow_fut = execute_flow(
             &self.flow,
@@ -235,7 +240,12 @@ impl FlowEngine {
         };
         // The loop binds `$answer` but does not stream it (a `jq`/`fmt` bind is silent), so emit it now.
         sink.text_delta(&answer);
-        let iterations = self.executor.evidence().by_kind("turn.iteration").count() as u32;
+        let iterations = self
+            .executor
+            .evidence()
+            .by_kind("turn.iteration")
+            .count()
+            .saturating_sub(iter_base) as u32;
         let _ = self
             .events
             .end_turn(session_id, turn_id, tag, iterations, &answer);
