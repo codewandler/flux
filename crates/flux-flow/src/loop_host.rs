@@ -240,7 +240,23 @@ impl LoopHost for EngineLoopHost {
         let executor = self.executor()?;
         // A fresh proxy over the shared sink: the inner run streams live, interleaved under the outer op.
         let mut sink = SharedSink(sink);
-        let outcome = execute_flow(
+
+        // Surface the compiled plan BEFORE executing it — auditable, and so the user sees what is about
+        // to run before any per-op approval prompt (the `flow.plan` observation the surfaces render as
+        // the plan tree). The inner ops then stream + gate live underneath.
+        let risk = crate::runtime::plan_risk(&ast, executor.registry());
+        sink.observation(&flux_evidence::Observation::new(
+            "flow.plan",
+            flux_evidence::Phase::Turn,
+            serde_json::json!({
+                "plan": crate::render::render_pretty(&ast),
+                "plan_ast": serde_json::to_value(&ast).unwrap_or(Value::Null),
+                "risk": risk.summary(),
+                "ops": risk.ops.len(),
+            }),
+        ));
+
+        let outcome = match execute_flow(
             self.store.as_ref(),
             executor.as_ref(),
             &session_id,
@@ -248,7 +264,21 @@ impl LoopHost for EngineLoopHost {
             &mut sink,
         )
         .await
-        .map_err(|e| Error::Other(e.to_string()))?;
+        {
+            Ok(o) => o,
+            // A plan step failed (a bad edit, an unsupported `jq`, a denied op…). Feed the error back as
+            // the outcome transcript so the loop re-plans (model-in-the-loop self-correction), exactly as
+            // the old Rust loop did — rather than letting it abort the whole turn.
+            Err(e) => {
+                return Ok(serde_json::json!({
+                    "transcript": format!(
+                        "[plan error] {e}\nAdjust and emit another plan, or answer in prose."
+                    ),
+                    "result": "",
+                    "steps": 0,
+                }));
+            }
+        };
 
         let mut out = serde_json::json!({
             "transcript": outcome.transcript,

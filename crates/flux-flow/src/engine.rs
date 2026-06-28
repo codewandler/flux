@@ -105,6 +105,10 @@ impl FlowEngine {
             init_sink,
             opts,
         );
+        // The loop machinery is the engine's own control flow (call the model, run its plan, record
+        // evidence), not a user action — pre-allow it so a turn never prompts to approve `plan`/
+        // `run_plan`/`observe`. The inner ops a plan runs still gate individually.
+        executor.allow(&["plan", "run_plan", "observe", "evidence", "metrics"]);
         let agent_loop = load_agent_loop(&cwd)?;
         Ok(FlowEngine {
             provider,

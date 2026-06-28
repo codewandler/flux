@@ -606,6 +606,16 @@ impl Executor {
         self.ctx.loop_host = Some(loop_host);
     }
 
+    /// Pre-allow these op names (they dispatch without an approval prompt). The engine uses this to
+    /// whitelist its own loop machinery (`plan`/`run_plan`/`observe`/…) — internal control flow, not
+    /// user-facing actions. A `deny` rule still wins, and the *inner* ops a plan runs gate individually.
+    pub fn allow(&self, rules: &[&str]) {
+        let mut perms = self.perms.lock().unwrap();
+        for r in rules {
+            perms.add_allow(r);
+        }
+    }
+
     /// The current approver (used by flow nodes such as `confirm` that need to request approval
     /// outside of a full tool dispatch). Returns a clone of the `Arc` (the approver is interior-mutable).
     pub fn approver(&self) -> Arc<dyn Approver> {
