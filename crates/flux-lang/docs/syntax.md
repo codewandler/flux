@@ -18,14 +18,15 @@ hand-written grammar stays small.
   `call` (bare `do …` or inline `op(…)`), `var` (`$x`), `lit` (JSON), `return`, `when`/`else`, `unless`,
   `each`, `repeat`, `seq`, the context-pack nodes **`ctx`** / **`ctx_append`**, and (added P6) the Tier-1
   control-flow blocks **`match`**, **`route`**, **`fallback`**, **`loop`**, **`timeout`**, **`budget`**,
-  the inline **`fmt("…")`** node, and **`$var.path`** field-access sugar (lowers to a `jq` node). Flow
-  header carries optional `name`/`params`/`returns`; a leading `goal "…"` line is accepted and ignored
-  (not part of the AST/round-trip). The actual P6 spellings are documented in
+  the inline **`fmt("…")`** node, and **`$var.path`** field-access sugar (lowers to a `jq` node); and
+  (added P8) the value-template constructors **`obj`** (`{ k: expr }`) / **`list`** (`[ expr ]`) plus the
+  **`assert`**, **`retry`**, and **`parallel`** blocks. Flow header carries optional
+  `name`/`params`/`returns`; a leading `goal "…"` line is accepted and ignored (not part of the
+  AST/round-trip). The actual P6/P8 spellings are documented in
   [§ Native control-flow forms (P6)](#native-control-flow-forms-p6) below.
-- **`@json` escape** (everything else, today): `parallel`, `race`, `try`, `retry`, `confirm`, `throttle`,
-  `debounce`, `assert`, `verify`, `pipe`, `memo`, `await`, `peek`, `thing`, `expr`, `parse`, and any `jq`
-  whose input is not a plain `$var` or whose path uses an array index (`.items[0]`) — those still
-  round-trip through `@json`.
+- **`@json` escape** (everything else, today): `race`, `try`, `confirm`, `throttle`, `debounce`,
+  `verify`, `pipe`, `memo`, `await`, `peek`, `thing`, `expr`, `parse`, and any `jq` whose input is not a
+  plain `$var` or whose path uses an array index (`.items[0]`) — those still round-trip through `@json`.
 - **Aspirational** (described below as the *target* language, **not** yet parsed): multiple flows per
   file, file-scope `type`/union declarations, and the `block`/`watch` spellings (the implemented nodes
   are `seq` and `loop`). The AST type is **`DraftAst`** (this doc historically said `FlowAst`, which does
@@ -478,6 +479,50 @@ budget 10 -> $used
 
 > The implemented loop keyword is **`loop`** (the aspirational `watch` spelling above is superseded).
 
+## Native value templates and blocks (P8)
+
+**Value templates** — a record or list whose leaves may be variables/expressions. `{ … }` / `[ … ]`
+is a template (`obj`/`list`) when it is **not** valid JSON (an unquoted key or a `$var`/expr leaf);
+pure JSON stays a `lit`. Each value is an expression (`$var`, `$v.path`, `op(…)`, `fmt(…)`, nested
+templates), so a record assembles from computed symbols:
+
+```flux
+$r = { ok: true, n: $count, intent: $extract.intent, items: [$a, $b] }
+return { status: "done", refs: $refs }
+```
+
+Keys are barewords when identifier-safe, else JSON-quoted (`{ "a-b": $x }`). An all-literal or empty
+template has no native form and round-trips via `@json`.
+
+**`assert <cond> [, "<message>"]`** — a one-line guard (the first top-level `,` begins the message):
+
+```flux
+assert $hits, "grep returned no results"
+assert ok($a, $b)
+```
+
+**`retry <max> [backoff <ident>] [delay <ms>] [-> $bind]`** + body — space-keyword tokens in fixed
+order (`backoff` is `none`/`linear`/`exponential`):
+
+```flux
+retry 3 backoff exponential delay 500 -> $out
+  do flaky_step
+```
+
+> Note: the `retry 3, backoff: exponential` comma form shown under [§ Named arguments](#named-arguments)
+> is aspirational; the implemented spelling is the space-keyword form above.
+
+**`parallel`** + indented `branch $name` arms — each branch runs concurrently and binds its result to
+`$name` (no `default` arm):
+
+```flux
+parallel
+  branch $readme
+    $readme = read("README.md")
+  branch $todos
+    $todos = grep("TODO")
+```
+
 ---
 
 ## Sequencing and piping
@@ -521,25 +566,25 @@ steps is a parse error.
 
 ### parallel
 
-Run independent branches concurrently. Each branch is introduced by `$name:` at one
-indent level, with the branch body indented one level further.
+Run independent branches concurrently. Each branch is introduced by a `branch $name`
+arm (mirroring `fallback`'s `branch` arms), with the branch body indented one level further.
 
 The **result of a branch** is the value of the last expression evaluated in its body.
 After the `parallel` block, each branch name is a bound symbol.
 
 ```flux
 parallel
-  $readme:
-    read("README.md")
-  $todos:
-    grep("TODO")
+  branch $readme
+    $readme = read("README.md")
+  branch $todos
+    $todos = grep("TODO")
 ```
 
 After this block, `$readme` holds the file contents and `$todos` holds the grep hits.
 
 A symbol bound *inside* a branch body (other than its implicit result) is not
 visible outside that branch. A `parallel` with one branch is valid (degenerates to a
-sequential bind). A `parallel` with zero branches is a parse error.
+sequential bind); a `parallel` with zero branches round-trips as an empty block.
 
 ### race
 

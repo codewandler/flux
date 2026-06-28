@@ -20,6 +20,7 @@
 
 use crate::ast::{DraftAst, FlowEffect, Node, Param, SymbolName, TypeRef};
 use crate::error::{FlowError, Result};
+use std::collections::BTreeMap;
 
 /// Parse a single Flux-Lang flow from text into a [`DraftAst`].
 pub fn parse(src: &str) -> Result<DraftAst> {
@@ -363,6 +364,9 @@ fn parse_stmt(lines: &[Line], indent: usize) -> Result<(Node, usize)> {
     if let Some(rest) = kw(t, "fallback") {
         return parse_fallback(rest, lines, indent);
     }
+    if let Some(rest) = kw(t, "parallel") {
+        return parse_parallel(rest, lines, indent);
+    }
     if let Some(rest) = kw(t, "loop") {
         return parse_loop(rest, lines, indent);
     }
@@ -372,6 +376,9 @@ fn parse_stmt(lines: &[Line], indent: usize) -> Result<(Node, usize)> {
     if let Some(rest) = kw(t, "budget") {
         return parse_budget(rest, lines, indent);
     }
+    if let Some(rest) = kw(t, "retry") {
+        return parse_retry(rest, lines, indent);
+    }
     if let Some(rest) = kw(t, "seq") {
         return parse_seq(rest, lines, indent);
     }
@@ -380,6 +387,9 @@ fn parse_stmt(lines: &[Line], indent: usize) -> Result<(Node, usize)> {
     }
     if let Some(rest) = kw(t, "return") {
         return parse_return(rest);
+    }
+    if let Some(rest) = kw(t, "assert") {
+        return parse_assert(rest);
     }
 
     if t.starts_with('$') {
@@ -654,6 +664,39 @@ fn parse_fallback(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, us
     Ok((Node::Fallback { branches, bind }, 1 + region.len()))
 }
 
+/// `parallel` + indented `branch $name` arms (mirrors `fallback`'s `branch` arms, but each names the
+/// symbol its branch result binds to). No `default` arm.
+fn parse_parallel(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
+    if !rest.trim().is_empty() {
+        return Err(perr(
+            "`parallel` takes no header — put each concurrent path on its own `branch $name` arm",
+        ));
+    }
+    let region = child_region(lines, indent);
+    let (arms, default) = parse_arms(region, "branch")?;
+    if !default.is_empty() {
+        return Err(perr(
+            "`parallel` has no `default` arm — use `branch $name` only",
+        ));
+    }
+    let mut branches = Vec::with_capacity(arms.len());
+    for (hdr, body) in arms {
+        let name = hdr
+            .trim()
+            .strip_prefix('$')
+            .ok_or_else(|| perr(&format!("`parallel` branch needs a `$name`, got: `{hdr}`")))?;
+        let (nm, tail) = take_while(name, is_var_char);
+        if nm.is_empty() || !tail.trim().is_empty() {
+            return Err(perr(&format!("invalid `parallel` branch name: `{hdr}`")));
+        }
+        branches.push(crate::ast::Branch {
+            name: nm.into(),
+            body,
+        });
+    }
+    Ok((Node::Parallel { branches }, 1 + region.len()))
+}
+
 fn parse_loop(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
     let r = kw(rest.trim_start(), "for").ok_or_else(|| perr("`loop` expects `for <ms>`"))?;
     let (for_ms, r) = take_u64(r)?;
@@ -681,6 +724,45 @@ fn parse_timeout(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usi
     let region = child_region(lines, indent);
     let (body, _) = parse_stmts(region, indent)?;
     Ok((Node::Timeout { ms, body, bind }, 1 + region.len()))
+}
+
+/// `retry <max> [backoff <ident>] [delay <ms>] [-> $bind]` + indented body. Space-keyword tokens in a
+/// fixed order (mirrors `loop for <ms> every <ms>`); `backoff` is `none`/`linear`/`exponential`.
+fn parse_retry(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
+    let (digits, mut r) = take_while(rest.trim_start(), |c| c.is_ascii_digit());
+    let max: u32 = digits
+        .parse()
+        .map_err(|_| perr("`retry` expects a numeric max"))?;
+    let mut backoff = None;
+    if let Some(after) = kw(r.trim_start(), "backoff") {
+        let (ident, rr) = take_while(after, is_name_char);
+        if ident.is_empty() {
+            return Err(perr(
+                "`retry backoff` expects a name (none/linear/exponential)",
+            ));
+        }
+        backoff = Some(ident.to_string());
+        r = rr;
+    }
+    let mut delay_ms = None;
+    if let Some(after) = kw(r.trim_start(), "delay") {
+        let (ms, rr) = take_u64(after)?;
+        delay_ms = Some(ms);
+        r = rr;
+    }
+    let bind = parse_optional_arrow_bind(r, "retry")?;
+    let region = child_region(lines, indent);
+    let (body, _) = parse_stmts(region, indent)?;
+    Ok((
+        Node::Retry {
+            max,
+            backoff,
+            delay_ms,
+            body,
+            bind,
+        },
+        1 + region.len(),
+    ))
 }
 
 fn parse_budget(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
@@ -774,6 +856,36 @@ fn parse_return(rest: &str) -> Result<(Node, usize)> {
     Ok((
         Node::Return {
             value: Box::new(value),
+        },
+        1,
+    ))
+}
+
+/// `assert <cond> [, "<message>"]` — a one-line boolean guard. The condition is a full expression
+/// (the first top-level `,` after it begins the optional message, so commas inside `op(a,b)`/`{…}`/
+/// `[…]`/strings are already consumed by `parse_expr`).
+fn parse_assert(rest: &str) -> Result<(Node, usize)> {
+    let (cond, tail) = parse_expr(rest)?;
+    let tail = tail.trim_start();
+    let message = if tail.is_empty() {
+        None
+    } else {
+        let after = tail
+            .strip_prefix(',')
+            .ok_or_else(|| perr("expected `,` before the `assert` message"))?;
+        let (v, rest2) = take_json(after.trim_start())?;
+        if !rest2.trim().is_empty() {
+            return Err(perr("trailing text after `assert` message"));
+        }
+        match v {
+            serde_json::Value::String(m) => Some(m),
+            _ => return Err(perr("`assert` message must be a quoted string")),
+        }
+    };
+    Ok((
+        Node::Assert {
+            cond: Box::new(cond),
+            message,
         },
         1,
     ))
@@ -907,10 +1019,22 @@ fn parse_expr(s: &str) -> Result<(Node, &str)> {
                 .map_err(|e| perr(&format!("invalid `@json` node: {e}")))?;
             Ok((node, tail))
         }
-        '"' | '[' | '{' => {
+        '"' => {
             let (v, rest) = take_json(s)?;
             Ok((Node::Lit { value: v }, rest))
         }
+        // A brace/bracket that is valid JSON (quoted keys, literal values) stays a `Lit`; otherwise —
+        // an unquoted key or a `$var`/expr leaf — it is a value-template `Obj`/`List`. This try-JSON-
+        // then-template split is exactly the round-trip partner of the formatter's "render a template
+        // natively only when it has a dynamic leaf" rule, so the two never collide.
+        '{' => match take_json(s) {
+            Ok((v, rest)) => Ok((Node::Lit { value: v }, rest)),
+            Err(_) => parse_obj_template(s),
+        },
+        '[' => match take_json(s) {
+            Ok((v, rest)) => Ok((Node::Lit { value: v }, rest)),
+            Err(_) => parse_list_template(s),
+        },
         c if c == '-' || c.is_ascii_digit() => {
             let (v, rest) = take_json(s)?;
             Ok((Node::Lit { value: v }, rest))
@@ -1007,6 +1131,87 @@ fn parse_arg_list(s: &str) -> Result<Vec<Node>> {
         return Err(perr(&format!(
             "expected `,` between arguments, got: `{rest}`"
         )));
+    }
+}
+
+/// Parse a value-template object `{ key: expr, … }` (the `Obj` node). Reached only when the braces are
+/// not valid JSON (an unquoted key or a `$var`/expr leaf), so a pure-JSON object stays a `Lit`. Keys
+/// may be bareword or JSON-quoted; each value is an arbitrary expression (so `$var`, `$v.path`,
+/// `op(args)`, `fmt(…)`, and nested `{}`/`[]` leaves all work via `parse_expr`).
+fn parse_obj_template(s: &str) -> Result<(Node, &str)> {
+    let s = s.strip_prefix('{').ok_or_else(|| perr("expected `{`"))?;
+    let mut fields: BTreeMap<String, Box<Node>> = BTreeMap::new();
+    let mut s = s.trim_start();
+    if let Some(r) = s.strip_prefix('}') {
+        return Ok((Node::Obj { fields }, r));
+    }
+    loop {
+        let (key, rest) = parse_obj_key(s)?;
+        let rest = rest
+            .trim_start()
+            .strip_prefix(':')
+            .ok_or_else(|| perr(&format!("expected `:` after object key `{key}`")))?;
+        let (val, rest) = parse_expr(rest)?;
+        fields.insert(key, Box::new(val));
+        let rest = rest.trim_start();
+        if let Some(r) = rest.strip_prefix(',') {
+            s = r.trim_start();
+            continue;
+        }
+        if let Some(r) = rest.strip_prefix('}') {
+            return Ok((Node::Obj { fields }, r));
+        }
+        return Err(perr(&format!(
+            "expected `,` or `}}` in object template, got: `{rest}`"
+        )));
+    }
+}
+
+/// Parse a value-template list `[ expr, … ]` (the `List` node). Reached only when the brackets are not
+/// valid JSON (a `$var`/expr item), so a pure-JSON array stays a `Lit`.
+fn parse_list_template(s: &str) -> Result<(Node, &str)> {
+    let s = s.strip_prefix('[').ok_or_else(|| perr("expected `[`"))?;
+    let mut items = Vec::new();
+    let mut s = s.trim_start();
+    if let Some(r) = s.strip_prefix(']') {
+        return Ok((Node::List { items }, r));
+    }
+    loop {
+        let (item, rest) = parse_expr(s)?;
+        items.push(item);
+        let rest = rest.trim_start();
+        if let Some(r) = rest.strip_prefix(',') {
+            s = r.trim_start();
+            continue;
+        }
+        if let Some(r) = rest.strip_prefix(']') {
+            return Ok((Node::List { items }, r));
+        }
+        return Err(perr(&format!(
+            "expected `,` or `]` in list template, got: `{rest}`"
+        )));
+    }
+}
+
+/// Parse an object-template key: a JSON-quoted string or a bareword identifier.
+fn parse_obj_key(s: &str) -> Result<(String, &str)> {
+    let s = s.trim_start();
+    if s.starts_with('"') {
+        let (v, rest) = take_json(s)?;
+        match v {
+            serde_json::Value::String(k) => Ok((k, rest)),
+            _ => Err(perr(
+                "object-template key must be a bareword or quoted string",
+            )),
+        }
+    } else {
+        let (k, rest) = take_while(s, |c| c.is_ascii_alphanumeric() || c == '_');
+        if k.is_empty() {
+            return Err(perr(&format!(
+                "expected an object-template key, got: `{s}`"
+            )));
+        }
+        Ok((k.to_string(), rest))
     }
 }
 
@@ -1170,27 +1375,210 @@ mod tests {
     }
 
     #[test]
-    fn obj_and_list_templates_round_trip_via_json_escape() {
-        // `obj`/`list` have no native `{k:expr}` spelling yet (that's a Phase-2 item), so they round-trip
-        // through the `@json` escape — the invariant `parse(format(ast)) == ast` must still hold.
+    fn all_literal_and_empty_templates_use_json_while_lit_json_stays_native() {
+        // The round-trip disjointness rule, pinned from both sides: an all-literal or empty `Obj`/`List`
+        // has no native spelling and uses `@json` (so its text can never collide with a `Lit`'s
+        // `{…}`/`[…]`), while a `Lit` holding a JSON object/array still renders as compact JSON.
+        let all_lit: Node = serde_json::from_value(serde_json::json!({
+            "kind": "obj", "fields": { "ok": {"kind": "lit", "value": true} }
+        }))
+        .unwrap();
+        let empty_obj: Node = serde_json::from_value(serde_json::json!({"kind": "obj"})).unwrap();
+        let empty_list: Node = serde_json::from_value(serde_json::json!({"kind": "list"})).unwrap();
+        for node in [all_lit, empty_obj, empty_list] {
+            let ast = DraftAst {
+                body: vec![bind("r", node)],
+                ..Default::default()
+            };
+            assert!(
+                format(&ast).contains("@json"),
+                "all-literal/empty template should use @json"
+            );
+            assert_round_trips(&ast);
+        }
+
+        // `Lit` JSON objects/arrays stay native compact JSON (NOT @json) and round-trip as `Lit`.
+        let lit_ast = DraftAst {
+            body: vec![
+                bind("o", lit(serde_json::json!({"a": 1}))),
+                bind("xs", lit(serde_json::json!([1, 2, 3]))),
+            ],
+            ..Default::default()
+        };
+        let text = format(&lit_ast);
+        assert!(!text.contains("@json"), "Lit JSON stays native: {text}");
+        assert!(text.contains(r#"$o = {"a":1}"#), "{text}");
+        assert_round_trips(&lit_ast);
+    }
+
+    #[test]
+    fn obj_and_list_templates_are_native_when_dynamic() {
+        // A template with a dynamic ($var/expr) leaf spells natively as `{ k: expr }` / `[ … ]` and
+        // round-trips: field-access leaves, nested templates, mixed static/dynamic, and a
+        // non-identifier (quoted) key.
         let template: Node = serde_json::from_value(serde_json::json!({
             "kind": "obj",
             "fields": {
+                "intent": {"kind": "jq", "path": ".intent", "input": {"kind": "var", "name": "x"}},
                 "ok": {"kind": "lit", "value": true},
-                "items": {"kind": "list", "items": [{"kind": "var", "name": "a"}]}
+                "items": {"kind": "list", "items": [
+                    {"kind": "var", "name": "a"},
+                    {"kind": "lit", "value": 1}
+                ]},
+                "nested": {"kind": "obj", "fields": { "deep": {"kind": "var", "name": "d"} }},
+                "a-b": {"kind": "var", "name": "q"}
             }
         }))
         .unwrap();
         let ast = DraftAst {
-            body: vec![bind("r", template)],
+            body: vec![Node::Return {
+                value: Box::new(template),
+            }],
             ..Default::default()
         };
         let text = format(&ast);
         assert!(
-            text.contains("@json"),
-            "templates use the json escape today: {text}"
+            !text.contains("@json"),
+            "dynamic template should be native: {text}"
+        );
+        assert!(text.contains("$x.intent"), "field-access leaf: {text}");
+        assert!(
+            text.contains("ok: true"),
+            "literal leaf rendered inline: {text}"
+        );
+        assert!(
+            text.contains(r#""a-b": $q"#),
+            "non-ident key is quoted: {text}"
         );
         assert_round_trips(&ast);
+    }
+
+    #[test]
+    fn assert_round_trips_natively() {
+        // `assert <cond> [, "<message>"]`; a comma inside `op(a,b)` belongs to the cond, not the message.
+        let ast = DraftAst {
+            body: vec![
+                Node::Assert {
+                    cond: Box::new(var("hits")),
+                    message: Some("grep returned nothing".into()),
+                },
+                Node::Assert {
+                    cond: Box::new(var("gate")),
+                    message: None,
+                },
+                Node::Assert {
+                    cond: Box::new(call("ok", vec![var("a"), var("b")])),
+                    message: Some("two-arg cond".into()),
+                },
+            ],
+            ..Default::default()
+        };
+        let text = format(&ast);
+        assert!(
+            text.contains("assert $hits, \"grep returned nothing\""),
+            "{text}"
+        );
+        assert!(text.contains("assert $gate\n"), "no-message form: {text}");
+        assert!(!text.contains("@json"), "assert is native: {text}");
+        assert_round_trips(&ast);
+    }
+
+    #[test]
+    fn retry_round_trips_natively_with_a_json_guard_fallback() {
+        let full = DraftAst {
+            body: vec![Node::Retry {
+                max: 3,
+                backoff: Some("exponential".into()),
+                delay_ms: Some(500),
+                body: vec![call("flaky", vec![])],
+                bind: Some("out".into()),
+            }],
+            ..Default::default()
+        };
+        let text = format(&full);
+        assert!(
+            text.contains("retry 3 backoff exponential delay 500 -> $out"),
+            "{text}"
+        );
+        assert!(!text.contains("@json"), "native: {text}");
+        assert_round_trips(&full);
+
+        let minimal = DraftAst {
+            body: vec![Node::Retry {
+                max: 1,
+                backoff: None,
+                delay_ms: None,
+                body: vec![call("once", vec![])],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        assert!(
+            format(&minimal).contains("retry 1\n"),
+            "minimal: {}",
+            format(&minimal)
+        );
+        assert_round_trips(&minimal);
+
+        // A `backoff` with whitespace can't be spelled natively → falls back to `@json` (still exact).
+        let weird = DraftAst {
+            body: vec![Node::Retry {
+                max: 2,
+                backoff: Some("a b".into()),
+                delay_ms: None,
+                body: vec![call("x", vec![])],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        assert!(
+            format(&weird).contains("@json"),
+            "guard fallback: {}",
+            format(&weird)
+        );
+        assert_round_trips(&weird);
+    }
+
+    #[test]
+    fn parallel_round_trips_natively() {
+        let ast = DraftAst {
+            body: vec![Node::Parallel {
+                branches: vec![
+                    Branch {
+                        name: "readme".into(),
+                        body: vec![call("read", vec![lit(s("README.md"))])],
+                    },
+                    Branch {
+                        name: "todos".into(),
+                        body: vec![call("grep", vec![lit(s("TODO"))])],
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+        let text = format(&ast);
+        assert!(text.contains("parallel\n"), "{text}");
+        assert!(text.contains("branch $readme"), "{text}");
+        assert!(text.contains("branch $todos"), "{text}");
+        assert!(!text.contains("@json"), "native: {text}");
+        assert_round_trips(&ast);
+
+        // Single-branch and empty `parallel` also round-trip.
+        let single = DraftAst {
+            body: vec![Node::Parallel {
+                branches: vec![Branch {
+                    name: "only".into(),
+                    body: vec![call("go", vec![])],
+                }],
+            }],
+            ..Default::default()
+        };
+        assert_round_trips(&single);
+        let empty = DraftAst {
+            body: vec![Node::Parallel { branches: vec![] }],
+            ..Default::default()
+        };
+        assert_round_trips(&empty);
     }
 
     #[test]

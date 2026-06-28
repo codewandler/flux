@@ -100,7 +100,59 @@ fn fmt_expr(node: &Node) -> String {
                 _ => unreachable!("guard checked Var"),
             }
         }
+        // Value templates render natively only when they carry a dynamic (non-`Lit`) leaf — `{ ok:
+        // true, n: $count }` / `[ $a, 1 ]`. An all-literal or empty template has no native spelling
+        // and falls through to `@json` below, so its text never collides with a `Lit`'s `{…}`/`[…]`.
+        Node::Obj { fields } if node_is_dynamic(node) => {
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|(k, v)| format!("{}: {}", fmt_obj_key(k), fmt_expr(v)))
+                .collect();
+            format!("{{ {} }}", parts.join(", "))
+        }
+        Node::List { items } if node_is_dynamic(node) => {
+            let parts: Vec<String> = items.iter().map(fmt_expr).collect();
+            format!("[ {} ]", parts.join(", "))
+        }
         other => format!("@json {}", compact(other)),
+    }
+}
+
+/// Whether a node's subtree carries any dynamic (non-`Lit`) leaf. A value-template (`Obj`/`List`)
+/// renders natively only when this holds; an all-literal/empty template falls through to `@json`, so
+/// its text can never collide with a `Lit`'s `{…}`/`[…]` JSON rendering (the round-trip disjointness
+/// rule — the partner of the parser's try-JSON-then-template split).
+fn node_is_dynamic(node: &Node) -> bool {
+    match node {
+        Node::Lit { .. } => false,
+        Node::Obj { fields } => fields.values().any(|v| node_is_dynamic(v)),
+        Node::List { items } => items.iter().any(node_is_dynamic),
+        _ => true,
+    }
+}
+
+/// Whether a string is a single bare word (no whitespace) — used to decide whether `retry`'s free-form
+/// `backoff` field can be spelled natively (else the whole node falls through to `@json`).
+fn is_word_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Whether an object-template key is identifier-safe (emit as a bareword); otherwise it is JSON-quoted.
+fn is_ident_key(k: &str) -> bool {
+    let mut chars = k.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Render an object-template key: a bareword when identifier-safe, else a JSON-quoted string. The
+/// parser accepts both forms and recovers the same key string, so the choice is lossless.
+fn fmt_obj_key(k: &str) -> String {
+    if is_ident_key(k) {
+        k.to_string()
+    } else {
+        compact(&serde_json::Value::String(k.to_string()))
     }
 }
 
@@ -422,6 +474,58 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
             }
             out.push('\n');
             fmt_body(body, level + 1, indent, out);
+        }
+        // `parallel` + indented `branch $name` arms. Native only when every branch name is an
+        // identifier (so the `$name` reader recovers it exactly); otherwise fall through to `@json`.
+        Node::Parallel { branches } if branches.iter().all(|b| is_ident_key(&b.name.0)) => {
+            out.push_str(&ind);
+            out.push_str("parallel\n");
+            for br in branches {
+                out.push_str(&indent_of(level + 1, indent));
+                out.push_str("branch $");
+                out.push_str(&br.name.0);
+                out.push('\n');
+                fmt_body(&br.body, level + 2, indent, out);
+            }
+        }
+        // `retry <max> [backoff <ident>] [delay <ms>] [-> $bind]` + body. Native only when `backoff`
+        // is a single bare word (the field is free-form `String`); otherwise fall through to `@json`.
+        Node::Retry {
+            max,
+            backoff,
+            delay_ms,
+            body,
+            bind,
+        } if backoff.as_deref().is_none_or(is_word_token) => {
+            out.push_str(&ind);
+            out.push_str("retry ");
+            out.push_str(&max.to_string());
+            if let Some(b) = backoff {
+                out.push_str(" backoff ");
+                out.push_str(b);
+            }
+            if let Some(ms) = delay_ms {
+                out.push_str(" delay ");
+                out.push_str(&ms.to_string());
+            }
+            if let Some(s) = bind {
+                out.push_str(" -> $");
+                out.push_str(&s.0);
+            }
+            out.push('\n');
+            fmt_body(body, level + 1, indent, out);
+        }
+        // `assert <cond> [, "<message>"]` — a one-line guard; the condition delegates to `fmt_expr`
+        // (with its own `@json` fallback), so `assert` itself always renders natively.
+        Node::Assert { cond, message } => {
+            out.push_str(&ind);
+            out.push_str("assert ");
+            out.push_str(&fmt_expr(cond));
+            if let Some(m) = message {
+                out.push_str(", ");
+                out.push_str(&compact(&serde_json::Value::String(m.clone())));
+            }
+            out.push('\n');
         }
         // Every other node kind round-trips through the single-line `@json` escape.
         other => {
