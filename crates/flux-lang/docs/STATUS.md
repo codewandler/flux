@@ -31,7 +31,9 @@ The forward design ([`flux-lang-evolution.md`](../../../docs/designs/flux-lang-e
 | **P6b** | Tier-1 control-flow primitives (`match`/`route`/`fallback`/`timeout`/`budget`) | ✅ |
 | **P6c** | polish: `fluxlang compile`, token-efficient `format_compact`, deterministic thing resolver (focus aliases deferred — no consumer) | ✅ |
 | **P7** | Tier-2 control-flow (`scope`/`saga`/`once`/`checkpoint`) + `DurableStore` seam (`FlowStore` event-log folds) + dead-step + **CSE** optimizer passes (`Stage::Alias`) | ✅ |
-| — | `ask` reply-correlation (flux-app MVP); `checkpoint`∘`await` composition; `once` crash-exactly-once | ⬜ (optional) |
+| **P8a** | bind-grammar ergonomics: `bind` now accepts a `var` (`$b = $a` alias) or `lit` (`$x = 5`/`[1,2,3]`/`{…}`) directly (runtime-only; parser/analyzer already produced these) | ✅ |
+| **P8b** | **value-template construction** — pure `obj`/`list` nodes so a record/list assembles from variables (`return { ok: true, n: $count, intent: $x.intent }`); leaves restricted to pure value nodes | ✅ |
+| — | `ask` reply-correlation (flux-app MVP); `checkpoint`∘`await` composition; `once` crash-exactly-once; native `{k:expr}`/`[expr]` text spelling + a strict-JSON-vs-native-text emission A/B | ⬜ (optional) |
 
 Each landed phase shipped behind the full dev loop (build/test/clippy/fmt/codegate) and an adversarial
 review pass (findings fixed before commit).
@@ -40,7 +42,7 @@ review pass (findings fixed before commit).
 
 | PRD § | Requirement | Status | Evidence / note |
 |---|---|---|---|
-| 8, 10.1 | Draft AST + core node kinds (`flow`/bind/call/thing/branch/repeat/await/return/effect) | ✅ | `src/ast.rs` — 36 `Node` kinds |
+| 8, 10.1 | Draft AST + core node kinds (`flow`/bind/call/thing/branch/repeat/await/return/effect) | ✅ | `src/ast.rs` — 42 `Node` kinds |
 | 8 | Constructs beyond v1 (`each`/`parallel`/`race`/`try`/`retry`/`confirm`/`loop`/`throttle`/…) | ✅ | `src/ast.rs`, `src/runtime.rs` |
 | 8 | `await` pause/resume | ✅ (P6a) | cross-turn suspend/resume: a top-level `await` suspends (`FlowOutcome.suspension`, `RunEvent::Awaiting`); the engine persists it (`suspensions` table) and resumes next turn via `resume_flow` — the prefix is not re-run. Top-level-only in v1 (analyzer-enforced) |
 | 1, 8 | Compact **text parser** (text → AST) | ✅ | `src/parse.rs` + `src/format.rs`; `parse(format(ast)) == ast` (native subset + `@json` fallback; round-trip + real-example tests) |

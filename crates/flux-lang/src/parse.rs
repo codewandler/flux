@@ -1150,6 +1150,50 @@ mod tests {
     // ---- P6: new native text forms ----
 
     #[test]
+    fn relaxed_bind_forms_are_native_and_round_trip() {
+        // The bind grammar now accepts `$b = $a` (var alias) and `$x = <literal>` directly. The text
+        // surface already produced these shapes; this pins that they stay native (no `@json`) and exact.
+        let ast = DraftAst {
+            body: vec![
+                bind("b", var("a")),
+                bind("n", lit(serde_json::json!(5))),
+                bind("greeting", lit(s("hi"))),
+                bind("xs", lit(serde_json::json!([1, 2, 3]))),
+            ],
+            ..Default::default()
+        };
+        let text = format(&ast);
+        assert!(text.contains("$b = $a"), "var alias: {text}");
+        assert!(text.contains("$n = 5"), "number lit: {text}");
+        assert!(!text.contains("@json"), "no json fallback: {text}");
+        assert_round_trips(&ast);
+    }
+
+    #[test]
+    fn obj_and_list_templates_round_trip_via_json_escape() {
+        // `obj`/`list` have no native `{k:expr}` spelling yet (that's a Phase-2 item), so they round-trip
+        // through the `@json` escape — the invariant `parse(format(ast)) == ast` must still hold.
+        let template: Node = serde_json::from_value(serde_json::json!({
+            "kind": "obj",
+            "fields": {
+                "ok": {"kind": "lit", "value": true},
+                "items": {"kind": "list", "items": [{"kind": "var", "name": "a"}]}
+            }
+        }))
+        .unwrap();
+        let ast = DraftAst {
+            body: vec![bind("r", template)],
+            ..Default::default()
+        };
+        let text = format(&ast);
+        assert!(
+            text.contains("@json"),
+            "templates use the json escape today: {text}"
+        );
+        assert_round_trips(&ast);
+    }
+
+    #[test]
     fn field_access_sugar_round_trips_and_is_native() {
         // `$plan.kind` <-> jq(".kind", $plan); nested `$o.a.b` too.
         let ast = DraftAst {

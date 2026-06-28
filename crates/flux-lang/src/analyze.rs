@@ -464,6 +464,14 @@ pub(crate) fn for_each_node(body: &[Node], f: &mut impl FnMut(&Node)) {
                 }
             }
             Node::Once { body, .. } => for_each_node(body, f),
+            // Value templates: descend into the sub-expressions so symbol reads inside a record/list
+            // are seen by liveness (else the optimizer could dead-step a symbol used only in a template).
+            Node::Obj { fields } => {
+                for v in fields.values() {
+                    for_each_node(std::slice::from_ref(v), f);
+                }
+            }
+            Node::List { items } => for_each_node(items, f),
             // Leaf nodes (no nested node bodies).
             Node::Await { .. }
             | Node::Checkpoint { .. }
@@ -817,6 +825,16 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, diags: &mut Vec<Diagnostic>) {
                 ));
             }
         }
+        Node::Obj { fields } => {
+            for v in fields.values() {
+                check_template_leaf(v, ops, diags);
+            }
+        }
+        Node::List { items } => {
+            for it in items {
+                check_template_leaf(it, ops, diags);
+            }
+        }
         Node::Await { .. }
         | Node::Peek { .. }
         | Node::Var { .. }
@@ -824,6 +842,31 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, diags: &mut Vec<Diagnostic>) {
         | Node::Thing { .. }
         | Node::CtxAppend { .. } => {}
     }
+}
+
+/// A value template (`obj`/`list`) assembles a value with no dispatch, so each leaf must be a **pure
+/// value node** (`var`/`lit`/`jq`/`expr`/`fmt`/`obj`/`list`). A `call` or control-flow leaf would
+/// smuggle side effects into a notionally-pure template, so it is rejected — bind it to a symbol
+/// first, then reference `$name`. Recurses so nested templates are checked too.
+fn check_template_leaf(node: &Node, ops: &dyn OpCatalog, diags: &mut Vec<Diagnostic>) {
+    if !matches!(
+        node,
+        Node::Var { .. }
+            | Node::Lit { .. }
+            | Node::Jq { .. }
+            | Node::Expr { .. }
+            | Node::Fmt { .. }
+            | Node::Obj { .. }
+            | Node::List { .. }
+    ) {
+        diags.push(Diagnostic::new(
+            "a value template (`obj`/`list`) may only contain pure value leaves \
+             (`var`/`lit`/`jq`/`expr`/`fmt`/`obj`/`list`); bind a call or control-flow result to a \
+             symbol first, then reference it as `$name`",
+        ));
+    }
+    // Recurse regardless, so a nested issue (e.g. an unknown op inside the offending call) also surfaces.
+    check_node(node, ops, diags);
 }
 
 /// Whether any statement in `body` is (or reaches, through nested control flow) a `return`. Used to
@@ -1388,6 +1431,54 @@ mod tests {
         };
         let diags = analyze_flow(&bad, &ops).unwrap_err();
         assert!(diags.iter().any(|d| d.message.contains("pipe")));
+    }
+
+    #[test]
+    fn analyze_rejects_an_impure_template_leaf_but_accepts_a_pure_one() {
+        use crate::ast::{DraftAst, Node};
+        let ops = catalog();
+
+        // A `call` (side-effecting) leaf inside a record template is rejected — templates stay pure.
+        let bad: Node = serde_json::from_value(serde_json::json!({
+            "kind": "obj",
+            "fields": { "x": {"kind": "call", "op": "read", "args": [{"kind": "lit", "value": "f"}]} }
+        }))
+        .unwrap();
+        let bad_ast = DraftAst {
+            body: vec![Node::Bind {
+                name: "r".into(),
+                value: Box::new(bad),
+                ty: None,
+                effect: None,
+            }],
+            ..Default::default()
+        };
+        let diags = analyze_flow(&bad_ast, &ops).unwrap_err();
+        assert!(
+            diags.iter().any(|d| d.message.contains("value template")),
+            "expected a template-leaf diagnostic, got: {diags:?}"
+        );
+
+        // The pure version (field-access + literal + nested list) analyzes clean.
+        let good: Node = serde_json::from_value(serde_json::json!({
+            "kind": "obj",
+            "fields": {
+                "intent": {"kind": "jq", "path": ".intent", "input": {"kind": "var", "name": "x"}},
+                "ok": {"kind": "lit", "value": true},
+                "items": {"kind": "list", "items": [{"kind": "var", "name": "x"}]}
+            }
+        }))
+        .unwrap();
+        let good_ast = DraftAst {
+            body: vec![Node::Bind {
+                name: "r".into(),
+                value: Box::new(good),
+                ty: None,
+                effect: None,
+            }],
+            ..Default::default()
+        };
+        assert!(analyze_flow(&good_ast, &ops).is_ok());
     }
 
     #[test]

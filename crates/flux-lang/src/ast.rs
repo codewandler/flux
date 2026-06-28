@@ -680,6 +680,25 @@ pub enum Node {
     /// `label` is a human-readable name for the phase it closes. Pairs with `once` for finer-grained
     /// idempotency; a no-op when no durable store is wired. Requires a non-empty literal label.
     Checkpoint { label: String },
+
+    /// Build an **object value** from sub-expressions — the record constructor `{ k: expr, … }`. Each
+    /// field value is itself a node, so a record can mix literals and variables:
+    /// `{ ok: true, n: $count, intent: $extract.intent }`. Pure: it assembles a value, performing no
+    /// IO and no op dispatch. Leaves must be pure value nodes (`var`/`lit`/`jq`/`expr`/`fmt`/`obj`/
+    /// `list`); a call or control-flow leaf is rejected by the analyzer so templates stay side-effect
+    /// free. This is what lets `return { … }` assemble a result from computed symbols.
+    Obj {
+        #[serde(default)]
+        fields: std::collections::BTreeMap<String, Box<Node>>,
+    },
+
+    /// Build a **list value** from sub-expressions — the list constructor `[ expr, … ]`. Each item is
+    /// itself a node (`[ $a, $b, 3 ]`). Pure, same leaf rules as [`Node::Obj`]; the array twin of the
+    /// record constructor.
+    List {
+        #[serde(default)]
+        items: Vec<Node>,
+    },
 }
 
 /// One branch of a [`Node::Parallel`] fan-out: a named sub-flow whose final result is bound to

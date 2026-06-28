@@ -110,8 +110,12 @@ before every release.
   (`FlowStore` folds them out of the append-only event log), plus a **dead-step optimizer pass**
   (drop read-only binds whose result is never used) and **common-subexpression elimination** (dedupe an
   identical read-only, deterministic call into a `Stage::Alias` — one dispatch, reused result).
-  Remaining (optional): deeper optimizer passes (predicate pushdown, batch/model-call fusion),
-  `checkpoint`∘`await` composition.
+  **P8** removed the language's top authoring friction: `bind` now accepts a `var` (`$b = $a` alias)
+  or `lit` (`$x = 5`/`[1,2,3]`/`{…}`) directly, and two pure **value-template** nodes (`obj`/`list`)
+  let a record/list assemble from variables (`return { ok: true, n: $count, intent: $x.intent }`) —
+  42 node kinds. Remaining (optional): native `{k:expr}`/`[expr]` text spelling + a strict-JSON-schema
+  vs. native-text **emission A/B** (measure planner accuracy before switching the model's surface);
+  deeper optimizer passes (predicate pushdown, batch/model-call fusion); `checkpoint`∘`await`.
 
 **Environment-gated (need a live key or external infra):**
 - **Homebrew tap** — an auto-updating `brew install codewandler/tap/flux` formula via cargo-dist

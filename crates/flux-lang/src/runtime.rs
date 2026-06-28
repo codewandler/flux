@@ -721,11 +721,78 @@ fn exec_body<'a>(
                             last_value = Some(vid);
                             continue;
                         }
+                        Node::Var { name: src } => {
+                            // Alias a symbol: `$b = $a` rebinds `name` to `$a`'s current value. Pure —
+                            // values are immutable, so sharing the same ValueId is sound (this is the
+                            // body-level twin of the optimizer's `Stage::Alias`). No dispatch, no IO.
+                            let vid = store.resolve(session_id, src)?.ok_or_else(|| {
+                                crate::FlowError::Runtime(format!("unbound symbol ${}", src.0))
+                            })?;
+                            let text = store
+                                .get_value(&vid)?
+                                .map(|v| value_text(&v))
+                                .unwrap_or_default();
+                            let ty_label = ty.as_ref().map(TypeRef::label);
+                            store.bind(
+                                session_id,
+                                name,
+                                &vid,
+                                ty_label.as_deref(),
+                                &summarize(&text),
+                                Visibility::Visible,
+                            )?;
+                            transcript.push(format!("[${} = ${}]\n{text}", name.0, src.0));
+                            last = text;
+                            last_value = Some(vid);
+                            continue;
+                        }
+                        Node::Lit { value } => {
+                            // Bind a literal directly: `$x = 5`, `"hi"`, `[1,2,3]`, `{"a":1}`. Stored as
+                            // the canonical JSON-as-string `Value::String` (same shape op results take),
+                            // with `{{sym}}` interpolation honored to match `eval_arg`. Pure, no IO.
+                            let jv = interpolate(value, store, session_id);
+                            let text = lit_text(&jv);
+                            let vid = store.put_value(session_id, &Value::String(text.clone()))?;
+                            let ty_label = ty.as_ref().map(TypeRef::label);
+                            store.bind(
+                                session_id,
+                                name,
+                                &vid,
+                                ty_label.as_deref(),
+                                &summarize(&text),
+                                Visibility::Visible,
+                            )?;
+                            transcript.push(format!("[${} = lit]\n{text}", name.0));
+                            last = text;
+                            last_value = Some(vid);
+                            continue;
+                        }
+                        Node::Obj { .. } | Node::List { .. } => {
+                            // Record/list constructor: `$r = { k: $v, … }` / `$xs = [ $a, $b ]`. Pure —
+                            // assembles a JSON value from its sub-expressions (the analyzer guarantees
+                            // every leaf is a pure value node). Stored as canonical JSON-as-string.
+                            let jv = eval_template(value, store, session_id)?;
+                            let text = lit_text(&jv);
+                            let vid = store.put_value(session_id, &Value::String(text.clone()))?;
+                            let ty_label = ty.as_ref().map(TypeRef::label);
+                            store.bind(
+                                session_id,
+                                name,
+                                &vid,
+                                ty_label.as_deref(),
+                                &summarize(&text),
+                                Visibility::Visible,
+                            )?;
+                            transcript.push(format!("[${} = template]\n{text}", name.0));
+                            last = text;
+                            last_value = Some(vid);
+                            continue;
+                        }
                         _ => {}
                     }
                     let Node::Call { op, args } = value.as_ref() else {
                         return Err(crate::FlowError::Runtime(
-                            "execution can only bind the result of a `call`, `expr`, `fmt`, `jq`, `parse`, or a `thing` reference".to_string(),
+                            "execution can only bind the result of a `call`, `expr`, `fmt`, `jq`, `parse`, `var` ($symbol), `lit`, or a `thing` reference".to_string(),
                         ));
                     };
                     let ty_label = ty.as_ref().map(TypeRef::label);
@@ -1972,7 +2039,11 @@ fn exec_body<'a>(
                             .to_string(),
                     ));
                 }
-                Node::Var { .. } | Node::Lit { .. } | Node::Thing { .. } => {
+                Node::Var { .. }
+                | Node::Lit { .. }
+                | Node::Thing { .. }
+                | Node::Obj { .. }
+                | Node::List { .. } => {
                     return Err(FlowError::Runtime(
                         "a bare value is not an executable statement".to_string(),
                     ));
@@ -2080,12 +2151,62 @@ fn eval_arg(node: &Node, store: &dyn ValueStore, session_id: &str) -> Result<ser
                 .ok_or_else(|| Error::Other(format!("dangling value for ${}", name.0)))?;
             Ok(value.to_json())
         }
+        // A record/list constructor is a valid call argument (and `each` source): assemble it now.
+        Node::Obj { .. } | Node::List { .. } => eval_template(node, store, session_id),
         other => Err(FlowError::Runtime(format!(
-            "unsupported call argument `{}` — only `lit` and `var` ($symbol) nodes are valid call \
-             args. To use a computed string (fmt/expr/jq/parse), `bind` it to a symbol first, then \
-             pass that symbol as a `var` arg.",
+            "unsupported call argument `{}` — only `lit`, `var` ($symbol), and `obj`/`list` template \
+             nodes are valid call args. To use a computed string (fmt/expr/jq/parse), `bind` it to a \
+             symbol first, then pass that symbol as a `var` arg.",
             node_kind(other)
         ))),
+    }
+}
+
+/// Evaluate a **pure value template** to a JSON value: `Obj`/`List` recurse through their
+/// sub-expressions; leaves are the pure value nodes (`var`/`lit` resolved via [`eval_arg`], plus
+/// `jq`/`expr`/`fmt`). No op dispatch, no IO — the analyzer rejects any impure (call/control) leaf,
+/// so none reaches here. This is what `Obj`/`List` binds, `return { … }`, and template call-args
+/// resolve through.
+fn eval_template(
+    node: &Node,
+    store: &dyn ValueStore,
+    session_id: &str,
+) -> Result<serde_json::Value> {
+    use serde_json::Value as J;
+    match node {
+        Node::Obj { fields } => {
+            let mut map = serde_json::Map::with_capacity(fields.len());
+            for (k, v) in fields {
+                map.insert(k.clone(), eval_template(v, store, session_id)?);
+            }
+            Ok(J::Object(map))
+        }
+        Node::List { items } => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                out.push(eval_template(it, store, session_id)?);
+            }
+            Ok(J::Array(out))
+        }
+        Node::Jq { path, input } => {
+            // Field access / sub-path: keep the raw extracted JSON value (objects/arrays nest as-is),
+            // unlike the bind arm which text-ifies it.
+            let jv = jq_parse_input(eval_arg(input, store, session_id)?);
+            eval_jq_path(path, &jv)
+        }
+        Node::Expr { formula, vars } => {
+            let resolved = resolve_expr_vars(vars, store, session_id)?;
+            Ok(match eval_expr_value(formula, &resolved)? {
+                ExprVal::Num(n) => J::from(n),
+                ExprVal::Bool(b) => J::Bool(b),
+                ExprVal::Str(s) => J::String(s),
+            })
+        }
+        Node::Fmt { template } => Ok(J::String(interpolate_str(template, store, session_id))),
+        // `var`/`lit` resolve through eval_arg; any other (impure) node errors there too. A symbol
+        // holding a JSON object/array (stored as its JSON *string*) is re-parsed so it nests as a
+        // structure rather than a quoted string; scalars (incl. strings) pass through unchanged.
+        _ => Ok(jq_parse_input(eval_arg(node, store, session_id)?)),
     }
 }
 
@@ -2242,6 +2363,13 @@ async fn eval_return(
         }
         Node::Lit { value } => {
             let text = lit_text(value);
+            let vid = store.put_value(session_id, &Value::String(text.clone()))?;
+            Ok((text, Some(vid)))
+        }
+        Node::Obj { .. } | Node::List { .. } => {
+            // `return { … }` / `return [ … ]` — assemble the result value from sub-expressions.
+            let jv = eval_template(value, store, session_id)?;
+            let text = lit_text(&jv);
             let vid = store.put_value(session_id, &Value::String(text.clone()))?;
             Ok((text, Some(vid)))
         }
@@ -3025,6 +3153,8 @@ fn node_kind(node: &Node) -> &'static str {
         Node::Fallback { .. } => "fallback",
         Node::Timeout { .. } => "timeout",
         Node::Budget { .. } => "budget",
+        Node::Obj { .. } => "obj",
+        Node::List { .. } => "list",
     }
 }
 
@@ -3684,6 +3814,219 @@ mod tests {
         };
         let mut sink = BufferSink::default();
         execute_flow(&store, host, "s", &ast, &mut sink).await
+    }
+
+    fn flow_bind(name: &str, value: Node) -> Node {
+        Node::Bind {
+            name: SymbolName(name.into()),
+            value: Box::new(value),
+            ty: None,
+            effect: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_literal_value_can_be_bound_directly() {
+        // `$x = 5 / "hi" / [1,2,3] / {"a":1}` — a `Lit` is now a legal bind value (was rejected with
+        // "execution can only bind the result of a `call`…"). Stored as canonical JSON-as-string.
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![
+                flow_bind("n", flow_lit(json!(5))),
+                flow_bind("s", flow_lit(json!("hi"))),
+                flow_bind("xs", flow_lit(json!([1, 2, 3]))),
+                flow_bind("obj", flow_lit(json!({"a": 1}))),
+                Node::Return {
+                    value: Box::new(flow_var("xs")),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let out = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(out.result, "[1,2,3]");
+
+        let text = |name: &str| {
+            let vid = store
+                .resolve("s", &SymbolName(name.into()))
+                .unwrap()
+                .unwrap();
+            value_text(&store.get_value(&vid).unwrap().unwrap())
+        };
+        assert_eq!(text("n"), "5");
+        assert_eq!(
+            text("s"),
+            "hi",
+            "a JSON string binds to its inner text, like `fmt`"
+        );
+        assert_eq!(text("obj"), r#"{"a":1}"#);
+    }
+
+    #[tokio::test]
+    async fn binding_a_var_aliases_the_same_value() {
+        // `$b = $a` rebinds to the same immutable value — the body-level twin of CSE's `Stage::Alias`.
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![
+                flow_bind("a", echo("hello")),
+                flow_bind("b", flow_var("a")),
+                Node::Return {
+                    value: Box::new(flow_var("b")),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let out = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(out.result, "hello");
+        let a = store
+            .resolve("s", &SymbolName("a".into()))
+            .unwrap()
+            .unwrap();
+        let b = store
+            .resolve("s", &SymbolName("b".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a, b, "the alias shares the source's ValueId");
+    }
+
+    #[tokio::test]
+    async fn a_lit_bind_interpolates_curly_symbols() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![
+                flow_bind("name", flow_lit(json!("world"))),
+                flow_bind("greeting", flow_lit(json!("hello {{name}}"))),
+                Node::Return {
+                    value: Box::new(flow_var("greeting")),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let out = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(out.result, "hello world");
+    }
+
+    #[tokio::test]
+    async fn aliasing_an_unbound_symbol_errors() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![flow_bind("b", flow_var("missing"))],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let err = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unbound symbol $missing"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_template_assembles_from_fields_jq_and_nested_lists() {
+        // `return { intent: $x.intent, dest: $x.slots.dest, ok: true, items: [1, 2] }` — the headline
+        // win: a record built from field-access + literals + a nested list. Wire form is exactly what
+        // the model emits as JSON (`{"kind":"obj","fields":{…}}`).
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let template: Node = serde_json::from_value(json!({
+            "kind": "obj",
+            "fields": {
+                "intent": {"kind": "jq", "path": ".intent", "input": {"kind": "var", "name": "x"}},
+                "dest":   {"kind": "jq", "path": ".slots.dest", "input": {"kind": "var", "name": "x"}},
+                "ok":     {"kind": "lit", "value": true},
+                "items":  {"kind": "list", "items": [
+                    {"kind": "lit", "value": 1},
+                    {"kind": "lit", "value": 2}
+                ]}
+            }
+        }))
+        .unwrap();
+        let ast = DraftAst {
+            body: vec![
+                flow_bind(
+                    "x",
+                    flow_lit(json!({"intent": "book", "slots": {"dest": "NYC"}})),
+                ),
+                flow_bind("r", template),
+                Node::Return {
+                    value: Box::new(flow_var("r")),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let out = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        let got: serde_json::Value = serde_json::from_str(&out.result).unwrap();
+        assert_eq!(
+            got,
+            json!({"intent": "book", "dest": "NYC", "ok": true, "items": [1, 2]})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_var_holding_an_object_nests_as_a_structure() {
+        // `{ wrap: $x }` where `$x` holds a JSON object nests the object, not a quoted string.
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let template: Node = serde_json::from_value(json!({
+            "kind": "obj",
+            "fields": { "wrap": {"kind": "var", "name": "x"} }
+        }))
+        .unwrap();
+        let ast = DraftAst {
+            body: vec![
+                flow_bind("x", flow_lit(json!({"a": 1}))),
+                flow_bind("r", template),
+                Node::Return {
+                    value: Box::new(flow_var("r")),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let out = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        let got: serde_json::Value = serde_json::from_str(&out.result).unwrap();
+        assert_eq!(got, json!({"wrap": {"a": 1}}));
+    }
+
+    #[tokio::test]
+    async fn a_bare_template_is_not_an_executable_statement() {
+        // A record/list is a value, not a statement — a bare one (not a bind/return/arg) is rejected.
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let bare: Node =
+            serde_json::from_value(json!({"kind": "list", "items": [{"kind": "lit", "value": 1}]}))
+                .unwrap();
+        let ast = DraftAst {
+            body: vec![bare],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let err = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("bare value is not an executable"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]

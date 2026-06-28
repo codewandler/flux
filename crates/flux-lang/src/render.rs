@@ -400,6 +400,8 @@ fn head(node: &Node, p: &Palette) -> String {
             None => format!("{} {label:?}", paint(p.keyword, "once")),
         },
         Node::Checkpoint { label } => format!("{} {label:?}", paint(p.keyword, "checkpoint")),
+        Node::Obj { fields } => format!("{} ({} fields)", paint(p.keyword, "obj"), fields.len()),
+        Node::List { items } => format!("{} ({} items)", paint(p.keyword, "list"), items.len()),
     }
 }
 
@@ -415,6 +417,8 @@ fn expr(node: &Node, p: &Palette) -> String {
         Node::Thing { thing } => thing_str(thing, p),
         Node::Bind { name, .. } => sym(p, &name.0),
         Node::Return { value } => format!("{} {}", paint(p.keyword, "return"), expr(value, p)),
+        Node::Obj { .. } => "{…}".to_string(),
+        Node::List { .. } => "[…]".to_string(),
         Node::When { .. }
         | Node::Repeat { .. }
         | Node::Each { .. }

@@ -102,6 +102,8 @@ mod tests {
             "saga",
             "once",
             "checkpoint",
+            "obj",
+            "list",
         ] {
             assert!(
                 catalog.contains(&format!("| `{kind}` |")),
@@ -109,10 +111,10 @@ mod tests {
             );
         }
 
-        // 40 variants + 2 header lines, and no description bleeds onto its own line (newlines collapsed).
+        // 42 variants + 2 header lines, and no description bleeds onto its own line (newlines collapsed).
         assert_eq!(
             catalog.lines().count(),
-            40 + 2,
+            42 + 2,
             "every variant is exactly one row"
         );
     }

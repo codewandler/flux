@@ -126,6 +126,26 @@ pub fn parse_as(value: Node, as_type: impl Into<String>) -> Node {
     }
 }
 
+/// Build an **object value** from sub-expressions — the record constructor. Each field value is a
+/// [`Node`] (typically [`var`]/[`lit`]/[`jq`]), so a record can mix literals and computed symbols.
+/// Example: `obj([("ok", lit(true)), ("n", var("count"))])`.
+pub fn obj<K: Into<String>>(fields: impl IntoIterator<Item = (K, Node)>) -> Node {
+    Node::Obj {
+        fields: fields
+            .into_iter()
+            .map(|(k, v)| (k.into(), Box::new(v)))
+            .collect(),
+    }
+}
+
+/// Build a **list value** from sub-expressions — the list constructor. Example:
+/// `list([var("a"), var("b"), lit(3)])`.
+pub fn list(items: impl IntoIterator<Item = Node>) -> Node {
+    Node::List {
+        items: items.into_iter().collect(),
+    }
+}
+
 /// A reference to an external thing (a file, person, ticket, url, …) addressed by a [`Selector`].
 pub fn thing(kind: ThingKind, selector: Selector) -> Node {
     Node::Thing {
@@ -1423,6 +1443,8 @@ mod tests {
             fmt("x"),
             jq(".a", var("r")),
             parse_as(var("r"), "f64"),
+            obj([("ok", lit(true)), ("n", var("count"))]),
+            list([var("a"), lit(1)]),
             thing(ThingKind::File, Selector::Path("p".into())),
             peek("x"),
             // Statement builders (Block methods).
@@ -1620,6 +1642,6 @@ mod tests {
             catalog.difference(&built).collect::<Vec<_>>(),
             built.difference(&catalog).collect::<Vec<_>>(),
         );
-        assert_eq!(built.len(), 40, "expected all 40 node kinds");
+        assert_eq!(built.len(), 42, "expected all 42 node kinds");
     }
 }

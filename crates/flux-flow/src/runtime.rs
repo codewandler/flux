@@ -385,6 +385,16 @@ fn walk_node<'a>(node: &'a Node, f: &mut impl FnMut(&'a str, &'a [Node])) {
             }
         }
         Node::Once { body, .. } => walk_calls(body, f),
+        Node::Obj { fields } => {
+            for v in fields.values() {
+                walk_node(v, f);
+            }
+        }
+        Node::List { items } => {
+            for it in items {
+                walk_node(it, f);
+            }
+        }
         Node::Var { .. }
         | Node::Lit { .. }
         | Node::Thing { .. }
