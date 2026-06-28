@@ -8,7 +8,7 @@ Used by flux-eval's TerminalBenchAdapter:
            --task-id <id> --n-attempts 1 --output-path <dir>
 
 (with the directory of this file on PYTHONPATH). The static `flux` binary is copied into the
-container; the agent then runs `flux --yes -m <model> -p <instruction>` and the task's own test grades
+container; the agent then runs `flux run --yes -m <model> -p <instruction>` and the task's own test grades
 the result. All flux logic stays in the binary — this shim is just install + run-command glue, modeled
 on terminal-bench's built-in `codex`/`claude_code` installed agents.
 """
@@ -37,7 +37,7 @@ class FluxAgent(AbstractInstalledAgent):
 
     @property
     def _env(self) -> dict[str, str]:
-        # Forward whatever provider keys are present so `flux -m <model>` can authenticate.
+        # Forward whatever provider keys are present so `flux run -m <model>` can authenticate.
         keys = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "FLUX_SECRET")
         return {k: os.environ[k] for k in keys if k in os.environ}
 
@@ -49,7 +49,7 @@ class FluxAgent(AbstractInstalledAgent):
         return [
             TerminalCommand(
                 command=(
-                    f"flux --yes -m {shlex.quote(self._model_name)} "
+                    f"flux run --yes -m {shlex.quote(self._model_name)} "
                     f"-p {shlex.quote(instruction)}"
                 ),
                 min_timeout_sec=0.0,

@@ -48,8 +48,8 @@ tagged release; CI running the full gate on every push.
 A **live-provider smoke test** is the manual gate that the offline mock can't replace (the mock
 doesn't enforce provider message-shape rules — which is exactly how the session-shape breakers
 slipped through). With a real key (e.g. `anthropic/opus`), exercise:
-- a one-shot (`flux -p`),
-- an agentic file edit under the envelope (`flux --agent --yes`, scratch workspace),
+- a one-shot (`flux run -p`),
+- an agentic file edit under the envelope (`flux run --yes`, scratch workspace),
 - a multi-turn `--continue` that replays tool-call history,
 - a compaction-then-continue past a tiny `FLUX_COMPACT_CHARS` (validates no 400 on the rewritten log),
 - (semi-manual) a Ctrl-C mid-turn in the REPL, then a follow-up turn in the same session.

@@ -53,26 +53,26 @@ Prebuilt binaries, installers, and checksums are attached to every
 flux run "add a test for the parser"
 
 # Preview the plan before running it
-flux --plan "summarize README.md into SUMMARY.txt"
+flux plan "summarize README.md into SUMMARY.txt"
 
 # Print the plan as JSON and exit (never runs)
-flux --plan -o json "print hello world 3 times"
+flux plan -o json "print hello world 3 times"
 
 # Interactive REPL — session auto-saved; /help for slash commands
 flux
-flux -c                       # continue the most recent session
+flux run -c                   # continue the most recent session
 
 # ratatui TUI with live token streaming and an in-UI approval modal
-flux --tui
+flux tui
 
 # HTTP daemon (REST + SSE streaming)
-flux --serve 127.0.0.1:8787 --yes
+flux serve 127.0.0.1:8787 --yes
 ```
 
 No API key needed to try the engine: `-m mock` runs an offline provider through the full pipeline.
 
 ```bash
-flux --yes -m mock "summarise this repo"
+flux run --yes -m mock "summarise this repo"
 ```
 
 See [`docs/usage.md`](docs/usage.md) for the full guide.
@@ -95,8 +95,8 @@ A provider is a **wire codec × credential** cell. Select one with `-m <provider
 ```bash
 flux auth status                 # show what credentials are available and from where
 flux auth login claude           # PKCE login for the Claude subscription path
-flux -m claude/opus -p "hi"
-flux -m openrouter/anthropic/claude-sonnet-4.5 -p "hi"
+flux run -m claude/opus "hi"
+flux run -m openrouter/anthropic/claude-sonnet-4.5 "hi"
 ```
 
 `--think` toggles adaptive thinking; `--effort low|medium|high|xhigh|max` controls depth.
@@ -179,7 +179,7 @@ Long sessions are **compacted** automatically: older turns are summarized once t
 
 ---
 
-## HTTP API (`flux --serve`)
+## HTTP API (`flux serve`)
 
 | Route | Purpose |
 |---|---|

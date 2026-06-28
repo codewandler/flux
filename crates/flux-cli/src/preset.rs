@@ -18,7 +18,6 @@
 use std::collections::BTreeMap;
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
 
 use flux_sdk::dsl::{lit, var, DraftAst, Node};
 use flux_sdk::recipes::{batch, compose, dispatch, fanout, lookup, resilience, routing};
@@ -371,19 +370,10 @@ pub async fn run_preset(args: &[String]) -> Result<()> {
     let ast = build_flow(name, &kv).with_context(|| format!("build preset `{name}`"))?;
 
     if run {
-        // Synthesize a Cli from the flags and reuse the shared execute core (build_agent → analyze →
-        // risk → approver → execute_flow), exactly as `flux flow run` does.
-        let mut synth: Vec<String> = vec!["flux".to_string()];
-        if yes {
-            synth.push("--yes".to_string());
-        }
-        if let Some(m) = &model {
-            synth.push("-m".to_string());
-            synth.push(m.clone());
-        }
-        let cli = crate::Cli::parse_from(&synth);
-        crate::style::init(cli.color);
-        crate::run_draft_ast(&cli, &ast).await
+        // Build the agent flags from the recipe's flags and reuse the shared execute core
+        // (build_agent → analyze → risk → approver → execute_flow), exactly as `flux flow run` does.
+        let flags = crate::AgentFlags::from_model_yes(model.as_deref(), yes);
+        crate::run_draft_ast(&flags, &ast).await
     } else {
         print_scaffold(&ast, &output)
     }

@@ -52,28 +52,28 @@ the work, gating risky steps as they come.
 ```bash
 # Normal: plan + run (prompts to approve risky/destructive steps; Ctrl-C interrupts)
 flux run "rename every TODO comment in src/ to FIXME"
-# (a bare first word — `flux rename …` — is refused; `run` or any flag-led form like the ones
-#  below is what launches a turn, so a stray word never starts the agent)
+# (every entry point is a subcommand: a bare `flux rename …` is a clap "unrecognized subcommand"
+#  error, so a stray word never starts the agent — use `flux run <prompt>`)
 
 # Run unattended (auto-approve every step — for headless/trusted use)
-flux --yes "delete the *.tmp files in build/"
+flux run --yes "delete the *.tmp files in build/"
 
 # Plan mode: show the plan, then (on a terminal) ask "run it? [y/N]"
-flux --plan "summarize README.md into SUMMARY.txt"
+flux plan "summarize README.md into SUMMARY.txt"
 
 # Inspect the plan as data — prints the graph and exits, never runs
-flux --plan -o json "print hello world 3 times"
-flux --plan -o yaml "..."     # yaml | json | pretty (default)
+flux plan -o json "print hello world 3 times"
+flux plan -o yaml "..."       # yaml | json | pretty (default)
 ```
 
-`--plan` prints-and-exits whenever output is piped or `-o json|yaml` is given (so it's safe in scripts);
-on an interactive terminal with no `-o`, it shows the plan and offers to run it.
+`flux plan` prints-and-exits whenever output is piped or `-o json|yaml` is given (so it's safe in
+scripts); on an interactive terminal with no `-o`, it shows the plan and offers to run it.
 
 ## Interactive session (REPL)
 
 ```bash
 flux                 # start a REPL (normal mode)
-flux -c              # continue the most recent session
+flux run -c          # continue the most recent session
 ```
 
 Inside the REPL:
@@ -108,9 +108,9 @@ Approve a prompt with `y` (once), `a` (always — saved to `.flux/config.toml`),
 ## Models & providers
 
 ```bash
-flux -m opus "..."                       # Anthropic alias: opus | sonnet | haiku
-flux -m openai/gpt-5 "..."               # provider/model
-flux -m openrouter/anthropic/claude-... "..."
+flux run -m opus "..."                   # Anthropic alias: opus | sonnet | haiku
+flux run -m openai/gpt-5 "..."           # provider/model
+flux run -m openrouter/anthropic/claude-... "..."
 flux auth status                         # which providers are configured
 flux auth login claude                   # Claude subscription (OAuth)
 ```
@@ -130,10 +130,10 @@ deny  = []                                    # always-blocked tools
 ## Other surfaces
 
 ```bash
-flux -v "..."                    # show tool output in full (no truncation); also FLUX_VERBOSE=1
-flux --color always|auto|never   # colorize output (auto = a terminal, NO_COLOR unset)
-flux --tui                       # ratatui chat UI (in-UI approval modal)
-flux --serve 127.0.0.1:8787 --yes   # HTTP API daemon (REST + SSE)
+flux run -v "..."                # show tool output in full (no truncation); also FLUX_VERBOSE=1
+flux --color always|auto|never   # colorize output (auto = a terminal, NO_COLOR unset; global flag)
+flux tui                         # ratatui chat UI (in-UI approval modal)
+flux serve 127.0.0.1:8787 --yes  # HTTP API daemon (REST + SSE)
 flux run app.flux                # run a multi-agent program (event bus + triggers + journeys); deny-destructive unless --yes
 flux sessions                    # list recent sessions
 flux plugin ls                   # manage subprocess plugins (any-language ops)

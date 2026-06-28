@@ -15,6 +15,17 @@ All notable changes to this project are documented in this file. The format is b
   Both are built on a new shared **`flux-messages`** crate (wire schema + body/stream helpers + a
   per-`(provider, model)` quirks profile); `flux-anthropic` now composes the same core.
 
+### Changed
+
+- **CLI: every entry point is now a subcommand (breaking).** The implicit top-level "run a turn"
+  behavior and the top-level mode flags are gone, so `flux --help` shows only the command list plus the
+  global `--color`. Migrate: `flux --serve <addr>` → `flux serve <addr>`, `flux --tui` → `flux tui`,
+  `flux --plan "…"` → `flux plan "…"`, and a flag-led one-shot like `flux -m X "…"` / `flux --yes "…"`
+  → `flux run -m X "…"` / `flux run --yes "…"`. `flux` with no arguments still opens the REPL; an
+  unrecognized first word is now a clap "unrecognized subcommand" error instead of a bespoke refusal.
+  The agent/turn flags (`-m`, `--yes`, `--max-tokens`, `-c`, …) live on the agent-path subcommands
+  (`run`/`plan`/`tui`/`serve`) and no longer leak onto `sessions`/`loop`/`eval`/… help.
+
 ### Fixed
 
 - **OpenRouter / local-model wire robustness (Messages path).** The shared parser tolerates the

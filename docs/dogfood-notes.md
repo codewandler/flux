@@ -1,10 +1,10 @@
 # flux — dogfood notes
 
-Friction captured by driving flux's own agentic mode (`flux --agent`) on real coding work. The point
+Friction captured by driving flux's own agentic mode (`flux run`) on real coding work. The point
 is not whether flux produces a perfect patch — it is **where using flux as a coding agent is painful**.
 This list, not an audit, sets the real priority order (see [vision.md](vision.md)).
 
-Protocol: `flux --agent --yes -m <model> -p "<task>"` against an **isolated scratch workspace** (never
+Protocol: `flux run --yes -m <model> -p "<task>"` against an **isolated scratch workspace** (never
 this repo); transcripts captured separately. Severity: **P0** blocks the task · **P1** forces a
 workaround / retry loop · **P2** friction/polish.
 

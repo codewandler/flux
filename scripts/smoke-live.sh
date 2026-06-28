@@ -166,7 +166,7 @@ cat <<'EOF'
   Cancel-then-continue (live R1):
     1) flux                                    # REPL on the latest session
     2) ask for a long task; press Ctrl-C mid-stream → "(interrupting…)"
-    3) flux --agent --yes -c -p "continue"     # must succeed (no 400); partial reply preserved
+    3) flux run --yes -c -p "continue"         # must succeed (no 400); partial reply preserved
 EOF
 
 printf '\n'

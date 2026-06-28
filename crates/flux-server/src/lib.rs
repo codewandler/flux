@@ -1,5 +1,5 @@
 //! `flux-server` — a long-running HTTP API around an [`Agent`], so flux can be driven headlessly
-//! or remotely (`flux --serve <addr>`).
+//! or remotely (`flux serve <addr>`).
 //!
 //! Routes:
 //! - `GET  /health`                       → `ok`

@@ -89,7 +89,7 @@ Each invariant below was established (and several re-learned the hard way) durin
 
 ## Testing
 
-- **Offline-first.** The built-in `mock` provider (`flux -m mock`) drives the full agent loop without network. CLI test hooks via env vars (`FLUX_MOCK_TOOL`, `FLUX_MOCK_TOOL_INPUT`, `FLUX_MOCK_BASH`, `FLUX_MOCK_HANG`) exercise specific tools and cancellation end-to-end.
+- **Offline-first.** The built-in `mock` provider (`flux run -m mock`) drives the full agent loop without network. CLI test hooks via env vars (`FLUX_MOCK_TOOL`, `FLUX_MOCK_TOOL_INPUT`, `FLUX_MOCK_BASH`, `FLUX_MOCK_HANG`) exercise specific tools and cancellation end-to-end.
 - **Pure crates** (`flux-policy`, `flux-spec`, `flux-secret`, …) get exhaustive unit tests.
 - **The safety envelope** has no-bypass tests (default-deny, destructive escalation under permissive rules, secret redaction, hook-deny short-circuit) — keep them passing and add to them when you touch the dispatcher.
 - **A new behavior ships with a test that fails before the change.**

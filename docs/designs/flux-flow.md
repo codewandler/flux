@@ -344,7 +344,7 @@ Resolved in design (no longer open):
   (`Request` carries only a `metadata` passthrough; neither the Anthropic nor OpenAI codec sends
   `tool_choice`/`response_format`). So the `compile` front-end **prompts the model to emit the AST as
   JSON, then extracts + parses + validates it, with a bounded analyze→repair loop**. A provider-level
-  structured-output seam is future work. Surfaced via `flux --plan [-o json|yaml|pretty] "…"` (plan
+  structured-output seam is future work. Surfaced via `flux plan [-o json|yaml|pretty] "…"` (plan
   mode), which compiles and shows the AST (the `render` module produces the `pretty` execution-path
   tree). `Node::Lit` holds raw JSON so model-written literals are natural.
 - **Pure DAG (the model's only tool is `emit_plan`).** The planner advertises **no directly-callable

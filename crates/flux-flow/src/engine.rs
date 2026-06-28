@@ -3,7 +3,7 @@
 //! There is exactly **one** engine. Every turn the model is a compiler front-end: it either emits a
 //! typed Flux-Lang plan (a graph the runtime executes through [`Executor::dispatch`](flux_runtime))
 //! or answers in prose (a chat turn). The free-form "one provider-native tool call at a time" loop is
-//! gone — a single op is just a one-node plan. `flux --compile-only` shows exactly what a turn would
+//! gone — a single op is just a one-node plan. `flux plan` shows exactly what a turn would
 //! run, because the same [`compile_turn`] drives the engine and the CLI.
 //!
 //! Per turn: append the user message → compile a plan (pure DAG — the model's only tool is emit_plan) →
@@ -185,7 +185,7 @@ impl FlowEngine {
 
         // Per-turn iteration count: snapshot the cumulative `turn.iteration` evidence now so we can
         // report only THIS turn's rounds. The executor (and its evidence log) is shared and persists
-        // across turns, so an unscoped count grows monotonically over a long-lived `flux --serve`.
+        // across turns, so an unscoped count grows monotonically over a long-lived `flux serve`.
         let iter_base = self.executor.evidence().by_kind("turn.iteration").count();
 
         let mut outer = crate::loop_host::SharedSink::new(channel.clone());

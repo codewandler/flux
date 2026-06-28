@@ -484,7 +484,7 @@ impl Approver for DenyApprover {
     }
 }
 
-/// A headless approver that allows everything (e.g. `flux --yes`). Use with care.
+/// A headless approver that allows everything (e.g. `flux run --yes`). Use with care.
 pub struct AllowApprover;
 
 #[async_trait]

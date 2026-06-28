@@ -8,13 +8,13 @@ it as a first-class agent.
 
 ```bash
 # Listen on all interfaces, auto-approve all tool calls
-flux --serve 0.0.0.0:3000 --yes
+flux serve 0.0.0.0:3000 --yes
 
 # Loopback only (no token required)
-flux --serve 127.0.0.1:3000 --yes
+flux serve 127.0.0.1:3000 --yes
 
 # With a bearer token (required for non-loopback)
-FLUX_SERVER_TOKEN=mysecret flux --serve 0.0.0.0:3000 --yes
+FLUX_SERVER_TOKEN=mysecret flux serve 0.0.0.0:3000 --yes
 ```
 
 On startup flux prints:
@@ -126,10 +126,10 @@ cleanly between plan rounds.
 
 ## Calling flux from Claude Code
 
-1. Start flux with `--serve` and a token:
+1. Start flux with `serve` and a token:
 
    ```bash
-   FLUX_SERVER_TOKEN=mytoken flux --serve 0.0.0.0:3000 --yes
+   FLUX_SERVER_TOKEN=mytoken flux serve 0.0.0.0:3000 --yes
    ```
 
 2. In Claude Code, add flux as an MCP/A2A tool pointing at

@@ -9,7 +9,7 @@ The structured event log gives the rest of the signal: planning attempts & compi
 (`plan_attempted`), per-step tool failures (`run` → `step_failed`), loop rounds (`run_plan`), and the
 final outcome (`turn_ended`).
 
-- **Model under observation:** `openrouter-anthropic/anthropic/claude-sonnet-4.6` (Sonnet via OpenRouter; `flux --serve`)
+- **Model under observation:** `openrouter-anthropic/anthropic/claude-sonnet-4.6` (Sonnet via OpenRouter; `flux serve`)
 - **Sample:** 30 runs, sessions `s_133`–`s_162`, over 16 curated questions (most run twice).
 - **Harness:** now first-class in `flux-eval` — the `synthetic` benchmark suite
   (`crates/flux-eval/assets/synthetic-suite.json`), run with **`flux eval synthetic [--watch] [--report out.md]`**.

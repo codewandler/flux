@@ -232,6 +232,7 @@ pub async fn run_local_task(spec: &TaskSpec, ctx: &RunContext<'_>) -> Result<Run
 
     let argv = vec![
         ctx.flux_bin.to_string_lossy().to_string(),
+        "run".to_string(),
         "--yes".to_string(),
         "-m".to_string(),
         model,

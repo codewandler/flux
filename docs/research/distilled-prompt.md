@@ -1,6 +1,6 @@
 # A distilled system prompt for flux
 
-A proposed default system prompt for flux's agentic CLI (`flux --agent`), **distilled from the best
+A proposed default system prompt for flux's agentic CLI (`flux run`), **distilled from the best
 techniques in the harvested corpus** ([system-prompts.md](system-prompts.md)) and **grounded in
 flux's actual code** — its real tool set, loop, and safety envelope — rather than copied from any one
 tool. Written **2026-06-25**.

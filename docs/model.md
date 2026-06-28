@@ -17,14 +17,14 @@ export ANTHROPIC_API_KEY=sk-ant-...
 
 ```bash
 # Bare aliases resolve to Anthropic automatically
-flux -m opus    "refactor this module"
-flux -m sonnet  "explain the auth flow"
-flux -m haiku   "summarise README.md"
+flux run -m opus    "refactor this module"
+flux run -m sonnet  "explain the auth flow"
+flux run -m haiku   "summarise README.md"
 
 # Fully qualified form
-flux -m anthropic/claude-opus-4-5      "write tests for the parser"
-flux -m anthropic/claude-sonnet-4-5    "review this PR"
-flux -m anthropic/claude-haiku-4-5     "quick lint pass"
+flux run -m anthropic/claude-opus-4-5      "write tests for the parser"
+flux run -m anthropic/claude-sonnet-4-5    "review this PR"
+flux run -m anthropic/claude-haiku-4-5     "quick lint pass"
 ```
 
 ### Config file
@@ -57,10 +57,10 @@ OpenRouter gives you access to hundreds of models from different providers behin
 ### Usage
 
 ```bash
-# General form: flux -m openrouter/<provider>/<model-slug>
-flux -m openrouter/anthropic/claude-sonnet-4-5  "review this PR"
-flux -m openrouter/google/gemini-2.5-pro         "explain the safety model"
-flux -m openrouter/meta-llama/llama-3.3-70b-instruct  "summarise docs"
+# General form: flux run -m openrouter/<provider>/<model-slug>
+flux run -m openrouter/anthropic/claude-sonnet-4-5  "review this PR"
+flux run -m openrouter/google/gemini-2.5-pro         "explain the safety model"
+flux run -m openrouter/meta-llama/llama-3.3-70b-instruct  "summarise docs"
 ```
 
 ### Config file
@@ -77,9 +77,9 @@ content blocks instead of risking the inline `<tool_call>` text leakage some mod
 OpenAI Chat path. Because flux's agent loop is tool-driven, this is the more reliable choice.
 
 ```bash
-flux -m openrouter-anthropic/z-ai/glm-4.6           "refactor the parser"
-flux -m openrouter-anthropic/qwen/qwen3-coder       "add tests for the auth module"
-flux -m openrouter-anthropic/deepseek/deepseek-chat "review this PR"
+flux run -m openrouter-anthropic/z-ai/glm-4.6           "refactor the parser"
+flux run -m openrouter-anthropic/qwen/qwen3-coder       "add tests for the auth module"
+flux run -m openrouter-anthropic/deepseek/deepseek-chat "review this PR"
 ```
 
 Same `OPENROUTER_API_KEY`; the slug is forwarded verbatim. The Chat-path `openrouter/…` provider
@@ -107,10 +107,10 @@ problem at the source and requests tool-capable routing (`provider.require_param
 export OPENROUTER_API_KEY=sk-or-...
 
 # Latest GLM-Z1 (the "5.2" generation reasoning model)
-flux -m openrouter/z-ai/glm-5.2 "write unit tests for the auth module"
+flux run -m openrouter/z-ai/glm-5.2 "write unit tests for the auth module"
 
 # Long-context variant for big codebases
-flux -m openrouter/thudm/glm-4-32b  "explain the entire provider layer"
+flux run -m openrouter/thudm/glm-4-32b  "explain the entire provider layer"
 ```
 
 ### Config file
@@ -153,7 +153,7 @@ since flux's agent loop is tool-driven.
 ollama pull qwen2.5-coder:7b      # serves automatically on http://localhost:11434
 
 # 2. Point flux at it:
-flux -m ollama/qwen2.5-coder:7b "explain the provider layer"
+flux run -m ollama/qwen2.5-coder:7b "explain the provider layer"
 ```
 
 The model string after `ollama/` is forwarded verbatim, including the tag (`:7b`, `:14b`, …), so
@@ -166,7 +166,7 @@ Recent Ollama also serves an **Anthropic Messages**–compatible endpoint (`/v1/
 risking inline-text tool-call leakage:
 
 ```bash
-flux -m ollama-anthropic/qwen2.5-coder:7b "explain the provider layer"
+flux run -m ollama-anthropic/qwen2.5-coder:7b "explain the provider layer"
 ```
 
 It honours `OLLAMA_HOST` the same way; requires a recent Ollama build with Messages-API support.
@@ -177,7 +177,7 @@ Set `OLLAMA_HOST` to target a non-default address (a bare `host:port` gets `http
 
 ```bash
 export OLLAMA_HOST=http://192.168.1.10:11434
-flux -m ollama/devstral "review this PR"
+flux run -m ollama/devstral "review this PR"
 ```
 
 ### Recommended models
