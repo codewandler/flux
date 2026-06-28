@@ -423,20 +423,28 @@ async fn run_top_level(
             &mut transcript,
         )
         .await?;
-        if !blast.is_empty() {
-            last = blast;
-        }
+        // A `return` exits the flow immediately. An explicit `return <expr>` yields that
+        // expression's value — even when it renders empty (e.g. the agent loop's `$answer`, which
+        // is "" once the loop exhausts its iteration budget). A bare `return` carries no value, so
+        // fall back to the last non-empty expression value. (Previously the empty explicit return
+        // was discarded and the stale `last` leaked out as the result — surfacing loop-machinery
+        // text like `observed \`turn.iteration\`` as the turn's answer.) Checked BEFORE the
+        // `last = blast` update below so `blast` is still available here.
         if let Step::Return(vid) = step {
             if let Some(v) = &vid {
                 store.append_event(session_id, &RunEvent::FlowReturned { value: v.clone() })?;
             }
+            let result = if vid.is_some() { blast } else { last };
             return Ok(FlowOutcome {
                 returned: vid,
-                result: last,
+                result,
                 transcript: transcript.join("\n\n"),
                 steps,
                 suspension: None,
             });
+        }
+        if !blast.is_empty() {
+            last = blast;
         }
         i += 1;
     }
@@ -3554,6 +3562,26 @@ mod tests {
         };
         let mut sink = BufferSink::default();
         execute_flow(&store, host, "s", &ast, &mut sink).await
+    }
+
+    #[tokio::test]
+    async fn explicit_empty_return_wins_over_stale_last() {
+        // Regression (Fix B): a non-empty expression sets `last`, then an explicit `return ""` must
+        // still return "" — not leak the stale `last`. The agent loop returns an empty `$answer` when
+        // it exhausts its iteration budget; the stale-last leak surfaced loop-machinery text
+        // (`observed \`turn.iteration\``) as the turn's answer with a falsely-`ok` outcome.
+        let host = CfHost::new();
+        let body = vec![
+            echo("HELLO"),
+            Node::Return {
+                value: Box::new(flow_lit(json!(""))),
+            },
+        ];
+        let out = run(&host, body).await.unwrap();
+        assert_eq!(
+            out.result, "",
+            "explicit empty return must override the stale last value"
+        );
     }
 
     #[tokio::test]
