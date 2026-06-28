@@ -51,11 +51,22 @@ pub enum Setup {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Criterion {
     /// Run a command (argv, whitespace-tokenized — no shell) in the workspace; pass iff its exit
-    /// code equals `expect_exit` (default 0).
+    /// code equals `expect_exit` (default 0) AND every supplied stdout matcher holds. The stdout
+    /// matchers let a task grade a program's *output* (e.g. `python3 solution.py` prints `42`), not
+    /// just that it ran.
     Command {
         run: String,
         #[serde(default)]
         expect_exit: i32,
+        /// The command's stdout, trimmed of surrounding whitespace, must equal this exactly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stdout_equals: Option<String>,
+        /// The command's stdout must contain this substring (raw, untrimmed).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stdout_contains: Option<String>,
+        /// The command's stdout must match this regex (raw, untrimmed).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stdout_regex: Option<String>,
     },
     /// A file must exist and (optionally) match. With multiple matchers, all must hold.
     FileContent {
@@ -162,6 +173,9 @@ FLUX_MOCK_BASH = "printf 3 > COUNT.txt"
                 Criterion::Command {
                     run: "cargo test --quiet".into(),
                     expect_exit: 0,
+                    stdout_equals: None,
+                    stdout_contains: None,
+                    stdout_regex: None,
                 },
                 Criterion::FileContent {
                     path: "out.txt".into(),

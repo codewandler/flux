@@ -48,6 +48,9 @@ pub struct RunContext<'a> {
     /// Model used when a [`TaskSpec`](crate::spec::TaskSpec) doesn't override it.
     pub default_model: &'a str,
     pub cancel: &'a CancellationToken,
+    /// When true (the `flux eval --watch` flag), stream the spawned agent's output to the terminal
+    /// live instead of capturing it silently, so the run can be observed as it happens.
+    pub watch: bool,
 }
 
 /// A source of benchmark tasks the runner can drive flux against.

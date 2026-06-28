@@ -29,6 +29,8 @@ const PROTECTED: &[&str] = &[
     "scripts",
     ".github",
     "examples/improve-tbench.flux",
+    "examples/improve-multi.flux",
+    "examples/eval-synthetic.flux",
     "examples/eval-smoke.flux",
 ];
 fn is_protected(path: &str) -> bool {

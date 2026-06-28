@@ -143,7 +143,13 @@ pub(crate) fn toolchain_env() -> Vec<(String, String)> {
 /// uses — one grading implementation, no divergence.
 pub async fn grade(c: &Criterion, sys: &System) -> Result<bool> {
     match c {
-        Criterion::Command { run, expect_exit } => {
+        Criterion::Command {
+            run,
+            expect_exit,
+            stdout_equals,
+            stdout_contains,
+            stdout_regex,
+        } => {
             let argv: Vec<String> = run.split_whitespace().map(String::from).collect();
             if argv.is_empty() {
                 return Ok(false);
@@ -152,7 +158,19 @@ pub async fn grade(c: &Criterion, sys: &System) -> Result<bool> {
             let out = sys
                 .run_with_env(&argv, &toolchain_env(), Duration::from_secs(180))
                 .await?;
-            Ok(out.exit_code == *expect_exit)
+            let mut ok = out.exit_code == *expect_exit;
+            if let Some(eq) = stdout_equals {
+                ok &= out.stdout.trim() == eq;
+            }
+            if let Some(sub) = stdout_contains {
+                ok &= out.stdout.contains(sub.as_str());
+            }
+            if let Some(re) = stdout_regex {
+                let re = Regex::new(re)
+                    .map_err(|e| Error::Other(format!("bad criterion stdout_regex {re:?}: {e}")))?;
+                ok &= re.is_match(&out.stdout);
+            }
+            Ok(ok)
         }
         Criterion::FileContent {
             path,
@@ -241,10 +259,19 @@ pub async fn run_local_task(spec: &TaskSpec, ctx: &RunContext<'_>) -> Result<Run
     for (k, v) in &spec.env {
         env.push((k.clone(), v.clone()));
     }
+    // In watch mode, reveal the loop machinery so the observer sees plan/run_plan/observe.
+    if ctx.watch {
+        env.push(("FLUX_SHOW_LOOP".to_string(), "1".to_string()));
+    }
 
-    let run = sys
-        .run_with_env(&argv, &env, Duration::from_secs(spec.timeout_secs))
-        .await;
+    let run = if ctx.watch {
+        eprintln!("\n── {} ──", spec.id);
+        sys.run_with_env_streamed(&argv, &env, Duration::from_secs(spec.timeout_secs))
+            .await
+    } else {
+        sys.run_with_env(&argv, &env, Duration::from_secs(spec.timeout_secs))
+            .await
+    };
     let wall_ms = started.elapsed().as_millis() as u64;
 
     let mut timed_out = false;
@@ -397,7 +424,10 @@ mod tests {
         assert!(grade(
             &Criterion::Command {
                 run: "true".into(),
-                expect_exit: 0
+                expect_exit: 0,
+                stdout_equals: None,
+                stdout_contains: None,
+                stdout_regex: None,
             },
             &sys
         )
@@ -406,7 +436,42 @@ mod tests {
         assert!(!grade(
             &Criterion::Command {
                 run: "false".into(),
-                expect_exit: 0
+                expect_exit: 0,
+                stdout_equals: None,
+                stdout_contains: None,
+                stdout_regex: None,
+            },
+            &sys
+        )
+        .await
+        .unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn grade_command_matches_stdout() {
+        let (dir, sys) = temp_system();
+        // exit 0 AND stdout (trimmed) equals "42" → pass.
+        assert!(grade(
+            &Criterion::Command {
+                run: "echo 42".into(),
+                expect_exit: 0,
+                stdout_equals: Some("42".into()),
+                stdout_contains: None,
+                stdout_regex: None,
+            },
+            &sys
+        )
+        .await
+        .unwrap());
+        // right exit but wrong stdout → fail (this is what catches a wrong-answer program).
+        assert!(!grade(
+            &Criterion::Command {
+                run: "echo 41".into(),
+                expect_exit: 0,
+                stdout_equals: Some("42".into()),
+                stdout_contains: None,
+                stdout_regex: None,
             },
             &sys
         )
@@ -424,6 +489,9 @@ mod tests {
                 Criterion::Command {
                     run: "true".into(),
                     expect_exit: 0,
+                    stdout_equals: None,
+                    stdout_contains: None,
+                    stdout_regex: None,
                 },
                 Criterion::FileContent {
                     path: "a.txt".into(),
@@ -440,6 +508,9 @@ mod tests {
                 Criterion::Command {
                     run: "false".into(),
                     expect_exit: 0,
+                    stdout_equals: None,
+                    stdout_contains: None,
+                    stdout_regex: None,
                 },
                 Criterion::FileContent {
                     path: "a.txt".into(),

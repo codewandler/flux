@@ -5,7 +5,9 @@
 //! same [`BenchmarkAdapter`](crate::adapter::BenchmarkAdapter) trait.
 
 pub mod local;
+pub mod multi;
 pub mod terminal_bench;
 
 pub use local::LocalAdapter;
+pub use multi::MultiAdapter;
 pub use terminal_bench::TerminalBenchAdapter;

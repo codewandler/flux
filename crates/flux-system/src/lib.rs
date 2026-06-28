@@ -384,34 +384,8 @@ impl System {
 
         // Don't leak the agent's environment (which may hold ANTHROPIC_API_KEY and other secrets)
         // into model-spawned commands: start from an empty env and pass only a minimal, non-secret
-        // set needed for programs to function.
-        cmd.env_clear();
-        const SAFE_ENV: &[&str] = &[
-            "PATH",
-            "HOME",
-            "LANG",
-            "LC_ALL",
-            "LC_CTYPE",
-            "TERM",
-            "TZ",
-            "USER",
-            "LOGNAME",
-            "TMPDIR",
-            // Non-secret toolchain locations so `cargo`/`rustup` (and the new cargo_* tools) can
-            // resolve a toolchain even under an isolated HOME without `~/.rustup`.
-            "RUSTUP_HOME",
-            "CARGO_HOME",
-            "RUSTUP_TOOLCHAIN",
-        ];
-        for key in SAFE_ENV {
-            if let Ok(val) = std::env::var(key) {
-                cmd.env(key, val);
-            }
-        }
-        // Caller-chosen overrides (added after the allow-list so they win).
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
+        // set needed for programs to function, plus the caller's explicit overrides.
+        Self::apply_safe_env(&mut cmd, env);
 
         let fut = cmd.output();
         let output = match tokio::time::timeout(timeout, fut).await {
@@ -429,6 +403,81 @@ impl System {
             stdout: capped_lossy(&output.stdout, MAX_OUTPUT),
             stderr: capped_lossy(&output.stderr, MAX_OUTPUT),
             exit_code: output.status.code().unwrap_or(-1),
+        })
+    }
+
+    /// Scrub a command's environment to the minimal non-secret allow-list, then apply caller
+    /// overrides (added last so they win). Shared by [`run_with_env`](Self::run_with_env) and
+    /// [`run_with_env_streamed`](Self::run_with_env_streamed).
+    fn apply_safe_env(cmd: &mut tokio::process::Command, env: &[(String, String)]) {
+        cmd.env_clear();
+        const SAFE_ENV: &[&str] = &[
+            "PATH",
+            "HOME",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "TERM",
+            "TZ",
+            "USER",
+            "LOGNAME",
+            "TMPDIR",
+            // Non-secret toolchain locations so `cargo`/`rustup` (and the cargo_* tools) resolve a
+            // toolchain even under an isolated HOME without `~/.rustup`.
+            "RUSTUP_HOME",
+            "CARGO_HOME",
+            "RUSTUP_TOOLCHAIN",
+        ];
+        for key in SAFE_ENV {
+            if let Ok(val) = std::env::var(key) {
+                cmd.env(key, val);
+            }
+        }
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+    }
+
+    /// Like [`run_with_env`](Self::run_with_env) but **streams** the child's stdout/stderr straight to
+    /// the parent terminal (inherited) instead of capturing them — for `flux eval --watch`, where the
+    /// whole point is to watch the spawned agent work live. The returned [`ProcessOutput`] carries only
+    /// the exit code (stdout/stderr are empty); the eval grades via the criterion and mines
+    /// `events.db`, neither of which needs captured output.
+    pub async fn run_with_env_streamed(
+        &self,
+        argv: &[String],
+        env: &[(String, String)],
+        timeout: Duration,
+    ) -> Result<ProcessOutput> {
+        let Some((program, args)) = argv.split_first() else {
+            return Err(Error::Other("empty command".to_string()));
+        };
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args)
+            .current_dir(self.workspace.root())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true);
+        Self::apply_safe_env(&mut cmd, env);
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| Error::Other(format!("spawn {program}: {e}")))?;
+        let status = match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(r) => r.map_err(|e| Error::Other(format!("wait {program}: {e}")))?,
+            Err(_) => {
+                let _ = child.start_kill();
+                return Err(Error::Other(format!(
+                    "command timed out after {}s",
+                    timeout.as_secs()
+                )));
+            }
+        };
+        Ok(ProcessOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: status.code().unwrap_or(-1),
         })
     }
 }

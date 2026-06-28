@@ -1,0 +1,226 @@
+[
+  {
+    "id": "synthetic/two-sum",
+    "category": "coding",
+    "description": "Self-contained coding riddle: two-sum.",
+    "setup": {
+      "kind": "empty"
+    },
+    "prompt": "Create a file named solution.py in the current directory. Given nums = [2, 7, 11, 15] and target = 9, it should find the two 0-based indices of the numbers that add up to the target and print them space-separated, smaller index first. Print ONLY that line, nothing else.",
+    "criterion": {
+      "kind": "command",
+      "run": "python3 solution.py",
+      "stdout_equals": "0 1"
+    }
+  },
+  {
+    "id": "synthetic/fizzbuzz-count",
+    "category": "coding",
+    "description": "Self-contained coding riddle: fizzbuzz-count.",
+    "setup": {
+      "kind": "empty"
+    },
+    "prompt": "Create a file named solution.py in the current directory that prints how many integers from 1 to 100 inclusive are divisible by 3 or by 5. Print ONLY the number.",
+    "criterion": {
+      "kind": "command",
+      "run": "python3 solution.py",
+      "stdout_equals": "47"
+    }
+  },
+  {
+    "id": "synthetic/sum-primes-below-100",
+    "category": "coding",
+    "description": "Self-contained coding riddle: sum-primes-below-100.",
+    "setup": {
+      "kind": "empty"
+    },
+    "prompt": "Create a file named solution.py in the current directory that prints the sum of all prime numbers strictly below 100. Print ONLY the number.",
+    "criterion": {
+      "kind": "command",
+      "run": "python3 solution.py",
+      "stdout_equals": "1060"
+    }
+  },
+  {
+    "id": "synthetic/fib-30",
+    "category": "coding",
+    "description": "Self-contained coding riddle: fib-30.",
+    "setup": {
+      "kind": "empty"
+    },
+    "prompt": "Create a file named solution.py in the current directory that prints the 30th Fibonacci number, where fib(1)=1 and fib(2)=1. Print ONLY the number.",
+    "criterion": {
+      "kind": "command",
+      "run": "python3 solution.py",
+      "stdout_equals": "832040"
+    }
+  },
+  {
+    "id": "synthetic/anagram-groups",
+    "category": "coding",
+    "description": "Self-contained coding riddle: anagram-groups.",
+    "setup": {
+      "kind": "empty"
+    },
+    "prompt": "Create a file named solution.py in the current directory. Given words = ['eat','tea','tan','ate','nat','bat'], it should print the number of distinct groups of anagrams. Print ONLY the number.",
+    "criterion": {
+      "kind": "command",
+      "run": "python3 solution.py",
+      "stdout_equals": "3"
+    }
+  },
+  {
+    "id": "synthetic/reverse-words",
+    "category": "coding",
+    "description": "Self-contained coding riddle: reverse-words.",
+    "setup": {
+      "kind": "empty"
+    },
+    "prompt": "Create a file named solution.py in the current directory that takes the string 'the quick brown fox' and prints its words in reverse order, separated by single spaces. Print ONLY that line.",
+    "criterion": {
+      "kind": "command",
+      "run": "python3 solution.py",
+      "stdout_equals": "fox brown quick the"
+    }
+  },
+  {
+    "id": "synthetic/count-vowels",
+    "category": "coding",
+    "description": "Self-contained coding riddle: count-vowels.",
+    "setup": {
+      "kind": "empty"
+    },
+    "prompt": "Create a file named solution.py in the current directory that prints the number of vowels (a, e, i, o, u; case-insensitive) in the string 'Advent of Code is fun'. Print ONLY the number.",
+    "criterion": {
+      "kind": "command",
+      "run": "python3 solution.py",
+      "stdout_equals": "7"
+    }
+  },
+  {
+    "id": "synthetic/max-subarray",
+    "category": "coding",
+    "description": "Self-contained coding riddle: max-subarray.",
+    "setup": {
+      "kind": "empty"
+    },
+    "prompt": "Create a file named solution.py in the current directory. Given nums = [-2,1,-3,4,-1,2,1,-5,4], it should print the maximum contiguous subarray sum. Print ONLY the number.",
+    "criterion": {
+      "kind": "command",
+      "run": "python3 solution.py",
+      "stdout_equals": "6"
+    }
+  },
+  {
+    "id": "synthetic/gcd",
+    "category": "coding",
+    "description": "Self-contained coding riddle: gcd.",
+    "setup": {
+      "kind": "empty"
+    },
+    "prompt": "Create a file named solution.py in the current directory that prints the greatest common divisor of 1071 and 462. Print ONLY the number.",
+    "criterion": {
+      "kind": "command",
+      "run": "python3 solution.py",
+      "stdout_equals": "21"
+    }
+  },
+  {
+    "id": "synthetic/roman-to-int",
+    "category": "coding",
+    "description": "Self-contained coding riddle: roman-to-int.",
+    "setup": {
+      "kind": "empty"
+    },
+    "prompt": "Create a file named solution.py in the current directory that converts the Roman numeral 'MCMXCIV' to its integer value and prints it. Print ONLY the number.",
+    "criterion": {
+      "kind": "command",
+      "run": "python3 solution.py",
+      "stdout_equals": "1994"
+    }
+  },
+  {
+    "id": "synthetic/palindrome-count",
+    "category": "coding",
+    "description": "Self-contained coding riddle: palindrome-count.",
+    "setup": {
+      "kind": "empty"
+    },
+    "prompt": "Create a file named solution.py in the current directory. Given words = ['racecar','hello','level','world','noon'], it should print how many of them are palindromes. Print ONLY the number.",
+    "criterion": {
+      "kind": "command",
+      "run": "python3 solution.py",
+      "stdout_equals": "3"
+    }
+  },
+  {
+    "id": "synthetic/digit-sum-2-pow-100",
+    "category": "coding",
+    "description": "Self-contained coding riddle: digit-sum-2-pow-100.",
+    "setup": {
+      "kind": "empty"
+    },
+    "prompt": "Create a file named solution.py in the current directory that prints the sum of the decimal digits of 2 raised to the power 100. Print ONLY the number.",
+    "criterion": {
+      "kind": "command",
+      "run": "python3 solution.py",
+      "stdout_equals": "115"
+    }
+  },
+  {
+    "id": "synthetic/word-count",
+    "category": "coding",
+    "description": "Self-contained coding riddle: word-count.",
+    "setup": {
+      "kind": "empty"
+    },
+    "prompt": "Create a file named solution.py in the current directory that prints the number of whitespace-separated words in the string 'the cat sat on the mat'. Print ONLY the number.",
+    "criterion": {
+      "kind": "command",
+      "run": "python3 solution.py",
+      "stdout_equals": "6"
+    }
+  },
+  {
+    "id": "synthetic/collatz-27",
+    "category": "coding",
+    "description": "Self-contained coding riddle: collatz-27.",
+    "setup": {
+      "kind": "empty"
+    },
+    "prompt": "Create a file named solution.py in the current directory that prints the number of steps to reach 1 from 27 using the Collatz rule (n -> n/2 if even, n -> 3n+1 if odd). The starting number counts as step 0; count each transformation as one step. Print ONLY the number.",
+    "criterion": {
+      "kind": "command",
+      "run": "python3 solution.py",
+      "stdout_equals": "111"
+    }
+  },
+  {
+    "id": "synthetic/binary-to-decimal",
+    "category": "coding",
+    "description": "Self-contained coding riddle: binary-to-decimal.",
+    "setup": {
+      "kind": "empty"
+    },
+    "prompt": "Create a file named solution.py in the current directory that prints the decimal value of the binary string '101010'. Print ONLY the number.",
+    "criterion": {
+      "kind": "command",
+      "run": "python3 solution.py",
+      "stdout_equals": "42"
+    }
+  },
+  {
+    "id": "synthetic/factorial-trailing-zeros",
+    "category": "coding",
+    "description": "Self-contained coding riddle: factorial-trailing-zeros.",
+    "setup": {
+      "kind": "empty"
+    },
+    "prompt": "Create a file named solution.py in the current directory that prints the number of trailing zeros in 100! (100 factorial). Print ONLY the number.",
+    "criterion": {
+      "kind": "command",
+      "run": "python3 solution.py",
+      "stdout_equals": "24"
+    }
+  }
+]

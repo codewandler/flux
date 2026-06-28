@@ -28,6 +28,7 @@ pub mod git;
 pub mod metrics;
 pub mod ops;
 pub mod painpoint;
+pub mod report;
 pub mod runner;
 pub mod score;
 pub mod spec;
@@ -49,10 +50,12 @@ pub fn register_eval_ops(registry: &mut ToolRegistry) {
     registry.register(Arc::new(ops::EvalSessionsTool));
     registry.register(Arc::new(ops::SessionsDigestTool));
     registry.register(Arc::new(ops::PainpointsCollectTool));
+    registry.register(Arc::new(ops::EvalReportMdTool));
     registry.register(Arc::new(ops::ImproveLogTool));
     registry.register(Arc::new(ops::EvalAdoptTool));
     registry.register(Arc::new(ops::EvalScalarTool));
     registry.register(Arc::new(ops::ScoreCompareTool));
+    registry.register(Arc::new(ops::ScoreCompareMultiTool));
     registry.register(Arc::new(ops::GradeTool));
     // Aggregate → candidates + loop control.
     registry.register(Arc::new(aggregate::ImprovementsAggregateTool));

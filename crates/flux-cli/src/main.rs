@@ -821,6 +821,130 @@ async fn run_agentic(cli: &Cli, prompt: String) -> Result<()> {
 /// The file is validated against the live op registry (`analyze_flow`) before anything runs, and it
 /// executes through the same `Executor::dispatch` envelope as every other turn (destructive ops still
 /// escalate; `--yes` auto-approves).
+/// `flux eval <adapter> [--tasks a,b] [--members a,b] [--limit N] [-m model] [--trials N]
+/// [--report out.md] [--watch]` — run a benchmark suite ad-hoc through flux-eval and print a summary
+/// (same adapters + scoring the `eval_run` op and improve loop use). `--watch` streams each task's
+/// agent activity live; `--report` writes the categorized Markdown report.
+async fn run_eval_cmd(args: &[String]) -> Result<()> {
+    let mut adapter: Option<String> = None;
+    let mut tasks: Vec<String> = Vec::new();
+    let mut members: Vec<String> = Vec::new();
+    let mut limit: u64 = 0;
+    let mut model: Option<String> = None;
+    let mut trials: u64 = 1;
+    let mut report_path: Option<String> = None;
+    let mut watch = false;
+    let split_csv = |s: String| -> Vec<String> {
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    };
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "--watch" => watch = true,
+            "-m" | "--model" => {
+                model = Some(
+                    iter.next()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("`-m` needs a model spec"))?,
+                )
+            }
+            "--tasks" => {
+                tasks = split_csv(
+                    iter.next()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("`--tasks` needs a,b,c"))?,
+                )
+            }
+            "--members" => {
+                members = split_csv(
+                    iter.next()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("`--members` needs a,b"))?,
+                )
+            }
+            "--limit" => {
+                limit = iter
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| anyhow::anyhow!("`--limit` needs a number"))?
+            }
+            "--trials" => {
+                trials = iter
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| anyhow::anyhow!("`--trials` needs a number"))?
+            }
+            "--report" => {
+                report_path = Some(
+                    iter.next()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("`--report` needs a path"))?,
+                )
+            }
+            other if !other.starts_with('-') && adapter.is_none() => {
+                adapter = Some(other.to_string())
+            }
+            other => bail!("flux eval: unexpected argument {other:?}"),
+        }
+    }
+    let adapter = adapter.ok_or_else(|| {
+        anyhow::anyhow!(
+            "usage: flux eval <adapter> [--tasks a,b] [--members a,b] [--limit N] [-m model] \
+             [--trials N] [--report out.md] [--watch]\n  adapters: synthetic | mock | terminal-bench | multi"
+        )
+    })?;
+
+    let mut params = serde_json::json!({
+        "adapter": adapter,
+        "tasks": tasks,
+        "limit": limit,
+        "trials": trials,
+        "watch": watch,
+    });
+    if let Some(m) = &model {
+        params["model"] = serde_json::Value::String(m.clone());
+    }
+    if !members.is_empty() {
+        params["members"] = serde_json::Value::Array(
+            members
+                .iter()
+                .map(|m| serde_json::json!({ "adapter": m }))
+                .collect(),
+        );
+    }
+
+    let report = flux_eval::ops::run_eval(params)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    println!("{}", flux_eval::ops::report_view(&report));
+    if let Some(cases) = report.get("cases").and_then(|v| v.as_array()) {
+        for c in cases {
+            let id = c.get("task_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let pr = c.get("pass_rate").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let mark = if pr >= 1.0 { "ok  " } else { "FAIL" };
+            let iters = c
+                .get("mean_iterations")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let errs = c
+                .get("mean_tool_errors")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            println!("  [{mark}] {id}  ({iters:.0} iters, {errs:.0} tool-errs)");
+        }
+    }
+    if let Some(path) = report_path {
+        let md = flux_eval::report::render_markdown(&report);
+        std::fs::write(&path, md).with_context(|| format!("write report {path}"))?;
+        println!("report written to {path}");
+    }
+    Ok(())
+}
+
 async fn run_flow(args: &[String]) -> Result<()> {
     let mut iter = args.iter();
     if iter.next().map(|s| s.as_str()) != Some("run") {
@@ -2457,6 +2581,12 @@ async fn main() -> Result<()> {
     // so it sits beside the other read-only subcommands and never starts a turn.
     if argv.get(1).map(|s| s == "loop").unwrap_or(false) {
         return run_loop_cmd(&argv[2..]);
+    }
+    // `flux eval <adapter>` runs a benchmark suite ad-hoc through flux-eval (the same path the
+    // `eval_run` op + improve loop use) and prints a summary. Read-only w.r.t. the repo; it spawns
+    // the agent in isolated temp workspaces.
+    if argv.get(1).map(|s| s == "eval").unwrap_or(false) {
+        return run_eval_cmd(&argv[2..]).await;
     }
     // `flux run …` is the explicit agent/program entry. `flux run <app.flux>` runs a multi-agent
     // program; `flux run <prompt…>` runs a one-shot agent turn on the prompt. A *bare* prompt

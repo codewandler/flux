@@ -38,8 +38,9 @@ impl Tool for EvalRunTool {
             name: "eval_run".into(),
             description: "Run a benchmark suite against the flux binary and return a JSON report \
                           {adapter, pass_rate, scalar, total, passed, mean_*, cases:[…]}. \
-                          `adapter` is \"mock\" (offline test fixture) or \"terminal-bench\" (the real \
-                          Docker benchmark); swebench-lite lands later."
+                          `adapter` is \"mock\" (offline fixture), \"synthetic\" (real-model coding \
+                          riddles), \"terminal-bench\" (the real Docker benchmark), or \"multi\" \
+                          (several behind one combined score); swebench-lite lands later."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -62,115 +63,199 @@ impl Tool for EvalRunTool {
     }
 
     async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let adapter_name = str_field(&params, "adapter").unwrap_or("mock").to_string();
-        let ids: Vec<String> = params
-            .get("tasks")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let filter = Filter { ids, limit };
-        let default_model = str_field(&params, "model").unwrap_or("sonnet").to_string();
-
-        let adapter: Box<dyn BenchmarkAdapter> = match adapter_name.as_str() {
-            "mock" => Box::new(LocalAdapter::mock()),
-            "terminal-bench" => {
-                Box::new(crate::adapters::TerminalBenchAdapter::from_params(&params)?)
-            }
-            other => {
-                return Ok(ToolResult::error(format!(
-                    "eval_run: adapter {other:?} is not available yet (swebench-lite lands later)"
-                )))
-            }
-        };
-
-        // Resolve the binary under test. A relative `flux_bin` (e.g. "target/debug/flux", the
-        // *rebuilt* binary inside the improve loop) is made absolute against the current dir, since the
-        // eval child runs with its cwd set to a task tempdir. Default: the running binary.
-        let flux_bin: PathBuf = match str_field(&params, "flux_bin") {
-            Some(p) => {
-                let pb = PathBuf::from(p);
-                if pb.is_absolute() {
-                    pb
-                } else {
-                    std::env::current_dir()
-                        .map_err(|e| Error::Other(format!("eval_run: current dir: {e}")))?
-                        .join(pb)
-                }
-            }
-            None => std::env::current_exe()
-                .map_err(|e| Error::Other(format!("eval_run: locate flux binary: {e}")))?,
-        };
-
-        let cancel = CancellationToken::new();
-        let rc = RunContext {
-            flux_bin: &flux_bin,
-            default_model: &default_model,
-            cancel: &cancel,
-        };
-
-        // Trials per task: >1 averages out single-run model noise so a "win" is real, not luck.
-        let trials = params
-            .get("trials")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1)
-            .max(1) as usize;
-
-        // Per-eval setup (e.g. the terminal-bench adapter rebuilds the static musl binary so a
-        // candidate eval reflects the worker's edits).
-        if let Err(e) = adapter.prepare(&rc).await {
-            return Ok(ToolResult::error(format!(
-                "eval_run: adapter prepare failed: {e}"
-            )));
-        }
-
-        let task_ids = adapter.list_tasks(&filter)?;
-        let mut cases: Vec<CaseOutcome> = Vec::with_capacity(task_ids.len());
-        for id in &task_ids {
-            let mut runs: Vec<RunResult> = Vec::with_capacity(trials);
-            for _ in 0..trials {
-                let r = match adapter.run_task(id, &rc).await {
-                    Ok(r) => r,
-                    Err(e) => RunResult::failed(id, 0, e.to_string()),
-                };
-                runs.push(r);
-            }
-            cases.push(CaseOutcome::from_trials(id, &runs));
-        }
-
-        let score = SuiteScore::from_cases(&cases, |id| adapter.weight_of(id));
-        let cases_json = serde_json::to_value(&cases).map_err(|e| Error::Other(e.to_string()))?;
-        let report = json!({
-            "adapter": adapter.name(),
-            "trials": trials,
-            "pass_rate": score.pass_rate,
-            "mean_check_pass_rate": score.mean_check_pass_rate,
-            "scalar": score.scalar(),
-            "total": score.total,
-            "passed": score.passed,
-            "mean_tool_errors": score.mean_tool_errors,
-            "mean_iterations": score.mean_iterations,
-            "mean_tokens": score.mean_tokens,
-            "mean_wall_ms": score.mean_wall_ms,
-            "cases": cases_json,
-        });
-        let view = format!(
-            "eval[{}] {}/{} tasks pass-all · checks {:.0}% · score {} · {} trial(s) · mean_iters {:.1} · mean_errors {:.1}",
-            adapter.name(),
-            score.passed,
-            score.total,
-            score.mean_check_pass_rate * 100.0,
-            score.scalar(),
-            trials,
-            score.mean_iterations,
-            score.mean_tool_errors,
-        );
+        let report = run_eval(params).await?;
+        let view = report_view(&report);
         json_result(&report, view)
     }
+}
+
+/// Run a benchmark suite and return its JSON report — shared by the `eval_run` op and the `flux eval`
+/// CLI so both drive the exact same adapters + scoring. `params` mirrors the op's input schema
+/// (`adapter`, `tasks`, `limit`, `model`, `flux_bin`, `trials`, plus adapter-specific keys).
+pub async fn run_eval(params: Value) -> Result<Value> {
+    let adapter_name = str_field(&params, "adapter").unwrap_or("mock").to_string();
+    let ids: Vec<String> = params
+        .get("tasks")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let filter = Filter { ids, limit };
+    let default_model = str_field(&params, "model").unwrap_or("sonnet").to_string();
+
+    let adapter: Box<dyn BenchmarkAdapter> = if adapter_name == "multi" {
+        let members = params
+            .get("members")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut subs: Vec<(String, Box<dyn BenchmarkAdapter>)> = Vec::new();
+        for m in &members {
+            let name = m.get("adapter").and_then(|v| v.as_str()).ok_or_else(|| {
+                Error::Other("eval_run: each multi member needs an `adapter`".into())
+            })?;
+            subs.push((name.to_string(), build_adapter(name, m)?));
+        }
+        if subs.is_empty() {
+            return Err(Error::Other(
+                "eval_run: adapter \"multi\" needs a non-empty `members` list".into(),
+            ));
+        }
+        Box::new(crate::adapters::MultiAdapter::new(subs))
+    } else {
+        build_adapter(&adapter_name, &params)?
+    };
+
+    // Resolve the binary under test. A relative `flux_bin` (e.g. "target/debug/flux", the *rebuilt*
+    // binary inside the improve loop) is made absolute against the current dir, since the eval child
+    // runs with its cwd set to a task tempdir. Default: the running binary.
+    let flux_bin: PathBuf = match str_field(&params, "flux_bin") {
+        Some(p) => {
+            let pb = PathBuf::from(p);
+            if pb.is_absolute() {
+                pb
+            } else {
+                std::env::current_dir()
+                    .map_err(|e| Error::Other(format!("eval_run: current dir: {e}")))?
+                    .join(pb)
+            }
+        }
+        None => std::env::current_exe()
+            .map_err(|e| Error::Other(format!("eval_run: locate flux binary: {e}")))?,
+    };
+
+    let watch = params
+        .get("watch")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let cancel = CancellationToken::new();
+    let rc = RunContext {
+        flux_bin: &flux_bin,
+        default_model: &default_model,
+        cancel: &cancel,
+        watch,
+    };
+
+    // Trials per task: >1 averages out single-run model noise so a "win" is real, not luck.
+    let trials = params
+        .get("trials")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1)
+        .max(1) as usize;
+
+    // Per-eval setup (e.g. the terminal-bench adapter rebuilds the static musl binary so a candidate
+    // eval reflects the worker's edits).
+    adapter
+        .prepare(&rc)
+        .await
+        .map_err(|e| Error::Other(format!("eval_run: adapter prepare failed: {e}")))?;
+
+    let task_ids = adapter.list_tasks(&filter)?;
+    let mut cases: Vec<CaseOutcome> = Vec::with_capacity(task_ids.len());
+    for id in &task_ids {
+        let mut runs: Vec<RunResult> = Vec::with_capacity(trials);
+        for _ in 0..trials {
+            let r = match adapter.run_task(id, &rc).await {
+                Ok(r) => r,
+                Err(e) => RunResult::failed(id, 0, e.to_string()),
+            };
+            runs.push(r);
+        }
+        cases.push(CaseOutcome::from_trials(id, &runs));
+    }
+
+    let score = SuiteScore::from_cases(&cases, |id| adapter.weight_of(id));
+    let cases_json = serde_json::to_value(&cases).map_err(|e| Error::Other(e.to_string()))?;
+    let mut report = json!({
+        "adapter": adapter.name(),
+        "trials": trials,
+        "pass_rate": score.pass_rate,
+        "mean_check_pass_rate": score.mean_check_pass_rate,
+        "scalar": score.scalar(),
+        "total": score.total,
+        "passed": score.passed,
+        "mean_tool_errors": score.mean_tool_errors,
+        "mean_iterations": score.mean_iterations,
+        "mean_tokens": score.mean_tokens,
+        "mean_wall_ms": score.mean_wall_ms,
+        "cases": cases_json,
+    });
+    // For a combined run, attach the per-member score breakdown so the keep-gate can refuse a
+    // candidate that lifts the mean while regressing one member (see `score_compare_multi`).
+    if adapter.name() == "multi" {
+        report["members"] = member_scores(&cases, adapter.as_ref());
+    }
+    Ok(report)
+}
+
+/// Construct a leaf benchmark adapter by name from its params — shared by `run_eval` and the `multi`
+/// adapter's member construction.
+fn build_adapter(name: &str, params: &Value) -> Result<Box<dyn BenchmarkAdapter>> {
+    Ok(match name {
+        "mock" => Box::new(LocalAdapter::mock()),
+        "synthetic" => Box::new(LocalAdapter::synthetic()),
+        "terminal-bench" => Box::new(crate::adapters::TerminalBenchAdapter::from_params(params)?),
+        other => {
+            return Err(Error::Other(format!(
+                "eval_run: adapter {other:?} is not available yet (swebench-lite lands later)"
+            )))
+        }
+    })
+}
+
+/// Per-member sub-scores for a `multi` report: partition cases by their `"<member>:"` id prefix and
+/// score each subset, so the keep-gate can require that no member regressed.
+fn member_scores(cases: &[CaseOutcome], adapter: &dyn BenchmarkAdapter) -> Value {
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<String, Vec<CaseOutcome>> = BTreeMap::new();
+    for c in cases {
+        let member = c
+            .task_id
+            .split_once(':')
+            .map(|(m, _)| m.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        groups.entry(member).or_default().push(c.clone());
+    }
+    let mut out = serde_json::Map::new();
+    for (member, gcases) in groups {
+        let s = SuiteScore::from_cases(&gcases, |id| adapter.weight_of(id));
+        out.insert(
+            member,
+            json!({
+                "pass_rate": s.pass_rate,
+                "mean_check_pass_rate": s.mean_check_pass_rate,
+                "scalar": s.scalar(),
+                "total": s.total,
+                "passed": s.passed,
+            }),
+        );
+    }
+    Value::Object(out)
+}
+
+/// One-line human summary of an eval report — the op's `view` and the CLI header.
+pub fn report_view(report: &Value) -> String {
+    let f = |k: &str| report.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let u = |k: &str| report.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+    let adapter = report
+        .get("adapter")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    format!(
+        "eval[{}] {}/{} tasks pass-all · checks {:.0}% · score {} · {} trial(s) · mean_iters {:.1} · mean_errors {:.1}",
+        adapter,
+        u("passed"),
+        u("total"),
+        f("mean_check_pass_rate") * 100.0,
+        u("scalar"),
+        u("trials"),
+        f("mean_iterations"),
+        f("mean_tool_errors"),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +349,38 @@ impl Tool for PainpointsCollectTool {
         let view = format!("{} pain-point(s) mined", all.len());
         let content = serde_json::to_string(&all).map_err(|e| Error::Other(e.to_string()))?;
         Ok(ToolResult::ok_view(content, view))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// eval_report_md
+// ---------------------------------------------------------------------------
+
+/// `eval_report_md(report)` — render an `eval_run` report as a categorized human-readable Markdown
+/// digest (headline score, per-task table, mined pain-points). Pain-points are mined internally from
+/// the report's session refs, so callers pass only the report.
+pub struct EvalReportMdTool;
+
+#[async_trait]
+impl Tool for EvalReportMdTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::read_only(
+            "eval_report_md",
+            "Render an eval_run report as a categorized human-readable Markdown report (headline \
+             score, per-task table, mined pain-points). Input: {report} (the eval_run JSON).",
+            json!({
+                "type": "object",
+                "properties": { "report": {"type": "string", "description": "an eval_run report (JSON)"} },
+                "required": ["report"]
+            }),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let report = arg(&params, "report");
+        let md = crate::report::render_markdown(&report);
+        let view = format!("rendered {} chars of markdown", md.len());
+        Ok(ToolResult::ok_view(md, view))
     }
 }
 
@@ -533,6 +650,80 @@ impl Tool for ScoreCompareTool {
 }
 
 // ---------------------------------------------------------------------------
+// score_compare_multi
+// ---------------------------------------------------------------------------
+
+/// Pure keep-decision for a `multi` report: returns `(keep, regressed_member)`. `keep` is true iff the
+/// combined candidate is strictly better AND no baseline member regressed (pass_rate & check-rate must
+/// not drop, and no member may disappear). Extracted from the op so it is unit-testable.
+fn multi_keep(baseline: &Value, candidate: &Value) -> (bool, Option<String>) {
+    const EPS: f64 = 1e-9;
+    let f = |v: &Value, k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let empty = serde_json::Map::new();
+    let base_members = baseline
+        .get("members")
+        .and_then(|v| v.as_object())
+        .unwrap_or(&empty);
+    let cand_members = candidate
+        .get("members")
+        .and_then(|v| v.as_object())
+        .unwrap_or(&empty);
+    for (name, bscore) in base_members {
+        match cand_members.get(name) {
+            None => return (false, Some(format!("{name} (missing)"))),
+            Some(cscore) => {
+                if f(cscore, "pass_rate") + EPS < f(bscore, "pass_rate")
+                    || f(cscore, "mean_check_pass_rate") + EPS < f(bscore, "mean_check_pass_rate")
+                {
+                    return (false, Some(name.clone()));
+                }
+            }
+        }
+    }
+    (report_is_better(candidate, baseline), None)
+}
+
+/// `score_compare_multi(baseline, candidate)` — like `score_compare`, but for `multi` reports: return
+/// "true" iff the combined candidate is strictly better AND **no member regressed**. This stops a
+/// candidate that lifts the combined mean while silently regressing one benchmark from being kept.
+pub struct ScoreCompareMultiTool;
+
+#[async_trait]
+impl Tool for ScoreCompareMultiTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::read_only(
+            "score_compare_multi",
+            "Return \"true\" iff the candidate multi-eval report is strictly better overall AND no \
+             member benchmark regressed (pass_rate & check-rate ≥ baseline). Use as the keep-gate for \
+             combined evals so a gain on one benchmark can't mask a regression on another.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "baseline": {"type": "string", "description": "baseline multi eval_run report (JSON)"},
+                    "candidate": {"type": "string", "description": "candidate multi eval_run report (JSON)"}
+                },
+                "required": ["baseline", "candidate"]
+            }),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let baseline = arg(&params, "baseline");
+        let candidate = arg(&params, "candidate");
+        let (keep, regressed) = multi_keep(&baseline, &candidate);
+        let view = match (&regressed, keep) {
+            (Some(m), _) => format!("REJECT: member `{m}` regressed"),
+            (None, true) => "KEEP: combined better, no member regressed".to_string(),
+            (None, false) => "REJECT: combined not strictly better".to_string(),
+        };
+        Ok(ToolResult::ok_view(
+            if keep { "true" } else { "false" },
+            view,
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // change_implement
 // ---------------------------------------------------------------------------
 
@@ -622,7 +813,45 @@ mod tests {
         assert_eq!(PainpointsCollectTool.spec().name, "painpoints_collect");
         assert_eq!(EvalAdoptTool.spec().name, "eval_adopt");
         assert_eq!(ScoreCompareTool.spec().name, "score_compare");
+        assert_eq!(ScoreCompareMultiTool.spec().name, "score_compare_multi");
+        assert_eq!(EvalReportMdTool.spec().name, "eval_report_md");
         assert_eq!(GradeTool.spec().name, "grade");
+    }
+
+    /// The combined-eval keep-gate must reject a candidate that lifts the overall mean while
+    /// regressing one member benchmark — otherwise a gain on one eval masks a loss on another.
+    #[test]
+    fn multi_keep_rejects_a_masked_member_regression() {
+        let base = serde_json::json!({
+            "pass_rate": 0.5,
+            "members": {
+                "syn": {"pass_rate": 0.4, "mean_check_pass_rate": 0.4},
+                "tb":  {"pass_rate": 0.6, "mean_check_pass_rate": 0.6}
+            }
+        });
+        // Combined mean rises, but `tb` regressed (0.6 → 0.3) — must be rejected.
+        let masked = serde_json::json!({
+            "pass_rate": 0.6,
+            "members": {
+                "syn": {"pass_rate": 0.9, "mean_check_pass_rate": 0.9},
+                "tb":  {"pass_rate": 0.3, "mean_check_pass_rate": 0.3}
+            }
+        });
+        let (keep, who) = multi_keep(&base, &masked);
+        assert!(!keep);
+        assert_eq!(who.as_deref(), Some("tb"));
+
+        // A candidate that improves overall and regresses nothing is kept.
+        let good = serde_json::json!({
+            "pass_rate": 0.7,
+            "members": {
+                "syn": {"pass_rate": 0.5, "mean_check_pass_rate": 0.5},
+                "tb":  {"pass_rate": 0.9, "mean_check_pass_rate": 0.9}
+            }
+        });
+        let (keep2, who2) = multi_keep(&base, &good);
+        assert!(keep2);
+        assert!(who2.is_none());
     }
 
     /// The `grade` op wraps `runner::grade`, returning the `"true"`/`"false"` string a `when` reads.

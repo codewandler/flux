@@ -112,6 +112,17 @@ impl LocalAdapter {
         Self::new("mock", tasks)
     }
 
+    /// The synthetic coding-riddle suite: short, self-contained problems with known answers, graded by
+    /// running the produced script and matching its stdout. Unlike the offline `mock` suite this drives
+    /// a *real* model and is a diagnostic workload (it surfaces tool-use friction, retry loops, etc.).
+    /// Tasks assume `python3` on PATH; the criterion fails cleanly otherwise.
+    pub fn synthetic() -> Self {
+        let json = include_str!("../../assets/synthetic-suite.json");
+        let tasks: Vec<TaskSpec> = serde_json::from_str(json)
+            .expect("embedded synthetic-suite.json must be valid TaskSpecs");
+        Self::new("synthetic", tasks)
+    }
+
     fn get(&self, id: &str) -> Option<&TaskSpec> {
         self.tasks.iter().find(|t| t.id == id)
     }
@@ -171,5 +182,14 @@ mod tests {
             })
             .unwrap();
         assert_eq!(capped.len(), 2);
+    }
+
+    #[test]
+    fn synthetic_suite_loads_all_riddles() {
+        let a = LocalAdapter::synthetic();
+        let ids = a.list_tasks(&Filter::default()).unwrap();
+        assert_eq!(ids.len(), 16);
+        assert!(ids.iter().all(|id| id.starts_with("synthetic/")));
+        assert!(ids.contains(&"synthetic/two-sum".to_string()));
     }
 }
