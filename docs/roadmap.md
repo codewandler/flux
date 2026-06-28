@@ -62,6 +62,11 @@ before every release.
 **Candidate phases (vision tail, in priority order):**
 - **Dogfood & harden** (tier 1) — drive flux's agentic mode on real coding work, capture friction as
   issues, and fix the top biters. Validates the daily-driver claim on real tasks.
+  - **Generic `bash` is now opt-in** (off-by-default `shell` group; `enable_shell`/`FLUX_ENABLE_BASH`/
+    `/shell`). Session-data analysis drove the dedicated-op coverage that makes default-off viable:
+    `expr` extended with comparison/boolean/string ops, `now`/`cwd`/`sys_info`, `len`/`first`/`last`/
+    `filter`, and the `go`/`node`/`python`/`make` toolchain ops. See
+    [designs/bash-replacement.md](designs/bash-replacement.md).
 - **SDK + crates.io** (tier 2) — **P7 landed the bulk:** a **Rust eDSL** (`flux_lang::dsl`, re-exported
   as `flux_sdk::dsl`) whose builder primitives compile to the Flux-Lang AST — loops
   (`each`/`repeat`/`loop_for`/`race`) and control-flow (`match`/`route`/`fallback`/`timeout`/`budget`)
@@ -70,7 +75,11 @@ before every release.
   (`#![warn(missing_docs)]`, crate READMEs, three runnable no-API-key examples, crates.io metadata) and
   **publish-prepped** (the 16-crate closure carries versions; topo order + runbook in
   [`crates/flux-sdk/PUBLISHING.md`](../crates/flux-sdk/PUBLISHING.md); `cargo package` validated).
-  **Blocked on a name decision before publishing:** the crate name `flux-core` is already taken on
+  A **recipe cookbook** (`flux_sdk::recipes` — routing/lookup/batch/resilience/fanout/dispatch/compose:
+  reusable, parameterized flow builders) was then folded into the SDK and made **✅ reachable from the
+  binary** via the **`flux preset`** subcommand (`list`/`help`, scaffold a recipe to a tree or JSON, or
+  `--run` it through the envelope; op-resolution gates offline-runnability) — the DSL/recipes line is no
+  longer library-only. **Blocked on a name decision before publishing:** the crate name `flux-core` is already taken on
   crates.io by an unrelated project — the namespace must be vanity-prefixed (`codewandler-flux-*`) or
   `flux-core` renamed (see the runbook §1). The real `cargo publish` is left to the maintainer (token +
   irreversible).
