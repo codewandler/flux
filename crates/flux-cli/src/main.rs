@@ -61,56 +61,9 @@ struct Cli {
     /// a bare `flux <prompt>` is refused so accidental words don't start a turn.
     prompt: Vec<String>,
 
-    /// (Hidden) Non-interactive print mode — a bare prompt is already one-shot, so this is a no-op alias.
-    #[arg(short = 'p', long = "print", hide = true, global = true)]
-    print: bool,
-
-    /// Fully-qualified `provider/model` spec. Provider must be one of:
-    ///   `anthropic` (API key), `claude` (OAuth/subscription), `openai`, `codex`, `openrouter`
-    ///   (OpenAI Chat wire), `openrouter-anthropic` (OpenRouter's native Messages endpoint —
-    ///   leak-proof tool calls), `ollama` (local, OpenAI Chat wire), `ollama-anthropic` (local
-    ///   Messages endpoint). Short aliases `sonnet`, `opus`, `haiku` are shorthands for
-    ///   `anthropic/<model>`.
-    /// Examples: `claude/claude-sonnet-4-6`, `openai/gpt-4o`, `openrouter-anthropic/z-ai/glm-4.6`.
-    /// Overrides `model` in `.flux/config.toml`; falls back to `sonnet` (= `anthropic/claude-sonnet-4-6`).
-    #[arg(short = 'm', long, global = true)]
-    model: Option<String>,
-
-    /// (Hidden) Adaptive thinking — only wired on the `-p` raw path; a no-op for the engine for now.
-    #[arg(long, hide = true, global = true)]
-    think: bool,
-
-    /// (Hidden) Reasoning effort — only wired on the `-p` raw path; a no-op for the engine for now.
-    #[arg(long, value_enum, hide = true, global = true)]
-    effort: Option<EffortArg>,
-
-    /// Maximum tokens to generate. The planner must fit the entire `emit_plan` graph in this budget,
-    /// so it is generous by default; a turn truncated here fails loudly rather than silently stopping.
-    #[arg(long, default_value_t = 16384, global = true)]
-    max_tokens: u32,
-
-    /// (Hidden) Print token usage — only wired on the `-p` raw path.
-    #[arg(long, hide = true, global = true)]
-    usage: bool,
-
-    /// (Hidden, deprecated) The Flux-Lang engine is the default for a bare prompt; this is a no-op.
-    #[arg(long, hide = true, global = true)]
-    agent: bool,
-
-    /// Auto-approve every tool call (headless). Without it, unmatched calls prompt for approval.
-    #[arg(long, global = true)]
-    yes: bool,
-
-    /// Show tool output in full (no truncation). Plans and tool inputs are always shown in full; this
-    /// also un-caps tool *output* (e.g. large file reads). Also enabled by `FLUX_VERBOSE`.
-    #[arg(short = 'v', long, global = true)]
-    verbose: bool,
-
-    /// Reveal the agent loop: stream the loop-machinery ops (`plan`/`run_plan`/`observe`/…) that are
-    /// filtered from the surface by default, so you can watch each turn iterate. Also enabled by
-    /// `FLUX_SHOW_LOOP`. See `flux loop show` for the loop itself and `/evidence` for the audit trail.
-    #[arg(long, global = true)]
-    show_loop: bool,
+    /// The flags for running an agent turn (model, --yes, …). Scoped to the agent path.
+    #[command(flatten)]
+    agent: AgentFlags,
 
     /// When to colorize output: auto (a terminal, `NO_COLOR` unset), always, or never.
     #[arg(long, value_enum, default_value_t, global = true)]
@@ -120,18 +73,6 @@ struct Cli {
     /// pass `--yes` to auto-approve all calls without a modal.
     #[arg(long)]
     tui: bool,
-
-    /// Continue the most recent session instead of starting a new one.
-    #[arg(short = 'c', long, global = true)]
-    continue_: bool,
-
-    /// Resume the most recent session (equivalent to --continue; used by hot-reload).
-    #[arg(long, global = true)]
-    resume: bool,
-
-    /// Dev mode: enables hot-reload (`flux_reload` tool) and other developer tools.
-    #[arg(long, global = true)]
-    dev: bool,
 
     /// Bind a long-running HTTP API daemon at this address (e.g. 127.0.0.1:8787).
     #[arg(long)]
@@ -147,23 +88,97 @@ struct Cli {
     output: Option<OutputFormat>,
 }
 
+/// The flags for running an agent turn — flattened into both the top-level [`Cli`] (flag-led prompts,
+/// `flux -m … "…"`) and the `run` subcommand (`flux run -m … "…"`), so they live on the agent path and
+/// stay off the other subcommands' help. (`--color` is `global` instead; it applies to every command.)
+#[derive(clap::Args, Debug)]
+struct AgentFlags {
+    /// (Hidden) Non-interactive print mode — a bare prompt is already one-shot, so this is a no-op alias.
+    #[arg(short = 'p', long = "print", hide = true)]
+    print: bool,
+
+    /// Fully-qualified `provider/model` spec. Provider must be one of:
+    ///   `anthropic` (API key), `claude` (OAuth/subscription), `openai`, `codex`, `openrouter`
+    ///   (OpenAI Chat wire), `openrouter-anthropic` (OpenRouter's native Messages endpoint —
+    ///   leak-proof tool calls), `ollama` (local, OpenAI Chat wire), `ollama-anthropic` (local
+    ///   Messages endpoint). Short aliases `sonnet`, `opus`, `haiku` are shorthands for
+    ///   `anthropic/<model>`.
+    /// Examples: `claude/claude-sonnet-4-6`, `openai/gpt-4o`, `openrouter-anthropic/z-ai/glm-4.6`.
+    /// Overrides `model` in `.flux/config.toml`; falls back to `sonnet` (= `anthropic/claude-sonnet-4-6`).
+    #[arg(short = 'm', long)]
+    model: Option<String>,
+
+    /// (Hidden) Adaptive thinking — only wired on the `-p` raw path; a no-op for the engine for now.
+    #[arg(long, hide = true)]
+    think: bool,
+
+    /// (Hidden) Reasoning effort — only wired on the `-p` raw path; a no-op for the engine for now.
+    #[arg(long, value_enum, hide = true)]
+    effort: Option<EffortArg>,
+
+    /// Maximum tokens to generate. The planner must fit the entire `emit_plan` graph in this budget,
+    /// so it is generous by default; a turn truncated here fails loudly rather than silently stopping.
+    #[arg(long, default_value_t = 16384)]
+    max_tokens: u32,
+
+    /// (Hidden) Print token usage — only wired on the `-p` raw path.
+    #[arg(long, hide = true)]
+    usage: bool,
+
+    /// (Hidden, deprecated) The Flux-Lang engine is the default for a bare prompt; this is a no-op.
+    #[arg(long, hide = true)]
+    agent: bool,
+
+    /// Auto-approve every tool call (headless). Without it, unmatched calls prompt for approval.
+    #[arg(long)]
+    yes: bool,
+
+    /// Show tool output in full (no truncation). Plans and tool inputs are always shown in full; this
+    /// also un-caps tool *output* (e.g. large file reads). Also enabled by `FLUX_VERBOSE`.
+    #[arg(short = 'v', long)]
+    verbose: bool,
+
+    /// Reveal the agent loop: stream the loop-machinery ops (`plan`/`run_plan`/`observe`/…) that are
+    /// filtered from the surface by default, so you can watch each turn iterate. Also enabled by
+    /// `FLUX_SHOW_LOOP`. See `flux loop show` for the loop itself and `/evidence` for the audit trail.
+    #[arg(long)]
+    show_loop: bool,
+
+    /// Continue the most recent session instead of starting a new one.
+    #[arg(short = 'c', long)]
+    continue_: bool,
+
+    /// Resume the most recent session (equivalent to --continue; used by hot-reload).
+    #[arg(long)]
+    resume: bool,
+
+    /// Dev mode: enables hot-reload (`flux_reload` tool) and other developer tools.
+    #[arg(long)]
+    dev: bool,
+}
+
 /// The flux subcommands. Each renders its own `flux <cmd> --help`. A first token that is NOT one of
 /// these is treated as a (flag-led) agent prompt — and a *bare* word is refused (use `flux run`).
 #[derive(clap::Subcommand, Debug)]
 enum Commands {
     /// Run the agent on a prompt, or a multi-agent program: `flux run <prompt…>` / `flux run <app.flux>`.
     Run {
-        /// The prompt words, or a path to an `<app.flux>` multi-agent program. Global flags
+        #[command(flatten)]
+        agent: AgentFlags,
+        /// The prompt words, or a path to an `<app.flux>` multi-agent program. Agent flags
         /// (`-m`, `--yes`, …) may appear before or after.
         prompt: Vec<String>,
     },
-    /// Run a benchmark suite against flux and print a summary (uses the global `-m`/`--model`).
+    /// Run a benchmark suite against flux and print a summary.
     #[command(
         after_help = "ADAPTERS:\n  synthetic       real-model coding riddles (fast, no Docker)\n  mock            offline CI fixture (drives -m mock)\n  terminal-bench  the real Docker benchmark\n  multi           several behind one combined score (with --members)\n\nEXAMPLES:\n  flux eval synthetic -m openrouter-anthropic/anthropic/claude-sonnet-4.6 --watch --report r.md\n  flux eval multi --members synthetic,terminal-bench"
     )]
     Eval {
         /// Which suite to run: synthetic | mock | terminal-bench | multi.
         adapter: String,
+        /// Model the suite's agent runs (e.g. `-m mock`, `-m openrouter-anthropic/anthropic/claude-sonnet-4.6`).
+        #[arg(short = 'm', long)]
+        model: Option<String>,
         /// Restrict to these task ids (comma-separated).
         #[arg(long, value_delimiter = ',')]
         tasks: Vec<String>,
@@ -229,6 +244,12 @@ enum FlowAction {
     Run {
         /// Path to the `.flux` DraftAst JSON.
         file: String,
+        /// Model for the program's agent steps.
+        #[arg(short = 'm', long)]
+        model: Option<String>,
+        /// Auto-approve every tool call (programs deny destructive ops without it).
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -683,7 +704,7 @@ async fn build_agent(cli: &Cli) -> Result<(FlowEngine, String, Arc<dyn flux_runt
     if cfg.enable_shell {
         std::env::set_var("FLUX_ENABLE_BASH", "1");
     }
-    let model_spec = resolve_model_spec(&cli.model, &cfg);
+    let model_spec = resolve_model_spec(&cli.agent.model, &cfg);
 
     // The built-in `mock` provider lets the full agentic loop be exercised offline via the CLI.
     let (provider, model): (Box<dyn Provider>, String) =
@@ -731,7 +752,7 @@ async fn build_agent(cli: &Cli) -> Result<(FlowEngine, String, Arc<dyn flux_runt
             sub_registry,
             system.clone(),
             model.clone(),
-            cli.max_tokens,
+            cli.agent.max_tokens,
         )
         .with_authorization(policy.clone(), caller.clone(), trust.clone()),
     );
@@ -741,7 +762,7 @@ async fn build_agent(cli: &Cli) -> Result<(FlowEngine, String, Arc<dyn flux_runt
     // (unless --yes) and "always-allow" choices are persisted back by the caller.
     let mut registry = ToolRegistry::new();
     flux_tools::register_builtins(&mut registry);
-    if cli.dev {
+    if cli.agent.dev {
         flux_tools::register_dev_builtins(&mut registry);
     }
     registry.register(Arc::new(TaskTool));
@@ -827,7 +848,7 @@ async fn build_agent(cli: &Cli) -> Result<(FlowEngine, String, Arc<dyn flux_runt
         allow.extend(["read", "glob", "grep", "search"].map(String::from));
     }
     let perms = PermissionManager::from_rules(&allow, &cfg.permissions.deny);
-    let approver: Arc<dyn Approver> = if cli.yes {
+    let approver: Arc<dyn Approver> = if cli.agent.yes {
         Arc::new(AllowApprover)
     } else {
         Arc::new(StdinApprover)
@@ -895,7 +916,7 @@ async fn build_agent(cli: &Cli) -> Result<(FlowEngine, String, Arc<dyn flux_runt
     ));
 
     let events = Arc::new(open_event_store()?);
-    let session_id = if cli.continue_ || cli.resume {
+    let session_id = if cli.agent.continue_ || cli.agent.resume {
         events
             .latest_session()
             .context("latest session")?
@@ -914,7 +935,7 @@ async fn build_agent(cli: &Cli) -> Result<(FlowEngine, String, Arc<dyn flux_runt
         flow,
         model,
         system_prompt,
-        cli.max_tokens,
+        cli.agent.max_tokens,
         25,
         load_skills(&cwd),
         compact_threshold(),
@@ -1182,14 +1203,14 @@ async fn run_plan(cli: Cli) -> Result<()> {
         eprintln!("{}", style::dim("empty plan — nothing to run"));
         return Ok(());
     }
-    if !(cli.yes || confirm_plan(risk.ops.len())) {
+    if !(cli.agent.yes || confirm_plan(risk.ops.len())) {
         eprintln!("{}", style::dim("not run"));
         return Ok(());
     }
 
     // Approved → run it through the same envelope (PlanApprover: approved ops pass without a re-prompt;
     // destructive ops still escalate to the fallback — per-op confirm, or auto under --yes).
-    let fallback: Arc<dyn Approver> = if cli.yes {
+    let fallback: Arc<dyn Approver> = if cli.agent.yes {
         Arc::new(AllowApprover)
     } else {
         Arc::new(StdinApprover)
@@ -2595,15 +2616,15 @@ async fn main() -> Result<()> {
     // We do this before `style::init` so even parse errors (before color flags are known) get color
     // when stderr is a tty — safe because `style::init` defaults to auto.
     style::init(style::ColorChoice::Auto);
-    // One clap parse handles every subcommand + `--help`/`-h`/`--version`/`help`. Agent flags are
-    // `global`, so they work top-level (`flux -m … "…"`), under `run`, and on subcommands alike.
+    // One clap parse handles every subcommand + `--help`/`-h`/`--version`/`help`. The agent (turn)
+    // flags live in `cli.agent` (flattened into the top-level path and `run`); only `--color` is global.
     let mut cli = Cli::parse();
     style::init(cli.color);
     // `-v`/`--verbose` exports `FLUX_VERBOSE`; `--show-loop` exports `FLUX_SHOW_LOOP`.
-    if cli.verbose {
+    if cli.agent.verbose {
         std::env::set_var("FLUX_VERBOSE", "1");
     }
-    if cli.show_loop {
+    if cli.agent.show_loop {
         std::env::set_var("FLUX_SHOW_LOOP", "1");
     }
 
@@ -2613,6 +2634,7 @@ async fn main() -> Result<()> {
     match cli.command.take() {
         Some(Commands::Eval {
             adapter,
+            model,
             tasks,
             members,
             limit,
@@ -2620,21 +2642,12 @@ async fn main() -> Result<()> {
             report,
             watch,
         }) => {
-            return run_eval_cmd(
-                adapter,
-                tasks,
-                members,
-                limit,
-                trials,
-                report,
-                watch,
-                cli.model.clone(),
-            )
-            .await;
+            return run_eval_cmd(adapter, tasks, members, limit, trials, report, watch, model)
+                .await;
         }
         Some(Commands::Flow {
-            action: FlowAction::Run { file },
-        }) => return run_flow(&file, cli.model.clone(), cli.yes).await,
+            action: FlowAction::Run { file, model, yes },
+        }) => return run_flow(&file, model, yes).await,
         Some(Commands::Loop { action }) => return run_loop_cmd(action),
         Some(Commands::Sessions { prune }) => return run_sessions(prune),
         Some(Commands::Auth { action }) => return run_auth(action).await,
@@ -2643,14 +2656,15 @@ async fn main() -> Result<()> {
         Some(Commands::Preset { args }) => return preset::run_preset(&args).await,
         // `flux run …` — the explicit agent/program entry. `flux run <app.flux>` runs a multi-agent
         // program; `flux run <prompt…>` runs a one-shot turn (a bare word is fine here — it's explicit).
-        Some(Commands::Run { prompt }) => {
+        Some(Commands::Run { agent, prompt }) => {
             if prompt
                 .first()
                 .map(|p| p.ends_with(".flux") || std::path::Path::new(p).is_file())
                 .unwrap_or(false)
             {
-                return run_app_cmd(prompt, cli.model.clone(), cli.yes).await;
+                return run_app_cmd(prompt, agent.model.clone(), agent.yes).await;
             }
+            cli.agent = agent;
             cli.prompt = prompt;
             explicit_run = true;
         }
@@ -2669,7 +2683,7 @@ async fn main() -> Result<()> {
         if cli.plan {
             return run_plan(cli).await;
         }
-        if cli.prompt.is_empty() && !cli.print {
+        if cli.prompt.is_empty() && !cli.agent.print {
             // No prompt → interactive REPL (also `flux run` with no prompt).
             return run_repl(cli).await;
         }
@@ -2769,7 +2783,7 @@ async fn run_app_cmd(
 
 /// Launch the HTTP API daemon.
 async fn run_serve(cli: Cli, addr: String) -> Result<()> {
-    if !cli.yes {
+    if !cli.agent.yes {
         bail!("`--serve` requires `--yes` (HTTP requests have no interactive approver)");
     }
     // The daemon auto-approves every tool call, so an unauthenticated listener is remote code
@@ -2805,7 +2819,7 @@ fn addr_is_loopback(addr: &str) -> bool {
 /// Launch the ratatui chat TUI. The TUI installs its own modal approver unless `--yes` was passed,
 /// in which case all tool calls are auto-approved (no modal).
 async fn run_tui(cli: Cli) -> Result<()> {
-    let auto_approve = cli.yes;
+    let auto_approve = cli.agent.yes;
     let (agent, session_id, _spawner) = build_agent(&cli).await?;
     flux_tui::run(agent, session_id, auto_approve).await
 }
@@ -2966,6 +2980,37 @@ mod tests {
         for want in ["--watch", "--report", "--tasks", "--members", "synthetic"] {
             assert!(help.contains(want), "`flux eval --help` missing {want:?}");
         }
+    }
+
+    /// The turn flags are scoped to the agent path (`run` + top-level), not leaked onto other
+    /// subcommands' help — and `eval` carries only its own `-m`, not the full turn-flag set.
+    #[test]
+    fn agent_flags_are_scoped_off_other_subcommands() {
+        use clap::CommandFactory;
+        let cmd = super::Cli::command();
+        let help_of = |name: &str| {
+            cmd.find_subcommand(name)
+                .unwrap_or_else(|| panic!("subcommand {name}"))
+                .clone()
+                .render_long_help()
+                .to_string()
+        };
+        for sub in ["sessions", "loop", "completion", "auth", "plugin"] {
+            let h = help_of(sub);
+            assert!(
+                !h.contains("--max-tokens"),
+                "`{sub} --help` leaks --max-tokens"
+            );
+            assert!(!h.contains("--continue"), "`{sub} --help` leaks --continue");
+        }
+        // `run` carries the turn flags; `eval` has its own `-m` but not `--max-tokens`.
+        assert!(help_of("run").contains("--max-tokens"));
+        let eval = help_of("eval");
+        assert!(eval.contains("--model"), "eval should keep its own --model");
+        assert!(
+            !eval.contains("--max-tokens"),
+            "eval should not carry the turn flags"
+        );
     }
 
     #[test]
