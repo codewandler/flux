@@ -1,19 +1,20 @@
-//! `flux-openrouter` — the `openrouter-anthropic` provider.
+//! The `openrouter-anthropic` provider.
 //!
 //! OpenRouter speaks the Anthropic **Messages** protocol at `/api/v1/messages` (model-agnostic:
 //! `model: "z-ai/glm-4.6"`, `model: "openai/gpt-4o"`, …). Routing tool calls through it yields
 //! native `tool_use` content blocks that can't leak as inline text — unlike the OpenAI Chat path
-//! (the `openrouter` provider in `flux-openai`), which some models corrupt by emitting
-//! `<tool_call>` markup. The shared wire/body/stream live in [`flux_messages`]; this crate adds the
-//! OpenRouter quirks profile and a Bearer credential with OpenRouter's attribution headers.
+//! (the `openrouter` provider in the [`crate::openai`] module), which some models corrupt by
+//! emitting `<tool_call>` markup. The shared wire/body/stream live in [`crate::messages`]; this
+//! module adds the OpenRouter quirks profile and a Bearer credential with OpenRouter's attribution
+//! headers.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::messages::{build_messages_body, map_messages_stream, MessagesQuirks, ProviderProfile};
 use flux_core::{Error, Result};
-use flux_messages::{build_messages_body, map_messages_stream, MessagesQuirks, ProviderProfile};
 use flux_provider::{ByteStream, ChunkStream, Credential, NativeProvider, Request, WireCodec};
 
 const OPENROUTER_MESSAGES_ENDPOINT: &str = "https://openrouter.ai/api/v1/messages";

@@ -1,6 +1,6 @@
-//! `flux-openai` — OpenAI-family wire codecs and credentials.
+//! OpenAI-family wire codecs and credentials.
 //!
-//! This crate implements the **Chat Completions** wire codec (used by the `openai` and
+//! This module implements the **Chat Completions** wire codec (used by the `openai` and
 //! `openrouter` providers) and a single generic Bearer-token credential (`OpenAiCred`) that
 //! covers API-key and OAuth-subscription transports. The **Responses** codec and the `codex`
 //! ChatGPT-subscription provider land in the next increment alongside `flux-credentials`

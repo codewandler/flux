@@ -20,15 +20,15 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use flux_agent::{AgentSink, DEFAULT_SYSTEM_PROMPT};
-use flux_anthropic::anthropic_from_env;
 use flux_context::{EnvContext, GitContext, ProjectFiles, Projector, RepoSignal};
 use flux_core::{Chunk, ContentBlock, StopReason, Usage};
 use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
 use flux_flow::state::FlowStore;
-use flux_openai::{ollama_api, openai_from_env, openrouter_from_env};
 use flux_orchestrate::{LocalSpawner, ProviderFactory, Role, RoleRegistry, TaskTool};
 use flux_provider::{ChunkStream, Effort, NativeProvider, Provider, Request};
+use flux_providers::anthropic::anthropic_from_env;
+use flux_providers::openai::{ollama_api, openai_from_env, openrouter_from_env};
 use flux_runtime::{
     AllowApprover, ApprovalChoice, Approver, Executor, PermissionManager, ToolContext,
     ToolRegistry, ToolResult,
@@ -252,18 +252,18 @@ fn build_provider(spec: &str) -> Result<(NativeProvider, String)> {
         "openrouter" => openrouter_from_env().context("openrouter provider")?,
         // OpenRouter over its native Anthropic Messages endpoint — tool calls come back as
         // structured `tool_use` blocks instead of leaking as `<tool_call>` text on the Chat path.
-        "openrouter-anthropic" => flux_openrouter::openrouter_anthropic_from_env()
+        "openrouter-anthropic" => flux_providers::openrouter::openrouter_anthropic_from_env()
             .context("openrouter-anthropic provider")?,
         "ollama" => ollama_api(),
         // Local ollama over its Anthropic Messages endpoint (latest ollama), for native tool calls.
-        "ollama-anthropic" => flux_ollama::ollama_anthropic_api(),
+        "ollama-anthropic" => flux_providers::ollama::ollama_anthropic_api(),
         "claude" => {
             let ts = flux_credentials::claude_token_source().context("claude provider")?;
-            flux_anthropic::claude_oauth(ts)
+            flux_providers::anthropic::claude_oauth(ts)
         }
         "codex" => {
             let ts = flux_credentials::codex_token_source().context("codex provider")?;
-            flux_openai::codex_oauth(ts)
+            flux_providers::openai::codex_oauth(ts)
         }
         other => bail!(
             "unknown provider `{other}` (known: {})",

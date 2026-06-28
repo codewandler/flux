@@ -224,7 +224,7 @@ Recipes are op-agnostic templates, so a preset runs offline whenever its ops res
 ## Library use (`flux-sdk`)
 
 ```rust
-let provider = Box::new(flux_anthropic::anthropic_from_env()?);
+let provider = Box::new(flux_providers::anthropic::anthropic_from_env()?);
 let client = flux_sdk::Client::builder().model("anthropic/opus").build(provider, ".")?;
 let out = client.run("Summarize the README").await?;
 println!("{}", out.text);

@@ -14,10 +14,7 @@ path = "src/main.rs"
 [dependencies]
 flux-core.workspace = true
 flux-provider.workspace = true
-flux-anthropic.workspace = true
-flux-openrouter.workspace = true
-flux-ollama.workspace = true
-flux-openai.workspace = true
+flux-providers.workspace = true
 flux-credentials.workspace = true
 flux-runtime.workspace = true
 flux-spec.workspace = true

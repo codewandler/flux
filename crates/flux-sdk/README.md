@@ -112,7 +112,7 @@ let flow = route_intent(
 ## Providers
 
 `flux-sdk` is provider-agnostic — pass any `flux_provider::Provider`. The concrete backends
-(`flux-anthropic`, `flux-openai`) live in their own crates so the SDK stays light.
+live in `flux-providers` (modules `anthropic`/`openai`/`openrouter`/`ollama`) so the SDK stays light.
 
 ## License
 

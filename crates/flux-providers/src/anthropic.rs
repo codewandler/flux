@@ -1,7 +1,7 @@
-//! `flux-anthropic` — the `anthropic` and `claude` providers.
+//! The `anthropic` and `claude` providers.
 //!
 //! Both speak the Anthropic **Messages** protocol; the wire schema, body builder, and SSE mapper
-//! live in [`flux_messages`]. This crate keeps only what is Anthropic-direct: the codec's quirks
+//! live in [`crate::messages`]. This module keeps only what is Anthropic-direct: the codec's quirks
 //! ([`AnthropicProfile`] — full feature set: prompt caching, adaptive thinking, effort config) and
 //! the two credentials that ride on it — `ApiKeyAnthropic` (the `anthropic` provider, `x-api-key`)
 //! and `OAuthAnthropic` (the `claude` provider — Claude Max / Claude-Code subscription OAuth).
@@ -11,8 +11,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::messages::{build_messages_body, map_messages_stream, MessagesQuirks, ProviderProfile};
 use flux_core::{Error, Result};
-use flux_messages::{build_messages_body, map_messages_stream, MessagesQuirks, ProviderProfile};
 use flux_provider::{
     ByteStream, ChunkStream, Credential, NativeProvider, Request, TokenSource, WireCodec,
 };
@@ -167,7 +167,7 @@ mod tests {
     #[test]
     fn codec_builds_a_messages_body_with_anthropic_quirks() {
         // A long system prompt must come back cache-controlled (the Anthropic profile turns caching
-        // on), proving the codec routes through flux-messages with the right quirks.
+        // on), proving the codec routes through crate::messages with the right quirks.
         let big = "x".repeat(8192);
         let req = Request::new("claude-opus-4-8", "hi").with_system(big.clone());
         let body = AnthropicMessages.build_body(&req).unwrap();

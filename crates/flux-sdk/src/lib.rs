@@ -1,7 +1,7 @@
 //! `flux-sdk` — the high-level library API.
 //!
 //! Wraps the agent loop, built-in tools, the safety envelope, and a session into a small
-//! [`Client`]. You supply a [`Provider`] (from `flux-anthropic`/`flux-openai`) and a workspace
+//! [`Client`]. You supply a [`Provider`] (from `flux-providers`) and a workspace
 //! root; the SDK wires the rest.
 //!
 //! There are three front doors: [`Client`] (this classic agent loop), [`FlowClient`] (the Flux-Lang
@@ -14,7 +14,7 @@
 //! // Runnable hermetic version: `cargo run -p flux-sdk --example client_basic`.
 //! # async fn ex() -> flux_core::Result<()> {
 //! use flux_sdk::Client;
-//! let provider = Box::new(flux_anthropic::anthropic_from_env()?);
+//! let provider = Box::new(flux_providers::anthropic::anthropic_from_env()?);
 //! let client = Client::builder().auto_approve(true).build(provider, ".")?;
 //! let out = client.run("Summarize the README").await?;
 //! println!("{}", out.text);

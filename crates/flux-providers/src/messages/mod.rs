@@ -1,4 +1,4 @@
-//! `flux-messages` — the shared **Anthropic Messages** protocol core.
+//! The shared **Anthropic Messages** protocol core.
 //!
 //! Anthropic-direct, OpenRouter, and ollama all speak the Messages wire (`POST /v1/messages`, SSE
 //! streaming, native `tool_use` content blocks). This crate owns the parts they share — the wire
@@ -26,8 +26,8 @@ mod wire;
 pub use quirks::{MessagesQuirks, ProviderProfile};
 use wire::{StreamEvent, WireBlock, WireDelta};
 
-// Convenience re-exports so provider crates can depend on `flux-messages` alone for the request
-// shape they build against.
+// Convenience re-exports so the sibling provider modules get the request shape they build against
+// straight from `crate::messages`.
 pub use flux_provider::{Effort, Request, ToolDef};
 
 // ---------------------------------------------------------------------------
@@ -133,6 +133,7 @@ fn role_str(role: Role) -> &'static str {
 /// streaming structured arguments:
 ///   - **trailing junk** after a complete value — e.g. an extra `}` (deepseek-v4-flash via OpenRouter)
 ///   - **an unterminated tail** — a missing trailing `}`/`]` or an open string (glm-5.2 via OpenRouter)
+///
 /// Reads the first JSON value (ignoring anything after it); if that fails, balances the unclosed
 /// brackets/strings once and retries.
 fn parse_tool_input(json: &str) -> std::result::Result<Value, serde_json::Error> {

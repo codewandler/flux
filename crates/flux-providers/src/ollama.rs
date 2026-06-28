@@ -1,18 +1,19 @@
-//! `flux-ollama` — the `ollama-anthropic` provider (local models over the Messages protocol).
+//! The `ollama-anthropic` provider (local models over the Messages protocol).
 //!
 //! Ollama (latest) serves an Anthropic **Messages** compatible endpoint with tool calling at
 //! `{OLLAMA_HOST}/v1/messages`, so local models (Qwen, Hermes, …) can return native `tool_use`
 //! blocks instead of leaking `<tool_call>` markup through the OpenAI Chat path (the `ollama`
-//! provider in `flux-openai`). The shared wire/body/stream live in [`flux_messages`]; this crate
-//! adds the ollama quirks profile and a no-auth transport that honours `OLLAMA_HOST`.
+//! provider in the [`crate::openai`] module). The shared wire/body/stream live in
+//! [`crate::messages`]; this module adds the ollama quirks profile and a no-auth transport that
+//! honours `OLLAMA_HOST`.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::messages::{build_messages_body, map_messages_stream, MessagesQuirks, ProviderProfile};
 use flux_core::Result;
-use flux_messages::{build_messages_body, map_messages_stream, MessagesQuirks, ProviderProfile};
 use flux_provider::{ByteStream, ChunkStream, Credential, NativeProvider, Request, WireCodec};
 
 const DEFAULT_MESSAGES_ENDPOINT: &str = "http://localhost:11434/v1/messages";

@@ -78,9 +78,9 @@ Crates **not** in the closure (`flux-app`, `flux-tui`, `flux-server`, `flux-eval
 provider backends, …) are **not** published by this runbook and stay path-only in
 `[workspace.dependencies]`.
 
-> **Provider backends.** `flux-sdk` is provider-agnostic, so `flux-anthropic` / `flux-openai` are *not*
-> in the closure. A user embedding the SDK still needs a concrete provider — publishing those (and their
-> own small closures: `flux-credentials`, …) is a sensible follow-on, scoped separately.
+> **Provider backends.** `flux-sdk` is provider-agnostic, so `flux-providers` (the concrete clients) is
+> *not* in the closure. A user embedding the SDK still needs a concrete provider — publishing it (and its
+> own small closure: `flux-credentials`, …) is a sensible follow-on, scoped separately.
 
 ## 3. Version metadata (already applied)
 

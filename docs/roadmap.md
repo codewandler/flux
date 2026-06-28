@@ -1,7 +1,7 @@
 # flux — roadmap & status
 
 Status as of **0.2.4 (2026-06-25)**: public + installable at
-[codewandler/flux](https://github.com/codewandler/flux); 34 crates, **450+ tests**, a permanently green
+[codewandler/flux](https://github.com/codewandler/flux); 33 crates, **450+ tests**, a permanently green
 gate (tests, clippy `-D warnings`, fmt, the `flux-codegate` layering lint). See
 [CHANGELOG.md](../CHANGELOG.md) for the released history and [architecture.md](architecture.md) for the
 design.
@@ -60,6 +60,13 @@ before every release.
 ## Next
 
 **Candidate phases (vision tail, in priority order):**
+- **Crate consolidation** — shrink the workspace by merging coherent *same-layer* siblings (keeps the
+  `flux-codegate` layering lint green). **Phase 1 ✅ shipped:** the five L1 provider crates
+  (`flux-messages`/`flux-anthropic`/`flux-openrouter`/`flux-ollama`/`flux-openai`) collapsed into one
+  `flux-providers` crate with per-provider modules (L1: 7→3; workspace 37→33), keeping `flux-provider`
+  (the published abstraction) and `flux-credentials` separate. Phases 2–4 (L4 `hooks`+`plugin`, L5
+  `browser`+`datasource`, L2 `context`→`runtime`, the orphan `integrations`) are tracked in
+  [designs/crate-consolidation.md](designs/crate-consolidation.md) — projected ~28–29 crates.
 - **Dogfood & harden** (tier 1) — drive flux's agentic mode on real coding work, capture friction as
   issues, and fix the top biters. Validates the daily-driver claim on real tasks.
   - **Generic `bash` is now opt-in** (off-by-default `shell` group; `enable_shell`/`FLUX_ENABLE_BASH`/
