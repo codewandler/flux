@@ -1,0 +1,110 @@
+<templateSet group="Flux">
+  <template name="flow" value="flow $NAME$ -> $RET$&#10;  $END$"
+            description="flow declaration" toReformat="false" toShortenFQNames="false">
+    <variable name="NAME" expression="" defaultValue="&quot;name&quot;" alwaysStopAt="true"/>
+    <variable name="RET" expression="" defaultValue="&quot;String&quot;" alwaysStopAt="true"/>
+    <context><option name="FLUX" value="true"/></context>
+  </template>
+
+  <template name="flowp" value="flow $NAME$($PARAMS$) -> $RET$&#10;  $END$"
+            description="flow with params" toReformat="false">
+    <variable name="NAME" expression="" defaultValue="&quot;name&quot;" alwaysStopAt="true"/>
+    <variable name="PARAMS" expression="" defaultValue="&quot;arg: String&quot;" alwaysStopAt="true"/>
+    <variable name="RET" expression="" defaultValue="&quot;String&quot;" alwaysStopAt="true"/>
+    <context><option name="FLUX" value="true"/></context>
+  </template>
+
+  <template name="when" value="when $COND$&#10;  $END$"
+            description="when conditional" toReformat="false">
+    <variable name="COND" expression="" defaultValue="&quot;$cond&quot;" alwaysStopAt="true"/>
+    <context><option name="FLUX" value="true"/></context>
+  </template>
+
+  <template name="whenelse" value="when $COND$&#10;  $THEN$&#10;else&#10;  $END$"
+            description="when / else" toReformat="false">
+    <variable name="COND" expression="" defaultValue="&quot;$cond&quot;" alwaysStopAt="true"/>
+    <variable name="THEN" expression="" defaultValue="" alwaysStopAt="true"/>
+    <context><option name="FLUX" value="true"/></context>
+  </template>
+
+  <template name="unless" value="unless $COND$&#10;  $END$"
+            description="unless guard" toReformat="false">
+    <variable name="COND" expression="" defaultValue="&quot;$ok&quot;" alwaysStopAt="true"/>
+    <context><option name="FLUX" value="true"/></context>
+  </template>
+
+  <template name="repeat" value="repeat $N$&#10;  $END$"
+            description="bounded repeat loop" toReformat="false">
+    <variable name="N" expression="" defaultValue="&quot;5&quot;" alwaysStopAt="true"/>
+    <context><option name="FLUX" value="true"/></context>
+  </template>
+
+  <template name="repeatu" value="repeat $N$&#10;  until $DONE$&#10;  $END$"
+            description="repeat with until early-exit" toReformat="false">
+    <variable name="N" expression="" defaultValue="&quot;10&quot;" alwaysStopAt="true"/>
+    <variable name="DONE" expression="" defaultValue="&quot;$done&quot;" alwaysStopAt="true"/>
+    <context><option name="FLUX" value="true"/></context>
+  </template>
+
+  <template name="each" value="each $ITEM$ in $LIST$&#10;  $END$"
+            description="each loop over a list" toReformat="false">
+    <variable name="ITEM" expression="" defaultValue="&quot;$item&quot;" alwaysStopAt="true"/>
+    <variable name="LIST" expression="" defaultValue="&quot;$items&quot;" alwaysStopAt="true"/>
+    <context><option name="FLUX" value="true"/></context>
+  </template>
+
+  <template name="eachc" value="each $ITEM$ in $LIST$ -> $COLLECT$&#10;  $END$"
+            description="each with collected result" toReformat="false">
+    <variable name="ITEM" expression="" defaultValue="&quot;$item&quot;" alwaysStopAt="true"/>
+    <variable name="LIST" expression="" defaultValue="&quot;$items&quot;" alwaysStopAt="true"/>
+    <variable name="COLLECT" expression="" defaultValue="&quot;$results&quot;" alwaysStopAt="true"/>
+    <context><option name="FLUX" value="true"/></context>
+  </template>
+
+  <template name="match" value="match $SUBJECT$&#10;  case $VALUE$&#10;    $THEN$&#10;  default&#10;    $END$"
+            description="match / case / default" toReformat="false">
+    <variable name="SUBJECT" expression="" defaultValue="&quot;$kind&quot;" alwaysStopAt="true"/>
+    <variable name="VALUE" expression="" defaultValue="&quot;&quot;&quot;ok&quot;&quot;&quot;" alwaysStopAt="true"/>
+    <variable name="THEN" expression="" defaultValue="" alwaysStopAt="true"/>
+    <context><option name="FLUX" value="true"/></context>
+  </template>
+
+  <template name="tryc" value="try&#10;  $BODY$&#10;catch $ERR$&#10;  $END$"
+            description="try / catch" toReformat="false">
+    <variable name="BODY" expression="" defaultValue="" alwaysStopAt="true"/>
+    <variable name="ERR" expression="" defaultValue="&quot;$err&quot;" alwaysStopAt="true"/>
+    <context><option name="FLUX" value="true"/></context>
+  </template>
+
+  <template name="retry" value="retry $N$, backoff: exponential, delay: $DELAY$ -> $OUT$&#10;  $END$"
+            description="retry with backoff" toReformat="false">
+    <variable name="N" expression="" defaultValue="&quot;3&quot;" alwaysStopAt="true"/>
+    <variable name="DELAY" expression="" defaultValue="&quot;500&quot;" alwaysStopAt="true"/>
+    <variable name="OUT" expression="" defaultValue="&quot;$out&quot;" alwaysStopAt="true"/>
+    <context><option name="FLUX" value="true"/></context>
+  </template>
+
+  <template name="confirm" value="confirm $MSG$, risk: $RISK$&#10;  $END$"
+            description="human-in-the-loop approval gate" toReformat="false">
+    <variable name="MSG" expression="" defaultValue="&quot;&quot;&quot;Proceed?&quot;&quot;&quot;" alwaysStopAt="true"/>
+    <variable name="RISK" expression="" defaultValue="&quot;medium&quot;" alwaysStopAt="true"/>
+    <context><option name="FLUX" value="true"/></context>
+  </template>
+
+  <template name="parallel" value="parallel&#10;  $A$:&#10;    $ABODY$&#10;  $B$:&#10;    $END$"
+            description="parallel branches" toReformat="false">
+    <variable name="A" expression="" defaultValue="&quot;$first&quot;" alwaysStopAt="true"/>
+    <variable name="ABODY" expression="" defaultValue="" alwaysStopAt="true"/>
+    <variable name="B" expression="" defaultValue="&quot;$second&quot;" alwaysStopAt="true"/>
+    <context><option name="FLUX" value="true"/></context>
+  </template>
+
+  <template name="ctx" value="ctx $NAME$&#10;  purpose $PURPOSE$&#10;  budget $BUDGET$&#10;  include $INCLUDE$"
+            description="context pack" toReformat="false">
+    <variable name="NAME" expression="" defaultValue="&quot;$pack&quot;" alwaysStopAt="true"/>
+    <variable name="PURPOSE" expression="" defaultValue="&quot;&quot;&quot;debug&quot;&quot;&quot;" alwaysStopAt="true"/>
+    <variable name="BUDGET" expression="" defaultValue="&quot;9000&quot;" alwaysStopAt="true"/>
+    <variable name="INCLUDE" expression="" defaultValue="&quot;$src&quot;" alwaysStopAt="true"/>
+    <context><option name="FLUX" value="true"/></context>
+  </template>
+</templateSet>

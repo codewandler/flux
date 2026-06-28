@@ -1,0 +1,83 @@
+<idea-plugin>
+    <id>dev.flux.intellij</id>
+    <name>Flux-Lang</name>
+    <vendor url="https://github.com/codewandler/flux">codewandler</vendor>
+
+    <description><![CDATA[
+        Editor support for <b>Flux-Lang</b> (<code>.flux</code>) — the typed execution-graph language
+        that flux compiles plans into. Tier 1: file-type recognition and syntax highlighting
+        (keywords, <code>$symbols</code>, strings, <code>{interpolation}</code>, numbers, <code>@annotations</code>,
+        types, <code>#</code> comments), line commenting, and brace matching. No semantic analysis yet.
+    ]]></description>
+
+    <!-- Platform-only: works in every JetBrains IDE (IDEA, RustRover, CLion, …). -->
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <fileType
+            name="Flux-Lang"
+            language="Flux-Lang"
+            implementationClass="dev.flux.intellij.FluxFileType"
+            fieldName="INSTANCE"
+            extensions="flux"/>
+
+        <lang.parserDefinition
+            language="Flux-Lang"
+            implementationClass="dev.flux.intellij.lang.FluxParserDefinition"/>
+
+        <lang.syntaxHighlighterFactory
+            language="Flux-Lang"
+            implementationClass="dev.flux.intellij.highlight.FluxSyntaxHighlighterFactory"/>
+
+        <lang.commenter
+            language="Flux-Lang"
+            implementationClass="dev.flux.intellij.FluxCommenter"/>
+
+        <lang.braceMatcher
+            language="Flux-Lang"
+            implementationClass="dev.flux.intellij.FluxBraceMatcher"/>
+
+        <lang.foldingBuilder
+            language="Flux-Lang"
+            implementationClass="dev.flux.intellij.editor.FluxFoldingBuilder"/>
+
+        <lang.documentationProvider
+            language="Flux-Lang"
+            implementationClass="dev.flux.intellij.editor.FluxDocumentationProvider"/>
+
+        <completion.contributor
+            language="Flux-Lang"
+            implementationClass="dev.flux.intellij.editor.FluxCompletionContributor"/>
+
+        <externalAnnotator
+            language="Flux-Lang"
+            implementationClass="dev.flux.intellij.editor.FluxExternalAnnotator"/>
+
+        <lang.psiStructureViewFactory
+            language="Flux-Lang"
+            implementationClass="dev.flux.intellij.editor.FluxStructureViewFactory"/>
+
+        <colorSettingsPage
+            implementation="dev.flux.intellij.highlight.FluxColorSettingsPage"/>
+
+        <liveTemplateContext
+            contextId="FLUX"
+            implementation="dev.flux.intellij.templates.FluxTemplateContextType"/>
+        <defaultLiveTemplates file="liveTemplates/Flux"/>
+    </extensions>
+
+    <actions>
+        <group id="dev.flux.intellij.FluxActions" text="Flux-Lang" popup="true">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+            <action id="dev.flux.intellij.ShowPlan"
+                    class="dev.flux.intellij.actions.FluxShowPlanAction"
+                    text="Preview Plan (Tree)"
+                    description="Compile this .flux file and show the rendered plan tree"/>
+            <action id="dev.flux.intellij.ShowAst"
+                    class="dev.flux.intellij.actions.FluxShowAstAction"
+                    text="Show AST (JSON)"
+                    description="Compile this .flux file to its JSON AST"/>
+        </group>
+    </actions>
+</idea-plugin>
