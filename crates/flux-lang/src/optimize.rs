@@ -6,22 +6,37 @@
 //! runs its nested bodies). [`NodeId`] is the index into the top-level `body`;
 //! [`crate::runtime::execute_plan`] runs the result.
 //!
+//! Two eliminations run alongside the scheduler:
+//! - **Dead-step elimination** drops a read-only `bind` whose symbol is read nowhere in the flow (it
+//!   has no observable effect), except the final result statement.
+//! - **Common-subexpression elimination (CSE)** dedupes an identical read-only, *deterministic*
+//!   (`Idempotent`) call: the second `$b = op(args)` is dispatched once as `$a`'s value and reused via a
+//!   [`Stage::Alias`] — provided no intervening node rebinds a symbol the call reads and no side effect
+//!   runs between them. Non-idempotent reads (a clock/random) are never deduped.
+//!
 //! **Soundness:** only consecutive *simple read-only binds* whose reads are the explicit `Var` names
 //! in their call args are reordered into a batch, and program order is preserved across every batch
 //! boundary — so no read-after-write / write-after-write hazard can cross a stage. A node whose reads
-//! can't be determined precisely (anything but a read-only `bind`-of-`call`) is never batched.
+//! can't be determined precisely (anything but a read-only `bind`-of-`call`) is never batched. CSE
+//! reuses a value only when the op is deterministic and the inputs are provably unchanged; a CSE source
+//! is kept live so dead-step never removes it out from under an alias.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use flux_spec::Effect;
+use flux_spec::{Effect, Idempotency};
 
-use crate::ast::{HirFlow, Node, NodeId, PhysicalPlan, Stage};
+use crate::ast::{HirFlow, Node, NodeId, PhysicalPlan, Stage, SymbolName};
 use crate::opspec::OpCatalog;
 
 /// Lower a [`HirFlow`] to a [`PhysicalPlan`] (see the module docs for the scheduling rules).
 pub fn optimize(hir: &HirFlow, ops: &dyn OpCatalog) -> PhysicalPlan {
     let mut stages: Vec<Stage> = Vec::new();
     let mut batch = Batch::default();
+
+    // Common-subexpression elimination: a read-only, deterministic op called twice with the same args
+    // (no intervening invalidation) is dispatched once; the duplicate becomes a `Stage::Alias` that
+    // copies the earlier result. Computed up front over the whole body, applied per node below.
+    let aliases = cse_aliases(&hir.body, ops);
 
     // Dead-step elimination: a read-only `bind` whose symbol is read nowhere in the flow has no
     // observable effect, so drop it from the schedule. The flow's final top-level statement is never
@@ -30,11 +45,26 @@ pub fn optimize(hir: &HirFlow, ops: &dyn OpCatalog) -> PhysicalPlan {
     // would catch; keeping it is sound, just less optimal.
     let mut live = BTreeSet::new();
     collect_reads_deep(&hir.body, &mut live);
+    // A CSE *source* is read by its alias, so it must survive dead-step elimination even if no real
+    // node reads it.
+    for (_, source) in aliases.values() {
+        live.insert(source.0.clone());
+    }
     let last = hir.body.len().saturating_sub(1);
     let is_dead = |i: usize, node: &Node| i != last && is_dead_readonly_bind(node, ops, &live);
 
     for (i, node) in hir.body.iter().enumerate() {
         if is_dead(i, node) {
+            continue;
+        }
+        if let Some((target, source)) = aliases.get(&i) {
+            // The `source` is an earlier node, so its stage is already emitted; flush the batch so the
+            // alias runs after it.
+            batch.flush(&mut stages);
+            stages.push(Stage::Alias {
+                target: target.clone(),
+                source: source.clone(),
+            });
             continue;
         }
         match readonly_bind(node, ops) {
@@ -239,29 +269,88 @@ fn is_dead_readonly_bind(node: &Node, ops: &dyn OpCatalog, live: &BTreeSet<Strin
     is_readonly_op(op, ops) && !live.contains(&name.0)
 }
 
+/// A read-only op whose result is a deterministic function of its inputs (`Idempotent`) — safe for CSE
+/// to **reuse** a prior result. Stronger than [`is_readonly_op`]: a read-only but *non*-idempotent op
+/// (a clock/random read) must NOT be deduplicated, because its two calls can legitimately differ.
+fn is_deterministic_readonly(op: &str, ops: &dyn OpCatalog) -> bool {
+    match ops.lookup(op) {
+        Some(sig) => {
+            sig.effects.iter().all(|e| matches!(e, Effect::Read))
+                && matches!(sig.idempotency, Idempotency::Idempotent)
+        }
+        None => false,
+    }
+}
+
+/// Common-subexpression elimination over the top-level body: return, for each top-level node index that
+/// duplicates an earlier identical read-only deterministic call, the pair `(target, source)` — its own
+/// bound symbol and the earlier symbol whose already-computed value it can reuse.
+///
+/// **Soundness.** Two `$a = op(args)` / `$b = op(args)` may share a value only when `op` is read-only +
+/// deterministic and the inputs are unchanged between them. Conservatively: any node that is not a
+/// deterministic read-only `bind`-of-`call` *clears* the table (a write / side-effecting op / control
+/// flow could change shared state or a read symbol); and a cached call is dropped as soon as a later
+/// node rebinds a symbol it reads (its input changed). Keys are the canonical JSON of the `call`
+/// (`Node: Serialize`), so identical op+args collide and differing args do not.
+fn cse_aliases(body: &[Node], ops: &dyn OpCatalog) -> BTreeMap<usize, (SymbolName, SymbolName)> {
+    let mut aliases = BTreeMap::new();
+    // canonical `call` JSON -> (first symbol bound to that call, the symbols the call reads)
+    let mut seen: BTreeMap<String, (SymbolName, BTreeSet<String>)> = BTreeMap::new();
+    for (i, node) in body.iter().enumerate() {
+        let Node::Bind { name, value, .. } = node else {
+            seen.clear();
+            continue;
+        };
+        let Node::Call { op, args } = value.as_ref() else {
+            // A pure non-call bind (expr/fmt/jq/…) still rebinds `name`; reset conservatively.
+            seen.clear();
+            continue;
+        };
+        if !is_deterministic_readonly(op, ops) {
+            // Side-effecting or non-deterministic: its result can't be reused, and a side effect may
+            // invalidate other cached reads — reset.
+            seen.clear();
+            continue;
+        }
+        let key = serde_json::to_string(value.as_ref()).unwrap_or_default();
+        if let Some((source, _)) = seen.get(&key) {
+            aliases.insert(i, (name.clone(), source.clone()));
+        } else {
+            let mut reads = BTreeSet::new();
+            collect_var_reads(args, &mut reads);
+            seen.insert(key, (name.clone(), reads));
+        }
+        // This node (re)binds `name`, so any cached call that reads `name` is now stale for later nodes.
+        seen.retain(|_, (_, reads)| !reads.contains(&name.0));
+    }
+    aliases
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::opspec::OpSignature;
 
-    /// `read` is read-only (effect `Read`); `write` mutates (effect `Write`); `pure` has no effects.
+    /// `read` is read-only + deterministic; `pure` has no effects; `write` mutates; `now` is read-only
+    /// but **non-deterministic** (`NonIdempotent`) — read-only enough to batch, but NOT safe to CSE.
     struct Cat;
     impl OpCatalog for Cat {
         fn lookup(&self, name: &str) -> Option<OpSignature> {
-            let mk = |effects: Vec<Effect>| OpSignature {
+            let mk = |effects: Vec<Effect>, idempotency: Idempotency| OpSignature {
                 name: name.into(),
                 description: String::new(),
                 effects,
                 risk: flux_spec::Risk::Low,
-                idempotency: flux_spec::Idempotency::Idempotent,
+                idempotency,
                 required_params: vec!["x".into()],
                 optional_params: Vec::new(),
                 param_types: Default::default(),
             };
             match name {
-                "read" => Some(mk(vec![Effect::Read])),
-                "pure" => Some(mk(Vec::new())),
-                "write" => Some(mk(vec![Effect::Write])),
+                "read" => Some(mk(vec![Effect::Read], Idempotency::Idempotent)),
+                "pure" => Some(mk(Vec::new(), Idempotency::Idempotent)),
+                "write" => Some(mk(vec![Effect::Write], Idempotency::NonIdempotent)),
+                "now" => Some(mk(vec![Effect::Read], Idempotency::NonIdempotent)),
                 _ => None,
             }
         }
@@ -437,5 +526,92 @@ mod tests {
         // a single unread read is the flow's result, so it must survive.
         let stages = plan(vec![bind("a", "read", vec![lit("x")])]);
         assert_eq!(stages, vec![Stage::Sequential(NodeId(0))]);
+    }
+
+    fn has_alias(stages: &[Stage]) -> bool {
+        stages.iter().any(|s| matches!(s, Stage::Alias { .. }))
+    }
+
+    #[test]
+    fn duplicate_read_only_call_is_aliased_and_dispatched_once() {
+        // $a = read "x"; $b = read "x" (identical, read-only, deterministic); $r consumes both.
+        // The second read collapses into an Alias of the first — one dispatch, $b reuses $a's value.
+        let stages = plan(vec![
+            bind("a", "read", vec![lit("x")]),
+            bind("b", "read", vec![lit("x")]),
+            bind("r", "read", vec![lit("{{a}}{{b}}")]),
+        ]);
+        assert_eq!(
+            stages,
+            vec![
+                Stage::Sequential(NodeId(0)),
+                Stage::Alias {
+                    target: SymbolName("b".into()),
+                    source: SymbolName("a".into()),
+                },
+                Stage::Sequential(NodeId(2)),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_nondeterministic_read_is_never_aliased() {
+        // `now` is read-only but NonIdempotent — two calls may differ, so CSE must NOT dedupe them.
+        let stages = plan(vec![
+            bind("a", "now", vec![lit("x")]),
+            bind("b", "now", vec![lit("x")]),
+            bind("r", "read", vec![lit("{{a}}{{b}}")]),
+        ]);
+        assert!(
+            !has_alias(&stages),
+            "non-idempotent reads are not CSE'd: {stages:?}"
+        );
+    }
+
+    #[test]
+    fn an_intervening_rebind_of_a_read_symbol_blocks_cse() {
+        // $a = read "{{cfg}}"; $cfg = read "c2" (rebinds cfg); $b = read "{{cfg}}".
+        // $a and $b are textually identical calls, but $b reads a DIFFERENT cfg, so no alias.
+        let stages = plan(vec![
+            bind("cfg", "read", vec![lit("c")]),
+            bind("a", "read", vec![lit("{{cfg}}")]),
+            bind("cfg", "read", vec![lit("c2")]),
+            bind("b", "read", vec![lit("{{cfg}}")]),
+            bind("r", "read", vec![lit("{{a}}{{b}}")]),
+        ]);
+        assert!(
+            !has_alias(&stages),
+            "an intervening rebind of a read symbol blocks CSE: {stages:?}"
+        );
+    }
+
+    #[test]
+    fn a_side_effecting_op_between_clears_cse() {
+        // $a = read "x"; $w = write "y" (side effect); $b = read "x". The write could change what the
+        // read observes, so the cached value is dropped — no alias.
+        let stages = plan(vec![
+            bind("a", "read", vec![lit("x")]),
+            bind("w", "write", vec![lit("y")]),
+            bind("b", "read", vec![lit("x")]),
+            bind("r", "read", vec![lit("{{a}}{{b}}")]),
+        ]);
+        assert!(
+            !has_alias(&stages),
+            "a side-effecting op between identical reads blocks CSE: {stages:?}"
+        );
+    }
+
+    #[test]
+    fn distinct_args_are_not_aliased() {
+        // read "x" and read "y" are different calls — never deduped.
+        let stages = plan(vec![
+            bind("a", "read", vec![lit("x")]),
+            bind("b", "read", vec![lit("y")]),
+            bind("r", "read", vec![lit("{{a}}{{b}}")]),
+        ]);
+        assert!(
+            !has_alias(&stages),
+            "distinct args are not CSE'd: {stages:?}"
+        );
     }
 }

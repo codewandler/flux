@@ -101,8 +101,10 @@ before every release.
   primitives** — `scope` (RAII cleanup), `saga`/`compensate` (reverse-order unwind), `once`
   (at-most-once side effect), `checkpoint` (durable resume point) — on a narrow `DurableStore` seam
   (`FlowStore` folds them out of the append-only event log), plus a **dead-step optimizer pass**
-  (drop read-only binds whose result is never used). Remaining (optional): deeper optimizer passes
-  (CSE, predicate pushdown), `checkpoint`∘`await` composition.
+  (drop read-only binds whose result is never used) and **common-subexpression elimination** (dedupe an
+  identical read-only, deterministic call into a `Stage::Alias` — one dispatch, reused result).
+  Remaining (optional): deeper optimizer passes (predicate pushdown, batch/model-call fusion),
+  `checkpoint`∘`await` composition.
 
 **Environment-gated (need a live key or external infra):**
 - **Homebrew tap** — an auto-updating `brew install codewandler/tap/flux` formula via cargo-dist

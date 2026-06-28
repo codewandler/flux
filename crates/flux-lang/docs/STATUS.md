@@ -30,7 +30,7 @@ The forward design ([`flux-lang-evolution.md`](../../../docs/designs/flux-lang-e
 | **P6a** | `await` cross-turn suspend/resume (`run_top_level`/`resume_flow` + engine `suspensions` table) | ✅ |
 | **P6b** | Tier-1 control-flow primitives (`match`/`route`/`fallback`/`timeout`/`budget`) | ✅ |
 | **P6c** | polish: `fluxlang compile`, token-efficient `format_compact`, deterministic thing resolver (focus aliases deferred — no consumer) | ✅ |
-| **P7** | Tier-2 control-flow (`scope`/`saga`/`once`/`checkpoint`) + `DurableStore` seam (`FlowStore` event-log folds) + dead-step optimizer pass | ✅ |
+| **P7** | Tier-2 control-flow (`scope`/`saga`/`once`/`checkpoint`) + `DurableStore` seam (`FlowStore` event-log folds) + dead-step + **CSE** optimizer passes (`Stage::Alias`) | ✅ |
 | — | `ask` reply-correlation (flux-app MVP); `checkpoint`∘`await` composition; `once` crash-exactly-once | ⬜ (optional) |
 
 Each landed phase shipped behind the full dev loop (build/test/clippy/fmt/codegate) and an adversarial
@@ -55,7 +55,7 @@ review pass (findings fixed before commit).
 | 8 | Bounded-loop checking | ✅ | `src/analyze.rs` |
 | 10.2 | **Type checking** + `DraftAst → HirFlow` lowering | ✅ (P4) | `analyze::lower`: validated body + **gathered effects** + **call arity** + **argument type-checking** against op param types (lenient on Any/Named) |
 | 12 | Effect gathering | ✅ | `src/effects.rs`; effects collected on `HirFlow` |
-| 10.3, 15 | **Optimizer** (parallelize independent reads) + `PhysicalPlan` execution | ✅ (P5b) | `src/optimize.rs` (read-only batching + fences) + `runtime::execute_plan`; `flux-sdk` `optimize`/`execute_optimized` |
+| 10.3, 15 | **Optimizer** (parallelize independent reads) + `PhysicalPlan` execution | ✅ (P5b, P7) | `src/optimize.rs` + `runtime::execute_plan`; `flux-sdk` `optimize`/`execute_optimized`. Passes: read-only batching → `Parallel` + side-effect `ApprovalFence` (P5b); **dead-step elimination** (drop unused read-only binds) + **CSE** (dedupe identical read-only deterministic calls into `Stage::Alias`) (P7) |
 
 ## Runtime, store & events (PRD §9, §14.3, §19, §20.2–20.3)
 

@@ -790,6 +790,14 @@ pub enum Stage {
     Await(AwaitPlan),
     /// A scheduling fence before a side-effecting node (approval is still enforced at dispatch).
     ApprovalFence(NodeId),
+    /// Common-subexpression reuse: bind `target` to the value already computed for `source`,
+    /// instead of re-dispatching an identical read-only, deterministic op. No op dispatch occurs —
+    /// the optimizer proved the two calls return the same value (same op + args, no intervening
+    /// invalidation), so the second is collapsed into a value copy.
+    Alias {
+        target: SymbolName,
+        source: SymbolName,
+    },
 }
 
 /// A conditional sub-plan.

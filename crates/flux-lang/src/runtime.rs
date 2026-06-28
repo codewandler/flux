@@ -550,6 +550,18 @@ pub async fn execute_plan(
                     last = text;
                 }
             }
+            Stage::Alias { target, source } => {
+                // CSE: the optimizer proved this node's op+args are identical to `source`'s, so reuse
+                // that value instead of dispatching. No `steps += 1` — the saved dispatch is the point.
+                let vid = store.resolve(session_id, source)?.ok_or_else(|| {
+                    FlowError::Runtime(format!("CSE alias source `{}` is unbound", source.0))
+                })?;
+                bind_existing(store, session_id, target, &vid)?;
+                last = store
+                    .get_value(&vid)?
+                    .map(|v| value_text(&v))
+                    .unwrap_or_default();
+            }
             Stage::Branch(_) | Stage::Repeat(_) | Stage::Await(_) => {
                 return Err(FlowError::Runtime(
                     "execute_plan v1 supports only sequential/parallel/approval_fence stages"
@@ -3451,6 +3463,116 @@ mod tests {
             .resolve("s", &SymbolName("dead".into()))
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn optimized_plan_deduplicates_an_identical_read() {
+        use crate::ast::HirFlow;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountCat;
+        impl OpCatalog for CountCat {
+            fn lookup(&self, name: &str) -> Option<OpSignature> {
+                (name == "read").then(|| OpSignature {
+                    name: "read".into(),
+                    description: String::new(),
+                    effects: vec![flux_spec::Effect::Read],
+                    risk: flux_spec::Risk::Low,
+                    idempotency: flux_spec::Idempotency::Idempotent,
+                    required_params: vec!["path".into()],
+                    optional_params: Vec::new(),
+                    param_types: Default::default(),
+                })
+            }
+        }
+        struct CountHost {
+            cat: CountCat,
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl OpHost for CountHost {
+            async fn dispatch(&self, op: &str, input: serde_json::Value) -> OpOutcome {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                OpOutcome::ok(format!("{op}({input})"))
+            }
+            fn catalog(&self) -> &dyn OpCatalog {
+                &self.cat
+            }
+            async fn request_approval(
+                &self,
+                _l: &str,
+                _i: &flux_spec::IntentSet,
+            ) -> ApprovalChoice {
+                ApprovalChoice::Allow
+            }
+            fn trim_output(&self, view: String, _op: &str) -> String {
+                view
+            }
+        }
+
+        let bind_read = |name: &str, arg: Node| Node::Bind {
+            name: SymbolName(name.into()),
+            value: Box::new(Node::Call {
+                op: "read".into(),
+                args: vec![arg],
+            }),
+            ty: None,
+            effect: None,
+        };
+        // $a = read "x"; $b = read "x" (duplicate); $r = read "{{a}}{{b}}" (result, consumes both).
+        let body = vec![
+            bind_read("a", flow_lit(json!("x"))),
+            bind_read("b", flow_lit(json!("x"))),
+            bind_read("r", flow_lit(json!("{{a}}{{b}}"))),
+        ];
+
+        // Optimized: CSE collapses $b into an alias of $a, so `read("x")` dispatches ONCE.
+        let host = CountHost {
+            cat: CountCat,
+            calls: AtomicUsize::new(0),
+        };
+        let hir = HirFlow {
+            body: body.clone(),
+            ..Default::default()
+        };
+        let plan = crate::optimize::optimize(&hir, host.catalog());
+        let store_plan = MemStore::new();
+        let mut sink = BufferSink::default();
+        let out_plan = execute_plan(&store_plan, &host, "s", &body, &plan, &mut sink)
+            .await
+            .unwrap();
+        let plan_calls = host.calls.load(Ordering::SeqCst);
+
+        // Linear: every node dispatches — read("x") twice + the read for $r = 3.
+        let host2 = CountHost {
+            cat: CountCat,
+            calls: AtomicUsize::new(0),
+        };
+        let store_flow = MemStore::new();
+        let ast = DraftAst {
+            body: body.clone(),
+            ..Default::default()
+        };
+        let mut sink2 = BufferSink::default();
+        let out_flow = execute_flow(&store_flow, &host2, "s", &ast, &mut sink2)
+            .await
+            .unwrap();
+        let flow_calls = host2.calls.load(Ordering::SeqCst);
+
+        assert_eq!(plan_calls, 2, "optimized: read(\"x\") once + read for $r");
+        assert_eq!(flow_calls, 3, "linear: read(\"x\") twice + read for $r");
+        // $b reused $a's value (same stored value), and the observable result is unchanged.
+        let va = store_plan
+            .resolve("s", &SymbolName("a".into()))
+            .unwrap()
+            .and_then(|id| store_plan.get_value(&id).unwrap());
+        let vb = store_plan
+            .resolve("s", &SymbolName("b".into()))
+            .unwrap()
+            .and_then(|id| store_plan.get_value(&id).unwrap());
+        assert!(va.is_some(), "$a is bound");
+        assert_eq!(va, vb, "$b aliases $a → identical value");
+        assert_eq!(out_plan.result, out_flow.result);
     }
 
     // ---- P6b: Tier-1 control-flow primitives (match/route/fallback/timeout/budget) ----
