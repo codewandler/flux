@@ -410,3 +410,11 @@ Deferred to implementation (detail, not concept):
 
 - Flow parameter schema + on-disk format under `.flux/flows/<name>` — specified at M6.
 - Exact `view(Session)` projection format and its token-budget interaction with compaction — M1/M3.
+
+Deferred follow-ups (separate decisions, not part of the self-hosted-loop work):
+
+- **One loop repo-wide.** The CLI/server/TUI turn loop is now the flux-lang `FlowEngine` (`agent-loop.flux`),
+  but the SDK's `flux_sdk::Client` front door still drives the classic provider-native `flux-agent::Agent`
+  loop. Unifying the SDK onto `FlowEngine`/`FlowClient` so there is a single loop everywhere — and then
+  retiring `flux-agent::Agent` — is a natural next step, but a separate decision (it changes the SDK's
+  public surface and `Client` semantics). Tracked here as an explicit follow-up, not started.

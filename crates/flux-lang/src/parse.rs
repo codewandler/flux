@@ -11,6 +11,10 @@
 //! - `$pack += $a, $b` — ctx_append; `ctx $p` + indented `purpose`/`budget`/`include`/`exclude`.
 //! - `when`/`else`, `unless`, `each $x in <src> [-> [flat] $c]`, `repeat <n> [-> $c]` (`until` first
 //!   body line), `seq [-> $c]`, `return <expr>`.
+//! - `match <subj>`/`route <sel>` (`case <v>` arms + `default`), `fallback [-> $b]` (`branch` arms),
+//!   `loop for <ms> every <ms> [-> $b]` (`until` first body line), `timeout <ms> [-> $b]`,
+//!   `budget <n> [-> $b]`.
+//! - Inline `fmt("<template>")` (the `Fmt` node) and `$var.path` field-access sugar (lowers to `jq`).
 //! - `@json <compact-json>` — the wire-format escape for any unsupported node (inline or statement).
 //! - A `goal "…"` header line is tolerated and ignored (`DraftAst` has no goal slot).
 

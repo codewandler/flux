@@ -16,13 +16,16 @@ hand-written grammar stays small.
 
 - **Native text** (markers `=` bind · `do <op> <args>` effectful call · `+=` `ctx_append`): `bind`,
   `call` (bare `do …` or inline `op(…)`), `var` (`$x`), `lit` (JSON), `return`, `when`/`else`, `unless`,
-  `each`, `repeat`, `seq`, and the context-pack nodes **`ctx`** / **`ctx_append`**. Flow header carries
-  optional `name`/`params`/`returns`; a leading `goal "…"` line is accepted and ignored (not part of the
-  AST/round-trip).
-- **`@json` escape** (everything else, today): `parallel`, `race`, `try`, `retry`, `confirm`, `loop`,
-  `throttle`, `debounce`, `assert`, `verify`, `pipe`, `memo`, `await`, `peek`, `thing`, `expr`, `fmt`,
-  `jq`, `parse`, and the Tier-1 control-flow nodes `match`, `route`, `fallback`, `timeout`, `budget`
-  (built P6b; no native grammar yet — they round-trip through `@json`).
+  `each`, `repeat`, `seq`, the context-pack nodes **`ctx`** / **`ctx_append`**, and (added P6) the Tier-1
+  control-flow blocks **`match`**, **`route`**, **`fallback`**, **`loop`**, **`timeout`**, **`budget`**,
+  the inline **`fmt("…")`** node, and **`$var.path`** field-access sugar (lowers to a `jq` node). Flow
+  header carries optional `name`/`params`/`returns`; a leading `goal "…"` line is accepted and ignored
+  (not part of the AST/round-trip). The actual P6 spellings are documented in
+  [§ Native control-flow forms (P6)](#native-control-flow-forms-p6) below.
+- **`@json` escape** (everything else, today): `parallel`, `race`, `try`, `retry`, `confirm`, `throttle`,
+  `debounce`, `assert`, `verify`, `pipe`, `memo`, `await`, `peek`, `thing`, `expr`, `parse`, and any `jq`
+  whose input is not a plain `$var` or whose path uses an array index (`.items[0]`) — those still
+  round-trip through `@json`.
 - **Aspirational** (described below as the *target* language, **not** yet parsed): multiple flows per
   file, file-scope `type`/union declarations, and the `block`/`watch` spellings (the implemented nodes
   are `seq` and `loop`). The AST type is **`DraftAst`** (this doc historically said `FlowAst`, which does
@@ -404,6 +407,79 @@ capture after the argument list). `for` is the only required argument.
 
 ---
 
+## Native control-flow forms (P6)
+
+These are the **as-implemented** text spellings of the Tier-1 control-flow nodes (added P6). They use
+positional headers and the same 2-space block rule as `when`/`each`; `default`/`case`/`branch` arms sit one
+indent under the header, their bodies one indent further.
+
+### match
+
+Multi-way exhaustive branch on a **bound** value (a `$var` or literal — to branch on an op result or a
+field, bind it first: `$k = $plan.kind`). Each `case <value>` runs when `subject == value` (JSON equality);
+an optional `default` runs when none match.
+
+```flux
+$kind = $plan.kind
+match $kind
+  case "chat"
+    $answer = $plan.text
+  case "error"
+    $answer = $plan.text
+  default
+    $ran = run_plan($plan)
+```
+
+### route
+
+Like `match`, but the subject is a `selector` op (typically model-backed) and the arms are string
+**labels** (`case "<label>"`). The model picks *which* declared branch runs, never *what*.
+
+```flux
+route classify($utterance)
+  case "bug"
+    do file_bug $utterance
+  case "feature"
+    do file_feature $utterance
+  default
+    do triage $utterance
+```
+
+### fallback
+
+Ordered "first branch that succeeds wins". Each `branch` is tried in turn; `-> $bind` names the winning
+result. (Branches have no header — they are bare `branch` + body.)
+
+```flux
+fallback -> $value
+  branch
+    $value = read("cache.json")
+  branch
+    $value = fetch($url)
+```
+
+### loop / timeout / budget
+
+`loop` is a time-bounded loop (`for`/`every` in ms; optional `until` as the first body line, like
+`repeat`); `timeout` bounds its body by wall-clock ms; `budget` caps the number of dispatches. All three
+take an optional `-> $bind`.
+
+```flux
+loop for 30000 every 2000 -> $last
+  until $done
+  $done = bash("health-check.sh")
+
+timeout 5000 -> $out
+  $out = bash("slow.sh")
+
+budget 10 -> $used
+  do retryable_step
+```
+
+> The implemented loop keyword is **`loop`** (the aspirational `watch` spelling above is superseded).
+
+---
+
 ## Sequencing and piping
 
 ### block
@@ -644,6 +720,18 @@ conditionals. Allowed forms:
 - `.field.nested`
 - `.field[0]`
 - `.field[0].nested`
+
+**Field-access sugar (P6):** when the input is a plain symbol and the path is a simple dotted field path
+(no array index), you may write `$var.path` instead of `jq(".path", $var)`:
+
+```flux
+$kind = $plan.kind          # sugar for jq(".kind", $plan)
+$txt  = $plan.message.text  # sugar for jq(".message.text", $plan)
+```
+
+This is a *bind-value* form: the lowered `jq` node, like any computed value, is only valid as a bind
+value — not inline as a `match` subject or call argument (bind it first). Bracket paths (`.items[0]`) and
+non-symbol inputs keep the explicit `jq(…)` / `@json` form.
 
 ---
 
