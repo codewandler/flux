@@ -11,7 +11,10 @@ final outcome (`turn_ended`).
 
 - **Model under observation:** `openrouter-anthropic/anthropic/claude-sonnet-4.6` (Sonnet via OpenRouter; `flux --serve`)
 - **Sample:** 30 runs, sessions `s_133`–`s_162`, over 16 curated questions (most run twice).
-- **Harness:** `scratchpad/a2a-loop/` (questions, runner, per-run logs) — not committed.
+- **Harness:** now first-class in `flux-eval` — the `synthetic` benchmark suite
+  (`crates/flux-eval/assets/synthetic-suite.json`), run with **`flux eval synthetic [--watch] [--report out.md]`**.
+  See [`docs/self-improvement/synthetic-eval.md`](self-improvement/synthetic-eval.md). _(The original ad-hoc
+  `scratchpad/a2a-loop/` harness this report was first produced with is superseded.)_
 - **Status:** all four findings **fixed and verified** on branch `fix/agent-loop-robustness` — see Resolution below.
 
 ---
