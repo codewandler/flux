@@ -201,7 +201,8 @@ pub async fn execute_plan(
 pub struct PlanRisk {
     /// The highest [`Risk`] across the plan's ops (`None` if it calls nothing registered).
     pub max_risk: Option<Risk>,
-    /// True if any op is destructive-shaped — forces a per-op re-confirm even inside an approved plan.
+    /// True if any op is destructive-shaped — surfaced in the plan's risk summary so the user sees it
+    /// before approving the plan as a whole (an approved plan then runs in full, no per-op re-confirm).
     pub destructive: bool,
     /// True if any op writes / executes / connects out.
     pub mutating: bool,
@@ -220,7 +221,7 @@ impl PlanRisk {
             None => "no-op",
         };
         if self.destructive {
-            format!("{base} · contains a destructive operation (will re-confirm)")
+            format!("{base} · contains a destructive operation")
         } else if self.mutating {
             format!("{base} · mutating")
         } else {

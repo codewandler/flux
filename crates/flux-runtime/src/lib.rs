@@ -9,6 +9,7 @@ mod perm;
 pub use perm::{Pattern, PermDecision, PermissionManager};
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -443,6 +444,16 @@ pub enum ApprovalChoice {
 pub trait Approver: Send + Sync {
     async fn request(&self, tool: &str, subjects: &[String], intents: &IntentSet)
         -> ApprovalChoice;
+
+    /// Approve a whole compiled plan as one unit (the "approve the graph, not each node" path). The
+    /// plan itself has already been rendered for the user (the `flow.plan` observation); this is just
+    /// the single confirm. `AllowAlways` here means "trust every plan for the rest of the session".
+    /// The default delegates to [`request`](Self::request) so existing approvers keep working.
+    async fn request_plan(&self, summary: &str, ops: usize) -> ApprovalChoice {
+        let subject = format!("{ops} op(s) · {summary}");
+        self.request("run plan", &[subject], &IntentSet::default())
+            .await
+    }
 }
 
 /// A headless approver that denies anything not pre-allowed by rules.
@@ -565,6 +576,23 @@ pub struct Executor {
     policy: Option<AuthorizationPolicy>,
     caller: Caller,
     trust: Trust,
+    /// Depth of the active "pre-approved plan" scope. `>0` means the ops being dispatched belong to a
+    /// plan the user already approved as a whole, so the per-op approval gate is skipped (deny rules
+    /// still win). A depth (not a bool) so a plan that runs a nested plan stays approved throughout.
+    plan_scope: AtomicU32,
+    /// Set when the user answered `always` at a plan prompt: every subsequent plan this session runs
+    /// without asking.
+    trust_all: AtomicBool,
+}
+
+/// Holds an approved-plan scope open. While alive, [`Executor::dispatch`] skips the per-op approval
+/// prompt; `Drop` closes the scope (decrementing the depth so re-planning asks again next round).
+pub struct PlanScopeGuard<'a>(&'a AtomicU32);
+
+impl Drop for PlanScopeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Executor {
@@ -583,6 +611,41 @@ impl Executor {
             policy: None,
             caller: default_local_caller(),
             trust: default_local_trust(),
+            plan_scope: AtomicU32::new(0),
+            trust_all: AtomicBool::new(false),
+        }
+    }
+
+    /// Whether we're currently executing the ops of an already-approved plan (or the user trusts all
+    /// plans). When true, [`dispatch`](Self::dispatch) skips the per-op approval prompt.
+    pub fn in_approved_scope(&self) -> bool {
+        self.trust_all.load(Ordering::SeqCst) || self.plan_scope.load(Ordering::SeqCst) > 0
+    }
+
+    /// Open a pre-approved scope for the duration of the returned guard — used when the act of running
+    /// *is* the approval (the REPL `/run`, where the human already reviewed the plan). Inner ops dispatch
+    /// without prompting; the guard closes the scope on drop.
+    pub fn enter_approved_scope(&self) -> PlanScopeGuard<'_> {
+        self.plan_scope.fetch_add(1, Ordering::SeqCst);
+        PlanScopeGuard(&self.plan_scope)
+    }
+
+    /// Approve a whole plan once, then keep it pre-approved while the returned guard is held. If already
+    /// inside an approved scope (a nested `run_plan`) or the user trusts all plans, returns a guard
+    /// without prompting. `None` means the user rejected the plan. `summary`/`ops` come from the plan's
+    /// risk preview — the plan tree itself was already rendered (the `flow.plan` observation).
+    pub async fn approve_plan(&self, summary: &str, ops: usize) -> Option<PlanScopeGuard<'_>> {
+        if self.in_approved_scope() {
+            return Some(self.enter_approved_scope());
+        }
+        let approver = self.approver.lock().unwrap().clone();
+        match approver.request_plan(summary, ops).await {
+            ApprovalChoice::Allow => Some(self.enter_approved_scope()),
+            ApprovalChoice::AllowAlways(_) => {
+                self.trust_all.store(true, Ordering::SeqCst);
+                Some(self.enter_approved_scope())
+            }
+            ApprovalChoice::Deny => None,
         }
     }
 
@@ -747,7 +810,9 @@ impl Executor {
             || spec.risk == Risk::Destructive
             || policy_requires_approval
             || unscoped_write;
-        if force_approval || perm != PermDecision::Allow {
+        //    Inside an approved-plan scope the prompt is skipped entirely — the user approved the plan as
+        //    a whole (its risk badge disclosed every op). Hard denies (steps 1-2 above) still apply.
+        if !self.in_approved_scope() && (force_approval || perm != PermDecision::Allow) {
             let approver = self.approver.lock().unwrap().clone();
             match approver.request(name, &subjects, &intents).await {
                 ApprovalChoice::Allow => {}
@@ -885,6 +950,116 @@ mod tests {
         assert!(r.is_error);
         assert!(r.content.contains("denied by permission rules"));
         assert!(!approver.asked.load(Ordering::Relaxed), "deny must not ask");
+    }
+
+    #[tokio::test]
+    async fn approved_scope_skips_the_per_op_prompt() {
+        // The approver would DENY if asked, so a skipped prompt is the only way the op can run.
+        let approver = Arc::new(RecordingApprover {
+            asked: AtomicBool::new(false),
+            choice: || ApprovalChoice::Deny,
+        });
+        let ex = Executor::new(
+            registry(),
+            PermissionManager::new(),
+            approver.clone(),
+            test_ctx(),
+        );
+
+        // Outside any approved scope: the op prompts (and is denied).
+        let r = ex.dispatch("echo", json!({"text": "hi"})).await;
+        assert!(r.is_error, "outside a scope the op prompts and is denied");
+        assert!(approver.asked.load(Ordering::Relaxed));
+
+        // Inside an approved-plan scope: no prompt, the op runs.
+        approver.asked.store(false, Ordering::Relaxed);
+        let r = {
+            let _scope = ex.enter_approved_scope();
+            ex.dispatch("echo", json!({"text": "hi"})).await
+        };
+        assert!(
+            !r.is_error,
+            "inside an approved scope the op runs: {}",
+            r.content
+        );
+        assert_eq!(r.content, "hi");
+        assert!(
+            !approver.asked.load(Ordering::Relaxed),
+            "no per-op prompt inside an approved scope"
+        );
+
+        // Scope closed (guard dropped): prompts again next time.
+        approver.asked.store(false, Ordering::Relaxed);
+        let _ = ex.dispatch("echo", json!({"text": "hi"})).await;
+        assert!(
+            approver.asked.load(Ordering::Relaxed),
+            "scope closed → prompts again"
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_scope_still_respects_deny_rules() {
+        let perms = PermissionManager::from_rules(&[], &["echo".into()]);
+        let ex = Executor::new(registry(), perms, Arc::new(AllowApprover), test_ctx());
+        let _scope = ex.enter_approved_scope();
+        let r = ex.dispatch("echo", json!({"text": "hi"})).await;
+        assert!(
+            r.is_error,
+            "a deny rule still blocks inside an approved plan"
+        );
+        assert!(r.content.contains("denied by permission rules"));
+    }
+
+    #[tokio::test]
+    async fn approve_plan_opens_scope_and_always_trusts_the_session() {
+        // `RecordingApprover` only implements `request`; `request_plan` uses the trait default that
+        // delegates to it, so this also covers the default delegation.
+        let approver = Arc::new(RecordingApprover {
+            asked: AtomicBool::new(false),
+            choice: || ApprovalChoice::AllowAlways("*plans*".into()),
+        });
+        let ex = Executor::new(
+            registry(),
+            PermissionManager::new(),
+            approver.clone(),
+            test_ctx(),
+        );
+        assert!(!ex.in_approved_scope());
+        {
+            let scope = ex.approve_plan("medium · mutating", 2).await;
+            assert!(scope.is_some(), "Allow/AllowAlways opens a scope");
+            assert!(ex.in_approved_scope());
+        }
+        // `always` set the session-wide trust, so we stay approved after the guard drops.
+        assert!(
+            ex.in_approved_scope(),
+            "`always` trusts every plan for the rest of the session"
+        );
+        approver.asked.store(false, Ordering::Relaxed);
+        let _ = ex.approve_plan("low", 1).await;
+        assert!(
+            !approver.asked.load(Ordering::Relaxed),
+            "a trusted session does not prompt again"
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_plan_deny_returns_none() {
+        let approver = Arc::new(RecordingApprover {
+            asked: AtomicBool::new(false),
+            choice: || ApprovalChoice::Deny,
+        });
+        let ex = Executor::new(
+            registry(),
+            PermissionManager::new(),
+            approver.clone(),
+            test_ctx(),
+        );
+        assert!(
+            ex.approve_plan("medium", 1).await.is_none(),
+            "Deny → no scope"
+        );
+        assert!(!ex.in_approved_scope());
     }
 
     #[tokio::test]

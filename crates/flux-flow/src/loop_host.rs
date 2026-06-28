@@ -256,6 +256,27 @@ impl LoopHost for EngineLoopHost {
             }),
         ));
 
+        // Plan-level approval: the user approves the plan as a whole here — its tree + aggregate risk
+        // were just surfaced. A read-only plan needs no approval; a mutating one prompts ONCE, and then
+        // every inner op runs without a per-op prompt (the scope guard, held across `execute_flow`,
+        // tells `dispatch` to skip the gate). `always` trusts all plans for the session. On rejection we
+        // feed a stop-signal back so the model ends the turn in prose rather than re-planning forever.
+        let _scope = if risk.mutating {
+            match executor.approve_plan(&risk.summary(), risk.ops.len()).await {
+                Some(scope) => Some(scope),
+                None => {
+                    return Ok(serde_json::json!({
+                        "transcript": "[plan rejected by user] The user declined to run this plan. \
+                                       Do not propose another — acknowledge briefly and stop.",
+                        "result": "",
+                        "steps": 0,
+                    }));
+                }
+            }
+        } else {
+            None
+        };
+
         let outcome = match execute_flow(
             self.store.as_ref(),
             executor.as_ref(),
@@ -735,6 +756,223 @@ mod tests {
             seen[1].contains("ROUND1-MARKER"),
             "round 2's planner saw round 1's transcript via loop-carried $feedback: {:?}",
             seen[1]
+        );
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A mutating echo: declares a `FilesystemWrite` intent so `plan_risk` marks the plan mutating
+    /// (and therefore approval-worthy). Not pre-allowed, so without plan-level approval it would prompt.
+    struct WriteEchoTool;
+    #[async_trait]
+    impl Tool for WriteEchoTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only(
+                "writeecho",
+                "echo (mutating)",
+                json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
+            )
+        }
+        fn intents(&self, _p: &Value) -> flux_spec::IntentSet {
+            use flux_spec::{Intent, IntentBehavior, IntentCertainty, IntentRole, IntentTarget};
+            let mut s = flux_spec::IntentSet::new();
+            s.push(Intent {
+                behavior: IntentBehavior::FilesystemWrite,
+                target: IntentTarget::Path {
+                    path: "out.txt".into(),
+                },
+                role: IntentRole::WriteTarget,
+                certainty: IntentCertainty::Certain,
+            });
+            s
+        }
+        async fn execute(&self, _c: &ToolContext, p: Value) -> Result<ToolResult> {
+            Ok(ToolResult::ok(
+                p.get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            ))
+        }
+    }
+
+    /// Counts plan-level vs per-op approval calls. Per-op `request` returns `Deny`, so any op that
+    /// wrongly prompts fails — a clean run proves the per-op gate was skipped.
+    struct CountingApprover {
+        plan_calls: Arc<AtomicUsize>,
+        op_calls: Arc<AtomicUsize>,
+        allow: bool,
+    }
+    #[async_trait]
+    impl flux_runtime::Approver for CountingApprover {
+        async fn request(
+            &self,
+            _t: &str,
+            _s: &[String],
+            _i: &flux_spec::IntentSet,
+        ) -> flux_runtime::ApprovalChoice {
+            self.op_calls.fetch_add(1, Ordering::SeqCst);
+            flux_runtime::ApprovalChoice::Deny
+        }
+        async fn request_plan(&self, _summary: &str, _ops: usize) -> flux_runtime::ApprovalChoice {
+            self.plan_calls.fetch_add(1, Ordering::SeqCst);
+            if self.allow {
+                flux_runtime::ApprovalChoice::Allow
+            } else {
+                flux_runtime::ApprovalChoice::Deny
+            }
+        }
+    }
+
+    /// Returns the executor `Arc` alongside the host — the host holds only a `Weak<Executor>`, so the
+    /// caller must keep this alive for the duration of the run (the real engine does via `FlowEngine`).
+    fn setup_host(
+        reg: ToolRegistry,
+        perms: PermissionManager,
+        approver: Arc<dyn flux_runtime::Approver>,
+        rec: Recorder,
+        tag: &str,
+    ) -> (Arc<Executor>, Arc<EngineLoopHost>) {
+        let dir =
+            std::env::temp_dir().join(format!("flux-planapproval-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let executor = Executor::new(reg, perms, approver, ToolContext::new(system));
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider {
+            responses: Mutex::new(VecDeque::new()),
+        });
+        let store = Arc::new(FlowStore::in_memory().unwrap());
+        let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(rec)));
+        EngineLoopHost::install(
+            executor,
+            provider,
+            "mock".into(),
+            None,
+            store,
+            "sess".into(),
+            shared,
+            CompileOptions::default(),
+        )
+    }
+
+    fn mutating_plan() -> serde_json::Value {
+        json!({"kind":"plan","ast":{"body":[
+            {"kind":"call","op":"writeecho","args":[{"kind":"lit","value":"hi"}]}
+        ]}})
+    }
+
+    /// A mutating plan is approved ONCE at the plan level; its ops then run with no per-op prompt.
+    #[tokio::test]
+    async fn run_plan_approves_a_mutating_plan_once_then_runs_all_ops() {
+        let rec = Recorder::default();
+        let plan_calls = Arc::new(AtomicUsize::new(0));
+        let op_calls = Arc::new(AtomicUsize::new(0));
+        let approver = Arc::new(CountingApprover {
+            plan_calls: plan_calls.clone(),
+            op_calls: op_calls.clone(),
+            allow: true,
+        });
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(WriteEchoTool));
+        let (_ex, host) = setup_host(
+            reg,
+            PermissionManager::new(),
+            approver,
+            rec.clone(),
+            "approve-once",
+        );
+
+        host.run_plan(mutating_plan()).await.unwrap();
+
+        assert_eq!(
+            plan_calls.load(Ordering::SeqCst),
+            1,
+            "asked once, at the plan level"
+        );
+        assert_eq!(
+            op_calls.load(Ordering::SeqCst),
+            0,
+            "no per-op prompt inside the approved plan"
+        );
+        assert!(
+            rec.tools.lock().unwrap().contains(&"writeecho".to_string()),
+            "the op ran"
+        );
+    }
+
+    /// Rejecting the plan runs nothing and feeds a stop-signal back.
+    #[tokio::test]
+    async fn run_plan_rejection_runs_nothing() {
+        let rec = Recorder::default();
+        let plan_calls = Arc::new(AtomicUsize::new(0));
+        let op_calls = Arc::new(AtomicUsize::new(0));
+        let approver = Arc::new(CountingApprover {
+            plan_calls: plan_calls.clone(),
+            op_calls: op_calls.clone(),
+            allow: false,
+        });
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(WriteEchoTool));
+        let (_ex, host) = setup_host(
+            reg,
+            PermissionManager::new(),
+            approver,
+            rec.clone(),
+            "reject",
+        );
+
+        let out = host.run_plan(mutating_plan()).await.unwrap();
+
+        assert_eq!(plan_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            out["transcript"]
+                .as_str()
+                .unwrap_or("")
+                .contains("rejected"),
+            "rejection is fed back: {out}"
+        );
+        assert!(
+            !rec.tools.lock().unwrap().contains(&"writeecho".to_string()),
+            "a rejected plan runs no ops"
+        );
+    }
+
+    /// A read-only plan needs no approval at all — neither a plan prompt nor a per-op prompt.
+    #[tokio::test]
+    async fn run_plan_skips_approval_for_a_read_only_plan() {
+        let rec = Recorder::default();
+        let plan_calls = Arc::new(AtomicUsize::new(0));
+        let op_calls = Arc::new(AtomicUsize::new(0));
+        let approver = Arc::new(CountingApprover {
+            plan_calls: plan_calls.clone(),
+            op_calls: op_calls.clone(),
+            allow: true,
+        });
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        // Reads are pre-allowed (as in the real CLI), so a pure-read plan never gates.
+        let perms = PermissionManager::from_rules(&["echo".into()], &[]);
+        let (_ex, host) = setup_host(reg, perms, approver, rec.clone(), "readonly");
+
+        host.run_plan(json!({"kind":"plan","ast":{"body":[
+            {"kind":"call","op":"echo","args":[{"kind":"lit","value":"hi"}]}
+        ]}}))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            plan_calls.load(Ordering::SeqCst),
+            0,
+            "no plan prompt for a read-only plan"
+        );
+        assert_eq!(
+            op_calls.load(Ordering::SeqCst),
+            0,
+            "no per-op prompt either"
+        );
+        assert!(
+            rec.tools.lock().unwrap().contains(&"echo".to_string()),
+            "the read ran"
         );
     }
 }

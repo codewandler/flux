@@ -1359,14 +1359,16 @@ async fn run_repl(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-/// REPL `/run`: execute a reviewed plan through the engine's existing envelope (per-op approval still
-/// applies, unless the REPL was started with `--yes`). The human reviewed the whole plan already.
+/// REPL `/run`: execute a reviewed plan. Typing `/run` after reviewing the plan in `/plan` mode IS the
+/// approval, so the plan runs as a pre-approved unit — its ops don't prompt individually (deny rules
+/// still apply). The scope guard closes when this returns.
 async fn run_pending_plan(
     agent: &FlowEngine,
     session_id: &str,
     ast: &flux_flow::ast::DraftAst,
     cancel: &tokio_util::sync::CancellationToken,
 ) {
+    let _scope = agent.executor.enter_approved_scope();
     let mut sink = CliSink::new(0);
     // Race execution against `cancel`: `execute_flow` has no cancellation of its own, so Ctrl-C is
     // honored by dropping the in-flight flow future (which aborts the current op's IO). The future
@@ -2141,22 +2143,112 @@ impl Approver for StdinApprover {
                 .collect();
             format!(" {}", formatted.join(", "))
         };
-        eprint!(
+        let prompt = format!(
             "\n{} `{}`{}  [y]es / [a]lways / [N]o: ",
             style::yellow("approve"),
             style::bold(tool),
             subjects_fmt
         );
-        std::io::stderr().flush().ok();
+        read_choice(prompt, ApprovalChoice::AllowAlways(tool.to_string())).await
+    }
+
+    /// The whole-plan confirm. The plan tree + risk were already rendered (the `flow.plan` observation),
+    /// so this is one line. `always` here trusts every plan for the rest of the session.
+    async fn request_plan(&self, summary: &str, ops: usize) -> ApprovalChoice {
+        let prompt = format!(
+            "\n{} this plan? ({} op(s) · {})  [y]es / [a]lways / [N]o: ",
+            style::yellow("run"),
+            ops,
+            summary,
+        );
+        read_choice(prompt, ApprovalChoice::AllowAlways("*plans*".to_string())).await
+    }
+}
+
+/// Print `prompt`, then read a y/a/N answer **off the async runtime** so the turn's future YIELDS while
+/// waiting — a blocking read inside the poll would freeze the task and make Ctrl-C inert. On a terminal
+/// we read a single keypress via crossterm in raw mode: the keystroke is consumed cleanly (no leaked
+/// line-reader that would fight reedline for stdin on the next prompt), and Ctrl-C / Ctrl-D / `n` / Esc
+/// all decline. Off a terminal (pipes, eval) we read a line — EOF ends it and there's no prompt to
+/// corrupt. `always` is returned for `a`/`always`.
+async fn read_choice(prompt: String, always: ApprovalChoice) -> ApprovalChoice {
+    eprint!("{prompt}");
+    std::io::stderr().flush().ok();
+    if !std::io::stdin().is_terminal() {
+        return match read_stdin_line().await {
+            Some(line) => parse_choice(&line, always),
+            None => ApprovalChoice::Deny,
+        };
+    }
+    let choice = tokio::task::spawn_blocking(move || read_key_choice(always))
+        .await
+        .unwrap_or(ApprovalChoice::Deny);
+    eprintln!(); // raw mode echoes nothing — close the prompt line
+    choice
+}
+
+/// Restores cooked mode on drop, so a panic or early return inside the key-read never leaves the
+/// terminal in raw mode.
+struct RawModeGuard;
+impl RawModeGuard {
+    fn enable() -> std::io::Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// Read one approval keypress in raw mode (blocking — call inside `spawn_blocking`). The key is consumed
+/// and the function returns, so nothing outlives the call to fight the next reedline read. Ctrl-C/Ctrl-D
+/// decline (in raw mode they arrive as key events, not SIGINT).
+fn read_key_choice(always: ApprovalChoice) -> ApprovalChoice {
+    use crossterm::event::{read, Event, KeyCode, KeyEventKind, KeyModifiers};
+    let _raw = match RawModeGuard::enable() {
+        Ok(g) => g,
+        Err(_) => return ApprovalChoice::Deny,
+    };
+    loop {
+        match read() {
+            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                return match k.code {
+                    KeyCode::Char('c') | KeyCode::Char('d') if ctrl => ApprovalChoice::Deny,
+                    KeyCode::Char('y') | KeyCode::Char('Y') => ApprovalChoice::Allow,
+                    KeyCode::Char('a') | KeyCode::Char('A') => always,
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Enter | KeyCode::Esc => {
+                        ApprovalChoice::Deny
+                    }
+                    _ => continue, // ignore other keys, keep waiting
+                };
+            }
+            Ok(_) => continue,
+            Err(_) => return ApprovalChoice::Deny,
+        }
+    }
+}
+
+/// Read one line from stdin off the async runtime (`spawn_blocking`). Used only on the non-terminal
+/// path (pipes / eval), where EOF ends the read and there's no interactive prompt to corrupt.
+async fn read_stdin_line() -> Option<String> {
+    tokio::task::spawn_blocking(|| {
         let mut line = String::new();
-        if std::io::stdin().read_line(&mut line).is_err() {
-            return ApprovalChoice::Deny;
-        }
-        match line.trim().to_lowercase().as_str() {
-            "y" | "yes" => ApprovalChoice::Allow,
-            "a" | "always" => ApprovalChoice::AllowAlways(tool.to_string()),
-            _ => ApprovalChoice::Deny,
-        }
+        std::io::stdin().read_line(&mut line).ok().map(|_| line)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Map a typed y/a/N line to a choice (the non-terminal fallback). `always` is returned for `a`/`always`.
+fn parse_choice(line: &str, always: ApprovalChoice) -> ApprovalChoice {
+    match line.trim().to_lowercase().as_str() {
+        "y" | "yes" => ApprovalChoice::Allow,
+        "a" | "always" => always,
+        _ => ApprovalChoice::Deny,
     }
 }
 
