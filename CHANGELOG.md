@@ -8,6 +8,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Global, multi-format skills.** Skills are now discovered from the project's `.flux/skills` **and**
+  the user-global dirs `~/.flux/skills`, `~/.agents/skills`, and `~/.claude/skills` (project wins on a
+  name clash), so skills kept for other agents work in flux without per-project copies. Beyond the
+  flux-native `triggers:` format, flux reads the cross-agent [Agent Skills](https://agentskills.io) /
+  Claude format (`name` + `description`, no triggers); trigger-less skills activate on
+  `name`/`description` keywords. A new **`flux-markdown`** crate (L0) owns frontmatter parsing
+  (`serde_norway`) shared by `flux-skill` and `flux-orchestrate`, and wraps the `codewandler/markdown`
+  crates for the TUI/CLI render paths behind off-by-default features. Activation is centralized in
+  `flux_skill::active_for` (ranked + capped) and used by both the `flux-flow` and `flux-agent` loops.
 - **Native tool calling for OpenRouter and local Ollama via the Anthropic Messages protocol.** Two new
   providers — `openrouter-anthropic` and `ollama-anthropic` — route through each gateway's Messages
   endpoint (`/api/v1/messages`, `/v1/messages`), so tool calls return as structured `tool_use` content

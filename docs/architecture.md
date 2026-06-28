@@ -19,7 +19,7 @@ the *surfaces* (CLI/TUI/server/SDK).
 
 | Layer | Crates | Role |
 |---|---|---|
-| **L0 contracts** (pure) | `flux-core` `flux-policy` `flux-secret` `flux-spec` `flux-config` `flux-evidence` `flux-skill` `flux-lang` | types, authorization, secrets, tool specs, config, evidence, skills, the Flux-Lang language + reference interpreter (effects injected via traits) |
+| **L0 contracts** (pure) | `flux-core` `flux-policy` `flux-secret` `flux-spec` `flux-config` `flux-evidence` `flux-skill` `flux-markdown` `flux-lang` | types, authorization, secrets, tool specs, config, evidence, skills, markdown/frontmatter, the Flux-Lang language + reference interpreter (effects injected via traits) |
 | **L1 providers** | `flux-provider` `flux-providers` `flux-credentials` | the `Provider` abstraction + the concrete clients (`flux-providers` modules: `messages` core, `anthropic`, `openai`, `openrouter`, `ollama`) + credential store |
 | **L2 runtime** | `flux-system` `flux-runtime` `flux-tools` `flux-events` `flux-context` | guarded IO, the safety envelope, built-in tools, the event store, context |
 | **L3 agent** | `flux-agent` `flux-orchestrate` `flux-flow` `flux-eval` `flux-cognition` | the agent loop + multi-agent orchestration + the Flux-Lang engine + the eval harness + the model-op cognition pack |
@@ -54,7 +54,8 @@ shared machinery beneath them. "Disposition" flags a planned move; see
 | `flux-secret` | L0 | secret refs + redaction | — |
 | `flux-evidence` | L0 | observations / evidence log | — |
 | `flux-config` | L0 | `.flux/config.toml` loading + precedence | — |
-| `flux-skill` | L0 | skill defs + trigger matching | — |
+| `flux-skill` | L0 | multi-format skill defs + discovery/merge + activation (triggers or name/description fallback) | — |
+| `flux-markdown` | L0 | frontmatter parse/validate (`serde_norway`) + feature-gated render wrappers over `codewandler/markdown` | — |
 | `flux-provider` | L1 | the `Provider` abstraction (published) | — |
 | `flux-providers` | L1 | concrete clients (anthropic / openai / openrouter / ollama) | — |
 | `flux-credentials` | L1 | credential store (PKCE, token import) | — |

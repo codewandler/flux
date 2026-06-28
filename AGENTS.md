@@ -45,7 +45,7 @@ Crates are stratified into layers (0 = innermost contracts, 6 = outermost surfac
 
 | Layer | Crates | Role |
 |---|---|---|
-| **L0 contracts** (pure, no IO¹) | `flux-core` `flux-policy` `flux-secret` `flux-spec` `flux-config` `flux-evidence` `flux-skill` `flux-lang` | types, authorization, secrets, tool specs, config, evidence, skills, the Flux-Lang language + reference interpreter |
+| **L0 contracts** (pure, no IO¹) | `flux-core` `flux-policy` `flux-secret` `flux-spec` `flux-config` `flux-evidence` `flux-skill` `flux-markdown` `flux-lang` | types, authorization, secrets, tool specs, config, evidence, skills, markdown/frontmatter, the Flux-Lang language + reference interpreter |
 | **L1 providers** | `flux-provider` `flux-providers` `flux-credentials` | the `Provider` abstraction + the concrete clients (`flux-providers` modules: `messages` core, `anthropic`, `openai`, `openrouter`, `ollama`) + credential store |
 | **L2 runtime** | `flux-system` `flux-runtime` `flux-tools` `flux-events` `flux-context` | guarded IO, the safety envelope, built-in tools, the event store, context |
 | **L3 agent** | `flux-agent` `flux-orchestrate` `flux-flow` `flux-eval` `flux-cognition` | the agent loop + multi-agent orchestration + the Flux-Lang engine + the eval harness + the model-op cognition pack |
@@ -55,7 +55,7 @@ Crates are stratified into layers (0 = innermost contracts, 6 = outermost surfac
 
 Key rules:
 - **`flux-runtime` (L2) must not depend on `flux-auth` (L5).** Surfaces resolve identity (`LocalIdentity` / `OidcIdentity`) into a `(Caller, Trust)` and inject it via `Executor::with_identity`.
-- `flux-evidence`, `flux-skill`, `flux-config`, and `flux-lang` are L0 leaves — no flux deps beyond other L0 — so runtime/agent crates may depend on them without a layering violation. `flux-flow` (L3, the Flux-Lang engine) builds on `flux-lang` and re-exports it as a facade.
+- `flux-evidence`, `flux-skill`, `flux-config`, `flux-markdown`, and `flux-lang` are L0 leaves — no flux deps beyond other L0 — so runtime/agent crates may depend on them without a layering violation. `flux-skill` builds on `flux-markdown` (frontmatter); both stay L0. `flux-markdown`'s render wrappers (over `codewandler/markdown`) are behind off-by-default `ratatui`/`terminal` features, so its default build pulls no UI deps. `flux-flow` (L3, the Flux-Lang engine) builds on `flux-lang` and re-exports it as a facade.
 - **If you add a crate, classify it in `flux-codegate`'s `layer()` map** or the lint fails.
 - **The CLI/server/TUI turn loop is itself Flux-Lang** — `crates/flux-flow::FlowEngine` runs `crates/flux-flow/assets/agent-loop.flux`, driven by the reflexive `plan`/`run_plan` ops and the evidence ops (`observe`/`evidence`/`grade`/`metrics`). `FlowEngine::run_turn_cancellable` is a thin bootstrap, not the loop. Those ops are documented in `crates/flux-flow/docs/ops-reference.md`. (The SDK's `flux_sdk::Client` still drives the classic provider-native `flux-agent::Agent` loop — a separate front door; `FlowClient` is the flow-based one.)
 
@@ -93,7 +93,7 @@ Each invariant below was established (and several re-learned the hard way) durin
 - **The generic `bash` op is opt-in.** It lives in the off-by-default `shell` group, so it is *not* advertised unless the workspace opts in — config `enable_shell = true`, env `FLUX_ENABLE_BASH=1`, or the `/shell` REPL toggle (each injects the `shell` signal via `detect_signals`). Prefer adding a dedicated, accurately-gated op over widening reliance on `bash`; the dedicated ops (`now`/`cwd`/`sys_info`, `git_*`, the `cargo_*`/`go_*`/`python`/`node`/`make` toolchains, the pure `expr`/`jq`/`fmt` + cognition list ops) exist to keep `bash` unnecessary.
 - **Add a provider:** a provider = `WireCodec` × `Credential` composed by `NativeProvider` (`flux-provider`). Add the codec/credential in the relevant `flux-providers` module (`anthropic`/`openai`/`openrouter`/`ollama`, or a new one) — Messages-protocol providers reuse `crate::messages`; wire model routing in `flux-cli`'s `build_provider`.
 - **Add a sub-agent role:** drop a markdown file in `.flux/agents/<role>.md` (frontmatter `description`/`model`/`tools`, body = system prompt), or add to the CLI defaults.
-- **Add a skill:** `.flux/skills/*.md` with `triggers:` frontmatter; activation and injection are handled by the agent loop.
+- **Add a skill:** drop a `.md` (or a dir with `SKILL.md`) in `.flux/skills` (project) or a user-global dir (`~/.flux/skills`, `~/.agents/skills`, `~/.claude/skills`; project wins on a name clash). Both the flux-native (`triggers:` frontmatter) and Agent-Skills/Claude (`name` + `description`, no triggers) formats are read by `flux-skill` (which parses frontmatter via `flux-markdown`); trigger-less skills activate on `name`/`description` keywords. `flux_skill::active_for` ranks + caps activation and is the single path both injection sites (`flux-flow`, `flux-agent`) use.
 - **Write a plugin:** any executable speaking the framed NDJSON protocol in `flux-plugin`; the Rust SDK (`serve` + `PluginHandler` + `GuestHost`) is the reference. Operations are projected as policy-gated tools; privileged IO is requested back from the host via declared capability callbacks. The host grants nothing you don't ask for.
 
 ---

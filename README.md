@@ -156,7 +156,13 @@ Sub-agents inherit the same policy and cannot approve destructive operations the
 
 **Built-in tools:** `read`, `write`, `edit`, `bash`, `glob`, `grep`, `web_fetch` (SSRF-guarded), `search` (auto-indexed workspace docs), `task` (delegate to a sub-agent role).
 
-**Skills** (`.flux/skills/*.md` with `triggers:` frontmatter): matched per-turn against your input and injected into that turn's context.
+**Skills** — markdown knowledge packs discovered from the project's `.flux/skills` **and** the
+user-global dirs `~/.flux/skills`, `~/.agents/skills`, and `~/.claude/skills` (project wins on a name
+clash). Both the flux-native format (`triggers:` frontmatter) and the cross-agent [Agent
+Skills](https://agentskills.io)/Claude format (`name` + `description`, no triggers) are read, so
+skills you already keep for other agents work in flux unchanged. Each turn flux activates the skills
+whose triggers match — or, for trigger-less skills, whose `name`/`description` keywords match — and
+injects their bodies into that turn's context (ranked and capped to keep the prompt lean).
 
 **Sub-agent roles** (`.flux/agents/<role>.md`): scout / planner / worker / reviewer / evaluator / summarizer — built-in defaults, overridable with your own markdown files.
 
