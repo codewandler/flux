@@ -1,4 +1,7 @@
-//! Anthropic streaming wire types and their mapping to the normalized `flux_core` model.
+//! Anthropic Messages streaming wire types and their mapping to the normalized `flux_core` model.
+//!
+//! OpenRouter and ollama both proxy this exact SSE shape, so these types are shared across every
+//! provider that speaks the Messages protocol.
 
 use serde::Deserialize;
 
@@ -92,14 +95,24 @@ pub struct MessageDeltaBody {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct WireUsage {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "u64_or_zero")]
     pub input_tokens: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "u64_or_zero")]
     pub output_tokens: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "u64_or_zero")]
     pub cache_creation_input_tokens: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "u64_or_zero")]
     pub cache_read_input_tokens: u64,
+}
+
+/// Some Messages-compatible gateways (e.g. OpenRouter) send usage counters as an explicit `null`
+/// instead of omitting them. `#[serde(default)]` only covers *absent* fields, so accept null too,
+/// mapping it to 0. Harmless for Anthropic-direct, which always sends real numbers.
+fn u64_or_zero<'de, D>(d: D) -> std::result::Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<u64>::deserialize(d)?.unwrap_or(0))
 }
 
 #[derive(Debug, Deserialize)]

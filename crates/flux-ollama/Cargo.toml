@@ -1,9 +1,9 @@
 [package]
-name = "flux-anthropic"
+name = "flux-ollama"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-description = "Native Anthropic Messages API client for flux (SSE streaming, tool use, extended thinking)"
+description = "Local Ollama provider for flux over the Anthropic Messages protocol (native tool calling)"
 
 [dependencies]
 flux-core.workspace = true

@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Native tool calling for OpenRouter and local Ollama via the Anthropic Messages protocol.** Two new
+  providers — `openrouter-anthropic` and `ollama-anthropic` — route through each gateway's Messages
+  endpoint (`/api/v1/messages`, `/v1/messages`), so tool calls return as structured `tool_use` content
+  blocks that can't leak as inline `<tool_call>` text the way some models do on the OpenAI Chat path.
+  Both are built on a new shared **`flux-messages`** crate (wire schema + body/stream helpers + a
+  per-`(provider, model)` quirks profile); `flux-anthropic` now composes the same core.
+
+### Fixed
+
+- **OpenRouter / local-model wire robustness (Messages path).** The shared parser tolerates the
+  malformations real gateways and models emit: `null` usage counters, the OpenAI-style `[DONE]` stream
+  sentinel, and tool-input JSON with trailing junk or an unterminated tail (off-by-one braces / open
+  strings are repaired best-effort). Each has a regression test.
+- **Inline tool-call recovery on the OpenAI Chat path.** When a model emits tool calls as text
+  (`<tool_call>…</tool_call>` or `<function=…><parameter=…>`) instead of structured `tool_calls` —
+  seen with GLM via OpenRouter and local models on multi-call turns — flux recovers them into
+  `tool_use` blocks instead of stalling the turn on what looks like prose.
+
 ## [0.2.4] — 2026-06-25
 
 Markdown rendering in the CLI — the highest-frequency dogfood readability gap (F2, [#1](https://github.com/codewandler/flux/issues/1)).

@@ -60,10 +60,12 @@ struct Cli {
     print: bool,
 
     /// Fully-qualified `provider/model` spec. Provider must be one of:
-    ///   `anthropic` (API key), `claude` (OAuth/subscription), `openai`, `codex`, `openrouter`,
-    ///   `ollama` (local). Short aliases `sonnet`, `opus`, `haiku` are shorthands for
+    ///   `anthropic` (API key), `claude` (OAuth/subscription), `openai`, `codex`, `openrouter`
+    ///   (OpenAI Chat wire), `openrouter-anthropic` (OpenRouter's native Messages endpoint —
+    ///   leak-proof tool calls), `ollama` (local, OpenAI Chat wire), `ollama-anthropic` (local
+    ///   Messages endpoint). Short aliases `sonnet`, `opus`, `haiku` are shorthands for
     ///   `anthropic/<model>`.
-    /// Examples: `claude/claude-sonnet-4-6`, `openai/gpt-4o`, `openrouter/anthropic/claude-sonnet-4-5`.
+    /// Examples: `claude/claude-sonnet-4-6`, `openai/gpt-4o`, `openrouter-anthropic/z-ai/glm-4.6`.
     /// Overrides `model` in `.flux/config.toml`; falls back to `sonnet` (= `anthropic/claude-sonnet-4-6`).
     #[arg(short = 'm', long)]
     model: Option<String>,
@@ -208,13 +210,15 @@ const KNOWN_PROVIDERS: &[&str] = &[
     "openai",
     "codex",
     "openrouter",
+    "openrouter-anthropic",
     "ollama",
+    "ollama-anthropic",
 ];
 
 /// Parse a fully-qualified `provider/model` spec and build the matching provider from environment
 /// credentials. Provider must be an explicit prefix (`anthropic/`, `claude/`, `openai/`, `codex/`,
-/// `openrouter/`, `ollama/`). Bare short aliases (`sonnet`, `opus`, `haiku`) are implicitly
-/// `anthropic/<alias>`.
+/// `openrouter/`, `openrouter-anthropic/`, `ollama/`, `ollama-anthropic/`). Bare short aliases
+/// (`sonnet`, `opus`, `haiku`) are implicitly `anthropic/<alias>`.
 /// Any other bare string (no `/`) is an error — use `anthropic/` or `claude/` to disambiguate.
 fn build_provider(spec: &str) -> Result<(NativeProvider, String)> {
     let (provider, model) = match spec.split_once('/') {
@@ -240,7 +244,13 @@ fn build_provider(spec: &str) -> Result<(NativeProvider, String)> {
         "anthropic" => anthropic_from_env().context("anthropic provider")?,
         "openai" => openai_from_env().context("openai provider")?,
         "openrouter" => openrouter_from_env().context("openrouter provider")?,
+        // OpenRouter over its native Anthropic Messages endpoint — tool calls come back as
+        // structured `tool_use` blocks instead of leaking as `<tool_call>` text on the Chat path.
+        "openrouter-anthropic" => flux_openrouter::openrouter_anthropic_from_env()
+            .context("openrouter-anthropic provider")?,
         "ollama" => ollama_api(),
+        // Local ollama over its Anthropic Messages endpoint (latest ollama), for native tool calls.
+        "ollama-anthropic" => flux_ollama::ollama_anthropic_api(),
         "claude" => {
             let ts = flux_credentials::claude_token_source().context("claude provider")?;
             flux_anthropic::claude_oauth(ts)

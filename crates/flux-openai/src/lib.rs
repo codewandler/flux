@@ -222,8 +222,10 @@ struct ToolCallDelta {
 struct FnDelta {
     #[serde(default)]
     name: Option<String>,
+    /// `arguments` is spec'd as a JSON string but some models (e.g. GLM via OpenRouter)
+    /// send it as a pre-parsed JSON object. Accept either and normalise below.
     #[serde(default)]
-    arguments: Option<String>,
+    arguments: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -296,7 +298,17 @@ fn map_chat_stream(byte_stream: ByteStream) -> impl futures::Stream<Item = Resul
                             }
                         }
                         if let Some(a) = f.arguments {
-                            slot.2.push_str(&a);
+                            match a {
+                                // Normal OpenAI path: arguments arrive as a JSON string fragment.
+                                serde_json::Value::String(s) => slot.2.push_str(&s),
+                                // Some models (e.g. GLM via OpenRouter) send arguments as a
+                                // pre-parsed JSON object instead of a string.  Serialise it back
+                                // so the existing accumulator / parse path works unchanged.
+                                other if !other.is_null() => {
+                                    slot.2.push_str(&other.to_string());
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -306,22 +318,170 @@ fn map_chat_stream(byte_stream: ByteStream) -> impl futures::Stream<Item = Resul
             }
         }
 
-        if !text.is_empty() {
-            yield Chunk::Block(ContentBlock::Text { text });
-        }
-        for (id, name, args) in calls {
-            if name.is_empty() {
-                continue;
+        // Recovery: if no native tool calls arrived but the assistant text carries inline tool-call
+        // markup (some local/gateway models emit `<tool_call>…` instead of structured `tool_calls`,
+        // especially on multi-call turns), parse it back into tool_use blocks so the agent loop sees
+        // a real tool turn instead of stalling on what looks like prose.
+        let recovered = if calls.is_empty() && has_inline_tool_markup(&text) {
+            parse_inline_tool_calls(&text)
+        } else {
+            Vec::new()
+        };
+
+        if !recovered.is_empty() {
+            let cleaned = strip_inline_tool_markup(&text);
+            if !cleaned.is_empty() {
+                yield Chunk::Block(ContentBlock::Text { text: cleaned });
             }
-            let input = if args.trim().is_empty() {
-                Value::Object(Default::default())
-            } else {
-                serde_json::from_str(&args)?
-            };
-            yield Chunk::Block(ContentBlock::ToolUse { id, name, input });
+            for (id, name, input) in recovered {
+                yield Chunk::Block(ContentBlock::ToolUse { id, name, input });
+            }
+            // A recovered turn is a tool-use turn regardless of the reported finish_reason (usually
+            // "stop", since the calls were just text to the endpoint).
+            yield Chunk::Done { stop_reason: Some(StopReason::ToolUse) };
+        } else {
+            if !text.is_empty() {
+                yield Chunk::Block(ContentBlock::Text { text });
+            }
+            for (id, name, args) in calls {
+                if name.is_empty() {
+                    continue;
+                }
+                let input = if args.trim().is_empty() {
+                    Value::Object(Default::default())
+                } else {
+                    serde_json::from_str(&args)?
+                };
+                yield Chunk::Block(ContentBlock::ToolUse { id, name, input });
+            }
+            yield Chunk::Done { stop_reason: stop };
         }
-        yield Chunk::Done { stop_reason: stop };
     }
+}
+
+// ---------------------------------------------------------------------------
+// Inline tool-call recovery
+//
+// Some OpenAI-compatible endpoints (GLM via OpenRouter, local models via ollama) sometimes emit
+// tool calls as text in the assistant `content` instead of the structured `tool_calls` field —
+// most often on multi-call turns. We recover them at stream end (only when no native calls arrived,
+// so well-behaved providers are untouched). NOTE: the raw markup was already streamed live as
+// `TextDelta`s during accumulation; this only cleans the final transcript block, not the live view.
+// ---------------------------------------------------------------------------
+
+const INLINE_TOOL_OPEN: &str = "<tool_call>";
+const INLINE_TOOL_CLOSE: &str = "</tool_call>";
+
+/// True if `text` looks like it carries inline tool-call markup worth attempting to recover.
+fn has_inline_tool_markup(text: &str) -> bool {
+    text.contains(INLINE_TOOL_OPEN) || text.contains("<function=")
+}
+
+/// Inner content of each non-overlapping `open … close` span, left to right.
+fn span_inners(text: &str, open: &str, close: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(s) = rest.find(open) {
+        let after = &rest[s + open.len()..];
+        let Some(e) = after.find(close) else { break };
+        out.push(after[..e].to_string());
+        rest = &after[e + close.len()..];
+    }
+    out
+}
+
+/// Parse one inline call body into `(name, input)`. Handles the GLM XML form
+/// (`<function=NAME><parameter=KEY>VALUE</parameter>…`) and the Qwen/Hermes JSON form
+/// (`{"name":…,"arguments":{…}|"…"}`). Returns `None` for anything unrecognized.
+fn parse_inline_call_body(body: &str) -> Option<(String, Value)> {
+    let t = body.trim();
+    if let Some(fpos) = t.find("<function=") {
+        // GLM XML form.
+        let after_fn = &t[fpos + "<function=".len()..];
+        let name_end = after_fn.find('>')?;
+        let name = after_fn[..name_end].trim().to_string();
+        if name.is_empty() {
+            return None;
+        }
+        let mut input = serde_json::Map::new();
+        for pinner in span_inners(after_fn, "<parameter=", "</parameter>") {
+            // pinner = "KEY>VALUE"
+            if let Some(k_end) = pinner.find('>') {
+                let key = pinner[..k_end].trim().to_string();
+                let raw = pinner[k_end + 1..].trim();
+                if !key.is_empty() {
+                    // Coerce JSON scalars (15, true, [..]) but keep bare strings (paths, prose).
+                    let val = serde_json::from_str::<Value>(raw)
+                        .unwrap_or_else(|_| Value::String(raw.to_string()));
+                    input.insert(key, val);
+                }
+            }
+        }
+        Some((name, Value::Object(input)))
+    } else {
+        // Qwen/Hermes JSON form: the first {…last} object in the body.
+        let start = t.find('{')?;
+        let end = t.rfind('}')?;
+        if start > end {
+            return None;
+        }
+        let obj = match serde_json::from_str::<Value>(&t[start..=end]) {
+            Ok(Value::Object(o)) => o,
+            _ => return None,
+        };
+        let name = obj.get("name").and_then(|v| v.as_str())?.to_string();
+        let input = match obj.get("arguments") {
+            Some(Value::Object(m)) => Value::Object(m.clone()),
+            Some(Value::String(s)) => serde_json::from_str(s).unwrap_or_else(|_| json!({})),
+            _ => json!({}),
+        };
+        Some((name, input))
+    }
+}
+
+/// Recover tool calls a model emitted as inline text. Returns `(id, name, input)` with synthetic
+/// ids, capped at [`MAX_TOOL_CALLS`].
+fn parse_inline_tool_calls(text: &str) -> Vec<(String, String, Value)> {
+    let bodies: Vec<String> = if text.contains(INLINE_TOOL_OPEN) {
+        span_inners(text, INLINE_TOOL_OPEN, INLINE_TOOL_CLOSE)
+    } else {
+        // No <tool_call> wrapper: treat each <function=…></function> element as its own body.
+        span_inners(text, "<function=", "</function>")
+            .into_iter()
+            .map(|inner| format!("<function={inner}</function>"))
+            .collect()
+    };
+    bodies
+        .into_iter()
+        .filter_map(|b| parse_inline_call_body(&b))
+        .take(MAX_TOOL_CALLS)
+        .enumerate()
+        .map(|(i, (name, input))| (format!("call_{i}"), name, input))
+        .collect()
+}
+
+/// Strip inline tool-call markup, leaving the model's surrounding prose (trimmed).
+fn strip_inline_tool_markup(text: &str) -> String {
+    let (open, close) = if text.contains(INLINE_TOOL_OPEN) {
+        (INLINE_TOOL_OPEN, INLINE_TOOL_CLOSE)
+    } else {
+        ("<function=", "</function>")
+    };
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(s) = rest.find(open) {
+        out.push_str(&rest[..s]);
+        let after = &rest[s + open.len()..];
+        match after.find(close) {
+            Some(e) => rest = &after[e + close.len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -826,6 +986,73 @@ mod tests {
                 assert_eq!(input["path"], "a.txt");
             }
             other => panic!("expected tool_use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_inline_recovers_glm_and_qwen_forms() {
+        // GLM XML form, two calls with surrounding prose.
+        let glm = "Let me read.<tool_call><function=read> <parameter=path>README.md</parameter>\
+                   </function></tool_call><tool_call> <function=read> <parameter=path>next.md\
+                   </parameter></function></tool_call>";
+        let calls = parse_inline_tool_calls(glm);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].1, "read");
+        assert_eq!(calls[0].2["path"], "README.md");
+        assert_eq!(calls[1].2["path"], "next.md");
+        assert_eq!(strip_inline_tool_markup(glm), "Let me read.");
+
+        // Qwen/Hermes JSON form.
+        let qwen = "<tool_call>{\"name\":\"write\",\"arguments\":{\"path\":\"tool.txt\",\"content\":\"X\"}}</tool_call>";
+        let calls = parse_inline_tool_calls(qwen);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "write");
+        assert_eq!(calls[0].2["content"], "X");
+
+        // A GLM numeric parameter is coerced to a JSON number; a path stays a string.
+        let numeric = "<tool_call><function=git_log> <parameter=limit>15</parameter></function></tool_call>";
+        let calls = parse_inline_tool_calls(numeric);
+        assert_eq!(calls[0].2["limit"], 15);
+    }
+
+    #[tokio::test]
+    async fn chat_stream_recovers_inline_tool_calls() {
+        // A model that emitted its tool call as text (no structured tool_calls) and finished with
+        // "stop" — the recovery path must still surface a tool_use block and a ToolUse stop reason.
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Let me read.<tool_call><function=read> <parameter=path>a.txt</parameter></function></tool_call>\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+
+        let mut blocks = Vec::new();
+        let mut stop = None;
+        let stream = map_chat_stream(byte_stream);
+        futures::pin_mut!(stream);
+        while let Some(chunk) = stream.next().await {
+            match chunk.unwrap() {
+                Chunk::Block(b) => blocks.push(b),
+                Chunk::Done { stop_reason } => stop = stop_reason,
+                _ => {}
+            }
+        }
+
+        assert_eq!(stop, Some(StopReason::ToolUse));
+        assert_eq!(blocks.len(), 2); // cleaned prose + recovered tool_use
+        match &blocks[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "Let me read."),
+            other => panic!("expected cleaned text, got {other:?}"),
+        }
+        match &blocks[1] {
+            ContentBlock::ToolUse { name, input, .. } => {
+                assert_eq!(name, "read");
+                assert_eq!(input["path"], "a.txt");
+            }
+            other => panic!("expected recovered tool_use, got {other:?}"),
         }
     }
 

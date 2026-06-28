@@ -617,17 +617,12 @@ dependencies = [
 name = "flux-anthropic"
 version = "0.2.4"
 dependencies = [
- "async-stream",
  "async-trait",
- "bytes",
- "eventsource-stream",
  "flux-core",
+ "flux-messages",
  "flux-provider",
- "futures",
  "reqwest",
- "serde",
  "serde_json",
- "tokio",
 ]
 
 [[package]]
@@ -698,7 +693,9 @@ dependencies = [
  "flux-evidence",
  "flux-flow",
  "flux-hooks",
+ "flux-ollama",
  "flux-openai",
+ "flux-openrouter",
  "flux-orchestrate",
  "flux-plugin",
  "flux-policy",
@@ -910,6 +907,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "flux-messages"
+version = "0.2.4"
+dependencies = [
+ "async-stream",
+ "bytes",
+ "eventsource-stream",
+ "flux-core",
+ "flux-provider",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "flux-ollama"
+version = "0.2.4"
+dependencies = [
+ "async-trait",
+ "flux-core",
+ "flux-messages",
+ "flux-provider",
+ "reqwest",
+ "serde_json",
+]
+
+[[package]]
 name = "flux-openai"
 version = "0.2.4"
 dependencies = [
@@ -924,6 +948,18 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "flux-openrouter"
+version = "0.2.4"
+dependencies = [
+ "async-trait",
+ "flux-core",
+ "flux-messages",
+ "flux-provider",
+ "reqwest",
+ "serde_json",
 ]
 
 [[package]]

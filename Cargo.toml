@@ -20,7 +20,10 @@ members = [
     "crates/flux-eval",
     "crates/flux-plugin",
     "crates/flux-hooks",
+    "crates/flux-messages",
     "crates/flux-anthropic",
+    "crates/flux-openrouter",
+    "crates/flux-ollama",
     "crates/flux-openai",
     "crates/flux-credentials",
     "crates/flux-sdk",
@@ -79,7 +82,10 @@ flux-browser = { path = "crates/flux-browser" }
 flux-sdk = { path = "crates/flux-sdk", version = "0.2.4" }
 flux-tui = { path = "crates/flux-tui" }
 flux-provider = { path = "crates/flux-provider", version = "0.2.4" }
+flux-messages = { path = "crates/flux-messages" }
 flux-anthropic = { path = "crates/flux-anthropic" }
+flux-openrouter = { path = "crates/flux-openrouter" }
+flux-ollama = { path = "crates/flux-ollama" }
 flux-openai = { path = "crates/flux-openai" }
 flux-credentials = { path = "crates/flux-credentials" }
 flux-cognition = { path = "crates/flux-cognition", version = "0.2.4" }

@@ -69,6 +69,23 @@ flux -m openrouter/meta-llama/llama-3.3-70b-instruct  "summarise docs"
 model = "openrouter/anthropic/claude-sonnet-4-5"
 ```
 
+### `openrouter-anthropic` — native tool calling (recommended for agentic use)
+
+OpenRouter also exposes an **Anthropic Messages**–compatible endpoint (`/api/v1/messages`). The
+`openrouter-anthropic` provider routes through it, so tool calls return as structured `tool_use`
+content blocks instead of risking the inline `<tool_call>` text leakage some models exhibit on the
+OpenAI Chat path. Because flux's agent loop is tool-driven, this is the more reliable choice.
+
+```bash
+flux -m openrouter-anthropic/z-ai/glm-4.6           "refactor the parser"
+flux -m openrouter-anthropic/qwen/qwen3-coder       "add tests for the auth module"
+flux -m openrouter-anthropic/deepseek/deepseek-chat "review this PR"
+```
+
+Same `OPENROUTER_API_KEY`; the slug is forwarded verbatim. The Chat-path `openrouter/…` provider
+still exists (and now *recovers* tool calls that leak as text), but `openrouter-anthropic` avoids the
+problem at the source and requests tool-capable routing (`provider.require_parameters`).
+
 ---
 
 ## GLM Z1 / GLM-4 (Zhipu AI) via OpenRouter
@@ -103,6 +120,12 @@ flux -m openrouter/thudm/glm-4-32b  "explain the entire provider layer"
 model = "openrouter/z-ai/glm-5.2"
 ```
 
+> **Tool-calling reliability:** GLM emits tool calls far more reliably through the Messages endpoint —
+> prefer **`openrouter-anthropic/z-ai/glm-4.6`** for agentic use. `glm-5.2` can still emit malformed
+> or empty tool JSON on some routes (e.g. Novita); flux repairs the common cases (off-by-one braces,
+> trailing characters), but an *empty* plan body can't be recovered. If you hit frequent failures, pin
+> a different upstream via OpenRouter provider routing or use `z-ai/glm-4.6`.
+
 ### Mid-session model switch
 
 You can switch models without restarting a session using the `/model` REPL command:
@@ -135,6 +158,18 @@ flux -m ollama/qwen2.5-coder:7b "explain the provider layer"
 
 The model string after `ollama/` is forwarded verbatim, including the tag (`:7b`, `:14b`, …), so
 any name from `ollama list` works.
+
+### `ollama-anthropic` — native tool calling
+
+Recent Ollama also serves an **Anthropic Messages**–compatible endpoint (`/v1/messages`). The
+`ollama-anthropic` provider uses it, so local models return native `tool_use` blocks rather than
+risking inline-text tool-call leakage:
+
+```bash
+flux -m ollama-anthropic/qwen2.5-coder:7b "explain the provider layer"
+```
+
+It honours `OLLAMA_HOST` the same way; requires a recent Ollama build with Messages-API support.
 
 ### Remote / custom host
 
@@ -212,8 +247,10 @@ Run `flux auth status` to see what credentials are currently resolved and from w
 | `claude` | Anthropic Messages | — | Claude subscription OAuth; opt-in (`flux auth login claude`) |
 | `openai` | OpenAI Chat | `OPENAI_API_KEY` | Full streaming + tool-call support |
 | `codex` | OpenAI Responses | — | ChatGPT/Codex OAuth; opt-in (`flux auth login codex`) |
-| `openrouter` | OpenAI Chat | `OPENROUTER_API_KEY` | Proxy to 300 + models; append any OpenRouter slug |
+| `openrouter` | OpenAI Chat | `OPENROUTER_API_KEY` | Proxy to 300 + models; append any OpenRouter slug; recovers inline-text tool calls |
+| `openrouter-anthropic` | Anthropic Messages | `OPENROUTER_API_KEY` | OpenRouter's native Messages endpoint — structured `tool_use`, no text leakage; preferred for agentic use |
 | `ollama` | OpenAI Chat | — | Local models; no key; `OLLAMA_HOST` overrides `localhost:11434`; needs a tool-capable model |
+| `ollama-anthropic` | Anthropic Messages | — | Local Ollama's Messages endpoint (recent builds) — native `tool_use` |
 | `mock` | — | — | Offline test provider; no key, exercises the full pipeline |
 
 See [docs/architecture.md](architecture.md) for the provider layer design and [docs/usage.md](usage.md) for the full CLI reference.
