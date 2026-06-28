@@ -8,6 +8,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **A2A client — `flux a2a <URL>`.** flux can now *consume* a remote A2A agent, not just expose one:
+  `flux a2a <URL>` connects to any spec-conformant Agent-to-Agent agent and drives it from the CLI
+  like a local agent — an interactive REPL, or a one-shot turn from command-line prompt words or
+  piped stdin. Streamed replies render live (`message/stream`); Ctrl-C cancels a turn. A2A is an
+  *agent* protocol, not a model protocol, so the client is thin: one user turn maps to one remote
+  task (the remote runs its own loop), carrying the A2A `contextId`/`messageId`/`taskId` so a
+  stateful remote keeps memory. A new leaf crate **`flux-a2a`** (L1) owns the spec wire types and
+  the `A2aClient` (`fetch_agent_card` / `message/send` / `message/stream` / `tasks/get`), shared with
+  the server.
 - **Global, multi-format skills.** Skills are now discovered from the project's `.flux/skills` **and**
   the user-global dirs `~/.flux/skills`, `~/.agents/skills`, and `~/.claude/skills` (project wins on a
   name clash), so skills kept for other agents work in flux without per-project copies. Beyond the
@@ -26,6 +35,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **A2A server speaks the current spec (breaking for A2A callers).** `flux serve`'s A2A endpoint
+  moved from the early-draft `tasks/send` / `tasks/sendSubscribe` methods to the current spec's
+  `message/send` / `message/stream`, with message parts keyed by `kind` (was `type`), a `Task` /
+  `TaskStatusUpdateEvent` result shape built from the shared `flux-a2a` types, and SSE frames as
+  plain JSON-RPC responses. The discovery card is now also served at `/.well-known/agent-card.json`
+  (the `…/agent.json` path remains as an alias). The old draft methods are gone (clean cutover).
 - **CLI: every entry point is now a subcommand (breaking).** The implicit top-level "run a turn"
   behavior and the top-level mode flags are gone, so `flux --help` shows only the command list plus the
   global `--color`. Migrate: `flux --serve <addr>` → `flux serve <addr>`, `flux --tui` → `flux tui`,

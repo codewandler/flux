@@ -3,8 +3,8 @@
 //!
 //! Routes:
 //! - `GET  /health`                       → `ok`
-//! - `GET  /.well-known/agent.json`       → A2A agent card (discovery)
-//! - `POST /a2a`                          → A2A JSON-RPC 2.0 (`tasks/send`, `tasks/sendSubscribe`)
+//! - `GET  /.well-known/agent-card.json`  → A2A agent card (discovery; `…/agent.json` is an alias)
+//! - `POST /a2a`                          → A2A JSON-RPC 2.0 (`message/send`, `message/stream`)
 //! - `POST /sessions`                     → `{ id, model }`
 //! - `GET  /sessions/:id`                 → session info
 //! - `POST /sessions/:id/messages`        → `{ text, tool_calls, usage }`
@@ -40,8 +40,8 @@ pub async fn serve(addr: &str, agent: FlowEngine, token: Option<String>) -> anyh
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let addr = listener.local_addr()?;
     eprintln!("flux server listening on http://{addr}");
-    eprintln!("  A2A agent card:  http://{addr}/.well-known/agent.json");
-    eprintln!("  A2A endpoint:    http://{addr}/a2a");
+    eprintln!("  A2A agent card:  http://{addr}/.well-known/agent-card.json");
+    eprintln!("  A2A endpoint:    http://{addr}/a2a  (message/send, message/stream)");
     serve_on(listener, agent, token).await
 }
 
@@ -60,6 +60,7 @@ fn router(state: Shared, token: Option<String>) -> Router {
     // cannot be bypassed by percent-encoding or double-slash tricks.
     let exempt = Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/.well-known/agent-card.json", get(a2a::agent_card))
         .route("/.well-known/agent.json", get(a2a::agent_card));
 
     // Every other route requires a valid Bearer token when one is configured.

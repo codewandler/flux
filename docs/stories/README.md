@@ -31,6 +31,7 @@ _(none)_
 - [I-01 — Statistically clean headline gain](I-01-headline-gain.md) · Improve · trials ≥ 3, grader-confirmed
 
 ## Done
+- [A-02 — A2A client (`flux a2a <URL>`)](A-02-a2a-client.md) · Agent · consume a remote A2A agent like a local one; server clean-cutover to the current spec (see [CHANGELOG](../../CHANGELOG.md))
 - [L-01 — Global, multi-format skill loading](L-01-global-skills.md) · Language · multi-dir + Agent-Skills/Claude format + `flux-markdown` (see [CHANGELOG](../../CHANGELOG.md))
 
 ## Done

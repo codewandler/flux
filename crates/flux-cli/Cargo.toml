@@ -34,6 +34,7 @@ flux-app.workspace = true
 flux-eval.workspace = true
 flux-orchestrate.workspace = true
 flux-hooks.workspace = true
+flux-a2a.workspace = true
 flux-server.workspace = true
 flux-tui.workspace = true
 flux-browser.workspace = true

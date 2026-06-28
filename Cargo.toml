@@ -26,6 +26,7 @@ members = [
     "crates/flux-auth",
     "crates/flux-evidence",
     "crates/flux-datasource",
+    "crates/flux-a2a",
     "crates/flux-server",
     "crates/flux-integrations",
     "crates/flux-browser",
@@ -73,6 +74,7 @@ flux-hooks = { path = "crates/flux-hooks" }
 flux-auth = { path = "crates/flux-auth" }
 flux-evidence = { path = "crates/flux-evidence", version = "0.2.4" }
 flux-datasource = { path = "crates/flux-datasource" }
+flux-a2a = { path = "crates/flux-a2a" }
 flux-server = { path = "crates/flux-server" }
 flux-integrations = { path = "crates/flux-integrations" }
 flux-browser = { path = "crates/flux-browser" }

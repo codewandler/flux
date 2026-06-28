@@ -1,0 +1,20 @@
+[package]
+name = "flux-a2a"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "A2A (Agent-to-Agent) protocol: spec-conformant wire types + an HTTP/JSON-RPC client for driving remote A2A agents."
+
+[dependencies]
+reqwest.workspace = true
+eventsource-stream.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

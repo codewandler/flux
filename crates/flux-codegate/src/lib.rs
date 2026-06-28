@@ -20,8 +20,9 @@ pub fn layer(name: &str) -> Option<u8> {
         "flux-core" | "flux-policy" | "flux-secret" | "flux-spec" | "flux-config"
         | "flux-evidence" | "flux-skill" | "flux-lang" | "flux-markdown" => 0,
         // L1 — the provider abstraction, the concrete providers (Anthropic/OpenAI/OpenRouter/
-        // Ollama + the shared Messages protocol core, all in `flux-providers`), and credentials
-        "flux-provider" | "flux-providers" | "flux-credentials" => 1,
+        // Ollama + the shared Messages protocol core, all in `flux-providers`), credentials, and
+        // the A2A agent-protocol client + wire types (`flux-a2a`; no flux deps — a network client)
+        "flux-provider" | "flux-providers" | "flux-credentials" | "flux-a2a" => 1,
         // L2 — runtime: execution + guarded IO + the safety envelope
         "flux-system" | "flux-runtime" | "flux-tools" | "flux-events" | "flux-context" => 2,
         // L3 — agent + orchestration + eval/self-improvement harness + cognition ops
