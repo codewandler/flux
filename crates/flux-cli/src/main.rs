@@ -47,16 +47,22 @@ use std::borrow::Cow;
     long_about = "flux — the LLM plans, the runtime runs.\n\n\
         Run the agent with `flux run <prompt>`; with no prompt, `flux` opens the interactive REPL. \
         A bare `flux <word>` is NOT run as a prompt (so a stray word or a shell completion probe \
-        can't launch an autonomous turn). Other entry points: `flux sessions`, `flux completion \
-        <shell>`, `flux auth`, `flux run <app.flux>`."
+        can't launch an autonomous turn). Run `flux help` for the full list of commands.",
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true
 )]
 struct Cli {
+    /// A subcommand (run `flux help` to list them). Omit it to run the agent on a flag-led prompt,
+    /// or pass no args at all to open the interactive REPL.
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     /// The prompt for a one-shot agent turn. Invoke via `flux run <prompt>` (or the headless `-p`);
     /// a bare `flux <prompt>` is refused so accidental words don't start a turn.
     prompt: Vec<String>,
 
     /// (Hidden) Non-interactive print mode — a bare prompt is already one-shot, so this is a no-op alias.
-    #[arg(short = 'p', long = "print", hide = true)]
+    #[arg(short = 'p', long = "print", hide = true, global = true)]
     print: bool,
 
     /// Fully-qualified `provider/model` spec. Provider must be one of:
@@ -67,47 +73,47 @@ struct Cli {
     ///   `anthropic/<model>`.
     /// Examples: `claude/claude-sonnet-4-6`, `openai/gpt-4o`, `openrouter-anthropic/z-ai/glm-4.6`.
     /// Overrides `model` in `.flux/config.toml`; falls back to `sonnet` (= `anthropic/claude-sonnet-4-6`).
-    #[arg(short = 'm', long)]
+    #[arg(short = 'm', long, global = true)]
     model: Option<String>,
 
     /// (Hidden) Adaptive thinking — only wired on the `-p` raw path; a no-op for the engine for now.
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, global = true)]
     think: bool,
 
     /// (Hidden) Reasoning effort — only wired on the `-p` raw path; a no-op for the engine for now.
-    #[arg(long, value_enum, hide = true)]
+    #[arg(long, value_enum, hide = true, global = true)]
     effort: Option<EffortArg>,
 
     /// Maximum tokens to generate. The planner must fit the entire `emit_plan` graph in this budget,
     /// so it is generous by default; a turn truncated here fails loudly rather than silently stopping.
-    #[arg(long, default_value_t = 16384)]
+    #[arg(long, default_value_t = 16384, global = true)]
     max_tokens: u32,
 
     /// (Hidden) Print token usage — only wired on the `-p` raw path.
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, global = true)]
     usage: bool,
 
     /// (Hidden, deprecated) The Flux-Lang engine is the default for a bare prompt; this is a no-op.
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, global = true)]
     agent: bool,
 
     /// Auto-approve every tool call (headless). Without it, unmatched calls prompt for approval.
-    #[arg(long)]
+    #[arg(long, global = true)]
     yes: bool,
 
     /// Show tool output in full (no truncation). Plans and tool inputs are always shown in full; this
     /// also un-caps tool *output* (e.g. large file reads). Also enabled by `FLUX_VERBOSE`.
-    #[arg(short = 'v', long)]
+    #[arg(short = 'v', long, global = true)]
     verbose: bool,
 
     /// Reveal the agent loop: stream the loop-machinery ops (`plan`/`run_plan`/`observe`/…) that are
     /// filtered from the surface by default, so you can watch each turn iterate. Also enabled by
     /// `FLUX_SHOW_LOOP`. See `flux loop show` for the loop itself and `/evidence` for the audit trail.
-    #[arg(long)]
+    #[arg(long, global = true)]
     show_loop: bool,
 
     /// When to colorize output: auto (a terminal, `NO_COLOR` unset), always, or never.
-    #[arg(long, value_enum, default_value_t)]
+    #[arg(long, value_enum, default_value_t, global = true)]
     color: style::ColorChoice,
 
     /// Launch the ratatui chat TUI (requires a real terminal). Tool calls raise a y/a/N modal;
@@ -116,15 +122,15 @@ struct Cli {
     tui: bool,
 
     /// Continue the most recent session instead of starting a new one.
-    #[arg(short = 'c', long)]
+    #[arg(short = 'c', long, global = true)]
     continue_: bool,
 
     /// Resume the most recent session (equivalent to --continue; used by hot-reload).
-    #[arg(long)]
+    #[arg(long, global = true)]
     resume: bool,
 
     /// Dev mode: enables hot-reload (`flux_reload` tool) and other developer tools.
-    #[arg(long)]
+    #[arg(long, global = true)]
     dev: bool,
 
     /// Bind a long-running HTTP API daemon at this address (e.g. 127.0.0.1:8787).
@@ -139,6 +145,134 @@ struct Cli {
     /// Plan output format for `--plan` when not running it: json, yaml, or pretty (default).
     #[arg(short = 'o', long, value_enum)]
     output: Option<OutputFormat>,
+}
+
+/// The flux subcommands. Each renders its own `flux <cmd> --help`. A first token that is NOT one of
+/// these is treated as a (flag-led) agent prompt — and a *bare* word is refused (use `flux run`).
+#[derive(clap::Subcommand, Debug)]
+enum Commands {
+    /// Run the agent on a prompt, or a multi-agent program: `flux run <prompt…>` / `flux run <app.flux>`.
+    Run {
+        /// The prompt words, or a path to an `<app.flux>` multi-agent program. Global flags
+        /// (`-m`, `--yes`, …) may appear before or after.
+        prompt: Vec<String>,
+    },
+    /// Run a benchmark suite against flux and print a summary (uses the global `-m`/`--model`).
+    #[command(
+        after_help = "ADAPTERS:\n  synthetic       real-model coding riddles (fast, no Docker)\n  mock            offline CI fixture (drives -m mock)\n  terminal-bench  the real Docker benchmark\n  multi           several behind one combined score (with --members)\n\nEXAMPLES:\n  flux eval synthetic -m openrouter-anthropic/anthropic/claude-sonnet-4.6 --watch --report r.md\n  flux eval multi --members synthetic,terminal-bench"
+    )]
+    Eval {
+        /// Which suite to run: synthetic | mock | terminal-bench | multi.
+        adapter: String,
+        /// Restrict to these task ids (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        tasks: Vec<String>,
+        /// For `multi`: the member adapters to combine (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        members: Vec<String>,
+        /// Cap the number of tasks (0 = all).
+        #[arg(long, default_value_t = 0)]
+        limit: u64,
+        /// Trials per task (>1 averages out single-run model noise).
+        #[arg(long, default_value_t = 1)]
+        trials: u64,
+        /// Write a categorized Markdown report to this path.
+        #[arg(long)]
+        report: Option<String>,
+        /// Stream each task's agent activity to the terminal live.
+        #[arg(long)]
+        watch: bool,
+    },
+    /// Run a pre-compiled Flux-Lang program (a DraftAst JSON file).
+    Flow {
+        #[command(subcommand)]
+        action: FlowAction,
+    },
+    /// Inspect or customize the agent loop (`assets/agent-loop.flux`).
+    Loop {
+        #[command(subcommand)]
+        action: Option<LoopAction>,
+    },
+    /// List recent sessions (newest first).
+    Sessions {
+        /// Delete all zero-message (abandoned) sessions.
+        #[arg(long)]
+        prune: bool,
+    },
+    /// Provider authentication (status / login).
+    Auth {
+        #[command(subcommand)]
+        action: Option<AuthAction>,
+    },
+    /// Manage subprocess plugins (any-language ops).
+    Plugin {
+        #[command(subcommand)]
+        action: Option<PluginAction>,
+    },
+    /// Print a shell completion script to stdout (defaults to fish).
+    Completion {
+        /// Shell to generate for: bash | zsh | fish | powershell | elvish.
+        shell: Option<String>,
+    },
+    /// Scaffold or run a parameterized flow recipe.
+    Preset {
+        /// `list` | `<name> key=value …` (passed through to the preset cookbook).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
+/// `flux flow …`
+#[derive(clap::Subcommand, Debug)]
+enum FlowAction {
+    /// Run a checked-in Flux-Lang program file.
+    Run {
+        /// Path to the `.flux` DraftAst JSON.
+        file: String,
+    },
+}
+
+/// `flux loop …`
+#[derive(clap::Subcommand, Debug)]
+enum LoopAction {
+    /// Print the active agent loop (the default).
+    Show,
+    /// Write the built-in loop to `.flux/agent-loop.flux` so it can be edited.
+    Eject {
+        /// Overwrite an existing override.
+        #[arg(short, long)]
+        force: bool,
+    },
+}
+
+/// `flux auth …`
+#[derive(clap::Subcommand, Debug)]
+enum AuthAction {
+    /// Show which providers are configured (the default).
+    Status,
+    /// Log in to a provider (currently `claude`).
+    Login {
+        /// Provider to log in to.
+        provider: String,
+    },
+}
+
+/// `flux plugin …`
+#[derive(clap::Subcommand, Debug)]
+enum PluginAction {
+    /// List installed plugins (the default).
+    Ls,
+    /// Add a plugin: `add <name> <program> [args…]`.
+    Add {
+        name: String,
+        program: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Pin a plugin to a version: `pin <name> <version>`.
+    Pin { name: String, version: String },
+    /// Clear a plugin's version pin: `rollback <name>`.
+    Rollback { name: String },
 }
 
 /// Reasoning effort, as a CLI value-enum mirroring [`Effort`].
@@ -354,9 +488,7 @@ fn fmt_age(created_at_ms: i64) -> String {
 
 /// `flux sessions` — list recent sessions (newest first).
 /// `flux sessions --prune` — delete all zero-message (abandoned) sessions.
-fn run_sessions() -> Result<()> {
-    let argv: Vec<String> = std::env::args().collect();
-    let prune = argv.get(2).map(|s| s == "--prune").unwrap_or(false);
+fn run_sessions(prune: bool) -> Result<()> {
     let store = open_event_store()?;
     if prune {
         let n = store.prune_empty()?;
@@ -392,13 +524,12 @@ fn run_sessions() -> Result<()> {
 /// repeated until the model answers in prose. `show` prints the active loop (a workspace
 /// `.flux/agent-loop.flux` override if present, else the built-in); `eject` writes the built-in to
 /// `.flux/agent-loop.flux` so it can be edited (the engine honors the override on the next turn).
-fn run_loop_cmd(args: &[String]) -> Result<()> {
+fn run_loop_cmd(action: Option<LoopAction>) -> Result<()> {
     use flux_flow::engine::{agent_loop_source, builtin_agent_loop, load_agent_loop, LoopSource};
 
     let cwd = std::env::current_dir().context("current dir")?;
-    match args.first().map(String::as_str) {
-        // Default to `show`.
-        None | Some("show") => {
+    match action.unwrap_or(LoopAction::Show) {
+        LoopAction::Show => {
             let (source, text) = agent_loop_source(&cwd);
             match &source {
                 LoopSource::Builtin => {
@@ -421,8 +552,7 @@ fn run_loop_cmd(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
-        Some("eject") | Some("init") => {
-            let force = args.iter().any(|a| a == "--force" || a == "-f");
+        LoopAction::Eject { force } => {
             let dir = cwd.join(".flux");
             let path = dir.join("agent-loop.flux");
             if path.exists() && !force {
@@ -440,9 +570,6 @@ fn run_loop_cmd(args: &[String]) -> Result<()> {
                 path.display()
             );
             Ok(())
-        }
-        Some(other) => {
-            bail!("unknown `flux loop` command: {other}\nusage: flux loop [show|eject [--force]]");
         }
     }
 }
@@ -825,78 +952,17 @@ async fn run_agentic(cli: &Cli, prompt: String) -> Result<()> {
 /// [--report out.md] [--watch]` — run a benchmark suite ad-hoc through flux-eval and print a summary
 /// (same adapters + scoring the `eval_run` op and improve loop use). `--watch` streams each task's
 /// agent activity live; `--report` writes the categorized Markdown report.
-async fn run_eval_cmd(args: &[String]) -> Result<()> {
-    let mut adapter: Option<String> = None;
-    let mut tasks: Vec<String> = Vec::new();
-    let mut members: Vec<String> = Vec::new();
-    let mut limit: u64 = 0;
-    let mut model: Option<String> = None;
-    let mut trials: u64 = 1;
-    let mut report_path: Option<String> = None;
-    let mut watch = false;
-    let split_csv = |s: String| -> Vec<String> {
-        s.split(',')
-            .map(|x| x.trim().to_string())
-            .filter(|x| !x.is_empty())
-            .collect()
-    };
-    let mut iter = args.iter();
-    while let Some(a) = iter.next() {
-        match a.as_str() {
-            "--watch" => watch = true,
-            "-m" | "--model" => {
-                model = Some(
-                    iter.next()
-                        .cloned()
-                        .ok_or_else(|| anyhow::anyhow!("`-m` needs a model spec"))?,
-                )
-            }
-            "--tasks" => {
-                tasks = split_csv(
-                    iter.next()
-                        .cloned()
-                        .ok_or_else(|| anyhow::anyhow!("`--tasks` needs a,b,c"))?,
-                )
-            }
-            "--members" => {
-                members = split_csv(
-                    iter.next()
-                        .cloned()
-                        .ok_or_else(|| anyhow::anyhow!("`--members` needs a,b"))?,
-                )
-            }
-            "--limit" => {
-                limit = iter
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| anyhow::anyhow!("`--limit` needs a number"))?
-            }
-            "--trials" => {
-                trials = iter
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| anyhow::anyhow!("`--trials` needs a number"))?
-            }
-            "--report" => {
-                report_path = Some(
-                    iter.next()
-                        .cloned()
-                        .ok_or_else(|| anyhow::anyhow!("`--report` needs a path"))?,
-                )
-            }
-            other if !other.starts_with('-') && adapter.is_none() => {
-                adapter = Some(other.to_string())
-            }
-            other => bail!("flux eval: unexpected argument {other:?}"),
-        }
-    }
-    let adapter = adapter.ok_or_else(|| {
-        anyhow::anyhow!(
-            "usage: flux eval <adapter> [--tasks a,b] [--members a,b] [--limit N] [-m model] \
-             [--trials N] [--report out.md] [--watch]\n  adapters: synthetic | mock | terminal-bench | multi"
-        )
-    })?;
-
+#[allow(clippy::too_many_arguments)]
+async fn run_eval_cmd(
+    adapter: String,
+    tasks: Vec<String>,
+    members: Vec<String>,
+    limit: u64,
+    trials: u64,
+    report_path: Option<String>,
+    watch: bool,
+    model: Option<String>,
+) -> Result<()> {
     let mut params = serde_json::json!({
         "adapter": adapter,
         "tasks": tasks,
@@ -945,32 +1011,8 @@ async fn run_eval_cmd(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-async fn run_flow(args: &[String]) -> Result<()> {
-    let mut iter = args.iter();
-    if iter.next().map(|s| s.as_str()) != Some("run") {
-        bail!("usage: flux flow run <file.flux> [--yes] [-m <model>]");
-    }
-    let mut file: Option<String> = None;
-    let mut yes = false;
-    let mut model: Option<String> = None;
-    while let Some(a) = iter.next() {
-        match a.as_str() {
-            "--yes" | "-y" => yes = true,
-            "-m" | "--model" => {
-                model = Some(
-                    iter.next()
-                        .cloned()
-                        .ok_or_else(|| anyhow::anyhow!("`-m` needs a model spec"))?,
-                )
-            }
-            other if !other.starts_with('-') && file.is_none() => file = Some(other.to_string()),
-            other => bail!("flow run: unexpected argument {other:?}"),
-        }
-    }
-    let file = file
-        .ok_or_else(|| anyhow::anyhow!("usage: flux flow run <file.flux> [--yes] [-m <model>]"))?;
-
-    // Synthesize a Cli for build_agent from the parsed flags (reuses all the agent wiring).
+async fn run_flow(file: &str, model: Option<String>, yes: bool) -> Result<()> {
+    // Synthesize a Cli for build_agent from the (global) model/`--yes` flags (reuses the agent wiring).
     let mut synth: Vec<String> = vec!["flux".to_string()];
     if yes {
         synth.push("--yes".to_string());
@@ -982,7 +1024,7 @@ async fn run_flow(args: &[String]) -> Result<()> {
     let cli = Cli::parse_from(&synth);
     style::init(cli.color);
 
-    let src = std::fs::read_to_string(&file).with_context(|| format!("read flow {file}"))?;
+    let src = std::fs::read_to_string(file).with_context(|| format!("read flow {file}"))?;
     let ast: flux_flow::ast::DraftAst = serde_json::from_str(&src)
         .with_context(|| format!("parse {file} as a Flux-Lang DraftAst (JSON)"))?;
 
@@ -2553,125 +2595,116 @@ async fn main() -> Result<()> {
     // We do this before `style::init` so even parse errors (before color flags are known) get color
     // when stderr is a tty — safe because `style::init` defaults to auto.
     style::init(style::ColorChoice::Auto);
-    // `flux auth …` is a distinct mode; everything else is the prompt runner.
-    let argv: Vec<String> = std::env::args().collect();
-    if argv.get(1).map(|s| s == "auth").unwrap_or(false) {
-        return run_auth(&argv[2..]).await;
-    }
-    if argv.get(1).map(|s| s == "plugin").unwrap_or(false) {
-        return run_plugin(&argv[2..]);
-    }
-    if argv.get(1).map(|s| s == "sessions").unwrap_or(false) {
-        return run_sessions();
-    }
-    // Shell completions. Intercepted before any agent path and printed with ZERO side effects — a
-    // shell sources this while you type (fish's bundled `flux.fish` runs `flux completion fish`), so
-    // it must never start a turn. (A bare prompt "completion fish" used to do exactly that, freezing
-    // the shell mid-keystroke.)
-    if argv.get(1).map(|s| s == "completion").unwrap_or(false) {
-        return run_completion(&argv[2..]);
-    }
-    if argv.get(1).map(|s| s == "flow").unwrap_or(false) {
-        return run_flow(&argv[2..]).await;
-    }
-    if argv.get(1).map(|s| s == "preset").unwrap_or(false) {
-        return preset::run_preset(&argv[2..]).await;
-    }
-    // `flux loop` shows/scaffolds the flux-lang agent loop that drives every turn — no side effects,
-    // so it sits beside the other read-only subcommands and never starts a turn.
-    if argv.get(1).map(|s| s == "loop").unwrap_or(false) {
-        return run_loop_cmd(&argv[2..]);
-    }
-    // `flux eval <adapter>` runs a benchmark suite ad-hoc through flux-eval (the same path the
-    // `eval_run` op + improve loop use) and prints a summary. Read-only w.r.t. the repo; it spawns
-    // the agent in isolated temp workspaces.
-    if argv.get(1).map(|s| s == "eval").unwrap_or(false) {
-        return run_eval_cmd(&argv[2..]).await;
-    }
-    // `flux run …` is the explicit agent/program entry. `flux run <app.flux>` runs a multi-agent
-    // program; `flux run <prompt…>` runs a one-shot agent turn on the prompt. A *bare* prompt
-    // (`flux fix the bug`) is refused below — the agent fires only through `run` (or the headless
-    // `-p` path used by scripts/eval), so a stray word, or a shell completion probe, never launches
-    // an autonomous turn.
-    let via_run = argv.get(1).map(|s| s == "run").unwrap_or(false);
-    if via_run
-        && argv
-            .get(2)
-            .map(|p| p.ends_with(".flux") || std::path::Path::new(p).is_file())
-            .unwrap_or(false)
-    {
-        return run_app_cmd(&argv[2..]).await;
-    }
-    let cli = if via_run {
-        // Parse the flags/prompt that follow `run`, so `flux run -m opus "do X"` works.
-        Cli::parse_from(std::iter::once(argv[0].clone()).chain(argv.iter().skip(2).cloned()))
-    } else {
-        Cli::parse()
-    };
+    // One clap parse handles every subcommand + `--help`/`-h`/`--version`/`help`. Agent flags are
+    // `global`, so they work top-level (`flux -m … "…"`), under `run`, and on subcommands alike.
+    let mut cli = Cli::parse();
     style::init(cli.color);
-    // `-v`/`--verbose` exports `FLUX_VERBOSE` so the sinks (and any sub-process) show full output.
+    // `-v`/`--verbose` exports `FLUX_VERBOSE`; `--show-loop` exports `FLUX_SHOW_LOOP`.
     if cli.verbose {
         std::env::set_var("FLUX_VERBOSE", "1");
     }
-    // `--show-loop` exports `FLUX_SHOW_LOOP` so the engine's drain reveals the loop machinery.
     if cli.show_loop {
         std::env::set_var("FLUX_SHOW_LOOP", "1");
     }
-    if let Some(addr) = cli.serve.clone() {
-        run_serve(cli, addr).await
-    } else if cli.tui {
-        run_tui(cli).await
-    } else if cli.plan {
-        run_plan(cli)
-            .await
-            .map_err(|e| {
-                eprintln!("{} {e:#}", style::red("error:"));
-                std::process::exit(1);
-            })
-            .unwrap_or(());
-        Ok(())
-    } else if cli.prompt.is_empty() && !cli.print {
-        // No prompt and not one-shot → interactive agentic REPL.
-        run_repl(cli)
-            .await
-            .map_err(|e| {
-                eprintln!("{} {e:#}", style::red("error:"));
-                std::process::exit(1);
-            })
-            .unwrap_or(());
-        Ok(())
-    } else {
-        // A one-shot agent prompt. The agent fires through `flux run <prompt>` or any flag-led
-        // invocation (`flux -m … "…"`, the headless `-p` used by scripts/eval). But a *bare first
-        // word* (`flux fix the bug`, or a shell completion probe like `flux completion fish`) is
-        // refused with a pointer to `run`, so a stray word can never launch an autonomous turn.
-        let bare_word = !via_run && argv.get(1).map(|s| !s.starts_with('-')).unwrap_or(false);
-        if bare_word {
-            eprintln!(
-                "{} `{}` is not a flux command. To run the agent on a prompt, use: `flux run <prompt>`",
-                style::red("error:"),
-                cli.prompt.join(" "),
-            );
-            std::process::exit(2);
+
+    // Subcommands other than the agent path return directly. `run` (and the no-subcommand top-level
+    // path) fall through to the shared mode/REPL/one-shot handling below.
+    let mut explicit_run = false;
+    match cli.command.take() {
+        Some(Commands::Eval {
+            adapter,
+            tasks,
+            members,
+            limit,
+            trials,
+            report,
+            watch,
+        }) => {
+            return run_eval_cmd(
+                adapter,
+                tasks,
+                members,
+                limit,
+                trials,
+                report,
+                watch,
+                cli.model.clone(),
+            )
+            .await;
         }
-        run_prompt(cli)
-            .await
-            .map_err(|e| {
-                eprintln!("{} {e:#}", style::red("error:"));
-                std::process::exit(1);
-            })
-            .unwrap_or(());
-        Ok(())
+        Some(Commands::Flow {
+            action: FlowAction::Run { file },
+        }) => return run_flow(&file, cli.model.clone(), cli.yes).await,
+        Some(Commands::Loop { action }) => return run_loop_cmd(action),
+        Some(Commands::Sessions { prune }) => return run_sessions(prune),
+        Some(Commands::Auth { action }) => return run_auth(action).await,
+        Some(Commands::Plugin { action }) => return run_plugin(action),
+        Some(Commands::Completion { shell }) => return run_completion(shell.as_deref()),
+        Some(Commands::Preset { args }) => return preset::run_preset(&args).await,
+        // `flux run …` — the explicit agent/program entry. `flux run <app.flux>` runs a multi-agent
+        // program; `flux run <prompt…>` runs a one-shot turn (a bare word is fine here — it's explicit).
+        Some(Commands::Run { prompt }) => {
+            if prompt
+                .first()
+                .map(|p| p.ends_with(".flux") || std::path::Path::new(p).is_file())
+                .unwrap_or(false)
+            {
+                return run_app_cmd(prompt, cli.model.clone(), cli.yes).await;
+            }
+            cli.prompt = prompt;
+            explicit_run = true;
+        }
+        // Top-level path: flag-led prompt, a mode flag, or the REPL.
+        None => {}
     }
+
+    // Mode flags (only set on the top-level path; a subcommand conflicts with them).
+    let run = async {
+        if let Some(addr) = cli.serve.clone() {
+            return run_serve(cli, addr).await;
+        }
+        if cli.tui {
+            return run_tui(cli).await;
+        }
+        if cli.plan {
+            return run_plan(cli).await;
+        }
+        if cli.prompt.is_empty() && !cli.print {
+            // No prompt → interactive REPL (also `flux run` with no prompt).
+            return run_repl(cli).await;
+        }
+        // A one-shot prompt. A *bare first word* (no `run`, not flag-led, e.g. `flux fix the bug`) is
+        // refused so a stray word never launches an autonomous turn.
+        if !explicit_run {
+            let bare_word = std::env::args()
+                .nth(1)
+                .map(|s| !s.starts_with('-'))
+                .unwrap_or(false);
+            if bare_word {
+                eprintln!(
+                    "{} `{}` is not a flux command. To run the agent on a prompt, use: `flux run <prompt>`",
+                    style::red("error:"),
+                    cli.prompt.join(" "),
+                );
+                std::process::exit(2);
+            }
+        }
+        run_prompt(cli).await
+    };
+    if let Err(e) = run.await {
+        eprintln!("{} {e:#}", style::red("error:"));
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// `flux completion <shell>` — print a shell completion script to stdout and exit. Pure output, no
 /// side effects: a shell sources this as you type, so it must never touch the network or start a
 /// turn. Supports bash/zsh/fish/powershell/elvish; defaults to fish.
-fn run_completion(args: &[String]) -> Result<()> {
+fn run_completion(shell: Option<&str>) -> Result<()> {
     use clap::CommandFactory;
     use clap_complete::Shell;
-    let shell = match args.first().map(String::as_str) {
+    let shell = match shell {
         Some("bash") => Shell::Bash,
         Some("zsh") => Shell::Zsh,
         Some("powershell" | "pwsh") => Shell::PowerShell,
@@ -2692,33 +2725,18 @@ fn run_completion(args: &[String]) -> Result<()> {
 /// (event bus + triggers + journeys). A bare single-flow file is accepted too. The provider is
 /// best-effort: a program built only from pure ops runs without credentials; model-backed ops need a
 /// resolvable `provider/model` (defaulting like the prompt path) and degrade with a clear note.
-async fn run_app_cmd(args: &[String]) -> Result<()> {
+async fn run_app_cmd(
+    prompt: Vec<String>,
+    model_spec: Option<String>,
+    auto_approve: bool,
+) -> Result<()> {
     use std::path::Path;
 
-    let mut path: Option<&str> = None;
-    let mut model_spec: Option<String> = None;
-    let mut auto_approve = false;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-m" | "--model" => {
-                model_spec = args.get(i + 1).cloned();
-                i += 2;
-            }
-            // By default destructive ops in the program are DENIED (no human at a prompt); `--yes`
-            // opts into allow-all for a trusted, pre-authored program.
-            "-y" | "--yes" => {
-                auto_approve = true;
-                i += 1;
-            }
-            s if !s.starts_with('-') && path.is_none() => {
-                path = Some(s);
-                i += 1;
-            }
-            _ => i += 1,
-        }
-    }
-    let path = path
+    // The `.flux` path is the first token; `-m`/`--yes` were parsed as global flags. By default
+    // destructive ops in a program are DENIED (no human at a prompt); `--yes` opts into allow-all.
+    let path = prompt
+        .first()
+        .map(String::as_str)
         .ok_or_else(|| anyhow::anyhow!("usage: flux run <app.flux> [-m provider/model] [--yes]"))?;
     let spec = model_spec.unwrap_or_else(|| "anthropic/claude-sonnet-4-6".to_string());
 
@@ -2793,10 +2811,10 @@ async fn run_tui(cli: Cli) -> Result<()> {
 }
 
 /// `flux plugin add <name> <program> [args…] | ls | pin <name> <version> | rollback <name>`.
-fn run_plugin(args: &[String]) -> Result<()> {
+fn run_plugin(action: Option<PluginAction>) -> Result<()> {
     let dir = plugins_dir().ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
-    match args.first().map(String::as_str) {
-        Some("ls") | None => {
+    match action.unwrap_or(PluginAction::Ls) {
+        PluginAction::Ls => {
             let found = flux_plugin::discover(&dir);
             if found.is_empty() {
                 println!("no plugins (add one with `flux plugin add <name> <program> [args…]`)");
@@ -2817,20 +2835,17 @@ fn run_plugin(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
-        Some("add") => {
-            let name = args
-                .get(1)
-                .context("usage: flux plugin add <name> <program> [args…]")?;
-            let program = args
-                .get(2)
-                .context("usage: flux plugin add <name> <program> [args…]")?;
-            let rest: Vec<String> = args.get(3..).unwrap_or(&[]).to_vec();
+        PluginAction::Add {
+            name,
+            program,
+            args,
+        } => {
             flux_plugin::add_descriptor(
                 &dir,
-                name,
+                &name,
                 &flux_plugin::PluginDescriptor {
                     program: program.clone(),
-                    args: rest,
+                    args,
                     pinned: None,
                 },
             )
@@ -2838,47 +2853,36 @@ fn run_plugin(args: &[String]) -> Result<()> {
             println!("added plugin `{name}` → {program}");
             Ok(())
         }
-        Some("pin") => {
-            let name = args
-                .get(1)
-                .context("usage: flux plugin pin <name> <version>")?;
-            let version = args
-                .get(2)
-                .context("usage: flux plugin pin <name> <version>")?;
-            flux_plugin::set_pinned(&dir, name, Some(version.clone())).context("pin plugin")?;
+        PluginAction::Pin { name, version } => {
+            flux_plugin::set_pinned(&dir, &name, Some(version.clone())).context("pin plugin")?;
             println!("pinned `{name}` to {version}");
             Ok(())
         }
-        Some("rollback") => {
-            let name = args.get(1).context("usage: flux plugin rollback <name>")?;
-            flux_plugin::set_pinned(&dir, name, None).context("rollback plugin")?;
+        PluginAction::Rollback { name } => {
+            flux_plugin::set_pinned(&dir, &name, None).context("rollback plugin")?;
             println!("cleared pin on `{name}`");
             Ok(())
         }
-        Some(other) => bail!("unknown `flux plugin` command `{other}` (try ls|add|pin|rollback)"),
     }
 }
 
 /// `flux auth status | login <provider>`.
-async fn run_auth(args: &[String]) -> Result<()> {
-    match args.first().map(String::as_str) {
-        Some("status") | None => {
+async fn run_auth(action: Option<AuthAction>) -> Result<()> {
+    match action.unwrap_or(AuthAction::Status) {
+        AuthAction::Status => {
             for s in flux_credentials::auth_status() {
                 let mark = if s.available { "✓" } else { "·" };
                 println!("{mark} {:<11} {}", s.provider, s.source);
             }
             Ok(())
         }
-        Some("login") => match args.get(1).map(String::as_str).unwrap_or("") {
+        AuthAction::Login { provider } => match provider.as_str() {
             "claude" => login_claude().await,
             "codex" => bail!(
                 "codex login: sign in with the Codex CLI — flux imports `~/.codex/auth.json` automatically"
             ),
             other => bail!("`flux auth login` expects `claude` (got `{other}`)"),
         },
-        Some(other) => {
-            bail!("unknown `flux auth` command `{other}` (try `status` or `login claude`)")
-        }
     }
 }
 
@@ -2919,6 +2923,50 @@ async fn run_prompt(cli: Cli) -> Result<()> {
 mod tests {
     use super::{format_evidence, loop_machinery_label, tool_preview, truncate};
     use serde_json::json;
+
+    /// clap validates the whole command tree (catches duplicate arg ids, the global-args + subcommand
+    /// wiring, conflicts) at test time rather than only when `flux --help` is first run.
+    #[test]
+    fn cli_command_tree_is_valid() {
+        use clap::CommandFactory;
+        super::Cli::command().debug_assert();
+    }
+
+    /// Every subcommand is registered so `flux --help` / `flux <cmd> --help` are complete.
+    #[test]
+    fn help_lists_every_subcommand() {
+        use clap::CommandFactory;
+        let cmd = super::Cli::command();
+        let names: Vec<&str> = cmd.get_subcommands().map(|c| c.get_name()).collect();
+        for want in [
+            "run",
+            "eval",
+            "flow",
+            "loop",
+            "sessions",
+            "auth",
+            "plugin",
+            "completion",
+            "preset",
+        ] {
+            assert!(
+                names.contains(&want),
+                "missing subcommand `{want}` in {names:?}"
+            );
+        }
+    }
+
+    /// `flux eval --help` carries its own typed flags + the adapter list (the original ask).
+    #[test]
+    fn eval_help_documents_its_flags() {
+        use clap::CommandFactory;
+        let cmd = super::Cli::command();
+        let eval = cmd.find_subcommand("eval").expect("eval subcommand");
+        let help = eval.clone().render_long_help().to_string();
+        for want in ["--watch", "--report", "--tasks", "--members", "synthetic"] {
+            assert!(help.contains(want), "`flux eval --help` missing {want:?}");
+        }
+    }
 
     #[test]
     fn truncate_caps_with_ellipsis() {
