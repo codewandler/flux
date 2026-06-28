@@ -1,0 +1,14 @@
+# https://taskfile.dev
+version: '3'
+
+tasks:
+  test:
+    desc: Run the workspace unit tests
+    cmds:
+      - cargo test --workspace --lib
+
+  install:
+    desc: Run unit tests, then install the flux binary
+    cmds:
+      - task: test
+      - cargo install --path crates/flux-cli --force
