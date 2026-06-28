@@ -124,6 +124,14 @@ A `BenchmarkAdapter` trait keeps benchmarks behind one seam:
   container, and `prepare()` rebuilds it from the *candidate* source so the eval measures the worker's
   edits. The in-container session is recorded (asciinema casts), and the tail of `agent.cast` is fed
   back to the reviewer as the per-case transcript. Grading is terminal-bench's own (authoritative).
+- **synthetic** (real-model, no Docker) — `LocalAdapter::synthetic()`: short self-contained coding
+  riddles with known answers (`crates/flux-eval/assets/synthetic-suite.json`), graded on the produced
+  program's stdout. A fast, cheap diagnostic workload — run ad-hoc with `flux eval synthetic`. See
+  [synthetic-eval.md](synthetic-eval.md).
+- **multi** — `MultiAdapter`: run several adapters behind **one combined score** (ids namespaced
+  `<member>:<id>`). The keep-gate `score_compare_multi` refuses a candidate that lifts the combined mean
+  while regressing any member, so terminal-bench + synthetic can be graded together without one masking
+  the other (`examples/improve-multi.flux`).
 - **mock** — an offline, deterministic CI fixture (`LocalAdapter::mock`); used by tests and
   `examples/eval-smoke.flux -m mock` to exercise the loop machinery with no provider or Docker. It is
   **not** a benchmark — just the offline smoke slice.

@@ -137,6 +137,8 @@ flux --serve 127.0.0.1:8787 --yes   # HTTP API daemon (REST + SSE)
 flux run app.flux                # run a multi-agent program (event bus + triggers + journeys); deny-destructive unless --yes
 flux sessions                    # list recent sessions
 flux plugin ls                   # manage subprocess plugins (any-language ops)
+flux eval synthetic --watch      # run a benchmark suite (synthetic riddles / mock / terminal-bench / multi);
+                                 #   --watch streams the agent live, --report out.md writes a categorized report
 ```
 
 A **multi-agent program** is a `.flux` file declaring agents / channels / triggers / journeys (see

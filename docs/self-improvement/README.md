@@ -13,6 +13,9 @@ This folder is the operator- and reviewer-facing record of that work.
 - **[STATUS.md](STATUS.md)** — where the journey stands: what's proven end-to-end, the bugs each live
   run surfaced and how they were fixed, the first kept gain (with its honest caveats), the known gaps,
   and what's next.
+- **[synthetic-eval.md](synthetic-eval.md)** — the lightweight `synthetic` coding-riddle benchmark, the
+  `flux eval` CLI (`--watch` to observe a run live, `--report` for a categorized Markdown report), and
+  **multi-eval** (grade on terminal-bench + synthetic at once, with a per-member regression guard).
 
 Related docs & code:
 
@@ -23,4 +26,6 @@ Related docs & code:
 The loop flow itself lives at [`examples/improve-tbench.flux`](../../examples/improve-tbench.flux)
 (terminal-bench — the real eval). Run it with
 [`bench/run-tbench-loop.sh`](../../bench/run-tbench-loop.sh). For a free, offline smoke of the flow
-machinery (no provider/Docker): `flux flow run examples/eval-smoke.flux -m mock`.
+machinery (no provider/Docker): `flux flow run examples/eval-smoke.flux -m mock`. To run the lightweight
+synthetic riddle benchmark ad-hoc and watch the agent work live:
+`flux eval synthetic --watch --report /tmp/r.md`.
