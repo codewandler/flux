@@ -204,6 +204,22 @@ impl DatasourceBackend for MemoryBackend {
         Ok(())
     }
 
+    fn delete_source(&self, source: &str) -> Result<usize> {
+        let mut store = self.records.lock().expect("datasource records poisoned");
+        let before = store.len();
+        store.retain(|r| r.source.key() != source);
+        Ok(before - store.len())
+    }
+
+    fn delete(&self, source: &str, entity: &str, ids: &[String]) -> Result<usize> {
+        let mut store = self.records.lock().expect("datasource records poisoned");
+        let before = store.len();
+        store.retain(|r| {
+            !(r.source.key() == source && r.entity == entity && ids.iter().any(|id| id == &r.id))
+        });
+        Ok(before - store.len())
+    }
+
     fn len(&self) -> usize {
         self.records
             .lock()
@@ -296,6 +312,32 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got.title, "v2");
+    }
+
+    #[test]
+    fn delete_source_and_by_id_are_scoped() {
+        let b = MemoryBackend::new();
+        b.upsert(&[
+            Record::new(Source::new("kb-a"), "doc", "1", "alpha", "a1"),
+            Record::new(Source::new("kb-a"), "doc", "2", "alpha two", "a2"),
+            Record::new(Source::new("kb-b"), "doc", "1", "beta", "b1"),
+        ])
+        .unwrap();
+        assert_eq!(b.len(), 3);
+        // delete-by-id removes only the addressed record.
+        assert_eq!(b.delete("kb-a", "doc", &["1".into()]).unwrap(), 1);
+        assert_eq!(b.len(), 2);
+        // delete_source drops the rest of kb-a, never kb-b.
+        assert_eq!(b.delete_source("kb-a").unwrap(), 1);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b.delete_source("absent").unwrap(), 0);
+        let survivor = b
+            .list(&ListInput {
+                source: "kb-b".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(survivor.len(), 1);
     }
 
     #[test]

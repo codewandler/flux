@@ -281,6 +281,39 @@ impl DatasourceBackend for SqliteBackend {
             .map_err(map_sql)
     }
 
+    fn delete_source(&self, source: &str) -> Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(map_sql)?;
+        tx.execute("DELETE FROM records_fts WHERE source=?1", params![source])
+            .map_err(map_sql)?;
+        let removed = tx
+            .execute("DELETE FROM records WHERE source=?1", params![source])
+            .map_err(map_sql)?;
+        tx.commit().map_err(map_sql)?;
+        Ok(removed)
+    }
+
+    fn delete(&self, source: &str, entity: &str, ids: &[String]) -> Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(map_sql)?;
+        let mut removed = 0;
+        for id in ids {
+            tx.execute(
+                "DELETE FROM records_fts WHERE source=?1 AND entity=?2 AND id=?3",
+                params![source, entity, id],
+            )
+            .map_err(map_sql)?;
+            removed += tx
+                .execute(
+                    "DELETE FROM records WHERE source=?1 AND entity=?2 AND id=?3",
+                    params![source, entity, id],
+                )
+                .map_err(map_sql)?;
+        }
+        tx.commit().map_err(map_sql)?;
+        Ok(removed)
+    }
+
     fn len(&self) -> usize {
         let conn = self.conn.lock().unwrap();
         conn.query_row("SELECT COUNT(*) FROM records", [], |r| r.get::<_, i64>(0))
@@ -434,5 +467,66 @@ mod tests {
             })
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn delete_source_and_by_id_remove_records_and_persist() {
+        let dir = std::env::temp_dir().join(format!("flux-ds-sqlite-del-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("datasource.db");
+        {
+            let b = SqliteBackend::open(&path).unwrap();
+            // Two sources; per-source ops must never touch the other source.
+            b.upsert(&[
+                Record::new(Source::new("kb-a"), "doc", "1", "alpha one", "body a1"),
+                Record::new(Source::new("kb-a"), "doc", "2", "alpha two", "body a2"),
+                Record::new(Source::new("kb-b"), "doc", "1", "beta", "body b1"),
+            ])
+            .unwrap();
+            assert_eq!(b.len(), 3);
+
+            // delete-by-id drops just that record, FTS mirror included.
+            assert_eq!(b.delete("kb-a", "doc", &["1".into()]).unwrap(), 1);
+            assert_eq!(b.len(), 2);
+            assert!(
+                b.get(&GetInput {
+                    source: "kb-a".into(),
+                    entity: "doc".into(),
+                    id: "1".into(),
+                })
+                .unwrap()
+                .is_none(),
+                "deleted record is gone from the canonical table"
+            );
+            assert!(
+                b.search(&SearchInput {
+                    query: "one".into(), // a term unique to the deleted record's title
+                    ..Default::default()
+                })
+                .unwrap()
+                .is_empty(),
+                "deleted record is gone from FTS too"
+            );
+
+            // delete_source drops the rest of kb-a but leaves kb-b.
+            assert_eq!(b.delete_source("kb-a").unwrap(), 1);
+            assert_eq!(b.len(), 1);
+        }
+        // Reopen: the deletions persisted; only kb-b survives.
+        {
+            let b = SqliteBackend::open(&path).unwrap();
+            assert_eq!(b.len(), 1);
+            let only = b
+                .list(&ListInput {
+                    source: "kb-b".into(),
+                    entity: None,
+                    offset: None,
+                    limit: None,
+                })
+                .unwrap();
+            assert_eq!(only.len(), 1);
+            assert_eq!(only[0].id, "1");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

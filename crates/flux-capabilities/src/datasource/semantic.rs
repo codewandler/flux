@@ -150,6 +150,22 @@ impl DatasourceBackend for SemanticIndex {
             .clear();
         self.inner.clear()
     }
+    fn delete_source(&self, source: &str) -> Result<usize> {
+        self.vectors
+            .lock()
+            .expect("semantic vectors poisoned")
+            .retain(|(src, _, _), _| src != source);
+        self.inner.delete_source(source)
+    }
+    fn delete(&self, source: &str, entity: &str, ids: &[String]) -> Result<usize> {
+        self.vectors
+            .lock()
+            .expect("semantic vectors poisoned")
+            .retain(|(src, ent, id), _| {
+                !(src == source && ent == entity && ids.iter().any(|i| i == id))
+            });
+        self.inner.delete(source, entity, ids)
+    }
     fn len(&self) -> usize {
         self.inner.len()
     }

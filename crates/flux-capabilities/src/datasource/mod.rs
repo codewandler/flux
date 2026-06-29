@@ -50,6 +50,11 @@ pub trait DatasourceBackend: Send + Sync {
     fn batch_get(&self, input: &BatchGetInput) -> Result<Vec<Record>>;
     /// Drop every record (the rebuild half of reindex; the caller then re-ingests).
     fn clear(&self) -> Result<()>;
+    /// Drop every record under one source key. Returns how many were removed. Unlike [`clear`](Self::clear)
+    /// this is scoped to a single source, so a multi-source backend can manage one source's lifecycle.
+    fn delete_source(&self, source: &str) -> Result<usize>;
+    /// Drop specific records of one entity in one source by id. Returns how many were removed.
+    fn delete(&self, source: &str, entity: &str, ids: &[String]) -> Result<usize>;
     /// Total record count (diagnostics / freshness).
     fn len(&self) -> usize;
     /// Whether the index holds no records.
