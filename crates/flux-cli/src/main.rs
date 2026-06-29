@@ -350,6 +350,16 @@ enum PluginAction {
     Pin { name: String, version: String },
     /// Clear a plugin's version pin: `rollback <name>`.
     Rollback { name: String },
+    /// Invoke one operation of an installed plugin directly: `call <name> <op> [json-input]`.
+    Call {
+        name: String,
+        op: String,
+        /// JSON input object for the operation (default `{}`).
+        input: Option<String>,
+    },
+    /// Register every `flux-plugin-*` binary in a directory: `install [dir]`
+    /// (default `plugins/target/release`).
+    Install { dir: Option<String> },
 }
 
 /// Reasoning effort, as a CLI value-enum mirroring [`Effort`].
@@ -3071,7 +3081,7 @@ async fn main() -> Result<()> {
             Some(Commands::Loop { action }) => run_loop_cmd(action),
             Some(Commands::Sessions { prune }) => run_sessions(prune),
             Some(Commands::Auth { action }) => run_auth(action).await,
-            Some(Commands::Plugin { action }) => run_plugin(action),
+            Some(Commands::Plugin { action }) => run_plugin(action).await,
             Some(Commands::Completion { shell }) => run_completion(shell.as_deref()),
             Some(Commands::Preset { args }) => preset::run_preset(&args).await,
             // No subcommand → interactive REPL (the one implicit entry point).
@@ -3274,7 +3284,7 @@ async fn run_tui(flags: AgentFlags) -> Result<()> {
 }
 
 /// `flux plugin add <name> <program> [args…] | ls | pin <name> <version> | rollback <name>`.
-fn run_plugin(action: Option<PluginAction>) -> Result<()> {
+async fn run_plugin(action: Option<PluginAction>) -> Result<()> {
     let dir = plugins_dir().ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
     match action.unwrap_or(PluginAction::Ls) {
         PluginAction::Ls => {
@@ -3326,7 +3336,107 @@ fn run_plugin(action: Option<PluginAction>) -> Result<()> {
             println!("cleared pin on `{name}`");
             Ok(())
         }
+        PluginAction::Call { name, op, input } => {
+            let desc = flux_plugin::load_descriptor(&dir, &name)
+                .context("load plugin descriptor")?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no such plugin `{name}` — add it with `flux plugin add`/`install` first"
+                    )
+                })?;
+            let input: serde_json::Value = match input {
+                Some(s) => serde_json::from_str(&s).context("parse <json-input>")?,
+                None => serde_json::json!({}),
+            };
+            // The same guarded boundary + datasource bridge the agent path uses, over a scratch index.
+            let system = Arc::new(System::new(
+                Workspace::new(&std::env::current_dir()?).map_err(|e| anyhow::anyhow!("{e}"))?,
+            ));
+            let backend: Arc<dyn flux_capabilities::DatasourceBackend> =
+                Arc::new(flux_capabilities::MemoryBackend::new());
+            let mut host = flux_plugin::PluginHost::spawn(&desc.program, &desc.args)
+                .await
+                .with_context(|| format!("spawn plugin `{name}` ({})", desc.program))?;
+            let manifest = host.manifest().await.context("fetch plugin manifest")?;
+            let caps = flux_capabilities::DatasourceHostCaps::new(
+                flux_plugin::SystemHostCaps::new(system).with_manifest(&manifest),
+                backend.clone(),
+            );
+            let result = host.call_with_host(&op, input, &caps).await;
+            let _ = host.shutdown().await;
+            let value = result.map_err(|e| anyhow::anyhow!("plugin `{name}` op `{op}`: {e}"))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+            );
+            let n = backend.len();
+            if n > 0 {
+                eprintln!("{}", style::dim(&format!("({n} record(s) contributed)")));
+            }
+            Ok(())
+        }
+        PluginAction::Install { dir: bin_dir } => {
+            let bin_dir = std::path::PathBuf::from(
+                bin_dir.unwrap_or_else(|| "plugins/target/release".to_string()),
+            );
+            let mut installed = 0usize;
+            for (name, program) in plugin_binaries_in(&bin_dir)
+                .with_context(|| format!("scan {}", bin_dir.display()))?
+            {
+                flux_plugin::add_descriptor(
+                    &dir,
+                    &name,
+                    &flux_plugin::PluginDescriptor {
+                        program: program.clone(),
+                        args: Vec::new(),
+                        pinned: None,
+                    },
+                )
+                .with_context(|| format!("register plugin `{name}`"))?;
+                println!("installed `{name}` → {program}");
+                installed += 1;
+            }
+            if installed == 0 {
+                eprintln!(
+                    "no `flux-plugin-*` binaries in {} (build them first: \
+                     `cd plugins && cargo build --release`)",
+                    bin_dir.display()
+                );
+            }
+            Ok(())
+        }
     }
+}
+
+/// Find every `flux-plugin-<name>` executable in `dir`, returning `(name, absolute-program-path)`
+/// pairs sorted by name. Skips sidecar files (e.g. `*.d`). Missing dir is an error (the caller reports).
+fn plugin_binaries_in(dir: &std::path::Path) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(file) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // Only `flux-plugin-<name>` with no extension (skip `flux-plugin-x.d`, etc.).
+        let Some(name) = file.strip_prefix("flux-plugin-") else {
+            continue;
+        };
+        if name.is_empty() || name.contains('.') {
+            continue;
+        }
+        let name = name.to_string(); // own it before `path` is moved below
+        let program = path
+            .canonicalize()
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned();
+        out.push((name, program));
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// `flux auth status | login <provider>`.
@@ -3385,10 +3495,34 @@ async fn run_prompt(flags: AgentFlags, prompt_words: Vec<String>) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::{
-        format_evidence, loop_machinery_label, new_render_suffix, tool_preview, truncate,
-        usage_annotation,
+        format_evidence, loop_machinery_label, new_render_suffix, plugin_binaries_in, tool_preview,
+        truncate, usage_annotation,
     };
     use serde_json::json;
+
+    /// `flux plugin install` scans a directory for `flux-plugin-<name>` executables: it picks those up
+    /// (sorted, by stripped name) and skips sidecars (`*.d`), non-prefixed files, and an empty name.
+    #[test]
+    fn plugin_binaries_in_picks_flux_plugin_executables() {
+        let dir = std::env::temp_dir().join(format!("flux-install-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in [
+            "flux-plugin-gitlab",
+            "flux-plugin-slack",
+            "flux-plugin-slack.d", // a cargo sidecar — must be skipped
+            "flux-plugin-",        // empty name — skipped
+            "not-a-plugin",        // wrong prefix — skipped
+        ] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let found = plugin_binaries_in(&dir).unwrap();
+        let names: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["gitlab", "slack"]);
+        // programs are absolute (canonicalized) paths to the binaries
+        assert!(found.iter().all(|(_, p)| p.contains("flux-plugin-")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// The turn-end token annotation reports all four figures the user asked for: context-window
     /// occupancy (fresh input + both cache tiers), generated output, the cached tokens, and the

@@ -42,3 +42,37 @@ jobs:
       # layers. Run explicitly too so a layering regression is an obvious, named failure.
       - name: Architecture layering lint
         run: cargo test -p flux-codegate
+
+  plugins:
+    name: plugins workspace · build · test · clippy · fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # The integration plugin pack (D-08) is a nested cargo workspace, EXCLUDED from the root workspace
+      # (heavy vendor deps), so the `check` job above never builds it — gate it here in its own job.
+      - name: Cache cargo (plugins)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: plugins
+
+      - name: Format
+        working-directory: plugins
+        run: cargo fmt --all --check
+
+      - name: Clippy (deny warnings)
+        working-directory: plugins
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        working-directory: plugins
+        run: cargo build --workspace
+
+      - name: Test
+        working-directory: plugins
+        run: cargo test --workspace
