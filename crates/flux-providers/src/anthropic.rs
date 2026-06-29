@@ -185,4 +185,105 @@ mod tests {
             vec![("anthropic-version", "2023-06-01".to_string())]
         );
     }
+
+    // --- claude end-to-end request-shape verify (C-04) -------------------------------------
+
+    use flux_provider::Provider;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A [`TokenSource`] that always returns a fixed access token.
+    struct StaticToken(&'static str);
+    #[async_trait]
+    impl TokenSource for StaticToken {
+        async fn access_token(&self) -> flux_core::Result<String> {
+            Ok(self.0.to_string())
+        }
+    }
+
+    /// A one-shot HTTP server that captures the full request (headers + body), replies 200, and
+    /// exposes the raw request text. Returns (base url, accept handle, captured-request slot).
+    #[allow(clippy::type_complexity)]
+    async fn capture_server() -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        Arc<Mutex<Option<String>>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(None::<String>));
+        let cap = captured.clone();
+        let handle = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                // Read until the full request (headers + Content-Length body) is in `buf`.
+                loop {
+                    let n = match sock.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf);
+                    if let Some(hdr_end) = text.find("\r\n\r\n") {
+                        let content_len = text[..hdr_end]
+                            .lines()
+                            .find_map(|l| {
+                                let low = l.to_ascii_lowercase();
+                                low.strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= hdr_end + 4 + content_len {
+                            break;
+                        }
+                    }
+                }
+                *cap.lock().unwrap() = Some(String::from_utf8_lossy(&buf).to_string());
+                let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}"), handle, captured)
+    }
+
+    #[tokio::test]
+    async fn claude_oauth_request_shape() {
+        let (url, handle, captured) = capture_server().await;
+        let provider = NativeProvider::new(
+            "claude",
+            Arc::new(AnthropicMessages),
+            Arc::new(OAuthAnthropic {
+                tokens: Arc::new(StaticToken("test-access-token")),
+                base_url: url,
+            }),
+        );
+        // No explicit system → the Claude-Code prefix becomes the whole system prompt.
+        let res = provider
+            .stream(Request::new("claude-sonnet-4-6", "hi"))
+            .await;
+        assert!(res.is_ok(), "the mock 200 should produce a stream");
+        // The server task finishes after one connection; join it so the capture is settled.
+        let _ = handle.await;
+
+        let raw = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("server captured a request");
+        let lower = raw.to_ascii_lowercase();
+        assert!(
+            lower.contains("authorization: bearer test-access-token"),
+            "Bearer OAuth header missing:\n{raw}"
+        );
+        assert!(
+            lower.contains("anthropic-beta: oauth-2025-04-20"),
+            "oauth beta gating header missing:\n{raw}"
+        );
+        assert!(
+            raw.contains(CLAUDE_CODE_SYSTEM_PREFIX),
+            "Claude-Code system prefix not applied:\n{raw}"
+        );
+    }
 }

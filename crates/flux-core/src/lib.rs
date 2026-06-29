@@ -10,6 +10,7 @@ mod content;
 mod error;
 mod event;
 mod message;
+pub mod pricing;
 mod stream;
 
 pub use audio::{AudioEncoding, AudioFormat};
@@ -17,4 +18,5 @@ pub use content::{ContentBlock, ImageSource, Role, ToolResultContent};
 pub use error::{Error, Result};
 pub use event::Event;
 pub use message::Message;
+pub use pricing::{is_subscription, Money, PricingTable, RateOverride, Rates};
 pub use stream::{Chunk, StopReason, Usage};

@@ -179,15 +179,32 @@ pub trait Credential: Send + Sync {
     fn system_prefix(&self) -> Option<String> {
         None
     }
+
+    /// The OAuth [`TokenSource`] backing this credential, if any. API-key credentials return
+    /// `None`; OAuth-backed credentials (subscription `claude`/`codex`) return their source so the
+    /// generic HTTP path can [force a refresh](TokenSource::refresh) on a `401` without knowing the
+    /// concrete credential type.
+    fn token_source(&self) -> Option<Arc<dyn TokenSource>> {
+        None
+    }
 }
 
 /// A source of OAuth access tokens that refreshes on demand. Implemented by
 /// `flux-credentials`; consumed by OAuth [`Credential`]s in the provider crates.
 #[async_trait]
 pub trait TokenSource: Send + Sync {
+    /// Return a valid access token, refreshing it lazily when it is near expiry.
     async fn access_token(&self) -> Result<String>;
+
     fn account_id(&self) -> Option<String> {
         None
+    }
+
+    /// Force a token refresh **ignoring the expiry buffer**, persisting the result. Called by the
+    /// HTTP path after a `401` to recover a stale/wrong-expiry token. The default is a no-op (for
+    /// sources that cannot refresh); concurrent calls must coalesce into a single refresh.
+    async fn refresh(&self) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -262,6 +279,8 @@ impl Provider for NativeProvider {
         // Retry only the connection attempt (POST + status). The token is (re)applied each attempt
         // so an OAuth refresh can recover a 401/expired credential on the next try.
         let mut attempt = 0u32;
+        // A 401 forces exactly one OAuth token refresh + retry; a second 401 surfaces the error.
+        let mut forced_refresh = false;
         let resp = loop {
             let mut rb = self
                 .http
@@ -278,6 +297,18 @@ impl Provider for NativeProvider {
                     let status = resp.status();
                     if status.is_success() {
                         break resp;
+                    }
+                    // Force-refresh on 401: the stored expiry can be wrong, so the lazy
+                    // refresh-on-expiry path may have re-applied a dead token. If the credential is
+                    // OAuth-backed, force one refresh (ignoring the expiry buffer) and retry once.
+                    // The retry re-applies the credential, which now reads the freshened token.
+                    if status.as_u16() == 401 && !forced_refresh {
+                        if let Some(ts) = self.cred.token_source() {
+                            tracing::warn!("401 unauthorized; forcing one OAuth refresh and retry");
+                            ts.refresh().await?;
+                            forced_refresh = true;
+                            continue;
+                        }
                     }
                     if is_retryable_status(status.as_u16()) && attempt < self.max_retries {
                         let delay = backoff_delay(attempt);
@@ -326,7 +357,7 @@ impl Provider for NativeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
@@ -434,6 +465,230 @@ mod tests {
         };
         assert_eq!(status, 503);
         assert_eq!(count.load(Ordering::SeqCst), 2, "initial attempt + 1 retry");
+        handle.abort();
+    }
+
+    // --- 401 force-refresh-then-retry (C-04) ------------------------------------------------
+
+    /// A [`TokenSource`] that starts handing out a dead token and flips to a good one on the first
+    /// `refresh()`. Counts refresh calls so a test can assert exactly one refresh fired.
+    struct FlipToken {
+        refreshed: AtomicBool,
+        refresh_calls: AtomicUsize,
+    }
+    impl FlipToken {
+        fn new() -> Self {
+            Self {
+                refreshed: AtomicBool::new(false),
+                refresh_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+    #[async_trait]
+    impl TokenSource for FlipToken {
+        async fn access_token(&self) -> Result<String> {
+            Ok(if self.refreshed.load(Ordering::SeqCst) {
+                "good-token".to_string()
+            } else {
+                "dead-token".to_string()
+            })
+        }
+        async fn refresh(&self) -> Result<()> {
+            self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            self.refreshed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// An OAuth-backed credential: applies `Bearer <token>` from its [`TokenSource`] and exposes
+    /// that source via [`Credential::token_source`] so the HTTP path can force-refresh on a 401.
+    struct OAuthTestCred {
+        endpoint: String,
+        ts: Arc<dyn TokenSource>,
+    }
+    #[async_trait]
+    impl Credential for OAuthTestCred {
+        fn endpoint(&self) -> String {
+            self.endpoint.clone()
+        }
+        async fn apply(&self, rb: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
+            let token = self.ts.access_token().await?;
+            Ok(rb.header("authorization", format!("Bearer {token}")))
+        }
+        fn token_source(&self) -> Option<Arc<dyn TokenSource>> {
+            Some(self.ts.clone())
+        }
+    }
+
+    /// A server that returns 401 until a request arrives carrying `Authorization: Bearer good-token`,
+    /// then 200. Records each request's `authorization` header so a test can assert the retry
+    /// carried the refreshed token. Returns (base url, accept handle, connection counter, auth log).
+    #[allow(clippy::type_complexity)]
+    async fn auth_gated_server() -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        Arc<AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let counter = count.clone();
+        let auths = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let auth_log = auths.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let auth = req
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                    .map(|l| {
+                        l.split_once(':')
+                            .map(|(_, v)| v.trim())
+                            .unwrap_or("")
+                            .to_string()
+                    })
+                    .unwrap_or_default();
+                auth_log.lock().unwrap().push(auth.clone());
+                let resp = if auth == "Bearer good-token" {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                        .to_string()
+                } else {
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}/"), handle, count, auths)
+    }
+
+    #[tokio::test]
+    async fn oauth_401_triggers_single_refresh_and_retry() {
+        let (url, handle, count, auths) = auth_gated_server().await;
+        let ts = Arc::new(FlipToken::new());
+        let provider = NativeProvider::new(
+            "test",
+            Arc::new(NullCodec),
+            Arc::new(OAuthTestCred {
+                endpoint: url,
+                ts: ts.clone(),
+            }),
+        );
+        let res = provider.stream(Request::new("m", "hi")).await;
+        assert!(
+            res.is_ok(),
+            "the retry with the refreshed token should succeed"
+        );
+        assert_eq!(
+            ts.refresh_calls.load(Ordering::SeqCst),
+            1,
+            "exactly one forced refresh"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "one 401 attempt + one retry"
+        );
+        let auths = auths.lock().unwrap();
+        assert_eq!(
+            *auths,
+            vec![
+                "Bearer dead-token".to_string(),
+                "Bearer good-token".to_string()
+            ],
+            "first request used the dead token, the retry used the refreshed token"
+        );
+        handle.abort();
+    }
+
+    /// A server that returns 401 on **every** request (a refresh would not help — e.g. a revoked
+    /// grant). Counts connections so a test can assert the retry happens at most once.
+    async fn always_401_server() -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let counter = count.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let resp =
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}/"), handle, count)
+    }
+
+    #[tokio::test]
+    async fn oauth_second_401_surfaces_error_no_infinite_loop() {
+        let (url, handle, count) = always_401_server().await;
+        let ts = Arc::new(FlipToken::new());
+        let provider = NativeProvider::new(
+            "test",
+            Arc::new(NullCodec),
+            Arc::new(OAuthTestCred {
+                endpoint: url,
+                ts: ts.clone(),
+            }),
+        );
+        let status = match provider.stream(Request::new("m", "hi")).await {
+            Err(Error::Api { status, .. }) => status,
+            Ok(_) => panic!("expected an Api 401 error, got a stream"),
+            Err(e) => panic!("expected an Api 401 error, got {e}"),
+        };
+        assert_eq!(status, 401);
+        assert_eq!(
+            ts.refresh_calls.load(Ordering::SeqCst),
+            1,
+            "refresh fires exactly once, even though the second 401 is unrecoverable"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "initial 401 + exactly one retry, then surface (no infinite loop)"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn oauth_500_does_not_force_refresh() {
+        // A 5xx uses the existing backoff/retry and must NOT trigger a token refresh.
+        let (url, handle, count) = flaky_server(1).await;
+        let ts = Arc::new(FlipToken::new());
+        let provider = NativeProvider::new(
+            "test",
+            Arc::new(NullCodec),
+            Arc::new(OAuthTestCred {
+                endpoint: url,
+                ts: ts.clone(),
+            }),
+        )
+        .with_max_retries(3);
+        let res = provider.stream(Request::new("m", "hi")).await;
+        assert!(
+            res.is_ok(),
+            "should recover after the transient 5xx via backoff"
+        );
+        assert_eq!(
+            ts.refresh_calls.load(Ordering::SeqCst),
+            0,
+            "a 5xx must not force a token refresh"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 2, "1 failure + 1 success");
         handle.abort();
     }
 }

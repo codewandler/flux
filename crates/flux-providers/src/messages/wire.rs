@@ -129,6 +129,9 @@ impl From<WireUsage> for Usage {
             output_tokens: u.output_tokens,
             cache_creation_input_tokens: u.cache_creation_input_tokens,
             cache_read_input_tokens: u.cache_read_input_tokens,
+            // Anthropic's wire usage folds thinking tokens into output_tokens with no separate
+            // count, so there is no reasoning figure to map here.
+            reasoning_tokens: 0,
         }
     }
 }

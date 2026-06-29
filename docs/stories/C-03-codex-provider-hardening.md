@@ -2,7 +2,7 @@
 id: C-03
 title: Codex provider hardening — account-id, usage tiers, reasoning continuity
 pillar: Core
-status: backlog
+status: in-progress
 priority:
 design: docs/designs/subscription-providers-and-cost.md
 theme: subscription-providers-cost
@@ -16,32 +16,50 @@ correct against the live backend's quirks: a reliable `chatgpt-account-id`, full
 reasoning continuity across a multi-turn tool loop. Foundation for C-07 (which reuses the codec/headers).
 
 ## Acceptance
-- [ ] **account-id fallback.** `import_codex` resolves `account_id` from the `id_token` JWT claims (the
-      `chatgpt_account_id` claim) when top-level `tokens.account_id` is absent. Failing-first test
-      `import_codex_reads_account_id_from_id_token` (fixture `auth.json` with the id only inside the
-      `id_token`) asserts the header-bearing account id is populated. (`crates/flux-credentials/src/lib.rs`)
-- [ ] **usage tiers.** `map_responses_stream` populates cache + reasoning token fields from
-      `response.usage.input_tokens_details.cached_tokens` / `output_tokens_details.reasoning_tokens` (not
-      just input/output). Failing-first test `responses_usage_captures_cache_and_reasoning` over a fixture
-      `response.completed` event. (`crates/flux-providers/src/openai.rs`)
-- [ ] **reasoning continuity.** Under `store:false`, the codex request opts into
+- [x] **account-id fallback.** `import_codex` resolves `account_id` from the `id_token` JWT claims (the
+      `chatgpt_account_id` claim, top-level or nested under `https://api.openai.com/auth`) when top-level
+      `tokens.account_id` is absent. Test `import_codex_reads_account_id_from_id_token` (hermetic fixture
+      `auth.json` under a temp `HOME`, id only inside the `id_token`) asserts the account id is populated.
+      (`crates/flux-credentials/src/lib.rs`)
+- [ ] **usage tiers.** → **C-05**. `map_responses_stream` populating cache + reasoning token fields was
+      reassigned to C-05 (cost-model + codec normalization) to keep the `Usage` struct / usage-token
+      parsing in one owner. Not done here.
+- [x] **reasoning continuity.** Under `store:false`, the codex request opts into
       `include:["reasoning.encrypted_content"]` and `build_responses_body` echoes prior encrypted reasoning
-      items back into `input` so a multi-turn tool loop keeps reasoning context. Failing-first test
-      `codex_body_echoes_encrypted_reasoning` asserts a reasoning item round-trips into the next request.
-- [ ] **missing-account-id is a clear error**, not a silent 401: `codex_oauth`/`OpenAiCred` surfaces a
-      typed error when `send_account_id` is set but no account id resolved. Test `codex_requires_account_id`.
-- [ ] Gate green: `cargo build/test`, `clippy -D warnings`, `fmt`, `cargo test -p flux-codegate`.
+      items (`Thinking`/`RedactedThinking` → `{"type":"reasoning","encrypted_content":…}`, pushed before the
+      function_call) back into `input` so a multi-turn tool loop keeps reasoning context. Test
+      `codex_body_echoes_encrypted_reasoning` asserts the reasoning items + `include` round-trip (and that a
+      non-codex body does neither).
+- [x] **missing-account-id is a clear error**, not a silent 401: `OpenAiCred::apply` surfaces a typed
+      `Error::Auth` when `send_account_id` is set but the token source resolves no account id. Test
+      `codex_requires_account_id`.
+- [x] Gate green: `cargo build/test`, `clippy -D warnings`, `fmt`, `cargo test -p flux-codegate`.
 
 ## Progress
-- (not started)
+- **Done (this worktree).** Closed the three in-lane gaps with failing-first tests:
+  - `flux-credentials`: generalized the JWT decode into `jwt_payload(token) -> Option<Value>` (refactored
+    `jwt_expiry_ms` onto it) + new `account_id_from_id_token`; `import_codex` now reads `tokens.id_token`
+    and falls back to its `chatgpt_account_id` claim (top-level or nested) when `tokens.account_id` is
+    absent/empty. Test `import_codex_reads_account_id_from_id_token` (hermetic temp `HOME`, unsigned
+    fixture JWT — no network, no real files).
+  - `flux-providers` (`build_responses_body`): codex bodies set `include:["reasoning.encrypted_content"]`
+    and echo assistant `Thinking`/`RedactedThinking` blocks as Responses `reasoning` input items
+    (encrypted payload = `signature`/redacted `data`), pushed inline so they precede their `function_call`.
+    Test `codex_body_echoes_encrypted_reasoning`.
+  - `flux-providers` (`OpenAiCred::apply`): a codex credential with no resolvable account id now errors
+    with a typed `Error::Auth` instead of silently omitting the `chatgpt-account-id` header. Test
+    `codex_requires_account_id`.
+- Gate: `cargo build/test -p flux-credentials -p flux-providers` green (7 + 26 tests), `clippy -D warnings`
+  clean, `cargo fmt` applied, `cargo test -p flux-codegate` green.
+- **Not done (out of lane):** usage-tier capture moved to **C-05** (it touches `Usage`/usage parsing,
+  C-05's owner). Live smoke against a real `~/.codex/auth.json` deferred to pre-release (epic Testing §).
 
 ## Notes
 - Epic + design: [subscription-providers-and-cost.md](../designs/subscription-providers-and-cost.md).
-- Touch points: `crates/flux-credentials/src/lib.rs` (`import_codex`, `jwt_expiry_ms` neighbour — add a
-  `jwt_claim`/account extractor), `crates/flux-providers/src/openai.rs` (`build_responses_body`,
-  `map_responses_stream`, `codex_oauth`/`OpenAiCred`).
-- Reuse: the existing `jwt_expiry_ms` base64url-JWT decode (generalize to read a string claim);
+- Touch points: `crates/flux-credentials/src/lib.rs` (`import_codex`, `jwt_payload`/`account_id_from_id_token`
+  next to `jwt_expiry_ms`), `crates/flux-providers/src/openai.rs` (`build_responses_body`, `OpenAiCred::apply`).
+- Reuse: the existing `jwt_expiry_ms` base64url-JWT decode (generalized to `jwt_payload`);
   `OpenAiResponses{codex:true}` already toggles `store:false`/effort/summary.
-- The usage-tier work overlaps C-05's codec normalization — land the codex side here, the OpenAI-Chat side
-  in C-05.
-- Verify against a real `~/.codex/auth.json` before closing (do **not** commit token values).
+- The usage-tier work overlaps C-05's codec normalization — landed **all** of it in C-05 (this story did
+  not touch the `Usage` struct or `map_responses_stream`'s usage emission, per the C-05 boundary).
+- Verify against a real `~/.codex/auth.json` before closing the epic (do **not** commit token values).

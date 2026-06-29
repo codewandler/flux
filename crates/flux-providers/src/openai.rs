@@ -234,6 +234,14 @@ struct ChatUsage {
     prompt_tokens: u64,
     #[serde(default)]
     completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 /// Parse the OpenAI Chat Completions SSE stream into normalized [`Chunk`]s. Tool-call argument
@@ -259,9 +267,19 @@ fn map_chat_stream(byte_stream: ByteStream) -> impl futures::Stream<Item = Resul
             let chunk: ChatChunk = serde_json::from_str(data)?;
 
             if let Some(u) = chunk.usage {
+                // OpenAI's `prompt_tokens` is the *whole* prompt incl. the cached prefix. Normalize
+                // to the cache-aware Usage shape (fresh input separate from cache reads) so cost and
+                // context figures are comparable with the Anthropic codec; OpenAI has no cache-write
+                // tier, so cache_creation stays 0.
+                let cached = u
+                    .prompt_tokens_details
+                    .as_ref()
+                    .map(|d| d.cached_tokens)
+                    .unwrap_or(0);
                 yield Chunk::Usage(Usage {
-                    input_tokens: u.prompt_tokens,
+                    input_tokens: u.prompt_tokens.saturating_sub(cached),
                     output_tokens: u.completion_tokens,
+                    cache_read_input_tokens: cached,
                     ..Default::default()
                 });
             }
@@ -520,11 +538,28 @@ impl Credential for OpenAiCred {
             rb = rb.header(*k, v);
         }
         if self.send_account_id {
-            if let Some(a) = account {
-                rb = rb.header("chatgpt-account-id", a);
-            }
+            // The ChatGPT backend rejects the request with a bare 401 if this header is missing.
+            // Fail with a clear, typed error instead of letting that opaque 401 surface.
+            let account = account.ok_or_else(|| {
+                Error::Auth(
+                    "codex: no ChatGPT account id — re-login to the Codex CLI so flux can read it \
+                     from `~/.codex/auth.json` (top-level `tokens.account_id` or the `id_token` \
+                     claims)"
+                        .to_string(),
+                )
+            })?;
+            rb = rb.header("chatgpt-account-id", account);
         }
         Ok(rb)
+    }
+
+    // C-04: expose the OAuth token source (codex) so the generic HTTP path can force-refresh on a
+    // 401; API-key secrets have nothing to refresh.
+    fn token_source(&self) -> Option<Arc<dyn TokenSource>> {
+        match &self.secret {
+            Secret::OAuth(ts) => Some(ts.clone()),
+            Secret::ApiKey(_) => None,
+        }
     }
 }
 
@@ -716,6 +751,34 @@ fn build_responses_body(req: &Request, codex: bool) -> Result<Value> {
                             "name": name,
                             "arguments": args.to_string(),
                         })),
+                        // Reasoning continuity (codex / store:false): the ChatGPT backend keeps no
+                        // server-side reasoning state, so echo prior assistant reasoning back into
+                        // the next request's `input` to preserve the chain across a multi-turn tool
+                        // loop. The encrypted/redacted payload is the load-bearing field (opted into
+                        // via include:["reasoning.encrypted_content"] below); the summary is best
+                        // effort. Pushed inline so the reasoning item precedes the function_call it
+                        // belongs to, as the API expects.
+                        ContentBlock::Thinking {
+                            thinking,
+                            signature,
+                        } if codex => {
+                            input.push(json!({
+                                "type": "reasoning",
+                                "summary": if thinking.is_empty() {
+                                    json!([])
+                                } else {
+                                    json!([{ "type": "summary_text", "text": thinking }])
+                                },
+                                "encrypted_content": signature,
+                            }));
+                        }
+                        ContentBlock::RedactedThinking { data } if codex => {
+                            input.push(json!({
+                                "type": "reasoning",
+                                "summary": [],
+                                "encrypted_content": data,
+                            }));
+                        }
                         _ => {}
                     }
                 }
@@ -760,6 +823,10 @@ fn build_responses_body(req: &Request, codex: bool) -> Result<Value> {
     }
     if codex {
         body["store"] = json!(false);
+        // With store:false there is no server-side reasoning state, so ask the backend to return
+        // the encrypted reasoning content; `build_responses_body` echoes those items back across
+        // turns (see the assistant `reasoning` mapping above) to keep reasoning continuity.
+        body["include"] = json!(["reasoning.encrypted_content"]);
         // Codex rejects max_*tokens / sampling params — omit them entirely.
     } else {
         if req.max_tokens > 0 {
@@ -828,9 +895,24 @@ fn map_responses_stream(byte_stream: ByteStream) -> impl futures::Stream<Item = 
                 }
                 "response.completed" => {
                     let u = &v["response"]["usage"];
+                    // The Responses API reports `input_tokens` as the *whole* prompt incl. the cached
+                    // prefix, and surfaces the cached count under `input_tokens_details.cached_tokens`
+                    // plus reasoning under `output_tokens_details.reasoning_tokens`. Normalize to the
+                    // cache-aware Usage shape (fresh input separate from cache reads, reasoning as a
+                    // subset of output) so cost is comparable across providers; there is no cache-write
+                    // tier, so cache_creation stays 0.
+                    let input = u["input_tokens"].as_u64().unwrap_or(0);
+                    let cached = u["input_tokens_details"]["cached_tokens"]
+                        .as_u64()
+                        .unwrap_or(0);
+                    let reasoning = u["output_tokens_details"]["reasoning_tokens"]
+                        .as_u64()
+                        .unwrap_or(0);
                     yield Chunk::Usage(Usage {
-                        input_tokens: u["input_tokens"].as_u64().unwrap_or(0),
+                        input_tokens: input.saturating_sub(cached),
                         output_tokens: u["output_tokens"].as_u64().unwrap_or(0),
+                        cache_read_input_tokens: cached,
+                        reasoning_tokens: reasoning,
                         ..Default::default()
                     });
                     if stop.is_none() {
@@ -989,6 +1071,38 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn chat_usage_captures_cached_tokens() {
+        // prompt_tokens is the whole prompt (incl. the cached prefix); cached_tokens is the cached
+        // portion. The codec must split fresh input from cache reads.
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":50,\
+             \"prompt_tokens_details\":{\"cached_tokens\":800}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+
+        let mut usage = None;
+        let stream = map_chat_stream(byte_stream);
+        futures::pin_mut!(stream);
+        while let Some(chunk) = stream.next().await {
+            if let Chunk::Usage(u) = chunk.unwrap() {
+                usage = Some(u);
+            }
+        }
+
+        let u = usage.expect("usage chunk");
+        assert_eq!(u.input_tokens, 200); // 1000 prompt - 800 cached
+        assert_eq!(u.cache_read_input_tokens, 800);
+        assert_eq!(u.output_tokens, 50);
+        assert_eq!(u.cache_creation_input_tokens, 0);
+        assert_eq!(u.context_tokens(), 1000);
+    }
+
     #[test]
     fn parse_inline_recovers_glm_and_qwen_forms() {
         // GLM XML form, two calls with surrounding prose.
@@ -1073,6 +1187,89 @@ mod tests {
         assert!(body.get("max_output_tokens").is_none()); // omitted for codex
     }
 
+    #[test]
+    fn codex_body_echoes_encrypted_reasoning() {
+        // A prior assistant turn carried a reasoning block + a tool call. Under codex/store:false
+        // the body must (a) opt into encrypted reasoning content and (b) echo the reasoning item
+        // back into `input` so the multi-turn tool loop keeps its reasoning context.
+        let mut req = Request::new("gpt-5-codex", "go").with_effort(Effort::Max);
+        req.messages.push(Message::assistant(vec![
+            ContentBlock::Thinking {
+                thinking: "let me think".into(),
+                signature: "ENC_ABC".into(),
+            },
+            ContentBlock::ToolUse {
+                id: "fc_1".into(),
+                name: "read".into(),
+                input: json!({ "path": "a.txt" }),
+            },
+        ]));
+        // A redacted reasoning block round-trips too.
+        req.messages
+            .push(Message::assistant(vec![ContentBlock::RedactedThinking {
+                data: "ENC_REDACTED".into(),
+            }]));
+
+        let body = build_responses_body(&req, true).unwrap();
+
+        // (a) include opts into the encrypted reasoning content.
+        let include = body["include"].as_array().expect("include array");
+        assert!(include.iter().any(|v| v == "reasoning.encrypted_content"));
+
+        // (b) a reasoning item carrying the encrypted payload round-trips into input.
+        let input = body["input"].as_array().expect("input array");
+        let reasoning: Vec<&Value> = input.iter().filter(|i| i["type"] == "reasoning").collect();
+        assert_eq!(reasoning.len(), 2, "both reasoning blocks should be echoed");
+        assert_eq!(reasoning[0]["encrypted_content"], "ENC_ABC");
+        assert_eq!(reasoning[0]["summary"][0]["text"], "let me think");
+        assert_eq!(reasoning[1]["encrypted_content"], "ENC_REDACTED");
+
+        // The reasoning item precedes the function_call it belongs to.
+        let r_idx = input.iter().position(|i| i["type"] == "reasoning").unwrap();
+        let fc_idx = input
+            .iter()
+            .position(|i| i["type"] == "function_call")
+            .unwrap();
+        assert!(r_idx < fc_idx, "reasoning must precede its function_call");
+
+        // Non-codex Responses bodies neither include encrypted reasoning nor echo reasoning items.
+        let plain = build_responses_body(&req, false).unwrap();
+        assert!(plain.get("include").is_none());
+        assert!(plain["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["type"] != "reasoning"));
+    }
+
+    #[tokio::test]
+    async fn codex_requires_account_id() {
+        // A codex credential (send_account_id:true) whose token source resolves no account id must
+        // fail with a clear typed error on `apply`, not silently send a header-less request that the
+        // backend rejects with a bare 401.
+        struct NoAccount;
+        #[async_trait]
+        impl TokenSource for NoAccount {
+            async fn access_token(&self) -> Result<String> {
+                Ok("tok".to_string())
+            }
+            // account_id() defaults to None.
+        }
+
+        let cred = OpenAiCred {
+            endpoint: CODEX_ENDPOINT.to_string(),
+            secret: Secret::OAuth(Arc::new(NoAccount)),
+            extra: Vec::new(),
+            send_account_id: true,
+        };
+        let rb = reqwest::Client::new().post(cred.endpoint());
+        let err = cred
+            .apply(rb)
+            .await
+            .expect_err("missing account id must error");
+        assert!(err.to_string().contains("account id"), "got: {err}");
+    }
+
     #[tokio::test]
     async fn parses_a_responses_sse_turn_with_tool_call() {
         let sse = concat!(
@@ -1114,5 +1311,38 @@ mod tests {
             }
             other => panic!("expected tool_use, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn responses_usage_captures_cache_and_reasoning() {
+        // input_tokens is the whole prompt (incl. cached); cached + reasoning come from the *_details.
+        let sse = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\
+             \"input_tokens\":1000,\"output_tokens\":300,\
+             \"input_tokens_details\":{\"cached_tokens\":600},\
+             \"output_tokens_details\":{\"reasoning_tokens\":120}}}}\n\n",
+        );
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+
+        let mut usage = None;
+        let stream = map_responses_stream(byte_stream);
+        futures::pin_mut!(stream);
+        while let Some(c) = stream.next().await {
+            if let Chunk::Usage(u) = c.unwrap() {
+                usage = Some(u);
+            }
+        }
+
+        let u = usage.expect("usage chunk");
+        assert_eq!(u.input_tokens, 400); // 1000 input - 600 cached
+        assert_eq!(u.cache_read_input_tokens, 600);
+        assert_eq!(u.output_tokens, 300);
+        assert_eq!(u.reasoning_tokens, 120); // subset of output_tokens
+        assert_eq!(u.cache_creation_input_tokens, 0);
+        assert_eq!(u.context_tokens(), 1000);
     }
 }

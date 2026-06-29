@@ -3783,6 +3783,7 @@ mod tests {
             output_tokens: 500,
             cache_read_input_tokens: 9_000,
             cache_creation_input_tokens: 0,
+            reasoning_tokens: 0,
         };
         let s = usage_annotation(&u);
         assert_eq!(s, " · ctx 10.0k · out 500 · cache 9.0k (90% hit)");
