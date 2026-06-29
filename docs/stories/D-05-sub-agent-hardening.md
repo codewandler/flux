@@ -2,7 +2,7 @@
 id: D-05
 title: Harden the sub-agent primitive for multi-tenant production
 pillar: Agent
-status: in-progress
+status: done
 priority:
 theme: downstream-managed-agents
 design: docs/designs/sub-agent-hardening.md
@@ -72,8 +72,8 @@ Verified in [`crates/flux-orchestrate/src/lib.rs`](../../crates/flux-orchestrate
 - [x] Full gate green (`cargo build/test`, `clippy -D warnings`, `fmt`, `cargo test -p flux-codegate`).
 
 ## Progress
-- **Implemented on branch `feat/d05-sub-agent-hardening`** (worktree); full gate green (clippy `-D
-  warnings`, fmt, codegate layering lint, `cargo test --workspace`). Pending review + merge to `main`.
+- **Done — merged to `main`** (commits `5617944` impl + `4c89134` review pass; reviewed in an isolated
+  worktree). Full gate green (clippy `-D warnings`, fmt, codegate layering lint, `cargo test --workspace`).
 - Design doc: [`docs/designs/sub-agent-hardening.md`](../designs/sub-agent-hardening.md).
 - **Landed:** WS1 (SDK seam + CLI refactor + hermetic example), WS2 (cancel threading + wall-clock-as-
   cancel + `SpawnLimits`), WS3 (injectable approver + workspace-confinement isolation test), WS4 (audit-
