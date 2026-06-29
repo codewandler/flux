@@ -4,6 +4,7 @@
 //! interactive REPL and TUI land in M2; this establishes the end-to-end path
 //! (CLI → provider → stream → render).
 
+mod plugin_skill;
 mod preset;
 mod style;
 
@@ -360,6 +361,20 @@ enum PluginAction {
     /// Register every `flux-plugin-*` binary in a directory: `install [dir]`
     /// (default `plugins/target/release`).
     Install { dir: Option<String> },
+    /// Generate a `flux-plugins` skill (SKILL.md + references/) from installed plugin manifests —
+    /// the flux analogue of fluxplane's `fluxplane-plugin skill`. Prints to stdout by default; rerun
+    /// with `--install` to (re)generate the skill tree (i.e. refresh).
+    Skill {
+        /// Write the SKILL.md + references/ into a skills dir (the project `.flux/skills/flux-plugins`).
+        #[arg(long)]
+        install: bool,
+        /// With `--install`, target the user-global `~/.claude/skills/flux-plugins` instead.
+        #[arg(long)]
+        global: bool,
+        /// Write the SKILL.md to this single file (references go in a sibling `references/`).
+        #[arg(long)]
+        out: Option<String>,
+    },
 }
 
 /// Reasoning effort, as a CLI value-enum mirroring [`Effort`].
@@ -3501,7 +3516,108 @@ async fn run_plugin(action: Option<PluginAction>) -> Result<()> {
             }
             Ok(())
         }
+        PluginAction::Skill {
+            install,
+            global,
+            out,
+        } => run_plugin_skill(&dir, install, global, out).await,
     }
+}
+
+/// Render the generated `flux-plugins` skill from the installed plugins' manifests (story D-13). Spawns
+/// each plugin only to fetch its manifest (no op call); a plugin that fails to spawn/manifest is skipped
+/// with a note rather than aborting the whole catalog.
+async fn run_plugin_skill(
+    dir: &std::path::Path,
+    install: bool,
+    global: bool,
+    out: Option<String>,
+) -> Result<()> {
+    let mut plugins: Vec<(String, flux_plugin::PluginManifest)> = Vec::new();
+    for p in flux_plugin::discover(dir) {
+        match flux_plugin::PluginHost::spawn(&p.descriptor.program, &p.descriptor.args).await {
+            Ok(mut host) => {
+                match host.manifest().await {
+                    Ok(m) => plugins.push((p.name.clone(), m)),
+                    Err(e) => eprintln!(
+                        "{}",
+                        style::dim(&format!("skip `{}`: manifest error: {e}", p.name))
+                    ),
+                }
+                let _ = host.shutdown().await;
+            }
+            Err(e) => eprintln!(
+                "{}",
+                style::dim(&format!("skip `{}`: spawn error: {e}", p.name))
+            ),
+        }
+    }
+    let rendered = plugin_skill::render_plugin_skill(&plugins);
+
+    if let Some(out) = out {
+        let out = std::path::PathBuf::from(out);
+        std::fs::write(&out, &rendered.skill_md)
+            .with_context(|| format!("write {}", out.display()))?;
+        let refdir = out
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("references");
+        write_skill_references(&refdir, &rendered.references)?;
+        println!(
+            "wrote {} (+ {} reference(s))",
+            out.display(),
+            rendered.references.len()
+        );
+        return Ok(());
+    }
+
+    if install {
+        let base = skill_install_dir(global)?;
+        std::fs::create_dir_all(&base).with_context(|| format!("create {}", base.display()))?;
+        let skill_file = base.join("SKILL.md");
+        std::fs::write(&skill_file, &rendered.skill_md)
+            .with_context(|| format!("write {}", skill_file.display()))?;
+        write_skill_references(&base.join("references"), &rendered.references)?;
+        println!(
+            "installed flux-plugins skill → {} ({} plugin(s), {} reference(s))",
+            base.display(),
+            plugins.len(),
+            rendered.references.len()
+        );
+        return Ok(());
+    }
+
+    print!("{}", rendered.skill_md);
+    Ok(())
+}
+
+/// Where `flux plugin skill --install` writes: the project `.flux/skills/flux-plugins` (highest skill
+/// precedence) or, with `--global`, the user-global `~/.claude/skills/flux-plugins`.
+fn skill_install_dir(global: bool) -> Result<std::path::PathBuf> {
+    if global {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+        Ok(home.join(".claude").join("skills").join("flux-plugins"))
+    } else {
+        Ok(std::env::current_dir()?
+            .join(".flux")
+            .join("skills")
+            .join("flux-plugins"))
+    }
+}
+
+/// Write each generated `references/<plugin>.md` into `dir` (created on demand).
+fn write_skill_references(dir: &std::path::Path, refs: &[(String, String)]) -> Result<()> {
+    if refs.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    for (name, md) in refs {
+        let f = dir.join(format!("{name}.md"));
+        std::fs::write(&f, md).with_context(|| format!("write {}", f.display()))?;
+    }
+    Ok(())
 }
 
 /// Find every `flux-plugin-<name>` executable in `dir`, returning `(name, absolute-program-path)`

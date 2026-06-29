@@ -7,6 +7,7 @@
 //! parses leniently to its defaults.
 
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 /// A parsed markdown document: typed frontmatter (`meta`) plus the remaining `body`.
 #[derive(Debug, Clone)]
@@ -53,13 +54,31 @@ pub fn parse_frontmatter<T: DeserializeOwned>(
     })
 }
 
+/// Serialize `meta` into a `---`-delimited YAML frontmatter block (including both fences and a
+/// trailing newline). The inverse of the block [`split_frontmatter`] extracts. Errors only if `meta`
+/// is not YAML-serializable.
+pub fn compose_frontmatter<T: Serialize>(meta: &T) -> Result<String, serde_norway::Error> {
+    let yaml = serde_norway::to_string(meta)?;
+    // `serde_norway` already ends its output with a newline; fence it.
+    Ok(format!("---\n{yaml}---\n"))
+}
+
+/// Render a markdown document from typed frontmatter (`meta`) and a `body`, the inverse of
+/// [`parse_frontmatter`]: a `---` YAML block followed by `body`. Round-trips —
+/// `parse_frontmatter(&render_document(&m, b)?)` yields `m` and `b` (modulo a normalized trailing
+/// newline on the body).
+pub fn render_document<T: Serialize>(meta: &T, body: &str) -> Result<String, serde_norway::Error> {
+    let front = compose_frontmatter(meta)?;
+    Ok(format!("{front}{body}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
 
-    #[derive(Debug, Default, Deserialize, PartialEq)]
+    #[derive(Debug, Default, Deserialize, Serialize, PartialEq)]
     #[serde(default)]
     struct Meta {
         name: String,
@@ -104,6 +123,31 @@ mod tests {
             parse_frontmatter("\u{feff}---\r\nname: beta\r\n---\r\nbody\r\n").unwrap();
         assert_eq!(doc.meta.name, "beta");
         assert!(doc.body.contains("body"));
+    }
+
+    #[test]
+    fn render_round_trips_through_parse() {
+        let meta = Meta {
+            name: "flux-plugins".into(),
+            tags: vec!["gitlab".into(), "slack".into()],
+            metadata: BTreeMap::from([("kind".into(), "generated".into())]),
+        };
+        let body = "# Installed plugins\n\nUse `flux plugin call`.\n";
+        let rendered = render_document(&meta, body).unwrap();
+        let doc: Document<Meta> = parse_frontmatter(&rendered).unwrap();
+        assert_eq!(doc.meta, meta);
+        assert_eq!(doc.body, body);
+    }
+
+    #[test]
+    fn compose_frontmatter_is_fenced() {
+        let meta = Meta {
+            name: "x".into(),
+            ..Meta::default()
+        };
+        let block = compose_frontmatter(&meta).unwrap();
+        assert!(block.starts_with("---\n"));
+        assert!(block.trim_end().ends_with("---"));
     }
 
     #[test]

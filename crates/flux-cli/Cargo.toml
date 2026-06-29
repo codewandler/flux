@@ -50,6 +50,7 @@ clap_complete.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 crossterm.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 serde_norway.workspace = true
 reedline = "0.48.0"

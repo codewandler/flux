@@ -11,7 +11,9 @@
 
 pub mod frontmatter;
 
-pub use frontmatter::{parse_frontmatter, split_frontmatter, Document};
+pub use frontmatter::{
+    compose_frontmatter, parse_frontmatter, render_document, split_frontmatter, Document,
+};
 
 #[cfg(any(feature = "ratatui", feature = "terminal"))]
 pub mod render;
