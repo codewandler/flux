@@ -17,6 +17,9 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - **Gate:** green — `cargo test` · `clippy -D warnings` · `fmt` · the `flux-codegate` layering lint.
 
 ## Now (in progress)
+- [C-02 — Integration-stack hardening](C-02-integration-stack-hardening.md) · Core · embeddings/semantic
+  datasource backend (feature-gated) + `flux plugin call`/`install` + a `plugins/` CI step + a live
+  env-gated plugin smoke — hardening the shipped D-07/D-08/D-09/D-10 stack
 - [I-01 — Statistically clean headline gain](I-01-headline-gain.md) · Improve · offline half done
   (partial-credit scalar + durable token capture + synthetic `trials = 5` loop); the trials ≥ 5
   grader-confirmed run is **staged** on a funded provider key
