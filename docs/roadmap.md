@@ -181,6 +181,41 @@ aggregator/generator surfaces (vision/websearch-aggregator/openapi) are explicit
 - **[D-17](stories/D-17-telephony-plugins.md) — Telephony pack** (asterisk, homer; serves the managed-agents voice
   surface; asterisk needs D-12 conn).
 
+### Subscription providers & cross-provider cost (epic)
+
+flux already drives the two **subscription / passthrough** model backends — `claude` (Claude Max / Claude-Code
+OAuth) and `codex` (ChatGPT/Codex OAuth) — by **reusing the desktop apps' tokens** and refreshing them, with no
+full interactive OAuth2 login (that is the deliberate later stage). `flux-credentials` imports from
+`~/.claude/.credentials.json` / `~/.codex/auth.json`, refreshes via a 0600 store, and `-m claude|codex/...`
+routes to them; the `claude` (Bearer + `oauth-2025-04-20` + Claude-Code system prefix) and `codex` (Responses
+API on the ChatGPT backend) providers are wired. This epic **hardens** that against the live-backend quirks,
+makes codex's **websocket** the default transport (HTTP fallback), and adds the missing cross-cutting piece:
+**full usage + cost tracking across all providers**. Epic design:
+[subscription-providers-and-cost.md](designs/subscription-providers-and-cost.md). Built in this order
+(C-03/C-04/C-05 parallelize — mostly disjoint files):
+
+- **[C-03](stories/C-03-codex-provider-hardening.md) — Codex provider hardening** · *core.* `account_id` from
+  the `id_token` JWT claims (real `auth.json` nests it there → missing `chatgpt-account-id` rejects), cache +
+  reasoning token capture in the Responses usage, and reasoning continuity under `store:false`. Foundation for
+  C-07.
+- **[C-04](stories/C-04-claude-401-refresh.md) — Claude verify + force-refresh-on-401** · *core.* Refresh today
+  is expiry-time-only; add a single 401→refresh→retry path on the credential/`NativeProvider` seam (shared by
+  both subscription providers), and a hermetic verify of the claude request shape.
+- **[C-05](stories/C-05-pricing-cost-model.md) — Cross-provider pricing & cost model** · *core.* Per-model
+  per-tier rates (input/output/cache-write/cache-read/reasoning) + `cost(&Usage, model)`; a **built-in table
+  overlaid by `~/.flux/pricing.toml`**; normalize the OpenAI Chat/Responses codecs to populate cache fields
+  (they zero them today). Subscription spend is labelled as *equivalent metered cost*.
+- **[C-06](stories/C-06-usage-cost-accounting.md) — Usage & cost accounting** · *core, needs C-05.* Per-model
+  attribution + sub-agent rollup + a `cost_summary` event-log projection + a `flux usage` command + a server
+  endpoint + cache-aware CLI/TUI/server output. The full "usage + cost across all providers" surface.
+- **[C-07](stories/C-07-codex-websocket-transport.md) — Codex WebSocket transport (default)** · *core, needs
+  C-03.* WS (`wss://chatgpt.com/backend-api/codex/responses`) as the primary path with transparent HTTP-SSE
+  fallback (a transport seam in `NativeProvider`; auth on the tungstenite handshake, per the realtime provider).
+  Upstream WS is experimental — the fallback is non-negotiable and test-covered.
+- **[C-08](stories/C-08-full-oauth2-login.md) — Full OAuth2 login (codex PKCE)** · *core, later stage.* A
+  flux-native `flux auth login codex` to parity with claude's PKCE login. Explicitly deferred — import + refresh
+  cover the near term.
+
 **Candidate phases (vision tail, in priority order):**
 - **Crate consolidation** ✅ **all phases shipped** — shrank the workspace by merging coherent
   *same-layer* siblings (layering lint stayed green throughout). Phase 1 collapsed the five L1 provider
@@ -264,6 +299,13 @@ Drift made visible, so it stops being silent. Each maps to a story on the
 - **crates.io publish** blocked on the `flux-core` name (needs a vanity prefix); deferred.
 - **Self-improvement headline gain** still lacks a trials ≥ 3, grader-confirmed result.
   → [I-01](stories/I-01-headline-gain.md).
+- **No cost tracking.** Per-turn token usage is captured + persisted, but there is no pricing layer and no
+  aggregation/reporting, and the OpenAI codecs drop cache tiers. → [C-05](stories/C-05-pricing-cost-model.md)
+  / [C-06](stories/C-06-usage-cost-accounting.md).
+- **Codex transport is HTTP-SSE only** while the upstream codex client uses a websocket transport (with HTTP
+  fallback). → [C-07](stories/C-07-codex-websocket-transport.md).
+- **Subscription-provider login is import-only for codex** (claude has PKCE); full OAuth2 for codex is the
+  deferred later stage. → [C-08](stories/C-08-full-oauth2-login.md).
 
 ## Backlog (product improvements)
 
