@@ -796,6 +796,7 @@ dependencies = [
  "async-trait",
  "flux-core",
  "flux-datasource",
+ "flux-plugin",
  "flux-runtime",
  "flux-spec",
  "flux-system",

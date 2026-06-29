@@ -8,11 +8,13 @@
 //! v1 ranks by keyword/term-frequency; the [`Embedder`] seam is defined but **no semantic backend is
 //! wired** (deferred).
 
+mod host_caps;
 mod ingest;
 mod memory;
 mod ops;
 mod sqlite;
 
+pub use host_caps::DatasourceHostCaps;
 pub use ingest::{freshness, ingest_markdown, ingest_openapi, reindex};
 pub use memory::MemoryBackend;
 pub use ops::register_datasource_ops;
