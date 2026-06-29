@@ -152,6 +152,35 @@ declarations with secrets as `secret "ENV"` references, replacing the JSON manif
     wires the `flux app run` path to **load plugins + register datasource tools** (today CLI-only). Design:
     [agentic-channel-target.md](designs/agentic-channel-target.md).
 
+### fluxplane-plugins parity (epic)
+
+flux shipped **8** native plugins (D-08) over the D-10 protocol; the fluxplane pack they were modelled on has
+**26 marketplace plugins**, and flux's 8 cover a fraction of their ops (gitlab 6/60+, slack 5/30, jira 3/~20,
+k8s 5/24). This epic drives **full native parity**: every *portable* fluxplane plugin rewritten as a native
+flux plugin at full op coverage, plus a generated plugin skill so the catalog is self-documenting. Builtin/
+provider-covered plugins (clock/system/sleep/git/openai/ollama/duckduckgo/tavily) and fluxplane's
+aggregator/generator surfaces (vision/websearch-aggregator/openapi) are explicit non-goals. Epic design:
+[fluxplane-plugins-parity.md](designs/fluxplane-plugins-parity.md). Built in this order:
+
+- **[D-12](stories/D-12-plugin-protocol-parity.md) — Plugin protocol parity extensions** · *core, leads.*
+  Three additive host capabilities the missing plugins need: non-Bearer auth injection (Basic/header/query by
+  purpose — Slice A), a guarded raw `conn.*` socket dialer (Slice B), and a `blob.*` store (Slice C). Clean
+  extension of `flux.plugin.v1`; the dialer lives in flux-system. Gates D-15/D-16/D-17 and lets D-14 delete
+  jira/confluence's hand-rolled base64. Design:
+  [plugin-protocol-parity.md](designs/plugin-protocol-parity.md).
+- **[D-13](stories/D-13-plugin-skill-command.md) — Generated plugin skill (`flux plugin skill`)** · *core.*
+  Renders the installed plugin manifests into a trigger-activated `flux-plugins` SKILL.md + `references/` (the
+  flux analogue of fluxplane's `fluxplane-plugin skill`); adds a frontmatter writer to flux-markdown.
+  Independent of D-12. Design: [plugin-skill-generation.md](designs/plugin-skill-generation.md).
+- **[D-14](stories/D-14-deepen-native-plugins.md) — Deepen the 8 native plugins** to their full fluxplane op
+  sets (and drop the base64 hand-rolling). · *epic, per-plugin.*
+- **[D-15](stories/D-15-observability-ai-plugins.md) — Observability & AI pack** (alertmanager, grafana,
+  opsgenie, huggingface; HTTP, needs D-12 auth).
+- **[D-16](stories/D-16-datastore-infra-plugins.md) — Datastore & infra pack** (sql, docker, aws; needs D-12
+  conn + blob).
+- **[D-17](stories/D-17-telephony-plugins.md) — Telephony pack** (asterisk, homer; serves the managed-agents voice
+  surface; asterisk needs D-12 conn).
+
 **Candidate phases (vision tail, in priority order):**
 - **Crate consolidation** ✅ **all phases shipped** — shrank the workspace by merging coherent
   *same-layer* siblings (layering lint stayed green throughout). Phase 1 collapsed the five L1 provider

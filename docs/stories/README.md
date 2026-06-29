@@ -23,6 +23,14 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [D-02 — Tenant/context-taggable event substrate](D-02-tenant-event-substrate.md) · Core · **high** ·
   optional stream-level account/agent/correlation context envelope on `flux-events` runs + account-scoped
   reads (`list_for_account`/`account_streams`); code-complete + gate-green, pending commit
+- [D-12 — Plugin protocol parity extensions](D-12-plugin-protocol-parity.md) · Core · **1** · additive host
+  caps for the missing fluxplane plugins — non-Bearer auth injection (A) + raw `conn.*` dialer (B) + `blob.*`
+  store (C); gates D-15/D-16/D-17 and D-14's base64 cleanup; **all 3 slices code-complete + gate-green,
+  pending commit**
+- [D-13 — Generated plugin skill (`flux plugin skill`)](D-13-plugin-skill-command.md) · Core · **2** · renders
+  installed-plugin manifests into a trigger-activated `flux-plugins` SKILL.md + `references/` (the flux analogue
+  of fluxplane's `fluxplane-plugin skill`); flux-markdown frontmatter writer; **code-complete + gate-green,
+  pending commit**
 
 ## Next (ready — take the top one unless the user named a story)
 _(none ready — the Slack-channel assistant integration stack D-07/D-10/D-08/D-09 all shipped; see Done. Promote one
@@ -34,6 +42,14 @@ _(none)_
 ## Backlog (unranked — promote to **Next** with a `priority` when ready)
 - [L-02 — flux-markdown engine + progressive-disclosure skills](L-02-flux-markdown-engine.md) · Language · AST parser, body-on-demand activation
 - [D-11 — App-runner ergonomics for declarative bots](D-11-app-runner-ergonomics.md) · Agent · configurable `flux app run` knowledge ingest + OpenAPI + persona/event-context-from-file; blocks Slack-channel assistant S-03/S-06
+
+### fluxplane-plugins parity (epic) — full native parity with the 26-plugin fluxplane pack
+The integration breadth+depth push: every *portable* fluxplane plugin rewritten natively at full op coverage,
+gated by D-12. See [epic design](../designs/fluxplane-plugins-parity.md). D-12/D-13 lead (in progress above).
+- [D-14 — Deepen the 8 native plugins to full op-parity](D-14-deepen-native-plugins.md) · Agent · gitlab 6→60+, slack 5→30, jira/confluence/k8s/loki/prometheus to their fluxplane op sets (needs D-12 auth/blob/conn)
+- [D-15 — Observability & AI plugin pack](D-15-observability-ai-plugins.md) · Agent · alertmanager, grafana, opsgenie, huggingface (HTTP; needs D-12 Slice A auth)
+- [D-16 — Datastore & infra plugin pack](D-16-datastore-infra-plugins.md) · Agent · sql, docker, aws (needs D-12 Slice B conn + blob)
+- [D-17 — Telephony plugin pack](D-17-telephony-plugins.md) · Agent · asterisk, homer — serves the managed-agents voice surface (asterisk needs D-12 Slice B conn)
 
 ### Downstream enablement (managed-agents) — queued behind the active Slack-channel assistant stack above
 These support the multi-tenant **managed-agents** service (path-dep consumer). D-02 now leads (in progress above);
