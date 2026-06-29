@@ -488,7 +488,12 @@ fn build_agent_engine(
     let ctx = ToolContext::new(system);
     let spec = agent_spec_from_decl(decl, default_model, root);
     let approver: Arc<dyn Approver> = Arc::new(DenyApprover);
-    let flow = FlowStore::in_memory().map_err(other)?;
+    // The agent loop's planner reads the turn's conversation via the FlowStore (`store.conversation()`),
+    // which delegates to the FlowStore's *internal* event log. Back it with the SAME `events` store the
+    // engine records the user message into — otherwise `in_memory()` mints a fresh, empty EventStore and
+    // the planner sees no conversation, so the model only ever gets the system prompt (never the user's
+    // message). This is what makes an `agent`-bound trigger actually answer the inbound mention.
+    let flow = FlowStore::in_memory_with_events(events.clone()).map_err(other)?;
     spec.assemble(provider, registry, approver, ctx, events, flow)
         .map_err(other)
 }
