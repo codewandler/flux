@@ -1,0 +1,13 @@
+[package]
+name = "host-kit"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Shared SDK for flux integration plugins: typed host-capability calls (secret-by-purpose, http+bearer, endpoint, datasource records) + a manifest/op builder over flux-plugin's guest protocol"
+
+[dependencies]
+flux-plugin.workspace = true
+flux-datasource.workspace = true
+flux-spec.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -35,6 +35,9 @@ members = [
     "crates/flux-markdown",
     "crates/flux-channels",
 ]
+# `plugins/` is its own nested cargo workspace (the integration plugin pack, D-08): subprocess binaries
+# with heavy vendor deps (k8s client, cloud SDKs) kept OUT of the main flux gate. Built separately.
+exclude = ["plugins"]
 
 [workspace.package]
 edition = "2021"

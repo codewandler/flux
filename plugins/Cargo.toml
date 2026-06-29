@@ -1,0 +1,27 @@
+# The flux integration plugin pack (story D-08) — a NESTED workspace, excluded from the root flux
+# workspace (see ../Cargo.toml `exclude`). Each plugin is a subprocess binary speaking flux's
+# plugin protocol; heavy vendor deps live here, not in the main flux gate. Build/test with
+# `cargo build` / `cargo test` from this directory.
+[workspace]
+resolver = "2"
+members = [
+    "host-kit",
+    # plugins are added here as each lands (websearch, gitlab, jira, confluence, kubernetes, loki,
+    # prometheus, slack)
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# flux contracts (path deps into the sibling crates; these are L0/L4 and pure of vendor deps)
+flux-plugin = { path = "../crates/flux-plugin" }
+flux-datasource = { path = "../crates/flux-datasource" }
+flux-secret = { path = "../crates/flux-secret" }
+flux-spec = { path = "../crates/flux-spec" }
+host-kit = { path = "host-kit" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
