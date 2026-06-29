@@ -10,8 +10,8 @@
 # Env keys (set the ones you want to exercise):
 #   TAVILY_API_KEY                          → websearch.search
 #   GITLAB_PERSONAL_TOKEN  (+ GITLAB_URL)   → gitlab.project.list
-#   JIRA_API_TOKEN + JIRA_EMAIL + JIRA_URL  → jira.project.list
-#   CONFLUENCE_API_TOKEN/.._EMAIL/.._URL    → confluence.space.list
+#   JIRA_API_TOKEN + JIRA_EMAIL + JIRA_URL  → jira.test
+#   CONFLUENCE_API_TOKEN/.._EMAIL/.._URL    → confluence.test
 #   SLACK_BOT_TOKEN                         → slack.channel.list
 #   PROMETHEUS_URL                          → prometheus.targets
 #   LOKI_URL                                → loki.labels
@@ -67,8 +67,8 @@ run_case() {
 step "plugin op round-trips (skipped when the key is absent)"
 run_case websearch  websearch.search     '{"query":"warm transfer","max_results":2}' TAVILY_API_KEY
 run_case gitlab     gitlab.project.list  '{}'                                         GITLAB_PERSONAL_TOKEN
-run_case jira       jira.project.list    '{}'                                         JIRA_API_TOKEN
-run_case confluence confluence.space.list '{}'                                        CONFLUENCE_API_TOKEN
+run_case jira       jira.test            '{}'                                         JIRA_API_TOKEN
+run_case confluence confluence.test      '{}'                                         CONFLUENCE_API_TOKEN
 run_case slack      slack.channel.list   '{}'                                         SLACK_BOT_TOKEN
 run_case prometheus prometheus.targets   '{}'                                         PROMETHEUS_URL
 run_case loki       loki.labels          '{}'                                         LOKI_URL
@@ -76,12 +76,12 @@ run_case loki       loki.labels          '{}'                                   
 # kubernetes needs a reachable cluster + kubectl; opt in explicitly.
 if [ -n "${FLUX_SMOKE_KUBERNETES:-}" ]; then
   if command -v kubectl >/dev/null 2>&1; then
-    run_case kubernetes k8s.namespace.list '{}' FLUX_SMOKE_KUBERNETES
+    run_case kubernetes kubernetes.namespace.list '{}' FLUX_SMOKE_KUBERNETES
   else
-    skip "kubernetes.k8s.namespace.list (kubectl not on PATH)"
+    skip "kubernetes.namespace.list (kubectl not on PATH)"
   fi
 else
-  skip "kubernetes.k8s.namespace.list (set FLUX_SMOKE_KUBERNETES=1 + a reachable cluster)"
+  skip "kubernetes.namespace.list (set FLUX_SMOKE_KUBERNETES=1 + a reachable cluster)"
 fi
 
 step "embeddings"

@@ -11,3 +11,7 @@ path = "src/main.rs"
 [dependencies]
 host-kit.workspace = true
 serde_json.workspace = true
+# Full-fidelity storage<->markdown conversion (D-14 residual): pulldown-cmark drives the
+# markdown -> storage XHTML render, quick-xml the forgiving storage XHTML -> markdown walk.
+pulldown-cmark = { version = "0.13", default-features = false }
+quick-xml = "0.41"
