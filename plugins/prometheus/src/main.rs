@@ -19,6 +19,7 @@ fn manifest_builder() -> PluginBuilder {
             purpose: "prometheus_token".into(),
             env: vec!["PROMETHEUS_TOKEN".into()],
             description: "Optional Prometheus bearer token".into(),
+            ..Default::default()
         })
         .endpoint(EndpointSpec {
             name: "prometheus.endpoint".into(),

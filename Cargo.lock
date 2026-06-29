@@ -896,6 +896,7 @@ dependencies = [
  "flux-tui",
  "futures",
  "reedline",
+ "serde",
  "serde_json",
  "serde_norway",
  "tokio",
@@ -1093,6 +1094,7 @@ name = "flux-plugin"
 version = "0.2.4"
 dependencies = [
  "async-trait",
+ "base64",
  "flux-core",
  "flux-datasource",
  "flux-runtime",
@@ -1103,6 +1105,7 @@ dependencies = [
  "rquickjs",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "toml",
  "url",

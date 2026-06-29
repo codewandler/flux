@@ -1,8 +1,8 @@
 //! `host-kit` — the shared SDK for flux integration plugins (story D-08).
 //!
 //! It wraps flux-plugin's guest protocol so a plugin is mostly "declare ops + implement each against a
-//! vendor API": a typed [`Host`] for the host-capability callbacks (secret-by-purpose, HTTP with bearer
-//! injection, endpoint resolution, datasource-record contribution) and a [`PluginBuilder`] that collects
+//! vendor API": a typed [`Host`] for the host-capability callbacks (secret-by-purpose, HTTP with
+//! auth-by-scheme injection, endpoint resolution, datasource-record contribution) and a [`PluginBuilder`] that collects
 //! a manifest + op handlers and serves them. Plugins never read state files or hold raw tokens for the
 //! auth-injection path — the host resolves secrets and injects them.
 //!
@@ -24,13 +24,14 @@
 
 use std::collections::HashMap;
 
+use base64::Engine as _;
 use serde_json::{json, Value};
 
 // Re-export the protocol vocabulary so a plugin depends only on host-kit.
 pub use flux_datasource::{Declaration, EntitySchema, Link, Record, SchemaField, Source};
 pub use flux_plugin::{
-    AuthMethod, EndpointSpec, GuestHost, OperationSpec, PluginCapabilities as Caps, PluginHandler,
-    PluginManifest,
+    AuthMethod, AuthScheme, EndpointSpec, GuestHost, OperationSpec, PluginCapabilities as Caps,
+    PluginHandler, PluginManifest,
 };
 pub use flux_spec::{Effect, Idempotency, Risk};
 
@@ -89,19 +90,20 @@ impl Host<'_> {
             .ok_or_else(|| "endpoint: host returned no url".into())
     }
 
-    /// Make an HTTP request through the host. `bearer_purpose` (when set) makes the host inject an
-    /// `Authorization: Bearer <resolved>` header — the plugin never sees the raw token.
+    /// Make an HTTP request through the host. `auth_purpose` (when set) names an auth method the host
+    /// resolves and injects per its declared [`AuthScheme`] (Bearer/Basic/Header/Query) — the plugin
+    /// never sees the raw token.
     pub fn http(
         &mut self,
         method: &str,
         url: &str,
-        bearer_purpose: Option<&str>,
+        auth_purpose: Option<&str>,
         headers: &[(&str, &str)],
         body: Option<&str>,
     ) -> Result<HttpResponse, String> {
         let mut payload = json!({ "method": method, "url": url });
-        if let Some(p) = bearer_purpose {
-            payload["bearer_purpose"] = json!(p);
+        if let Some(p) = auth_purpose {
+            payload["auth_purpose"] = json!(p);
         }
         if !headers.is_empty() {
             let map: serde_json::Map<String, Value> = headers
@@ -124,28 +126,28 @@ impl Host<'_> {
         })
     }
 
-    /// Convenience: GET a URL (optional bearer purpose) and parse the JSON body, erroring on non-2xx.
-    pub fn get_json(&mut self, url: &str, bearer_purpose: Option<&str>) -> Result<Value, String> {
-        let resp = self.http("GET", url, bearer_purpose, &[], None)?;
+    /// Convenience: GET a URL (optional auth purpose) and parse the JSON body, erroring on non-2xx.
+    pub fn get_json(&mut self, url: &str, auth_purpose: Option<&str>) -> Result<Value, String> {
+        let resp = self.http("GET", url, auth_purpose, &[], None)?;
         if !resp.is_success() {
             return Err(format!("GET {url} → {} {}", resp.status, resp.body));
         }
         resp.json()
     }
 
-    /// Convenience: send a JSON body with `method` (optional bearer purpose) and parse the response.
+    /// Convenience: send a JSON body with `method` (optional auth purpose) and parse the response.
     pub fn send_json(
         &mut self,
         method: &str,
         url: &str,
-        bearer_purpose: Option<&str>,
+        auth_purpose: Option<&str>,
         body: &Value,
     ) -> Result<Value, String> {
         let s = serde_json::to_string(body).map_err(|e| e.to_string())?;
         let resp = self.http(
             method,
             url,
-            bearer_purpose,
+            auth_purpose,
             &[("content-type", "application/json")],
             Some(&s),
         )?;
@@ -184,6 +186,110 @@ impl Host<'_> {
             .host_call("datasource.records", json!({ "records": records }))?;
         Ok(v.get("indexed").and_then(|x| x.as_u64()).unwrap_or(0) as usize)
     }
+
+    /// Open a raw socket connection through the host (gated by the plugin's `conn` capability; TCP is
+    /// SSRF-guarded). Returns an opaque id for [`conn_write`](Self::conn_write) /
+    /// [`conn_read`](Self::conn_read) / [`conn_close`](Self::conn_close) — the way a plugin drives a
+    /// wire protocol (SQL, AMI, the Docker socket) the host never speaks itself.
+    pub fn conn_dial(&mut self, target: ConnTarget) -> Result<u64, String> {
+        let payload = match target {
+            ConnTarget::Tcp { host, port } => json!({ "kind": "tcp", "host": host, "port": port }),
+            ConnTarget::Unix { path } => json!({ "kind": "unix", "path": path }),
+        };
+        let v = self.inner.host_call("conn.dial", payload)?;
+        v.get("conn_id")
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| "conn.dial: host returned no conn_id".into())
+    }
+
+    /// Write bytes to an open connection; returns the number written.
+    pub fn conn_write(&mut self, conn_id: u64, data: &[u8]) -> Result<usize, String> {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+        let v = self
+            .inner
+            .host_call("conn.write", json!({ "conn_id": conn_id, "data_b64": b64 }))?;
+        Ok(v.get("written").and_then(|x| x.as_u64()).unwrap_or(0) as usize)
+    }
+
+    /// Read up to `max` bytes from an open connection; an empty `Vec` means EOF.
+    pub fn conn_read(&mut self, conn_id: u64, max: usize) -> Result<Vec<u8>, String> {
+        let v = self
+            .inner
+            .host_call("conn.read", json!({ "conn_id": conn_id, "max": max }))?;
+        let b64 = v.get("data_b64").and_then(|x| x.as_str()).unwrap_or("");
+        base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| format!("conn.read: bad base64: {e}"))
+    }
+
+    /// Close an open connection.
+    pub fn conn_close(&mut self, conn_id: u64) -> Result<(), String> {
+        self.inner
+            .host_call("conn.close", json!({ "conn_id": conn_id }))?;
+        Ok(())
+    }
+
+    /// Store bytes in the host's content-addressed scratch store (gated by the `blob` capability);
+    /// returns an opaque `blob_ref` to pass as a `blob_ref` input instead of inlining base64.
+    pub fn blob_put(&mut self, name: &str, data: &[u8]) -> Result<String, String> {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+        let v = self
+            .inner
+            .host_call("blob.put", json!({ "name": name, "data_b64": b64 }))?;
+        v.get("blob_ref")
+            .and_then(|x| x.as_str())
+            .map(String::from)
+            .ok_or_else(|| "blob.put: host returned no blob_ref".into())
+    }
+
+    /// Fetch the bytes behind a `blob_ref`.
+    pub fn blob_get(&mut self, blob_ref: &str) -> Result<Vec<u8>, String> {
+        let v = self
+            .inner
+            .host_call("blob.get", json!({ "blob_ref": blob_ref }))?;
+        let b64 = v.get("data_b64").and_then(|x| x.as_str()).unwrap_or("");
+        base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| format!("blob.get: bad base64: {e}"))
+    }
+
+    /// Metadata for a `blob_ref` (name, size, sha256).
+    pub fn blob_info(&mut self, blob_ref: &str) -> Result<BlobInfo, String> {
+        let v = self
+            .inner
+            .host_call("blob.info", json!({ "blob_ref": blob_ref }))?;
+        Ok(BlobInfo {
+            name: v
+                .get("name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            size: v.get("size").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+            sha256: v
+                .get("sha256")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+        })
+    }
+}
+
+/// A socket target for [`Host::conn_dial`].
+pub enum ConnTarget<'a> {
+    /// A TCP `host:port`.
+    Tcp { host: &'a str, port: u16 },
+    /// A local Unix-domain socket path.
+    Unix { path: &'a str },
+}
+
+/// Metadata for a stored blob (from [`Host::blob_info`]).
+pub struct BlobInfo {
+    /// The name the blob was stored under.
+    pub name: String,
+    /// Size in bytes.
+    pub size: usize,
+    /// The content's sha256 (also the `blob_ref`).
+    pub sha256: String,
 }
 
 /// A handler closure for one operation: `(input, host) -> result`.
@@ -326,6 +432,10 @@ pub struct MockHost {
     pub process: Vec<(String, String)>,
     /// Records the plugin contributed (captured for assertions).
     pub contributed: std::cell::RefCell<Vec<Record>>,
+    /// An in-memory `conn.*` byte buffer: `conn.write` appends, `conn.read` drains (a loopback echo).
+    pub conn_buf: std::cell::RefCell<Vec<u8>>,
+    /// An in-memory `blob.*` store: `blob_ref -> (name, bytes)`.
+    pub blobs: std::cell::RefCell<HashMap<String, (String, Vec<u8>)>>,
 }
 
 impl Default for MockHost {
@@ -336,6 +446,8 @@ impl Default for MockHost {
             endpoints: HashMap::new(),
             process: Vec::new(),
             contributed: std::cell::RefCell::new(Vec::new()),
+            conn_buf: std::cell::RefCell::new(Vec::new()),
+            blobs: std::cell::RefCell::new(HashMap::new()),
         }
     }
 }
@@ -420,6 +532,65 @@ impl GuestHost for MockHost {
                 self.contributed.borrow_mut().extend(recs);
                 Ok(json!({ "indexed": n }))
             }
+            "conn.dial" => Ok(json!({ "conn_id": 1 })),
+            "conn.write" => {
+                let b64 = payload
+                    .get("data_b64")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let data = base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .map_err(|e| e.to_string())?;
+                let n = data.len();
+                self.conn_buf.borrow_mut().extend(data);
+                Ok(json!({ "written": n }))
+            }
+            "conn.read" => {
+                let max = payload.get("max").and_then(|v| v.as_u64()).unwrap_or(65536) as usize;
+                let mut buf = self.conn_buf.borrow_mut();
+                let take = buf.len().min(max);
+                let out: Vec<u8> = buf.drain(..take).collect();
+                Ok(json!({
+                    "data_b64": base64::engine::general_purpose::STANDARD.encode(&out),
+                    "eof": out.is_empty()
+                }))
+            }
+            "conn.close" => Ok(json!({ "ok": true })),
+            "blob.put" => {
+                let name = payload
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let b64 = payload
+                    .get("data_b64")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let data = base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .map_err(|e| e.to_string())?;
+                let r = format!("mockblob-{}", self.blobs.borrow().len() + 1);
+                self.blobs.borrow_mut().insert(r.clone(), (name, data));
+                Ok(json!({ "blob_ref": r }))
+            }
+            "blob.get" => {
+                let r = payload
+                    .get("blob_ref")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let blobs = self.blobs.borrow();
+                let (_, data) = blobs.get(r).ok_or_else(|| format!("mock: no blob {r}"))?;
+                Ok(json!({ "data_b64": base64::engine::general_purpose::STANDARD.encode(data) }))
+            }
+            "blob.info" => {
+                let r = payload
+                    .get("blob_ref")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let blobs = self.blobs.borrow();
+                let (name, data) = blobs.get(r).ok_or_else(|| format!("mock: no blob {r}"))?;
+                Ok(json!({ "name": name, "size": data.len(), "sha256": r }))
+            }
             other => Err(format!("mock: unknown command `{other}`")),
         }
     }
@@ -441,6 +612,7 @@ mod tests {
                 purpose: "api_token".into(),
                 env: vec!["ACME_TOKEN".into()],
                 description: String::new(),
+                ..Default::default()
             })
             .endpoint(EndpointSpec {
                 name: "acme.endpoint".into(),
@@ -484,5 +656,36 @@ mod tests {
 
         // unknown op errors
         assert!(plugin.call("nope", json!({}), &mut host).is_err());
+    }
+
+    #[test]
+    fn conn_methods_round_trip_through_host() {
+        let mut backend = MockHost::default();
+        let mut host = Host {
+            inner: &mut backend,
+        };
+        let id = host
+            .conn_dial(ConnTarget::Tcp {
+                host: "db",
+                port: 5432,
+            })
+            .unwrap();
+        assert_eq!(id, 1);
+        assert_eq!(host.conn_write(id, b"SELECT 1").unwrap(), 8);
+        assert_eq!(host.conn_read(id, 64).unwrap(), b"SELECT 1");
+        host.conn_close(id).unwrap();
+    }
+
+    #[test]
+    fn blob_methods_round_trip_through_host() {
+        let mut backend = MockHost::default();
+        let mut host = Host {
+            inner: &mut backend,
+        };
+        let r = host.blob_put("greeting.txt", b"hi there").unwrap();
+        let info = host.blob_info(&r).unwrap();
+        assert_eq!(info.name, "greeting.txt");
+        assert_eq!(info.size, 8);
+        assert_eq!(host.blob_get(&r).unwrap(), b"hi there");
     }
 }

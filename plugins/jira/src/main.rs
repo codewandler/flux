@@ -25,11 +25,13 @@ fn manifest_builder() -> PluginBuilder {
             purpose: "api_token".into(),
             env: vec!["JIRA_API_TOKEN".into(), "ATLASSIAN_API_TOKEN".into()],
             description: "Atlassian API token (the password half of Basic auth)".into(),
+            ..Default::default()
         })
         .auth(AuthMethod {
             purpose: "email".into(),
             env: vec!["JIRA_EMAIL".into(), "ATLASSIAN_EMAIL".into()],
             description: "Atlassian account email (the username half of Basic auth)".into(),
+            ..Default::default()
         })
         .endpoint(EndpointSpec {
             name: "jira.endpoint".into(),

@@ -18,6 +18,7 @@ fn manifest_builder() -> PluginBuilder {
             purpose: "loki_token".into(),
             env: vec!["LOKI_TOKEN".into(), "LOKI_BEARER_TOKEN".into()],
             description: "Optional bearer token for the Loki HTTP API".into(),
+            ..Default::default()
         })
         .endpoint(EndpointSpec {
             name: "loki.endpoint".into(),

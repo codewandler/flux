@@ -16,6 +16,7 @@ fn manifest_builder() -> PluginBuilder {
             purpose: "tavily_api_key".into(),
             env: vec!["TAVILY_API_KEY".into()],
             description: "Tavily API key (optional; falls back to DuckDuckGo)".into(),
+            ..Default::default()
         })
         .datasource(Declaration {
             name: "websearch.results".into(),

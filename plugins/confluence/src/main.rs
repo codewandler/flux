@@ -29,6 +29,7 @@ fn manifest_builder() -> PluginBuilder {
                 "JIRA_API_TOKEN".into(),
             ],
             description: "Atlassian API token (Basic auth password)".into(),
+            ..Default::default()
         })
         .auth(AuthMethod {
             purpose: "email".into(),
@@ -38,6 +39,7 @@ fn manifest_builder() -> PluginBuilder {
                 "JIRA_EMAIL".into(),
             ],
             description: "Atlassian account email (Basic auth username)".into(),
+            ..Default::default()
         })
         .endpoint(EndpointSpec {
             name: "confluence.endpoint".into(),

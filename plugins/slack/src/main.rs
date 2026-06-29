@@ -23,11 +23,13 @@ fn manifest_builder() -> PluginBuilder {
             purpose: "bot_token".into(),
             env: vec!["SLACK_BOT_TOKEN".into()],
             description: "Slack bot token (xoxb-…) for posting/reading via the bot.".into(),
+            ..Default::default()
         })
         .auth(AuthMethod {
             purpose: "user_token".into(),
             env: vec!["SLACK_USER_TOKEN".into()],
             description: "Slack user token (xoxp-…) for search-scoped calls.".into(),
+            ..Default::default()
         })
         .endpoint(EndpointSpec {
             name: "slack.endpoint".into(),

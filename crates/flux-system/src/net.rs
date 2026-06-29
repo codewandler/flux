@@ -91,6 +91,125 @@ fn is_blocked_v4(v4: Ipv4Addr) -> bool {
         || (o[0] == 100 && (64..=127).contains(&o[1])) // 100.64/10 CGNAT
 }
 
+// ---------------------------------------------------------------------------
+// Guarded socket dialer — the raw-connection equivalent of `guard_url`, for plugins whose backend
+// speaks a wire protocol over a TCP or Unix socket rather than HTTP (sql, docker, asterisk). The
+// same SSRF egress policy applies to TCP; Unix sockets are local and gated by capability, not here.
+// Story D-12 (plugin protocol parity).
+// ---------------------------------------------------------------------------
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// A socket target to dial.
+#[derive(Debug, Clone)]
+pub enum DialTarget {
+    /// A TCP `host:port` (subject to the same SSRF policy as [`guard_url`]).
+    Tcp { host: String, port: u16 },
+    /// A local Unix-domain socket path.
+    Unix { path: String },
+}
+
+/// An opened connection. Read/write are async methods (rather than exposing the concrete stream) so
+/// the caller — the plugin host's `conn.*` capability — can shuttle bytes uniformly over TCP or Unix.
+pub enum DialStream {
+    /// A TCP stream.
+    Tcp(tokio::net::TcpStream),
+    /// A Unix-domain stream.
+    #[cfg(unix)]
+    Unix(tokio::net::UnixStream),
+}
+
+impl DialStream {
+    /// Read up to `max` bytes; an empty `Vec` signals EOF.
+    pub async fn read(&mut self, max: usize) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; max];
+        let n = match self {
+            DialStream::Tcp(s) => s.read(&mut buf).await,
+            #[cfg(unix)]
+            DialStream::Unix(s) => s.read(&mut buf).await,
+        }
+        .map_err(|e| Error::Other(format!("conn read: {e}")))?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    /// Write all of `data`.
+    pub async fn write_all(&mut self, data: &[u8]) -> Result<()> {
+        match self {
+            DialStream::Tcp(s) => s.write_all(data).await,
+            #[cfg(unix)]
+            DialStream::Unix(s) => s.write_all(data).await,
+        }
+        .map_err(|e| Error::Other(format!("conn write: {e}")))
+    }
+
+    /// Shut the connection down.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        match self {
+            DialStream::Tcp(s) => s.shutdown().await,
+            #[cfg(unix)]
+            DialStream::Unix(s) => s.shutdown().await,
+        }
+        .map_err(|e| Error::Other(format!("conn shutdown: {e}")))
+    }
+}
+
+/// Dial a socket target, applying the SSRF egress policy to TCP unless `allow_private`.
+pub async fn dial(target: &DialTarget, allow_private: bool) -> Result<DialStream> {
+    match target {
+        DialTarget::Tcp { host, port } => {
+            guard_target_host(host, *port, allow_private)?;
+            let s = tokio::net::TcpStream::connect((host.as_str(), *port))
+                .await
+                .map_err(|e| Error::Other(format!("tcp dial {host}:{port}: {e}")))?;
+            Ok(DialStream::Tcp(s))
+        }
+        DialTarget::Unix { path } => {
+            #[cfg(unix)]
+            {
+                let s = tokio::net::UnixStream::connect(path)
+                    .await
+                    .map_err(|e| Error::Other(format!("unix dial {path}: {e}")))?;
+                Ok(DialStream::Unix(s))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                Err(Error::Other(
+                    "unix-socket dial is unsupported on this platform".into(),
+                ))
+            }
+        }
+    }
+}
+
+/// Guard a `host:port` for a socket dial with the same policy as [`guard_url`]: internal hostnames and
+/// private/loopback/link-local IPs are blocked unless `allow_private`.
+fn guard_target_host(host: &str, port: u16, allow_private: bool) -> Result<()> {
+    if allow_private {
+        return Ok(());
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return block_if(ip, host);
+    }
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost"
+        || lower.ends_with(".localhost")
+        || lower == "metadata.google.internal"
+        || lower.ends_with(".internal")
+    {
+        return Err(Error::Other(format!(
+            "refusing to dial internal host {host}"
+        )));
+    }
+    if let Ok(addrs) = (host, port).to_socket_addrs() {
+        for sa in addrs {
+            block_if(sa.ip(), host)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +263,37 @@ mod tests {
     #[test]
     fn allow_private_opt_in() {
         assert!(guard_url("http://127.0.0.1/", true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn dial_tcp_round_trips_and_guards_private() {
+        // A loopback echo server (hermetic — no external network).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 64];
+                if let Ok(n) = sock.read(&mut buf).await {
+                    let _ = sock.write_all(&buf[..n]).await;
+                }
+            }
+        });
+
+        // Loopback is blocked by the egress policy unless `allow_private`.
+        let target = DialTarget::Tcp {
+            host: "127.0.0.1".into(),
+            port,
+        };
+        assert!(
+            dial(&target, false).await.is_err(),
+            "loopback must be guarded"
+        );
+
+        // With `allow_private`, the dial round-trips.
+        let mut s = dial(&target, true).await.unwrap();
+        s.write_all(b"ping").await.unwrap();
+        let got = s.read(64).await.unwrap();
+        assert_eq!(&got, b"ping");
+        s.shutdown().await.ok();
     }
 }

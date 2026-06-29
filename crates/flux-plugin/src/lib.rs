@@ -10,8 +10,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
 
 use flux_core::{Error, Result};
 use flux_runtime::{Tool, ToolContext, ToolResult};
@@ -117,9 +119,28 @@ pub struct OperationSpec {
     pub secret_purposes: Vec<String>,
 }
 
+/// How the host injects a resolved secret into an `http.do` request for an auth method. Default
+/// `Bearer`, so manifests written before this field — and the legacy `bearer_purpose` call path —
+/// behave unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthScheme {
+    /// `Authorization: Bearer <secret>`.
+    #[default]
+    Bearer,
+    /// `Authorization: Basic base64(<user>:<secret>)` — `<user>` resolved from the method's `user_env`.
+    Basic,
+    /// A custom header `<name>: <secret>` (e.g. `PRIVATE-TOKEN`, `GenieKey`).
+    Header { name: String },
+    /// A query parameter `?<name>=<secret>`.
+    Query { name: String },
+}
+
 /// An authentication method the plugin needs, resolved **by purpose**: the host maps `purpose` (e.g.
 /// `"bot_token"`) to a secret value by trying `env` keys in order (each must also be a granted secret).
-/// A plugin asks `secret { "purpose": "bot_token" }` or `http.do { "bearer_purpose": "api_token" }`.
+/// A plugin asks `secret { "purpose": "bot_token" }` or `http.do { "auth_purpose": "api_token" }`; the
+/// host injects the resolved secret per the method's [`AuthScheme`] (the plugin never sees the token on
+/// the injection path).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthMethod {
     /// The purpose name the plugin references (e.g. `"bot_token"`, `"api_token"`).
@@ -129,6 +150,48 @@ pub struct AuthMethod {
     pub env: Vec<String>,
     #[serde(default)]
     pub description: String,
+    /// How the host injects the resolved secret into an HTTP request (default `Bearer`).
+    #[serde(default)]
+    pub scheme: AuthScheme,
+    /// For `AuthScheme::Basic`: env-var keys holding the username/email half, tried in order. These are
+    /// config (not a gated secret), so they resolve directly from declared env like an endpoint.
+    #[serde(default)]
+    pub user_env: Vec<String>,
+}
+
+impl AuthMethod {
+    /// A Bearer-token method: `Authorization: Bearer <env>`.
+    pub fn bearer(purpose: impl Into<String>, env: Vec<String>) -> Self {
+        Self {
+            purpose: purpose.into(),
+            env,
+            scheme: AuthScheme::Bearer,
+            ..Self::default()
+        }
+    }
+
+    /// A Basic-auth method: `Authorization: Basic base64(<user_env>:<env>)`.
+    pub fn basic(purpose: impl Into<String>, user_env: Vec<String>, env: Vec<String>) -> Self {
+        Self {
+            purpose: purpose.into(),
+            env,
+            user_env,
+            scheme: AuthScheme::Basic,
+            ..Self::default()
+        }
+    }
+
+    /// A custom-header method: `<header>: <env>`.
+    pub fn header(purpose: impl Into<String>, header: impl Into<String>, env: Vec<String>) -> Self {
+        Self {
+            purpose: purpose.into(),
+            env,
+            scheme: AuthScheme::Header {
+                name: header.into(),
+            },
+            ..Self::default()
+        }
+    }
 }
 
 /// A configurable API endpoint (base URL) the plugin resolves by name from env. A plugin asks
@@ -158,6 +221,13 @@ pub struct PluginCapabilities {
     /// Whether `http.do` is permitted at all (host-side SSRF guard still applies).
     #[serde(default)]
     pub http: bool,
+    /// Allowed `conn.dial` targets (`tcp:host:port` / `unix:/path`; a single `*` wildcards one
+    /// segment, e.g. `tcp:*:5432`). Empty = the `conn.*` capability is denied.
+    #[serde(default)]
+    pub conn: Vec<String>,
+    /// Whether the `blob.*` capability (content-addressed scratch store) is permitted.
+    #[serde(default)]
+    pub blob: bool,
 }
 
 /// What a plugin advertises about itself — the single source of truth the host introspects (ops,
@@ -337,6 +407,12 @@ pub struct SystemHostCaps {
     grants: PluginCapabilities,
     auth: Vec<AuthMethod>,
     endpoints: Vec<EndpointSpec>,
+    /// Open `conn.dial` connections for this call scope, keyed by an opaque id. A tokio mutex so a
+    /// `conn.read`/`write` can hold the stream across its await without making the guard non-Send.
+    conns: tokio::sync::Mutex<std::collections::HashMap<u64, flux_system::net::DialStream>>,
+    next_conn: std::sync::atomic::AtomicU64,
+    /// `blob.*` content-addressed scratch store for this call scope: `sha256-hex -> (name, bytes)`.
+    blobs: tokio::sync::Mutex<std::collections::HashMap<String, (String, Vec<u8>)>>,
 }
 
 impl SystemHostCaps {
@@ -347,6 +423,9 @@ impl SystemHostCaps {
             grants: PluginCapabilities::default(),
             auth: Vec::new(),
             endpoints: Vec::new(),
+            conns: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            next_conn: std::sync::atomic::AtomicU64::new(1),
+            blobs: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -409,6 +488,65 @@ impl SystemHostCaps {
             ep.env
         ))
     }
+
+    /// Resolve the username half of Basic auth from a method's `user_env` (config, not a gated secret —
+    /// resolved directly from declared env, like an endpoint).
+    fn resolve_user(&self, user_env: &[String]) -> std::result::Result<String, String> {
+        for key in user_env {
+            if let Some(v) = self.system.env(key) {
+                return Ok(v);
+            }
+        }
+        Err(format!(
+            "no env value for basic-auth username (tried {user_env:?})"
+        ))
+    }
+
+    /// Decide what auth the host injects into an `http.do` request: the legacy `bearer_purpose` (always
+    /// Bearer) or `auth_purpose` (respects the declared [`AuthScheme`]). Pure given the resolved env, so
+    /// it is unit-testable without a network round-trip.
+    fn resolve_auth(&self, payload: &Value) -> std::result::Result<AuthInjection, String> {
+        if let Some(p) = payload.get("bearer_purpose").and_then(|v| v.as_str()) {
+            return Ok(AuthInjection::Bearer(self.resolve_purpose(p)?));
+        }
+        let Some(p) = payload.get("auth_purpose").and_then(|v| v.as_str()) else {
+            return Ok(AuthInjection::None);
+        };
+        let method = self
+            .auth
+            .iter()
+            .find(|a| a.purpose == p)
+            .ok_or_else(|| format!("no auth method declared for purpose `{p}`"))?;
+        let scheme = method.scheme.clone();
+        let user_env = method.user_env.clone();
+        let secret = self.resolve_purpose(p)?;
+        Ok(match scheme {
+            AuthScheme::Bearer => AuthInjection::Bearer(secret),
+            AuthScheme::Basic => AuthInjection::Basic {
+                user: self.resolve_user(&user_env)?,
+                secret,
+            },
+            AuthScheme::Header { name } => AuthInjection::Header {
+                name,
+                value: secret,
+            },
+            AuthScheme::Query { name } => AuthInjection::Query {
+                name,
+                value: secret,
+            },
+        })
+    }
+}
+
+/// The auth the host injects into an `http.do` request, resolved from the payload + manifest. The
+/// secret never crosses back to the plugin on this path.
+#[derive(Debug, PartialEq)]
+enum AuthInjection {
+    None,
+    Bearer(String),
+    Basic { user: String, secret: String },
+    Header { name: String, value: String },
+    Query { name: String, value: String },
 }
 
 #[async_trait]
@@ -474,7 +612,7 @@ impl HostCapabilities for SystemHostCaps {
                     return Err("http.do not granted to this plugin".into());
                 }
                 let raw = payload.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                let url = guard_http_url(raw, self.allow_private_net)?;
+                let mut url = guard_http_url(raw, self.allow_private_net)?;
                 let method = payload
                     .get("method")
                     .and_then(|v| v.as_str())
@@ -482,6 +620,13 @@ impl HostCapabilities for SystemHostCaps {
                     .to_uppercase();
                 let m = reqwest::Method::from_bytes(method.as_bytes())
                     .map_err(|e| format!("http.do: bad method `{method}`: {e}"))?;
+                // Auth injection by purpose: the host resolves the secret and injects it per the
+                // method's declared scheme — the plugin never sees raw tokens on this path. `Query`
+                // mutates the URL, so resolve before building the request.
+                let inject = self.resolve_auth(payload)?;
+                if let AuthInjection::Query { name, value } = &inject {
+                    url.query_pairs_mut().append_pair(name, value);
+                }
                 let mut req = reqwest::Client::new().request(m, url);
                 if let Some(headers) = payload.get("headers").and_then(|v| v.as_object()) {
                     for (k, v) in headers {
@@ -490,10 +635,13 @@ impl HostCapabilities for SystemHostCaps {
                         }
                     }
                 }
-                // Optional bearer-token injection by purpose (host resolves the secret; the plugin
-                // never sees raw tokens for the auth-injection path).
-                if let Some(purpose) = payload.get("bearer_purpose").and_then(|v| v.as_str()) {
-                    req = req.bearer_auth(self.resolve_purpose(purpose)?);
+                match inject {
+                    AuthInjection::None | AuthInjection::Query { .. } => {}
+                    AuthInjection::Bearer(t) => req = req.bearer_auth(t),
+                    AuthInjection::Basic { user, secret } => {
+                        req = req.basic_auth(user, Some(secret))
+                    }
+                    AuthInjection::Header { name, value } => req = req.header(name.as_str(), value),
                 }
                 if let Some(body) = payload.get("body").and_then(|v| v.as_str()) {
                     req = req.body(body.to_string());
@@ -504,8 +652,183 @@ impl HostCapabilities for SystemHostCaps {
                 let body = truncate_on_char_boundary(body, 256 * 1024);
                 Ok(json!({ "status": status, "body": body }))
             }
+            "conn.dial" => {
+                let kind = payload
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("tcp");
+                let target = match kind {
+                    "tcp" => {
+                        let host = payload
+                            .get("host")
+                            .and_then(|v| v.as_str())
+                            .ok_or("conn.dial: `host` required for tcp")?
+                            .to_string();
+                        let port = payload
+                            .get("port")
+                            .and_then(|v| v.as_u64())
+                            .ok_or("conn.dial: `port` required for tcp")?
+                            as u16;
+                        flux_system::net::DialTarget::Tcp { host, port }
+                    }
+                    "unix" => {
+                        let path = payload
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .ok_or("conn.dial: `path` required for unix")?
+                            .to_string();
+                        flux_system::net::DialTarget::Unix { path }
+                    }
+                    other => return Err(format!("conn.dial: unknown kind `{other}`")),
+                };
+                let tstr = conn_target_str(&target);
+                if !conn_granted(&self.grants.conn, &tstr) {
+                    return Err(format!(
+                        "conn.dial: target `{tstr}` not in this plugin's granted conn capabilities"
+                    ));
+                }
+                let stream = flux_system::net::dial(&target, self.allow_private_net)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let id = self
+                    .next_conn
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.conns.lock().await.insert(id, stream);
+                Ok(json!({ "conn_id": id }))
+            }
+            "conn.read" => {
+                let id = payload
+                    .get("conn_id")
+                    .and_then(|v| v.as_u64())
+                    .ok_or("conn.read: `conn_id` required")?;
+                let max = payload
+                    .get("max")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(64 * 1024)
+                    .min(1024 * 1024) as usize;
+                let mut guard = self.conns.lock().await;
+                let stream = guard
+                    .get_mut(&id)
+                    .ok_or_else(|| format!("conn.read: no open connection {id}"))?;
+                let data = stream.read(max).await.map_err(|e| e.to_string())?;
+                let eof = data.is_empty();
+                Ok(json!({
+                    "data_b64": base64::engine::general_purpose::STANDARD.encode(&data),
+                    "eof": eof
+                }))
+            }
+            "conn.write" => {
+                let id = payload
+                    .get("conn_id")
+                    .and_then(|v| v.as_u64())
+                    .ok_or("conn.write: `conn_id` required")?;
+                let data_b64 = payload
+                    .get("data_b64")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let data = base64::engine::general_purpose::STANDARD
+                    .decode(data_b64)
+                    .map_err(|e| format!("conn.write: bad base64: {e}"))?;
+                let mut guard = self.conns.lock().await;
+                let stream = guard
+                    .get_mut(&id)
+                    .ok_or_else(|| format!("conn.write: no open connection {id}"))?;
+                stream.write_all(&data).await.map_err(|e| e.to_string())?;
+                Ok(json!({ "written": data.len() }))
+            }
+            "conn.close" => {
+                let id = payload
+                    .get("conn_id")
+                    .and_then(|v| v.as_u64())
+                    .ok_or("conn.close: `conn_id` required")?;
+                if let Some(mut stream) = self.conns.lock().await.remove(&id) {
+                    let _ = stream.shutdown().await;
+                }
+                Ok(json!({ "ok": true }))
+            }
+            "blob.put" => {
+                if !self.grants.blob {
+                    return Err("blob.put not granted to this plugin".into());
+                }
+                let name = payload
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let b64 = payload
+                    .get("data_b64")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let data = base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .map_err(|e| format!("blob.put: bad base64: {e}"))?;
+                let mut h = Sha256::new();
+                h.update(&data);
+                let blob_ref = h
+                    .finalize()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>();
+                self.blobs
+                    .lock()
+                    .await
+                    .insert(blob_ref.clone(), (name, data));
+                Ok(json!({ "blob_ref": blob_ref }))
+            }
+            "blob.get" => {
+                if !self.grants.blob {
+                    return Err("blob.get not granted to this plugin".into());
+                }
+                let r = payload
+                    .get("blob_ref")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let guard = self.blobs.lock().await;
+                let (_, data) = guard
+                    .get(r)
+                    .ok_or_else(|| format!("blob.get: no blob {r}"))?;
+                Ok(json!({ "data_b64": base64::engine::general_purpose::STANDARD.encode(data) }))
+            }
+            "blob.info" => {
+                if !self.grants.blob {
+                    return Err("blob.info not granted to this plugin".into());
+                }
+                let r = payload
+                    .get("blob_ref")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let guard = self.blobs.lock().await;
+                let (name, data) = guard
+                    .get(r)
+                    .ok_or_else(|| format!("blob.info: no blob {r}"))?;
+                Ok(json!({ "name": name, "size": data.len(), "sha256": r }))
+            }
             other => Err(format!("unknown host capability: {other}")),
         }
+    }
+}
+
+/// The canonical grant string for a dial target (`tcp:host:port` / `unix:/path`).
+fn conn_target_str(t: &flux_system::net::DialTarget) -> String {
+    match t {
+        flux_system::net::DialTarget::Tcp { host, port } => format!("tcp:{host}:{port}"),
+        flux_system::net::DialTarget::Unix { path } => format!("unix:{path}"),
+    }
+}
+
+/// Whether a plugin's `conn` grant list permits `target`. Entries match exactly or with a single `*`
+/// wildcard segment (e.g. `tcp:*:5432`, `tcp:db.internal:*`, `unix:/var/run/*.sock`).
+fn conn_granted(grants: &[String], target: &str) -> bool {
+    grants.iter().any(|g| conn_glob(g, target))
+}
+
+/// Match a pattern with at most one `*` wildcard against a string.
+fn conn_glob(pat: &str, s: &str) -> bool {
+    match pat.split_once('*') {
+        Some((pre, suf)) => {
+            s.len() >= pre.len() + suf.len() && s.starts_with(pre) && s.ends_with(suf)
+        }
+        None => pat == s,
     }
 }
 
@@ -907,6 +1230,7 @@ mod tests {
             process: vec!["echo".into()],
             secrets: vec![],
             http: false,
+            ..Default::default()
         });
         assert!(
             limited
@@ -948,6 +1272,7 @@ mod tests {
                 purpose: "api_token".into(),
                 env: vec!["FLUX_TEST_API_TOKEN_XZ".into()],
                 description: String::new(),
+                ..Default::default()
             }],
             endpoints: vec![EndpointSpec {
                 name: "gitlab.endpoint".into(),
@@ -983,6 +1308,223 @@ mod tests {
 
         std::env::remove_var("FLUX_TEST_API_TOKEN_XZ");
         std::env::remove_var("FLUX_TEST_GITLAB_URL_XZ");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn auth_injection_resolves_per_scheme() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!("flux-authinj-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        std::env::set_var("FLUX_TEST_BEARER_AJ", "bear-tok");
+        std::env::set_var("FLUX_TEST_BASIC_TOK_AJ", "basic-tok");
+        std::env::set_var("FLUX_TEST_BASIC_USER_AJ", "user@example.com");
+        std::env::set_var("FLUX_TEST_HDR_AJ", "hdr-tok");
+        std::env::set_var("FLUX_TEST_QRY_AJ", "qry-tok");
+
+        let manifest = PluginManifest {
+            name: "multi".into(),
+            auth: vec![
+                AuthMethod::bearer("bear", vec!["FLUX_TEST_BEARER_AJ".into()]),
+                AuthMethod::basic(
+                    "basic",
+                    vec!["FLUX_TEST_BASIC_USER_AJ".into()],
+                    vec!["FLUX_TEST_BASIC_TOK_AJ".into()],
+                ),
+                AuthMethod::header("genie", "GenieKey", vec!["FLUX_TEST_HDR_AJ".into()]),
+                AuthMethod {
+                    purpose: "qry".into(),
+                    env: vec!["FLUX_TEST_QRY_AJ".into()],
+                    scheme: AuthScheme::Query {
+                        name: "apikey".into(),
+                    },
+                    ..Default::default()
+                },
+            ],
+            capabilities: PluginCapabilities {
+                secrets: vec![
+                    "FLUX_TEST_BEARER_AJ".into(),
+                    "FLUX_TEST_BASIC_TOK_AJ".into(),
+                    "FLUX_TEST_HDR_AJ".into(),
+                    "FLUX_TEST_QRY_AJ".into(),
+                ],
+                http: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let caps = SystemHostCaps::new(sys).with_manifest(&manifest);
+
+        // legacy bearer_purpose → Bearer (unchanged behaviour)
+        assert_eq!(
+            caps.resolve_auth(&json!({"bearer_purpose": "bear"}))
+                .unwrap(),
+            AuthInjection::Bearer("bear-tok".into())
+        );
+        // auth_purpose respects each declared scheme
+        assert_eq!(
+            caps.resolve_auth(&json!({"auth_purpose": "bear"})).unwrap(),
+            AuthInjection::Bearer("bear-tok".into())
+        );
+        assert_eq!(
+            caps.resolve_auth(&json!({"auth_purpose": "basic"}))
+                .unwrap(),
+            AuthInjection::Basic {
+                user: "user@example.com".into(),
+                secret: "basic-tok".into()
+            }
+        );
+        assert_eq!(
+            caps.resolve_auth(&json!({"auth_purpose": "genie"}))
+                .unwrap(),
+            AuthInjection::Header {
+                name: "GenieKey".into(),
+                value: "hdr-tok".into()
+            }
+        );
+        assert_eq!(
+            caps.resolve_auth(&json!({"auth_purpose": "qry"})).unwrap(),
+            AuthInjection::Query {
+                name: "apikey".into(),
+                value: "qry-tok".into()
+            }
+        );
+        // no auth requested → None; undeclared purpose → error
+        assert_eq!(caps.resolve_auth(&json!({})).unwrap(), AuthInjection::None);
+        assert!(caps.resolve_auth(&json!({"auth_purpose": "nope"})).is_err());
+
+        for k in [
+            "FLUX_TEST_BEARER_AJ",
+            "FLUX_TEST_BASIC_TOK_AJ",
+            "FLUX_TEST_BASIC_USER_AJ",
+            "FLUX_TEST_HDR_AJ",
+            "FLUX_TEST_QRY_AJ",
+        ] {
+            std::env::remove_var(k);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn conn_dial_round_trips_and_is_gated() {
+        use flux_system::{System, Workspace};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = std::env::temp_dir().join(format!("flux-conn-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+
+        // A loopback echo server (hermetic).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 64];
+                if let Ok(n) = sock.read(&mut buf).await {
+                    let _ = sock.write_all(&buf[..n]).await;
+                }
+            }
+        });
+        let dial = json!({"kind": "tcp", "host": "127.0.0.1", "port": port});
+
+        // Ungranted conn.dial is denied even with private-net allowed (the grant is the gate).
+        let none = SystemHostCaps::new(sys.clone()).allow_private_net(true);
+        assert!(none.handle("conn.dial", &dial).await.is_err());
+
+        // Granted (loopback wildcard) → dial/write/read/close round-trips.
+        let caps = SystemHostCaps::new(sys)
+            .allow_private_net(true)
+            .with_grants(PluginCapabilities {
+                conn: vec!["tcp:127.0.0.1:*".into()],
+                ..Default::default()
+            });
+        let id = caps.handle("conn.dial", &dial).await.unwrap()["conn_id"]
+            .as_u64()
+            .unwrap();
+        let ping = base64::engine::general_purpose::STANDARD.encode(b"ping");
+        let wrote = caps
+            .handle("conn.write", &json!({"conn_id": id, "data_b64": ping}))
+            .await
+            .unwrap();
+        assert_eq!(wrote["written"], 4);
+        let read = caps
+            .handle("conn.read", &json!({"conn_id": id, "max": 64}))
+            .await
+            .unwrap();
+        let got = base64::engine::general_purpose::STANDARD
+            .decode(read["data_b64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(&got, b"ping");
+        caps.handle("conn.close", &json!({"conn_id": id}))
+            .await
+            .unwrap();
+        // reading a closed/unknown connection errors
+        assert!(caps
+            .handle("conn.read", &json!({"conn_id": id, "max": 8}))
+            .await
+            .is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn blob_put_get_info_round_trips_and_is_gated() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!("flux-blob-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let payload = base64::engine::general_purpose::STANDARD.encode(b"hello blob");
+
+        // Ungranted blob.* is denied.
+        let none = SystemHostCaps::new(sys.clone());
+        assert!(none
+            .handle("blob.put", &json!({"name": "x", "data_b64": payload}))
+            .await
+            .is_err());
+
+        let caps = SystemHostCaps::new(sys).with_grants(PluginCapabilities {
+            blob: true,
+            ..Default::default()
+        });
+        let put = caps
+            .handle(
+                "blob.put",
+                &json!({"name": "greeting.txt", "data_b64": payload}),
+            )
+            .await
+            .unwrap();
+        let r = put["blob_ref"].as_str().unwrap().to_string();
+        // content-addressed: same content → same ref
+        let put2 = caps
+            .handle(
+                "blob.put",
+                &json!({"name": "again.txt", "data_b64": payload}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put2["blob_ref"].as_str().unwrap(), r);
+
+        let info = caps
+            .handle("blob.info", &json!({"blob_ref": r}))
+            .await
+            .unwrap();
+        assert_eq!(info["size"], 10);
+        assert_eq!(info["sha256"], r);
+
+        let got = caps
+            .handle("blob.get", &json!({"blob_ref": r}))
+            .await
+            .unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(got["data_b64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(&bytes, b"hello blob");
+
+        // unknown ref errors
+        assert!(caps
+            .handle("blob.get", &json!({"blob_ref": "deadbeef"}))
+            .await
+            .is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 

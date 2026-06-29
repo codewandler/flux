@@ -26,6 +26,7 @@ fn manifest_builder() -> PluginBuilder {
                 "GITLAB_PERSONAL_ACCESS_TOKEN".into(),
             ],
             description: "GitLab personal access token".into(),
+            ..Default::default()
         })
         .endpoint(EndpointSpec {
             name: "gitlab.endpoint".into(),
