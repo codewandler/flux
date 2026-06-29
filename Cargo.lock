@@ -756,6 +756,7 @@ dependencies = [
 name = "flux-a2a"
 version = "0.2.4"
 dependencies = [
+ "async-trait",
  "eventsource-stream",
  "futures",
  "rand 0.8.6",

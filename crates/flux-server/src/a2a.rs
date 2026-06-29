@@ -26,9 +26,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use flux_a2a::{
-    AgentCard, Capabilities, Message, Skill, Task, TaskState, TaskStatus, TaskStatusUpdateEvent,
-};
+use flux_a2a::server;
+use flux_a2a::{AgentCard, Message, Task, TaskState, TaskStatus};
 use flux_flow::AgentSink;
 
 use super::Collect;
@@ -52,33 +51,23 @@ pub async fn agent_card(headers: HeaderMap) -> Json<AgentCard> {
         .unwrap_or("http");
     let url = format!("{scheme}://{host}/a2a");
 
-    Json(AgentCard {
-        name: "flux".to_string(),
-        description: "flux — a precise, autonomous coding agent. Reads, writes, edits, \
-                      searches, and runs code in a workspace. Carries tasks from instruction to \
-                      verified completion through a deterministic Flux-Lang plan + guarded safety \
-                      envelope."
-            .to_string(),
-        url: Some(url),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        capabilities: Capabilities {
-            streaming: true,
-            push_notifications: false,
-            ..Default::default()
-        },
-        default_input_modes: vec!["text/plain".to_string()],
-        default_output_modes: vec!["text/plain".to_string()],
-        skills: vec![Skill {
-            id: "coding".to_string(),
-            name: "Coding Agent".to_string(),
-            description: "Read, write, edit, search, and execute code tasks in a workspace. The \
-                          agent plans, executes, and verifies — then reports back."
+    Json(server::agent_card(
+        "flux",
+        "flux — a precise, autonomous coding agent. Reads, writes, edits, \
+         searches, and runs code in a workspace. Carries tasks from instruction to \
+         verified completion through a deterministic Flux-Lang plan + guarded safety \
+         envelope.",
+        Some(url),
+        env!("CARGO_PKG_VERSION"),
+        &[(
+            "coding".to_string(),
+            "Coding Agent".to_string(),
+            "Read, write, edit, search, and execute code tasks in a workspace. The \
+             agent plans, executes, and verifies — then reports back."
                 .to_string(),
-            input_modes: vec!["text/plain".to_string()],
-            output_modes: vec!["text/plain".to_string()],
-        }],
-        interfaces: Vec::new(),
-    })
+        )],
+        true,
+    ))
 }
 
 // ── JSON-RPC 2.0 helpers ──────────────────────────────────────────────────────
@@ -100,35 +89,11 @@ fn rpc_err(id: Option<Value>, code: i32, msg: impl Into<String>) -> Json<Value> 
 }
 
 // ── A2A message helpers ───────────────────────────────────────────────────────
-
-/// Concatenate all text parts of an A2A `message` (parts with `kind == "text"`).
-fn extract_text(params: &Value) -> Option<String> {
-    let parts = params.get("message")?.get("parts")?.as_array()?;
-    let texts: Vec<&str> = parts
-        .iter()
-        .filter_map(|p| {
-            if p.get("kind")?.as_str()? == "text" {
-                p.get("text")?.as_str()
-            } else {
-                None
-            }
-        })
-        .collect();
-    if texts.is_empty() {
-        None
-    } else {
-        Some(texts.join("\n"))
-    }
-}
-
-/// The conversation `contextId` the client supplied on the message, if any.
-fn extract_context_id(params: &Value) -> Option<String> {
-    params
-        .get("message")?
-        .get("contextId")?
-        .as_str()
-        .map(str::to_string)
-}
+//
+// Text/contextId extraction, the agent card, the RFC-3339 stamp, and the status-update shaping are
+// the reusable A2A protocol logic — they live in `flux_a2a::server` and are shared with other A2A
+// surfaces (e.g. downstream's `managed-agents`). This module keeps only the flux-server-specific axum
+// routes, the engine wiring, and the SSE streaming control-flow.
 
 /// Build an SSE frame: a JSON-RPC response whose `result` is a `TaskStatusUpdateEvent`. The SSE
 /// event name is left at the default so the frame is a plain `data:` JSON-RPC response per spec.
@@ -140,9 +105,7 @@ fn status_frame(
     message: Option<Message>,
     is_final: bool,
 ) -> Event {
-    let status = TaskStatus::new(state, message, Some(now_rfc3339()));
-    let evt = TaskStatusUpdateEvent::new(task_id, Some(context_id.to_string()), status, is_final);
-    let result = serde_json::to_value(&evt).unwrap_or(Value::Null);
+    let result = server::status_update_value(task_id, context_id, state, message, is_final);
     Event::default().data(json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string())
 }
 
@@ -177,7 +140,7 @@ async fn send(engine: Shared, id: Option<Value>, params: Option<Value>) -> Json<
         Some(p) => p,
         None => return rpc_err(id, -32602, "Missing params"),
     };
-    let input = match extract_text(&params) {
+    let input = match server::extract_text(&params) {
         Some(t) => t,
         None => return rpc_err(id, -32602, "No text found in message parts"),
     };
@@ -185,14 +148,14 @@ async fn send(engine: Shared, id: Option<Value>, params: Option<Value>) -> Json<
         Ok(s) => s,
         Err(e) => return rpc_err(id, -32603, format!("Session error: {e}")),
     };
-    let context_id = extract_context_id(&params).unwrap_or_else(|| session_id.clone());
+    let context_id = server::extract_context_id(&params).unwrap_or_else(|| session_id.clone());
     let mut sink = Collect::default();
     match engine.run_turn(&session_id, &input, &mut sink).await {
         Ok(()) => {
             let status = TaskStatus::new(
                 TaskState::Completed,
                 Some(Message::agent_text(sink.text)),
-                Some(now_rfc3339()),
+                Some(server::now_rfc3339()),
             );
             let task = Task::new(session_id, Some(context_id), status);
             match serde_json::to_value(&task) {
@@ -212,7 +175,8 @@ async fn subscribe(
     params: Option<Value>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, String> {
     let params = params.ok_or_else(|| "Missing params".to_string())?;
-    let input = extract_text(&params).ok_or_else(|| "No text in message parts".to_string())?;
+    let input =
+        server::extract_text(&params).ok_or_else(|| "No text in message parts".to_string())?;
     // TODO: sessions created for A2A tasks are never explicitly pruned. Add a TTL-based cleanup
     // pass (e.g. `DELETE FROM sessions WHERE created_at_ms < now - 3_600_000`) on a background timer
     // in `serve_on`, or expire them inside `SessionStore::create_session`.
@@ -220,7 +184,7 @@ async fn subscribe(
         .events
         .create_session(&engine.model)
         .map_err(|e| e.to_string())?;
-    let context_id = extract_context_id(&params).unwrap_or_else(|| session_id.clone());
+    let context_id = server::extract_context_id(&params).unwrap_or_else(|| session_id.clone());
     let task_id = session_id.clone();
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
@@ -314,79 +278,5 @@ impl AgentSink for StreamSink {
     }
 }
 
-// ── Timestamp ─────────────────────────────────────────────────────────────────
-
-/// ISO 8601 / RFC 3339 UTC timestamp from `SystemTime` — no external deps.
-/// Uses Howard Hinnant's civil-from-days algorithm (2013).
-fn now_rfc3339() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0) as i64;
-    let s = secs % 60;
-    let min = (secs / 60) % 60;
-    let h = (secs / 3_600) % 24;
-    // civil_from_days
-    let z = secs / 86_400 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097; // 0 <= doe < 146097
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}Z")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn now_rfc3339_looks_valid() {
-        let ts = now_rfc3339();
-        // Basic shape: 2024-01-01T00:00:00Z
-        assert_eq!(ts.len(), 20, "unexpected length: {ts}");
-        assert!(ts.ends_with('Z'), "must end with Z: {ts}");
-        assert!(ts.contains('T'), "must contain T: {ts}");
-        // Year must be >= 2024
-        let year: u32 = ts[..4].parse().unwrap();
-        assert!(year >= 2024, "year looks wrong: {ts}");
-    }
-
-    #[test]
-    fn extract_text_happy_path() {
-        let params = serde_json::json!({
-            "message": {
-                "kind": "message",
-                "messageId": "m1",
-                "role": "user",
-                "parts": [{ "kind": "text", "text": "hello flux" }]
-            }
-        });
-        assert_eq!(extract_text(&params).as_deref(), Some("hello flux"));
-    }
-
-    #[test]
-    fn extract_text_missing_returns_none() {
-        let params = serde_json::json!({ "message": { "role": "user", "parts": [] } });
-        assert!(extract_text(&params).is_none());
-    }
-
-    #[test]
-    fn extract_text_ignores_non_text_parts() {
-        let params = serde_json::json!({
-            "message": { "parts": [{ "kind": "file", "file": {} }] }
-        });
-        assert!(extract_text(&params).is_none());
-    }
-
-    #[test]
-    fn extract_context_id_reads_message() {
-        let params = serde_json::json!({ "message": { "contextId": "ctx-7", "parts": [] } });
-        assert_eq!(extract_context_id(&params).as_deref(), Some("ctx-7"));
-        let none = serde_json::json!({ "message": { "parts": [] } });
-        assert!(extract_context_id(&none).is_none());
-    }
-}
+// The text/contextId extraction, the agent card, the RFC-3339 timestamp, and the status-update
+// shaping now live in `flux_a2a::server` (shared with other A2A surfaces) and are unit-tested there.

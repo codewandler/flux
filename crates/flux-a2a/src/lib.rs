@@ -10,8 +10,13 @@
 //!
 //! The model is a **thin client**: one user turn maps to one remote A2A task. The remote agent runs
 //! its own loop (model + tools); this crate just speaks the protocol.
+//!
+//! - [`server`] — the reusable, transport-agnostic server side ([`server::dispatch`],
+//!   [`server::agent_card`], the [`server::A2aTurn`] seam, and the message/event shaping). A surface
+//!   (axum in `flux-server` / downstream's `managed-agents`) provides the route + state and calls these.
 
 mod client;
+pub mod server;
 pub mod types;
 
 pub use client::{A2aClient, A2aError, EventStream, Result};

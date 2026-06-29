@@ -8,7 +8,11 @@ flux speaks the [A2A protocol](https://a2a-protocol.org/) in **both directions**
   the CLI exactly like a local agent (interactive REPL or one-shot).
 
 Both directions share one wire definition (the `flux-a2a` crate) and speak the current spec:
-`message/send` (blocking) and `message/stream` (SSE), with message parts keyed by `kind`.
+`message/send` (blocking) and `message/stream` (SSE), with message parts keyed by `kind`. The
+**server-side** protocol logic (JSON-RPC dispatch, the agent-card builder, message/event shaping) is
+itself reusable — `flux_a2a::server`, an axum-free module over a small `A2aTurn` seam — so `flux-server`
+and downstream surfaces (e.g. downstream's `managed-agents`) mount the same A2A endpoint on their own HTTP
+server without re-implementing the protocol.
 
 ---
 
