@@ -8,7 +8,12 @@ members = [
     "host-kit",
     "websearch",
     "gitlab",
-    # remaining plugins added as each lands (jira, confluence, kubernetes, loki, prometheus, slack)
+    "jira",
+    "confluence",
+    "kubernetes",
+    "loki",
+    "prometheus",
+    "slack",
 ]
 
 [workspace.package]

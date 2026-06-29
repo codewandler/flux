@@ -46,7 +46,10 @@ fn search(input: Value, host: &mut Host) -> Result<Value, String> {
         .get("query")
         .and_then(|v| v.as_str())
         .ok_or("websearch.search: `query` required")?;
-    let max = input.get("max_results").and_then(|v| v.as_u64()).unwrap_or(5);
+    let max = input
+        .get("max_results")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5);
 
     let results = match host.secret("tavily_api_key") {
         Ok(key) => tavily(host, &key, query, max)?,
@@ -170,7 +173,11 @@ mod tests {
                 ]}),
             );
         let out = plugin
-            .call("websearch.search", json!({ "query": "warm transfer" }), &mut host)
+            .call(
+                "websearch.search",
+                json!({ "query": "warm transfer" }),
+                &mut host,
+            )
             .unwrap();
         assert_eq!(out["results"][0]["url"], "https://x/y");
         // result was contributed as a record
@@ -186,7 +193,11 @@ mod tests {
             json!({ "Heading": "Rust", "AbstractURL": "https://r/", "AbstractText": "a language", "RelatedTopics": [] }),
         );
         let out = plugin
-            .call("websearch.search", json!({ "query": "rust lang" }), &mut host)
+            .call(
+                "websearch.search",
+                json!({ "query": "rust lang" }),
+                &mut host,
+            )
             .unwrap();
         assert_eq!(out["results"][0]["title"], "Rust");
     }

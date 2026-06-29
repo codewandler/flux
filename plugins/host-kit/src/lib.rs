@@ -47,6 +47,16 @@ pub struct HttpResponse {
     pub body: String,
 }
 
+/// The result of a host `process.run`.
+pub struct ProcessOutput {
+    /// Captured standard output.
+    pub stdout: String,
+    /// Captured standard error.
+    pub stderr: String,
+    /// The process exit code (`-1` if unknown).
+    pub exit_code: i64,
+}
+
 impl HttpResponse {
     /// Parse the body as JSON.
     pub fn json(&self) -> Result<Value, String> {
@@ -61,7 +71,9 @@ impl HttpResponse {
 impl Host<'_> {
     /// Resolve a secret by purpose (an auth-method name declared in the manifest).
     pub fn secret(&mut self, purpose: &str) -> Result<String, String> {
-        let v = self.inner.host_call("secret", json!({ "purpose": purpose }))?;
+        let v = self
+            .inner
+            .host_call("secret", json!({ "purpose": purpose }))?;
         v.get("value")
             .and_then(|x| x.as_str())
             .map(String::from)
@@ -141,6 +153,28 @@ impl Host<'_> {
             return Err(format!("{method} {url} → {} {}", resp.status, resp.body));
         }
         resp.json()
+    }
+
+    /// Run an allow-listed subprocess through the host (e.g. `kubectl`). `argv[0]` must be in the
+    /// plugin's granted `process` capabilities. Returns stdout/stderr/exit code.
+    pub fn run(&mut self, argv: &[&str], timeout_secs: u64) -> Result<ProcessOutput, String> {
+        let v = self.inner.host_call(
+            "process.run",
+            json!({ "argv": argv, "timeout_secs": timeout_secs }),
+        )?;
+        Ok(ProcessOutput {
+            stdout: v
+                .get("stdout")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            stderr: v
+                .get("stderr")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            exit_code: v.get("exit_code").and_then(|x| x.as_i64()).unwrap_or(-1),
+        })
     }
 
     /// Contribute records to the host's datasource index (they become searchable knowledge).
@@ -288,6 +322,8 @@ pub struct MockHost {
     pub secrets: HashMap<String, String>,
     /// `endpoint name -> base url`.
     pub endpoints: HashMap<String, String>,
+    /// `(argv-substring) -> stdout string for process.run` (matched in insertion order).
+    pub process: Vec<(String, String)>,
     /// Records the plugin contributed (captured for assertions).
     pub contributed: std::cell::RefCell<Vec<Record>>,
 }
@@ -298,6 +334,7 @@ impl Default for MockHost {
             http: Vec::new(),
             secrets: HashMap::new(),
             endpoints: HashMap::new(),
+            process: Vec::new(),
             contributed: std::cell::RefCell::new(Vec::new()),
         }
     }
@@ -319,13 +356,21 @@ impl MockHost {
         self.secrets.insert(purpose.into(), value.into());
         self
     }
+    /// Canned stdout for any `process.run` whose joined argv contains `argv_substr`.
+    pub fn with_process(mut self, argv_substr: &str, stdout: &str) -> Self {
+        self.process.push((argv_substr.into(), stdout.into()));
+        self
+    }
 }
 
 impl GuestHost for MockHost {
     fn host_call(&mut self, command: &str, payload: Value) -> Result<Value, String> {
         match command {
             "secret" => {
-                let p = payload.get("purpose").and_then(|v| v.as_str()).unwrap_or("");
+                let p = payload
+                    .get("purpose")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 self.secrets
                     .get(p)
                     .map(|v| json!({ "value": v }))
@@ -347,6 +392,25 @@ impl GuestHost for MockHost {
                     .map(|(_, v)| v.clone())
                     .ok_or_else(|| format!("mock: no canned http for `{url}`"))?;
                 Ok(json!({ "status": 200, "body": serde_json::to_string(&body).unwrap() }))
+            }
+            "process.run" => {
+                let argv = payload
+                    .get("argv")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default();
+                let stdout = self
+                    .process
+                    .iter()
+                    .find(|(sub, _)| argv.contains(sub.as_str()))
+                    .map(|(_, out)| out.clone())
+                    .ok_or_else(|| format!("mock: no canned process for `{argv}`"))?;
+                Ok(json!({ "stdout": stdout, "stderr": "", "exit_code": 0 }))
             }
             "datasource.records" => {
                 let recs: Vec<Record> =

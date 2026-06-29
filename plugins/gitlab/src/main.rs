@@ -112,7 +112,13 @@ fn gl_get(host: &mut Host, path: &str) -> Result<Value, String> {
         .unwrap_or_else(|_| "https://gitlab.com".into());
     let token = host.secret("personal_token")?;
     let url = format!("{}/api/v4{}", base.trim_end_matches('/'), path);
-    let resp = host.http("GET", &url, None, &[("PRIVATE-TOKEN", token.as_str())], None)?;
+    let resp = host.http(
+        "GET",
+        &url,
+        None,
+        &[("PRIVATE-TOKEN", token.as_str())],
+        None,
+    )?;
     if !resp.is_success() {
         return Err(format!("gitlab GET {path} → {} {}", resp.status, resp.body));
     }
@@ -157,12 +163,26 @@ fn project_show(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn mr_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_str(&input, "project")?;
-    let state = input.get("state").and_then(|v| v.as_str()).unwrap_or("opened");
+    let state = input
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("opened");
     let mrs = gl_get(
         host,
-        &format!("/projects/{}/merge_requests?state={state}&per_page=20", enc(project)),
+        &format!(
+            "/projects/{}/merge_requests?state={state}&per_page=20",
+            enc(project)
+        ),
     )?;
-    contribute_list(host, &mrs, "gitlab.merge_request", project, "iid", "title", "description");
+    contribute_list(
+        host,
+        &mrs,
+        "gitlab.merge_request",
+        project,
+        "iid",
+        "title",
+        "description",
+    );
     Ok(mrs)
 }
 
@@ -172,27 +192,49 @@ fn mr_show(input: Value, host: &mut Host) -> Result<Value, String> {
         .get("iid")
         .and_then(|v| v.as_i64())
         .ok_or("`iid` (integer) required")?;
-    gl_get(host, &format!("/projects/{}/merge_requests/{iid}", enc(project)))
+    gl_get(
+        host,
+        &format!("/projects/{}/merge_requests/{iid}", enc(project)),
+    )
 }
 
 fn issue_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_str(&input, "project")?;
-    let state = input.get("state").and_then(|v| v.as_str()).unwrap_or("opened");
+    let state = input
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("opened");
     let issues = gl_get(
         host,
-        &format!("/projects/{}/issues?state={state}&per_page=20", enc(project)),
+        &format!(
+            "/projects/{}/issues?state={state}&per_page=20",
+            enc(project)
+        ),
     )?;
-    contribute_list(host, &issues, "gitlab.issue", project, "iid", "title", "description");
+    contribute_list(
+        host,
+        &issues,
+        "gitlab.issue",
+        project,
+        "iid",
+        "title",
+        "description",
+    );
     Ok(issues)
 }
 
 fn pipeline_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_str(&input, "project")?;
-    gl_get(host, &format!("/projects/{}/pipelines?per_page=20", enc(project)))
+    gl_get(
+        host,
+        &format!("/projects/{}/pipelines?per_page=20", enc(project)),
+    )
 }
 
 fn contribute_projects(host: &mut Host, projects: &Value) {
-    let Some(arr) = projects.as_array() else { return };
+    let Some(arr) = projects.as_array() else {
+        return;
+    };
     let records: Vec<Record> = arr
         .iter()
         .filter_map(|p| {
@@ -201,7 +243,9 @@ fn contribute_projects(host: &mut Host, projects: &Value) {
                 Source::new("gitlab"),
                 "gitlab.project",
                 id,
-                p.get("name_with_namespace").and_then(|v| v.as_str()).unwrap_or(id),
+                p.get("name_with_namespace")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(id),
                 p.get("description").and_then(|v| v.as_str()).unwrap_or(""),
             ))
         })
@@ -281,9 +325,16 @@ mod tests {
         let mut host = MockHost::default()
             .with_secret("personal_token", "tok")
             // default endpoint (gitlab.com) since none configured; matched by the encoded path
-            .with_http("gitlab.com/api/v4/projects/group%2Fapp", json!({ "id": 1, "name": "app" }));
+            .with_http(
+                "gitlab.com/api/v4/projects/group%2Fapp",
+                json!({ "id": 1, "name": "app" }),
+            );
         let out = plugin
-            .call("gitlab.project.show", json!({ "project": "group/app" }), &mut host)
+            .call(
+                "gitlab.project.show",
+                json!({ "project": "group/app" }),
+                &mut host,
+            )
             .unwrap();
         assert_eq!(out["name"], "app");
     }
@@ -293,6 +344,9 @@ mod tests {
         let m = manifest_builder().build().manifest();
         assert_eq!(m.operations.len(), 6);
         assert_eq!(m.auth[0].purpose, "personal_token");
-        assert!(m.datasources.iter().any(|d| d.entity == "gitlab.merge_request"));
+        assert!(m
+            .datasources
+            .iter()
+            .any(|d| d.entity == "gitlab.merge_request"));
     }
 }
