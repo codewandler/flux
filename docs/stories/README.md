@@ -20,6 +20,9 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [I-01 — Statistically clean headline gain](I-01-headline-gain.md) · Improve · offline half done
   (partial-credit scalar + durable token capture + synthetic `trials = 5` loop); the trials ≥ 5
   grader-confirmed run is **staged** on a funded provider key
+- [D-02 — Tenant/context-taggable event substrate](D-02-tenant-event-substrate.md) · Core · **high** ·
+  optional stream-level account/agent/correlation context envelope on `flux-events` runs + account-scoped
+  reads (`list_for_account`/`account_streams`); code-complete + gate-green, pending commit
 
 ## Next (ready — take the top one unless the user named a story)
 _(none ready — the Slack-channel assistant integration stack D-07/D-10/D-08/D-09 all shipped; see Done. Promote one
@@ -34,11 +37,10 @@ _(none)_
 - [D-11 — App-runner ergonomics for declarative bots](D-11-app-runner-ergonomics.md) · Agent · configurable `flux app run` knowledge ingest + OpenAPI + persona/event-context-from-file; blocks Slack-channel assistant S-03/S-06
 
 ### Downstream enablement (managed-agents) — queued behind the active Slack-channel assistant stack above
-These support the multi-tenant **managed-agents** service (path-dep consumer). The Slack-channel assistant's integration stack
-(D-07/D-10/D-08/D-09) was promoted to **Next** above and now leads; these are next in line. See
+These support the multi-tenant **managed-agents** service (path-dep consumer). D-02 now leads (in progress above);
+D-03 is next in line. See
 [roadmap → Downstream enablement](../roadmap.md#downstream-enablement-managed-agents-Slack-channel assistant).
-- **1.** [D-02 — Tenant/context-taggable event substrate](D-02-tenant-event-substrate.md) · Core · **high** · account/agent tag + account-scoped projections on `flux-events`; decide early so managed-agents R-04 is a projection, not a retrofit
-- **2.** [D-03 — Reusable A2A server helpers (current spec)](D-03-a2a-server-helpers.md) · Agent · **medium** · lift flux-server's A2A routes into a helper; unblocks managed-agents E-02 + fixes the `tasks/send` drift
+- **1.** [D-03 — Reusable A2A server helpers (current spec)](D-03-a2a-server-helpers.md) · Agent · **medium** · lift flux-server's A2A routes into a helper; unblocks managed-agents E-02 + fixes the `tasks/send` drift
 
 ## Done
 - [C-02 — Integration-stack hardening](C-02-integration-stack-hardening.md) · Core · `flux plugin call`/`install` + a `plugins/` CI job (`a8092dc`); feature-gated embeddings/semantic backend — `OpenAiEmbedder` + a `SemanticIndex` hybrid-rerank decorator, default build unchanged (`f912c24`); a live env-gated `scripts/smoke-plugins.sh` (`5fda8be`)

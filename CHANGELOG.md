@@ -8,6 +8,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Tenant/agent context envelope on the event log (D-02).** `flux-events` runs can now carry an optional,
+  stream-level `EventContext { account, agent_id, agent_version, correlation_id }`, set once at creation via
+  `EventStore::create_session_with_context` (the 1-arg `create_session` delegates with an empty envelope, so
+  the single-tenant path and every existing call site are unchanged). The context is surfaced on
+  `StoredEvent` / `SessionInfo` / `SessionSummary`, and new account-scoped reads `list_for_account` /
+  `account_streams` return only one tenant's runs — so a downstream multi-tenant service (managed-agents R-04 run
+  persistence + the M4 transparency surface) replays per-account transcripts as *projections over the same
+  log* (via the unchanged `conversation`/`turns` projections), not a parallel store. Additive, idempotent
+  column migration; the `events` table and all projections are untouched. See
+  [docs/designs/tenant-event-substrate.md](docs/designs/tenant-event-substrate.md).
 - **Integration-stack hardening (C-02).** Three follow-ups over the shipped D-07/D-08/D-09/D-10 stack:
   - **`flux plugin call <name> <op> [json]`** — invoke one declared op of an installed plugin directly
     (spawns the binary via `PluginHost`, drives it through the `DatasourceHostCaps` bridge), plus

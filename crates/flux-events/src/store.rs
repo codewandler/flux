@@ -13,6 +13,7 @@ use rusqlite::{Connection, OptionalExtension};
 use flux_core::{Error, Message, Result, Usage};
 use flux_lang::ast::RunEvent;
 
+use crate::context::EventContext;
 use crate::kind::{EventKind, NewEvent, StoredEvent};
 use crate::projection;
 
@@ -35,6 +36,96 @@ fn parse_id(id: &str) -> Result<i64> {
         .ok_or_else(|| Error::Other(format!("invalid session id: {id:?}")))
 }
 
+/// The `streams` columns a [`SessionSummary`] reads, in `row_to_summary` order. Shared by
+/// [`EventStore::list`] and [`EventStore::list_for_account`] so the two never drift.
+const SUMMARY_COLS: &str =
+    "n, model, created_at, updated_at, msg_count, account, agent_id, agent_version, correlation_id";
+
+/// Decode a `streams` row selected as [`SUMMARY_COLS`] into a [`SessionSummary`].
+fn row_to_summary(r: &rusqlite::Row) -> rusqlite::Result<SessionSummary> {
+    let n: i64 = r.get(0)?;
+    Ok(SessionSummary {
+        id: format!("s_{n}"),
+        model: r.get(1)?,
+        created_at_ms: r.get(2)?,
+        updated_at_ms: r.get(3)?,
+        messages: r.get::<_, i64>(4)? as usize,
+        context: EventContext {
+            account: r.get(5)?,
+            agent_id: r.get(6)?,
+            agent_version: r.get(7)?,
+            correlation_id: r.get(8)?,
+        },
+    })
+}
+
+/// The run context tagged on a stream's registry row, or empty for ad-hoc / unknown streams.
+/// All events in a stream share one context, so reads look it up once and stamp every event.
+fn read_context(conn: &Connection, stream: &str) -> Result<EventContext> {
+    let Ok(n) = parse_id(stream) else {
+        return Ok(EventContext::default());
+    };
+    let ctx = conn
+        .query_row(
+            "SELECT account, agent_id, agent_version, correlation_id FROM streams WHERE n = ?1",
+            [n],
+            |r| {
+                Ok(EventContext {
+                    account: r.get(0)?,
+                    agent_id: r.get(1)?,
+                    agent_version: r.get(2)?,
+                    correlation_id: r.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(map_sql)?;
+    Ok(ctx.unwrap_or_default())
+}
+
+/// Add the optional run-context columns + account index to `streams` (idempotent). The
+/// `CREATE TABLE` in [`EventStore::init`] makes the base table; this fills in the additive
+/// columns, so a fresh store and a pre-existing one converge on the same schema with no
+/// destructive migration.
+fn migrate_stream_context(conn: &Connection) -> Result<()> {
+    for col in ["account", "agent_id", "agent_version", "correlation_id"] {
+        add_column_if_missing(conn, "streams", col)?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_streams_account ON streams(account)",
+        [],
+    )
+    .map_err(map_sql)?;
+    Ok(())
+}
+
+/// `ALTER TABLE <table> ADD COLUMN <col> TEXT`, but only if the column is absent — SQLite has
+/// no `ADD COLUMN IF NOT EXISTS`, so we consult `PRAGMA table_info`. `table`/`col` are internal
+/// `&'static str` constants (never user input), so the formatted SQL is safe.
+fn add_column_if_missing(conn: &Connection, table: &str, col: &str) -> Result<()> {
+    let present = {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(map_sql)?;
+        let names = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .map_err(map_sql)?;
+        let mut found = false;
+        for name in names {
+            if name.map_err(map_sql)? == col {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !present {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} TEXT"), [])
+            .map_err(map_sql)?;
+    }
+    Ok(())
+}
+
 /// Metadata about a session, projected from its events. (The session registry view —
 /// "stream" and "session" are the same thing here.)
 #[derive(Debug, Clone, PartialEq)]
@@ -43,6 +134,8 @@ pub struct SessionInfo {
     pub model: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// The owning run's tenant/agent context (empty for single-tenant sessions).
+    pub context: EventContext,
 }
 
 /// A one-line session summary for listings (`flux sessions` / the REPL `/sessions`).
@@ -55,6 +148,8 @@ pub struct SessionSummary {
     /// Length of the current (post-compaction) conversation — kept equal to
     /// `conversation(id).len()` by the registry, so the count never disagrees with a replay.
     pub messages: usize,
+    /// The owning run's tenant/agent context (empty for single-tenant sessions).
+    pub context: EventContext,
 }
 
 /// The append-only event store. Backed by SQLite (WAL); serialized in-process by a `Mutex`,
@@ -105,6 +200,7 @@ impl EventStore {
              );",
         )
         .map_err(map_sql)?;
+        migrate_stream_context(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -113,15 +209,36 @@ impl EventStore {
     // --- streams (sessions) -------------------------------------------------
 
     /// Mint a new session and return its id (`"s_<n>"`). Atomically registers the stream
-    /// and appends its `SessionStarted` event at `stream_seq` 0.
+    /// and appends its `SessionStarted` event at `stream_seq` 0. Single-tenant: the run is
+    /// tagged with an empty [`EventContext`] (see [`create_session_with_context`] to tag it).
+    ///
+    /// [`create_session_with_context`]: Self::create_session_with_context
     pub fn create_session(&self, model: &str) -> Result<String> {
+        self.create_session_with_context(model, &EventContext::default())
+    }
+
+    /// Mint a new session tagged with `ctx` (account / agent id+version / correlation id) and
+    /// return its id. The context is fixed for the run's whole lifetime, recorded on the stream
+    /// registry; reads of this stream's events, [`info`](Self::info), and [`list`](Self::list)
+    /// carry it back, and [`list_for_account`](Self::list_for_account) scopes to it. An empty
+    /// `ctx` is exactly equivalent to [`create_session`](Self::create_session).
+    pub fn create_session_with_context(&self, model: &str, ctx: &EventContext) -> Result<String> {
         let ts = now_ms();
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction().map_err(map_sql)?;
         tx.execute(
-            "INSERT INTO streams (model, created_at, updated_at, last_seq, msg_count) \
-             VALUES (?1, ?2, ?2, 0, 0)",
-            rusqlite::params![model, ts],
+            "INSERT INTO streams \
+             (model, created_at, updated_at, last_seq, msg_count, \
+              account, agent_id, agent_version, correlation_id) \
+             VALUES (?1, ?2, ?2, 0, 0, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                model,
+                ts,
+                ctx.account,
+                ctx.agent_id,
+                ctx.agent_version,
+                ctx.correlation_id
+            ],
         )
         .map_err(map_sql)?;
         let n = tx.last_insert_rowid();
@@ -129,7 +246,7 @@ impl EventStore {
         let ev = NewEvent::new(EventKind::SessionStarted {
             model: model.to_string(),
         });
-        insert_event(&tx, &stream, &ev, 0)?;
+        insert_event(&tx, &stream, &ev, 0, ctx)?;
         tx.commit().map_err(map_sql)?;
         Ok(stream)
     }
@@ -155,7 +272,8 @@ impl EventStore {
         let n = parse_id(stream)?;
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT model, created_at, updated_at FROM streams WHERE n = ?1",
+            "SELECT model, created_at, updated_at, account, agent_id, agent_version, correlation_id \
+             FROM streams WHERE n = ?1",
             [n],
             |r| {
                 Ok(SessionInfo {
@@ -163,6 +281,12 @@ impl EventStore {
                     model: r.get(0)?,
                     created_at_ms: r.get(1)?,
                     updated_at_ms: r.get(2)?,
+                    context: EventContext {
+                        account: r.get(3)?,
+                        agent_id: r.get(4)?,
+                        agent_version: r.get(5)?,
+                        correlation_id: r.get(6)?,
+                    },
                 })
             },
         )
@@ -178,22 +302,46 @@ impl EventStore {
     pub fn list(&self, limit: usize) -> Result<Vec<SessionSummary>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare(
-                "SELECT n, model, created_at, updated_at, msg_count FROM streams \
-                 ORDER BY updated_at DESC, n DESC LIMIT ?1",
-            )
+            .prepare(&format!(
+                "SELECT {SUMMARY_COLS} FROM streams \
+                 ORDER BY updated_at DESC, n DESC LIMIT ?1"
+            ))
             .map_err(map_sql)?;
         let rows = stmt
-            .query_map([limit as i64], |r| {
-                let n: i64 = r.get(0)?;
-                Ok(SessionSummary {
-                    id: format!("s_{n}"),
-                    model: r.get(1)?,
-                    created_at_ms: r.get(2)?,
-                    updated_at_ms: r.get(3)?,
-                    messages: r.get::<_, i64>(4)? as usize,
-                })
-            })
+            .query_map([limit as i64], row_to_summary)
+            .map_err(map_sql)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_sql)
+    }
+
+    /// The most recent runs for `account` (newest-active first) — the account-scoped sibling of
+    /// [`list`](Self::list). Returns **only** streams tagged with that account, so a downstream
+    /// multi-tenant service can enumerate one tenant's runs without seeing any other's.
+    pub fn list_for_account(&self, account: &str, limit: usize) -> Result<Vec<SessionSummary>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {SUMMARY_COLS} FROM streams \
+                 WHERE account = ?1 ORDER BY updated_at DESC, n DESC LIMIT ?2"
+            ))
+            .map_err(map_sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params![account, limit as i64], row_to_summary)
+            .map_err(map_sql)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_sql)
+    }
+
+    /// The stream ids for `account`, newest-active first — the enumeration primitive a downstream
+    /// consumer folds over (`account_streams` → per-stream [`conversation`](Self::conversation) /
+    /// [`turns`](Self::turns)) to replay a tenant's transcripts as projections over the log.
+    pub fn account_streams(&self, account: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT n FROM streams WHERE account = ?1 ORDER BY updated_at DESC, n DESC")
+            .map_err(map_sql)?;
+        let rows = stmt
+            .query_map([account], |r| Ok(format!("s_{}", r.get::<_, i64>(0)?)))
             .map_err(map_sql)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(map_sql)
@@ -251,6 +399,8 @@ impl EventStore {
             }
         }
         let tx = conn.unchecked_transaction().map_err(map_sql)?;
+        // All events in a stream share its run context; read it once and stamp the stored event.
+        let ctx = read_context(&tx, stream)?;
         let next_seq: i64 = tx
             .query_row(
                 "SELECT COALESCE(MAX(stream_seq), -1) + 1 FROM events WHERE stream = ?1",
@@ -258,7 +408,7 @@ impl EventStore {
                 |r| r.get(0),
             )
             .map_err(map_sql)?;
-        let stored = insert_event(&tx, stream, &ev, next_seq)?;
+        let stored = insert_event(&tx, stream, &ev, next_seq, &ctx)?;
         // Maintain the session registry — but only for real `s_<n>` sessions. The log itself accepts
         // any stream string (the interpreter writes run events under ad-hoc ids like `"sess"`), so a
         // non-session stream simply has no registry row to update.
@@ -312,6 +462,7 @@ impl EventStore {
     /// All events of a stream in order; `after_seq` enables incremental replay.
     pub fn load_stream(&self, stream: &str, after_seq: Option<i64>) -> Result<Vec<StoredEvent>> {
         let conn = self.conn.lock().unwrap();
+        let ctx = read_context(&conn, stream)?;
         let after = after_seq.unwrap_or(-1);
         let mut stmt = conn
             .prepare(
@@ -320,12 +471,13 @@ impl EventStore {
             )
             .map_err(map_sql)?;
         let raw = collect_raw(&mut stmt, rusqlite::params![stream, after])?;
-        decode_all(stream, raw)
+        decode_all(stream, &ctx, raw)
     }
 
     /// Events of a stream filtered by `kind` tag (e.g. `"message"`, `"run"`), in order.
     pub fn load_by_kind(&self, stream: &str, kind: &str) -> Result<Vec<StoredEvent>> {
         let conn = self.conn.lock().unwrap();
+        let ctx = read_context(&conn, stream)?;
         let mut stmt = conn
             .prepare(
                 "SELECT global_seq, stream_seq, id, schema_version, ts, payload, turn_id \
@@ -333,13 +485,14 @@ impl EventStore {
             )
             .map_err(map_sql)?;
         let raw = collect_raw(&mut stmt, rusqlite::params![stream, kind])?;
-        decode_all(stream, raw)
+        decode_all(stream, &ctx, raw)
     }
 
     /// Every event tagged with `turn_id`, plus its `TurnStarted` anchor (whose `global_seq`
     /// *is* the turn id), in order — the old `turn_log` + `plan_attempts` join.
     pub fn load_turn(&self, stream: &str, turn_id: i64) -> Result<Vec<StoredEvent>> {
         let conn = self.conn.lock().unwrap();
+        let ctx = read_context(&conn, stream)?;
         let mut stmt = conn
             .prepare(
                 "SELECT global_seq, stream_seq, id, schema_version, ts, payload, turn_id \
@@ -348,7 +501,7 @@ impl EventStore {
             )
             .map_err(map_sql)?;
         let raw = collect_raw(&mut stmt, rusqlite::params![stream, turn_id])?;
-        decode_all(stream, raw)
+        decode_all(stream, &ctx, raw)
     }
 
     /// The current head sequence of a stream (`-1` if empty) — the optimistic-concurrency anchor.
@@ -489,8 +642,8 @@ fn collect_raw(
         .map_err(map_sql)
 }
 
-/// Decode a batch of raw rows (all from `stream`) into [`StoredEvent`]s.
-fn decode_all(stream: &str, raw: Vec<RawEvent>) -> Result<Vec<StoredEvent>> {
+/// Decode a batch of raw rows (all from `stream`, all sharing its run `ctx`) into [`StoredEvent`]s.
+fn decode_all(stream: &str, ctx: &EventContext, raw: Vec<RawEvent>) -> Result<Vec<StoredEvent>> {
     let mut out = Vec::with_capacity(raw.len());
     for (global_seq, stream_seq, id, schema_version, ts, payload, turn_id) in raw {
         let kind: EventKind = serde_json::from_str(&payload)?;
@@ -503,18 +656,22 @@ fn decode_all(stream: &str, raw: Vec<RawEvent>) -> Result<Vec<StoredEvent>> {
             schema_version,
             ts_ms: ts,
             kind,
+            context: ctx.clone(),
         });
     }
     Ok(out)
 }
 
 /// Insert one event row (no registry update — callers handle that). Mints a ULID id when
-/// the event has none. `conn` is the active transaction (a `Transaction` derefs here).
+/// the event has none. `conn` is the active transaction (a `Transaction` derefs here). `ctx` is
+/// the stream's run context, stamped onto the returned [`StoredEvent`] (it lives on the registry,
+/// not the event row, so it is not persisted here — only surfaced).
 fn insert_event(
     conn: &Connection,
     stream: &str,
     ev: &NewEvent,
     stream_seq: i64,
+    ctx: &EventContext,
 ) -> Result<StoredEvent> {
     let id = ev
         .id
@@ -548,6 +705,7 @@ fn insert_event(
         schema_version: ev.schema_version,
         ts_ms: ts,
         kind: ev.kind.clone(),
+        context: ctx.clone(),
     })
 }
 
@@ -575,6 +733,7 @@ fn load_by_id(conn: &Connection, id: &str) -> Result<Option<StoredEvent>> {
     match row {
         Some((global_seq, stream, stream_seq, schema_version, ts, payload, turn_id)) => {
             let kind = serde_json::from_str(&payload)?;
+            let context = read_context(conn, &stream)?;
             Ok(Some(StoredEvent {
                 global_seq,
                 stream,
@@ -584,6 +743,7 @@ fn load_by_id(conn: &Connection, id: &str) -> Result<Option<StoredEvent>> {
                 schema_version,
                 ts_ms: ts,
                 kind,
+                context,
             }))
         }
         None => Ok(None),
@@ -882,5 +1042,99 @@ mod tests {
             .unwrap();
         assert_eq!(first.global_seq, again.global_seq, "retry is a no-op");
         assert_eq!(store.conversation(&id).unwrap().len(), 1);
+    }
+
+    // --- D-02: tenant/agent context envelope ---
+
+    #[test]
+    fn context_round_trips_on_stored_events_and_summaries() {
+        let store = EventStore::in_memory().unwrap();
+        let ctx = EventContext {
+            account: Some("acme".into()),
+            agent_id: Some("support-bot".into()),
+            agent_version: Some("v3".into()),
+            correlation_id: Some("corr-1".into()),
+        };
+        let id = store.create_session_with_context("m", &ctx).unwrap();
+        store
+            .record_message(&id, &Message::user_text("hi"))
+            .unwrap();
+
+        // Every event read back from the stream carries the run context (SessionStarted + msg).
+        let events = store.load_stream(&id, None).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|e| e.context == ctx));
+        // The append return value carries it too.
+        let stored = store
+            .append(&id, NewEvent::message(Message::user_text("again")))
+            .unwrap();
+        assert_eq!(stored.context, ctx);
+        // The session registry views surface it.
+        assert_eq!(store.info(&id).unwrap().context, ctx);
+        assert_eq!(store.list(1).unwrap()[0].context, ctx);
+    }
+
+    #[test]
+    fn accounts_are_isolated_in_scoped_reads() {
+        let store = EventStore::in_memory().unwrap();
+        let a = store
+            .create_session_with_context("m", &EventContext::for_account("a"))
+            .unwrap();
+        let b = store
+            .create_session_with_context("m", &EventContext::for_account("b"))
+            .unwrap();
+        store.record_message(&a, &Message::user_text("ax")).unwrap();
+        store.record_message(&b, &Message::user_text("bx")).unwrap();
+
+        // list_for_account returns only that account's run.
+        let a_list = store.list_for_account("a", 10).unwrap();
+        assert_eq!(a_list.len(), 1);
+        assert_eq!(a_list[0].id, a);
+        assert_eq!(a_list[0].context.account.as_deref(), Some("a"));
+        // account_streams is the same isolation, as bare ids.
+        assert_eq!(store.account_streams("b").unwrap(), vec![b.clone()]);
+        // An unknown account sees nothing; the global list still sees both runs.
+        assert!(store.list_for_account("nope", 10).unwrap().is_empty());
+        assert!(store.account_streams("nope").unwrap().is_empty());
+        assert_eq!(store.list(10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn single_tenant_session_has_empty_context() {
+        let store = EventStore::in_memory().unwrap();
+        let id = store.create_session("m").unwrap();
+        store
+            .record_message(&id, &Message::user_text("hi"))
+            .unwrap();
+
+        // The single-tenant path is unchanged: every surface carries an empty envelope.
+        assert!(store.info(&id).unwrap().context.is_empty());
+        assert!(store.list(1).unwrap()[0].context.is_empty());
+        assert!(store
+            .load_stream(&id, None)
+            .unwrap()
+            .iter()
+            .all(|e| e.context.is_empty()));
+        // An untagged run never surfaces in account-scoped reads.
+        assert!(store.list_for_account("anything", 10).unwrap().is_empty());
+        assert!(store.account_streams("anything").unwrap().is_empty());
+    }
+
+    #[test]
+    fn context_survives_reopen() {
+        let path =
+            std::env::temp_dir().join(format!("flux-events-d02-reopen-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let ctx = EventContext::for_account("tenant-7");
+        let id = {
+            let store = EventStore::open(&path).unwrap();
+            store.create_session_with_context("m", &ctx).unwrap()
+        };
+        // Reopen: the additive column migration is idempotent (columns already exist) and the
+        // context persists across the process boundary.
+        let store = EventStore::open(&path).unwrap();
+        assert_eq!(store.info(&id).unwrap().context, ctx);
+        assert_eq!(store.list_for_account("tenant-7", 10).unwrap()[0].id, id);
+        let _ = std::fs::remove_file(&path);
     }
 }

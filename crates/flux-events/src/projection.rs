@@ -128,6 +128,7 @@ pub fn turns(events: &[StoredEvent]) -> Vec<TurnSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::EventContext;
     use crate::kind::EventKind;
     use flux_core::Message;
 
@@ -142,6 +143,7 @@ mod tests {
             schema_version: 1,
             ts_ms: 1000 + global_seq,
             kind,
+            context: EventContext::default(),
         }
     }
 

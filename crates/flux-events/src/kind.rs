@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use flux_core::{Message, Usage};
 use flux_lang::ast::RunEvent;
 
+use crate::context::EventContext;
+
 /// The closed set of event kinds in flux's unified log. Adding a kind of fact is one
 /// new variant here plus one projection arm — never a new table and new methods.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -149,4 +151,7 @@ pub struct StoredEvent {
     pub ts_ms: i64,
     /// The decoded event.
     pub kind: EventKind,
+    /// The owning run's tenant/agent context, stamped from the stream registry on read. Empty
+    /// ([`EventContext::is_empty`]) for single-tenant sessions and ad-hoc (non-`s_<n>`) streams.
+    pub context: EventContext,
 }

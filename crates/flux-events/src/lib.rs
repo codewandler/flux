@@ -21,10 +21,12 @@
 //! assert_eq!(store.conversation(&s).unwrap().len(), 2);
 //! ```
 
+mod context;
 mod kind;
 mod projection;
 mod store;
 
+pub use context::EventContext;
 pub use kind::{EventKind, NewEvent, StoredEvent};
 pub use projection::{conversation, run_trace, turns, PlanAttempt, TurnSummary};
 pub use store::{EventStore, SessionInfo, SessionSummary};
