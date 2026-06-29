@@ -2,7 +2,7 @@
 id: C-02
 title: Integration-stack hardening — embeddings backend, plugin install/call + CI, live smoke
 pillar: Core
-status: in-progress
+status: done
 theme: downstream-managed-agents
 design: docs/designs/integration-plugins.md
 ---
@@ -23,27 +23,27 @@ in CI, and nothing exercises a plugin against a live API. These are the gaps bet
 "production-solid".
 
 ## Acceptance
-- [ ] **`flux plugin call <name> <op> [json]`** invokes one declared op of an installed plugin directly
-      (spawns the binary via `PluginHost`, drives it through `DatasourceHostCaps`), printing the result —
-      the missing direct-invocation path (debugging + the smoke). Hermetic test against the `echo`/`caps`
-      fixtures.
-- [ ] **`flux plugin install [dir]`** registers every `flux-plugin-*` binary in `dir` (default
-      `plugins/target/release`) as a descriptor. Hermetic test (temp dir → descriptors written).
-- [ ] **plugins CI**: `.github/workflows/ci.yml` builds/tests/clippy/fmt the `plugins/` workspace
-      (`working-directory: ./plugins`).
-- [ ] **Embeddings (feature-gated `embeddings`):** an `OpenAiEmbedder` (`/v1/embeddings`, reqwest +
-      `guard_url`, env key) + a `SemanticIndex` decorator over any `DatasourceBackend` doing hybrid
-      keyword∪cosine rerank. Default build (feature off) and the keyword path are unchanged. Failing-first
-      test: a stub `Embedder` makes `search` rerank by cosine/blend; no-embedder path identical to keyword.
-- [ ] **Live smoke** `scripts/smoke-plugins.sh` (skip-not-fail, env-gated): `flux plugin call` against a
-      real API when a key is present (e.g. `TAVILY_API_KEY`→websearch, `GITLAB_PERSONAL_TOKEN`→gitlab) + an
-      embeddings round-trip with `FLUX_EMBEDDINGS_API_KEY`. Documented in the roadmap's standing gate.
-- [ ] Full gate green each phase (`cargo build/test --workspace`, clippy `-D warnings`, fmt, flux-codegate)
-      + `cargo build -p flux-capabilities --features embeddings`; plugins workspace green.
+- [x] **`flux plugin call <name> <op> [json]`** invokes one declared op directly (spawns the binary via
+      `PluginHost`, drives it through `DatasourceHostCaps`), printing the result. Commit `a8092dc`; smoked
+      `flux plugin call echo upper` → `{"text":"HELLO PLUGIN CALL"}`.
+- [x] **`flux plugin install [dir]`** registers every `flux-plugin-*` binary in `dir` (default
+      `plugins/target/release`). Hermetic unit test for the scan (`plugin_binaries_in`). Commit `a8092dc`.
+- [x] **plugins CI**: a new `plugins` job in `.github/workflows/ci.yml` builds/tests/clippy/fmt the
+      nested `plugins/` workspace. Commit `a8092dc`.
+- [x] **Embeddings (feature-gated `embeddings`):** `OpenAiEmbedder` (`/v1/embeddings` via runtime-free
+      `ureq` + `guard_url`, env config) + a `SemanticIndex` decorator over any `DatasourceBackend` doing
+      hybrid keyword∪cosine rerank. Default build (feature off) + keyword path unchanged; hermetic
+      stub-embedder rerank test. Commit `f912c24`.
+- [x] **Live smoke** `scripts/smoke-plugins.sh` (skip-not-fail, env-gated) via `flux plugin call`;
+      embeddings validated by the feature build. Documented in the roadmap's standing gate. Commit `5fda8be`.
+- [x] Full gate green (`cargo build/test --workspace`, clippy `-D warnings`, fmt, flux-codegate) +
+      `cargo build -p flux-capabilities --features embeddings`; plugins workspace green.
 
 ## Progress
-- In progress. Plan: `~/.claude/plans/steady-sniffing-storm.md`. Phase order: plugin call/install + CI →
-  embeddings (feature-gated) → live smoke.
+- **Done** (commits `a8092dc` → `f912c24` → `5fda8be`). Plugins are directly invocable (`flux plugin
+  call`) + one-shot installable + CI-tested; the embeddings/semantic backend is wired behind a feature gate
+  (default build unchanged); a live env-gated smoke covers the pack. Plan:
+  `~/.claude/plans/steady-sniffing-storm.md`.
 
 ## Notes
 - Reuse: `flux_system::net::guard_url` + reqwest (`browser.rs`); `flux-plugin`

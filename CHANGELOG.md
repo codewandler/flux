@@ -8,6 +8,22 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Integration-stack hardening (C-02).** Three follow-ups over the shipped D-07/D-08/D-09/D-10 stack:
+  - **`flux plugin call <name> <op> [json]`** — invoke one declared op of an installed plugin directly
+    (spawns the binary via `PluginHost`, drives it through the `DatasourceHostCaps` bridge), plus
+    **`flux plugin install [dir]`** to register every built `flux-plugin-*` binary in one shot. A new
+    `plugins` CI job now builds/tests/clippy/fmt the nested `plugins/` workspace (previously untested
+    because it's excluded from the root workspace).
+  - **Semantic / embeddings retrieval** behind the D-07 `Embedder` seam, feature-gated (`embeddings`, off
+    by default): an `OpenAiEmbedder` over an OpenAI-compatible `/v1/embeddings` (config from env, via the
+    runtime-free `ureq` client + the `guard_url` SSRF check) and a `SemanticIndex` decorator over any
+    `DatasourceBackend` that reranks keyword candidates by a blend of keyword score + query/record cosine
+    similarity. The default build, keyword path, and gate are unchanged; the rerank logic has a hermetic
+    stub-embedder test.
+  - **`scripts/smoke-plugins.sh`** — a live, env-gated plugin smoke (skip-not-fail) driving `flux plugin
+    call` against real vendor APIs for whichever keys are present; documented in the roadmap's standing
+    pre-release gate.
+
 - **Integration plugin pack — 8 native plugins (D-08).** A new in-repo `plugins/` cargo workspace
   (excluded from the root flux gate so vendor surface stays out of it) with eight subprocess plugins on a
   shared **`host-kit`** SDK: `websearch` (Tavily + DuckDuckGo), `gitlab` (projects/MRs/issues/pipelines),

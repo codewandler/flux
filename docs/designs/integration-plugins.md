@@ -55,6 +55,14 @@ services the datasource record/search/get host commands against the index. The b
 flux-plugin, L4) because the index is L5 — flux-plugin defines only the trait + protocol. The record
 contract is identical across local docs and live integrations (the shared `flux-datasource` schema).
 
+## Install + invoke + CI (C-02)
+Once built, register the pack with **`flux plugin install [dir]`** (one descriptor per `flux-plugin-*`
+binary; `add`/`ls`/`pin`/`rollback` exist too). Invoke one op directly — without an agent — with
+**`flux plugin call <name> <op> [json]`** (spawns the binary, drives the op through `DatasourceHostCaps`);
+this powers debugging and the live `scripts/smoke-plugins.sh`. The nested `plugins/` workspace builds in a
+dedicated **`plugins` CI job** (it's excluded from the root workspace). See
+[C-02](../stories/C-02-integration-stack-hardening.md).
+
 ## Slices (ship per integration)
 1. **Slack ops** (post/edit/react/search/users/channels/thread) + **websearch** (Tavily + DuckDuckGo
    aggregation) — unblocks the Slack-channel assistant MVP (the bot can *answer*, not just receive).

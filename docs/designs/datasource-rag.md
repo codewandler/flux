@@ -67,9 +67,14 @@ Each implements `flux_runtime::Tool` with an input JSON Schema and dispatches th
 - `reindex(source)` + a `freshness(source)` staleness check (an `updated_at` watermark). The Slack-channel assistant calls
   these at boot over `bot/data/knowledge/**`.
 
-### 5. Embeddings seam (deferred backend)
-A `Embedder` trait (`embed(texts) -> Vec<Vec<f32>>`) and a `semantic` query path are **defined but not
-wired** in v1 — keyword/BM25 only. A vector backend (and hybrid rerank) lands behind this seam on demand.
+### 5. Embeddings seam — wired behind a feature gate (C-02)
+A `Embedder` trait (`embed(texts) -> Vec<Vec<f32>>`). Originally defined-but-unwired; **now wired by
+[C-02](../stories/C-02-integration-stack-hardening.md) behind the `embeddings` Cargo feature** (off by
+default — the keyword path is unchanged): a `SemanticIndex` decorator wraps any `DatasourceBackend`,
+embeds title+body on upsert, and on search reranks the keyword candidates by a blend of normalized keyword
+score + query/record cosine similarity; the concrete `OpenAiEmbedder` calls an OpenAI-compatible
+`/v1/embeddings` (runtime-free `ureq` + `guard_url`, env config). v1 holds vectors in-memory (rebuilt on
+ingest) — durable vector storage + a local embedder are follow-ups.
 
 ## Testing (hermetic)
 - Ingest the help-center fixtures → `search("warm transfer")` returns the matching article; `get(id)`
