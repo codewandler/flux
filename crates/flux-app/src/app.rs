@@ -11,19 +11,23 @@
 //! `DraftAst`, with a [`FlowStore`] for state and an [`AgentSink`] for output. Nothing about the
 //! interpreter is reinvented here — the multi-agent layer is pure wiring over the existing engine.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
+use flux_agent::{AgentSpec, Permissions};
 use flux_core::{Error, Result};
+use flux_events::EventStore;
+use flux_flow::engine::FlowEngine;
 use flux_flow::state::FlowStore;
 use flux_flow::AgentSink;
 use flux_lang::ast::{SymbolName, Value as FluxValue, Visibility};
-use flux_lang::program::Program;
+use flux_lang::program::{AgentDecl, Program};
 use flux_provider::Provider;
 use flux_runtime::{
     AllowApprover, Approver, DenyApprover, Executor, PermissionManager, ToolContext, ToolRegistry,
@@ -130,6 +134,22 @@ impl App {
         }
         Ok(())
     }
+
+    /// Test-only: how many messages the agent's bound session for `conversation` holds (`0` if none).
+    /// Used to assert per-thread agent memory (same conversation reuses one session).
+    #[cfg(test)]
+    pub(crate) fn agent_session_len(&self, agent: &str, conversation: &str) -> usize {
+        let map = self.engine.sessions.lock().expect("sessions map poisoned");
+        match map.get(&(agent.to_string(), conversation.to_string())) {
+            Some(sid) => self
+                .engine
+                .events
+                .conversation(sid)
+                .map(|m| m.len())
+                .unwrap_or(0),
+            None => 0,
+        }
+    }
 }
 
 /// The worker behind [`App`]. Owns the program, the registry, and the bus; resolves and runs journeys.
@@ -145,6 +165,17 @@ pub(crate) struct Engine {
     /// When true, journeys run under an allow-all approver (`--yes`); otherwise destructive ops
     /// outside the pre-allowed safe set are **denied** (the safe headless default).
     auto_approve: bool,
+    /// The model provider (when wired); needed to assemble an agent-target engine lazily. An
+    /// `agent`-bound trigger with no provider is a clear error.
+    provider: Option<Arc<dyn Provider>>,
+    /// The host default model (used when an `AgentDecl` declares none, and for new sessions).
+    default_model: String,
+    /// The append-only store backing agent-target **session memory** (a Slack thread → one session).
+    events: Arc<EventStore>,
+    /// Lazily-built engines for agents named by an `agent`-bound trigger, keyed by agent name.
+    agents: Mutex<HashMap<String, Arc<FlowEngine>>>,
+    /// `(agent, conversation)` → persistent session id (in-memory; a restart starts threads fresh).
+    sessions: Mutex<HashMap<(String, String), String>>,
 }
 
 impl Engine {
@@ -156,13 +187,16 @@ impl Engine {
     ) -> Arc<Self> {
         let bus = Bus::new();
         let channels = Arc::new(program.channels.clone());
+        // Agent-target turns persist per-thread conversation memory here; in-memory is fine for v1
+        // (a restart starts threads fresh — flagged, pairs with D-02 later).
+        let events = Arc::new(EventStore::in_memory().expect("flux-app: in-memory event store"));
         // `new_cyclic`: the `spawn` op needs a back-reference to the engine it re-enters, but the
         // engine owns the registry that owns the op — a `Weak` breaks the cycle.
         Arc::new_cyclic(|weak: &Weak<Engine>| {
             let mut registry = ToolRegistry::new();
             flux_tools::register_builtins(&mut registry);
-            if let Some(provider) = provider {
-                flux_cognition::CognitionPack::new(provider, model).register(&mut registry);
+            if let Some(provider) = provider.clone() {
+                flux_cognition::CognitionPack::new(provider, model.clone()).register(&mut registry);
             }
             let host: Weak<dyn JourneyHost> = weak.clone();
             ops::register(&mut registry, bus.clone(), channels, host);
@@ -173,6 +207,11 @@ impl Engine {
                 depth: AtomicU32::new(0),
                 runs: AtomicU64::new(0),
                 auto_approve,
+                provider,
+                default_model: model,
+                events,
+                agents: Mutex::new(HashMap::new()),
+                sessions: Mutex::new(HashMap::new()),
             }
         })
     }
@@ -186,7 +225,13 @@ impl Engine {
     ) -> Result<Vec<JourneyRun>> {
         let mut runs = Vec::new();
         for trigger in self.program.triggers.iter().filter(|t| t.on == label) {
-            runs.push(self.run_journey(&trigger.run, payload, sink).await?);
+            // An `agent`-bound trigger wakes an agent turn (the model drives RAG + granted tools over
+            // the thread's persistent session); otherwise it runs a journey (a fixed DAG), unchanged.
+            let run = match trigger.agent.as_deref() {
+                Some(agent) => self.run_agent(agent, payload).await?,
+                None => self.run_journey(&trigger.run, payload, sink).await?,
+            };
+            runs.push(run);
         }
         Ok(runs)
     }
@@ -257,6 +302,84 @@ impl Engine {
             steps: outcome.steps,
         })
     }
+
+    /// Get (build + cache) the [`FlowEngine`] for a declared agent. Built lazily on first use; an
+    /// `agent`-bound trigger naming an undeclared agent, or one with no model provider, is a clear error.
+    fn agent_engine(&self, name: &str) -> Result<Arc<FlowEngine>> {
+        let mut cache = self.agents.lock().expect("agents cache poisoned");
+        if let Some(engine) = cache.get(name) {
+            return Ok(engine.clone());
+        }
+        let decl = self
+            .program
+            .agents
+            .iter()
+            .find(|a| a.name == name)
+            .ok_or_else(|| Error::Other(format!("trigger names unknown agent `{name}`")))?;
+        let provider = self
+            .provider
+            .clone()
+            .ok_or_else(|| Error::Other(format!("agent `{name}` needs a model provider")))?;
+        let engine = Arc::new(build_agent_engine(
+            decl,
+            provider,
+            self.registry.clone(),
+            self.events.clone(),
+            &self.default_model,
+        )?);
+        cache.insert(name.to_string(), engine.clone());
+        Ok(engine)
+    }
+
+    /// Resolve the persistent session for `(agent, conversation)`: reuse the bound session (multi-turn
+    /// thread memory) or mint one. A delivery with no conversation id runs in a fresh one-shot session.
+    fn session_for(&self, agent: &str, conversation: Option<&str>) -> Result<String> {
+        match conversation {
+            Some(conv) => {
+                let key = (agent.to_string(), conv.to_string());
+                let mut map = self.sessions.lock().expect("sessions map poisoned");
+                if let Some(sid) = map.get(&key) {
+                    return Ok(sid.clone());
+                }
+                let sid = self
+                    .events
+                    .create_session(&self.default_model)
+                    .map_err(other)?;
+                map.insert(key, sid.clone());
+                Ok(sid)
+            }
+            None => self
+                .events
+                .create_session(&self.default_model)
+                .map_err(other),
+        }
+    }
+
+    /// Run one agent turn for an `agent`-bound trigger: the model drives RAG + granted tools over the
+    /// thread's persistent session, and the assistant's reply becomes the run result (the channel posts
+    /// it). The conversation id (a Slack thread ts) binds repeated events to one session.
+    async fn run_agent(&self, name: &str, payload: &Value) -> Result<JourneyRun> {
+        let engine = self.agent_engine(name)?;
+        let conversation = payload
+            .get("conversation")
+            .or_else(|| payload.get("thread"))
+            .and_then(|v| v.as_str());
+        let session_id = self.session_for(name, conversation)?;
+        let input = payload
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let mut sink = RecordingSink::default();
+        engine
+            .run_turn(&session_id, input, &mut sink)
+            .await
+            .map_err(other)?;
+        Ok(JourneyRun {
+            journey: name.to_string(),
+            result: sink.text,
+            steps: sink.tools.len(),
+        })
+    }
 }
 
 #[async_trait]
@@ -295,6 +418,58 @@ fn build_executor(registry: ToolRegistry, auto_approve: bool) -> Result<Executor
         Arc::new(DenyApprover)
     };
     Ok(Executor::new(registry, perms, approver, ctx))
+}
+
+/// Map a program-level [`AgentDecl`] to an [`AgentSpec`]. Its declared `tools` become **both** the visible
+/// op subset *and* the pre-allow grants (`permissions.allow`), so under a [`DenyApprover`] only granted ops
+/// run and everything else is denied — declared grants without a blanket `--yes`. The `description` (or a
+/// `settings.system_prompt` string) seeds the persona; `model` falls back to the host default.
+fn agent_spec_from_decl(decl: &AgentDecl, default_model: &str, cwd: PathBuf) -> AgentSpec {
+    let system_prompt = decl
+        .description
+        .clone()
+        .or_else(|| {
+            decl.settings
+                .get("system_prompt")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| AgentSpec::default().system_prompt);
+    AgentSpec {
+        model: decl
+            .model
+            .clone()
+            .unwrap_or_else(|| default_model.to_string()),
+        system_prompt,
+        tools: Some(decl.tools.clone()),
+        permissions: Permissions {
+            allow: decl.tools.clone(),
+            deny: Vec::new(),
+        },
+        cwd,
+        ..AgentSpec::default()
+    }
+}
+
+/// Assemble an agent-target [`FlowEngine`] from a declaration: a guarded [`System`] rooted at the cwd, the
+/// host's op registry (subset to the agent's tools), the spec's grants, and a headless [`DenyApprover`] —
+/// so the agent runs only its granted ops with no human at a prompt.
+fn build_agent_engine(
+    decl: &AgentDecl,
+    provider: Arc<dyn Provider>,
+    registry: ToolRegistry,
+    events: Arc<EventStore>,
+    default_model: &str,
+) -> Result<FlowEngine> {
+    let root = std::env::current_dir().map_err(other)?;
+    let workspace = Workspace::new(&root).map_err(other)?;
+    let system = Arc::new(System::new(workspace));
+    let ctx = ToolContext::new(system);
+    let spec = agent_spec_from_decl(decl, default_model, root);
+    let approver: Arc<dyn Approver> = Arc::new(DenyApprover);
+    let flow = FlowStore::in_memory().map_err(other)?;
+    spec.assemble(provider, registry, approver, ctx, events, flow)
+        .map_err(other)
 }
 
 /// Seed an event's payload into the journey's session so the flow can read it: the whole payload binds
@@ -368,5 +543,148 @@ impl AgentSink for RecordingSink {
     }
     fn tool_call(&mut self, name: &str, _input: &Value) {
         self.tools.push(name.to_string());
+    }
+}
+
+#[cfg(test)]
+mod agent_target_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use flux_core::{Chunk, StopReason};
+    use flux_lang::program::Module;
+    use flux_provider::{ChunkStream, Request};
+
+    /// A provider that answers every turn with the same prose (no plan) — enough to drive an agent turn
+    /// to a final reply hermetically (no network, no real model).
+    struct ReplyProvider {
+        reply: String,
+    }
+    #[async_trait]
+    impl Provider for ReplyProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            let chunks = vec![
+                Chunk::TextDelta(self.reply.clone()),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::EndTurn),
+                },
+            ];
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    fn program(src: &str) -> Program {
+        match Module::parse_str(src).expect("parse program") {
+            Module::Program(p) => p,
+            Module::Flow(_) => panic!("expected a program, got a bare flow"),
+        }
+    }
+
+    /// An app with one agent reachable via an `agent`-bound `slack` trigger.
+    fn app_with_agent(reply: &str) -> App {
+        let src = r#"{
+            "name": "t",
+            "agents": [{ "name": "assistant", "description": "be terse", "tools": [] }],
+            "triggers": [{ "name": "t1", "on": "slack", "run": "_", "agent": "assistant" }]
+        }"#;
+        let provider: Arc<dyn Provider> = Arc::new(ReplyProvider {
+            reply: reply.to_string(),
+        });
+        App::with_options(program(src), Some(provider), "mock", false)
+    }
+
+    #[test]
+    fn agent_spec_maps_tools_to_grants_and_persona() {
+        let decl = AgentDecl {
+            name: "a".into(),
+            model: None,
+            tools: vec!["read".into(), "now".into()],
+            datasources: vec![],
+            description: Some("be terse".into()),
+            settings: Value::Null,
+        };
+        let spec = agent_spec_from_decl(&decl, "host-model", PathBuf::from("."));
+        assert_eq!(spec.model, "host-model"); // falls back to the host default
+        assert_eq!(spec.system_prompt, "be terse");
+        // tools are the visible subset AND the pre-allow grants — under DenyApprover only these run.
+        assert_eq!(
+            spec.tools.as_deref(),
+            Some(&["read".to_string(), "now".to_string()][..])
+        );
+        assert_eq!(
+            spec.permissions.allow,
+            vec!["read".to_string(), "now".to_string()]
+        );
+        assert!(spec.permissions.deny.is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_trigger_runs_a_turn_and_returns_the_reply() {
+        let app = app_with_agent("hi back");
+        let runs = app
+            .deliver("slack", json!({ "text": "hello", "conversation": "T1" }))
+            .await
+            .expect("deliver");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].journey, "assistant");
+        assert!(
+            runs[0].result.contains("hi back"),
+            "agent reply should be the model's answer, got: {:?}",
+            runs[0].result
+        );
+    }
+
+    #[tokio::test]
+    async fn same_conversation_reuses_one_session_distinct_ones_isolate() {
+        let app = app_with_agent("ok");
+        // Two mentions on the same thread accumulate in one session (multi-turn memory).
+        app.deliver("slack", json!({ "text": "first", "conversation": "T1" }))
+            .await
+            .unwrap();
+        let after_one = app.agent_session_len("assistant", "T1");
+        app.deliver("slack", json!({ "text": "second", "conversation": "T1" }))
+            .await
+            .unwrap();
+        let after_two = app.agent_session_len("assistant", "T1");
+        assert!(
+            after_one > 0,
+            "the first turn should persist to the thread's session"
+        );
+        assert!(
+            after_two > after_one,
+            "the thread's session should grow across turns: {after_one} -> {after_two}"
+        );
+        // A different thread is a separate session, not the T1 one.
+        app.deliver(
+            "slack",
+            json!({ "text": "elsewhere", "conversation": "T2" }),
+        )
+        .await
+        .unwrap();
+        assert!(app.agent_session_len("assistant", "T2") > 0);
+        assert_eq!(
+            app.agent_session_len("assistant", "T1"),
+            after_two,
+            "delivering to T2 must not touch T1's session"
+        );
+    }
+
+    #[tokio::test]
+    async fn trigger_without_agent_still_runs_its_journey() {
+        // A plain journey trigger (no `agent`) runs the journey unchanged — the agentic path is additive.
+        let src = r#"{
+            "name": "t",
+            "triggers": [{ "name": "t1", "on": "ping", "run": "pong" }],
+            "journeys": [{ "name": "pong", "flow": { "name": "pong", "body": [
+                { "kind": "return", "value": { "kind": "lit", "value": "pong!" } }
+            ] } }]
+        }"#;
+        let app = App::with_options(program(src), None, "mock", false);
+        let runs = app.deliver("ping", json!({})).await.expect("deliver");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].journey, "pong");
+        assert_eq!(runs[0].result, "pong!");
     }
 }
