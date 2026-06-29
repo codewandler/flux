@@ -507,9 +507,12 @@ async fn build_doc_index(system: &System) -> Arc<dyn flux_capabilities::Datasour
     const DOC_EXTS: &[&str] = &[".md", ".txt", ".rst", ".adoc", ".mdx"];
     const MAX_DOCS: usize = 200;
     const MAX_BYTES: usize = 100_000;
-    let backend = flux_capabilities::MemoryBackend::new();
+    // Wrap the keyword backend in the semantic (embeddings) backend *before* ingest — when built with
+    // `--features embeddings` and an embeddings key resolves — so records are embedded as they're indexed.
+    let backend: Arc<dyn flux_capabilities::DatasourceBackend> =
+        datasource_backend(Arc::new(flux_capabilities::MemoryBackend::new()));
     let Ok(files) = system.walk_files(".", 4000).await else {
-        return Arc::new(backend);
+        return backend;
     };
     let mut docs: Vec<(String, String)> = Vec::new();
     for f in files {
@@ -526,8 +529,30 @@ async fn build_doc_index(system: &System) -> Arc<dyn flux_capabilities::Datasour
         }
     }
     // Index under the `local` source as `file.document` records via the markdown ingester.
-    let _ = flux_capabilities::ingest_markdown(&backend, "local", &docs);
-    Arc::new(backend)
+    let _ = flux_capabilities::ingest_markdown(&*backend, "local", &docs);
+    backend
+}
+
+/// Wrap a keyword backend in the semantic (embeddings) backend when built with `--features embeddings`
+/// and an embeddings API key resolves from env; otherwise return it unchanged (the default).
+#[cfg(feature = "embeddings")]
+fn datasource_backend(
+    inner: Arc<dyn flux_capabilities::DatasourceBackend>,
+) -> Arc<dyn flux_capabilities::DatasourceBackend> {
+    match flux_capabilities::OpenAiEmbedder::from_env() {
+        Some(embedder) => Arc::new(flux_capabilities::SemanticIndex::new(
+            inner,
+            Arc::new(embedder),
+        )),
+        None => inner,
+    }
+}
+
+#[cfg(not(feature = "embeddings"))]
+fn datasource_backend(
+    inner: Arc<dyn flux_capabilities::DatasourceBackend>,
+) -> Arc<dyn flux_capabilities::DatasourceBackend> {
+    inner
 }
 
 /// Session size (serialized chars) past which the agent summarizes old turns. Override with

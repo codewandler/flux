@@ -12,13 +12,21 @@ mod host_caps;
 mod ingest;
 mod memory;
 mod ops;
+mod semantic;
 mod sqlite;
+
+#[cfg(feature = "embeddings")]
+mod embeddings;
 
 pub use host_caps::DatasourceHostCaps;
 pub use ingest::{freshness, ingest_markdown, ingest_openapi, reindex};
 pub use memory::MemoryBackend;
 pub use ops::{datasource_tools, register_datasource_ops};
+pub use semantic::SemanticIndex;
 pub use sqlite::SqliteBackend;
+
+#[cfg(feature = "embeddings")]
+pub use embeddings::OpenAiEmbedder;
 
 use flux_core::Result;
 use flux_datasource::{

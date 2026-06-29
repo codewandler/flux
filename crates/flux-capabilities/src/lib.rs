@@ -14,5 +14,8 @@ pub mod datasource;
 pub use browser::WebFetchTool;
 pub use datasource::{
     datasource_tools, freshness, ingest_markdown, ingest_openapi, register_datasource_ops, reindex,
-    DatasourceBackend, DatasourceHostCaps, Embedder, MemoryBackend, SqliteBackend,
+    DatasourceBackend, DatasourceHostCaps, Embedder, MemoryBackend, SemanticIndex, SqliteBackend,
 };
+
+#[cfg(feature = "embeddings")]
+pub use datasource::OpenAiEmbedder;

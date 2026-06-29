@@ -18,6 +18,14 @@ url.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Embeddings (optional): a runtime-free blocking HTTP client for the synchronous `Embedder` seam — NOT
+# reqwest::blocking, which spins its own runtime and panics when called from within tokio.
+ureq = { version = "2", optional = true, features = ["json"] }
+
+[features]
+# Wire the semantic/embeddings datasource backend (the `OpenAiEmbedder` over /v1/embeddings). Off by
+# default — the keyword path and the whole default gate are unchanged.
+embeddings = ["dep:ureq"]
 
 [dev-dependencies]
 tokio.workspace = true
