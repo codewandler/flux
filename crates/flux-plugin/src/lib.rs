@@ -1151,8 +1151,20 @@ impl PluginTool {
         } else {
             op.effects.clone()
         };
+        // The model-facing tool name is the operation's fully-qualified name. flux plugin ops are
+        // authored already qualified (e.g. `slack.message.send`), and the plugin's own dispatch,
+        // `flux plugin call`, and the generated skill docs all use that name — so adopt it verbatim when
+        // it is already prefixed, and only add the `{plugin}.` prefix for an un-qualified op name.
+        // (Unconditionally prefixing double-qualified the common case to `slack.slack.message.send`, so
+        // an agent's `tools` grant — `slack.message.send` — never matched and every plugin op was
+        // silently dropped from the agent surface.)
+        let qualified = if op.name == plugin || op.name.starts_with(&format!("{plugin}.")) {
+            op.name.clone()
+        } else {
+            format!("{plugin}.{}", op.name)
+        };
         let spec = ToolSpec {
-            name: format!("{plugin}.{}", op.name),
+            name: qualified,
             description: op.description.clone(),
             input_schema: op.input_schema.clone(),
             output_schema: None,
