@@ -8,6 +8,53 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Plugin host protocol — managed background processes + binary HTTP body (D-14 enabler).** Two additive
+  capabilities on `flux.plugin.v1`, extending the host the way D-12 added auth/conn/blob:
+  - **Managed background processes** — `process.spawn`/`read`/`status`/`kill`, a per-session registry in
+    `SystemHostCaps` beside `conns`/`blobs` (so a process started in one op call is stopped/queried in a
+    later one — one host instance is shared across a plugin's tool calls). Backed by a new
+    `flux_system::System::spawn_background` returning a `ManagedChild` (piped stdout/stderr drained into
+    capped buffers, `kill_on_drop`). Same safety envelope as `run_with_env`: argv-only, env **cleared** +
+    minimal allow-list + caller overrides, workspace-pinned cwd; `process.spawn` is gated by the manifest's
+    `process` allow-list exactly like `process.run` (deny-by-default). This is what lets a plugin host a
+    long-lived `kubectl port-forward`.
+  - **Binary HTTP body** — `http.do` accepts a base64 `body_b64` request body and, with `response_binary:
+    true`, returns the raw response bytes as `body_b64` (16 MiB cap, no char-truncation). host-kit exposes
+    `Host::process_*` and `Host::http_bytes`. Byte-exact file upload **and** download (was lossy through the
+    UTF-8 `String` body before).
+- **fluxplane-plugins parity — the 8 native plugins at full op + behavioural parity (D-14).** Brought every
+  plugin in the in-repo `plugins/` pack to its fluxplane counterpart's operation set (**+~160 ops**) *and*
+  to faithful behaviour (not just op names):
+  - **gitlab 6 → 64** — full MR review/diff/discussion workflow, branches, repo files/tree/commits/tags,
+    CI/CD, releases + links + changelog, issues, snippets, `repository.archive` → host blob; `mr.diff.lines`
+    uses real **regex** matching (matching the reference), `mr.merge` sends the modern `auto_merge` (not the
+    deprecated field), `pipeline.create` validates its `variables`.
+  - **slack 5 → 30** — edit/delete, threads, search, reactions, bookmarks, presence, emoji; **`mentions`**
+    does the reference's replied/acked/pending thread classification and **`unreads`** uses real `last_read`
+    cursor math; files upload/download **byte-exact** via `http_bytes`.
+  - **kubernetes 5 → 24** — renamed `k8s.*` → `kubernetes.*`; full inventory, scale/restart/history,
+    logs/events, secret.read, endpoint.discover, one-shot `pod.exec`; **port-forward start/stop/list run on
+    the host managed-process capability** (spawns `kubectl port-forward`, parses the readiness line for the
+    real local port, kills on stop).
+  - **jira 3 → 21** / **confluence 3 → 15** — full issue/page CRUD + transitions/comments/attachments/
+    links/user-search; **attachments byte-exact** via `http_bytes`; jira ports the markdown→ADF renderer and
+    the transition-selection scorer faithfully; confluence renders storage↔markdown with `body_format`.
+  - **prometheus 4 → 8** (series/targets/rules/alerts; rejects empty `query`), **loki 3 → 5** (metric,
+    recent_logs; Basic + `X-Scope-OrgID` tenant header, auth purposes named per the reference), **websearch**
+    `provider.list` + provider selector. Each HTTP plugin has an `index.build` op driving its datasource
+    contribution exhaustively (`{indexed: n}`).
+  - **Auth re-port:** jira/confluence drop the hand-rolled Basic-auth base64 — primary is **Bearer
+    `api_token` via the `cloud_id` gateway** (`api.atlassian.com/ex/jira|confluence/{cloud_id}`, the
+    fluxplane reference), with **Basic (email:token) retained as a configurable fallback**, selected per
+    request from the configured env. The host injects both schemes (D-12 `AuthScheme`); no base64 in-plugin.
+
+  Op shapes + behaviour were ported from the fluxplane manifests/clients; every op keeps a MockHost unit
+  test (incl. non-UTF-8 byte round-trips and managed-process lifecycle), and the nested `plugins/` workspace
+  gate stays green (203 plugin tests). Deeper fidelity closed too: confluence full storage↔markdown
+  conversion, prometheus typed `query`/`query_range` results, loki SHA1 entry ids + RFC3339Nano timestamps,
+  slack `mentions`/`unreads` `since`/`unhandled`/`tickets`. New **plugin-local** dependencies: `regex`
+  (gitlab `diff.lines`), `pulldown-cmark` + `quick-xml` (confluence storage↔markdown), `sha1` + `time`
+  (loki). See [docs/designs/fluxplane-plugins-parity.md](docs/designs/fluxplane-plugins-parity.md).
 - **Reusable A2A server protocol — `flux_a2a::server` (D-03).** Lifted the duplicated A2A server-side
   logic out of `flux-server/src/a2a.rs` into a reusable, **axum-free** module on the L1 `flux-a2a` crate:
   the `A2aTurn` runner seam, `dispatch` (`message/send` → a completed `Task`; JSON-RPC errors),

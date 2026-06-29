@@ -20,15 +20,12 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [I-01 — Statistically clean headline gain](I-01-headline-gain.md) · Improve · offline half done
   (partial-credit scalar + durable token capture + synthetic `trials = 5` loop); the trials ≥ 5
   grader-confirmed run is **staged** on a funded provider key
-- [D-14 — Deepen the 8 native plugins to full op-parity](D-14-deepen-native-plugins.md) · Agent · parity
-  epic (unblocked now D-12 landed) · **in progress** — per-plugin: gitlab 6→64, slack 5→30, jira 3→21,
-  confluence 3→15, kubernetes 5→24, loki 3→5, prometheus 4→8, websearch confirm; jira/confluence drop the
-  hand-rolled base64 for D-12 `AuthMethod::basic`
 
 ## Next (ready — take the top one unless the user named a story)
-- The **fluxplane-plugins parity epic** is the active track: **D-14** (above, in progress) leads; **D-15**
-  (observability/AI), **D-16** (datastore/infra), **D-17** (telephony) follow once D-14's pattern lands —
-  all unblocked now D-12 shipped. See the epic in Backlog below.
+- The **fluxplane-plugins parity epic** continues: **D-14 shipped** (all 8 plugins at op + behavioural
+  parity; see Done). **D-15** (observability/AI), **D-16** (datastore/infra), **D-17** (telephony) are the
+  ready follow-ons — all unblocked now D-12 (+ the D-14 host extensions: managed processes, binary body)
+  shipped. See the epic in Backlog below.
 - [D-11 — App-runner ergonomics](D-11-app-runner-ergonomics.md) · Agent · the alternate ready pick (makes
   `flux app run` a viable host for a declarative bot; unblocks Slack-channel assistant S-01/S-03/S-06).
 
@@ -72,6 +69,7 @@ all providers**. Most plumbing already exists (`flux-credentials` import/refresh
   stage; import + refresh cover the near term
 
 ## Done
+- [D-14 — Deepen the 8 native plugins to full op-parity](D-14-deepen-native-plugins.md) · Agent · all 8 `plugins/` at fluxplane op + **behavioural** parity (+~160 ops): gitlab 6→64, slack 5→30, kubernetes 5→24, jira 3→21, confluence 3→15, prometheus 4→8, loki 3→5, websearch +`provider.list`. Added two **host protocol** capabilities (managed background processes `process.spawn/read/status/kill`; binary HTTP body `body_b64`/`response_binary`). jira/confluence auth re-ported to the reference (Bearer/`cloud_id` gateway + Basic fallback); k8s port-forward on managed processes; byte-exact attachments/files; jira ADF + transition scorer, slack mentions/unreads, gitlab `diff.lines` regex ported faithfully. One MockHost test per op; `plugins/` + host gate green
 - [D-13 — Generated plugin skill (`flux plugin skill`)](D-13-plugin-skill-command.md) · Core · renders installed-plugin manifests into a trigger-activated `flux-plugins` SKILL.md + `references/` (the flux analogue of fluxplane's `fluxplane-plugin skill`); flux-markdown frontmatter writer (commit `7030261`)
 - [D-12 — Plugin protocol parity extensions](D-12-plugin-protocol-parity.md) · Core · additive host caps for the missing fluxplane plugins — non-Bearer auth injection (A: Basic/header/query by purpose) + raw `conn.*` dialer (B) + `blob.*` store (C); clean extension of `flux.plugin.v1`, unblocks D-14..D-17 (commit `a21bc47`)
 - [D-03 — Reusable A2A server helpers](D-03-a2a-server-helpers.md) · Agent · lifted flux-server's A2A routes into the reusable `flux_a2a::server` helper; unblocks managed-agents E-02 + fixed the `tasks/send` drift (commit `7dcc6b3`)

@@ -1,6 +1,7 @@
 # Design: fluxplane-plugins parity (the integration-plugin epic)
 
-**Status:** planned · **Pillar:** Agent · **Layer:** L4 (`flux-plugin`) + the `plugins/` workspace ·
+**Status:** D-12 / D-13 / **D-14 shipped** (the 8 native plugins are at full op-parity); D-15–D-17 next ·
+**Pillar:** Agent · **Layer:** L4 (`flux-plugin`) + the `plugins/` workspace ·
 **Owner:** Timo · **Stories:** [D-12](../stories/D-12-plugin-protocol-parity.md) ·
 [D-13](../stories/D-13-plugin-skill-command.md) · [D-14](../stories/D-14-deepen-native-plugins.md) ·
 [D-15](../stories/D-15-observability-ai-plugins.md) · [D-16](../stories/D-16-datastore-infra-plugins.md) ·
@@ -23,7 +24,7 @@ same safety envelope as the agent's own tools.
 
 | Disposition | fluxplane plugins | Story |
 |---|---|---|
-| **Native, shallow** — port-deepen to full op set | confluence, gitlab, jira, kubernetes, loki, prometheus, slack, websearch | **D-14** |
+| **Native, shallow** — port-deepen to full op set ✅ **done (D-14)** | confluence, gitlab, jira, kubernetes, loki, prometheus, slack, websearch | **D-14** |
 | **Missing — HTTP** (needs non-Bearer auth) | alertmanager, grafana, opsgenie, huggingface | **D-15** |
 | **Missing — raw-conn / SDK** | sql, docker, aws | **D-16** |
 | **Missing — telephony** | asterisk, homer | **D-17** |
@@ -79,7 +80,22 @@ D-12 (protocol: auth → conn → blob)         D-13 (flux plugin skill)   ← t
 ```
 
 D-13 is independent (no protocol dependency) and ships first. D-12's auth slice is the first protocol
-deliverable; conn + blob follow. The plugin-port stories (D-14…D-17) consume D-12 and run in later sessions.
+deliverable; conn + blob follow. **D-14 has shipped** (all 8 plugins deepened to op-parity, ~160 ops, via
+one sub-agent per plugin in parallel — each gated package-scoped, then the full `plugins/` workspace gate
+together). The remaining plugin-pack stories (D-15…D-17) consume D-12 next.
+
+### Host protocol extensions landed with D-14
+The fidelity pass added two capabilities to `flux.plugin.v1` (the way D-12 added auth/conn/blob):
+- **Managed background processes** — `process.spawn`/`read`/`status`/`kill`, a per-session registry in
+  `SystemHostCaps` (beside `conns`/`blobs`), backed by `flux_system::System::spawn_background`
+  (`ManagedChild`: piped+capped stdout/stderr, `kill_on_drop`, argv-only, env cleared+allow-listed). Gated by
+  the manifest `process` allow-list. This is what lets the host hold a long-lived `kubectl port-forward` — the
+  plugin process being one-shot is irrelevant since **the host runs and holds all IO**, and one host instance
+  is shared across a plugin's op calls (`load_plugin_tools`). (Replaced the earlier, mistaken "plugin can't
+  hold a process" punt.)
+- **Binary HTTP body** — `http.do` accepts `body_b64` and, with `response_binary: true`, returns the raw
+  bytes as `body_b64` (16 MiB cap); host-kit `Host::http_bytes`. Byte-exact upload **and** download (the
+  earlier `String`-body lossiness is gone).
 
 ## Authoring pattern (for the port stories)
 
