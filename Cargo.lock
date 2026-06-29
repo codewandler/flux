@@ -841,16 +841,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flux-integrations"
-version = "0.2.4"
-dependencies = [
- "flux-core",
- "reqwest",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "flux-lang"
 version = "0.2.4"
 dependencies = [

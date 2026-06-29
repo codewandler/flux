@@ -205,7 +205,7 @@ impl AgentSink for SseSink {
 }
 
 /// Inbound webhook: a single external event creates a fresh session and runs one turn. This is
-/// the trigger surface for integrations (a CI hook, a chat message bridged by `flux-integrations`).
+/// the trigger surface for integrations (a CI hook, or a chat message bridged by an external adapter).
 async fn webhook(
     State(agent): State<Shared>,
     Json(req): Json<MessageRequest>,
