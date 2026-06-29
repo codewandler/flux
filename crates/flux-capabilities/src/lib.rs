@@ -12,4 +12,7 @@ pub mod browser;
 pub mod datasource;
 
 pub use browser::WebFetchTool;
-pub use datasource::{register_datasource_ops, DatasourceBackend, Embedder, MemoryBackend};
+pub use datasource::{
+    freshness, ingest_markdown, ingest_openapi, register_datasource_ops, reindex,
+    DatasourceBackend, Embedder, MemoryBackend, SqliteBackend,
+};

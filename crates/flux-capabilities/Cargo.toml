@@ -12,6 +12,7 @@ flux-runtime.workspace = true
 flux-spec.workspace = true
 flux-system.workspace = true
 reqwest.workspace = true
+rusqlite.workspace = true
 url.workspace = true
 async-trait.workspace = true
 serde.workspace = true

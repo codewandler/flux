@@ -8,11 +8,15 @@
 //! v1 ranks by keyword/term-frequency; the [`Embedder`] seam is defined but **no semantic backend is
 //! wired** (deferred).
 
+mod ingest;
 mod memory;
 mod ops;
+mod sqlite;
 
+pub use ingest::{freshness, ingest_markdown, ingest_openapi, reindex};
 pub use memory::MemoryBackend;
 pub use ops::register_datasource_ops;
+pub use sqlite::SqliteBackend;
 
 use flux_core::Result;
 use flux_datasource::{
@@ -34,6 +38,8 @@ pub trait DatasourceBackend: Send + Sync {
     fn relation(&self, input: &RelationInput) -> Result<Vec<Record>>;
     /// Fetch several records of one entity from one source in a single call.
     fn batch_get(&self, input: &BatchGetInput) -> Result<Vec<Record>>;
+    /// Drop every record (the rebuild half of reindex; the caller then re-ingests).
+    fn clear(&self) -> Result<()>;
     /// Total record count (diagnostics / freshness).
     fn len(&self) -> usize;
     /// Whether the index holds no records.

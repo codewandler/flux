@@ -494,8 +494,6 @@ fn build_provider(spec: &str) -> Result<(NativeProvider, String)> {
 /// count and size — code search is served by `grep`, not this. Errors are swallowed (an empty index just
 /// yields "no matches"). Returns the shared backend the retrieval ops dispatch against.
 async fn build_doc_index(system: &System) -> Arc<dyn flux_capabilities::DatasourceBackend> {
-    use flux_capabilities::DatasourceBackend;
-    use flux_datasource::{Record, Source};
     const DOC_EXTS: &[&str] = &[".md", ".txt", ".rst", ".adoc", ".mdx"];
     const MAX_DOCS: usize = 200;
     const MAX_BYTES: usize = 100_000;
@@ -503,9 +501,9 @@ async fn build_doc_index(system: &System) -> Arc<dyn flux_capabilities::Datasour
     let Ok(files) = system.walk_files(".", 4000).await else {
         return Arc::new(backend);
     };
-    let mut count = 0usize;
+    let mut docs: Vec<(String, String)> = Vec::new();
     for f in files {
-        if count >= MAX_DOCS {
+        if docs.len() >= MAX_DOCS {
             break;
         }
         if !DOC_EXTS.iter().any(|e| f.ends_with(e)) {
@@ -513,12 +511,12 @@ async fn build_doc_index(system: &System) -> Arc<dyn flux_capabilities::Datasour
         }
         if let Ok(text) = system.read_file(&f).await {
             if text.len() <= MAX_BYTES {
-                let rec = Record::new(Source::new("local"), "file.document", &f, &f, text);
-                let _ = backend.upsert(&[rec]);
-                count += 1;
+                docs.push((f, text));
             }
         }
     }
+    // Index under the `local` source as `file.document` records via the markdown ingester.
+    let _ = flux_capabilities::ingest_markdown(&backend, "local", &docs);
     Arc::new(backend)
 }
 

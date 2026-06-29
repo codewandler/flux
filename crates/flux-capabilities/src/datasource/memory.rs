@@ -196,6 +196,14 @@ impl DatasourceBackend for MemoryBackend {
             .collect())
     }
 
+    fn clear(&self) -> Result<()> {
+        self.records
+            .lock()
+            .expect("datasource records poisoned")
+            .clear();
+        Ok(())
+    }
+
     fn len(&self) -> usize {
         self.records
             .lock()
