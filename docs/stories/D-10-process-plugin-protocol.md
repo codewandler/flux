@@ -2,8 +2,7 @@
 id: D-10
 title: Process-plugin protocol redesign — a clean, unified plugin wire protocol
 pillar: Core
-status: ready
-priority: 2
+status: done
 theme: downstream-managed-agents
 design: docs/designs/process-plugin-protocol.md
 ---

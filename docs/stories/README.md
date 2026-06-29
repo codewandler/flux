@@ -22,21 +22,8 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
   grader-confirmed run is **staged** on a funded provider key
 
 ## Next (ready — take the top one unless the user named a story)
-
-### Slack-channel assistant integration stack — the active push (build in rank order; each depends on the prior)
-The upstream flux work that unblocks the downstream Slack-channel assistant's agentic, knowledge-grounded DevOps
-assistant. Tracked as the plan of record; see [roadmap → Downstream enablement](../roadmap.md#downstream-enablement-managed-agents-Slack-channel assistant).
-- **1.** [D-10 — Process-plugin protocol redesign](D-10-process-plugin-protocol.md) · Core · one clean
-  unified plugin frame (ops + datasource records + host caps with secret-by-purpose) — informed by
-  fluxplane v2, dropping its cruft; clean cutover of `flux.plugin.v1`; blocks D-08
-  ([design](../designs/process-plugin-protocol.md))
-- **2.** [D-08 — Integration plugin pack](D-08-integration-plugin-pack.md) · Agent · **epic** · native
-  plugins (Slack/websearch/GitLab/Jira/Confluence/K8s/Loki/Prometheus) in an **in-repo `plugins/`
-  workspace**; emit `flux-datasource` records via an L5 bridge; slice 1 unblocks the MVP
-  ([design](../designs/integration-plugins.md))
-- **4.** [D-09 — Agentic channel target](D-09-agentic-channel-target.md) · Agent · **mechanism landed**
-  (`trigger.agent` runs an agent turn with per-thread memory + grants, `0d8ac58`); **remaining:** wire the
-  datasource (D-07) + plugin (D-08) tools into the agent's registry ([design](../designs/agentic-channel-target.md))
+_(none ready — the Slack-channel assistant integration stack D-07/D-10/D-08/D-09 all shipped; see Done. Promote one
+from Backlog below.)_
 
 ## Blocked
 _(none)_
@@ -52,6 +39,9 @@ These support the multi-tenant **managed-agents** service (path-dep consumer). T
 - **2.** [D-03 — Reusable A2A server helpers (current spec)](D-03-a2a-server-helpers.md) · Agent · **medium** · lift flux-server's A2A routes into a helper; unblocks managed-agents E-02 + fixes the `tasks/send` drift
 
 ## Done
+- [D-08 — Integration plugin pack](D-08-integration-plugin-pack.md) · Agent · 8 native plugins in the in-repo `plugins/` workspace (websearch/gitlab/jira/confluence/kubernetes/loki/prometheus/slack) on a shared `host-kit`; reach vendors only via host caps; contribute `flux-datasource` records through the L5 `DatasourceHostCaps` bridge (commits `0e9b93e`/`deafe68`/`6b20c41`)
+- [D-09 — Agentic channel target](D-09-agentic-channel-target.md) · Agent · `trigger.agent` wakes an `AgentSpec` turn (per-thread session memory + declared grants, `0d8ac58`) + the registry wiring (`App::with_tools` loads datasource + plugin tools on the `flux app run` path, `e4710ad`)
+- [D-10 — Process-plugin protocol redesign](D-10-process-plugin-protocol.md) · Core · enriched the plugin manifest (auth-by-purpose, datasource declarations, endpoints) + host capabilities (HTTP method/headers/body + bearer injection, secret-by-purpose, endpoint, datasource-record contribution) over the existing unified frame; `DatasourceHostCaps` L5 bridge (commits `f389bc7`/`7db537a`)
 - [D-07 — Knowledge datasource (a real RAG layer)](D-07-knowledge-datasource-rag.md) · Core · new L0 `flux-datasource` schema crate + a `DatasourceBackend` trait with in-memory + **SQLite-FTS5** backends, the five retrieval ops (`search`/`get`/`list`/`relation`/`batch_get`), markdown + OpenAPI ingesters, reindex/freshness, and an unwired embeddings seam (commits `2642479`/`e6d7279`/`5241c97`)
 - [D-01 — Parameterized flow execution (the behaviour-runner seam)](D-01-flow-input-seeding.md) · Agent · deterministic `FlowClient::parse` (no model round-trip) + a per-run input-seeding seam (`FlowStore::seed` + `FlowClient::execute_with`/`run_flow`) so a stored flow runs per invocation with injected `$var` settings — fresh-store isolation, flow-local binds shadow seeds, envelope unchanged; modules, zero new crates; serves managed-agents R-01/A-03 (see [CHANGELOG](../../CHANGELOG.md))
 - [D-06 — Realtime voice-to-voice as a first-class flux provider](D-06-realtime-voice-provider.md) · Agent · sibling `RealtimeProvider`/`RealtimeSession` seam (modules in flux-provider/flux-providers/flux-flow — zero new crates) + OpenAI-Realtime impl lifted from managed-agents; realtime tool calls run through `Executor` declared once; SDK `FlowClient::run_voice_session` + a Phase-2 engine-owned-turns spike (see [CHANGELOG](../../CHANGELOG.md))

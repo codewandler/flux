@@ -2,8 +2,7 @@
 id: D-08
 title: Integration plugin pack — native flux plugins for the DevOps surface
 pillar: Agent
-status: ready
-priority: 3
+status: done
 theme: downstream-managed-agents
 design: docs/designs/integration-plugins.md
 ---

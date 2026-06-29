@@ -8,6 +8,26 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Integration plugin pack — 8 native plugins (D-08).** A new in-repo `plugins/` cargo workspace
+  (excluded from the root flux gate so vendor surface stays out of it) with eight subprocess plugins on a
+  shared **`host-kit`** SDK: `websearch` (Tavily + DuckDuckGo), `gitlab` (projects/MRs/issues/pipelines),
+  `jira` (issue search/show, projects), `confluence` (search/page/spaces), `kubernetes`
+  (namespaces/pods/deployments/logs/events via `kubectl`), `loki` (LogQL), `prometheus` (PromQL/alerts/
+  targets), `slack` (post/history/channels/users/thread). Plugins do **no privileged IO of their own** —
+  every side effect is a host-capability callback (http with bearer-injection / process / secret-by-purpose
+  / datasource-record contribution); list/search ops contribute `flux-datasource` records that reach the
+  D-07 index via the L5 `DatasourceHostCaps` bridge. Hermetic `MockHost` tests throughout. See
+  [`plugins/README.md`](plugins/README.md) and [`docs/designs/integration-plugins.md`](docs/designs/integration-plugins.md).
+- **Process-plugin protocol — manifest + host-capability enrichment (D-10).** `flux-plugin`'s manifest
+  is now the single host-introspected source of truth: it gains `auth` (auth-by-purpose), `datasources`
+  (shared `flux-datasource` `Declaration`s a plugin contributes), and `endpoints` (env-resolved base URLs);
+  `OperationSpec` gains `idempotency` + `secret_purposes` (reusing flux's own `Effect`/`Risk` vocabulary,
+  not a ported access enum). `SystemHostCaps` grows `with_manifest`, secret-by-purpose resolution, full
+  HTTP (method/headers/body + bearer injection), and `endpoint` resolution. The transport was already a
+  single unified Request/Response frame (no `target` field), so this is an additive enrichment, not a
+  cutover. A new L5 **`DatasourceHostCaps`** (in flux-capabilities) services a plugin's
+  `datasource.records`/`search`/`get` against the D-07 index. See
+  [`docs/designs/process-plugin-protocol.md`](docs/designs/process-plugin-protocol.md).
 - **Knowledge datasource — a real RAG layer (D-07).** A new L0 **`flux-datasource`** crate holds the
   shared record/retrieval schema (`Record` addressable by `(source, entity, id)`, `Declaration`/
   `EntitySchema`, and the `Search`/`Get`/`List`/`Relation`/`BatchGet` I/O types) — so the knowledge index
@@ -23,8 +43,11 @@ All notable changes to this project are documented in this file. The format is b
   now wakes a `FlowEngine` agent turn (the model drives RAG + granted tools) instead of a journey, with
   per-thread `(agent, conversation) → EventStore` session memory and grants from the `AgentDecl`'s `tools`
   under a headless `DenyApprover`. Reuses the existing `TriggerDecl.agent` field; the journey route is
-  unchanged. (Remaining: registering the datasource/plugin tools into the agent's registry — pairs with
-  D-08.) See [`docs/designs/agentic-channel-target.md`](docs/designs/agentic-channel-target.md).
+  unchanged. **Registry wiring (completing D-09):** a non-breaking `App::with_tools` seam + the CLI's
+  `flux app run` now index workspace docs into a shared `DatasourceBackend` and register the D-07
+  datasource ops + every discovered D-08 plugin's tools into the host registry (plugin-contributed records
+  land in the same index via `DatasourceHostCaps`) — so the agent target drives RAG `search` + the granted
+  integration ops over one knowledge index. See [`docs/designs/agentic-channel-target.md`](docs/designs/agentic-channel-target.md).
 - **Parameterized flow execution — the behaviour-runner seam (D-01).** Run a *stored, validated* Flux-Lang
   flow **per invocation** with input values injected at call time, instead of re-compiling from natural
   language or baking inputs into the AST. Two thin `flux-sdk` additions over a new `flux-flow` store
