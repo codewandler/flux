@@ -24,6 +24,9 @@ flux-agent.workspace = true
 flux-lang.workspace = true
 flux-flow.workspace = true
 flux-cognition.workspace = true
+# L3 sub-agent orchestration: the reusable `SubAgents` wiring + the `task` tool, surfaced through
+# `FlowClient::with_sub_agents` so a consumer drives sub-agents without re-assembling the spawner.
+flux-orchestrate.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

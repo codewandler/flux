@@ -54,6 +54,34 @@ impl Approver for SubAgentApprover {
 /// Produces a fresh provider per sub-agent (sub-agents can't share one `Box<dyn Provider>`).
 pub type ProviderFactory = Arc<dyn Fn() -> Result<Box<dyn Provider>> + Send + Sync>;
 
+/// Per-sub-agent resource limits. Defaults preserve the historical behaviour: 30 iterations (a
+/// planner that grounds a task in files or a worker that reads/edits/then runs the dev-gate needs
+/// more than a handful of tool turns), the spawner's configured token budget, and no wall-clock
+/// deadline.
+#[derive(Clone)]
+pub struct SpawnLimits {
+    /// Per-turn tool-iteration cap.
+    pub max_iterations: usize,
+    /// Per-turn model token budget.
+    pub max_tokens: u32,
+    /// Optional wall-clock deadline. On expiry the child's cancel token is **fired** (cooperative,
+    /// valid-history termination) and `spawn` returns a typed timeout error — it never drops the
+    /// child future mid-turn, which could otherwise leave a split tool_use/tool_result pair in a
+    /// shared audit store.
+    pub wall_clock: Option<std::time::Duration>,
+}
+
+impl SpawnLimits {
+    /// Default limits for a given per-turn token budget (30 iterations, no wall-clock deadline).
+    pub fn new(max_tokens: u32) -> Self {
+        Self {
+            max_iterations: 30,
+            max_tokens,
+            wall_clock: None,
+        }
+    }
+}
+
 /// Spawns sub-agents from roles, locally and in-process.
 pub struct LocalSpawner {
     provider_factory: ProviderFactory,
@@ -61,11 +89,21 @@ pub struct LocalSpawner {
     base_registry: ToolRegistry,
     system: Arc<System>,
     default_model: String,
-    max_tokens: u32,
-    max_iterations: usize,
+    limits: SpawnLimits,
+    /// Approver the sub-agent's tool calls dispatch through. `None` → the default [`SubAgentApprover`]
+    /// (auto-approve non-destructive, deny destructive). A multi-tenant consumer injects an approver
+    /// that approval-gates its mutations.
+    approver: Option<Arc<dyn Approver>>,
     /// Authorization the sub-agents inherit (policy floor + caller/trust). When unset, sub-agents
-    /// still run under [`SubAgentApprover`] but without the policy gate.
+    /// still run under the headless approver but without the policy gate.
     auth: Option<(AuthorizationPolicy, Caller, Trust)>,
+    /// When set, child runs persist into this shared (tenant) event store instead of a throwaway
+    /// in-memory one, so a sub-agent's inner tool calls land in the audit log the parent reads.
+    audit: Option<Arc<EventStore>>,
+    /// Current delegation depth (0 = a top-level agent's direct child). A child is a leaf when
+    /// `depth + 1 >= max_depth`. The default `max_depth = 1` keeps every sub-agent a leaf.
+    depth: usize,
+    max_depth: usize,
 }
 
 impl LocalSpawner {
@@ -83,12 +121,12 @@ impl LocalSpawner {
             base_registry,
             system,
             default_model: default_model.into(),
-            max_tokens,
-            // Sub-agents that explore *and* act (a planner grounding a task in files, a worker that
-            // reads/edits/then runs the dev-gate) need more than a handful of tool turns. 15 cut them
-            // off mid-task before they could emit their result; 30 gives real headroom.
-            max_iterations: 30,
+            limits: SpawnLimits::new(max_tokens),
+            approver: None,
             auth: None,
+            audit: None,
+            depth: 0,
+            max_depth: 1,
         }
     }
 
@@ -102,6 +140,49 @@ impl LocalSpawner {
     ) -> Self {
         self.auth = Some((policy, caller, trust));
         self
+    }
+
+    /// Override the per-sub-agent resource limits (iteration cap, token budget, wall-clock deadline).
+    pub fn with_limits(mut self, limits: SpawnLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Inject the approver a sub-agent's tool calls dispatch through (default: [`SubAgentApprover`]).
+    pub fn with_approver(mut self, approver: Arc<dyn Approver>) -> Self {
+        self.approver = Some(approver);
+        self
+    }
+
+    /// Persist child runs into a shared (tenant) event store so their inner tool calls are auditable.
+    pub fn with_audit(mut self, events: Arc<EventStore>) -> Self {
+        self.audit = Some(events);
+        self
+    }
+
+    /// Allow bounded nested delegation: a sub-agent at `depth < max_depth` keeps the `task` tool and a
+    /// depth-incremented spawner. Default `1` (children are leaves). `> 1` is an opt-in escape hatch —
+    /// the recursion bound is `max_depth`, never unbounded.
+    pub fn with_max_depth(mut self, max_depth: usize) -> Self {
+        self.max_depth = max_depth.max(1);
+        self
+    }
+
+    /// A clone of this spawner at a deeper delegation level (shares all Arc-held state).
+    fn at_depth(&self, depth: usize) -> LocalSpawner {
+        LocalSpawner {
+            provider_factory: self.provider_factory.clone(),
+            roles: self.roles.clone(),
+            base_registry: self.base_registry.clone(),
+            system: self.system.clone(),
+            default_model: self.default_model.clone(),
+            limits: self.limits.clone(),
+            approver: self.approver.clone(),
+            auth: self.auth.clone(),
+            audit: self.audit.clone(),
+            depth,
+            max_depth: self.max_depth,
+        }
     }
 }
 
@@ -121,20 +202,34 @@ impl Spawner for LocalSpawner {
         let provider = (self.provider_factory)()?;
 
         // Scoped toolset; sub-agents run autonomously under the policy-bounded headless approver
-        // (auto-approve scoped, policy-permitted calls; refuse destructive ones).
-        // `task` is always excluded: sub-agents are leaves and must never spawn further sub-agents
-        // (that causes unbounded recursion — each sub-agent calls task → more sub-agents → …).
-        // `register_agent_ops` adds the reflexive ops (`plan`/`run_plan`/…) the flux-lang agent loop
-        // calls — sub-agents run the same audited loop as the top-level agent.
+        // (auto-approve scoped, policy-permitted calls; refuse destructive ones — unless an approver
+        // is injected). `register_agent_ops` adds the reflexive ops (`plan`/`run_plan`/…) the flux-lang
+        // agent loop calls — sub-agents run the same audited loop as the top-level agent.
         let mut registry = self.base_registry.subset(role.tools.as_deref());
-        registry.remove("task");
         register_agent_ops(&mut registry);
-        let mut executor = Executor::new(
-            registry,
-            PermissionManager::new(),
-            Arc::new(SubAgentApprover),
-            ToolContext::new(self.system.clone()),
-        );
+
+        // Recursion bound: a child at the leaf depth must never spawn further sub-agents, so `task` is
+        // stripped from its registry AND no spawner is installed in its context (the two guards that
+        // make a sub-agent a leaf). Below the bound, the child keeps `task` and a depth-incremented
+        // spawner. With the default `max_depth = 1`, every child is a leaf — today's behaviour exactly.
+        let child_depth = self.depth + 1;
+        let child_can_delegate = child_depth < self.max_depth;
+        let mut ctx = ToolContext::new(self.system.clone());
+        if child_can_delegate {
+            // Bounded nested delegation: the child keeps both halves of the delegation capability —
+            // the `task` tool in its registry AND a depth-incremented spawner in its context.
+            registry.register(Arc::new(TaskTool));
+            ctx = ctx.with_spawner(Arc::new(self.at_depth(child_depth)));
+        } else {
+            // Leaf: never spawn further sub-agents. Both guards apply — `task` is stripped from the
+            // registry and no spawner is installed in the context.
+            registry.remove("task");
+        }
+        let approver: Arc<dyn Approver> = self
+            .approver
+            .clone()
+            .unwrap_or_else(|| Arc::new(SubAgentApprover));
+        let mut executor = Executor::new(registry, PermissionManager::new(), approver, ctx);
         if let Some((policy, caller, trust)) = &self.auth {
             executor = executor
                 .with_policy(policy.clone())
@@ -144,19 +239,145 @@ impl Spawner for LocalSpawner {
         // The role *is* the agent definition: body → system prompt, `tools` already applied to the
         // scoped registry above, model inherits the spawner default when the role doesn't override it.
         let mut spec = role.to_spec(&self.default_model);
-        spec.max_tokens = self.max_tokens;
-        spec.max_iterations = self.max_iterations;
+        spec.max_tokens = self.limits.max_tokens;
+        spec.max_iterations = self.limits.max_iterations;
 
-        let events = Arc::new(EventStore::in_memory()?);
+        // Child runs persist into the shared (tenant) store when auditing; otherwise a throwaway
+        // in-memory store keeps the sub-agent ephemeral (the historical default).
+        let events = match &self.audit {
+            Some(store) => store.clone(),
+            None => Arc::new(EventStore::in_memory()?),
+        };
         let session_id = events.create_session(&spec.model)?;
-        let flow = flux_flow::state::FlowStore::in_memory()?;
+        // Share the event store with the flow store so the child's run trace (its inner tool calls)
+        // lands in the same log as its conversation — into the shared audit store when one is set.
+        let flow = flux_flow::state::FlowStore::in_memory_with_events(events.clone())?;
         let engine = spec.into_engine(Arc::from(provider), executor, events, flow)?;
 
+        // The child runs under a child of the parent's cancel token: cancelling the parent turn
+        // cancels the child. A wall-clock deadline fires that same token (cooperative termination) and
+        // returns a typed error, rather than dropping the future mid-turn.
+        let run_cancel = cancel.child_token();
         let mut sink = TextCollector::default();
-        engine
-            .run_turn_cancellable(&session_id, task, &mut sink, cancel)
-            .await?;
+        match self.limits.wall_clock {
+            Some(dur) => {
+                let run = engine.run_turn_cancellable(&session_id, task, &mut sink, &run_cancel);
+                tokio::pin!(run);
+                tokio::select! {
+                    res = &mut run => { res?; }
+                    _ = tokio::time::sleep(dur) => {
+                        run_cancel.cancel();
+                        // Let the child observe the cancel and finalize a valid session shape.
+                        let _ = run.await;
+                        return Err(Error::Other(format!(
+                            "sub-agent '{role_name}' exceeded its {dur:?} wall-clock limit"
+                        )));
+                    }
+                }
+            }
+            None => {
+                engine
+                    .run_turn_cancellable(&session_id, task, &mut sink, &run_cancel)
+                    .await?;
+            }
+        }
         Ok(sink.text)
+    }
+}
+
+/// A reusable bundle for wiring sub-agents into any surface (the CLI, the SDK): the role catalog, the
+/// tool surface children may be granted, how to build a fresh provider per child, and the safety
+/// knobs. [`SubAgents::into_spawner`] is the single construction path — the surface then registers
+/// [`TaskTool`] into its own catalog and installs the returned spawner via `ToolContext::with_spawner`.
+pub struct SubAgents {
+    /// The named roles a `task` call may target (in-memory or disk-loaded).
+    pub roles: RoleRegistry,
+    /// The tool surface children may be granted — each role's `tools` allowlist subsets this. Kept
+    /// explicit (not the parent's assembled registry) so child wiring is decoupled from parent
+    /// registration order and the child's tool surface is auditable.
+    pub child_base: ToolRegistry,
+    pub provider_factory: ProviderFactory,
+    pub default_model: String,
+    pub limits: SpawnLimits,
+    pub approver: Option<Arc<dyn Approver>>,
+    pub auth: Option<(AuthorizationPolicy, Caller, Trust)>,
+    pub audit: Option<Arc<EventStore>>,
+}
+
+impl SubAgents {
+    /// A bundle with default limits for `max_tokens`; everything else off (no approver override, no
+    /// inherited authorization, no audit store). Set those with the `with_*` methods.
+    pub fn new(
+        roles: RoleRegistry,
+        child_base: ToolRegistry,
+        provider_factory: ProviderFactory,
+        default_model: impl Into<String>,
+        max_tokens: u32,
+    ) -> Self {
+        Self {
+            roles,
+            child_base,
+            provider_factory,
+            default_model: default_model.into(),
+            limits: SpawnLimits::new(max_tokens),
+            approver: None,
+            auth: None,
+            audit: None,
+        }
+    }
+
+    /// Inherit an authorization policy + resolved identity (the parent's floor) for every sub-agent.
+    pub fn with_authorization(
+        mut self,
+        policy: AuthorizationPolicy,
+        caller: Caller,
+        trust: Trust,
+    ) -> Self {
+        self.auth = Some((policy, caller, trust));
+        self
+    }
+
+    /// Override the per-sub-agent resource limits.
+    pub fn with_limits(mut self, limits: SpawnLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Inject the approver a sub-agent's tool calls dispatch through.
+    pub fn with_approver(mut self, approver: Arc<dyn Approver>) -> Self {
+        self.approver = Some(approver);
+        self
+    }
+
+    /// Persist child runs into a shared (tenant) event store for auditability.
+    pub fn with_audit(mut self, events: Arc<EventStore>) -> Self {
+        self.audit = Some(events);
+        self
+    }
+
+    /// Build the spawner over `system` (the guarded IO surface children share). The caller registers
+    /// [`TaskTool`] into its catalog and installs the returned spawner via `ToolContext::with_spawner`.
+    pub fn into_spawner(self, system: Arc<System>) -> Arc<dyn Spawner> {
+        let limits = self.limits;
+        let mut spawner = LocalSpawner::new(
+            self.provider_factory,
+            Arc::new(self.roles),
+            self.child_base,
+            system,
+            self.default_model,
+            limits.max_tokens,
+        )
+        .with_limits(limits);
+        if let Some(approver) = self.approver {
+            spawner = spawner.with_approver(approver);
+        }
+        if let Some((policy, caller, trust)) = self.auth {
+            spawner = spawner.with_authorization(policy, caller, trust);
+        }
+        if let Some(store) = self.audit {
+            spawner = spawner.with_audit(store);
+        }
+        Arc::new(spawner)
     }
 }
 
@@ -376,9 +597,13 @@ impl Tool for TaskTool {
         let Some(spawner) = &ctx.spawner else {
             return Ok(ToolResult::error("no sub-agent spawner configured"));
         };
-        // The `task` tool isn't separately interruptible from the parent turn (the executor doesn't
-        // thread a token into tools); use a fresh token so the sub-agent runs to completion.
-        let cancel = CancellationToken::new();
+        // Thread a child of the parent turn's cancellation token (installed on the context per turn by
+        // the engine) so cancelling the parent turn cancels the sub-agent. Outside a cancellable driver
+        // (e.g. the one-shot SDK path) no token is installed and the sub-agent runs to completion.
+        let cancel = ctx
+            .cancel_token()
+            .map(|t| t.child_token())
+            .unwrap_or_default();
         match spawner.spawn(role, task, &cancel).await {
             Ok(text) => Ok(ToolResult::ok(text)),
             Err(e) => Ok(ToolResult::error(e.to_string())),
@@ -885,5 +1110,494 @@ mod tests {
         assert!(out.contains("── plan ──"));
         assert!(out.contains("── result ──"));
         assert!(out.contains("scouted: 3 files"));
+    }
+
+    // ----- D-05 hardening -----
+
+    /// A clean, per-test workspace (unique dir, wiped first) so marker files from one test can't leak
+    /// into another running in parallel or a stale prior run.
+    fn unique_system(tag: &str) -> Arc<System> {
+        let dir = std::env::temp_dir().join(format!("flux-orch-d05-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Arc::new(System::new(Workspace::new(&dir).unwrap()))
+    }
+
+    /// A provider that hangs forever on its first call — stands in for a runaway/stuck sub-agent.
+    struct HangProvider;
+    #[async_trait]
+    impl Provider for HangProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, _r: Request) -> Result<ChunkStream> {
+            futures::future::pending::<()>().await;
+            unreachable!()
+        }
+    }
+
+    /// WS2: a wall-clock deadline fires the child's cancel token (cooperative termination) and surfaces
+    /// a typed timeout error, instead of letting a stuck sub-agent run forever.
+    #[tokio::test]
+    async fn wall_clock_deadline_aborts_a_hung_sub_agent() {
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role("---\ntools: []\n---\nYou stall.", "sloth"));
+        let spawner = LocalSpawner::new(
+            Arc::new(|| Ok(Box::new(HangProvider))),
+            Arc::new(roles),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1024,
+        )
+        .with_limits(SpawnLimits {
+            max_iterations: 30,
+            max_tokens: 1024,
+            wall_clock: Some(std::time::Duration::from_millis(100)),
+        });
+
+        // The 5s guard fails the test (rather than hanging CI) if the deadline doesn't fire.
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            spawner.spawn("sloth", "spin forever", &CancellationToken::new()),
+        )
+        .await
+        .expect("spawn should return by its wall-clock deadline, not hang");
+        let err = out.expect_err("a hung sub-agent past its deadline must error");
+        assert!(
+            err.to_string().contains("wall-clock"),
+            "expected a wall-clock timeout error, got: {err}"
+        );
+    }
+
+    /// WS2: cancelling the parent turn cancels the sub-agent. The `task` tool threads a child of the
+    /// context's cancel token into the spawner — so a cancelled parent token stops a stuck child rather
+    /// than the old orphan-token behaviour that let it run on regardless.
+    #[tokio::test]
+    async fn parent_cancellation_propagates_to_the_sub_agent() {
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role("---\ntools: []\n---\nYou stall.", "sloth"));
+        let spawner: Arc<dyn Spawner> = Arc::new(LocalSpawner::new(
+            Arc::new(|| Ok(Box::new(HangProvider))),
+            Arc::new(roles),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1024,
+        ));
+
+        // A pre-cancelled parent token, installed on the context the way the engine installs it per
+        // turn. With the orphan-token bug, `task` ignored it and the hung child ran forever.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let ctx = ToolContext::new(temp_system()).with_spawner(spawner);
+        ctx.set_cancel(cancel);
+
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            TaskTool.execute(&ctx, json!({"role": "sloth", "task": "spin forever"})),
+        )
+        .await;
+        assert!(
+            r.is_ok(),
+            "task hung despite a cancelled parent token (orphan-token regression)"
+        );
+    }
+
+    /// An op that writes a marker iff it actually executes (used to prove an approver blocked it).
+    struct Ping;
+    #[async_trait]
+    impl Tool for Ping {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only("ping", "p", json!({"type": "object"}))
+        }
+        async fn execute(&self, ctx: &ToolContext, _p: Value) -> Result<ToolResult> {
+            ctx.system.write_file("PINGED.marker", "1").await?;
+            Ok(ToolResult::ok("pong"))
+        }
+    }
+
+    /// A provider that plans a single `ping` call (turn 0) then finishes with prose (turn 1).
+    struct PingPlanMock {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Provider for PingPlanMock {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, _r: Request) -> Result<ChunkStream> {
+            let n = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let chunks = if n == 0 {
+                vec![
+                    Chunk::Block(ContentBlock::ToolUse {
+                        id: "p".into(),
+                        name: "emit_plan".into(),
+                        input: json!({ "ast": { "body": [{ "kind": "call", "op": "ping", "args": [] }] } }),
+                    }),
+                    Chunk::Done {
+                        stop_reason: Some(StopReason::ToolUse),
+                    },
+                ]
+            } else {
+                vec![
+                    Chunk::Block(ContentBlock::Text {
+                        text: "done".into(),
+                    }),
+                    Chunk::Done {
+                        stop_reason: Some(StopReason::EndTurn),
+                    },
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    /// WS3: an injected approver governs the sub-agent's tool calls. A deny-everything approver blocks
+    /// the child's `ping` — which the default `SubAgentApprover` would have allowed.
+    #[tokio::test]
+    async fn injected_approver_governs_the_sub_agent() {
+        struct DenyAll;
+        #[async_trait]
+        impl Approver for DenyAll {
+            async fn request(&self, _t: &str, _s: &[String], _i: &IntentSet) -> ApprovalChoice {
+                ApprovalChoice::Deny
+            }
+        }
+
+        let system = unique_system("approver");
+        let mut base = ToolRegistry::new();
+        base.register(Arc::new(Ping));
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role(
+            "---\ntools: [ping]\n---\nYou are a scout.",
+            "scout",
+        ));
+        let spawner = LocalSpawner::new(
+            Arc::new(|| {
+                Ok(Box::new(PingPlanMock {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }))
+            }),
+            Arc::new(roles),
+            base,
+            system.clone(),
+            "mock",
+            1024,
+        )
+        .with_approver(Arc::new(DenyAll));
+
+        let out = spawner
+            .spawn("scout", "scout the repo", &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(out, "done");
+        assert!(
+            system.read_file("PINGED.marker").await.is_err(),
+            "the injected deny-all approver must block the child's ping"
+        );
+    }
+
+    /// WS3 (isolation): a sub-agent inherits the parent's workspace-confined `System`, so a child op
+    /// cannot read outside the workspace — the filesystem half of account isolation.
+    #[tokio::test]
+    async fn sub_agent_is_confined_to_the_parent_workspace() {
+        /// Probes a path outside the workspace and records whether the guarded surface denied it.
+        struct EscapeProbe;
+        #[async_trait]
+        impl Tool for EscapeProbe {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec::read_only("escape_probe", "p", json!({"type": "object"}))
+            }
+            async fn execute(&self, ctx: &ToolContext, _p: Value) -> Result<ToolResult> {
+                let escaped = ctx.system.read_file("../../../../../../etc/hostname").await;
+                ctx.system
+                    .write_file(
+                        "PROBE.marker",
+                        if escaped.is_err() { "denied" } else { "LEAKED" },
+                    )
+                    .await?;
+                Ok(ToolResult::ok("probed"))
+            }
+        }
+
+        struct ProbePlanMock {
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for ProbePlanMock {
+            fn name(&self) -> &str {
+                "mock"
+            }
+            async fn stream(&self, _r: Request) -> Result<ChunkStream> {
+                let n = self
+                    .calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let chunks = if n == 0 {
+                    vec![
+                        Chunk::Block(ContentBlock::ToolUse {
+                            id: "p".into(),
+                            name: "emit_plan".into(),
+                            input: json!({ "ast": { "body": [{ "kind": "call", "op": "escape_probe", "args": [] }] } }),
+                        }),
+                        Chunk::Done {
+                            stop_reason: Some(StopReason::ToolUse),
+                        },
+                    ]
+                } else {
+                    vec![
+                        Chunk::Block(ContentBlock::Text {
+                            text: "done".into(),
+                        }),
+                        Chunk::Done {
+                            stop_reason: Some(StopReason::EndTurn),
+                        },
+                    ]
+                };
+                Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+            }
+        }
+
+        let system = unique_system("escape");
+        let mut base = ToolRegistry::new();
+        base.register(Arc::new(EscapeProbe));
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role(
+            "---\ntools: [escape_probe]\n---\nYou probe.",
+            "prober",
+        ));
+        let spawner = LocalSpawner::new(
+            Arc::new(|| {
+                Ok(Box::new(ProbePlanMock {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }))
+            }),
+            Arc::new(roles),
+            base,
+            system.clone(),
+            "mock",
+            1024,
+        );
+        spawner
+            .spawn("prober", "try to escape", &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            system.read_file("PROBE.marker").await.unwrap(),
+            "denied",
+            "the sub-agent must not read outside the parent's workspace"
+        );
+    }
+
+    /// WS4: with an audit store, the child's run (and its inner tool call) persists into the shared
+    /// store the parent reads — instead of a throwaway in-memory one.
+    #[tokio::test]
+    async fn audit_store_captures_child_run_events() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        assert!(store.latest_session().unwrap().is_none());
+
+        let mut base = ToolRegistry::new();
+        base.register(Arc::new(Ping));
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role(
+            "---\ntools: [ping]\n---\nYou are a scout.",
+            "scout",
+        ));
+        let spawner = LocalSpawner::new(
+            Arc::new(|| {
+                Ok(Box::new(PingPlanMock {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }))
+            }),
+            Arc::new(roles),
+            base,
+            temp_system(),
+            "mock",
+            1024,
+        )
+        .with_audit(store.clone());
+
+        spawner
+            .spawn("scout", "scout the repo", &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let child = store
+            .latest_session()
+            .unwrap()
+            .expect("child session created in the shared audit store");
+        let trace = store.run_trace(&child).unwrap();
+        assert!(
+            !trace.is_empty(),
+            "the child's run events should land in the shared audit store"
+        );
+    }
+
+    /// WS4: without an audit store, a shared store handed elsewhere stays untouched (no regression for
+    /// the CLI / self-improvement loop, which keep ephemeral in-memory child stores).
+    #[tokio::test]
+    async fn without_audit_the_shared_store_is_untouched() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role("---\n---\nscout prompt", "scout"));
+        let spawner = LocalSpawner::new(
+            Arc::new(|| Ok(Box::new(MockProvider))),
+            Arc::new(roles),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1024,
+        );
+        spawner
+            .spawn("scout", "recon", &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            store.latest_session().unwrap().is_none(),
+            "no audit store configured → the shared store must be untouched"
+        );
+    }
+
+    /// WS5: roles register in memory (no shared `.flux/agents` directory) and spawn.
+    #[tokio::test]
+    async fn in_memory_roles_spawn() {
+        let roles = RoleRegistry::from_roles([Role {
+            name: "scout".into(),
+            description: "recon".into(),
+            model: None,
+            tools: Some(Vec::new()),
+            prompt: "You are a scout.".into(),
+        }]);
+        assert_eq!(roles.names(), vec!["scout"]);
+        let spawner = LocalSpawner::new(
+            Arc::new(|| Ok(Box::new(MockProvider))),
+            Arc::new(roles),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1024,
+        );
+        let out = spawner
+            .spawn("scout", "look around", &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(out, "scouted: 3 files");
+    }
+
+    /// WS5: `max_depth` bounds nested delegation. With the default (1) a child is a leaf and cannot
+    /// delegate; with `max_depth = 2` it can — the grandchild runs and leaves its marker.
+    #[tokio::test]
+    async fn max_depth_bounds_nested_delegation() {
+        /// The grandchild op: writes a marker iff a second-level sub-agent actually ran.
+        struct GrandPing;
+        #[async_trait]
+        impl Tool for GrandPing {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec::read_only("ping", "p", json!({"type": "object"}))
+            }
+            async fn execute(&self, ctx: &ToolContext, _p: Value) -> Result<ToolResult> {
+                ctx.system.write_file("GRANDCHILD.marker", "1").await?;
+                Ok(ToolResult::ok("pong"))
+            }
+        }
+
+        /// Role-discriminating mock: a "DELEGATE" role plans `task("inner", …)`; a leaf "inner" role
+        /// plans `ping`. Per-instance call counter (a fresh provider is built per sub-agent).
+        struct DepthMock {
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for DepthMock {
+            fn name(&self) -> &str {
+                "mock"
+            }
+            async fn stream(&self, req: Request) -> Result<ChunkStream> {
+                let n = self
+                    .calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let is_delegator = req.system.unwrap_or_default().contains("DELEGATE");
+                let chunks = if n == 0 {
+                    let ast = if is_delegator {
+                        json!({ "body": [{ "kind": "call", "op": "task", "args": [
+                            { "kind": "lit", "value": "inner" },
+                            { "kind": "lit", "value": "do the thing" }
+                        ] }] })
+                    } else {
+                        json!({ "body": [{ "kind": "call", "op": "ping", "args": [] }] })
+                    };
+                    vec![
+                        Chunk::Block(ContentBlock::ToolUse {
+                            id: "p".into(),
+                            name: "emit_plan".into(),
+                            input: json!({ "ast": ast }),
+                        }),
+                        Chunk::Done {
+                            stop_reason: Some(StopReason::ToolUse),
+                        },
+                    ]
+                } else {
+                    vec![
+                        Chunk::Block(ContentBlock::Text {
+                            text: "done".into(),
+                        }),
+                        Chunk::Done {
+                            stop_reason: Some(StopReason::EndTurn),
+                        },
+                    ]
+                };
+                Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+            }
+        }
+
+        fn build(system: Arc<System>, max_depth: usize) -> LocalSpawner {
+            let mut base = ToolRegistry::new();
+            base.register(Arc::new(GrandPing));
+            let mut roles = RoleRegistry::default();
+            roles.insert(parse_role(
+                "---\ntools: [ping]\n---\nYou DELEGATE to a sub-agent.",
+                "delegator",
+            ));
+            roles.insert(parse_role(
+                "---\ntools: [ping]\n---\nYou are a leaf.",
+                "inner",
+            ));
+            LocalSpawner::new(
+                Arc::new(|| {
+                    Ok(Box::new(DepthMock {
+                        calls: std::sync::atomic::AtomicUsize::new(0),
+                    }))
+                }),
+                Arc::new(roles),
+                base,
+                system,
+                "mock",
+                1024,
+            )
+            .with_max_depth(max_depth)
+        }
+
+        // Default depth (1): the delegator is a leaf — its `task` call finds no tool, so no grandchild.
+        let sys1 = unique_system("depth-leaf");
+        build(sys1.clone(), 1)
+            .spawn("delegator", "go", &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            sys1.read_file("GRANDCHILD.marker").await.is_err(),
+            "default max_depth=1 must keep children leaves (no nested delegation)"
+        );
+
+        // max_depth=2: the delegator may spawn the inner leaf, which runs `ping` and leaves its marker.
+        let sys2 = unique_system("depth-nested");
+        build(sys2.clone(), 2)
+            .spawn("delegator", "go", &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            sys2.read_file("GRANDCHILD.marker").await.is_ok(),
+            "max_depth=2 must allow one level of nested delegation"
+        );
     }
 }

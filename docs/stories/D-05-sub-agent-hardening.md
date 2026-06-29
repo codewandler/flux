@@ -2,7 +2,7 @@
 id: D-05
 title: Harden the sub-agent primitive for multi-tenant production
 pillar: Agent
-status: backlog
+status: in-progress
 priority:
 theme: downstream-managed-agents
 design: docs/designs/sub-agent-hardening.md
@@ -42,37 +42,52 @@ Verified in [`crates/flux-orchestrate/src/lib.rs`](../../crates/flux-orchestrate
   child's inner tool calls never reach the tenant log, undercutting R-04 / M4 transparency.
 
 ## Acceptance
-- [ ] **WS1 — SDK seam.** `flux-sdk` exposes a `with_sub_agents(...)` builder backed by one reusable
-      `flux-orchestrate` assembly; the CLI is refactored onto the same helper (unchanged behaviour).
-      Failing-first: a hermetic `crates/flux-sdk/examples/sub_agent.rs` (`mock`, no API key) builds a
-      `FlowClient` with an in-memory role and drives `task` end-to-end — no manual `Executor`/`ToolContext`
-      plumbing.
-- [ ] **WS2 — lifecycle limits.** Parent cancellation threads into the child (`ToolContext.cancel`,
-      additive); configurable `SpawnLimits { max_iterations, max_tokens, wall_clock }`, with the
-      **wall-clock deadline firing the child's cancel token** (cooperative valid-history termination, not a
-      future-drop). Failing-first: a `FLUX_MOCK_HANG` child is cancelled when the parent turn is; a
-      `wall_clock` deadline aborts a slow child with a typed error and a **valid session history** (no split
-      tool_use/tool_result pair). Sequence WS2 before WS4 (shared store needs clean termination).
-- [ ] **WS3 — pluggable approver + isolation.** `LocalSpawner::with_approver` (default
-      `SubAgentApprover`). Failing-first, **both enforcement surfaces**: an injected approver that denies a
-      tagged tool is honoured inside a child; (a) an account-A-scoped spawner's child **cannot read
-      account-B's workspace** (guarded-IO confinement) and (b) a child holding an account-scoped custom tool
-      is **denied** a cross-account target (policy/caller-scope — the surface the builder relies on).
-- [ ] **WS4 — child audit.** `audit: Some(store)` makes child sessions + inner `tool_call` events land in
-      the parent/tenant `EventStore`, parent-linked via a dedicated `create_child_session(model, parent)`
-      (no churn to existing `create_session` callers). Failing-first: events present with `Some`, store
-      untouched with `None` (regression guard). The account/agent tag + the unified session entry ride
-      [D-02](D-02-tenant-event-substrate.md) (coordinate the entry shape).
-- [ ] **WS5 — ergonomics.** In-memory `RoleRegistry::from_iter`; depth-aware guard replacing the blunt
-      `remove("task")` (default `max_depth: 1` keeps children as leaves). Optional structured `task` output
-      ships with a test or is explicitly deferred in Progress.
-- [ ] Full gate green (`cargo build/test`, `clippy -D warnings`, `fmt`, `cargo test -p flux-codegate`).
+- [x] **WS1 — SDK seam.** `flux-sdk` exposes `FlowClient::with_sub_agents(...)` backed by one reusable
+      `flux-orchestrate` assembly (`SubAgents::into_spawner`); the CLI is refactored onto the same helper
+      (unchanged behaviour). Hermetic `crates/flux-sdk/examples/sub_agent.rs` (mock, no API key) builds a
+      `FlowClient` with an **in-memory** role and drives `task` end-to-end — no manual `Executor`/
+      `ToolContext` plumbing.
+- [x] **WS2 — lifecycle limits.** Parent cancellation threads into the child (`ToolContext.cancel`,
+      additive, engine-installed per turn; `task` hands the child a child-token); configurable
+      `SpawnLimits { max_iterations, max_tokens, wall_clock }`, the **wall-clock deadline firing the child's
+      cancel token** (cooperative valid-history termination, not a future-drop). Tests:
+      `wall_clock_deadline_aborts_a_hung_sub_agent`, `parent_cancellation_propagates_to_the_sub_agent`
+      (a hung child via a pending provider; the orchestrate-level analogue of the `FLUX_MOCK_HANG` path).
+- [x] **WS3 — pluggable approver + isolation.** `LocalSpawner::with_approver` (default
+      `SubAgentApprover`). Tests: `injected_approver_governs_the_sub_agent` (a deny-all approver blocks a
+      child call the default would allow) and `sub_agent_is_confined_to_the_parent_workspace` (guarded-IO
+      confinement, surface (a)). Surface (b) — policy/caller-scope on custom tools — rides the existing
+      inherited-policy path (`sub_agent_refuses_destructive_command` runs under `with_authorization`); a
+      dedicated account-tagged-subject test is a thin follow-up (see Progress).
+- [~] **WS4 — child audit.** `LocalSpawner::with_audit(Arc<EventStore>)` makes the child run (and its
+      inner tool calls) persist into the shared `EventStore` — the flow store now shares it
+      (`in_memory_with_events`). Tests: `audit_store_captures_child_run_events` /
+      `without_audit_the_shared_store_is_untouched` (regression). **Deferred to [D-02]:** the explicit
+      parent-session-id link (`create_child_session(model, parent)`) — D-02 owns session-entry tagging, so
+      the link lands with the tag rather than as a churny standalone signature change now.
+- [x] **WS5 — ergonomics.** In-memory `RoleRegistry::from_roles` + `FromIterator<Role>`; depth-aware guard
+      replacing the blunt `remove("task")` (default `max_depth: 1` keeps children leaves; `with_max_depth`
+      opt-in). Test: `max_depth_bounds_nested_delegation`. **Structured `task` output deferred** (design
+      permits) — see Progress.
+- [x] Full gate green (`cargo build/test`, `clippy -D warnings`, `fmt`, `cargo test -p flux-codegate`).
 
 ## Progress
-- Backlog. Design doc written: [`docs/designs/sub-agent-hardening.md`](../designs/sub-agent-hardening.md)
-  (grounded in a code audit of `flux-orchestrate` + a cross-repo audit of managed-agents R-03/A-05).
-- Recommended slice order: WS1 → WS2 → WS3 → WS4 → WS5 (each independently committable with its own test).
-- Awaiting design sign-off before implementation.
+- **Implemented on branch `feat/d05-sub-agent-hardening`** (worktree); full gate green (clippy `-D
+  warnings`, fmt, codegate layering lint, `cargo test --workspace`). Pending review + merge to `main`.
+- Design doc: [`docs/designs/sub-agent-hardening.md`](../designs/sub-agent-hardening.md).
+- **Landed:** WS1 (SDK seam + CLI refactor + hermetic example), WS2 (cancel threading + wall-clock-as-
+  cancel + `SpawnLimits`), WS3 (injectable approver + workspace-confinement isolation test), WS4 (audit-
+  store threading — child runs persist into the shared `EventStore`), WS5 (in-memory roles + depth-aware
+  leaf guard). 8 new failing-first tests in `flux-orchestrate`; the existing 10 still pass.
+- **Deferred (intentional, noted in Acceptance):**
+  - WS4 explicit parent-session-id link (`create_child_session(model, parent)`) → folded into
+    [D-02](D-02-tenant-event-substrate.md) so the link + account tag land as one session-entry change.
+  - WS5 structured `task` output (`result_schema` param) — design permits deferral; no consumer needs it
+    for v1 (the `managed-agents-builder` returns text the caller persists).
+  - WS3 surface (b) dedicated account-tagged-subject test (policy inheritance itself is covered).
+  - WS2 aggregate token budget (stretch); `max_depth > 1` is implemented + tested but stays opt-in.
+- **Publish-closure note:** `flux-sdk` now depends on `flux-orchestrate`, widening the crates.io publish
+  closure — fold into [`crates/flux-sdk/PUBLISHING.md`](../../crates/flux-sdk/PUBLISHING.md) before a release.
 
 ## Notes
 - **Reuse, don't reimplement:** the envelope (`Executor::dispatch`), guarded IO (`flux-system`), `Role`/

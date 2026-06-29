@@ -97,6 +97,12 @@ impl RoleRegistry {
         n
     }
 
+    /// Build a registry from in-memory roles — for a programmatic consumer (e.g. a multi-tenant
+    /// service) that registers roles in code rather than from a shared `.flux/agents` directory.
+    pub fn from_roles(roles: impl IntoIterator<Item = Role>) -> Self {
+        roles.into_iter().collect()
+    }
+
     /// Load roles from `*.md` files under each directory (filename stem = default role name).
     pub fn load(dirs: &[PathBuf]) -> Self {
         let mut reg = RoleRegistry::default();
@@ -116,6 +122,16 @@ impl RoleRegistry {
                     }
                 }
             }
+        }
+        reg
+    }
+}
+
+impl FromIterator<Role> for RoleRegistry {
+    fn from_iter<I: IntoIterator<Item = Role>>(iter: I) -> Self {
+        let mut reg = RoleRegistry::default();
+        for role in iter {
+            reg.insert(role);
         }
         reg
     }

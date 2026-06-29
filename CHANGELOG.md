@@ -8,6 +8,28 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Sub-agents are production-hardened for multi-tenant consumption (D-05).** The `flux-orchestrate`
+  sub-agent primitive — single-tenant and wired only in the CLI — now has the seams a downstream service
+  (managed-agents R-03/A-05) needs:
+  - **SDK seam.** `FlowClient::with_sub_agents(SubAgents { … })` registers the `task` tool and installs
+    the spawner into every run's context, so a consumer drives sub-agents without re-assembling the
+    executor/registry/context by hand. `SubAgents::into_spawner` is the single construction path; the CLI
+    refactors onto it (unchanged behaviour). Hermetic `flux-sdk` example `sub_agent.rs` (mock, no API key).
+  - **Lifecycle limits.** Configurable `SpawnLimits { max_iterations, max_tokens, wall_clock }`; the
+    wall-clock deadline **fires the child's cancel token** (cooperative, valid-history termination) rather
+    than dropping the future mid-turn. The `task` tool now threads a child of the parent turn's cancel
+    token (installed on `ToolContext` per turn by the engine) into the sub-agent — cancelling the parent
+    cancels the child, fixing the old orphan-token behaviour.
+  - **Pluggable approver.** `LocalSpawner::with_approver` lets a consumer approval-gate a sub-agent's
+    mutations instead of the hardcoded auto-approve-non-destructive default.
+  - **Audit threading.** `LocalSpawner::with_audit(EventStore)` persists a child's run (and its inner tool
+    calls) into a shared tenant event store — the flow store now shares it — instead of a throwaway
+    in-memory one. (The account/agent tag + explicit parent-session link land with D-02.)
+  - **Ergonomics.** In-memory roles (`RoleRegistry::from_roles` / `FromIterator<Role>`) for programmatic
+    consumers, and a depth-aware recursion guard (`with_max_depth`, default `1` keeps children leaves;
+    `> 1` is a bounded opt-in). 8 new failing-first tests in `flux-orchestrate`. Isolation stays
+    composition over the existing envelope — no new sandbox. See
+    [`docs/designs/sub-agent-hardening.md`](docs/designs/sub-agent-hardening.md).
 - **Per-turn token usage flows through the unified loop and renders in the CLI.** The planner's token
   counts are now captured from the provider stream (`compile_turn` returns them), accumulated across a
   turn's planner calls by the loop host (output summed; input/cache reflect the final, largest prompt

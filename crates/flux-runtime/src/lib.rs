@@ -133,6 +133,12 @@ pub struct ToolContext {
     /// ops, and any sibling run that re-enters this same context all write to **one** audit trail.
     /// Lives here (not Executor-private) so the `observe`/`evidence` ops can read and append to it.
     pub evidence: Arc<Mutex<EvidenceLog>>,
+    /// The turn's cancellation token, installed per turn by the engine (interior-mutable so the
+    /// shared, long-lived context can carry a fresh token each turn — same lifecycle as `loop_host`).
+    /// A spawning tool (`task`) threads a child of this token into its sub-agent so cancelling the
+    /// parent turn cancels the child; `None` (no cancellable driver, e.g. the one-shot SDK path) means
+    /// the sub-agent simply runs to completion.
+    cancel: Arc<Mutex<Option<tokio_util::sync::CancellationToken>>>,
 }
 
 impl ToolContext {
@@ -144,7 +150,19 @@ impl ToolContext {
             loop_host: None,
             read_times: Arc::new(Mutex::new(HashMap::new())),
             evidence: Arc::new(Mutex::new(EvidenceLog::new())),
+            cancel: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Install the turn's cancellation token (the engine calls this per turn before running the loop).
+    /// Interior-mutable so a cloned, shared context picks it up.
+    pub fn set_cancel(&self, token: tokio_util::sync::CancellationToken) {
+        *self.cancel.lock().unwrap() = Some(token);
+    }
+
+    /// The turn's cancellation token, if a cancellable driver installed one.
+    pub fn cancel_token(&self) -> Option<tokio_util::sync::CancellationToken> {
+        self.cancel.lock().unwrap().clone()
     }
 
     /// Record that `path` was read at `mtime` (called by `read`/`read_many`).

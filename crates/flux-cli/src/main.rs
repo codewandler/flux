@@ -25,7 +25,7 @@ use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
 use flux_flow::state::FlowStore;
 use flux_flow::AgentSink;
-use flux_orchestrate::{LocalSpawner, ProviderFactory, Role, RoleRegistry, TaskTool};
+use flux_orchestrate::{ProviderFactory, Role, RoleRegistry, SubAgents, TaskTool};
 use flux_provider::{ChunkStream, Effort, NativeProvider, Provider, Request};
 use flux_providers::anthropic::anthropic_from_env;
 use flux_providers::openai::{ollama_api, openai_from_env, openrouter_from_env};
@@ -767,24 +767,20 @@ async fn build_agent(
 
     // Sub-agent spawner (multi-agent orchestration): the `task` tool delegates to roles, each run
     // as an isolated sub-agent — bounded by the same authorization policy (no blanket allow).
-    let roles = Arc::new(load_roles(&cwd));
-    let mut sub_registry = ToolRegistry::new();
-    flux_tools::register_builtins(&mut sub_registry);
+    let roles = load_roles(&cwd);
+    let mut child_base = ToolRegistry::new();
+    flux_tools::register_builtins(&mut child_base);
     let factory: ProviderFactory = {
         let spec = model_spec.clone();
         Arc::new(move || provider_for(&spec).map_err(|e| flux_core::Error::Other(e.to_string())))
     };
-    let spawner: Arc<dyn flux_runtime::Spawner> = Arc::new(
-        LocalSpawner::new(
-            factory,
-            roles,
-            sub_registry,
-            system.clone(),
-            model.clone(),
-            flags.max_tokens,
-        )
-        .with_authorization(policy.clone(), caller.clone(), trust.clone()),
-    );
+    // One construction path for sub-agents (shared with the SDK's `FlowClient::with_sub_agents`):
+    // `SubAgents::into_spawner` builds the spawner; we register `TaskTool` into the top-level registry
+    // below. Sub-agents inherit the same authorization floor as the top-level agent.
+    let spawner: Arc<dyn flux_runtime::Spawner> =
+        SubAgents::new(roles, child_base, factory, model.clone(), flags.max_tokens)
+            .with_authorization(policy.clone(), caller.clone(), trust.clone())
+            .into_spawner(system.clone());
 
     // Tools + permissions: from config (deny/allow rules); if no allow rules are configured,
     // reads are pre-allowed by default so the common case needs no config. Mutating tools prompt

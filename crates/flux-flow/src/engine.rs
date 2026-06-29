@@ -182,6 +182,9 @@ impl FlowEngine {
         ));
         self.loop_host
             .set_turn(session_id.to_string(), Some(base_system), channel.clone());
+        // Thread this turn's cancellation into the tool context so a spawning tool (`task`) can hand a
+        // child token to its sub-agent — cancelling the parent turn then cancels the child.
+        self.executor.context().set_cancel(cancel.clone());
 
         // Per-turn iteration count: snapshot the cumulative `turn.iteration` evidence now so we can
         // report only THIS turn's rounds. The executor (and its evidence log) is shared and persists

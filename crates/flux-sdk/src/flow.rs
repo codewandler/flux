@@ -51,9 +51,10 @@ use flux_flow::state::FlowStore;
 use flux_flow::AgentSink;
 use flux_lang::analyze::analyze_flow;
 use flux_lang::prelude;
+use flux_orchestrate::{SubAgents, TaskTool};
 use flux_provider::Provider;
 use flux_runtime::{
-    AllowApprover, Approver, DenyApprover, Executor, PermissionManager, Tool, ToolContext,
+    AllowApprover, Approver, DenyApprover, Executor, PermissionManager, Spawner, Tool, ToolContext,
     ToolRegistry,
 };
 use flux_system::{System, Workspace};
@@ -166,6 +167,7 @@ impl FlowClientBuilder {
             compile_opts: self.compile_opts,
             prelude_defs,
             session_id: "flux-sdk".to_string(),
+            spawner: None,
         })
     }
 }
@@ -186,6 +188,9 @@ pub struct FlowClient {
     /// [`register_prelude`](Self::register_prelude); available for catalog enrichment / inspection.
     prelude_defs: Value,
     session_id: String,
+    /// Optional sub-agent spawner (installed by [`with_sub_agents`](Self::with_sub_agents)): when set,
+    /// `build_executor` threads it into the per-run `ToolContext` so a `task` call delegates to a role.
+    spawner: Option<Arc<dyn Spawner>>,
 }
 
 impl FlowClient {
@@ -228,6 +233,17 @@ impl FlowClient {
     /// `CognitionPack::register`-style installer or `flux_tools::register_dev_builtins`.
     pub fn register_pack<F: FnOnce(&mut ToolRegistry)>(&mut self, pack: F) -> &mut Self {
         pack(&mut self.registry);
+        self
+    }
+
+    /// Attach named sub-agents: register the `task` tool into this client's catalog and build the
+    /// spawner from `sub_agents` over the client's guarded `System`. After this, a flow that calls
+    /// `task(role, …)` delegates to a role's sub-agent through the same safety envelope. The single
+    /// seam — a consumer (e.g. a multi-tenant service) drives sub-agents without re-assembling the
+    /// spawner, executor, and context by hand.
+    pub fn with_sub_agents(&mut self, sub_agents: SubAgents) -> &mut Self {
+        self.registry.register(Arc::new(TaskTool));
+        self.spawner = Some(sub_agents.into_spawner(self.system.clone()));
         self
     }
 
@@ -354,12 +370,13 @@ impl FlowClient {
         } else {
             Arc::new(DenyApprover)
         };
-        Executor::new(
-            self.registry.clone(),
-            perms,
-            approver,
-            ToolContext::new(self.system.clone()),
-        )
+        // Thread the sub-agent spawner into the per-run context when one is attached, so a `task` call
+        // can delegate. `None` (the common case) leaves the context exactly as before.
+        let mut ctx = ToolContext::new(self.system.clone());
+        if let Some(spawner) = &self.spawner {
+            ctx = ctx.with_spawner(spawner.clone());
+        }
+        Executor::new(self.registry.clone(), perms, approver, ctx)
     }
 }
 
