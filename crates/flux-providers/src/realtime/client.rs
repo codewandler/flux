@@ -175,7 +175,16 @@ pub async fn connect_ws(
                         }
                         Some(Ok(Message::Close(_))) | None => break,
                         Some(Ok(_)) => continue,
-                        Some(Err(_)) => break,
+                        Some(Err(e)) => {
+                            // Surface a mid-call transport failure before tearing down, so the driver
+                            // can distinguish it from a clean hangup (otherwise the stream just ends).
+                            let _ = ev_tx
+                                .send(ServerEvent::Error(json!({
+                                    "error": { "message": format!("transport: {e}") }
+                                })))
+                                .await;
+                            break;
+                        }
                     }
                 }
             }

@@ -85,6 +85,11 @@ impl VoiceSessionDriver {
                                 let _ = session.cancel_response().await;
                                 response_active = false;
                             }
+                            // A barge-in is a new user turn — disarm any pending forced continuation so
+                            // we don't make the model speak a tool-driven reply over the user. The
+                            // in-flight tool result still flows back to the model for history.
+                            response_done = false;
+                            response_had_tools = false;
                             sink.barge_in();
                         }
                         RealtimeEvent::SpeechStopped => {}
@@ -99,8 +104,9 @@ impl VoiceSessionDriver {
                             sink.response_done();
                         }
                         RealtimeEvent::ToolCall { call_id, name, arguments } => {
-                            let params: Value =
-                                serde_json::from_str(&arguments).unwrap_or(Value::Null);
+                            // Default malformed/empty args to an empty object (tools expect an object).
+                            let params: Value = serde_json::from_str(&arguments)
+                                .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
                             sink.tool_call(&name, &params);
                             response_had_tools = true;
                             tools_in_flight += 1;
@@ -140,6 +146,10 @@ impl VoiceSessionDriver {
     /// cross-turn `await` — a single suspendable flow owning the whole call stays future work. The
     /// handler runs inline here for simplicity; a production driver would spawn it off the audio loop
     /// like a tool call. The executor this driver holds is unused in this mode (the flow owns tools).
+    ///
+    /// Configure [`RealtimeConfig::turn_detection`](flux_provider::RealtimeConfig) so the model does
+    /// **not** auto-respond (`TurnDetection::None`, or server-VAD with response creation off) —
+    /// otherwise the model's own auto-reply races the flow's `send_text` reply and both speak.
     pub async fn run_flow_turns(
         &self,
         conn: RealtimeConnection,

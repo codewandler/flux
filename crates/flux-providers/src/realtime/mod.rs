@@ -142,12 +142,14 @@ fn to_session_config(cfg: &RealtimeConfig) -> SessionConfig {
             threshold: threshold.map(f64::from),
             prefix_padding_ms: *prefix_padding_ms,
             silence_duration_ms: *silence_duration_ms,
+            eagerness: None,
         }),
-        SeamTurnDetection::SemanticVad { .. } => Some(WireTurnDetection {
+        SeamTurnDetection::SemanticVad { eagerness } => Some(WireTurnDetection {
             kind: "semantic_vad".into(),
             threshold: None,
             prefix_padding_ms: None,
             silence_duration_ms: None,
+            eagerness: eagerness.clone(),
         }),
         SeamTurnDetection::None => None,
     };

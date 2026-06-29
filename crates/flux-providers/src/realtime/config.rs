@@ -124,6 +124,9 @@ pub struct TurnDetection {
     /// Silence before a turn is considered ended, in ms.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub silence_duration_ms: Option<u32>,
+    /// Eagerness hint for `semantic_vad` (e.g. `"low"`/`"medium"`/`"high"`/`"auto"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eagerness: Option<String>,
 }
 
 /// A function tool exposed to the model.
@@ -190,6 +193,7 @@ mod tests {
                 threshold: None,
                 prefix_padding_ms: None,
                 silence_duration_ms: None,
+                eagerness: None,
             }),
             ..Default::default()
         };

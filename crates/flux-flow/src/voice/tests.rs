@@ -120,7 +120,7 @@ impl Tool for BoomTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::read_only("boom", "destructive", json!({"type": "object"}))
             .with_effects(vec![Effect::Process])
-            .with_risk(Risk::High)
+            .with_risk(Risk::Destructive)
     }
     async fn execute(&self, _ctx: &ToolContext, _params: Value) -> flux_core::Result<ToolResult> {
         BOOMED.store(true, Ordering::SeqCst);
@@ -239,11 +239,51 @@ async fn barge_in_cancel_is_idempotent() {
         RealtimeEvent::SpeechStarted, // active response — cancels once
     ]);
     let mut sink = CaptureSink::default();
-    drive(exec, log.clone(), events, &mut sink, || true).await;
+    let log2 = log.clone();
+    drive(exec, log.clone(), events, &mut sink, move || {
+        log2.lock().unwrap().cancels == 1
+    })
+    .await;
 
     let log = log.lock().unwrap();
     assert_eq!(log.cancels, 1, "only the active response is cancelled");
     assert_eq!(sink.barge_ins, 2, "both barge-ins surface to the sink");
+}
+
+#[tokio::test]
+async fn barge_in_disarms_pending_continuation() {
+    // A barge-in mid-tool-call must NOT force a tool-driven continuation (else the model speaks over
+    // the user). The tool result still flows back for history; there's just no forced `create_response`.
+    let exec = executor(Arc::new(AllowApprover), registry(Arc::new(EchoTool)));
+    let log = Arc::new(Mutex::new(SessionLog::default()));
+    let events = scripted(vec![
+        RealtimeEvent::ResponseStarted,
+        RealtimeEvent::ToolCall {
+            call_id: "c1".into(),
+            name: "echo".into(),
+            arguments: json!({"text": "x"}).to_string(),
+        },
+        RealtimeEvent::SpeechStarted, // user interrupts while the tool is running
+        RealtimeEvent::ResponseDone,  // the cancelled response completes
+    ]);
+    let mut sink = CaptureSink::default();
+    let log2 = log.clone();
+    drive(exec, log.clone(), events, &mut sink, move || {
+        log2.lock().unwrap().tool_results.len() == 1
+    })
+    .await;
+
+    let log = log.lock().unwrap();
+    assert_eq!(
+        log.tool_results.len(),
+        1,
+        "tool result still flows back for history"
+    );
+    assert_eq!(log.cancels, 1, "the active response was cancelled");
+    assert_eq!(
+        log.create_responses, 0,
+        "barge-in disarmed the forced continuation"
+    );
 }
 
 #[tokio::test]
