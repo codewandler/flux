@@ -1,8 +1,32 @@
 # Design: realtime voice-to-voice as a first-class flux provider
 
-**Status:** proposed (story [D-06](../stories/D-06-realtime-voice-provider.md)) · **Layer:** L0
-(`flux-core` vocabulary) + L1 seam (`flux-provider`) + L1 impl (new `flux-realtime`) + L3 driver (new
-`flux-voice`) · **Owner:** Timo
+**Status:** **implemented** — Phase 1 (provider primitive) + the Phase 2 engine-owned-turns spike landed
+(story [D-06](../stories/D-06-realtime-voice-provider.md)) · **Layer:** L0 (`flux-core` vocabulary) + L1
+seam (`flux-provider`) + L1 impl (`flux-providers::realtime`, feature-gated) + L3 driver
+(`flux-flow::voice`) · **Owner:** Timo
+
+## As built (deltas from the proposal below)
+
+The proposal weighed two open forks; both resolved toward the user's standing "prefer single crate with
+modules" preference and the crate-consolidation precedent:
+
+- **Modules, not new crates** (resolves the "crate vs. module" fork). The OpenAI impl is
+  `crates/flux-providers/src/realtime/` behind a **`realtime` Cargo feature** (so the default HTTP build
+  stays lean; the WS deps — `tokio-tungstenite`/`tokio-util`/`base64` — are optional). The driver is
+  `crates/flux-flow/src/voice/`. **Zero new crates**, so `flux-codegate::layer()` and workspace members are
+  untouched — layering stays green by construction.
+- **`RealtimeProvider`** name kept (the other fork).
+- **`send_tool_result(call_id, output)`** — dropped the proposal's `is_error` arg (OpenAI's
+  `function_call_output` has no error flag; the driver folds error-ness into the output text).
+- **Added `RealtimeEvent::InputTranscriptDone`** (full caller transcript) — the engine-owned-turns spike
+  consumes it as one user turn.
+- **Phase 2 spike** = `VoiceSessionDriver::run_flow_turns` + a `VoiceTurnHandler` seam (a flux-side decider
+  that, in production, wraps `FlowEngine::run_turn`); proven by `flow_owns_two_voice_turns` against a mock.
+  No engine-suspension work — per-turn `run_turn`, not cross-turn `await` (still future).
+- **SDK seam** = `FlowClient::run_voice_session(provider, config, sink, cancel)` (mirrors `with_sub_agents`).
+- **`ContentBlock::Audio`** stayed deferred (not needed by the voice hot path).
+- managed-agents rewiring is a **separate pass in that repo** (the "Changed (managed-agents consumer)" list is the
+  guide).
 
 ## Why
 
@@ -308,11 +332,11 @@ correct for a latency-bound voice surface.
 |---|---|---|
 | `AudioFormat` / `AudioEncoding` / `AudioSource` | `flux-core` (new `audio.rs`) | **L0** |
 | `RealtimeProvider` / `RealtimeSession` / `RealtimeEvent` / `RealtimeConfig` / `TurnDetection` | `flux-provider` (new `realtime.rs`) | **L1** |
-| OpenAI Realtime impl (lifted from managed-agents `crates/realtime`) | new **`flux-realtime`** | **L1** |
-| `VoiceSessionDriver` / `VoiceSink` / `tool_defs_from_registry` | new **`flux-voice`** | **L3** |
+| OpenAI Realtime impl (lifted from managed-agents `crates/realtime`) | `flux-providers::realtime` (feature `realtime`) | **L1** |
+| `VoiceSessionDriver` / `VoiceSink` / `VoiceTurnHandler` / `tool_defs_from_registry` | `flux-flow::voice` | **L3** |
 
-`flux-codegate`'s `layer()` (`crates/flux-codegate/src/lib.rs:17`) must classify `flux-realtime => 1` and
-`flux-voice => 3`; root `Cargo.toml` adds both to members + workspace deps.
+> **As built:** modules in existing L1/L3 crates (not new crates) — so `flux-codegate::layer()` and
+> workspace members are unchanged. The proposal's new-crate variant is below for the record.
 
 ## Risks / open forks / known limitations
 
@@ -340,28 +364,32 @@ correct for a latency-bound voice surface.
   layer/correctness, muddier identity).
 - **Open fork — D-06 rank:** placement in the Downstream-enablement track is the product owner's call.
 
-## New / changed files (for the implementation pass)
+## New / changed files (as built)
 
 **New (flux):**
-- `crates/flux-core/src/audio.rs` — L0 — `AudioFormat`/`AudioEncoding`/`AudioSource`
+- `crates/flux-core/src/audio.rs` — L0 — `AudioFormat`/`AudioEncoding`
 - `crates/flux-provider/src/realtime.rs` — L1 — traits + `RealtimeConfig` + `RealtimeEvent`
-- `crates/flux-realtime/src/{lib,session,config,event}.rs` — L1 — OpenAI Realtime impl (lifted)
-- `crates/flux-voice/src/{lib,driver,sink}.rs` — L3 — `VoiceSessionDriver`, `VoiceSink`,
-  `tool_defs_from_registry`
+- `crates/flux-providers/src/realtime/{mod,client,config,event}.rs` — L1 — OpenAI Realtime impl (lifted),
+  feature `realtime`
+- `crates/flux-flow/src/voice/{mod,driver,sink,tests}.rs` — L3 — `VoiceSessionDriver`, `VoiceSink`,
+  `VoiceTurnHandler`, `tool_defs_from_registry`
 
 **Changed (flux):**
-- `crates/flux-core/src/lib.rs` — re-export `audio`; (Phase 2) `ContentBlock::Audio` in `content.rs`
+- `crates/flux-core/src/lib.rs` — re-export `audio`
 - `crates/flux-provider/src/lib.rs` — `pub mod realtime;`
-- `crates/flux-codegate/src/lib.rs` — classify `flux-realtime` = 1, `flux-voice` = 3
-- root `Cargo.toml` — add the two crates to members + workspace deps
+- `crates/flux-providers/src/lib.rs` + `Cargo.toml` — feature-gated `realtime` module + optional WS deps
+- `crates/flux-flow/src/lib.rs` — `pub mod voice;`
+- `crates/flux-sdk/src/flow.rs` + `Cargo.toml` — `FlowClient::run_voice_session` + `tokio-util` dep
+- root `Cargo.toml` — add `tokio-tungstenite` to `[workspace.dependencies]`
+- (no `flux-codegate` / workspace-member change — modules, not crates)
 
-**Changed (managed-agents consumer, outside this repo):**
-- `crates/channel-rtvbp/src/backend.rs` — consume `flux-voice` + `flux-realtime`; resampling stays here
-  (or drop it via `g711`)
+**Changed (managed-agents consumer, outside this repo — separate follow-up pass):**
+- `crates/channel-rtvbp/src/backend.rs` — consume `flux_flow::voice` + `flux_providers::realtime`
+  (`flux-providers` with the `realtime` feature); resampling stays here (or drop it via `g711`)
 - `crates/agent-core/src/spec.rs` — delete the model-facing `Tool` list; source from
-  `tool_defs_from_registry`
-- `crates/agent-core/src/{flow.rs,dispatch.rs}` — retire/adapt `ToolDispatcher` onto the `flux-voice`
-  driver
+  `flux_flow::tool_defs_from_registry`
+- `crates/agent-core/src/{flow.rs,dispatch.rs}` — retire/adapt `ToolDispatcher` onto the
+  `flux_flow::VoiceSessionDriver`
 
 ## Test plan (for the implementation pass — out of scope this pass)
 

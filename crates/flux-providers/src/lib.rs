@@ -24,3 +24,8 @@ pub mod anthropic;
 pub mod ollama;
 pub mod openai;
 pub mod openrouter;
+
+/// The OpenAI Realtime (full-duplex, voice-to-voice) provider — WebSocket, behind the `realtime`
+/// feature. See [`flux_provider::realtime`] for the seam it implements.
+#[cfg(feature = "realtime")]
+pub mod realtime;

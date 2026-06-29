@@ -30,6 +30,8 @@ flux-orchestrate.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# `run_voice_session` takes a cancel token to end a full-duplex voice session.
+tokio-util.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

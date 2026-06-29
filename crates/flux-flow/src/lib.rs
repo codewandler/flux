@@ -25,8 +25,10 @@ pub mod loop_host;
 pub mod registry;
 pub mod runtime;
 pub mod state;
+pub mod voice;
 
 pub use agent_sink::AgentSink;
+pub use voice::{tool_defs_from_registry, VoiceSessionDriver, VoiceSink, VoiceTurnHandler};
 
 // Facade: the language core + reference interpreter live in `flux-lang`. Re-export them so the
 // language surface stays available from the engine crate (no consumer churn) and

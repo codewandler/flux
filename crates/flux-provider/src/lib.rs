@@ -15,6 +15,12 @@ use serde::{Deserialize, Serialize};
 
 use flux_core::{Chunk, Error, Message, Result};
 
+pub mod realtime;
+pub use realtime::{
+    RealtimeConfig, RealtimeConnection, RealtimeEvent, RealtimeEventStream, RealtimeProvider,
+    RealtimeSession, TurnDetection,
+};
+
 /// A boxed, sendable stream of response chunks.
 pub type ChunkStream = Pin<Box<dyn Stream<Item = Result<Chunk>> + Send>>;
 

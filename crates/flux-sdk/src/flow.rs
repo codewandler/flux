@@ -48,11 +48,11 @@ use flux_flow::compile::{compile as compile_flow, CompileOptions};
 use flux_flow::registry::OpRegistry;
 use flux_flow::runtime::execute_flow;
 use flux_flow::state::FlowStore;
-use flux_flow::AgentSink;
+use flux_flow::{tool_defs_from_registry, AgentSink, VoiceSessionDriver, VoiceSink};
 use flux_lang::analyze::analyze_flow;
 use flux_lang::prelude;
 use flux_orchestrate::{SubAgents, TaskTool};
-use flux_provider::Provider;
+use flux_provider::{Provider, RealtimeConfig, RealtimeProvider};
 use flux_runtime::{
     AllowApprover, Approver, DenyApprover, Executor, PermissionManager, Spawner, Tool, ToolContext,
     ToolRegistry,
@@ -60,6 +60,7 @@ use flux_runtime::{
 use flux_system::{System, Workspace};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 // Re-export the lifecycle's public language types so a consumer can stay in `flux_sdk::flow`.
 pub use flux_flow::analyze::Diagnostic;
@@ -371,6 +372,31 @@ impl FlowClient {
 
     /// Build a fresh [`Executor`] over a clone of the assembled registry (the safety envelope every
     /// op dispatches through). The registry's `Arc<dyn Tool>` entries clone cheaply.
+    /// Run a full-duplex **voice** session: connect `provider` (any [`RealtimeProvider`] — e.g.
+    /// `flux_providers::realtime::openai_realtime`), declare this client's registered ops to the model
+    /// **once** via [`tool_defs_from_registry`], and drive it through a [`VoiceSessionDriver`] so the
+    /// model's tool calls run through the same `Executor` envelope as a text turn. `sink` receives
+    /// audio / transcripts / tool events; `cancel` ends the session (e.g. a caller hangup).
+    ///
+    /// The single seam: a consumer (e.g. a telephony channel) drives a voice agent without assembling
+    /// an `Executor`, the driver, or the model-facing tool declarations by hand — the same "don't
+    /// re-implement the wiring" shape as [`with_sub_agents`](Self::with_sub_agents).
+    pub async fn run_voice_session(
+        &self,
+        provider: &dyn RealtimeProvider,
+        mut config: RealtimeConfig,
+        sink: &mut dyn VoiceSink,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        config.tools = tool_defs_from_registry(&self.registry);
+        let conn = provider.connect(config).await?;
+        let executor = Arc::new(self.build_executor());
+        VoiceSessionDriver::new(executor)
+            .run(conn, sink, cancel)
+            .await;
+        Ok(())
+    }
+
     fn build_executor(&self) -> Executor {
         let perms = PermissionManager::from_rules(&self.allow, &self.deny);
         let approver: Arc<dyn Approver> = if self.auto_approve {
@@ -489,6 +515,144 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // ----- voice session seam -----
+
+    use flux_provider::{RealtimeConnection, RealtimeEvent, RealtimeEventStream, RealtimeSession};
+    use flux_runtime::ToolResult;
+    use futures::StreamExt;
+
+    struct VoiceLog {
+        tool_output: Option<String>,
+    }
+
+    struct MockRtSession {
+        log: Arc<Mutex<VoiceLog>>,
+    }
+
+    #[async_trait]
+    impl RealtimeSession for MockRtSession {
+        async fn send_audio(&self, _f: &[u8]) -> CoreResult<()> {
+            Ok(())
+        }
+        async fn commit_audio(&self) -> CoreResult<()> {
+            Ok(())
+        }
+        async fn send_text(&self, _t: &str) -> CoreResult<()> {
+            Ok(())
+        }
+        async fn create_response(&self) -> CoreResult<()> {
+            Ok(())
+        }
+        async fn cancel_response(&self) -> CoreResult<()> {
+            Ok(())
+        }
+        async fn send_tool_result(&self, _call_id: &str, output: &str) -> CoreResult<()> {
+            self.log.lock().unwrap().tool_output = Some(output.to_string());
+            Ok(())
+        }
+        fn close(&self) {}
+    }
+
+    /// A scripted realtime provider: the model "decides" to call the first declared tool.
+    struct MockRealtime {
+        log: Arc<Mutex<VoiceLog>>,
+    }
+
+    #[async_trait]
+    impl RealtimeProvider for MockRealtime {
+        fn name(&self) -> &str {
+            "mock-realtime"
+        }
+        async fn connect(&self, config: RealtimeConfig) -> CoreResult<RealtimeConnection> {
+            // The registry op is among the model-facing declarations (declared once) — call it.
+            let name = config
+                .tools
+                .iter()
+                .find(|t| t.name == "lookup")
+                .map(|t| t.name.clone())
+                .expect("registered op `lookup` is declared to the model");
+            let events = vec![
+                RealtimeEvent::ResponseStarted,
+                RealtimeEvent::ToolCall {
+                    call_id: "c1".into(),
+                    name,
+                    arguments: json!({"day": "fri"}).to_string(),
+                },
+                RealtimeEvent::ResponseDone,
+            ];
+            let head = futures::stream::iter(events.into_iter().map(Ok::<_, flux_core::Error>));
+            let events: RealtimeEventStream =
+                Box::pin(head.chain(futures::stream::pending::<CoreResult<RealtimeEvent>>()));
+            Ok(RealtimeConnection {
+                session: Arc::new(MockRtSession {
+                    log: self.log.clone(),
+                }),
+                events,
+            })
+        }
+    }
+
+    struct LookupTool;
+
+    #[async_trait]
+    impl Tool for LookupTool {
+        fn spec(&self) -> flux_spec::ToolSpec {
+            flux_spec::ToolSpec::read_only("lookup", "look up slots", json!({"type": "object"}))
+        }
+        async fn execute(&self, _ctx: &ToolContext, params: Value) -> CoreResult<ToolResult> {
+            Ok(ToolResult::ok(format!(
+                "free on {}",
+                params["day"].as_str().unwrap_or("?")
+            )))
+        }
+    }
+
+    struct NoopSink;
+    impl VoiceSink for NoopSink {}
+
+    #[tokio::test]
+    async fn run_voice_session_routes_a_tool_call_through_the_envelope() {
+        let mut client = FlowClient::builder()
+            .auto_approve(true)
+            .build(MockProvider::one("noop"), temp_root("voice"))
+            .unwrap();
+        client.register_op(Arc::new(LookupTool));
+
+        let log = Arc::new(Mutex::new(VoiceLog { tool_output: None }));
+        let provider = MockRealtime { log: log.clone() };
+        let config = RealtimeConfig::voice_agent("mock", "be a booking agent");
+        let cancel = CancellationToken::new();
+        let mut sink = NoopSink;
+
+        // End the (otherwise open) session once the tool result is back.
+        let controller = {
+            let cancel = cancel.clone();
+            let log = log.clone();
+            async move {
+                for _ in 0..400 {
+                    if log.lock().unwrap().tool_output.is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                cancel.cancel();
+            }
+        };
+
+        let (res, _) = tokio::join!(
+            client.run_voice_session(&provider, config, &mut sink, &cancel),
+            controller,
+        );
+        res.unwrap();
+
+        // The model's tool call ran through `Executor::dispatch` (declared once from the registry)
+        // and the op's output went back to the model.
+        assert_eq!(
+            log.lock().unwrap().tool_output.as_deref(),
+            Some("free on fri")
+        );
     }
 
     #[test]

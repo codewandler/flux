@@ -8,6 +8,24 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Realtime voice-to-voice as a first-class provider (D-06).** A **sibling, session-oriented** model seam
+  beside the half-duplex `Provider`, so a full-duplex speech-to-speech model (OpenAI Realtime) is a flux
+  provider whose tool calls run through the **same `Executor` safety envelope** as a text turn — declared
+  **once** from the live `ToolRegistry` (no more model-facing-vs-runtime double declaration). Built as
+  modules (zero new crates):
+  - `flux_core::audio` (L0) — `AudioFormat`/`AudioEncoding`.
+  - `flux_provider::realtime` (L1) — `RealtimeProvider`/`RealtimeSession`/`RealtimeEvent`/`RealtimeConfig`/
+    `TurnDetection`; events carry decoded bytes and plain strings only (the seam never names a runtime type).
+  - `flux_providers::realtime` (L1, behind the **`realtime`** Cargo feature) — the OpenAI-Realtime WebSocket
+    impl lifted from the managed-agents `realtime` crate (GA shape; one `openai_realtime(...)` constructor;
+    idempotent barge-in cancel).
+  - `flux_flow::voice` (L3) — `VoiceSessionDriver` (routes `ToolCall` → `Executor::dispatch` off the audio
+    loop; debounced `create_response`; idempotent barge-in), `VoiceSink`, `tool_defs_from_registry`, plus a
+    Phase-2 *engine-owned-turns* spike (`run_flow_turns` + a `VoiceTurnHandler` seam — a flux-lang flow
+    drives turns; per-turn `run_turn`, not yet cross-turn `await`).
+  - `flux_sdk::flow::FlowClient::run_voice_session(...)` (L6) — the one-call consumer seam (mirrors
+    `with_sub_agents`). Audio resampling stays in the consumer/channel (model-native format only). The
+    managed-agents rewiring lands in that repo as a follow-up.
 - **Event-trigger channels — background agents woken by events (D-04).** A new `flux-channels` (L6) crate
   lets a `.flux` **program** be woken by external events: a cron schedule, an inbound webhook, or a Slack
   mention. Channels are declared in the program as ordinary `ChannelDecl`s and run by the **app runner** —

@@ -17,5 +17,15 @@ eventsource-stream.workspace = true
 bytes.workspace = true
 reqwest.workspace = true
 
+# Realtime (voice-to-voice) provider — WebSocket transport, off by default so the HTTP family stays lean.
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+
+[features]
+# The OpenAI Realtime (full-duplex, voice-to-voice) provider.
+realtime = ["dep:tokio", "dep:tokio-util", "dep:tokio-tungstenite", "dep:base64"]
+
 [dev-dependencies]
 tokio.workspace = true

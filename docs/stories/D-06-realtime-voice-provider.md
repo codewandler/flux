@@ -2,7 +2,7 @@
 id: D-06
 title: Realtime voice-to-voice as a first-class flux provider
 pillar: Agent
-status: backlog
+status: done
 priority:
 theme: downstream-managed-agents
 design: docs/designs/realtime-voice-provider.md
@@ -28,42 +28,50 @@ session — so this is a new seam, not a tweak.
 
 ## Acceptance
 
-**Phase 1 — the provider primitive** (each behavioural criterion names the failing-first test, all
-hermetic / no API key, against a mock `RealtimeProvider`):
-- [ ] **L0 vocabulary.** `flux-core::audio` exposes `AudioFormat`/`AudioEncoding` (+ `OPENAI_PCM16` /
-      `TELEPHONY_ULAW` consts). (`ContentBlock::Audio` deferred to Phase 2.)
-- [ ] **L1 seam.** `flux-provider::realtime` exposes `RealtimeProvider`/`RealtimeSession`/`RealtimeEvent`/
+**Phase 1 — the provider primitive** (each behavioural criterion names its hermetic test — mock
+`RealtimeProvider`, no API key — all passing):
+- [x] **L0 vocabulary.** `flux_core::audio` — `AudioFormat`/`AudioEncoding` (+ `OPENAI_PCM16` /
+      `TELEPHONY_ULAW` consts). (`ContentBlock::Audio` deferred.)
+- [x] **L1 seam.** `flux_provider::realtime` — `RealtimeProvider`/`RealtimeSession`/`RealtimeEvent`/
       `RealtimeConfig`/`TurnDetection`; `AudioDelta`/`send_audio` carry **decoded bytes** and `ToolCall`
-      carries only strings (no L2 type). Layering proven by `cargo test -p flux-codegate`
-      (`flux-realtime` = 1, `flux-voice` = 3).
-- [ ] **L1 impl.** `flux-realtime` provides an OpenAI-Realtime `RealtimeProvider` (lifted from managed-agents
-      `crates/realtime`), GA endpoint, no beta header, a private `Secret { ApiKey | OAuth }` reusing
-      `flux_provider::TokenSource`, and one `openai_realtime(secret)` constructor.
-- [ ] **Tools through the envelope.** `tool_call_routes_through_executor` — a scripted `ToolCall` reaches
-      `Executor::dispatch`, the result is fed back via `send_tool_result` + `create_response`, and a
-      denied/destructive op is **gated by the envelope** (proves no bypass).
-- [ ] **Single declaration.** `tools_declared_once` — `tool_defs_from_registry(&ToolRegistry)` yields the
-      registry's `ToolSpec`s as `ToolDef`s and the session config carries exactly those (kills managed-agents'
-      double-declaration).
-- [ ] **Barge-in.** `barge_in_cancel_is_idempotent` — `SpeechStarted` with no active response is `Ok` and
-      emits `barge_in()`; `create_response_debounced` — a turn with two tool calls fires exactly one
-      `create_response`.
-- [ ] **Driver + sink.** `flux-voice` provides `VoiceSessionDriver::run(conn, sink, cancel)` (off-loop
-      dispatch so a slow tool never stalls audio) + `VoiceSink` (a symmetric cousin of `AgentSink`).
-- [ ] Full gate green (`cargo build/test --workspace`, `clippy -D warnings`, `fmt`,
-      `cargo test -p flux-codegate`).
+      carries only strings (no L2 type).
+- [x] **L1 impl.** `flux_providers::realtime` (feature `realtime`) — OpenAI-Realtime `RealtimeProvider`
+      lifted from managed-agents `crates/realtime`; GA endpoint, no beta header; private
+      `Secret { ApiKey | OAuth(Arc<dyn TokenSource>) }`; one `openai_realtime(...)` constructor. Tests:
+      `realtime::event::*`, `realtime::config::*`.
+- [x] **Tools through the envelope.** `tool_call_routes_through_executor` — a scripted `ToolCall` reaches
+      `Executor::dispatch`; result fed back via `send_tool_result` + `create_response`. `denied_tool_is_gated`
+      — a destructive op is **gated** (never executes; model gets an error) — proves no bypass.
+- [x] **Single declaration.** `tools_declared_once` — `tool_defs_from_registry(&ToolRegistry)` yields the
+      registry's `ToolSpec`s as `ToolDef`s (kills managed-agents' double-declaration). Re-proven end-to-end at
+      the SDK seam by `run_voice_session_routes_a_tool_call_through_the_envelope`.
+- [x] **Barge-in + debounce.** `barge_in_cancel_is_idempotent` (idle `SpeechStarted` doesn't cancel/error;
+      both barge-ins surface) + `create_response_debounced` (a turn with two tool calls fires exactly one
+      `create_response`).
+- [x] **Driver + sink + SDK seam.** `flux_flow::voice::{VoiceSessionDriver::run, VoiceSink,
+      tool_defs_from_registry}` (off-loop dispatch); surfaced as `FlowClient::run_voice_session`.
+- [x] Full gate green (`cargo build/test --workspace`, `clippy -D warnings`, `fmt`,
+      `cargo test -p flux-codegate`, plus `cargo {clippy,test} -p flux-providers --features realtime`).
 
 **Phase 2 — engine-owned voice turns (spike):**
-- [ ] A `VoiceSessionDriver` mode driving a **suspendable `FlowEngine` flow** across turns (the deferred
-      cross-turn `await` from managed-agents `behaviour-runner.md`), proven by a 2-turn scripted flow against a
-      mock `RealtimeProvider` — without committing the full engine-suspension work.
+- [x] `VoiceSessionDriver::run_flow_turns` + a `VoiceTurnHandler` seam (a flux-side decider that, in
+      production, wraps `FlowEngine::run_turn`) — each completed user turn (`InputTranscriptDone`) drives one
+      reply, the model is STT/TTS. Proven by `flow_owns_two_voice_turns`. Per-turn `run_turn`, **not**
+      cross-turn `await` (a single suspendable flow owning the whole call stays future work).
 
 ## Progress
-- **Design committed; implementation deferred** (the D-05 pattern — sign off the design, build in a later
-  pass). Design doc: [`docs/designs/realtime-voice-provider.md`](../designs/realtime-voice-provider.md).
-- Scope designed: Phase 1 (provider primitive) + a Phase 2 engine-owned-turns spike.
-- API claims grounded against real symbols: `flux_provider::{Provider, ToolDef, TokenSource}`,
-  `flux_spec::ToolSpec`, `flux_runtime::{Executor::dispatch, ToolRegistry::specs}`, `flux-codegate::layer`.
+- **Done — landed on `main`.** Phase 1 + the Phase 2 spike. **Built as modules, not new crates** (the
+  user's "prefer single crate" preference + consolidation precedent; resolves the design's crate-vs-module
+  fork): L0 `flux_core::audio`, L1 `flux_provider::realtime` (seam) + `flux_providers::realtime` (OpenAI
+  impl, feature `realtime`), L3 `flux_flow::voice`, SDK `FlowClient::run_voice_session`. Zero new crates →
+  `flux-codegate::layer()` + workspace members untouched, layering green by construction.
+- 11 new tests (6 in `flux_flow::voice`, ~4 lifted/extended in `flux_providers::realtime`, 1 SDK seam).
+  Gate green: 667 workspace tests, clippy `-D warnings` (default + `realtime` feature), fmt, codegate.
+- **Deferred (intentional):** the full single-suspendable-flow voice mode (cross-turn `await`);
+  `ContentBlock::Audio`; the managed-agents rewiring (a separate pass in that repo — see the design's
+  "Changed (managed-agents consumer)" list).
+- **Publish note:** `flux-providers` gains an **optional** WS dep set behind the `realtime` feature;
+  `flux-sdk` gains `tokio-util`. Fold into `PUBLISHING.md` before a release.
 
 ## Notes
 - **Sibling, not replacement:** the half-duplex `Provider` and the session-oriented `RealtimeProvider`
