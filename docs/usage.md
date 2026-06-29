@@ -141,10 +141,14 @@ flux eval synthetic --watch      # run a benchmark suite (synthetic riddles / mo
                                  #   --watch streams the agent live, --report out.md writes a categorized report
 ```
 
-A **multi-agent program** is a `.flux` file declaring agents / channels / triggers / journeys (see
-`crates/flux-app/examples/hello.flux` and [`designs/flux-lang-evolution.md`](designs/flux-lang-evolution.md) §6).
-To **embed** flux as a library, use `flux-sdk`'s `FlowClient` for the Flux-Lang compile→analyze→execute
-lifecycle (`crates/flux-sdk/src/flow.rs`).
+A **multi-agent program** is a **native flux-lang `.flux` file** that declares the whole app as typed
+module declarations — `agent` / `channel` / `datasource` / `trigger` / `journey` — with each module's
+settings written inline as flux-lang values, and secrets as `secret "ENV_NAME"` *references* (resolved
+from the environment at load; plaintext is never inline). Journey bodies are ordinary flux-lang flows.
+See `crates/flux-app/examples/hello.flux` (minimal) and `crates/flux-app/examples/support-bot.flux`
+(the full agent + Slack channel + datasource surface), and
+[`designs/native-text-modules.md`](designs/native-text-modules.md). To **embed** flux as a library, use
+`flux-sdk`'s `FlowClient` for the Flux-Lang compile→analyze→execute lifecycle (`crates/flux-sdk/src/flow.rs`).
 
 Plans and tool *inputs* always print in full; tool *output* (e.g. a large file read) is previewed by
 default and shown in full with `-v`.

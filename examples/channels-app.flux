@@ -1,42 +1,42 @@
-{
-  "name": "channels-demo",
-  "comment": "A background agent woken by events: a cron heartbeat + an inbound webhook. Run it with `flux app run examples/channels-app.flux` (Ctrl-C to stop). Each channel fires a bus event under its own name; the matching trigger runs a journey. These journeys use only pure ops, so no model/credentials are needed.",
+# channels-app.flux — a background agent woken by events, the whole app in native flux-lang.
+#
+# Run it with `flux app run examples/channels-app.flux` (Ctrl-C to stop). A cron heartbeat fires every
+# 5s and an inbound webhook accepts CI events; each channel fires a bus event under its own name and the
+# matching trigger runs a journey. These journeys use only pure ops, so no model/credentials are needed.
 
-  "channels": [
-    { "name": "heartbeat", "kind": "schedule", "settings": { "schedule": "*/5 * * * * *" } },
-    { "name": "ci",        "kind": "webhook",  "settings": { "addr": "127.0.0.1:8799", "path": "/ci" } }
-  ],
+channel heartbeat
+  kind "schedule"
+  schedule "*/5 * * * * *"
 
-  "triggers": [
-    { "name": "on_boot", "on": "startup",   "run": "announce" },
-    { "name": "on_beat", "on": "heartbeat", "run": "tick" },
-    { "name": "on_ci",   "on": "ci",        "run": "ci_report" }
-  ],
+channel ci
+  kind "webhook"
+  addr "127.0.0.1:8799"
+  path "/ci"
 
-  "journeys": [
-    {
-      "name": "announce",
-      "flow": { "name": "announce", "body": [
-        { "kind": "call", "op": "send", "args": [
-          { "kind": "lit", "value": { "channel": "cli", "message": "channels-demo up — heartbeat every 5s; POST JSON to http://127.0.0.1:8799/ci" } }
-        ] },
-        { "kind": "return", "value": { "kind": "lit", "value": "" } }
-      ] }
-    },
-    {
-      "name": "tick",
-      "flow": { "name": "tick", "body": [
-        { "kind": "bind", "name": "m", "value": { "kind": "fmt", "template": "heartbeat at {at}" } },
-        { "kind": "call", "op": "send", "args": [ { "kind": "lit", "value": "cli" }, { "kind": "var", "name": "m" } ] },
-        { "kind": "return", "value": { "kind": "var", "name": "m" } }
-      ] }
-    },
-    {
-      "name": "ci_report",
-      "flow": { "name": "ci_report", "body": [
-        { "kind": "bind", "name": "r", "value": { "kind": "fmt", "template": "received CI event: {status}" } },
-        { "kind": "return", "value": { "kind": "var", "name": "r" } }
-      ] }
-    }
-  ]
-}
+trigger on_boot
+  on "startup"
+  run announce
+
+trigger on_beat
+  on "heartbeat"
+  run tick
+
+trigger on_ci
+  on "ci"
+  run ci_report
+
+journey announce
+  flow
+    send({ "channel": "cli", "message": "channels-demo up — heartbeat every 5s; POST JSON to http://127.0.0.1:8799/ci" })
+    return ""
+
+journey tick
+  flow
+    $m = fmt("heartbeat at {at}")
+    send("cli", $m)
+    return $m
+
+journey ci_report
+  flow
+    $r = fmt("received CI event: {status}")
+    return $r

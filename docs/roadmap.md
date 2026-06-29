@@ -78,7 +78,10 @@ consumes the shipped channel transport (D-04) and drives the **active integratio
 order: a knowledge/RAG datasource (**D-07**, which adds the shared `flux-datasource` schema) → a clean
 **process-plugin protocol redesign** (**D-10**) → a native integration-plugin pack (**D-08**, in an in-repo
 `plugins/` workspace) → an agentic channel target (**D-09**). The earlier managed-agents items (D-02/D-03)
-remain queued behind this push (D-01 + D-06 have since shipped).
+remain queued behind this push (D-01 + D-06 have since shipped). The app these consumers author is now a
+single **native flux-lang `.flux`** file — `agent`/`channel`/`datasource`/`trigger`/`journey` module
+declarations with secrets as `secret "ENV"` references, replacing the JSON manifest
+([L-03](stories/L-03-native-text-program-grammar.md), [design](designs/native-text-modules.md)).
 
 1. **[D-01](stories/D-01-flow-input-seeding.md) — Parameterized flow execution (the behaviour-runner
    seam)** · ✅ **shipped.** A deterministic `FlowClient::parse(text)` (no model round-trip) + a per-run

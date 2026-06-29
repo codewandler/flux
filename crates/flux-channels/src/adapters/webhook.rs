@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use flux_lang::program::ChannelDecl;
 
-use crate::config::{resolve_secret, WebhookSettings};
+use crate::config::WebhookSettings;
 use crate::{Channel, Deliverer};
 
 pub struct WebhookChannel {
@@ -33,16 +33,14 @@ impl WebhookChannel {
             .map_err(|e| anyhow::anyhow!("channel `{}` settings: {e}", decl.name))?;
         let addr = SocketAddr::from_str(&s.addr)
             .map_err(|e| anyhow::anyhow!("channel `{}`: bad addr `{}`: {e}", decl.name, s.addr))?;
-        let token = match s.token {
-            Some(t) => Some(resolve_secret(&t)?),
-            None => None,
-        };
+        // Secrets are already host-resolved before these settings deserialize, so `token` is a plain value.
+        let token = s.token;
         // The host auto-approves tools (no interactive approver), so an open non-loopback listener is a
         // remote-trigger surface — require a bearer token there, mirroring flux-server.
         if !addr.ip().is_loopback() && token.is_none() {
             anyhow::bail!(
                 "channel `{}`: refusing to bind non-loopback {addr} without a `token` \
-                 (set `token = \"secret:env/KEY\"`)",
+                 (set `token secret \"KEY\"`)",
                 decl.name
             );
         }

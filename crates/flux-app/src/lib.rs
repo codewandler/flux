@@ -1,8 +1,8 @@
 //! `flux-app` — the L6 runtime **host** that runs a multi-agent flux [`Program`].
 //!
 //! Where flux-flow (L3) runs *one* compiled flow per turn, flux-app runs a whole **program**: a
-//! `.flux` file declaring agents, channels, triggers, and journeys. The host turns those pure-data
-//! declarations into a live system:
+//! native flux-lang `.flux` file declaring agents, channels, datasources, triggers, and journeys. The
+//! host turns those pure-data declarations into a live system:
 //!
 //! - an in-process **event bus** ([`Bus`]) — "user input is just an event"; channels inject events,
 //!   journeys `emit` events, triggers route them;
@@ -29,12 +29,14 @@
 //! let app = App::new(program, /* provider */ None, "model-id");
 //! app.deliver("startup", serde_json::json!({})).await?; // run the {on:"startup"} journeys
 //! # Ok(()) }
-//! # const SRC: &str = "{}";
+//! # const SRC: &str = "trigger boot\n  on \"startup\"\n  run hello\njourney hello\n  flow\n    return \"hi\"";
 //! ```
 
 mod app;
 mod bus;
 mod ops;
+mod secrets;
 
 pub use app::{App, JourneyRun, RecordingSink};
 pub use bus::{Bus, Event, SentMessage};
+pub use secrets::resolve_secrets;

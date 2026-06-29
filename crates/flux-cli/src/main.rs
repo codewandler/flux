@@ -241,7 +241,7 @@ enum Commands {
         #[command(subcommand)]
         action: AppAction,
     },
-    /// Run a pre-compiled Flux-Lang program (a DraftAst JSON file).
+    /// Run a single behavioral loop (a Flux-Lang flow — native text, or a pre-compiled DraftAst JSON file).
     Flow {
         #[command(subcommand)]
         action: FlowAction,
@@ -298,7 +298,7 @@ enum AppAction {
 enum FlowAction {
     /// Run a checked-in Flux-Lang program file.
     Run {
-        /// Path to the `.flux` DraftAst JSON.
+        /// Path to the `.flux` loop — native Flux-Lang text, or a checked-in DraftAst JSON.
         file: String,
         /// Model for the program's agent steps.
         #[arg(short = 'm', long)]
@@ -531,6 +531,67 @@ async fn build_doc_index(system: &System) -> Arc<dyn flux_capabilities::Datasour
     // Index under the `local` source as `file.document` records via the markdown ingester.
     let _ = flux_capabilities::ingest_markdown(&*backend, "local", &docs);
     backend
+}
+
+/// Build the knowledge backend from a program's declared [`datasource`](flux_lang::program::DatasourceDecl)s
+/// — the `flux app run` counterpart of [`build_doc_index`]'s implicit workspace index. Each declared
+/// source is ingested under its own name by the matching ingester (`markdown` walks a docs directory;
+/// `openapi` reads a JSON spec file). An unknown `kind` is a clean error. Returns the shared backend the
+/// retrieval ops dispatch against.
+async fn build_datasources(
+    decls: &[flux_lang::program::DatasourceDecl],
+    system: &System,
+) -> Result<Arc<dyn flux_capabilities::DatasourceBackend>> {
+    const DOC_EXTS: &[&str] = &[".md", ".txt", ".rst", ".adoc", ".mdx"];
+    const MAX_DOCS: usize = 1000;
+    const MAX_BYTES: usize = 200_000;
+    let backend: Arc<dyn flux_capabilities::DatasourceBackend> =
+        datasource_backend(Arc::new(flux_capabilities::MemoryBackend::new()));
+    for d in decls {
+        match d.kind.as_str() {
+            "markdown" => {
+                let base = d.path.as_deref().unwrap_or(".");
+                let files = system.walk_files(base, 4000).await.unwrap_or_default();
+                let mut docs: Vec<(String, String)> = Vec::new();
+                for f in files {
+                    if docs.len() >= MAX_DOCS {
+                        break;
+                    }
+                    if !DOC_EXTS.iter().any(|e| f.ends_with(e)) {
+                        continue;
+                    }
+                    if let Ok(text) = system.read_file(&f).await {
+                        if text.len() <= MAX_BYTES {
+                            docs.push((f, text));
+                        }
+                    }
+                }
+                flux_capabilities::ingest_markdown(&*backend, &d.name, &docs)
+                    .map_err(|e| anyhow::anyhow!("datasource `{}` (markdown): {e}", d.name))?;
+            }
+            "openapi" => {
+                let path = d.path.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("datasource `{}` (openapi) needs a `path`", d.name)
+                })?;
+                let text = system
+                    .read_file(path)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("datasource `{}`: read {path}: {e}", d.name))?;
+                let spec: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+                    anyhow::anyhow!("datasource `{}`: parse {path} as OpenAPI JSON: {e}", d.name)
+                })?;
+                flux_capabilities::ingest_openapi(&*backend, &d.name, &spec)
+                    .map_err(|e| anyhow::anyhow!("datasource `{}` (openapi): {e}", d.name))?;
+            }
+            other => {
+                return Err(anyhow::anyhow!(
+                    "datasource `{}` has unknown kind `{other}` (expected markdown | openapi)",
+                    d.name
+                ))
+            }
+        }
+    }
+    Ok(backend)
 }
 
 /// Wrap a keyword backend in the semantic (embeddings) backend when built with `--features embeddings`
@@ -1122,8 +1183,15 @@ async fn run_flow(file: &str, model: Option<String>, yes: bool) -> Result<()> {
     let flags = AgentFlags::from_model_yes(model.as_deref(), yes);
 
     let src = std::fs::read_to_string(file).with_context(|| format!("read flow {file}"))?;
-    let ast: flux_flow::ast::DraftAst = serde_json::from_str(&src)
-        .with_context(|| format!("parse {file} as a Flux-Lang DraftAst (JSON)"))?;
+    // A behavioral loop file is native flux-lang text, or a checked-in JSON `DraftAst` (sniffed by the
+    // leading `{`). Both load as the same AST.
+    let ast: flux_flow::ast::DraftAst = if src.trim_start().starts_with('{') {
+        serde_json::from_str(&src)
+            .with_context(|| format!("parse {file} as a Flux-Lang DraftAst (JSON)"))?
+    } else {
+        flux_lang::parse::parse(&src)
+            .map_err(|e| anyhow::anyhow!("parse {file} as Flux-Lang text: {e}"))?
+    };
 
     run_draft_ast(&flags, &ast).await
 }
@@ -3202,23 +3270,26 @@ async fn run_app(path: &str, model_spec: Option<String>, auto_approve: bool) -> 
 
     let src =
         std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("read program `{path}`: {e}"))?;
-    let program = match Module::parse_str(&src).map_err(|e| anyhow::anyhow!("{e}"))? {
+    let mut program = match Module::parse_str(&src).map_err(|e| anyhow::anyhow!("{e}"))? {
         Module::Program(p) => p,
         Module::Flow(flow) => Program {
             flows: vec![flow],
             ..Default::default()
         },
     };
+    // Resolve `secret "ENV_NAME"` references in declaration settings from the environment (plaintext is
+    // never inline) before any of those settings reach a channel/datasource/agent.
+    flux_app::resolve_secrets(&mut program).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Assemble the knowledge + integration tools the program's agent target (`trigger.agent`) and its
     // journeys can drive — the D-09 registry wiring. A guarded `System` rooted at the cwd backs both.
     let system = Arc::new(System::new(
         Workspace::new(&std::env::current_dir()?).map_err(|e| anyhow::anyhow!("{e}"))?,
     ));
-    // The knowledge datasource: index the workspace docs, and SHARE the backend so integration
-    // plugins' contributed records (via the DatasourceHostCaps bridge) land in the same index the
-    // `search`/`get`/`list`/`relation`/`batch_get` ops read.
-    let backend = build_doc_index(&system).await;
+    // The knowledge datasource: build the program's declared datasources, and SHARE the backend so
+    // integration plugins' contributed records (via the DatasourceHostCaps bridge) land in the same
+    // index the `search`/`get`/`list`/`relation`/`batch_get` ops read.
+    let backend = build_datasources(&program.datasources, &system).await?;
     let mut extra_tools: Vec<Arc<dyn flux_runtime::Tool>> =
         flux_capabilities::datasource_tools(backend.clone());
     // Discover subprocess plugins (~/.flux/plugins/*.toml) and project their ops as tools; their host
@@ -3520,10 +3591,45 @@ async fn run_prompt(flags: AgentFlags, prompt_words: Vec<String>) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::{
-        format_evidence, loop_machinery_label, new_render_suffix, plugin_binaries_in, tool_preview,
-        truncate, usage_annotation,
+        build_datasources, format_evidence, loop_machinery_label, new_render_suffix,
+        plugin_binaries_in, tool_preview, truncate, usage_annotation,
     };
     use serde_json::json;
+
+    /// `build_datasources` walks a `markdown` datasource's directory and ingests its docs into a shared
+    /// backend; an unknown `kind` is a clean error.
+    #[tokio::test]
+    async fn build_datasources_ingests_markdown_and_rejects_unknown_kinds() {
+        use flux_lang::program::DatasourceDecl;
+        use flux_system::{System, Workspace};
+
+        let dir = std::env::temp_dir().join(format!("flux-ds-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("note.md"), "# Title\nhello from a markdown note").unwrap();
+        let system = System::new(Workspace::new(&dir).unwrap());
+
+        let ok = vec![DatasourceDecl {
+            name: "docs".into(),
+            kind: "markdown".into(),
+            path: Some(".".into()),
+            settings: serde_json::Value::Null,
+        }];
+        let backend = build_datasources(&ok, &system).await.unwrap();
+        assert!(!backend.is_empty(), "the markdown note was ingested");
+
+        let bad = vec![DatasourceDecl {
+            name: "x".into(),
+            kind: "nope".into(),
+            path: None,
+            settings: serde_json::Value::Null,
+        }];
+        assert!(
+            build_datasources(&bad, &system).await.is_err(),
+            "an unknown datasource kind is a clean error"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// `flux plugin install` scans a directory for `flux-plugin-<name>` executables: it picks those up
     /// (sorted, by stripped name) and skips sidecars (`*.d`), non-prefixed files, and an empty name.

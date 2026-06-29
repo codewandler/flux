@@ -7,28 +7,30 @@ use std::time::Duration;
 use flux_app::App;
 use flux_channels::{build_channels, serve};
 use flux_lang::program::Module;
-use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 async fn one_shot_channel_does_not_stop_the_host() {
     // Two channels: a one-shot `startup` schedule (finishes immediately) and a per-second cron (runs
     // until cancel). The host must keep running after the one-shot ends.
-    let src = serde_json::to_string(&json!({
-        "channels": [
-            { "name": "boot", "kind": "schedule", "settings": { "on": "startup" } },
-            { "name": "tick", "kind": "schedule", "settings": { "schedule": "* * * * * *" } }
-        ],
-        "triggers": [{ "name": "t", "on": "tick", "run": "noop" }],
-        "journeys": [{
-            "name": "noop",
-            "flow": { "name": "noop", "body": [
-                { "kind": "return", "value": { "kind": "lit", "value": "" } }
-            ] }
-        }]
-    }))
-    .unwrap();
-    let program = match Module::parse_str(&src).unwrap() {
+    let src = "\
+channel boot
+  kind \"schedule\"
+  on \"startup\"
+
+channel tick
+  kind \"schedule\"
+  schedule \"* * * * * *\"
+
+trigger t
+  on \"tick\"
+  run noop
+
+journey noop
+  flow
+    return \"\"
+";
+    let program = match Module::parse_str(src).unwrap() {
         Module::Program(p) => p,
         Module::Flow(_) => unreachable!("a program"),
     };

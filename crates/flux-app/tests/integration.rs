@@ -16,19 +16,18 @@ fn program(src: &str) -> Program {
 
 /// A hermetic program: a startup trigger runs a journey that `send`s on the cli channel and returns a
 /// literal — entirely pure ops, no model.
-const HELLO: &str = r#"{
-    "name": "hello",
-    "channels": [{ "name": "cli", "kind": "cli" }],
-    "triggers": [{ "name": "t", "on": "startup", "run": "greet" }],
-    "journeys": [{
-        "name": "greet",
-        "flow": { "body": [
-            { "kind": "call", "op": "send",
-              "args": [{ "kind": "lit", "value": { "channel": "cli", "message": "Hello from flux-app!" } }] },
-            { "kind": "return", "value": { "kind": "lit", "value": "Hello from flux-app!" } }
-        ]}
-    }]
-}"#;
+const HELLO: &str = "\
+channel cli
+
+trigger t
+  on \"startup\"
+  run greet
+
+journey greet
+  flow
+    send({ \"channel\": \"cli\", \"message\": \"Hello from flux-app!\" })
+    return \"Hello from flux-app!\"
+";
 
 #[tokio::test]
 async fn startup_trigger_runs_journey_and_records_send() {
@@ -66,19 +65,19 @@ async fn unmatched_event_runs_nothing() {
 
 /// The event payload is seeded into the journey's session: a top-level field binds to its own symbol,
 /// so `fmt("...{text}...")` and `$reply` resolve.
-const ECHO: &str = r#"{
-    "channels": [{ "name": "cli", "kind": "cli" }],
-    "triggers": [{ "name": "t", "on": "user_input", "run": "echo" }],
-    "journeys": [{
-        "name": "echo",
-        "flow": { "body": [
-            { "kind": "bind", "name": "reply", "value": { "kind": "fmt", "template": "you said: {text}" } },
-            { "kind": "call", "op": "send",
-              "args": [{ "kind": "lit", "value": "cli" }, { "kind": "var", "name": "reply" }] },
-            { "kind": "return", "value": { "kind": "var", "name": "reply" } }
-        ]}
-    }]
-}"#;
+const ECHO: &str = "\
+channel cli
+
+trigger t
+  on \"user_input\"
+  run echo
+
+journey echo
+  flow
+    $reply = fmt(\"you said: {text}\")
+    send(\"cli\", $reply)
+    return $reply
+";
 
 #[tokio::test]
 async fn user_input_payload_is_seeded_and_echoed() {
@@ -104,21 +103,25 @@ async fn user_input_payload_is_seeded_and_echoed() {
 
 /// A journey that `emit`s a second event whose trigger runs another journey — proving the bus cascade
 /// inside one `deliver`.
-const CASCADE: &str = r#"{
-    "channels": [{ "name": "cli", "kind": "cli" }],
-    "triggers": [
-        { "name": "a", "on": "startup",  "run": "first" },
-        { "name": "b", "on": "followup", "run": "second" }
-    ],
-    "journeys": [
-        { "name": "first", "flow": { "body": [
-            { "kind": "call", "op": "emit", "args": [{ "kind": "lit", "value": { "event": "followup" } }] }
-        ]}},
-        { "name": "second", "flow": { "body": [
-            { "kind": "call", "op": "send", "args": [{ "kind": "lit", "value": { "channel": "cli", "message": "cascaded!" } }] }
-        ]}}
-    ]
-}"#;
+const CASCADE: &str = "\
+channel cli
+
+trigger a
+  on \"startup\"
+  run first
+
+trigger b
+  on \"followup\"
+  run second
+
+journey first
+  flow
+    emit({ \"event\": \"followup\" })
+
+journey second
+  flow
+    send({ \"channel\": \"cli\", \"message\": \"cascaded!\" })
+";
 
 #[tokio::test]
 async fn emit_cascades_to_a_second_trigger_within_one_deliver() {
@@ -143,21 +146,23 @@ async fn emit_cascades_to_a_second_trigger_within_one_deliver() {
 
 /// A parent journey that `spawn`s a child journey to completion and returns its result — proving the
 /// `spawn` op re-enters the engine and runs a real journey through the same execution path.
-const SPAWN: &str = r#"{
-    "channels": [{ "name": "cli", "kind": "cli" }],
-    "triggers": [{ "name": "t", "on": "startup", "run": "parent" }],
-    "journeys": [
-        { "name": "parent", "flow": { "body": [
-            { "kind": "bind", "name": "out",
-              "value": { "kind": "call", "op": "spawn", "args": [{ "kind": "lit", "value": { "run": "child" } }] } },
-            { "kind": "return", "value": { "kind": "var", "name": "out" } }
-        ]}},
-        { "name": "child", "flow": { "body": [
-            { "kind": "call", "op": "send", "args": [{ "kind": "lit", "value": { "channel": "cli", "message": "child ran" } }] },
-            { "kind": "return", "value": { "kind": "lit", "value": "child-result" } }
-        ]}}
-    ]
-}"#;
+const SPAWN: &str = "\
+channel cli
+
+trigger t
+  on \"startup\"
+  run parent
+
+journey parent
+  flow
+    $out = spawn({ \"run\": \"child\" })
+    return $out
+
+journey child
+  flow
+    send({ \"channel\": \"cli\", \"message\": \"child ran\" })
+    return \"child-result\"
+";
 
 #[tokio::test]
 async fn spawn_runs_a_named_journey_and_returns_its_result() {
@@ -193,8 +198,26 @@ async fn registry_carries_the_orchestration_ops_and_builtins() {
 fn bundled_example_parses_as_a_program() {
     let src = include_str!("../examples/hello.flux");
     let p = program(src);
-    assert_eq!(p.name.as_deref(), Some("hello-app"));
     assert!(p.triggers.iter().any(|t| t.on == "startup"));
     assert!(p.flow_named("greet").is_some());
     assert!(p.flow_named("echo").is_some());
+}
+
+/// The full-surface example exercises every typed declaration — agent + slack channel (with `secret`
+/// references) + a markdown datasource + an agent-bound trigger + a journey — and secrets stay as
+/// unresolved markers until the host resolves them.
+#[test]
+fn support_bot_example_covers_the_full_module_surface() {
+    let p = program(include_str!("../examples/support-bot.flux"));
+    assert_eq!(p.agents[0].datasources, vec!["docs"]);
+    assert_eq!(p.channels[0].kind, "slack");
+    assert_eq!(
+        p.channels[0].settings["bot_token"],
+        json!({ "$secret": "SLACK_BOT_TOKEN" }),
+        "secrets are references, never inline plaintext"
+    );
+    assert_eq!(p.datasources[0].kind, "markdown");
+    assert_eq!(p.datasources[0].path.as_deref(), Some("./docs"));
+    assert_eq!(p.triggers[0].agent.as_deref(), Some("assistant"));
+    assert!(p.flow_named("answer").is_some());
 }

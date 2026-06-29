@@ -77,8 +77,9 @@ slot. UTC only (per-entry timezone is a follow-up). Fire-and-forget; results are
 ### webhook (`kind = "webhook" | "http"`)
 `axum`. Each webhook channel runs its **own** server on `settings.addr`; `POST settings.path` delivers
 the JSON body under the channel name and replies with the journeys' results as JSON. `settings.async =
-true` replies `202 Accepted` and runs fire-and-forget. Optional bearer `token` (literal or
-`secret:env/KEY`), compared in constant time. A **non-loopback `addr` requires a `token`** (the host
+true` replies `202 Accepted` and runs fire-and-forget. Optional bearer `token` (`token secret "KEY"`,
+host-resolved before the adapter reads settings), compared in constant time. A **non-loopback `addr`
+requires a `token`** (the host
 auto-approves tools, so an open listener is a remote-trigger surface — mirrors flux-server). HMAC and a
 shared multi-channel server are follow-ups.
 
@@ -87,7 +88,8 @@ shared multi-channel server are follow-ups.
 Subscribes to app-mentions and human messages (bot/subtype messages are skipped to avoid reply loops);
 delivers `{ text, user, channel, thread, conversation }` under the channel name and posts the journeys'
 joined result back to the thread. `allow_users` / `allow_channels` settings gate access; bot/app tokens
-come via `secret:env/...`. Live validation needs a real Slack app — the hermetic tests cover the
+come via `secret "ENV_NAME"` references (host-resolved at load). Live validation needs a real Slack app
+— the hermetic tests cover the
 event→payload mapping and the allow-list only.
 
 > **slack-morphism version:** capped at `>=2.10, <2.18`. 2.18+ require `signal-hook-tokio ^0.4`, which

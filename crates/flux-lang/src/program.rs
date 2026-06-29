@@ -1,19 +1,20 @@
 //! The multi-agent **Program** layer: a `.flux` file may declare a whole app — agents, channels,
-//! triggers, and journeys — not just a single flow. These are **pure-data declarations** (L0,
-//! strings + an opaque `settings` JSON map); the L3 engine and the L6 `flux-app` host give them their
-//! runtime *meaning* (model/datasource/channel wiring, the event bus, the scheduler). This keeps the
-//! multi-agent vision coherent without expanding the language core: **orchestration is an op-pack**
+//! datasources, triggers, and journeys — not just a single flow. These are **pure-data declarations**
+//! (L0, strings + an opaque `settings` JSON map); the L3 engine and the L6 `flux-app` host give them
+//! their runtime *meaning* (model/datasource/channel wiring, the event bus, the scheduler). This keeps
+//! the multi-agent vision coherent without expanding the language core: **orchestration is an op-pack**
 //! (`ask`/`send`/`emit`/`spawn`), so this layer needs **zero new node kinds**.
 //!
-//! A bare single-flow file still loads — [`Module::from_json`] sniffs the shape and wraps a lone
-//! [`DraftAst`]. "User input is just an event": a trigger's `on` label shares the event-label space
-//! with [`crate::ast::Node::Await`].
+//! A program is authored in **native flux-lang text** ([`crate::parse::parse_program`], reached via
+//! [`Module::parse_str`]); a bare single-flow file still loads, wrapping a lone [`DraftAst`]. "User
+//! input is just an event": a trigger's `on` label shares the event-label space with
+//! [`crate::ast::Node::Await`].
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::ast::DraftAst;
-use crate::error::{FlowError, Result};
+use crate::error::Result;
 
 /// An agent: an identity plus the model / tool / datasource access surface it runs with. A superset
 /// of an orchestration role; the L3 engine resolves the names to concrete capabilities.
@@ -44,6 +45,21 @@ pub struct ChannelDecl {
     pub name: String,
     /// The channel runtime to use (e.g. `cli`, `http`, `slack`).
     pub kind: String,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub settings: serde_json::Value,
+}
+
+/// A datasource: a named knowledge index an agent can query. The `kind` selects the L6 ingester
+/// (`markdown`, `openapi`, …); `path` points at the source; `settings` configures it. Like the other
+/// decls this is pure data — the host (`flux-capabilities`) gives it runtime meaning.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DatasourceDecl {
+    pub name: String,
+    /// The ingester to use (e.g. `markdown`, `openapi`). In native text this defaults to the decl name.
+    pub kind: String,
+    /// The source location (a directory for `markdown`, a spec file for `openapi`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub settings: serde_json::Value,
 }
@@ -85,6 +101,8 @@ pub struct Program {
     #[serde(default)]
     pub channels: Vec<ChannelDecl>,
     #[serde(default)]
+    pub datasources: Vec<DatasourceDecl>,
+    #[serde(default)]
     pub triggers: Vec<TriggerDecl>,
     #[serde(default)]
     pub journeys: Vec<JourneyDecl>,
@@ -104,8 +122,41 @@ impl Program {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Secret references
+// ---------------------------------------------------------------------------
+
+/// The reserved settings key marking an **unresolved secret reference**: `{"$secret":"ENV_NAME"}`. A
+/// `secret "NAME"` in native text lowers (in the pure parser) to this marker; the host resolves it from
+/// the environment once at load (`flux_app::resolve_secrets`) — plaintext never lives in a committed
+/// `.flux`. This is the single secret mechanism across the module layer.
+pub const SECRET_KEY: &str = "$secret";
+
+/// Build a secret-reference marker for the environment variable `name`.
+pub fn secret_marker(name: &str) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    m.insert(
+        SECRET_KEY.to_string(),
+        serde_json::Value::String(name.to_string()),
+    );
+    serde_json::Value::Object(m)
+}
+
+/// If `v` is exactly a secret marker (`{"$secret":"NAME"}`), return `NAME`.
+pub fn as_secret_ref(v: &serde_json::Value) -> Option<&str> {
+    let obj = v.as_object()?;
+    if obj.len() == 1 {
+        if let Some(serde_json::Value::String(name)) = obj.get(SECRET_KEY) {
+            return Some(name);
+        }
+    }
+    None
+}
+
 /// A loaded `.flux` module: either a single bare flow or a full multi-agent program. The loader
-/// sniffs the shape so a host can accept both `foo.flux` (one flow) and `app.flux` (a program).
+/// sniffs the shape so a host can accept both `foo.flux` (one flow) and `app.flux` (a program). Both
+/// are **native flux-lang text** — module declarations (`agent`/`channel`/`datasource`/`trigger`/
+/// `journey`) mark a program; a lone `flow` header is a bare flow.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Module {
     /// A bare single-flow file (a lone `DraftAst`).
@@ -115,29 +166,11 @@ pub enum Module {
 }
 
 impl Module {
-    /// The keys that mark a document as a [`Program`] rather than a bare flow. A document carrying any
-    /// of these is a program; otherwise it loads as a single flow.
-    const PROGRAM_KEYS: [&'static str; 5] = ["agents", "channels", "triggers", "journeys", "flows"];
-
-    /// Load a `.flux` JSON document, sniffing whether it is a bare [`DraftAst`] or a [`Program`].
-    pub fn from_json(v: serde_json::Value) -> Result<Module> {
-        let is_program = Self::PROGRAM_KEYS.iter().any(|k| v.get(k).is_some());
-        if is_program {
-            serde_json::from_value(v)
-                .map(Module::Program)
-                .map_err(|e| FlowError::Parse(format!("program: {e}")))
-        } else {
-            serde_json::from_value(v)
-                .map(Module::Flow)
-                .map_err(|e| FlowError::Parse(format!("flow: {e}")))
-        }
-    }
-
-    /// Load a `.flux` module from a JSON string.
+    /// Load a `.flux` module from native flux-lang text, sniffing whether it is a bare flow or a
+    /// multi-agent program. (The program/app layer used to be JSON; it is now native text — see
+    /// [`crate::parse::parse_program`].)
     pub fn parse_str(s: &str) -> Result<Module> {
-        let v: serde_json::Value =
-            serde_json::from_str(s).map_err(|e| FlowError::Parse(format!("json: {e}")))?;
-        Self::from_json(v)
+        crate::parse::parse_program(s)
     }
 
     /// The [`Program`] if this module is one, else `None` (a bare flow is not implicitly a program).
@@ -155,7 +188,7 @@ mod tests {
 
     #[test]
     fn a_bare_flow_loads_as_a_single_flow() {
-        let m = Module::parse_str(r#"{"name":"greet","body":[]}"#).unwrap();
+        let m = Module::parse_str("flow greet\n  return null").unwrap();
         match m {
             Module::Flow(f) => assert_eq!(f.name.as_deref(), Some("greet")),
             Module::Program(_) => panic!("a bare flow must not sniff as a program"),
@@ -164,18 +197,28 @@ mod tests {
 
     #[test]
     fn a_document_with_agents_loads_as_a_program() {
-        let src = r#"{
-            "name": "support-app",
-            "agents": [{"name": "triager", "model": "claude-opus-4-8", "tools": ["read", "grep"]}],
-            "channels": [{"name": "cli", "kind": "cli"}],
-            "triggers": [{"name": "t", "on": "user_input", "run": "handle"}],
-            "journeys": [{"name": "handle", "flow": {"body": []}}]
-        }"#;
+        // Native flux-lang text: module declarations make it a program; `channel cli` defaults its
+        // `kind` to the decl name.
+        let src = "\
+agent triager
+  model \"claude-opus-4-8\"
+  tools [read, grep]
+
+channel cli
+
+trigger t
+  on \"user_input\"
+  run handle
+
+journey handle
+  flow
+    return null
+";
         let Module::Program(p) = Module::parse_str(src).unwrap() else {
-            panic!("a document with `agents` must sniff as a program");
+            panic!("module declarations must sniff as a program");
         };
-        assert_eq!(p.name.as_deref(), Some("support-app"));
         assert_eq!(p.agents.len(), 1);
+        assert_eq!(p.agents[0].model.as_deref(), Some("claude-opus-4-8"));
         assert_eq!(p.agents[0].tools, vec!["read", "grep"]);
         assert_eq!(p.channels[0].kind, "cli");
         assert_eq!(p.triggers[0].on, "user_input");

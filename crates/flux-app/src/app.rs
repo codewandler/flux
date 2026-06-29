@@ -605,11 +605,16 @@ mod agent_target_tests {
 
     /// An app with one agent reachable via an `agent`-bound `slack` trigger.
     fn app_with_agent(reply: &str) -> App {
-        let src = r#"{
-            "name": "t",
-            "agents": [{ "name": "assistant", "description": "be terse", "tools": [] }],
-            "triggers": [{ "name": "t1", "on": "slack", "run": "_", "agent": "assistant" }]
-        }"#;
+        let src = "\
+agent assistant
+  description \"be terse\"
+  tools []
+
+trigger t1
+  on \"slack\"
+  run _
+  agent assistant
+";
         let provider: Arc<dyn Provider> = Arc::new(ReplyProvider {
             reply: reply.to_string(),
         });
@@ -695,13 +700,15 @@ mod agent_target_tests {
     #[tokio::test]
     async fn trigger_without_agent_still_runs_its_journey() {
         // A plain journey trigger (no `agent`) runs the journey unchanged — the agentic path is additive.
-        let src = r#"{
-            "name": "t",
-            "triggers": [{ "name": "t1", "on": "ping", "run": "pong" }],
-            "journeys": [{ "name": "pong", "flow": { "name": "pong", "body": [
-                { "kind": "return", "value": { "kind": "lit", "value": "pong!" } }
-            ] } }]
-        }"#;
+        let src = "\
+trigger t1
+  on \"ping\"
+  run pong
+
+journey pong
+  flow
+    return \"pong!\"
+";
         let app = App::with_options(program(src), None, "mock", false);
         let runs = app.deliver("ping", json!({})).await.expect("deliver");
         assert_eq!(runs.len(), 1);

@@ -20,6 +20,9 @@
 
 use crate::ast::{DraftAst, FlowEffect, Node, Param, SymbolName, TypeRef};
 use crate::error::{FlowError, Result};
+use crate::program::{
+    AgentDecl, ChannelDecl, DatasourceDecl, JourneyDecl, Module, Program, TriggerDecl,
+};
 use std::collections::BTreeMap;
 
 /// Parse a single Flux-Lang flow from text into a [`DraftAst`].
@@ -61,6 +64,398 @@ fn perr(msg: &str) -> FlowError {
 
 fn is_goal_line(t: &str) -> bool {
     t == "goal" || t.starts_with("goal ")
+}
+
+// ---------------------------------------------------------------------------
+// Program / module layer: native-text typed declarations
+// ---------------------------------------------------------------------------
+
+/// Whether `t` opens a `flow` header (`flow`, `flow <name>`, or `flow(`).
+fn is_flow_header(t: &str) -> bool {
+    t == "flow"
+        || t.strip_prefix("flow")
+            .is_some_and(|r| r.starts_with(char::is_whitespace) || r.starts_with('('))
+}
+
+/// Parse a `.flux` **module** from native flux-lang text: a multi-agent [`Program`] — any of the
+/// `agent`/`channel`/`datasource`/`trigger`/`journey` declarations plus top-level `flow`s — or, when the
+/// file is a lone `flow`, a bare [`Module::Flow`]. The backend of
+/// [`crate::program::Module::parse_str`]; module declarations are pure data (the L6 hosts give them
+/// runtime meaning), so this adds **no** new node kinds.
+pub fn parse_program(src: &str) -> Result<Module> {
+    let lines = preprocess(src)?;
+    if lines.is_empty() {
+        return Err(perr(
+            "empty input: expected a `flow` header or module declarations",
+        ));
+    }
+    let mut program = Program::default();
+    let mut saw_module_decl = false;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = &lines[i];
+        if line.indent != 0 {
+            return Err(perr(&format!(
+                "a declaration must start at column 0: `{}`",
+                line.text
+            )));
+        }
+        let header = line.text.as_str();
+        let region = child_region(&lines[i..], 0);
+        let consumed = 1 + region.len();
+
+        if let Some(rest) = kw(header, "agent") {
+            program.agents.push(parse_agent_decl(rest, region)?);
+            saw_module_decl = true;
+        } else if let Some(rest) = kw(header, "channel") {
+            program.channels.push(parse_channel_decl(rest, region)?);
+            saw_module_decl = true;
+        } else if let Some(rest) = kw(header, "datasource") {
+            program
+                .datasources
+                .push(parse_datasource_decl(rest, region)?);
+            saw_module_decl = true;
+        } else if let Some(rest) = kw(header, "trigger") {
+            program.triggers.push(parse_trigger_decl(rest, region)?);
+            saw_module_decl = true;
+        } else if let Some(rest) = kw(header, "journey") {
+            program.journeys.push(parse_journey_decl(rest, region)?);
+            saw_module_decl = true;
+        } else if is_flow_header(header) {
+            program.flows.push(parse_flow_decl(header, region)?);
+        } else if is_goal_line(header) {
+            // tolerated and ignored, mirroring `parse`
+        } else {
+            return Err(perr(&format!(
+                "unknown top-level declaration: `{header}` (expected agent / channel / datasource / \
+                 trigger / journey / flow)"
+            )));
+        }
+        i += consumed;
+    }
+
+    // A file with no module declarations and exactly one top-level flow is a bare flow.
+    if !saw_module_decl && program.flows.len() == 1 {
+        return Ok(Module::Flow(program.flows.pop().unwrap()));
+    }
+    Ok(Module::Program(program))
+}
+
+/// A flow declaration (header + indented body region) → a [`DraftAst`]. Shared by top-level `flow`
+/// decls and a `journey`'s inline `flow` block; reuses the flow header + statement parsers verbatim.
+fn parse_flow_decl(header: &str, region: &[Line]) -> Result<DraftAst> {
+    let (name, params, returns) = parse_header(header)?;
+    let (body, _) = parse_stmts(region, 0)?;
+    Ok(DraftAst {
+        name,
+        params,
+        returns,
+        body,
+    })
+}
+
+/// The single-identifier name after a decl keyword (e.g. `assistant` in `agent assistant`).
+fn decl_name(s: &str, kind: &str) -> Result<String> {
+    let name = s.trim();
+    let (tok, rest) = take_while(name, is_name_char);
+    if tok.is_empty() || !rest.trim().is_empty() {
+        return Err(perr(&format!(
+            "`{kind}` name must be a single identifier, got: `{name}`"
+        )));
+    }
+    Ok(tok.to_string())
+}
+
+/// The `key value` attribute lines of a flat decl body — all at one indentation level (no nested
+/// blocks). Returns each key paired with the rest of its line (the value text).
+fn attr_lines(region: &[Line]) -> Result<Vec<(String, &str)>> {
+    let mut out = Vec::new();
+    if region.is_empty() {
+        return Ok(out);
+    }
+    let indent = region[0].indent;
+    for l in region {
+        if l.indent != indent {
+            return Err(perr(&format!(
+                "unexpected indentation in declaration body: `{}`",
+                l.text
+            )));
+        }
+        let (key, rest) = take_while(&l.text, is_name_char);
+        if key.is_empty() {
+            return Err(perr(&format!(
+                "expected a `key value` attribute, got: `{}`",
+                l.text
+            )));
+        }
+        out.push((key.to_string(), rest.trim_start()));
+    }
+    Ok(out)
+}
+
+fn parse_agent_decl(name_str: &str, region: &[Line]) -> Result<AgentDecl> {
+    let name = decl_name(name_str, "agent")?;
+    let mut decl = AgentDecl {
+        name,
+        ..Default::default()
+    };
+    let mut settings = serde_json::Map::new();
+    for (key, val) in attr_lines(region)? {
+        match key.as_str() {
+            "model" => decl.model = Some(string_value(val, "model")?),
+            "tools" => decl.tools = as_string_list(&parse_setting(val)?, "tools")?,
+            "datasources" => {
+                decl.datasources = as_string_list(&parse_setting(val)?, "datasources")?
+            }
+            "description" => decl.description = Some(string_value(val, "description")?),
+            _ => {
+                settings.insert(key, parse_setting(val)?);
+            }
+        }
+    }
+    if !settings.is_empty() {
+        decl.settings = serde_json::Value::Object(settings);
+    }
+    Ok(decl)
+}
+
+fn parse_channel_decl(name_str: &str, region: &[Line]) -> Result<ChannelDecl> {
+    let name = decl_name(name_str, "channel")?;
+    let mut kind: Option<String> = None;
+    let mut settings = serde_json::Map::new();
+    for (key, val) in attr_lines(region)? {
+        match key.as_str() {
+            "kind" => kind = Some(string_value(val, "kind")?),
+            _ => {
+                settings.insert(key, parse_setting(val)?);
+            }
+        }
+    }
+    Ok(ChannelDecl {
+        kind: kind.unwrap_or_else(|| name.clone()), // `kind` defaults to the decl name
+        name,
+        settings: settings_value(settings),
+    })
+}
+
+fn parse_datasource_decl(name_str: &str, region: &[Line]) -> Result<DatasourceDecl> {
+    let name = decl_name(name_str, "datasource")?;
+    let mut kind: Option<String> = None;
+    let mut path: Option<String> = None;
+    let mut settings = serde_json::Map::new();
+    for (key, val) in attr_lines(region)? {
+        match key.as_str() {
+            "kind" => kind = Some(string_value(val, "kind")?),
+            "path" => path = Some(string_value(val, "path")?),
+            _ => {
+                settings.insert(key, parse_setting(val)?);
+            }
+        }
+    }
+    Ok(DatasourceDecl {
+        kind: kind.unwrap_or_else(|| name.clone()),
+        name,
+        path,
+        settings: settings_value(settings),
+    })
+}
+
+fn parse_trigger_decl(name_str: &str, region: &[Line]) -> Result<TriggerDecl> {
+    let name = decl_name(name_str, "trigger")?;
+    let mut on: Option<String> = None;
+    let mut run: Option<String> = None;
+    let mut agent: Option<String> = None;
+    for (key, val) in attr_lines(region)? {
+        match key.as_str() {
+            "on" => on = Some(string_value(val, "on")?),
+            "run" => run = Some(string_value(val, "run")?),
+            "agent" => agent = Some(string_value(val, "agent")?),
+            other => return Err(perr(&format!("unknown trigger attribute `{other}`"))),
+        }
+    }
+    Ok(TriggerDecl {
+        name,
+        on: on.ok_or_else(|| perr("a `trigger` needs an `on` event label"))?,
+        run: run.ok_or_else(|| perr("a `trigger` needs a `run` journey/flow name"))?,
+        agent,
+    })
+}
+
+fn parse_journey_decl(name_str: &str, region: &[Line]) -> Result<JourneyDecl> {
+    let name = decl_name(name_str, "journey")?;
+    if region.is_empty() {
+        return Err(perr(&format!("journey `{name}` needs a `flow` body")));
+    }
+    let block_indent = region[0].indent;
+    let mut agent: Option<String> = None;
+    let mut flow: Option<DraftAst> = None;
+    let mut j = 0;
+    while j < region.len() {
+        let line = &region[j];
+        if line.indent != block_indent {
+            return Err(perr(&format!(
+                "unexpected indentation in journey `{name}`: `{}`",
+                line.text
+            )));
+        }
+        let t = line.text.as_str();
+        if let Some(rest) = kw(t, "agent") {
+            agent = Some(string_value(rest, "agent")?);
+            j += 1;
+        } else if is_flow_header(t) {
+            let body = child_region(&region[j..], block_indent);
+            let mut ast = parse_flow_decl(t, body)?;
+            if ast.name.is_none() {
+                ast.name = Some(name.clone());
+            }
+            flow = Some(ast);
+            j += 1 + body.len();
+        } else {
+            return Err(perr(&format!("unexpected line in journey `{name}`: `{t}`")));
+        }
+    }
+    let flow = flow.ok_or_else(|| perr(&format!("journey `{name}` needs a `flow` body")))?;
+    Ok(JourneyDecl { name, agent, flow })
+}
+
+/// An empty settings map renders as `Value::Null` (so it serializes away); a non-empty one as an object.
+fn settings_value(map: serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+    if map.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Object(map)
+    }
+}
+
+/// Parse a full setting value, rejecting trailing text.
+fn parse_setting(s: &str) -> Result<serde_json::Value> {
+    let (v, rest) = parse_setting_value(s)?;
+    if !rest.trim().is_empty() {
+        return Err(perr(&format!(
+            "trailing text after setting value: `{rest}`"
+        )));
+    }
+    Ok(v)
+}
+
+/// A setting value coerced to a string (a quoted string or a bare identifier both work).
+fn string_value(s: &str, what: &str) -> Result<String> {
+    match parse_setting(s)? {
+        serde_json::Value::String(s) => Ok(s),
+        _ => Err(perr(&format!("`{what}` must be a string"))),
+    }
+}
+
+fn as_string_list(v: &serde_json::Value, what: &str) -> Result<Vec<String>> {
+    match v {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|i| match i {
+                serde_json::Value::String(s) => Ok(s.clone()),
+                _ => Err(perr(&format!("`{what}` must be a list of strings"))),
+            })
+            .collect(),
+        _ => Err(perr(&format!("`{what}` must be a list of strings"))),
+    }
+}
+
+/// Evaluate a native-text **setting value** to a [`serde_json::Value`] (no IO): string / number /
+/// `true|false|null`; `[ … ]` lists and `{ k: v }` records (bare identifiers coerce to strings, so
+/// `tools [search, send]` works); and `secret "NAME"` → the reserved marker `{"$secret":"NAME"}`,
+/// resolved later by the host (never inline plaintext). Returns the value and the unconsumed remainder.
+fn parse_setting_value(s: &str) -> Result<(serde_json::Value, &str)> {
+    let s = s.trim_start();
+    let first = s
+        .chars()
+        .next()
+        .ok_or_else(|| perr("expected a setting value"))?;
+    match first {
+        '"' => take_json(s),
+        '-' | '0'..='9' => take_json(s),
+        '[' => parse_setting_list(s),
+        '{' => parse_setting_record(s),
+        c if c.is_ascii_alphabetic() || c == '_' => {
+            let (ident, rest) = take_while(s, is_name_char);
+            match ident {
+                "true" => Ok((serde_json::Value::Bool(true), rest)),
+                "false" => Ok((serde_json::Value::Bool(false), rest)),
+                "null" => Ok((serde_json::Value::Null, rest)),
+                "secret" => parse_secret_ref(rest),
+                _ => Ok((serde_json::Value::String(ident.to_string()), rest)),
+            }
+        }
+        _ => Err(perr(&format!(
+            "unexpected character in setting value: `{first}`"
+        ))),
+    }
+}
+
+/// `secret "NAME"` → `{"$secret":"NAME"}` (the env-var name to resolve at load; plaintext never inline).
+fn parse_secret_ref(after_kw: &str) -> Result<(serde_json::Value, &str)> {
+    let s = after_kw.trim_start();
+    let (name_v, rest) = take_json(s).map_err(|_| {
+        perr("`secret` expects a quoted env-var name, e.g. `secret \"SLACK_BOT_TOKEN\"`")
+    })?;
+    let name = match name_v {
+        serde_json::Value::String(n) => n,
+        _ => return Err(perr("`secret` expects a quoted env-var name")),
+    };
+    Ok((crate::program::secret_marker(&name), rest))
+}
+
+fn parse_setting_list(s: &str) -> Result<(serde_json::Value, &str)> {
+    let mut s = s
+        .strip_prefix('[')
+        .ok_or_else(|| perr("expected `[`"))?
+        .trim_start();
+    let mut items = Vec::new();
+    if let Some(r) = s.strip_prefix(']') {
+        return Ok((serde_json::Value::Array(items), r));
+    }
+    loop {
+        let (item, rest) = parse_setting_value(s)?;
+        items.push(item);
+        let rest = rest.trim_start();
+        if let Some(r) = rest.strip_prefix(',') {
+            s = r.trim_start();
+            continue;
+        }
+        if let Some(r) = rest.strip_prefix(']') {
+            return Ok((serde_json::Value::Array(items), r));
+        }
+        return Err(perr(&format!("expected `,` or `]` in list, got: `{rest}`")));
+    }
+}
+
+fn parse_setting_record(s: &str) -> Result<(serde_json::Value, &str)> {
+    let mut s = s
+        .strip_prefix('{')
+        .ok_or_else(|| perr("expected `{`"))?
+        .trim_start();
+    let mut map = serde_json::Map::new();
+    if let Some(r) = s.strip_prefix('}') {
+        return Ok((serde_json::Value::Object(map), r));
+    }
+    loop {
+        let (key, rest) = parse_obj_key(s)?;
+        let rest = rest
+            .trim_start()
+            .strip_prefix(':')
+            .ok_or_else(|| perr(&format!("expected `:` after record key `{key}`")))?;
+        let (val, rest) = parse_setting_value(rest)?;
+        map.insert(key, val);
+        let rest = rest.trim_start();
+        if let Some(r) = rest.strip_prefix(',') {
+            s = r.trim_start();
+            continue;
+        }
+        if let Some(r) = rest.strip_prefix('}') {
+            return Ok((serde_json::Value::Object(map), r));
+        }
+        return Err(perr(&format!(
+            "expected `,` or `}}` in record, got: `{rest}`"
+        )));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2142,5 +2537,127 @@ flow pack-it
         let (v, rest) = take_json("[1, 2])").unwrap();
         assert_eq!(v, serde_json::json!([1, 2]));
         assert_eq!(rest, ")");
+    }
+
+    // -----------------------------------------------------------------------
+    // Program / module layer
+    // -----------------------------------------------------------------------
+
+    const CANONICAL_APP: &str = "\
+# app.flux — the whole app in native flux-lang
+agent assistant
+  model \"claude-sonnet-4-6\"
+  tools [search, send]
+  datasources [docs]
+  description \"answers from the docs\"
+
+channel slack
+  bot_token secret \"SLACK_BOT_TOKEN\"
+  app_token secret \"SLACK_APP_TOKEN\"
+
+datasource docs
+  kind \"markdown\"
+  path \"./docs\"
+
+trigger on_msg
+  on \"slack\"
+  run greet
+  agent assistant
+
+journey greet
+  agent assistant
+  flow
+    $r = complete($text)
+    return $r
+";
+
+    #[test]
+    fn parse_program_reads_the_full_typed_module_surface() {
+        let Module::Program(p) = parse_program(CANONICAL_APP).unwrap() else {
+            panic!("module declarations must sniff as a program");
+        };
+
+        // agent
+        assert_eq!(p.agents.len(), 1);
+        let a = &p.agents[0];
+        assert_eq!(a.name, "assistant");
+        assert_eq!(a.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(a.tools, vec!["search", "send"]);
+        assert_eq!(a.datasources, vec!["docs"]);
+        assert_eq!(a.description.as_deref(), Some("answers from the docs"));
+
+        // channel — kind defaults to the name; secrets are markers, never plaintext
+        assert_eq!(p.channels.len(), 1);
+        assert_eq!(p.channels[0].kind, "slack");
+        assert_eq!(
+            p.channels[0].settings["bot_token"],
+            serde_json::json!({ "$secret": "SLACK_BOT_TOKEN" })
+        );
+
+        // datasource
+        assert_eq!(p.datasources.len(), 1);
+        assert_eq!(p.datasources[0].kind, "markdown");
+        assert_eq!(p.datasources[0].path.as_deref(), Some("./docs"));
+
+        // trigger
+        assert_eq!(p.triggers[0].on, "slack");
+        assert_eq!(p.triggers[0].run, "greet");
+        assert_eq!(p.triggers[0].agent.as_deref(), Some("assistant"));
+
+        // journey + its inline flow body (defaulted to the journey name)
+        let flow = p.flow_named("greet").expect("journey resolves by name");
+        assert_eq!(flow.name.as_deref(), Some("greet"));
+        assert_eq!(p.journeys[0].agent.as_deref(), Some("assistant"));
+        assert!(
+            matches!(flow.body.last(), Some(Node::Return { .. })),
+            "the flow body parsed as native statements"
+        );
+    }
+
+    #[test]
+    fn channel_kind_can_be_overridden() {
+        let src = "channel myslack\n  kind \"slack\"\n";
+        let Module::Program(p) = parse_program(src).unwrap() else {
+            panic!("program")
+        };
+        assert_eq!(p.channels[0].name, "myslack");
+        assert_eq!(p.channels[0].kind, "slack");
+    }
+
+    #[test]
+    fn setting_values_cover_literals_lists_records_and_secrets() {
+        assert_eq!(parse_setting("\"hi\"").unwrap(), serde_json::json!("hi"));
+        assert_eq!(parse_setting("42").unwrap(), serde_json::json!(42));
+        assert_eq!(parse_setting("true").unwrap(), serde_json::json!(true));
+        assert_eq!(parse_setting("null").unwrap(), serde_json::Value::Null);
+        // bare identifiers coerce to strings (so `tools [search, send]` works)
+        assert_eq!(
+            parse_setting("markdown").unwrap(),
+            serde_json::json!("markdown")
+        );
+        assert_eq!(
+            parse_setting("[a, b]").unwrap(),
+            serde_json::json!(["a", "b"])
+        );
+        assert_eq!(
+            parse_setting("{ k: 1, name: hello }").unwrap(),
+            serde_json::json!({ "k": 1, "name": "hello" })
+        );
+        assert_eq!(
+            parse_setting("secret \"TOKEN\"").unwrap(),
+            serde_json::json!({ "$secret": "TOKEN" })
+        );
+    }
+
+    #[test]
+    fn a_lone_flow_is_a_bare_flow_not_a_program() {
+        let m = parse_program("flow greet\n  return null").unwrap();
+        assert!(matches!(m, Module::Flow(_)));
+    }
+
+    #[test]
+    fn an_unknown_top_level_decl_is_a_clean_error() {
+        let err = parse_program("widget foo\n  x 1\n").unwrap_err();
+        assert!(format!("{err}").contains("unknown top-level declaration"));
     }
 }

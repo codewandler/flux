@@ -9,17 +9,16 @@ use serde_json::json;
 
 /// A tiny program: a `tick` trigger → a pure-op journey that returns the literal `"ok"`. No provider.
 fn tick_app() -> Arc<App> {
-    let src = serde_json::to_string(&json!({
-        "triggers": [{ "name": "t", "on": "tick", "run": "tick" }],
-        "journeys": [{
-            "name": "tick",
-            "flow": { "name": "tick", "body": [
-                { "kind": "return", "value": { "kind": "lit", "value": "ok" } }
-            ] }
-        }]
-    }))
-    .unwrap();
-    let program = match Module::parse_str(&src).unwrap() {
+    let src = "\
+trigger t
+  on \"tick\"
+  run tick
+
+journey tick
+  flow
+    return \"ok\"
+";
+    let program = match Module::parse_str(src).unwrap() {
         Module::Program(p) => p,
         Module::Flow(_) => unreachable!("a program"),
     };

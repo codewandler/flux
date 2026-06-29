@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use flux_lang::program::ChannelDecl;
 
-use crate::config::{resolve_secret, SlackSettings};
+use crate::config::SlackSettings;
 use crate::{Channel, Deliverer};
 
 pub struct SlackChannel {
@@ -27,8 +27,10 @@ impl SlackChannel {
             .map_err(|e| anyhow::anyhow!("channel `{}` settings: {e}", decl.name))?;
         Ok(Self {
             name: decl.name.clone(),
-            bot_token: resolve_secret(&s.bot_token)?,
-            app_token: resolve_secret(&s.app_token)?,
+            // Secrets are already host-resolved (the `{"$secret":…}` marker → env value) before these
+            // settings deserialize, so the token fields are plain values here.
+            bot_token: s.bot_token,
+            app_token: s.app_token,
             allow_users: s.allow_users,
             allow_channels: s.allow_channels,
         })

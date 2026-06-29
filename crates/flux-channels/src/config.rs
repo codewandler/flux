@@ -25,7 +25,7 @@ pub struct WebhookSettings {
     /// When true, reply `202 Accepted` immediately and run the delivery fire-and-forget.
     #[serde(default, rename = "async")]
     pub is_async: bool,
-    /// Optional bearer token (a literal, or a `secret:env/KEY` / `env:KEY` reference). Required for a
+    /// Optional bearer token (host-resolved — use `token secret "KEY"` in the program). Required for a
     /// non-loopback `addr`.
     #[serde(default)]
     pub token: Option<String>,
@@ -35,13 +35,17 @@ fn default_path() -> String {
     "/".to_string()
 }
 
+// Secrets are a single mechanism: `secret "ENV"` references in the program (lowered to a
+// `{"$secret":…}` marker) are resolved from the environment once at load by `flux_app::resolve_secrets`,
+// before any adapter deserializes these settings. So the token fields above are already plain values.
+
 /// `kind = "slack"` settings (feature `slack`).
 #[cfg(feature = "slack")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SlackSettings {
-    /// Bot OAuth token (`xoxb-…`), literal or `secret:env/KEY`.
+    /// Bot OAuth token (`xoxb-…`), host-resolved (use `bot_token secret "KEY"` in the program).
     pub bot_token: String,
-    /// App-level token for socket mode (`xapp-…`), literal or `secret:env/KEY`.
+    /// App-level token for socket mode (`xapp-…`), host-resolved (use `app_token secret "KEY"`).
     pub app_token: String,
     /// If non-empty, only these Slack user ids may trigger the agent.
     #[serde(default)]
@@ -49,17 +53,4 @@ pub struct SlackSettings {
     /// If non-empty, only these Slack channel ids are listened to.
     #[serde(default)]
     pub allow_channels: Vec<String>,
-}
-
-/// Resolve a possible `secret:env/KEY` (or `env:KEY`) reference to its value; a plain string passes
-/// through unchanged. Keeps tokens out of the program file.
-pub fn resolve_secret(s: &str) -> anyhow::Result<String> {
-    let key = s
-        .strip_prefix("secret:env/")
-        .or_else(|| s.strip_prefix("env:"));
-    match key {
-        Some(key) => std::env::var(key)
-            .map_err(|_| anyhow::anyhow!("env var `{key}` not set (referenced by `{s}`)")),
-        None => Ok(s.to_string()),
-    }
 }

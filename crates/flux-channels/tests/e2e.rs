@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use flux_app::{App, JourneyRun};
 use flux_channels::{build_channels, AppDeliverer, Deliverer};
 use flux_lang::program::Module;
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -31,19 +31,21 @@ impl Deliverer for Tee {
 #[tokio::test]
 async fn cron_tick_runs_journey_via_app() {
     // A `ticker` schedule channel → trigger → a journey that formats the seeded `{name}` payload field.
-    let src = serde_json::to_string(&json!({
-        "channels": [{ "name": "ticker", "kind": "schedule", "settings": { "schedule": "* * * * * *" } }],
-        "triggers": [{ "name": "t", "on": "ticker", "run": "tick" }],
-        "journeys": [{
-            "name": "tick",
-            "flow": { "name": "tick", "body": [
-                { "kind": "bind", "name": "r", "value": { "kind": "fmt", "template": "ran for {name}" } },
-                { "kind": "return", "value": { "kind": "var", "name": "r" } }
-            ] }
-        }]
-    }))
-    .unwrap();
-    let program = match Module::parse_str(&src).unwrap() {
+    let src = "\
+channel ticker
+  kind \"schedule\"
+  schedule \"* * * * * *\"
+
+trigger t
+  on \"ticker\"
+  run tick
+
+journey tick
+  flow
+    $r = fmt(\"ran for {name}\")
+    return $r
+";
+    let program = match Module::parse_str(src).unwrap() {
         Module::Program(p) => p,
         Module::Flow(_) => unreachable!("a program"),
     };
