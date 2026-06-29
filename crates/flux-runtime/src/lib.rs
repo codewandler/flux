@@ -134,10 +134,14 @@ pub struct ToolContext {
     /// Lives here (not Executor-private) so the `observe`/`evidence` ops can read and append to it.
     pub evidence: Arc<Mutex<EvidenceLog>>,
     /// The turn's cancellation token, installed per turn by the engine (interior-mutable so the
-    /// shared, long-lived context can carry a fresh token each turn — same lifecycle as `loop_host`).
-    /// A spawning tool (`task`) threads a child of this token into its sub-agent so cancelling the
-    /// parent turn cancels the child; `None` (no cancellable driver, e.g. the one-shot SDK path) means
-    /// the sub-agent simply runs to completion.
+    /// shared, long-lived context can carry a fresh token each turn — same lifecycle, and the same
+    /// **one-active-turn-per-engine** assumption, as `loop_host`'s per-turn `set_turn`). A spawning
+    /// tool (`task`) threads a child of this token into its sub-agent so cancelling the parent turn
+    /// cancels the child; `None` (no cancellable driver, e.g. the one-shot SDK path) means the
+    /// sub-agent simply runs to completion. INVARIANT: a single engine must not drive two turns
+    /// concurrently — running concurrent turns would clobber this slot (and `loop_host`'s). Surfaces
+    /// that fan out concurrently (e.g. a server) must use one engine per concurrent turn; the SDK's
+    /// `FlowClient` is already safe (a fresh `ToolContext` per `execute`).
     cancel: Arc<Mutex<Option<tokio_util::sync::CancellationToken>>>,
 }
 

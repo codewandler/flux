@@ -88,6 +88,15 @@ Verified in [`crates/flux-orchestrate/src/lib.rs`](../../crates/flux-orchestrate
   - WS2 aggregate token budget (stretch); `max_depth > 1` is implemented + tested but stays opt-in.
 - **Publish-closure note:** `flux-sdk` now depends on `flux-orchestrate`, widening the crates.io publish
   closure — fold into [`crates/flux-sdk/PUBLISHING.md`](../../crates/flux-sdk/PUBLISHING.md) before a release.
+- **Post-implementation review pass** (independent diff review) → refinements applied: rewrote a
+  tautological audit test into an adversarial one-store gate test; tightened the confinement test to
+  assert a *workspace-escape* error (not just `is_err`); added `SubAgents::with_max_depth` (the SDK/CLI
+  seam can now opt into bounded nesting); a bounded grace backstop on the wall-clock `run.await`; and a
+  default 10-min `wall_clock` in `FlowClient::with_sub_agents` (the one-shot SDK path has no other kill
+  switch). Two lifecycle gaps **documented, not fixed** (see the design's "Known limitations"):
+  parent-turn cancel drops an in-flight child without finalizing it (matters under `with_audit`), and the
+  per-turn cancel slot assumes one active turn per engine (a latent `flux serve` concern, same assumption
+  `loop_host.set_turn` already makes).
 
 ## Notes
 - **Reuse, don't reimplement:** the envelope (`Executor::dispatch`), guarded IO (`flux-system`), `Role`/

@@ -241,7 +241,15 @@ impl FlowClient {
     /// `task(role, …)` delegates to a role's sub-agent through the same safety envelope. The single
     /// seam — a consumer (e.g. a multi-tenant service) drives sub-agents without re-assembling the
     /// spawner, executor, and context by hand.
-    pub fn with_sub_agents(&mut self, sub_agents: SubAgents) -> &mut Self {
+    ///
+    /// The one-shot `execute`/`run` path installs **no** cancellation token (`ToolContext::cancel` is
+    /// `None`), so a sub-agent's only lifecycle bound here is its wall-clock deadline. To guarantee a
+    /// hung child can't run forever, this applies a generous **default `wall_clock` (10 min)** when the
+    /// bundle sets none; a consumer with longer-running work overrides it via [`SubAgents::with_limits`].
+    pub fn with_sub_agents(&mut self, mut sub_agents: SubAgents) -> &mut Self {
+        if sub_agents.limits.wall_clock.is_none() {
+            sub_agents.limits.wall_clock = Some(std::time::Duration::from_secs(600));
+        }
         self.registry.register(Arc::new(TaskTool));
         self.spawner = Some(sub_agents.into_spawner(self.system.clone()));
         self

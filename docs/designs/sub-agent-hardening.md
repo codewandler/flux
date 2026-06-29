@@ -310,6 +310,29 @@ independent, separately-committable slice with its own test.
 - **Not** changing the role markdown format or the one-loop-everywhere engine.
 - **Not** removing the leaf-by-default guarantee — `max_depth` default stays `1`.
 
+## Known limitations (surfaced in implementation review)
+
+Two lifecycle gaps are **documented and accepted** for this pass rather than fixed, because both touch
+the shared turn engine and a fix is riskier than the gap. Both are benign today; both matter only once a
+multi-tenant surface wires real cancellation.
+
+- **Parent-turn cancellation drops an in-flight sub-agent without finalizing it.** The wall-clock path
+  cancels cooperatively and awaits the child to a valid finish; but when the *parent* engine turn is
+  cancelled (e.g. Ctrl-C), the parent's `select!` returns immediately and **drops** the whole turn future
+  — the in-flight `task` call and its child included — without awaiting the child's `finish_turn`. Under
+  `with_audit`, that can leave the child's turn **unterminated** (a user message with no finalizing
+  assistant message) in the shared store. Harmless for the CLI default (throwaway child store). *Fix when
+  needed:* a short grace window in the engine's cancel branch that awaits in-flight spawning tools before
+  dropping. Noted in the `spawn` code comment.
+- **The per-turn cancel slot assumes one active turn per engine.** `ToolContext::set_cancel` writes into a
+  single interior-mutable slot on the engine's shared context — the **same** one-active-turn-per-engine
+  assumption `loop_host.set_turn` already relies on. A surface that drives two turns concurrently on one
+  engine (e.g. `flux serve` via `tokio::spawn`) would clobber the slot; once real cancellation is wired
+  there, cancelling tenant B could stop tenant A's sub-agent. Benign today (serve uses non-cancellable
+  `run_turn` with fresh never-cancelled tokens). *Fix when needed:* one engine per concurrent turn
+  (per-tenant engines), or move per-turn state onto a per-turn handle. The SDK path is already safe
+  (`FlowClient::build_executor` mints a fresh context per run). Documented on `ToolContext::cancel`.
+
 ## Open questions
 
 - **Structured `task` output:** a second tool (`task_json`) vs. an optional `result_schema` param on `task`.

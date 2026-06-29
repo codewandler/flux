@@ -64,10 +64,11 @@ pub struct SpawnLimits {
     pub max_iterations: usize,
     /// Per-turn model token budget.
     pub max_tokens: u32,
-    /// Optional wall-clock deadline. On expiry the child's cancel token is **fired** (cooperative,
-    /// valid-history termination) and `spawn` returns a typed timeout error — it never drops the
-    /// child future mid-turn, which could otherwise leave a split tool_use/tool_result pair in a
-    /// shared audit store.
+    /// Optional wall-clock deadline. On expiry the child's cancel token is **fired** and `spawn` then
+    /// awaits the child so it reaches its own cancel path and persists a finalizing assistant message
+    /// — rather than abandoning it, which would leave an **unterminated turn** (a user message with no
+    /// finalizing assistant message) in a shared audit store. (A bounded grace backstops a child that
+    /// somehow doesn't observe the cancel; see `spawn`.)
     pub wall_clock: Option<std::time::Duration>,
 }
 
@@ -255,8 +256,12 @@ impl Spawner for LocalSpawner {
         let engine = spec.into_engine(Arc::from(provider), executor, events, flow)?;
 
         // The child runs under a child of the parent's cancel token: cancelling the parent turn
-        // cancels the child. A wall-clock deadline fires that same token (cooperative termination) and
-        // returns a typed error, rather than dropping the future mid-turn.
+        // cancels the child. A wall-clock deadline fires that same token so the child reaches its own
+        // cancel path (a finalizing assistant message, valid in a shared audit store) and `spawn`
+        // returns a typed error. NOTE: this clean finalization holds for the *deadline* path; if the
+        // *parent turn* is cancelled, the parent engine drops the whole turn future (this `task` call
+        // included) without awaiting the child — so under `with_audit` a parent Ctrl-C can leave the
+        // child's turn unterminated in the shared store. See docs/designs/sub-agent-hardening.md.
         let run_cancel = cancel.child_token();
         let mut sink = TextCollector::default();
         match self.limits.wall_clock {
@@ -267,8 +272,12 @@ impl Spawner for LocalSpawner {
                     res = &mut run => { res?; }
                     _ = tokio::time::sleep(dur) => {
                         run_cancel.cancel();
-                        // Let the child observe the cancel and finalize a valid session shape.
-                        let _ = run.await;
+                        // Let the child observe the cancel and finalize a valid session shape. A bounded
+                        // grace backstops the (currently unreachable) case where an await inside the
+                        // child doesn't observe the token — e.g. a compaction-time provider call, which
+                        // sub-agents never hit since they run a single fresh-session turn. Without the
+                        // backstop such a child would hang `spawn` forever, defeating the deadline.
+                        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), run).await;
                         return Err(Error::Other(format!(
                             "sub-agent '{role_name}' exceeded its {dur:?} wall-clock limit"
                         )));
@@ -302,11 +311,14 @@ pub struct SubAgents {
     pub approver: Option<Arc<dyn Approver>>,
     pub auth: Option<(AuthorizationPolicy, Caller, Trust)>,
     pub audit: Option<Arc<EventStore>>,
+    /// Max delegation depth (default `1` = children are leaves). `> 1` is a bounded opt-in for nested
+    /// delegation; see [`LocalSpawner::with_max_depth`].
+    pub max_depth: usize,
 }
 
 impl SubAgents {
     /// A bundle with default limits for `max_tokens`; everything else off (no approver override, no
-    /// inherited authorization, no audit store). Set those with the `with_*` methods.
+    /// inherited authorization, no audit store, children are leaves). Set those with the `with_*` methods.
     pub fn new(
         roles: RoleRegistry,
         child_base: ToolRegistry,
@@ -323,6 +335,7 @@ impl SubAgents {
             approver: None,
             auth: None,
             audit: None,
+            max_depth: 1,
         }
     }
 
@@ -355,6 +368,13 @@ impl SubAgents {
         self
     }
 
+    /// Allow bounded nested delegation (default `1` = children are leaves). See
+    /// [`LocalSpawner::with_max_depth`].
+    pub fn with_max_depth(mut self, max_depth: usize) -> Self {
+        self.max_depth = max_depth.max(1);
+        self
+    }
+
     /// Build the spawner over `system` (the guarded IO surface children share). The caller registers
     /// [`TaskTool`] into its catalog and installs the returned spawner via `ToolContext::with_spawner`.
     pub fn into_spawner(self, system: Arc<System>) -> Arc<dyn Spawner> {
@@ -367,7 +387,8 @@ impl SubAgents {
             self.default_model,
             limits.max_tokens,
         )
-        .with_limits(limits);
+        .with_limits(limits)
+        .with_max_depth(self.max_depth);
         if let Some(approver) = self.approver {
             spawner = spawner.with_approver(approver);
         }
@@ -1312,13 +1333,13 @@ mod tests {
                 ToolSpec::read_only("escape_probe", "p", json!({"type": "object"}))
             }
             async fn execute(&self, ctx: &ToolContext, _p: Value) -> Result<ToolResult> {
-                let escaped = ctx.system.read_file("../../../../../../etc/hostname").await;
-                ctx.system
-                    .write_file(
-                        "PROBE.marker",
-                        if escaped.is_err() { "denied" } else { "LEAKED" },
-                    )
-                    .await?;
+                // Record the actual outcome so the test can distinguish a *confinement* denial from a
+                // plain not-found (the error rendering carries the workspace-escape reason).
+                let outcome = match ctx.system.read_file("../../../../../../etc/hostname").await {
+                    Err(e) => format!("denied: {e}"),
+                    Ok(_) => "LEAKED".to_string(),
+                };
+                ctx.system.write_file("PROBE.marker", &outcome).await?;
                 Ok(ToolResult::ok("probed"))
             }
         }
@@ -1384,10 +1405,10 @@ mod tests {
             .spawn("prober", "try to escape", &CancellationToken::new())
             .await
             .unwrap();
-        assert_eq!(
-            system.read_file("PROBE.marker").await.unwrap(),
-            "denied",
-            "the sub-agent must not read outside the parent's workspace"
+        let marker = system.read_file("PROBE.marker").await.unwrap();
+        assert!(
+            marker.contains("escapes the workspace"),
+            "the read must be denied as a workspace escape (not a not-found): got {marker:?}"
         );
     }
 
@@ -1435,28 +1456,45 @@ mod tests {
         );
     }
 
-    /// WS4: without an audit store, a shared store handed elsewhere stays untouched (no regression for
-    /// the CLI / self-improvement loop, which keep ephemeral in-memory child stores).
+    /// WS4: auditing is gated on `with_audit`. Against **one** shared store: a non-audited spawn leaves
+    /// it untouched, then an audited spawn (same store) routes the child into it — so the negative half
+    /// can't pass vacuously (a broken gate that always/never wrote would fail one of the asserts).
     #[tokio::test]
-    async fn without_audit_the_shared_store_is_untouched() {
+    async fn audit_is_gated_on_with_audit() {
+        fn scout_spawner() -> LocalSpawner {
+            let mut roles = RoleRegistry::default();
+            roles.insert(parse_role("---\n---\nscout prompt", "scout"));
+            LocalSpawner::new(
+                Arc::new(|| Ok(Box::new(MockProvider))),
+                Arc::new(roles),
+                ToolRegistry::new(),
+                temp_system(),
+                "mock",
+                1024,
+            )
+        }
+
         let store = Arc::new(EventStore::in_memory().unwrap());
-        let mut roles = RoleRegistry::default();
-        roles.insert(parse_role("---\n---\nscout prompt", "scout"));
-        let spawner = LocalSpawner::new(
-            Arc::new(|| Ok(Box::new(MockProvider))),
-            Arc::new(roles),
-            ToolRegistry::new(),
-            temp_system(),
-            "mock",
-            1024,
-        );
-        spawner
+
+        // No `with_audit` → the child uses a throwaway store; the shared one stays empty.
+        scout_spawner()
             .spawn("scout", "recon", &CancellationToken::new())
             .await
             .unwrap();
         assert!(
             store.latest_session().unwrap().is_none(),
-            "no audit store configured → the shared store must be untouched"
+            "a non-audited spawn must not write to the shared store"
+        );
+
+        // `with_audit(store)` → the same store now receives the child's session.
+        scout_spawner()
+            .with_audit(store.clone())
+            .spawn("scout", "recon", &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            store.latest_session().unwrap().is_some(),
+            "with_audit must route the child's session into the shared store"
         );
     }
 
