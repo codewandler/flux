@@ -510,7 +510,7 @@ pub enum HookOutcome {
 }
 
 /// A hook run before a tool executes — may observe, modify the input, or deny the call. Engine-
-/// agnostic so `flux-runtime` doesn't depend on a JS runtime; `flux-hooks` provides a JS impl.
+/// agnostic so `flux-runtime` doesn't depend on a JS runtime; `flux_plugin::hooks` provides a JS impl.
 pub trait PreToolHook: Send + Sync {
     fn pre_tool(&self, tool: &str, input: &serde_json::Value) -> HookOutcome;
 }

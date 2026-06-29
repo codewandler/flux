@@ -887,7 +887,7 @@ async fn build_agent(
     if let Some(home) = std::env::var_os("HOME") {
         hook_dirs.push(std::path::PathBuf::from(home).join(".flux").join("hooks"));
     }
-    let js_hooks = flux_hooks::JsHookEngine::load(&hook_dirs);
+    let js_hooks = flux_plugin::hooks::JsHookEngine::load(&hook_dirs);
     let mut hook_vec: Vec<Arc<dyn flux_runtime::PreToolHook>> = Vec::new();
     if !js_hooks.is_empty() {
         hook_vec.push(Arc::new(js_hooks));

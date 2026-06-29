@@ -17,6 +17,11 @@ use flux_core::{Error, Result};
 use flux_runtime::{Tool, ToolContext, ToolResult};
 use flux_spec::{Effect, Idempotency, Risk, ToolSpec};
 
+/// JavaScript pre-tool hooks (QuickJS via `rquickjs`) — the other half of L4 extensibility, folded in
+/// from the former `flux-hooks` crate. Re-exported at the crate root as [`JsHookEngine`].
+pub mod hooks;
+pub use hooks::JsHookEngine;
+
 pub const PROTOCOL: &str = "flux.plugin.v1";
 
 /// Whether a frame is a request (host→plugin) or a response (plugin→host).

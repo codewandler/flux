@@ -692,7 +692,6 @@ dependencies = [
  "flux-events",
  "flux-evidence",
  "flux-flow",
- "flux-hooks",
  "flux-markdown",
  "flux-orchestrate",
  "flux-plugin",
@@ -866,15 +865,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flux-hooks"
-version = "0.2.4"
-dependencies = [
- "flux-runtime",
- "rquickjs",
- "serde_json",
-]
-
-[[package]]
 name = "flux-integrations"
 version = "0.2.4"
 dependencies = [
@@ -947,6 +937,7 @@ dependencies = [
  "flux-spec",
  "flux-system",
  "reqwest",
+ "rquickjs",
  "serde",
  "serde_json",
  "tokio",

@@ -19,7 +19,6 @@ members = [
     "crates/flux-flow",
     "crates/flux-eval",
     "crates/flux-plugin",
-    "crates/flux-hooks",
     "crates/flux-providers",
     "crates/flux-credentials",
     "crates/flux-sdk",
@@ -70,7 +69,6 @@ flux-lang = { path = "crates/flux-lang", version = "0.2.4" }
 flux-flow = { path = "crates/flux-flow", version = "0.2.4" }
 flux-eval = { path = "crates/flux-eval" }
 flux-plugin = { path = "crates/flux-plugin" }
-flux-hooks = { path = "crates/flux-hooks" }
 flux-auth = { path = "crates/flux-auth" }
 flux-evidence = { path = "crates/flux-evidence", version = "0.2.4" }
 flux-datasource = { path = "crates/flux-datasource" }

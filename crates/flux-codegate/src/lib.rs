@@ -27,8 +27,8 @@ pub fn layer(name: &str) -> Option<u8> {
         "flux-system" | "flux-runtime" | "flux-tools" | "flux-events" | "flux-context" => 2,
         // L3 — agent + orchestration + eval/self-improvement harness + cognition ops
         "flux-agent" | "flux-orchestrate" | "flux-flow" | "flux-eval" | "flux-cognition" => 3,
-        // L4 — extensibility
-        "flux-hooks" | "flux-plugin" => 4,
+        // L4 — extensibility (subprocess plugins + the JS pre-tool hooks module)
+        "flux-plugin" => 4,
         // L5 — heavy capabilities
         "flux-browser" | "flux-datasource" | "flux-auth" => 5,
         // L6 — surfaces / apps (and this lint crate itself)

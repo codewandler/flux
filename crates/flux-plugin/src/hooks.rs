@@ -1,5 +1,5 @@
-//! `flux-hooks` — JavaScript pre-tool hooks evaluated in an embedded engine (QuickJS via
-//! `rquickjs`).
+//! JavaScript pre-tool hooks evaluated in an embedded engine (QuickJS via `rquickjs`) — the
+//! `hooks` module of `flux-plugin` (folded in from the former `flux-hooks` crate).
 //!
 //! A hook file exports `preToolUse(ctx)` where `ctx = { tool, input }`. It returns:
 //! - nothing / `null` → continue unchanged;
