@@ -84,6 +84,16 @@ from a cross-repo audit; filed as the **D- story track** (see the [board](storie
    *medium (epic).* A `flux-channels` abstraction + daemon host so agents **wake on external events**
    (schedule, webhook, Slack), generalising flux-app's in-process triggers. Schedule adapter first;
    fluxplane (Go) is the prior art. Background agents woken by events.
+5. **[D-05](stories/D-05-sub-agent-hardening.md) — Harden the sub-agent primitive for multi-tenant
+   production** · *medium.* The sub-agent primitive (`flux-orchestrate`: `LocalSpawner` + `task` tool)
+   works in the CLI and the self-improvement loop, but is single-tenant and wired only there. Close the
+   five gaps a downstream service hits: a consumable `flux-sdk` seam (no re-implementing the CLI's ~140
+   lines of assembly), lifecycle limits (parent-cancellation threading, wall-clock timeout, configurable
+   caps), a pluggable approver + a **tested** account-isolation guarantee, and child tool calls threaded
+   into the tenant audit log (the seam now; the account tag rides D-02). Built on the existing envelope —
+   isolation is per-scope composition, not new sandboxing. Unblocks managed-agents **R-03** (sub-agent support)
+   + **A-05** (manager agent + `managed-agents-builder`). Design:
+   [sub-agent-hardening.md](designs/sub-agent-hardening.md).
 
 **Candidate phases (vision tail, in priority order):**
 - **Crate consolidation** ✅ **all phases shipped** — shrank the workspace by merging coherent

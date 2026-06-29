@@ -37,6 +37,7 @@ These exist to support the downstream multi-tenant agents service (path-dep cons
 - **2.** [D-02 — Tenant/context-taggable event substrate](D-02-tenant-event-substrate.md) · Core · **high** · account/agent tag + account-scoped projections on `flux-events`; decide early so managed-agents R-04 is a projection, not a retrofit
 - **3.** [D-03 — Reusable A2A server helpers (current spec)](D-03-a2a-server-helpers.md) · Agent · **medium** · lift flux-server's A2A routes into a helper; unblocks managed-agents E-02 + fixes the `tasks/send` drift
 - **4.** [D-04 — Event-trigger channels (cron/webhook/Slack)](D-04-event-trigger-channels.md) · Agent · **medium** (epic) · background agents waking on events; schedule adapter first (fluxplane prior art)
+- **5.** [D-05 — Harden the sub-agent primitive for multi-tenant production](D-05-sub-agent-hardening.md) · Agent · **medium** · SDK seam + lifecycle limits + pluggable approver/tested isolation + child audit; the primitive managed-agents R-03/A-05 consume ([design](../designs/sub-agent-hardening.md))
 
 ## Done
 - [C-01 — Crate consolidation, phases 2–4](C-01-crate-consolidation.md) · Core · hooks→plugin, browser+datasource→capabilities, context→runtime; removed dead integrations (35 → 31 crates)
