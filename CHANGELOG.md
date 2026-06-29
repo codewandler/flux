@@ -8,6 +8,33 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Reusable A2A server protocol — `flux_a2a::server` (D-03).** Lifted the duplicated A2A server-side
+  logic out of `flux-server/src/a2a.rs` into a reusable, **axum-free** module on the L1 `flux-a2a` crate:
+  the `A2aTurn` runner seam, `dispatch` (`message/send` → a completed `Task`; JSON-RPC errors),
+  `agent_card`, `extract_text`/`extract_context_id`, `rpc_ok`/`rpc_err`, `now_rfc3339`, and
+  `status_update_value` (the `message/stream` frame `result`). `flux-server` now consumes it (keeping its
+  axum routes + SSE + engine wiring); downstream's `managed-agents` re-homes its `channel-a2a` onto the same
+  module — one definition for the A2A *server* the way `flux-a2a`'s types give the *wire* one. Current
+  spec only (no `tasks/send`); `flux-codegate` confirms `flux-a2a` stays L1 (only new dep: `async-trait`).
+  Serves managed-agents **E-02**.
+- **`.flux` does all of it — native-text module declarations (L-03).** A `.flux` app is now written
+  entirely in native flux-lang: `agent` / `channel` / `datasource` / `trigger` / `journey` declarations
+  (each with an indented `key value` settings block) plus the journey flows, replacing the JSON program
+  manifest. Settings are flux-lang values (strings/numbers/bools/lists/records, bare identifiers coerce to
+  strings); `channel`/`datasource` default `kind` to the decl name. **Secrets are references, never
+  inline** — `secret "ENV_NAME"` lowers to a `{"$secret":…}` marker in the pure parser and is resolved
+  from the environment at load by the host (`flux_app::resolve_secrets`); a missing var errors naming the
+  var, not the value. This is the **single** secret mechanism — the channel adapters' former
+  `"secret:env/KEY"` string convention was removed (token fields now read the host-resolved value), with
+  the marker shape owned by L0 (`flux_lang::program::{SECRET_KEY, secret_marker, as_secret_ref}`) and
+  `build_channels` guarding against an unresolved marker so the resolve-before-consume order can't be
+  skipped silently. The host builds the knowledge backend from the declared `datasource`s
+  (markdown/openapi ingesters). **Clean cutover:** `flux_lang::program::Module::parse_str` now parses
+  native text (`from_json`/`PROGRAM_KEYS` deleted); `flux app run` and `flux flow run` load native-text
+  `.flux` (the latter still sniffs a leading `{` for checked-in JSON `DraftAst` loops). The bundled
+  examples (`crates/flux-app/examples/{hello,support-bot}.flux`, `examples/channels-app.flux`) are
+  rewritten in native text. No new node kinds; `flux-codegate` layering unchanged. See
+  [docs/designs/native-text-modules.md](docs/designs/native-text-modules.md).
 - **Tenant/agent context envelope on the event log (D-02).** `flux-events` runs can now carry an optional,
   stream-level `EventContext { account, agent_id, agent_version, correlation_id }`, set once at creation via
   `EventStore::create_session_with_context` (the 1-arg `create_session` delegates with an empty envelope, so

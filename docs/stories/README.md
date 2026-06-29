@@ -33,16 +33,16 @@ _(none)_
 
 ## Backlog (unranked — promote to **Next** with a `priority` when ready)
 - [L-02 — flux-markdown engine + progressive-disclosure skills](L-02-flux-markdown-engine.md) · Language · AST parser, body-on-demand activation
-- [L-03 — Native-text program/app grammar](L-03-native-text-program-grammar.md) · Language · author `agents`/`channels`/`triggers`/`journeys` in flux-lang text, not JSON; surfaced by the Slack-channel assistant `bot.flux`
 - [D-11 — App-runner ergonomics for declarative bots](D-11-app-runner-ergonomics.md) · Agent · configurable `flux app run` knowledge ingest + OpenAPI + persona/event-context-from-file; blocks Slack-channel assistant S-03/S-06
 
 ### Downstream enablement (managed-agents) — queued behind the active Slack-channel assistant stack above
 These support the multi-tenant **managed-agents** service (path-dep consumer). D-02 now leads (in progress above);
 D-03 is next in line. See
 [roadmap → Downstream enablement](../roadmap.md#downstream-enablement-managed-agents-Slack-channel assistant).
-- **1.** [D-03 — Reusable A2A server helpers (current spec)](D-03-a2a-server-helpers.md) · Agent · **medium** · lift flux-server's A2A routes into a helper; unblocks managed-agents E-02 + fixes the `tasks/send` drift
+- **1.** [D-03 — Reusable A2A server helpers (current spec)](D-03-a2a-server-helpers.md) · Agent · **medium** · lift flux-server's A2A routes into a helper; unblocks managed-agents E-02 + fixes the `tasks/send` drift — **code-complete + gate-green, pending commit** (`flux_a2a::server`; flux-server re-homed)
 
 ## Done
+- [L-03 — Native-text module declarations (`.flux` does all of it)](L-03-native-text-program-grammar.md) · Language · the whole app — `agent`/`channel`/`datasource`/`trigger`/`journey` + flows — in native flux-lang text (settings inline, secrets as `secret "ENV"` refs); JSON-program path deleted (clean cutover); `flux app run`/`flux flow run` load native text; supersedes the JSON manifest (see [design](../designs/native-text-modules.md))
 - [C-02 — Integration-stack hardening](C-02-integration-stack-hardening.md) · Core · `flux plugin call`/`install` + a `plugins/` CI job (`a8092dc`); feature-gated embeddings/semantic backend — `OpenAiEmbedder` + a `SemanticIndex` hybrid-rerank decorator, default build unchanged (`f912c24`); a live env-gated `scripts/smoke-plugins.sh` (`5fda8be`)
 - [D-08 — Integration plugin pack](D-08-integration-plugin-pack.md) · Agent · 8 native plugins in the in-repo `plugins/` workspace (websearch/gitlab/jira/confluence/kubernetes/loki/prometheus/slack) on a shared `host-kit`; reach vendors only via host caps; contribute `flux-datasource` records through the L5 `DatasourceHostCaps` bridge (commits `0e9b93e`/`deafe68`/`6b20c41`)
 - [D-09 — Agentic channel target](D-09-agentic-channel-target.md) · Agent · `trigger.agent` wakes an `AgentSpec` turn (per-thread session memory + declared grants, `0d8ac58`) + the registry wiring (`App::with_tools` loads datasource + plugin tools on the `flux app run` path, `e4710ad`)
