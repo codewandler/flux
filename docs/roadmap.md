@@ -57,6 +57,14 @@ slipped through). With a real key (e.g. `anthropic/opus`), exercise:
 This is scripted as `scripts/smoke-live.sh` (model overridable via `FLUX_SMOKE_MODEL`) — run it
 before every release.
 
+A second, **integration-plugin** smoke (`scripts/smoke-plugins.sh`) exercises the D-08 plugin pack against
+real vendor APIs: for each integration whose credential is in the environment it builds the plugin,
+registers it in an isolated registry, and drives one op via `flux plugin call`, asserting a non-error
+result; plugins whose key is absent are **skipped** (not failed). Run it (with whatever keys you have —
+`TAVILY_API_KEY`, `GITLAB_PERSONAL_TOKEN`, `SLACK_BOT_TOKEN`, …) before releasing anything touching the
+plugins. The semantic/embeddings path (`--features embeddings`) is validated manually with a feature build
+(`FLUX_EMBEDDINGS_API_KEY`); its rerank logic is covered by the default-build unit test.
+
 ## Next
 
 ### Downstream enablement (managed-agents, Slack-channel assistant)

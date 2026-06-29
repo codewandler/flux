@@ -48,8 +48,28 @@ spec helpers, and a `MockHost` for hermetic unit tests. See `gitlab/src/main.rs`
 | `prometheus` | PromQL query / query_range / alerts / targets | bearer (optional) | — |
 | `slack` | post / history / channels / users / thread | bearer bot token | `slack.channel` / `slack.user` |
 
-## Installing a plugin into flux
+## Installing + invoking plugins
 
-Build the binary, then register a descriptor under `~/.flux/plugins/<name>.toml` (`flux plugin add …`)
-pointing at the built `flux-plugin-<name>` binary. `flux` discovers it at startup and projects each
-declared operation as a policy-gated tool; the agent's grants decide which ops it may call.
+Build the binaries, then register them as descriptors under `~/.flux/plugins/<name>.toml`:
+
+```
+cd plugins && cargo build --release      # → plugins/target/release/flux-plugin-<name>
+flux plugin install                      # register every built flux-plugin-* binary (one-shot)
+#  …or one at a time:
+flux plugin add gitlab  /abs/path/to/flux-plugin-gitlab
+flux plugin ls                           # list installed plugins
+```
+
+`flux` discovers them at startup (`flux run`, `flux app run`) and projects each declared operation as a
+policy-gated tool; the agent's grants decide which ops it may call.
+
+**Invoke one op directly** (debugging / scripting / the smoke), without an agent:
+
+```
+flux plugin call gitlab gitlab.project.list '{}'
+flux plugin call websearch websearch.search '{"query":"warm transfer"}'
+```
+
+`flux plugin call` spawns the plugin and drives the op through the same guarded host + datasource bridge
+the agent uses. A live, env-gated smoke over the whole pack is `scripts/smoke-plugins.sh` (skips an
+integration when its key is absent).
