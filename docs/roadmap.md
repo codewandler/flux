@@ -59,6 +59,32 @@ before every release.
 
 ## Next
 
+### Downstream enablement (managed-agents)
+
+A ranked track that exists to **unblock and de-risk the managed-agents service** — a multi-tenant
+managed-agents product (in a separate repo) that consumes flux by **path dependency** (no version
+boundary, so flux churn breaks it directly; tightening these seams also eases that coupling). Sourced
+from a cross-repo audit; filed as the **D- story track** (see the [board](stories/README.md)).
+
+1. **[D-01](stories/D-01-flow-input-seeding.md) — Parameterized flow execution (the behaviour-runner
+   seam)** · *highest.* Add a deterministic `FlowClient::parse(text)` + a per-run input-seeding seam so a
+   stored, validated Flux-Lang flow runs per invocation with effective-settings injected (not baked into
+   the AST) and custom ops registered. The deepest near-term integration; unblocks managed-agents R-01
+   (behaviour runner) + A-03 (presets as flows). Design:
+   [flow-input-seeding.md](designs/flow-input-seeding.md).
+2. **[D-02](stories/D-02-tenant-event-substrate.md) — Tenant/context-taggable event substrate** · *high.*
+   Tag `flux-events` with an account/agent context + an account-scoped projection read API, so managed-agents
+   R-04 run-persistence/transparency is a projection over the log, not a parallel store. "Build it in,
+   not on" — decide while R-01 lands, or it's a retrofit.
+3. **[D-03](stories/D-03-a2a-server-helpers.md) — Reusable A2A server helpers (current spec)** · *medium.*
+   Lift flux-server's inline A2A routes (`message/send`/`message/stream`/`tasks/get`) into a reusable
+   helper. Unblocks managed-agents E-02 **and** fixes a live drift — managed-agents' `channel-a2a` still serves the
+   deleted `tasks/send` dialect (removed in the A-02 cutover, commit `06065f6`).
+4. **[D-04](stories/D-04-event-trigger-channels.md) — Event-trigger channels (cron/webhook/Slack)** ·
+   *medium (epic).* A `flux-channels` abstraction + daemon host so agents **wake on external events**
+   (schedule, webhook, Slack), generalising flux-app's in-process triggers. Schedule adapter first;
+   fluxplane (Go) is the prior art. Background agents woken by events.
+
 **Candidate phases (vision tail, in priority order):**
 - **Crate consolidation** ✅ **all phases shipped** — shrank the workspace by merging coherent
   *same-layer* siblings (layering lint stayed green throughout). Phase 1 collapsed the five L1 provider

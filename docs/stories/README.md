@@ -30,6 +30,14 @@ _(none)_
 ## Backlog (unranked — promote to **Next** with a `priority` when ready)
 - [L-02 — flux-markdown engine + progressive-disclosure skills](L-02-flux-markdown-engine.md) · Language · AST parser, body-on-demand activation
 
+### Downstream enablement (managed-agents) — ranked by leverage on the managed-agents critical path
+These exist to support the downstream multi-tenant agents service (path-dep consumer of flux). See
+[roadmap → Downstream enablement](../roadmap.md#downstream-enablement-managed-agents).
+- **1.** [D-01 — Parameterized flow execution (behaviour-runner seam)](D-01-flow-input-seeding.md) · Agent · **highest** · `parse` + per-run input seeding into `FlowClient`; serves managed-agents R-01/A-03 ([design](../designs/flow-input-seeding.md))
+- **2.** [D-02 — Tenant/context-taggable event substrate](D-02-tenant-event-substrate.md) · Core · **high** · account/agent tag + account-scoped projections on `flux-events`; decide early so managed-agents R-04 is a projection, not a retrofit
+- **3.** [D-03 — Reusable A2A server helpers (current spec)](D-03-a2a-server-helpers.md) · Agent · **medium** · lift flux-server's A2A routes into a helper; unblocks managed-agents E-02 + fixes the `tasks/send` drift
+- **4.** [D-04 — Event-trigger channels (cron/webhook/Slack)](D-04-event-trigger-channels.md) · Agent · **medium** (epic) · background agents waking on events; schedule adapter first (fluxplane prior art)
+
 ## Done
 - [C-01 — Crate consolidation, phases 2–4](C-01-crate-consolidation.md) · Core · hooks→plugin, browser+datasource→capabilities, context→runtime; removed dead integrations (35 → 31 crates)
 - [A-02 — A2A client (`flux a2a <URL>`)](A-02-a2a-client.md) · Agent · consume a remote A2A agent like a local one; server clean-cutover to the current spec (see [CHANGELOG](../../CHANGELOG.md))
