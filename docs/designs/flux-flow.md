@@ -419,5 +419,8 @@ Deferred follow-ups (separate decisions, not part of the self-hosted-loop work):
   assemble a `FlowEngine` via the new `flux_agent::AgentSpec`, and the classic provider-native
   `flux-agent::Agent` loop has been **deleted**. `flux-agent` is repurposed into the Agent-pillar crate
   (`AgentSpec` + markdown `Role`); the `AgentSink` streaming trait moved to `flux-flow`. The SDK
-  `Client` keeps its `TurnOutput` API (token usage is not surfaced through the unified loop, matching
-  every other FlowEngine surface — a possible future enhancement).
+  `Client` keeps its `TurnOutput` API. Per-turn **token usage now flows through the loop**:
+  `compile_turn` returns the planner call's `Usage`, the loop host accumulates it across the turn's
+  `plan` re-entries (output summed; input/cache reflect the final, largest prompt so re-sent context
+  isn't multiply-counted), and the engine surfaces it via `sink.turn_end` — the CLI renders
+  context/output/cache + cache-hit-rate, and `TurnOutput.usage` is populated.

@@ -22,7 +22,7 @@ use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::AgentSink;
-use flux_core::{Chunk, ContentBlock, Message, Result};
+use flux_core::{Chunk, ContentBlock, Message, Result, Usage};
 use flux_events::EventStore;
 use flux_provider::{Provider, Request};
 use flux_runtime::Executor;
@@ -206,7 +206,7 @@ impl FlowEngine {
                 _ = cancel.cancelled() => {
                     while let Ok(ev) = rx.try_recv() { drain_event(ev, sink, reveal); }
                     let _ = self.events.end_turn(session_id, turn_id, "cancelled", 0, "(turn cancelled)");
-                    return self.finish_turn(session_id, sink, "(turn cancelled)", true);
+                    return self.finish_turn(session_id, sink, "(turn cancelled)", true, self.turn_usage());
                 }
                 maybe = rx.recv() => {
                     if let Some(ev) = maybe { drain_event(ev, sink, reveal); }
@@ -249,7 +249,7 @@ impl FlowEngine {
         let _ = self
             .events
             .end_turn(session_id, turn_id, tag, iterations, &answer);
-        self.finish_turn(session_id, sink, &answer, false)
+        self.finish_turn(session_id, sink, &answer, false, self.turn_usage())
     }
 
     /// Compile a single instruction into a [`TurnOutput`] using this engine's full catalog + current
@@ -268,7 +268,7 @@ impl FlowEngine {
             max_tokens: self.max_tokens,
             ..CompileOptions::default()
         };
-        compile_turn(
+        let (out, _usage) = compile_turn(
             &*self.provider,
             &self.model,
             &[Message::user_text(prompt)],
@@ -279,7 +279,8 @@ impl FlowEngine {
             None,
             opts,
         )
-        .await
+        .await?;
+        Ok(out)
     }
 
     /// A plan-mode turn (the REPL `/plan` toggle): compile ONE plan from the conversation, render it,
@@ -337,7 +338,9 @@ impl FlowEngine {
         };
         // Surface a provider failure (credit, auth, rate limit, transport) with a readable message
         // rather than the raw API JSON body — the REPL prints this `error:` line directly.
-        let out = out.map_err(|e| flux_core::Error::Other(planner_error(&e)))?;
+        let (out, usage) = out.map_err(|e| flux_core::Error::Other(planner_error(&e)))?;
+        // The compose-a-plan call is the turn's only model call here, so its usage IS the turn's.
+        let usage = (usage.total() > 0).then_some(usage);
 
         match out {
             TurnOutput::Plan(compiled) => {
@@ -349,7 +352,7 @@ impl FlowEngine {
                         text: format!("Proposed plan:\n{rendered}"),
                     }]),
                 )?;
-                sink.turn_end(None);
+                sink.turn_end(usage);
                 Ok(Some(compiled.ast))
             }
             TurnOutput::Chat(text) => {
@@ -358,7 +361,7 @@ impl FlowEngine {
                     session_id,
                     &Message::assistant(vec![ContentBlock::Text { text }]),
                 )?;
-                sink.turn_end(None);
+                sink.turn_end(usage);
                 Ok(None)
             }
         }
@@ -453,13 +456,15 @@ impl FlowEngine {
     }
 
     /// Persist the single assistant message for this turn (keeping the `user → assistant` session
-    /// shape) and end the turn. `cancelled` records the audit observation.
+    /// shape) and end the turn. `cancelled` records the audit observation. `usage` is this turn's
+    /// token tally (the planner calls summed), surfaced to the sink for the turn-end annotation.
     fn finish_turn(
         &self,
         session_id: &str,
         sink: &mut dyn AgentSink,
         answer: &str,
         cancelled: bool,
+        usage: Option<Usage>,
     ) -> Result<()> {
         if cancelled {
             let obs = flux_evidence::Observation::new(
@@ -476,8 +481,15 @@ impl FlowEngine {
                 text: answer.to_string(),
             }]),
         )?;
-        sink.turn_end(None);
+        sink.turn_end(usage);
         Ok(())
+    }
+
+    /// This turn's token tally, as an `Option` for the sink: `None` when nothing was billed (e.g. an
+    /// offline `-m mock` turn) so a surface needn't render a misleading all-zero annotation.
+    fn turn_usage(&self) -> Option<Usage> {
+        let usage = self.loop_host.turn_usage();
+        (usage.total() > 0).then_some(usage)
     }
 
     /// Resume a flow suspended on a top-level `await`, with this turn's message as the awaited input.
@@ -517,7 +529,7 @@ impl FlowEngine {
             Err(e) => {
                 let msg = format!("The resumed flow failed — {e}");
                 sink.text_delta(&msg);
-                return self.finish_turn(session_id, sink, &msg, true);
+                return self.finish_turn(session_id, sink, &msg, true, None);
             }
         };
 
@@ -527,7 +539,7 @@ impl FlowEngine {
                 .save_suspension(session_id, &body, susp.node, &susp.source)?;
             let hint = "(awaiting your input — reply to continue the flow)";
             sink.text_delta(hint);
-            return self.finish_turn(session_id, sink, hint, false);
+            return self.finish_turn(session_id, sink, hint, false, None);
         }
 
         // Completed: the flow's own output is the answer (a model-grounded summary is a later refinement).
@@ -537,7 +549,7 @@ impl FlowEngine {
             format!("Resumed and completed ({} step(s)).", outcome.steps)
         };
         sink.text_delta(&answer);
-        self.finish_turn(session_id, sink, &answer, false)
+        self.finish_turn(session_id, sink, &answer, false, None)
     }
 
     /// If the session has grown past `compact_threshold_chars`, summarize everything but the most

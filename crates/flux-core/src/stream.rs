@@ -30,6 +30,27 @@ impl Usage {
             + self.cache_creation_input_tokens
             + self.cache_read_input_tokens
     }
+
+    /// The prompt size of a single call — the context-window occupancy (fresh input + both cache
+    /// tiers). Distinct from [`Self::total`], which also counts generated output.
+    pub fn context_tokens(&self) -> u64 {
+        self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens
+    }
+
+    /// Fold one model call's usage into a turn-level accumulator. Output tokens are **summed** (each
+    /// call generates new tokens), while the input/cache counts are **replaced** by this call's — in
+    /// the agent loop every successive call re-sends the growing conversation, so the latest prompt
+    /// size *is* the context-window occupancy; summing the input side would multiply-count the
+    /// re-sent (and largely cache-read) prefix. The replace is skipped for a call that reported no
+    /// prompt at all, so a usage-less follow-up can't zero an already-recorded context figure.
+    pub fn accumulate(&mut self, call: &Usage) {
+        self.output_tokens += call.output_tokens;
+        if call.context_tokens() > 0 {
+            self.input_tokens = call.input_tokens;
+            self.cache_read_input_tokens = call.cache_read_input_tokens;
+            self.cache_creation_input_tokens = call.cache_creation_input_tokens;
+        }
+    }
 }
 
 /// Why the model stopped generating.

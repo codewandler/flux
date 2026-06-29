@@ -215,7 +215,7 @@ impl AgentSink for Collector {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use flux_core::{Chunk, ContentBlock, StopReason};
+    use flux_core::{Chunk, ContentBlock, StopReason, Usage};
     use flux_provider::{ChunkStream, Request};
     use std::sync::Mutex;
 
@@ -245,6 +245,12 @@ mod tests {
                 Chunk::Block(ContentBlock::Text {
                     text: "hello from sdk".into(),
                 }),
+                Chunk::Usage(Usage {
+                    input_tokens: 64,
+                    output_tokens: 8,
+                    cache_read_input_tokens: 16,
+                    ..Default::default()
+                }),
                 Chunk::Done {
                     stop_reason: Some(StopReason::EndTurn),
                 },
@@ -257,9 +263,14 @@ mod tests {
         let out = client.run("hi").await.unwrap();
         assert_eq!(out.text, "hello from sdk");
         assert!(out.tool_calls.is_empty());
-        // Token usage is not surfaced through the unified flux-lang loop (true for every FlowEngine
-        // surface today); the `TurnOutput::usage` field stays for API compatibility.
-        assert!(out.usage.is_none());
+        // Token usage now rides back out through the unified flux-lang loop: the planner call's
+        // `Usage` is accumulated by the loop host and handed to `turn_end` at turn completion.
+        let usage = out
+            .usage
+            .expect("usage surfaced through the FlowEngine loop");
+        assert_eq!(usage.input_tokens, 64);
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(usage.cache_read_input_tokens, 16);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -2626,46 +2626,43 @@ impl AgentSink for CliSink {
             .turn_start
             .map(|t| style::fmt_elapsed(t.elapsed()))
             .unwrap_or_default();
+        // The right-hand token annotation: context-window occupancy, generated tokens, cache + hit-rate.
+        let token_inline = usage.as_ref().map(usage_annotation).unwrap_or_default();
         // Always print a rule so the turn boundary is visible even for prose-only replies.
-        if self.steps > 0 {
+        let summary = if self.steps > 0 {
             let plural = if self.steps == 1 { "" } else { "s" };
-            // Build the right-hand annotation: steps + timing + inline token counts.
-            let token_inline = usage
-                .as_ref()
-                .map(|u| {
-                    if u.cache_read_input_tokens > 0 {
-                        format!(
-                            " · in {} out {} $cache {}",
-                            u.input_tokens, u.output_tokens, u.cache_read_input_tokens
-                        )
-                    } else {
-                        format!(" · in {} out {}", u.input_tokens, u.output_tokens)
-                    }
-                })
-                .unwrap_or_default();
-            let summary = format!("{} step{plural} · {elapsed}{token_inline}", self.steps);
-            let rule_len = self.width.saturating_sub(summary.chars().count() + 2);
-            eprintln!("{} {}", style::rule(rule_len), style::dim(&summary));
+            format!("{} step{plural} · {elapsed}{token_inline}", self.steps)
         } else {
-            // Prose-only turn: print a minimal rule with elapsed + token stats.
-            let token_inline = usage
-                .as_ref()
-                .map(|u| {
-                    if u.cache_read_input_tokens > 0 {
-                        format!(
-                            " · in {} out {} $cache {}",
-                            u.input_tokens, u.output_tokens, u.cache_read_input_tokens
-                        )
-                    } else {
-                        format!(" · in {} out {}", u.input_tokens, u.output_tokens)
-                    }
-                })
-                .unwrap_or_default();
-            let summary = format!("· {elapsed}{token_inline}");
-            let rule_len = self.width.saturating_sub(summary.chars().count() + 2);
-            eprintln!("{} {}", style::rule(rule_len), style::dim(&summary));
-        }
+            // Prose-only turn: a minimal rule with elapsed + token stats.
+            format!("· {elapsed}{token_inline}")
+        };
+        let rule_len = self.width.saturating_sub(summary.chars().count() + 2);
+        eprintln!("{} {}", style::rule(rule_len), style::dim(&summary));
     }
+}
+
+/// The compact token annotation appended to a turn-end rule (and the prose `/goal` footer): the
+/// context-window occupancy (the final prompt size), the tokens generated, and — when prompt caching
+/// is in play — the cached tokens with the hit-rate (cached ÷ context). All four figures the user
+/// asked to see; empty when nothing was billed (e.g. an offline `-m mock` turn).
+fn usage_annotation(u: &Usage) -> String {
+    let context = u.context_tokens();
+    if context == 0 && u.output_tokens == 0 {
+        return String::new();
+    }
+    let mut s = format!(
+        " · ctx {} · out {}",
+        style::fmt_tokens(context),
+        style::fmt_tokens(u.output_tokens)
+    );
+    if u.cache_read_input_tokens > 0 && context > 0 {
+        let pct = (u.cache_read_input_tokens as f64 / context as f64 * 100.0).round() as u64;
+        s.push_str(&format!(
+            " · cache {} ({pct}% hit)",
+            style::fmt_tokens(u.cache_read_input_tokens)
+        ));
+    }
+    s
 }
 
 impl CliSink {
@@ -2727,15 +2724,12 @@ impl AgentSink for GoalSink {
     fn turn_end(&mut self, usage: Option<Usage>) {
         println!();
         if let Some(u) = usage {
-            let stats = if u.cache_read_input_tokens > 0 {
-                format!(
-                    "in {} out {} $cache {}",
-                    u.input_tokens, u.output_tokens, u.cache_read_input_tokens
-                )
-            } else {
-                format!("in {} out {}", u.input_tokens, u.output_tokens)
-            };
-            eprintln!("{}", style::dim(&stats));
+            // Same figures as the main rule, without the leading separator.
+            let stats = usage_annotation(&u);
+            let stats = stats.trim_start_matches(" · ");
+            if !stats.is_empty() {
+                eprintln!("{}", style::dim(stats));
+            }
         }
     }
 }
@@ -2769,11 +2763,19 @@ impl Provider for MockCliProvider {
         }
 
         // Second call: the plan (emitted on the first call with no `complete`) has run and its results
-        // were fed back, so the engine loops here — answer in prose, which ends the turn.
+        // were fed back, so the engine loops here — answer in prose, which ends the turn. The usage
+        // chunk mimics a cached re-send (most of the prompt read from cache) so the offline path
+        // exercises the turn-end token annotation (context / output / cache + hit-rate).
         if n > 0 {
             let chunks = vec![
                 Chunk::Block(ContentBlock::Text {
                     text: "Finished.".into(),
+                }),
+                Chunk::Usage(Usage {
+                    input_tokens: 180,
+                    output_tokens: 12,
+                    cache_read_input_tokens: 1_240,
+                    ..Default::default()
                 }),
                 Chunk::Done {
                     stop_reason: Some(StopReason::EndTurn),
@@ -2822,6 +2824,11 @@ impl Provider for MockCliProvider {
                 id: "plan1".into(),
                 name: "emit_plan".into(),
                 input: serde_json::json!({ "ast": ast }),
+            }),
+            Chunk::Usage(Usage {
+                input_tokens: 1_240,
+                output_tokens: 48,
+                ..Default::default()
             }),
             Chunk::Done {
                 stop_reason: Some(StopReason::ToolUse),
@@ -3286,8 +3293,39 @@ async fn run_prompt(flags: AgentFlags, prompt_words: Vec<String>) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
-    use super::{format_evidence, loop_machinery_label, new_render_suffix, tool_preview, truncate};
+    use super::{
+        format_evidence, loop_machinery_label, new_render_suffix, tool_preview, truncate,
+        usage_annotation,
+    };
     use serde_json::json;
+
+    /// The turn-end token annotation reports all four figures the user asked for: context-window
+    /// occupancy (fresh input + both cache tiers), generated output, the cached tokens, and the
+    /// hit-rate (cached ÷ context). It is empty when nothing was billed (offline `-m mock`).
+    #[test]
+    fn usage_annotation_shows_context_output_and_cache_hit_rate() {
+        use flux_core::Usage;
+        // 1000 fresh + 9000 cache-read = 10k context; 9000/10000 = 90% hit.
+        let u = Usage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            cache_read_input_tokens: 9_000,
+            cache_creation_input_tokens: 0,
+        };
+        let s = usage_annotation(&u);
+        assert_eq!(s, " · ctx 10.0k · out 500 · cache 9.0k (90% hit)");
+
+        // No cache → no cache segment, but context + output still show.
+        let u = Usage {
+            input_tokens: 320,
+            output_tokens: 80,
+            ..Default::default()
+        };
+        assert_eq!(usage_annotation(&u), " · ctx 320 · out 80");
+
+        // Nothing billed → empty (so `-m mock` turns render a clean rule).
+        assert_eq!(usage_annotation(&Usage::default()), "");
+    }
 
     /// clap validates the whole command tree (catches duplicate arg ids, the global-args + subcommand
     /// wiring, conflicts) at test time rather than only when `flux --help` is first run.

@@ -8,6 +8,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Per-turn token usage flows through the unified loop and renders in the CLI.** The planner's token
+  counts are now captured from the provider stream (`compile_turn` returns them), accumulated across a
+  turn's planner calls by the loop host (output summed; input/cache reflect the final, largest prompt
+  so re-sent context isn't multiply-counted), and handed to `sink.turn_end` by the engine. The CLI's
+  turn-end rule now shows **context-window occupancy, generated tokens, and — under prompt caching —
+  cached tokens with the hit-rate** (e.g. `1 step · 90ms · ctx 1.4k · out 60 · cache 1.2k (87% hit)`);
+  it stays clean (no all-zero noise) on offline `-m mock` turns. The SDK `Client` now also populates
+  `TurnOutput.usage`. (Previously usage was dropped through the flux-lang loop — `turn_end(None)`.)
 - **A2A client — `flux a2a <URL>`.** flux can now *consume* a remote A2A agent, not just expose one:
   `flux a2a <URL>` connects to any spec-conformant Agent-to-Agent agent and drives it from the CLI
   like a local agent — an interactive REPL, or a one-shot turn from command-line prompt words or
@@ -42,8 +50,7 @@ All notable changes to this project are documented in this file. The format is b
   repurposed into the **Agent-pillar** crate: it owns **`AgentSpec`** (model, persona, skills, tool
   selection, permissions, settings) + `assemble`/`into_engine` (→ `FlowEngine`), keeps
   `DEFAULT_SYSTEM_PROMPT`, and absorbs the markdown `Role` agent-definition format (moved from
-  `flux-orchestrate`). The SDK `Client` keeps its `TurnOutput` API; token usage is not surfaced through
-  the unified loop (consistent with every other FlowEngine surface).
+  `flux-orchestrate`). The SDK `Client` keeps its `TurnOutput` API.
 - **A2A server speaks the current spec (breaking for A2A callers).** `flux serve`'s A2A endpoint
   moved from the early-draft `tasks/send` / `tasks/sendSubscribe` methods to the current spec's
   `message/send` / `message/stream`, with message parts keyed by `kind` (was `type`), a `Task` /

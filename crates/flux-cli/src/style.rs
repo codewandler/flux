@@ -87,6 +87,17 @@ pub fn plan_palette() -> flux_flow::render::Palette {
     }
 }
 
+/// Format a token count compactly: `940` / `5.4k` / `1.2M`.
+pub fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 /// Format an elapsed duration compactly: `820µs` / `12ms` / `1.4s`.
 pub fn fmt_elapsed(d: std::time::Duration) -> String {
     let ms = d.as_millis();
@@ -130,5 +141,12 @@ mod tests {
         use std::time::Duration;
         assert_eq!(fmt_elapsed(Duration::from_millis(12)), "12ms");
         assert_eq!(fmt_elapsed(Duration::from_millis(1400)), "1.4s");
+    }
+
+    #[test]
+    fn fmt_tokens_scales() {
+        assert_eq!(fmt_tokens(940), "940");
+        assert_eq!(fmt_tokens(5_400), "5.4k");
+        assert_eq!(fmt_tokens(1_200_000), "1.2M");
     }
 }

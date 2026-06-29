@@ -19,7 +19,7 @@
 
 use futures::StreamExt;
 
-use flux_core::{Chunk, ContentBlock, Error, Message, Result, StopReason};
+use flux_core::{Chunk, ContentBlock, Error, Message, Result, StopReason, Usage};
 use flux_provider::{Provider, Request, ToolDef};
 
 use crate::analyze::{analyze_flow, Diagnostic};
@@ -178,7 +178,7 @@ pub async fn compile_turn(
     // reasoning in real time instead of showing a silent "composing plan\u2026" indicator.
     mut thinking_sink: Option<&'_ mut dyn crate::AgentSink>,
     opts: CompileOptions,
-) -> Result<TurnOutput> {
+) -> Result<(TurnOutput, Usage)> {
     let steps = opts.max_steps.max(1);
     let interactive = ask.is_some();
     let planner = build_planner_prompt(ops, view, interactive);
@@ -197,6 +197,9 @@ pub async fn compile_turn(
     // live instead of silently waiting behind "composing plan\u2026".
     let enable_thinking = thinking_sink.is_some();
 
+    // Token usage for this whole planner consultation: summed across the repair/tool-result steps
+    // below (each is a separate provider call), with the input/cache side reflecting the final step.
+    let mut usage = Usage::default();
     for step in 1..=steps {
         let req = Request {
             model: model.to_string(),
@@ -218,7 +221,9 @@ pub async fn compile_turn(
         let ts: Option<&mut dyn crate::AgentSink> = thinking_sink
             .as_mut()
             .map(|s| unsafe { &mut *(*s as *mut dyn crate::AgentSink) });
-        let (mut blocks, acc_text, stop_reason) = stream_blocks(provider, req, ts).await?;
+        let (mut blocks, acc_text, stop_reason, call_usage) =
+            stream_blocks(provider, req, ts).await?;
+        usage.accumulate(&call_usage);
         if blocks.is_empty() && !acc_text.trim().is_empty() {
             blocks.push(ContentBlock::Text { text: acc_text });
         }
@@ -232,12 +237,15 @@ pub async fn compile_turn(
             // No tool call. Perhaps the model emitted the AST as plain text → a plan.
             if let Ok(ast) = parse_draft_ast(&assistant.text()) {
                 if analyze_flow(&ast, ops).is_ok() {
-                    return Ok(TurnOutput::Plan(Compiled {
-                        ast,
-                        attempts: step,
-                        diagnostics: Vec::new(),
-                        complete: None,
-                    }));
+                    return Ok((
+                        TurnOutput::Plan(Compiled {
+                            ast,
+                            attempts: step,
+                            diagnostics: Vec::new(),
+                            complete: None,
+                        }),
+                        usage,
+                    ));
                 }
             }
             // A `max_tokens` cutoff drops the in-flight `emit_plan` block — the provider never sends its
@@ -255,7 +263,7 @@ pub async fn compile_turn(
             // turn (no blocks, no text) wasn't pushed, so just retry on the next step.
             let text = assistant.text();
             if !text.trim().is_empty() {
-                return Ok(TurnOutput::Chat(text));
+                return Ok((TurnOutput::Chat(text), usage));
             }
             if step == steps {
                 return Err(Error::Other(format!(
@@ -347,7 +355,7 @@ pub async fn compile_turn(
         }
         messages.push(Message::user(results));
         if let Some(c) = done {
-            return Ok(TurnOutput::Plan(c));
+            return Ok((TurnOutput::Plan(c), usage));
         }
     }
     Err(Error::Other(format!(
@@ -370,7 +378,7 @@ pub async fn plan(
     opts: CompileOptions,
 ) -> Result<Compiled> {
     let conversation = [Message::user_text(instruction)];
-    match compile_turn(
+    let (out, _usage) = compile_turn(
         provider,
         model,
         &conversation,
@@ -381,8 +389,8 @@ pub async fn plan(
         None,
         opts,
     )
-    .await?
-    {
+    .await?;
+    match out {
         TurnOutput::Plan(c) => Ok(c),
         TurnOutput::Chat(_) => Err(Error::Other(
             "the model answered without emitting a plan".to_string(),
@@ -482,7 +490,7 @@ pub async fn render_completion(
         effort: None,
         metadata: serde_json::Map::new(),
     };
-    let (mut blocks, acc_text, _stop) = stream_blocks(provider, req, None).await?;
+    let (mut blocks, acc_text, _stop, _usage) = stream_blocks(provider, req, None).await?;
     if blocks.is_empty() && !acc_text.trim().is_empty() {
         blocks.push(ContentBlock::Text { text: acc_text });
     }
@@ -500,11 +508,14 @@ async fn stream_blocks(
     provider: &dyn Provider,
     req: Request,
     mut on_thinking: Option<&mut dyn crate::AgentSink>,
-) -> Result<(Vec<ContentBlock>, String, Option<StopReason>)> {
+) -> Result<(Vec<ContentBlock>, String, Option<StopReason>, Usage)> {
     let mut stream = provider.stream(req).await?;
     let mut blocks = Vec::new();
     let mut text = String::new();
     let mut stop_reason = None;
+    // Providers emit usage cumulatively (the codec carries the input/cache counts from `message_start`
+    // forward onto the final `message_delta`), so the last chunk holds the complete picture — last wins.
+    let mut usage = Usage::default();
     while let Some(chunk) = stream.next().await {
         match chunk? {
             Chunk::ThinkingDelta(t) => {
@@ -514,11 +525,12 @@ async fn stream_blocks(
             }
             Chunk::TextDelta(t) => text.push_str(&t),
             Chunk::Block(b) => blocks.push(b),
+            Chunk::Usage(u) => usage = u,
             Chunk::Done { stop_reason: r } => stop_reason = r,
             _ => {}
         }
     }
-    Ok((blocks, text, stop_reason))
+    Ok((blocks, text, stop_reason, usage))
 }
 
 /// Extract `(id, name, input)` for every tool_use block in a message.
@@ -815,6 +827,21 @@ mod tests {
         ]
     }
 
+    /// Like [`tool_call`] but with a `Usage` chunk, so a test can assert usage rides back out.
+    fn tool_call_with_usage(name: &str, input: serde_json::Value, usage: Usage) -> Vec<Chunk> {
+        vec![
+            Chunk::Block(ContentBlock::ToolUse {
+                id: format!("{name}_1"),
+                name: name.to_string(),
+                input,
+            }),
+            Chunk::Usage(usage),
+            Chunk::Done {
+                stop_reason: Some(flux_core::StopReason::ToolUse),
+            },
+        ]
+    }
+
     fn mock(responses: Vec<Vec<Chunk>>) -> Mock {
         Mock {
             responses: Mutex::new(responses.into_iter().collect()),
@@ -981,7 +1008,7 @@ mod tests {
         let ops = OpRegistry::new(&reg);
         // Prose with no `emit_plan` and no tool calls = a chat answer, not an error.
         let p = mock(vec![text_chunk("Here's an explanation — no plan needed.")]);
-        let out = compile_turn(
+        let (out, _usage) = compile_turn(
             &p,
             "mock",
             &[Message::user_text("explain the safety model")],
@@ -1041,11 +1068,17 @@ mod tests {
     async fn compile_turn_returns_plan_for_emit() {
         let reg = full_registry();
         let ops = OpRegistry::new(&reg);
-        let p = mock(vec![tool_call(
+        let p = mock(vec![tool_call_with_usage(
             "emit_plan",
             serde_json::from_str(VALID_AST).unwrap(),
+            Usage {
+                input_tokens: 120,
+                output_tokens: 40,
+                cache_read_input_tokens: 80,
+                ..Default::default()
+            },
         )]);
-        let out = compile_turn(
+        let (out, usage) = compile_turn(
             &p,
             "mock",
             &[Message::user_text("read x")],
@@ -1059,6 +1092,11 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(out, TurnOutput::Plan(_)));
+        // The planner call's token usage rides back out alongside the plan.
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 40);
+        assert_eq!(usage.cache_read_input_tokens, 80);
+        assert_eq!(usage.context_tokens(), 200);
     }
 
     #[tokio::test]

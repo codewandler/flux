@@ -35,8 +35,9 @@ delete `flux-agent::Agent`. Honors "no fallbacks / clean cutover" and removes a 
 - Scope grew beyond the original SDK-only framing: introduced a first-class agent-definition type
   (`AgentSpec`) — the home for "what an agent is" (model/prompt/skills/tools/settings) — and unified
   the three ad-hoc engine-assembly sites (CLI/SDK/orchestrate) onto it.
-- Known limitation (deferred): token usage is not surfaced through the unified flux-lang loop
-  (`turn_end(None)`), so `TurnOutput.usage` is `None` — consistent with the CLI's `--usage` no-op. A
-  follow-up could thread usage from the planner through the loop, benefiting every surface.
+- Follow-up since shipped: token usage now *is* surfaced through the unified loop. `compile_turn`
+  returns the planner call's `Usage`; the loop host accumulates it per turn (output summed, input/cache
+  = the final/largest prompt) and the engine hands it to `sink.turn_end`. `TurnOutput.usage` is
+  populated, and the CLI rule renders context/output/cache + hit-rate.
 - Files: `crates/flux-agent/src/{lib.rs,role.rs}`, `crates/flux-flow/src/agent_sink.rs`,
   `crates/flux-sdk/src/lib.rs`, `crates/flux-orchestrate/src/lib.rs`, `crates/flux-cli/src/main.rs`.

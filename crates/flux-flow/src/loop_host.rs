@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::AgentSink;
-use flux_core::{Error, Message, Result};
+use flux_core::{Error, Message, Result, Usage};
 use flux_provider::Provider;
 use flux_runtime::{Executor, LoopHost, ToolResult};
 
@@ -90,6 +90,9 @@ pub struct EngineLoopHost {
     turn: Mutex<TurnCtx>,
     /// Retry-breaker state, reset per turn — stops a stalled loop from replaying to the cap.
     guard: Mutex<LoopGuard>,
+    /// Token usage accumulated across every planner call this turn (the loop calls `plan` once per
+    /// iteration). Reset per turn in [`set_turn`]; read by the engine at turn-end for `sink.turn_end`.
+    usage: Mutex<Usage>,
 }
 
 impl EngineLoopHost {
@@ -127,6 +130,7 @@ impl EngineLoopHost {
                     sink,
                 }),
                 guard: Mutex::new(LoopGuard::default()),
+                usage: Mutex::new(Usage::default()),
             });
             *slot2.lock().unwrap() = Some(host.clone());
             executor.set_loop_host(host);
@@ -151,6 +155,14 @@ impl EngineLoopHost {
         };
         // Fresh turn → reset the retry-breaker so a prior turn's stall never bleeds in.
         *self.guard.lock().unwrap() = LoopGuard::default();
+        // …and the per-turn token tally, so usage reflects only this turn's planner calls.
+        *self.usage.lock().unwrap() = Usage::default();
+    }
+
+    /// The token usage accumulated across this turn's planner calls (every `plan` re-entry). The
+    /// engine reads it once the agent loop completes and hands it to `sink.turn_end`.
+    pub fn turn_usage(&self) -> Usage {
+        self.usage.lock().unwrap().clone()
     }
 
     /// Swap the planner (provider + model) — the REPL `/model` command, applied to the shared host so
@@ -244,7 +256,7 @@ impl LoopHost for EngineLoopHost {
         let ops = OpRegistry::new(executor.registry());
         let provider = self.provider.lock().unwrap().clone();
         let model = self.model.lock().unwrap().clone();
-        let out = compile_turn(
+        let (out, call_usage) = compile_turn(
             &*provider,
             &model,
             &conversation,
@@ -259,6 +271,8 @@ impl LoopHost for EngineLoopHost {
         // Surface a provider failure (credit/auth/rate-limit/transport) as a readable sentence — the
         // error flows out through the op envelope and becomes the turn's answer, never raw JSON.
         .map_err(|e| Error::Other(crate::engine::planner_error(&e)))?;
+        // Fold this planner call's tokens into the per-turn tally the engine reports at turn-end.
+        self.usage.lock().unwrap().accumulate(&call_usage);
 
         let plan = match out {
             TurnOutput::Plan(c) => serde_json::json!({
