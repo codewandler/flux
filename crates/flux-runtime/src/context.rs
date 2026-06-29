@@ -1,4 +1,5 @@
-//! `flux-context` — assembles per-turn context from an ordered chain of providers.
+//! `context` — assembles per-turn context from an ordered chain of providers (the `context` module
+//! of `flux-runtime`, folded in from the former `flux-context` crate).
 //!
 //! Each [`ContextProvider`] contributes an optional block; [`Projector::system_prompt`] appends
 //! them to a base prompt wrapped in `<context source="...">` tags. v1 ships project-file context

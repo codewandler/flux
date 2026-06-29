@@ -20,7 +20,6 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use flux_agent::{AgentSpec, DEFAULT_SYSTEM_PROMPT};
-use flux_context::{EnvContext, GitContext, ProjectFiles, Projector, RepoSignal};
 use flux_core::{Chunk, ContentBlock, StopReason, Usage};
 use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
@@ -30,6 +29,7 @@ use flux_orchestrate::{LocalSpawner, ProviderFactory, Role, RoleRegistry, TaskTo
 use flux_provider::{ChunkStream, Effort, NativeProvider, Provider, Request};
 use flux_providers::anthropic::anthropic_from_env;
 use flux_providers::openai::{ollama_api, openai_from_env, openrouter_from_env};
+use flux_runtime::context::{EnvContext, GitContext, ProjectFiles, Projector, RepoSignal};
 use flux_runtime::{
     AllowApprover, ApprovalChoice, Approver, Executor, PermissionManager, ToolContext,
     ToolRegistry, ToolResult,

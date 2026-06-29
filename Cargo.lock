@@ -685,7 +685,6 @@ dependencies = [
  "flux-capabilities",
  "flux-cognition",
  "flux-config",
- "flux-context",
  "flux-core",
  "flux-credentials",
  "flux-eval",
@@ -748,15 +747,6 @@ dependencies = [
  "flux-policy",
  "serde",
  "toml",
-]
-
-[[package]]
-name = "flux-context"
-version = "0.2.4"
-dependencies = [
- "async-trait",
- "flux-core",
- "tokio",
 ]
 
 [[package]]

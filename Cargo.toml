@@ -11,7 +11,6 @@ members = [
     "crates/flux-runtime",
     "crates/flux-tools",
     "crates/flux-events",
-    "crates/flux-context",
     "crates/flux-skill",
     "crates/flux-agent",
     "crates/flux-orchestrate",
@@ -61,7 +60,6 @@ flux-runtime = { path = "crates/flux-runtime", version = "0.2.4" }
 flux-tools = { path = "crates/flux-tools", version = "0.2.4" }
 flux-events = { path = "crates/flux-events", version = "0.2.4" }
 flux-agent = { path = "crates/flux-agent", version = "0.2.4" }
-flux-context = { path = "crates/flux-context" }
 flux-skill = { path = "crates/flux-skill", version = "0.2.4" }
 flux-orchestrate = { path = "crates/flux-orchestrate" }
 flux-lang = { path = "crates/flux-lang", version = "0.2.4" }

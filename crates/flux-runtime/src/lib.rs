@@ -8,6 +8,8 @@
 mod perm;
 pub use perm::{Pattern, PermDecision, PermissionManager};
 
+pub mod context;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};

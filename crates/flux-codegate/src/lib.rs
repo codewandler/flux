@@ -23,8 +23,9 @@ pub fn layer(name: &str) -> Option<u8> {
         // Ollama + the shared Messages protocol core, all in `flux-providers`), credentials, and
         // the A2A agent-protocol client + wire types (`flux-a2a`; no flux deps — a network client)
         "flux-provider" | "flux-providers" | "flux-credentials" | "flux-a2a" => 1,
-        // L2 — runtime: execution + guarded IO + the safety envelope
-        "flux-system" | "flux-runtime" | "flux-tools" | "flux-events" | "flux-context" => 2,
+        // L2 — runtime: execution + guarded IO + the safety envelope (context-projector module
+        // now lives inside flux-runtime)
+        "flux-system" | "flux-runtime" | "flux-tools" | "flux-events" => 2,
         // L3 — agent + orchestration + eval/self-improvement harness + cognition ops
         "flux-agent" | "flux-orchestrate" | "flux-flow" | "flux-eval" | "flux-cognition" => 3,
         // L4 — extensibility (subprocess plugins + the JS pre-tool hooks module)

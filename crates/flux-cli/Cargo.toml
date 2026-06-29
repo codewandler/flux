@@ -26,7 +26,6 @@ flux-evidence.workspace = true
 flux-system.workspace = true
 flux-tools.workspace = true
 flux-events.workspace = true
-flux-context.workspace = true
 flux-agent.workspace = true
 flux-flow.workspace = true
 flux-cognition.workspace = true
