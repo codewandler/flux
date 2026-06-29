@@ -26,12 +26,12 @@ _(none)_
 
 ## Backlog (unranked — promote to **Next** with a `priority` when ready)
 - [L-02 — flux-markdown engine + progressive-disclosure skills](L-02-flux-markdown-engine.md) · Language · AST parser, body-on-demand activation
-- [A-01 — Unify SDK onto FlowEngine](A-01-unify-flowengine.md) · Agent · retire the second turn loop
 - [C-01 — Crate consolidation, phases 2–4](C-01-crate-consolidation.md) · Core · 33 → ~28–29 crates
 - [I-01 — Statistically clean headline gain](I-01-headline-gain.md) · Improve · trials ≥ 3, grader-confirmed
 
 ## Done
 - [A-02 — A2A client (`flux a2a <URL>`)](A-02-a2a-client.md) · Agent · consume a remote A2A agent like a local one; server clean-cutover to the current spec (see [CHANGELOG](../../CHANGELOG.md))
+- [A-01 — Unify on FlowEngine, retire the classic Agent loop](A-01-unify-flowengine.md) · Agent · one loop everywhere; `flux-agent` repurposed as the `AgentSpec` home (see [CHANGELOG](../../CHANGELOG.md))
 - [L-01 — Global, multi-format skill loading](L-01-global-skills.md) · Language · multi-dir + Agent-Skills/Claude format + `flux-markdown` (see [CHANGELOG](../../CHANGELOG.md))
 
 ## Done

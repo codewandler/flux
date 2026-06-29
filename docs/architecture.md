@@ -22,7 +22,7 @@ the *surfaces* (CLI/TUI/server/SDK).
 | **L0 contracts** (pure) | `flux-core` `flux-policy` `flux-secret` `flux-spec` `flux-config` `flux-evidence` `flux-skill` `flux-markdown` `flux-lang` | types, authorization, secrets, tool specs, config, evidence, skills, markdown/frontmatter, the Flux-Lang language + reference interpreter (effects injected via traits) |
 | **L1 providers** | `flux-provider` `flux-providers` `flux-credentials` | the `Provider` abstraction + the concrete clients (`flux-providers` modules: `messages` core, `anthropic`, `openai`, `openrouter`, `ollama`) + credential store |
 | **L2 runtime** | `flux-system` `flux-runtime` `flux-tools` `flux-events` `flux-context` | guarded IO, the safety envelope, built-in tools, the event store, context |
-| **L3 agent** | `flux-agent` `flux-orchestrate` `flux-flow` `flux-eval` `flux-cognition` | the agent loop + multi-agent orchestration + the Flux-Lang engine + the eval harness + the model-op cognition pack |
+| **L3 agent** | `flux-agent` `flux-orchestrate` `flux-flow` `flux-eval` `flux-cognition` | agent definitions (`AgentSpec`/`Role`) + multi-agent orchestration + the Flux-Lang engine (the one turn loop) + the eval harness + the model-op cognition pack |
 | **L4 extensibility** | `flux-hooks` `flux-plugin` | JS hooks + subprocess plugins |
 | **L5 capabilities** | `flux-browser` `flux-datasource` `flux-auth` | web egress, datasource/RAG, caller identity |
 | **L6 surfaces** | `flux-sdk` `flux-server` `flux-integrations` `flux-tui` `flux-cli` `flux-app` | SDK, HTTP server, integrations, TUI, the `flux` binary, the multi-agent program runtime host (`flux run app.flux`) |
@@ -69,8 +69,8 @@ shared machinery beneath them. "Disposition" flags a planned move; see
 ### Agent pillar
 | Crate | Layer | Role | Disposition |
 |---|---|---|---|
-| `flux-flow` | L3 | the FlowEngine: compile NL→plan, execute the DAG, session store | — |
-| `flux-agent` | L3 | the *classic* provider-native loop (SDK door only) | retire → [A-01](stories/A-01-unify-flowengine.md) |
+| `flux-flow` | L3 | the FlowEngine (the one turn loop) + the `AgentSink` streaming trait: compile NL→plan, execute the DAG, session store | — |
+| `flux-agent` | L3 | the Agent pillar: `AgentSpec` + markdown `Role` definitions, assembled onto `FlowEngine` | — |
 | `flux-orchestrate` | L3 | sub-agents + multi-agent orchestration | — |
 | `flux-cognition` | L3 | model-backed ops (`ai.extract` / `rank` / `judge` / …) | — |
 
@@ -157,9 +157,11 @@ A "provider" conflates two orthogonal axes, modeled separately and composed by `
   the evidence ops `observe`/`evidence`/`grade`/`metrics` are what let the loop call the model and reason
   over its own runtime evidence (see `flux-flow/docs/ops-reference.md`). A workspace can override the loop
   with its own `.flux/agent-loop.flux`. The loop is cancellable (a `CancellationToken`). This is the
-  CLI/server/TUI turn loop; `flux-agent` provides the `AgentSink` streaming trait plus its **classic**
-  provider-native `Agent` loop, which the SDK's `flux_sdk::Client` front door still uses (`flux_sdk::FlowClient`
-  is the flow-based SDK door). The loop is filtered from the surface by default; watch it with
+  **one** turn loop everywhere — CLI/server/TUI, the SDK (`flux_sdk::Client` assembles a `FlowEngine`
+  via `AgentSpec`; `flux_sdk::FlowClient` is the declarative flow door), and sub-agents
+  (`flux-orchestrate`). `flux-flow` owns the `AgentSink` streaming trait; `flux-agent` is the
+  agent-definition crate (`AgentSpec` + markdown `Role`). The classic provider-native `Agent` loop is
+  gone. The loop is filtered from the surface by default; watch it with
   `flux run --show-loop`, inspect its evidence with the REPL `/evidence`, and read or scaffold it with
   `flux loop show`/`eject` — see [the agent-loop guide](agent-loop.md).
 - **Session shape is a hard invariant.** The persisted message log must always be a valid

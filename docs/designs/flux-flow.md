@@ -320,8 +320,9 @@ re-enter history (the don't-re-send win), which structurally removes the session
 (no persisted tool_use/tool_result pairs). The quality bar still holds — a fixed head-to-head dogfood
 suite (multi-file edits, read→fix loops, an incident runbook, a Slack/kubectl flow) must show no
 regression in success rate, turn count, and p95 latency before this is trusted; `docs/vision.md` reflects
-the new claim. (The classic `flux-agent::Agent` loop is still the engine behind the SDK's `flux_sdk::Client`
-front door — a separate path; unifying the SDK onto `FlowEngine`/`FlowClient` is future work.)
+the new claim. (Update: there is now **one loop everywhere** — the SDK's `flux_sdk::Client` and the
+sub-agent spawner assemble a `FlowEngine` too, and the classic `flux-agent::Agent` loop has been
+deleted. See §12 and story A-01.)
 
 **The loop is itself Flux-Lang.** That "compile → execute → feed back → repeat" orchestration is no longer
 Rust — it is `crates/flux-flow/assets/agent-loop.flux`, a Flux-Lang flow. `run_turn_cancellable` is now a
@@ -413,8 +414,10 @@ Deferred to implementation (detail, not concept):
 
 Deferred follow-ups (separate decisions, not part of the self-hosted-loop work):
 
-- **One loop repo-wide.** The CLI/server/TUI turn loop is now the flux-lang `FlowEngine` (`agent-loop.flux`),
-  but the SDK's `flux_sdk::Client` front door still drives the classic provider-native `flux-agent::Agent`
-  loop. Unifying the SDK onto `FlowEngine`/`FlowClient` so there is a single loop everywhere — and then
-  retiring `flux-agent::Agent` — is a natural next step, but a separate decision (it changes the SDK's
-  public surface and `Client` semantics). Tracked here as an explicit follow-up, not started.
+- **One loop repo-wide. ✅ Done (story A-01).** Every surface now runs the flux-lang `FlowEngine`
+  (`agent-loop.flux`): the SDK's `flux_sdk::Client` and the sub-agent spawner (`flux-orchestrate`)
+  assemble a `FlowEngine` via the new `flux_agent::AgentSpec`, and the classic provider-native
+  `flux-agent::Agent` loop has been **deleted**. `flux-agent` is repurposed into the Agent-pillar crate
+  (`AgentSpec` + markdown `Role`); the `AgentSink` streaming trait moved to `flux-flow`. The SDK
+  `Client` keeps its `TurnOutput` API (token usage is not surfaced through the unified loop, matching
+  every other FlowEngine surface — a possible future enhancement).

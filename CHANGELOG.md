@@ -35,6 +35,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **One agent loop everywhere; the classic `Agent` loop is gone.** The SDK `Client` and the sub-agent
+  spawner (`flux-orchestrate`) now run on the same `FlowEngine` flux-lang loop as the CLI/TUI/server —
+  the legacy provider-native `flux-agent::Agent::run_turn` loop has been **deleted** (no fallback, no
+  bridge). The `AgentSink` streaming trait moved to `flux-flow` (the engine crate). `flux-agent` is
+  repurposed into the **Agent-pillar** crate: it owns **`AgentSpec`** (model, persona, skills, tool
+  selection, permissions, settings) + `assemble`/`into_engine` (→ `FlowEngine`), keeps
+  `DEFAULT_SYSTEM_PROMPT`, and absorbs the markdown `Role` agent-definition format (moved from
+  `flux-orchestrate`). The SDK `Client` keeps its `TurnOutput` API; token usage is not surfaced through
+  the unified loop (consistent with every other FlowEngine surface).
 - **A2A server speaks the current spec (breaking for A2A callers).** `flux serve`'s A2A endpoint
   moved from the early-draft `tasks/send` / `tasks/sendSubscribe` methods to the current spec's
   `message/send` / `message/stream`, with message parts keyed by `kind` (was `type`), a `Task` /

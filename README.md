@@ -253,7 +253,7 @@ flux is a single Cargo workspace of strictly-layered crates — inner crates nev
 | **Contracts (L0)** | pure types, policy, secrets, tool specs, config, evidence, skills — no IO |
 | **Providers (L1)** | wire codec × credential cells; Anthropic, OpenAI, OpenRouter |
 | **Runtime (L2)** | guarded IO, the safety envelope, built-in tools, sessions, context |
-| **Agent (L3)** | the agent loop + multi-agent orchestration |
+| **Agent (L3)** | the Flux-Lang engine (the one turn loop) + agent definitions (`AgentSpec`/`Role`) + multi-agent orchestration |
 | **Extensibility (L4)** | JavaScript hooks + subprocess plugins |
 | **Capabilities (L5)** | browser/web egress, datasource/RAG, caller identity |
 | **Surfaces (L6)** | SDK, HTTP server, integrations, TUI, the `flux` CLI |
