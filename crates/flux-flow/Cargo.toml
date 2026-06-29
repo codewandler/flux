@@ -12,7 +12,6 @@ flux-spec.workspace = true
 flux-runtime.workspace = true
 flux-provider.workspace = true
 flux-events.workspace = true
-flux-agent.workspace = true
 flux-evidence.workspace = true
 flux-skill.workspace = true
 serde_json.workspace = true

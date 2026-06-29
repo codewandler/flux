@@ -27,9 +27,9 @@ use axum::{Json, Router};
 use futures::Stream;
 use serde_json::{json, Value};
 
-use flux_agent::AgentSink;
 use flux_core::Usage;
 use flux_flow::engine::FlowEngine;
+use flux_flow::AgentSink;
 
 type Shared = Arc<FlowEngine>;
 

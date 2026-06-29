@@ -19,12 +19,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use flux_agent::{AgentSink, DEFAULT_SYSTEM_PROMPT};
+use flux_agent::{AgentSpec, DEFAULT_SYSTEM_PROMPT};
 use flux_context::{EnvContext, GitContext, ProjectFiles, Projector, RepoSignal};
 use flux_core::{Chunk, ContentBlock, StopReason, Usage};
 use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
 use flux_flow::state::FlowStore;
+use flux_flow::AgentSink;
 use flux_orchestrate::{LocalSpawner, ProviderFactory, Role, RoleRegistry, TaskTool};
 use flux_provider::{ChunkStream, Effort, NativeProvider, Provider, Request};
 use flux_providers::anthropic::anthropic_from_env;
@@ -956,21 +957,23 @@ async fn build_agent(
     let flow = open_flow_store(events.clone())?;
     // Assemble the engine: this installs the reflexive loop host on the executor and loads the flux-lang
     // `agent-loop.flux` (the turn loop is flux-lang, not Rust).
-    let agent = FlowEngine::assemble(
-        Arc::from(provider),
-        executor,
-        events,
-        flow,
+    let spec = AgentSpec {
         model,
         system_prompt,
-        flags.max_tokens,
-        25,
-        load_skills(&cwd),
-        compact_threshold(),
+        skills: load_skills(&cwd),
+        max_tokens: flags.max_tokens,
+        max_iterations: 25,
         groups,
-        cwd.clone(),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+        compact_threshold_chars: compact_threshold(),
+        cwd: cwd.clone(),
+        // The CLI builds its own richly-configured executor (perms/approver/hooks/policy/identity)
+        // above, so `tools`/`permissions` are already applied there — `into_engine` consumes only the
+        // engine-identity fields.
+        ..AgentSpec::default()
+    };
+    let agent = spec
+        .into_engine(Arc::from(provider), executor, events, flow)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok((agent, session_id, spawner))
 }
 

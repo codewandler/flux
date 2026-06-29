@@ -612,20 +612,17 @@ dependencies = [
 name = "flux-agent"
 version = "0.2.4"
 dependencies = [
- "async-trait",
  "flux-core",
  "flux-events",
  "flux-evidence",
+ "flux-flow",
+ "flux-markdown",
  "flux-provider",
  "flux-runtime",
  "flux-skill",
- "flux-spec",
- "flux-system",
  "flux-tools",
- "futures",
- "serde_json",
- "tokio",
- "tokio-util",
+ "serde",
+ "serde_norway",
 ]
 
 [[package]]
@@ -633,7 +630,6 @@ name = "flux-app"
 version = "0.2.4"
 dependencies = [
  "async-trait",
- "flux-agent",
  "flux-cognition",
  "flux-core",
  "flux-evidence",
@@ -851,7 +847,6 @@ name = "flux-flow"
 version = "0.2.4"
 dependencies = [
  "async-trait",
- "flux-agent",
  "flux-core",
  "flux-events",
  "flux-evidence",
@@ -928,7 +923,7 @@ dependencies = [
  "flux-agent",
  "flux-core",
  "flux-events",
- "flux-markdown",
+ "flux-flow",
  "flux-policy",
  "flux-provider",
  "flux-runtime",
@@ -937,7 +932,6 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
- "serde_norway",
  "tokio",
  "tokio-util",
 ]
@@ -1053,7 +1047,6 @@ dependencies = [
  "async-stream",
  "axum",
  "flux-a2a",
- "flux-agent",
  "flux-core",
  "flux-flow",
  "flux-runtime",
@@ -1121,7 +1114,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "crossterm 0.28.1",
- "flux-agent",
  "flux-core",
  "flux-evidence",
  "flux-flow",

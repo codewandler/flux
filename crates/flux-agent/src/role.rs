@@ -1,10 +1,13 @@
 //! Agent roles loaded from markdown (`.flux/agents/<name>.md`): frontmatter `description`/`model`/
-//! `tools` plus a body used as the role's system prompt.
+//! `tools` plus a body used as the role's system prompt. A [`Role`] is a file-defined agent
+//! definition; [`Role::to_spec`] turns it into an [`AgentSpec`](crate::AgentSpec).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+use crate::AgentSpec;
 
 /// A sub-agent role.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +24,23 @@ pub struct Role {
     pub tools: Option<Vec<String>>,
     /// The role's system prompt (markdown body).
     pub prompt: String,
+}
+
+impl Role {
+    /// An [`AgentSpec`] for this role: the role body becomes the system prompt, `tools` becomes the
+    /// tool selection, and the model falls back to `default_model` when the role doesn't override it.
+    /// Turn settings (`max_tokens`, `max_iterations`, …) take spec defaults; the caller can override.
+    pub fn to_spec(&self, default_model: &str) -> AgentSpec {
+        AgentSpec {
+            model: self
+                .model
+                .clone()
+                .unwrap_or_else(|| default_model.to_string()),
+            system_prompt: self.prompt.clone(),
+            tools: self.tools.clone(),
+            ..AgentSpec::default()
+        }
+    }
 }
 
 /// Role frontmatter (all fields optional → lenient parsing). `tools` distinguishes a missing key
@@ -137,6 +157,21 @@ mod tests {
         // `tools: []` is the most-restrictive declaration and must parse to Some([]), not None.
         let r = parse_role("---\ntools: []\n---\nbody", "locked");
         assert_eq!(r.tools, Some(Vec::new()));
+    }
+
+    #[test]
+    fn to_spec_inherits_model_and_carries_tools() {
+        let r = parse_role("---\ntools: [read, grep]\n---\nBe terse.", "scout");
+        let spec = r.to_spec("default-model");
+        assert_eq!(spec.model, "default-model"); // role omitted model → inherit
+        assert_eq!(spec.system_prompt, "Be terse.");
+        assert_eq!(
+            spec.tools.as_deref(),
+            Some(&["read".into(), "grep".into()][..])
+        );
+
+        let r2 = parse_role("---\nmodel: haiku\n---\nx", "s");
+        assert_eq!(r2.to_spec("default-model").model, "haiku"); // role overrides
     }
 
     #[test]

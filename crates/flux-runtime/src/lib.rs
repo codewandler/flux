@@ -315,6 +315,11 @@ pub fn shell_opt_in() -> bool {
     std::env::var("FLUX_ENABLE_BASH").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
+/// The group tag for the reflexive loop-machinery ops (`plan`/`run_plan`). It is never surfaced by a
+/// workspace signal, so these ops stay out of the model-facing catalog while remaining dispatchable
+/// by the agent loop. Shared so the tag and the catalog filters can't drift.
+pub const REFLECT_GROUP: &str = "reflect";
+
 /// The group an op effectively belongs to: a manifest group that lists it in `tools` wins (so config
 /// can (re)assign membership), otherwise the op's own [`ToolSpec::group`] tag. `None` ⇒ *core*.
 fn effective_group<'a>(

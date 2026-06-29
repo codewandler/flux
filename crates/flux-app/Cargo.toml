@@ -14,7 +14,6 @@ flux-runtime.workspace = true
 flux-tools.workspace = true
 flux-provider.workspace = true
 flux-evidence.workspace = true
-flux-agent.workspace = true
 flux-system.workspace = true
 flux-cognition.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-std", "io-util"] }

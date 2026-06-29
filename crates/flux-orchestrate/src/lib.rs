@@ -6,17 +6,19 @@
 //! (fresh in-memory session, scoped toolset, auto-approved within its sandboxed tools) and returns
 //! its final text. Plan-and-dispatch builds on this (follow-up).
 
-mod role;
-pub use role::{parse_role, Role, RoleRegistry};
+// Agent roles + definitions live in the Agent-pillar crate (`flux-agent`); re-exported here so
+// `flux_orchestrate::{Role, RoleRegistry, parse_role}` keep resolving for consumers.
+pub use flux_agent::{parse_role, Role, RoleRegistry};
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use flux_agent::{Agent, AgentSink};
+use flux_agent::register_agent_ops;
 use flux_core::{Error, Result, Usage};
 use flux_events::EventStore;
+use flux_flow::AgentSink;
 use flux_policy::{AuthorizationPolicy, Caller, Trust};
 use flux_provider::Provider;
 use flux_runtime::{
@@ -116,18 +118,17 @@ impl Spawner for LocalSpawner {
             .get(role_name)
             .ok_or_else(|| Error::Other(format!("unknown role: {role_name}")))?;
 
-        let model = role
-            .model
-            .clone()
-            .unwrap_or_else(|| self.default_model.clone());
         let provider = (self.provider_factory)()?;
 
         // Scoped toolset; sub-agents run autonomously under the policy-bounded headless approver
         // (auto-approve scoped, policy-permitted calls; refuse destructive ones).
         // `task` is always excluded: sub-agents are leaves and must never spawn further sub-agents
         // (that causes unbounded recursion — each sub-agent calls task → more sub-agents → …).
+        // `register_agent_ops` adds the reflexive ops (`plan`/`run_plan`/…) the flux-lang agent loop
+        // calls — sub-agents run the same audited loop as the top-level agent.
         let mut registry = self.base_registry.subset(role.tools.as_deref());
         registry.remove("task");
+        register_agent_ops(&mut registry);
         let mut executor = Executor::new(
             registry,
             PermissionManager::new(),
@@ -140,26 +141,19 @@ impl Spawner for LocalSpawner {
                 .with_identity(caller.clone(), trust.clone());
         }
 
-        let store = Arc::new(EventStore::in_memory()?);
-        let session_id = store.create_session(&model)?;
+        // The role *is* the agent definition: body → system prompt, `tools` already applied to the
+        // scoped registry above, model inherits the spawner default when the role doesn't override it.
+        let mut spec = role.to_spec(&self.default_model);
+        spec.max_tokens = self.max_tokens;
+        spec.max_iterations = self.max_iterations;
 
-        let agent = Agent {
-            provider,
-            executor,
-            store,
-            model,
-            system_prompt: role.prompt.clone(),
-            max_tokens: self.max_tokens,
-            max_iterations: self.max_iterations,
-            skills: Vec::new(),
-            compact_threshold_chars: 0,
-            // Sub-agents get an explicit scoped tool registry, so no evidence gating (empty manifest).
-            groups: Vec::new(),
-            cwd: std::path::PathBuf::from("."),
-        };
+        let events = Arc::new(EventStore::in_memory()?);
+        let session_id = events.create_session(&spec.model)?;
+        let flow = flux_flow::state::FlowStore::in_memory()?;
+        let engine = spec.into_engine(Arc::from(provider), executor, events, flow)?;
 
         let mut sink = TextCollector::default();
-        agent
+        engine
             .run_turn_cancellable(&session_id, task, &mut sink, cancel)
             .await?;
         Ok(sink.text)
@@ -448,6 +442,96 @@ mod tests {
             .unwrap();
         assert_eq!(out, "scouted: 3 files");
         assert!(spawner.spawn("nope", "x", &cancel).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn restricted_sub_agent_runs_a_plan_with_loop_machinery() {
+        use flux_runtime::{Tool, ToolContext};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A minimal read-only op the role is allowed to use; writes a marker iff it executes.
+        struct Ping;
+        #[async_trait]
+        impl Tool for Ping {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec::read_only("ping", "p", json!({"type": "object"}))
+            }
+            async fn execute(&self, ctx: &ToolContext, _p: Value) -> Result<ToolResult> {
+                ctx.system.write_file("PINGED.marker", "1").await?;
+                Ok(ToolResult::ok("pong"))
+            }
+        }
+
+        // Plan (call 0) — a one-op plan, no `complete` — then prose (call 1). Running the plan drives
+        // the loop's `observe`, so this fails unless `register_agent_ops` re-added the evidence ops
+        // after the role's `tools: [ping]` subset dropped them.
+        struct PlanMock {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for PlanMock {
+            fn name(&self) -> &str {
+                "mock"
+            }
+            async fn stream(&self, _r: Request) -> Result<ChunkStream> {
+                let n = self.calls.fetch_add(1, Ordering::Relaxed);
+                let chunks = if n == 0 {
+                    let ast = json!({ "body": [{ "kind": "call", "op": "ping", "args": [] }] });
+                    vec![
+                        Chunk::Block(ContentBlock::ToolUse {
+                            id: "p".into(),
+                            name: "emit_plan".into(),
+                            input: json!({ "ast": ast }),
+                        }),
+                        Chunk::Done {
+                            stop_reason: Some(StopReason::ToolUse),
+                        },
+                    ]
+                } else {
+                    vec![
+                        Chunk::Block(ContentBlock::Text {
+                            text: "done scouting".into(),
+                        }),
+                        Chunk::Done {
+                            stop_reason: Some(StopReason::EndTurn),
+                        },
+                    ]
+                };
+                Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+            }
+        }
+
+        let system = temp_system();
+        let mut base = ToolRegistry::new();
+        base.register(Arc::new(Ping));
+        let mut roles = RoleRegistry::default();
+        // Restricted role: only `ping`. The subset drops the loop-machinery ops, which
+        // `register_agent_ops` must re-add for the flux-lang loop to run.
+        roles.insert(parse_role(
+            "---\ntools: [ping]\n---\nYou are a scout.",
+            "scout",
+        ));
+        let spawner = LocalSpawner::new(
+            Arc::new(|| {
+                Ok(Box::new(PlanMock {
+                    calls: AtomicUsize::new(0),
+                }))
+            }),
+            Arc::new(roles),
+            base,
+            system.clone(),
+            "mock",
+            1024,
+        );
+        let out = spawner
+            .spawn("scout", "scout the repo", &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(out, "done scouting");
+        assert!(
+            system.read_file("PINGED.marker").await.is_ok(),
+            "the plan's op executed through the loop"
+        );
     }
 
     #[tokio::test]

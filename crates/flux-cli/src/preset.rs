@@ -602,7 +602,7 @@ mod tests {
     async fn map_each_runs_over_read_in_a_temp_workspace() {
         use std::sync::Arc;
 
-        use flux_agent::AgentSink;
+        use flux_flow::AgentSink;
         use flux_runtime::{AllowApprover, Executor, PermissionManager, ToolContext, ToolRegistry};
         use flux_system::{System, Workspace};
 

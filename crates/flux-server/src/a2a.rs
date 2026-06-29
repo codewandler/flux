@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 use flux_a2a::{
     AgentCard, Capabilities, Message, Skill, Task, TaskState, TaskStatus, TaskStatusUpdateEvent,
 };
-use flux_agent::AgentSink;
+use flux_flow::AgentSink;
 
 use super::Collect;
 use crate::Shared;

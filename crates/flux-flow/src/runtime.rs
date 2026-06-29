@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use flux_agent::AgentSink;
+use crate::AgentSink;
 use flux_runtime::{ApprovalChoice, Approver, Executor, ToolRegistry, ToolResult};
 use flux_spec::{IntentSet, Risk};
 

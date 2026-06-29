@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, Weak};
 use async_trait::async_trait;
 use serde_json::Value;
 
-use flux_agent::AgentSink;
+use crate::AgentSink;
 use flux_core::{Error, Message, Result};
 use flux_provider::Provider;
 use flux_runtime::{Executor, LoopHost, ToolResult};

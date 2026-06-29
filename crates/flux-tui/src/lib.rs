@@ -25,9 +25,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tui_textarea::TextArea;
 
-use flux_agent::AgentSink;
 use flux_core::Usage;
 use flux_flow::engine::FlowEngine;
+use flux_flow::AgentSink;
 use flux_runtime::{ApprovalChoice, Approver, ToolResult};
 use flux_spec::IntentSet;
 

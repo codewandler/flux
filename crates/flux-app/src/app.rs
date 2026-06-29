@@ -19,9 +19,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
-use flux_agent::AgentSink;
 use flux_core::{Error, Result};
 use flux_flow::state::FlowStore;
+use flux_flow::AgentSink;
 use flux_lang::ast::{SymbolName, Value as FluxValue, Visibility};
 use flux_lang::program::Program;
 use flux_provider::Provider;

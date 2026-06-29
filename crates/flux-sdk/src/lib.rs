@@ -1,11 +1,13 @@
 //! `flux-sdk` — the high-level library API.
 //!
-//! Wraps the agent loop, built-in tools, the safety envelope, and a session into a small
+//! Wraps the flux-flow engine, built-in tools, the safety envelope, and a session into a small
 //! [`Client`]. You supply a [`Provider`] (from `flux-providers`) and a workspace
 //! root; the SDK wires the rest.
 //!
-//! There are three front doors: [`Client`] (this classic agent loop), [`FlowClient`] (the Flux-Lang
-//! `compile → analyze → execute` lifecycle, NL→AST), and the [`dsl`] (author the AST in Rust). Each
+//! There are three front doors: [`Client`] (an agentic turn — the model plans, the runtime runs the
+//! flux-lang agent loop — returning a [`TurnOutput`]), [`FlowClient`] (the Flux-Lang
+//! `compile → analyze → execute` lifecycle, NL→AST), and the [`dsl`] (author the AST in Rust). Both
+//! `Client` and `FlowClient` run on the same engine ([`flux_flow::engine::FlowEngine`]). Each door
 //! has a runnable, no-API-key example: `examples/client_basic.rs`, `examples/flow_compile.rs`, and
 //! `examples/dsl_loops.rs` respectively. On top of the DSL, [`recipes`] is a cookbook of reusable,
 //! parameterized flow builders (routing, lookup, the loop family, resilience).
@@ -37,14 +39,14 @@ pub mod recipes;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use flux_agent::{Agent, AgentSink, DEFAULT_SYSTEM_PROMPT};
+use flux_agent::{AgentSpec, Permissions, DEFAULT_SYSTEM_PROMPT};
 use flux_core::{Result, Usage};
 use flux_events::EventStore;
+use flux_flow::engine::FlowEngine;
+use flux_flow::state::FlowStore;
+use flux_flow::AgentSink;
 use flux_provider::Provider;
-use flux_runtime::{
-    AllowApprover, Approver, DenyApprover, Executor, PermissionManager, ToolContext, ToolRegistry,
-    ToolResult,
-};
+use flux_runtime::{AllowApprover, Approver, DenyApprover, ToolContext, ToolRegistry, ToolResult};
 use flux_system::{System, Workspace};
 
 /// The result of one `Client::run` turn.
@@ -122,43 +124,53 @@ impl ClientBuilder {
     }
 
     /// Build the client with `provider` and a workspace rooted at `root`. Sessions are in-memory.
+    /// The turn runs on [`FlowEngine`] (the model plans, the runtime runs the flux-lang agent loop).
     pub fn build(self, provider: Box<dyn Provider>, root: impl Into<PathBuf>) -> Result<Client> {
-        let system = Arc::new(System::new(Workspace::new(root.into())?));
+        let root = root.into();
+        let system = Arc::new(System::new(Workspace::new(root.clone())?));
         let mut registry = ToolRegistry::new();
         flux_tools::register_builtins(&mut registry);
-        let perms = PermissionManager::from_rules(&self.allow, &self.deny);
         let approver: Arc<dyn Approver> = if self.auto_approve {
             Arc::new(AllowApprover)
         } else {
             Arc::new(DenyApprover)
         };
-        let executor = Executor::new(registry, perms, approver, ToolContext::new(system));
 
-        let store = Arc::new(EventStore::in_memory()?);
-        let session_id = store.create_session(&self.model)?;
+        let events = Arc::new(EventStore::in_memory()?);
+        let session_id = events.create_session(&self.model)?;
+        let flow = FlowStore::in_memory()?;
 
-        let agent = Agent {
-            provider,
-            executor,
-            store,
+        // The agent's definition; `assemble` selects the tool subset (all, here), applies the
+        // permissions, registers the reflexive ops, and ties the engine⇄loop-host cycle.
+        let spec = AgentSpec {
             model: self.model,
             system_prompt: self
                 .system_prompt
                 .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()),
+            permissions: Permissions {
+                allow: self.allow,
+                deny: self.deny,
+            },
             max_tokens: self.max_tokens,
             max_iterations: self.max_iterations,
-            skills: Vec::new(),
-            compact_threshold_chars: 0,
-            groups: Vec::new(),
-            cwd: std::path::PathBuf::from("."),
+            cwd: root,
+            ..AgentSpec::default()
         };
-        Ok(Client { agent, session_id })
+        let engine = spec.assemble(
+            Arc::from(provider),
+            registry,
+            approver,
+            ToolContext::new(system),
+            events,
+            flow,
+        )?;
+        Ok(Client { engine, session_id })
     }
 }
 
-/// A configured, session-bound agent.
+/// A configured, session-bound agent (runs on [`FlowEngine`]).
 pub struct Client {
-    agent: Agent,
+    engine: FlowEngine,
     session_id: String,
 }
 
@@ -176,7 +188,7 @@ impl Client {
     /// Run one turn to completion, collecting the final text and the tools invoked.
     pub async fn run(&self, input: &str) -> Result<TurnOutput> {
         let mut sink = Collector::default();
-        self.agent
+        self.engine
             .run_turn(&self.session_id, input, &mut sink)
             .await?;
         Ok(sink.0)
@@ -225,16 +237,13 @@ mod tests {
     async fn client_runs_a_text_turn() {
         let dir = std::env::temp_dir().join(format!("flux-sdk-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        // The model answers in prose (no `emit_plan`) → the flux-lang loop takes the `chat` path:
+        // it returns that text as the turn's answer and runs no ops.
         let provider = Box::new(OneShotMock {
             chunks: Mutex::new(Some(vec![
                 Chunk::TextDelta("hello from sdk".into()),
                 Chunk::Block(ContentBlock::Text {
                     text: "hello from sdk".into(),
-                }),
-                Chunk::Usage(Usage {
-                    input_tokens: 5,
-                    output_tokens: 3,
-                    ..Default::default()
                 }),
                 Chunk::Done {
                     stop_reason: Some(StopReason::EndTurn),
@@ -248,7 +257,81 @@ mod tests {
         let out = client.run("hi").await.unwrap();
         assert_eq!(out.text, "hello from sdk");
         assert!(out.tool_calls.is_empty());
-        assert_eq!(out.usage.unwrap().output_tokens, 3);
+        // Token usage is not surfaced through the unified flux-lang loop (true for every FlowEngine
+        // surface today); the `TurnOutput::usage` field stays for API compatibility.
+        assert!(out.usage.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two-call mock: the planner emits a one-op plan (call 0), the engine runs it (which also calls
+    /// the loop-machinery `observe`), then the model answers in prose (call 1). Proves the SDK drives
+    /// the *full* flux-lang loop end-to-end — `plan`/`run_plan`/`observe` are all registered (the
+    /// `register_agent_ops` path) and a real op dispatches and surfaces to the sink.
+    struct PlanThenProseMock {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Provider for PlanThenProseMock {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            let n = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let chunks = if n == 0 {
+                // A one-op plan with no `complete` ⇒ the engine runs it and loops back to plan again.
+                let ast = serde_json::json!({
+                    "body": [{
+                        "kind": "call", "op": "write",
+                        "args": [
+                            { "kind": "lit", "value": "sdk-plan.txt" },
+                            { "kind": "lit", "value": "from the sdk plan\n" }
+                        ]
+                    }]
+                });
+                vec![
+                    Chunk::Block(ContentBlock::ToolUse {
+                        id: "p1".into(),
+                        name: "emit_plan".into(),
+                        input: serde_json::json!({ "ast": ast }),
+                    }),
+                    Chunk::Done {
+                        stop_reason: Some(StopReason::ToolUse),
+                    },
+                ]
+            } else {
+                vec![
+                    Chunk::Block(ContentBlock::Text {
+                        text: "Wrote the file.".into(),
+                    }),
+                    Chunk::Done {
+                        stop_reason: Some(StopReason::EndTurn),
+                    },
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    #[tokio::test]
+    async fn client_runs_a_plan_then_answers() {
+        let dir = std::env::temp_dir().join(format!("flux-sdk-plan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let provider = Box::new(PlanThenProseMock {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let client = Client::builder()
+            .model("mock")
+            .auto_approve(true) // no human in the loop: the plan's `write` is allowed
+            .build(provider, &dir)
+            .unwrap();
+        let out = client.run("write a file").await.unwrap();
+        assert_eq!(out.text, "Wrote the file.");
+        // The real op surfaced to the sink; loop machinery (plan/run_plan/observe) is filtered out.
+        assert_eq!(out.tool_calls, vec!["write"]);
+        // The plan actually executed through the guarded envelope.
+        assert!(dir.join("sdk-plan.txt").exists(), "the plan's write ran");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

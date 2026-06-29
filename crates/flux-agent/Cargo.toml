@@ -3,23 +3,17 @@ name = "flux-agent"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-description = "flux agent loop: provider stream → tool dispatch through the safety envelope → tool results → repeat, persisted per session"
+description = "flux Agent pillar: agent definitions (AgentSpec, markdown Roles) assembled onto the flux-flow engine"
 
 [dependencies]
 flux-core.workspace = true
 flux-provider.workspace = true
 flux-runtime.workspace = true
 flux-events.workspace = true
-flux-spec.workspace = true
 flux-evidence.workspace = true
 flux-skill.workspace = true
-futures.workspace = true
-async-trait.workspace = true
-serde_json.workspace = true
-tokio.workspace = true
-tokio-util.workspace = true
-
-[dev-dependencies]
-tokio.workspace = true
-flux-system.workspace = true
+flux-flow.workspace = true
 flux-tools.workspace = true
+flux-markdown.workspace = true
+serde.workspace = true
+serde_norway.workspace = true

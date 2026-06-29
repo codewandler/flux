@@ -18,12 +18,15 @@
 //! **engine**: the [`compile`] front-end (natural language → AST), the [`registry`] adapter over the
 //! real tool registry, the [`runtime`] interpreter, the [`engine`] turn loop, and the [`state`] store.
 
+pub mod agent_sink;
 pub mod compile;
 pub mod engine;
 pub mod loop_host;
 pub mod registry;
 pub mod runtime;
 pub mod state;
+
+pub use agent_sink::AgentSink;
 
 // Facade: the language core + reference interpreter live in `flux-lang`. Re-export them so the
 // language surface stays available from the engine crate (no consumer churn) and

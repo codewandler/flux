@@ -13,7 +13,7 @@
 //! never re-enter history (the "don't re-send" token win), which also removes the session-shape bug
 //! class (no persisted tool_use/tool_result pairs). Symbols + summaries carry state forward.
 //!
-//! The engine reuses [`flux_agent::AgentSink`] so a surface (CLI/TUI) can drive it with the same sink.
+//! The engine reuses [`crate::AgentSink`] so a surface (CLI/TUI) can drive it with the same sink.
 //! Every op still executes through `Executor::dispatch` — there is no new bypass surface.
 
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use flux_agent::AgentSink;
+use crate::AgentSink;
 use flux_core::{Chunk, ContentBlock, Message, Result};
 use flux_events::EventStore;
 use flux_provider::{Provider, Request};
@@ -388,7 +388,18 @@ impl FlowEngine {
     fn advertised_registry(&self, sink: Option<&mut dyn AgentSink>) -> OpRegistry<'_> {
         let reg = self.executor.registry();
         if self.groups.is_empty() {
-            return OpRegistry::new(reg);
+            // Gating disabled: advertise everything EXCEPT the never-surfaced loop machinery (the
+            // `reflect` group — `plan`/`run_plan`). Those are registered for dispatch (the agent loop
+            // calls them) but must never enter the model-facing catalog. With a groups manifest,
+            // `advertised_op_names` already excludes `reflect`; this keeps that true for the
+            // gating-off agents (the SDK `Client`, sub-agents) that carry no manifest.
+            let advertised = reg
+                .specs()
+                .iter()
+                .filter(|s| s.group.as_deref() != Some(flux_runtime::REFLECT_GROUP))
+                .map(|s| s.name.clone())
+                .collect();
+            return OpRegistry::new(reg).with_advertised(advertised);
         }
         let signals = flux_runtime::detect_signals(&self.cwd);
         let active = flux_evidence::resolve_active_groups(&self.groups, &signals);

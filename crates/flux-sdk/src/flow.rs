@@ -42,13 +42,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use flux_agent::AgentSink;
 use flux_cognition::CognitionPack;
 use flux_core::{Error, Result};
 use flux_flow::compile::{compile as compile_flow, CompileOptions};
 use flux_flow::registry::OpRegistry;
 use flux_flow::runtime::execute_flow;
 use flux_flow::state::FlowStore;
+use flux_flow::AgentSink;
 use flux_lang::analyze::analyze_flow;
 use flux_lang::prelude;
 use flux_provider::Provider;

@@ -7,7 +7,6 @@ description = "flux HTTP API daemon: create/drive/inspect agent sessions over RE
 
 [dependencies]
 flux-core.workspace = true
-flux-agent.workspace = true
 flux-a2a.workspace = true
 flux-flow.workspace = true
 flux-runtime.workspace = true

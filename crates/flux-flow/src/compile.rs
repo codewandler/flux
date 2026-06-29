@@ -176,7 +176,7 @@ pub async fn compile_turn(
     // Optional sink for live thinking-token streaming during the planning call. When present,
     // each ThinkingDelta chunk is forwarded via sink.thinking_delta so the surface can display
     // reasoning in real time instead of showing a silent "composing plan\u2026" indicator.
-    mut thinking_sink: Option<&'_ mut dyn flux_agent::AgentSink>,
+    mut thinking_sink: Option<&'_ mut dyn crate::AgentSink>,
     opts: CompileOptions,
 ) -> Result<TurnOutput> {
     let steps = opts.max_steps.max(1);
@@ -215,9 +215,9 @@ pub async fn compile_turn(
         // SAFETY: we reborrow through a raw pointer to break the loop-iteration
         // lifetime cycle. `stream_blocks` is `await`ed to completion before the next
         // iteration touches `thinking_sink`, so there is no actual aliasing.
-        let ts: Option<&mut dyn flux_agent::AgentSink> = thinking_sink
+        let ts: Option<&mut dyn crate::AgentSink> = thinking_sink
             .as_mut()
-            .map(|s| unsafe { &mut *(*s as *mut dyn flux_agent::AgentSink) });
+            .map(|s| unsafe { &mut *(*s as *mut dyn crate::AgentSink) });
         let (mut blocks, acc_text, stop_reason) = stream_blocks(provider, req, ts).await?;
         if blocks.is_empty() && !acc_text.trim().is_empty() {
             blocks.push(ContentBlock::Text { text: acc_text });
@@ -499,7 +499,7 @@ pub async fn render_completion(
 async fn stream_blocks(
     provider: &dyn Provider,
     req: Request,
-    mut on_thinking: Option<&mut dyn flux_agent::AgentSink>,
+    mut on_thinking: Option<&mut dyn crate::AgentSink>,
 ) -> Result<(Vec<ContentBlock>, String, Option<StopReason>)> {
     let mut stream = provider.stream(req).await?;
     let mut blocks = Vec::new();

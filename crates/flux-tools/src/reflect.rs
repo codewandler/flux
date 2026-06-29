@@ -68,7 +68,7 @@ impl Tool for PlanOp {
             // The `reflect` group never surfaces from workspace signals, so these ops stay OUT of the
             // model-facing catalog in ordinary turns — yet a pre-authored flow can still call them
             // (`OpRegistry::get` resolves any registered op; gating only filters advertising).
-            group: Some("reflect".into()),
+            group: Some(flux_runtime::REFLECT_GROUP.into()),
         }
     }
 
@@ -109,7 +109,7 @@ impl Tool for RunPlanOp {
             idempotency: Idempotency::NonIdempotent,
             access: Vec::new(),
             // Hidden from the model-facing catalog (see `plan`), reachable by pre-authored flows.
-            group: Some("reflect".into()),
+            group: Some(flux_runtime::REFLECT_GROUP.into()),
         }
     }
 
