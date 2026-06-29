@@ -1,7 +1,17 @@
-# Design: agentic channel target (`EngineDeliverer`)
+# Design: agentic channel target
 
-**Status:** proposed (story [D-09](../stories/D-09-agentic-channel-target.md)) · **Layer:** L6
-(`flux-channels`, + a small `flux-app` seam) · **Owner:** Timo
+**Status:** **mechanism implemented** (story [D-09](../stories/D-09-agentic-channel-target.md), commit
+`0d8ac58`) · **Layer:** L6 (`flux-app`) · **Owner:** Timo
+
+> **Implemented as `trigger.agent` in flux-app — not the `EngineDeliverer`-in-flux-channels shape this doc
+> first proposed.** An `agent`-bound trigger (the existing `TriggerDecl.agent` field) runs a `FlowEngine`
+> agent turn instead of a journey, with an `(agent, conversation) → EventStore` session map and grants from
+> the `AgentDecl`'s `tools` under a headless `DenyApprover`. This reuses an existing Program field and needs
+> no adapter change, so it was preferred over adding a parallel `Deliverer`. The seams:
+> `crates/flux-app/src/app.rs` — `run_agent` / `agent_engine` / `session_for` / `agent_spec_from_decl` /
+> `build_agent_engine`. The `EngineDeliverer`-in-flux-channels write-up below is retained as the
+> **considered alternative**. **Remaining D-09 work:** register datasource (D-07) + plugin (D-08) tools
+> into the agent's registry (today it sees only the App's builtins/cognition/orchestration).
 
 ## Why
 
@@ -74,6 +84,16 @@ meaning "allow everything."
 `AppDeliverer`; channels whose trigger names the agent route to it, journeys route as before. v1 keeps it
 simple: **one target per program** (agent *or* journeys), selected by whether the program declares an agent.
 
+### Registry wiring — the app path must load plugins + datasource tools
+The agent target is only useful with tools to drive. Today **only the CLI agent path** (`build_agent`,
+`crates/flux-cli/src/main.rs:742`) loads subprocess plugins (`load_plugin_tools` / `discover`) and registers
+the datasource `search` tool (`build_doc_index`); the **app/journey path does not** (`Engine::new` registers
+only builtins + orchestration + cognition, `crates/flux-app/src/app.rs:151`). So D-09 also **factors that
+plugin + datasource-index assembly into a shared helper** and has the `EngineDeliverer`'s registry include:
+builtins + orchestration + the **D-07 retrieval ops** + the **D-08 plugin tools** (the program's
+`allow_plugin_access`/declared plugins), authorized by the program's **op-grants**. This is the seam that
+lets a Slack mention drive RAG `search` + `gitlab.*`/`slack.*` ops in one turn.
+
 ## Testing (hermetic — no provider, no network)
 - **Agent turn:** a `MockProvider` (the pattern in `flux-flow`/`flux-sdk` tests) behind a real
   `EngineDeliverer`; a synthetic Slack payload drives one `run_turn` and the reply equals the mock's text —
@@ -93,6 +113,8 @@ simple: **one target per program** (agent *or* journeys), selected by whether th
 | Session create/reuse | `EventStore::create_session(model)` | `crates/flux-events/src/store.rs:117` |
 | Headless executor (extend with grants) | `build_executor` | `crates/flux-app/src/app.rs:280` |
 | App-runner wiring | `flux app run` → `build_channels`/`serve` | `crates/flux-cli/src/main.rs:3176` |
+| Plugin load + datasource index (today CLI-only; share it) | `load_plugin_tools`/`discover`, `build_doc_index` | `crates/flux-cli/src/main.rs:742` |
+| App registry (add plugin + datasource tools) | `Engine::new` | `crates/flux-app/src/app.rs:151` |
 
 ## Non-goals (v1) / named follow-ups
 - Durable `conversation → session` index (in-memory v1; durable pairs with D-02).

@@ -2,8 +2,8 @@
 id: D-09
 title: Agentic channel target — wake an AgentSpec (not just a journey) on an event
 pillar: Agent
-status: backlog
-priority:
+status: in-progress
+priority: 4
 theme: downstream-managed-agents
 design: docs/designs/agentic-channel-target.md
 ---
@@ -43,30 +43,39 @@ The clean injection point already exists: the **`Deliverer` trait**
 `runs[].result` → posts to the thread — so an alternative `Deliverer` needs **no adapter change**.
 
 ## Acceptance
-- [ ] A new `Deliverer` (e.g. `EngineDeliverer`) routes an event to `FlowEngine::run_turn` against a
-      configured `AgentSpec`, returning the answer as a single `JourneyRun { result }`. Failing-first test:
-      a synthetic Slack-shaped payload + a `MockProvider` drives one agent turn and returns its text (no
-      journey, no network).
-- [ ] A `conversation → EventStore session` map so repeat events with the same `payload.conversation`
-      append to one session (multi-turn thread), a fresh `conversation` gets a fresh session. Failing-first
-      test: two deliveries with the same `conversation` share a session; distinct ones stay isolated.
-- [ ] A per-program op-grant seam so the program authorizes its integration ops under the headless approver
-      **without** blanket `--yes`. Failing-first test: a program granting `gitlab.*` can dispatch it; an
-      ungranted op is denied.
-- [ ] Target selectable from the program/CLI (`flux app run` — e.g. a top-level `AgentSpec`/`target` knob
-      in the `Program`); the journey route stays the default and is unchanged.
-- [ ] Full gate green (`cargo build/test/clippy/fmt`, `cargo test -p flux-codegate`); `flux-channels`/
-      `flux-app` layer placement unchanged.
+- [x] An `agent`-bound trigger routes an event to `FlowEngine::run_turn` against an `AgentSpec`, returning
+      the answer as a single `JourneyRun { result }`. **Implemented as `trigger.agent` in flux-app** (reuses
+      the existing `TriggerDecl.agent` field), *not* a flux-channels `EngineDeliverer` — the simpler fit,
+      no adapter change. Test: `agent_trigger_runs_a_turn_and_returns_the_reply` (mock provider, no network).
+      Committed `0d8ac58`.
+- [x] A `(agent, conversation) → EventStore session` map so repeat events with the same
+      `payload.conversation` append to one session (multi-turn thread), a fresh `conversation` gets a fresh
+      session. Test: `same_conversation_reuses_one_session_distinct_ones_isolate`. (In-memory v1.)
+- [x] Declared op grants: an `AgentDecl`'s `tools` become both the visible op subset **and** the pre-allow
+      grants under a headless `DenyApprover` — granted ops run, everything else is denied, no blanket
+      `--yes`. Test: `agent_spec_maps_tools_to_grants_and_persona`.
+- [x] Target selection: an `agent`-bound trigger routes to the agent; a plain trigger runs its journey,
+      unchanged (the journey route stays the default). Test: `trigger_without_agent_still_runs_its_journey`.
+- [ ] **Registry wiring (remaining; depends on D-07/D-08):** the agent's registry is currently the App's
+      builtins + cognition + orchestration — it must also get the **datasource retrieval tools (D-07)** and
+      **plugin tools (D-08)** so the model has tools to drive. Factor the shared plugin/index assembly out
+      of the CLI's `build_agent` so the `flux app run` path uses it too. Failing-first test: an agent target
+      sees a registered plugin op + the `search` tool.
+- [x] Full gate green for the mechanism (`cargo test -p flux-app`); `flux-app` layer placement unchanged.
 
 ## Progress
-- Backlog. Builds the `EngineTarget` capability the D-04 design specified but the impl intentionally
-  deferred (see [[d04-channels-via-app-runner]] / `docs/designs/event-trigger-channels.md`).
+- **Mechanism landed & green** (`0d8ac58`): `trigger.agent` runs an agent turn with per-thread session
+  memory + declared grants; 4 hermetic tests. Builds the `EngineTarget` the D-04 design deferred — via
+  `trigger.agent` in flux-app rather than the originally-designed `EngineDeliverer` (the implemented shape
+  reuses the existing Program field; see [[d04-channels-via-app-runner]]).
+- **Remaining:** the registry wiring (datasource + plugin tools into the agent's registry) — blocked on
+  **D-07** (datasource tools) and **D-08** (plugin tools). Land those, then close this.
 
 ## Notes
-- Reuse, don't reimplement: `FlowEngine::run_turn` + `EventStore` sessions (the channels design's
-  *Implementation references* table lists every seam); `AgentSpec::into_engine` for assembly; the
-  `Deliverer`/`AppDeliverer` pattern in `crates/flux-channels/src/deliver.rs`.
-- The op-grant seam pairs with — but does not require — **D-02** (tenant-tagged events); single-tenant bot
-  needs only the `conversation → session` binding, not account tags.
+- **Implemented approach vs the design:** the committed mechanism is `trigger.agent`-in-flux-app
+  (`crates/flux-app/src/app.rs` — `run_agent`/`agent_engine`/`session_for`/`agent_spec_from_decl`). The
+  design doc's `EngineDeliverer`-in-flux-channels is recorded there as the *considered alternative*.
+- Reuse, don't reimplement: `FlowEngine::run_turn` + `EventStore` sessions; `AgentSpec::assemble` for
+  assembly. The op-grant seam pairs with — but does not require — **D-02** (tenant-tagged events).
 - Serves the Slack-channel assistant **S-02/S-04** stories and managed-agents' background-agent direction. Non-goal: per-event
   trust/policy variation (the D-04 design's named follow-up).

@@ -2,8 +2,8 @@
 id: D-07
 title: Knowledge datasource — a real RAG layer (record schema, persistent index, retrieval ops)
 pillar: Core
-status: backlog
-priority:
+status: ready
+priority: 1
 theme: downstream-managed-agents
 design: docs/designs/datasource-rag.md
 ---
@@ -31,9 +31,16 @@ gap behind the Slack-channel assistant's v0 (journey RAG) and v1 (agentic) miles
 ops, an ingester for markdown + OpenAPI, and any embeddings seam.
 
 ## Acceptance
-- [ ] A datasource **record schema** (entity type, id, source, title, body/snippet, links/relations) +
-      a **persistent** index (sqlite-backed; reuse `flux-events`' storage patterns). Additive — the
-      existing in-memory `Index`/`search` keep working.
+- [ ] A datasource **record schema** in a **new L0 crate `flux-datasource`**: `Record`/`RecordBase`
+      (entity / id / source{plugin,instance} / title / body / links / meta), `Declaration` +
+      `EntitySchema`, and `Lookup`/`Search`/`Get` input/output + `Match{score,matched_fields}`. Pure, no
+      IO — so **both** `flux-plugin` (L4, via D-10) and `flux-capabilities` (L5) share one record contract.
+      Classified L0 in `flux-codegate`. `EntitySchema` is declared **explicitly** (a `flux-datasource-derive`
+      `#[derive(EntitySchema)]` is an **optional** convenience — minimal-if-cheap, not on the critical path).
+- [ ] A **persistent** index over those records — a **sqlite FTS5** backend (the workspace `rusqlite` is
+      `bundled`, so `bm25()` ranking is built in; reuse `flux-events`' `Connection`+WAL pattern). Additive —
+      the existing in-memory `Index`/`search` keep working (a `DatasourceBackend` trait with both impls,
+      in-memory as the default).
 - [ ] Retrieval ops `search` / `list` / `get` / `relation` / `batch_get` implement `flux_runtime::Tool`
       and dispatch through `Executor` (the safety envelope), each with an input JSON Schema.
 - [ ] An **ingester** loads a directory of markdown + an OpenAPI JSON into typed records. Failing-first
@@ -44,12 +51,16 @@ ops, an ingester for markdown + OpenAPI, and any embeddings seam.
 - [ ] Full gate green; `flux-codegate` layer placement confirmed (datasource stays within `flux-capabilities`).
 
 ## Progress
-- Backlog. Design doc to write: `docs/designs/datasource-rag.md`.
+- Ready — **first story in the Slack-channel assistant integration stack** (plan Phase 1). Owns the new `flux-datasource`
+  L0 schema crate that **D-10** (protocol redesign) and **D-08** (plugins) then build on. Design:
+  `docs/designs/datasource-rag.md`.
 
 ## Notes
 - Reuse, don't reimplement: the existing `datasource::Index`/`SearchTool`, `flux-events`' sqlite/WAL
-  patterns, the op-input-schema + `Executor::dispatch` machinery.
-- Integration plugins (**D-08**) contribute datasource records (e.g. `gitlab.merge_requests`,
-  `slack.messages`) into this same schema — keep the record contract plugin-friendly.
+  patterns, the op-input-schema + `Executor::dispatch` machinery. Record/lookup shapes ported (not copied)
+  from `fluxplane-datasource`.
+- The shared `flux-datasource` crate is the record contract: integration plugins (**D-08**, over the
+  **D-10** protocol) contribute records (e.g. `gitlab.merge_request`, `slack.channel`) into this same
+  schema via the L5 `DatasourceHostCaps` bridge — keep it plugin-friendly.
 - Serves Slack-channel assistant **S-01/S-03**. Non-goal (v1): vector/embedding retrieval, hybrid rerank, a cross-source
   lookup-fanout resolver (those land behind the embeddings seam on demand).

@@ -22,7 +22,24 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
   grader-confirmed run is **staged** on a funded provider key
 
 ## Next (ready — take the top one unless the user named a story)
-_(none ready — promote one from Backlog below)_
+
+### Slack-channel assistant integration stack — the active push (build in rank order; each depends on the prior)
+The upstream flux work that unblocks the downstream Slack-channel assistant's agentic, knowledge-grounded DevOps
+assistant. Tracked as the plan of record; see [roadmap → Downstream enablement](../roadmap.md#downstream-enablement-managed-agents-Slack-channel assistant).
+- **1.** [D-07 — Knowledge datasource (a real RAG layer)](D-07-knowledge-datasource-rag.md) · Core · adds the
+  L0 **`flux-datasource`** schema crate + a persistent sqlite index + `search`/`list`/`get`/`relation`/
+  `batch_get` + freshness; keyword/BM25 behind an embeddings seam ([design](../designs/datasource-rag.md))
+- **2.** [D-10 — Process-plugin protocol redesign](D-10-process-plugin-protocol.md) · Core · one clean
+  unified plugin frame (ops + datasource records + host caps with secret-by-purpose) — informed by
+  fluxplane v2, dropping its cruft; clean cutover of `flux.plugin.v1`; blocks D-08
+  ([design](../designs/process-plugin-protocol.md))
+- **3.** [D-08 — Integration plugin pack](D-08-integration-plugin-pack.md) · Agent · **epic** · native
+  plugins (Slack/websearch/GitLab/Jira/Confluence/K8s/Loki/Prometheus) in an **in-repo `plugins/`
+  workspace**; emit `flux-datasource` records via an L5 bridge; slice 1 unblocks the MVP
+  ([design](../designs/integration-plugins.md))
+- **4.** [D-09 — Agentic channel target](D-09-agentic-channel-target.md) · Agent · **mechanism landed**
+  (`trigger.agent` runs an agent turn with per-thread memory + grants, `0d8ac58`); **remaining:** wire the
+  datasource (D-07) + plugin (D-08) tools into the agent's registry ([design](../designs/agentic-channel-target.md))
 
 ## Blocked
 _(none)_
@@ -30,19 +47,16 @@ _(none)_
 ## Backlog (unranked — promote to **Next** with a `priority` when ready)
 - [L-02 — flux-markdown engine + progressive-disclosure skills](L-02-flux-markdown-engine.md) · Language · AST parser, body-on-demand activation
 
-### Downstream enablement (managed-agents, Slack-channel assistant) — ranked by leverage on the downstream critical path
-These exist to support the path-dep downstream consumers of flux: the multi-tenant managed-agents service and
-the downstream Slack-channel assistant (the second consumer). See
+### Downstream enablement (managed-agents) — queued behind the active Slack-channel assistant stack above
+These support the multi-tenant **managed-agents** service (path-dep consumer). The Slack-channel assistant's integration stack
+(D-07/D-10/D-08/D-09) was promoted to **Next** above and now leads; these are next in line. See
 [roadmap → Downstream enablement](../roadmap.md#downstream-enablement-managed-agents-Slack-channel assistant).
 - **1.** [D-01 — Parameterized flow execution (behaviour-runner seam)](D-01-flow-input-seeding.md) · Agent · **highest** · `parse` + per-run input seeding into `FlowClient`; serves managed-agents R-01/A-03 ([design](../designs/flow-input-seeding.md))
 - **2.** [D-02 — Tenant/context-taggable event substrate](D-02-tenant-event-substrate.md) · Core · **high** · account/agent tag + account-scoped projections on `flux-events`; decide early so managed-agents R-04 is a projection, not a retrofit
 - **3.** [D-03 — Reusable A2A server helpers (current spec)](D-03-a2a-server-helpers.md) · Agent · **medium** · lift flux-server's A2A routes into a helper; unblocks managed-agents E-02 + fixes the `tasks/send` drift
-- **4.** [D-06 — Realtime voice-to-voice as a first-class flux provider](D-06-realtime-voice-provider.md) · Agent · **design-ready** · sibling `RealtimeProvider`/`RealtimeSession` seam + OpenAI-Realtime impl (lift managed-agents' `crates/realtime`); routes realtime tool calls through `Executor` with tools declared once; serves the managed-agents voice surface ([design](../designs/realtime-voice-provider.md)) — rank to confirm
-- **5.** [D-07 — Knowledge datasource (a real RAG layer)](D-07-knowledge-datasource-rag.md) · Core · **Slack-channel assistant** · record schema + persistent index + `search`/`list`/`get`/`relation`/`batch_get` + freshness; keyword/BM25 behind an embeddings seam; grounds the bot in help-center + OpenAPI docs ([design](../designs/datasource-rag.md))
-- **6.** [D-08 — Integration plugin pack](D-08-integration-plugin-pack.md) · Agent · **Slack-channel assistant (epic)** · native flux plugins (NDJSON, capability-gated) for Slack/websearch/GitLab/Jira/Confluence/K8s/Loki/Prometheus in a new sibling `flux-plugins` repo; emit D-07 records; slice 1 unblocks the MVP ([design](../designs/integration-plugins.md))
-- **7.** [D-09 — Agentic channel target](D-09-agentic-channel-target.md) · Agent · **Slack-channel assistant** · wake an `AgentSpec` `run_turn` (model drives RAG + tools) alongside the journey route, with per-thread memory + declared op grants; a new `Deliverer` (Slack adapter unchanged) — builds the `EngineTarget` D-04 deferred ([design](../designs/agentic-channel-target.md))
 
 ## Done
+- [D-06 — Realtime voice-to-voice as a first-class flux provider](D-06-realtime-voice-provider.md) · Agent · sibling `RealtimeProvider`/`RealtimeSession` seam (modules in flux-provider/flux-providers/flux-flow — zero new crates) + OpenAI-Realtime impl lifted from managed-agents; realtime tool calls run through `Executor` declared once; SDK `FlowClient::run_voice_session` + a Phase-2 engine-owned-turns spike (see [CHANGELOG](../../CHANGELOG.md))
 - [D-04 — Event-trigger channels (cron/webhook/Slack)](D-04-event-trigger-channels.md) · Agent · new `flux-channels` L6 crate; channels declared in the Program + run by `flux app run` (each fires a bus event → trigger → journey via `App::deliver`); schedule/webhook/Slack adapters (see [CHANGELOG](../../CHANGELOG.md))
 - [D-05 — Harden the sub-agent primitive for multi-tenant production](D-05-sub-agent-hardening.md) · Agent · SDK seam (`FlowClient::with_sub_agents`) + lifecycle limits (cancel/wall-clock) + pluggable approver + tested isolation + child audit; the primitive managed-agents R-03/A-05 consume (see [CHANGELOG](../../CHANGELOG.md))
 - [C-01 — Crate consolidation, phases 2–4](C-01-crate-consolidation.md) · Core · hooks→plugin, browser+datasource→capabilities, context→runtime; removed dead integrations (35 → 31 crates)

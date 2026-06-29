@@ -1,7 +1,7 @@
 # Design: knowledge datasource — a real RAG layer
 
-**Status:** proposed (story [D-07](../stories/D-07-knowledge-datasource-rag.md)) · **Layer:** L5
-(`flux-capabilities`, `datasource` module) · **Owner:** Timo
+**Status:** proposed (story [D-07](../stories/D-07-knowledge-datasource-rag.md)) · **Layers:** L0 (new
+`flux-datasource` schema crate) + L5 (`flux-capabilities` `datasource` module) · **Owner:** Timo
 
 ## Why
 
@@ -14,24 +14,35 @@ contribute records into the same schema.
 
 ## Shape
 
-### 1. Record schema
+### 1. Record schema — a new **L0 `flux-datasource` crate**
+The record/declaration/lookup types live in a **pure, no-IO L0 crate `flux-datasource`**, so **both**
+`flux-plugin` (L4 — plugins emit records, via [D-10](process-plugin-protocol.md)) **and**
+`flux-capabilities` (L5 — the index) share one contract without a layering violation. `EntitySchema` is
+declared **explicitly**; a `flux-datasource-derive` `#[derive(EntitySchema)]` is an **optional** convenience
+(flux has no proc-macro precedent — explicit values are the baseline). Shapes ported (not copied) from
+`fluxplane-datasource`:
 ```rust
 pub struct Record {
     pub entity: String,         // "file.document" | "openapi.operation" | "gitlab.merge_request" | …
     pub id: String,             // stable within (source, entity)
-    pub source: String,         // datasource name, e.g. "local-docs", "downstream-manager_api_docs"
+    pub source: Source,         // { plugin, instance } — the datasource origin
     pub title: String,
     pub body: String,           // indexed text (the chunk)
     pub links: Vec<Link>,       // typed relations: {rel, target_entity, target_id}
     pub meta: serde_json::Value,// freeform (url, path, line, updated_at)
 }
+// + Declaration / EntitySchema / SchemaField (manifest-facing) and
+//   Lookup / Search / Get input+output with Match { score, matched_fields } (retrieval).
 ```
-A record is `(source, entity, id)`-addressable; `links` carry relations for `relation`.
+A record is `(source, entity, id)`-addressable; `links` carry relations for `relation`. `Declaration` +
+`EntitySchema` are what a D-08 plugin's manifest uses to declare a contributed datasource.
 
 ### 2. Persistent index
-A sqlite-backed store (reuse `flux-events`' sqlite/WAL patterns; a `datasource.db` or a table set), holding
-records + an inverted keyword/BM25 index over `title`+`body`. The in-memory `Index` becomes the default
-backend behind a small trait so the persistent one is a drop-in:
+A sqlite-backed store (reuse `flux-events`' `Connection`+WAL patterns; a `datasource.db` or a table set),
+holding records + a **FTS5** virtual table over `title`+`body` for keyword/**BM25** ranking (the workspace
+`rusqlite` is `features = ["bundled"]`, so SQLite ships with FTS5 and the built-in `bm25()` function — no
+hand-rolled inverted index). The in-memory `Index` stays the default backend behind a small trait so the
+persistent one is a drop-in:
 ```rust
 pub trait DatasourceBackend: Send + Sync {
     fn upsert(&self, recs: &[Record]) -> Result<()>;
@@ -73,5 +84,7 @@ wired** in v1 — keyword/BM25 only. A vector backend (and hybrid rerank) lands 
 
 ## Reuse, don't reimplement
 - The existing `datasource::Index`/`SearchTool`; `flux-events`' sqlite patterns; the op-input-schema +
-  `Executor::dispatch` machinery. D-08 plugins emit `Record`s into this schema (the integration datasource
-  surface) — keep the contract stable.
+  `Executor::dispatch` machinery. The new `flux-datasource` L0 crate is the shared record contract:
+  D-08 plugins emit `Record`s into it over the D-10 protocol, reaching the L5 index through the
+  `DatasourceHostCaps` bridge (see [integration-plugins.md](integration-plugins.md)) — keep the contract
+  stable. Classify `flux-datasource`/`-derive` as **L0** in `flux-codegate`.
