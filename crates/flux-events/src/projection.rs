@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use flux_core::Message;
+use flux_core::{Message, Usage};
 use flux_lang::ast::RunEvent;
 
 use crate::kind::{EventKind, StoredEvent};
@@ -65,6 +65,8 @@ pub struct TurnSummary {
     pub plan_attempts: Vec<PlanAttempt>,
     pub started_at_ms: i64,
     pub ended_at_ms: Option<i64>,
+    /// The turn's accumulated token usage, when recorded (`None` for older logs / no provider usage).
+    pub usage: Option<Usage>,
 }
 
 /// Fold turn telemetry, keyed (and ordered) by `turn_id` = the `TurnStarted`'s `global_seq`.
@@ -86,6 +88,7 @@ pub fn turns(events: &[StoredEvent]) -> Vec<TurnSummary> {
                         plan_attempts: Vec::new(),
                         started_at_ms: e.ts_ms,
                         ended_at_ms: None,
+                        usage: None,
                     },
                 );
             }
@@ -106,12 +109,14 @@ pub fn turns(events: &[StoredEvent]) -> Vec<TurnSummary> {
                 outcome,
                 iterations,
                 answer,
+                usage,
             } => {
                 if let Some(t) = e.turn_id.and_then(|tid| by_turn.get_mut(&tid)) {
                     t.outcome = outcome.clone();
                     t.iterations = *iterations;
                     t.answer = Some(answer.clone());
                     t.ended_at_ms = Some(e.ts_ms);
+                    t.usage = usage.clone();
                 }
             }
             _ => {}
@@ -282,6 +287,11 @@ mod tests {
                     outcome: "accepted".into(),
                     iterations: 2,
                     answer: "done".into(),
+                    usage: Some(Usage {
+                        input_tokens: 100,
+                        output_tokens: 20,
+                        ..Default::default()
+                    }),
                 },
             ),
         ];
@@ -297,6 +307,7 @@ mod tests {
         assert_eq!(t.plan_attempts[0].outcome, "compile_error");
         assert_eq!(t.plan_attempts[0].error.as_deref(), Some("boom"));
         assert!(t.ended_at_ms.is_some());
+        assert_eq!(t.usage.as_ref().map(|u| u.total()), Some(120));
     }
 
     #[test]

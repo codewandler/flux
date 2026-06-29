@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use flux_core::Message;
+use flux_core::{Message, Usage};
 use flux_lang::ast::RunEvent;
 
 /// The closed set of event kinds in flux's unified log. Adding a kind of fact is one
@@ -47,11 +47,15 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
-    /// A turn closed with its final `outcome`, iteration count, and assistant `answer`.
+    /// A turn closed with its final `outcome`, iteration count, and assistant `answer`. `usage` is
+    /// the turn's accumulated token tally — `None` for turns recorded before usage capture, or when
+    /// the provider reported none. Optional + serde-default so older logs (no `usage`) still decode.
     TurnEnded {
         outcome: String,
         iterations: u32,
         answer: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
     },
 }
 

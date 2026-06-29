@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use regex::Regex;
 
-use flux_core::{Error, Message, Result};
+use flux_core::{Error, Message, Result, Usage};
 use flux_events::EventStore;
 use flux_system::{System, Workspace};
 
@@ -118,6 +118,31 @@ fn load_events(events_db: &Path, session_id: &str) -> Vec<RunEvent> {
         .ok()
         .and_then(|s| s.run_trace(session_id).ok())
         .unwrap_or_default()
+}
+
+/// Sum the per-turn token `usage` recorded in a session's `TurnEnded` telemetry. Returns `None` when
+/// no turn carried usage (an older binary, or a provider that reported none), so a token-less run keeps
+/// `tokens: None` rather than a misleading zero. Fields are summed across turns — each turn's prompt is
+/// billed independently — so `total()` reflects the run's real token cost (the `mean_tokens`
+/// score tiebreaker).
+fn load_usage(events_db: &Path, session_id: &str) -> Option<Usage> {
+    if !events_db.exists() {
+        return None;
+    }
+    let store = EventStore::open(events_db).ok()?;
+    let turns = store.turns(session_id).ok()?;
+    let mut acc = Usage::default();
+    let mut any = false;
+    for t in turns {
+        if let Some(u) = t.usage {
+            acc.input_tokens += u.input_tokens;
+            acc.output_tokens += u.output_tokens;
+            acc.cache_read_input_tokens += u.cache_read_input_tokens;
+            acc.cache_creation_input_tokens += u.cache_creation_input_tokens;
+            any = true;
+        }
+    }
+    any.then_some(acc)
 }
 
 /// Rust toolchain env to forward into the scrubbed child / grader: without `RUSTUP_HOME` (and the
@@ -294,6 +319,9 @@ pub async fn run_local_task(spec: &TaskSpec, ctx: &RunContext<'_>) -> Result<Run
         None => Vec::new(),
     };
     let (tool_calls, tool_errors) = metrics_from_events(&events);
+    let tokens = session_id
+        .as_deref()
+        .and_then(|id| load_usage(&events_db, id));
 
     let passed = if timed_out {
         false
@@ -320,7 +348,7 @@ pub async fn run_local_task(spec: &TaskSpec, ctx: &RunContext<'_>) -> Result<Run
         iterations,
         tool_calls,
         tool_errors,
-        tokens: None,
+        tokens,
         wall_ms,
         session_id,
         session_db: Some(events_db.clone()),
@@ -341,6 +369,63 @@ mod tests {
         let dir = unique_temp_dir("flux-eval-runner-test").unwrap();
         let sys = System::new(Workspace::new(&dir).unwrap());
         (dir, sys)
+    }
+
+    #[test]
+    fn load_usage_sums_token_tally_across_turns() {
+        let dir = unique_temp_dir("flux-eval-usage-test").unwrap();
+        let db = dir.join("events.db");
+        let id = {
+            let store = EventStore::open(&db).unwrap();
+            let id = store.create_session("m").unwrap();
+            let t1 = store.begin_turn(&id, "task", "m").unwrap();
+            store
+                .end_turn(
+                    &id,
+                    t1,
+                    "accepted",
+                    1,
+                    "a",
+                    Some(Usage {
+                        input_tokens: 100,
+                        output_tokens: 20,
+                        ..Default::default()
+                    }),
+                )
+                .unwrap();
+            let t2 = store.begin_turn(&id, "more", "m").unwrap();
+            store
+                .end_turn(
+                    &id,
+                    t2,
+                    "accepted",
+                    1,
+                    "b",
+                    Some(Usage {
+                        input_tokens: 30,
+                        output_tokens: 5,
+                        ..Default::default()
+                    }),
+                )
+                .unwrap();
+            id
+        };
+        // Summed across both turns: in 130, out 25 → total 155 (each turn's prompt is billed).
+        let usage = load_usage(&db, &id).expect("usage recorded");
+        assert_eq!(usage.input_tokens, 130);
+        assert_eq!(usage.output_tokens, 25);
+        assert_eq!(usage.total(), 155);
+
+        // A session with no recorded usage reads back as `None`, not a misleading zero.
+        let db2 = dir.join("events2.db");
+        let id2 = {
+            let store = EventStore::open(&db2).unwrap();
+            let id2 = store.create_session("m").unwrap();
+            let t = store.begin_turn(&id2, "task", "m").unwrap();
+            store.end_turn(&id2, t, "accepted", 1, "a", None).unwrap();
+            id2
+        };
+        assert!(load_usage(&db2, &id2).is_none());
     }
 
     #[test]

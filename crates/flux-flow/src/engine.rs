@@ -205,8 +205,9 @@ impl FlowEngine {
                 biased;
                 _ = cancel.cancelled() => {
                     while let Ok(ev) = rx.try_recv() { drain_event(ev, sink, reveal); }
-                    let _ = self.events.end_turn(session_id, turn_id, "cancelled", 0, "(turn cancelled)");
-                    return self.finish_turn(session_id, sink, "(turn cancelled)", true, self.turn_usage());
+                    let usage = self.turn_usage();
+                    let _ = self.events.end_turn(session_id, turn_id, "cancelled", 0, "(turn cancelled)", usage.clone());
+                    return self.finish_turn(session_id, sink, "(turn cancelled)", true, usage);
                 }
                 maybe = rx.recv() => {
                     if let Some(ev) = maybe { drain_event(ev, sink, reveal); }
@@ -246,10 +247,11 @@ impl FlowEngine {
             .by_kind("turn.iteration")
             .count()
             .saturating_sub(iter_base) as u32;
+        let usage = self.turn_usage();
         let _ = self
             .events
-            .end_turn(session_id, turn_id, tag, iterations, &answer);
-        self.finish_turn(session_id, sink, &answer, false, self.turn_usage())
+            .end_turn(session_id, turn_id, tag, iterations, &answer, usage.clone());
+        self.finish_turn(session_id, sink, &answer, false, usage)
     }
 
     /// Compile a single instruction into a [`TurnOutput`] using this engine's full catalog + current

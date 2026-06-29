@@ -10,7 +10,7 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension};
 
-use flux_core::{Error, Message, Result};
+use flux_core::{Error, Message, Result, Usage};
 use flux_lang::ast::RunEvent;
 
 use crate::kind::{EventKind, NewEvent, StoredEvent};
@@ -420,8 +420,8 @@ impl EventStore {
         Ok(())
     }
 
-    /// Close a turn with its final outcome, iteration count, and assistant answer. A
-    /// negative `turn_id` is a no-op.
+    /// Close a turn with its final outcome, iteration count, assistant answer, and token `usage`
+    /// tally (`None` when the provider reported none). A negative `turn_id` is a no-op.
     pub fn end_turn(
         &self,
         stream: &str,
@@ -429,6 +429,7 @@ impl EventStore {
         outcome: &str,
         iterations: u32,
         answer: &str,
+        usage: Option<Usage>,
     ) -> Result<()> {
         if turn_id < 0 {
             return Ok(());
@@ -439,6 +440,7 @@ impl EventStore {
                 outcome: outcome.to_string(),
                 iterations,
                 answer: answer.to_string(),
+                usage,
             })
             .in_turn(turn_id),
         )?;
@@ -816,7 +818,20 @@ mod tests {
         store
             .record_message(&id, &Message::user_text("hi"))
             .unwrap();
-        store.end_turn(&id, turn, "accepted", 2, "done").unwrap();
+        store
+            .end_turn(
+                &id,
+                turn,
+                "accepted",
+                2,
+                "done",
+                Some(Usage {
+                    input_tokens: 100,
+                    output_tokens: 20,
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
 
         // run trace projection
         let trace = store.run_trace(&id).unwrap();
@@ -829,6 +844,8 @@ mod tests {
         assert_eq!(turns[0].outcome, "accepted");
         assert_eq!(turns[0].iterations, 2);
         assert_eq!(turns[0].plan_attempts.len(), 2);
+        // token usage survives the SQLite payload round-trip
+        assert_eq!(turns[0].usage.as_ref().map(|u| u.total()), Some(120));
 
         // load_turn returns the anchor plus its scoped children
         let turn_events = store.load_turn(&id, turn).unwrap();
