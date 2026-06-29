@@ -933,6 +933,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "flux-datasource"
+version = "0.2.4"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "flux-eval"
 version = "0.2.4"
 dependencies = [

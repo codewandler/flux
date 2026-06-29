@@ -1,0 +1,10 @@
+[package]
+name = "flux-datasource"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "flux datasource schema: records, entity declarations, and retrieval (search/get/list/relation) types — the shared contract between the knowledge index (flux-capabilities) and integration plugins (flux-plugin)"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
