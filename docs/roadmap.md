@@ -59,12 +59,15 @@ before every release.
 
 ## Next
 
-### Downstream enablement (managed-agents)
+### Downstream enablement (managed-agents, Slack-channel assistant)
 
-A ranked track that exists to **unblock and de-risk the managed-agents service** — a multi-tenant
-managed-agents product (in a separate repo) that consumes flux by **path dependency** (no version
-boundary, so flux churn breaks it directly; tightening these seams also eases that coupling). Sourced
-from a cross-repo audit; filed as the **D- story track** (see the [board](stories/README.md)).
+A ranked track that exists to **unblock and de-risk the downstream products** that consume flux by **path
+dependency** (no version boundary, so flux churn breaks them directly; tightening these seams also eases
+that coupling): the multi-tenant **managed-agents** managed-agents service and the **downstream Slack-channel assistant** (the
+second consumer — a flux rewrite of the fluxplane Go bot into a Slack-channel DevOps assistant). Sourced
+from cross-repo audits; filed as the **D- story track** (see the [board](stories/README.md)). The Slack-channel assistant
+consumes the shipped channel transport (D-04) and drives three new items — a knowledge/RAG datasource
+(D-07), a native integration-plugin pack (D-08), and an agentic channel target (D-09).
 
 1. **[D-01](stories/D-01-flow-input-seeding.md) — Parameterized flow execution (the behaviour-runner
    seam)** · *highest.* Add a deterministic `FlowClient::parse(text)` + a per-run input-seeding seam so a
@@ -81,9 +84,10 @@ from a cross-repo audit; filed as the **D- story track** (see the [board](storie
    helper. Unblocks managed-agents E-02 **and** fixes a live drift — managed-agents' `channel-a2a` still serves the
    deleted `tasks/send` dialect (removed in the A-02 cutover, commit `06065f6`).
 4. **[D-04](stories/D-04-event-trigger-channels.md) — Event-trigger channels (cron/webhook/Slack)** ·
-   *medium (epic).* A `flux-channels` abstraction + daemon host so agents **wake on external events**
-   (schedule, webhook, Slack), generalising flux-app's in-process triggers. Schedule adapter first;
-   fluxplane (Go) is the prior art. Background agents woken by events.
+   ✅ **shipped.** A `flux-channels` (L6) crate so agents **wake on external events** (schedule, webhook,
+   Slack). Routes each event to a **journey** declared in the `.flux` program, run by `flux app run`
+   (the App-runner route, superseding the design's `EngineTarget`; that agentic target is now **D-09**).
+   Background agents woken by events; the Slack-channel assistant consumes the Slack adapter directly.
 5. **[D-05](stories/D-05-sub-agent-hardening.md) — Harden the sub-agent primitive for multi-tenant
    production** · ✅ **shipped.** Closed the five gaps a downstream service hits: a consumable `flux-sdk`
    seam (`FlowClient::with_sub_agents` over a reusable `SubAgents` assembly — the CLI consumes the same
@@ -94,6 +98,31 @@ from a cross-repo audit; filed as the **D- story track** (see the [board](storie
    Unblocks managed-agents **R-03** + **A-05**. Design: [sub-agent-hardening.md](designs/sub-agent-hardening.md).
    Two lifecycle gaps documented (parent-turn cancel finalization; per-engine concurrent-turn cancel
    slot) — see the design's "Known limitations".
+6. **[D-06](stories/D-06-realtime-voice-provider.md) — Realtime voice-to-voice as a first-class flux
+   provider** · *design-ready.* A **sibling, session-oriented provider seam**
+   (`RealtimeProvider`/`RealtimeSession`, full-duplex) beside the half-duplex `Provider`, plus an
+   OpenAI-Realtime impl lifted from managed-agents' `crates/realtime`. The win: realtime tool calls route
+   through the **same `Executor` envelope** with tools declared **once** from the live `ToolRegistry` — so
+   managed-agents can delete its parallel voice-model stack (bespoke WS client, double tool-declaration,
+   scattered keys) and run voice agents on flux's safety/audit guarantees. Phase 1 = the provider
+   primitive; a Phase 2 spike has a suspendable `FlowEngine` flow own the conversation across turns (the
+   deferred cross-turn `await`). Design: [realtime-voice-provider.md](designs/realtime-voice-provider.md).
+   Rank within this track to confirm.
+7. **[D-07](stories/D-07-knowledge-datasource-rag.md) — Knowledge datasource (a real RAG layer)** ·
+   *Slack-channel assistant.* Turn `flux-capabilities::datasource` from an in-memory keyword index into a real knowledge
+   layer: a record schema, a persistent index, `search`/`list`/`get`/`relation`/`batch_get`, and
+   reindex/freshness — keyword/BM25 behind a pluggable embeddings seam. Grounds the Slack-channel assistant's answers in
+   help-center + OpenAPI docs. Design: [datasource-rag.md](designs/datasource-rag.md).
+8. **[D-08](stories/D-08-integration-plugin-pack.md) — Integration plugin pack** · *Slack-channel assistant (epic).*
+   Native flux plugins (NDJSON, capability-gated) for the DevOps surface — Slack ops, websearch, GitLab,
+   Jira, Confluence, Kubernetes, Loki, Prometheus — in a new sibling **`flux-plugins`** repo; each emits
+   D-07 datasource records. Slice 1 (Slack ops + websearch) unblocks the bot MVP. Design:
+   [integration-plugins.md](designs/integration-plugins.md).
+9. **[D-09](stories/D-09-agentic-channel-target.md) — Agentic channel target** · *Slack-channel assistant.* Let a channel
+   wake an `AgentSpec` `run_turn` (model drives RAG + tools) **alongside** the shipped journey route, with
+   per-conversation thread memory + declared op grants — builds the `EngineTarget` the D-04 design deferred,
+   via a new `Deliverer` (the Slack adapter is unchanged). Design:
+   [agentic-channel-target.md](designs/agentic-channel-target.md).
 
 **Candidate phases (vision tail, in priority order):**
 - **Crate consolidation** ✅ **all phases shipped** — shrank the workspace by merging coherent
