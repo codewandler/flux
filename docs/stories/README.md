@@ -44,6 +44,19 @@ gated by D-12. See [epic design](../designs/fluxplane-plugins-parity.md). **D-12
 - [D-16 — Datastore & infra plugin pack](D-16-datastore-infra-plugins.md) · Agent · sql, docker, aws (D-12 Slice B conn + blob ready)
 - [D-17 — Telephony plugin pack](D-17-telephony-plugins.md) · Agent · asterisk, homer — serves the managed-agents voice surface (D-12 Slice B conn ready)
 
+### Plugin platform hardening — lifecycle, internal-network reach, distribution
+Gaps surfaced while verifying the plugin install + running `scripts/smoke-plugins.sh` (the gitlab case fails
+only because the SSRF guard refuses the internal downstream GitLab — see D-20).
+- [D-19 — Complete the `flux plugin` lifecycle surface](D-19-plugin-lifecycle-cli.md) · Core · add `uninstall`
+  + a richer `status`/`info` (version, pin, liveness, declared surface); small, no design doc
+- [D-20 — Scope private-network egress to declared plugins/endpoints](D-20-scoped-private-net-egress.md) · Core ·
+  replace the global all-or-nothing `allow_private_net` with a declared + granted + audited per-plugin **and**
+  per-endpoint allowance, so internal GitLab/Jira-DC/in-cluster Prometheus work without globally disabling SSRF
+  protection; design-first ([design](../designs/scoped-private-net-egress.md))
+- [D-21 — Plugin distribution for non-source users](D-21-plugin-distribution.md) · Core · scoping/epic-seed: how
+  a non-repo user obtains the pack (bundled binaries / fetch-on-install / marketplace); produces a design + the
+  follow-on stories, no code
+
 ### Downstream enablement (managed-agents) — queued behind the active Slack-channel assistant stack above
 These support the multi-tenant **managed-agents** service (path-dep consumer). **D-02 and D-03 both shipped**
 (see Done); the remaining managed-agents items are not yet filed. See
