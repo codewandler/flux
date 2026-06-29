@@ -55,11 +55,14 @@ serde_json.workspace = true
 serde_norway.workspace = true
 reedline = "0.48.0"
 flux-markdown = { workspace = true, features = ["terminal"] }
+# Only pulled in with the `slack` feature, to install a process-level rustls crypto provider in `main`
+# (the slack dep tree enables BOTH aws-lc-rs and ring, so rustls can't auto-pick one on its own).
+rustls = { version = "0.23", optional = true }
 
 [features]
 # Build the `flux` binary with the Slack channel adapter compiled in (off by default to keep the heavy
 # slack-morphism dep out of the standard build). Use `cargo build -p flux-cli --features slack`.
-slack = ["flux-channels/slack"]
+slack = ["flux-channels/slack", "dep:rustls"]
 # Wire the semantic/embeddings datasource backend (the agent's `search` blends keyword + embeddings).
 # Off by default; needs an embeddings API key at runtime (see flux-capabilities `OpenAiEmbedder`).
 embeddings = ["flux-capabilities/embeddings"]

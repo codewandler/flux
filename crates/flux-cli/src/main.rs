@@ -3119,6 +3119,14 @@ fn parse_choice(line: &str, always: ApprovalChoice) -> ApprovalChoice {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // With the `slack` feature the dependency tree pulls rustls with BOTH crypto providers
+    // (slack-morphism's hyper-rustls brings aws-lc-rs; reqwest/tungstenite bring ring), so rustls
+    // cannot pick a process-level default on its own and panics on first TLS use. Install one
+    // explicitly, once, before any TLS client (the Slack socket or a provider HTTP call) is created.
+    #[cfg(feature = "slack")]
+    {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
     // Install a colored error formatter so top-level anyhow errors use the same style as inline
     // `eprintln!("{} {e:#}", style::red("error:"))` calls rather than a bare `Error: …` line.
     // We do this before `style::init` so even parse errors (before color flags are known) get color
@@ -3298,9 +3306,17 @@ async fn run_app(path: &str, model_spec: Option<String>, auto_approve: bool) -> 
 
     // Assemble the knowledge + integration tools the program's agent target (`trigger.agent`) and its
     // journeys can drive — the D-09 registry wiring. A guarded `System` rooted at the cwd backs both.
+    let cwd = std::env::current_dir()?;
     let system = Arc::new(System::new(
-        Workspace::new(&std::env::current_dir()?).map_err(|e| anyhow::anyhow!("{e}"))?,
+        Workspace::new(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?,
     ));
+    // SSRF egress opt-in, off by default. `flux app run` honors the same `allow_private_net` setting as
+    // the interactive path (`~/.flux/config.toml`): with it on, plugin HTTP ops may reach
+    // private/loopback hosts — needed for a bot deployed next to private DevOps endpoints (in-cluster
+    // GitLab / Loki / Prometheus / Kubernetes). A missing or unreadable config keeps the safe default.
+    let allow_private = flux_config::load(&cwd)
+        .map(|c| c.allow_private_net)
+        .unwrap_or(false);
     // The knowledge datasource: build the program's declared datasources, and SHARE the backend so
     // integration plugins' contributed records (via the DatasourceHostCaps bridge) land in the same
     // index the `search`/`get`/`list`/`relation`/`batch_get` ops read.
@@ -3315,7 +3331,9 @@ async fn run_app(path: &str, model_spec: Option<String>, auto_approve: bool) -> 
             let backend = backend.clone();
             let make_caps = move |m: &flux_plugin::PluginManifest| {
                 Arc::new(flux_capabilities::DatasourceHostCaps::new(
-                    flux_plugin::SystemHostCaps::new(system).with_manifest(m),
+                    flux_plugin::SystemHostCaps::new(system)
+                        .allow_private_net(allow_private)
+                        .with_manifest(m),
                     backend,
                 )) as Arc<dyn flux_plugin::HostCapabilities>
             };
