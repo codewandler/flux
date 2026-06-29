@@ -8,6 +8,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Knowledge datasource — a real RAG layer (D-07).** A new L0 **`flux-datasource`** crate holds the
+  shared record/retrieval schema (`Record` addressable by `(source, entity, id)`, `Declaration`/
+  `EntitySchema`, and the `Search`/`Get`/`List`/`Relation`/`BatchGet` I/O types) — so the knowledge index
+  and (future) integration plugins agree on one shape. `flux-capabilities::datasource` is rebuilt onto it:
+  a **`DatasourceBackend`** trait with two impls — the in-memory `MemoryBackend` (default, keyword/TF) and
+  a persistent **`SqliteBackend`** (a `records` table + an FTS5 virtual table over title+body, ranked by
+  the built-in `bm25()`, WAL) — five agent-facing retrieval ops (`search`/`get`/`list`/`relation`/
+  `batch_get`, registered via `register_datasource_ops`), markdown + OpenAPI ingesters
+  (`ingest_markdown`/`ingest_openapi`), `reindex`/`freshness`, and an unwired `Embedder` (semantic) seam.
+  The CLI's `search` is unchanged for users; the model also gains the four new verbs. See
+  [`docs/designs/datasource-rag.md`](docs/designs/datasource-rag.md).
+- **Agentic channel target — `trigger.agent` (D-09, mechanism).** A channel trigger naming an `agent`
+  now wakes a `FlowEngine` agent turn (the model drives RAG + granted tools) instead of a journey, with
+  per-thread `(agent, conversation) → EventStore` session memory and grants from the `AgentDecl`'s `tools`
+  under a headless `DenyApprover`. Reuses the existing `TriggerDecl.agent` field; the journey route is
+  unchanged. (Remaining: registering the datasource/plugin tools into the agent's registry — pairs with
+  D-08.) See [`docs/designs/agentic-channel-target.md`](docs/designs/agentic-channel-target.md).
 - **Realtime voice-to-voice as a first-class provider (D-06).** A **sibling, session-oriented** model seam
   beside the half-duplex `Provider`, so a full-duplex speech-to-speech model (OpenAI Realtime) is a flux
   provider whose tool calls run through the **same `Executor` safety envelope** as a text turn — declared

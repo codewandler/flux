@@ -2,8 +2,7 @@
 id: D-07
 title: Knowledge datasource — a real RAG layer (record schema, persistent index, retrieval ops)
 pillar: Core
-status: ready
-priority: 1
+status: done
 theme: downstream-managed-agents
 design: docs/designs/datasource-rag.md
 ---
@@ -31,29 +30,29 @@ gap behind the Slack-channel assistant's v0 (journey RAG) and v1 (agentic) miles
 ops, an ingester for markdown + OpenAPI, and any embeddings seam.
 
 ## Acceptance
-- [ ] A datasource **record schema** in a **new L0 crate `flux-datasource`**: `Record`/`RecordBase`
+- [x] A datasource **record schema** in a **new L0 crate `flux-datasource`**: `Record`/`RecordBase`
       (entity / id / source{plugin,instance} / title / body / links / meta), `Declaration` +
-      `EntitySchema`, and `Lookup`/`Search`/`Get` input/output + `Match{score,matched_fields}`. Pure, no
-      IO — so **both** `flux-plugin` (L4, via D-10) and `flux-capabilities` (L5) share one record contract.
-      Classified L0 in `flux-codegate`. `EntitySchema` is declared **explicitly** (a `flux-datasource-derive`
-      `#[derive(EntitySchema)]` is an **optional** convenience — minimal-if-cheap, not on the critical path).
-- [ ] A **persistent** index over those records — a **sqlite FTS5** backend (the workspace `rusqlite` is
-      `bundled`, so `bm25()` ranking is built in; reuse `flux-events`' `Connection`+WAL pattern). Additive —
-      the existing in-memory `Index`/`search` keep working (a `DatasourceBackend` trait with both impls,
-      in-memory as the default).
-- [ ] Retrieval ops `search` / `list` / `get` / `relation` / `batch_get` implement `flux_runtime::Tool`
-      and dispatch through `Executor` (the safety envelope), each with an input JSON Schema.
-- [ ] An **ingester** loads a directory of markdown + an OpenAPI JSON into typed records. Failing-first
-      test: index the help-center fixtures → `search("warm transfer")` returns the matching article record;
-      `get(id)` round-trips it.
-- [ ] A **reindex/freshness** API (rebuild + a staleness check). The **embeddings** path is a trait seam
-      with **no backend wired** in v1 (documented as the deferred slice).
-- [ ] Full gate green; `flux-codegate` layer placement confirmed (datasource stays within `flux-capabilities`).
+      `EntitySchema`, and `Search`/`Get`/`List`/`Relation`/`BatchGet` input/output + `Match{score,
+      matched_fields}`. Pure, no IO — shared by `flux-plugin` (L4) and `flux-capabilities` (L5); classified
+      L0 in `flux-codegate`. `EntitySchema` declared explicitly (derive deferred). Commit `2642479`.
+- [x] A **persistent** index — the **`SqliteBackend`** (records table + FTS5 virtual table over title+body,
+      `bm25()` ranking, WAL); the in-memory `MemoryBackend` stays the default, both behind a
+      `DatasourceBackend` trait. Reopen-the-store test proves durability. Commit `5241c97`.
+- [x] Retrieval ops `search` / `get` / `list` / `relation` / `batch_get` implement `flux_runtime::Tool`
+      with input JSON Schemas, registered via `register_datasource_ops`. Commit `e6d7279`.
+- [x] Ingesters: `ingest_markdown` + `ingest_openapi` (operations + component schemas → typed records).
+      Tests: markdown index → `search("warm transfer")` hits the article; OpenAPI → operation/schema
+      records + `get` round-trip. Commit `5241c97`.
+- [x] `reindex` (clear-then-reingest, via `DatasourceBackend::clear`) + `freshness` (record count). The
+      **embeddings** path is the `Embedder` trait seam with **no backend wired** (deferred). Commit `5241c97`.
+- [x] Full gate green; `flux-codegate` layer placement confirmed (`flux-datasource` L0; `flux-capabilities`
+      stays L5).
 
 ## Progress
-- Ready — **first story in the Slack-channel assistant integration stack** (plan Phase 1). Owns the new `flux-datasource`
-  L0 schema crate that **D-10** (protocol redesign) and **D-08** (plugins) then build on. Design:
-  `docs/designs/datasource-rag.md`.
+- **Done** (commits `2642479` → `e6d7279` → `5241c97`). The whole knowledge layer: the L0 `flux-datasource`
+  schema, the `DatasourceBackend` trait with in-memory + SQLite-FTS5 backends, the five retrieval ops,
+  markdown + OpenAPI ingesters, reindex/freshness, and the (unwired) embeddings seam. Unblocks **D-10**
+  (plugins emit these records) and **D-08**.
 
 ## Notes
 - Reuse, don't reimplement: the existing `datasource::Index`/`SearchTool`, `flux-events`' sqlite/WAL
