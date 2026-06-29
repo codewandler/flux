@@ -1066,6 +1066,7 @@ version = "0.2.4"
 dependencies = [
  "async-trait",
  "flux-core",
+ "flux-datasource",
  "flux-runtime",
  "flux-secret",
  "flux-spec",

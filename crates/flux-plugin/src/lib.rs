@@ -92,13 +92,16 @@ impl Frame {
 }
 
 /// A plugin-declared operation (becomes a tool projected to the agent, after the policy gate). The
-/// `effects`/`risk` an operation declares feed the authorization floor; when omitted, the projection
-/// assumes a conservative default (see [`PluginTool::new`]) so an undeclared op can't slip the gate.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `effects`/`risk`/`idempotency` an operation declares feed the authorization floor; when omitted, the
+/// projection assumes a conservative default (see [`PluginTool::new`]) so an undeclared op can't slip the
+/// gate. flux reuses its own [`Effect`]/[`Risk`]/[`Idempotency`] vocabulary — there is no separate
+/// fluxplane-style "access" enum.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OperationSpec {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
     pub input_schema: Value,
     /// IO effects this operation may produce (drives the policy floor + approval).
     #[serde(default)]
@@ -106,6 +109,39 @@ pub struct OperationSpec {
     /// Declared risk; `None` → `Risk::Medium`.
     #[serde(default)]
     pub risk: Option<Risk>,
+    /// Declared idempotency; `None` → `Idempotency::NonIdempotent`.
+    #[serde(default)]
+    pub idempotency: Option<Idempotency>,
+    /// Secret purposes (auth-method names) this op needs the host to resolve (e.g. `"api_token"`).
+    #[serde(default)]
+    pub secret_purposes: Vec<String>,
+}
+
+/// An authentication method the plugin needs, resolved **by purpose**: the host maps `purpose` (e.g.
+/// `"bot_token"`) to a secret value by trying `env` keys in order (each must also be a granted secret).
+/// A plugin asks `secret { "purpose": "bot_token" }` or `http.do { "bearer_purpose": "api_token" }`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AuthMethod {
+    /// The purpose name the plugin references (e.g. `"bot_token"`, `"api_token"`).
+    pub purpose: String,
+    /// Env-var keys to resolve the secret from, tried in order.
+    #[serde(default)]
+    pub env: Vec<String>,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// A configurable API endpoint (base URL) the plugin resolves by name from env. A plugin asks
+/// `endpoint { "name": "gitlab.endpoint" }` and the host returns `{ "url": … }`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EndpointSpec {
+    /// The endpoint name the plugin references.
+    pub name: String,
+    /// Env-var keys holding the base URL, tried in order.
+    #[serde(default)]
+    pub env: Vec<String>,
+    #[serde(default)]
+    pub description: String,
 }
 
 /// The host capabilities a plugin requests. The host grants ONLY what is declared here and checks
@@ -124,14 +160,26 @@ pub struct PluginCapabilities {
     pub http: bool,
 }
 
-/// What a plugin advertises about itself.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// What a plugin advertises about itself — the single source of truth the host introspects (ops,
+/// auth methods, datasources, endpoints, and the capabilities it requests). No separate `*.list`
+/// round-trips: the host reads it once.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PluginManifest {
     pub name: String,
     #[serde(default)]
     pub version: String,
     #[serde(default)]
     pub operations: Vec<OperationSpec>,
+    /// Auth methods (by purpose) the host resolves to secrets for this plugin.
+    #[serde(default)]
+    pub auth: Vec<AuthMethod>,
+    /// Datasources this plugin contributes/serves (records feed the D-07 knowledge index via the
+    /// host's datasource capability). Uses the shared `flux-datasource` schema.
+    #[serde(default)]
+    pub datasources: Vec<flux_datasource::Declaration>,
+    /// Configurable API endpoints (base URLs) the host resolves from env.
+    #[serde(default)]
+    pub endpoints: Vec<EndpointSpec>,
     /// Host capabilities the plugin requests (default: none — the plugin gets no privileged IO).
     #[serde(default)]
     pub capabilities: PluginCapabilities,
@@ -287,6 +335,8 @@ pub struct SystemHostCaps {
     system: Arc<flux_system::System>,
     allow_private_net: bool,
     grants: PluginCapabilities,
+    auth: Vec<AuthMethod>,
+    endpoints: Vec<EndpointSpec>,
 }
 
 impl SystemHostCaps {
@@ -295,6 +345,8 @@ impl SystemHostCaps {
             system,
             allow_private_net: false,
             grants: PluginCapabilities::default(),
+            auth: Vec::new(),
+            endpoints: Vec::new(),
         }
     }
 
@@ -307,6 +359,55 @@ impl SystemHostCaps {
     pub fn with_grants(mut self, grants: PluginCapabilities) -> Self {
         self.grants = grants;
         self
+    }
+
+    /// Pin this host to a plugin's whole manifest: its capability grants, auth methods (for
+    /// secret-by-purpose resolution), and endpoints. The one-call setup for [`load_plugin_tools`].
+    pub fn with_manifest(mut self, m: &PluginManifest) -> Self {
+        self.grants = m.capabilities.clone();
+        self.auth = m.auth.clone();
+        self.endpoints = m.endpoints.clone();
+        self
+    }
+
+    /// Resolve a secret **by purpose**: find the auth method, try its env keys in order; each key must
+    /// also be in the plugin's granted `secrets`. Returns the first value set, else an error.
+    fn resolve_purpose(&self, purpose: &str) -> std::result::Result<String, String> {
+        let method = self
+            .auth
+            .iter()
+            .find(|a| a.purpose == purpose)
+            .ok_or_else(|| format!("no auth method declared for purpose `{purpose}`"))?;
+        for key in &method.env {
+            if !self.grants.secrets.iter().any(|k| k == key) {
+                continue; // not a granted secret — skip
+            }
+            if let Some(v) = self.system.env(key) {
+                return Ok(v);
+            }
+        }
+        Err(format!(
+            "no granted env value for purpose `{purpose}` (tried {:?})",
+            method.env
+        ))
+    }
+
+    /// Resolve a named endpoint base URL from its declared env keys (config, not a secret).
+    fn resolve_endpoint(&self, name: &str) -> std::result::Result<String, String> {
+        let ep = self
+            .endpoints
+            .iter()
+            .find(|e| e.name == name)
+            .ok_or_else(|| format!("no endpoint declared named `{name}`"))?;
+        for key in &ep.env {
+            if let Some(v) = self.system.env(key) {
+                return Ok(v);
+            }
+        }
+        Err(format!(
+            "no env value for endpoint `{name}` (tried {:?})",
+            ep.env
+        ))
     }
 }
 
@@ -348,8 +449,12 @@ impl HostCapabilities for SystemHostCaps {
                 )
             }
             "secret" => {
+                // Resolve by `purpose` (auth-method indirection) or a direct `key`. Either way only
+                // granted env keys are read — never arbitrary host secrets.
+                if let Some(purpose) = payload.get("purpose").and_then(|v| v.as_str()) {
+                    return self.resolve_purpose(purpose).map(|v| json!({ "value": v }));
+                }
                 let key = payload.get("key").and_then(|v| v.as_str()).unwrap_or("");
-                // Only env keys the plugin declared may be read — never arbitrary host secrets.
                 if !self.grants.secrets.iter().any(|k| k == key) {
                     return Err(format!(
                         "secret `{key}` not in this plugin's granted capabilities"
@@ -360,20 +465,43 @@ impl HostCapabilities for SystemHostCaps {
                     None => Err(format!("secret `{key}` not set")),
                 }
             }
+            "endpoint" => {
+                let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                self.resolve_endpoint(name).map(|url| json!({ "url": url }))
+            }
             "http.do" => {
                 if !self.grants.http {
                     return Err("http.do not granted to this plugin".into());
                 }
                 let raw = payload.get("url").and_then(|v| v.as_str()).unwrap_or("");
                 let url = guard_http_url(raw, self.allow_private_net)?;
-                let resp = reqwest::Client::new()
-                    .get(url)
-                    .send()
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let method = payload
+                    .get("method")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("GET")
+                    .to_uppercase();
+                let m = reqwest::Method::from_bytes(method.as_bytes())
+                    .map_err(|e| format!("http.do: bad method `{method}`: {e}"))?;
+                let mut req = reqwest::Client::new().request(m, url);
+                if let Some(headers) = payload.get("headers").and_then(|v| v.as_object()) {
+                    for (k, v) in headers {
+                        if let Some(s) = v.as_str() {
+                            req = req.header(k.as_str(), s);
+                        }
+                    }
+                }
+                // Optional bearer-token injection by purpose (host resolves the secret; the plugin
+                // never sees raw tokens for the auth-injection path).
+                if let Some(purpose) = payload.get("bearer_purpose").and_then(|v| v.as_str()) {
+                    req = req.bearer_auth(self.resolve_purpose(purpose)?);
+                }
+                if let Some(body) = payload.get("body").and_then(|v| v.as_str()) {
+                    req = req.body(body.to_string());
+                }
+                let resp = req.send().await.map_err(|e| e.to_string())?;
                 let status = resp.status().as_u16();
                 let body = resp.text().await.unwrap_or_default();
-                let body = truncate_on_char_boundary(body, 64 * 1024);
+                let body = truncate_on_char_boundary(body, 256 * 1024);
                 Ok(json!({ "status": status, "body": body }))
             }
             other => Err(format!("unknown host capability: {other}")),
@@ -587,7 +715,7 @@ impl PluginTool {
             output_schema: None,
             effects,
             risk: op.risk.unwrap_or(Risk::Medium),
-            idempotency: Idempotency::NonIdempotent,
+            idempotency: op.idempotency.unwrap_or(Idempotency::NonIdempotent),
             access: Vec::new(),
             group: None,
         };
@@ -801,6 +929,60 @@ mod tests {
                 .is_err(),
             "secret not in the grant list must be denied"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn secret_by_purpose_and_endpoint_resolution() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!("flux-purpose-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        // Unique env keys so the process-global set_var doesn't collide with other tests.
+        std::env::set_var("FLUX_TEST_API_TOKEN_XZ", "s3cr3t");
+        std::env::set_var("FLUX_TEST_GITLAB_URL_XZ", "https://gl.example.com");
+
+        let manifest = PluginManifest {
+            name: "gl".into(),
+            auth: vec![AuthMethod {
+                purpose: "api_token".into(),
+                env: vec!["FLUX_TEST_API_TOKEN_XZ".into()],
+                description: String::new(),
+            }],
+            endpoints: vec![EndpointSpec {
+                name: "gitlab.endpoint".into(),
+                env: vec!["FLUX_TEST_GITLAB_URL_XZ".into()],
+                description: String::new(),
+            }],
+            capabilities: PluginCapabilities {
+                secrets: vec!["FLUX_TEST_API_TOKEN_XZ".into()],
+                http: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let caps = SystemHostCaps::new(sys).with_manifest(&manifest);
+
+        // secret-by-purpose resolves the granted env key
+        let got = caps
+            .handle("secret", &json!({"purpose": "api_token"}))
+            .await
+            .unwrap();
+        assert_eq!(got["value"], "s3cr3t");
+        // endpoint resolves from its declared env
+        let ep = caps
+            .handle("endpoint", &json!({"name": "gitlab.endpoint"}))
+            .await
+            .unwrap();
+        assert_eq!(ep["url"], "https://gl.example.com");
+        // an undeclared purpose is denied
+        assert!(caps
+            .handle("secret", &json!({"purpose": "nope"}))
+            .await
+            .is_err());
+
+        std::env::remove_var("FLUX_TEST_API_TOKEN_XZ");
+        std::env::remove_var("FLUX_TEST_GITLAB_URL_XZ");
         std::fs::remove_dir_all(&dir).ok();
     }
 

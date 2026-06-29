@@ -24,8 +24,10 @@ impl PluginHandler for Caps {
                 }),
                 effects: Vec::new(),
                 risk: None,
+                ..OperationSpec::default()
             }],
             capabilities: PluginCapabilities::default(),
+            ..PluginManifest::default()
         }
     }
 

@@ -24,8 +24,10 @@ impl PluginHandler for Echo {
                 }),
                 effects: Vec::new(), // pure transform — no IO
                 risk: None,
+                ..OperationSpec::default()
             }],
             capabilities: PluginCapabilities::default(), // requests no host capabilities
+            ..PluginManifest::default()
         }
     }
 

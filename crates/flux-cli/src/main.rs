@@ -863,7 +863,7 @@ async fn build_agent(
                 Arc::new(
                     flux_plugin::SystemHostCaps::new(system)
                         .allow_private_net(allow_private)
-                        .with_grants(m.capabilities.clone()),
+                        .with_manifest(m),
                 ) as Arc<dyn flux_plugin::HostCapabilities>
             };
             match flux_plugin::load_plugin_tools(
