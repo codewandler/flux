@@ -236,6 +236,11 @@ enum Commands {
         #[arg(long)]
         watch: bool,
     },
+    /// Run a multi-agent program with its event-trigger channels (cron / webhook / Slack).
+    App {
+        #[command(subcommand)]
+        action: AppAction,
+    },
     /// Run a pre-compiled Flux-Lang program (a DraftAst JSON file).
     Flow {
         #[command(subcommand)]
@@ -272,6 +277,19 @@ enum Commands {
         /// `list` | `<name> key=value …` (passed through to the preset cookbook).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+}
+
+/// `flux app …`
+#[derive(clap::Subcommand, Debug)]
+enum AppAction {
+    /// Run a `.flux` program and serve its declared channels until Ctrl-C. A program with cron/webhook/
+    /// Slack channels runs as a background daemon; one with only a `cli` channel (or none) reads stdin.
+    Run {
+        #[command(flatten)]
+        agent: AgentFlags,
+        /// Path to the `<program.flux>` multi-agent program.
+        program: String,
     },
 }
 
@@ -3038,6 +3056,12 @@ async fn main() -> Result<()> {
                 report,
                 watch,
             }) => run_eval_cmd(adapter, tasks, members, limit, trials, report, watch, model).await,
+            Some(Commands::App {
+                action: AppAction::Run { agent, program },
+            }) => {
+                apply_agent_env(&agent);
+                run_app(&program, agent.model.clone(), agent.yes).await
+            }
             Some(Commands::Flow {
                 action: FlowAction::Run { file, model, yes },
             }) => run_flow(&file, model, yes).await,
@@ -3100,18 +3124,24 @@ async fn run_app_cmd(
     model_spec: Option<String>,
     auto_approve: bool,
 ) -> Result<()> {
-    use std::path::Path;
-
-    // The `.flux` path is the first token; `-m`/`--yes` were parsed as global flags. By default
-    // destructive ops in a program are DENIED (no human at a prompt); `--yes` opts into allow-all.
+    // The `.flux` path is the first token; `-m`/`--yes` were parsed as global flags.
     let path = prompt
         .first()
         .map(String::as_str)
         .ok_or_else(|| anyhow::anyhow!("usage: flux run <app.flux> [-m provider/model] [--yes]"))?;
-    let spec = model_spec.unwrap_or_else(|| "anthropic/claude-sonnet-4-6".to_string());
+    run_app(path, model_spec, auto_approve).await
+}
 
-    // Best-effort: a pure-op program runs without a provider. `build_provider` resolves the model
-    // alias (`-m opus`/`sonnet`/…) to a real id, so the cognition pack gets a valid model.
+/// Build and run a multi-agent program together with its declared **channels**, the shared body behind
+/// both `flux run <app.flux>` (auto-detect) and `flux app run <program.flux>`. Cron/webhook/Slack
+/// channels start as background tasks that deliver events into the program's bus (→ triggers → journeys)
+/// until Ctrl-C; a program with a `cli` channel — or none at all — keeps the interactive stdin loop. By
+/// default destructive ops are DENIED (no human at a prompt); `--yes` opts into allow-all. The provider
+/// is best-effort: a pure-op program runs without credentials.
+async fn run_app(path: &str, model_spec: Option<String>, auto_approve: bool) -> Result<()> {
+    use flux_lang::program::{Module, Program};
+
+    let spec = model_spec.unwrap_or_else(|| "anthropic/claude-sonnet-4-6".to_string());
     let (provider, model): (Option<std::sync::Arc<dyn Provider>>, String) = match build_provider(
         &spec,
     ) {
@@ -3132,9 +3162,29 @@ async fn run_app_cmd(
         }
     };
 
-    flux_app::run_program_file(Path::new(path), provider, model, auto_approve)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
+    let src =
+        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("read program `{path}`: {e}"))?;
+    let program = match Module::parse_str(&src).map_err(|e| anyhow::anyhow!("{e}"))? {
+        Module::Program(p) => p,
+        Module::Flow(flow) => Program {
+            flows: vec![flow],
+            ..Default::default()
+        },
+    };
+
+    let channel_decls = program.channels.clone();
+    let app = std::sync::Arc::new(flux_app::App::with_options(
+        program,
+        provider,
+        model,
+        auto_approve,
+    ));
+    let channels = flux_channels::build_channels(&channel_decls)?;
+    // Serve stdin when an interactive `cli` channel is declared, or when the program declares no
+    // channels at all (preserving the plain read-eval-print behavior).
+    let run_stdin = channel_decls.is_empty() || channel_decls.iter().any(|c| c.kind == "cli");
+    let cancel = tokio_util::sync::CancellationToken::new();
+    flux_channels::serve(app, channels, run_stdin, cancel).await
 }
 
 /// Launch the HTTP API daemon.

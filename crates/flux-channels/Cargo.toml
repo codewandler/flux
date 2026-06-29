@@ -1,0 +1,29 @@
+[package]
+name = "flux-channels"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "flux event-trigger channels: cron/webhook/Slack adapters that wake a flux-app program's journeys on external events"
+
+[dependencies]
+flux-app.workspace = true
+flux-lang.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+cron.workspace = true
+chrono.workspace = true
+slack-morphism = { workspace = true, optional = true }
+
+[features]
+# The Slack socket-mode adapter. slack-morphism's `hyper` feature pulls its hyper/tungstenite connector
+# (and avoids its optional axum 0.8, so there is no clash with our axum 0.7).
+slack = ["dep:slack-morphism", "slack-morphism/hyper"]
+
+[dev-dependencies]
+tokio.workspace = true
+tower = { version = "0.5", features = ["util"] }

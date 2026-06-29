@@ -32,6 +32,7 @@ members = [
     "crates/flux-cognition",
     "crates/flux-app",
     "crates/flux-markdown",
+    "crates/flux-channels",
 ]
 
 [workspace.package]
@@ -78,6 +79,7 @@ flux-credentials = { path = "crates/flux-credentials" }
 flux-cognition = { path = "crates/flux-cognition", version = "0.2.4" }
 flux-app = { path = "crates/flux-app" }
 flux-markdown = { path = "crates/flux-markdown" }
+flux-channels = { path = "crates/flux-channels" }
 
 # external
 serde = { version = "1", features = ["derive"] }
@@ -109,6 +111,11 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 ulid = "1"
 rquickjs = "0.6"
 axum = "0.7"
+cron = "0.12"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Capped below 2.18: 2.18+ require `signal-hook-tokio ^0.4`, which does not exist on crates.io (max is
+# 0.3.1), so their socket-mode (`hyper`) feature is unbuildable. 2.17 is the newest resolvable release.
+slack-morphism = ">=2.10, <2.18"
 url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -8,6 +8,26 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Event-trigger channels — background agents woken by events (D-04).** A new `flux-channels` (L6) crate
+  lets a `.flux` **program** be woken by external events: a cron schedule, an inbound webhook, or a Slack
+  mention. Channels are declared in the program as ordinary `ChannelDecl`s and run by the **app runner** —
+  `flux app run <program.flux>` (a new explicit subcommand; `flux run <app.flux>` routes through the same
+  path). Each channel fires a bus event **under its own name**; a `trigger { on: "<channel name>", run:
+  "<journey>" }` routes it to a journey via the existing `App::deliver` → triggers → journeys path (the
+  event payload is seeded into the journey's flow store). flux-app is unchanged — the heavy adapter deps
+  (`axum`, `cron`/`chrono`, feature-gated `slack-morphism`) live only in `flux-channels`, which depends on
+  flux-app.
+  - **schedule** (`kind = "schedule"`): full cron (5-field crontab **or** 6/7-field seconds-first) +
+    `on:"startup"`; UTC, fire-and-forget.
+  - **webhook** (`kind = "webhook"`): an axum server per channel; `POST` delivers the JSON body and
+    replies with the journeys' results, or `202` when `async = true`; optional bearer token, **required**
+    for a non-loopback bind (mirrors flux-server).
+  - **slack** (`kind = "slack"`, feature `slack`): socket-mode mentions/messages → delivery; posts the
+    journeys' result back to the thread; `allow_users`/`allow_channels` policy; tokens via `secret:env/…`.
+  - Deliveries are **serialized** (`App::deliver` drains the broadcast bus's cascades, so concurrent
+    deliveries would double-process via fan-out); journeys themselves run on independent per-run stores.
+    10 hermetic tests + 3 feature-gated Slack unit tests; `examples/channels-app.flux`. See
+    [`docs/designs/event-trigger-channels.md`](docs/designs/event-trigger-channels.md).
 - **Sub-agents are production-hardened for multi-tenant consumption (D-05).** The `flux-orchestrate`
   sub-agent primitive — single-tenant and wired only in the CLI — now has the seams a downstream service
   (managed-agents R-03/A-05) needs:

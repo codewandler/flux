@@ -34,9 +34,7 @@
 
 mod app;
 mod bus;
-mod channel;
 mod ops;
 
 pub use app::{App, JourneyRun, RecordingSink};
 pub use bus::{Bus, Event, SentMessage};
-pub use channel::{run_program_file, run_stdin};

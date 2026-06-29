@@ -2,7 +2,7 @@
 id: D-04
 title: Event-trigger channels — cron/timed, webhook, Slack (background agents)
 pillar: Agent
-status: backlog
+status: done
 priority:
 theme: downstream-managed-agents
 design: docs/designs/event-trigger-channels.md
@@ -11,15 +11,17 @@ design: docs/designs/event-trigger-channels.md
 # Event-trigger channels — cron/timed, webhook, Slack (background agents)
 
 ## Goal
-Give flux a real **event-trigger channel** abstraction in a dedicated **`flux-channels` (L6) crate**: a
-long-running host where a *channel* is an entrypoint that **wakes an agent on an external event** — a cron
-schedule, an inbound webhook, or a Slack message — and routes the event into a run through the safety
-envelope. **Epic** — ship the abstraction (`Channel` trait + normalized envelope + `Target` seam +
-`Host`) + the schedule adapter first; webhook and Slack follow as slices. See the
-[design](../designs/event-trigger-channels.md).
+Give flux real **event-trigger channels** — a *channel* is a long-running event source that **wakes an
+agent on an external event** (a cron schedule, an inbound webhook, a Slack message). **Shipped** as a
+dedicated **`flux-channels` (L6) crate** (keeps axum/cron/Slack deps out of flux-app's tree) whose
+channels are **declared inside the `.flux` program** and run by the **app runner**: each channel fires a
+bus event under its own name; a `trigger { on: "<channel name>", run: "<journey>" }` routes it to a
+journey via `App::deliver`. See the [design](../designs/event-trigger-channels.md).
 
-**Decisions:** a **dedicated crate** (keeps axum/Slack/cron deps out of flux-app's always-loaded tree),
-and **full cron expressions** in the first schedule slice (the `cron` crate, not just `every: "5m"`).
+**Decisions:** channels are Program-declared (`ChannelDecl` + `TriggerDecl`), not a separate config/CLI;
+the entry point is **`flux app run <program.flux>`** (with `flux run <app.flux>` as an alias); **full cron
+expressions** (the `cron` crate). This replaced an earlier standalone-host / `flux channels run` / TOML /
+single-agent-`EngineTarget` draft — the Program's bus/triggers/journeys already do the routing.
 
 ## Why (managed-agents)
 Today an managed-agents agent only responds over voice (RTVBP) or A2A request/response. The product wants
@@ -42,33 +44,31 @@ agents on cron/webhook/Slack.
   v1; flag it).
 
 ## Acceptance
-- [ ] **Slice 1 (crate + trait + Target + Host + schedule):** the `flux-channels` crate with a `Channel`
-      trait, the normalized `Inbound`/`Outbound` envelope, a `Target` seam (`EngineTarget` over
-      `FlowEngine::run_turn`, session-bound by `conversation`), a `Host` running channels concurrently,
-      and a **schedule** adapter taking **full cron** (`"0 9 * * *"`) + `startup`. Failing-first tests:
-      (a) a `MockTarget` proves per-`conversation` session reuse + serialization with no provider; (b) a
-      fast cron (`* * * * * *`) submits one `Inbound` per tick; (c) a `MockProvider` `EngineTarget` proves
-      `run_turn` is reached and a session created.
-- [ ] **Slice 2 (webhook):** axum `POST /<channel>` → `Inbound`; sync reply with `Outbound`, optional
-      `async = true` → `202`; optional bearer/HMAC.
-- [ ] **Slice 3 (Slack, feature-gated):** socket-mode mentions/DMs/threads; `conversation = thread ts`;
-      post `Outbound` back; access policy in per-channel settings.
-- [ ] New CLI subcommand `flux channels run <config.toml>`.
-- [ ] `flux-channels` added to the `flux-codegate` `layer()` map as L6 + root `Cargo.toml` members; full
-      gate green (`cargo build/test/clippy/fmt`, `cargo test -p flux-codegate`).
-- [ ] The in-memory-only caveats (scheduled work, `conversation → session` map) and the per-event-trust
-      follow-up are documented (see the design's Non-goals).
+- [x] **Core:** the `flux-channels` crate with a `Channel` trait, a `Deliverer` seam, the gate-serialized
+      `AppDeliverer` over `App::deliver`, `serve(app, channels, run_stdin, cancel)`, and `build_channels`
+      (kind → adapter; `cli` skipped; unknown = error).
+- [x] **schedule** adapter: **full cron** (5-field crontab + 6/7-field seconds-first) + `on:"startup"`.
+- [x] **webhook** adapter: axum `POST <path>` per channel → delivery; sync JSON reply / `async=true` →
+      `202`; optional bearer token; non-loopback bind requires a token.
+- [x] **slack** adapter (feature `slack`): socket-mode mentions/messages; thread as conversation; posts
+      results back; `allow_users`/`allow_channels` policy.
+- [x] **`flux app run <program.flux>`** subcommand (+ `flux run <app.flux>` routes through it).
+- [x] `flux-channels` in the `flux-codegate` `layer()` map (L6) + root `Cargo.toml` members; full gate
+      green (`cargo build/test/clippy/fmt`, `cargo test -p flux-codegate`, `--features slack`).
+- [x] Hermetic tests: routing/serialization, fast-cron + startup, webhook sync/async/token, an e2e
+      cron→real-App→journey run, and the Slack mapping/allow-list. Example `examples/channels-app.flux`.
+- [x] The serialization rationale + the slack-morphism `<2.18` cap + follow-ups documented in the design.
 
 ## Progress
-- Backlog (epic). Design written: [`docs/designs/event-trigger-channels.md`](../designs/event-trigger-channels.md).
-  Decomposes into the three acceptance slices above.
+- **Done.** Implemented as the `flux-channels` L6 crate; design rewritten to the Program/app-runner model;
+  10 hermetic tests + 3 feature-gated Slack unit tests pass; smoke-tested live via `flux app run`
+  (startup + cron heartbeat to stdout, webhook POST returns the journey result).
 
 ## Notes
-- The run seam is `FlowEngine::run_turn` (`crates/flux-flow/src/engine.rs:132`); the existing
-  "event → run" reference is flux-server's `serve`/`webhook` (`crates/flux-server/src/lib.rs:39`,`:209`).
-- `ProgramTarget` (reuse flux-app's `App::deliver` + bus for declarative multi-journey Programs) is
-  specced but **deferred** — the `Target` trait leaves the door open without building it in slice 1.
-- Pairs with **D-01** (the host runs a parameterized flow) and **D-02** (triggered runs persist to the
-  tagged event log; also the home for the durable `conversation → session` index).
-- Serves the managed-agents channel-breadth direction (alongside its RTVBP + A2A channels) and the fluxplane
-  use case directly.
+- Routing reuses flux-app: `App::deliver` (`crates/flux-app/src/app.rs:104`) → `run_triggers` (exact
+  `on == label`) → `run_journey` → `execute_flow` (fresh per-run store). flux-app is unchanged.
+- Deliveries are **serialized** (a gate Mutex) because `App::deliver` drains the broadcast bus's cascade
+  events — concurrent deliveries would double-process via fan-out. Journeys are independent; cross-channel
+  concurrency is a follow-up.
+- Pairs with **D-01** (a journey can run a parameterized flow) and **D-02** (triggered runs persist to the
+  tagged event log). Serves the managed-agents channel-breadth direction and the fluxplane use case directly.

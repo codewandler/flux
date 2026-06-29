@@ -28,8 +28,10 @@ flux-tools.workspace = true
 flux-events.workspace = true
 flux-agent.workspace = true
 flux-flow.workspace = true
+flux-lang.workspace = true
 flux-cognition.workspace = true
 flux-app.workspace = true
+flux-channels.workspace = true
 flux-eval.workspace = true
 flux-orchestrate.workspace = true
 flux-a2a.workspace = true
@@ -51,3 +53,8 @@ serde_json.workspace = true
 serde_norway.workspace = true
 reedline = "0.48.0"
 flux-markdown = { workspace = true, features = ["terminal"] }
+
+[features]
+# Build the `flux` binary with the Slack channel adapter compiled in (off by default to keep the heavy
+# slack-morphism dep out of the standard build). Use `cargo build -p flux-cli --features slack`.
+slack = ["flux-channels/slack"]
