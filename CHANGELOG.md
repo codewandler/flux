@@ -54,6 +54,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **Crate consolidation, phases 2–4 — workspace 35 → 31 crates.** Continuing the within-layer-merge
+  pattern from phase 1 (the providers collapse), four thin single-consumer crates were folded into
+  their same-layer neighbours (the `flux-codegate` layering lint stayed green throughout, one commit
+  per phase): `flux-hooks` → a `hooks` module of **`flux-plugin`** (L4); `flux-browser` +
+  `flux-datasource` → a new **`flux-capabilities`** crate with `browser`/`datasource` modules (L5);
+  `flux-context` → a `context` module of **`flux-runtime`** (L2, additive to the published surface).
+  **`flux-auth` was kept standalone** — caller identity is a distinct concern from tool capabilities
+  (and `flux-runtime` must not depend on it). The orphan **`flux-integrations`** crate (Slack
+  webhook/notify helpers, no consumers — never wired in) was **removed**; its code remains in git
+  history for a future flux-server-native rebuild. No behavior change; all public entry points
+  (`flux-plugin::hooks`, `flux_capabilities::{browser,datasource}`, `flux_runtime::context`) keep
+  working.
 - **One agent loop everywhere; the classic `Agent` loop is gone.** The SDK `Client` and the sub-agent
   spawner (`flux-orchestrate`) now run on the same `FlowEngine` flux-lang loop as the CLI/TUI/server —
   the legacy provider-native `flux-agent::Agent::run_turn` loop has been **deleted** (no fallback, no

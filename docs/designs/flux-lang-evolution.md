@@ -212,7 +212,7 @@ domain meaning (PRD §11):
   `synth { claims, format, cite } -> Answer`, `ai.rewrite { text, style }`.
 - **Pure:** `need`, `gaps`, `compare`, `dedupe`, `sort`, `top`, `merge`, `cite`.
 - **Datasource (`!Read`/`!Network`):** `query` (→ `Query`), and `Repo.search` / `Read.many` /
-  `Test.run` / `Repo.patch`, which **lower onto existing flux-tools / flux-datasource ops** — they are
+  `Test.run` / `Repo.patch`, which **lower onto existing flux-tools / flux-capabilities ops** — they are
   naming conventions over the live `ToolRegistry`, not new machinery.
 
 **Where each op lives (layering).** Split by whether a provider is needed: the **pure** ops
@@ -222,7 +222,7 @@ IO. The **model-backed** ops (`ai.*`, `synth`) go in a **new provider-injected p
 **`ToolContext` is untouched** (it exposes a `spawner` but no provider — `crates/flux-runtime/src/lib.rs:102-132`).
 Classify `"flux-cognition" => 3` in `flux-codegate`'s `layer()` map when the crate lands. The
 **datasource** verbs (`query`, `Repo.search`, `Read.many`, `Search.run`) are the *existing*
-`flux-datasource` (L5) / `flux-tools` ops surfaced at **L6** — **not** bundled into the L3 cognition
+`flux-capabilities` (L5) / `flux-tools` ops surfaced at **L6** — **not** bundled into the L3 cognition
 crate (that would invert the layering).
 
 **The cognition pack is additive — `task` stays.** A direct single-shot model call (the `flux-cognition`
@@ -491,7 +491,7 @@ with a test that fails before the change.
 Executing a `Program` long-running (the "phone-troubleshooting" story) needs infrastructure that does
 **not** exist yet: an in-process **event bus** (tokio broadcast + oneshot correlation), a **scheduler**
 (interval/at; `cron` only on demand), a **channel runtime** (CLI/HTTP/Slack listeners reusing
-`flux-server` auth + `flux-integrations` parsing), **agent instances** (long-lived `FlowEngine`s with
+`flux-server` auth + external-event parsing), **agent instances** (long-lived `FlowEngine`s with
 scoped `Executor`s), the orchestration ops as `Tool`s through `Executor::dispatch`, and a **supervisor**
 loop (cancellation/shutdown). It would be a new **L6 crate `flux-app`** (registered in
 `flux-codegate`'s `layer()` map), driven by `flux run app.flux`. The safe headless default is

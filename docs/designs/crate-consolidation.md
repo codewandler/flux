@@ -1,6 +1,6 @@
 # Design: crate consolidation
 
-**Status:** Phase 1 ✅ shipped (`flux-providers`) · Phases 2–4 planned · **Layers:** L1 now, L4/L5/L2/L6 next · **Owner:** Timo
+**Status:** Phases 1–4 ✅ shipped · **Layers:** L1, then L4 / L5 / L2 / L6 · **Owner:** Timo
 
 The workspace grew breadth-first — every surface got its own crate — leaving several layers with many
 small, tightly-coupled crates that only ever serve one consumer. That is pure overhead: a wider build
@@ -46,21 +46,25 @@ destined to back credentials for *all* future integrations, not just LLM provide
 > Side note: the move also fixed a pre-existing clippy 1.91 `doc_lazy_continuation` lint that was
 > latent in `flux-messages` (present on `main` too).
 
-## Further reductions (tracked, not yet executed)
+## Phases 2–4 — within-layer merges of single-consumer (`flux-cli`-only) crates (✅ shipped)
 
-Each is a within-layer merge of single-consumer (`flux-cli`-only) crates:
-
-- **Phase 2 — L4 extensibility:** `flux-hooks` (214 LOC) + `flux-plugin` (986) → **`flux-plugin`**
-  with `hooks`/`plugin` modules. 2→1.
-- **Phase 3 — L5 capabilities:** `flux-browser` (135) + `flux-datasource` (229) → **`flux-capabilities`**.
-  2→1. `flux-auth` (caller identity) is also L5 but a distinct concern (not web egress / RAG); decide
-  at execution whether to fold it in (→ 3→1) or leave it standalone.
+- **Phase 2 — L4 extensibility:** `flux-hooks` (214 LOC) folded into **`flux-plugin`** as a `hooks`
+  module (re-exporting `JsHookEngine`). 2→1.
+- **Phase 3 — L5 capabilities:** `flux-browser` (135) + `flux-datasource` (229) → new
+  **`flux-capabilities`** crate with `browser`/`datasource` modules. 2→1. **`flux-auth` (caller
+  identity) was kept standalone** — it is a distinct concern (identity resolved into `(Caller, Trust)`
+  by surfaces), not a tool capability, and `flux-runtime` must not depend on it; folding it under a
+  "capabilities" name would muddy that boundary.
 - **Phase 4 — L2 / L6 odds & ends:**
-  - `flux-context` (332, sessions/context) → fold into `flux-runtime` (same layer L2). −1.
-  - `flux-integrations` (102) is an **orphan** — nothing depends on it. Confirm it's live; fold into a
-    surface or remove. −1.
+  - `flux-context` (332) folded into **`flux-runtime`** as a `context` module (additive to the
+    published surface; tokio promoted from a dev- to a normal dependency for the module's async IO). −1.
+  - `flux-integrations` (102) was confirmed **dead** — no crate depended on it and nothing imported
+    `flux_integrations::` (its only mention was a flux-server doc-comment). **Removed**; the Slack
+    helpers live on in git history for a future flux-server-native rebuild. −1.
 
-**Projected:** 33 → ~28–29 crates.
+**Outcome:** the workspace had drifted to **35 crates** since Phase 1 (new leaves added meanwhile —
+`flux-markdown`, `flux-a2a`, …); phases 2–4 removed a net 4 (five merged/removed, one new
+`flux-capabilities`), landing at **31 crates**.
 
 ## Out of scope (do not merge)
 

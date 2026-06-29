@@ -21,11 +21,11 @@ the *surfaces* (CLI/TUI/server/SDK).
 |---|---|---|
 | **L0 contracts** (pure) | `flux-core` `flux-policy` `flux-secret` `flux-spec` `flux-config` `flux-evidence` `flux-skill` `flux-markdown` `flux-lang` | types, authorization, secrets, tool specs, config, evidence, skills, markdown/frontmatter, the Flux-Lang language + reference interpreter (effects injected via traits) |
 | **L1 providers** | `flux-provider` `flux-providers` `flux-credentials` | the `Provider` abstraction + the concrete clients (`flux-providers` modules: `messages` core, `anthropic`, `openai`, `openrouter`, `ollama`) + credential store |
-| **L2 runtime** | `flux-system` `flux-runtime` `flux-tools` `flux-events` `flux-context` | guarded IO, the safety envelope, built-in tools, the event store, context |
+| **L2 runtime** | `flux-system` `flux-runtime` `flux-tools` `flux-events` | guarded IO, the safety envelope (+ the `context` projector module), built-in tools, the event store |
 | **L3 agent** | `flux-agent` `flux-orchestrate` `flux-flow` `flux-eval` `flux-cognition` | agent definitions (`AgentSpec`/`Role`) + multi-agent orchestration + the Flux-Lang engine (the one turn loop) + the eval harness + the model-op cognition pack |
-| **L4 extensibility** | `flux-hooks` `flux-plugin` | JS hooks + subprocess plugins |
-| **L5 capabilities** | `flux-browser` `flux-datasource` `flux-auth` | web egress, datasource/RAG, caller identity |
-| **L6 surfaces** | `flux-sdk` `flux-server` `flux-integrations` `flux-tui` `flux-cli` `flux-app` | SDK, HTTP server, integrations, TUI, the `flux` binary, the multi-agent program runtime host (`flux run app.flux`) |
+| **L4 extensibility** | `flux-plugin` | subprocess plugins + the JS pre-tool `hooks` module |
+| **L5 capabilities** | `flux-capabilities` `flux-auth` | web egress + datasource/RAG tools (`browser`/`datasource` modules); caller identity (separate) |
+| **L6 surfaces** | `flux-sdk` `flux-server` `flux-tui` `flux-cli` `flux-app` | SDK, HTTP server, TUI, the `flux` binary, the multi-agent program runtime host (`flux run app.flux`) |
 
 Why this matters: it keeps the safety core (L0–L2) small and auditable, and makes "route around the
 envelope" structurally hard. Notable rules that fall out:
@@ -60,10 +60,9 @@ shared machinery beneath them. "Disposition" flags a planned move; see
 | `flux-providers` | L1 | concrete clients (anthropic / openai / openrouter / ollama) | — |
 | `flux-credentials` | L1 | credential store (PKCE, token import) | — |
 | `flux-system` | L2 | guarded IO — the *only* real fs / proc / net | — |
-| `flux-runtime` | L2 | `Executor::dispatch` — the safety envelope | absorbs `flux-context` (consolidation P4) |
+| `flux-runtime` | L2 | `Executor::dispatch` — the safety envelope; `context` module = the projector | absorbed `flux-context` (consolidation P4 ✅) |
 | `flux-tools` | L2 | built-in tools (read / write / edit / grep / …) | — |
 | `flux-events` | L2 | append-only event store (SQLite) | — |
-| `flux-context` | L2 | context projector + compaction | → fold into `flux-runtime` (P4) |
 | `flux-codegate` | infra | the layering lint (enforces L0→L6) | — |
 
 ### Agent pillar
@@ -92,12 +91,9 @@ shared machinery beneath them. "Disposition" flags a planned move; see
 | `flux-server` | L6 | axum HTTP API + SSE (bearer-auth) | — |
 | `flux-sdk` | L6 | embeddable API (`Client` + `FlowClient`, DSL, recipes) | — |
 | `flux-app` | L6 | multi-agent Program runtime host (`flux run app.flux`) | — |
-| `flux-integrations` | L6 | Slack parsing + webhook | orphan → fold or remove (P4) |
-| `flux-plugin` | L4 | subprocess plugins (NDJSON, capability-gated) | absorbs `flux-hooks` (P2) |
-| `flux-hooks` | L4 | JS pre-tool hooks | → merge into `flux-plugin` (P2) |
-| `flux-browser` | L5 | `web_fetch` (SSRF-guarded); CDP browser deferred | → `flux-capabilities` (P3) |
-| `flux-datasource` | L5 | keyword index + search; RAG deferred | → `flux-capabilities` (P3) |
-| `flux-auth` | L5 | caller identity (`LocalIdentity`; OIDC seam) | thin seam — keep |
+| `flux-plugin` | L4 | subprocess plugins (NDJSON, capability-gated) + the JS pre-tool `hooks` module | absorbed `flux-hooks` (P2 ✅) |
+| `flux-capabilities` | L5 | `browser` (`web_fetch`, SSRF-guarded; CDP deferred) + `datasource` (keyword index + search; RAG deferred) modules | merged `flux-browser` + `flux-datasource` (P3 ✅) |
+| `flux-auth` | L5 | caller identity (`LocalIdentity`; OIDC seam) | kept standalone — identity ≠ tool capability |
 
 ## The safety envelope (the execution substrate)
 
@@ -173,12 +169,12 @@ A "provider" conflates two orthogonal axes, modeled separately and composed by `
   conversation messages, the flow run-trace, and per-turn telemetry. The "conversations view" is a
   *projection* over the log (replay message-kind events), and compaction is an append-only `Compacted`
   snapshot the projection resets to — history is never deleted. Turn events are just one event kind.
-- **`flux-context`** projects an ordered provider chain (system / files / skills / task) under token
-  budgets; long sessions compact older turns into a synthetic summary.
+- **`flux-runtime`'s `context` module** projects an ordered provider chain (system / files / skills /
+  task) under token budgets; long sessions compact older turns into a synthetic summary.
 
 ## Extensibility
 
-- **Hooks** (`flux-hooks`): JavaScript pre-tool hooks (observe/modify/deny), run with a timeout.
+- **Hooks** (`flux-plugin`'s `hooks` module): JavaScript pre-tool hooks (observe/modify/deny), run with a timeout.
 - **Plugins** (`flux-plugin`): any-language subprocess binaries over a framed NDJSON protocol. A
   plugin's operations are projected as policy-gated tools; its privileged IO is requested back from the
   host as **capabilities the plugin declares in its manifest** (`process` allow-list, `secret` key

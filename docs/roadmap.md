@@ -1,7 +1,7 @@
 # flux — roadmap & status
 
 Status as of **0.2.4 (2026-06-25)**: public + installable at
-[codewandler/flux](https://github.com/codewandler/flux); 33 crates, **450+ tests**, a permanently green
+[codewandler/flux](https://github.com/codewandler/flux); 31 crates, **450+ tests**, a permanently green
 gate (tests, clippy `-D warnings`, fmt, the `flux-codegate` layering lint). See
 [CHANGELOG.md](../CHANGELOG.md) for the released history and [architecture.md](architecture.md) for the
 design.
@@ -60,13 +60,13 @@ before every release.
 ## Next
 
 **Candidate phases (vision tail, in priority order):**
-- **Crate consolidation** — shrink the workspace by merging coherent *same-layer* siblings (keeps the
-  `flux-codegate` layering lint green). **Phase 1 ✅ shipped:** the five L1 provider crates
-  (`flux-messages`/`flux-anthropic`/`flux-openrouter`/`flux-ollama`/`flux-openai`) collapsed into one
-  `flux-providers` crate with per-provider modules (L1: 7→3; workspace 37→33), keeping `flux-provider`
-  (the published abstraction) and `flux-credentials` separate. Phases 2–4 (L4 `hooks`+`plugin`, L5
-  `browser`+`datasource`, L2 `context`→`runtime`, the orphan `integrations`) are tracked in
-  [designs/crate-consolidation.md](designs/crate-consolidation.md) — projected ~28–29 crates.
+- **Crate consolidation** ✅ **all phases shipped** — shrank the workspace by merging coherent
+  *same-layer* siblings (layering lint stayed green throughout). Phase 1 collapsed the five L1 provider
+  crates into `flux-providers` (37→33). Phases 2–4 folded `flux-hooks`→`flux-plugin`,
+  `flux-browser`+`flux-datasource`→`flux-capabilities`, `flux-context`→`flux-runtime`, and removed the
+  dead `flux-integrations` (the workspace had drifted to 35; landed at **31**). `flux-auth` was kept
+  standalone (caller identity ≠ tool capability). See
+  [designs/crate-consolidation.md](designs/crate-consolidation.md).
 - **Dogfood & harden** (tier 1) — drive flux's agentic mode on real coding work, capture friction as
   issues, and fix the top biters. Validates the daily-driver claim on real tasks.
   - **Generic `bash` is now opt-in** (off-by-default `shell` group; `enable_shell`/`FLUX_ENABLE_BASH`/
@@ -127,7 +127,7 @@ before every release.
 
 **Deferred behind existing seams (add on concrete demand):**
 - A `deno_core` / `rustyscript` hook backend (async / TypeScript / npm) behind the `PreToolHook` seam.
-- A `chromiumoxide` CDP browser tool (navigate/screenshot; needs Chrome) behind the `flux-browser` surface.
+- A `chromiumoxide` CDP browser tool (navigate/screenshot; needs Chrome) behind `flux-capabilities`' `browser` module.
 
 ## Known divergences / decisions pending
 
@@ -138,7 +138,7 @@ Drift made visible, so it stops being silent. Each maps to a story on the
   `flux_sdk::Client` still drives the classic `flux-agent::Agent` loop. Unify onto
   `FlowEngine`/`FlowClient` and retire `flux-agent::Agent` (ref
   [designs/flux-flow.md](designs/flux-flow.md) §11). → [A-01](stories/A-01-unify-flowengine.md).
-- **Crate consolidation phases 2–4** (33 → ~28–29). → [C-01](stories/C-01-crate-consolidation.md).
+- ~~**Crate consolidation phases 2–4**~~ ✅ done (35 → 31). → [C-01](stories/C-01-crate-consolidation.md).
 - **crates.io publish** blocked on the `flux-core` name (needs a vanity prefix); deferred.
 - **Self-improvement headline gain** still lacks a trials ≥ 3, grader-confirmed result.
   → [I-01](stories/I-01-headline-gain.md).

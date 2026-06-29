@@ -130,7 +130,7 @@ generator feeds the `generated:node-kinds` tables in `crates/flux-lang/docs/refe
 `flux-lang` language skill, and the `flux-flow` engine skill — CI-checked by
 `cargo test -p flux-lang --test skill_in_sync` and `cargo test -p flux-flow --test skill_docs_in_sync`.
 Op packs and
-resolver impls that need L5 capabilities (`flux-datasource`, `flux-browser`) and the fluxplane/plugin op
+resolver impls that need L5 capabilities (`flux-capabilities`' `datasource`/`browser`) and the fluxplane/plugin op
 packs are registered **externally** (e.g. in `flux-cli`); L3 cannot depend on L5, and ops are
 embedder-registered anyway. (A text→AST parser is deferred — the renderer exists; the AST is produced
 as JSON by the model today.)
@@ -256,7 +256,7 @@ The SDK surface: `compile(nl) -> Flow`, `flow.render()`, `flow.risk()`, `flow.ru
 The message log stays the provider-history source of truth, preserving every **session-shape invariant**
 (never an empty assistant message, a split tool_use/tool_result pair, or user-after-user). A planned
 flow emits **one assistant summary per turn** (or one question on `await`); symbol/value/event state is
-projected into context via a `flux-context` `ContextProvider`, never sent as messages — so the bug class
+projected into context via a `flux_runtime::context` `ContextProvider`, never sent as messages — so the bug class
 cannot reappear. `await` persists `RunEvent::Awaiting` + suspended state, emits one question, ends the
 turn; the next user turn resumes the interpreter. This await/resume path is the "fourth sibling" of the
 cancel/compaction/iteration-cap shape-fixes — validate via `scripts/smoke-live.sh` (the mock provider
