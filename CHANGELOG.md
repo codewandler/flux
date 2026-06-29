@@ -25,6 +25,20 @@ All notable changes to this project are documented in this file. The format is b
   under a headless `DenyApprover`. Reuses the existing `TriggerDecl.agent` field; the journey route is
   unchanged. (Remaining: registering the datasource/plugin tools into the agent's registry — pairs with
   D-08.) See [`docs/designs/agentic-channel-target.md`](docs/designs/agentic-channel-target.md).
+- **Parameterized flow execution — the behaviour-runner seam (D-01).** Run a *stored, validated* Flux-Lang
+  flow **per invocation** with input values injected at call time, instead of re-compiling from natural
+  language or baking inputs into the AST. Two thin `flux-sdk` additions over a new `flux-flow` store
+  primitive — modules, zero new crates:
+  - `FlowStore::seed(session_id, name, value)` (`flux-flow`) — pre-bind a named input so a flow's `$name`
+    resolves to it before the run (`put_value` via `Value::from_json` + `bind` as `Hidden`, so a seed
+    resolves for the interpreter but stays out of the model-facing `view`).
+  - `FlowClient::parse(text)` — deterministic text → AST (wraps `flux_lang`'s parser; **no** provider
+    round-trip, the non-NL partner of `compile`).
+  - `FlowClient::execute_with(ast, inputs)` + `run_flow(text, inputs)` — execute a flow with `inputs`
+    seeded as `$vars`, through the **same `Executor` safety envelope** (seeding injects *data*, never a
+    capability). Each call runs against a **fresh store** (per-run isolation); a flow-local `bind` shadows
+    a seed. One-shot — genuine cross-turn `await` flows stay on `FlowEngine`. Serves managed-agents R-01
+    (behaviour runner) + A-03 (presets as flows). Hermetic example: `examples/parameterized_flow.rs`.
 - **Realtime voice-to-voice as a first-class provider (D-06).** A **sibling, session-oriented** model seam
   beside the half-duplex `Provider`, so a full-duplex speech-to-speech model (OpenAI Realtime) is a flux
   provider whose tool calls run through the **same `Executor` safety envelope** as a text turn — declared

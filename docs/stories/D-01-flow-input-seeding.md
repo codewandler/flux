@@ -2,7 +2,7 @@
 id: D-01
 title: Parameterized flow execution — the behaviour-runner seam
 pillar: Agent
-status: backlog
+status: done
 priority:
 theme: downstream-managed-agents
 design: docs/designs/flow-input-seeding.md
@@ -31,21 +31,31 @@ and return structured output (`ExecutionResult`), but:
 - `execute` is **one-shot** (a top-level `await` errors out — flow.rs:284).
 
 ## Acceptance
-- [ ] `FlowClient::parse(text) -> Result<DraftAst>` exists, wrapping the deterministic `flux_lang` parser
-      (`crates/flux-lang/src/parse.rs`); no provider call. Failing-first test: parse a stored flow string
-      → analyze → execute, asserting no `stream()` was hit.
-- [ ] An input-seeding seam (e.g. `FlowClient::execute_with(ast, inputs)` + a `FlowStore` `seed`/
-      `with_inputs` primitive) makes a flow's `$var` references resolve to injected values. Failing-first
-      test: a flow returning `$greeting` yields the seeded value, with **no** literal in the AST.
-- [ ] Custom ops still dispatch through the safety envelope (`Executor::dispatch`) unchanged.
-- [ ] A hermetic example `crates/flux-sdk/examples/parameterized_flow.rs` injects a settings JSON object
-      and reads structured output — no API key, no baked-in inputs.
-- [ ] Full gate green (`cargo build/test/clippy/fmt`, `cargo test -p flux-codegate`).
+- [x] `FlowClient::parse(text) -> Result<DraftAst>` exists, wrapping the deterministic `flux_lang` parser
+      (`crates/flux-lang/src/parse.rs`); no provider call. Test `parse_is_deterministic_no_provider_call`:
+      parse a stored flow → analyze, asserting the mock provider consumed no reply.
+- [x] An input-seeding seam — `FlowClient::execute_with(ast, inputs)` + a `FlowStore::seed` primitive —
+      makes a flow's `$var` references resolve to injected values. Test `execute_with_seeds_a_var_no_literal`:
+      a flow returning `$greeting` yields the seeded value, with **no** `lit` node in the AST.
+- [x] Custom ops still dispatch through the safety envelope (`Executor::dispatch`) unchanged — test
+      `custom_op_still_dispatches_through_the_envelope` (a seeded value reaches a registered op; a
+      destructive op under the default `DenyApprover` is gated).
+- [x] A hermetic example `crates/flux-sdk/examples/parameterized_flow.rs` injects a settings JSON object
+      and reads structured output — no API key, no baked-in inputs (one stored flow, three invocations).
+- [x] Full gate green (`cargo build/test/clippy/fmt`, `cargo test -p flux-codegate`) — 680 tests pass.
 
 ## Progress
-- Backlog. Design doc written: [`docs/designs/flow-input-seeding.md`](../designs/flow-input-seeding.md).
-- Open design call captured there: whether multi-turn `await`/resume rides this path (via `FlowEngine`)
-  or `execute_with` stays one-shot.
+- **Done.** Shipped as **modules, zero new crates**: `FlowStore::seed` (`crates/flux-flow/src/state.rs`)
+  = `put_value(Value::from_json)` + `bind` as `Hidden` (resolves for `$name`, stays out of the model-facing
+  `view`); `FlowClient::{parse, execute_with, run_flow}` (`crates/flux-sdk/src/flow.rs`) wrapping
+  `flux_lang::parse::parse` and reusing `execute_flow` + the envelope verbatim.
+- **Decisions made:** (1) **isolation** — `execute_with` runs against a **fresh per-run `FlowStore`**, so
+  successive runs of one stored AST with different inputs can't leak symbols (test
+  `execute_with_isolates_runs`). (2) **precedence** — a flow-local `bind` shadows a seed (last-writer-wins;
+  test `a_flow_bind_shadows_a_seed`). (3) **multi-turn** — shipped **Option A** (one-shot `execute_with`;
+  cross-turn state lives in the caller). Genuine top-level-`await` flows still belong on `FlowEngine`; not
+  built here speculatively (left as a follow-up only on concrete demand).
+- Built in an isolated worktree (`feat/d01-flow-input-seeding`), off the contested `main`.
 
 ## Notes
 - Reuse, don't reimplement: `flux_lang`'s `parse`/`format`, `flux_flow::state::FlowStore` (already holds

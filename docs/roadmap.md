@@ -69,14 +69,16 @@ from cross-repo audits; filed as the **D- story track** (see the [board](stories
 consumes the shipped channel transport (D-04) and drives the **active integration stack** — built in this
 order: a knowledge/RAG datasource (**D-07**, which adds the shared `flux-datasource` schema) → a clean
 **process-plugin protocol redesign** (**D-10**) → a native integration-plugin pack (**D-08**, in an in-repo
-`plugins/` workspace) → an agentic channel target (**D-09**). The earlier managed-agents items (D-01/D-02/D-03/
-D-06) remain queued behind this push.
+`plugins/` workspace) → an agentic channel target (**D-09**). The earlier managed-agents items (D-02/D-03)
+remain queued behind this push (D-01 + D-06 have since shipped).
 
 1. **[D-01](stories/D-01-flow-input-seeding.md) — Parameterized flow execution (the behaviour-runner
-   seam)** · *highest.* Add a deterministic `FlowClient::parse(text)` + a per-run input-seeding seam so a
-   stored, validated Flux-Lang flow runs per invocation with effective-settings injected (not baked into
-   the AST) and custom ops registered. The deepest near-term integration; unblocks managed-agents R-01
-   (behaviour runner) + A-03 (presets as flows). Design:
+   seam)** · ✅ **shipped.** A deterministic `FlowClient::parse(text)` (no model round-trip) + a per-run
+   input-seeding seam (`FlowStore::seed` + `FlowClient::execute_with`/`run_flow`) so a stored, validated
+   Flux-Lang flow runs per invocation with effective-settings injected as `$vars` (not baked into the AST)
+   and custom ops registered — fresh-store isolation, flow-local binds shadow seeds, the safety envelope
+   unchanged; one-shot (genuine cross-turn `await` stays on the engine). Modules, zero new crates.
+   Unblocks managed-agents R-01 (behaviour runner) + A-03 (presets as flows). Design:
    [flow-input-seeding.md](designs/flow-input-seeding.md).
 2. **[D-02](stories/D-02-tenant-event-substrate.md) — Tenant/context-taggable event substrate** · *high.*
    Tag `flux-events` with an account/agent context + an account-scoped projection read API, so managed-agents

@@ -292,6 +292,31 @@ impl FlowStore {
         }
     }
 
+    /// Pre-bind a named input so a flow's `$name` resolves to `value` **before** the run — the
+    /// per-invocation value-injection seam a behaviour runner needs (run a stored flow with these
+    /// settings, without baking them into the AST as `lit` nodes). `value` is natural JSON, stored via
+    /// the same [`Value::from_json`] the interpreter uses for literals.
+    ///
+    /// Bound [`Visibility::Hidden`]: the interpreter's [`resolve`](Self::resolve) sees it (so `$name`
+    /// works), but it stays out of the model-facing [`view`](Self::view). A flow-local `bind` to the
+    /// same name later overwrites the pointer (last-writer-wins), so the flow can shadow its inputs.
+    pub fn seed(
+        &self,
+        session_id: &str,
+        name: &SymbolName,
+        value: &serde_json::Value,
+    ) -> Result<()> {
+        let vid = self.put_value(session_id, &Value::from_json(value))?;
+        self.bind(
+            session_id,
+            name,
+            &vid,
+            None,
+            "<seeded input>",
+            Visibility::Hidden,
+        )
+    }
+
     /// Append a run-event to the session's trace (forwarded to the unified event log).
     pub fn append_event(&self, session_id: &str, event: &RunEvent) -> Result<()> {
         self.events.record_run_event(session_id, event)
@@ -497,6 +522,71 @@ mod tests {
         assert_eq!(s.resolve("sess", &draft).unwrap(), Some(v2));
         // the superseded value is still retrievable
         assert_eq!(s.get_value(&v1).unwrap(), Some(Value::String("v1".into())));
+    }
+
+    #[test]
+    fn seed_then_resolve_round_trips() {
+        let s = FlowStore::in_memory().unwrap();
+        // A scalar seed resolves for `$greeting`.
+        let greeting = SymbolName("greeting".into());
+        s.seed("sess", &greeting, &serde_json::json!("hej"))
+            .unwrap();
+        let vid = s
+            .resolve("sess", &greeting)
+            .unwrap()
+            .expect("a seeded var resolves");
+        assert_eq!(
+            s.get_value(&vid).unwrap(),
+            Some(Value::String("hej".into()))
+        );
+        // A structured seed round-trips through the value model. Numbers are `f64` in the value model,
+        // so an integer `3` reads back as `3.0` — assert against that reality, not the input literal.
+        let cfg = SymbolName("cfg".into());
+        s.seed("sess", &cfg, &serde_json::json!({"n": 3})).unwrap();
+        let vid = s.resolve("sess", &cfg).unwrap().unwrap();
+        assert_eq!(
+            s.get_value(&vid).unwrap().unwrap().to_json(),
+            serde_json::json!({"n": 3.0})
+        );
+    }
+
+    #[test]
+    fn seed_is_hidden_from_view() {
+        let s = FlowStore::in_memory().unwrap();
+        s.seed(
+            "sess",
+            &SymbolName("secret_input".into()),
+            &serde_json::json!("x"),
+        )
+        .unwrap();
+        let names: Vec<String> = s
+            .view("sess")
+            .unwrap()
+            .symbols
+            .iter()
+            .map(|s| s.name.0.clone())
+            .collect();
+        assert!(
+            !names.contains(&"secret_input".to_string()),
+            "a seeded input must not appear in the model-facing view"
+        );
+    }
+
+    #[test]
+    fn a_bind_shadows_a_seed() {
+        let s = FlowStore::in_memory().unwrap();
+        let name = SymbolName("x".into());
+        s.seed("sess", &name, &serde_json::json!("seeded")).unwrap();
+        // A flow-local bind to the same name overwrites the pointer (last-writer-wins).
+        let v = s.put_value("sess", &Value::String("bound".into())).unwrap();
+        s.bind("sess", &name, &v, None, "flow-local", Visibility::Visible)
+            .unwrap();
+        let vid = s.resolve("sess", &name).unwrap().unwrap();
+        assert_eq!(
+            s.get_value(&vid).unwrap(),
+            Some(Value::String("bound".into())),
+            "a flow-local bind shadows the seed"
+        );
     }
 
     #[test]

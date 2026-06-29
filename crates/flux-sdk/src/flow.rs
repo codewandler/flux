@@ -44,9 +44,10 @@ use std::sync::Arc;
 
 use flux_cognition::CognitionPack;
 use flux_core::{Error, Result};
+use flux_flow::ast::SymbolName;
 use flux_flow::compile::{compile as compile_flow, CompileOptions};
 use flux_flow::registry::OpRegistry;
-use flux_flow::runtime::execute_flow;
+use flux_flow::runtime::{execute_flow, FlowOutcome};
 use flux_flow::state::FlowStore;
 use flux_flow::{tool_defs_from_registry, AgentSink, VoiceSessionDriver, VoiceSink};
 use flux_lang::analyze::analyze_flow;
@@ -286,6 +287,14 @@ impl FlowClient {
         Ok(compiled.ast)
     }
 
+    /// Deterministic text → AST for a stored / already-validated flow — the non-NL partner of
+    /// [`compile`](Self::compile), with **no** provider round-trip. Wraps `flux_lang`'s parser so a
+    /// behaviour runner can re-hydrate a stored flow without a model call. Malformed input is a parse
+    /// error folded into the SDK's error type (the parser is total — never a panic).
+    pub fn parse(&self, text: &str) -> Result<DraftAst> {
+        flux_lang::parse::parse(text).map_err(|e| Error::Other(e.to_string()))
+    }
+
     /// Analyze an AST against the assembled registry's op catalog. `Ok(())` means every referenced op
     /// resolves; `Err` carries the [`Diagnostic`]s (e.g. unknown ops).
     pub fn analyze(&self, ast: &DraftAst) -> std::result::Result<(), Vec<Diagnostic>> {
@@ -303,22 +312,38 @@ impl FlowClient {
         let outcome = execute_flow(&self.store, &executor, &self.session_id, ast, &mut sink)
             .await
             .map_err(|e| Error::Other(e.to_string()))?;
-        // A top-level `await` suspends the flow mid-execution. This one-shot path has no resume hook,
-        // so surface it as an error rather than silently returning a half-run flow (the prefix's side
-        // effects fired, the remainder never will) — cross-turn `await` flows belong on the engine.
-        if let Some(susp) = &outcome.suspension {
-            return Err(Error::Other(format!(
-                "flow suspended on a top-level `await` (source `{}`); the one-shot SDK `execute` path \
-                 does not support cross-turn resume — drive await flows through the engine instead",
-                susp.source
-            )));
+        finish_outcome(outcome, sink)
+    }
+
+    /// Execute `ast` with `inputs` seeded as flow variables (`$name`) **before** the run — the
+    /// per-invocation value-injection seam: run a stored, validated flow with these settings without
+    /// baking them into the AST as `lit` nodes (what a behaviour runner / preset framework needs).
+    /// Same safety envelope as [`execute`](Self::execute) — ops still dispatch through
+    /// `Executor::dispatch`; seeding injects *data*, never a capability.
+    ///
+    /// Each call runs against a **fresh store**, so repeated runs of the same stored AST with different
+    /// inputs never leak symbols between them. A flow-local `bind` to a seeded name shadows the seed
+    /// (ordinary lexical shadowing); a referenced-but-unseeded `$name` fails at runtime exactly like any
+    /// unbound var; extra inputs the flow never references are ignored.
+    pub async fn execute_with(
+        &self,
+        ast: &DraftAst,
+        inputs: serde_json::Map<String, Value>,
+    ) -> Result<ExecutionResult> {
+        // A fresh per-run store is the isolation boundary: seeds (and anything the flow binds) live and
+        // die with this call, so concurrent/successive runs of the same AST can't see each other's vars.
+        let store = FlowStore::in_memory()?;
+        for (name, value) in &inputs {
+            store
+                .seed(&self.session_id, &SymbolName(name.clone()), value)
+                .map_err(|e| Error::Other(e.to_string()))?;
         }
-        Ok(ExecutionResult {
-            result: outcome.result,
-            transcript: outcome.transcript,
-            steps: outcome.steps,
-            tool_calls: sink.tool_calls,
-        })
+        let executor = self.build_executor();
+        let mut sink = ExecSink::default();
+        let outcome = execute_flow(&store, &executor, &self.session_id, ast, &mut sink)
+            .await
+            .map_err(|e| Error::Other(e.to_string()))?;
+        finish_outcome(outcome, sink)
     }
 
     /// Lower an AST to an optimizer [`PhysicalPlan`]: `analyze::lower` (validate + gather effects)
@@ -368,6 +393,21 @@ impl FlowClient {
             return Err(Error::Other(format!("analyze: {}", join_diags(&diags))));
         }
         self.execute(&ast).await
+    }
+
+    /// The deterministic counterpart of [`run`](Self::run): `parse` → `analyze` → `execute_with`. Runs
+    /// a **stored** flow per invocation with injected `inputs` and no model round-trip. A failed
+    /// analysis aborts before any side effect (the AST referenced an op the registry doesn't have).
+    pub async fn run_flow(
+        &self,
+        text: &str,
+        inputs: serde_json::Map<String, Value>,
+    ) -> Result<ExecutionResult> {
+        let ast = self.parse(text)?;
+        if let Err(diags) = self.analyze(&ast) {
+            return Err(Error::Other(format!("analyze: {}", join_diags(&diags))));
+        }
+        self.execute_with(&ast, inputs).await
     }
 
     /// Build a fresh [`Executor`] over a clone of the assembled registry (the safety envelope every
@@ -460,6 +500,27 @@ fn join_diags(diags: &[Diagnostic]) -> String {
         .map(|d| d.message.clone())
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// Fold a finished `execute_flow` outcome into an [`ExecutionResult`], surfacing a top-level `await`
+/// suspension as an error: the one-shot SDK path has no resume hook, so a half-run suspended flow (its
+/// prefix's side effects fired, the remainder never will) is reported rather than silently returned —
+/// cross-turn `await` flows belong on the engine. Shared by [`FlowClient::execute`] and
+/// [`FlowClient::execute_with`] so the two can't drift.
+fn finish_outcome(outcome: FlowOutcome, sink: ExecSink) -> Result<ExecutionResult> {
+    if let Some(susp) = &outcome.suspension {
+        return Err(Error::Other(format!(
+            "flow suspended on a top-level `await` (source `{}`); the one-shot SDK `execute` path does \
+             not support cross-turn resume — drive await flows through the engine instead",
+            susp.source
+        )));
+    }
+    Ok(ExecutionResult {
+        result: outcome.result,
+        transcript: outcome.transcript,
+        steps: outcome.steps,
+        tool_calls: sink.tool_calls,
+    })
 }
 
 #[cfg(test)]
@@ -731,6 +792,182 @@ mod tests {
             out.result.contains("lifecycle surface works"),
             "result should carry the file content, got: {}",
             out.result
+        );
+    }
+
+    // ----- D-01: parameterized flow execution (deterministic parse + per-run seeding) -----
+
+    /// A read-only op that echoes the params it received — lets a test assert a *seeded* value reached
+    /// the op through `Executor::dispatch`, whatever the arg→params shape.
+    struct EchoArgsTool;
+    #[async_trait]
+    impl Tool for EchoArgsTool {
+        fn spec(&self) -> flux_spec::ToolSpec {
+            flux_spec::ToolSpec::read_only(
+                "echo_args",
+                "echo args",
+                json!({"type": "object", "properties": {"value": {"type": "string"}},
+                       "required": ["value"]}),
+            )
+        }
+        async fn execute(&self, _ctx: &ToolContext, params: Value) -> CoreResult<ToolResult> {
+            Ok(ToolResult::ok(format!("args={params}")))
+        }
+    }
+
+    /// A destructive op: if the envelope ever lets it run it shouts, so a test can prove it was gated.
+    struct BoomTool;
+    #[async_trait]
+    impl Tool for BoomTool {
+        fn spec(&self) -> flux_spec::ToolSpec {
+            flux_spec::ToolSpec::read_only("boom", "destructive", json!({"type": "object"}))
+                .with_risk(flux_spec::Risk::Destructive)
+        }
+        async fn execute(&self, _ctx: &ToolContext, _params: Value) -> CoreResult<ToolResult> {
+            Ok(ToolResult::ok("BOOM EXECUTED"))
+        }
+    }
+
+    fn one_input(key: &str, value: Value) -> serde_json::Map<String, Value> {
+        let mut m = serde_json::Map::new();
+        m.insert(key.to_string(), value);
+        m
+    }
+
+    #[tokio::test]
+    async fn parse_is_deterministic_no_provider_call() {
+        // A stored flow is already valid — `parse`/`analyze` must never touch the provider.
+        let mock = Arc::new(MockProvider::new(["UNUSED".to_string()]));
+        let client = FlowClient::builder()
+            .model("mock")
+            .build(mock.clone(), temp_root("parse"))
+            .unwrap();
+        let ast = client.parse("flow\n  return $greeting").unwrap();
+        client.analyze(&ast).expect("a parsed flow analyzes clean");
+        assert_eq!(
+            mock.replies.lock().unwrap().len(),
+            1,
+            "parse + analyze must not call the provider (no reply was consumed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_with_seeds_a_var_no_literal() {
+        let client = FlowClient::builder()
+            .model("mock")
+            .build(MockProvider::one("noop"), temp_root("seed"))
+            .unwrap();
+        let ast = client.parse("flow\n  return $greeting").unwrap();
+        // Proof there is no baked-in value: the AST carries no `lit` node anywhere.
+        let astr = serde_json::to_string(&ast).unwrap();
+        assert!(
+            !astr.contains("\"lit\""),
+            "the flow must hold no literal: {astr}"
+        );
+
+        let out = client
+            .execute_with(&ast, one_input("greeting", json!("hello from settings")))
+            .await
+            .unwrap();
+        assert!(
+            out.result.contains("hello from settings"),
+            "the seeded value should surface as the result, got: {}",
+            out.result
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_with_isolates_runs() {
+        let client = FlowClient::builder()
+            .model("mock")
+            .build(MockProvider::one("noop"), temp_root("isolate"))
+            .unwrap();
+        let ast = client.parse("flow\n  return $greeting").unwrap();
+
+        let first = client
+            .execute_with(&ast, one_input("greeting", json!("first")))
+            .await
+            .unwrap();
+        assert!(first.result.contains("first"));
+
+        // The same stored AST, run again with NO seed: a fresh per-run store means run 1's seed must
+        // not leak in, so this references an unbound var and fails — proving per-run isolation.
+        let leaked = client.execute_with(&ast, serde_json::Map::new()).await;
+        assert!(
+            leaked.is_err(),
+            "run 1's seed must not leak into run 2 (got {leaked:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flow_bind_shadows_a_seed() {
+        // The flow re-binds `$greeting` from a file before returning it; the seed must lose.
+        let root = temp_root("shadow");
+        std::fs::write(root.join("note.txt"), "bound").unwrap();
+        let client = FlowClient::builder()
+            .model("mock")
+            .build(MockProvider::one("noop"), &root)
+            .unwrap();
+        let ast: DraftAst = serde_json::from_value(json!({
+            "body": [
+                { "kind": "bind", "name": "greeting",
+                  "value": { "kind": "call", "op": "read",
+                             "args": [ { "kind": "lit", "value": "note.txt" } ] } },
+                { "kind": "return", "value": { "kind": "var", "name": "greeting" } }
+            ]
+        }))
+        .unwrap();
+        let out = client
+            .execute_with(&ast, one_input("greeting", json!("seeded")))
+            .await
+            .unwrap();
+        assert!(
+            out.result.contains("bound") && !out.result.contains("seeded"),
+            "a flow-local bind shadows the seed, got: {}",
+            out.result
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_op_still_dispatches_through_the_envelope() {
+        // A seeded value flows into a custom op via `Executor::dispatch`...
+        let mut client = FlowClient::builder()
+            .auto_approve(true)
+            .build(MockProvider::one("noop"), temp_root("envelope"))
+            .unwrap();
+        client.register_op(Arc::new(EchoArgsTool));
+        let call: DraftAst = serde_json::from_value(json!({
+            "body": [ { "kind": "return", "value": {
+                "kind": "call", "op": "echo_args",
+                "args": [ { "kind": "var", "name": "greeting" } ] } } ]
+        }))
+        .unwrap();
+        let out = client
+            .execute_with(&call, one_input("greeting", json!("HELLO-SEED")))
+            .await
+            .unwrap();
+        assert!(
+            out.result.contains("HELLO-SEED"),
+            "the seeded value should reach the op, got: {}",
+            out.result
+        );
+
+        // ...and the envelope is not bypassed: a destructive op under the default DenyApprover is gated.
+        let mut denied = FlowClient::builder()
+            .build(MockProvider::one("noop"), temp_root("gated"))
+            .unwrap();
+        denied.register_op(Arc::new(BoomTool));
+        let boom: DraftAst = serde_json::from_value(json!({
+            "body": [ { "kind": "call", "op": "boom", "args": [] } ]
+        }))
+        .unwrap();
+        let res = denied.execute_with(&boom, serde_json::Map::new()).await;
+        let ran = res
+            .map(|r| r.result.contains("BOOM EXECUTED"))
+            .unwrap_or(false);
+        assert!(
+            !ran,
+            "a destructive op must be gated by the default approver"
         );
     }
 

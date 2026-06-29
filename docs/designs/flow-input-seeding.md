@@ -1,7 +1,18 @@
 # Design: parameterized flow execution (input seeding)
 
-**Status:** proposed (story [D-01](../stories/D-01-flow-input-seeding.md)) · **Layer:** L5
+**Status:** implemented (story [D-01](../stories/D-01-flow-input-seeding.md)) · **Layer:** L5
 (`flux-sdk`), reusing L1–L2 (`flux-lang`, `flux-flow`) · **Owner:** Timo
+
+> **As built.** Shipped as the two thin additions + a store primitive this design proposed, zero new
+> crates. `FlowStore::seed(session_id, name, value)` (`crates/flux-flow/src/state.rs`) = `put_value`
+> (via `Value::from_json`) + `bind` as `Visibility::Hidden` — so a seed resolves for `$name` (the
+> interpreter's `resolve` is visibility-agnostic) but never shows in the model-facing `view`.
+> `FlowClient::{parse, execute_with, run_flow}` (`crates/flux-sdk/src/flow.rs`) wrap `flux_lang::parse`
+> and reuse `execute_flow` + the envelope verbatim (a shared `finish_outcome` helper keeps `execute`
+> and `execute_with` from drifting). Resolved decisions: **isolation** = a **fresh per-run `FlowStore`**
+> (the "use a fresh store view per run" option below); **precedence** = a flow-local `bind` shadows a
+> seed (recommended default); **multi-turn** = **Option (A)**, one-shot — genuine top-level-`await` flows
+> still belong on `FlowEngine`, not built here speculatively.
 
 ## Why
 
