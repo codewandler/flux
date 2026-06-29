@@ -474,11 +474,11 @@ fn build_provider(spec: &str) -> Result<(NativeProvider, String)> {
 /// Build a keyword index of the workspace's documentation files (markdown/text), for the `search`
 /// tool. Deliberately cheap: doc extensions only, capped file count and size — code search is
 /// served by `grep`, not this. Errors are swallowed (an empty index just yields "no matches").
-async fn build_doc_index(system: &System) -> flux_datasource::Index {
+async fn build_doc_index(system: &System) -> flux_capabilities::datasource::Index {
     const DOC_EXTS: &[&str] = &[".md", ".txt", ".rst", ".adoc", ".mdx"];
     const MAX_DOCS: usize = 200;
     const MAX_BYTES: usize = 100_000;
-    let mut index = flux_datasource::Index::new();
+    let mut index = flux_capabilities::datasource::Index::new();
     let Ok(files) = system.walk_files(".", 4000).await else {
         return index;
     };
@@ -825,12 +825,14 @@ async fn build_agent(
 
     // Guarded web access (policy-gated as network egress; private/loopback per config).
     registry.register(Arc::new(
-        flux_browser::WebFetchTool::default().allow_private(cfg.allow_private_net),
+        flux_capabilities::browser::WebFetchTool::default().allow_private(cfg.allow_private_net),
     ));
 
     // Auto-index workspace docs (markdown/text, capped & cheap) for the `search` tool.
     let index = Arc::new(build_doc_index(&system).await);
-    registry.register(Arc::new(flux_datasource::SearchTool::new(index)));
+    registry.register(Arc::new(flux_capabilities::datasource::SearchTool::new(
+        index,
+    )));
 
     // Discover subprocess plugins (~/.flux/plugins/*.toml) and project their operations as tools.
     // Each plugin's host capabilities are the guarded System (same boundary as built-in tools).

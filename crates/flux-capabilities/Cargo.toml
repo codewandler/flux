@@ -1,9 +1,9 @@
 [package]
-name = "flux-browser"
+name = "flux-capabilities"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-description = "flux web access: a guarded web_fetch tool (no loopback/private egress). CDP browser automation is the planned upgrade behind this surface."
+description = "flux agent capabilities: a guarded web_fetch tool (browser) + an in-memory keyword search index (datasource)"
 
 [dependencies]
 flux-core.workspace = true
@@ -13,6 +13,7 @@ flux-system.workspace = true
 reqwest.workspace = true
 url.workspace = true
 async-trait.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]

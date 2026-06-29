@@ -1,5 +1,5 @@
-//! `flux-datasource` — a minimal in-memory document index with keyword search, exposed to the
-//! agent as a `search` tool.
+//! `datasource` — a minimal in-memory document index with keyword search, exposed to the agent as
+//! a `search` tool (the `datasource` module of `flux-capabilities`).
 //!
 //! v1 is a term-frequency keyword index (no embeddings): documents are scored by how many query
 //! terms they contain. The [`SearchTool`] makes an [`Index`] queryable by the model. Pluggable

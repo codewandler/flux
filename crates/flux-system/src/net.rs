@@ -1,5 +1,5 @@
 //! Network egress guard — the single SSRF policy reused by every surface that fetches a URL
-//! (`flux-browser`'s `web_fetch`, `flux-plugin`'s `http.do`).
+//! (`flux-capabilities`' `browser` web_fetch, `flux-plugin`'s `http.do`).
 //!
 //! Beyond rejecting non-HTTP schemes and raw private/loopback IP literals, this **resolves the
 //! host to IP addresses** and blocks the request if any resolved address is private, loopback,

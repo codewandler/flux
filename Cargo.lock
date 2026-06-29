@@ -654,7 +654,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "flux-browser"
+name = "flux-capabilities"
 version = "0.2.4"
 dependencies = [
  "async-trait",
@@ -663,6 +663,7 @@ dependencies = [
  "flux-spec",
  "flux-system",
  "reqwest",
+ "serde",
  "serde_json",
  "tokio",
  "url",
@@ -681,13 +682,12 @@ dependencies = [
  "flux-agent",
  "flux-app",
  "flux-auth",
- "flux-browser",
+ "flux-capabilities",
  "flux-cognition",
  "flux-config",
  "flux-context",
  "flux-core",
  "flux-credentials",
- "flux-datasource",
  "flux-eval",
  "flux-events",
  "flux-evidence",
@@ -783,20 +783,6 @@ dependencies = [
  "sha2",
  "tokio",
  "toml",
-]
-
-[[package]]
-name = "flux-datasource"
-version = "0.2.4"
-dependencies = [
- "async-trait",
- "flux-core",
- "flux-runtime",
- "flux-spec",
- "flux-system",
- "serde",
- "serde_json",
- "tokio",
 ]
 
 [[package]]

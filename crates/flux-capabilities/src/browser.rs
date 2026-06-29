@@ -1,4 +1,4 @@
-//! `flux-browser` — guarded web access for the agent.
+//! `browser` — guarded web access for the agent (the `browser` module of `flux-capabilities`).
 //!
 //! v1 ships a [`WebFetchTool`] that fetches a URL over HTTP(S) with an egress guard: it rejects
 //! non-HTTP schemes and (unless explicitly allowed) loopback/private/link-local addresses, the
@@ -17,7 +17,7 @@ const MAX_BYTES: usize = 256 * 1024;
 
 /// Reject URLs that aren't safe to fetch. Delegates to the shared egress guard in `flux-system`
 /// (the single SSRF policy: scheme check + host→IP resolution against private/loopback/link-local
-/// ranges). Re-exported here so callers and tests of `flux-browser` keep a stable entry point.
+/// ranges). Re-exported here so callers and tests of the `browser` module keep a stable entry point.
 pub fn guard_url(raw: &str, allow_private: bool) -> Result<url::Url> {
     flux_system::net::guard_url(raw, allow_private)
 }
