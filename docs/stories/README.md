@@ -31,6 +31,7 @@ _(none)_
 ## Backlog (unranked — promote to **Next** with a `priority` when ready)
 - [L-02 — flux-markdown engine + progressive-disclosure skills](L-02-flux-markdown-engine.md) · Language · AST parser, body-on-demand activation
 - [L-03 — Native-text program/app grammar](L-03-native-text-program-grammar.md) · Language · author `agents`/`channels`/`triggers`/`journeys` in flux-lang text, not JSON; surfaced by the Slack-channel assistant `bot.flux`
+- [D-11 — App-runner ergonomics for declarative bots](D-11-app-runner-ergonomics.md) · Agent · configurable `flux app run` knowledge ingest + OpenAPI + persona/event-context-from-file; blocks Slack-channel assistant S-03/S-06
 
 ### Downstream enablement (managed-agents) — queued behind the active Slack-channel assistant stack above
 These support the multi-tenant **managed-agents** service (path-dep consumer). The Slack-channel assistant's integration stack
