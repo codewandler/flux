@@ -1,7 +1,7 @@
 {
-  "name": "improve_tbench",
-  "params": [],
+  "name": "improve_synthetic",
   "returns": { "named": "EvalReport" },
+  "params": [],
   "body": [
     {
       "kind": "bind",
@@ -11,14 +11,10 @@
         "op": "eval_run",
         "args": [
           { "kind": "lit", "value": {
-            "adapter": "terminal-bench",
-            "tasks": ["chess-best-move", "fibonacci-server"],
-            "trials": 3,
-            "dataset": "terminal-bench-core==0.1.1",
+            "adapter": "synthetic",
+            "trials": 5,
             "model": "anthropic/claude-sonnet-4-6",
-            "flux_binary": "target/x86_64-unknown-linux-musl/release/flux",
-            "agent_timeout_secs": 180,
-            "rebuild": true
+            "flux_bin": "target/debug/flux"
           } }
         ]
       }
@@ -36,7 +32,7 @@
         "op": "task",
         "args": [
           { "kind": "lit", "value": "reviewer" },
-          { "kind": "lit", "value": "These are flux's terminal-bench results. Each failing case names a task, a failure_mode, and (when partial) which sub-checks failed (failed_checks). Identify flux HARNESS improvements (tools, tool output/views, system prompt, a new tool, or an agent-loop efficiency fix) that would help flux pass more. Results:\n{{baseline}}\n\nReturn ONLY a JSON array: [{\"area\":..,\"symptom\":..,\"suggested_fix\":..,\"severity\":1-5}]." }
+          { "kind": "lit", "value": "These are flux's synthetic coding-riddle results: short self-contained problems that ask the agent to write `solution.py`, graded objectively on `python3 solution.py` stdout. Each failing case names a task and a failure_mode. Identify flux HARNESS improvements (tools, tool output/views, system prompt, a new tool, or an agent-loop efficiency fix) that would help flux solve more riddles on the first attempt — not changes to any single riddle. Results:\n{{baseline}}\n\nReturn ONLY a JSON array: [{\"area\":..,\"symptom\":..,\"suggested_fix\":..,\"severity\":1-5}]." }
         ]
       }
     },
@@ -62,7 +58,7 @@
             "op": "task",
             "args": [
               { "kind": "lit", "value": "planner" },
-              { "kind": "lit", "value": "Turn these flux-harness improvement candidates into AT MOST 2 concrete, small, safe engineering tasks for the flux codebase (tool specs, tool output/views, system prompt, a new tool, or an agent-loop efficiency fix). Do NOT touch crates/flux-eval, bench/, the loop flows, or CI. Candidates:\n{{candidates}}\n\nReturn ONLY the JSON array of tasks." }
+              { "kind": "lit", "value": "Turn these flux-harness improvement candidates into AT MOST 2 concrete, small, safe engineering tasks for the flux codebase (tool specs, tool output/views, system prompt, a new tool, or an agent-loop efficiency fix). Do NOT touch crates/flux-eval, bench/, the loop flows, the synthetic suite, or CI. Candidates:\n{{candidates}}\n\nReturn ONLY the JSON array of tasks." }
             ]
           }
         },
@@ -98,14 +94,10 @@
                 "op": "eval_run",
                 "args": [
                   { "kind": "lit", "value": {
-                    "adapter": "terminal-bench",
-                    "tasks": ["chess-best-move", "fibonacci-server"],
-                    "trials": 3,
-                    "dataset": "terminal-bench-core==0.1.1",
+                    "adapter": "synthetic",
+                    "trials": 5,
                     "model": "anthropic/claude-sonnet-4-6",
-                    "flux_binary": "target/x86_64-unknown-linux-musl/release/flux",
-                    "agent_timeout_secs": 180,
-                    "rebuild": true
+                    "flux_bin": "target/debug/flux"
                   } }
                 ]
               }
@@ -124,13 +116,13 @@
               },
               "then": [
                 { "kind": "call", "op": "git_stage", "args": [ { "kind": "lit", "value": ["."] } ] },
-                { "kind": "call", "op": "git_commit", "args": [ { "kind": "lit", "value": "improve: adopt candidate (terminal-bench gain)" } ] },
-                { "kind": "call", "op": "git_tag", "args": [ { "kind": "lit", "value": "improve-tbench-{{cand_score}}" } ] },
+                { "kind": "call", "op": "git_commit", "args": [ { "kind": "lit", "value": "improve: adopt candidate (synthetic gain)" } ] },
+                { "kind": "call", "op": "git_tag", "args": [ { "kind": "lit", "value": "improve-synthetic-{{cand_score}}" } ] },
                 {
                   "kind": "call",
                   "op": "improve_log",
                   "args": [
-                    { "kind": "lit", "value": { "bench": "terminal-bench", "decision": "kept", "reason": "candidate_beat_baseline", "base_score": "{{base_score}}", "cand_score": "{{cand_score}}", "tag": "improve-tbench-{{cand_score}}", "guard": "{{guard}}", "gate": "{{gate}}", "tasks": "{{tasks}}" } }
+                    { "kind": "lit", "value": { "bench": "synthetic", "decision": "kept", "reason": "candidate_beat_baseline", "base_score": "{{base_score}}", "cand_score": "{{cand_score}}", "tag": "improve-synthetic-{{cand_score}}", "guard": "{{guard}}", "gate": "{{gate}}", "tasks": "{{tasks}}" } }
                   ]
                 },
                 {
@@ -145,7 +137,7 @@
                   "kind": "call",
                   "op": "improve_log",
                   "args": [
-                    { "kind": "lit", "value": { "bench": "terminal-bench", "decision": "reverted", "reason": "no_improvement", "base_score": "{{base_score}}", "cand_score": "{{cand_score}}", "guard": "{{guard}}", "gate": "{{gate}}", "tasks": "{{tasks}}" } }
+                    { "kind": "lit", "value": { "bench": "synthetic", "decision": "reverted", "reason": "no_improvement", "base_score": "{{base_score}}", "cand_score": "{{cand_score}}", "guard": "{{guard}}", "gate": "{{gate}}", "tasks": "{{tasks}}" } }
                   ]
                 }
               ]
@@ -157,7 +149,7 @@
               "kind": "call",
               "op": "improve_log",
               "args": [
-                { "kind": "lit", "value": { "bench": "terminal-bench", "decision": "reverted", "reason": "gate_failed", "base_score": "{{base_score}}", "guard": "{{guard}}", "gate": "{{gate}}", "tasks": "{{tasks}}" } }
+                { "kind": "lit", "value": { "bench": "synthetic", "decision": "reverted", "reason": "gate_failed", "base_score": "{{base_score}}", "guard": "{{guard}}", "gate": "{{gate}}", "tasks": "{{tasks}}" } }
               ]
             }
           ]

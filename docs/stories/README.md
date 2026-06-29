@@ -9,14 +9,17 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 > frontmatter may automate this later — see the docs map.)
 
 ## Status
-- **Released:** v0.2.4 (2026-06-25). **In flight (`[Unreleased]`):** global multi-format skills
-  (project + `~/.flux`/`~/.agents`/`~/.claude`, Agent-Skills/Claude format, new `flux-markdown` L0
-  crate); provider wire robustness — OpenRouter/Ollama via the Anthropic Messages protocol + inline
-  tool-call recovery. See [CHANGELOG](../../CHANGELOG.md).
+- **Released:** v0.2.4 (2026-06-25). **In flight (`[Unreleased]`):** one agent loop everywhere
+  (classic `flux-agent::Agent` retired) with per-turn token usage flowing through it; global
+  multi-format skills; A2A client; provider wire robustness (OpenRouter/Ollama via the Anthropic
+  Messages protocol); and the self-improvement offline half — partial-credit tag scalar, durable token
+  capture, and a stable-baseline synthetic loop. See [CHANGELOG](../../CHANGELOG.md).
 - **Gate:** green — `cargo test` · `clippy -D warnings` · `fmt` · the `flux-codegate` layering lint.
 
 ## Now (in progress)
-_(none)_
+- [I-01 — Statistically clean headline gain](I-01-headline-gain.md) · Improve · offline half done
+  (partial-credit scalar + durable token capture + synthetic `trials = 5` loop); the trials ≥ 5
+  grader-confirmed run is **staged** on a funded provider key
 
 ## Next (ready — take the top one unless the user named a story)
 _(none ready — promote one from Backlog below)_
@@ -27,7 +30,6 @@ _(none)_
 ## Backlog (unranked — promote to **Next** with a `priority` when ready)
 - [L-02 — flux-markdown engine + progressive-disclosure skills](L-02-flux-markdown-engine.md) · Language · AST parser, body-on-demand activation
 - [C-01 — Crate consolidation, phases 2–4](C-01-crate-consolidation.md) · Core · 33 → ~28–29 crates
-- [I-01 — Statistically clean headline gain](I-01-headline-gain.md) · Improve · trials ≥ 3, grader-confirmed
 
 ## Done
 - [A-02 — A2A client (`flux a2a <URL>`)](A-02-a2a-client.md) · Agent · consume a remote A2A agent like a local one; server clean-cutover to the current spec (see [CHANGELOG](../../CHANGELOG.md))

@@ -16,7 +16,7 @@
             "kind": "lit",
             "value": {
               "adapter": "multi",
-              "trials": 2,
+              "trials": 3,
               "model": "anthropic/claude-sonnet-4-6",
               "flux_bin": "target/x86_64-unknown-linux-musl/release/flux",
               "members": [
@@ -190,7 +190,7 @@
                     "kind": "lit",
                     "value": {
                       "adapter": "multi",
-                      "trials": 2,
+                      "trials": 3,
                       "model": "anthropic/claude-sonnet-4-6",
                       "flux_bin": "target/x86_64-unknown-linux-musl/release/flux",
                       "members": [

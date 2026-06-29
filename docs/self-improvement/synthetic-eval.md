@@ -54,3 +54,9 @@ candidate is strictly better **and** no member regressed (`pass_rate` & check-ra
   freshly-rebuilt musl binary (terminal-bench via `flux_binary`, synthetic via the top-level `flux_bin`),
   so the loop scores the worker's edits, not a stale binary.
 - Ad-hoc synthetic-only flow: `examples/eval-synthetic.flux`.
+- **Synthetic-only self-improvement loop:** `examples/improve-synthetic.flux` (runner
+  `bench/run-synthetic-loop.sh`) — the keep/revert loop gated on single-member `score_compare`, at
+  **trials = 5**. No Docker and no musl: the candidate's edits are measured through `gate_check`'s
+  `target/debug/flux` rebuild, so a round is cheap enough to run trials ≥ 5 for a statistically clean,
+  stable-baseline headline gain. This is the recommended vehicle for closing the "clean headline gain"
+  gap in [STATUS.md](STATUS.md).

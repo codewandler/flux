@@ -130,9 +130,14 @@ impl SuiteScore {
         }
     }
 
-    /// A single committable scalar for tags/reporting: `round(pass_rate * 1000)` (e.g. 0.857 → 857).
+    /// A single committable scalar for tags/reporting: `round(mean_check_pass_rate * 1000)` (e.g.
+    /// 0.833 → 833). Tracks the **sub-check** pass-rate (partial credit), not the full-pass-rate, so a
+    /// candidate that improves only on sub-checks without flipping a full pass tags meaningfully
+    /// (`improve-tbench-833`) instead of `improve-tbench-0`. `mean_check_pass_rate >= pass_rate`
+    /// always, and equals it for binary adapters (e.g. the synthetic suite), so the scalar is
+    /// unchanged there.
     pub fn scalar(&self) -> u32 {
-        (self.pass_rate * 1000.0).round() as u32
+        (self.mean_check_pass_rate * 1000.0).round() as u32
     }
 
     /// Is `self` strictly better than `baseline`? Lexicographic: higher full-pass-rate wins; on a tie,
@@ -255,8 +260,24 @@ mod tests {
         let s = SuiteScore::from_results(&results, weights);
         assert_eq!(s.total, 2);
         assert_eq!(s.passed, 1);
+        // For a binary suite the check-rate equals the pass-rate, so the partial-credit scalar fix
+        // leaves this case unchanged.
+        assert!((s.mean_check_pass_rate - s.pass_rate).abs() < 1e-9);
         assert!((s.pass_rate - 0.75).abs() < 1e-9); // 3/(3+1)
         assert_eq!(s.scalar(), 750);
+    }
+
+    #[test]
+    fn scalar_tracks_partial_credit() {
+        // A candidate that passes no task fully but clears 5/6 sub-checks must tag as 833, not 0 —
+        // the scalar tracks mean_check_pass_rate, so partial-credit-only gains read meaningfully.
+        let mut r = result("a", false, 0, 1);
+        r.checks_passed = 5;
+        r.checks_total = 6;
+        let s = SuiteScore::from_results(&[r], |_| 1.0);
+        assert!((s.pass_rate - 0.0).abs() < 1e-9);
+        assert!((s.mean_check_pass_rate - 5.0 / 6.0).abs() < 1e-9);
+        assert_eq!(s.scalar(), 833); // round(0.8333 * 1000)
     }
 
     #[test]

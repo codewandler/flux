@@ -16,6 +16,17 @@ All notable changes to this project are documented in this file. The format is b
   cached tokens with the hit-rate** (e.g. `1 step · 90ms · ctx 1.4k · out 60 · cache 1.2k (87% hit)`);
   it stays clean (no all-zero noise) on offline `-m mock` turns. The SDK `Client` now also populates
   `TurnOutput.usage`. (Previously usage was dropped through the flux-lang loop — `turn_end(None)`.)
+  Per-turn usage is now also **persisted** to the unified event store on the `TurnEnded` event
+  (serde-default, so older logs still decode) and summed back by the eval runner (`load_usage` →
+  `RunResult.tokens`), so `mean_tokens` becomes a real keep/revert tiebreaker for the self-improvement
+  loop instead of always reading 0.
+- **Stable-baseline self-improvement loop on the synthetic suite.** A new no-Docker loop —
+  `examples/improve-synthetic.flux` (adapter `synthetic`, **trials = 5**, strict `score_compare`) with
+  its runner `bench/run-synthetic-loop.sh` — drives the keep/revert loop against the 16 deterministic,
+  objectively-graded coding riddles. The candidate's edits are measured via `gate_check`'s
+  `target/debug/flux` rebuild (no musl), so a round is cheap enough to run trials ≥ 5 for a
+  statistically clean gain. The flow is added to the loop's `PROTECTED` paths and the flow-validation
+  test.
 - **A2A client — `flux a2a <URL>`.** flux can now *consume* a remote A2A agent, not just expose one:
   `flux a2a <URL>` connects to any spec-conformant Agent-to-Agent agent and drives it from the CLI
   like a local agent — an interactive REPL, or a one-shot turn from command-line prompt words or
@@ -68,6 +79,11 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Self-improvement tag scalar is partial-credit-aware.** `SuiteScore::scalar()` now returns
+  `round(mean_check_pass_rate * 1000)` instead of `round(pass_rate * 1000)`, so a candidate that
+  improves only on sub-checks (partial credit) tags meaningfully (e.g. `improve-tbench-833`) instead of
+  the misleading `improve-tbench-0`. Unchanged for binary adapters where `mean_check_pass_rate ==
+  pass_rate` (e.g. the synthetic suite).
 - **OpenRouter / local-model wire robustness (Messages path).** The shared parser tolerates the
   malformations real gateways and models emit: `null` usage counters, the OpenAI-style `[DONE]` stream
   sentinel, and tool-input JSON with trailing junk or an unterminated tail (off-by-one braces / open

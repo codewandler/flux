@@ -96,10 +96,13 @@ comparison is strictly lexicographic, so a faster-but-wronger agent can never ou
 2. higher **sub-check pass-rate** (`mean_check_pass_rate`, partial credit), then
 3. fewer tool-errors, then fewer iterations, then fewer tokens.
 
-The committable scalar baked into a tag is currently `round(pass_rate * 1000)`. This is a known
-cosmetic limitation: a candidate that improves only on partial credit (sub-checks) without flipping a
-full pass tags as `improve-tbench-0`, because the scalar tracks full-pass-rate, not the check-rate that
-actually drove the keep. See STATUS → known gaps.
+The committable scalar baked into a tag is `round(mean_check_pass_rate * 1000)` — the **sub-check**
+pass-rate, so a candidate that improves only on partial credit (without flipping a full pass) tags
+meaningfully (`improve-tbench-833`) instead of the misleading `improve-tbench-0`. It equals
+`round(pass_rate * 1000)` for binary adapters (e.g. the synthetic suite), where `mean_check_pass_rate
+== pass_rate`. The `mean_tokens` tiebreaker is likewise real now: per-turn `Usage` is persisted on the
+event store's `TurnEnded` and summed back into `RunResult.tokens` (the local/synthetic adapter; the
+terminal-bench in-container case is tracked in STATUS).
 
 ## The sub-agent roles
 
@@ -126,8 +129,10 @@ A `BenchmarkAdapter` trait keeps benchmarks behind one seam:
   back to the reviewer as the per-case transcript. Grading is terminal-bench's own (authoritative).
 - **synthetic** (real-model, no Docker) — `LocalAdapter::synthetic()`: short self-contained coding
   riddles with known answers (`crates/flux-eval/assets/synthetic-suite.json`), graded on the produced
-  program's stdout. A fast, cheap diagnostic workload — run ad-hoc with `flux eval synthetic`. See
-  [synthetic-eval.md](synthetic-eval.md).
+  program's stdout. A fast, cheap diagnostic workload — run ad-hoc with `flux eval synthetic`, **or as
+  the stable-baseline self-improvement loop** (`examples/improve-synthetic.flux`, runner
+  `bench/run-synthetic-loop.sh`). Because grading is deterministic and there's no Docker, it is the
+  cheap, low-noise vehicle for a trials ≥ 5 headline gain. See [synthetic-eval.md](synthetic-eval.md).
 - **multi** — `MultiAdapter`: run several adapters behind **one combined score** (ids namespaced
   `<member>:<id>`). The keep-gate `score_compare_multi` refuses a candidate that lifts the combined mean
   while regressing any member, so terminal-bench + synthetic can be graded together without one masking
@@ -160,9 +165,11 @@ Observation tooling (in `bench/`, no extra deps):
 
 ## The loop + the offline smoke
 
-There is one real self-improvement loop — **terminal-bench** (`examples/improve-tbench.flux`, runner
-`bench/run-tbench-loop.sh`). For free, provider-less, Docker-less validation of the *flow machinery*
-(op wiring, mining, aggregation), there is a mock smoke:
+There are two real self-improvement loops behind the same machinery: **terminal-bench**
+(`examples/improve-tbench.flux`, runner `bench/run-tbench-loop.sh`) — the hard, Docker-backed eval —
+and **synthetic** (`examples/improve-synthetic.flux`, runner `bench/run-synthetic-loop.sh`) — the
+stable-baseline, no-Docker eval used for a clean trials ≥ 5 headline gain. For free, provider-less,
+Docker-less validation of the *flow machinery* (op wiring, mining, aggregation), there is a mock smoke:
 `flux flow run examples/eval-smoke.flux -m mock`. The smoke is a CI fixture, not an evaluation.
 
 (There is no toy "local suite" loop — the former `suites/` + `examples/improve.flux` +
@@ -171,7 +178,8 @@ There is one real self-improvement loop — **terminal-bench** (`examples/improv
 ## Running it
 
 ```sh
-bash bench/run-tbench-loop.sh                    # the real self-improvement loop (terminal-bench)
+bash bench/run-synthetic-loop.sh                 # stable-baseline self-improvement loop (synthetic, no Docker)
+bash bench/run-tbench-loop.sh                    # the hard self-improvement loop (terminal-bench, Docker)
 flux flow run examples/eval-smoke.flux -m mock   # offline smoke of the flow machinery (no provider/Docker)
 ```
 

@@ -30,6 +30,7 @@ const PROTECTED: &[&str] = &[
     ".github",
     "examples/improve-tbench.flux",
     "examples/improve-multi.flux",
+    "examples/improve-synthetic.flux",
     "examples/eval-synthetic.flux",
     "examples/eval-smoke.flux",
 ];

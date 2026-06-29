@@ -1,6 +1,6 @@
 # Self-improvement: status & journey
 
-_Last updated: 2026-06-27._
+_Last updated: 2026-06-29._
 
 This is the honest, dated record of where the self-improvement loop stands and how it got here —
 including the bugs each live run surfaced, the first kept gain, and the caveats that keep the claims
@@ -139,11 +139,17 @@ was valid and the revert was correct — the loop did not reward a plausible-but
 
 ## Hardening landed (all on `main`, gate green)
 
+- **Stable-baseline synthetic loop + partial-credit-aware scalar + durable token capture** (I-01,
+  offline half). `SuiteScore::scalar()` now tracks `mean_check_pass_rate` (a sub-check-only gain tags
+  `…-833`, not `…-0`); per-turn `Usage` is persisted on the event store's `TurnEnded` and summed back
+  into `RunResult.tokens` (the `mean_tokens` tiebreaker is real for the local/synthetic adapter); and
+  `examples/improve-synthetic.flux` + `bench/run-synthetic-loop.sh` add a no-Docker, `trials = 5`
+  loop on the 16-riddle synthetic suite — the vehicle for the still-open clean headline gain.
 - **Partial-credit scoring** — the terminal-bench adapter parses `parser_results` into
   `mean_check_pass_rate`, used as the first tiebreaker after full-pass-rate, so the loop sees 5/6 → 6/6
   progress instead of only binary pass/fail (`2199477`).
-- **trials = 2** in `improve-tbench.flux`, plus a **per-decision audit log** appended to
-  `.flux/eval/improve-log.jsonl` each round (`81fe021`).
+- **trials = 3** (raised from 2) in `improve-tbench.flux` / `improve-multi.flux`, plus a
+  **per-decision audit log** appended to `.flux/eval/improve-log.jsonl` each round (`81fe021`).
 - **Tracked sub-agent roles** in `crates/flux-eval/agents/`, seeded into the worktree by the runner (`4930bf9`).
 - **Observability** — `bench/watch-agent.sh` (live in-container pane) + `bench/replay-agent.sh`
   (asciinema cast replay, no API) (`7499649`).
@@ -170,14 +176,19 @@ was valid and the revert was correct — the loop did not reward a plausible-but
 
 ## Known gaps
 
-- **Partial-credit-aware tag scalar.** `scalar()` is `round(pass_rate*1000)`, so partial-credit-only
-  gains tag as `improve-tbench-0`. Make the scalar reflect `mean_check_pass_rate` so tags read
-  meaningfully (e.g. `improve-tbench-833`).
-- **A statistically clean headline gain.** Run with **trials ≥ 3** on a task whose baseline is stable,
-  so the kept gain isn't flattered by a noisy-low baseline.
-- **Token/cost capture.** terminal-bench reports 0 tokens for flux; needs flux-flow `Usage` plumbing
-  into `RunResult.tokens` (so `mean_tokens` becomes a real tiebreaker). Deferred — flux-flow is under
-  concurrent edit. (Task #12.)
+- **Partial-credit-aware tag scalar.** ✅ Resolved — `SuiteScore::scalar()` now returns
+  `round(mean_check_pass_rate*1000)`, so a partial-credit-only gain tags as `improve-tbench-833`
+  rather than `-0`. Faithful for binary adapters (where `mean_check_pass_rate == pass_rate`).
+- **A statistically clean headline gain.** Still open, but now has a stable-baseline vehicle: the
+  **synthetic** suite (16 deterministic, objectively-graded riddles, no Docker). Run
+  `bench/run-synthetic-loop.sh` (`examples/improve-synthetic.flux`, **trials = 5**, strict
+  `score_compare`) on a calibrated, stable baseline so the kept gain isn't flattered by noise.
+- **Token/cost capture.** ✅ Resolved for the local/synthetic adapter. flux-flow now surfaces per-turn
+  `Usage` through the loop (commit `b9a0b06`); the events store persists it on `TurnEnded`, and the
+  eval runner sums it back via `load_usage` into `RunResult.tokens`, so `mean_tokens` is a real
+  lexicographic tiebreaker. *Still open for terminal-bench:* its flux runs inside the container, so the
+  tally must be extracted from the container's `~/.flux/events.db` (the same `TurnEnded.usage` is now
+  recorded there). (Task #12.)
 - **In-container metrics.** flux's RunEvent trace lives inside the container, so `mean_iterations` /
   `mean_tokens` read 0 for terminal-bench; extract `~/.flux/flow.db` from the container for
   deterministic mining.
@@ -190,7 +201,11 @@ was valid and the revert was correct — the loop did not reward a plausible-but
 1. **Bring the kept prompt fix to `main`** — `3c86874` (runtime verification + background-server +
    confirm-port) is genuinely good guidance for any shell task and currently lives only on the loop's
    branch.
-2. **Fix the tag scalar** to be partial-credit-aware (small, in `score.rs`).
-3. **One trials ≥ 3 run** on a stable-baseline task for a clean, defensible headline gain.
+2. ~~**Fix the tag scalar** to be partial-credit-aware~~ — ✅ done (`score.rs`,
+   `round(mean_check_pass_rate*1000)`).
+3. **One trials ≥ 5 run on the synthetic suite** for a clean, defensible headline gain — the loop
+   (`bench/run-synthetic-loop.sh` → `examples/improve-synthetic.flux`) is wired and gate-green; first
+   calibrate the baseline (`flux eval synthetic --trials 5 …`, twice) to confirm it's stable and has
+   headroom, then drive rounds until a strict kept gain.
 4. Optionally, a tracked pre-commit hook to mechanically block un-`fmt`'d commits (enforces the process
    rule above).
