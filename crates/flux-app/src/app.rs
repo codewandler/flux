@@ -249,7 +249,7 @@ impl Engine {
             // An `agent`-bound trigger wakes an agent turn (the model drives RAG + granted tools over
             // the thread's persistent session); otherwise it runs a journey (a fixed DAG), unchanged.
             let run = match trigger.agent.as_deref() {
-                Some(agent) => self.run_agent(agent, payload).await?,
+                Some(agent) => self.run_agent(agent, label, payload).await?,
                 None => self.run_journey(&trigger.run, payload, sink).await?,
             };
             runs.push(run);
@@ -379,20 +379,23 @@ impl Engine {
     /// Run one agent turn for an `agent`-bound trigger: the model drives RAG + granted tools over the
     /// thread's persistent session, and the assistant's reply becomes the run result (the channel posts
     /// it). The conversation id (a Slack thread ts) binds repeated events to one session.
-    async fn run_agent(&self, name: &str, payload: &Value) -> Result<JourneyRun> {
+    async fn run_agent(&self, name: &str, label: &str, payload: &Value) -> Result<JourneyRun> {
         let engine = self.agent_engine(name)?;
         let conversation = payload
             .get("conversation")
             .or_else(|| payload.get("thread"))
             .and_then(|v| v.as_str());
         let session_id = self.session_for(name, conversation)?;
-        let input = payload
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
+        // The turn's input: a real user message (a Slack mention's `text`) when present; otherwise
+        // synthesize the event context so an event-driven agent (a `startup`/schedule trigger carries no
+        // `text`) still wakes to a concrete turn naming the trigger that fired it (flux D-11).
+        let input = match payload.get("text").and_then(|v| v.as_str()) {
+            Some(t) if !t.trim().is_empty() => t.to_string(),
+            _ => event_context(label, payload),
+        };
         let mut sink = RecordingSink::default();
         engine
-            .run_turn(&session_id, input, &mut sink)
+            .run_turn(&session_id, &input, &mut sink)
             .await
             .map_err(other)?;
         Ok(JourneyRun {
@@ -496,6 +499,26 @@ fn build_agent_engine(
     let flow = FlowStore::in_memory_with_events(events.clone()).map_err(other)?;
     spec.assemble(provider, registry, approver, ctx, events, flow)
         .map_err(other)
+}
+
+/// Synthesize a turn input for an `agent`-bound trigger whose event carries no user `text` (a `startup`
+/// or a schedule tick, vs. a Slack mention). The agent's system prompt says what to do per event; this
+/// hands it a concrete turn naming the trigger that woke it, plus any payload fields (e.g. a tick's
+/// `at`), so an event-driven agent acts instead of waking to an empty prompt (flux D-11).
+fn event_context(label: &str, payload: &Value) -> String {
+    let mut s = format!("You were woken by the `{label}` trigger (event `{label}`).");
+    if let Some(obj) = payload.as_object() {
+        let fields: Vec<String> = obj
+            .iter()
+            .filter(|(k, _)| k.as_str() != "text")
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        if !fields.is_empty() {
+            s.push_str(&format!(" Event data: {}.", fields.join(", ")));
+        }
+    }
+    s.push_str(" Act according to your instructions for this event.");
+    s
 }
 
 /// Seed an event's payload into the journey's session so the flow can read it: the whole payload binds
