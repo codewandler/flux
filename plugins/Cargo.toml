@@ -6,8 +6,9 @@
 resolver = "2"
 members = [
     "host-kit",
-    # plugins are added here as each lands (websearch, gitlab, jira, confluence, kubernetes, loki,
-    # prometheus, slack)
+    "websearch",
+    "gitlab",
+    # remaining plugins added as each lands (jira, confluence, kubernetes, loki, prometheus, slack)
 ]
 
 [workspace.package]
