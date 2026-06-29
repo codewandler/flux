@@ -58,6 +58,35 @@ pub struct ProcessOutput {
     pub exit_code: i64,
 }
 
+/// A drained snapshot of a host-managed background process (from [`Host::process_read`]): the output
+/// accumulated since the previous read plus the current liveness.
+pub struct ProcRead {
+    /// stdout accumulated since the last read (drained).
+    pub stdout: String,
+    /// stderr accumulated since the last read (drained).
+    pub stderr: String,
+    /// Whether the process is still running.
+    pub running: bool,
+    /// The exit code once it has exited (`None` while running).
+    pub exit_code: Option<i64>,
+}
+
+/// Liveness of a host-managed background process (from [`Host::process_status`]).
+pub struct ProcStatus {
+    /// Whether the process is still running.
+    pub running: bool,
+    /// The exit code once it has exited (`None` while running).
+    pub exit_code: Option<i64>,
+}
+
+/// A binary HTTP response (from [`Host::http_bytes`]): the raw response bytes, never text-truncated.
+pub struct HttpBytesResponse {
+    /// HTTP status code.
+    pub status: u16,
+    /// The raw response body bytes.
+    pub bytes: Vec<u8>,
+}
+
 impl HttpResponse {
     /// Parse the body as JSON.
     pub fn json(&self) -> Result<Value, String> {
@@ -177,6 +206,111 @@ impl Host<'_> {
                 .to_string(),
             exit_code: v.get("exit_code").and_then(|x| x.as_i64()).unwrap_or(-1),
         })
+    }
+
+    /// Spawn an allow-listed **long-lived background** subprocess through the host (e.g.
+    /// `kubectl port-forward`). `argv[0]` must be in the plugin's granted `process` capabilities; the
+    /// optional `env` overrides are applied on top of the host's cleared+allow-listed environment.
+    /// Returns an opaque `proc_id` for [`process_read`](Self::process_read) /
+    /// [`process_status`](Self::process_status) / [`process_kill`](Self::process_kill) — the proc
+    /// persists across op calls, so start it in one call and stop it in a later one.
+    pub fn process_spawn(&mut self, argv: &[&str], env: &[(&str, &str)]) -> Result<u64, String> {
+        let mut payload = json!({ "argv": argv });
+        if !env.is_empty() {
+            let map: serde_json::Map<String, Value> = env
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), json!(v)))
+                .collect();
+            payload["env"] = Value::Object(map);
+        }
+        let v = self.inner.host_call("process.spawn", payload)?;
+        v.get("proc_id")
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| "process.spawn: host returned no proc_id".into())
+    }
+
+    /// Drain the output a background process has produced since the last read, plus its liveness.
+    pub fn process_read(&mut self, proc_id: u64) -> Result<ProcRead, String> {
+        let v = self
+            .inner
+            .host_call("process.read", json!({ "proc_id": proc_id }))?;
+        Ok(ProcRead {
+            stdout: v
+                .get("stdout")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            stderr: v
+                .get("stderr")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            running: v.get("running").and_then(|x| x.as_bool()).unwrap_or(false),
+            exit_code: v.get("exit_code").and_then(|x| x.as_i64()),
+        })
+    }
+
+    /// Poll a background process's liveness (non-blocking) without draining its output.
+    pub fn process_status(&mut self, proc_id: u64) -> Result<ProcStatus, String> {
+        let v = self
+            .inner
+            .host_call("process.status", json!({ "proc_id": proc_id }))?;
+        Ok(ProcStatus {
+            running: v.get("running").and_then(|x| x.as_bool()).unwrap_or(false),
+            exit_code: v.get("exit_code").and_then(|x| x.as_i64()),
+        })
+    }
+
+    /// Kill a background process and drop it from the host registry.
+    pub fn process_kill(&mut self, proc_id: u64) -> Result<(), String> {
+        self.inner
+            .host_call("process.kill", json!({ "proc_id": proc_id }))?;
+        Ok(())
+    }
+
+    /// Make an HTTP request with a **byte-exact** body and/or response — for binary upload/download
+    /// (file uploads, attachment fetches) where the text [`http`](Self::http) path would corrupt
+    /// non-UTF-8 bytes. `body` (when set) is sent verbatim; `binary_response` asks the host to return
+    /// the raw response bytes (otherwise the response body's bytes are its UTF-8 text). `auth_purpose`
+    /// is injected by the host exactly as for [`http`](Self::http) — the plugin never sees the token.
+    pub fn http_bytes(
+        &mut self,
+        method: &str,
+        url: &str,
+        auth_purpose: Option<&str>,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+        binary_response: bool,
+    ) -> Result<HttpBytesResponse, String> {
+        let mut payload = json!({ "method": method, "url": url });
+        if let Some(p) = auth_purpose {
+            payload["auth_purpose"] = json!(p);
+        }
+        if !headers.is_empty() {
+            let map: serde_json::Map<String, Value> = headers
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), json!(v)))
+                .collect();
+            payload["headers"] = Value::Object(map);
+        }
+        if let Some(b) = body {
+            payload["body_b64"] = json!(base64::engine::general_purpose::STANDARD.encode(b));
+        }
+        if binary_response {
+            payload["response_binary"] = json!(true);
+        }
+        let v = self.inner.host_call("http.do", payload)?;
+        let status = v.get("status").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
+        let bytes = if let Some(b64) = v.get("body_b64").and_then(|x| x.as_str()) {
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| format!("http_bytes: bad body_b64: {e}"))?
+        } else if let Some(s) = v.get("body").and_then(|x| x.as_str()) {
+            s.as_bytes().to_vec()
+        } else {
+            Vec::new()
+        };
+        Ok(HttpBytesResponse { status, bytes })
     }
 
     /// Contribute records to the host's datasource index (they become searchable knowledge).
@@ -430,6 +564,16 @@ pub struct MockHost {
     pub endpoints: HashMap<String, String>,
     /// `(argv-substring) -> stdout string for process.run` (matched in insertion order).
     pub process: Vec<(String, String)>,
+    /// The `proc_id` returned by every `process.spawn`.
+    pub spawn_proc_id: u64,
+    /// Canned `process.read` output `(stdout, stderr)`.
+    pub proc_output: (String, String),
+    /// Liveness reported by `process.read` / `process.status`.
+    pub proc_running: bool,
+    /// Exit code reported once not running.
+    pub proc_exit_code: Option<i64>,
+    /// `(url-substring) -> raw bytes` for a binary `http.do` (response_binary), matched in insertion order.
+    pub http_bytes: Vec<(String, Vec<u8>)>,
     /// Records the plugin contributed (captured for assertions).
     pub contributed: std::cell::RefCell<Vec<Record>>,
     /// An in-memory `conn.*` byte buffer: `conn.write` appends, `conn.read` drains (a loopback echo).
@@ -445,6 +589,11 @@ impl Default for MockHost {
             secrets: HashMap::new(),
             endpoints: HashMap::new(),
             process: Vec::new(),
+            spawn_proc_id: 1,
+            proc_output: (String::new(), String::new()),
+            proc_running: false,
+            proc_exit_code: None,
+            http_bytes: Vec::new(),
             contributed: std::cell::RefCell::new(Vec::new()),
             conn_buf: std::cell::RefCell::new(Vec::new()),
             blobs: std::cell::RefCell::new(HashMap::new()),
@@ -473,6 +622,22 @@ impl MockHost {
         self.process.push((argv_substr.into(), stdout.into()));
         self
     }
+    /// The `proc_id` every `process.spawn` returns.
+    pub fn with_spawn(mut self, proc_id: u64) -> Self {
+        self.spawn_proc_id = proc_id;
+        self
+    }
+    /// Canned `process.read` output + liveness.
+    pub fn with_proc_output(mut self, stdout: &str, stderr: &str, running: bool) -> Self {
+        self.proc_output = (stdout.into(), stderr.into());
+        self.proc_running = running;
+        self
+    }
+    /// Canned raw bytes for any binary `http.do` (response_binary) whose URL contains `url_substr`.
+    pub fn with_http_bytes(mut self, url_substr: &str, bytes: Vec<u8>) -> Self {
+        self.http_bytes.push((url_substr.into(), bytes));
+        self
+    }
 }
 
 impl GuestHost for MockHost {
@@ -497,6 +662,23 @@ impl GuestHost for MockHost {
             }
             "http.do" => {
                 let url = payload.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                // Binary download path: return base64 of canned raw bytes, matching the host.
+                if payload
+                    .get("response_binary")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    let bytes = self
+                        .http_bytes
+                        .iter()
+                        .find(|(sub, _)| url.contains(sub.as_str()))
+                        .map(|(_, b)| b.clone())
+                        .ok_or_else(|| format!("mock: no canned http_bytes for `{url}`"))?;
+                    return Ok(json!({
+                        "status": 200,
+                        "body_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    }));
+                }
                 let body = self
                     .http
                     .iter()
@@ -505,6 +687,26 @@ impl GuestHost for MockHost {
                     .ok_or_else(|| format!("mock: no canned http for `{url}`"))?;
                 Ok(json!({ "status": 200, "body": serde_json::to_string(&body).unwrap() }))
             }
+            "process.spawn" => Ok(json!({ "proc_id": self.spawn_proc_id })),
+            "process.read" => {
+                let mut v = json!({
+                    "stdout": self.proc_output.0,
+                    "stderr": self.proc_output.1,
+                    "running": self.proc_running,
+                });
+                if let Some(code) = self.proc_exit_code {
+                    v["exit_code"] = json!(code);
+                }
+                Ok(v)
+            }
+            "process.status" => {
+                let mut v = json!({ "running": self.proc_running });
+                if let Some(code) = self.proc_exit_code {
+                    v["exit_code"] = json!(code);
+                }
+                Ok(v)
+            }
+            "process.kill" => Ok(json!({ "ok": true })),
             "process.run" => {
                 let argv = payload
                     .get("argv")
@@ -687,5 +889,65 @@ mod tests {
         assert_eq!(info.name, "greeting.txt");
         assert_eq!(info.size, 8);
         assert_eq!(host.blob_get(&r).unwrap(), b"hi there");
+    }
+
+    #[test]
+    fn process_methods_round_trip_through_host() {
+        let mut backend =
+            MockHost::default()
+                .with_spawn(7)
+                .with_proc_output("forwarding 8080", "", true);
+        let mut host = Host {
+            inner: &mut backend,
+        };
+        // spawn returns the canned proc_id (with env overrides accepted)
+        let id = host
+            .process_spawn(
+                &["kubectl", "port-forward", "svc/x", "8080:80"],
+                &[("KUBECONFIG", "/k")],
+            )
+            .unwrap();
+        assert_eq!(id, 7);
+        // read drains canned output + liveness
+        let r = host.process_read(id).unwrap();
+        assert_eq!(r.stdout, "forwarding 8080");
+        assert!(r.running);
+        assert_eq!(r.exit_code, None);
+        // status reports liveness
+        let st = host.process_status(id).unwrap();
+        assert!(st.running);
+        // kill is accepted
+        host.process_kill(id).unwrap();
+    }
+
+    #[test]
+    fn http_bytes_round_trips_binary_and_text() {
+        let raw: Vec<u8> = vec![0, 159, 146, 150, 255];
+        let mut backend = MockHost::default()
+            .with_http_bytes("/download", raw.clone())
+            .with_http("/upload", json!({ "ok": true }));
+        let mut host = Host {
+            inner: &mut backend,
+        };
+        // binary_response=true → byte-exact download (non-UTF-8 preserved)
+        let dl = host
+            .http_bytes("GET", "https://api.test/download", None, &[], None, true)
+            .unwrap();
+        assert_eq!(dl.status, 200);
+        assert_eq!(dl.bytes, raw);
+        // binary_response=false → response bytes are the (text) body's bytes; body upload works too
+        let up = host
+            .http_bytes(
+                "POST",
+                "https://api.test/upload",
+                None,
+                &[],
+                Some(b"payload"),
+                false,
+            )
+            .unwrap();
+        assert_eq!(up.status, 200);
+        // the mock echoes the canned JSON as the text body, whose bytes we get back
+        assert_eq!(up.bytes, b"{\"ok\":true}");
     }
 }

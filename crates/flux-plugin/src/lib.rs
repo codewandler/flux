@@ -413,7 +413,16 @@ pub struct SystemHostCaps {
     next_conn: std::sync::atomic::AtomicU64,
     /// `blob.*` content-addressed scratch store for this call scope: `sha256-hex -> (name, bytes)`.
     blobs: tokio::sync::Mutex<std::collections::HashMap<String, (String, Vec<u8>)>>,
+    /// Host-managed background processes (`process.spawn`/`read`/`status`/`kill`), keyed by an opaque
+    /// id. Persists across op calls (one `SystemHostCaps` is shared for a plugin's whole session), so
+    /// a `kubectl port-forward` started in one call is stopped in a later one. A tokio mutex so a
+    /// handler can hold the map across the `try_wait`/drain (neither awaits, but the guard stays Send).
+    procs: tokio::sync::Mutex<std::collections::HashMap<u64, ManagedProc>>,
+    next_proc: std::sync::atomic::AtomicU64,
 }
+
+/// A long-lived host-managed process registered in [`SystemHostCaps::procs`].
+type ManagedProc = flux_system::ManagedChild;
 
 impl SystemHostCaps {
     pub fn new(system: Arc<flux_system::System>) -> Self {
@@ -426,6 +435,8 @@ impl SystemHostCaps {
             conns: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             next_conn: std::sync::atomic::AtomicU64::new(1),
             blobs: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            procs: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            next_proc: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -586,6 +597,94 @@ impl HostCapabilities for SystemHostCaps {
                     json!({ "stdout": out.stdout, "stderr": out.stderr, "exit_code": out.exit_code }),
                 )
             }
+            "process.spawn" => {
+                let argv: Vec<String> = payload
+                    .get("argv")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if argv.is_empty() {
+                    return Err("process.spawn: `argv` (non-empty array) required".into());
+                }
+                // Same deny-by-default gate as `process.run`: only allow-listed `argv[0]` programs.
+                if !self.grants.process.iter().any(|p| p == &argv[0]) {
+                    return Err(format!(
+                        "process.spawn: program `{}` not in this plugin's granted capabilities",
+                        argv[0]
+                    ));
+                }
+                // Optional caller env overrides (applied on top of the cleared+allow-listed env by
+                // `spawn_background`); only string values are taken.
+                let env: Vec<(String, String)> = payload
+                    .get("env")
+                    .and_then(|v| v.as_object())
+                    .map(|o| {
+                        o.iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let child = self
+                    .system
+                    .spawn_background(&argv, &env)
+                    .map_err(|e| e.to_string())?;
+                let id = self
+                    .next_proc
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.procs.lock().await.insert(id, child);
+                Ok(json!({ "proc_id": id }))
+            }
+            "process.read" => {
+                let id = payload
+                    .get("proc_id")
+                    .and_then(|v| v.as_u64())
+                    .ok_or("process.read: `proc_id` required")?;
+                let mut guard = self.procs.lock().await;
+                let child = guard
+                    .get_mut(&id)
+                    .ok_or_else(|| format!("process.read: no managed process {id}"))?;
+                let (stdout, stderr) = child.read_output();
+                let st = child.status();
+                let mut out = json!({
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "running": st.running,
+                });
+                if let Some(code) = st.exit_code {
+                    out["exit_code"] = json!(code);
+                }
+                Ok(out)
+            }
+            "process.status" => {
+                let id = payload
+                    .get("proc_id")
+                    .and_then(|v| v.as_u64())
+                    .ok_or("process.status: `proc_id` required")?;
+                let mut guard = self.procs.lock().await;
+                let child = guard
+                    .get_mut(&id)
+                    .ok_or_else(|| format!("process.status: no managed process {id}"))?;
+                let st = child.status();
+                let mut out = json!({ "running": st.running });
+                if let Some(code) = st.exit_code {
+                    out["exit_code"] = json!(code);
+                }
+                Ok(out)
+            }
+            "process.kill" => {
+                let id = payload
+                    .get("proc_id")
+                    .and_then(|v| v.as_u64())
+                    .ok_or("process.kill: `proc_id` required")?;
+                if let Some(mut child) = self.procs.lock().await.remove(&id) {
+                    child.kill();
+                }
+                Ok(json!({ "ok": true }))
+            }
             "secret" => {
                 // Resolve by `purpose` (auth-method indirection) or a direct `key`. Either way only
                 // granted env keys are read — never arbitrary host secrets.
@@ -643,11 +742,32 @@ impl HostCapabilities for SystemHostCaps {
                     }
                     AuthInjection::Header { name, value } => req = req.header(name.as_str(), value),
                 }
-                if let Some(body) = payload.get("body").and_then(|v| v.as_str()) {
+                // Request body: a base64 `body_b64` (byte-exact upload) wins over the text `body`;
+                // either one (never both) becomes the request body.
+                if let Some(b64) = payload.get("body_b64").and_then(|v| v.as_str()) {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(b64)
+                        .map_err(|e| format!("http.do: bad body_b64: {e}"))?;
+                    req = req.body(bytes);
+                } else if let Some(body) = payload.get("body").and_then(|v| v.as_str()) {
                     req = req.body(body.to_string());
                 }
                 let resp = req.send().await.map_err(|e| e.to_string())?;
                 let status = resp.status().as_u16();
+                // Binary download path (`response_binary: true`): return the raw bytes base64-encoded,
+                // capped (NOT char-truncated) so a byte-exact download survives. Default keeps the
+                // text path unchanged.
+                if payload
+                    .get("response_binary")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    const MAX_BIN_BODY: usize = 16 * 1024 * 1024;
+                    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+                    let capped = &bytes[..bytes.len().min(MAX_BIN_BODY)];
+                    let body_b64 = base64::engine::general_purpose::STANDARD.encode(capped);
+                    return Ok(json!({ "status": status, "body_b64": body_b64 }));
+                }
                 let body = resp.text().await.unwrap_or_default();
                 let body = truncate_on_char_boundary(body, 256 * 1024);
                 Ok(json!({ "status": status, "body": body }))
@@ -1525,6 +1645,235 @@ mod tests {
             .handle("blob.get", &json!({"blob_ref": "deadbeef"}))
             .await
             .is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn process_spawn_denies_ungranted_program() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!("flux-procdeny-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+
+        // A fresh caps grants no programs → process.spawn is denied.
+        let none = SystemHostCaps::new(sys.clone());
+        assert!(
+            none.handle("process.spawn", &json!({"argv": ["echo", "hi"]}))
+                .await
+                .is_err(),
+            "ungranted process.spawn must be denied"
+        );
+        // Granting only `printf` still denies `sleep` (same allow-list as process.run).
+        let limited = SystemHostCaps::new(sys).with_grants(PluginCapabilities {
+            process: vec!["printf".into()],
+            ..Default::default()
+        });
+        assert!(
+            limited
+                .handle("process.spawn", &json!({"argv": ["sleep", "30"]}))
+                .await
+                .is_err(),
+            "a non-granted program must be denied on process.spawn"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn process_spawn_read_status_kill_lifecycle() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!("flux-proclife-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let caps = SystemHostCaps::new(sys).with_grants(PluginCapabilities {
+            process: vec!["sleep".into()],
+            ..Default::default()
+        });
+
+        // spawn a long-lived child
+        let spawned = caps
+            .handle("process.spawn", &json!({"argv": ["sleep", "30"]}))
+            .await
+            .unwrap();
+        let id = spawned["proc_id"].as_u64().unwrap();
+
+        // read + status both report it running (and no exit_code yet)
+        let read = caps
+            .handle("process.read", &json!({"proc_id": id}))
+            .await
+            .unwrap();
+        assert_eq!(read["running"], true);
+        assert!(read.get("exit_code").is_none());
+        let st = caps
+            .handle("process.status", &json!({"proc_id": id}))
+            .await
+            .unwrap();
+        assert_eq!(st["running"], true);
+
+        // kill removes it from the registry
+        let killed = caps
+            .handle("process.kill", &json!({"proc_id": id}))
+            .await
+            .unwrap();
+        assert_eq!(killed["ok"], true);
+        assert!(
+            caps.handle("process.status", &json!({"proc_id": id}))
+                .await
+                .is_err(),
+            "a killed process is no longer in the registry"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn process_read_captures_output_and_exit_code() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!("flux-procout-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let caps = SystemHostCaps::new(sys).with_grants(PluginCapabilities {
+            process: vec!["printf".into()],
+            ..Default::default()
+        });
+        let id = caps
+            .handle("process.spawn", &json!({"argv": ["printf", "out-bg"]}))
+            .await
+            .unwrap()["proc_id"]
+            .as_u64()
+            .unwrap();
+
+        // Poll read (it drains) accumulating stdout. The drain task copies the pipe asynchronously,
+        // so the final bytes can arrive a tick *after* the child is observed exited — keep reading
+        // until the expected output shows up, not just until exit.
+        let mut combined = String::new();
+        let mut exit_code: Option<i64> = None;
+        let mut saw_exit = false;
+        for _ in 0..200 {
+            let r = caps
+                .handle("process.read", &json!({"proc_id": id}))
+                .await
+                .unwrap();
+            combined.push_str(r["stdout"].as_str().unwrap());
+            if r["running"] == false {
+                saw_exit = true;
+                exit_code = r.get("exit_code").and_then(|v| v.as_i64());
+            }
+            if saw_exit && combined.contains("out-bg") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(saw_exit, "child should have exited");
+        assert_eq!(exit_code, Some(0));
+        assert_eq!(combined, "out-bg");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A throwaway HTTP/1.1 server that echoes each request body back as the response body. Lets the
+    /// `http.do` binary-body paths round-trip without a network dependency. Returns the bound port.
+    async fn spawn_echo_http_server() -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 2048];
+                    // Read until we have the full header block, then parse Content-Length.
+                    let (headers_end, content_length) = loop {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let header_str = String::from_utf8_lossy(&buf[..pos]);
+                            let cl = header_str
+                                .lines()
+                                .find_map(|l| {
+                                    let lower = l.to_ascii_lowercase();
+                                    lower
+                                        .strip_prefix("content-length:")
+                                        .and_then(|v| v.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            break (pos + 4, cl);
+                        }
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break (buf.len(), 0),
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                    };
+                    // Read the remaining body bytes.
+                    while buf.len() < headers_end + content_length {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    let end = (headers_end + content_length).min(buf.len());
+                    let body = buf[headers_end..end].to_vec();
+                    let mut resp =
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
+                            .into_bytes();
+                    resp.extend_from_slice(&body);
+                    let _ = sock.write_all(&resp).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn http_body_b64_round_trips_and_response_binary_is_byte_exact() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!("flux-httpbin-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        // http granted + private net allowed so the loopback test server is reachable.
+        let caps = SystemHostCaps::new(sys)
+            .allow_private_net(true)
+            .with_grants(PluginCapabilities {
+                http: true,
+                ..Default::default()
+            });
+        let port = spawn_echo_http_server().await;
+        let url = format!("http://127.0.0.1:{port}/echo");
+
+        // Raw, non-UTF-8 bytes: body_b64 upload + response_binary download must round-trip exactly.
+        let raw: Vec<u8> = vec![0u8, 159, 146, 150, 255, 0, 1, 2];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
+        let resp = caps
+            .handle(
+                "http.do",
+                &json!({
+                    "method": "POST",
+                    "url": url,
+                    "body_b64": b64,
+                    "response_binary": true,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], 200);
+        assert!(
+            resp.get("body").is_none(),
+            "binary response must not carry a text body"
+        );
+        let got = base64::engine::general_purpose::STANDARD
+            .decode(resp["body_b64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(got, raw, "binary body must be byte-exact");
+
+        // Default (no response_binary): body_b64 still uploads, response comes back as text.
+        let text_b64 = base64::engine::general_purpose::STANDARD.encode(b"hello-text");
+        let resp2 = caps
+            .handle(
+                "http.do",
+                &json!({"method": "POST", "url": url, "body_b64": text_b64}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp2["status"], 200);
+        assert_eq!(resp2["body"], "hello-text");
+        assert!(resp2.get("body_b64").is_none());
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

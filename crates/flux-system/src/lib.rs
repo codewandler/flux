@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use flux_core::{Error, Result};
@@ -213,6 +214,113 @@ pub struct ProcessOutput {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
+}
+
+/// Liveness of a [`ManagedChild`] (non-blocking snapshot from [`ManagedChild::status`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildStatus {
+    /// Whether the child is still running (no exit observed yet).
+    pub running: bool,
+    /// The exit code once the child has exited (`None` while running or if it was signalled).
+    pub exit_code: Option<i32>,
+}
+
+/// Per-stream output cap for a [`ManagedChild`] — bounds the in-memory buffer a long-lived child can
+/// accumulate between reads so a chatty process can't OOM the host. Matches the spirit of the
+/// `run_with_env` output cap (here per managed stream, drained on each [`ManagedChild::read_output`]).
+const MANAGED_OUTPUT_CAP: usize = 256 * 1024;
+
+/// A host-managed background process spawned by [`System::spawn_background`] — a long-lived child
+/// (e.g. `kubectl port-forward`) started in one call and stopped/queried in later ones.
+///
+/// stdout/stderr are continuously drained by background tasks into capped in-memory buffers, so the
+/// child never blocks on a full pipe even if nothing reads it for a while.
+/// [`read_output`](Self::read_output) drains what has accumulated, [`status`](Self::status) polls
+/// liveness without blocking, and [`kill`](Self::kill) terminates the child and stops the drain
+/// tasks. Dropping the handle kills the child (`kill_on_drop`).
+pub struct ManagedChild {
+    child: tokio::process::Child,
+    stdout_buf: Arc<Mutex<Vec<u8>>>,
+    stderr_buf: Arc<Mutex<Vec<u8>>>,
+    stdout_task: Option<tokio::task::JoinHandle<()>>,
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ManagedChild {
+    /// Drain and return whatever stdout/stderr has accumulated since the last call, clearing the
+    /// buffers. Bytes are decoded with `from_utf8_lossy` (never panics off a UTF-8 boundary, the same
+    /// guarantee as [`capped_lossy`]); a multibyte codepoint straddling two reads degrades to a
+    /// replacement char rather than erroring.
+    pub fn read_output(&mut self) -> (String, String) {
+        let out = drain_locked(&self.stdout_buf);
+        let err = drain_locked(&self.stderr_buf);
+        (
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+        )
+    }
+
+    /// Non-blocking liveness check (via `try_wait`): does not reap-block on a still-running child.
+    pub fn status(&mut self) -> ChildStatus {
+        match self.child.try_wait() {
+            Ok(Some(es)) => ChildStatus {
+                running: false,
+                exit_code: es.code(),
+            },
+            Ok(None) => ChildStatus {
+                running: true,
+                exit_code: None,
+            },
+            // A wait error (already reaped, etc.) → report not-running with an unknown code rather
+            // than surfacing an error for a status poll.
+            Err(_) => ChildStatus {
+                running: false,
+                exit_code: None,
+            },
+        }
+    }
+
+    /// Kill the child and abort the stdout/stderr drain tasks. Idempotent.
+    pub fn kill(&mut self) {
+        let _ = self.child.start_kill();
+        if let Some(t) = self.stdout_task.take() {
+            t.abort();
+        }
+        if let Some(t) = self.stderr_task.take() {
+            t.abort();
+        }
+    }
+}
+
+/// Drain a shared byte buffer, returning its current contents and leaving it empty. Recovers from a
+/// poisoned lock (the drain tasks only `extend`, so they can't poison, but be defensive).
+fn drain_locked(buf: &Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
+    let mut guard = buf.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::take(&mut *guard)
+}
+
+/// Continuously copy a child stream into `buf`, appending up to `cap` total bytes held at once. Once
+/// the buffer is full (nothing has drained it yet), further bytes are discarded so a runaway child
+/// can't grow host memory without bound. Runs as a spawned task; exits on EOF or read error.
+async fn drain_stream<R>(mut reader: R, buf: Arc<Mutex<Vec<u8>>>, cap: usize)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => break, // EOF
+            Ok(n) => {
+                let mut guard = buf.lock().unwrap_or_else(|e| e.into_inner());
+                let room = cap.saturating_sub(guard.len());
+                if room > 0 {
+                    guard.extend_from_slice(&chunk[..n.min(room)]);
+                }
+            }
+            Err(_) => break,
+        }
+    }
 }
 
 /// The guarded IO surface tools are given. All filesystem access is confined to the workspace;
@@ -480,6 +588,59 @@ impl System {
             exit_code: status.code().unwrap_or(-1),
         })
     }
+
+    /// Spawn a **long-lived background** child without awaiting it — for host-managed processes such
+    /// as `kubectl port-forward` that start in one op call and are stopped/queried in later ones.
+    ///
+    /// Same safety envelope as [`run_with_env`](Self::run_with_env): argv-only (no shell;
+    /// `program = argv[0]`), env **cleared** then restricted to the minimal allow-list plus the
+    /// caller's explicit (non-model) `env` overrides, and the working directory pinned to the
+    /// workspace root. stdout/stderr are **piped** and continuously drained into capped buffers
+    /// (see [`ManagedChild`]); the child is `kill_on_drop` so a dropped handle never leaks a process.
+    ///
+    /// Must be called from within a Tokio runtime (it spawns drain tasks).
+    pub fn spawn_background(
+        &self,
+        argv: &[String],
+        env: &[(String, String)],
+    ) -> Result<ManagedChild> {
+        let Some((program, args)) = argv.split_first() else {
+            return Err(Error::Other("empty command".to_string()));
+        };
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args)
+            .current_dir(self.workspace.root())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        Self::apply_safe_env(&mut cmd, env);
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| Error::Other(format!("spawn {program}: {e}")))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::Other("managed child stdout unavailable".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| Error::Other("managed child stderr unavailable".into()))?;
+        let stdout_buf = Arc::new(Mutex::new(Vec::new()));
+        let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+        let stdout_task =
+            tokio::spawn(drain_stream(stdout, stdout_buf.clone(), MANAGED_OUTPUT_CAP));
+        let stderr_task =
+            tokio::spawn(drain_stream(stderr, stderr_buf.clone(), MANAGED_OUTPUT_CAP));
+        Ok(ManagedChild {
+            child,
+            stdout_buf,
+            stderr_buf,
+            stdout_task: Some(stdout_task),
+            stderr_task: Some(stderr_task),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -743,6 +904,91 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(out.exit_code, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn spawn_background_reads_output_and_exit_code() {
+        let (dir, sys) = temp_workspace();
+        let mut child = sys
+            .spawn_background(&["printf".to_string(), "hello-bg".to_string()], &[])
+            .unwrap();
+        // Drain across polls until the output shows up (the drain task copies asynchronously, so a
+        // single read right after spawn can race the pipe).
+        let mut out = String::new();
+        for _ in 0..200 {
+            let (o, _e) = child.read_output();
+            out.push_str(&o);
+            if out.contains("hello-bg") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(out, "hello-bg", "background stdout not captured");
+        // After exit, status is non-blocking and reports the code.
+        let mut st = child.status();
+        for _ in 0..200 {
+            if !st.running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            st = child.status();
+        }
+        assert!(!st.running, "child should have exited");
+        assert_eq!(st.exit_code, Some(0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn spawn_background_kill_stops_running_child() {
+        let (dir, sys) = temp_workspace();
+        let mut child = sys
+            .spawn_background(&["sleep".to_string(), "30".to_string()], &[])
+            .unwrap();
+        assert!(child.status().running, "a freshly spawned sleep should run");
+        child.kill();
+        let mut stopped = false;
+        for _ in 0..200 {
+            if !child.status().running {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(stopped, "killed child should stop running");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn spawn_background_clears_parent_env_and_applies_overrides() {
+        let (dir, sys) = temp_workspace();
+        std::env::set_var("FLUX_TEST_BG_SECRET", "leak-me-not");
+        let mut child = sys
+            .spawn_background(
+                &["env".to_string()],
+                &[("FLUX_BG_MARKER".to_string(), "bg-42".to_string())],
+            )
+            .unwrap();
+        std::env::remove_var("FLUX_TEST_BG_SECRET");
+        // The drain task copies the pipe asynchronously, so keep draining until the marker shows up
+        // rather than stopping at the first observed exit (the final bytes can lag the exit).
+        let mut out = String::new();
+        for _ in 0..200 {
+            let (o, _e) = child.read_output();
+            out.push_str(&o);
+            if out.contains("FLUX_BG_MARKER=bg-42") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            out.contains("FLUX_BG_MARKER=bg-42"),
+            "caller env override missing: {out}"
+        );
+        assert!(
+            !out.contains("leak-me-not"),
+            "background child inherited a parent secret: {out}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
