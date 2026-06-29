@@ -16,13 +16,23 @@ use flux_spec::ToolSpec;
 
 use super::DatasourceBackend;
 
+/// The five datasource retrieval ops over `backend`, as a tool vec (the form a surface registers into
+/// an agent/app registry — e.g. `App::with_tools`).
+pub fn datasource_tools(backend: Arc<dyn DatasourceBackend>) -> Vec<Arc<dyn Tool>> {
+    vec![
+        Arc::new(SearchOp(backend.clone())) as Arc<dyn Tool>,
+        Arc::new(GetOp(backend.clone())),
+        Arc::new(ListOp(backend.clone())),
+        Arc::new(RelationOp(backend.clone())),
+        Arc::new(BatchGetOp(backend)),
+    ]
+}
+
 /// Register all five datasource retrieval ops over `backend` into `registry`.
 pub fn register_datasource_ops(registry: &mut ToolRegistry, backend: Arc<dyn DatasourceBackend>) {
-    registry.register(Arc::new(SearchOp(backend.clone())));
-    registry.register(Arc::new(GetOp(backend.clone())));
-    registry.register(Arc::new(ListOp(backend.clone())));
-    registry.register(Arc::new(RelationOp(backend.clone())));
-    registry.register(Arc::new(BatchGetOp(backend)));
+    for tool in datasource_tools(backend) {
+        registry.register(tool);
+    }
 }
 
 /// `[entity id] (source, score) title — snippet`

@@ -17,7 +17,7 @@ mod sqlite;
 pub use host_caps::DatasourceHostCaps;
 pub use ingest::{freshness, ingest_markdown, ingest_openapi, reindex};
 pub use memory::MemoryBackend;
-pub use ops::register_datasource_ops;
+pub use ops::{datasource_tools, register_datasource_ops};
 pub use sqlite::SqliteBackend;
 
 use flux_core::Result;

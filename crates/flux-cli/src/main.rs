@@ -3175,12 +3175,52 @@ async fn run_app(path: &str, model_spec: Option<String>, auto_approve: bool) -> 
         },
     };
 
+    // Assemble the knowledge + integration tools the program's agent target (`trigger.agent`) and its
+    // journeys can drive — the D-09 registry wiring. A guarded `System` rooted at the cwd backs both.
+    let system = Arc::new(System::new(
+        Workspace::new(&std::env::current_dir()?).map_err(|e| anyhow::anyhow!("{e}"))?,
+    ));
+    // The knowledge datasource: index the workspace docs, and SHARE the backend so integration
+    // plugins' contributed records (via the DatasourceHostCaps bridge) land in the same index the
+    // `search`/`get`/`list`/`relation`/`batch_get` ops read.
+    let backend = build_doc_index(&system).await;
+    let mut extra_tools: Vec<Arc<dyn flux_runtime::Tool>> =
+        flux_capabilities::datasource_tools(backend.clone());
+    // Discover subprocess plugins (~/.flux/plugins/*.toml) and project their ops as tools; their host
+    // capabilities are the datasource bridge over the guarded System (same boundary as built-in tools).
+    if let Some(dir) = plugins_dir() {
+        for p in flux_plugin::discover(&dir) {
+            let system = system.clone();
+            let backend = backend.clone();
+            let make_caps = move |m: &flux_plugin::PluginManifest| {
+                Arc::new(flux_capabilities::DatasourceHostCaps::new(
+                    flux_plugin::SystemHostCaps::new(system).with_manifest(m),
+                    backend,
+                )) as Arc<dyn flux_plugin::HostCapabilities>
+            };
+            match flux_plugin::load_plugin_tools(
+                &p.descriptor.program,
+                &p.descriptor.args,
+                make_caps,
+            )
+            .await
+            {
+                Ok((tools, _host)) => extra_tools.extend(tools),
+                Err(e) => eprintln!(
+                    "{}",
+                    style::dim(&format!("(plugin `{}` failed to load: {e})", p.name))
+                ),
+            }
+        }
+    }
+
     let channel_decls = program.channels.clone();
-    let app = std::sync::Arc::new(flux_app::App::with_options(
+    let app = std::sync::Arc::new(flux_app::App::with_tools(
         program,
         provider,
         model,
         auto_approve,
+        extra_tools,
     ));
     let channels = flux_channels::build_channels(&channel_decls)?;
     // Serve stdin when an interactive `cli` channel is declared, or when the program declares no

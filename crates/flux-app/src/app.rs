@@ -30,7 +30,8 @@ use flux_lang::ast::{SymbolName, Value as FluxValue, Visibility};
 use flux_lang::program::{AgentDecl, Program};
 use flux_provider::Provider;
 use flux_runtime::{
-    AllowApprover, Approver, DenyApprover, Executor, PermissionManager, ToolContext, ToolRegistry,
+    AllowApprover, Approver, DenyApprover, Executor, PermissionManager, Tool, ToolContext,
+    ToolRegistry,
 };
 use flux_system::{System, Workspace};
 
@@ -82,8 +83,22 @@ impl App {
         model: impl Into<String>,
         auto_approve: bool,
     ) -> Self {
+        Self::with_tools(program, provider, model, auto_approve, Vec::new())
+    }
+
+    /// Like [`with_options`](Self::with_options) but also registers `extra_tools` into the host
+    /// registry — the seam the CLI uses to give journeys **and** the agent target (`trigger.agent`) the
+    /// knowledge datasource retrieval ops (D-07) and the integration plugin tools (D-08), assembled in
+    /// the async CLI layer so flux-app stays free of those deps.
+    pub fn with_tools(
+        program: Program,
+        provider: Option<Arc<dyn Provider>>,
+        model: impl Into<String>,
+        auto_approve: bool,
+        extra_tools: Vec<Arc<dyn Tool>>,
+    ) -> Self {
         App {
-            engine: Engine::new(program, provider, model.into(), auto_approve),
+            engine: Engine::new(program, provider, model.into(), auto_approve, extra_tools),
         }
     }
 
@@ -184,6 +199,7 @@ impl Engine {
         provider: Option<Arc<dyn Provider>>,
         model: String,
         auto_approve: bool,
+        extra_tools: Vec<Arc<dyn Tool>>,
     ) -> Arc<Self> {
         let bus = Bus::new();
         let channels = Arc::new(program.channels.clone());
@@ -200,6 +216,11 @@ impl Engine {
             }
             let host: Weak<dyn JourneyHost> = weak.clone();
             ops::register(&mut registry, bus.clone(), channels, host);
+            // Extra tools assembled by the surface (datasource retrieval ops + integration plugin
+            // tools) — available to journeys and to the `trigger.agent` target's registry.
+            for tool in extra_tools {
+                registry.register(tool);
+            }
             Engine {
                 program,
                 registry,
