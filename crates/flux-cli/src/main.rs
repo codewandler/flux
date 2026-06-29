@@ -489,19 +489,23 @@ fn build_provider(spec: &str) -> Result<(NativeProvider, String)> {
     Ok((native, model))
 }
 
-/// Build a keyword index of the workspace's documentation files (markdown/text), for the `search`
-/// tool. Deliberately cheap: doc extensions only, capped file count and size — code search is
-/// served by `grep`, not this. Errors are swallowed (an empty index just yields "no matches").
-async fn build_doc_index(system: &System) -> flux_capabilities::datasource::Index {
+/// Build the knowledge datasource from the workspace's documentation files (markdown/text), indexed as
+/// `file.document` records under the `local` source. Deliberately cheap: doc extensions only, capped file
+/// count and size — code search is served by `grep`, not this. Errors are swallowed (an empty index just
+/// yields "no matches"). Returns the shared backend the retrieval ops dispatch against.
+async fn build_doc_index(system: &System) -> Arc<dyn flux_capabilities::DatasourceBackend> {
+    use flux_capabilities::DatasourceBackend;
+    use flux_datasource::{Record, Source};
     const DOC_EXTS: &[&str] = &[".md", ".txt", ".rst", ".adoc", ".mdx"];
     const MAX_DOCS: usize = 200;
     const MAX_BYTES: usize = 100_000;
-    let mut index = flux_capabilities::datasource::Index::new();
+    let backend = flux_capabilities::MemoryBackend::new();
     let Ok(files) = system.walk_files(".", 4000).await else {
-        return index;
+        return Arc::new(backend);
     };
+    let mut count = 0usize;
     for f in files {
-        if index.len() >= MAX_DOCS {
+        if count >= MAX_DOCS {
             break;
         }
         if !DOC_EXTS.iter().any(|e| f.ends_with(e)) {
@@ -509,11 +513,13 @@ async fn build_doc_index(system: &System) -> flux_capabilities::datasource::Inde
         }
         if let Ok(text) = system.read_file(&f).await {
             if text.len() <= MAX_BYTES {
-                index.add(f, text);
+                let rec = Record::new(Source::new("local"), "file.document", &f, &f, text);
+                let _ = backend.upsert(&[rec]);
+                count += 1;
             }
         }
     }
-    index
+    Arc::new(backend)
 }
 
 /// Session size (serialized chars) past which the agent summarizes old turns. Override with
@@ -842,11 +848,10 @@ async fn build_agent(
         flux_capabilities::browser::WebFetchTool::default().allow_private(cfg.allow_private_net),
     ));
 
-    // Auto-index workspace docs (markdown/text, capped & cheap) for the `search` tool.
-    let index = Arc::new(build_doc_index(&system).await);
-    registry.register(Arc::new(flux_capabilities::datasource::SearchTool::new(
-        index,
-    )));
+    // Auto-index workspace docs (markdown/text, capped & cheap) into the knowledge datasource, and
+    // register the retrieval ops (`search`/`get`/`list`/`relation`/`batch_get`).
+    let backend = build_doc_index(&system).await;
+    flux_capabilities::register_datasource_ops(&mut registry, backend);
 
     // Discover subprocess plugins (~/.flux/plugins/*.toml) and project their operations as tools.
     // Each plugin's host capabilities are the guarded System (same boundary as built-in tools).

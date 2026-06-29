@@ -795,6 +795,7 @@ version = "0.2.4"
 dependencies = [
  "async-trait",
  "flux-core",
+ "flux-datasource",
  "flux-runtime",
  "flux-spec",
  "flux-system",
@@ -843,6 +844,7 @@ dependencies = [
  "flux-config",
  "flux-core",
  "flux-credentials",
+ "flux-datasource",
  "flux-eval",
  "flux-events",
  "flux-evidence",

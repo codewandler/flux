@@ -38,6 +38,7 @@ flux-a2a.workspace = true
 flux-server.workspace = true
 flux-tui.workspace = true
 flux-capabilities.workspace = true
+flux-datasource.workspace = true
 flux-plugin.workspace = true
 flux-skill.workspace = true
 flux-sdk.workspace = true
