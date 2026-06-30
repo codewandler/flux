@@ -10,6 +10,7 @@
 //! response's `"error"` field. File ops never inline base64 — `slack.file.upload` reads its bytes from a
 //! host `blob_ref`, and the download ops stage the fetched bytes back into the blob store, returning a ref.
 
+use base64::Engine as _;
 use host_kit::*;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -35,9 +36,14 @@ struct InfoInput {}
 #[allow(dead_code)]
 struct MessageSendInput {
     channel: String,
-    text: String,
+    text: Option<String>,
+    markdown: Option<String>,
+    blocks: Option<Vec<Value>>,
     thread_ts: Option<String>,
     reply_broadcast: Option<bool>,
+    unfurl_links: Option<bool>,
+    unfurl_media: Option<bool>,
+    parse: Option<String>,
 }
 
 /// `slack.message.list`.
@@ -49,6 +55,7 @@ struct MessageListInput {
     cursor: Option<String>,
     oldest: Option<String>,
     latest: Option<String>,
+    text_format: Option<String>,
 }
 
 /// `slack.message.edit`.
@@ -58,7 +65,12 @@ struct MessageEditInput {
     r#ref: Option<String>,
     channel: Option<String>,
     ts: Option<String>,
-    text: String,
+    text: Option<String>,
+    markdown: Option<String>,
+    blocks: Option<Vec<Value>>,
+    unfurl_links: Option<bool>,
+    unfurl_media: Option<bool>,
+    parse: Option<String>,
 }
 
 /// `slack.message.delete`.
@@ -78,6 +90,8 @@ struct ThreadInput {
     channel: Option<String>,
     ts: Option<String>,
     limit: Option<i64>,
+    max_bytes: Option<i64>,
+    text_format: Option<String>,
 }
 
 /// `slack.search`.
@@ -86,6 +100,8 @@ struct ThreadInput {
 struct SearchInput {
     query: String,
     limit: Option<i64>,
+    tickets: Option<bool>,
+    ticket_keys: Option<Vec<String>>,
 }
 
 /// `slack.mentions`.
@@ -93,12 +109,13 @@ struct SearchInput {
 #[allow(dead_code)]
 struct MentionsInput {
     user: Option<String>,
+    bot: Option<bool>,
     since: Option<String>,
     limit: Option<i64>,
     unhandled: Option<bool>,
     max_thread: Option<i64>,
     tickets: Option<bool>,
-    ticket_keys: Option<Vec<Value>>,
+    ticket_keys: Option<Vec<String>>,
 }
 
 /// `slack.unreads`.
@@ -133,7 +150,10 @@ struct ReactionRemoveInput {
 /// `slack.channel.list`.
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
-struct ChannelListInput {}
+struct ChannelListInput {
+    query: Option<String>,
+    limit: Option<i64>,
+}
 
 /// `slack.channel.join`.
 #[derive(Deserialize, JsonSchema)]
@@ -156,7 +176,8 @@ struct ChannelMarkReadInput {
 #[allow(dead_code)]
 struct FileUploadInput {
     channel: String,
-    blob_ref: String,
+    blob_ref: Option<String>,
+    content_bytes: Option<String>,
     filename: Option<String>,
     thread_ts: Option<String>,
     initial_comment: Option<String>,
@@ -168,6 +189,7 @@ struct FileUploadInput {
 #[allow(dead_code)]
 struct FileDownloadInput {
     file_id: String,
+    blob_ref: Option<String>,
     filename: Option<String>,
 }
 
@@ -176,6 +198,7 @@ struct FileDownloadInput {
 #[allow(dead_code)]
 struct DownloadInput {
     file_id: String,
+    blob_ref: Option<String>,
     filename: Option<String>,
 }
 
@@ -193,6 +216,7 @@ struct FileListInput {
     channel: Option<String>,
     user: Option<String>,
     types: Option<String>,
+    query: Option<String>,
     limit: Option<i64>,
 }
 
@@ -237,12 +261,17 @@ struct BookmarkDeleteInput {
 #[allow(dead_code)]
 struct BookmarkListInput {
     channel: String,
+    query: Option<String>,
+    limit: Option<i64>,
 }
 
 /// `slack.user.list`.
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
-struct UserListInput {}
+struct UserListInput {
+    query: Option<String>,
+    limit: Option<i64>,
+}
 
 /// `slack.presence.get`.
 #[derive(Deserialize, JsonSchema)]
@@ -261,7 +290,12 @@ struct PresenceSetInput {
 /// `slack.emoji.list`.
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
-struct EmojiListInput {}
+struct EmojiListInput {
+    query: Option<String>,
+    limit: Option<i64>,
+    mode: Option<String>,
+    include_aliases: Option<bool>,
+}
 
 /// `slack.index.build`.
 #[derive(Deserialize, JsonSchema)]
@@ -652,6 +686,340 @@ fn resolve_ref(input: &Value) -> Result<(String, String), String> {
     }
 }
 
+/// Resolved message-content payload: a text fallback plus optional Block Kit blocks,
+/// plus the Slack message-options that control unfurling/parsing.
+#[derive(Default)]
+struct MessageContent {
+    text: String,
+    blocks: Vec<Value>,
+    unfurl_links: Option<bool>,
+    unfurl_media: Option<bool>,
+    parse: String,
+}
+
+/// Build a message-content payload from `text`, `markdown`, or `blocks` (mutually exclusive
+/// carriers), mirroring fluxplane's `messageContent`. A `blocks` payload still requires a
+/// `text` fallback string.
+fn message_content(input: &Value) -> Result<MessageContent, String> {
+    let text = opt_str(input, "text")
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let markdown = opt_str(input, "markdown")
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let blocks = input
+        .get("blocks")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .filter(|a| !a.is_empty());
+    let has_blocks = blocks.is_some();
+    match (text.is_some(), markdown.is_some(), has_blocks) {
+        (true, true, _) => {
+            return Err("exactly one of text, markdown, or blocks is required".into());
+        }
+        (_, true, true) => {
+            return Err("blocks cannot be combined with markdown".into());
+        }
+        (false, false, false) => {
+            return Err("exactly one of text, markdown, or blocks is required".into());
+        }
+        (false, false, true) => {
+            return Err("text fallback is required when blocks are provided".into());
+        }
+        _ => {}
+    }
+
+    let mut content = MessageContent::default();
+    if let Some(md) = markdown {
+        content.text = md.to_string();
+        content.blocks = vec![markdown_section_block(md)];
+    } else if let Some(t) = text {
+        content.text = t.to_string();
+        if has_blocks {
+            content.blocks = blocks.unwrap_or_default();
+        }
+    } else {
+        // unreachable because of the match above
+        return Err("exactly one of text, markdown, or blocks is required".into());
+    }
+
+    content.unfurl_links = input.get("unfurl_links").and_then(|v| v.as_bool());
+    content.unfurl_media = input.get("unfurl_media").and_then(|v| v.as_bool());
+    content.parse = opt_str(input, "parse").unwrap_or("").to_string();
+    Ok(content)
+}
+
+/// True if any of a channel's searchable string fields contain `query` (case-insensitive).
+fn channel_matches_query(channel: &Value, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let haystack = [
+        channel.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+        channel.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+        channel
+            .get("topic")
+            .and_then(|v| v.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        channel
+            .get("purpose")
+            .and_then(|v| v.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+    ];
+    haystack
+        .iter()
+        .any(|s| s.to_ascii_lowercase().contains(query))
+}
+
+/// True if any of a user's searchable string fields contain `query` (case-insensitive).
+fn user_matches_query(user: &Value, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let haystack = [
+        user.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+        user.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+        user.get("profile")
+            .and_then(|v| v.get("real_name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        user.get("profile")
+            .and_then(|v| v.get("display_name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        user.get("profile")
+            .and_then(|v| v.get("email"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+    ];
+    haystack
+        .iter()
+        .any(|s| s.to_ascii_lowercase().contains(query))
+}
+
+/// True if any of a bookmark's searchable string fields contain `query` (case-insensitive).
+fn bookmark_matches_query(bookmark: &Value, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let haystack = [
+        bookmark.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+        bookmark.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+        bookmark.get("link").and_then(|v| v.as_str()).unwrap_or(""),
+        bookmark.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+    ];
+    haystack
+        .iter()
+        .any(|s| s.to_ascii_lowercase().contains(query))
+}
+
+/// True if any of a file record's searchable string fields contain `query` (case-insensitive).
+fn file_matches_query(file: &Value, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let haystack = [
+        file.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+        file.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+        file.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+        file.get("mimetype").and_then(|v| v.as_str()).unwrap_or(""),
+        file.get("filetype").and_then(|v| v.as_str()).unwrap_or(""),
+        file.get("pretty_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        file.get("user").and_then(|v| v.as_str()).unwrap_or(""),
+    ];
+    haystack
+        .iter()
+        .any(|s| s.to_ascii_lowercase().contains(query))
+}
+
+/// Aggregate ticket references collected from search matches into the fluxplane
+/// `{key, mentions, permalinks}` shape, sorted by key then permalink.
+fn collect_search_ticket_mentions(mentions: &[Value]) -> Vec<Value> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut seen: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for m in mentions {
+        let key = m.get("key").and_then(|v| v.as_str()).unwrap_or("");
+        let permalink = m.get("permalink").and_then(|v| v.as_str()).unwrap_or("");
+        if key.is_empty() {
+            continue;
+        }
+        let entry = seen.entry(key.to_string()).or_default();
+        if !permalink.is_empty() {
+            entry.insert(permalink.to_string());
+        }
+    }
+    seen.into_iter()
+        .map(|(key, permalinks)| {
+            let links: Vec<&String> = permalinks.iter().collect();
+            json!({ "key": key, "mentions": links.len(), "permalinks": links })
+        })
+        .collect()
+}
+
+/// A Slack Block Kit `section` block backed by a single `mrkdwn` text object.
+fn markdown_section_block(markdown: &str) -> Value {
+    json!({
+        "type": "section",
+        "text": { "type": "mrkdwn", "text": markdown }
+    })
+}
+
+/// Text rendering mode for message reads, matching fluxplane's `textFormat`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextFormat {
+    Markdown,
+    Mrkdwn,
+    Both,
+}
+
+/// Parse the `text_format` enum (`markdown`/`mrkdwn`/`both`, default `markdown`).
+fn parse_text_format(raw: &str) -> TextFormat {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "mrkdwn" => TextFormat::Mrkdwn,
+        "both" => TextFormat::Both,
+        _ => TextFormat::Markdown,
+    }
+}
+
+/// Apply the requested `text_format` to a raw Slack message object in-place:
+/// `markdown` returns readable Markdown, `mrkdwn` keeps raw mrkdwn, `both`
+/// returns both forms as `text` and `text_mrkdwn`.
+fn render_message_text(message: &mut Value, format: TextFormat) {
+    let raw = message
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    match format {
+        TextFormat::Mrkdwn => {
+            message["text_mrkdwn"] = Value::Null;
+        }
+        TextFormat::Both => {
+            message["text"] = json!(mrkdwn_to_markdown(&raw));
+            message["text_mrkdwn"] = json!(raw);
+        }
+        TextFormat::Markdown => {
+            message["text"] = json!(mrkdwn_to_markdown(&raw));
+            message["text_mrkdwn"] = Value::Null;
+        }
+    }
+}
+
+/// Best-effort Slack mrkdwn → Markdown renderer. Links, mentions, channels, and
+/// subteam/special broadcasts are translated; bold/italic/strike and HTML
+/// entity decoding are applied outside code spans.
+fn mrkdwn_to_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Code spans/fences are preserved verbatim.
+        if text[i..].starts_with("```") {
+            if let Some(end) = text[i + 3..].find("```") {
+                out.push_str(&text[i..i + 3 + end + 3]);
+                i += 3 + end + 3;
+                continue;
+            }
+        }
+        if bytes[i] == b'`' {
+            if let Some(end) = text[i + 1..].find('`') {
+                out.push_str(&text[i..i + 1 + end + 1]);
+                i += 1 + end + 1;
+                continue;
+            }
+        }
+        // mrkdwr links / mentions / channels / subteams on one scan.
+        if bytes[i] == b'<' {
+            if let Some(j) = text[i + 1..].find('>') {
+                let inner = &text[i + 1..i + 1 + j];
+                if let Some((left, right)) = inner.split_once('|') {
+                    if left.starts_with("https://") || left.starts_with("http://") {
+                        out.push_str(&format!("[{right}]({left})"));
+                    } else if left.starts_with('@')
+                        || left.starts_with('#')
+                        || left.starts_with('!')
+                    {
+                        out.push_str(&format!("@{right}"));
+                    } else {
+                        out.push_str(&format!("<{inner}>"));
+                    }
+                } else if inner.starts_with("https://")
+                    || inner.starts_with("http://")
+                    || inner.starts_with('@')
+                    || inner.starts_with('#')
+                    || inner.starts_with('!')
+                {
+                    out.push_str(inner);
+                } else {
+                    out.push_str(&format!("<{inner}>"));
+                }
+                i += 1 + j + 1;
+                continue;
+            }
+        }
+        // Emphasis outside code spans.
+        if bytes[i] == b'*' {
+            if let Some(j) = text[i + 1..].find('*') {
+                let inner = &text[i + 1..i + 1 + j];
+                if !inner.contains('\n') && !inner.is_empty() {
+                    out.push_str("**");
+                    out.push_str(inner);
+                    out.push_str("**");
+                    i += 1 + j + 1;
+                    continue;
+                }
+            }
+        }
+        if bytes[i] == b'~' {
+            if let Some(j) = text[i + 1..].find('~') {
+                let inner = &text[i + 1..i + 1 + j];
+                if !inner.contains('\n') && !inner.is_empty() {
+                    out.push_str("~~");
+                    out.push_str(inner);
+                    out.push_str("~~");
+                    i += 1 + j + 1;
+                    continue;
+                }
+            }
+        }
+        if bytes[i] == b'_' {
+            if let Some(j) = text[i + 1..].find('_') {
+                let inner = &text[i + 1..i + 1 + j];
+                if !inner.contains('\n') && !inner.is_empty() {
+                    out.push('*');
+                    out.push_str(inner);
+                    out.push('*');
+                    i += 1 + j + 1;
+                    continue;
+                }
+            }
+        }
+        // HTML entities.
+        if text[i..].starts_with("&lt;") {
+            out.push('<');
+            i += 4;
+            continue;
+        }
+        if text[i..].starts_with("&gt;") {
+            out.push('>');
+            i += 4;
+            continue;
+        }
+        if text[i..].starts_with("&amp;") {
+            out.push('&');
+            i += 5;
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // auth / identity
 // ---------------------------------------------------------------------------
@@ -697,8 +1065,11 @@ fn auth_test(_input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn message_send(input: Value, host: &mut Host) -> Result<Value, String> {
     let channel = req_str(&input, "channel")?;
-    let text = req_str(&input, "text")?;
-    let mut body = json!({ "channel": channel, "text": text });
+    let content = message_content(&input)?;
+    let mut body = json!({ "channel": channel, "text": content.text });
+    if !content.blocks.is_empty() {
+        body["blocks"] = json!(content.blocks);
+    }
     if let Some(ts) = opt_str(&input, "thread_ts") {
         body["thread_ts"] = json!(ts);
     }
@@ -708,6 +1079,15 @@ fn message_send(input: Value, host: &mut Host) -> Result<Value, String> {
         .unwrap_or(false)
     {
         body["reply_broadcast"] = json!(true);
+    }
+    if let Some(v) = content.unfurl_links {
+        body["unfurl_links"] = json!(v);
+    }
+    if let Some(v) = content.unfurl_media {
+        body["unfurl_media"] = json!(v);
+    }
+    if !content.parse.is_empty() {
+        body["parse"] = json!(content.parse);
     }
     check_ok(sl_send(
         host,
@@ -730,13 +1110,32 @@ fn message_list(input: Value, host: &mut Host) -> Result<Value, String> {
             path.push_str(&format!("&{key}={}", urlencode(val)));
         }
     }
-    check_ok(sl_get(host, &path, Some("bot_token"))?)
+    let format = parse_text_format(opt_str(&input, "text_format").unwrap_or(""));
+    let mut v = check_ok(sl_get(host, &path, Some("bot_token"))?)?;
+    if let Some(messages) = v.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for message in messages {
+            render_message_text(message, format);
+        }
+    }
+    Ok(v)
 }
 
 fn message_edit(input: Value, host: &mut Host) -> Result<Value, String> {
     let (channel, ts) = resolve_ref(&input)?;
-    let text = req_str(&input, "text")?;
-    let body = json!({ "channel": channel, "ts": ts, "text": text });
+    let content = message_content(&input)?;
+    let mut body = json!({ "channel": channel, "ts": ts, "text": content.text });
+    if !content.blocks.is_empty() {
+        body["blocks"] = json!(content.blocks);
+    }
+    if let Some(v) = content.unfurl_links {
+        body["unfurl_links"] = json!(v);
+    }
+    if let Some(v) = content.unfurl_media {
+        body["unfurl_media"] = json!(v);
+    }
+    if !content.parse.is_empty() {
+        body["parse"] = json!(content.parse);
+    }
     check_ok(sl_send(
         host,
         "POST",
@@ -761,12 +1160,25 @@ fn message_delete(input: Value, host: &mut Host) -> Result<Value, String> {
 fn thread(input: Value, host: &mut Host) -> Result<Value, String> {
     let (channel, ts) = resolve_ref(&input)?;
     let limit = input.get("limit").and_then(|v| v.as_i64()).unwrap_or(100);
+    // max_bytes gates per-image downloads in fluxplane; this handler still
+    // surfaces the raw message envelope, but records the cap for callers.
+    let _max_bytes = input
+        .get("max_bytes")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(10_485_760);
     let path = format!(
         "/conversations.replies?channel={}&ts={}&limit={limit}&inclusive=true",
         urlencode(&channel),
         urlencode(&ts),
     );
-    check_ok(sl_get(host, &path, Some("bot_token"))?)
+    let format = parse_text_format(opt_str(&input, "text_format").unwrap_or(""));
+    let mut v = check_ok(sl_get(host, &path, Some("bot_token"))?)?;
+    if let Some(messages) = v.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for message in messages {
+            render_message_text(message, format);
+        }
+    }
+    Ok(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -777,19 +1189,55 @@ fn search(input: Value, host: &mut Host) -> Result<Value, String> {
     let query = req_str(&input, "query")?;
     let limit = input.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
     let path = format!("/search.messages?query={}&count={limit}", urlencode(query));
-    check_ok(sl_get(host, &path, Some("user_token"))?)
+    let mut v = check_ok(sl_get(host, &path, Some("user_token"))?)?;
+    let want_tickets = input
+        .get("tickets")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let keys = ticket_keys(&input);
+    if want_tickets {
+        let mut mentions = Vec::new();
+        if let Some(matches) = v
+            .get_mut("messages")
+            .and_then(|m| m.get_mut("matches"))
+            .and_then(|m| m.as_array_mut())
+        {
+            for m in matches.iter_mut() {
+                let text = m.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                let tix = extract_tickets(text, &keys);
+                if !tix.is_empty() {
+                    m["tickets"] = json!(tix);
+                }
+                let permalink = m.get("permalink").and_then(|p| p.as_str()).unwrap_or("");
+                for ticket in &tix {
+                    mentions.push(json!({
+                        "key": ticket,
+                        "permalink": permalink,
+                    }));
+                }
+            }
+        }
+        v["tickets"] = json!(collect_search_ticket_mentions(&mentions));
+    }
+    Ok(v)
 }
 
 fn mentions(input: Value, host: &mut Host) -> Result<Value, String> {
+    let search_bot = input.get("bot").and_then(|v| v.as_bool()).unwrap_or(false);
     let target = match opt_str(&input, "user") {
         Some(u) => u.to_string(),
         None => {
-            // Fall back to the user-token identity.
+            // Fall back to the requested token identity (user by default, bot if `bot: true`).
+            let purpose = if search_bot {
+                "bot_token"
+            } else {
+                "user_token"
+            };
             let me = check_ok(sl_send(
                 host,
                 "POST",
                 "/auth.test",
-                Some("user_token"),
+                Some(purpose),
                 &json!({}),
             )?)?;
             me.get("user_id")
@@ -1361,13 +1809,35 @@ fn reaction(input: Value, host: &mut Host, method: &str) -> Result<Value, String
 // channels
 // ---------------------------------------------------------------------------
 
-fn channel_list(_input: Value, host: &mut Host) -> Result<Value, String> {
+fn channel_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let v = check_ok(sl_get(
         host,
         "/conversations.list?types=public_channel,private_channel,mpim,im&limit=200",
         Some("bot_token"),
     )?)?;
     contribute_channels(host, &v);
+    let query = opt_str(&input, "query")
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let limit = input
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .filter(|n| *n > 0);
+    if query.is_empty() && limit.is_none() {
+        return Ok(v);
+    }
+    let mut v = v;
+    if let Some(channels) = v.get_mut("channels").and_then(|c| c.as_array_mut()) {
+        if !query.is_empty() {
+            channels.retain(|c| channel_matches_query(c, &query));
+        }
+        if let Some(n) = limit {
+            if channels.len() > n as usize {
+                channels.truncate(n as usize);
+            }
+        }
+    }
     Ok(v)
 }
 
@@ -1399,11 +1869,28 @@ fn channel_mark(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn file_upload(input: Value, host: &mut Host) -> Result<Value, String> {
     let channel = req_str(&input, "channel")?.to_string();
-    let blob_ref = req_str(&input, "blob_ref")?.to_string();
-    let bytes = host.blob_get(&blob_ref)?;
+
+    // Bytes come from either an inline base64 payload or a host blob_ref (exactly one).
+    let has_blob_ref = opt_str(&input, "blob_ref").is_some();
+    let has_content_bytes = opt_str(&input, "content_bytes").is_some();
+    if has_blob_ref == has_content_bytes {
+        return Err("provide exactly one of blob_ref or content_bytes".into());
+    }
+    let bytes = if let Some(b64) = opt_str(&input, "content_bytes") {
+        base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .map_err(|e| format!("content_bytes is not valid base64: {e}"))?
+    } else {
+        let blob_ref = req_str(&input, "blob_ref")?.to_string();
+        host.blob_get(&blob_ref)?
+    };
+
     let filename = opt_str(&input, "filename")
         .map(str::to_string)
         .unwrap_or_else(|| "upload.bin".into());
+    if bytes.is_empty() {
+        return Err("file content is empty".into());
+    }
 
     // 1. Reserve an external upload URL.
     let reserve_path = format!(
@@ -1435,8 +1922,12 @@ fn file_upload(input: Value, host: &mut Host) -> Result<Value, String> {
     }
 
     // 3. Complete the upload, attaching the file to the channel/thread.
+    let mut file_entry = json!({ "id": file_id, "title": filename });
+    if let Some(alt) = opt_str(&input, "alt_text") {
+        file_entry["alt_text"] = json!(alt);
+    }
     let mut complete = json!({
-        "files": [{ "id": file_id, "title": filename }],
+        "files": [file_entry],
         "channel_id": channel,
     });
     if let Some(ts) = opt_str(&input, "thread_ts") {
@@ -1493,7 +1984,14 @@ fn file_download(input: Value, host: &mut Host) -> Result<Value, String> {
                 .map(str::to_string)
         })
         .unwrap_or_else(|| file_id.clone());
-    let blob_ref = host.blob_put(&filename, &bytes)?;
+    // If the caller provided a blob_ref seed, use it as the returned reference (the host's
+    // blob store receives the content under that name). Mirrors fluxplane's BlobWrite.Ref.
+    let blob_ref = if let Some(seed) = opt_str(&input, "blob_ref") {
+        host.blob_put(seed, &bytes)?;
+        seed.to_string()
+    } else {
+        host.blob_put(&filename, &bytes)?
+    };
     Ok(json!({
         "ok": true,
         "file_id": file_id,
@@ -1518,7 +2016,26 @@ fn file_list(input: Value, host: &mut Host) -> Result<Value, String> {
             path.push_str(&format!("&{key}={}", urlencode(val)));
         }
     }
-    check_ok(sl_get(host, &path, Some("bot_token"))?)
+    let query = opt_str(&input, "query")
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let mut v = check_ok(sl_get(host, &path, Some("bot_token"))?)?;
+    if let Some(files) = v.get_mut("files").and_then(|f| f.as_array_mut()) {
+        if !query.is_empty() {
+            files.retain(|f| file_matches_query(f, &query));
+        }
+        let cap = input
+            .get("limit")
+            .and_then(|v| v.as_i64())
+            .filter(|n| *n > 0);
+        if let Some(n) = cap {
+            if files.len() > n as usize {
+                files.truncate(n as usize);
+            }
+        }
+    }
+    Ok(v)
 }
 
 fn file_delete(input: Value, host: &mut Host) -> Result<Value, String> {
@@ -1591,16 +2108,57 @@ fn bookmark_delete(input: Value, host: &mut Host) -> Result<Value, String> {
 fn bookmark_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let channel = req_str(&input, "channel")?;
     let path = format!("/bookmarks.list?channel_id={}", urlencode(channel));
-    check_ok(sl_get(host, &path, Some("bot_token"))?)
+    let query = opt_str(&input, "query")
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let limit = input
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .filter(|n| *n > 0);
+    let mut v = check_ok(sl_get(host, &path, Some("bot_token"))?)?;
+    if let Some(bookmarks) = v.get_mut("bookmarks").and_then(|b| b.as_array_mut()) {
+        if !query.is_empty() {
+            bookmarks.retain(|b| bookmark_matches_query(b, &query));
+        }
+        if let Some(n) = limit {
+            if bookmarks.len() > n as usize {
+                bookmarks.truncate(n as usize);
+            }
+        }
+    }
+    Ok(v)
 }
 
 // ---------------------------------------------------------------------------
 // users / presence / emoji
 // ---------------------------------------------------------------------------
 
-fn user_list(_input: Value, host: &mut Host) -> Result<Value, String> {
+fn user_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let v = check_ok(sl_get(host, "/users.list?limit=200", Some("bot_token"))?)?;
     contribute_users(host, &v);
+    let query = opt_str(&input, "query")
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let limit = input
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .filter(|n| *n > 0);
+    if query.is_empty() && limit.is_none() {
+        return Ok(v);
+    }
+    let mut v = v;
+    if let Some(members) = v.get_mut("members").and_then(|m| m.as_array_mut()) {
+        if !query.is_empty() {
+            members.retain(|u| user_matches_query(u, &query));
+        }
+        if let Some(n) = limit {
+            if members.len() > n as usize {
+                members.truncate(n as usize);
+            }
+        }
+    }
     Ok(v)
 }
 
@@ -1623,8 +2181,114 @@ fn presence_set(input: Value, host: &mut Host) -> Result<Value, String> {
     )?)
 }
 
-fn emoji_list(_input: Value, host: &mut Host) -> Result<Value, String> {
-    check_ok(sl_get(host, "/emoji.list", Some("bot_token"))?)
+fn emoji_list(input: Value, host: &mut Host) -> Result<Value, String> {
+    let mode = opt_str(&input, "mode")
+        .unwrap_or("custom")
+        .trim()
+        .to_ascii_lowercase();
+    if mode != "custom" && mode != "builtin" && mode != "all" {
+        return Err("mode must be custom, builtin, or all".into());
+    }
+    let include_aliases = input
+        .get("include_aliases")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let query = opt_str(&input, "query")
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let limit = input
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .filter(|n| *n > 0);
+    let unfiltered = query.is_empty() && limit.is_none() && !include_aliases && mode == "custom";
+
+    let mut v = check_ok(sl_get(host, "/emoji.list", Some("bot_token"))?)?;
+    if unfiltered {
+        // No client-side filtering requested: keep Slack's native emoji map shape.
+        return Ok(v);
+    }
+
+    let mut out: Vec<Value> = Vec::new();
+
+    if mode == "custom" || mode == "all" {
+        if let Some(emoji) = v.get("emoji").and_then(|e| e.as_object()) {
+            let mut names: Vec<&String> = emoji.keys().collect();
+            names.sort();
+            for name in names {
+                let value = emoji
+                    .get(name)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let (is_alias, alias_for) = value
+                    .strip_prefix("alias:")
+                    .map(|rest| (true, rest.trim()))
+                    .unwrap_or((false, ""));
+                if is_alias && !include_aliases {
+                    continue;
+                }
+                if name.to_ascii_lowercase().contains(&query) {
+                    let mut entry = json!({ "name": name, "source": "custom" });
+                    if is_alias {
+                        entry["alias_for"] = json!(alias_for);
+                    } else if !value.is_empty() {
+                        entry["url"] = json!(value);
+                    }
+                    out.push(entry);
+                }
+            }
+        }
+    }
+
+    if mode == "builtin" || mode == "all" {
+        if let Some(categories) = v.get("categories").and_then(|c| c.as_array()) {
+            for category in categories {
+                let category_name = category
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if let Some(names) = category.get("emoji_names").and_then(|v| v.as_array()) {
+                    for name in names {
+                        let name = name
+                            .as_str()
+                            .map(str::trim)
+                            .map(|s| s.trim_matches(':'))
+                            .unwrap_or("");
+                        if name.is_empty() {
+                            continue;
+                        }
+                        if name.to_ascii_lowercase().contains(&query) {
+                            out.push(json!({
+                                "name": name,
+                                "source": "builtin",
+                                "category": category_name.clone(),
+                            }));
+                        }
+                    }
+                }
+            }
+            if mode == "all" {
+                // Sort combined custom+builtin by name for stable output.
+                out.sort_by(|a, b| {
+                    let a_name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let b_name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    a_name.cmp(b_name)
+                });
+            }
+        }
+    }
+
+    if let Some(n) = limit {
+        if out.len() > n as usize {
+            out.truncate(n as usize);
+        }
+    }
+
+    v["emoji"] = json!(out);
+    Ok(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -2566,6 +3230,403 @@ mod tests {
     }
 
     #[test]
+    fn message_send_blocks_requires_no_text_fails_without_fallback() {
+        let mut h = host().with_http("chat.postMessage", json!({ "ok": true, "ts": "1.0" }));
+        let err = plugin()
+            .call(
+                "slack.message.send",
+                json!({
+                    "channel": "C1",
+                    "blocks": [{ "type": "divider" }]
+                }),
+                &mut h,
+            )
+            .unwrap_err();
+        assert!(err.contains("text fallback"), "got: {err}");
+    }
+
+    #[test]
+    fn message_send_blocks_and_text_posts_blocks() {
+        let mut h = host().with_http("chat.postMessage", json!({ "ok": true, "ts": "1.0" }));
+        let out = plugin()
+            .call(
+                "slack.message.send",
+                json!({
+                    "channel": "C1",
+                    "text": "fallback",
+                    "blocks": [{ "type": "divider" }],
+                    "unfurl_links": false,
+                    "unfurl_media": false,
+                    "parse": "none"
+                }),
+                &mut h,
+            )
+            .unwrap();
+        assert_eq!(out["ts"], "1.0");
+    }
+
+    #[test]
+    fn message_send_markdown_posts_mrkdwn_block() {
+        let mut h = host().with_http("chat.postMessage", json!({ "ok": true, "ts": "1.0" }));
+        let out = plugin()
+            .call(
+                "slack.message.send",
+                json!({"channel": "C1", "markdown": "hello *world*" }),
+                &mut h,
+            )
+            .unwrap();
+        assert_eq!(out["ts"], "1.0");
+    }
+
+    #[test]
+    fn message_edit_blocks_without_text_is_rejected() {
+        let mut h = host().with_http("chat.update", json!({ "ok": true, "ts": "1.0" }));
+        let err = plugin()
+            .call(
+                "slack.message.edit",
+                json!({ "ref": "C1:1.0", "blocks": [{ "type": "divider" }] }),
+                &mut h,
+            )
+            .unwrap_err();
+        assert!(err.contains("text fallback"), "got: {err}");
+    }
+
+    #[test]
+    fn message_list_text_format_mrkdwn_keeps_raw() {
+        let mut h = host().with_http(
+            "conversations.history",
+            json!({ "ok": true, "messages": [{ "ts": "1.1", "text": "<https://x|link> plain" }] }),
+        );
+        let out = plugin()
+            .call(
+                "slack.message.list",
+                json!({ "channel": "C1", "text_format": "mrkdwn" }),
+                &mut h,
+            )
+            .unwrap();
+        assert_eq!(out["messages"][0]["text"], "<https://x|link> plain");
+        assert!(out["messages"][0]["text_mrkdwn"].is_null());
+    }
+
+    #[test]
+    fn thread_text_format_default_renders_markdown() {
+        let mut h = host().with_http(
+            "conversations.replies",
+            json!({ "ok": true, "messages": [{ "ts": "1.1", "text": "<https://x|link>" }] }),
+        );
+        let out = plugin()
+            .call(
+                "slack.thread",
+                json!({ "channel": "C1", "ts": "1.0" }),
+                &mut h,
+            )
+            .unwrap();
+        assert_eq!(out["messages"][0]["text"], "[link](https://x)");
+    }
+
+    #[test]
+    fn search_extracts_tickets() {
+        let mut h = host().with_http(
+            "search.messages",
+            json!({
+                "ok": true,
+                "messages": {
+                    "total": 1,
+                    "matches": [{
+                        "text": "PROJ-123 is fixed",
+                        "permalink": "https://acme.slack.com/archives/C1/p1"
+                    }]
+                }
+            }),
+        );
+        let out = plugin()
+            .call(
+                "slack.search",
+                json!({ "query": "PROJ", "tickets": true, "ticket_keys": ["PROJ"] }),
+                &mut h,
+            )
+            .unwrap();
+        assert_eq!(
+            out["messages"]["matches"][0]["tickets"],
+            json!(["PROJ-123"])
+        );
+        let tickets = out["tickets"].as_array().unwrap();
+        assert_eq!(tickets.len(), 1);
+        assert_eq!(tickets[0]["key"], "PROJ-123");
+        assert_eq!(tickets[0]["mentions"], 1);
+    }
+
+    #[test]
+    fn mentions_uses_bot_identity_when_requested() {
+        let now = unix_now();
+        let matched = format!("{now}.000001");
+        let mut h = host()
+            .with_http(
+                "search.messages",
+                json!({ "ok": true, "messages": { "total": 1, "matches": [{
+                    "ts": matched,
+                    "user": "U2",
+                    "text": "<@U_bot> look",
+                    "permalink": "https://acme.slack.com/archives/C1/p1001000000",
+                    "channel": { "id": "" }
+                }] } }),
+            )
+            .with_http("auth.test", json!({ "ok": true, "user_id": "U_bot" }));
+        let out = plugin()
+            .call("slack.mentions", json!({ "bot": true }), &mut h)
+            .unwrap();
+        assert_eq!(out["target"], "U_bot");
+        assert_eq!(out["count"], 1);
+    }
+
+    #[test]
+    fn mentions_ticket_keys_are_strings() {
+        let now = unix_now();
+        let matched = format!("{now}.000001");
+        let mut h = host()
+            .with_http(
+                "search.messages",
+                json!({ "ok": true, "messages": { "total": 1, "matches": [{
+                    "ts": matched,
+                    "user": "U2",
+                    "text": "dev-5 ABC-9",
+                    "permalink": "https://x",
+                    "channel": { "id": "" }
+                }] } }),
+            )
+            .with_http("auth.test", json!({ "ok": true, "user_id": "U_me" }));
+        let out = plugin()
+            .call(
+                "slack.mentions",
+                json!({ "tickets": true, "ticket_keys": ["DEV", "abc"] }),
+                &mut h,
+            )
+            .unwrap();
+        assert_eq!(out["mentions"][0]["tickets"], json!(["ABC-9", "DEV-5"]));
+    }
+
+    #[test]
+    fn file_upload_content_bytes_decodes_inline_base64() {
+        let mut h = host()
+            .with_http(
+                "files.getUploadURLExternal",
+                json!({ "ok": true, "upload_url": "https://files.slack.test/up", "file_id": "F1" }),
+            )
+            .with_http("files.slack.test/up", json!({ "ok": true }))
+            .with_http(
+                "files.completeUploadExternal",
+                json!({ "ok": true, "files": [{ "id": "F1", "title": "hello.txt" }] }),
+            );
+        let content = b"hello bytes";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(content);
+        let out = plugin()
+            .call(
+                "slack.file.upload",
+                json!({
+                    "channel": "C1",
+                    "content_bytes": b64,
+                    "filename": "hello.txt",
+                    "alt_text": "chart"
+                }),
+                &mut h,
+            )
+            .unwrap();
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["filename"], "hello.txt");
+        assert_eq!(out["size"], content.len());
+    }
+
+    #[test]
+    fn file_upload_requires_exactly_one_content_source() {
+        let mut h = host().with_http("files.getUploadURLExternal", json!({ "ok": false }));
+        let err = plugin()
+            .call(
+                "slack.file.upload",
+                json!({
+                    "channel": "C1",
+                    "blob_ref": "blob-1",
+                    "content_bytes": "aGVsbG8="
+                }),
+                &mut h,
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("exactly one of blob_ref or content_bytes"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn file_download_blob_ref_seed_returns_prefixed_ref() {
+        let mut h = host()
+            .with_http(
+                "files.info",
+                json!({ "ok": true, "file": { "id": "F1", "name": "a.txt", "url_private_download": "https://files.slack.test/dl" } }),
+            )
+            .with_http_bytes("files.slack.test/dl", b"data".to_vec());
+        let out = plugin()
+            .call(
+                "slack.file.download",
+                json!({ "file_id": "F1", "blob_ref": "myprefix" }),
+                &mut h,
+            )
+            .unwrap();
+        let blob_ref = out["blob_ref"].as_str().unwrap();
+        assert!(blob_ref.starts_with("myprefix"), "got: {blob_ref}");
+    }
+
+    #[test]
+    fn file_list_filters_and_limits_client_side() {
+        let mut h = host().with_http(
+            "files.list",
+            json!({
+                "ok": true,
+                "files": [
+                    { "id": "F1", "name": "foo.txt" },
+                    { "id": "F2", "name": "bar.txt" },
+                    { "id": "F3", "name": "fooagain.txt" }
+                ]
+            }),
+        );
+        let out = plugin()
+            .call(
+                "slack.file.list",
+                json!({ "query": "foo", "limit": 2 }),
+                &mut h,
+            )
+            .unwrap();
+        let files = out["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files
+            .iter()
+            .all(|f| f["name"].as_str().unwrap().contains("foo")));
+    }
+
+    #[test]
+    fn channel_list_filters_and_limits_client_side() {
+        let mut h = host().with_http(
+            "conversations.list",
+            json!({
+                "ok": true,
+                "channels": [
+                    { "id": "C1", "name": "team-alpha" },
+                    { "id": "C2", "name": "team-beta" },
+                    { "id": "C3", "name": "alpha-2" }
+                ]
+            }),
+        );
+        let out = plugin()
+            .call(
+                "slack.channel.list",
+                json!({ "query": "alpha", "limit": 1 }),
+                &mut h,
+            )
+            .unwrap();
+        let channels = out["channels"].as_array().unwrap();
+        assert_eq!(channels.len(), 1);
+        assert!(channels[0]["name"].as_str().unwrap().contains("alpha"));
+    }
+
+    #[test]
+    fn user_list_filters_and_limits_client_side() {
+        let mut h = host().with_http(
+            "users.list",
+            json!({
+                "ok": true,
+                "members": [
+                    { "id": "U1", "name": "alice", "profile": { "real_name": "Alice A" } },
+                    { "id": "U2", "name": "bob", "profile": { "real_name": "Bob B" } },
+                    { "id": "U3", "name": "alicia", "profile": { "real_name": "Alicia C" } }
+                ]
+            }),
+        );
+        let out = plugin()
+            .call(
+                "slack.user.list",
+                json!({ "query": "ali", "limit": 2 }),
+                &mut h,
+            )
+            .unwrap();
+        let members = out["members"].as_array().unwrap();
+        assert_eq!(members.len(), 2);
+    }
+
+    #[test]
+    fn bookmark_list_filters_and_limits_client_side() {
+        let mut h = host().with_http(
+            "bookmarks.list",
+            json!({
+                "ok": true,
+                "bookmarks": [
+                    { "id": "B1", "title": "Alpha docs", "link": "https://a" },
+                    { "id": "B2", "title": "Beta docs", "link": "https://b" },
+                    { "id": "B3", "title": "Gamma runbook", "link": "https://g" }
+                ]
+            }),
+        );
+        let out = plugin()
+            .call(
+                "slack.bookmark.list",
+                json!({ "channel": "C1", "query": "docs", "limit": 1 }),
+                &mut h,
+            )
+            .unwrap();
+        let bookmarks = out["bookmarks"].as_array().unwrap();
+        assert_eq!(bookmarks.len(), 1);
+        assert!(bookmarks[0]["title"].as_str().unwrap().contains("docs"));
+    }
+
+    #[test]
+    fn emoji_list_custom_mode_and_query_and_limit() {
+        let mut h = host().with_http(
+            "emoji.list",
+            json!({
+                "ok": true,
+                "emoji": {
+                    "party": "https://x",
+                    "partyparrot": "alias:party",
+                    "work": "https://y"
+                }
+            }),
+        );
+        let out = plugin()
+            .call(
+                "slack.emoji.list",
+                json!({ "query": "party", "limit": 1 }),
+                &mut h,
+            )
+            .unwrap();
+        let emoji = out["emoji"].as_array().unwrap();
+        assert_eq!(emoji.len(), 1);
+        assert_eq!(emoji[0]["name"], "party");
+    }
+
+    #[test]
+    fn emoji_list_include_aliases_shows_alias_entry() {
+        let mut h = host().with_http(
+            "emoji.list",
+            json!({
+                "ok": true,
+                "emoji": {
+                    "party": "https://x",
+                    "partyparrot": "alias:party"
+                }
+            }),
+        );
+        let out = plugin()
+            .call(
+                "slack.emoji.list",
+                json!({ "include_aliases": true }),
+                &mut h,
+            )
+            .unwrap();
+        let emoji = out["emoji"].as_array().unwrap();
+        assert!(emoji
+            .iter()
+            .any(|e| e["name"] == "partyparrot" && e["alias_for"] == "party"));
+    }
+
+    #[test]
     fn manifest_declares_ops_auth_and_datasources() {
         let m = plugin().manifest();
         assert_eq!(m.operations.len(), 30);
@@ -2599,6 +3660,7 @@ mod schema_contract {
         Int,
         Bool,
         ArrayAny,
+        ArrayStr,
     }
     #[derive(Clone)]
     struct Prop {
@@ -2625,10 +3687,15 @@ mod schema_contract {
                     vec![
                         p("channel", Kind::Str),
                         p("text", Kind::Str),
+                        p("markdown", Kind::Str),
+                        p("blocks", Kind::ArrayAny),
                         p("thread_ts", Kind::Str),
                         p("reply_broadcast", Kind::Bool),
+                        p("unfurl_links", Kind::Bool),
+                        p("unfurl_media", Kind::Bool),
+                        p("parse", Kind::Str),
                     ],
-                    vec!["channel", "text"],
+                    vec!["channel"],
                 ),
             ),
             (
@@ -2640,6 +3707,7 @@ mod schema_contract {
                         p("cursor", Kind::Str),
                         p("oldest", Kind::Str),
                         p("latest", Kind::Str),
+                        p("text_format", Kind::Str),
                     ],
                     vec!["channel"],
                 ),
@@ -2652,8 +3720,13 @@ mod schema_contract {
                         p("channel", Kind::Str),
                         p("ts", Kind::Str),
                         p("text", Kind::Str),
+                        p("markdown", Kind::Str),
+                        p("blocks", Kind::ArrayAny),
+                        p("unfurl_links", Kind::Bool),
+                        p("unfurl_media", Kind::Bool),
+                        p("parse", Kind::Str),
                     ],
-                    vec!["text"],
+                    vec![],
                 ),
             ),
             (
@@ -2675,6 +3748,8 @@ mod schema_contract {
                         p("channel", Kind::Str),
                         p("ts", Kind::Str),
                         p("limit", Kind::Int),
+                        p("max_bytes", Kind::Int),
+                        p("text_format", Kind::Str),
                     ],
                     vec![],
                 ),
@@ -2682,7 +3757,12 @@ mod schema_contract {
             (
                 "slack.search",
                 c(
-                    vec![p("query", Kind::Str), p("limit", Kind::Int)],
+                    vec![
+                        p("query", Kind::Str),
+                        p("limit", Kind::Int),
+                        p("tickets", Kind::Bool),
+                        p("ticket_keys", Kind::ArrayStr),
+                    ],
                     vec!["query"],
                 ),
             ),
@@ -2691,12 +3771,13 @@ mod schema_contract {
                 c(
                     vec![
                         p("user", Kind::Str),
+                        p("bot", Kind::Bool),
                         p("since", Kind::Str),
                         p("limit", Kind::Int),
                         p("unhandled", Kind::Bool),
                         p("max_thread", Kind::Int),
                         p("tickets", Kind::Bool),
-                        p("ticket_keys", Kind::ArrayAny),
+                        p("ticket_keys", Kind::ArrayStr),
                     ],
                     vec![],
                 ),
@@ -2736,7 +3817,10 @@ mod schema_contract {
                     vec!["emoji"],
                 ),
             ),
-            ("slack.channel.list", c(vec![], vec![])),
+            (
+                "slack.channel.list",
+                c(vec![p("query", Kind::Str), p("limit", Kind::Int)], vec![]),
+            ),
             (
                 "slack.channel.join",
                 c(vec![p("channel", Kind::Str)], vec!["channel"]),
@@ -2758,25 +3842,34 @@ mod schema_contract {
                     vec![
                         p("channel", Kind::Str),
                         p("blob_ref", Kind::Str),
+                        p("content_bytes", Kind::Str),
                         p("filename", Kind::Str),
                         p("thread_ts", Kind::Str),
                         p("initial_comment", Kind::Str),
                         p("alt_text", Kind::Str),
                     ],
-                    vec!["channel", "blob_ref"],
+                    vec!["channel"],
                 ),
             ),
             (
                 "slack.file.download",
                 c(
-                    vec![p("file_id", Kind::Str), p("filename", Kind::Str)],
+                    vec![
+                        p("file_id", Kind::Str),
+                        p("blob_ref", Kind::Str),
+                        p("filename", Kind::Str),
+                    ],
                     vec!["file_id"],
                 ),
             ),
             (
                 "slack.download",
                 c(
-                    vec![p("file_id", Kind::Str), p("filename", Kind::Str)],
+                    vec![
+                        p("file_id", Kind::Str),
+                        p("blob_ref", Kind::Str),
+                        p("filename", Kind::Str),
+                    ],
                     vec!["file_id"],
                 ),
             ),
@@ -2791,6 +3884,7 @@ mod schema_contract {
                         p("channel", Kind::Str),
                         p("user", Kind::Str),
                         p("types", Kind::Str),
+                        p("query", Kind::Str),
                         p("limit", Kind::Int),
                     ],
                     vec![],
@@ -2834,15 +3928,36 @@ mod schema_contract {
             ),
             (
                 "slack.bookmark.list",
-                c(vec![p("channel", Kind::Str)], vec!["channel"]),
+                c(
+                    vec![
+                        p("channel", Kind::Str),
+                        p("query", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec!["channel"],
+                ),
             ),
-            ("slack.user.list", c(vec![], vec![])),
+            (
+                "slack.user.list",
+                c(vec![p("query", Kind::Str), p("limit", Kind::Int)], vec![]),
+            ),
             ("slack.presence.get", c(vec![p("user", Kind::Str)], vec![])),
             (
                 "slack.presence.set",
                 c(vec![p("presence", Kind::Str)], vec!["presence"]),
             ),
-            ("slack.emoji.list", c(vec![], vec![])),
+            (
+                "slack.emoji.list",
+                c(
+                    vec![
+                        p("query", Kind::Str),
+                        p("limit", Kind::Int),
+                        p("mode", Kind::Str),
+                        p("include_aliases", Kind::Bool),
+                    ],
+                    vec![],
+                ),
+            ),
             ("slack.index.build", c(vec![], vec![])),
         ]
     }
@@ -2854,15 +3969,26 @@ mod schema_contract {
                 .find(|v| v.as_str() != Some("null"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("null");
-            return base_kind(first);
+            return base_kind(first, node);
         }
-        base_kind(t.and_then(|v| v.as_str()).unwrap_or(""))
+        base_kind(t.and_then(|v| v.as_str()).unwrap_or(""), node)
     }
-    fn base_kind(t: &str) -> Kind {
+    fn base_kind(t: &str, node: &Value) -> Kind {
         match t {
             "integer" => Kind::Int,
             "boolean" => Kind::Bool,
-            "array" => Kind::ArrayAny,
+            "array" => {
+                if node
+                    .get("items")
+                    .and_then(|v| v.get("type"))
+                    .and_then(|v| v.as_str())
+                    == Some("string")
+                {
+                    Kind::ArrayStr
+                } else {
+                    Kind::ArrayAny
+                }
+            }
             "string" => Kind::Str,
             other => panic!("unsupported property type: {other}"),
         }

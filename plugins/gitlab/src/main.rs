@@ -28,6 +28,11 @@ use serde::Deserialize;
 #[allow(dead_code)]
 struct ProjectListInput {
     search: Option<String>,
+    query: Option<String>,
+    order_by: Option<String>,
+    sort: Option<String>,
+    limit: Option<i64>,
+    membership: Option<bool>,
 }
 
 /// `gitlab.project.show`.
@@ -43,6 +48,13 @@ struct ProjectShowInput {
 struct MrListInput {
     project: String,
     state: Option<String>,
+    search: Option<String>,
+    query: Option<String>,
+    order_by: Option<String>,
+    sort: Option<String>,
+    limit: Option<i64>,
+    source_branch: Option<String>,
+    target_branch: Option<String>,
 }
 
 /// `gitlab.mr.show`.
@@ -60,6 +72,11 @@ struct MrShowInput {
 struct IssueListInput {
     project: String,
     state: Option<String>,
+    search: Option<String>,
+    query: Option<String>,
+    order_by: Option<String>,
+    sort: Option<String>,
+    limit: Option<i64>,
 }
 
 /// `gitlab.pipeline.list`.
@@ -67,6 +84,11 @@ struct IssueListInput {
 #[allow(dead_code)]
 struct PipelineListInput {
     project: String,
+    status: Option<String>,
+    r#ref: Option<String>,
+    source: Option<String>,
+    username: Option<String>,
+    limit: Option<i64>,
 }
 
 /// `gitlab.test`.
@@ -78,7 +100,36 @@ struct TestInput {}
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
 struct IndexBuildInput {
+    index: Option<String>,
+    indexes: Option<Vec<String>>,
+    entity: Option<String>,
+    entities: Option<Vec<String>>,
     limit: Option<i64>,
+    search: Option<String>,
+    query: Option<String>,
+    order_by: Option<String>,
+    sort: Option<String>,
+    membership: Option<bool>,
+    user_limit: Option<i64>,
+    user_search: Option<String>,
+    active_users: Option<bool>,
+    group_limit: Option<i64>,
+    group_search: Option<String>,
+    group_order_by: Option<String>,
+    group_sort: Option<String>,
+    active_groups: Option<bool>,
+    all_visible_groups: Option<bool>,
+    issue_limit: Option<i64>,
+    issue_search: Option<String>,
+    issue_state: Option<String>,
+    issue_order_by: Option<String>,
+    issue_sort: Option<String>,
+    mr_project: Option<String>,
+    mr_limit: Option<i64>,
+    mr_search: Option<String>,
+    mr_state: Option<String>,
+    mr_order_by: Option<String>,
+    mr_sort: Option<String>,
 }
 
 /// `gitlab.project.create`.
@@ -149,6 +200,7 @@ struct MrMergeInput {
     squash_commit_message: Option<String>,
     squash: Option<bool>,
     should_remove_source_branch: Option<bool>,
+    remove_source_branch: Option<bool>,
     sha: Option<String>,
 }
 
@@ -290,6 +342,7 @@ struct RepositoryFileShowInput {
     project: String,
     path: String,
     r#ref: Option<String>,
+    max_bytes: Option<i64>,
 }
 
 /// `gitlab.repository.tree`.
@@ -393,6 +446,7 @@ struct SearchBlobsInput {
     group: Option<String>,
     r#ref: Option<String>,
     limit: Option<i64>,
+    max_data_bytes: Option<i64>,
 }
 
 /// `gitlab.mr.changes`.
@@ -1431,13 +1485,31 @@ fn qs(pairs: &[(&str, String)]) -> String {
 // ---------------------------------------------------------------------------
 
 fn project_list(input: Value, host: &mut Host) -> Result<Value, String> {
-    let search = flex_str(&input, "search").unwrap_or_default();
-    let path = if search.is_empty() {
-        "/projects?membership=true&per_page=20&order_by=last_activity_at".to_string()
-    } else {
-        format!("/projects?search={}&per_page=20", enc(&search))
-    };
-    let projects = gl_get(host, &path)?;
+    let membership = input
+        .get("membership")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let search = flex_str(&input, "search")
+        .or_else(|| flex_str(&input, "query"))
+        .unwrap_or_default();
+    let order_by = flex_str(&input, "order_by").unwrap_or_else(|| "last_activity_at".into());
+    let sort = flex_str(&input, "sort").unwrap_or_else(|| "desc".into());
+    let limit = clamp(flex_i64(&input, &["limit"]).unwrap_or(0), 20, 100);
+    let pairs = [
+        (
+            "membership",
+            if membership {
+                "true".into()
+            } else {
+                "false".into()
+            },
+        ),
+        ("search", search),
+        ("order_by", order_by),
+        ("sort", sort),
+        ("per_page", limit.to_string()),
+    ];
+    let projects = gl_get(host, &format!("/projects{}", qs(&pairs)))?;
     contribute_projects(host, &projects);
     Ok(projects)
 }
@@ -1450,12 +1522,26 @@ fn project_show(input: Value, host: &mut Host) -> Result<Value, String> {
 fn mr_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
     let state = flex_str(&input, "state").unwrap_or_else(|| "opened".into());
+    let search = flex_str(&input, "search")
+        .or_else(|| flex_str(&input, "query"))
+        .unwrap_or_default();
+    let order_by = flex_str(&input, "order_by").unwrap_or_else(|| "updated_at".into());
+    let sort = flex_str(&input, "sort").unwrap_or_else(|| "desc".into());
+    let limit = clamp(flex_i64(&input, &["limit"]).unwrap_or(0), 20, 100);
+    let source_branch = flex_str(&input, "source_branch").unwrap_or_default();
+    let target_branch = flex_str(&input, "target_branch").unwrap_or_default();
+    let pairs = [
+        ("state", state),
+        ("search", search),
+        ("order_by", order_by),
+        ("sort", sort),
+        ("per_page", limit.to_string()),
+        ("source_branch", source_branch),
+        ("target_branch", target_branch),
+    ];
     let mrs = gl_get(
         host,
-        &format!(
-            "/projects/{}/merge_requests?state={state}&per_page=20",
-            enc(&project)
-        ),
+        &format!("/projects/{}/merge_requests{}", enc(&project), qs(&pairs)),
     )?;
     contribute_list(host, &mrs, "gitlab.merge_request", &project);
     Ok(mrs)
@@ -1472,12 +1558,22 @@ fn mr_show(input: Value, host: &mut Host) -> Result<Value, String> {
 fn issue_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
     let state = flex_str(&input, "state").unwrap_or_else(|| "opened".into());
+    let search = flex_str(&input, "search")
+        .or_else(|| flex_str(&input, "query"))
+        .unwrap_or_default();
+    let order_by = flex_str(&input, "order_by").unwrap_or_default();
+    let sort = flex_str(&input, "sort").unwrap_or_default();
+    let limit = clamp(flex_i64(&input, &["limit"]).unwrap_or(0), 20, 100);
+    let pairs = [
+        ("state", state),
+        ("search", search),
+        ("order_by", order_by),
+        ("sort", sort),
+        ("per_page", limit.to_string()),
+    ];
     let issues = gl_get(
         host,
-        &format!(
-            "/projects/{}/issues?state={state}&per_page=20",
-            enc(&project)
-        ),
+        &format!("/projects/{}/issues{}", enc(&project), qs(&pairs)),
     )?;
     contribute_list(host, &issues, "gitlab.issue", &project);
     Ok(issues)
@@ -1485,9 +1581,21 @@ fn issue_list(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn pipeline_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
+    let status = flex_str(&input, "status").unwrap_or_default();
+    let git_ref = flex_str(&input, "ref").unwrap_or_default();
+    let source = flex_str(&input, "source").unwrap_or_default();
+    let username = flex_str(&input, "username").unwrap_or_default();
+    let limit = clamp(flex_i64(&input, &["limit"]).unwrap_or(0), 20, 200);
+    let pairs = [
+        ("status", status),
+        ("ref", git_ref),
+        ("source", source),
+        ("username", username),
+        ("per_page", limit.to_string()),
+    ];
     gl_get(
         host,
-        &format!("/projects/{}/pipelines?per_page=20", enc(&project)),
+        &format!("/projects/{}/pipelines{}", enc(&project), qs(&pairs)),
     )
 }
 
@@ -1500,38 +1608,176 @@ fn auth_test(_input: Value, host: &mut Host) -> Result<Value, String> {
     Ok(json!({ "status": "ok", "text": "GitLab auth OK", "user": user }))
 }
 
-/// Drive datasource contribution exhaustively over the global surface: projects, then merge requests,
-/// then issues — paging each up to a few hundred records — and return the total `indexed` count.
+/// Which datasource categories the current `index.build` call should populate.
+#[derive(Default)]
+struct IndexInclude {
+    projects: bool,
+    merge_requests: bool,
+    issues: bool,
+}
+
+fn index_include(input: &Value) -> IndexInclude {
+    let mut raw = Vec::new();
+    for key in ["index", "indexes", "entity", "entities"] {
+        match input.get(key) {
+            Some(Value::String(s)) => {
+                for part in s.split(',') {
+                    raw.push(part.trim().to_lowercase());
+                }
+            }
+            Some(Value::Array(arr)) => {
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        raw.push(s.trim().to_lowercase());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let raw: Vec<String> = raw.into_iter().filter(|s| !s.is_empty()).collect();
+    if raw.is_empty() {
+        return IndexInclude {
+            projects: true,
+            merge_requests: true,
+            issues: true,
+        };
+    }
+    let mut inc = IndexInclude::default();
+    for v in raw {
+        match v.as_str() {
+            "projects" | "project" | "gitlab.projects" | "gitlab.project" => inc.projects = true,
+            "merge_requests"
+            | "merge_request"
+            | "mr"
+            | "mrs"
+            | "gitlab.merge_requests"
+            | "gitlab.merge_request" => inc.merge_requests = true,
+            "issues" | "issue" | "gitlab.issues" | "gitlab.issue" => inc.issues = true,
+            _ => {}
+        }
+    }
+    inc
+}
+
+/// Resolve a 1-based `limit` into `(all_pages, per_page)` for index paging.
+/// A positive limit yields a single page of up to `max_per_page` items; otherwise all pages are fetched with `per_page`.
+fn page_plan(input: &Value, limit_key: &str, max_per_page: i64) -> (bool, i64) {
+    match flex_i64(input, &[limit_key]) {
+        Some(v) if v > 0 => (false, clamp(v, 1, max_per_page)),
+        _ => (true, max_per_page),
+    }
+}
+
+/// Drive datasource contribution over the requested selectors. Each category pages via
+/// `per_page`/`page` unless a datasource-specific limit pins it to a single page.
 fn index_build(input: Value, host: &mut Host) -> Result<Value, String> {
-    let cap = clamp(flex_i64(&input, &["limit"]).unwrap_or(0), 300, 1000) as usize;
+    let include = index_include(&input);
     let mut total = 0;
-    total += page_index(
-        host,
-        "/projects?membership=true&order_by=last_activity_at",
-        cap,
-        contribute_projects,
-    );
-    total += page_index(host, "/merge_requests?scope=all", cap, |h, page| {
-        contribute_refs(h, page, "gitlab.merge_request")
-    });
-    total += page_index(host, "/issues?scope=all", cap, |h, page| {
-        contribute_refs(h, page, "gitlab.issue")
-    });
+    if include.projects {
+        total += index_projects(host, &input);
+    }
+    if include.merge_requests {
+        total += index_merge_requests(host, &input);
+    }
+    if include.issues {
+        total += index_issues(host, &input);
+    }
     Ok(json!({ "indexed": total }))
 }
 
-/// Page `base_path` (per_page=100) until exhausted or `cap` reached, contributing each page.
+fn index_projects(host: &mut Host, input: &Value) -> usize {
+    let membership = input
+        .get("membership")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let search = flex_str(input, "search")
+        .or_else(|| flex_str(input, "query"))
+        .unwrap_or_default();
+    let order_by = flex_str(input, "order_by").unwrap_or_else(|| "last_activity_at".into());
+    let sort = flex_str(input, "sort").unwrap_or_else(|| "desc".into());
+    let (all_pages, per_page) = page_plan(input, "limit", 100);
+    let mut pairs = vec![(
+        "membership",
+        if membership {
+            "true".into()
+        } else {
+            "false".into()
+        },
+    )];
+    if !search.is_empty() {
+        pairs.push(("search", search));
+    }
+    pairs.push(("order_by", order_by));
+    pairs.push(("sort", sort));
+    let base = format!("/projects{}", qs(&pairs));
+    page_index(host, &base, per_page, all_pages, contribute_projects)
+}
+
+fn index_merge_requests(host: &mut Host, input: &Value) -> usize {
+    let project = flex_str(input, "mr_project")
+        .or_else(|| flex_str(input, "project"))
+        .or_else(|| flex_str(input, "project_id"))
+        .or_else(|| flex_str(input, "path"));
+    let state = flex_str(input, "mr_state").unwrap_or_else(|| "all".into());
+    let search = flex_str(input, "mr_search").unwrap_or_default();
+    let order_by = flex_str(input, "mr_order_by").unwrap_or_else(|| "updated_at".into());
+    let sort = flex_str(input, "mr_sort").unwrap_or_else(|| "desc".into());
+    let (all_pages, per_page) = page_plan(input, "mr_limit", 100);
+    let mut pairs = vec![("scope", "all".into())];
+    if !state.is_empty() {
+        pairs.push(("state", state));
+    }
+    if !search.is_empty() {
+        pairs.push(("search", search));
+    }
+    pairs.push(("order_by", order_by));
+    pairs.push(("sort", sort));
+    let base = if let Some(project) = project {
+        format!("/projects/{}/merge_requests{}", enc(&project), qs(&pairs))
+    } else {
+        format!("/merge_requests{}", qs(&pairs))
+    };
+    page_index(host, &base, per_page, all_pages, |h, page| {
+        contribute_refs(h, page, "gitlab.merge_request")
+    })
+}
+
+fn index_issues(host: &mut Host, input: &Value) -> usize {
+    let state = flex_str(input, "issue_state").unwrap_or_else(|| "all".into());
+    let search = flex_str(input, "issue_search").unwrap_or_default();
+    let order_by = flex_str(input, "issue_order_by").unwrap_or_else(|| "updated_at".into());
+    let sort = flex_str(input, "issue_sort").unwrap_or_else(|| "desc".into());
+    let (all_pages, per_page) = page_plan(input, "issue_limit", 100);
+    let mut pairs = vec![("scope", "all".into())];
+    if !state.is_empty() {
+        pairs.push(("state", state));
+    }
+    if !search.is_empty() {
+        pairs.push(("search", search));
+    }
+    pairs.push(("order_by", order_by));
+    pairs.push(("sort", sort));
+    let base = format!("/issues{}", qs(&pairs));
+    page_index(host, &base, per_page, all_pages, |h, page| {
+        contribute_refs(h, page, "gitlab.issue")
+    })
+}
+
+/// Page `base_path` until exhausted (or a single page when `all_pages` is false),
+/// contributing each page and returning the number of records indexed.
 fn page_index(
     host: &mut Host,
     base_path: &str,
-    cap: usize,
+    per_page: i64,
+    all_pages: bool,
     contribute: impl Fn(&mut Host, &Value) -> usize,
 ) -> usize {
     let mut total = 0;
     let mut page = 1;
     loop {
         let sep = if base_path.contains('?') { "&" } else { "?" };
-        let path = format!("{base_path}{sep}per_page=100&page={page}");
+        let path = format!("{base_path}{sep}per_page={per_page}&page={page}");
         let items = match gl_get(host, &path) {
             Ok(v) => v,
             Err(_) => break,
@@ -1541,7 +1787,7 @@ fn page_index(
             break;
         }
         total += contribute(host, &items);
-        if len < 100 || total >= cap {
+        if !all_pages || len < per_page as usize {
             break;
         }
         page += 1;
@@ -1918,7 +2164,7 @@ fn repo_file_show(input: Value, host: &mut Host) -> Result<Value, String> {
                 .ok_or("project has no default branch — pass ref explicitly")?
         }
     };
-    gl_get(
+    let mut file = gl_get(
         host,
         &format!(
             "/projects/{}/repository/files/{}?ref={}",
@@ -1926,7 +2172,23 @@ fn repo_file_show(input: Value, host: &mut Host) -> Result<Value, String> {
             enc(&path),
             enc(&git_ref)
         ),
-    )
+    )?;
+    if let Some(max_bytes) = flex_i64(&input, &["max_bytes"]) {
+        if max_bytes > 0 {
+            if let Some(Value::String(content)) = file.get_mut("content") {
+                let max = max_bytes as usize;
+                if content.len() > max {
+                    let mut end = max;
+                    while end > 0 && !content.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    *content = content[..end].to_string();
+                    file["truncated"] = json!(true);
+                }
+            }
+        }
+    }
+    Ok(file)
 }
 
 fn repo_tree(input: Value, host: &mut Host) -> Result<Value, String> {
@@ -2134,7 +2396,27 @@ fn search_blobs(input: Value, host: &mut Host) -> Result<Value, String> {
     } else {
         format!("/search{scope}")
     };
-    gl_get(host, &path)
+    let mut matches = gl_get(host, &path)?;
+    if let Some(max_data_bytes) = flex_i64(&input, &["max_data_bytes"]) {
+        if max_data_bytes > 0 {
+            if let Some(arr) = matches.as_array_mut() {
+                let max = max_data_bytes as usize;
+                for m in arr {
+                    if let Some(Value::String(data)) = m.get_mut("data") {
+                        if data.len() > max {
+                            let mut end = max;
+                            while end > 0 && !data.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            *data = format!("{}\n[snippet truncated]", &data[..end]);
+                            m["data_truncated"] = json!(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(matches)
 }
 
 // ---------------------------------------------------------------------------
@@ -3490,6 +3772,181 @@ mod tests {
         assert_eq!(out[0]["path"], "src/main.rs");
     }
 
+    // ---- parity tests (D-36) ----
+
+    #[test]
+    fn project_list_pagination_and_filters() {
+        let mut host = base().with_http(
+            "/projects?membership=false&search=foo&order_by=last_activity_at&sort=desc&per_page=5",
+            json!([{ "path_with_namespace": "group/app", "name_with_namespace": "Group / App" }]),
+        );
+        let out = run(
+            "gitlab.project.list",
+            json!({ "query": "foo", "membership": false, "limit": 5 }),
+            &mut host,
+        );
+        assert_eq!(out[0]["path_with_namespace"], "group/app");
+    }
+
+    #[test]
+    fn mr_list_pagination_and_branch_filters() {
+        let mut host = base().with_http(
+            "/projects/group%2Fapp/merge_requests?state=opened&order_by=updated_at&sort=desc&per_page=5&source_branch=feat&target_branch=main",
+            json!([{ "iid": 1, "title": "MR" }]),
+        );
+        let out = run(
+            "gitlab.mr.list",
+            json!({
+                "project": "group/app",
+                "limit": 5,
+                "source_branch": "feat",
+                "target_branch": "main"
+            }),
+            &mut host,
+        );
+        assert_eq!(out[0]["iid"], 1);
+    }
+
+    #[test]
+    fn issue_list_pagination_and_search() {
+        let mut host = base().with_http(
+            "/projects/group%2Fapp/issues?state=all&search=bug&order_by=created_at&sort=asc&per_page=5",
+            json!([{ "iid": 2, "title": "Bug" }]),
+        );
+        let out = run(
+            "gitlab.issue.list",
+            json!({
+                "project": "group/app",
+                "state": "all",
+                "query": "bug",
+                "order_by": "created_at",
+                "sort": "asc",
+                "limit": 5
+            }),
+            &mut host,
+        );
+        assert_eq!(out[0]["iid"], 2);
+    }
+
+    #[test]
+    fn pipeline_list_passes_filters() {
+        let mut host = base().with_http(
+            "/projects/group%2Fapp/pipelines?status=success&ref=main&source=push&username=agent&per_page=50",
+            json!([{ "id": 9, "status": "success" }]),
+        );
+        let out = run(
+            "gitlab.pipeline.list",
+            json!({
+                "project": "group/app",
+                "status": "success",
+                "ref": "main",
+                "source": "push",
+                "username": "agent",
+                "limit": 50
+            }),
+            &mut host,
+        );
+        assert_eq!(out[0]["id"], 9);
+    }
+
+    #[test]
+    fn index_build_selects_only_requested_entities() {
+        let mut host = base().with_http(
+            "/projects?membership=true&order_by=last_activity_at&sort=desc&per_page=100&page=1",
+            json!([{ "path_with_namespace": "group/app", "name_with_namespace": "Group / App" }]),
+        );
+        let out = run(
+            "gitlab.index.build",
+            json!({ "entities": ["projects"] }),
+            &mut host,
+        );
+        assert_eq!(out["indexed"], 1);
+        let recs = host.contributed.borrow();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].entity, "gitlab.project");
+    }
+
+    #[test]
+    fn repo_file_show_respects_max_bytes() {
+        let content = "a".repeat(1000);
+        let mut host = base().with_http(
+            "/repository/files/big.txt?ref=main",
+            json!({ "file_path": "big.txt", "content": content, "encoding": "base64" }),
+        );
+        let out = run(
+            "gitlab.repository.file.show",
+            json!({
+                "project": "group/app",
+                "path": "big.txt",
+                "ref": "main",
+                "max_bytes": 100
+            }),
+            &mut host,
+        );
+        let got = out["content"].as_str().unwrap();
+        assert!(got.len() <= 100, "content len {} > 100", got.len());
+        assert_eq!(out["truncated"], true);
+    }
+
+    #[test]
+    fn search_blobs_truncates_match_data() {
+        let data = "a".repeat(100);
+        let mut host = base().with_http(
+            "/projects/group%2Fapp/search?scope=blobs",
+            json!([{ "path": "src/main.rs", "data": data }]),
+        );
+        let out = run(
+            "gitlab.search.blobs",
+            json!({
+                "query": "fn main",
+                "project": "group/app",
+                "max_data_bytes": 10
+            }),
+            &mut host,
+        );
+        let got = out[0]["data"].as_str().unwrap();
+        let prefix = got
+            .strip_suffix("\n[snippet truncated]")
+            .expect("truncated data should end with marker");
+        assert!(prefix.len() <= 10, "prefix len {} > 10", prefix.len());
+        assert_eq!(out[0]["data_truncated"], true);
+    }
+
+    #[test]
+    fn mr_merge_accepts_remove_source_branch_alias() {
+        let mut host = base().with_http(
+            "/merge_requests/7/merge",
+            json!({ "iid": 7, "state": "merged" }),
+        );
+        let out = run(
+            "gitlab.mr.merge",
+            json!({
+                "project": "group/app",
+                "iid": 7,
+                "remove_source_branch": true
+            }),
+            &mut host,
+        );
+        assert_eq!(out["state"], "merged");
+    }
+
+    #[test]
+    fn mr_merge_schema_has_remove_source_branch() {
+        let m = manifest_builder().build().manifest();
+        let spec = m
+            .operations
+            .iter()
+            .find(|o| o.name == "gitlab.mr.merge")
+            .unwrap();
+        let props = spec
+            .input_schema
+            .get("properties")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert!(props.contains_key("remove_source_branch"));
+    }
+
     // ---- review ----
 
     #[test]
@@ -3988,7 +4445,17 @@ mod schema_contract {
         vec![
             (
                 "gitlab.project.list",
-                c(vec![p("search", Kind::Str)], vec![]),
+                c(
+                    vec![
+                        p("search", Kind::Str),
+                        p("query", Kind::Str),
+                        p("order_by", Kind::Str),
+                        p("sort", Kind::Str),
+                        p("limit", Kind::Int),
+                        p("membership", Kind::Bool),
+                    ],
+                    vec![],
+                ),
             ),
             (
                 "gitlab.project.show",
@@ -3997,7 +4464,17 @@ mod schema_contract {
             (
                 "gitlab.mr.list",
                 c(
-                    vec![p("project", Kind::Str), p("state", Kind::Str)],
+                    vec![
+                        p("project", Kind::Str),
+                        p("state", Kind::Str),
+                        p("search", Kind::Str),
+                        p("query", Kind::Str),
+                        p("order_by", Kind::Str),
+                        p("sort", Kind::Str),
+                        p("limit", Kind::Int),
+                        p("source_branch", Kind::Str),
+                        p("target_branch", Kind::Str),
+                    ],
                     vec!["project"],
                 ),
             ),
@@ -4015,16 +4492,71 @@ mod schema_contract {
             (
                 "gitlab.issue.list",
                 c(
-                    vec![p("project", Kind::Str), p("state", Kind::Str)],
+                    vec![
+                        p("project", Kind::Str),
+                        p("state", Kind::Str),
+                        p("search", Kind::Str),
+                        p("query", Kind::Str),
+                        p("order_by", Kind::Str),
+                        p("sort", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
                     vec!["project"],
                 ),
             ),
             (
                 "gitlab.pipeline.list",
-                c(vec![p("project", Kind::Str)], vec!["project"]),
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("status", Kind::Str),
+                        p("ref", Kind::Str),
+                        p("source", Kind::Str),
+                        p("username", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec!["project"],
+                ),
             ),
             ("gitlab.test", c(vec![], vec![])),
-            ("gitlab.index.build", c(vec![p("limit", Kind::Int)], vec![])),
+            (
+                "gitlab.index.build",
+                c(
+                    vec![
+                        p("index", Kind::Str),
+                        p("indexes", Kind::ArrayAny),
+                        p("entity", Kind::Str),
+                        p("entities", Kind::ArrayAny),
+                        p("limit", Kind::Int),
+                        p("search", Kind::Str),
+                        p("query", Kind::Str),
+                        p("order_by", Kind::Str),
+                        p("sort", Kind::Str),
+                        p("membership", Kind::Bool),
+                        p("user_limit", Kind::Int),
+                        p("user_search", Kind::Str),
+                        p("active_users", Kind::Bool),
+                        p("group_limit", Kind::Int),
+                        p("group_search", Kind::Str),
+                        p("group_order_by", Kind::Str),
+                        p("group_sort", Kind::Str),
+                        p("active_groups", Kind::Bool),
+                        p("all_visible_groups", Kind::Bool),
+                        p("issue_limit", Kind::Int),
+                        p("issue_search", Kind::Str),
+                        p("issue_state", Kind::Str),
+                        p("issue_order_by", Kind::Str),
+                        p("issue_sort", Kind::Str),
+                        p("mr_project", Kind::Str),
+                        p("mr_limit", Kind::Int),
+                        p("mr_search", Kind::Str),
+                        p("mr_state", Kind::Str),
+                        p("mr_order_by", Kind::Str),
+                        p("mr_sort", Kind::Str),
+                    ],
+                    vec![],
+                ),
+            ),
             (
                 "gitlab.project.create",
                 c(
@@ -4101,6 +4633,7 @@ mod schema_contract {
                         p("squash_commit_message", Kind::Str),
                         p("squash", Kind::Bool),
                         p("should_remove_source_branch", Kind::Bool),
+                        p("remove_source_branch", Kind::Bool),
                         p("sha", Kind::Str),
                     ],
                     vec![],
@@ -4270,6 +4803,7 @@ mod schema_contract {
                         p("project", Kind::Str),
                         p("path", Kind::Str),
                         p("ref", Kind::Str),
+                        p("max_bytes", Kind::Int),
                     ],
                     vec!["project", "path"],
                 ),
@@ -4382,6 +4916,7 @@ mod schema_contract {
                         p("group", Kind::Str),
                         p("ref", Kind::Str),
                         p("limit", Kind::Int),
+                        p("max_data_bytes", Kind::Int),
                     ],
                     vec!["query"],
                 ),

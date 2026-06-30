@@ -228,3 +228,41 @@ overlap, and additionally by involving an extra number.
 - **Fluxplane parity re-audit: deferred** (same as gitlab — D-14 ported the slack surface 5→30;
   contract test locks flux's existing contracts; a fresh field-by-field re-audit against
   `~/projects/fluxplane/fluxplane-plugins/slack/` is a separate pass).
+
+---
+
+# D-38 / D-39 — gitlab + slack fluxplane parity ports (re-audit gaps closed)
+
+The D-36 re-audit (`.flux/plans/d36-parity-audits/{gitlab,slack}.md`) confirmed D-14's "full
+parity" claim was unreliable: both plugins had real feature gaps (the schemars migration had
+faithfully locked flux's *gapped* contracts). All gaps are now ported from the fluxplane Go
+reference. Per-op contracts updated in each `schema_contract` test; failing-first MockHost tests
+per change.
+
+## gitlab (D-38)
+- `mr.merge` drift fixed: `remove_source_branch` (handler already read it, schema omitted) now in
+  the struct.
+- List-op pagination/filter parity: `project.list`/`mr.list`/`issue.list`/`pipeline.list` gained
+  `limit`/`query`/`order_by`/`sort` + per-op filters (`mr.list` `source_branch`/`target_branch`;
+  `pipeline.list` `status`/`ref`/`source`/`username`); `limit`→`per_page` in the API query.
+- `index.build` selector surface: `index`/`indexes`/`entity`/`entities` + per-datasource tuning —
+  a caller can index just `projects` (or `issues`/`merge_requests`) instead of all three.
+- `repository.file.show` `max_bytes` (char-boundary truncate + `truncated` flag);
+  `search.blobs` `max_data_bytes` (per-match snippet cap + `data_truncated`).
+- Out of scope: the ~58 shared-alias cases (handler accepts `project_id`/`path`/`id`/`name`
+  aliases the schema omits — intentional leniency).
+
+## slack (D-39)
+- `message.send`/`message.edit` Block Kit parity: `markdown`/`blocks`/`unfurl_links`/
+  `unfurl_media`/`parse`; `text` relaxed to optional (blocks/markdown carry content). Highest-value
+  fix — the model can now send Block Kit messages.
+- `message.list`/`thread` `text_format` (`markdown`/`mrkdwn`/`both`); `thread` `max_bytes`
+  (parsed/defaulted, not enforced — thread doesn't download images).
+- `search`/`mentions` ticket extraction (`tickets`/`ticket_keys` `Vec<String>`); `mentions` `bot`.
+- `file.upload` `alt_text` (was a dead param) wired in; `content_bytes` (base64 inline alt to
+  `blob_ref`); `blob_ref` relaxed to optional.
+- `file.download`/`download` `blob_ref` seed.
+- List filters: `query`/`limit` on `file.list`/`channel.list`/`user.list`/`bookmark.list`;
+  `emoji.list` `mode`/`include_aliases`. `schema_contract` gained `Kind::ArrayStr`.
+
+Both: `endpoint_ref` + (slack) per-call `role` architectural splits left as-is (do-not-port).

@@ -31,6 +31,21 @@ All notable changes to this project are documented in this file. The format is b
   inline `json!({"type":"object",...})`), verified failing-first for both. Contract test locks
   all 30 schemas. Fluxplane parity re-audit deferred (D-14 ported the surface).
 
+- **gitlab fluxplane parity ports (D-38).** Closed the gaps the D-36 re-audit surfaced: list-op
+  pagination/filter (`project.list`/`mr.list`/`issue.list`/`pipeline.list` got `limit`/`query`/
+  `order_by`/`sort` + per-op filters), `index.build` selector surface (index just `projects` /
+  `issues` / `merge_requests`), `repository.file.show` `max_bytes` + `search.blobs`
+  `max_data_bytes` byte caps, and the `mr.merge` `remove_source_branch` drift. Failing-first
+  tests; 44 gitlab tests.
+
+- **slack fluxplane parity ports (D-39).** Closed the re-audit gaps: **Block Kit messaging**
+  (`message.send`/`message.edit` gained `markdown`/`blocks`/`unfurl_links`/`unfurl_media`/`parse`,
+  `text` relaxed to optional — the model can now send Block Kit messages), `message.list`/`thread`
+  `text_format`, `search`/`mentions` ticket extraction + `mentions` `bot`, `file.upload`
+  `content_bytes` (base64 inline) + `alt_text` (was dead) + `blob_ref` relaxed, `file.download`
+  `blob_ref` seed, and `query`/`limit` filters on the list ops (`emoji.list` also `mode`/
+  `include_aliases`). `schema_contract` gained `Kind::ArrayStr`. Failing-first tests; 65 slack tests.
+
 - **Plugin-side schemars op schemas — D-36 (in-progress).** `host-kit` now derives a plugin
   op's `input_schema` from a typed struct via `read_op_typed::<T>` / `write_op_typed::<T>`
   (+ `op_input_schema::<T>()`, a `schemars` re-export), the plugin-side counterpart of D-34.
