@@ -473,21 +473,11 @@ enum OutputFormat {
     Pretty,
 }
 
-/// Resolve a friendly Anthropic alias to a concrete model id (pass-through otherwise).
-fn resolve_anthropic_alias(alias: &str) -> String {
-    match alias {
-        "sonnet" => "claude-sonnet-4-6",
-        "opus" => "claude-opus-4-8",
-        "haiku" => "claude-haiku-4-5-20251001",
-        other => other,
-    }
-    .to_string()
-}
-
-// Codex model resolution is backend knowledge (which ids the ChatGPT-subscription Codex backend
-// serves vs. rejects) and lives with the rest of the codex wire quirks in `flux-providers`. The
-// CLI owns only the *shorthand policy* — bare `codex` means "use the default" — and delegates the
-// concrete id to `resolve_codex_model` so the SDK/server/TUI/sub-agent spawner share one owner.
+// Codex/Anthropic model resolution is backend knowledge owned by each provider crate
+// (`flux_providers::codex::resolve_model`, `flux_providers::anthropic::resolve_model`) so every
+// surface — CLI, SDK, server, TUI, the L3 sub-agent spawner — shares one owner instead of each
+// carrying its own alias table. The CLI owns only the *shorthand policy*: bare `codex` (no model)
+// means "use the provider default".
 
 /// Resolve the model spec with precedence: `--model` flag > config `model` > `sonnet`.
 fn resolve_model_spec(cli_model: &Option<String>, cfg: &flux_config::Config) -> String {
@@ -542,9 +532,7 @@ fn build_provider(spec: &str) -> Result<(NativeProvider, String)> {
         None => {
             // Allow bare short aliases only; everything else requires an explicit provider prefix.
             match spec {
-                "sonnet" | "opus" | "haiku" | "mock" => {
-                    ("anthropic".to_string(), spec.to_string())
-                }
+                "sonnet" | "opus" | "haiku" | "mock" => ("anthropic".to_string(), spec.to_string()),
                 // Bare `codex` → the ChatGPT-subscription main model (resolved in `build_provider`).
                 "codex" => ("codex".to_string(), String::new()),
                 other => bail!(
@@ -573,7 +561,7 @@ fn build_provider(spec: &str) -> Result<(NativeProvider, String)> {
         }
         "codex" => {
             let ts = flux_credentials::codex_token_source().context("codex provider")?;
-            flux_providers::openai::codex_oauth(ts)
+            flux_providers::codex::oauth(ts)
         }
         other => bail!(
             "unknown provider `{other}` (known: {})",
@@ -582,8 +570,8 @@ fn build_provider(spec: &str) -> Result<(NativeProvider, String)> {
     };
 
     let model = match provider.as_str() {
-        "anthropic" | "claude" => resolve_anthropic_alias(&model),
-        "codex" => flux_providers::openai::resolve_codex_model(&model),
+        "anthropic" | "claude" => flux_providers::anthropic::resolve_model(&model),
+        "codex" => flux_providers::codex::resolve_model(&model),
         _ => model,
     };
     Ok((native, model))

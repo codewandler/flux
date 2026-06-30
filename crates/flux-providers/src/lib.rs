@@ -11,8 +11,11 @@
 //! - [`anthropic`] — the `anthropic` (API key) and `claude` (subscription OAuth) providers.
 //! - [`openrouter`] — the `openrouter-anthropic` provider (Messages protocol, native tool calling).
 //! - [`ollama`] — the `ollama-anthropic` provider (local models over the Messages protocol).
-//! - [`openai`] — the OpenAI-family Chat Completions / Responses wire codecs and the unified Bearer
-//!   credential (the `openai`, `openrouter`, `ollama`, and `codex` providers).
+//! - [`openai`] — the API-key OpenAI Chat / Responses wire codecs and the unified Bearer
+//!   credential shared by the OpenAI-family providers (`openai`, `openrouter`, `ollama`).
+//! - [`codex`] — the `codex` provider (ChatGPT/Codex subscription over the Responses wire on the
+//!   ChatGPT backend). It reuses the [`openai`] codec but owns its own surface and model
+//!   resolution.
 //!
 //! Provider **credentials/OAuth** (token sources, PKCE login, CLI-credential import) deliberately
 //! stay in the separate `flux-credentials` crate — it is destined to back all integrations, not
@@ -21,6 +24,7 @@
 pub mod messages;
 
 pub mod anthropic;
+pub mod codex;
 pub mod ollama;
 pub mod openai;
 pub mod openrouter;

@@ -2,7 +2,7 @@
 id: C-03
 title: Codex provider hardening — account-id, usage tiers, reasoning continuity
 pillar: Core
-status: in-progress
+status: done
 epic: subscription-providers-and-cost
 theme: subscription-providers-cost
 design: docs/designs/subscription-providers-and-cost.md
@@ -25,6 +25,10 @@ reasoning continuity across a multi-turn tool loop. Foundation for C-07 (which r
 - [ ] **usage tiers.** → **C-05**. `map_responses_stream` populating cache + reasoning token fields was
       reassigned to C-05 (cost-model + codec normalization) to keep the `Usage` struct / usage-token
       parsing in one owner. Not done here.
+      **Update (live smoke):** the cache + reasoning token capture is in fact present in committed
+      code (`map_responses_stream` lines 897–915, test `responses_usage_captures_cache_and_reasoning`),
+      and a live `codex/gpt-5.5` turn reports `cache 5.1k (15% hit)` on the real wire — so the *capture*
+      half is done. The pricing/cost roll-up half remains C-05.
 - [x] **reasoning continuity.** Under `store:false`, the codex request opts into
       `include:["reasoning.encrypted_content"]` and `build_responses_body` echoes prior encrypted reasoning
       items (`Thinking`/`RedactedThinking` → `{"type":"reasoning","encrypted_content":…}`, pushed before the
@@ -34,6 +38,18 @@ reasoning continuity across a multi-turn tool loop. Foundation for C-07 (which r
 - [x] **missing-account-id is a clear error**, not a silent 401: `OpenAiCred::apply` surfaces a typed
       `Error::Auth` when `send_account_id` is set but the token source resolves no account id. Test
       `codex_requires_account_id`.
+- [x] **model resolution is provider-internal, not CLI-embedded (live-smoke finding).** A live
+      `codex/gpt-5-codex` turn died with HTTP 400 ("`gpt-5-codex` is not supported when using Codex with a
+      ChatGPT account") because the ChatGPT-subscription backend serves the `gpt-5.5` family and the
+      `*-codex` ids are legacy. The CLI had no codex model-alias resolution (unlike `anthropic`/`claude`)
+      and passed the id through verbatim, and the codec tests hardcoded the dead `gpt-5-codex`. Fixed by
+      (a) giving `codex` its own provider module `flux_providers::codex` (it was a `providers::openai`
+      misfit) that owns `DEFAULT_MODEL = "gpt-5.5"` + `resolve_model` (empty or `*-codex` → `gpt-5.5`, else
+      pass-through), and (b) moving `anthropic`/`claude` alias resolution out of the CLI into
+      `flux_providers::anthropic::resolve_model` so every surface (CLI/SDK/server/TUI/L3 sub-agent
+      spawner) shares one owner — the CLI keeps only the bare-`codex` shorthand policy. Tests
+      `resolve_model_*` in both provider modules. Live smoke confirms bare `codex`, legacy
+      `codex/gpt-5-codex`, and `codex/gpt-5.5` all resolve to `gpt-5.5` and complete.
 - [x] Gate green: `cargo build/test`, `clippy -D warnings`, `fmt`, `cargo test -p flux-codegate`.
 
 ## Progress
@@ -52,13 +68,29 @@ reasoning continuity across a multi-turn tool loop. Foundation for C-07 (which r
     `codex_requires_account_id`.
 - Gate: `cargo build/test -p flux-credentials -p flux-providers` green (7 + 26 tests), `clippy -D warnings`
   clean, `cargo fmt` applied, `cargo test -p flux-codegate` green.
-- **Not done (out of lane):** usage-tier capture moved to **C-05** (it touches `Usage`/usage parsing,
-  C-05's owner). Live smoke against a real `~/.codex/auth.json` deferred to pre-release (epic Testing §).
+- **Live smoke (this session).** Ran `flux run -m codex/...` against the real ChatGPT backend
+  (`~/.codex/auth.json` present; no token values committed). It surfaced one real bug the unit tests
+  couldn't: `codex/gpt-5-codex` died with HTTP 400 ("`gpt-5-codex` is not supported when using Codex
+  with a ChatGPT account") — the backend serves the `gpt-5.5` family; `*-codex` ids are legacy. Fixed by
+  giving `codex` its own provider module (`flux_providers::codex`) owning `DEFAULT_MODEL` +
+  `resolve_model`, and moving `anthropic`/`claude` alias resolution out of the CLI into
+  `flux_providers::anthropic::resolve_model` (one owner for every surface). After the fix, bare `codex`,
+  legacy `codex/gpt-5-codex`, and `codex/gpt-5.5` all resolve to `gpt-5.5` and complete; the cache-token
+  capture shows live (`cache 5.1k (15% hit)`).
+- **Not done (out of lane):** the pricing/cost roll-up of cache + reasoning tiers is **C-05** (it touches
+  the `Rates`/cost-model, C-05's owner). The *capture* itself (codec → `Usage`) is done and live-verified.
 
 ## Notes
 - Epic + design: [subscription-providers-and-cost.md](../designs/subscription-providers-and-cost.md).
 - Touch points: `crates/flux-credentials/src/lib.rs` (`import_codex`, `jwt_payload`/`account_id_from_id_token`
-  next to `jwt_expiry_ms`), `crates/flux-providers/src/openai.rs` (`build_responses_body`, `OpenAiCred::apply`).
+  next to `jwt_expiry_ms`); `crates/flux-providers/src/openai.rs` (`build_responses_body`,
+  `OpenAiCred::apply`, the shared `OpenAiResponses` codec — `OpenAiCred`/`Secret`/`CODEX_ENDPOINT` are now
+  `pub(crate)` so the sibling `codex` module can assemble the credential); `crates/flux-providers/src/codex.rs`
+  (new — the `codex` provider module: `oauth`, `DEFAULT_MODEL`, `resolve_model`);
+  `crates/flux-providers/src/anthropic.rs` (`resolve_model` — moved out of the CLI);
+  `crates/flux-cli/src/main.rs` (now calls the provider-owned resolvers; keeps only the bare-`codex`
+  shorthand policy); `crates/flux-core/src/pricing.rs` (its `resolve_alias` mirror is **layer-forced** —
+  L0 cannot depend on L1 `flux-providers`; comment updated to point at the canonical home).
 - Reuse: the existing `jwt_expiry_ms` base64url-JWT decode (generalized to `jwt_payload`);
   `OpenAiResponses{codex:true}` already toggles `store:false`/effort/summary.
 - The usage-tier work overlaps C-05's codec normalization — landed **all** of it in C-05 (this story did

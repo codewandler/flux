@@ -109,7 +109,15 @@ fn split_provider(spec: &str) -> (Option<&str>, &str) {
     }
 }
 
-/// Resolve flux's short model aliases to their canonical ids (mirrors `resolve_anthropic_alias`).
+/// Resolve flux's short model aliases to their canonical ids.
+///
+/// This is a **layer-forced mirror** of the canonical mapping in
+/// `flux_providers::anthropic::resolve_model`: `flux-core` is L0 and cannot depend on L1
+/// (`flux-providers`), so the cost model keeps its own copy to turn a user alias into the
+/// canonical id it prices by. The provider crate remains the single source of truth for surfaces
+/// that *can* reach it (CLI/SDK/server/TUI); keep these two tables in lock-step when an alias
+/// changes. (The codex alias `gpt-5.5`-vs-legacy `*-codex` lives in `flux_providers::codex` and
+/// is not mirrored here — pricing keys by the resolved canonical id, so it never sees the alias.)
 fn resolve_alias(model: &str) -> &str {
     match model {
         "sonnet" => "claude-sonnet-4-6",

@@ -8,6 +8,19 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Codex provider hardening + provider-owned model resolution (C-03).** The ChatGPT-subscription
+  `codex` provider is now correct against the live backend's quirks, verified by a real
+  `~/.codex/auth.json` smoke test (no token values committed). A live turn surfaced one bug the unit
+  tests couldn't: `-m codex/gpt-5-codex` died with HTTP 400 ("`gpt-5-codex` is not supported when
+  using Codex with a ChatGPT account") — the backend serves the `gpt-5.5` family; the `*-codex` ids are
+  legacy. `codex` now has its own provider module (`flux_providers::codex`) owning `DEFAULT_MODEL`
+  (`gpt-5.5`) and `resolve_model` (empty/`*-codex` → `gpt-5.5`, else pass-through), so bare `codex`,
+  legacy `codex/gpt-5-codex`, and `codex/gpt-5.5` all resolve and complete. The `anthropic`/`claude`
+  alias resolution moved out of the CLI into `flux_providers::anthropic::resolve_model` so every
+  surface (CLI/SDK/server/TUI/L3 sub-agent spawner) shares one owner instead of each carrying its own
+  alias table — the CLI keeps only the bare-`codex` shorthand policy. (The cache + reasoning token
+  capture in the Responses codec was already present and is now live-verified: `cache 5.1k (15% hit)`.)
+
 - **Complete `flux plugin` lifecycle — `uninstall` + `status` (D-19).** Plugin management is now
   fully first-class from the CLI. `flux plugin uninstall <name>` removes the descriptor at
   `~/.flux/plugins/<name>.toml` (a missing name is a clean `no such plugin — nothing to uninstall`, never

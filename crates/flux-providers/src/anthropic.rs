@@ -150,10 +150,38 @@ pub fn claude_oauth(tokens: Arc<dyn TokenSource>) -> NativeProvider {
     )
 }
 
+/// The canonical ids behind flux's short Anthropic model aliases. Kept here (in the provider)
+/// rather than in any one surface (CLI/SDK/server/TUI) so every caller reaches one owner:
+/// `flux_providers::anthropic::resolve_model`. A future id is honoured without a flux release —
+/// only the documented short aliases are rewritten.
+pub fn resolve_model(alias: &str) -> String {
+    match alias {
+        "sonnet" => "claude-sonnet-4-6",
+        "opus" => "claude-opus-4-8",
+        "haiku" => "claude-haiku-4-5-20251001",
+        other => other,
+    }
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn resolve_model_maps_short_aliases_to_canonical_ids() {
+        assert_eq!(resolve_model("sonnet"), "claude-sonnet-4-6");
+        assert_eq!(resolve_model("opus"), "claude-opus-4-8");
+        assert_eq!(resolve_model("haiku"), "claude-haiku-4-5-20251001");
+    }
+
+    #[test]
+    fn resolve_model_passes_explicit_ids_through_verbatim() {
+        // A fully-qualified id or a future id is not rewritten.
+        assert_eq!(resolve_model("claude-sonnet-4-6"), "claude-sonnet-4-6");
+        assert_eq!(resolve_model("claude-opus-5"), "claude-opus-5");
+    }
 
     #[test]
     fn profile_enables_the_full_feature_set() {

@@ -506,20 +506,24 @@ fn strip_inline_tool_markup(text: &str) -> String {
 // Credential (one generic Bearer transport for the whole OpenAI family)
 // ---------------------------------------------------------------------------
 
-enum Secret {
+/// `pub(crate)` so the sibling [`crate::codex`] module can build the OAuth variant; it is an
+/// internal building block of this crate's credentials, not part of the provider surface.
+pub(crate) enum Secret {
     ApiKey(String),
-    // Used by the `codex` provider once `flux-credentials` supplies a `TokenSource`.
     #[allow(dead_code)]
     OAuth(Arc<dyn TokenSource>),
 }
 
-/// A Bearer-token credential covering `openai`, `openrouter`, and (later) `codex` — they differ
-/// only in endpoint, extra gating headers, and whether a `chatgpt-account-id` header is sent.
+/// A Bearer-token credential covering `openai`, `openrouter`, and `codex` — they differ only in
+/// endpoint, extra gating headers, and whether a `chatgpt-account-id` header is sent. Fields are
+/// `pub(crate)` so the sibling [`crate::codex`] module can assemble the codex variant without
+/// re-implementing the credential; external crates build it through the provider constructors
+/// (`openai_from_env`, [`crate::codex::oauth`], …).
 pub struct OpenAiCred {
-    endpoint: String,
-    secret: Secret,
-    extra: Vec<(&'static str, String)>,
-    send_account_id: bool,
+    pub(crate) endpoint: String,
+    pub(crate) secret: Secret,
+    pub(crate) extra: Vec<(&'static str, String)>,
+    pub(crate) send_account_id: bool,
 }
 
 #[async_trait]
@@ -667,7 +671,9 @@ pub fn openrouter_from_env() -> Result<NativeProvider> {
 // Responses wire codec (used by `openai` later and by `codex` now)
 // ===========================================================================
 
-const CODEX_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
+/// The ChatGPT-backend Responses endpoint used by the `codex` provider. `pub(crate)` so
+/// [`crate::codex`] can reference it without re-declaring the URL.
+pub(crate) const CODEX_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 
 /// The OpenAI Responses wire protocol (`POST .../responses`, typed SSE events). `codex` toggles
 /// the ChatGPT-backend quirks (no `max_output_tokens`, `store:false`, `xhigh` effort, forced
@@ -961,24 +967,9 @@ fn map_responses_stream(byte_stream: ByteStream) -> impl futures::Stream<Item = 
     }
 }
 
-/// `codex` provider: ChatGPT/Codex subscription via OAuth, OpenAI Responses wire on the ChatGPT
-/// backend. Needs a [`TokenSource`] (from `flux-credentials`).
-pub fn codex_oauth(tokens: Arc<dyn TokenSource>) -> NativeProvider {
-    NativeProvider::new(
-        "codex",
-        Arc::new(OpenAiResponses { codex: true }),
-        Arc::new(OpenAiCred {
-            endpoint: CODEX_ENDPOINT.to_string(),
-            secret: Secret::OAuth(tokens),
-            extra: vec![
-                ("OpenAI-Beta", "responses=experimental".to_string()),
-                ("originator", "codex_cli_rs".to_string()),
-            ],
-            send_account_id: true,
-        }),
-    )
-}
-
+/// `codex` provider construction now lives in [`crate::codex`] (its own provider module, like
+/// `anthropic`/`openrouter`/`ollama`). The Responses wire codec (`OpenAiResponses`) and
+/// `build_responses_body` stay here because the `openai` and `codex` providers share them.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1173,7 +1164,7 @@ mod tests {
 
     #[test]
     fn responses_body_uses_instructions_and_codex_quirks() {
-        let req = Request::new("gpt-5-codex", "go")
+        let req = Request::new("gpt-5.5", "go")
             .with_system("be terse")
             .with_effort(Effort::Max);
         let body = build_responses_body(&req, true).unwrap();
@@ -1192,7 +1183,7 @@ mod tests {
         // A prior assistant turn carried a reasoning block + a tool call. Under codex/store:false
         // the body must (a) opt into encrypted reasoning content and (b) echo the reasoning item
         // back into `input` so the multi-turn tool loop keeps its reasoning context.
-        let mut req = Request::new("gpt-5-codex", "go").with_effort(Effort::Max);
+        let mut req = Request::new("gpt-5.5", "go").with_effort(Effort::Max);
         req.messages.push(Message::assistant(vec![
             ContentBlock::Thinking {
                 thinking: "let me think".into(),
