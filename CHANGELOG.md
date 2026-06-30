@@ -8,6 +8,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Scoped private-network egress, finished (D-20).** The 0.2.7 scoped model gained **per-endpoint**
+  grant granularity (`PrivateNetConfig.endpoints`, keyed `"<plugin>:<endpoint>"`, merged with the
+  plugin-level grant) and a **private-network-admit audit event**: a new `EventKind::PrivateNetAdmit`
+  is recorded whenever the host admits a private/internal address under a scoped grant, via a new
+  `flux_plugin::EgressAudit` seam (no flux-plugin→flux-events dependency) with the event-store-backed
+  impl wired at the `flux` CLI. Pulled in as the prerequisite for the endpoint-discovery epic.
 - **Endpoint reference model & registry (D-25).** The references-only spine of the endpoint-discovery
   epic: a new L0 `flux_secret::endpoint` schema (`EndpointRef`/`EndpointCandidate`/`EndpointRecord` weak
   references that carry a `credential_ref` location, never a secret; and a host-only `ResolvedEndpoint`

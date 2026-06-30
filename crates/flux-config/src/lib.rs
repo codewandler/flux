@@ -55,18 +55,24 @@ impl PrivateNetGrant {
     }
 }
 
-/// Scoped private-network egress grants. Plugin grants are keyed by plugin manifest name.
+/// Scoped private-network egress grants. Plugin grants are keyed by plugin manifest name;
+/// per-endpoint grants are keyed by `"<plugin>:<endpoint_name>"` (finer than a whole plugin).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrivateNetConfig {
     #[serde(default, skip_serializing_if = "PrivateNetGrant::is_default")]
     pub web_fetch: PrivateNetGrant,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub plugins: BTreeMap<String, PrivateNetGrant>,
+    /// Per-endpoint grants, keyed by `"<plugin>:<endpoint_name>"`. Merged on top of the
+    /// owning plugin's grant, so an endpoint can be granted a private host the plugin as a
+    /// whole was not (and vice versa).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub endpoints: BTreeMap<String, PrivateNetGrant>,
 }
 
 impl PrivateNetConfig {
     fn is_default(&self) -> bool {
-        self.web_fetch.is_default() && self.plugins.is_empty()
+        self.web_fetch.is_default() && self.plugins.is_empty() && self.endpoints.is_empty()
     }
 }
 
@@ -110,6 +116,25 @@ impl Config {
         self.private_net
             .plugins
             .get(plugin)
+            .map(PrivateNetGrant::to_hosts)
+            .map(dedupe)
+            .unwrap_or_default()
+    }
+
+    /// Host patterns granted to a specific plugin **endpoint** for private-network egress: the
+    /// plugin-level grant merged with the per-endpoint (`"<plugin>:<endpoint>"`) grant. An
+    /// endpoint with no entry of its own gets exactly the plugin-level grant (possibly empty).
+    pub fn endpoint_private_hosts(&self, plugin: &str, endpoint: &str) -> Vec<String> {
+        let mut hosts = self.private_net.plugins.get(plugin).cloned();
+        let key = format!("{plugin}:{endpoint}");
+        if let Some(ep) = self.private_net.endpoints.get(&key) {
+            hosts = Some(match hosts {
+                Some(plugin_grant) => merge_grant(plugin_grant, ep.clone()),
+                None => ep.clone(),
+            });
+        }
+        hosts
+            .as_ref()
             .map(PrivateNetGrant::to_hosts)
             .map(dedupe)
             .unwrap_or_default()
@@ -164,17 +189,25 @@ fn merge(user: Config, project: Config) -> Config {
 }
 
 fn merge_private_net(user: PrivateNetConfig, project: PrivateNetConfig) -> PrivateNetConfig {
-    let mut plugins = user.plugins;
-    for (name, grant) in project.plugins {
-        plugins
-            .entry(name)
+    PrivateNetConfig {
+        web_fetch: merge_grant(user.web_fetch, project.web_fetch),
+        plugins: merge_grant_map(user.plugins, project.plugins),
+        endpoints: merge_grant_map(user.endpoints, project.endpoints),
+    }
+}
+
+/// Merge two keyed grant maps (user + project): a key present in both has its grants combined
+/// via [`merge_grant`]; project-only keys are added.
+fn merge_grant_map(
+    mut user: BTreeMap<String, PrivateNetGrant>,
+    project: BTreeMap<String, PrivateNetGrant>,
+) -> BTreeMap<String, PrivateNetGrant> {
+    for (name, grant) in project {
+        user.entry(name)
             .and_modify(|existing| *existing = merge_grant(existing.clone(), grant.clone()))
             .or_insert(grant);
     }
-    PrivateNetConfig {
-        web_fetch: merge_grant(user.web_fetch, project.web_fetch),
-        plugins,
-    }
+    user
 }
 
 fn merge_grant(a: PrivateNetGrant, b: PrivateNetGrant) -> PrivateNetGrant {
@@ -503,6 +536,42 @@ gitlab = true
         );
         assert_eq!(cfg.plugin_private_hosts("loki"), vec!["loki.local"]);
         assert_eq!(cfg.plugin_private_hosts("gitlab"), vec!["*"]);
+
+        std::fs::remove_dir_all(&project).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn per_endpoint_grant_merges_with_plugin_level() {
+        let project = temp_dir();
+        let home = temp_dir();
+        std::env::set_var("HOME", &home);
+        write_project(
+            &project,
+            r#"
+[private_net.plugins]
+gitlab = ["gitlab.internal"]
+
+[private_net.endpoints]
+"gitlab:api.endpoint" = ["api.internal"]
+"#,
+        );
+
+        let cfg = load(&project).unwrap();
+        // The declared endpoint merges its own grant on top of the plugin-level grant.
+        assert_eq!(
+            cfg.endpoint_private_hosts("gitlab", "api.endpoint"),
+            vec!["gitlab.internal", "api.internal"]
+        );
+        // An undeclared endpoint of the same plugin inherits only the plugin-level grant.
+        assert_eq!(
+            cfg.endpoint_private_hosts("gitlab", "other.endpoint"),
+            vec!["gitlab.internal"]
+        );
+        // An endpoint of a plugin with no grant at all is empty.
+        assert!(cfg
+            .endpoint_private_hosts("prometheus", "metrics.endpoint")
+            .is_empty());
 
         std::fs::remove_dir_all(&project).ok();
         std::fs::remove_dir_all(&home).ok();

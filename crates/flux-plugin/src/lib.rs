@@ -429,6 +429,17 @@ impl HostCapabilities for DenyHostCaps {
     }
 }
 
+/// An audit seam: the host calls [`record_private_admit`](Self::record_private_admit) whenever it
+/// admits an egress request to a **private/internal** address under a scoped grant — the auditable
+/// security event. This crate (L4) only defines the trait; the concrete, `flux-events`-backed
+/// implementation that appends a `PrivateNetAdmit` event lives at a surface (L6), so flux-plugin
+/// stays free of an event-store dependency. A host with no audit installed simply admits silently.
+pub trait EgressAudit: Send + Sync {
+    /// Record that `caller` (a plugin name, or `"web_fetch"`) reached the private `host`, admitted by
+    /// `grant_source` (e.g. `"config:plugin/<name>"` or `"config:endpoint/<plugin>:<ep>"`).
+    fn record_private_admit(&self, caller: &str, host: &str, grant_source: &str);
+}
+
 /// Host capabilities backed by the guarded [`System`](flux_system::System): `process.run` (argv
 /// only), `http.do` (GET, loopback/private blocked unless allowed), and `secret` (env refs). This
 /// is the bridge that keeps plugin IO inside the same safety boundary as the agent's own tools.
@@ -443,6 +454,14 @@ pub struct SystemHostCaps {
     grants: PluginCapabilities,
     auth: Vec<AuthMethod>,
     endpoints: Vec<EndpointSpec>,
+    /// The caller name recorded in egress-admit audit events (the plugin's manifest name, set by
+    /// [`with_manifest`](Self::with_manifest)). Defaults to `"plugin"` until a manifest is pinned.
+    caller: String,
+    /// How this plugin's private-net grants were sourced, recorded in audit events (defaults to a
+    /// generic plugin-scope label; the surface can override via [`with_grant_source`](Self::with_grant_source)).
+    grant_source: String,
+    /// Optional egress-audit hook: fires when a private host is admitted under a scoped grant.
+    audit: Option<Arc<dyn EgressAudit>>,
     /// Open `conn.dial` connections for this call scope, keyed by an opaque id. A tokio mutex so a
     /// `conn.read`/`write` can hold the stream across its await without making the guard non-Send.
     conns: tokio::sync::Mutex<std::collections::HashMap<u64, flux_system::net::DialStream>>,
@@ -468,6 +487,9 @@ impl SystemHostCaps {
             grants: PluginCapabilities::default(),
             auth: Vec::new(),
             endpoints: Vec::new(),
+            caller: "plugin".to_string(),
+            grant_source: "config:plugin".to_string(),
+            audit: None,
             conns: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             next_conn: std::sync::atomic::AtomicU64::new(1),
             blobs: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -504,7 +526,35 @@ impl SystemHostCaps {
         self.grants = m.capabilities.clone();
         self.auth = m.auth.clone();
         self.endpoints = m.endpoints.clone();
+        if !m.name.is_empty() {
+            self.caller = m.name.clone();
+            self.grant_source = format!("config:plugin/{}", m.name);
+        }
         self
+    }
+
+    /// Install an [`EgressAudit`] hook. When set, the host records a private-network-admit event the
+    /// moment it lets a request to a private/internal host through under a scoped grant.
+    pub fn with_egress_audit(mut self, audit: Arc<dyn EgressAudit>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    /// Override the `grant_source` label recorded in egress-admit audit events (e.g. an
+    /// endpoint-scoped `"config:endpoint/<plugin>:<ep>"` when grants were resolved per endpoint).
+    pub fn with_grant_source(mut self, grant_source: impl Into<String>) -> Self {
+        self.grant_source = grant_source.into();
+        self
+    }
+
+    /// Fire the egress-audit hook (if installed) when `host` is a private/internal address — i.e. the
+    /// scoped grant just admitted a request the bare SSRF guard would have refused.
+    fn audit_admit(&self, host: &str) {
+        if let Some(audit) = &self.audit {
+            if flux_system::net::host_resolves_private(host) {
+                audit.record_private_admit(&self.caller, host, &self.grant_source);
+            }
+        }
     }
 
     /// Resolve a secret **by purpose**: find the auth method, try its env keys in order; each key must
@@ -806,6 +856,11 @@ impl HostCapabilities for SystemHostCaps {
                 let raw = payload.get("url").and_then(|v| v.as_str()).unwrap_or("");
                 let mut url = guard_http_url(raw, &self.private_net_allow())?;
                 self.ensure_http_host_allowed(&url)?;
+                // The request is admitted. If the (now-allowed) host is private/internal, the scoped
+                // grant just let through what the bare SSRF guard would refuse — audit it.
+                if let Some(host) = url.host_str() {
+                    self.audit_admit(host);
+                }
                 let method = payload
                     .get("method")
                     .and_then(|v| v.as_str())
@@ -904,6 +959,11 @@ impl HostCapabilities for SystemHostCaps {
                 let stream = flux_system::net::dial_scoped(&target, &self.private_net_allow())
                     .await
                     .map_err(|e| e.to_string())?;
+                // The dial was admitted. A TCP target that resolves private was let through by the
+                // scoped grant (Unix sockets aren't IP egress) — audit it.
+                if let flux_system::net::DialTarget::Tcp { host, .. } = &target {
+                    self.audit_admit(host);
+                }
                 let id = self
                     .next_conn
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2105,6 +2165,83 @@ mod tests {
         assert_eq!(resp2["status"], 200);
         assert_eq!(resp2["body"], "hello-text");
         assert!(resp2.get("body_b64").is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A test [`EgressAudit`] double that records every admit as `(caller, host, grant_source)`.
+    #[derive(Default)]
+    struct RecordingAudit {
+        admits: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl EgressAudit for RecordingAudit {
+        fn record_private_admit(&self, caller: &str, host: &str, grant_source: &str) {
+            self.admits.lock().unwrap().push((
+                caller.to_string(),
+                host.to_string(),
+                grant_source.to_string(),
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn egress_audit_fires_on_private_admit_only() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!("flux-audit-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let audit = Arc::new(RecordingAudit::default());
+
+        // A loopback echo server so a *private* host can actually be reached (admitted).
+        let port = spawn_echo_http_server().await;
+
+        // Manifest names the plugin (→ caller + grant_source), grants http + a loopback private host
+        // (declared + operator-granted), plus a *public* host allow so a public request isn't blocked.
+        let manifest = PluginManifest {
+            name: "auditplug".into(),
+            capabilities: PluginCapabilities {
+                http: true,
+                http_hosts: vec!["127.0.0.1".into(), "example.com".into()],
+                private_hosts: vec!["127.0.0.1".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let caps = SystemHostCaps::new(sys)
+            .with_manifest(&manifest)
+            .with_private_net_grants(vec!["127.0.0.1".into()])
+            .with_egress_audit(audit.clone());
+
+        // Admitting a PRIVATE host fires the audit with the plugin name + plugin grant_source.
+        caps.handle(
+            "http.do",
+            &json!({"url": format!("http://127.0.0.1:{port}/echo")}),
+        )
+        .await
+        .unwrap();
+        {
+            let admits = audit.admits.lock().unwrap();
+            assert_eq!(
+                admits.len(),
+                1,
+                "private admit must record exactly one event"
+            );
+            assert_eq!(admits[0].0, "auditplug");
+            assert_eq!(admits[0].1, "127.0.0.1");
+            assert_eq!(admits[0].2, "config:plugin/auditplug");
+        }
+
+        // A PUBLIC host does NOT fire the audit (the request fails at connect/DNS, but the host is
+        // allow-listed so it passes the host gate and reaches the audit check — which must not fire).
+        let _ = caps
+            .handle("http.do", &json!({"url": "http://example.com/"}))
+            .await;
+        assert_eq!(
+            audit.admits.lock().unwrap().len(),
+            1,
+            "a public host must not record a private-admit event"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

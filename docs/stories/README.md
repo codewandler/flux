@@ -69,10 +69,6 @@ Gaps surfaced while verifying the plugin install + running `scripts/smoke-plugin
 only because the SSRF guard refuses a private-network GitLab fixture — see D-20).
 - [D-19 — Complete the `flux plugin` lifecycle surface](D-19-plugin-lifecycle-cli.md) · Core · add `uninstall`
   + a richer `status`/`info` (version, pin, liveness, declared surface); small, no design doc
-- [D-20 — Scope private-network egress to declared plugins/endpoints](D-20-scoped-private-net-egress.md) · Core ·
-  replace the global all-or-nothing `allow_private_net` with a declared + granted + audited per-plugin **and**
-  per-endpoint allowance, so internal GitLab/Jira-DC/in-cluster Prometheus work without globally disabling SSRF
-  protection; design-first ([design](../designs/scoped-private-net-egress.md))
 - [D-21 — Plugin distribution for non-source users](D-21-plugin-distribution.md) · Core · scoping/epic-seed: how
   a non-repo user obtains the pack (bundled binaries / fetch-on-install / marketplace); produces a design + the
   follow-on stories, no code
@@ -102,6 +98,10 @@ all providers**. Most plumbing already exists (`flux-credentials` import/refresh
   stage; import + refresh cover the near term
 
 ## Done
+- [D-20 — Scope private-network egress](D-20-scoped-private-net-egress.md) · Core · finished as the
+  endpoint-epic Phase-2 prereq: the 0.2.7 scoped model gained **per-endpoint** grants
+  (`PrivateNetConfig.endpoints`) and a **private-net-admit audit event** (`PrivateNetAdmit` via the
+  `flux_plugin::EgressAudit` seam + a flux-cli event-store impl)
 - [D-25 — Endpoint reference model & registry](D-25-endpoint-reference-model.md) · Core · the
   references-only spine of the endpoint epic: L0 `flux_secret::endpoint` schema (`EndpointRef`/
   `Candidate`/`Record`/`ResolvedEndpoint`), the `flux_plugin::ReferenceResolver` trait seam, and

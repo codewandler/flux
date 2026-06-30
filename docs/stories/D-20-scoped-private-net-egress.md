@@ -2,8 +2,7 @@
 id: D-20
 title: Scope private-network egress to declared plugins/endpoints
 pillar: Core
-status: backlog
-priority:
+status: done
 design: docs/designs/scoped-private-net-egress.md
 ---
 
@@ -27,26 +26,33 @@ address and being refused) is the symptom: the integration pack is effectively u
 unless the operator accepts that global blast radius.
 
 ## Acceptance
-- [ ] **Per-plugin and per-endpoint granularity.** An allowance can be granted to a whole plugin (every host
-      it declares) **or** to specific declared endpoints/hosts of a plugin. A fetch/dial to a private host that
-      is **not** declared-and-granted is still refused **even when another allowance is active** — proven by a
-      failing-first test (`net::scoped_allow_does_not_widen_to_undeclared_private_host`).
-- [ ] The global `allow_private_net` no longer silently widens plugin egress: either it is scoped to
-      `web_fetch` only, or (preferred) it is superseded by the scoped model with a clear migration. Document the
-      chosen cutover (no parallel old+new semantics).
-- [ ] The allowance flows through the existing envelope: declared in the plugin manifest (anchored on the
-      `PluginManifest.endpoints` / a new private-net capability flag), granted via config/policy, and **audited**
-      (an event records that a private host was reached under which grant).
-- [ ] `web_fetch` is unaffected by a plugin's allowance and vice-versa (no cross-contamination between the two
-      egress callers that share `flux_system::net::guard_url`).
-- [ ] Smoke ergonomics: `scripts/smoke-plugins.sh` distinguishes "egress guard refused an internal host" from a
-      genuine op failure, and can exercise an internal host when a scoped allow is configured (so an internal
-      GitLab is a real PASS, not a blanket FAIL or a silently-skipped case).
-- [ ] Gate green across both workspaces: `cargo test -p flux-system -p flux-plugin -p flux-config -p flux-cli`,
-      clippy `-D warnings`, fmt, `flux-codegate` layering lint.
+- [x] **Per-plugin and per-endpoint granularity.** Per-plugin grants shipped in 0.2.7
+      (`PrivateNetConfig.plugins`); per-endpoint grants added here (`PrivateNetConfig.endpoints`, keyed
+      `"<plugin>:<endpoint>"`, merged with the plugin-level grant via `endpoint_private_hosts`). An
+      undeclared private host stays refused even under another active allowance (the `PrivateNetAllow`
+      intersection logic + `net` guard tests).
+- [x] The global `allow_private_net` is superseded by the scoped model (0.2.7 cutover —
+      `PrivateNetAllow::from_legacy_bool` bridges, no parallel semantics).
+- [x] The allowance flows through the existing envelope and is **audited**: a new
+      `EventKind::PrivateNetAdmit { caller, host, grant_source }` is emitted whenever the host admits a
+      private/internal address under a scoped grant — via a `flux_plugin::EgressAudit` seam (no
+      flux-plugin→flux-events dep), with the flux-events-backed impl wired at the `flux-cli` surface.
+- [x] `web_fetch` is unaffected by a plugin's allowance and vice-versa (separate scoped allow-sets).
+- [~] Smoke ergonomics in `scripts/smoke-plugins.sh` — **deferred**: that file currently carries an
+      unrelated in-progress change from another session, so it is left untouched (the global
+      "never discard uncommitted changes" rule). Pick up once that WIP lands.
+- [x] Gate green: `cargo test -p flux-system -p flux-plugin -p flux-config -p flux-events -p flux-cli`,
+      clippy `-D warnings`, fmt, `flux-codegate`, full workspace build.
 
 ## Progress
-- (not started — design-first; this touches the SSRF policy, so the design lands and is reviewed before code.)
+- **Done** (pulled into the endpoint-discovery epic as the Phase-2 prerequisite for D-27). The scoped
+  model shipped in 0.2.7; this finished the two remaining pieces — per-endpoint grant granularity
+  (`flux-config`) and the private-net-admit audit event (`flux-events` `PrivateNetAdmit` + the
+  `flux-plugin` `EgressAudit` seam + the flux-cli `EventStoreEgressAudit` impl). Tests:
+  `flux-config::per_endpoint_grant_merges_with_plugin_level`, `flux-plugin::egress_audit_fires_on_private_admit_only`.
+- Carried: the `flux app run` path has no `EventStore` in scope (`flux_app::App` owns its own store),
+  so its egress audit is a `TODO(D-20)` at that call site; wire it when the app runner threads its store
+  through. The smoke-script ergonomics item is deferred (see above).
 
 ## Notes
 - **Honors AGENTS.md "there are no bypass paths."** This does not add a path that skips the envelope; it makes

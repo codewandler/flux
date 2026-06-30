@@ -795,6 +795,32 @@ fn open_flow_store(events: Arc<EventStore>) -> Result<FlowStore> {
     FlowStore::open(dir.join("flow.db"), events).context("open flow store")
 }
 
+/// The `flux-events`-backed [`EgressAudit`](flux_plugin::EgressAudit) impl: appends a
+/// [`EventKind::PrivateNetAdmit`] to the session's stream whenever the plugin host admits a request
+/// to a private/internal address under a scoped grant. This is the L6 binding of the L4 trait seam —
+/// flux-plugin stays free of an event-store dependency. An append failure is logged, never fatal
+/// (auditing must not break a live tool call).
+struct EventStoreEgressAudit {
+    store: Arc<EventStore>,
+    stream: String,
+}
+
+impl flux_plugin::EgressAudit for EventStoreEgressAudit {
+    fn record_private_admit(&self, caller: &str, host: &str, grant_source: &str) {
+        let ev = flux_events::NewEvent::new(flux_events::EventKind::PrivateNetAdmit {
+            caller: caller.to_string(),
+            host: host.to_string(),
+            grant_source: grant_source.to_string(),
+        });
+        if let Err(e) = self.store.append(&self.stream, ev) {
+            eprintln!(
+                "{}",
+                style::dim(&format!("(audit: failed to record private-net admit: {e})"))
+            );
+        }
+    }
+}
+
 /// Build a fresh boxed provider for a model spec (used by the sub-agent factory).
 fn provider_for(spec: &str) -> Result<Box<dyn Provider>> {
     if spec == "mock" || spec.starts_with("mock/") {
@@ -992,6 +1018,18 @@ async fn build_agent(
     let backend = build_doc_index(&system).await;
     flux_capabilities::register_datasource_ops(&mut registry, backend);
 
+    // The unified event store + this run's session, opened before plugins so the egress-audit hook
+    // (which appends `PrivateNetAdmit` events to this stream) can be wired into each plugin's caps.
+    let events = Arc::new(open_event_store()?);
+    let session_id = if flags.continue_ || flags.resume {
+        events
+            .latest_session()
+            .context("latest session")?
+            .ok_or_else(|| anyhow::anyhow!("no session to resume"))?
+    } else {
+        events.create_session(&model).context("create session")?
+    };
+
     // Discover subprocess plugins (~/.flux/plugins/*.toml) and project their operations as tools.
     // Each plugin's host capabilities are the guarded System (same boundary as built-in tools).
     if let Some(dir) = plugins_dir() {
@@ -1001,12 +1039,17 @@ async fn build_agent(
             let system = system.clone();
             let cfg_for_caps = cfg.clone();
             let caps_system = system.clone();
+            let audit: Arc<dyn flux_plugin::EgressAudit> = Arc::new(EventStoreEgressAudit {
+                store: events.clone(),
+                stream: session_id.clone(),
+            });
             let make_caps = move |m: &flux_plugin::PluginManifest| {
                 let plugin_private_hosts = cfg_for_caps.plugin_private_hosts(&m.name);
                 Arc::new(
                     flux_plugin::SystemHostCaps::new(caps_system)
                         .with_manifest(m)
-                        .with_private_net_grants(plugin_private_hosts),
+                        .with_private_net_grants(plugin_private_hosts)
+                        .with_egress_audit(audit),
                 ) as Arc<dyn flux_plugin::HostCapabilities>
             };
             match flux_plugin::load_plugin_tools(
@@ -1106,16 +1149,6 @@ async fn build_agent(
         flux_evidence::Phase::Startup,
         serde_json::json!({ "signals": signals }),
     ));
-
-    let events = Arc::new(open_event_store()?);
-    let session_id = if flags.continue_ || flags.resume {
-        events
-            .latest_session()
-            .context("latest session")?
-            .ok_or_else(|| anyhow::anyhow!("no session to resume"))?
-    } else {
-        events.create_session(&model).context("create session")?
-    };
 
     let flow = open_flow_store(events.clone())?;
     // Assemble the engine: this installs the reflexive loop host on the executor and loads the flux-lang
@@ -3475,6 +3508,9 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
         flux_capabilities::datasource_tools(backend.clone());
     // Discover subprocess plugins (~/.flux/plugins/*.toml) and project their ops as tools; their host
     // capabilities are the datasource bridge over the guarded System (same boundary as built-in tools).
+    // TODO(D-20): wire `SystemHostCaps::with_egress_audit` here once the app path exposes its
+    // per-run EventStore stream (the seam exists; `flux_app::App` owns its own store/bus, so there is
+    // no `EventStore` in scope at this point to back the audit — unlike the `build_agent` path).
     if let Some(dir) = plugins_dir() {
         for p in flux_plugin::discover(&dir) {
             let system = system.clone();

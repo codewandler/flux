@@ -96,6 +96,26 @@ pub fn guard_url(raw: &str, allow_private: bool) -> Result<url::Url> {
     guard_url_scoped(raw, &PrivateNetAllow::from_legacy_bool(allow_private))
 }
 
+/// Whether `host` is (or resolves to) a private/internal address — i.e. one the SSRF guard would
+/// block absent a grant. Reuses the same IP-range and internal-hostname rules as [`guard_url_scoped`]
+/// so callers (e.g. the plugin host's egress-admit audit) classify an admitted host identically to
+/// how it was guarded. An unresolvable host is treated as not-private (it isn't an internal target).
+pub fn host_resolves_private(host: &str) -> bool {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return is_blocked_ip(ip);
+    }
+    let lower = host.to_ascii_lowercase();
+    if is_internal_hostname(&lower) {
+        return true;
+    }
+    // Resolve and treat the host as private if ANY resolved address is in a blocked range. Use a
+    // throwaway port — only the IPs matter. `to_socket_addrs` needs a port, hence `(host, 0)`.
+    if let Ok(addrs) = (host, 0u16).to_socket_addrs() {
+        return addrs.into_iter().any(|sa| is_blocked_ip(sa.ip()));
+    }
+    false
+}
+
 /// `Err` if `ip` is in a range the agent may never reach (SSRF protection); `Ok(())` otherwise.
 fn block_if(ip: IpAddr, host: &str, allow: &PrivateNetAllow) -> Result<()> {
     if is_blocked_ip(ip) && !allow.allows_host(host) {

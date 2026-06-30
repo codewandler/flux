@@ -59,6 +59,16 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<Usage>,
     },
+
+    /// The host admitted an egress request to a **private/internal** address under a scoped
+    /// private-network grant — the auditable security event. `caller` is the plugin name (or
+    /// `"web_fetch"`); `host` is the private host that was reached; `grant_source` names the grant
+    /// that let it through (e.g. `"config:plugin/<name>"` or `"config:endpoint/<plugin>:<ep>"`).
+    PrivateNetAdmit {
+        caller: String,
+        host: String,
+        grant_source: String,
+    },
 }
 
 impl EventKind {
@@ -74,6 +84,7 @@ impl EventKind {
             EventKind::TurnStarted { .. } => "turn_started",
             EventKind::PlanAttempted { .. } => "plan_attempted",
             EventKind::TurnEnded { .. } => "turn_ended",
+            EventKind::PrivateNetAdmit { .. } => "private_net_admit",
         }
     }
 }
