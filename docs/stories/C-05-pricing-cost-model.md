@@ -2,7 +2,7 @@
 id: C-05
 title: Cross-provider pricing & cost model
 pillar: Core
-status: backlog
+status: done
 epic: subscription-providers-and-cost
 theme: subscription-providers-cost
 design: docs/designs/subscription-providers-and-cost.md
@@ -67,6 +67,21 @@ the foundation the reporting surface (C-06) consumes.
   - Gate: `cargo build --workspace`, `cargo test -p flux-core -p flux-providers -p flux-credentials`,
     `clippy --workspace --all-targets -D warnings`, `fmt`, `cargo test -p flux-codegate` all green. (The
     pre-existing `flux-flow::skill_docs_in_sync` node-kind drift is unrelated to this story.)
+- **Live wiring + codex pricing fix (this session).** The cost model above was shipped but never
+  *called* — `cost()` was dead code and the CLI showed tokens (`ctx`/`out`/`cache`) but no dollar cost.
+  Made it live: `flux run` loads the pricing table (`flux_credentials::load_pricing_table`) and `CliSink`
+  appends a per-turn cost suffix to the turn-end rule — `· $X` for metered spend, `· ~$X (sub)` for
+  subscription spend (claude/codex, shown as *equivalent metered cost*). `build_agent` now returns the
+  canonical resolved `provider/model` spec (the raw input may be a bare alias like `codex` that neither
+  `is_subscription` nor `rates_for` can decode) and `build_provider` returns the provider so the
+  canonical spec is reconstructed without duplicating the alias map. The live smoke also caught a real
+  regression from C-03: the table keyed codex on the legacy `gpt-5-codex` id, but the C-03 resolver
+  emits `gpt-5.5` — so codex spend priced as `None` (zero). Fixed by keying `gpt-5.5` (keeping
+  `gpt-5`/`gpt-5-codex` as defence-in-depth aliases). Failing-first tests `cost_annotation_*` and
+  `sink_prices_a_codex_turn_as_subscription` (flux-cli); the `subscription_cost_is_labelled` test now
+  asserts the canonical `codex/gpt-5.5` path (fails before the key is added). A live codex turn reports
+  `· ~$0.0359 (sub)`. Gate green (build/test --workspace, clippy -D warnings, fmt, flux-codegate).
+  **The fuller reporting surface (per-call attribution, `flux usage`, server endpoint) is C-06.**
 
 ## Notes
 - Epic + design: [subscription-providers-and-cost.md](../designs/subscription-providers-and-cost.md).

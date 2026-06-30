@@ -33,6 +33,21 @@ All notable changes to this project are documented in this file. The format is b
   alias table — the CLI keeps only the bare-`codex` shorthand policy. (The cache + reasoning token
   capture in the Responses codec was already present and is now live-verified: `cache 5.1k (15% hit)`.)
 
+- **Live per-turn cost in the CLI annotation + codex pricing fix (C-05).** The cross-provider cost
+  model (`flux_core::pricing`: per-model per-tier rates, `cost(&Usage, model)`, `~/.flux/pricing.toml`
+  overlay, subscription labelling) was shipped but never *wired* — `cost()` was dead code and the CLI
+  showed tokens (`ctx`/`out`/`cache`) but no dollar cost. It is now live: `flux run` loads the pricing
+  table and appends a per-turn cost suffix to the turn-end rule — `· $0.0023` for metered spend
+  (`anthropic`/`openai`/…), `· ~$0.0359 (sub)` for subscription spend (`claude`/`codex`, shown as
+  *equivalent metered cost* since it bills against a flat sub, not the API). To wire it, `build_agent`
+  now returns the canonical resolved `provider/model` spec (the raw input may be a bare alias like
+  `codex` that neither `is_subscription` nor `rates_for` can decode) and `CliSink` carries the spec +
+  table. The live smoke also caught a real regression from C-03: the pricing table keyed codex on the
+  legacy `gpt-5-codex` id, but the C-03 resolver emits `gpt-5.5` — so codex spend priced as `None`
+  (zero). Fixed by keying `gpt-5.5` (keeping `gpt-5`/`gpt-5-codex` as defence-in-depth aliases). A live
+  codex turn now shows `· ~$0.0359 (sub)`. The fuller reporting surface (per-call attribution,
+  `flux usage`, server endpoint) is C-06.
+
 - **Complete `flux plugin` lifecycle — `uninstall` + `status` (D-19).** Plugin management is now
   fully first-class from the CLI. `flux plugin uninstall <name>` removes the descriptor at
   `~/.flux/plugins/<name>.toml` (a missing name is a clean `no such plugin — nothing to uninstall`, never

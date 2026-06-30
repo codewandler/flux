@@ -185,6 +185,9 @@ impl PricingTable {
             reasoning: 0.0,
         };
         rates.insert("gpt-5".to_string(), gpt5);
+        rates.insert("gpt-5.5".to_string(), gpt5);
+        // Legacy alias: the `codex` provider resolves `*-codex` → `gpt-5.5` before cost, but keep the
+        // key so a raw `codex/gpt-5-codex` spec still prices (defence-in-depth, never the live path).
         rates.insert("gpt-5-codex".to_string(), gpt5);
 
         // --- OpenRouter passthrough models (keyed by the OpenRouter model id, slash and all) -------
@@ -331,12 +334,15 @@ mod tests {
 
         // claude/codex providers → labelled as subscription (equivalent metered cost).
         assert!(table.cost(&usage, "claude/opus").unwrap().subscription);
-        assert!(
-            table
-                .cost(&usage, "codex/gpt-5-codex")
-                .unwrap()
-                .subscription
-        );
+        // The codex provider resolves to `gpt-5.5` (C-03); cost must resolve on that canonical id,
+        // not just the legacy `gpt-5-codex`. Failing-first: before `gpt-5.5` was added to the table
+        // this returned `None` (codex spend unpriced) — the C-03 model-resolution fix had made the
+        // resolver emit an id the pricing table didn't carry.
+        let codex_cost = table
+            .cost(&usage, "codex/gpt-5.5")
+            .expect("codex/gpt-5.5 must price — the resolver emits this canonical id");
+        assert!(codex_cost.subscription);
+        assert!(codex_cost.usd > 0.0);
 
         // Metered API providers → not subscription.
         assert!(
@@ -351,7 +357,7 @@ mod tests {
 
         // The free function agrees.
         assert!(is_subscription("claude/sonnet"));
-        assert!(is_subscription("codex/gpt-5-codex"));
+        assert!(is_subscription("codex/gpt-5.5"));
         assert!(!is_subscription("anthropic/claude-opus-4-8"));
         assert!(!is_subscription("claude-opus-4-8"));
     }

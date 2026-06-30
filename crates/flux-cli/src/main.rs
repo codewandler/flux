@@ -522,7 +522,9 @@ const KNOWN_PROVIDERS: &[&str] = &[
 /// `openrouter/`, `openrouter-anthropic/`, `ollama/`, `ollama-anthropic/`). Bare short aliases
 /// (`sonnet`, `opus`, `haiku`) are implicitly `anthropic/<alias>`.
 /// Any other bare string (no `/`) is an error — use `anthropic/` or `claude/` to disambiguate.
-fn build_provider(spec: &str) -> Result<(NativeProvider, String)> {
+fn build_provider(spec: &str) -> Result<(NativeProvider, String, String)> {
+    // Returns (native, provider, resolved_model) so callers can reconstruct the canonical
+    // `provider/model` spec (e.g. for cost/subscription detection, which reads the provider prefix).
     let (provider, model) = match spec.split_once('/') {
         Some((p, m)) if KNOWN_PROVIDERS.contains(&p) => (p.to_string(), m.to_string()),
         Some((p, _)) => bail!(
@@ -574,7 +576,7 @@ fn build_provider(spec: &str) -> Result<(NativeProvider, String)> {
         "codex" => flux_providers::codex::resolve_model(&model),
         _ => model,
     };
-    Ok((native, model))
+    Ok((native, provider, model))
 }
 
 /// Build the knowledge datasource from the workspace's documentation files (markdown/text), indexed as
@@ -933,7 +935,7 @@ fn provider_for(spec: &str) -> Result<Box<dyn Provider>> {
     if spec == "mock" || spec.starts_with("mock/") {
         Ok(Box::<MockCliProvider>::default())
     } else {
-        let (native, _model) = build_provider(spec).map_err(|e| {
+        let (native, _provider, _model) = build_provider(spec).map_err(|e| {
             anyhow::anyhow!(
             "sub-agent provider: {e} (hint: the parent --model spec is forwarded to sub-agents)"
         )
@@ -1008,7 +1010,7 @@ fn load_roles(cwd: &std::path::Path) -> RoleRegistry {
 /// Build a tool-enabled agent (provider + safety envelope + session) for agentic mode / the REPL.
 async fn build_agent(
     flags: &AgentFlags,
-) -> Result<(FlowEngine, String, Arc<dyn flux_runtime::Spawner>)> {
+) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
     // Guarded system rooted at the current directory; layered config loaded from it.
     let cwd = std::env::current_dir().context("current dir")?;
     let cfg = flux_config::load(&cwd).context("load .flux/config.toml")?;
@@ -1021,12 +1023,20 @@ async fn build_agent(
     let model_spec = resolve_model_spec(&flags.model, &cfg);
 
     // The built-in `mock` provider lets the full agentic loop be exercised offline via the CLI.
-    let (provider, model): (Box<dyn Provider>, String) =
+    let (provider, model, canonical_spec): (Box<dyn Provider>, String, String) =
         if model_spec == "mock" || model_spec.starts_with("mock/") {
-            (Box::<MockCliProvider>::default(), "mock".to_string())
+            (
+                Box::<MockCliProvider>::default(),
+                "mock".to_string(),
+                "mock".to_string(),
+            )
         } else {
-            let (native, m) = build_provider(&model_spec)?;
-            (Box::new(native), m)
+            let (native, provider, m) = build_provider(&model_spec)?;
+            // The canonical `provider/model` spec (resolved) — what cost/subscription detection
+            // reads. The raw `model_spec` input may be a bare alias (`codex`, `sonnet`) that neither
+            // `is_subscription` nor `rates_for` can decode, so surface the resolved form.
+            let canonical_spec = format!("{provider}/{m}");
+            (Box::new(native), m, canonical_spec)
         };
 
     let mut workspace = Workspace::new(&cwd).context("workspace")?;
@@ -1354,18 +1364,19 @@ async fn build_agent(
     let agent = spec
         .into_engine(Arc::from(provider), executor, events, flow)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok((agent, session_id, spawner))
+    Ok((agent, session_id, canonical_spec, spawner))
 }
 
 /// One-shot agentic turn.
 async fn run_agentic(flags: &AgentFlags, prompt: String) -> Result<()> {
-    let (agent, session_id, _spawner) = build_agent(flags).await?;
+    let (agent, session_id, model_spec, _spawner) = build_agent(flags).await?;
     eprintln!(
         "{}",
         style::dim(&format!("{} · session {session_id}", agent.model))
     );
     let initial_rules = agent.executor.allow_rules();
-    let mut sink = CliSink::new(agent.max_iterations);
+    let pricing = flux_credentials::load_pricing_table();
+    let mut sink = CliSink::new(agent.max_iterations).with_cost(model_spec, pricing);
     agent
         .run_turn(&session_id, &prompt, &mut sink)
         .await
@@ -1496,7 +1507,7 @@ pub(crate) async fn run_draft_ast_with_composites(
     ast: &flux_flow::ast::DraftAst,
     composites: &[flux_lang::program::CompositeOpDecl],
 ) -> Result<()> {
-    let (engine, session_id, _spawner) = build_agent(flags).await?;
+    let (engine, session_id, _spec, _spawner) = build_agent(flags).await?;
     eprintln!(
         "{}",
         style::dim(&format!("flow · {} · session {session_id}", engine.model))
@@ -1621,7 +1632,7 @@ async fn run_plan(
             "`flux plan` needs a prompt, e.g. `flux plan \"summarize the README into SUMMARY.txt\"`"
         );
     }
-    let (engine, session_id, _spawner) = build_agent(&flags).await?;
+    let (engine, session_id, _spec, _spawner) = build_agent(&flags).await?;
     let cli_ask = CliAsk;
     eprintln!(
         "{}",
@@ -2110,7 +2121,7 @@ async fn run_a2a(url: String, prompt_words: Vec<String>, token: Option<String>) 
 
 /// Interactive agentic REPL (tools enabled), with slash commands.
 async fn run_repl(flags: AgentFlags) -> Result<()> {
-    let (mut agent, mut session_id, spawner) = build_agent(&flags).await?;
+    let (mut agent, mut session_id, _spec, spawner) = build_agent(&flags).await?;
     let initial_rules = agent.executor.allow_rules();
     eprintln!(
         "{}",
@@ -2250,7 +2261,7 @@ async fn run_repl(flags: AgentFlags) -> Result<()> {
                         );
                     } else {
                         match build_provider(spec) {
-                            Ok((native, model)) => {
+                            Ok((native, _provider, model)) => {
                                 let provider: Arc<dyn Provider> = Arc::new(native);
                                 agent.provider = provider.clone();
                                 agent.model = model.clone();
@@ -2883,6 +2894,10 @@ struct CliSink {
     iter: usize,
     /// Max iterations cap (threaded from `Agent::max_iterations` for display).
     max_iter: usize,
+    /// The resolved model spec (e.g. `codex/gpt-5.5`) + pricing table for the per-turn cost
+    /// annotation. `None` when the sink wasn't given a spec (sub-paths that don't show cost).
+    model_spec: Option<String>,
+    pricing: Option<flux_core::PricingTable>,
 }
 
 impl CliSink {
@@ -2908,6 +2923,32 @@ impl CliSink {
             spinner: None,
             iter: 0,
             max_iter,
+            model_spec: None,
+            pricing: None,
+        }
+    }
+
+    /// Attach a model spec + pricing table so the per-turn annotation appends a dollar cost. The
+    /// spec is the full `provider/model` (e.g. `codex/gpt-5.5`) so subscription spend is detected
+    /// from the provider prefix; the table is the loaded overlay-on-builtin (`load_pricing_table`).
+    fn with_cost(mut self, model_spec: String, pricing: flux_core::PricingTable) -> Self {
+        self.model_spec = Some(model_spec);
+        self.pricing = Some(pricing);
+        self
+    }
+
+    /// The per-turn dollar-cost suffix for the annotation, when a model spec + pricing table are
+    /// attached and the turn reported usage. Returns an empty string otherwise (or when the model is
+    /// unknown to the table — never panics).
+    fn cost_inline(&self, usage: Option<&Usage>) -> String {
+        let (Some(u), Some(spec), Some(table)) =
+            (usage, self.model_spec.as_deref(), self.pricing.as_ref())
+        else {
+            return String::new();
+        };
+        match table.cost(u, spec) {
+            Some(money) => cost_annotation(&money),
+            None => String::new(),
         }
     }
 
@@ -3075,13 +3116,18 @@ impl AgentSink for CliSink {
             .unwrap_or_default();
         // The right-hand token annotation: context-window occupancy, generated tokens, cache + hit-rate.
         let token_inline = usage.as_ref().map(usage_annotation).unwrap_or_default();
+        // The dollar cost of this turn's tokens, when a model spec + pricing table were attached.
+        let cost_inline = self.cost_inline(usage.as_ref());
         // Always print a rule so the turn boundary is visible even for prose-only replies.
         let summary = if self.steps > 0 {
             let plural = if self.steps == 1 { "" } else { "s" };
-            format!("{} step{plural} · {elapsed}{token_inline}", self.steps)
+            format!(
+                "{} step{plural} · {elapsed}{token_inline}{cost_inline}",
+                self.steps
+            )
         } else {
             // Prose-only turn: a minimal rule with elapsed + token stats.
-            format!("· {elapsed}{token_inline}")
+            format!("· {elapsed}{token_inline}{cost_inline}")
         };
         let rule_len = self.width.saturating_sub(summary.chars().count() + 2);
         eprintln!("{} {}", style::rule(rule_len), style::dim(&summary));
@@ -3110,6 +3156,22 @@ fn usage_annotation(u: &Usage) -> String {
         ));
     }
     s
+}
+
+/// The dollar-cost suffix for the turn-end annotation. Subscription spend (claude/codex) is shown
+/// as an *equivalent metered cost* prefixed with `~` and tagged `(sub)` — it bills against a flat
+/// subscription, not the API, so the figure is illustrative, not a charge. Metered spend shows the
+/// raw dollar amount. Returns an empty string for a zero-cost turn (e.g. a cached/no-op call).
+fn cost_annotation(money: &flux_core::Money) -> String {
+    if money.usd <= 0.0 {
+        return String::new();
+    }
+    let usd = format!("${:.4}", money.usd);
+    if money.subscription {
+        format!(" · ~{usd} (sub)")
+    } else {
+        format!(" · {usd}")
+    }
 }
 
 impl CliSink {
@@ -3612,7 +3674,7 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
                  FLUX_SERVER_TOKEN to require `Authorization: Bearer <token>`, or bind 127.0.0.1"
             );
         }
-        let (agent, _session_id, _spawner) = build_agent(flags).await?;
+        let (agent, _session_id, _spec, _spawner) = build_agent(flags).await?;
         return flux_server::serve(&addr, agent, token).await;
     };
 
@@ -3624,7 +3686,7 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
     let (provider, model): (Option<std::sync::Arc<dyn Provider>>, String) = match build_provider(
         &spec,
     ) {
-        Ok((native, resolved)) => (Some(std::sync::Arc::new(native)), resolved),
+        Ok((native, _provider_name, resolved)) => (Some(std::sync::Arc::new(native)), resolved),
         Err(e) => {
             eprintln!(
                     "{}",
@@ -3827,7 +3889,7 @@ fn addr_is_loopback(addr: &str) -> bool {
 /// in which case all tool calls are auto-approved (no modal).
 async fn run_tui(flags: AgentFlags) -> Result<()> {
     let auto_approve = flags.yes;
-    let (agent, session_id, _spawner) = build_agent(&flags).await?;
+    let (agent, session_id, _spec, _spawner) = build_agent(&flags).await?;
     flux_tui::run(agent, session_id, auto_approve).await
 }
 
@@ -4670,10 +4732,10 @@ async fn run_prompt(flags: AgentFlags, prompt_words: Vec<String>) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_datasources, credential_location, format_evidence, loop_machinery_label,
-        new_render_suffix, plugin_binaries_in, plugin_status_one, render_endpoint_row,
-        resolve_plugin_operation_name, run_plugin_in, tool_preview, truncate, usage_annotation,
-        write_generated_skill, Liveness, PluginAction,
+        build_datasources, cost_annotation, credential_location, format_evidence,
+        loop_machinery_label, new_render_suffix, plugin_binaries_in, plugin_status_one,
+        render_endpoint_row, resolve_plugin_operation_name, run_plugin_in, tool_preview, truncate,
+        usage_annotation, write_generated_skill, Liveness, PluginAction,
     };
     use serde_json::json;
 
@@ -5029,6 +5091,80 @@ mod tests {
 
         // Nothing billed → empty (so `-m mock` turns render a clean rule).
         assert_eq!(usage_annotation(&Usage::default()), "");
+    }
+
+    /// `cost_annotation` formats metered spend as `$X`, subscription spend (claude/codex) as the
+    /// *equivalent metered cost* `~$X (sub)` (it bills against a flat sub, not the API), and a
+    /// zero-cost turn as empty (C-05).
+    #[test]
+    fn cost_annotation_labels_metered_vs_subscription() {
+        use flux_core::Money;
+        // Metered spend → raw dollar amount.
+        let metered = cost_annotation(&Money {
+            usd: 0.0023,
+            subscription: false,
+        });
+        assert_eq!(metered, " · $0.0023");
+        // Subscription spend → equivalent metered cost, tagged `(sub)`.
+        let sub = cost_annotation(&Money {
+            usd: 0.0023,
+            subscription: true,
+        });
+        assert_eq!(sub, " · ~$0.0023 (sub)");
+        // A zero-cost turn (e.g. fully cached, or no usage) → empty, so the rule stays clean.
+        assert_eq!(
+            cost_annotation(&Money {
+                usd: 0.0,
+                subscription: false
+            }),
+            ""
+        );
+        assert_eq!(
+            cost_annotation(&Money {
+                usd: 0.0,
+                subscription: true
+            }),
+            ""
+        );
+    }
+
+    /// A `CliSink` with an attached model spec + pricing table prices a turn's usage through the
+    /// cost model end-to-end (the wiring that makes C-05's `cost()` live, not dead code). The codex
+    /// path resolves on `gpt-5.5` and is labelled subscription spend (C-03 model resolution + C-05).
+    #[tokio::test]
+    async fn sink_prices_a_codex_turn_as_subscription() {
+        use flux_core::Usage;
+        let sink = super::CliSink::new(0).with_cost(
+            "codex/gpt-5.5".to_string(),
+            flux_core::PricingTable::builtin(),
+        );
+        let u = Usage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            ..Default::default()
+        };
+        let inline = sink.cost_inline(Some(&u));
+        assert!(
+            inline.contains("(sub)"),
+            "codex spend is subscription-labelled, got: {inline}"
+        );
+        assert!(
+            inline.contains('$'),
+            "a non-zero turn shows a dollar cost, got: {inline}"
+        );
+        // A metered spec on the same usage is not tagged `(sub)`.
+        let metered = super::CliSink::new(0)
+            .with_cost(
+                "anthropic/claude-sonnet-4-6".to_string(),
+                flux_core::PricingTable::builtin(),
+            )
+            .cost_inline(Some(&u));
+        assert!(
+            !metered.contains("(sub)"),
+            "anthropic is metered, got: {metered}"
+        );
+        // No spec attached → no cost suffix (sub-paths that don't show cost).
+        assert_eq!(super::CliSink::new(0).cost_inline(Some(&u)), "");
     }
 
     /// clap validates the whole command tree (catches duplicate arg ids, the global-args + subcommand
