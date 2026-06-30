@@ -197,36 +197,49 @@ only the *credential source* moves.
 | **Dev SSO** | ✓ (aws-config) | ✓ (aws CLI) | ✓ (aws-config in plugin) |
 | **Prod k8s (IRSA / EKS Pod Identity)** | ✓ (aws-config) | ✓ **iff `aws` CLI in image** | ✓ (no `aws` CLI needed) |
 | **AWS IO through `flux_system` guard** | ✗ (aws-config's own reqwest) | ✓ (SigV4 HTTP in flux-providers, via guarded net) | ✓ (custom HTTP client over host `http.do`) |
-| **New protocol surface** | none | 2 small (host-only op, `process.run` env) | 3 (the two + `fs.read` + AWS HTTP client) |
+| **New protocol surface** | none | 2 (host-only op, `process.run` env) | 3 (host-only op, `fs.read`, AWS `HttpClient` over `host.http.do`) |
 | **`flux plugin aws-bedrock auth` UX** | ✗ | ✓ | ✓ |
 | **Reusable cred provider for non-LLM AWS** | ✗ | ✓ (one aws plugin) | ✓ |
 | **Lines / lift** | smallest | small + 2 protocol knobs | largest |
 
-#### Recommendation: Option B smallest-first, Option C as the documented escalation
+#### Recommendation: Option C — the prod constraint settles it
+
+The deployment model is now confirmed: **the prod flux image has no `aws` CLI**. That removes Option B
+(shelling the CLI) — it would work in dev and fail in prod. **Option C is the path**: a
+`plugins/aws-bedrock` member embedding `aws-config` is the resolver, installed where flux runs (the
+plugin is shipped with the flux image, so no external `aws` binary is needed). This is the most
+architecturally pure of the three: **zero AWS deps in the flux core**, **every byte of AWS IO through
+the guarded envelope** (no `aws-config` bypass reqwest), and **no dependency on an external `aws` CLI
+binary**. The cost is the largest new-protocol surface of the three, and it is real — scoped below.
 
 The user's framing — *"aws plugin — needs to be installed, holds all the credentials, and also
-provides credentials providers … `flux plugin aws-bedrock auth`"* — maps directly to the plugin
-options and is the most flux-aligned: it isolates AWS deps from the root gate (AUTHORING.md policy),
-keeps the plugin process env-cleared (it never reads host secrets from `std::env`; the `aws` CLI it
-shells to is itself env-cleared by the guarded spawn path and resolves the chain from `~/.aws`), and
-reuses the existing `plugins/aws` plugin's `process: ["aws"]` capability plus the D-27
-`credential`-capability/Redactor precedent.
+provides credentials providers … `flux plugin aws-bedrock auth`"* — maps directly onto C: the
+`aws-bedrock` plugin is the installed credential holder, its `auth` op is the resolver, and the
+`flux plugin aws-bedrock auth` UX falls out of the existing `flux plugin call <name> <op>` path.
 
-- **B first** because it is the smallest lift that stays in the plugin model and gives the `auth`
-  UX, reusing the `aws` CLI as the universal chain resolver (SSO + IRSA + EKS Pod Identity + IMDS).
-  It covers both stated modes **provided the flux image bundles the `aws` CLI** — which is the one
-  thing to confirm against your prod k8s setup.
-- **C is the escalation** if a prod container can't carry the `aws` CLI: then the plugin embeds
-  `aws-config` and becomes the resolver itself. The two share the exact same L1 seam
-  (`BedrockCredentialsResolver`), so moving B→C changes the plugin, not `flux-providers::bedrock`.
-- **A is rejected** as the primary path: it puts AWS deps in the flux build graph and lets
-  `aws-config` bypass `net::guard`. (A remains a valid *fallback* if the plugin protocol work proves
-  out of scope for a given release — the seam makes the swap one file.)
+**Why C over A (embedded `aws-config` in `flux-providers`):** A also drives both modes, but it puts
+AWS SDK deps in the flux build graph and lets `aws-config` make its STS/SSO calls with its own
+`reqwest`, **bypassing `flux_system::net::guard`**. Routing those through the guarded net means
+plugging a custom HTTP client into `aws-config` — which is the hard part of C done in the wrong
+crate (L1, not the plugin nested workspace). C keeps core dep-free and keeps AWS IO in the guarded
+envelope, where AUTHORING.md says heavy vendor deps belong.
 
-The thing to *not* do is half-implement any of them: a static-key reader (the earlier v1 idea)
-  covers neither mode; a plugin `auth` op without the host-only channel leaks keys to the model; an
-  embedded `aws-config` without a guarded HTTP client bypasses the net guard. Pick B, land the two
-  small protocol knobs, and escalate to C only if the prod image can't carry `aws`.
+**The thing to *not* do** is half-implement C: an `auth` op without the host-only channel leaks keys
+to the model; an embedded `aws-config` without a guarded HTTP client bypasses the net guard; a
+`fs.read` capability that isn't path-scoped + Redactor-registered would let a plugin read arbitrary
+host files (and `~/.aws/sso/cache` holds refresh tokens — a privilege boundary). Land all three
+knobs with their failing-first tests.
+
+The seam note: A and C share the exact same L1 trait (`BedrockCredentialsResolver`), so the
+credential source is swappable at one trait. **A remains a valid *fallback* only if the plugin
+protocol work proves out of scope for a given release** — but it pays the `net::guard` bypass cost,
+so C is the target, not A.
+
+The thing to *not* do is half-implement C: a plugin `auth` op without the host-only channel leaks
+keys to the model; an embedded `aws-config` without a guarded HTTP client bypasses `net::guard`; a
+`fs.read` capability that isn't path-scoped + Redactor-registered lets a plugin read arbitrary
+host files (and `~/.aws/sso/cache` holds refresh tokens). Land all three knobs with failing-first
+tests.
 
 #### The unifying seam — `BedrockCredentialsResolver` (L1, all options share it)
 
@@ -265,18 +278,25 @@ flux-providers (L1)  — no AWS SDK deps; the credential source is injected.
     reuses flux-secret crypto ← sha2/hmac/base64 (already deps, for sign_v4)
 └── src/lib.rs                ← pub mod bedrock;  (no feature gate — no AWS deps live here)
 
-plugins/aws (L4)             ← gains an `auth` op (Option B): host.run("aws",
-                                 ["configure","export-credentials","--format","env","--profile",p])
-                                 → creds, returned on the host-only/credential channel (Redactor-registered).
-                                 Already declares process: ["aws"]; EC2/datasource ops unchanged.
-   (Option C escalation: a plugins/aws-bedrock member embeds aws-config + a host-callback HTTP client.)
+plugins/aws-bedrock (L4)     ← NEW plugin member: embeds aws-config, resolves the chain over host
+                                 callbacks. `auth` op (host-only/internal, Redactor-registered) returns
+                                 {access_key, secret_key, session_token, region, expiry} to the host.
+                                 Services aws-config's IO through the guarded envelope:
+                                   - custom aws-types::HttpClient impl over host.http.do (STS/SSO → net::guard)
+                                   - new scoped fs.read capability for ~/.aws/config + ~/.aws/credentials
+                                     + ~/.aws/sso/cache (path-scoped, deny-by-default, results Redactor-registered)
+                                 Drives dev SSO (reads ~/.aws/config sso block + ~/.aws/sso/cache) and prod
+                                 k8s (IRSA via AWS_ROLE_ARN+AWS_WEB_IDENTITY_TOKEN_FILE, EKS Pod Identity via
+                                 AWS_CONTAINER_CREDENTIALS_FULL_URI) — no external `aws` CLI binary needed.
+   (Option A fallback — if the plugin work is deferred — embeds aws-config in flux-providers behind
+    a `bedrock` feature; pays the net::guard bypass cost. Not the target.)
 
 flux-credentials (L1)         ← no AWS reader; the chain lives in the plugin. (Keeps the OAuth store.)
 
 flux-cli (L6)
 └── src/main.rs               ← "aws" in KNOWN_PROVIDERS; bedrock_from_env() builds a resolver that
-                                 calls the aws plugin's `auth` op via the plugin host, injects it into
-                                 BedrockCredential; bare "aws" shorthand → provider default model
+                                 calls the aws-bedrock plugin's `auth` op via the plugin host, injects it
+                                 into BedrockCredential; bare "aws" shorthand → provider default model
 
 flux-core (L0)
 └── src/pricing.rs            ← bedrock/anthropic.* rate entries (match direct Anthropic rates)
@@ -324,22 +344,25 @@ impl Credential for BedrockCredential {
         unimplemented!("see apply: endpoint needs the resolved region")
     }
     async fn apply(&self, rb: RequestBuilder) -> Result<RequestBuilder> {
-        let creds = self.resolver.resolve().await?;          // aws CLI plugin (B) / aws-config (A/C)
+        let creds = self.resolver.resolve().await?;          // aws-config-in-plugin (C) / aws-config (A fallback)
         sign_v4(rb, &creds, service="bedrock").await        // hand-rolled SigV4 (region from creds)
     }
     // C-04 force-refresh-on-401: surface the resolver as a TokenSource whose refresh() calls
-    // resolver.refresh() (for B: re-shells `aws configure export-credentials`; for A/C: the chain).
+    // resolver.refresh() (for C/A: the chain re-resolves).
     fn token_source(&self) -> Option<Arc<dyn TokenSource>> { Some(self.as_token_source()) }
 }
 ```
 
 - `BedrockCredential` is **credential-source-agnostic** — it holds only `model_id` + the injected
-  `BedrockCredentialsResolver`. The CLI picks the resolver: Option B wires a resolver that calls the
-  `aws` plugin's `auth` op (creds returned on the host-only channel, Redactor-registered so the keys
-  never appear in model-visible output); Option A/C wire an `aws-config`-backed resolver. In dev,
-  `AWS_PROFILE=<p>` after `aws sso login` is enough (B shells `aws configure export-credentials
-  --profile <p>`); in prod k8s the injected IRSA/EKS-Pod-Identity vars are enough (the `aws` CLI or
-  the in-plugin chain resolves them). **No `flux-credentials` AWS reader and no manual
+  `BedrockCredentialsResolver`. The CLI picks the resolver: **Option C wires a resolver that calls
+  the `aws-bedrock` plugin's `auth` op** (creds returned on the host-only channel, Redactor-registered
+  so the keys never appear in model-visible output); the A fallback wires an `aws-config`-backed
+  resolver directly. In dev, `AWS_PROFILE=<p>` after `aws sso login` is enough (C's plugin reads
+  `~/.aws/config` + `~/.aws/sso/cache` over the scoped `fs.read` capability and refreshes the SSO
+  access token via `sso-oidc:CreateToken` over the guarded HTTP client, then calls
+  `sso:GetRoleCredentials`); in prod k8s the injected IRSA (`AWS_ROLE_ARN`+
+  `AWS_WEB_IDENTITY_TOKEN_FILE`) / EKS Pod Identity (`AWS_CONTAINER_CREDENTIALS_FULL_URI`) vars are
+  resolved by the in-plugin `aws-config` chain. **No `flux-credentials` AWS reader and no manual
   `export-credentials` step from the user.**
 - `sign_v4` is a free function in `bedrock.rs` (~150 lines): canonical request → string-to-sign →
   AWS4-HMAC-SHA256 signing key → signature → `Authorization` header. Sets `x-amz-date`,
@@ -388,19 +411,29 @@ another `Provider`.
 - [ ] Pricing: the `aws/anthropic.*` rate entries resolve in `flux_core::pricing` (Bedrock Anthropic
   rates match direct Anthropic); a live codex-style smoke shows the cost suffix on a Bedrock turn.
 - [ ] SSO (dev) and k8s-injected (prod) auth both work with **no manual `export-credentials`
-      step**: dev uses `AWS_PROFILE=<p>` after `aws sso login` (Option B: the aws plugin shells
-      `aws configure export-credentials --profile <p>`); prod uses the injected IRSA
-      (`AWS_ROLE_ARN`+`AWS_WEB_IDENTITY_TOKEN_FILE`) or EKS Pod Identity
-      (`AWS_CONTAINER_CREDENTIALS_FULL_URI`) vars, resolved by the `aws` CLI / in-plugin chain.
+      step and no `aws` CLI in the image**: dev uses `AWS_PROFILE=<p>` after `aws sso login` (the
+      aws-bedrock plugin reads `~/.aws/config`+`~/.aws/sso/cache` over the scoped `fs.read` and
+      refreshes via `sso-oidc:CreateToken`/`sso:GetRoleCredentials` over the guarded HTTP client);
+      prod uses the injected IRSA (`AWS_ROLE_ARN`+`AWS_WEB_IDENTITY_TOKEN_FILE`) or EKS Pod Identity
+      (`AWS_CONTAINER_CREDENTIALS_FULL_URI`) vars, resolved by the in-plugin `aws-config` chain.
       Failing-first: a mock `BedrockCredentialsResolver` returns canned creds; a live smoke
       confirms a real `aws sso login`'d turn against the dev account.
-- [ ] The `aws` plugin's `auth` op is **host-only/internal** (not advertised to the LLM as a tool)
-      and its returned keys are registered with the `Redactor` — the model cannot call `auth` and
-      the keys never appear in model-visible output. Failing-first: a test asserts the op is absent
-      from the projected tool catalog; a redactor test asserts the keys are scrubbed.
+- [ ] The `aws-bedrock` plugin's `auth` op is **host-only/internal** (not advertised to the LLM as
+      a tool) and its returned keys are registered with the `Redactor` — the model cannot call
+      `auth` and the keys never appear in model-visible output. Failing-first: a test asserts the op
+      is absent from the projected tool catalog; a redactor test asserts the keys are scrubbed.
+- [ ] **All AWS IO goes through `flux_system::net::guard`** — `aws-config`'s STS/SSO calls run via
+      a custom `aws-types::HttpClient` impl over the plugin `host.http.do` callback (no bypass
+      reqwest in the plugin). Failing-first: a test asserts the plugin makes no direct `reqwest`
+      call (the `cargo ban` / dependency check, or a `MockHost` test asserting STS went through
+      `http.do`).
+- [ ] **`fs.read` is path-scoped + deny-by-default** — the plugin can read only
+      `~/.aws/config`, `~/.aws/credentials`, `~/.aws/sso/cache/**` (manifest-declared); any other
+      path is refused; read results that may contain secrets (e.g. `~/.aws/sso/cache` refresh
+      tokens) are registered with the `Redactor`. Failing-first: a test asserts an out-of-scope path
+      read is denied.
 - [ ] **Zero AWS SDK crates in the root flux gate** — `cargo build --workspace` (no features) pulls
-      none; the chain lives in the `aws` plugin (Option B shells the user's `aws` CLI; Option C would
-      add `aws-config` to the plugin's nested workspace, not the root).
+      none; `aws-config` lives in `plugins/aws-bedrock`'s nested workspace, not the root.
 
 ## Risks / open questions
 
@@ -423,35 +456,48 @@ another `Provider`.
   pure crypto (no IO) — it could even live in `flux-secret` (L0) if we want it testable without L1,
   but keeping it in `flux-providers::bedrock` avoids an L0→nothing edge and matches where it's used.
 - **Token refresh / 401.** The injected `BedrockCredentialsResolver.refresh()` is the C-04 path:
-  Option B re-shells `aws configure export-credentials`; A/C re-resolve the chain. Static (long-lived
-  IAM) keys don't expire; SSO role creds expire as a unit (~8h). On a 401 with a refreshable
-  resolver, force one refresh + retry; otherwise surface the AWS error.
+  Option C re-resolves the `aws-config` chain (the chain refreshes SSO/web-identity internally);
+  A ditto. Static (long-lived IAM) keys don't expire; SSO role creds expire as a unit (~8h). On a 401
+  with a refreshable resolver, force one refresh + retry; otherwise surface the AWS error.
 
 ## Smallest-first cut (recommended story breakdown)
 
-1. **C-09a — Plugin protocol knobs + `aws` plugin `auth` op (L4).** Add an `internal`/`host_only`
-   flag to `OperationSpec` (op not advertised to the LLM; result fed to the `Redactor`) and an
-   optional `env` to `process.run` (parity with `process_spawn`). Add the `auth` op to the existing
-   `plugins/aws` plugin: `host.run("aws", ["configure","export-credentials","--format","env","--profile",p])`
-   → parse creds → return on the host-only channel. Failing-first: a test asserts `auth` is absent
-   from the projected tool catalog and its keys are redacted; a test asserts `process.run` forwards
-   `env`.
-2. **C-09b — Bedrock SigV4 + codec + injected resolver (L1).** `flux-providers::bedrock.rs`:
+1. **C-09a — Plugin protocol knobs (L4).** Three new, precedent-backed surfaces: (i) an
+   `internal`/`host_only` flag on `OperationSpec` (op not advertised to the LLM; result fed to the
+   `Redactor`) — precedent: D-27 `credential` capability + the host-directed `contribute` channel;
+   (ii) a new **path-scoped, deny-by-default `fs.read` capability** (manifest declares the exact
+   paths `~/.aws/config`/`~/.aws/credentials`/`~/.aws/sso/cache/**`; out-of-scope reads refused;
+   results that may contain secrets Redactor-registered) — `blob.*` is a scratch store, not this;
+   (iii) the contract that a plugin's STS/SSO HTTP goes through `host.http.do` (no `reqwest` in the
+   plugin — already a plugin rule; this step adds the `aws-types::HttpClient`-over-`host.http.do`
+   adapter shape to host-kit, or documents the impl pattern). Failing-first: an `internal` op is
+   absent from the projected tool catalog + its keys are redacted; an out-of-scope `fs.read` is
+   denied.
+2. **C-09b — `aws-bedrock` plugin + embedded `aws-config` (L4).** New `plugins/aws-bedrock` member
+   embedding `aws-config`+`aws-sdk-sso`+`aws-sdk-sts` (nested workspace, not the root gate). Its
+   **host-only `auth` op** builds an `SdkConfig` (honouring `AWS_PROFILE`/`AWS_REGION`/
+   `AWS_ROLE_ARN`/`AWS_WEB_IDENTITY_TOKEN_FILE`/`AWS_CONTAINER_CREDENTIALS_FULL_URI`) with the custom
+   `HttpClient` over `host.http.do` + the `fs.read` provider for `~/.aws`, resolves the chain, and
+   returns `{access_key, secret_key, session_token, region, expiry}` on the host-only channel
+   (Redactor-registered). Drives dev SSO (`aws sso login` once) **and** prod k8s IRSA / EKS Pod
+   Identity — **no `aws` CLI in the image**. Hermetic test with a `MockHost` + a recorded SSO/STS
+   fixture.
+3. **C-09c — Bedrock SigV4 + codec + injected resolver (L1).** `flux-providers::bedrock.rs`:
    `BedrockCredentialsResolver` trait, `BedrockCredential` (holds `model_id` + resolver), hand-rolled
-   `sign_v4` + known-answer test, `BedrockAnthropic` codec (reuses `messages`), `resolve_model`.
-   Drives the dev account via the aws plugin (`AWS_PROFILE=<p>` after `aws sso login`); a prod k8s
-   pod via the injected IRSA / EKS Pod Identity vars (resolved by the `aws` CLI the plugin shells).
-   CLI wires the plugin-backed resolver at the seam. Live smoke green against dev. (Non-streaming
-   fallback first; streaming in C-09c.)
-3. **C-09c — AWS event-stream deframer + streaming (L1).** `map_bedrock_event_stream`, fixture test,
+   `sign_v4` + known-answer test, `BedrockAnthropic` codec (reuses `messages`), `resolve_model`. CLI
+   wires the aws-bedrock-plugin-backed resolver at the seam. Live smoke green against dev.
+   (Non-streaming first; streaming in C-09d.)
+4. **C-09d — AWS event-stream deframer + streaming (L1).** `map_bedrock_event_stream`, fixture test,
    wire `invoke-with-response-stream`. Streaming turn green.
-4. **C-09d — Pricing + CLI routing + docs (L0+L6).** `aws` in `KNOWN_PROVIDERS`, `bedrock_from_env()`,
+5. **C-09e — Pricing + CLI routing + docs (L0+L6).** `aws` in `KNOWN_PROVIDERS`, `bedrock_from_env()`,
    bare `aws` shorthand, `aws/anthropic.*` pricing entries, README docs (dev `AWS_PROFILE`+`aws sso
-   login`; prod k8s injected vars; **Option C escalation** if the prod image can't carry the `aws` CLI).
+   login`; prod k8s injected vars; **no `aws` CLI required** — the aws-bedrock plugin ships with the
+   flux image).
 
-(C-09a+b is enough for a working `flux run -m aws` across dev-SSO and prod-k8s; c makes it stream;
-d makes it first-class. Option C — a `plugins/aws-bedrock` member embedding `aws-config` over host
-callbacks — is the documented escalation, swapping only the resolver impl at the C-09b seam.)
+(C-09a+b+c is enough for a working `flux run -m aws` across dev-SSO and prod-k8s with no `aws` CLI;
+d makes it stream; e makes it first-class. Option A — embedding `aws-config` in `flux-providers`
+behind a `bedrock` feature — remains the documented **fallback only if the plugin protocol work is
+deferred** for a release; it pays the `net::guard` bypass cost, so it is not the target.)
 
 ## What this is *not*
 
