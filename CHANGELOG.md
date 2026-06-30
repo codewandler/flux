@@ -8,6 +8,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Plugin-side schemars op schemas — D-36 (in-progress).** `host-kit` now derives a plugin
+  op's `input_schema` from a typed struct via `read_op_typed::<T>` / `write_op_typed::<T>`
+  (+ `op_input_schema::<T>()`, a `schemars` re-export), the plugin-side counterpart of D-34.
+  `homer` is the first migrated plugin (8 ops): its hand-written `so(json!{...}, json![...])`
+  op schemas are gone, replaced by `#[derive(Deserialize, schemars::JsonSchema)]` structs
+  (handlers unchanged — schema-only, the D-34 precedent). A contract test asserts each derived
+  schema's fields/required/types/enums match the legacy `so(...)` contract, and a workspace
+  guard (`plugins/host-kit/tests/no_manual_plugin_schema.rs`, scoped to `MIGRATED_PLUGINS`) fails
+  on a reintroduced `so(json!{...})`. Drift the migration surfaced is recorded in `DRIFT.md`
+  (two `homer` drifts, preserved as-is — pure schema-source change, not a contract change).
+  16 plugins remain under D-36.
+
 - **Codex provider hardening + provider-owned model resolution (C-03).** The ChatGPT-subscription
   `codex` provider is now correct against the live backend's quirks, verified by a real
   `~/.codex/auth.json` smoke test (no token values committed). A live turn surfaced one bug the unit

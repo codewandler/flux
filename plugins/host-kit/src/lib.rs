@@ -35,6 +35,24 @@ pub use flux_plugin::{
 };
 pub use flux_spec::{Effect, Idempotency, Risk};
 
+/// Re-export `schemars` so a plugin crate can `#[derive(host_kit::schemars::JsonSchema)]`
+/// (or `Deserialize`) on its op-input structs without adding its own `schemars` dependency —
+/// host-kit is the single owner of the plugin-side schema-derivation path (story D-36).
+pub use schemars;
+
+/// Derive the provider-facing JSON Schema for a typed plugin op input.
+///
+/// This is the plugin-side counterpart of `flux_spec::tool_input_schema::<T>()` (same
+/// semantics: strips the root `$schema`/`title`/`description` while preserving field
+/// descriptions and definitions). Every plugin `OperationSpec` should get its `input_schema`
+/// from here via a `#[derive(Deserialize, schemars::JsonSchema)]` struct, so the schema the
+/// model sees and the fields the handler reads cannot drift (D-36).
+///
+/// Prefer the [`read_op_typed`] / [`write_op_typed`] helpers, which call this for you.
+pub fn op_input_schema<T: schemars::JsonSchema>() -> Value {
+    flux_spec::tool_input_schema::<T>()
+}
+
 /// A typed view over the host-capability channel, handed to each op handler.
 pub struct Host<'a> {
     inner: &'a mut dyn GuestHost,
@@ -716,6 +734,25 @@ pub fn write_op(name: &str, description: &str, input_schema: Value) -> Operation
         idempotency: Some(Idempotency::NonIdempotent),
         secret_purposes: Vec::new(),
     }
+}
+
+/// A **typed** read-only op: `input_schema` is derived from `T` via `schemars`
+/// ([`op_input_schema`]) instead of a hand-written `json!({...})` object.
+///
+/// `T` should be a `#[derive(Deserialize, schemars::JsonSchema)]` struct whose fields encode
+/// the op's params (use `Option<T>` for optional fields so `required` is a set, per L-09).
+/// Add `#[schemars(allow_unknown_fields)]` when the handler ignores unknown keys (the common
+/// case for flex-extractors) so the derived schema doesn't forbid extras the runtime accepts.
+/// Effects/risk/idempotency match [`read_op`] (Read, Low, Idempotent).
+pub fn read_op_typed<T: schemars::JsonSchema>(name: &str, description: &str) -> OperationSpec {
+    read_op(name, description, op_input_schema::<T>())
+}
+
+/// A **typed** write/mutating op: `input_schema` derived from `T` via `schemars`
+/// ([`op_input_schema`]). Effects/risk/idempotency match [`write_op`] (Write+Network,
+/// Medium, NonIdempotent). See [`read_op_typed`] for the `T` contract.
+pub fn write_op_typed<T: schemars::JsonSchema>(name: &str, description: &str) -> OperationSpec {
+    write_op(name, description, op_input_schema::<T>())
 }
 
 // ---------------------------------------------------------------------------

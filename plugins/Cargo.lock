@@ -447,6 +447,8 @@ name = "homer"
 version = "0.1.0"
 dependencies = [
  "host-kit",
+ "schemars",
+ "serde",
  "serde_json",
 ]
 
@@ -458,6 +460,7 @@ dependencies = [
  "flux-datasource",
  "flux-plugin",
  "flux-spec",
+ "schemars",
  "serde",
  "serde_json",
 ]

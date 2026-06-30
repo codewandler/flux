@@ -84,3 +84,64 @@ type mismatches). Each is now fixed by construction; the notes record what was w
 - **Provider `json!({"type":"object"})` sites** (`flux-providers` tests / MCP passthrough
   `ToolDef`s) — not real `ToolSpec` op declarations.
 - **`flux-cli/plugin_skill.rs`** + **`flux-plugin/bin/*`** — test/example code, not registered ops.
+
+---
+
+# D-36 drift report — plugin OperationSpec schema↔handler mismatches
+
+The plugin-side continuation of D-34: each migrated plugin's `OperationSpec.input_schema` is
+derived from a typed `#[derive(Deserialize, schemars::JsonSchema)]` struct via
+`host_kit::read_op_typed::<T>` / `write_op_typed::<T>`, instead of a hand-written
+`so(json!({...}), json![...]))` literal. The structs are schema-only (handlers keep their
+existing extractors — the D-34 schema-only precedent); schemars' `Option<T>` → `["T","null"]`
+representation is the repo-wide convention (D-34 already adopted it on the crate side), so the
+derived JSON is **demonstrably equivalent**, not byte-identical, to the legacy literal. The
+contract (fields, required set, base types, enum value sets) is asserted per migrated plugin by
+an inline `schema_contract` test, and a workspace guard
+(`plugins/host-kit/tests/no_manual_plugin_schema.rs`, scoped to `MIGRATED_PLUGINS`) fails on a
+reintroduced `so(json!{...})`.
+
+This section records the drifts the migration surfaced in each plugin — cases where the *old*
+hand-written schema already disagreed with what the handler actually parses. Each is preserved
+as-is (the struct encodes the legacy schema verbatim) so the migration is a pure schema-source
+change, **not** a contract change; fixing the drift is a separate story.
+
+## Migrated so far
+
+- **`homer`** (8 ops). Guard-scoped. Contract test: `homer` `schema_contract::*`.
+
+### homer
+
+- **`homer.call.list`** — handler drift (handler wider than schema). `op_call_list` shares
+  `build_search_filters` with `homer.search`, so it also reads `ua`, `method`, and `call_id`
+  from the input — but the legacy `homer.call.list` schema never advertised those fields. The
+  model therefore cannot filter `call.list` by `ua`/`method`/`call_id`; those reads are silent
+  no-ops for this op. The `CallListInput` struct omits them to preserve the contract.
+- **`homer.call.show`** — handler drift (schema wider than handler). The legacy schema
+  advertises a `render` field (`enum: ["svg"]`) but `op_call_show` never reads it — the op
+  always renders the SVG ladder unconditionally. `CallShowInput` keeps `render: Option<Render>`
+  so the derived schema still advertises it (dead param), preserving the contract.
+- All other `homer` ops (`test`, `search`, `call.qos`, `call.analyze`, `pcap.export`,
+  `alias.list`): no schema↔handler drift — field sets and `required` match the handler reads.
+
+## Representation notes (not drift — expected schemars behaviour)
+
+- Optional fields serialize as `{"type": ["<T>", "null"]}` and are omitted from `required`
+  (schemars 0.8 default). The legacy `so(...)` form wrote `{"type": "<T>"}` and `"required": []`
+  explicitly. These are semantically equivalent for flux's runtime, which does not validate
+  input against the schema (handlers parse leniently and ignore unknown keys).
+- Enums serialize as a top-level `definitions` entry referenced by `$ref` (and wrapped in
+  `anyOf` with `null` when the field is `Option<Enum>`), instead of an inline
+  `{"type":"string","enum":[...]}`. The enum value set is unchanged.
+- Empty-input structs serialize as `{"type":"object"}` (no `properties`/`required` keys) rather
+  than `{"type":"object","properties":{},"required":[]}`. Equivalent.
+- `additionalProperties` is not emitted (schemars default), matching the legacy `so(...)` form
+  and the handlers' ignore-unknown-keys behaviour.
+
+## Not yet migrated (tracked in `docs/stories/D-36-schemars-plugin-op-schemas.md`)
+
+`gitlab`, `grafana`, `docker`, `huggingface`, `opsgenie`, `homer`✓, `asterisk`, `sql`,
+`slack`, `websearch`, `jira`, `confluence`, `kubernetes`, `loki`, `prometheus`,
+`alertmanager`, `aws`. Several use `flex_str`/`flex_i64` string-or-number coercion; their
+handlers stay (schema-only struct, D-34 precedent) and any drift they surface will be recorded
+here as they migrate.

@@ -9,7 +9,120 @@
 //! Source of truth: `~/projects/fluxplane/fluxplane-plugins/homer/`.
 
 use host_kit::*;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{json, Value};
+
+// ─── op input schemas (D-36) ───────────────────────────────────────────────
+// Each op's `input_schema` is derived from the struct below via schemars
+// (`host_kit::read_op_typed::<T>`), instead of a hand-written `json!({...})` object, so the
+// schema the model sees cannot drift from a separately-maintained literal. The structs are
+// schema-only: handlers keep their existing `str_opt`/`bool_opt`/`i64_opt`/`str_array` extractors
+// (the D-34 schema-only precedent). Drifts the migration surfaced are recorded in `DRIFT.md`.
+// schemars emits no `additionalProperties` by default, matching the legacy `so(...)` form.
+
+/// `homer.test` — no params.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct TestInput {}
+
+/// `homer.search` — SIP message search filters.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct SearchInput {
+    number: Option<String>,
+    number_match: Option<NumberMatch>,
+    from_user: Option<String>,
+    to_user: Option<String>,
+    call_id: Option<String>,
+    method: Option<String>,
+    ua: Option<String>,
+    query: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `homer.call.list` — call grouping filters. NOTE (drift): the handler shares
+/// `build_search_filters` with `homer.search`, so it also reads `ua`/`method`/`call_id`,
+/// but the legacy schema never advertised those for `call.list` — they stay out here to
+/// preserve the contract; see `DRIFT.md` (D-36).
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CallListInput {
+    number: Option<String>,
+    number_match: Option<NumberMatch>,
+    from_user: Option<String>,
+    to_user: Option<String>,
+    query: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `homer.call.show` — ordered SIP flow. NOTE (drift): the legacy schema advertises a
+/// `render` (enum `svg`) field the handler never reads; it is kept here to preserve the
+/// contract — see `DRIFT.md` (D-36).
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CallShowInput {
+    call_ids: Vec<String>,
+    since: Option<String>,
+    until: Option<String>,
+    include_raw: Option<bool>,
+    headers: Option<Vec<String>>,
+    render: Option<Render>,
+}
+
+/// `homer.call.qos` — per-stream RTCP QoS.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CallQosInput {
+    call_ids: Vec<String>,
+    since: Option<String>,
+    until: Option<String>,
+    clock_rate: Option<i64>,
+    latency_ms: Option<i64>,
+}
+
+/// `homer.call.analyze` — multi-leg call correlation.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CallAnalyzeInput {
+    call_id: String,
+    correlation_header: String,
+    since: Option<String>,
+    until: Option<String>,
+}
+
+/// `homer.pcap.export` — PCAP export.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PcapExportInput {
+    call_ids: Vec<String>,
+    since: Option<String>,
+    until: Option<String>,
+}
+
+/// `homer.alias.list` — no params.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct AliasListInput {}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+enum NumberMatch {
+    Exact,
+    Contains,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+enum Render {
+    Svg,
+}
 
 // ─── manifest ────────────────────────────────────────────────────────────────
 
@@ -55,127 +168,58 @@ fn manifest_builder() -> PluginBuilder {
         ))
         // ─── ops ──────────────────────────────────────────────────────────
         .operation(
-            read_op(
+            read_op_typed::<TestInput>(
                 "homer.test",
                 "Probe reachability and JWT authentication against a Homer instance.",
-                so(json!({}), json!([])),
             ),
             op_test,
         )
         .operation(
-            read_op(
+            read_op_typed::<SearchInput>(
                 "homer.search",
                 "Search SIP messages by number, from_user, to_user, method, Call-ID, or a query DSL. Contributes message records.",
-                so(
-                    json!({
-                        "number":       {"type": "string"},
-                        "number_match": {"type": "string", "enum": ["exact", "contains"]},
-                        "from_user":    {"type": "string"},
-                        "to_user":      {"type": "string"},
-                        "call_id":      {"type": "string"},
-                        "method":       {"type": "string"},
-                        "ua":           {"type": "string"},
-                        "query":        {"type": "string"},
-                        "since":        {"type": "string"},
-                        "until":        {"type": "string"},
-                        "limit":        {"type": "integer"}
-                    }),
-                    json!([]),
-                ),
             ),
             op_search,
         )
         .operation(
-            read_op(
+            read_op_typed::<CallListInput>(
                 "homer.call.list",
                 "List calls grouped by Call-ID; same filters as homer.search. Contributes call-summary records.",
-                so(
-                    json!({
-                        "number":       {"type": "string"},
-                        "number_match": {"type": "string", "enum": ["exact", "contains"]},
-                        "from_user":    {"type": "string"},
-                        "to_user":      {"type": "string"},
-                        "query":        {"type": "string"},
-                        "since":        {"type": "string"},
-                        "until":        {"type": "string"},
-                        "limit":        {"type": "integer"}
-                    }),
-                    json!([]),
-                ),
             ),
             op_call_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<CallShowInput>(
                 "homer.call.show",
                 "Ordered SIP flow for one or more Call-IDs, with SDP annotations and optional raw messages.",
-                so(
-                    json!({
-                        "call_ids":    {"type": "array", "items": {"type": "string"}},
-                        "since":       {"type": "string"},
-                        "until":       {"type": "string"},
-                        "include_raw": {"type": "boolean"},
-                        "headers":     {"type": "array", "items": {"type": "string"}},
-                        "render":      {"type": "string", "enum": ["svg"]}
-                    }),
-                    json!(["call_ids"]),
-                ),
             ),
             op_call_show,
         )
         .operation(
-            read_op(
+            read_op_typed::<CallQosInput>(
                 "homer.call.qos",
                 "Per-stream QoS from RTCP (packet loss, jitter, MOS). Contributes stream-metric records.",
-                so(
-                    json!({
-                        "call_ids":   {"type": "array", "items": {"type": "string"}},
-                        "since":      {"type": "string"},
-                        "until":      {"type": "string"},
-                        "clock_rate": {"type": "integer"},
-                        "latency_ms": {"type": "integer"}
-                    }),
-                    json!(["call_ids"]),
-                ),
             ),
             op_call_qos,
         )
         .operation(
-            read_op(
+            read_op_typed::<CallAnalyzeInput>(
                 "homer.call.analyze",
                 "Multi-leg call analysis via a correlation SIP header; fan-out from a seed call_id.",
-                so(
-                    json!({
-                        "call_id":            {"type": "string"},
-                        "correlation_header": {"type": "string"},
-                        "since":              {"type": "string"},
-                        "until":              {"type": "string"}
-                    }),
-                    json!(["call_id", "correlation_header"]),
-                ),
             ),
             op_call_analyze,
         )
         .operation(
-            read_op(
+            read_op_typed::<PcapExportInput>(
                 "homer.pcap.export",
                 "Export call messages as PCAP; stores bytes via blob_put and returns the blob ref.",
-                so(
-                    json!({
-                        "call_ids": {"type": "array", "items": {"type": "string"}},
-                        "since":    {"type": "string"},
-                        "until":    {"type": "string"}
-                    }),
-                    json!(["call_ids"]),
-                ),
             ),
             op_pcap_export,
         )
         .operation(
-            read_op(
+            read_op_typed::<AliasListInput>(
                 "homer.alias.list",
                 "List IP/port aliases configured in Homer. Contributes alias records.",
-                so(json!({}), json!([])),
             ),
             op_alias_list,
         )
@@ -189,10 +233,6 @@ fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
         capabilities: vec!["search".into(), "get".into(), "index".into()],
         entity_schema: None,
     }
-}
-
-fn so(props: Value, required: Value) -> Value {
-    json!({ "type": "object", "properties": props, "required": required })
 }
 
 // ─── JWT login helper ─────────────────────────────────────────────────────────
@@ -1882,5 +1922,276 @@ mod tests {
         let contributed = host.contributed.borrow();
         assert_eq!(contributed.len(), 2);
         assert_eq!(contributed[0].entity, "homer.alias");
+    }
+}
+
+// ===========================================================================
+// D-36: schema-derivation contract test.
+//
+// Each op's `input_schema` now comes from a schemars-derived struct (`read_op_typed::<T>`)
+// instead of a hand-written `so(props, required)` literal. schemars represents optional fields
+// as `type: ["T","null"]` (the repo-wide D-34 convention) and enums as `definitions` + `$ref`,
+// so the derived JSON is not byte-identical to the legacy literal — but the *contract* (which
+// fields exist, which are required, their base type, and enum value sets) must be unchanged.
+// This test encodes the legacy contract per op and asserts the derived schema matches it after
+// normalizing schemars' nullable/ref representation. A change here is a real contract change.
+// ===========================================================================
+#[cfg(test)]
+mod schema_contract {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// The normalized kind of one input property.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Kind {
+        Str,
+        Int,
+        Bool,
+        ArrayStr,
+        Enum(Vec<String>),
+    }
+
+    /// A property spec: `(name, kind)`.
+    #[derive(Clone)]
+    struct Prop {
+        name: &'static str,
+        kind: Kind,
+    }
+
+    /// The legacy contract for one op: its properties + required set.
+    struct OpContract {
+        props: Vec<Prop>,
+        required: Vec<&'static str>,
+    }
+
+    fn p(name: &'static str, kind: Kind) -> Prop {
+        Prop { name, kind }
+    }
+
+    /// The exact legacy `so(props, required)` contracts (pre-D-36), transcribed verbatim.
+    fn contracts() -> Vec<(&'static str, OpContract)> {
+        vec![
+            (
+                "homer.test",
+                OpContract {
+                    props: vec![],
+                    required: vec![],
+                },
+            ),
+            (
+                "homer.search",
+                OpContract {
+                    props: vec![
+                        p("number", Kind::Str),
+                        p(
+                            "number_match",
+                            Kind::Enum(vec!["exact".into(), "contains".into()]),
+                        ),
+                        p("from_user", Kind::Str),
+                        p("to_user", Kind::Str),
+                        p("call_id", Kind::Str),
+                        p("method", Kind::Str),
+                        p("ua", Kind::Str),
+                        p("query", Kind::Str),
+                        p("since", Kind::Str),
+                        p("until", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    required: vec![],
+                },
+            ),
+            (
+                "homer.call.list",
+                OpContract {
+                    props: vec![
+                        p("number", Kind::Str),
+                        p(
+                            "number_match",
+                            Kind::Enum(vec!["exact".into(), "contains".into()]),
+                        ),
+                        p("from_user", Kind::Str),
+                        p("to_user", Kind::Str),
+                        p("query", Kind::Str),
+                        p("since", Kind::Str),
+                        p("until", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    required: vec![],
+                },
+            ),
+            (
+                "homer.call.show",
+                OpContract {
+                    props: vec![
+                        p("call_ids", Kind::ArrayStr),
+                        p("since", Kind::Str),
+                        p("until", Kind::Str),
+                        p("include_raw", Kind::Bool),
+                        p("headers", Kind::ArrayStr),
+                        p("render", Kind::Enum(vec!["svg".into()])),
+                    ],
+                    required: vec!["call_ids"],
+                },
+            ),
+            (
+                "homer.call.qos",
+                OpContract {
+                    props: vec![
+                        p("call_ids", Kind::ArrayStr),
+                        p("since", Kind::Str),
+                        p("until", Kind::Str),
+                        p("clock_rate", Kind::Int),
+                        p("latency_ms", Kind::Int),
+                    ],
+                    required: vec!["call_ids"],
+                },
+            ),
+            (
+                "homer.call.analyze",
+                OpContract {
+                    props: vec![
+                        p("call_id", Kind::Str),
+                        p("correlation_header", Kind::Str),
+                        p("since", Kind::Str),
+                        p("until", Kind::Str),
+                    ],
+                    required: vec!["call_id", "correlation_header"],
+                },
+            ),
+            (
+                "homer.pcap.export",
+                OpContract {
+                    props: vec![
+                        p("call_ids", Kind::ArrayStr),
+                        p("since", Kind::Str),
+                        p("until", Kind::Str),
+                    ],
+                    required: vec!["call_ids"],
+                },
+            ),
+            (
+                "homer.alias.list",
+                OpContract {
+                    props: vec![],
+                    required: vec![],
+                },
+            ),
+        ]
+    }
+
+    /// Resolve a property's JSON-schema node, handling schemars' `$ref` → `definitions` and
+    /// `anyOf` (Option<Enum>) → the non-null member.
+    fn resolve<'a>(node: &'a Value, defs: &'a Value) -> &'a Value {
+        if let Some(obj) = node.as_object() {
+            if let Some(r) = obj.get("$ref").and_then(|v| v.as_str()) {
+                if let Some(name) = r.strip_prefix("#/definitions/") {
+                    return defs.get(name).unwrap_or(node);
+                }
+            }
+            if let Some(any) = obj.get("anyOf").and_then(|v| v.as_array()) {
+                for m in any {
+                    if m.get("type").and_then(|v| v.as_str()) != Some("null") {
+                        return resolve(m, defs);
+                    }
+                }
+            }
+        }
+        node
+    }
+
+    /// Extract the base type of a resolved property node, ignoring schemars' nullable wrapping.
+    fn kind_of(node: &Value) -> Kind {
+        let t = node.get("type");
+        if let Some(arr) = t.and_then(|v| v.as_array()) {
+            // Nullable: ["string","null"] → take the non-null type.
+            let first = arr
+                .iter()
+                .find(|v| v.as_str() != Some("null"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("null");
+            return base_kind(first, node);
+        }
+        base_kind(t.and_then(|v| v.as_str()).unwrap_or(""), node)
+    }
+
+    fn base_kind(t: &str, node: &Value) -> Kind {
+        match t {
+            "integer" => Kind::Int,
+            "boolean" => Kind::Bool,
+            "array" => {
+                let items = node.get("items").cloned().unwrap_or(Value::Null);
+                if items.get("type").and_then(|v| v.as_str()) == Some("string") {
+                    Kind::ArrayStr
+                } else {
+                    panic!("unsupported array items: {items}");
+                }
+            }
+            "string" => {
+                if let Some(e) = node.get("enum").and_then(|v| v.as_array()) {
+                    let vals: Vec<String> = e
+                        .iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect();
+                    return Kind::Enum(vals);
+                }
+                Kind::Str
+            }
+            other => panic!("unsupported property type: {other} ({node})"),
+        }
+    }
+
+    fn assert_contract(op_name: &str, schema: &Value, contract: &OpContract) {
+        let defs = schema.get("definitions").cloned().unwrap_or(json!({}));
+        assert_eq!(schema["type"], "object", "{op_name}: root type");
+
+        let props_obj = schema.get("properties").and_then(|v| v.as_object());
+        let mut got: BTreeMap<&str, Kind> = BTreeMap::new();
+        if let Some(props) = props_obj {
+            for (k, v) in props {
+                let resolved = resolve(v, &defs);
+                got.insert(k.as_str(), kind_of(resolved));
+            }
+        }
+        let want: BTreeMap<&str, Kind> = contract
+            .props
+            .iter()
+            .map(|Prop { name, kind }| (*name, kind.clone()))
+            .collect();
+        assert_eq!(got.len(), want.len(), "{op_name}: property count");
+        for Prop { name, kind } in &contract.props {
+            let got_kind = got.get(*name).unwrap_or_else(|| {
+                panic!("{op_name}: missing property `{name}` in derived schema")
+            });
+            assert_eq!(got_kind, kind, "{op_name}: property `{name}` kind");
+        }
+
+        let req: Vec<&str> = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let mut req_set: Vec<&str> = req.clone();
+        req_set.sort();
+        let mut want_req: Vec<&str> = contract.required.clone();
+        want_req.sort();
+        assert_eq!(req_set, want_req, "{op_name}: required set");
+    }
+
+    #[test]
+    fn derived_schemas_match_legacy_contract() {
+        let ops = contracts();
+        let manifest = manifest_builder().build().manifest();
+        let by_name: BTreeMap<&str, &OperationSpec> = manifest
+            .operations
+            .iter()
+            .map(|o| (o.name.as_str(), o))
+            .collect();
+        assert_eq!(by_name.len(), ops.len(), "op count changed");
+        for (name, contract) in &ops {
+            let spec = by_name
+                .get(*name)
+                .unwrap_or_else(|| panic!("missing op {name}"));
+            assert_contract(name, &spec.input_schema, contract);
+        }
     }
 }
