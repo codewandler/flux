@@ -18,6 +18,7 @@ fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("grafana", "0.1.0")
         .capabilities(Caps {
             http: true,
+            private_hosts: vec!["*".into()],
             secrets: vec!["GRAFANA_API_TOKEN".into(), "GRAFANA_PASSWORD".into()],
             ..Default::default()
         })
@@ -38,6 +39,7 @@ fn manifest_builder() -> PluginBuilder {
         .endpoint(EndpointSpec {
             name: "grafana.endpoint".into(),
             env: vec!["GRAFANA_URL".into()],
+            http_hosts: Vec::new(),
             description: "Grafana base URL (e.g. https://grafana.example.com).".into(),
         })
         .datasource(ds(

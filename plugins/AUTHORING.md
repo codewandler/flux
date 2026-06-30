@@ -16,14 +16,16 @@ authorization → approval → guarded IO. There are no bypass paths; do not add
 "Native" means: a Rust subprocess on flux's own `host-kit` over `flux.plugin.v1`. Not an MCP bridge,
 not a wrapper around a vendor binary.
 
-## The one rule that governs everything: the host does all IO
+## The one rule that governs everything: the host does all privileged IO
 
 **A plugin performs no privileged IO of its own.** Every side effect — HTTP, a socket, a subprocess, a
 file, a secret read — is a **host-capability callback** the plugin requests back over the protocol, and
 the host (`SystemHostCaps`) executes it inside the guarded envelope. A plugin must never reach for
 `reqwest`, `std::net`, `std::process::Command`, `std::fs`, or a vendor SDK that owns its own socket.
 
-This is enforced, not merely advised:
+The host side is enforced; the plugin binary itself is trusted, pinned code rather than an OS
+sandbox. Review installed plugins like dependencies, and keep all privileged effects on host
+callbacks so the manifest gates below actually apply.
 
 - **The plugin process is launched with a cleared environment.** flux spawns every plugin through its
   single guarded process path (`flux_system::System::spawn_interactive` → `build_command`), which
@@ -34,6 +36,7 @@ This is enforced, not merely advised:
   → `plugin_cannot_read_host_env`.)
 - **Host capabilities are deny-by-default and manifest-scoped.** A fresh host grants nothing; each
   callback is checked against what the plugin's manifest declared (`SystemHostCaps::with_manifest`).
+  Private/loopback network access additionally requires an operator grant in `.flux/config.toml`.
   Ask for nothing and you get nothing.
 
 ## Lifecycle: install → configure → call
@@ -51,7 +54,9 @@ This is enforced, not merely advised:
    variables the host resolves on the plugin's behalf**: the secret env keys and endpoint URLs the
    plugin **declared** in its manifest (e.g. `GITLAB_PERSONAL_TOKEN`, `GITLAB_URL`). The host reads
    these from **its own** environment at call time, gated by the manifest. Configuration is "set the
-   declared env before you call", not an interactive step inside the plugin.
+   declared env before you call", not an interactive step inside the plugin. If an endpoint resolves
+   to a private/loopback host, also grant that plugin under `[private_net.plugins]` in
+   `.flux/config.toml`.
 3. **Call** — `flux plugin call <name> <op> '<json>'` (debugging/scripting), or let the agent path
    (`flux run` / `flux app run`) discover installed plugins and project their ops as tools. The plugin
    is launched once per session; its manifest is fetched once and pins the host's grants for that
@@ -68,7 +73,7 @@ All requested via the `host-kit` `Host`/`GuestHost`; serviced by `SystemHostCaps
 |---|---|---|
 | `secret` | `secrets` (env-key allow-list) | Resolve a secret **by purpose** (manifest auth method) → value. |
 | `endpoint` | — (config, not a secret) | Resolve a named base URL from declared env keys. |
-| `http.do` | `http: true` + SSRF guard | HTTP method/headers/body; **auth injected by the host** per `AuthScheme`; binary via `body_b64` (request) / `response_binary` → `body_b64` (response, 16 MiB cap). |
+| `http.do` | `http: true` + `http_hosts` + SSRF guard | HTTP method/headers/body; **auth injected by the host** per `AuthScheme`; binary via `body_b64` (request) / `response_binary` → `body_b64` (response, 16 MiB cap). Private hosts require `private_hosts` plus config. |
 | `process.run` | `process` (argv[0] allow-list) | Run a subprocess to completion; captured, capped output. |
 | `process.spawn`/`read`/`status`/`kill` | `process` | Start/drain/poll/stop a long-lived host-managed child (e.g. `kubectl port-forward`). |
 | `conn.dial`/`read`/`write`/`close` | `conn` (`tcp:host:port` / `unix:/path` allow-list, SSRF-guarded) | A raw TCP/Unix byte stream for non-HTTP protocols (SQL wire, Docker socket, AMI). |
@@ -96,8 +101,8 @@ never base64 in-plugin, never read the token from env — declare the scheme and
 ## The rules (checklist)
 
 1. **Declare everything in the manifest** — every op, every `secrets`/`process`/`conn`/`http`/`blob`
-   capability, every auth method and endpoint, every datasource. Undeclared → denied at runtime with a
-   clear error.
+   capability, every `http_hosts`/`private_hosts` entry, every auth method and endpoint, every
+   datasource. Undeclared → denied at runtime with a clear error.
 2. **Never do IO directly** — no `reqwest`, `std::net`, `std::fs`, `std::process::Command`. Use the
    `Host` callbacks. (Vendor SDKs that insist on owning a `TcpStream` don't fit; sit a minimal client
    on `conn_*` instead.)

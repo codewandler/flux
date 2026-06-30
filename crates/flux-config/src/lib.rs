@@ -5,10 +5,10 @@
 //! contributes nothing; a malformed file is an error. CLI flags layer on top of the result (the
 //! caller resolves that). The config carries the coder-style permission rules, an optional default
 //! model, an optional [`AuthorizationPolicy`] (extends [`flux_policy::default_local_grants`]), and
-//! the network egress toggle. Newly "always-allow"ed approval rules are persisted back to the
+//! scoped private-network egress grants. Newly "always-allow"ed approval rules are persisted back to the
 //! **project** file via [`persist_allow_rules`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -25,15 +25,64 @@ pub struct Permissions {
     pub deny: Vec<String>,
 }
 
+/// A private-network grant for one egress caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PrivateNetGrant {
+    /// `true` means this caller may reach any private host; `false` means none.
+    Enabled(bool),
+    /// Only these host patterns may reach private addresses.
+    Hosts(Vec<String>),
+}
+
+impl Default for PrivateNetGrant {
+    fn default() -> Self {
+        Self::Enabled(false)
+    }
+}
+
+impl PrivateNetGrant {
+    fn is_default(&self) -> bool {
+        matches!(self, Self::Enabled(false))
+    }
+
+    fn to_hosts(&self) -> Vec<String> {
+        match self {
+            Self::Enabled(true) => vec!["*".to_string()],
+            Self::Enabled(false) => Vec::new(),
+            Self::Hosts(hosts) => hosts.clone(),
+        }
+    }
+}
+
+/// Scoped private-network egress grants. Plugin grants are keyed by plugin manifest name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrivateNetConfig {
+    #[serde(default, skip_serializing_if = "PrivateNetGrant::is_default")]
+    pub web_fetch: PrivateNetGrant,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plugins: BTreeMap<String, PrivateNetGrant>,
+}
+
+impl PrivateNetConfig {
+    fn is_default(&self) -> bool {
+        self.web_fetch.is_default() && self.plugins.is_empty()
+    }
+}
+
 /// The merged flux configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     /// Default `provider/model` spec (a CLI `--model` flag overrides this).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Allow the guarded web tool to reach private/loopback addresses (off by default).
+    /// Deprecated compatibility flag. If true, only `web_fetch` gets a private-net `*` grant; plugins
+    /// require `[private_net.plugins]` grants.
     #[serde(default)]
     pub allow_private_net: bool,
+    /// Scoped private-network egress grants.
+    #[serde(default, skip_serializing_if = "PrivateNetConfig::is_default")]
+    pub private_net: PrivateNetConfig,
     /// Opt into the generic `bash` op (the `shell` group). Off by default — the agent works through
     /// the dedicated ops; setting this surfaces `bash` as an escape hatch. The CLI exports
     /// `FLUX_ENABLE_BASH` from this so the runtime's `shell` signal fires.
@@ -44,6 +93,27 @@ pub struct Config {
     /// Extra authorization grants, layered onto the built-in local defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<AuthorizationPolicy>,
+}
+
+impl Config {
+    /// Host patterns allowed to bypass the private-network guard for the `web_fetch` tool.
+    pub fn web_fetch_private_hosts(&self) -> Vec<String> {
+        let mut hosts = self.private_net.web_fetch.to_hosts();
+        if self.allow_private_net && hosts.is_empty() {
+            hosts.push("*".to_string());
+        }
+        dedupe(hosts)
+    }
+
+    /// Host patterns granted to a specific plugin for private-network egress.
+    pub fn plugin_private_hosts(&self, plugin: &str) -> Vec<String> {
+        self.private_net
+            .plugins
+            .get(plugin)
+            .map(PrivateNetGrant::to_hosts)
+            .map(dedupe)
+            .unwrap_or_default()
+    }
 }
 
 fn home_config_path() -> Option<PathBuf> {
@@ -68,11 +138,12 @@ fn read_optional(path: &Path) -> Result<Option<Config>> {
 }
 
 /// Merge `project` onto `user`: lists (and policy grants) concatenate (user first), scalars prefer
-/// project, `allow_private_net` is true if either enables it.
+/// project, legacy `allow_private_net` is true if either enables it, scoped private-net grants merge.
 fn merge(user: Config, project: Config) -> Config {
     Config {
         model: project.model.or(user.model),
         allow_private_net: user.allow_private_net || project.allow_private_net,
+        private_net: merge_private_net(user.private_net, project.private_net),
         enable_shell: user.enable_shell || project.enable_shell,
         permissions: Permissions {
             allow: [user.permissions.allow, project.permissions.allow].concat(),
@@ -90,6 +161,46 @@ fn merge(user: Config, project: Config) -> Config {
             }),
         },
     }
+}
+
+fn merge_private_net(user: PrivateNetConfig, project: PrivateNetConfig) -> PrivateNetConfig {
+    let mut plugins = user.plugins;
+    for (name, grant) in project.plugins {
+        plugins
+            .entry(name)
+            .and_modify(|existing| *existing = merge_grant(existing.clone(), grant.clone()))
+            .or_insert(grant);
+    }
+    PrivateNetConfig {
+        web_fetch: merge_grant(user.web_fetch, project.web_fetch),
+        plugins,
+    }
+}
+
+fn merge_grant(a: PrivateNetGrant, b: PrivateNetGrant) -> PrivateNetGrant {
+    match (a, b) {
+        (PrivateNetGrant::Enabled(true), _) | (_, PrivateNetGrant::Enabled(true)) => {
+            PrivateNetGrant::Enabled(true)
+        }
+        (PrivateNetGrant::Enabled(false), other) | (other, PrivateNetGrant::Enabled(false)) => {
+            other
+        }
+        (PrivateNetGrant::Hosts(a), PrivateNetGrant::Hosts(b)) => {
+            PrivateNetGrant::Hosts(dedupe([a, b].concat()))
+        }
+    }
+}
+
+fn dedupe(items: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        let trimmed = item.trim();
+        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
 }
 
 /// Load and merge `~/.flux/config.toml` (user) then `<cwd>/.flux/config.toml` (project).
@@ -282,6 +393,8 @@ deny = ["Bash(rm:*)"]
         let cfg = load(&dir).unwrap();
         assert_eq!(cfg.model.as_deref(), Some("claude/opus"));
         assert!(cfg.allow_private_net);
+        assert_eq!(cfg.web_fetch_private_hosts(), vec!["*"]);
+        assert!(cfg.plugin_private_hosts("prometheus").is_empty());
         assert_eq!(cfg.permissions.allow, vec!["read", "Bash(git:*)"]);
         assert_eq!(cfg.permissions.deny, vec!["Bash(rm:*)"]);
         std::fs::remove_dir_all(&dir).ok();
@@ -348,6 +461,51 @@ actions = ["workspace.read"]
             2,
             "user + project policy grants must concatenate, not replace"
         );
+    }
+
+    #[test]
+    fn scoped_private_net_grants_parse_and_merge() {
+        let project = temp_dir();
+        let home = temp_dir();
+        std::env::set_var("HOME", &home);
+        std::fs::write(
+            home.join(".flux").join("config.toml"),
+            r#"
+[private_net]
+web_fetch = ["localhost"]
+
+[private_net.plugins]
+prometheus = ["prometheus.local"]
+loki = ["loki.local"]
+"#,
+        )
+        .unwrap();
+        write_project(
+            &project,
+            r#"
+[private_net]
+web_fetch = ["127.0.0.1"]
+
+[private_net.plugins]
+prometheus = ["127.0.0.1"]
+gitlab = true
+"#,
+        );
+
+        let cfg = load(&project).unwrap();
+        assert_eq!(
+            cfg.web_fetch_private_hosts(),
+            vec!["localhost", "127.0.0.1"]
+        );
+        assert_eq!(
+            cfg.plugin_private_hosts("prometheus"),
+            vec!["prometheus.local", "127.0.0.1"]
+        );
+        assert_eq!(cfg.plugin_private_hosts("loki"), vec!["loki.local"]);
+        assert_eq!(cfg.plugin_private_hosts("gitlab"), vec!["*"]);
+
+        std::fs::remove_dir_all(&project).ok();
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

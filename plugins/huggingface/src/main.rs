@@ -19,6 +19,7 @@ fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("huggingface", "0.1.0")
         .capabilities(Caps {
             http: true,
+            http_hosts: vec!["huggingface.co".into(), "router.huggingface.co".into()],
             secrets: vec!["HF_TOKEN".into(), "HUGGING_FACE_HUB_TOKEN".into()],
             ..Default::default()
         })
@@ -31,11 +32,13 @@ fn manifest_builder() -> PluginBuilder {
         .endpoint(EndpointSpec {
             name: "huggingface.hub".into(),
             env: vec!["HF_HUB_URL".into()],
+            http_hosts: vec!["huggingface.co".into()],
             description: "Hugging Face Hub base URL (default https://huggingface.co)".into(),
         })
         .endpoint(EndpointSpec {
             name: "huggingface.router".into(),
             env: vec!["HF_ROUTER_URL".into()],
+            http_hosts: vec!["router.huggingface.co".into()],
             description: "Hugging Face inference router base URL (default https://router.huggingface.co)".into(),
         })
         .datasource(ds("huggingface.models", "huggingface.model", "Hugging Face Hub models."))

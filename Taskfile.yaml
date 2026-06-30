@@ -12,3 +12,15 @@ tasks:
     cmds:
       - task: test
       - cargo install --path crates/flux-cli --force
+
+  plugins:build:
+    desc: Build every native flux plugin in release mode
+    cmds:
+      - cargo build --manifest-path plugins/Cargo.toml --workspace --release
+
+  plugins:install:
+    desc: Build and register every native flux plugin
+    cmds:
+      - task: plugins:build
+      - flux plugin install "{{.TASKFILE_DIR}}/plugins/target/release"
+      - flux plugin ls

@@ -31,6 +31,7 @@ fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("loki", "0.1.0")
         .capabilities(Caps {
             http: true,
+            private_hosts: vec!["*".into()],
             // The two secret-resolved env keys. The Basic username (`LOKI_USERNAME`) is config-like
             // (a `user_env`), so it is resolved without a secret grant — like an endpoint.
             secrets: vec!["LOKI_PASSWORD".into(), "LOKI_TENANT_ID".into()],
@@ -54,6 +55,7 @@ fn manifest_builder() -> PluginBuilder {
         .endpoint(EndpointSpec {
             name: "loki.endpoint".into(),
             env: vec!["LOKI_URL".into(), "LOKI_ADDR".into()],
+            http_hosts: Vec::new(),
             description: "Loki base URL (e.g. https://loki.example.com)".into(),
         })
         .datasource(ds(

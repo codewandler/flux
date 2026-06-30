@@ -230,6 +230,7 @@ mod tests {
             endpoints: vec![EndpointSpec {
                 name: "gitlab.endpoint".into(),
                 env: vec!["GITLAB_URL".into()],
+                http_hosts: vec!["gitlab.com".into()],
                 ..Default::default()
             }],
             ..Default::default()

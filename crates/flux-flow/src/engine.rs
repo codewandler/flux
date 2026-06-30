@@ -91,7 +91,7 @@ impl FlowEngine {
         cwd: std::path::PathBuf,
     ) -> Result<Self> {
         let flow = Arc::new(flow);
-        let composites = Arc::new(DynamicComposites::load(&cwd)?);
+        let composites = Arc::new(DynamicComposites::load(executor.context().system.as_ref())?);
         let opts = CompileOptions {
             max_tokens,
             ..Default::default()

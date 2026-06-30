@@ -421,6 +421,50 @@ impl System {
         Ok(out)
     }
 
+    /// Read all UTF-8 files with `extension` directly under a workspace directory, returning
+    /// `(workspace_path, content)` sorted by filename. Missing directories are treated as empty.
+    ///
+    /// This is synchronous for startup-time callers that cannot await yet, but it still resolves the
+    /// directory and every child path through [`Workspace::resolve`], including symlink-escape checks.
+    pub fn read_dir_text_files(&self, dir: &str, extension: &str) -> Result<Vec<(String, String)>> {
+        let root = self.workspace.resolve(dir)?;
+        let mut names = Vec::new();
+        let rd = match std::fs::read_dir(&root) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in rd {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if std::path::Path::new(&name)
+                .extension()
+                .and_then(|e| e.to_str())
+                != Some(extension)
+            {
+                continue;
+            }
+            names.push(name);
+        }
+        names.sort();
+
+        let base = dir.trim_end_matches('/');
+        let mut out = Vec::new();
+        for name in names {
+            let path = if base.is_empty() {
+                name.clone()
+            } else {
+                format!("{base}/{name}")
+            };
+            let resolved = self.workspace.resolve(&path)?;
+            let bytes = std::fs::read(&resolved)?;
+            let content = String::from_utf8(bytes)
+                .map_err(|_| Error::Other(format!("{path}: not valid UTF-8")))?;
+            out.push((path, content));
+        }
+        Ok(out)
+    }
+
     /// Recursively list files under a workspace-relative directory, returning workspace-relative
     /// paths (sorted, capped at `max`). Symlinks are never followed (an escape guard), and the
     /// noisy `.git`/`target`/`node_modules` directories are skipped. Used by `glob`/`grep`.

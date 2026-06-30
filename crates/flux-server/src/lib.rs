@@ -17,6 +17,7 @@
 mod a2a;
 
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::{FromRef, Path, Query, Request, State};
@@ -34,6 +35,7 @@ use flux_flow::engine::FlowEngine;
 use flux_flow::AgentSink;
 
 type Shared = Arc<FlowEngine>;
+pub(crate) type TurnGate = Arc<tokio::sync::Mutex<()>>;
 
 /// Discovery metadata for the served agent — what the A2A agent card advertises. The `/a2a` URL is
 /// not stored here; it is derived per-request from the `Host`/`X-Forwarded-Proto` headers.
@@ -85,6 +87,7 @@ impl CardInfo {
 pub struct ServerState {
     engine: Arc<FlowEngine>,
     card: Arc<CardInfo>,
+    turn_gate: TurnGate,
 }
 
 impl FromRef<ServerState> for Arc<FlowEngine> {
@@ -99,9 +102,15 @@ impl FromRef<ServerState> for Arc<CardInfo> {
     }
 }
 
+impl FromRef<ServerState> for TurnGate {
+    fn from_ref(s: &ServerState) -> Self {
+        s.turn_gate.clone()
+    }
+}
+
 /// Bind `addr` and serve until shutdown. When `token` is `Some`, every route except `/health`
-/// requires `Authorization: Bearer <token>`; when `None`, no authentication is enforced (the CLI
-/// only permits that for a loopback bind).
+/// requires `Authorization: Bearer <token>`; when `None`, no authentication is enforced and the
+/// listener must be loopback.
 pub async fn serve(addr: &str, agent: FlowEngine, token: Option<String>) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let addr = listener.local_addr()?;
@@ -117,6 +126,13 @@ pub async fn serve_on(
     agent: FlowEngine,
     token: Option<String>,
 ) -> anyhow::Result<()> {
+    let addr = listener.local_addr()?;
+    if token.is_none() && !unauthenticated_bind_allowed(addr) {
+        anyhow::bail!(
+            "refusing unauthenticated non-loopback bind on {addr}; set FLUX_SERVER_TOKEN or bind \
+             to 127.0.0.1/::1"
+        );
+    }
     axum::serve(
         listener,
         router(Arc::new(agent), token, CardInfo::flux_coding()),
@@ -124,6 +140,10 @@ pub async fn serve_on(
     .with_graceful_shutdown(shutdown_signal())
     .await?;
     Ok(())
+}
+
+fn unauthenticated_bind_allowed(addr: SocketAddr) -> bool {
+    addr.ip().is_loopback()
 }
 
 /// Wait for the process-level shutdown signals a daemon should honor.
@@ -166,6 +186,7 @@ pub fn router(engine: Arc<FlowEngine>, token: Option<String>, card: CardInfo) ->
     let state = ServerState {
         engine,
         card: Arc::new(card),
+        turn_gate: Arc::new(tokio::sync::Mutex::new(())),
     };
     // Auth-exempt routes — registered outside the middleware layer so path-string comparison
     // cannot be bypassed by percent-encoding or double-slash tricks.
@@ -256,10 +277,12 @@ struct MessageRequest {
 
 async fn post_message(
     State(agent): State<Shared>,
+    State(turn_gate): State<TurnGate>,
     Path(id): Path<String>,
     Json(req): Json<MessageRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let mut sink = Collect::default();
+    let _turn = turn_gate.lock().await;
     agent
         .run_turn(&id, &req.input, &mut sink)
         .await
@@ -281,6 +304,7 @@ struct StreamQuery {
 /// mpsc channel that backs the SSE stream.
 async fn stream_message(
     State(agent): State<Shared>,
+    State(turn_gate): State<TurnGate>,
     Path(id): Path<String>,
     Query(q): Query<StreamQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -288,6 +312,7 @@ async fn stream_message(
     let agent = agent.clone();
     tokio::spawn(async move {
         let mut sink = SseSink { tx: tx.clone() };
+        let _turn = turn_gate.lock().await;
         if let Err(e) = agent.run_turn(&id, &q.input, &mut sink).await {
             let _ = tx.send(Event::default().event("error").data(e.to_string()));
         }
@@ -319,10 +344,12 @@ impl AgentSink for SseSink {
 /// the trigger surface for integrations (a CI hook, or a chat message bridged by an external adapter).
 async fn webhook(
     State(agent): State<Shared>,
+    State(turn_gate): State<TurnGate>,
     Json(req): Json<MessageRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let session_id = agent.events.create_session(&agent.model).map_err(err500)?;
     let mut sink = Collect::default();
+    let _turn = turn_gate.lock().await;
     agent
         .run_turn(&session_id, &req.input, &mut sink)
         .await
@@ -368,6 +395,14 @@ mod tests {
         assert!(!constant_time_eq(b"secret", b"secre")); // length mismatch
     }
 
+    #[test]
+    fn unauthenticated_bind_is_loopback_only() {
+        assert!(unauthenticated_bind_allowed("127.0.0.1:0".parse().unwrap()));
+        assert!(unauthenticated_bind_allowed("[::1]:0".parse().unwrap()));
+        assert!(!unauthenticated_bind_allowed("0.0.0.0:0".parse().unwrap()));
+        assert!(!unauthenticated_bind_allowed("[::]:0".parse().unwrap()));
+    }
+
     /// Build a tiny router carrying only the auth layer over a `/health` and a protected route, so
     /// the gate can be exercised without standing up a full `Agent`.
     /// Mirror the split-router structure from [`router`]: exempt routes outside the middleware,
@@ -375,6 +410,10 @@ mod tests {
     fn guarded_app(token: Option<String>) -> Router {
         let exempt = Router::new()
             .route("/health", get(|| async { "ok" }))
+            .route(
+                "/.well-known/agent-card.json",
+                get(|| async { Json(json!({})) }),
+            )
             .route("/.well-known/agent.json", get(|| async { Json(json!({})) }));
         let protected = Router::new()
             .route("/protected", get(|| async { "data" }))
@@ -415,6 +454,10 @@ mod tests {
         );
         // /health and /.well-known/agent.json are exempt (liveness probes / A2A discovery).
         assert_eq!(status(app(), "/health", None).await, StatusCode::OK);
+        assert_eq!(
+            status(app(), "/.well-known/agent-card.json", None).await,
+            StatusCode::OK
+        );
         assert_eq!(
             status(app(), "/.well-known/agent.json", None).await,
             StatusCode::OK

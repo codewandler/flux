@@ -23,11 +23,13 @@ fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("prometheus", "0.1.0")
         .capabilities(Caps {
             http: true,
+            private_hosts: vec!["*".into()],
             ..Default::default()
         })
         .endpoint(EndpointSpec {
             name: "prometheus.endpoint".into(),
             env: vec!["PROMETHEUS_URL".into(), "PROM_URL".into()],
+            http_hosts: Vec::new(),
             description: "Prometheus base URL (e.g. https://prom.example.com)".into(),
         })
         .datasource(ds(

@@ -18,6 +18,7 @@ use sha2::{Digest as _, Sha256};
 use flux_core::{Error, Result};
 use flux_runtime::{Tool, ToolContext, ToolResult};
 use flux_spec::{Effect, Idempotency, Risk, ToolSpec};
+use flux_system::net::PrivateNetAllow;
 
 /// JavaScript pre-tool hooks (QuickJS via `rquickjs`) — the other half of L4 extensibility, folded in
 /// from the former `flux-hooks` crate. Re-exported at the crate root as [`JsHookEngine`].
@@ -203,6 +204,9 @@ pub struct EndpointSpec {
     /// Env-var keys holding the base URL, tried in order.
     #[serde(default)]
     pub env: Vec<String>,
+    /// Allowed public/fallback hosts for this endpoint. Env-resolved endpoint hosts are allowed too.
+    #[serde(default)]
+    pub http_hosts: Vec<String>,
     #[serde(default)]
     pub description: String,
 }
@@ -221,6 +225,12 @@ pub struct PluginCapabilities {
     /// Whether `http.do` is permitted at all (host-side SSRF guard still applies).
     #[serde(default)]
     pub http: bool,
+    /// Allowed public HTTP hosts for `http.do` in addition to declared endpoint hosts.
+    #[serde(default)]
+    pub http_hosts: Vec<String>,
+    /// Declared hosts this plugin may reach at private/loopback addresses when the operator grants them.
+    #[serde(default)]
+    pub private_hosts: Vec<String>,
     /// Allowed `conn.dial` targets (`tcp:host:port` / `unix:/path`; a single `*` wildcards one
     /// segment, e.g. `tcp:*:5432`). Empty = the `conn.*` capability is denied.
     #[serde(default)]
@@ -403,7 +413,7 @@ impl HostCapabilities for DenyHostCaps {
 /// nothing — call [`with_grants`](Self::with_grants).
 pub struct SystemHostCaps {
     system: Arc<flux_system::System>,
-    allow_private_net: bool,
+    private_net_grants: Vec<String>,
     grants: PluginCapabilities,
     auth: Vec<AuthMethod>,
     endpoints: Vec<EndpointSpec>,
@@ -428,7 +438,7 @@ impl SystemHostCaps {
     pub fn new(system: Arc<flux_system::System>) -> Self {
         Self {
             system,
-            allow_private_net: false,
+            private_net_grants: Vec::new(),
             grants: PluginCapabilities::default(),
             auth: Vec::new(),
             endpoints: Vec::new(),
@@ -441,7 +451,18 @@ impl SystemHostCaps {
     }
 
     pub fn allow_private_net(mut self, yes: bool) -> Self {
-        self.allow_private_net = yes;
+        self.private_net_grants = if yes {
+            vec!["*".to_string()]
+        } else {
+            Vec::new()
+        };
+        self
+    }
+
+    /// Operator grants for private-network egress for this plugin. These are intersected with the
+    /// plugin's manifest-declared `private_hosts`.
+    pub fn with_private_net_grants(mut self, hosts: Vec<String>) -> Self {
+        self.private_net_grants = hosts;
         self
     }
 
@@ -498,6 +519,52 @@ impl SystemHostCaps {
             "no env value for endpoint `{name}` (tried {:?})",
             ep.env
         ))
+    }
+
+    fn private_net_allow(&self) -> PrivateNetAllow {
+        let declared = normalize_patterns(&self.grants.private_hosts);
+        let grants = normalize_patterns(&self.private_net_grants);
+        if declared.is_empty() || grants.is_empty() {
+            return PrivateNetAllow::None;
+        }
+        if grants.iter().any(|g| g == "*") {
+            return PrivateNetAllow::from_hosts(declared);
+        }
+        if declared.iter().any(|d| d == "*") {
+            return PrivateNetAllow::from_hosts(grants);
+        }
+        PrivateNetAllow::from_hosts(
+            grants
+                .into_iter()
+                .filter(|grant| host_matches(&declared, grant))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn ensure_http_host_allowed(&self, url: &url::Url) -> std::result::Result<(), String> {
+        let host = url
+            .host_str()
+            .ok_or_else(|| "http.do: url has no host".to_string())?;
+        if host_matches(&self.grants.http_hosts, host) || self.endpoint_allows_host(host) {
+            Ok(())
+        } else {
+            Err(format!(
+                "http.do: host `{host}` not in this plugin's declared HTTP capabilities"
+            ))
+        }
+    }
+
+    fn endpoint_allows_host(&self, host: &str) -> bool {
+        self.endpoints.iter().any(|ep| {
+            host_matches(&ep.http_hosts, host)
+                || ep.env.iter().any(|key| {
+                    self.system
+                        .env(key)
+                        .and_then(|raw| url::Url::parse(&raw).ok())
+                        .and_then(|url| url.host_str().map(|h| h.eq_ignore_ascii_case(host)))
+                        .unwrap_or(false)
+                })
+        })
     }
 
     /// Resolve the username half of Basic auth from a method's `user_env` (config, not a gated secret —
@@ -711,7 +778,8 @@ impl HostCapabilities for SystemHostCaps {
                     return Err("http.do not granted to this plugin".into());
                 }
                 let raw = payload.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                let mut url = guard_http_url(raw, self.allow_private_net)?;
+                let mut url = guard_http_url(raw, &self.private_net_allow())?;
+                self.ensure_http_host_allowed(&url)?;
                 let method = payload
                     .get("method")
                     .and_then(|v| v.as_str())
@@ -807,7 +875,7 @@ impl HostCapabilities for SystemHostCaps {
                         "conn.dial: target `{tstr}` not in this plugin's granted conn capabilities"
                     ));
                 }
-                let stream = flux_system::net::dial(&target, self.allow_private_net)
+                let stream = flux_system::net::dial_scoped(&target, &self.private_net_allow())
                     .await
                     .map_err(|e| e.to_string())?;
                 let id = self
@@ -969,8 +1037,38 @@ fn truncate_on_char_boundary(mut s: String, max: usize) -> String {
 /// Reject non-HTTP(S) schemes and (unless `allow_private`) private/loopback/link-local hosts —
 /// delegating to the shared egress guard in `flux-system` (host→IP resolution, IPv6/IPv4-mapped
 /// coverage), the same SSRF policy the agent's own `web_fetch` uses.
-fn guard_http_url(raw: &str, allow_private: bool) -> std::result::Result<url::Url, String> {
-    flux_system::net::guard_url(raw, allow_private).map_err(|e| e.to_string())
+fn guard_http_url(raw: &str, allow: &PrivateNetAllow) -> std::result::Result<url::Url, String> {
+    flux_system::net::guard_url_scoped(raw, allow).map_err(|e| e.to_string())
+}
+
+fn normalize_patterns(patterns: &[String]) -> Vec<String> {
+    patterns
+        .iter()
+        .map(|p| p.trim().to_ascii_lowercase())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+fn host_matches(patterns: &[String], host: &str) -> bool {
+    let host = host
+        .trim()
+        .trim_matches('[')
+        .trim_matches(']')
+        .to_ascii_lowercase();
+    patterns.iter().any(|pattern| {
+        let p = pattern
+            .trim()
+            .trim_matches('[')
+            .trim_matches(']')
+            .to_ascii_lowercase();
+        p == "*"
+            || p == host
+            || p.strip_prefix("*.").is_some_and(|suffix| {
+                host.ends_with(suffix)
+                    && host.len() > suffix.len()
+                    && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+            })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1412,11 +1510,13 @@ mod tests {
             endpoints: vec![EndpointSpec {
                 name: "gitlab.endpoint".into(),
                 env: vec!["FLUX_TEST_GITLAB_URL_XZ".into()],
+                http_hosts: vec!["gl.example.com".into()],
                 description: String::new(),
             }],
             capabilities: PluginCapabilities {
                 secrets: vec!["FLUX_TEST_API_TOKEN_XZ".into()],
                 http: true,
+                http_hosts: vec!["gl.example.com".into()],
                 ..Default::default()
             },
             ..Default::default()
@@ -1443,6 +1543,93 @@ mod tests {
 
         std::env::remove_var("FLUX_TEST_API_TOKEN_XZ");
         std::env::remove_var("FLUX_TEST_GITLAB_URL_XZ");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn http_do_denies_undeclared_hosts_before_network() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!("flux-http-host-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let caps = SystemHostCaps::new(sys).with_grants(PluginCapabilities {
+            http: true,
+            http_hosts: vec!["api.example.com".into()],
+            ..Default::default()
+        });
+
+        let err = caps
+            .handle("http.do", &json!({"url": "https://evil.example.com/"}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("not in this plugin's declared HTTP capabilities"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn endpoint_env_hosts_are_http_allow_listed() {
+        use flux_system::{System, Workspace};
+        let dir =
+            std::env::temp_dir().join(format!("flux-http-endpoint-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        std::env::set_var(
+            "FLUX_TEST_ENDPOINT_HOST_XZ",
+            "https://selfhosted.example.com/base",
+        );
+        let caps = SystemHostCaps::new(sys)
+            .with_grants(PluginCapabilities {
+                http: true,
+                ..Default::default()
+            })
+            .with_manifest(&PluginManifest {
+                endpoints: vec![EndpointSpec {
+                    name: "service.endpoint".into(),
+                    env: vec!["FLUX_TEST_ENDPOINT_HOST_XZ".into()],
+                    ..Default::default()
+                }],
+                capabilities: PluginCapabilities {
+                    http: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        let url = url::Url::parse("https://selfhosted.example.com/path").unwrap();
+
+        assert!(caps.ensure_http_host_allowed(&url).is_ok());
+
+        std::env::remove_var("FLUX_TEST_ENDPOINT_HOST_XZ");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn private_net_requires_manifest_declaration_and_operator_grant() {
+        use flux_system::{System, Workspace};
+        let dir =
+            std::env::temp_dir().join(format!("flux-private-host-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let loopback = "http://127.0.0.1:8123/";
+
+        let operator_only =
+            SystemHostCaps::new(sys.clone()).with_private_net_grants(vec!["127.0.0.1".into()]);
+        assert!(guard_http_url(loopback, &operator_only.private_net_allow()).is_err());
+
+        let manifest_only = SystemHostCaps::new(sys.clone()).with_grants(PluginCapabilities {
+            private_hosts: vec!["127.0.0.1".into()],
+            ..Default::default()
+        });
+        assert!(guard_http_url(loopback, &manifest_only.private_net_allow()).is_err());
+
+        let both = SystemHostCaps::new(sys)
+            .with_private_net_grants(vec!["127.0.0.1".into()])
+            .with_grants(PluginCapabilities {
+                private_hosts: vec!["127.0.0.1".into()],
+                ..Default::default()
+            });
+        assert!(guard_http_url(loopback, &both.private_net_allow()).is_ok());
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1563,14 +1750,16 @@ mod tests {
         let dial = json!({"kind": "tcp", "host": "127.0.0.1", "port": port});
 
         // Ungranted conn.dial is denied even with private-net allowed (the grant is the gate).
-        let none = SystemHostCaps::new(sys.clone()).allow_private_net(true);
+        let none =
+            SystemHostCaps::new(sys.clone()).with_private_net_grants(vec!["127.0.0.1".into()]);
         assert!(none.handle("conn.dial", &dial).await.is_err());
 
         // Granted (loopback wildcard) → dial/write/read/close round-trips.
         let caps = SystemHostCaps::new(sys)
-            .allow_private_net(true)
+            .with_private_net_grants(vec!["127.0.0.1".into()])
             .with_grants(PluginCapabilities {
                 conn: vec!["tcp:127.0.0.1:*".into()],
+                private_hosts: vec!["127.0.0.1".into()],
                 ..Default::default()
             });
         let id = caps.handle("conn.dial", &dial).await.unwrap()["conn_id"]
@@ -1841,11 +2030,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("flux-httpbin-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
-        // http granted + private net allowed so the loopback test server is reachable.
+        // http granted + loopback declared and operator-granted so the test server is reachable.
         let caps = SystemHostCaps::new(sys)
-            .allow_private_net(true)
+            .with_private_net_grants(vec!["127.0.0.1".into()])
             .with_grants(PluginCapabilities {
                 http: true,
+                http_hosts: vec!["127.0.0.1".into()],
+                private_hosts: vec!["127.0.0.1".into()],
                 ..Default::default()
             });
         let port = spawn_echo_http_server().await;

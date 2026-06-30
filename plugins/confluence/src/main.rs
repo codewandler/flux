@@ -28,6 +28,8 @@ fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("confluence", "0.1.0")
         .capabilities(Caps {
             http: true,
+            http_hosts: vec!["api.atlassian.com".into()],
+            private_hosts: vec!["*".into()],
             blob: true,
             // The api-token + email + cloud-id env keys must be granted secrets so the host can resolve
             // them by purpose. The email is *also* a Basic `user_env` (config) — it is granted here only
@@ -72,6 +74,7 @@ fn manifest_builder() -> PluginBuilder {
                 "ATLASSIAN_URL".into(),
                 "ATLASSIAN_SITE_URL".into(),
             ],
+            http_hosts: Vec::new(),
             description: "Confluence Cloud base URL (e.g. https://site.atlassian.net)".into(),
         })
         .datasource(ds("confluence.pages", "confluence.page", "Confluence pages."))

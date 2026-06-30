@@ -120,7 +120,9 @@ pre-tool hooks → authorization policy (default-deny) → permission rules → 
 5. **Guarded IO** (`flux-system`): the *only* place real filesystem / process / network IO happens.
    Workspace-confined, symlink/escape-rejecting (including dangling symlinks), **argv-only** process
    execution with the parent environment cleared, output-capped, and an SSRF-guarded URL resolver
-   (`flux_system::net::guard_url`) shared by every egress path.
+   (`flux_system::net::guard_url_scoped` / `guard_url`) shared by every egress path. Private or
+   loopback egress is caller-scoped; plugin access requires both a manifest declaration and an
+   operator config grant.
 
 Secrets are registered with a `Redactor` and scrubbed from tool output (success and error). Evidence
 observations (tool calls, destructive markers, skill activations, compaction) are recorded and
@@ -179,8 +181,9 @@ A "provider" conflates two orthogonal axes, modeled separately and composed by `
 - **Plugins** (`flux-plugin`): any-language subprocess binaries over a framed NDJSON protocol. A
   plugin's operations are projected as policy-gated tools; its privileged IO is requested back from the
   host as **capabilities the plugin declares in its manifest** (`process` allow-list, `secret` key
-  allow-list, `http` toggle) and the host checks every call against that grant. A plugin gets nothing
-  by default.
+  allow-list, HTTP host allow-list, connection targets, private-network hosts) and the host checks
+  every callback against that grant. A plugin gets no host capability by default; the plugin binary
+  itself is trusted, pinned code, not an OS-sandboxed workload.
 - **Roles & skills**: markdown with frontmatter, discovered from `.flux/`.
 
 ## Surfaces
@@ -190,7 +193,8 @@ A "provider" conflates two orthogonal axes, modeled separately and composed by `
 - **`flux-app`** — the L6 runtime host that runs a multi-agent `.flux` **Program** (event bus, triggers,
   journeys; orchestration ops `emit`/`send`/`ask`/`spawn`), driven by `flux run app.flux`,
   deny-destructive by default.
-- **`flux-server`** — axum HTTP API + SSE streaming; bearer-token authenticated (no open listener).
+- **`flux-server`** — axum HTTP API + SSE streaming; bearer-token authenticated except `/health` and
+  the A2A discovery card, and refuses unauthenticated non-loopback binds.
 - **`flux-tui`** — ratatui chat with live streaming + an in-TUI approval modal.
 - **`flux-cli`** — the `flux` binary: REPL, `-p` one-shot, `--agent`, `--serve`, slash commands,
   `/pd` `/goal` `/loop` autopilot.

@@ -1,16 +1,15 @@
 # Design: scoped private-network egress (D-20)
 
-**Status:** proposed · **Pillar:** Core · **Layer:** L2 (`flux-system` net guard) + L4 (`flux-plugin` host
+**Status:** implemented core, audit/smoke follow-ups remain · **Pillar:** Core · **Layer:** L2 (`flux-system` net guard) + L4 (`flux-plugin` host
 caps) + L0 (`flux-config`) + L6 wiring (`flux-cli`) · **Owner:** Timo ·
 **Story:** [D-20](../stories/D-20-scoped-private-net-egress.md)
 
 ## Why
 
-flux's SSRF guard (`flux_system::net::guard_url` / `dial`) refuses private, loopback, link-local, unique-local,
+flux's SSRF guard (`flux_system::net::guard_url_scoped` / `guard_url` / `dial_scoped`) refuses private, loopback, link-local, unique-local,
 and CGNAT addresses — defense against an attacker-influenced URL reaching cloud metadata (`169.254.169.254`),
-in-cluster services, or `localhost`. The **only** escape hatch today is a single global boolean,
-`Config.allow_private_net` (`crates/flux-config/src/lib.rs:36`), merged from user + project config and wired
-into both egress callers:
+in-cluster services, or `localhost`. The old escape hatch was a single global boolean,
+`Config.allow_private_net`, merged from user + project config and wired into both egress callers:
 
 - `web_fetch` — `crates/flux-cli/src/main.rs:957` (`WebFetchTool::allow_private`)
 - the plugin host — `crates/flux-cli/src/main.rs:976` (`flux plugin call`) and `:3335` (`flux app run`)
@@ -30,7 +29,7 @@ allowance through declaration → grant → audit — exactly the model `PluginC
 
 ## The model
 
-Replace one global bool with a **scoped allow-set** resolved per egress caller. Two granularities, both
+The implementation replaces one global bool with a **scoped allow-set** resolved per egress caller. Two granularities, both
 deny-by-default:
 
 1. **Per-plugin** — "this plugin may reach the private hosts it declares." Anchored on the existing
@@ -43,42 +42,46 @@ private-net broadly) **and** the operator granted it. `web_fetch` is its own sco
 widens `web_fetch`, and the `web_fetch` allowance never widens a plugin. Any undeclared private host stays
 refused even while some other allowance is active.
 
-### Shape (sketch — finalize during implementation)
+### Shape
 
-`flux_system::net` stops taking a bare `bool`:
+`flux_system::net` has scoped entry points plus compatibility wrappers:
 
 ```rust
 /// What a single egress caller is allowed to reach beyond public addresses.
 pub enum PrivateNetAllow {
     None,                       // default — full SSRF guard (today's behaviour with the flag off)
-    Hosts(Vec<HostPattern>),    // only these declared hosts may resolve to private addrs
+    Hosts(Vec<String>),         // only these declared hosts may resolve to private addrs
     Any,                        // caller-wide (e.g. an explicit `web_fetch` opt-in) — still per-caller
 }
 
-pub fn guard_url(raw: &str, allow: &PrivateNetAllow) -> Result<url::Url>;
+pub fn guard_url_scoped(raw: &str, allow: &PrivateNetAllow) -> Result<url::Url>;
+pub fn dial_scoped(target: &DialTarget, allow: &PrivateNetAllow) -> Result<DialStream>;
 ```
 
-`PluginCapabilities` gains a declared private-net request, mirroring `conn`'s allow-list idiom:
+`PluginCapabilities` declares both public HTTP hosts and private-net intent:
 
 ```rust
 pub struct PluginCapabilities {
     // … process / secrets / http / conn / blob …
+    #[serde(default)]
+    pub http_hosts: Vec<String>,
     /// Declared hosts this plugin may reach at private/loopback addresses (empty = none).
-    /// `*` segment wildcard like `conn`. Subset of / cross-checked against `endpoints`.
     #[serde(default)]
     pub private_hosts: Vec<String>,
 }
 ```
 
-`Config` replaces the scalar with a grant the operator writes per plugin (and a separate `web_fetch` opt-in),
+`Config` adds a scoped grant the operator writes per plugin (and a separate `web_fetch` opt-in),
 e.g.:
 
 ```toml
 # ~/.flux/config.toml
 [private_net]
-web_fetch = false                          # web_fetch stays guarded
-gitlab    = ["gitlab.internal.example"] # this plugin, these declared hosts only
-prometheus = true                           # whole plugin: all hosts it declares
+web_fetch = false                           # web_fetch stays guarded
+
+[private_net.plugins]
+gitlab = ["gitlab.internal.example"]        # this plugin, these declared hosts only
+prometheus = true                           # all private_hosts declared by the plugin
 ```
 
 The host resolves, per plugin, the intersection of *declared* (`private_hosts` / `endpoints`) and *granted*
@@ -87,20 +90,17 @@ reachable.
 
 ## Cutover (no parallel semantics)
 
-Per the no-fallbacks rule, the global `allow_private_net` boolean does not coexist with the scoped model. Pick
-one at implementation:
-
-- **Preferred:** remove the global scalar; migrate it to `[private_net].web_fetch = true` + per-plugin grants.
-  A bare legacy `allow_private_net = true` is read once with a deprecation note mapping it to "web_fetch = Any";
-  it never widens plugins.
-- The three wiring sites (`main.rs:957/976/3335`) each resolve their own caller-scoped `PrivateNetAllow`.
+The legacy `allow_private_net` scalar remains as a compatibility read. It maps only to
+`private_net.web_fetch = true`; it never widens plugin egress. The plugin path requires
+`[private_net.plugins]` grants, intersected with each plugin's manifest declarations.
 
 ## Audit
 
-Reaching a private host is a security-relevant event. When `guard_url` admits a private address under a grant,
-the host emits a `flux-events` record (plugin, host, grant source) so an operator can answer "what internal
-addresses did flux reach, and under whose grant." DNS-rebinding caveat from `net.rs` is unchanged (this is
-defense-in-depth, not a TOCTOU fix) and stays documented.
+Reaching a private host is a security-relevant event. A follow-up should emit a `flux-events` record
+(plugin/tool, host, grant source) when `guard_url_scoped` admits a private address under a grant, so
+an operator can answer "what internal addresses did flux reach, and under whose grant."
+DNS-rebinding caveat from `net.rs` is unchanged (this is defense-in-depth, not a TOCTOU fix) and
+stays documented.
 
 ## Smoke
 
@@ -119,11 +119,12 @@ defense-in-depth, not a TOCTOU fix) and stays documented.
 
 ## Touch points
 
-- `crates/flux-system/src/net.rs` — `guard_url`/`dial`/`guard_target_host` take `&PrivateNetAllow`.
-- `crates/flux-plugin/src/lib.rs` — `PluginCapabilities.private_hosts`; `SystemHostCaps` resolves the scoped
-  allow per plugin from manifest ∩ config; replaces `allow_private_net: bool`.
-- `crates/flux-config/src/lib.rs` — `[private_net]` grant shape; merge semantics (project refines user); legacy
-  scalar migration.
+- `crates/flux-system/src/net.rs` — `guard_url_scoped`/`dial_scoped`/`guard_target_host` take
+  `&PrivateNetAllow`; bool wrappers remain for compatibility.
+- `crates/flux-plugin/src/lib.rs` — `PluginCapabilities.http_hosts`/`private_hosts`; `SystemHostCaps`
+  resolves the scoped private allow per plugin from manifest ∩ config.
+- `crates/flux-config/src/lib.rs` — `[private_net]` grant shape; merge semantics; legacy scalar maps to
+  `web_fetch` only.
 - `crates/flux-cli/src/main.rs:957,976,3335` — the three egress wiring sites resolve caller-scoped allows.
-- `crates/flux-events` — the private-egress audit record.
-- `scripts/smoke-plugins.sh` — guard-refusal vs. failure distinction + a scoped-grant exercise path.
+- Follow-up: `crates/flux-events` private-egress audit records.
+- Follow-up: `scripts/smoke-plugins.sh` guard-refusal vs. failure distinction + a scoped-grant exercise path.

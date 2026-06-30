@@ -39,6 +39,8 @@ fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("jira", "0.1.0")
         .capabilities(Caps {
             http: true,
+            http_hosts: vec!["api.atlassian.com".into()],
+            private_hosts: vec!["*".into()],
             blob: true,
             secrets: vec!["JIRA_API_TOKEN".into(), "ATLASSIAN_API_TOKEN".into()],
             ..Default::default()
@@ -63,18 +65,21 @@ fn manifest_builder() -> PluginBuilder {
                 "ATLASSIAN_URL".into(),
                 "ATLASSIAN_SITE_URL".into(),
             ],
+            http_hosts: Vec::new(),
             description: "Jira Cloud site URL (e.g. https://site.atlassian.net)".into(),
         })
         // The cloud_id (config) selects the OAuth gateway base + Bearer. Absent → site-URL modes.
         .endpoint(EndpointSpec {
             name: "jira.cloud_id".into(),
             env: vec!["ATLASSIAN_CLOUD_ID".into(), "JIRA_CLOUD_ID".into()],
+            http_hosts: Vec::new(),
             description: "Atlassian Cloud ID; when set, calls go through the OAuth gateway".into(),
         })
         // The email (config) selects the Basic fallback when no cloud_id is set.
         .endpoint(EndpointSpec {
             name: "jira.email".into(),
             env: vec!["JIRA_EMAIL".into(), "ATLASSIAN_EMAIL".into()],
+            http_hosts: Vec::new(),
             description: "Atlassian account email; enables the Basic auth fallback".into(),
         })
         .datasource(ds("jira.issues", "jira.issue", "Jira issues."))

@@ -129,7 +129,12 @@ Precedence: CLI flags > project `.flux/config.toml` > user `~/.flux/config.toml`
 
 ```toml
 model = "claude/opus"            # default model (-m overrides)
-allow_private_net = false        # let web_fetch / plugins reach loopback/private addresses
+
+[private_net]                    # optional private/loopback egress grants
+web_fetch = ["localhost"]        # or true for any private host, web_fetch only
+
+[private_net.plugins]            # plugin grants are per manifest name
+prometheus = ["prometheus.local"] # intersected with the plugin's declared private_hosts
 
 [permissions]                    # deny wins, then allow, otherwise prompt
 allow = ["read", "glob", "grep", "search", "Bash(git:*)"]
@@ -142,6 +147,8 @@ actions   = ["workspace.write"]
 ```
 
 "Always-allow" choices from approval prompts are saved back here automatically.
+The legacy `allow_private_net = true` flag is still read for compatibility, but it only maps to
+`private_net.web_fetch = true`; plugins require explicit `[private_net.plugins]` grants.
 
 ---
 
@@ -177,7 +184,7 @@ injects their bodies into that turn's context (ranked and capped to keep the pro
 
 **Sub-agent roles** (`.flux/agents/<role>.md`): scout / planner / worker / reviewer / evaluator / summarizer — built-in defaults, overridable with your own markdown files.
 
-**Plugins** (`~/.flux/plugins/*.toml`): subprocess binaries in any language over a framed NDJSON protocol. Their operations become policy-gated tools; privileged IO is requested back from the host via declared capabilities. A plugin gets **only** what its manifest declares — runnable programs, readable secret keys, and HTTP access are all explicit allow-lists checked on every call.
+**Plugins** (`~/.flux/plugins/*.toml`): trusted subprocess binaries in any language over a framed NDJSON protocol. Their operations become policy-gated tools; privileged IO is requested back from the host via declared capabilities. A plugin host callback gets **only** what its manifest declares — runnable programs, readable secret keys, HTTP hosts, connection targets, and private-network hosts are explicit allow-lists checked on every call.
 - `flux plugin add <name> <program> [args…] | ls | pin <name> <ver> | rollback <name>`
 
 **Hooks** (`.flux/hooks/*.js`): JavaScript pre-tool hooks that can observe, modify, or deny a call.
@@ -211,14 +218,17 @@ Long sessions are **compacted** automatically: older turns are summarized once t
 | Route | Purpose |
 |---|---|
 | `GET  /health` | liveness |
+| `GET  /.well-known/agent-card.json` | A2A discovery card (`/.well-known/agent.json` alias) |
+| `POST /a2a` | A2A JSON-RPC (`message/send`, `message/stream`) |
 | `POST /sessions` | create a session → `{ id, model }` |
 | `GET  /sessions/:id` | session info |
 | `POST /sessions/:id/messages` | run a turn → `{ text, tool_calls, usage }` |
 | `GET  /sessions/:id/stream?input=…` | **Server-Sent Events**: `text` / `tool` / `done` |
 | `POST /webhook` | external trigger → fresh session + one turn |
 
-Every route except `GET /health` requires `Authorization: Bearer $FLUX_SERVER_TOKEN`. A non-loopback bind
-without the token set is refused (the daemon auto-approves tools, so an open listener is RCE).
+Every route except `GET /health` and the A2A discovery card requires
+`Authorization: Bearer $FLUX_SERVER_TOKEN`. A non-loopback bind without the token set is refused (the
+daemon auto-approves tools, so an open listener is RCE).
 
 ---
 

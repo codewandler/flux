@@ -16,6 +16,7 @@ fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("slack", "0.1.0")
         .capabilities(Caps {
             http: true,
+            http_hosts: vec!["slack.com".into(), "*.slack.com".into()],
             blob: true,
             secrets: vec!["SLACK_BOT_TOKEN".into(), "SLACK_USER_TOKEN".into()],
             ..Default::default()
@@ -35,6 +36,7 @@ fn manifest_builder() -> PluginBuilder {
         .endpoint(EndpointSpec {
             name: "slack.endpoint".into(),
             env: vec!["SLACK_API_URL".into()],
+            http_hosts: vec!["slack.com".into()],
             description: "Slack Web API base URL (default https://slack.com/api)".into(),
         })
         .datasource(ds("slack.channels", "slack.channel", "Slack channels."))

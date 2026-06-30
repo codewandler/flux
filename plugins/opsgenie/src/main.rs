@@ -12,6 +12,7 @@ fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("opsgenie", "0.1.0")
         .capabilities(Caps {
             http: true,
+            http_hosts: vec!["api.eu.opsgenie.com".into(), "api.opsgenie.com".into()],
             secrets: vec!["OPSGENIE_API_KEY".into()],
             ..Default::default()
         })
@@ -25,6 +26,7 @@ fn manifest_builder() -> PluginBuilder {
         .endpoint(EndpointSpec {
             name: "opsgenie.endpoint".into(),
             env: vec!["OPSGENIE_API_URL".into()],
+            http_hosts: vec!["api.eu.opsgenie.com".into(), "api.opsgenie.com".into()],
             description:
                 "Opsgenie API base URL (default https://api.eu.opsgenie.com for the EU region)."
                     .into(),

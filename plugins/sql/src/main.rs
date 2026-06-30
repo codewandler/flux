@@ -47,6 +47,7 @@ fn manifest_builder() -> PluginBuilder {
                 format!("tcp:*:{PG_DEFAULT_PORT}"),
                 format!("tcp:*:{MYSQL_DEFAULT_PORT}"),
             ],
+            private_hosts: vec!["*".into()],
             secrets: vec![
                 "SQL_USERNAME".into(),
                 "SQL_PASSWORD".into(),
@@ -73,6 +74,7 @@ fn manifest_builder() -> PluginBuilder {
         .endpoint(EndpointSpec {
             name: "sql.endpoint".into(),
             env: vec!["SQL_DSN".into(), "SQL_URL".into()],
+            http_hosts: Vec::new(),
             description: "SQL connection DSN/URL, e.g. postgres://host:5432/db".into(),
         })
         .datasource(Declaration {

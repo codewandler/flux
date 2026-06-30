@@ -33,7 +33,7 @@ use flux_flow::AgentSink;
 use std::sync::Arc;
 
 use super::Collect;
-use crate::{CardInfo, Shared};
+use crate::{CardInfo, Shared, TurnGate};
 
 // ── Agent Card ────────────────────────────────────────────────────────────────
 
@@ -112,14 +112,17 @@ fn status_frame(
 /// - `message/stream` → [`subscribe`] (SSE stream of `TaskStatusUpdate`s)
 pub async fn a2a_handler(
     State(engine): State<Shared>,
+    State(turn_gate): State<TurnGate>,
     Json(req): Json<JsonRpcRequest>,
 ) -> Response {
     if req.jsonrpc != "2.0" {
         return rpc_err(req.id, -32600, "jsonrpc must be \"2.0\"").into_response();
     }
     match req.method.as_str() {
-        "message/send" => send(engine, req.id, req.params).await.into_response(),
-        "message/stream" => match subscribe(engine, req.id.clone(), req.params).await {
+        "message/send" => send(engine, turn_gate, req.id, req.params)
+            .await
+            .into_response(),
+        "message/stream" => match subscribe(engine, turn_gate, req.id.clone(), req.params).await {
             Ok(sse) => sse.into_response(),
             // Format pre-SSE errors as JSON-RPC so the `id` is not silently dropped.
             Err(msg) => rpc_err(req.id, -32602, msg).into_response(),
@@ -130,7 +133,12 @@ pub async fn a2a_handler(
 
 // ── message/send ──────────────────────────────────────────────────────────────
 
-async fn send(engine: Shared, id: Option<Value>, params: Option<Value>) -> Json<Value> {
+async fn send(
+    engine: Shared,
+    turn_gate: TurnGate,
+    id: Option<Value>,
+    params: Option<Value>,
+) -> Json<Value> {
     let params = match params {
         Some(p) => p,
         None => return rpc_err(id, -32602, "Missing params"),
@@ -145,6 +153,7 @@ async fn send(engine: Shared, id: Option<Value>, params: Option<Value>) -> Json<
     };
     let context_id = server::extract_context_id(&params).unwrap_or_else(|| session_id.clone());
     let mut sink = Collect::default();
+    let _turn = turn_gate.lock().await;
     match engine.run_turn(&session_id, &input, &mut sink).await {
         Ok(()) => {
             let status = TaskStatus::new(
@@ -166,6 +175,7 @@ async fn send(engine: Shared, id: Option<Value>, params: Option<Value>) -> Json<
 
 async fn subscribe(
     engine: Shared,
+    turn_gate: TurnGate,
     id: Option<Value>,
     params: Option<Value>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, String> {
@@ -207,6 +217,7 @@ async fn subscribe(
             context_id: context_id.clone(),
             cancel: cancel_task.clone(),
         };
+        let _turn = turn_gate.lock().await;
         let result = engine_clone
             .run_turn_cancellable(&session_id, &input, &mut sink, &cancel_task)
             .await;

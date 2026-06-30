@@ -27,6 +27,7 @@ fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("asterisk", "0.1.0")
         .capabilities(Caps {
             conn: vec!["tcp:*:5038".into()],
+            private_hosts: vec!["*".into()],
             secrets: vec![
                 "ASTERISK_AMI_USERNAME".into(),
                 "ASTERISK_AMI_SECRET".into(),
@@ -51,6 +52,7 @@ fn manifest_builder() -> PluginBuilder {
                 "ASTERISK_AMI_HOST".into(),
                 "ASTERISK_AMI_PORT".into(),
             ],
+            http_hosts: Vec::new(),
             description: "Asterisk AMI endpoint host (ASTERISK_AMI_HOST) and port (ASTERISK_AMI_PORT, default 5038)".into(),
         })
         // ---- reads ----

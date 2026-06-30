@@ -6,10 +6,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-06-30
+
 ### Changed
 
 - Clarified the root docs split: `AGENTS.md` is now explicitly the operating contract for coding agents,
   while `README.md` gives humans a faster product overview, common entry points, and contributor map.
+- Hardened pre-push security edges: plugin HTTP callbacks now require declared host allow-lists, private
+  network access is scoped per caller and per plugin config grant, server turns are serialized on shared
+  engines, unauthenticated non-loopback server binds are refused, and persisted composite-op loading now
+  goes through guarded `flux-system` paths.
 
 ## [0.2.6] - 2026-06-30
 

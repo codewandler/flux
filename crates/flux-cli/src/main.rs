@@ -980,9 +980,11 @@ async fn build_agent(
     // delegates to the engine-installed composite registrar.
     flux_tools::register_reflect(&mut registry);
 
-    // Guarded web access (policy-gated as network egress; private/loopback per config).
+    // Guarded web access (policy-gated as network egress; private/loopback scoped to web_fetch).
     registry.register(Arc::new(
-        flux_capabilities::browser::WebFetchTool::default().allow_private(cfg.allow_private_net),
+        flux_capabilities::browser::WebFetchTool::default().private_net(
+            flux_system::net::PrivateNetAllow::from_hosts(cfg.web_fetch_private_hosts()),
+        ),
     ));
 
     // Auto-index workspace docs (markdown/text, capped & cheap) into the knowledge datasource, and
@@ -997,13 +999,14 @@ async fn build_agent(
             // Build host capabilities from the plugin's own manifest declaration, so each plugin
             // gets only the process/secret/http access it asked for (and nothing by default).
             let system = system.clone();
-            let allow_private = cfg.allow_private_net;
+            let cfg_for_caps = cfg.clone();
             let caps_system = system.clone();
             let make_caps = move |m: &flux_plugin::PluginManifest| {
+                let plugin_private_hosts = cfg_for_caps.plugin_private_hosts(&m.name);
                 Arc::new(
                     flux_plugin::SystemHostCaps::new(caps_system)
-                        .allow_private_net(allow_private)
-                        .with_manifest(m),
+                        .with_manifest(m)
+                        .with_private_net_grants(plugin_private_hosts),
                 ) as Arc<dyn flux_plugin::HostCapabilities>
             };
             match flux_plugin::load_plugin_tools(
@@ -3461,13 +3464,9 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
     let system = Arc::new(System::new(
         Workspace::new(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?,
     ));
-    // SSRF egress opt-in, off by default. `flux app run` honors the same `allow_private_net` setting as
-    // the interactive path (`~/.flux/config.toml`): with it on, plugin HTTP ops may reach
-    // private/loopback hosts — needed for a bot deployed next to private DevOps endpoints (in-cluster
-    // GitLab / Loki / Prometheus / Kubernetes). A missing or unreadable config keeps the safe default.
-    let allow_private = flux_config::load(&cwd)
-        .map(|c| c.allow_private_net)
-        .unwrap_or(false);
+    // Scoped SSRF egress opt-in, off by default. Program-serving plugin hosts use per-plugin grants;
+    // a missing or unreadable config keeps the safe default.
+    let cfg = flux_config::load(&cwd).unwrap_or_default();
     // The knowledge datasource: build the program's declared datasources, and SHARE the backend so
     // integration plugins' contributed records (via the DatasourceHostCaps bridge) land in the same
     // index the `search`/`get`/`list`/`relation`/`batch_get` ops read.
@@ -3481,11 +3480,13 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
             let system = system.clone();
             let backend = backend.clone();
             let caps_system = system.clone();
+            let cfg_for_caps = cfg.clone();
             let make_caps = move |m: &flux_plugin::PluginManifest| {
+                let plugin_private_hosts = cfg_for_caps.plugin_private_hosts(&m.name);
                 Arc::new(flux_capabilities::DatasourceHostCaps::new(
                     flux_plugin::SystemHostCaps::new(caps_system)
-                        .allow_private_net(allow_private)
-                        .with_manifest(m),
+                        .with_manifest(m)
+                        .with_private_net_grants(plugin_private_hosts),
                     backend,
                 )) as Arc<dyn flux_plugin::HostCapabilities>
             };
@@ -3610,8 +3611,10 @@ async fn run_plugin(action: Option<PluginAction>) -> Result<()> {
                 None => serde_json::json!({}),
             };
             // The same guarded boundary + datasource bridge the agent path uses, over a scratch index.
+            let cwd = std::env::current_dir()?;
+            let cfg = flux_config::load(&cwd).unwrap_or_default();
             let system = Arc::new(System::new(
-                Workspace::new(&std::env::current_dir()?).map_err(|e| anyhow::anyhow!("{e}"))?,
+                Workspace::new(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?,
             ));
             let backend: Arc<dyn flux_capabilities::DatasourceBackend> =
                 Arc::new(flux_capabilities::MemoryBackend::new());
@@ -3621,7 +3624,9 @@ async fn run_plugin(action: Option<PluginAction>) -> Result<()> {
             let manifest = host.manifest().await.context("fetch plugin manifest")?;
             let resolved_op = resolve_plugin_operation_name(&name, &op, &manifest)?;
             let caps = flux_capabilities::DatasourceHostCaps::new(
-                flux_plugin::SystemHostCaps::new(system).with_manifest(&manifest),
+                flux_plugin::SystemHostCaps::new(system)
+                    .with_manifest(&manifest)
+                    .with_private_net_grants(cfg.plugin_private_hosts(&manifest.name)),
                 backend.clone(),
             );
             let result = host.call_with_host(&resolved_op, input, &caps).await;

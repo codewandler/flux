@@ -14,6 +14,7 @@ fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("websearch", "0.1.0")
         .capabilities(Caps {
             http: true,
+            http_hosts: vec!["api.tavily.com".into(), "api.duckduckgo.com".into()],
             secrets: vec!["TAVILY_API_KEY".into()],
             ..Default::default()
         })

@@ -17,6 +17,8 @@ fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("homer", "0.1.0")
         .capabilities(Caps {
             http: true,
+            http_hosts: vec!["localhost".into(), "127.0.0.1".into()],
+            private_hosts: vec!["*".into()],
             blob: true,
             secrets: vec!["HOMER_USERNAME".into(), "HOMER_PASSWORD".into()],
             ..Default::default()
@@ -36,6 +38,7 @@ fn manifest_builder() -> PluginBuilder {
         .endpoint(EndpointSpec {
             name: "homer.endpoint".into(),
             env: vec!["HOMER_URL".into()],
+            http_hosts: vec!["localhost".into(), "127.0.0.1".into()],
             description: "Homer base URL (e.g. https://homer.example.com)".into(),
         })
         .datasource(ds(

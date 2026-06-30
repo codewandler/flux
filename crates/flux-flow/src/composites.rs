@@ -4,12 +4,12 @@
 //! definitions are stored, how scopes override each other, and when persisted definitions are loaded.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
 use std::sync::Mutex;
 
 use flux_core::{Error, Result};
 use flux_lang::program::{CompositeOpDecl, Module};
 use flux_runtime::{CompositeRegisterRequest, ToolRegistry};
+use flux_system::System;
 
 use crate::registry::analyze_composites;
 use crate::state::FlowStore;
@@ -73,12 +73,13 @@ pub struct DynamicComposites {
 }
 
 impl DynamicComposites {
-    pub fn load(cwd: &Path) -> Result<Self> {
-        let global = match std::env::var_os("HOME") {
-            Some(home) => load_dir(&Path::new(&home).join(".flux").join("ops"))?,
-            None => BTreeMap::new(),
+    pub fn load(system: &System) -> Result<Self> {
+        let global = if system.workspace().has_named_root("global_ops") {
+            load_dir(system, "@global_ops")?
+        } else {
+            BTreeMap::new()
         };
-        let project = load_dir(&cwd.join(".flux").join("ops"))?;
+        let project = load_dir(system, ".flux/ops")?;
         Ok(Self {
             state: Mutex::new(State {
                 global,
@@ -194,26 +195,14 @@ pub fn prepare_registration(
     Ok((scope, decl, source, request.replace))
 }
 
-fn load_dir(dir: &Path) -> Result<BTreeMap<String, Entry>> {
-    if !dir.exists() {
-        return Ok(BTreeMap::new());
-    }
-    let mut paths = std::fs::read_dir(dir)?
-        .map(|res| res.map(|e| e.path()))
-        .collect::<std::io::Result<Vec<_>>>()?;
-    paths.sort();
+fn load_dir(system: &System, dir: &str) -> Result<BTreeMap<String, Entry>> {
     let mut out = BTreeMap::new();
-    for path in paths {
-        if path.extension().and_then(|e| e.to_str()) != Some("flux") {
-            continue;
-        }
-        let source = std::fs::read_to_string(&path)?;
-        let decl = parse_one_composite(&source)
-            .map_err(|e| Error::Other(format!("{}: {e}", path.display())))?;
+    for (path, source) in system.read_dir_text_files(dir, "flux")? {
+        let decl =
+            parse_one_composite(&source).map_err(|e| Error::Other(format!("{path}: {e}")))?;
         if out.contains_key(&decl.name) {
             return Err(Error::Other(format!(
-                "{}: duplicate persisted composite op `{}`",
-                path.display(),
+                "{path}: duplicate persisted composite op `{}`",
                 decl.name
             )));
         }

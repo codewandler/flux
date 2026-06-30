@@ -12,29 +12,68 @@ use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 
 use flux_core::{Error, Result};
 
-/// Reject URLs that aren't safe to fetch. With `allow_private`, only the scheme check applies.
-pub fn guard_url(raw: &str, allow_private: bool) -> Result<url::Url> {
+/// What one egress caller is allowed to reach beyond public addresses.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PrivateNetAllow {
+    /// Full SSRF guard: private/loopback/link-local/internal hosts are refused.
+    #[default]
+    None,
+    /// Only these host patterns may resolve to private addresses.
+    Hosts(Vec<String>),
+    /// This one caller may reach any private address.
+    Any,
+}
+
+impl PrivateNetAllow {
+    pub fn from_legacy_bool(allow: bool) -> Self {
+        if allow {
+            Self::Any
+        } else {
+            Self::None
+        }
+    }
+
+    pub fn from_hosts(hosts: impl IntoIterator<Item = String>) -> Self {
+        let hosts = hosts
+            .into_iter()
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect::<Vec<_>>();
+        if hosts.iter().any(|h| h == "*") {
+            Self::Any
+        } else if hosts.is_empty() {
+            Self::None
+        } else {
+            Self::Hosts(hosts)
+        }
+    }
+
+    pub fn allows_host(&self, host: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::None => false,
+            Self::Hosts(patterns) => host_matches(patterns, host),
+        }
+    }
+}
+
+/// Reject URLs that aren't safe to fetch. Private addresses are allowed only when `allow` covers the
+/// URL host for this caller.
+pub fn guard_url_scoped(raw: &str, allow: &PrivateNetAllow) -> Result<url::Url> {
     let url = url::Url::parse(raw).map_err(|e| Error::Other(format!("invalid url: {e}")))?;
     match url.scheme() {
         "http" | "https" => {}
         other => return Err(Error::Other(format!("unsupported url scheme: {other}"))),
     }
-    if allow_private {
-        return Ok(url);
-    }
     // `Host` parses literal IPs into typed addresses (so an IPv6 literal isn't a bracketed string).
     match url.host() {
         None => Err(Error::Other("url has no host".into())),
-        Some(url::Host::Ipv4(v4)) => block_if(IpAddr::V4(v4), &v4.to_string()).map(|()| url),
-        Some(url::Host::Ipv6(v6)) => block_if(IpAddr::V6(v6), &v6.to_string()).map(|()| url),
+        Some(url::Host::Ipv4(v4)) => block_if(IpAddr::V4(v4), &v4.to_string(), allow).map(|()| url),
+        Some(url::Host::Ipv6(v6)) => block_if(IpAddr::V6(v6), &v6.to_string(), allow).map(|()| url),
         Some(url::Host::Domain(domain)) => {
             // Block internal hostnames outright (these often front link-local metadata services).
             let lower = domain.to_ascii_lowercase();
-            if lower == "localhost"
-                || lower.ends_with(".localhost")
-                || lower == "metadata.google.internal"
-                || lower.ends_with(".internal")
-            {
+            if is_internal_hostname(&lower) && !allow.allows_host(domain) {
                 return Err(Error::Other(format!(
                     "refusing to fetch internal host {domain}"
                 )));
@@ -44,7 +83,7 @@ pub fn guard_url(raw: &str, allow_private: bool) -> Result<url::Url> {
             let port = url.port_or_known_default().unwrap_or(80);
             if let Ok(addrs) = (domain, port).to_socket_addrs() {
                 for sa in addrs {
-                    block_if(sa.ip(), domain)?;
+                    block_if(sa.ip(), domain, allow)?;
                 }
             }
             Ok(url)
@@ -52,9 +91,14 @@ pub fn guard_url(raw: &str, allow_private: bool) -> Result<url::Url> {
     }
 }
 
+/// Compatibility wrapper for callers that still need the old all-or-nothing shape.
+pub fn guard_url(raw: &str, allow_private: bool) -> Result<url::Url> {
+    guard_url_scoped(raw, &PrivateNetAllow::from_legacy_bool(allow_private))
+}
+
 /// `Err` if `ip` is in a range the agent may never reach (SSRF protection); `Ok(())` otherwise.
-fn block_if(ip: IpAddr, host: &str) -> Result<()> {
-    if is_blocked_ip(ip) {
+fn block_if(ip: IpAddr, host: &str, allow: &PrivateNetAllow) -> Result<()> {
+    if is_blocked_ip(ip) && !allow.allows_host(host) {
         return Err(Error::Other(format!(
             "refusing to fetch private/loopback/link-local address {ip} ({host})"
         )));
@@ -154,11 +198,11 @@ impl DialStream {
     }
 }
 
-/// Dial a socket target, applying the SSRF egress policy to TCP unless `allow_private`.
-pub async fn dial(target: &DialTarget, allow_private: bool) -> Result<DialStream> {
+/// Dial a socket target, applying the SSRF egress policy to TCP unless `allow` covers the host.
+pub async fn dial_scoped(target: &DialTarget, allow: &PrivateNetAllow) -> Result<DialStream> {
     match target {
         DialTarget::Tcp { host, port } => {
-            guard_target_host(host, *port, allow_private)?;
+            guard_target_host(host, *port, allow)?;
             let s = tokio::net::TcpStream::connect((host.as_str(), *port))
                 .await
                 .map_err(|e| Error::Other(format!("tcp dial {host}:{port}: {e}")))?;
@@ -183,31 +227,58 @@ pub async fn dial(target: &DialTarget, allow_private: bool) -> Result<DialStream
     }
 }
 
+/// Compatibility wrapper for callers that still need the old all-or-nothing shape.
+pub async fn dial(target: &DialTarget, allow_private: bool) -> Result<DialStream> {
+    dial_scoped(target, &PrivateNetAllow::from_legacy_bool(allow_private)).await
+}
+
 /// Guard a `host:port` for a socket dial with the same policy as [`guard_url`]: internal hostnames and
-/// private/loopback/link-local IPs are blocked unless `allow_private`.
-fn guard_target_host(host: &str, port: u16, allow_private: bool) -> Result<()> {
-    if allow_private {
-        return Ok(());
-    }
+/// private/loopback/link-local IPs are blocked unless `allow` covers this host.
+fn guard_target_host(host: &str, port: u16, allow: &PrivateNetAllow) -> Result<()> {
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return block_if(ip, host);
+        return block_if(ip, host, allow);
     }
     let lower = host.to_ascii_lowercase();
-    if lower == "localhost"
-        || lower.ends_with(".localhost")
-        || lower == "metadata.google.internal"
-        || lower.ends_with(".internal")
-    {
+    if is_internal_hostname(&lower) && !allow.allows_host(host) {
         return Err(Error::Other(format!(
             "refusing to dial internal host {host}"
         )));
     }
     if let Ok(addrs) = (host, port).to_socket_addrs() {
         for sa in addrs {
-            block_if(sa.ip(), host)?;
+            block_if(sa.ip(), host, allow)?;
         }
     }
     Ok(())
+}
+
+fn is_internal_hostname(lower: &str) -> bool {
+    lower == "localhost"
+        || lower.ends_with(".localhost")
+        || lower == "metadata.google.internal"
+        || lower.ends_with(".internal")
+}
+
+fn host_matches(patterns: &[String], host: &str) -> bool {
+    let host = host
+        .trim()
+        .trim_matches('[')
+        .trim_matches(']')
+        .to_ascii_lowercase();
+    patterns.iter().any(|p| {
+        let p = p
+            .trim()
+            .trim_matches('[')
+            .trim_matches(']')
+            .to_ascii_lowercase();
+        p == "*"
+            || p == host
+            || p.strip_prefix("*.").is_some_and(|suffix| {
+                host.ends_with(suffix)
+                    && host.len() > suffix.len()
+                    && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+            })
+    })
 }
 
 #[cfg(test)]
@@ -263,6 +334,17 @@ mod tests {
     #[test]
     fn allow_private_opt_in() {
         assert!(guard_url("http://127.0.0.1/", true).is_ok());
+    }
+
+    #[test]
+    fn scoped_private_allow_is_host_specific() {
+        let loopback = PrivateNetAllow::from_hosts(vec!["127.0.0.1".to_string()]);
+        assert!(guard_url_scoped("http://127.0.0.1/", &loopback).is_ok());
+        assert!(guard_url_scoped("http://10.0.0.5/", &loopback).is_err());
+
+        let localhost = PrivateNetAllow::from_hosts(vec!["localhost".to_string()]);
+        assert!(guard_url_scoped("http://localhost:8080/", &localhost).is_ok());
+        assert!(guard_url_scoped("http://metadata.google.internal/", &localhost).is_err());
     }
 
     #[tokio::test]

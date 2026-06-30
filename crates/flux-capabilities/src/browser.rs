@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use flux_core::{Error, Result};
 use flux_runtime::{Tool, ToolContext, ToolResult};
 use flux_spec::ToolSpec;
+use flux_system::net::PrivateNetAllow;
 
 const MAX_BYTES: usize = 256 * 1024;
 
@@ -19,20 +20,20 @@ const MAX_BYTES: usize = 256 * 1024;
 /// (the single SSRF policy: scheme check + host→IP resolution against private/loopback/link-local
 /// ranges). Re-exported here so callers and tests of the `browser` module keep a stable entry point.
 pub fn guard_url(raw: &str, allow_private: bool) -> Result<url::Url> {
-    flux_system::net::guard_url(raw, allow_private)
+    flux_system::net::guard_url_scoped(raw, &PrivateNetAllow::from_legacy_bool(allow_private))
 }
 
 /// A tool that fetches a URL's body (guarded, size-capped).
 pub struct WebFetchTool {
     http: reqwest::Client,
-    allow_private: bool,
+    private_net: PrivateNetAllow,
 }
 
 impl Default for WebFetchTool {
     fn default() -> Self {
         Self {
             http: reqwest::Client::new(),
-            allow_private: false,
+            private_net: PrivateNetAllow::None,
         }
     }
 }
@@ -40,7 +41,13 @@ impl Default for WebFetchTool {
 impl WebFetchTool {
     /// Allow fetching private/loopback addresses (e.g. for local development). Off by default.
     pub fn allow_private(mut self, yes: bool) -> Self {
-        self.allow_private = yes;
+        self.private_net = PrivateNetAllow::from_legacy_bool(yes);
+        self
+    }
+
+    /// Configure scoped private-network egress for this web-fetch caller.
+    pub fn private_net(mut self, allow: PrivateNetAllow) -> Self {
+        self.private_net = allow;
         self
     }
 }
@@ -74,7 +81,7 @@ impl Tool for WebFetchTool {
             .get("url")
             .and_then(|v| v.as_str())
             .ok_or_else(|| Error::Other("web_fetch: `url` required".into()))?;
-        let url = guard_url(raw, self.allow_private)?;
+        let url = flux_system::net::guard_url_scoped(raw, &self.private_net)?;
         let resp = self
             .http
             .get(url)

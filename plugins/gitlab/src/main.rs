@@ -18,6 +18,8 @@ fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("gitlab", "0.1.0")
         .capabilities(Caps {
             http: true,
+            http_hosts: vec!["gitlab.com".into()],
+            private_hosts: vec!["*".into()],
             blob: true,
             secrets: vec![
                 "GITLAB_PERSONAL_TOKEN".into(),
@@ -37,6 +39,7 @@ fn manifest_builder() -> PluginBuilder {
         .endpoint(EndpointSpec {
             name: "gitlab.endpoint".into(),
             env: vec!["GITLAB_URL".into(), "GITLAB_BASE_URL".into()],
+            http_hosts: vec!["gitlab.com".into()],
             description: "GitLab base URL (default https://gitlab.com)".into(),
         })
         .datasource(ds("gitlab.projects", "gitlab.project", "GitLab projects."))

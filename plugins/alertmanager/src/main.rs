@@ -14,6 +14,7 @@ fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("alertmanager", "0.1.0")
         .capabilities(Caps {
             http: true,
+            private_hosts: vec!["*".into()],
             secrets: vec!["ALERTMANAGER_PASSWORD".into()],
             ..Default::default()
         })
@@ -28,6 +29,7 @@ fn manifest_builder() -> PluginBuilder {
         .endpoint(EndpointSpec {
             name: "alertmanager.endpoint".into(),
             env: vec!["ALERTMANAGER_URL".into()],
+            http_hosts: Vec::new(),
             description: "Alertmanager base URL (e.g. http://alertmanager.example.com:9093)".into(),
         })
         .datasource(Declaration {

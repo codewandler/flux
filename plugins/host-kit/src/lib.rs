@@ -876,6 +876,7 @@ mod tests {
         let plugin = PluginBuilder::new("acme", "0.1.0")
             .capabilities(Caps {
                 http: true,
+                http_hosts: vec!["acme.example.com".into()],
                 secrets: vec!["ACME_TOKEN".into()],
                 ..Default::default()
             })
@@ -888,6 +889,7 @@ mod tests {
             .endpoint(EndpointSpec {
                 name: "acme.endpoint".into(),
                 env: vec!["ACME_URL".into()],
+                http_hosts: vec!["acme.example.com".into()],
                 description: String::new(),
             })
             .operation(
