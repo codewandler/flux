@@ -22,6 +22,9 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
   grader-confirmed run is **staged** on a funded provider key
 
 ## Next (ready — take the top one unless the user named a story)
+- [D-25 — Endpoint reference model & registry](D-25-endpoint-reference-model.md) · Core · **top pick** ·
+  leads the **Endpoint discovery & brokerage** epic (below): the references-only spine — a plugin op deals
+  only in host-managed endpoint/credential references, never env vars or raw secrets.
 - [D-11 — App-runner ergonomics](D-11-app-runner-ergonomics.md) · Agent · the alternate ready pick (makes
   `flux app run` a viable host for a declarative bot; unblocks Slack-channel assistant flows).
 
@@ -36,6 +39,33 @@ _(none)_
 The integration breadth+depth push: every *portable* fluxplane plugin rewritten natively at full op coverage,
 gated by D-12. See [epic design](../designs/fluxplane-plugins-parity.md). **D-12 through D-17 shipped** (see
 Done); **D-22** added the single guarded spawn path + plugin authoring guide.
+
+### Endpoint discovery & brokerage (epic) — references-only plugin IO + cross-plugin endpoint discovery
+The missing fluxplane essentials feature, and a **new top priority**: make a host-managed **reference** the
+only currency a plugin operation handles (never an env var, raw secret, or credential-bearing URL), then
+broker **cross-plugin endpoint discovery** over it — the kubernetes plugin discovers cluster + in-cluster
+service endpoints (prometheus/loki/grafana/alertmanager/sql) and hands consumers a *weak reference*; the host
+resolves it and injects credentials host-side, so neither the plugin nor the LLM ever sees a secret. Reverses
+the `.dex`-style endpoint-registry deferral from D-10/D-12. See [epic design](../designs/endpoint-discovery.md).
+**[D-20](D-20-scoped-private-net-egress.md) is pulled in as a hard dependency** (discovered endpoints are
+usually private/in-cluster hosts). Built in this order:
+- [D-25 — Endpoint reference model & registry](D-25-endpoint-reference-model.md) · Core · **leads, ready** ·
+  `EndpointRef` weak refs + `EndpointRegistry` + a static env/config resolver replacing per-plugin env
+  coupling (no discovery yet)
+- [D-26 — Discovery provider role & host fan-out broker](D-26-endpoint-discovery-broker.md) · Core · manifest
+  `discovers: [products]` + an `endpoint.discover` host capability; the broker fans out to providers and
+  returns weak refs only
+- [D-27 — Reference-based IO & host-injected connect](D-27-reference-based-io.md) · Core · the protocol
+  cutover that **enforces** the invariant: host IO takes an `endpoint_ref`, injects creds host-side (incl.
+  cross-plugin Kubernetes-scheme refs); deny-by-default + grant + first-use approval + audit; **needs D-20**
+- [D-28 — Kubernetes endpoint provider](D-28-kubernetes-endpoint-provider.md) · Agent · elevate the existing
+  k8s discover/cluster/secret ops into the reference provider (`discovers: [kubernetes, prometheus, loki,
+  grafana, alertmanager, postgres, mysql]`)
+- [D-29 — Migrate native plugins to references](D-29-migrate-plugins-to-references.md) · Agent · clean-cutover
+  every native plugin onto ref-based IO + let the observability/sql consumers use discovered endpoints
+  (multi-instance); wire `flux app run` + agent paths
+- [D-30 — Endpoint lifecycle: refresh runner, CLI & audit](D-30-endpoint-lifecycle-cli.md) · Core · periodic
+  rediscovery + `flux endpoint list/show/resolve` (weak refs + health, never secrets) + audit
 
 ### Plugin platform hardening — lifecycle, internal-network reach, distribution
 Gaps surfaced while verifying the plugin install + running `scripts/smoke-plugins.sh` (the gitlab case fails

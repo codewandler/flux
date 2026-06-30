@@ -67,6 +67,40 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 
 ## Next
 
+### Endpoint discovery & brokerage (epic) — **new top priority**
+
+flux's plugins each talk to a single, statically-configured service; the fluxplane pack they were modelled on
+had **cross-plugin endpoint discovery**, which flux deferred in
+[D-10](stories/D-10-process-plugin-protocol.md) (both it and the parity epic list a `.dex`-style endpoint
+registry as a non-goal). This epic **reverses that deferral**. Its spine is a hard invariant — **a plugin
+operation deals only in references**: it never reads, names, or receives an environment variable, never
+receives a raw secret, never assembles a credential-bearing URL. Everything host-bound is an opaque,
+host-managed `endpoint_ref` / `credential_ref`; the host alone resolves a reference and injects credentials,
+so neither the plugin nor the LLM ever sees a secret value. Over that, the kubernetes plugin becomes an
+endpoint **provider** (kubeconfig contexts → clusters; in-cluster services → prometheus/loki/grafana/
+alertmanager/sql endpoints; RDS/crossplane secrets → credential *references*), and a consumer asks the host
+*"which endpoints exist?"* → the host **fans out** to providers and returns weak refs. Epic design:
+[endpoint-discovery.md](designs/endpoint-discovery.md). **[D-20](stories/D-20-scoped-private-net-egress.md) is
+a hard prerequisite** (discovered endpoints are usually private/in-cluster hosts). Built in this order:
+
+- **[D-25](stories/D-25-endpoint-reference-model.md) — Reference model & registry** · *Core, leads (ready).*
+  `EndpointRef` weak refs + `EndpointRegistry` (owner/TTL) + a static env/config resolver that moves env
+  binding out of the plugin into host config (clean cutover). The spine; no discovery yet.
+- **[D-26](stories/D-26-endpoint-discovery-broker.md) — Discovery provider role & fan-out broker** · *Core.*
+  Manifest `discovers: [products]` + an `endpoint.discover` host capability; the broker matches a product and
+  fans out to provider plugins, returning weak refs only.
+- **[D-27](stories/D-27-reference-based-io.md) — Reference-based IO & host-injected connect** · *Core, needs
+  D-20.* The protocol cutover that **enforces** the invariant — host IO takes an `endpoint_ref` and injects
+  credentials host-side (incl. cross-plugin Kubernetes-scheme refs); cross-plugin credential use is
+  deny-by-default + operator grant + first-use approval + audit.
+- **[D-28](stories/D-28-kubernetes-endpoint-provider.md) — Kubernetes endpoint provider** · *Agent.* The
+  reference provider; elevates the existing k8s discover/cluster/secret ops into a real provider.
+- **[D-29](stories/D-29-migrate-plugins-to-references.md) — Migrate native plugins to references** · *Agent.*
+  Clean-cutover every native plugin onto ref-based IO; the sql/observability consumers use discovered
+  endpoints (multi-instance); `flux app run` + agent wiring.
+- **[D-30](stories/D-30-endpoint-lifecycle-cli.md) — Endpoint lifecycle: refresh runner, CLI & audit** ·
+  *Core.* Periodic rediscovery + `flux endpoint list/show/resolve` (weak refs + health, never secrets) + audit.
+
 ### Downstream enablement
 
 A ranked track that exists to **unblock and de-risk downstream products** that consume flux by **path
@@ -289,6 +323,10 @@ makes codex's **websocket** the default transport (HTTP fallback), and adds the 
 Drift made visible, so it stops being silent. Each maps to a story on the
 [board](stories/README.md):
 
+- **Plugin ops still bind to env-var names + receive raw URLs; no cross-plugin endpoint discovery.**
+  fluxplane's reference / registry / discovery / runner was dropped in D-10/D-12 (a `.dex`-style endpoint
+  registry was an explicit non-goal); it is now a top-priority essentials epic. → endpoint discovery &
+  brokerage ([D-25](stories/D-25-endpoint-reference-model.md)..[D-30](stories/D-30-endpoint-lifecycle-cli.md)).
 - **Two turn loops.** The CLI/TUI/server run the pure-DAG `FlowEngine`, but the SDK's
   `flux_sdk::Client` still drives the classic `flux-agent::Agent` loop. Unify onto
   `FlowEngine`/`FlowClient` and retire `flux-agent::Agent` (ref

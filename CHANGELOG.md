@@ -6,6 +6,21 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **Endpoint discovery & brokerage epic (planning).** Filed the design for cross-plugin endpoint discovery
+  ([docs/designs/endpoint-discovery.md](docs/designs/endpoint-discovery.md)) and stories D-25–D-30: a
+  references-only plugin-IO model (a plugin operation deals only in host-managed endpoint/credential
+  references — never env vars, raw secrets, or credential-bearing URLs), a host fan-out discovery broker, a
+  kubernetes endpoint provider, and an endpoint-lifecycle CLI. Reverses the `.dex`-style endpoint-registry
+  deferral from D-10/D-12; D-20 (scoped private-net egress) is pulled in as a hard dependency. Design +
+  backlog only — no code yet.
+
+### Fixed
+
+- Preserved kubeconfig access in `scripts/smoke-plugins.sh` when the Kubernetes plugin smoke uses an
+  isolated `HOME`, so `kubectl` sees the same configured cluster as the caller.
+
 ## [0.2.7] - 2026-06-30
 
 ### Changed
