@@ -25,9 +25,6 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [I-01 — Statistically clean self-improvement headline gain (trials ≥ 3)](I-01-headline-gain.md) · Improve · offline half done (partial-credit scalar + durable token capture + synthetic `trials = 5` loop); the trials ≥ 5 grader-confirmed run is **staged** on a funded provider key
 
 ## Next (ready — take the top one unless the user named a story)
-- [D-31 — schemars-derive every operation schema](D-31-schemars-op-schemas.md) · Core · **top pick** · kill
-  all hand-written `input_schema: json!` in-process; now unblocked by L-09 (named-args killed
-  `x-param-order`). Worktree `flux-schemars-refactor` has foundations + half the files migrated.
 - [D-11 — App-runner ergonomics for declarative bots (knowledge-ingest config, OpenAPI, persona/event-context from file)](D-11-app-runner-ergonomics.md) · Agent · the ready pick: configurable `flux app run` knowledge ingest + OpenAPI + persona/event-context-from-file; makes it a viable host for a declarative bot, unblocking Slack-channel assistant flows
 
 ## Blocked
@@ -58,6 +55,11 @@ _flux can already drive the two **subscription / passthrough** model backends �
 - [C-08 — Full OAuth2 login — codex PKCE (+ claude parity)](C-08-full-oauth2-login.md) · Core · the explicit later stage; import + refresh cover the near term
 
 ## Done
+- [D-31 — schemars-derive every operation schema](D-31-schemars-op-schemas.md) · Core · every in-process
+  `ToolSpec` op's `input_schema` is derived from a `#[derive(Deserialize, JsonSchema)]` struct via
+  `tool_input_schema::<T>()`; a regression guard (`tests/no_manual_schema.rs`) blocks reintroducing a
+  hand-written `json!` schema, and `DRIFT.md` records the schema↔handler mismatches found + fixed.
+  Plugin `OperationSpec` ops remain deferred. Unblocked by L-09 (named-args killed `x-param-order`).
 - [L-09 — Named-argument calls](L-09-named-argument-calls.md) · Language · `call` parameter
   order is no longer load-bearing — multi-param ops use a single named object arg, sole-required-param
   ops keep bare-value sugar, `x-param-order` is gone and `required` is a set. Unblocks D-31 (schemars).

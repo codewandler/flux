@@ -120,6 +120,15 @@ All notable changes to this project are documented in this file. The format is b
   prompt + catalog signature (`name({params})`) + skills/reference docs now teach the
   named-args form. This unblocks the schemars schema migration (D-31), since `schemars`
   does not emit `x-param-order`.
+- **schemars-derived op input schemas (D-31).** Every in-process `ToolSpec` operation's
+  `input_schema` is now derived from a typed Rust struct via
+  `flux_spec::tool_input_schema::<T>()` (schemars), killing all hand-written
+  `json!({...})` schemas across `flux-tools`, `flux-eval`, and `flux-orchestrate` — so an
+  op's schema and its runtime parsing can no longer drift. A regression guard
+  (`crates/flux-tools/tests/no_manual_schema.rs`) fails on a reintroduced hand-written
+  schema; `DRIFT.md` records the mismatches found + fixed (notably broken `$ref`s in the
+  eval comparison ops and the dropped `x-param-order` cargo extension). Plugin
+  `OperationSpec` ops (~275) remain deferred.
 
 ### Fixed
 

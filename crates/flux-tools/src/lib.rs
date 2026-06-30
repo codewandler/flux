@@ -19,7 +19,7 @@ pub use evidence::register_evidence;
 pub use reflect::register_reflect;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use flux_core::{Error, Result};
 use flux_policy::wildcard_match;
@@ -227,6 +227,228 @@ pub fn register_builtins(registry: &mut ToolRegistry) {
 }
 
 // ---------------------------------------------------------------------------
+// typed op input structs (schemars-derived input_schema — single source of truth
+// for the model-facing schema; handlers keep ad-hoc &Value parsing, so the structs
+// are schema-only and carry #[allow(dead_code)]).
+// ---------------------------------------------------------------------------
+
+/// A string or an array of strings (read's `path` accepts a glob/path or a list).
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+enum StringOrVec {
+    Single(String),
+    Many(Vec<String>),
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReadInput {
+    /// A single workspace-relative path (string), an array of paths, or a glob pattern (string containing * or ?)
+    path: StringOrVec,
+    /// 0-based first line (single-file only)
+    #[serde(default)]
+    offset: Option<u64>,
+    /// Max lines to return (single-file only)
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct EditInput {
+    path: String,
+    old_string: String,
+    new_string: String,
+    #[serde(default)]
+    replace_all: Option<bool>,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct BashInput {
+    command: String,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ProcRunInput {
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GlobInput {
+    /// Glob, e.g. `*.rs` or `src/*`
+    pattern: String,
+    /// Subdirectory to search (default `.`)
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GrepInput {
+    /// Regex to find (or substring if `literal`)
+    pattern: String,
+    /// Treat `pattern` as a plain substring, not a regex
+    #[serde(default)]
+    literal: Option<bool>,
+    /// Only search files matching this glob
+    #[serde(default)]
+    glob: Option<String>,
+    /// Subdirectory to search (default `.`)
+    #[serde(default)]
+    path: Option<String>,
+    /// Cap on matches (default 200)
+    #[serde(default)]
+    max_results: Option<u64>,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AppendInput {
+    path: String,
+    content: String,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReadManyInput {
+    /// Workspace-relative paths to read
+    paths: Vec<String>,
+}
+
+/// A patch edit operation.
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum PatchOpKind {
+    InsertBefore,
+    InsertAfter,
+    ReplaceRange,
+    DeleteRange,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PatchEdit {
+    op: PatchOpKind,
+    /// 1-based anchor line in the ORIGINAL file
+    line: u64,
+    /// 1-based inclusive end (range ops)
+    #[serde(default)]
+    end_line: Option<u64>,
+    /// Text to insert/replace with
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PatchInput {
+    path: String,
+    edits: Vec<PatchEdit>,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitStageInput {
+    /// Workspace-relative paths to stage
+    paths: Vec<String>,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitCommitInput {
+    /// Commit title
+    message: String,
+    /// Optional commit body (appended after a blank line)
+    #[serde(default)]
+    body: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitDiffInput {
+    /// Restrict diff to this file (optional)
+    #[serde(default)]
+    path: Option<String>,
+    /// Show staged (index) diff instead of unstaged
+    #[serde(default)]
+    staged: Option<bool>,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitLogInput {
+    /// Number of commits to show (default 10)
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitPushInput {
+    /// Remote name (default `origin`)
+    #[serde(default)]
+    remote: Option<String>,
+    /// Branch to push (default current branch)
+    #[serde(default)]
+    branch: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitCheckoutInput {
+    /// Branch name to switch to or create
+    branch: String,
+    /// Create the branch if it doesn't exist
+    #[serde(default)]
+    create: Option<bool>,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitUnstageInput {
+    /// Files to unstage
+    paths: Vec<String>,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitStatusInput {}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct FluxReloadInput {}
+
+// ---------------------------------------------------------------------------
 // read
 // ---------------------------------------------------------------------------
 
@@ -243,21 +465,7 @@ impl Tool for ReadTool {
              sections headed `==> path <==`. Optional `offset`/`limit` apply only to single-file \
              reads. Refuses binary files and, for a very large file read whole, returns guidance \
              to request a range instead.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "description": "A single workspace-relative path (string), an array of paths, or a glob pattern (string containing * or ?)",
-                        "oneOf": [
-                            {"type": "string"},
-                            {"type": "array", "items": {"type": "string"}}
-                        ]
-                    },
-                    "offset": {"type": "integer", "description": "0-based first line (single-file only)"},
-                    "limit": {"type": "integer", "description": "Max lines to return (single-file only)"}
-                },
-                "required": ["path"]
-            }),
+            tool_input_schema::<ReadInput>(),
         )
         .with_access(vec![AccessKind::Filesystem])
     }
@@ -435,16 +643,7 @@ impl Tool for EditTool {
                           then indentation drift, then anchoring on the first/last line of a block — \
                           and the result reports which strategy matched. Returns a unified diff."
                 .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "old_string": {"type": "string"},
-                    "new_string": {"type": "string"},
-                    "replace_all": {"type": "boolean"}
-                },
-                "required": ["path", "old_string", "new_string"]
-            }),
+            input_schema: tool_input_schema::<EditInput>(),
             output_schema: None,
             effects: vec![Effect::Write, Effect::Filesystem],
             risk: Risk::Medium,
@@ -908,14 +1107,7 @@ impl Tool for BashTool {
                           `enable_shell = true` or `FLUX_ENABLE_BASH=1`). Prefer the dedicated ops. \
                           Gated by permission rules and approval."
                 .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"},
-                    "timeout_secs": {"type": "integer"}
-                },
-                "required": ["command"]
-            }),
+            input_schema: tool_input_schema::<BashInput>(),
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
             risk: Risk::High,
@@ -1014,15 +1206,7 @@ impl Tool for ProcRunTool {
                           parsing, env cleared by flux-system, output capped, approval-gated, and \
                           hidden by default behind the `shell` group."
                 .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "program": {"type": "string"},
-                    "args": {"type": "array", "items": {"type": "string"}},
-                    "timeout_secs": {"type": "integer"}
-                },
-                "required": ["program"]
-            }),
+            input_schema: tool_input_schema::<ProcRunInput>(),
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
             risk: Risk::High,
@@ -1090,14 +1274,7 @@ impl Tool for GlobTool {
             "List workspace files matching a glob pattern. `*` matches any characters (including \
              `/`), so `*.rs` finds all Rust files and `src/*` everything under src. Optional \
              `path` scopes the search to a subdirectory. Patterns match workspace-relative paths.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "Glob, e.g. `*.rs` or `src/*`"},
-                    "path": {"type": "string", "description": "Subdirectory to search (default `.`)"}
-                },
-                "required": ["pattern"]
-            }),
+            tool_input_schema::<GlobInput>(),
         )
         .with_effects(vec![Effect::Read, Effect::Filesystem])
         .with_access(vec![AccessKind::Filesystem])
@@ -1145,17 +1322,7 @@ impl Tool for GrepTool {
             "Search file contents by regular expression across the workspace (set `literal` for a \
              plain substring instead). Optional `glob` restricts which files are searched (e.g. \
              `*.rs`) and `path` scopes to a subdirectory. Returns `path:line: text` for each match.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "Regex to find (or substring if `literal`)"},
-                    "literal": {"type": "boolean", "description": "Treat `pattern` as a plain substring, not a regex"},
-                    "glob": {"type": "string", "description": "Only search files matching this glob"},
-                    "path": {"type": "string", "description": "Subdirectory to search (default `.`)"},
-                    "max_results": {"type": "integer", "description": "Cap on matches (default 200)"}
-                },
-                "required": ["pattern"]
-            }),
+            tool_input_schema::<GrepInput>(),
         )
         .with_effects(vec![Effect::Read, Effect::Filesystem])
         .with_access(vec![AccessKind::Filesystem])
@@ -1249,14 +1416,7 @@ impl Tool for AppendTool {
                 "Append text to a workspace file, creating it (and parent dirs) if absent. \
                           Lower-risk than `write`, which overwrites the whole file."
                     .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"}
-                },
-                "required": ["path", "content"]
-            }),
+            input_schema: tool_input_schema::<AppendInput>(),
             output_schema: None,
             effects: vec![Effect::Write, Effect::Filesystem],
             risk: Risk::Low,
@@ -1352,17 +1512,7 @@ impl Tool for ReadManyTool {
             "Read several files at once (each section is headed `==> path <==`). Prefer `read` \
              with an array or glob pattern — `read_many` is a legacy alias kept for backward \
              compatibility.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "paths": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Workspace-relative paths to read"
-                    }
-                },
-                "required": ["paths"]
-            }),
+            tool_input_schema::<ReadManyInput>(),
         )
         .with_effects(vec![Effect::Read, Effect::Filesystem])
         .with_access(vec![AccessKind::Filesystem])
@@ -1512,26 +1662,7 @@ impl Tool for PatchTool {
                           file (use `read`/numbered output to find them); overlapping edits are \
                           rejected. Returns a unified diff."
                 .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "edits": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "op": {"type": "string", "enum": ["insert_before", "insert_after", "replace_range", "delete_range"]},
-                                "line": {"type": "integer", "description": "1-based anchor line in the ORIGINAL file"},
-                                "end_line": {"type": "integer", "description": "1-based inclusive end (range ops)"},
-                                "text": {"type": "string", "description": "Text to insert/replace with"}
-                            },
-                            "required": ["op", "line"]
-                        }
-                    }
-                },
-                "required": ["path", "edits"]
-            }),
+            input_schema: tool_input_schema::<PatchInput>(),
             output_schema: None,
             effects: vec![Effect::Write, Effect::Filesystem],
             risk: Risk::Medium,
@@ -1721,17 +1852,7 @@ impl Tool for GitStageTool {
             description: "Stage specific workspace files for the next git commit (`git add`). \
                           Pass a list of workspace-relative paths."
                 .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "paths": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Workspace-relative paths to stage"
-                    }
-                },
-                "required": ["paths"]
-            }),
+            input_schema: tool_input_schema::<GitStageInput>(),
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
             risk: Risk::Medium,
@@ -1798,14 +1919,7 @@ impl Tool for GitCommitTool {
                           title (required); `body` is an optional multi-line description appended \
                           after a blank line."
                 .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "message": {"type": "string", "description": "Commit title"},
-                    "body": {"type": "string", "description": "Optional commit body (appended after a blank line)"}
-                },
-                "required": ["message"]
-            }),
+            input_schema: tool_input_schema::<GitCommitInput>(),
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
             risk: Risk::Medium,
@@ -1872,7 +1986,7 @@ impl Tool for GitStatusTool {
                 "Show the working tree status (like `git status --short`). Returns a list \
                           of modified, staged, and untracked files."
                     .into(),
-            input_schema: json!({"type": "object", "properties": {}}),
+            input_schema: tool_input_schema::<GitStatusInput>(),
             output_schema: None,
             effects: vec![Effect::Process],
             risk: Risk::Low,
@@ -1935,13 +2049,7 @@ impl Tool for GitDiffTool {
             description: "Show unstaged changes (or staged changes with `staged: true`). Optional \
                           `path` restricts the diff to a specific file."
                 .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Restrict diff to this file (optional)"},
-                    "staged": {"type": "boolean", "description": "Show staged (index) diff instead of unstaged"}
-                }
-            }),
+            input_schema: tool_input_schema::<GitDiffInput>(),
             output_schema: None,
             effects: vec![Effect::Process],
             risk: Risk::Low,
@@ -2016,12 +2124,7 @@ impl Tool for GitLogTool {
                 "Show recent commits (hash + subject). Optional `limit` controls how many \
                           entries are returned (default 10)."
                     .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "description": "Number of commits to show (default 10)"}
-                }
-            }),
+            input_schema: tool_input_schema::<GitLogInput>(),
             output_schema: None,
             effects: vec![Effect::Process],
             risk: Risk::Low,
@@ -2086,13 +2189,7 @@ impl Tool for GitPushTool {
             description: "Push the current branch to its upstream remote. Optional `remote` \
                           (default `origin`) and `branch` (default current branch)."
                 .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "remote": {"type": "string", "description": "Remote name (default `origin`)"},
-                    "branch": {"type": "string", "description": "Branch to push (default current branch)"}
-                }
-            }),
+            input_schema: tool_input_schema::<GitPushInput>(),
             output_schema: None,
             effects: vec![Effect::Process, Effect::Network],
             risk: Risk::Medium,
@@ -2163,14 +2260,7 @@ impl Tool for GitCheckoutTool {
             description: "Switch to a branch or create a new one. Set `create: true` to create \
                           the branch (equivalent to `git checkout -b`)."
                 .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "branch": {"type": "string", "description": "Branch name to switch to or create"},
-                    "create": {"type": "boolean", "description": "Create the branch if it doesn't exist"}
-                },
-                "required": ["branch"]
-            }),
+            input_schema: tool_input_schema::<GitCheckoutInput>(),
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
             risk: Risk::Medium,
@@ -2239,17 +2329,7 @@ impl Tool for GitUnstageTool {
             description: "Remove files from the git index (unstage) without losing working-tree \
                           changes. `paths` is a list of workspace-relative paths to unstage."
                 .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "paths": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Files to unstage"
-                    }
-                },
-                "required": ["paths"]
-            }),
+            input_schema: tool_input_schema::<GitUnstageInput>(),
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
             risk: Risk::Low,
@@ -2328,7 +2408,7 @@ impl Tool for ReloadTool {
                           the freshly built binary, resuming the session. Dev mode only. Call \
                           this when you want to apply code changes without losing session state."
                 .into(),
-            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            input_schema: tool_input_schema::<FluxReloadInput>(),
             output_schema: None,
             effects: vec![Effect::Process],
             risk: flux_spec::Risk::High,
@@ -2412,6 +2492,7 @@ pub fn register_dev_builtins(registry: &mut flux_runtime::ToolRegistry) {
 mod tests {
     use super::*;
     use flux_system::{System, Workspace};
+    use serde_json::json;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);

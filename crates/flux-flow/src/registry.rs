@@ -346,17 +346,22 @@ mod tests {
         assert_eq!(read.param_signature(), "{path, limit, offset}");
 
         let edit = ops.get("edit").unwrap();
+        // `required` is a set (membership, not order): schemars builds it from a map, so its
+        // serialization order is non-deterministic. Check as a sorted set.
+        let mut req_sorted = edit.required_params.clone();
+        req_sorted.sort();
         assert_eq!(
-            edit.required_params,
+            req_sorted,
             vec![
-                "path".to_string(),
+                "new_string".to_string(),
                 "old_string".to_string(),
-                "new_string".to_string()
+                "path".to_string()
             ]
         );
+        assert_eq!(edit.optional_params, vec!["replace_all".to_string()]);
         assert_eq!(
             edit.param_signature(),
-            "{path, old_string, new_string, replace_all}"
+            "{new_string, old_string, path, replace_all}"
         );
     }
 }
