@@ -2,9 +2,9 @@
 id: D-12
 title: Plugin protocol parity extensions (auth / conn / blob)
 pillar: Core
-status: in-progress
-priority: 1
+status: done
 design: docs/designs/plugin-protocol-parity.md
+note: "additive host caps for the missing fluxplane plugins — non-Bearer auth injection (A: Basic/header/query by purpose) + raw `conn.*` dialer (B) + `blob.*` store (C); clean extension of `flux.plugin.v1`, unblocks D-14..D-17 (commit `a21bc47`)"
 ---
 
 # Plugin protocol parity extensions (auth / conn / blob)

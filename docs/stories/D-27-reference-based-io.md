@@ -4,6 +4,7 @@ title: Reference-based IO & host-injected connect (the invariant, enforced)
 pillar: Core
 status: done
 design: docs/designs/endpoint-discovery.md
+note: "enforces the references-only invariant: `http.do`/`conn.dial` take an `endpoint_ref`, the host resolves + injects the credential (cross-plugin `Kubernetes`-scheme via the owning plugin's `secret.read`), gated deny-by-default + operator grant + first-use-approval seam + `CrossPluginResolve` audit; the gated `credential` capability serves raw-socket in-band auth (trusted plugin only, never the model)"
 ---
 
 # Reference-based IO & host-injected connect (the invariant, enforced)

@@ -3,8 +3,8 @@ id: C-01
 title: Crate consolidation, phases 2–4
 pillar: Core
 status: done
-priority:
 design: docs/designs/crate-consolidation.md
+note: hooks→plugin, browser+datasource→capabilities, context→runtime; removed dead integrations (35 → 31 crates)
 ---
 
 # Crate consolidation, phases 2–4

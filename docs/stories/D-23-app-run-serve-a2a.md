@@ -3,8 +3,7 @@ id: D-23
 title: Serve agents through flux app run
 pillar: Agent
 status: done
-priority:
-design:
+note: removed the standalone `flux serve` command; `flux app run --serve <addr> --yes` now serves the built-in coding agent, `.flux` programs can declare an `a2a` channel, and one-agent programs can be exposed ad hoc with `--serve`
 ---
 
 # Serve agents through flux app run

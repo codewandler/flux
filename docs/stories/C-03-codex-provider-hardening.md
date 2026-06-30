@@ -3,9 +3,10 @@ id: C-03
 title: Codex provider hardening — account-id, usage tiers, reasoning continuity
 pillar: Core
 status: in-progress
-priority:
-design: docs/designs/subscription-providers-and-cost.md
+epic: subscription-providers-and-cost
 theme: subscription-providers-cost
+design: docs/designs/subscription-providers-and-cost.md
+note: "`account_id` from the `id_token` JWT, cache+reasoning token capture, reasoning continuity under `store:false`"
 ---
 
 # Codex provider hardening — account-id, usage tiers, reasoning continuity

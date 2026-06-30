@@ -3,9 +3,9 @@ id: D-01
 title: Parameterized flow execution — the behaviour-runner seam
 pillar: Agent
 status: done
-priority:
 theme: downstream-managed-services
 design: docs/designs/flow-input-seeding.md
+note: "deterministic `FlowClient::parse` (no model round-trip) + a per-run input-seeding seam (`FlowStore::seed` + `FlowClient::execute_with`/`run_flow`) so a stored flow runs per invocation with injected `$var` settings — fresh-store isolation, flow-local binds shadow seeds, envelope unchanged; modules, zero new crates; serves downstream behaviour-runner/preset consumers (see [CHANGELOG](../../CHANGELOG.md))"
 ---
 
 # Parameterized flow execution — the behaviour-runner seam

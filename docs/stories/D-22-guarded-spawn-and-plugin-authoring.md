@@ -3,8 +3,7 @@ id: D-22
 title: One guarded process-spawn path + the plugin authoring guide
 pillar: Core
 status: done
-priority:
-design:
+note: "funneled all OS-process creation through one `flux_system` `build_command` (+ new `spawn_interactive`); `PluginHost::spawn` routed through it so the **plugin process is env-cleared** — a plugin can no longer read the host's secrets via `std::env` (gated `secret` is the only path), closing a bypass of the deny-by-default model; flux-runtime git-context also via `System::run`; new `plugins/AUTHORING.md` (linked from AGENTS.md + README); env-isolation regression test; full root gate green"
 ---
 
 # One guarded process-spawn path + the plugin authoring guide

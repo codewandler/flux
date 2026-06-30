@@ -4,6 +4,7 @@ title: Kubernetes endpoint provider (the reference provider)
 pillar: Agent
 status: done
 design: docs/designs/endpoint-discovery.md
+note: the reference provider (`kubernetes.endpoint.discover` → cluster/Service/Ingress/RDS `EndpointCandidate`s with a `credential_ref`, latest-namespace) + the broker op-name reconciliation + the agent-facing `endpoint.discover/select/info/list` ops, `endpoint` group, `kubernetes` signal, and a mapping skill — the "connect to my latest namespace backend RDS" demo path is now wired
 ---
 
 # Kubernetes endpoint provider (the reference provider)

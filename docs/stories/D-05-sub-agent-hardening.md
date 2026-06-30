@@ -3,9 +3,9 @@ id: D-05
 title: Harden the sub-agent primitive for multi-tenant production
 pillar: Agent
 status: done
-priority:
 theme: downstream-managed-services
 design: docs/designs/sub-agent-hardening.md
+note: "SDK seam (`FlowClient::with_sub_agents`) + lifecycle limits (cancel/wall-clock) + pluggable approver + tested isolation + child audit; the primitive downstream multi-tenant consumers use (see [CHANGELOG](../../CHANGELOG.md))"
 ---
 
 # Harden the sub-agent primitive for multi-tenant production

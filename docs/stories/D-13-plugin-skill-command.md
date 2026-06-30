@@ -3,8 +3,8 @@ id: D-13
 title: Generated plugin skill — `flux plugin skill`
 pillar: Core
 status: done
-priority:
 design: docs/designs/plugin-skill-generation.md
+note: renders installed-plugin manifests into a Claude-format `flux-plugin` SKILL.md + `references/` (the flux analogue of fluxplane's `fluxplane-plugin skill`); now also exposed through `flux skill plugin`
 ---
 
 # Generated plugin skill — `flux plugin skill`

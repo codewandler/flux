@@ -4,6 +4,7 @@ title: Observability & AI plugin pack (alertmanager, grafana, opsgenie, huggingf
 pillar: Agent
 status: done
 design: docs/designs/fluxplane-plugins-parity.md
+note: added native `alertmanager` (5 ops), `grafana` (20), `opsgenie` (8), and `huggingface` (9), with datasource contributions and env-gated smoke coverage; full `plugins/` gate green
 ---
 
 # Observability & AI plugin pack

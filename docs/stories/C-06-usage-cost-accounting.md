@@ -3,9 +3,10 @@ id: C-06
 title: Usage & cost accounting — attribution, aggregation, reporting
 pillar: Core
 status: backlog
-priority:
-design: docs/designs/subscription-providers-and-cost.md
+epic: subscription-providers-and-cost
 theme: subscription-providers-cost
+design: docs/designs/subscription-providers-and-cost.md
+note: model attribution + sub-agent rollup + a `cost_summary` projection + `flux usage` + a server endpoint + cache-aware surfacing (needs C-05)
 ---
 
 # Usage & cost accounting — attribution, aggregation, reporting

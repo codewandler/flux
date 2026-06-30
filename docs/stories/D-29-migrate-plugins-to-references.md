@@ -4,6 +4,7 @@ title: Migrate native plugins to references & consume discovered endpoints
 pillar: Agent
 status: done
 design: docs/designs/endpoint-discovery.md
+note: primary plugin IO is now reference-based (the `SystemHostCaps` named-vs-discovered split + host-kit `*_ref` helpers; 6 URL-handback callers migrated), and `sql` consumes a discovered Postgres endpoint (password via the gated `credential` capability, never a URL/model). Full removal of `host.endpoint` is a tracked follow-up (byte-IO / Atlassian gateway / config residuals)
 ---
 
 # Migrate native plugins to references & consume discovered endpoints

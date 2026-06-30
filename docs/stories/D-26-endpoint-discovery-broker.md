@@ -4,6 +4,7 @@ title: Discovery provider role & host fan-out broker
 pillar: Core
 status: done
 design: docs/designs/endpoint-discovery.md
+note: manifest `discovers`/`discover` + the L5 `EndpointBroker` (fan-out over a `ProviderInvoker` seam, rank, re-entrancy guard) + `EndpointBrokerHostCaps`; wired into both `flux run` and `flux app run` so a consumer plugin's `endpoint.discover` reaches provider plugins through the host
 ---
 
 # Discovery provider role & host fan-out broker

@@ -4,6 +4,7 @@ title: Telephony plugin pack (asterisk, homer)
 pillar: Agent
 status: done
 design: docs/designs/fluxplane-plugins-parity.md
+note: added native `asterisk` (8 AMI ops over guarded `conn.*`) and `homer` (8 HTTP/JWT ops, including SIP search/call/QoS/PCAP export); full `plugins/` gate green
 ---
 
 # Telephony plugin pack

@@ -3,9 +3,10 @@ id: C-05
 title: Cross-provider pricing & cost model
 pillar: Core
 status: backlog
-priority:
-design: docs/designs/subscription-providers-and-cost.md
+epic: subscription-providers-and-cost
 theme: subscription-providers-cost
+design: docs/designs/subscription-providers-and-cost.md
+note: per-model per-tier rates + `cost(&Usage, model)`; built-in table + `~/.flux/pricing.toml` override; normalize codecs' cache fields
 ---
 
 # Cross-provider pricing & cost model

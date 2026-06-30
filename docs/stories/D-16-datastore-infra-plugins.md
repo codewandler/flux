@@ -4,6 +4,7 @@ title: Datastore & infra plugin pack (sql, docker, aws)
 pillar: Agent
 status: done
 design: docs/designs/fluxplane-plugins-parity.md
+note: added native `sql` (6 PostgreSQL read/introspection ops over `ConnStream`, MySQL/SQLite explicit residuals), `docker` (33 core Docker Engine REST ops over Unix socket), and `aws` (11 read-only ops via host-managed `aws` CLI); full `plugins/` gate green
 ---
 
 # Datastore & infra plugin pack

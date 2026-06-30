@@ -3,7 +3,7 @@ id: D-31
 title: Host-terminated raw-socket auth (no credential to the plugin)
 pillar: Core
 status: backlog
-priority:
+epic: endpoint-discovery
 design: docs/designs/endpoint-discovery.md
 ---
 

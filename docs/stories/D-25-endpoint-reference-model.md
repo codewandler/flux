@@ -4,6 +4,7 @@ title: Endpoint reference model & registry (the references-only spine)
 pillar: Core
 status: done
 design: docs/designs/endpoint-discovery.md
+note: "the references-only spine of the endpoint epic: L0 `flux_secret::endpoint` schema (`EndpointRef`/ `Candidate`/`Record`/`ResolvedEndpoint`), the `flux_plugin::ReferenceResolver` trait seam, and `flux_capabilities::endpoint::{EndpointRegistry, StaticResolver}` with `~/.flux/endpoints.toml` persistence (weak refs only)"
 ---
 
 # Endpoint reference model & registry (the references-only spine)

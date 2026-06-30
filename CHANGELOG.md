@@ -6,6 +6,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **Board is now generated from story frontmatter (`track` plugin).** `docs/stories/README.md`'s
+  status lists (Now / Next / Blocked / Backlog / Done) are regenerated from each story's
+  frontmatter by the [`track` plugin](https://github.com/codewandler/agentplugins)
+  (`/track:board`), delimited by `<!-- BEGIN/END track:board -->` markers; the hand-written intro
+  and `## Status` summary stay outside the markers. This retires flux's manual "keep this board in
+  sync" upkeep. Story frontmatter gained two optional fields — `epic:` (design-doc slug; the board
+  groups backlog/ready rows under the epic, with a one-line blurb from the design doc's `## Why`)
+  and `note:` (a one-line row annotation) — and the prior per-story board one-liners were moved into
+  `note:` so the source of truth is the story file. Frontmatter drift surfaced by the migration was
+  reconciled: D-02/D-03/D-12 set to `done` (board + commits already showed them shipped), D-11 set
+  to `ready` (the board's "Next" pick), I-01's `priority: P1` normalized to `1`, and D-18 — which
+  was missing from the hand-written board — now correctly appears. Epic narrative prose that lived
+  on the board is summarized by the generator's blurb; the full narratives remain in each epic's
+  design doc.
+
 ### Added
 
 - **Endpoint lifecycle — refresh runner, operator CLI & audit (D-30).** The final step of the

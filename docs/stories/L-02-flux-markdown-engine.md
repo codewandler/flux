@@ -3,8 +3,7 @@ id: L-02
 title: flux-markdown engine + progressive-disclosure skills
 pillar: Language
 status: backlog
-priority:
-design:
+note: AST parser, body-on-demand activation
 ---
 
 # flux-markdown engine + progressive-disclosure skills

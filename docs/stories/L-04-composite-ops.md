@@ -3,8 +3,8 @@ id: L-04
 title: Define custom ops by composing Flux-Lang
 pillar: Language
 status: done
-priority:
 design: docs/designs/composite-ops.md
+note: "`.flux` modules can declare scoped composite ops that chain existing ops through the normal safety envelope; SDK, `flux flow run`, and `flux-app` install module composites; new argv-only `proc.run` process op is shell-group gated"
 ---
 
 # Define custom ops by composing Flux-Lang

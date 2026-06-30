@@ -3,8 +3,7 @@ id: L-05
 title: Publish public Docusaurus docs
 pillar: Language
 status: done
-priority:
-design:
+note: public Docusaurus site scaffold under `website/`, with Flux-Lang text syntax/semantics docs and GitHub Pages deployment to `codewandler.github.io/flux`
 ---
 
 # Publish public Docusaurus docs

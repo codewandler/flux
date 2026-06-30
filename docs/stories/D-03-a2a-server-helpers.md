@@ -2,9 +2,9 @@
 id: D-03
 title: Reusable A2A server helpers on the current spec
 pillar: Agent
-status: backlog
-priority:
+status: done
 theme: downstream-managed-services
+note: "lifted flux-server's A2A routes into the reusable `flux_a2a::server` helper; unblocks downstream A2A consumers + fixed the `tasks/send` drift (commit `7dcc6b3`)"
 ---
 
 # Reusable A2A server helpers on the current spec

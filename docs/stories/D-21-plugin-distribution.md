@@ -3,8 +3,8 @@ id: D-21
 title: Plugin distribution for non-source users (scoping)
 pillar: Core
 status: backlog
-priority:
-design:
+epic: plugin-platform-hardening
+note: "scoping/epic-seed: how a non-repo user obtains the pack (bundled binaries / fetch-on-install / marketplace); produces a design + the follow-on stories, no code"
 ---
 
 # Plugin distribution for non-source users (scoping)

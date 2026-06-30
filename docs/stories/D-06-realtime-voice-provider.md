@@ -3,9 +3,9 @@ id: D-06
 title: Realtime voice-to-voice as a first-class flux provider
 pillar: Agent
 status: done
-priority:
 theme: downstream-managed-services
 design: docs/designs/realtime-voice-provider.md
+note: "sibling `RealtimeProvider`/`RealtimeSession` seam (modules in flux-provider/flux-providers/flux-flow — zero new crates) + OpenAI-Realtime impl ported from a downstream realtime client; realtime tool calls run through `Executor` declared once; SDK `FlowClient::run_voice_session` + a Phase-2 engine-owned-turns spike (see [CHANGELOG](../../CHANGELOG.md))"
 ---
 
 # Realtime voice-to-voice as a first-class flux provider

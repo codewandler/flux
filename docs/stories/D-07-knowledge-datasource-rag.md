@@ -5,6 +5,7 @@ pillar: Core
 status: done
 theme: downstream-managed-services
 design: docs/designs/datasource-rag.md
+note: new L0 `flux-datasource` schema crate + a `DatasourceBackend` trait with in-memory + **SQLite-FTS5** backends, the five retrieval ops (`search`/`get`/`list`/`relation`/`batch_get`), markdown + OpenAPI ingesters, reindex/freshness, and an unwired embeddings seam (commits `2642479`/`e6d7279`/`5241c97`)
 ---
 
 # Knowledge datasource — a real RAG layer

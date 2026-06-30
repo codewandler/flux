@@ -3,8 +3,7 @@ id: I-02
 title: Reduce wasted agent-loop retries
 pillar: Improve
 status: done
-priority:
-design:
+note: cargo wrappers normalize duplicate model-supplied scope flags, and the loop guard fingerprints repeated deterministic failures before replanning again
 ---
 
 # Reduce wasted agent-loop retries

@@ -2,9 +2,9 @@
 id: D-02
 title: Tenant/context-taggable event substrate for downstream run persistence
 pillar: Core
-status: in progress
-priority: high
+status: done
 theme: downstream-managed-services
+note: optional stream-level account/agent/correlation context envelope on `flux-events` runs + account-scoped reads (`list_for_account`/`account_streams`) (commit `c97c8a4`)
 ---
 
 # Tenant/context-taggable event substrate for downstream run persistence

@@ -3,7 +3,7 @@ id: D-32
 title: Retire the host.endpoint URL-handback (complete the references-only cutover)
 pillar: Core
 status: backlog
-priority:
+epic: endpoint-discovery
 design: docs/designs/endpoint-discovery.md
 ---
 

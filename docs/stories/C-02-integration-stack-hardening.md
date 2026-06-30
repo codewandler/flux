@@ -5,6 +5,7 @@ pillar: Core
 status: done
 theme: downstream-managed-services
 design: docs/designs/integration-plugins.md
+note: "`flux plugin call`/`install` + a `plugins/` CI job (`a8092dc`); feature-gated embeddings/semantic backend — `OpenAiEmbedder` + a `SemanticIndex` hybrid-rerank decorator, default build unchanged (`f912c24`); a live env-gated `scripts/smoke-plugins.sh` (`5fda8be`)"
 ---
 
 # Integration-stack hardening

@@ -3,9 +3,10 @@ id: C-04
 title: Claude provider verify + force-refresh-on-401
 pillar: Core
 status: backlog
-priority:
-design: docs/designs/subscription-providers-and-cost.md
+epic: subscription-providers-and-cost
 theme: subscription-providers-cost
+design: docs/designs/subscription-providers-and-cost.md
+note: refresh today is expiry-time-only; add a 401→refresh→retry path (shared by both subscription providers)
 ---
 
 # Claude provider verify + force-refresh-on-401

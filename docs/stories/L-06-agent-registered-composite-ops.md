@@ -3,8 +3,8 @@ id: L-06
 title: Let agents register reusable composite ops
 pillar: Language
 status: done
-priority:
 design: docs/designs/composite-ops.md
+note: "`op.register` lets an agent install validated Flux-Lang composite ops into turn/session/project/global scope; project/global writes use guarded paths and registered ops remain scoped composite dispatch"
 ---
 
 # Let agents register reusable composite ops

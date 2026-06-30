@@ -3,8 +3,7 @@ id: D-24
 title: Harden provider schemas and CLI daemon ergonomics
 pillar: Agent
 status: done
-priority:
-design:
+note: "`emit_plan` now advertises the derived `DraftAst` schema, `flux plugin call` resolves short op names, served daemons honor SIGTERM, and `flux tui` fails clearly without a TTY"
 ---
 
 # Harden provider schemas and CLI daemon ergonomics

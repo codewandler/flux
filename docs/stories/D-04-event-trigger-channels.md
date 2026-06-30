@@ -3,9 +3,9 @@ id: D-04
 title: Event-trigger channels — cron/timed, webhook, Slack (background agents)
 pillar: Agent
 status: done
-priority:
 theme: downstream-managed-services
 design: docs/designs/event-trigger-channels.md
+note: "new `flux-channels` L6 crate; channels declared in the Program + run by `flux app run` (each fires a bus event → trigger → journey via `App::deliver`); schedule/webhook/Slack adapters (see [CHANGELOG](../../CHANGELOG.md))"
 ---
 
 # Event-trigger channels — cron/timed, webhook, Slack (background agents)

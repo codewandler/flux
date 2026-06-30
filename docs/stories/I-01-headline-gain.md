@@ -3,8 +3,8 @@ id: I-01
 title: Statistically clean self-improvement headline gain (trials ≥ 3)
 pillar: Improve
 status: in-progress
-priority: P1
-design:
+priority: 1
+note: offline half done (partial-credit scalar + durable token capture + synthetic `trials = 5` loop); the trials ≥ 5 grader-confirmed run is **staged** on a funded provider key
 ---
 
 # Statistically clean self-improvement headline gain (trials ≥ 3)

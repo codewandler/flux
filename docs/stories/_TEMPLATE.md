@@ -4,7 +4,9 @@ title: Short imperative title
 pillar: Agent         # Agent | Language | Improve | Core
 status: backlog       # backlog | ready | in-progress | blocked | done
 priority:             # integer rank among `ready` stories; omit otherwise
+epic:                 # optional: design-doc slug; the board groups backlog/ready rows under it
 design:               # optional: docs/designs/<slug>.md for non-trivial work
+note:                 # optional: one-line annotation rendered on the board row (never a secret)
 ---
 
 # <title>

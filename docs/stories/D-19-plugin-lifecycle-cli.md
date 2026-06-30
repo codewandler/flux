@@ -3,8 +3,8 @@ id: D-19
 title: Complete the `flux plugin` lifecycle surface (uninstall + status)
 pillar: Core
 status: backlog
-priority:
-design:
+epic: plugin-platform-hardening
+note: add `uninstall` + a richer `status`/`info` (version, pin, liveness, declared surface); small, no design doc
 ---
 
 # Complete the `flux plugin` lifecycle surface (uninstall + status)

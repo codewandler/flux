@@ -5,6 +5,7 @@ pillar: Core
 status: done
 theme: downstream-managed-services
 design: docs/designs/process-plugin-protocol.md
+note: enriched the plugin manifest (auth-by-purpose, datasource declarations, endpoints) + host capabilities (HTTP method/headers/body + bearer injection, secret-by-purpose, endpoint, datasource-record contribution) over the existing unified frame; `DatasourceHostCaps` L5 bridge (commits `f389bc7`/`7db537a`)
 ---
 
 # Process-plugin protocol redesign — a clean, unified plugin wire protocol

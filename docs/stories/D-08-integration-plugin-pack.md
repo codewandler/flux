@@ -5,6 +5,7 @@ pillar: Agent
 status: done
 theme: downstream-managed-services
 design: docs/designs/integration-plugins.md
+note: 8 native plugins in the in-repo `plugins/` workspace (websearch/gitlab/jira/confluence/kubernetes/loki/prometheus/slack) on a shared `host-kit`; reach vendors only via host caps; contribute `flux-datasource` records through the L5 `DatasourceHostCaps` bridge (commits `0e9b93e`/`deafe68`/`6b20c41`)
 ---
 
 # Integration plugin pack — native flux plugins for the DevOps surface

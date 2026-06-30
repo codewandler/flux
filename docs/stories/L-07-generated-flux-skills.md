@@ -3,8 +3,8 @@ id: L-07
 title: Generate Flux skills from live catalogs
 pillar: Language
 status: done
-priority:
 design: docs/designs/generated-flux-skills.md
+note: "`flux skill` renders Claude-format root/CLI/language/plugin/ops skills from live Clap, Flux-Lang, ToolRegistry/OpRegistry, and plugin-manifest sources; `--install` writes root + sections, and project `.claude/skills` is loaded by default after `.flux/skills`"
 ---
 
 # Generate Flux skills from live catalogs

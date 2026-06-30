@@ -4,7 +4,7 @@ title: A2A client — talk to a remote agent like a local one (flux a2a <URL>)
 pillar: Agent
 status: done
 priority: 1
-design:
+note: consume a remote A2A agent like a local one; server clean-cutover to the current spec (see [CHANGELOG](../../CHANGELOG.md))
 ---
 
 # A2A client — `flux a2a <URL>`

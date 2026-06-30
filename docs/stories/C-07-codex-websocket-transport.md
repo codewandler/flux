@@ -3,9 +3,10 @@ id: C-07
 title: Codex WebSocket transport (default, HTTP fallback)
 pillar: Core
 status: backlog
-priority:
-design: docs/designs/subscription-providers-and-cost.md
+epic: subscription-providers-and-cost
 theme: subscription-providers-cost
+design: docs/designs/subscription-providers-and-cost.md
+note: WS primary with transparent HTTP-SSE fallback (needs C-03)
 ---
 
 # Codex WebSocket transport (default, HTTP fallback)

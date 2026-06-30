@@ -4,6 +4,7 @@ title: Scope private-network egress to declared plugins/endpoints
 pillar: Core
 status: done
 design: docs/designs/scoped-private-net-egress.md
+note: "finished as the endpoint-epic Phase-2 prereq: the 0.2.7 scoped model gained **per-endpoint** grants (`PrivateNetConfig.endpoints`) and a **private-net-admit audit event** (`PrivateNetAdmit` via the `flux_plugin::EgressAudit` seam + a flux-cli event-store impl)"
 ---
 
 # Scope private-network egress to declared plugins/endpoints

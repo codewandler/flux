@@ -3,8 +3,8 @@ id: D-30
 title: Endpoint lifecycle — refresh runner, operator CLI & audit
 pillar: Core
 status: done
-priority:
 design: docs/designs/endpoint-discovery.md
+note: "the epic's final step: `EndpointBroker::refresh` re-discovers + reconciles each owner's set via `replace_owned` (stale dropped, other owners untouched) driven on-demand by `EndpointRunner::tick` (no always-on ticker — it would contend with the agent's plugin-host locks); a `flux endpoint` CLI (`list`/`show`/`resolve`/`import`) renders weak refs + health + the credential *location*, never a value (pinned by `cli::endpoint_list_redacts`); the agent `endpoint.import` op persists a weak ref to `~/.flux/endpoints.toml`; and a new `EndpointDiscovered` audit event fires per provider on `discover`/`refresh` (count only — no URL, no secret). The **endpoint-discovery epic core (D-25→D-30 + D-20) is complete**; D-31 (host-terminated raw-socket auth) and D-32 (retire the `host.endpoint` URL-handback) are filed as backlog hardenings."
 ---
 
 # Endpoint lifecycle — refresh runner, operator CLI & audit
