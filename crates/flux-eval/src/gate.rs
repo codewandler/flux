@@ -7,11 +7,11 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use flux_core::Result;
 use flux_runtime::{Tool, ToolContext, ToolResult};
-use flux_spec::{AccessKind, Effect, Idempotency, Risk, ToolSpec};
+use flux_spec::{tool_input_schema, AccessKind, Effect, Idempotency, Risk, ToolSpec};
 
 /// One gate step: a label, its argv, and the params key that toggles it.
 const STEPS: &[(&str, &[&str], &str)] = &[
@@ -36,6 +36,27 @@ const STEPS: &[(&str, &[&str], &str)] = &[
 /// `gate_check()` — build/test/clippy/fmt; `"pass"` only if every enabled step exits 0.
 pub struct GateCheckTool;
 
+/// Arguments for the `gate_check` op. Every step toggle defaults to on; `timeout_secs` bounds each step.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GateCheckInput {
+    /// Run `cargo build --workspace` (default true).
+    #[allow(dead_code)]
+    build: Option<bool>,
+    /// Run `cargo test --workspace` (default true).
+    #[allow(dead_code)]
+    test: Option<bool>,
+    /// Run `cargo clippy` with `-D warnings` (default true).
+    #[allow(dead_code)]
+    clippy: Option<bool>,
+    /// Run `cargo fmt --check` (default true).
+    #[allow(dead_code)]
+    fmt: Option<bool>,
+    /// Per-step timeout in seconds (default 1800).
+    #[allow(dead_code)]
+    timeout_secs: Option<u64>,
+}
+
 #[async_trait]
 impl Tool for GateCheckTool {
     fn spec(&self) -> ToolSpec {
@@ -45,16 +66,7 @@ impl Tool for GateCheckTool {
                           (all green) or \"false\". Toggle steps with booleans build/test/clippy/fmt \
                           (default all on); `timeout_secs` bounds each step."
                 .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "build": {"type": "boolean"},
-                    "test": {"type": "boolean"},
-                    "clippy": {"type": "boolean"},
-                    "fmt": {"type": "boolean"},
-                    "timeout_secs": {"type": "integer"}
-                }
-            }),
+            input_schema: tool_input_schema::<GateCheckInput>(),
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
             risk: Risk::Medium,

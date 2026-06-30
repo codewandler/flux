@@ -77,6 +77,52 @@ fn register_subject(params: &Value) -> Option<String> {
     }
 }
 
+/// Arguments for the `plan` op.
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PlanInput {
+    /// working feedback / conversation seed for the planner
+    #[serde(default)]
+    feedback: Option<String>,
+}
+
+/// Arguments for the `run_plan` op.
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RunPlanInput {
+    /// the Plan emitted by `plan` (its `ast` is executed)
+    plan: serde_json::Value,
+}
+
+/// Where a registered composite op is reusable.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum RegisterScope {
+    Turn,
+    Session,
+    Project,
+    Global,
+}
+
+/// Arguments for the `op.register` op.
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RegisterCompositeInput {
+    /// Flux-Lang source containing exactly one top-level `op ...` declaration
+    source: String,
+    /// where the op is reusable; use session by default for ad-hoc user-created operations, project/global only when explicitly requested
+    scope: RegisterScope,
+    /// replace an existing op of the same name; defaults to false
+    #[serde(default)]
+    replace: Option<bool>,
+    /// override the op declaration's model-facing exposure flag
+    #[serde(default)]
+    expose: Option<bool>,
+}
+
 /// `plan(feedback?) -> Plan` — re-enter the planner (the model) to produce a plan from the working
 /// feedback/conversation. Returns a `Plan` object `{kind: "plan"|"chat"|"error", text?, ast?,
 /// complete?}` as JSON text. The model stays the planner; this op only wraps the audited compile step.
@@ -92,15 +138,7 @@ impl Tool for PlanOp {
                           model stays the planner — this re-enters only the compile step, through the \
                           same audited envelope as any op."
                 .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "feedback": {
-                        "type": "string",
-                        "description": "working feedback / conversation seed for the planner"
-                    }
-                }
-            }),
+            input_schema: flux_spec::tool_input_schema::<PlanInput>(),
             output_schema: None,
             // A model call travels over the network and needs the provider; lowered like a cognition op.
             effects: vec![Effect::Network],
@@ -115,6 +153,9 @@ impl Tool for PlanOp {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        // Validate the argument shape against the typed schema, then forward the raw object to the
+        // host (which seeds the planner from the `feedback` field directly).
+        let _args: PlanInput = crate::parse_params(params.clone(), "plan")?;
         let plan = loop_host(ctx)?.plan(params).await?;
         Ok(ToolResult::ok(
             serde_json::to_string(&plan).unwrap_or_default(),
@@ -136,13 +177,7 @@ impl Tool for RunPlanOp {
                           {transcript, result, steps, suspension?}. The plan is re-validated and every \
                           op runs through the same approval+IO envelope; bounded by a reentry-depth cap."
                 .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "plan": { "description": "the Plan emitted by `plan` (its `ast` is executed)" }
-                },
-                "required": ["plan"]
-            }),
+            input_schema: flux_spec::tool_input_schema::<RunPlanInput>(),
             output_schema: None,
             // No host effects of its own: the inner ops declare and gate their own effects at their own
             // dispatch. Medium + non-idempotent so a risk pass never mistakes it for an inert read.
@@ -192,29 +227,7 @@ impl Tool for RegisterCompositeOp {
                           is requested. The registered op can only call existing ops, and every inner \
                           call still runs through the same approval and guarded-IO envelope."
                 .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "source": {
-                        "type": "string",
-                        "description": "Flux-Lang source containing exactly one top-level `op ...` declaration"
-                    },
-                    "scope": {
-                        "type": "string",
-                        "enum": ["turn", "session", "project", "global"],
-                        "description": "where the op is reusable; use session by default for ad-hoc user-created operations, project/global only when explicitly requested"
-                    },
-                    "replace": {
-                        "type": "boolean",
-                        "description": "replace an existing op of the same name; defaults to false"
-                    },
-                    "expose": {
-                        "type": "boolean",
-                        "description": "override the op declaration's model-facing exposure flag"
-                    }
-                },
-                "required": ["source", "scope"]
-            }),
+            input_schema: flux_spec::tool_input_schema::<RegisterCompositeInput>(),
             output_schema: None,
             effects: vec![Effect::Write, Effect::Filesystem],
             risk: Risk::Medium,

@@ -13,7 +13,7 @@ pub use flux_agent::{parse_role, Role, RoleRegistry};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use flux_agent::register_agent_ops;
 use flux_core::{Error, Result, Usage};
@@ -25,9 +25,16 @@ use flux_runtime::{
     ApprovalChoice, Approver, Executor, PermissionManager, Spawner, Tool, ToolContext,
     ToolRegistry, ToolResult,
 };
-use flux_spec::{Idempotency, IntentSet, Risk, ToolSpec};
+use flux_spec::{tool_input_schema, Idempotency, IntentSet, Risk, ToolSpec};
 use flux_system::System;
 use tokio_util::sync::CancellationToken;
+
+/// Deserialize an op's JSON arguments into its typed input struct — the single source of truth
+/// paired with the `schemars`-derived `input_schema`. Maps a serde error to the op-error style.
+fn parse_params<T: serde::de::DeserializeOwned>(params: serde_json::Value, op: &str) -> Result<T> {
+    serde_json::from_value(params)
+        .map_err(|e| Error::Other(format!("{op}: invalid arguments: {e}")))
+}
 
 /// The headless approver for sub-agents: they run non-interactively, so they auto-approve their
 /// scoped, policy-permitted tool calls — but a **destructive** operation is refused outright (a
@@ -570,6 +577,16 @@ pub async fn plan_and_dispatch_waves(
     Ok(output)
 }
 
+/// Arguments for the `task` op.
+#[derive(Default, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TaskInput {
+    /// Sub-agent role name
+    role: String,
+    /// What the sub-agent should do
+    task: String,
+}
+
 /// The `task` tool: delegate a subtask to a named role's sub-agent and return its result.
 pub struct TaskTool;
 
@@ -581,14 +598,7 @@ impl Tool for TaskTool {
             description: "Delegate a self-contained subtask to a sub-agent role \
                           (e.g. scout, planner, worker) and receive its result."
                 .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "role": {"type": "string", "description": "Sub-agent role name"},
-                    "task": {"type": "string", "description": "What the sub-agent should do"}
-                },
-                "required": ["role", "task"]
-            }),
+            input_schema: tool_input_schema::<TaskInput>(),
             output_schema: None,
             effects: Vec::new(),
             risk: Risk::Medium,
@@ -599,22 +609,14 @@ impl Tool for TaskTool {
     }
 
     fn permission_subjects(&self, params: &Value) -> Vec<String> {
-        params
-            .get("role")
-            .and_then(|v| v.as_str())
-            .map(|s| vec![s.to_string()])
+        // Best-effort: a missing/invalid `role` yields no subjects rather than failing here.
+        serde_json::from_value::<TaskInput>(params.clone())
+            .map(|args| vec![args.role])
             .unwrap_or_default()
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let role = params
-            .get("role")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| Error::Other("task: `role` required".into()))?;
-        let task = params
-            .get("task")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| Error::Other("task: `task` required".into()))?;
+        let args: TaskInput = parse_params(params, "task")?;
         let Some(spawner) = &ctx.spawner else {
             return Ok(ToolResult::error("no sub-agent spawner configured"));
         };
@@ -625,7 +627,7 @@ impl Tool for TaskTool {
             .cancel_token()
             .map(|t| t.child_token())
             .unwrap_or_default();
-        match spawner.spawn(role, task, &cancel).await {
+        match spawner.spawn(&args.role, &args.task, &cancel).await {
             Ok(text) => Ok(ToolResult::ok(text)),
             Err(e) => Ok(ToolResult::error(e.to_string())),
         }
@@ -638,6 +640,7 @@ mod tests {
     use flux_core::{Chunk, ContentBlock, StopReason};
     use flux_provider::{ChunkStream, Request};
     use flux_system::Workspace;
+    use serde_json::json;
 
     /// Mock provider: returns a fixed text reply (one canned turn).
     struct MockProvider;
@@ -1559,8 +1562,7 @@ mod tests {
                 let chunks = if n == 0 {
                     let ast = if is_delegator {
                         json!({ "body": [{ "kind": "call", "op": "task", "args": [
-                            { "kind": "lit", "value": "inner" },
-                            { "kind": "lit", "value": "do the thing" }
+                            { "kind": "lit", "value": { "role": "inner", "task": "do the thing" } }
                         ] }] })
                     } else {
                         json!({ "body": [{ "kind": "call", "op": "ping", "args": [] }] })

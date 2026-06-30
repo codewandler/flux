@@ -11,11 +11,11 @@ use serde_json::{json, Value};
 use flux_core::{Error, Result};
 use flux_runtime::{Tool, ToolContext, ToolResult};
 use flux_spec::{
-    AccessKind, Effect, Idempotency, Intent, IntentBehavior, IntentCertainty, IntentRole,
-    IntentSet, IntentTarget, Risk, ToolSpec,
+    tool_input_schema, AccessKind, Effect, Idempotency, Intent, IntentBehavior, IntentCertainty,
+    IntentRole, IntentSet, IntentTarget, Risk, ToolSpec,
 };
 
-use crate::util::{arg, json_result, str_field};
+use crate::util::{arg, json_result};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -67,13 +67,18 @@ fn short(sha: &str) -> &str {
 /// revert is exact). Erroring here aborts the flow — the safety floor for the autonomous loop.
 pub struct GitSnapshotTool;
 
+/// Arguments for the `git_snapshot` op (none).
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitSnapshotInput {}
+
 #[async_trait]
 impl Tool for GitSnapshotTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::read_only(
             "git_snapshot",
             "Capture HEAD for later revert; errors if the working tree is dirty.",
-            json!({ "type": "object", "properties": {} }),
+            tool_input_schema::<GitSnapshotInput>(),
         )
         .with_access(vec![AccessKind::Process])
     }
@@ -104,17 +109,24 @@ impl Tool for GitSnapshotTool {
 /// `git_tag(name, message?)` — tag the current commit (annotated if a message is given).
 pub struct GitTagTool;
 
+/// Arguments for the `git_tag` op.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitTagInput {
+    /// Tag name prefix (the short HEAD sha is appended for uniqueness).
+    name: String,
+    /// Optional annotation message; when given, an annotated tag is created.
+    #[serde(default)]
+    message: Option<String>,
+}
+
 #[async_trait]
 impl Tool for GitTagTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "git_tag".into(),
             description: "Tag the current commit (annotated when a message is given).".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": { "name": {"type": "string"}, "message": {"type": "string"} },
-                "required": ["name"]
-            }),
+            input_schema: tool_input_schema::<GitTagInput>(),
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
             risk: Risk::Medium,
@@ -125,13 +137,13 @@ impl Tool for GitTagTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let prefix = str_field(&params, "name")
-            .ok_or_else(|| Error::Other("git_tag: `name` required".to_string()))?;
+        let args: GitTagInput = crate::util::parse_params(&params, "git_tag")?;
+        let prefix = args.name.as_str();
         // Append the short HEAD sha so each adopted improvement gets a unique, discoverable tag
         // (the autonomous loop tags every round; identical score scalars would otherwise collide).
         let sha = git(ctx, &["rev-parse", "HEAD"]).await?;
         let name = format!("{prefix}-{}", short(&sha));
-        match str_field(&params, "message") {
+        match args.message.as_deref() {
             Some(msg) => {
                 git(ctx, &["tag", "-a", &name, "-m", msg]).await?;
             }
@@ -154,6 +166,15 @@ impl Tool for GitTagTool {
 /// the top-level loop reverts (never a sub-agent), discarding exactly the round's own changes.
 pub struct GitRevertTool;
 
+/// Arguments for the `git_revert` op.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitRevertInput {
+    /// a git_snapshot result (JSON)
+    #[allow(dead_code)]
+    snapshot: String,
+}
+
 #[async_trait]
 impl Tool for GitRevertTool {
     fn spec(&self) -> ToolSpec {
@@ -162,11 +183,7 @@ impl Tool for GitRevertTool {
             description:
                 "Hard-reset the working tree to a git_snapshot (discards the round's changes)."
                     .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": { "snapshot": {"type": "string", "description": "a git_snapshot result (JSON)"} },
-                "required": ["snapshot"]
-            }),
+            input_schema: tool_input_schema::<GitRevertInput>(),
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
             risk: Risk::Destructive,
@@ -216,6 +233,15 @@ impl Tool for GitRevertTool {
 /// — is the real enforcement. Returns `{tampered, restored:[…]}`.
 pub struct GuardProtectedTool;
 
+/// Arguments for the `guard_protected` op.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GuardProtectedInput {
+    /// a git_snapshot result (JSON)
+    #[allow(dead_code)]
+    snapshot: String,
+}
+
 #[async_trait]
 impl Tool for GuardProtectedTool {
     fn spec(&self) -> ToolSpec {
@@ -224,11 +250,7 @@ impl Tool for GuardProtectedTool {
             description: "Restore the grader/suite/loop/CI paths to the round snapshot after the worker \
                           runs, so the agent cannot game its own measurement. Returns {tampered, restored}."
                 .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": { "snapshot": {"type": "string", "description": "a git_snapshot result (JSON)"} },
-                "required": ["snapshot"]
-            }),
+            input_schema: tool_input_schema::<GuardProtectedInput>(),
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
             risk: Risk::Medium,

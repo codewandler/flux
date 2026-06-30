@@ -158,6 +158,19 @@ fn dedup_keep(items: impl Iterator<Item = Value>) -> Vec<Value> {
 // need
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NeedInput {
+    /// The question or goal to satisfy
+    ask: String,
+    /// Field names an answer must cover
+    require: Vec<String>,
+    /// Optional free-form completion predicate
+    #[serde(default)]
+    done_when: Option<Value>,
+}
+
 pub struct NeedTool;
 
 #[async_trait]
@@ -168,19 +181,7 @@ impl Tool for NeedTool {
             "Construct a `Need` artifact `{ ask, require, done_when }` — the question to satisfy, \
              the field names an answer must cover, and an optional completion predicate. Pure: just \
              normalizes the inputs.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "ask": {"type": "string", "description": "The question or goal to satisfy"},
-                    "require": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Field names an answer must cover"
-                    },
-                    "done_when": {"description": "Optional free-form completion predicate"}
-                },
-                "required": ["ask", "require"]
-            }),
+            flux_spec::tool_input_schema::<NeedInput>(),
         )
     }
 
@@ -203,6 +204,16 @@ impl Tool for NeedTool {
 // gaps
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GapsInput {
+    /// Evidence claims gathered so far
+    claims: Vec<Value>,
+    /// The need whose `require` fields are checked
+    need: Value,
+}
+
 pub struct GapsTool;
 
 #[async_trait]
@@ -213,21 +224,7 @@ impl Tool for GapsTool {
             "Given `claims` and a `need`, return a JSON array of the `need.require` field names not \
              yet covered. Heuristic (v1): a field is covered if any claim's `text` contains the \
              field name (case-insensitive) OR a claim has a truthy field of that name.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "claims": {
-                        "type": "array",
-                        "items": {"$ref": "#/$defs/Claim"},
-                        "description": "Evidence claims gathered so far"
-                    },
-                    "need": {
-                        "$ref": "#/$defs/Need",
-                        "description": "The need whose `require` fields are checked"
-                    }
-                },
-                "required": ["claims", "need"]
-            }),
+            flux_spec::tool_input_schema::<GapsInput>(),
         )
     }
 
@@ -283,6 +280,16 @@ impl Tool for GapsTool {
 // compare
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CompareInput {
+    /// Baseline list
+    a: Vec<Value>,
+    /// Candidate list
+    b: Vec<Value>,
+}
+
 pub struct CompareTool;
 
 #[async_trait]
@@ -292,14 +299,7 @@ impl Tool for CompareTool {
             "compare",
             "Compare two arrays by JSON equality, returning `{ added, removed, common }`: items in \
              `b` but not `a`, in `a` but not `b`, and in both (each de-duplicated, first-seen order).",
-            json!({
-                "type": "object",
-                "properties": {
-                    "a": {"type": "array", "items": {}, "description": "Baseline list"},
-                    "b": {"type": "array", "items": {}, "description": "Candidate list"}
-                },
-                "required": ["a", "b"]
-            }),
+            flux_spec::tool_input_schema::<CompareInput>(),
         )
     }
 
@@ -318,6 +318,16 @@ impl Tool for CompareTool {
 // dedupe
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DedupeInput {
+    items: Vec<Value>,
+    /// Optional object field to de-duplicate by
+    #[serde(default)]
+    by: Option<String>,
+}
+
 pub struct DedupeTool;
 
 #[async_trait]
@@ -327,14 +337,7 @@ impl Tool for DedupeTool {
             "dedupe",
             "Remove duplicates from an array, preserving first-seen order. By default duplicates are \
              by whole-value equality; pass `by` to de-duplicate on that object field instead.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "items": {"type": "array", "items": {}},
-                    "by": {"type": "string", "description": "Optional object field to de-duplicate by"}
-                },
-                "required": ["items"]
-            }),
+            flux_spec::tool_input_schema::<DedupeInput>(),
         )
     }
 
@@ -365,6 +368,27 @@ impl Tool for DedupeTool {
 // sort
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum SortOrder {
+    Asc,
+    Desc,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SortInput {
+    items: Vec<Value>,
+    /// Optional object field to sort by
+    #[serde(default)]
+    by: Option<String>,
+    /// Sort direction (default asc)
+    #[serde(default)]
+    order: Option<SortOrder>,
+}
+
 pub struct SortTool;
 
 #[async_trait]
@@ -374,19 +398,7 @@ impl Tool for SortTool {
             "sort",
             "Stably sort an array. By default values sort naturally; pass `by` to sort on an object \
              field, and `order` (\"asc\" | \"desc\", default \"asc\") to choose direction.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "items": {"type": "array", "items": {}},
-                    "by": {"type": "string", "description": "Optional object field to sort by"},
-                    "order": {
-                        "type": "string",
-                        "enum": ["asc", "desc"],
-                        "description": "Sort direction (default asc)"
-                    }
-                },
-                "required": ["items"]
-            }),
+            flux_spec::tool_input_schema::<SortInput>(),
         )
     }
 
@@ -430,6 +442,15 @@ impl Tool for SortTool {
 // top
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TopInput {
+    items: Vec<Value>,
+    /// Number of leading items to keep
+    n: u64,
+}
+
 pub struct TopTool;
 
 #[async_trait]
@@ -438,14 +459,7 @@ impl Tool for TopTool {
         pure_spec(
             "top",
             "Return the first `n` items of an array (fewer if the array is shorter).",
-            json!({
-                "type": "object",
-                "properties": {
-                    "items": {"type": "array", "items": {}},
-                    "n": {"type": "integer", "minimum": 0, "description": "Number of leading items to keep"}
-                },
-                "required": ["items", "n"]
-            }),
+            flux_spec::tool_input_schema::<TopInput>(),
         )
     }
 
@@ -463,6 +477,14 @@ impl Tool for TopTool {
 // merge
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct MergeInput {
+    /// The lists to concatenate, in order
+    lists: Vec<Vec<Value>>,
+}
+
 pub struct MergeTool;
 
 #[async_trait]
@@ -471,17 +493,7 @@ impl Tool for MergeTool {
         pure_spec(
             "merge",
             "Concatenate an array-of-arrays into a single array, in order.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "lists": {
-                        "type": "array",
-                        "items": {"type": "array"},
-                        "description": "The lists to concatenate, in order"
-                    }
-                },
-                "required": ["lists"]
-            }),
+            flux_spec::tool_input_schema::<MergeInput>(),
         )
     }
 
@@ -506,6 +518,22 @@ impl Tool for MergeTool {
 // len
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+enum LenItems {
+    String(String),
+    Array(Vec<Value>),
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct LenInput {
+    /// An array (length) or a string (character count)
+    items: LenItems,
+}
+
 pub struct LenTool;
 
 #[async_trait]
@@ -515,13 +543,7 @@ impl Tool for LenTool {
             "len",
             "Return the number of items in an array (or the character count of a string). \
              Use with `when`/`expr` to branch on list size without shelling out.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "items": {"description": "An array (length) or a string (character count)"}
-                },
-                "required": ["items"]
-            }),
+            flux_spec::tool_input_schema::<LenInput>(),
         )
     }
 
@@ -543,6 +565,13 @@ impl Tool for LenTool {
 // first / last
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct FirstInput {
+    items: Vec<Value>,
+}
+
 pub struct FirstTool;
 
 #[async_trait]
@@ -551,11 +580,7 @@ impl Tool for FirstTool {
         pure_spec(
             "first",
             "Return the first item of an array (or `null` if the array is empty).",
-            json!({
-                "type": "object",
-                "properties": {"items": {"type": "array", "items": {}}},
-                "required": ["items"]
-            }),
+            flux_spec::tool_input_schema::<FirstInput>(),
         )
     }
 
@@ -566,6 +591,13 @@ impl Tool for FirstTool {
     }
 }
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct LastInput {
+    items: Vec<Value>,
+}
+
 pub struct LastTool;
 
 #[async_trait]
@@ -574,11 +606,7 @@ impl Tool for LastTool {
         pure_spec(
             "last",
             "Return the last item of an array (or `null` if the array is empty).",
-            json!({
-                "type": "object",
-                "properties": {"items": {"type": "array", "items": {}}},
-                "required": ["items"]
-            }),
+            flux_spec::tool_input_schema::<LastInput>(),
         )
     }
 
@@ -593,6 +621,19 @@ impl Tool for LastTool {
 // filter
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct FilterInput {
+    items: Vec<Value>,
+    /// Optional object field to inspect
+    #[serde(default)]
+    by: Option<String>,
+    /// Optional value to match (default: keep truthy)
+    #[serde(default)]
+    equals: Option<Value>,
+}
+
 pub struct FilterTool;
 
 #[async_trait]
@@ -603,15 +644,7 @@ impl Tool for FilterTool {
             "Keep array items that satisfy a predicate. With `by`, the object field of that name is \
              inspected (otherwise the item itself). With `equals`, an item is kept when the inspected \
              value equals it; without `equals`, when the inspected value is truthy.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "items": {"type": "array", "items": {}},
-                    "by": {"type": "string", "description": "Optional object field to inspect"},
-                    "equals": {"description": "Optional value to match (default: keep truthy)"}
-                },
-                "required": ["items"]
-            }),
+            flux_spec::tool_input_schema::<FilterInput>(),
         )
     }
 
@@ -647,6 +680,14 @@ impl Tool for FilterTool {
 // cite
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CiteInput {
+    /// Claims to cite
+    claims: Vec<Value>,
+}
+
 pub struct CiteTool;
 
 /// Build the trailing `(source/span)` part of a citation line, or empty if neither is present.
@@ -671,17 +712,7 @@ impl Tool for CiteTool {
             "cite",
             "Render claims as a markdown citation list — one line per claim: \
              `- \"<text>\" (<source/span if present>)`.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "claims": {
-                        "type": "array",
-                        "items": {"$ref": "#/$defs/Claim"},
-                        "description": "Claims to cite"
-                    }
-                },
-                "required": ["claims"]
-            }),
+            flux_spec::tool_input_schema::<CiteInput>(),
         )
     }
 

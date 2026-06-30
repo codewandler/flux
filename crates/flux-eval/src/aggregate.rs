@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use flux_core::Result;
 use flux_runtime::{Tool, ToolContext, ToolResult};
-use flux_spec::ToolSpec;
+use flux_spec::{tool_input_schema, ToolSpec};
 
 use crate::util::{arg, json_result};
 
@@ -183,20 +183,25 @@ pub fn aggregate(mined: &[Value], reviewed: &[Value]) -> Vec<Value> {
 /// `improvements_aggregate(mined, reviewed)` — cluster pain-points into ranked candidates.
 pub struct ImprovementsAggregateTool;
 
+/// Arguments for the `improvements_aggregate` op.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ImprovementsAggregateInput {
+    /// deterministic pain-points (JSON array)
+    #[allow(dead_code)]
+    mined: String,
+    /// LLM review findings (JSON array or prose)
+    #[allow(dead_code)]
+    reviewed: String,
+}
+
 #[async_trait]
 impl Tool for ImprovementsAggregateTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::read_only(
             "improvements_aggregate",
             "Cluster mined pain-points and LLM review findings into ranked improvement candidates.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "mined": {"type": "string", "description": "deterministic pain-points (JSON array)"},
-                    "reviewed": {"type": "string", "description": "LLM review findings (JSON array or prose)"}
-                },
-                "required": ["mined", "reviewed"]
-            }),
+            tool_input_schema::<ImprovementsAggregateInput>(),
         )
     }
 
@@ -212,17 +217,22 @@ impl Tool for ImprovementsAggregateTool {
 /// `candidates_empty(candidates)` — `"true"` when there are no candidates (the loop's `until` guard).
 pub struct CandidatesEmptyTool;
 
+/// Arguments for the `candidates_empty` op.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CandidatesInput {
+    /// candidates (JSON array)
+    #[allow(dead_code)]
+    candidates: String,
+}
+
 #[async_trait]
 impl Tool for CandidatesEmptyTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::read_only(
             "candidates_empty",
             "Return \"true\" iff the candidate list is empty.",
-            json!({
-                "type": "object",
-                "properties": { "candidates": {"type": "string", "description": "candidates (JSON array)"} },
-                "required": ["candidates"]
-            }),
+            tool_input_schema::<CandidatesInput>(),
         )
     }
 
@@ -245,11 +255,7 @@ impl Tool for CandidatesAdvanceTool {
         ToolSpec::read_only(
             "candidates_advance",
             "Drop the first (consumed) candidate and return the remaining candidates.",
-            json!({
-                "type": "object",
-                "properties": { "candidates": {"type": "string", "description": "candidates (JSON array)"} },
-                "required": ["candidates"]
-            }),
+            tool_input_schema::<CandidatesInput>(),
         )
     }
 

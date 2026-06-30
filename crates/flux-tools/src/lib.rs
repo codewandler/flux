@@ -26,8 +26,8 @@ use flux_policy::wildcard_match;
 use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
 
 use flux_spec::{
-    AccessKind, Effect, Idempotency, Intent, IntentBehavior, IntentCertainty, IntentRole,
-    IntentSet, IntentTarget, Risk, ToolSpec,
+    tool_input_schema, AccessKind, Effect, Idempotency, Intent, IntentBehavior, IntentCertainty,
+    IntentRole, IntentSet, IntentTarget, Risk, ToolSpec,
 };
 use std::sync::Arc;
 
@@ -63,6 +63,13 @@ fn str_param<'a>(params: &'a Value, key: &str, tool: &str) -> Result<&'a str> {
         .get(key)
         .and_then(|v| v.as_str())
         .ok_or_else(|| Error::Other(format!("{tool}: required string param `{key}` missing")))
+}
+
+/// Deserialize an op's JSON arguments into its typed input struct — the single source of truth
+/// paired with the `schemars`-derived `input_schema`. Maps a serde error to the op-error style.
+pub(crate) fn parse_params<T: serde::de::DeserializeOwned>(params: Value, tool: &str) -> Result<T> {
+    serde_json::from_value(params)
+        .map_err(|e| Error::Other(format!("{tool}: invalid arguments: {e}")))
 }
 
 /// Read an integer argument from `obj[key]`, accepting either a JSON number or a numeric string —
@@ -351,20 +358,23 @@ impl Tool for ReadTool {
 
 pub struct WriteTool;
 
+/// Arguments for the `write` op.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WriteInput {
+    /// Workspace path of the file to create or overwrite.
+    path: String,
+    /// Full UTF-8 contents to write.
+    content: String,
+}
+
 #[async_trait]
 impl Tool for WriteTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "write".into(),
             description: "Write (create/overwrite) a UTF-8 file in the workspace.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"}
-                },
-                "required": ["path", "content"]
-            }),
+            input_schema: tool_input_schema::<WriteInput>(),
             output_schema: None,
             effects: vec![Effect::Write, Effect::Filesystem],
             risk: Risk::Medium,
@@ -375,21 +385,17 @@ impl Tool for WriteTool {
     }
 
     fn permission_subjects(&self, params: &Value) -> Vec<String> {
-        params
-            .get("path")
-            .and_then(|v| v.as_str())
-            .map(|s| vec![s.to_string()])
+        serde_json::from_value::<WriteInput>(params.clone())
+            .map(|a| vec![a.path])
             .unwrap_or_default()
     }
 
     fn intents(&self, params: &Value) -> IntentSet {
         let mut set = IntentSet::new();
-        if let Some(p) = params.get("path").and_then(|v| v.as_str()) {
+        if let Ok(a) = serde_json::from_value::<WriteInput>(params.clone()) {
             set.push(Intent {
                 behavior: IntentBehavior::FilesystemWrite,
-                target: IntentTarget::Path {
-                    path: p.to_string(),
-                },
+                target: IntentTarget::Path { path: a.path },
                 role: IntentRole::WriteTarget,
                 certainty: IntentCertainty::Certain,
             });
@@ -398,8 +404,9 @@ impl Tool for WriteTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let path = str_param(&params, "path", "write")?;
-        let content = str_param(&params, "content", "write")?;
+        let args: WriteInput = parse_params(params, "write")?;
+        let path = args.path.as_str();
+        let content = args.content.as_str();
         // Soft guard: refuse only if we saw this file and it changed on disk since (don't clobber).
         guard_unchanged(ctx, path, false).await?;
         // Read prior content for a diff (a missing/binary file ⇒ empty `before` = all additions).

@@ -8,13 +8,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use flux_core::Result;
 use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{
-    AccessKind, Effect, Idempotency, Intent, IntentBehavior, IntentCertainty, IntentRole,
-    IntentSet, IntentTarget, Risk, ToolSpec,
+    tool_input_schema, AccessKind, Effect, Idempotency, Intent, IntentBehavior, IntentCertainty,
+    IntentRole, IntentSet, IntentTarget, Risk, ToolSpec,
 };
 
 /// Timeout for cargo commands — cold workspace builds can be slow.
@@ -299,6 +299,21 @@ fn cargo_fmt_argv(params: &Value) -> Vec<String> {
 // cargo_check
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CargoCheckInput {
+    /// Specific package to check (omit for --workspace)
+    #[serde(default)]
+    package: Option<String>,
+    /// Path to Cargo.toml for a nested workspace
+    #[serde(default)]
+    manifest_path: Option<String>,
+    /// Extra cargo flags
+    #[serde(default)]
+    args: Option<Vec<String>>,
+}
+
 pub struct CargoCheckTool;
 
 #[async_trait]
@@ -312,15 +327,7 @@ impl Tool for CargoCheckTool {
                           Faster than build — only type-checks, no codegen. Optional `args` passes \
                           extra cargo flags only; use typed fields for package/workspace scope. Risk: Medium."
                     .into(),
-            input_schema: json!({
-                "type": "object",
-                "x-param-order": ["package", "manifest_path", "args"],
-                "properties": {
-                    "package": {"type": "string", "description": "Specific package to check (omit for --workspace)"},
-                    "manifest_path": {"type": "string", "description": "Path to Cargo.toml for a nested workspace"},
-                    "args": {"type": "array", "items": {"type": "string"}, "description": "Extra cargo flags"}
-                }
-            }),
+            input_schema: tool_input_schema::<CargoCheckInput>(),
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
             risk: Risk::Medium,
@@ -347,6 +354,24 @@ impl Tool for CargoCheckTool {
 // cargo_build
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CargoBuildInput {
+    /// Specific package (omit for --workspace)
+    #[serde(default)]
+    package: Option<String>,
+    /// Path to Cargo.toml for a nested workspace
+    #[serde(default)]
+    manifest_path: Option<String>,
+    /// Build in release mode
+    #[serde(default)]
+    release: Option<bool>,
+    /// Extra cargo flags
+    #[serde(default)]
+    args: Option<Vec<String>>,
+}
+
 pub struct CargoBuildTool;
 
 #[async_trait]
@@ -359,16 +384,7 @@ impl Tool for CargoBuildTool {
                           for an optimised build. Optional `args` for extra cargo flags only; use typed \
                           fields for package/workspace scope."
                 .into(),
-            input_schema: json!({
-                "type": "object",
-                "x-param-order": ["package", "manifest_path", "release", "args"],
-                "properties": {
-                    "package": {"type": "string", "description": "Specific package (omit for --workspace)"},
-                    "manifest_path": {"type": "string", "description": "Path to Cargo.toml for a nested workspace"},
-                    "release": {"type": "boolean", "description": "Build in release mode"},
-                    "args": {"type": "array", "items": {"type": "string"}, "description": "Extra cargo flags"}
-                }
-            }),
+            input_schema: tool_input_schema::<CargoBuildInput>(),
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
             risk: Risk::Medium,
@@ -395,6 +411,24 @@ impl Tool for CargoBuildTool {
 // cargo_test
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CargoTestInput {
+    /// Specific package (omit for --workspace)
+    #[serde(default)]
+    package: Option<String>,
+    /// Path to Cargo.toml for a nested workspace
+    #[serde(default)]
+    manifest_path: Option<String>,
+    /// Test name filter substring
+    #[serde(default)]
+    filter: Option<String>,
+    /// Extra cargo flags
+    #[serde(default)]
+    args: Option<Vec<String>>,
+}
+
 pub struct CargoTestTool;
 
 #[async_trait]
@@ -407,16 +441,7 @@ impl Tool for CargoTestTool {
                           Optional `filter` is passed as the test-name filter, `args` for extra cargo \
                           flags only; use typed fields for package/workspace scope."
                 .into(),
-            input_schema: json!({
-                "type": "object",
-                "x-param-order": ["package", "manifest_path", "filter", "args"],
-                "properties": {
-                    "package": {"type": "string", "description": "Specific package (omit for --workspace)"},
-                    "manifest_path": {"type": "string", "description": "Path to Cargo.toml for a nested workspace"},
-                    "filter": {"type": "string", "description": "Test name filter substring"},
-                    "args": {"type": "array", "items": {"type": "string"}, "description": "Extra cargo flags"}
-                }
-            }),
+            input_schema: tool_input_schema::<CargoTestInput>(),
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
             risk: Risk::Medium,
@@ -443,6 +468,24 @@ impl Tool for CargoTestTool {
 // cargo_clippy
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CargoClippyInput {
+    /// Specific package (omit for --workspace)
+    #[serde(default)]
+    package: Option<String>,
+    /// Path to Cargo.toml for a nested workspace
+    #[serde(default)]
+    manifest_path: Option<String>,
+    /// Fail on any warning (-D warnings)
+    #[serde(default)]
+    deny_warnings: Option<bool>,
+    /// Extra cargo flags
+    #[serde(default)]
+    args: Option<Vec<String>>,
+}
+
 pub struct CargoClippyTool;
 
 #[async_trait]
@@ -456,16 +499,7 @@ impl Tool for CargoClippyTool {
                           Optional `args` for extra cargo flags only; use typed fields for package, \
                           workspace/all-targets scope, and warning denial."
                 .into(),
-            input_schema: json!({
-                "type": "object",
-                "x-param-order": ["package", "manifest_path", "deny_warnings", "args"],
-                "properties": {
-                    "package": {"type": "string", "description": "Specific package (omit for --workspace)"},
-                    "manifest_path": {"type": "string", "description": "Path to Cargo.toml for a nested workspace"},
-                    "deny_warnings": {"type": "boolean", "description": "Fail on any warning (-D warnings)"},
-                    "args": {"type": "array", "items": {"type": "string"}, "description": "Extra cargo flags"}
-                }
-            }),
+            input_schema: tool_input_schema::<CargoClippyInput>(),
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
             risk: Risk::Medium,
@@ -492,6 +526,21 @@ impl Tool for CargoClippyTool {
 // cargo_fmt
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CargoFmtInput {
+    /// Specific package (omit for --all)
+    #[serde(default)]
+    package: Option<String>,
+    /// Path to Cargo.toml for a nested workspace
+    #[serde(default)]
+    manifest_path: Option<String>,
+    /// Check only, don't write (-- --check)
+    #[serde(default)]
+    check: Option<bool>,
+}
+
 pub struct CargoFmtTool;
 
 #[async_trait]
@@ -503,15 +552,7 @@ impl Tool for CargoFmtTool {
                           package). Use `manifest_path` for a nested workspace Cargo.toml. Pass \
                           `check: true` to only check formatting without writing."
                 .into(),
-            input_schema: json!({
-                "type": "object",
-                "x-param-order": ["package", "manifest_path", "check"],
-                "properties": {
-                    "package": {"type": "string", "description": "Specific package (omit for --all)"},
-                    "manifest_path": {"type": "string", "description": "Path to Cargo.toml for a nested workspace"},
-                    "check": {"type": "boolean", "description": "Check only, don't write (-- --check)"}
-                }
-            }),
+            input_schema: tool_input_schema::<CargoFmtInput>(),
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
             risk: Risk::Medium,
@@ -546,6 +587,7 @@ pub fn register_cargo(registry: &mut ToolRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn cargo_test_argv_supports_nested_manifest_package_and_filter() {
@@ -682,11 +724,13 @@ mod tests {
     }
 
     #[test]
-    fn cargo_test_schema_declares_positional_order() {
+    fn cargo_test_schema_has_no_positional_order_extension() {
+        // `x-param-order` is gone: parameter order is non-load-bearing (calls name args via an
+        // object). The derived schema must not carry the deprecated ordering extension.
         let schema = CargoTestTool.spec().input_schema;
-        assert_eq!(
-            schema["x-param-order"],
-            json!(["package", "manifest_path", "filter", "args"])
+        assert!(
+            schema.get("x-param-order").is_none(),
+            "cargo_test schema should not declare x-param-order: {schema}"
         );
     }
 }

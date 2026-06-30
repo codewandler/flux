@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use flux_core::Result;
 use flux_evidence::{Observation, Phase};
 use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
-use flux_spec::{Effect, Idempotency, Risk, ToolSpec};
+use flux_spec::{tool_input_schema, Effect, Idempotency, Risk, ToolSpec};
 
 /// Register the evidence ops (`observe`, `evidence`, `metrics`). Called from
 /// [`register_builtins`](crate::register_builtins) — they are general-purpose audit primitives any flow
@@ -27,6 +27,18 @@ pub fn register_evidence(registry: &mut ToolRegistry) {
 /// `observe(kind, data?)` — append an observation to the run's shared evidence log.
 struct ObserveOp;
 
+/// Arguments for the `observe` op.
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ObserveInput {
+    /// the observation label
+    kind: String,
+    /// arbitrary JSON payload
+    #[serde(default)]
+    data: Option<Value>,
+}
+
 #[async_trait]
 impl Tool for ObserveOp {
     fn spec(&self) -> ToolSpec {
@@ -36,14 +48,7 @@ impl Tool for ObserveOp {
                           \"turn.iteration\"), optional `data` is arbitrary JSON. This is the SAME log \
                           the runtime records tool calls into and that `evidence`/grading read back."
                 .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "kind": { "type": "string", "description": "the observation label" },
-                    "data": { "type": "object", "description": "arbitrary JSON payload" }
-                },
-                "required": ["kind"]
-            }),
+            input_schema: tool_input_schema::<ObserveInput>(),
             output_schema: None,
             // No host IO: an in-memory audit append. Non-idempotent (it accumulates).
             effects: Vec::new(),
@@ -55,23 +60,29 @@ impl Tool for ObserveOp {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let Some(kind) = params.get("kind").and_then(|v| v.as_str()) else {
-            return Ok(ToolResult::error(
-                "observe: missing required string param `kind`",
-            ));
-        };
-        let data = params.get("data").cloned().unwrap_or_else(|| json!({}));
+        let args: ObserveInput = crate::parse_params(params, "observe")?;
+        let data = args.data.unwrap_or_else(|| json!({}));
         ctx.evidence
             .lock()
             .unwrap()
-            .record(Observation::new(kind, Phase::Turn, data));
-        Ok(ToolResult::ok(format!("observed `{kind}`")))
+            .record(Observation::new(&args.kind, Phase::Turn, data));
+        Ok(ToolResult::ok(format!("observed `{}`", args.kind)))
     }
 }
 
 /// `evidence(kind?)` — read observations from the run's shared evidence log as a JSON array. With
 /// `kind`, only observations of that label; without it, the whole log. Each item is `{kind, phase, data}`.
 struct EvidenceOp;
+
+/// Arguments for the `evidence` op.
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct EvidenceInput {
+    /// optional label filter
+    #[serde(default)]
+    kind: Option<String>,
+}
 
 #[async_trait]
 impl Tool for EvidenceOp {
@@ -83,12 +94,7 @@ impl Tool for EvidenceOp {
                           only observations of that label; without it, the whole log. Each item is \
                           {kind, phase, data} — so a flow can branch on what has happened so far."
                     .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "kind": { "type": "string", "description": "optional label filter" }
-                }
-            }),
+            input_schema: tool_input_schema::<EvidenceInput>(),
             output_schema: None,
             effects: vec![Effect::Read],
             risk: Risk::Low,
@@ -115,6 +121,12 @@ impl Tool for EvidenceOp {
 /// observations a loop emits via `observe`.
 struct MetricsOp;
 
+/// Arguments for the `metrics` op.
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct MetricsInput {}
+
 #[async_trait]
 impl Tool for MetricsOp {
     fn spec(&self) -> ToolSpec {
@@ -124,7 +136,7 @@ impl Tool for MetricsOp {
                           iterations}: tool_calls/tool_errors are dispatch markers; iterations counts \
                           the `turn.iteration` observations a loop emits. Branch on how the run is going."
                 .into(),
-            input_schema: json!({ "type": "object", "properties": {} }),
+            input_schema: tool_input_schema::<MetricsInput>(),
             output_schema: None,
             effects: vec![Effect::Read],
             risk: Risk::Low,

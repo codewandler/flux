@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use flux_core::{Error, Result};
 use flux_events::EventStore;
 use flux_runtime::{Tool, ToolContext, ToolResult};
-use flux_spec::{AccessKind, Effect, Idempotency, Risk, ToolSpec};
+use flux_spec::{tool_input_schema, AccessKind, Effect, Idempotency, Risk, ToolSpec};
 
 use crate::adapter::{BenchmarkAdapter, Filter, RunContext};
 use crate::adapters::LocalAdapter;
@@ -31,6 +31,33 @@ use crate::util::{arg, json_result, str_field};
 /// `eval_run(adapter)` — run a benchmark suite and return a report with per-case results + a score.
 pub struct EvalRunTool;
 
+/// Arguments for the `eval_run` op. `adapter` selects the suite; the remaining keys are read by
+/// `run_eval` and the adapters it builds. Note: this op accepts adapter-specific keys not enumerated
+/// here (e.g. terminal-bench's `flux_binary`/`dataset`/…, `multi`'s `members`), so it is intentionally
+/// an open object (no `deny_unknown_fields`).
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct EvalRunInput {
+    /// mock | synthetic | terminal-bench | multi (swebench-lite lands later)
+    #[allow(dead_code)]
+    adapter: String,
+    /// restrict to these task ids
+    #[serde(default)]
+    #[allow(dead_code)]
+    tasks: Option<Vec<String>>,
+    /// cap the number of tasks (0 = all)
+    #[serde(default)]
+    #[allow(dead_code)]
+    limit: Option<u64>,
+    /// default model when a task doesn't override
+    #[serde(default)]
+    #[allow(dead_code)]
+    model: Option<String>,
+    /// path to the flux binary under test (default: current binary)
+    #[serde(default)]
+    #[allow(dead_code)]
+    flux_bin: Option<String>,
+}
+
 #[async_trait]
 impl Tool for EvalRunTool {
     fn spec(&self) -> ToolSpec {
@@ -42,17 +69,7 @@ impl Tool for EvalRunTool {
                           riddles), \"terminal-bench\" (the real Docker benchmark), or \"multi\" \
                           (several behind one combined score); swebench-lite lands later."
                 .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "adapter": {"type": "string", "description": "mock | terminal-bench | swebench-lite"},
-                    "tasks": {"type": "array", "items": {"type": "string"}, "description": "restrict to these task ids"},
-                    "limit": {"type": "integer", "description": "cap the number of tasks (0 = all)"},
-                    "model": {"type": "string", "description": "default model when a task doesn't override"},
-                    "flux_bin": {"type": "string", "description": "path to the flux binary under test (default: current binary)"}
-                },
-                "required": ["adapter"]
-            }),
+            input_schema: tool_input_schema::<EvalRunInput>(),
             output_schema: None,
             effects: vec![Effect::Process, Effect::Read],
             risk: Risk::Medium,
@@ -266,17 +283,23 @@ pub fn report_view(report: &Value) -> String {
 /// `eval_run` report, so review/mining can consume them.
 pub struct EvalSessionsTool;
 
+/// Arguments for the `eval_report`-shaped ops (`eval_sessions`, `eval_report_md`, `eval_adopt`,
+/// `eval_scalar`): a single `report` JSON string.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReportInput {
+    /// an eval_run report (JSON)
+    #[allow(dead_code)]
+    report: String,
+}
+
 #[async_trait]
 impl Tool for EvalSessionsTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::read_only(
             "eval_sessions",
             "Extract the session references [{id, db, task_id}] from an eval_run report.",
-            json!({
-                "type": "object",
-                "properties": { "report": {"type": "string", "description": "an eval_run report (JSON)"} },
-                "required": ["report"]
-            }),
+            tool_input_schema::<ReportInput>(),
         )
     }
 
@@ -312,6 +335,16 @@ impl Tool for EvalSessionsTool {
 /// `painpoints_collect(sessions)` — deterministically mine pain-points from the referenced sessions.
 pub struct PainpointsCollectTool;
 
+/// Arguments for the session-list ops (`painpoints_collect`, `sessions_digest`): a single `sessions`
+/// JSON-array string.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SessionsInput {
+    /// session references (JSON array)
+    #[allow(dead_code)]
+    sessions: String,
+}
+
 #[async_trait]
 impl Tool for PainpointsCollectTool {
     fn spec(&self) -> ToolSpec {
@@ -319,11 +352,7 @@ impl Tool for PainpointsCollectTool {
             "painpoints_collect",
             "Mine pain-points (tool errors, retry loops, missing tools, churn, …) from a list of \
              session references [{id, db}] and return them as JSON.",
-            json!({
-                "type": "object",
-                "properties": { "sessions": {"type": "string", "description": "session references (JSON array)"} },
-                "required": ["sessions"]
-            }),
+            tool_input_schema::<SessionsInput>(),
         )
     }
 
@@ -368,11 +397,7 @@ impl Tool for EvalReportMdTool {
             "eval_report_md",
             "Render an eval_run report as a categorized human-readable Markdown report (headline \
              score, per-task table, mined pain-points). Input: {report} (the eval_run JSON).",
-            json!({
-                "type": "object",
-                "properties": { "report": {"type": "string", "description": "an eval_run report (JSON)"} },
-                "required": ["report"]
-            }),
+            tool_input_schema::<ReportInput>(),
         )
     }
 
@@ -398,11 +423,7 @@ impl Tool for SessionsDigestTool {
         ToolSpec::read_only(
             "sessions_digest",
             "Render each session's RunEvent trace into a compact transcript for review.",
-            json!({
-                "type": "object",
-                "properties": { "sessions": {"type": "string", "description": "session references (JSON array)"} },
-                "required": ["sessions"]
-            }),
+            tool_input_schema::<SessionsInput>(),
         )
     }
 
@@ -450,6 +471,15 @@ impl Tool for SessionsDigestTool {
 /// human can audit what the loop tried, whether the grader was tampered with, and the gate outcome.
 pub struct ImproveLogTool;
 
+/// Arguments for the `improve_log` op.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ImproveLogInput {
+    /// round record (any JSON object)
+    #[allow(dead_code)]
+    record: serde_json::Map<String, Value>,
+}
+
 #[async_trait]
 impl Tool for ImproveLogTool {
     fn spec(&self) -> ToolSpec {
@@ -458,11 +488,7 @@ impl Tool for ImproveLogTool {
             description:
                 "Append a timestamped round record to .flux/eval/improve-log.jsonl (audit trail)."
                     .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": { "record": {"type": "object", "description": "round record (any JSON object)"} },
-                "required": ["record"]
-            }),
+            input_schema: tool_input_schema::<ImproveLogInput>(),
             output_schema: None,
             effects: vec![Effect::Write, Effect::Filesystem],
             risk: Risk::Low,
@@ -511,11 +537,7 @@ impl Tool for EvalAdoptTool {
         ToolSpec::read_only(
             "eval_adopt",
             "Return an eval report unchanged (used to re-bind the baseline after adopting a candidate).",
-            json!({
-                "type": "object",
-                "properties": { "report": {"type": "string", "description": "an eval_run report (JSON)"} },
-                "required": ["report"]
-            }),
+            tool_input_schema::<ReportInput>(),
         )
     }
 
@@ -540,11 +562,7 @@ impl Tool for EvalScalarTool {
         ToolSpec::read_only(
             "eval_scalar",
             "Return an eval report's score scalar as a plain string (e.g. \"667\").",
-            json!({
-                "type": "object",
-                "properties": { "report": {"type": "string", "description": "an eval_run report (JSON)"} },
-                "required": ["report"]
-            }),
+            tool_input_schema::<ReportInput>(),
         )
     }
 
@@ -566,6 +584,15 @@ impl Tool for EvalScalarTool {
 /// condition's truthiness — `when grade(@json{…}) -> $done = true` is the evidence-based early stop.
 pub struct GradeTool;
 
+/// Arguments for the `grade` op.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GradeInput {
+    /// a Criterion: {kind:"command",run,expect_exit?} | {kind:"file_content",path,equals?/contains?/regex?} | {kind:"all",of:[…]}
+    #[allow(dead_code)]
+    criterion: serde_json::Map<String, Value>,
+}
+
 #[async_trait]
 impl Tool for GradeTool {
     fn spec(&self) -> ToolSpec {
@@ -574,18 +601,7 @@ impl Tool for GradeTool {
             "Evaluate a pass/fail criterion against the current workspace; returns \"true\" or \
              \"false\". `criterion` is {kind: \"command\"|\"file_content\"|\"all\", …} — the same check \
              the eval harness uses. A `command` criterion runs a check command (e.g. `cargo test`).",
-            json!({
-                "type": "object",
-                "properties": {
-                    "criterion": {
-                        "type": "object",
-                        "description": "a Criterion: {kind:\"command\",run,expect_exit?} | \
-                                        {kind:\"file_content\",path,equals?/contains?/regex?} | \
-                                        {kind:\"all\",of:[…]}"
-                    }
-                },
-                "required": ["criterion"]
-            }),
+            tool_input_schema::<GradeInput>(),
         )
         // A `command` criterion shells out to a checker, so be honest about the process effect.
         .with_effects(vec![Effect::Read, Effect::Process])
@@ -611,20 +627,26 @@ impl Tool for GradeTool {
 /// read by a `when` condition's truthiness.
 pub struct ScoreCompareTool;
 
+/// Arguments for the report-comparison ops (`score_compare`, `score_compare_multi`): a `baseline`
+/// and `candidate` eval_run report, each a JSON string.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct BaselineCandidateInput {
+    /// baseline eval_run report (JSON)
+    #[allow(dead_code)]
+    baseline: String,
+    /// candidate eval_run report (JSON)
+    #[allow(dead_code)]
+    candidate: String,
+}
+
 #[async_trait]
 impl Tool for ScoreCompareTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::read_only(
             "score_compare",
             "Return \"true\" iff the candidate eval report is strictly better than the baseline.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "baseline": {"type": "string", "description": "baseline eval_run report (JSON)"},
-                    "candidate": {"type": "string", "description": "candidate eval_run report (JSON)"}
-                },
-                "required": ["baseline", "candidate"]
-            }),
+            tool_input_schema::<BaselineCandidateInput>(),
         )
     }
 
@@ -696,14 +718,7 @@ impl Tool for ScoreCompareMultiTool {
             "Return \"true\" iff the candidate multi-eval report is strictly better overall AND no \
              member benchmark regressed (pass_rate & check-rate ≥ baseline). Use as the keep-gate for \
              combined evals so a gain on one benchmark can't mask a regression on another.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "baseline": {"type": "string", "description": "baseline multi eval_run report (JSON)"},
-                    "candidate": {"type": "string", "description": "candidate multi eval_run report (JSON)"}
-                },
-                "required": ["baseline", "candidate"]
-            }),
+            tool_input_schema::<BaselineCandidateInput>(),
         )
     }
 
@@ -734,6 +749,19 @@ impl Tool for ScoreCompareMultiTool {
 /// `ctx.spawner` (the same seam `task` uses); each worker is scoped + non-destructive (SubAgentApprover).
 pub struct ChangeImplementTool;
 
+/// Arguments for the `change_implement` op.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ChangeImplementInput {
+    /// tasks to implement (JSON array)
+    #[allow(dead_code)]
+    tasks: String,
+    /// cap on tasks implemented this round (0 = all)
+    #[serde(default)]
+    #[allow(dead_code)]
+    limit: Option<u64>,
+}
+
 #[async_trait]
 impl Tool for ChangeImplementTool {
     fn spec(&self) -> ToolSpec {
@@ -742,14 +770,7 @@ impl Tool for ChangeImplementTool {
             description: "Implement each derived task by spawning a `worker` sub-agent; returns a \
                           per-task summary. Input is a JSON array of tasks (objects or strings)."
                 .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "tasks": {"type": "string", "description": "tasks to implement (JSON array)"},
-                    "limit": {"type": "integer", "description": "cap on tasks implemented this round (0 = all)"}
-                },
-                "required": ["tasks"]
-            }),
+            input_schema: tool_input_schema::<ChangeImplementInput>(),
             output_schema: None,
             effects: Vec::new(),
             risk: Risk::Medium,

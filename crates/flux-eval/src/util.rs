@@ -16,6 +16,14 @@ pub fn coerce_json(v: &Value) -> Value {
     }
 }
 
+/// Deserialize an op's arguments into its typed input struct — the single source of truth paired
+/// with the `schemars`-derived `input_schema`. Coerces JSON-encoded-string args first (how a `$var`
+/// arrives), so the typed struct sees real JSON. Maps a serde error to the op-error style.
+pub fn parse_params<T: serde::de::DeserializeOwned>(params: &Value, op: &str) -> Result<T> {
+    serde_json::from_value(coerce_json(params))
+        .map_err(|e| Error::Other(format!("{op}: invalid arguments: {e}")))
+}
+
 /// Read named field `key` from `params`, coerced to JSON. Falls back to treating `params` itself as
 /// the payload (the lone-object-passthrough case, where there is no wrapper key).
 pub fn arg(params: &Value, key: &str) -> Value {

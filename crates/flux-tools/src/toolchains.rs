@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use flux_core::Result;
 use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
@@ -97,11 +97,6 @@ fn run_argv(
     })
 }
 
-/// `extra flags` schema fragment reused by most tools.
-fn args_prop() -> Value {
-    json!({"type": "array", "items": {"type": "string"}, "description": "Extra command-line flags"})
-}
-
 // ---------------------------------------------------------------------------
 // python: python_run, pytest
 // ---------------------------------------------------------------------------
@@ -124,6 +119,21 @@ async fn newest_py(ctx: &ToolContext) -> Option<String> {
     best.map(|(_, name)| name)
 }
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PythonRunInput {
+    /// Path to a .py file to run
+    #[serde(default)]
+    script: Option<String>,
+    /// Module to run with -m (alternative to script)
+    #[serde(default)]
+    module: Option<String>,
+    /// Extra command-line flags
+    #[serde(default)]
+    args: Vec<String>,
+}
+
 pub struct PythonRunTool;
 
 #[async_trait]
@@ -134,14 +144,7 @@ impl Tool for PythonRunTool {
             "Run Python: a script file (`script`) or a module (`module`, like `python -m`). \
              If neither is given, runs the most-recently-modified `.py` in the workspace. \
              Optional `args` are passed through. Uses `python3`.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "script": {"type": "string", "description": "Path to a .py file to run"},
-                    "module": {"type": "string", "description": "Module to run with -m (alternative to script)"},
-                    "args": args_prop()
-                }
-            }),
+            flux_spec::tool_input_schema::<PythonRunInput>(),
             Idempotency::NonIdempotent,
             "python",
         )
@@ -184,6 +187,18 @@ impl Tool for PythonRunTool {
     }
 }
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PytestInput {
+    /// File or directory to test (omit for the whole suite)
+    #[serde(default)]
+    path: Option<String>,
+    /// Extra command-line flags
+    #[serde(default)]
+    args: Vec<String>,
+}
+
 pub struct PytestTool;
 
 #[async_trait]
@@ -193,13 +208,7 @@ impl Tool for PytestTool {
             "pytest",
             "Run `pytest`. Optional `path` scopes the run to a file/directory; `args` passes extra \
              flags (e.g. `[\"-k\", \"name\"]`).",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "File or directory to test (omit for the whole suite)"},
-                    "args": args_prop()
-                }
-            }),
+            flux_spec::tool_input_schema::<PytestInput>(),
             Idempotency::NonIdempotent,
             "python",
         )
@@ -228,6 +237,14 @@ impl Tool for PytestTool {
 // node: npm, node_run
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NpmInput {
+    /// Extra command-line flags
+    args: Vec<String>,
+}
+
 pub struct NpmTool;
 
 #[async_trait]
@@ -237,11 +254,7 @@ impl Tool for NpmTool {
             "npm",
             "Run an `npm` command — `args` is the full argument vector (e.g. `[\"install\"]`, \
              `[\"run\", \"build\"]`, `[\"test\"]`).",
-            json!({
-                "type": "object",
-                "properties": {"args": args_prop()},
-                "required": ["args"]
-            }),
+            flux_spec::tool_input_schema::<NpmInput>(),
             Idempotency::NonIdempotent,
             "node",
         )
@@ -273,6 +286,17 @@ impl Tool for NpmTool {
     }
 }
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NodeRunInput {
+    /// Path to a .js file to run
+    script: String,
+    /// Extra command-line flags
+    #[serde(default)]
+    args: Vec<String>,
+}
+
 pub struct NodeRunTool;
 
 #[async_trait]
@@ -282,14 +306,7 @@ impl Tool for NodeRunTool {
             "node_run",
             "Run a JavaScript file with `node`. `script` is the file path; optional `args` are passed \
              through.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "script": {"type": "string", "description": "Path to a .js file to run"},
-                    "args": args_prop()
-                },
-                "required": ["script"]
-            }),
+            flux_spec::tool_input_schema::<NodeRunInput>(),
             Idempotency::NonIdempotent,
             "node",
         )
@@ -323,6 +340,18 @@ impl Tool for NodeRunTool {
 // go: go_build, go_test, go_vet
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GoInput {
+    /// Package/path to target (default ./...)
+    #[serde(default)]
+    package: Option<String>,
+    /// Extra command-line flags
+    #[serde(default)]
+    args: Vec<String>,
+}
+
 /// Shared executor for the `go <sub>` tools: defaults the package set to `./...`.
 fn go_tool_spec(name: &str, sub: &str, idempotency: Idempotency) -> ToolSpec {
     proc_spec(
@@ -331,13 +360,7 @@ fn go_tool_spec(name: &str, sub: &str, idempotency: Idempotency) -> ToolSpec {
             "Run `go {sub}` (defaults to `./...`). Optional `package` overrides the target; `args` \
              passes extra flags."
         ),
-        json!({
-            "type": "object",
-            "properties": {
-                "package": {"type": "string", "description": "Package/path to target (default ./...)"},
-                "args": args_prop()
-            }
-        }),
+        flux_spec::tool_input_schema::<GoInput>(),
         idempotency,
         "go",
     )
@@ -424,6 +447,18 @@ impl Tool for GoVetTool {
 // make
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct MakeInput {
+    /// Make target (omit for the default target)
+    #[serde(default)]
+    target: Option<String>,
+    /// Extra command-line flags
+    #[serde(default)]
+    args: Vec<String>,
+}
+
 pub struct MakeTool;
 
 #[async_trait]
@@ -432,13 +467,7 @@ impl Tool for MakeTool {
         proc_spec(
             "make",
             "Run `make` with an optional `target` (e.g. `build`, `test`); `args` passes extra flags.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "target": {"type": "string", "description": "Make target (omit for the default target)"},
-                    "args": args_prop()
-                }
-            }),
+            flux_spec::tool_input_schema::<MakeInput>(),
             Idempotency::NonIdempotent,
             "make",
         )

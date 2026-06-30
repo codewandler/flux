@@ -19,6 +19,9 @@ pub fn tool_input_schema<T: schemars::JsonSchema>() -> serde_json::Value {
     if let Some(obj) = schema.as_object_mut() {
         obj.remove("$schema");
         obj.remove("title");
+        // The op's own `description` carries its purpose; a struct doc-comment would land here as a
+        // redundant top-level description, so drop it. Field descriptions (under `properties`) stay.
+        obj.remove("description");
     }
     schema
 }

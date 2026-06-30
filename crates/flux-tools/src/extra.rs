@@ -19,8 +19,8 @@ use serde_json::{json, Value};
 use flux_core::{Error, Result};
 use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{
-    AccessKind, Effect, Idempotency, Intent, IntentBehavior, IntentCertainty, IntentRole,
-    IntentSet, IntentTarget, Risk, ToolSpec,
+    tool_input_schema, AccessKind, Effect, Idempotency, Intent, IntentBehavior, IntentCertainty,
+    IntentRole, IntentSet, IntentTarget, Risk, ToolSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -28,6 +28,15 @@ use flux_spec::{
 // ---------------------------------------------------------------------------
 
 pub struct FileStatTool;
+
+/// Arguments for the `file_stat` op.
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct FileStatInput {
+    /// Workspace-relative path.
+    path: String,
+}
 
 #[async_trait]
 impl Tool for FileStatTool {
@@ -37,13 +46,7 @@ impl Tool for FileStatTool {
             "Return metadata for a workspace file: size in bytes, line count, last-modified \
              timestamp (Unix seconds), and octal mode. Replaces `wc -l`, `stat`, `ls -la` for \
              routine metadata checks.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Workspace-relative path"}
-                },
-                "required": ["path"]
-            }),
+            tool_input_schema::<FileStatInput>(),
         )
         .with_access(vec![AccessKind::Filesystem])
     }
@@ -125,6 +128,15 @@ impl Tool for FileStatTool {
 
 pub struct PathExistsTool;
 
+/// Arguments for the `path_exists` op.
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PathExistsInput {
+    /// Workspace-relative path to probe.
+    path: String,
+}
+
 #[async_trait]
 impl Tool for PathExistsTool {
     fn spec(&self) -> ToolSpec {
@@ -132,13 +144,7 @@ impl Tool for PathExistsTool {
             "path_exists",
             "Check whether a workspace path exists. Returns \"true\" or \"false\". \
              Use with `when`/`unless` to branch on file presence without shelling out.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Workspace-relative path to probe"}
-                },
-                "required": ["path"]
-            }),
+            tool_input_schema::<PathExistsInput>(),
         )
         .with_access(vec![AccessKind::Filesystem])
     }
@@ -185,6 +191,20 @@ impl Tool for PathExistsTool {
 
 pub struct SqliteQueryTool;
 
+/// Arguments for the `sqlite_query` op.
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SqliteQueryInput {
+    /// Path to the SQLite database file.
+    db: String,
+    /// SELECT or PRAGMA statement to execute.
+    sql: String,
+    /// Max rows to return (default 200).
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
 /// Reject any SQL that looks like a write operation.
 fn is_write_sql(sql: &str) -> bool {
     let upper = sql.trim_start().to_ascii_uppercase();
@@ -210,15 +230,7 @@ impl Tool for SqliteQueryTool {
                           Returns rows as a JSON array. `db` may be an absolute path to a \
                           file outside the workspace (e.g. ~/.flux/sessions.db)."
                 .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "db": {"type": "string", "description": "Path to the SQLite database file"},
-                    "sql": {"type": "string", "description": "SELECT or PRAGMA statement to execute"},
-                    "limit": {"type": "integer", "description": "Max rows to return (default 200)"}
-                },
-                "required": ["db", "sql"]
-            }),
+            input_schema: tool_input_schema::<SqliteQueryInput>(),
             output_schema: None,
             effects: vec![Effect::Read, Effect::Filesystem],
             risk: Risk::Low,
@@ -350,6 +362,21 @@ impl Tool for SqliteQueryTool {
 
 pub struct WebSearchTool;
 
+/// Arguments for the `web_search` op.
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WebSearchInput {
+    /// Search query.
+    query: String,
+    /// Max results (default 5, max 10).
+    #[serde(default)]
+    max_results: Option<u64>,
+    /// Tavily API key (overrides TAVILY_API_KEY env var).
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
 #[async_trait]
 impl Tool for WebSearchTool {
     fn spec(&self) -> ToolSpec {
@@ -361,15 +388,7 @@ impl Tool for WebSearchTool {
                           (default 5, max 10). Use this when you need to find documentation, \
                           current information, or a URL you don't already know."
                 .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query"},
-                    "max_results": {"type": "integer", "description": "Max results (default 5, max 10)"},
-                    "api_key": {"type": "string", "description": "Tavily API key (overrides TAVILY_API_KEY env var)"}
-                },
-                "required": ["query"]
-            }),
+            input_schema: tool_input_schema::<WebSearchInput>(),
             output_schema: None,
             effects: vec![Effect::Network],
             risk: Risk::Low,
@@ -506,6 +525,12 @@ impl Tool for WebSearchTool {
 // home_dir
 // ---------------------------------------------------------------------------
 
+/// Arguments for the `home_dir` op (no parameters).
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct HomeDirInput {}
+
 /// Returns the current user's home directory (`$HOME`). Zero args, read-only, pure.
 pub struct HomeDirTool;
 
@@ -516,7 +541,7 @@ impl Tool for HomeDirTool {
             "home_dir",
             "Return the current user's home directory path (value of $HOME). \
              Use this to build absolute paths like `~/.flux/sessions.db` without shelling out.",
-            serde_json::json!({"type": "object", "properties": {}}),
+            tool_input_schema::<HomeDirInput>(),
         )
     }
 
@@ -558,6 +583,12 @@ fn format_unix_utc(secs: i64) -> String {
     format!("{y:04}-{m:02}-{d:02} {hour:02}:{min:02}:{sec:02} UTC")
 }
 
+/// Arguments for the `now` op (no parameters).
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NowInput {}
+
 /// Returns the current wall-clock time. Zero args, read-only, no approval gate.
 pub struct NowTool;
 
@@ -568,7 +599,7 @@ impl Tool for NowTool {
             "now",
             "Return the current wall-clock time: unix seconds and a UTC timestamp \
              (`YYYY-MM-DD HH:MM:SS UTC`). Replaces shelling out to `date`.",
-            json!({"type": "object", "properties": {}}),
+            tool_input_schema::<NowInput>(),
         )
     }
 
@@ -596,6 +627,12 @@ impl Tool for NowTool {
 // cwd
 // ---------------------------------------------------------------------------
 
+/// Arguments for the `cwd` op (no parameters).
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CwdInput {}
+
 /// Returns the workspace root directory. Zero args, read-only, no approval gate.
 pub struct CwdTool;
 
@@ -606,7 +643,7 @@ impl Tool for CwdTool {
             "cwd",
             "Return the absolute path of the workspace root (the agent's working directory). \
              Replaces shelling out to `pwd`.",
-            json!({"type": "object", "properties": {}}),
+            tool_input_schema::<CwdInput>(),
         )
     }
 
@@ -629,6 +666,12 @@ impl Tool for CwdTool {
 // sys_info
 // ---------------------------------------------------------------------------
 
+/// Arguments for the `sys_info` op (no parameters).
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SysInfoInput {}
+
 /// Returns OS / architecture / host metadata. Zero args, read-only, no approval gate.
 pub struct SysInfoTool;
 
@@ -639,7 +682,7 @@ impl Tool for SysInfoTool {
             "sys_info",
             "Return host metadata: operating system, CPU architecture, OS family, and hostname \
              (best-effort). Replaces shelling out to `uname`.",
-            json!({"type": "object", "properties": {}}),
+            tool_input_schema::<SysInfoInput>(),
         )
     }
 
