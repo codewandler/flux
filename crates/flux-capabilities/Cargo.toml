@@ -10,6 +10,7 @@ flux-core.workspace = true
 flux-datasource.workspace = true
 flux-plugin.workspace = true
 flux-runtime.workspace = true
+flux-secret.workspace = true
 flux-spec.workspace = true
 flux-system.workspace = true
 reqwest.workspace = true
@@ -18,6 +19,7 @@ url.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 # Embeddings (optional): a runtime-free blocking HTTP client for the synchronous `Embedder` seam — NOT
 # reqwest::blocking, which spins its own runtime and panics when called from within tokio.
 ureq = { version = "2", optional = true, features = ["json"] }

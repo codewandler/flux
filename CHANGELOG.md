@@ -8,6 +8,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Endpoint reference model & registry (D-25).** The references-only spine of the endpoint-discovery
+  epic: a new L0 `flux_secret::endpoint` schema (`EndpointRef`/`EndpointCandidate`/`EndpointRecord` weak
+  references that carry a `credential_ref` location, never a secret; and a host-only `ResolvedEndpoint`
+  with no serializer), a `flux_plugin::ReferenceResolver` trait seam, and
+  `flux_capabilities::endpoint::{EndpointRegistry, StaticResolver}` — a session registry with
+  `put`/`resolve`/`list`/`replace_owned` and `~/.flux/endpoints.toml` persistence (weak refs only), plus
+  a static config-binding resolver. No discovery wiring yet (that lands with D-26/D-27).
 - **Endpoint discovery & brokerage epic (planning).** Filed the design for cross-plugin endpoint discovery
   ([docs/designs/endpoint-discovery.md](docs/designs/endpoint-discovery.md)) and stories D-25–D-30: a
   references-only plugin-IO model (a plugin operation deals only in host-managed endpoint/credential

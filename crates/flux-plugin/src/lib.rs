@@ -392,6 +392,32 @@ pub trait HostCapabilities: Send + Sync {
     async fn handle(&self, command: &str, payload: &Value) -> std::result::Result<Value, String>;
 }
 
+/// Resolves endpoint/credential **references** to their runtime form — host-side only. This is the
+/// seam the L5 endpoint broker implements; [`SystemHostCaps`] consults it (when present, see
+/// [`SystemHostCaps::with_resolver`]) so a plugin op can pass an `endpoint_ref` instead of a URL,
+/// and the host alone turns it into a connection + injected credentials. The plugin and the model
+/// never see a resolved URL-with-credentials.
+///
+/// A *reference* is either a **named** config/manifest endpoint (`"sql.endpoint"`) or a
+/// **discovered** `@endpoint/<id>`; the resolver handles both.
+#[async_trait]
+pub trait ReferenceResolver: Send + Sync {
+    /// Resolve an endpoint reference to its runtime form (absolute URL + any injected auth headers).
+    /// Host-only — the result has no model-visible serializer.
+    async fn resolve_endpoint(
+        &self,
+        reference: &str,
+    ) -> std::result::Result<flux_secret::endpoint::ResolvedEndpoint, String>;
+
+    /// Materialize a credential reference to secret material — for raw-socket in-band-auth protocols
+    /// (e.g. Postgres SCRAM) that must speak the handshake themselves. Host-side; the value is
+    /// delivered only to the trusted plugin binary, never surfaced to the model.
+    async fn resolve_credential(
+        &self,
+        reference: &flux_secret::Ref,
+    ) -> std::result::Result<flux_secret::Material, String>;
+}
+
 /// Denies every host-capability callback (the default for `call`). A plugin that needs callbacks
 /// must be driven via [`PluginHost::call_with_host`] with a real [`HostCapabilities`].
 pub struct DenyHostCaps;

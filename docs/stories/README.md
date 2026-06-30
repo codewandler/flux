@@ -22,9 +22,9 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
   grader-confirmed run is **staged** on a funded provider key
 
 ## Next (ready — take the top one unless the user named a story)
-- [D-25 — Endpoint reference model & registry](D-25-endpoint-reference-model.md) · Core · **top pick** ·
-  leads the **Endpoint discovery & brokerage** epic (below): the references-only spine — a plugin op deals
-  only in host-managed endpoint/credential references, never env vars or raw secrets.
+- [D-26 — Discovery provider role & host fan-out broker](D-26-endpoint-discovery-broker.md) · Core · **top pick** ·
+  the next step in the **Endpoint discovery & brokerage** epic (below) now that the D-25 references-only spine
+  has landed.
 - [D-11 — App-runner ergonomics](D-11-app-runner-ergonomics.md) · Agent · the alternate ready pick (makes
   `flux app run` a viable host for a declarative bot; unblocks Slack-channel assistant flows).
 
@@ -49,10 +49,7 @@ resolves it and injects credentials host-side, so neither the plugin nor the LLM
 the `.dex`-style endpoint-registry deferral from D-10/D-12. See [epic design](../designs/endpoint-discovery.md).
 **[D-20](D-20-scoped-private-net-egress.md) is pulled in as a hard dependency** (discovered endpoints are
 usually private/in-cluster hosts). Built in this order:
-- [D-25 — Endpoint reference model & registry](D-25-endpoint-reference-model.md) · Core · **leads, ready** ·
-  `EndpointRef` weak refs + `EndpointRegistry` + a static env/config resolver replacing per-plugin env
-  coupling (no discovery yet)
-- [D-26 — Discovery provider role & host fan-out broker](D-26-endpoint-discovery-broker.md) · Core · manifest
+- [D-26 — Discovery provider role & host fan-out broker](D-26-endpoint-discovery-broker.md) · Core · **next** · manifest
   `discovers: [products]` + an `endpoint.discover` host capability; the broker fans out to providers and
   returns weak refs only
 - [D-27 — Reference-based IO & host-injected connect](D-27-reference-based-io.md) · Core · the protocol
@@ -105,6 +102,11 @@ all providers**. Most plumbing already exists (`flux-credentials` import/refresh
   stage; import + refresh cover the near term
 
 ## Done
+- [D-25 — Endpoint reference model & registry](D-25-endpoint-reference-model.md) · Core · the
+  references-only spine of the endpoint epic: L0 `flux_secret::endpoint` schema (`EndpointRef`/
+  `Candidate`/`Record`/`ResolvedEndpoint`), the `flux_plugin::ReferenceResolver` trait seam, and
+  `flux_capabilities::endpoint::{EndpointRegistry, StaticResolver}` with `~/.flux/endpoints.toml`
+  persistence (weak refs only)
 - [I-02 — Reduce wasted agent-loop retries](I-02-agent-loop-retry-efficiency.md) · Improve · cargo
   wrappers normalize duplicate model-supplied scope flags, and the loop guard fingerprints repeated
   deterministic failures before replanning again

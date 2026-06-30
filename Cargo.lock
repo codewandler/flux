@@ -824,6 +824,7 @@ dependencies = [
  "flux-datasource",
  "flux-plugin",
  "flux-runtime",
+ "flux-secret",
  "flux-spec",
  "flux-system",
  "reqwest",
@@ -831,6 +832,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "toml",
  "ureq",
  "url",
 ]
@@ -1203,6 +1205,8 @@ name = "flux-secret"
 version = "0.2.7"
 dependencies = [
  "serde",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]

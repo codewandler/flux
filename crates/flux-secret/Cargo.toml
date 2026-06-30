@@ -7,3 +7,7 @@ description = "flux secret references, material, sensitivity, and log/output red
 
 [dependencies]
 serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+toml.workspace = true
