@@ -82,13 +82,21 @@ host-kit derives the schema + parses the call in one typed step.
   overlap, number matching) + 5 new params. The `schema_contract` test's `call.analyze` entry
   was updated for the new contract (`call_id` now optional, `correlation_header` required).
   `render` (svg) + `route` deferred (recorded in DRIFT).
+- **`gitlab` migrated** (64 ops, the largest surface). All `so(...)` → schemars structs; `so`
+  helper deleted; `r#ref` raw-ident for the `ref` keyword; contract test locks all 64 schemas.
+  `gitlab` in `MIGRATED_PLUGINS`. Fluxplane parity re-audit deferred (D-14 ported the surface).
+- **`slack` migrated** (30 ops). slack used an inline `json!({"type":"object",...})` shape
+  (no `so`); all 30 → schemars structs; `slack.channel.mark-read` → `ChannelMarkReadInput`
+  (hyphen). The guard was **strengthened** to flag both hand-written shapes (`so(json!{...})`
+  and inline `json!({"type":"object",...})`), failing-first for both. `slack` in
+  `MIGRATED_PLUGINS`. Fluxplane parity re-audit deferred (D-14 ported the surface).
 - **Guard landed.** `plugins/host-kit/tests/no_manual_plugin_schema.rs` (scoped to
   `MIGRATED_PLUGINS = ["homer"]`) fails on a reintroduced `fn so(` / `so(json!{...})` and on a
   partial migration (no `*_op_typed::<`); verified failing-first by reintroducing `so`.
 - **Drift collected.** `DRIFT.md` § D-36 records two `homer` drifts (`call.list` handler reads
   `ua`/`method`/`call_id` the schema omits; `call.show` advertises a `render` field the handler
   ignores) — preserved as-is (pure schema-source change), plus schemars representation notes.
-- **Remaining (16 plugins):** `gitlab`, `grafana`, `docker`, `huggingface`, `opsgenie`,
+- **Remaining (13 plugins):** `grafana`, `docker`, `huggingface`, `opsgenie`,
   `asterisk`, `sql`, `slack`, `websearch`, `jira`, `confluence`, `kubernetes`, `loki`,
   `prometheus`, `alertmanager`, `aws`. Several use `flex_str`/`flex_i64` string-or-number
   coercion → schema-only struct (handler stays), D-34 precedent. As each migrates: delete its
