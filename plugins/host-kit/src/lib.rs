@@ -186,6 +186,76 @@ impl Host<'_> {
         resp.json()
     }
 
+    /// Make an HTTP request through the host **by endpoint reference** — the plugin never holds a
+    /// URL. The host resolves `endpoint_ref` (a named manifest endpoint, or a discovered
+    /// `@endpoint/<id>`), joins `path` onto the resolved base, and injects any credential the
+    /// reference carries host-side. `auth_purpose` (when set) names a manifest auth method the host
+    /// injects per its declared scheme — same as [`http`](Self::http), but the URL stays host-only.
+    pub fn http_ref(
+        &mut self,
+        endpoint_ref: &str,
+        method: &str,
+        path: &str,
+        auth_purpose: Option<&str>,
+        body: Option<&[u8]>,
+    ) -> Result<HttpResponse, String> {
+        let mut payload = json!({ "method": method, "endpoint_ref": endpoint_ref, "path": path });
+        if let Some(p) = auth_purpose {
+            payload["auth_purpose"] = json!(p);
+        }
+        if let Some(b) = body {
+            payload["body_b64"] = json!(base64::engine::general_purpose::STANDARD.encode(b));
+        }
+        let v = self.inner.host_call("http.do", payload)?;
+        Ok(HttpResponse {
+            status: v.get("status").and_then(|x| x.as_u64()).unwrap_or(0) as u16,
+            body: v
+                .get("body")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        })
+    }
+
+    /// Convenience: GET an endpoint-reference path (optional auth purpose) and parse the JSON body,
+    /// erroring on non-2xx. The ref-based mirror of [`get_json`](Self::get_json).
+    pub fn get_json_ref(
+        &mut self,
+        endpoint_ref: &str,
+        path: &str,
+        auth_purpose: Option<&str>,
+    ) -> Result<Value, String> {
+        let resp = self.http_ref(endpoint_ref, "GET", path, auth_purpose, None)?;
+        if !resp.is_success() {
+            return Err(format!(
+                "GET {endpoint_ref} {path} → {} {}",
+                resp.status, resp.body
+            ));
+        }
+        resp.json()
+    }
+
+    /// Convenience: send a JSON body to an endpoint-reference path with `method` (optional auth
+    /// purpose) and parse the response. The ref-based mirror of [`send_json`](Self::send_json).
+    pub fn send_json_ref(
+        &mut self,
+        endpoint_ref: &str,
+        method: &str,
+        path: &str,
+        auth_purpose: Option<&str>,
+        body: &Value,
+    ) -> Result<Value, String> {
+        let s = serde_json::to_string(body).map_err(|e| e.to_string())?;
+        let resp = self.http_ref(endpoint_ref, method, path, auth_purpose, Some(s.as_bytes()))?;
+        if !resp.is_success() {
+            return Err(format!(
+                "{method} {endpoint_ref} {path} → {} {}",
+                resp.status, resp.body
+            ));
+        }
+        resp.json()
+    }
+
     /// Run an allow-listed subprocess through the host (e.g. `kubectl`). `argv[0]` must be in the
     /// plugin's granted `process` capabilities. Returns stdout/stderr/exit code.
     pub fn run(&mut self, argv: &[&str], timeout_secs: u64) -> Result<ProcessOutput, String> {
@@ -334,6 +404,50 @@ impl Host<'_> {
         v.get("conn_id")
             .and_then(|x| x.as_u64())
             .ok_or_else(|| "conn.dial: host returned no conn_id".into())
+    }
+
+    /// Open a raw socket connection **by endpoint reference** — the plugin passes the ref, never the
+    /// host:port. The host resolves `endpoint_ref` (named manifest endpoint or discovered
+    /// `@endpoint/<id>`) to a host:port and dials it under the same SSRF/grant guard as
+    /// [`conn_dial`](Self::conn_dial). Returns the opaque connection id. This is how a raw-socket
+    /// plugin (SQL, AMI) reaches a discovered endpoint without ever holding a URL.
+    pub fn conn_dial_ref(&mut self, endpoint_ref: &str) -> Result<u64, String> {
+        let v = self
+            .inner
+            .host_call("conn.dial", json!({ "endpoint_ref": endpoint_ref }))?;
+        v.get("conn_id")
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| "conn.dial: host returned no conn_id".into())
+    }
+
+    /// Materialize a credential **reference** into its raw secret value via the gated `credential`
+    /// host capability — for raw-socket in-band-auth protocols (e.g. Postgres SCRAM) that must speak
+    /// the handshake themselves. Deny-by-default: the plugin's manifest must grant `credential`. The
+    /// value is delivered only to the trusted plugin binary and registered with the host redactor, so
+    /// it never leaks into model-visible output. `credential_ref` is a `scheme/...` string (e.g.
+    /// `kubernetes/monitoring/pg-creds/password`).
+    pub fn credential(&mut self, credential_ref: &str) -> Result<String, String> {
+        let v = self
+            .inner
+            .host_call("credential", json!({ "credential_ref": credential_ref }))?;
+        v.get("value")
+            .and_then(|x| x.as_str())
+            .map(String::from)
+            .ok_or_else(|| "credential: host returned no value".into())
+    }
+
+    /// Materialize the credential **attached to an endpoint reference** via the gated `credential`
+    /// host capability — the host looks the endpoint's `credential_ref` up in its registry and
+    /// resolves it (cross-plugin grants/audit apply). Same deny-by-default + redaction guarantees as
+    /// [`credential`](Self::credential); the plugin passes only the `endpoint_ref`.
+    pub fn credential_for_endpoint(&mut self, endpoint_ref: &str) -> Result<String, String> {
+        let v = self
+            .inner
+            .host_call("credential", json!({ "endpoint_ref": endpoint_ref }))?;
+        v.get("value")
+            .and_then(|x| x.as_str())
+            .map(String::from)
+            .ok_or_else(|| "credential: host returned no value".into())
     }
 
     /// Write bytes to an open connection; returns the number written.
@@ -617,6 +731,13 @@ pub struct MockHost {
     pub secrets: HashMap<String, String>,
     /// `endpoint name -> base url`.
     pub endpoints: HashMap<String, String>,
+    /// `endpoint_ref -> base url` for ref-based IO (`http.do`/`conn.dial` with an `endpoint_ref`).
+    /// Covers both named (`svc.endpoint`) and discovered (`@endpoint/<id>`) refs — the resolver the
+    /// real host installs. `http_ref`/`conn_dial_ref` resolve against this map.
+    pub endpoint_refs: HashMap<String, String>,
+    /// `credential_ref` OR `endpoint_ref` -> materialized value, for the gated `credential` host
+    /// capability (the password a raw-socket plugin needs for in-band auth).
+    pub credentials: HashMap<String, String>,
     /// `(argv-substring) -> stdout string for process.run` (matched in insertion order).
     pub process: Vec<(String, String)>,
     /// The `proc_id` returned by every `process.spawn`.
@@ -647,6 +768,8 @@ impl Default for MockHost {
             http: Vec::new(),
             secrets: HashMap::new(),
             endpoints: HashMap::new(),
+            endpoint_refs: HashMap::new(),
+            credentials: HashMap::new(),
             process: Vec::new(),
             spawn_proc_id: 1,
             proc_output: (String::new(), String::new()),
@@ -670,6 +793,18 @@ impl MockHost {
     /// A resolvable endpoint base URL.
     pub fn with_endpoint(mut self, name: &str, url: &str) -> Self {
         self.endpoints.insert(name.into(), url.into());
+        self
+    }
+    /// A resolvable endpoint **reference** (named or discovered `@endpoint/<id>`) → base URL, for
+    /// the ref-based `http_ref`/`conn_dial_ref` paths the real host resolves through the broker.
+    pub fn with_endpoint_ref(mut self, endpoint_ref: &str, url: &str) -> Self {
+        self.endpoint_refs.insert(endpoint_ref.into(), url.into());
+        self
+    }
+    /// A materialized credential for the gated `credential` host capability, keyed by EITHER a
+    /// `credential_ref` string or an `endpoint_ref` — whichever the plugin passes.
+    pub fn with_credential(mut self, key: &str, value: &str) -> Self {
+        self.credentials.insert(key.into(), value.into());
         self
     }
     /// A resolvable secret purpose.
@@ -706,6 +841,20 @@ impl MockHost {
     }
 }
 
+/// Join a base URL and a relative `path` with exactly one separating slash — a small stand-in for
+/// the real host's `url::Url::join` over the SQL/HTTP-DSN shapes the tests exercise (avoids a `url`
+/// dependency in the mock). An empty path returns the base unchanged.
+fn join_url(base: &str, path: &str) -> String {
+    if path.is_empty() {
+        return base.to_string();
+    }
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
 impl GuestHost for MockHost {
     fn host_call(&mut self, command: &str, payload: Value) -> Result<Value, String> {
         match command {
@@ -727,7 +876,25 @@ impl GuestHost for MockHost {
                     .ok_or_else(|| format!("mock: no endpoint `{n}`"))
             }
             "http.do" => {
-                let url = payload.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                // Ref-based IO: resolve `endpoint_ref` to a base URL + join `path`, mirroring the
+                // real host so a plugin's `http_ref` call matches against the same canned `http`/
+                // `http_bytes` entries (by URL substring) as a `url`-based call.
+                let url = if let Some(er) = payload.get("endpoint_ref").and_then(|v| v.as_str()) {
+                    let base = self
+                        .endpoint_refs
+                        .get(er)
+                        .cloned()
+                        .ok_or_else(|| format!("mock: no endpoint_ref `{er}`"))?;
+                    let path = payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                    join_url(&base, path)
+                } else {
+                    payload
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let url = url.as_str();
                 // Binary download path: return base64 of canned raw bytes, matching the host.
                 if payload
                     .get("response_binary")
@@ -800,7 +967,29 @@ impl GuestHost for MockHost {
                 self.contributed.borrow_mut().extend(recs);
                 Ok(json!({ "indexed": n }))
             }
-            "conn.dial" => Ok(json!({ "conn_id": 1 })),
+            "credential" => {
+                // The gated `credential` host capability: materialize a credential value for the
+                // trusted plugin's in-band auth. Keyed by EITHER `credential_ref` or `endpoint_ref`.
+                let key = payload
+                    .get("credential_ref")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| payload.get("endpoint_ref").and_then(|v| v.as_str()))
+                    .ok_or("mock: credential requires `credential_ref` or `endpoint_ref`")?;
+                self.credentials
+                    .get(key)
+                    .map(|v| json!({ "value": v }))
+                    .ok_or_else(|| format!("mock: no credential for `{key}`"))
+            }
+            "conn.dial" => {
+                // A ref-based dial resolves the `endpoint_ref` (so a bad/unconfigured ref errors,
+                // and the ref — not global state — drives which target a multi-instance plugin hits).
+                if let Some(er) = payload.get("endpoint_ref").and_then(|v| v.as_str()) {
+                    if !self.endpoint_refs.contains_key(er) {
+                        return Err(format!("mock: no endpoint_ref `{er}` to dial"));
+                    }
+                }
+                Ok(json!({ "conn_id": 1 }))
+            }
             "conn.write" => {
                 let b64 = payload
                     .get("data_b64")
@@ -937,6 +1126,54 @@ mod tests {
 
         // unknown op errors
         assert!(plugin.call("nope", json!({}), &mut host).is_err());
+    }
+
+    #[test]
+    fn ref_based_http_and_credential_helpers() {
+        // http_ref resolves the endpoint_ref + path host-side; the plugin never holds a URL. The
+        // canned http entry matches by the composed-URL substring, exactly like the real host.
+        let mut backend = MockHost::default()
+            .with_endpoint_ref("@endpoint/svc-1", "https://svc.internal/v1/")
+            .with_http("/v1/ping", json!({ "pong": true }))
+            .with_credential("kubernetes/ns/sec/password", "pw-from-cred-ref")
+            .with_credential("@endpoint/pg-1", "pw-from-endpoint-ref");
+        let mut host = Host {
+            inner: &mut backend,
+        };
+        let v = host.get_json_ref("@endpoint/svc-1", "ping", None).unwrap();
+        assert_eq!(v["pong"], true);
+        // An unconfigured ref is a clear error (the plugin can't reach an unknown endpoint).
+        assert!(host
+            .http_ref("@endpoint/nope", "GET", "x", None, None)
+            .is_err());
+        // The gated `credential` capability materializes by credential_ref or endpoint_ref.
+        assert_eq!(
+            host.credential("kubernetes/ns/sec/password").unwrap(),
+            "pw-from-cred-ref"
+        );
+        assert_eq!(
+            host.credential_for_endpoint("@endpoint/pg-1").unwrap(),
+            "pw-from-endpoint-ref"
+        );
+        assert!(host.credential("kubernetes/ns/sec/missing").is_err());
+    }
+
+    #[test]
+    fn conn_dial_ref_resolves_and_round_trips() {
+        let mut backend = MockHost::default()
+            .with_endpoint_ref("@endpoint/db-1", "postgres://db.internal:5432/app")
+            .with_conn_response(b"OK".to_vec());
+        let mut host = Host {
+            inner: &mut backend,
+        };
+        let id = host.conn_dial_ref("@endpoint/db-1").unwrap();
+        assert_eq!(id, 1);
+        assert_eq!(host.conn_read(id, 64).unwrap(), b"OK");
+        host.conn_close(id).unwrap();
+        // Dialing an unconfigured ref errors (the ref drives the target, not global state).
+        let mut empty = MockHost::default();
+        let mut host2 = Host { inner: &mut empty };
+        assert!(host2.conn_dial_ref("@endpoint/unknown").is_err());
     }
 
     #[test]

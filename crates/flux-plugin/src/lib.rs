@@ -1008,24 +1008,37 @@ impl HostCapabilities for SystemHostCaps {
                 // to an absolute URL + injected auth headers — the plugin (and the model) never see the
                 // URL or the credential. The composed URL still runs through the SAME egress guard +
                 // host allow-list as the legacy `url` path, so SSRF/private-net rules still apply.
+                //
+                // NAMED vs DISCOVERED split: a *discovered* `@endpoint/<id>` ref goes to the injected
+                // resolver (the L5 broker, which owns the discovery registry + the cross-plugin gate). A
+                // *named* manifest endpoint resolves LOCALLY here from the plugin's own `EndpointSpec`
+                // env binding + the declared `auth_purpose` injection — so a static plugin needs NO host
+                // config beyond "set the documented env var and go" and works with no resolver installed.
                 let mut ref_injected: Vec<(String, String)> = Vec::new();
                 let mut url = if let Some(endpoint_ref) =
                     payload.get("endpoint_ref").and_then(|v| v.as_str())
                 {
-                    let resolver = self.resolver.as_ref().ok_or(
-                        "http.do: endpoint_ref requires a reference resolver (none installed)",
-                    )?;
-                    // Resolve on behalf of THIS plugin (the real consumer): if the endpoint's
-                    // credential is owned by another plugin, host-injecting it is a cross-plugin use
-                    // and the broker's deny-by-default gate fires against `self.consumer`.
-                    let resolved = resolver
-                        .resolve_endpoint_for(&self.consumer, endpoint_ref)
-                        .await?;
                     let path = payload.get("path").and_then(|v| v.as_str());
-                    let composed = compose_url(&resolved.url, path)?;
+                    let base =
+                        if flux_secret::endpoint::EndpointRef::is_discovered_ref(endpoint_ref) {
+                            let resolver = self.resolver.as_ref().ok_or(
+                            "http.do: endpoint_ref requires a reference resolver (none installed)",
+                        )?;
+                            // Resolve on behalf of THIS plugin (the real consumer): if the endpoint's
+                            // credential is owned by another plugin, host-injecting it is a cross-plugin use
+                            // and the broker's deny-by-default gate fires against `self.consumer`.
+                            let resolved = resolver
+                                .resolve_endpoint_for(&self.consumer, endpoint_ref)
+                                .await?;
+                            ref_injected = resolved.injected_headers;
+                            resolved.url
+                        } else {
+                            // Named manifest endpoint → resolve its base URL locally from the declared env.
+                            self.resolve_endpoint(endpoint_ref)?
+                        };
+                    let composed = compose_url(&base, path)?;
                     let url = guard_http_url(&composed, &self.private_net_allow())?;
                     self.ensure_http_host_allowed(&url)?;
-                    ref_injected = resolved.injected_headers;
                     url
                 } else {
                     let raw = payload.get("url").and_then(|v| v.as_str()).unwrap_or("");
@@ -1109,19 +1122,33 @@ impl HostCapabilities for SystemHostCaps {
                 // it and takes host:port from the resolved URL — the plugin passes the ref, not the
                 // host:port. The resolved target still runs through the same `dial_scoped` guard +
                 // grant check below.
+                //
+                // NAMED vs DISCOVERED split (mirrors `http.do`): a *discovered* `@endpoint/<id>` ref
+                // resolves through the injected resolver; a *named* manifest endpoint resolves its
+                // host:port LOCALLY from the plugin's own `EndpointSpec` env binding (no host config,
+                // no resolver needed).
                 let target = if let Some(endpoint_ref) =
                     payload.get("endpoint_ref").and_then(|v| v.as_str())
                 {
-                    let resolver = self.resolver.as_ref().ok_or(
-                        "conn.dial: endpoint_ref requires a reference resolver (none installed)",
-                    )?;
-                    // Resolve on behalf of THIS plugin (the real consumer) — same cross-plugin gating
-                    // rationale as the `http.do` path (the resolved URL's host:port is what we dial;
-                    // any cross-plugin credential on the record is gated against `self.consumer`).
-                    let resolved = resolver
-                        .resolve_endpoint_for(&self.consumer, endpoint_ref)
-                        .await?;
-                    dial_target_from_url(&resolved.url)?
+                    let base = if flux_secret::endpoint::EndpointRef::is_discovered_ref(
+                        endpoint_ref,
+                    ) {
+                        let resolver = self.resolver.as_ref().ok_or(
+                            "conn.dial: endpoint_ref requires a reference resolver (none installed)",
+                        )?;
+                        // Resolve on behalf of THIS plugin (the real consumer) — same cross-plugin
+                        // gating rationale as the `http.do` path (the resolved URL's host:port is what
+                        // we dial; any cross-plugin credential on the record is gated against
+                        // `self.consumer`).
+                        let resolved = resolver
+                            .resolve_endpoint_for(&self.consumer, endpoint_ref)
+                            .await?;
+                        resolved.url
+                    } else {
+                        // Named manifest endpoint → resolve its base URL locally from the declared env.
+                        self.resolve_endpoint(endpoint_ref)?
+                    };
+                    dial_target_from_url(&base)?
                 } else {
                     let kind = payload
                         .get("kind")
@@ -2699,6 +2726,81 @@ mod tests {
             result.get("url").is_none() && result.get("endpoint_ref").is_none(),
             "frame must not echo the URL/ref back to the plugin"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn http_by_named_ref_resolves_from_manifest() {
+        use flux_system::{System, Workspace};
+        let dir =
+            std::env::temp_dir().join(format!("flux-httpnamedref-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let port = spawn_header_echo_server().await;
+
+        // A NAMED manifest endpoint bound to the loopback test server via env, plus a declared
+        // Bearer auth method. The plugin passes only the named `endpoint_ref` + `path`; the host
+        // resolves the base URL locally from the manifest (no resolver installed), composes the URL,
+        // and injects the declared `auth_purpose` host-side. A resolver is deliberately NOT installed
+        // to prove a named ref resolves entirely from the manifest.
+        std::env::set_var(
+            "FLUX_TEST_NAMEDREF_URL",
+            format!("http://127.0.0.1:{port}/"),
+        );
+        std::env::set_var("FLUX_TEST_NAMEDREF_TOK", "named-bear-tok");
+        let manifest = PluginManifest {
+            name: "svc".into(),
+            auth: vec![AuthMethod::bearer(
+                "api_token",
+                vec!["FLUX_TEST_NAMEDREF_TOK".into()],
+            )],
+            endpoints: vec![EndpointSpec {
+                name: "svc.endpoint".into(),
+                env: vec!["FLUX_TEST_NAMEDREF_URL".into()],
+                http_hosts: vec!["127.0.0.1".into()],
+                description: String::new(),
+            }],
+            capabilities: PluginCapabilities {
+                http: true,
+                http_hosts: vec!["127.0.0.1".into()],
+                private_hosts: vec!["127.0.0.1".into()],
+                secrets: vec!["FLUX_TEST_NAMEDREF_TOK".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let caps = SystemHostCaps::new(sys)
+            .with_manifest(&manifest)
+            .with_private_net_grants(vec!["127.0.0.1".into()]);
+
+        let result = caps
+            .handle(
+                "http.do",
+                &json!({
+                    "endpoint_ref": "svc.endpoint",
+                    "path": "/api/x",
+                    "auth_purpose": "api_token",
+                }),
+            )
+            .await
+            .unwrap();
+
+        // The host composed `{base}/api/x` and injected the declared Bearer token; the echo server
+        // reflects the Authorization header it saw.
+        assert_eq!(result["status"], 200);
+        assert_eq!(
+            result["body"], "Bearer named-bear-tok",
+            "the host injected the declared auth_purpose for a named ref"
+        );
+        // The frame carries neither the resolved URL nor the token — only the ref + path went in.
+        let frame = result.to_string();
+        assert!(
+            !frame.contains("127.0.0.1") && !frame.contains("FLUX_TEST_NAMEDREF"),
+            "frame must not carry the URL/env: {frame}"
+        );
+
+        std::env::remove_var("FLUX_TEST_NAMEDREF_URL");
+        std::env::remove_var("FLUX_TEST_NAMEDREF_TOK");
         std::fs::remove_dir_all(&dir).ok();
     }
 

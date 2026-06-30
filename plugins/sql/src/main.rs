@@ -43,6 +43,8 @@ fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("sql", "0.1.0")
         .capabilities(Caps {
             // Sockets only — the conn allow-list covers the two SQL ports. (SSRF-guarded host-side.)
+            // The same `conn` grant covers a dial to a *discovered* postgres endpoint: the host
+            // resolves its host:port from the ref and applies the egress guard.
             conn: vec![
                 format!("tcp:*:{PG_DEFAULT_PORT}"),
                 format!("tcp:*:{MYSQL_DEFAULT_PORT}"),
@@ -54,6 +56,11 @@ fn manifest_builder() -> PluginBuilder {
                 "MYSQL_USERNAME".into(),
                 "MYSQL_PASSWORD".into(),
             ],
+            // Consume discovered endpoints' credentials: the gated `credential` capability lets sql
+            // materialize the password (e.g. a kubernetes `credential_ref`) for the SCRAM handshake.
+            // Deny-by-default + cross-plugin grant/audit still apply host-side; the value is redacted
+            // and never returned to the model.
+            credential: true,
             ..Default::default()
         })
         // Credentials resolved by purpose. The handshake needs the *raw* values (it builds its own
@@ -165,11 +172,14 @@ fn manifest_builder() -> PluginBuilder {
         )
 }
 
-/// The connection fields every op accepts (the `endpoint_ref`/driver/database trio mirrors the
-/// reference). `endpoint_ref` is optional here: flux resolves the single declared `sql.endpoint`.
+/// The connection fields every op accepts. An endpoint can be addressed three ways (priority order):
+/// `endpoint` (a discovered endpoint reference object, from `endpoint.select` — preferred for a
+/// discovered postgres endpoint), `endpoint_ref` (a discovered `@endpoint/<id>` id, or a registered
+/// endpoint name; defaults to `sql.endpoint`). `driver`/`database` override the dialect/database.
 fn conn_props() -> Value {
     json!({
-        "endpoint_ref": {"type": "string", "description": "Registered SQL endpoint name (default sql.endpoint)."},
+        "endpoint": {"type": "object", "description": "A discovered endpoint reference (from endpoint.select). Secret-free; preferred for discovered endpoints."},
+        "endpoint_ref": {"type": "string", "description": "A discovered @endpoint/<id> ref, or a registered SQL endpoint name (default sql.endpoint)."},
         "driver": {"type": "string", "description": "Dialect override: postgres|mysql|sqlite.", "enum": ["postgres", "mysql", "sqlite"]},
         "database": {"type": "string", "description": "Database override."}
     })
@@ -228,6 +238,24 @@ struct SqlTarget {
     dsn_password: Option<String>,
     /// A password-redacted form of the URL, surfaced as `endpoint_url`.
     safe_url: String,
+    /// When this target came from a **discovered** endpoint (an `@endpoint/<id>` ref), how the host
+    /// resolves it: the plugin dials and fetches the password by reference, never holding a URL with
+    /// a password. `None` = a static/named endpoint resolved the legacy way (DSN + `secret`).
+    discovered: Option<DiscoveredSource>,
+}
+
+/// The host-resolved references a discovered-endpoint [`SqlTarget`] carries. The plugin passes these
+/// references back to the host for the privileged operations (dial, materialize the password); it
+/// never holds the URL-with-password itself.
+#[derive(Debug, Clone)]
+struct DiscoveredSource {
+    /// The `@endpoint/<id>` reference — dialed via `host.conn_dial_ref` (the host applies the egress
+    /// guard) and used to materialize the password via `host.credential_for_endpoint` when no
+    /// explicit `credential_ref` is present.
+    endpoint_ref: String,
+    /// The endpoint's `credential_ref` string (a *location*, never a value), when the weak
+    /// `EndpointRef` carried one. Materialized via the gated `credential` capability for SCRAM.
+    credential_ref: Option<String>,
 }
 
 /// Normalize a dialect override / URL scheme to a [`Dialect`] (matching the reference aliases).
@@ -241,19 +269,131 @@ fn normalize_dialect(value: &str) -> Option<Dialect> {
     }
 }
 
-/// Resolve the endpoint DSN (from the host) + any input overrides into a [`SqlTarget`].
+/// Resolve the op input into a [`SqlTarget`]. Three input shapes are accepted, in priority order:
+///
+/// 1. A full weak `EndpointRef` JSON object in `endpoint` (preferred for a discovered endpoint — the
+///    agent gets it from `endpoint.select`). It is secret-free: its `url` is a bare
+///    `postgres://user@host:port/db` (NO password), plus an optional `credential_ref` *location*. The
+///    plugin parses host:port/database/dialect/username from that bare URL and dials + fetches the
+///    password by reference.
+/// 2. An `endpoint_ref` string that is a **discovered** `@endpoint/<id>`: the host resolves it for the
+///    dial/credential references; host:port/db/user come from the host-resolved URL (host-only — the
+///    plugin learns them only as connection metadata, never a password).
+/// 3. An `endpoint_ref` string naming a **static** endpoint (or the default `sql.endpoint`): the
+///    legacy path — `host.endpoint` hands back a DSN, username/password via `secret`.
 fn resolve_target(input: &Value, host: &mut Host) -> Result<SqlTarget, String> {
+    let driver = flex_str(input, "driver");
+    let db_override = flex_str(input, "database");
+
+    // (1) A full weak EndpointRef object passed inline by the agent.
+    if let Some(obj) = input.get("endpoint").filter(|v| v.is_object()) {
+        return target_from_endpoint_ref(obj, driver.as_deref(), db_override.as_deref());
+    }
+
     let endpoint_ref = flex_str(input, "endpoint_ref").unwrap_or_else(|| "sql.endpoint".into());
+
+    // (2) A discovered `@endpoint/<id>` ref id: resolve the bare URL host-side via the `endpoint`
+    // capability (no password in it), and carry the ref for the dial + credential references.
+    if is_discovered_ref(&endpoint_ref) {
+        let raw_url = host.endpoint(&endpoint_ref)?;
+        let raw_url = raw_url.trim();
+        if raw_url.is_empty() {
+            return Err("discovered endpoint has no url".into());
+        }
+        let mut target = target_from_url(driver.as_deref(), raw_url, db_override.as_deref())?;
+        target.discovered = Some(DiscoveredSource {
+            endpoint_ref,
+            credential_ref: None,
+        });
+        return Ok(target);
+    }
+
+    // (3) A static/named endpoint: the legacy DSN-handback path.
     let raw_url = host.endpoint(&endpoint_ref)?;
     let raw_url = raw_url.trim();
     if raw_url.is_empty() {
         return Err("endpoint has no url".into());
     }
-    target_from_url(
-        flex_str(input, "driver").as_deref(),
-        raw_url,
-        flex_str(input, "database").as_deref(),
-    )
+    target_from_url(driver.as_deref(), raw_url, db_override.as_deref())
+}
+
+/// Canonical prefix for a discovered endpoint id (`@endpoint/<id>`), matching
+/// `flux_secret::endpoint::ENDPOINT_REF_PREFIX`. Kept local so the plugin pulls no extra crate edge.
+const ENDPOINT_REF_PREFIX: &str = "@endpoint/";
+
+/// Whether a reference id is a discovered `@endpoint/<id>` (vs a named/config endpoint).
+fn is_discovered_ref(id: &str) -> bool {
+    id.starts_with(ENDPOINT_REF_PREFIX)
+}
+
+/// Build a [`SqlTarget`] from a weak endpoint-reference object the agent passed inline (the
+/// `flux_secret::endpoint::EndpointRef` JSON shape, parsed here without the crate edge). The ref's
+/// `url` is bare (no password); host:port/database/dialect/username come from it, the password from
+/// the gated `credential` capability against the ref's `credential_ref` (or the ref id).
+fn target_from_endpoint_ref(
+    endpoint: &Value,
+    driver_override: Option<&str>,
+    database_override: Option<&str>,
+) -> Result<SqlTarget, String> {
+    let url = endpoint
+        .get("url")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .ok_or("`endpoint` reference has no url")?;
+    let id = endpoint
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or("`endpoint` reference has no id")?;
+    // The protocol hint (or product) can stand in for the dialect when the URL scheme is generic.
+    let driver = driver_override.map(str::to_string).or_else(|| {
+        endpoint
+            .get("protocol")
+            .and_then(|v| v.as_str())
+            .or_else(|| endpoint.get("product").and_then(|v| v.as_str()))
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    });
+    let mut target = target_from_url(driver.as_deref(), url, database_override)?;
+    target.discovered = Some(DiscoveredSource {
+        endpoint_ref: id,
+        // The `credential_ref` is the structured `Ref` (a location) `endpoint.select` emits; render
+        // it to the `scheme/...` string the host's `credential` capability parses. `None` = the host
+        // looks the credential up by the endpoint ref instead.
+        credential_ref: endpoint
+            .get("credential_ref")
+            .filter(|v| !v.is_null())
+            .map(credential_ref_to_string)
+            .transpose()?,
+    });
+    Ok(target)
+}
+
+/// Render a `credential_ref` (the structured `Ref` JSON `endpoint.select` emits, or already a
+/// `scheme/...` string) into the `scheme/...` form the host's `credential` capability parses.
+fn credential_ref_to_string(v: &Value) -> Result<String, String> {
+    if let Some(s) = v.as_str() {
+        return Ok(s.to_string());
+    }
+    let obj = v
+        .as_object()
+        .ok_or("`credential_ref` must be a string or object")?;
+    let scheme = obj
+        .get("scheme")
+        .and_then(|s| s.as_str())
+        .ok_or("`credential_ref` missing `scheme`")?;
+    let slot = obj.get("slot").and_then(|s| s.as_str()).unwrap_or("");
+    match scheme {
+        // `env/KEY` uses only the slot; plugin/kubernetes use plugin/instance/slot.
+        "env" => Ok(format!("env/{slot}")),
+        "plugin" | "kubernetes" => {
+            let plugin = obj.get("plugin").and_then(|s| s.as_str()).unwrap_or("");
+            let instance = obj.get("instance").and_then(|s| s.as_str()).unwrap_or("");
+            Ok(format!("{scheme}/{plugin}/{instance}/{slot}"))
+        }
+        other => Err(format!("unknown credential_ref scheme {other:?}")),
+    }
 }
 
 /// Parse a `scheme://[user[:pass]@]host[:port]/database` DSN into a [`SqlTarget`]. The dialect comes
@@ -352,15 +492,47 @@ fn target_from_url(
         dsn_user,
         dsn_password,
         safe_url,
+        discovered: None,
     })
 }
 
-/// Resolve the effective `(user, password, database)` for the handshake: host secrets win over the
-/// DSN userinfo; the Postgres database defaults to the user when unset (libpq behavior).
+/// Resolve the effective `(user, password, database)` for the handshake.
+///
+/// For a **discovered** endpoint the connection metadata (username, host, port, database) comes from
+/// the weak ref's bare URL — those are non-secret. The PASSWORD is materialized through the gated
+/// `credential` host capability (host-side, audited, redacted): by the endpoint's explicit
+/// `credential_ref` when present, else by the `endpoint_ref` itself (the host looks the record's
+/// credential up). The password is never in a URL and never returned to the model.
+///
+/// For a **static/named** endpoint the legacy path applies: `host.secret("username"/"password")`
+/// wins over the DSN userinfo; the Postgres database defaults to the user when unset (libpq behavior).
 fn resolve_credentials(
     target: &SqlTarget,
     host: &mut Host,
 ) -> Result<(String, String, String), String> {
+    if let Some(disc) = &target.discovered {
+        // Username/database are non-secret connection metadata parsed from the bare ref URL.
+        let user = target
+            .dsn_user
+            .clone()
+            .unwrap_or_else(|| match target.dialect {
+                Dialect::Postgres => "postgres".into(),
+                Dialect::MySql => "root".into(),
+                Dialect::Sqlite => String::new(),
+            });
+        // Password via the gated `credential` capability — by explicit ref, else by endpoint ref.
+        let password = match &disc.credential_ref {
+            Some(cref) => host.credential(cref)?,
+            None => host.credential_for_endpoint(&disc.endpoint_ref)?,
+        };
+        let database = if target.database.trim().is_empty() {
+            user.clone()
+        } else {
+            target.database.clone()
+        };
+        return Ok((user, password, database));
+    }
+
     let user = host
         .secret("username")
         .ok()
@@ -383,6 +555,19 @@ fn resolve_credentials(
         target.database.clone()
     };
     Ok((user, password, database))
+}
+
+/// Dial the target through the host: a discovered endpoint dials **by reference**
+/// (`host.conn_dial_ref` — the host resolves host:port and applies the egress guard); a static
+/// endpoint dials the parsed host:port directly. Either way the host owns the socket.
+fn dial(target: &SqlTarget, host: &mut Host) -> Result<u64, String> {
+    match &target.discovered {
+        Some(disc) => host.conn_dial_ref(&disc.endpoint_ref),
+        None => host.conn_dial(ConnTarget::Tcp {
+            host: &target.host,
+            port: target.port,
+        }),
+    }
 }
 
 // ===========================================================================
@@ -600,10 +785,7 @@ fn op_test(input: Value, host: &mut Host) -> Result<Value, String> {
     require_postgres(&target)?;
     let (user, password, database) = resolve_credentials(&target, host)?;
 
-    let cid = host.conn_dial(ConnTarget::Tcp {
-        host: &target.host,
-        port: target.port,
-    })?;
+    let cid = dial(&target, host)?;
     let result = (|| -> Result<Value, String> {
         let mut pg = PgClient::connect(host, cid, &user, &password, &database)?;
         let res = pg.simple_query("SELECT 1")?;
@@ -630,10 +812,7 @@ fn op_query(input: Value, host: &mut Host) -> Result<Value, String> {
     require_postgres(&target)?;
     let (user, password, database) = resolve_credentials(&target, host)?;
 
-    let cid = host.conn_dial(ConnTarget::Tcp {
-        host: &target.host,
-        port: target.port,
-    })?;
+    let cid = dial(&target, host)?;
     let shaped = (|| -> Result<Value, String> {
         let mut pg = PgClient::connect(host, cid, &user, &password, &database)?;
         let result = pg.simple_query(&query)?;
@@ -661,10 +840,7 @@ fn op_database_list(input: Value, host: &mut Host) -> Result<Value, String> {
     require_postgres(&target)?;
     let (user, password, database) = resolve_credentials(&target, host)?;
 
-    let cid = host.conn_dial(ConnTarget::Tcp {
-        host: &target.host,
-        port: target.port,
-    })?;
+    let cid = dial(&target, host)?;
     let result = (|| -> Result<Value, String> {
         let mut pg = PgClient::connect(host, cid, &user, &password, &database)?;
         let mut databases: Vec<Value> = Vec::new();
@@ -718,10 +894,7 @@ fn op_table_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let include_views = flex_bool(&input, "include_views");
     let max_results = clamp(flex_i64(&input, "max_results").unwrap_or(0), 200, 1000) as usize;
 
-    let cid = host.conn_dial(ConnTarget::Tcp {
-        host: &target.host,
-        port: target.port,
-    })?;
+    let cid = dial(&target, host)?;
     let result = (|| -> Result<Value, String> {
         let mut pg = PgClient::connect(host, cid, &user, &password, &database)?;
         let relkinds = if include_views {
@@ -784,10 +957,7 @@ fn op_table_show(input: Value, host: &mut Host) -> Result<Value, String> {
     let table = flex_str(&input, "table").ok_or("`table` (string) required")?;
     let schema = flex_str(&input, "schema").unwrap_or_default();
 
-    let cid = host.conn_dial(ConnTarget::Tcp {
-        host: &target.host,
-        port: target.port,
-    })?;
+    let cid = dial(&target, host)?;
     let result = (|| -> Result<Value, String> {
         let mut pg = PgClient::connect(host, cid, &user, &password, &database)?;
 
@@ -894,10 +1064,7 @@ fn op_index_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let schema = flex_str(&input, "schema").unwrap_or_default();
     let table = flex_str(&input, "table").unwrap_or_default();
 
-    let cid = host.conn_dial(ConnTarget::Tcp {
-        host: &target.host,
-        port: target.port,
-    })?;
+    let cid = dial(&target, host)?;
     let result = (|| -> Result<Value, String> {
         let mut pg = PgClient::connect(host, cid, &user, &password, &database)?;
         let sql = format!(
@@ -1990,6 +2157,170 @@ mod tests {
         assert_eq!(out["indexes"][0]["columns"], json!(["id"]));
         assert_eq!(out["indexes"][1]["unique"], false);
         assert_eq!(out["indexes"][1]["columns"], json!(["name"]));
+    }
+
+    /// A MockHost for a DISCOVERED postgres endpoint: the conn stream replays the connect frames +
+    /// `responses` keyed by the discovered `endpoint_ref` (so `conn_dial_ref` resolves it), the URL
+    /// resolves bare (no password), and the password is materialized through the gated `credential`
+    /// capability — never via a `secret` purpose and never inside a URL.
+    fn discovered_host(
+        endpoint_ref: &str,
+        bare_url: &str,
+        password: &str,
+        responses: Vec<Vec<u8>>,
+    ) -> MockHost {
+        let mut stream = connect_frames();
+        for r in responses {
+            stream.extend(r);
+        }
+        MockHost::default()
+            // The host-resolved bare URL for the discovered-id input path (no password in it).
+            .with_endpoint(endpoint_ref, bare_url)
+            // The dial-by-ref resolution target.
+            .with_endpoint_ref(endpoint_ref, bare_url)
+            // The password via the gated `credential` capability, keyed by endpoint_ref.
+            .with_credential(endpoint_ref, password)
+            .with_conn_response(stream)
+    }
+
+    #[test]
+    fn sql_queries_discovered_endpoint() {
+        // The demo: an agent discovers a postgres endpoint and sql.query connects to it. The plugin
+        // (and the model) never see a URL-with-password.
+        let password = "k8s-scram-password";
+
+        // (a) The PREFERRED shape: the full weak EndpointRef object passed inline, with a kubernetes
+        // `credential_ref` (a location). The bare `url` carries NO password; the password is fetched
+        // through the gated `credential` capability against the `credential_ref`.
+        let endpoint = json!({
+            "id": "@endpoint/pg-1",
+            "url": "postgres://app@pg.monitoring.svc:5432/warehouse",
+            "product": "postgres",
+            "protocol": "postgres",
+            "source": "discovered",
+            // The `credential_ref` is a structured `Ref` (a location), exactly as `endpoint.select`
+            // serializes it — never a value.
+            "credential_ref": {"scheme": "kubernetes", "plugin": "monitoring", "instance": "pg-creds", "slot": "password"},
+        });
+        let mut host = MockHost::default()
+            .with_endpoint_ref(
+                "@endpoint/pg-1",
+                "postgres://app@pg.monitoring.svc:5432/warehouse",
+            )
+            .with_credential("kubernetes/monitoring/pg-creds/password", password)
+            .with_conn_response({
+                let mut s = connect_frames();
+                s.extend(query_response(
+                    &["id", "name"],
+                    &[vec![Some("1"), Some("ada")]],
+                ));
+                s
+            });
+        let out = run(
+            "sql.query",
+            json!({ "endpoint": endpoint, "query": "select id, name from users" }),
+            &mut host,
+        )
+        .expect("sql.query against a discovered endpoint");
+        assert_eq!(out["driver"], "postgres");
+        assert_eq!(out["database"], "warehouse");
+        assert_eq!(out["row_count"], 1);
+        assert_eq!(out["rows"][0]["name"], "ada");
+        // The bare (no-password) URL is surfaced; the password value never appears in the result.
+        assert_eq!(
+            out["endpoint_url"],
+            "postgres://app@pg.monitoring.svc:5432/warehouse"
+        );
+        let dumped = out.to_string();
+        assert!(
+            !dumped.contains(password),
+            "the password must never appear in the op's returned JSON: {dumped}"
+        );
+
+        // (b) The discovered `@endpoint/<id>` id shape: host resolves the bare URL + the password by
+        // endpoint_ref (no inline credential_ref).
+        let mut host2 = discovered_host(
+            "@endpoint/pg-1",
+            "postgres://app@pg.monitoring.svc:5432/warehouse",
+            password,
+            vec![query_response(&["v"], &[vec![Some("ok")]])],
+        );
+        let out2 = run(
+            "sql.test",
+            json!({ "endpoint_ref": "@endpoint/pg-1" }),
+            &mut host2,
+        )
+        .expect("sql.test against a discovered endpoint id");
+        assert_eq!(out2["status"], "ok");
+        assert_eq!(out2["database"], "warehouse");
+        assert!(
+            !out2.to_string().contains(password),
+            "no password in output"
+        );
+    }
+
+    #[test]
+    fn multi_instance_selection() {
+        // Two different discovered postgres refs select two different endpoints — the ref drives the
+        // target, no global state. Each carries its own bare URL + its own password.
+        let ep = |id: &str, url: &str| {
+            let name = id.trim_start_matches("@endpoint/").to_string();
+            json!({
+                "id": id,
+                "url": url,
+                "product": "postgres",
+                "protocol": "postgres",
+                "source": "discovered",
+                "credential_ref": {"scheme": "kubernetes", "plugin": "ns", "instance": name, "slot": "password"},
+            })
+        };
+
+        let mut host_a = MockHost::default()
+            .with_endpoint_ref("@endpoint/pg-a", "postgres://ua@a.svc:5432/dba")
+            .with_credential("kubernetes/ns/pg-a/password", "pw-a")
+            .with_conn_response({
+                let mut s = connect_frames();
+                s.extend(query_response(&["db"], &[vec![Some("a")]]));
+                s
+            });
+        let out_a = run(
+            "sql.test",
+            json!({ "endpoint": ep("@endpoint/pg-a", "postgres://ua@a.svc:5432/dba") }),
+            &mut host_a,
+        )
+        .expect("instance a");
+        assert_eq!(out_a["endpoint_url"], "postgres://ua@a.svc:5432/dba");
+        assert_eq!(out_a["database"], "dba");
+
+        let mut host_b = MockHost::default()
+            .with_endpoint_ref("@endpoint/pg-b", "postgres://ub@b.svc:5432/dbb")
+            .with_credential("kubernetes/ns/pg-b/password", "pw-b")
+            .with_conn_response({
+                let mut s = connect_frames();
+                s.extend(query_response(&["db"], &[vec![Some("b")]]));
+                s
+            });
+        let out_b = run(
+            "sql.test",
+            json!({ "endpoint": ep("@endpoint/pg-b", "postgres://ub@b.svc:5432/dbb") }),
+            &mut host_b,
+        )
+        .expect("instance b");
+        assert_eq!(out_b["endpoint_url"], "postgres://ub@b.svc:5432/dbb");
+        assert_eq!(out_b["database"], "dbb");
+
+        // Distinct targets selected purely by the passed ref.
+        assert_ne!(out_a["endpoint_url"], out_b["endpoint_url"]);
+        assert_ne!(out_a["database"], out_b["database"]);
+
+        // A ref whose endpoint isn't configured in the host errors (the ref drives the dial/cred).
+        let mut bare = MockHost::default();
+        assert!(run(
+            "sql.test",
+            json!({ "endpoint": ep("@endpoint/pg-x", "postgres://ux@x.svc:5432/dbx") }),
+            &mut bare,
+        )
+        .is_err());
     }
 
     #[test]
