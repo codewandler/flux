@@ -22,10 +22,9 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
   grader-confirmed run is **staged** on a funded provider key
 
 ## Next (ready — take the top one unless the user named a story)
-- [D-29 — Migrate native plugins to references](D-29-migrate-plugins-to-references.md) · Agent · **top pick** ·
-  the next step in the **Endpoint discovery & brokerage** epic (below): migrate plugin op handlers to
-  ref-based IO + let sql/observability consume discovered endpoints. (D-25..D-28 + D-20 landed; the demo
-  provider + agent ops are in.)
+- [D-30 — Endpoint lifecycle: refresh runner, CLI & audit](D-30-endpoint-lifecycle-cli.md) · Core · **top pick** ·
+  the final step in the **Endpoint discovery & brokerage** epic (below): periodic re-discovery +
+  `flux endpoint list/show/resolve/import` + audit. (D-25..D-29 + D-20 landed.)
 - [D-11 — App-runner ergonomics](D-11-app-runner-ergonomics.md) · Agent · the alternate ready pick (makes
   `flux app run` a viable host for a declarative bot; unblocks Slack-channel assistant flows).
 
@@ -50,10 +49,7 @@ resolves it and injects credentials host-side, so neither the plugin nor the LLM
 the `.dex`-style endpoint-registry deferral from D-10/D-12. See [epic design](../designs/endpoint-discovery.md).
 **[D-20](D-20-scoped-private-net-egress.md) is pulled in as a hard dependency** (discovered endpoints are
 usually private/in-cluster hosts). Built in this order:
-- [D-29 — Migrate native plugins to references](D-29-migrate-plugins-to-references.md) · Agent · **next** · clean-cutover
-  every native plugin onto ref-based IO + let the observability/sql consumers use discovered endpoints
-  (multi-instance); wire `flux app run` + agent paths
-- [D-30 — Endpoint lifecycle: refresh runner, CLI & audit](D-30-endpoint-lifecycle-cli.md) · Core · periodic
+- [D-30 — Endpoint lifecycle: refresh runner, CLI & audit](D-30-endpoint-lifecycle-cli.md) · Core · **next** · periodic
   rediscovery + `flux endpoint list/show/resolve` (weak refs + health, never secrets) + audit
 
 ### Plugin platform hardening — lifecycle, internal-network reach, distribution
@@ -90,6 +86,11 @@ all providers**. Most plumbing already exists (`flux-credentials` import/refresh
   stage; import + refresh cover the near term
 
 ## Done
+- [D-29 — Migrate native plugins to references](D-29-migrate-plugins-to-references.md) · Agent · primary
+  plugin IO is now reference-based (the `SystemHostCaps` named-vs-discovered split + host-kit `*_ref`
+  helpers; 6 URL-handback callers migrated), and `sql` consumes a discovered Postgres endpoint (password
+  via the gated `credential` capability, never a URL/model). Full removal of `host.endpoint` is a tracked
+  follow-up (byte-IO / Atlassian gateway / config residuals)
 - [D-28 — Kubernetes endpoint provider](D-28-kubernetes-endpoint-provider.md) · Agent · the reference
   provider (`kubernetes.endpoint.discover` → cluster/Service/Ingress/RDS `EndpointCandidate`s with a
   `credential_ref`, latest-namespace) + the broker op-name reconciliation + the agent-facing

@@ -8,6 +8,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Reference-based plugin IO migration (D-29).** Plugin operations now do their primary IO through
+  references rather than holding URLs: `SystemHostCaps` resolves a named manifest endpoint locally (env
+  binding stays a host-side resolver default) and a discovered `@endpoint/<id>` through the broker;
+  host-kit gained `http_ref`/`get_json_ref`/`send_json_ref`/`conn_dial_ref`/`credential` helpers; and the
+  six URL-handback callers (alertmanager, grafana, huggingface, slack, confluence, jira) were migrated.
+  The `sql` plugin connects to a discovered Postgres endpoint — host:port/db/user from the secret-free
+  weak reference, the password materialized via the gated `credential` capability (never in a URL, never
+  to the model), with multi-instance selection. Full removal of the `host.endpoint` URL-handback is a
+  tracked follow-up (it remains for attachment byte-IO, the Atlassian gateway, and a couple of config
+  reads).
 - **Kubernetes endpoint provider + agent-facing discovery ops (D-28).** The kubernetes plugin is now a
   discovery provider: `kubernetes.endpoint.discover` declares the products it can find and returns weak
   `EndpointCandidate`s — kubeconfig contexts → cluster endpoints, in-cluster Services/Ingresses → product
