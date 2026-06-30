@@ -4509,6 +4509,72 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// `build_datasources` ingests an `openapi` source (via the existing `ingest_openapi`) alongside a
+    /// `markdown` one, so a declarative bot's help-center docs AND its OpenAPI spec are both searchable —
+    /// the `flux app run` knowledge gap D-11 closes.
+    #[tokio::test]
+    async fn build_datasources_ingests_markdown_and_openapi_searchable() {
+        use flux_datasource::SearchInput;
+        use flux_lang::program::DatasourceDecl;
+        use flux_system::{System, Workspace};
+
+        let dir = std::env::temp_dir().join(format!("flux-ds-oa-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("guide.md"),
+            "# Booking\nHow to book a widget appointment.",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("api.json"),
+            r#"{"openapi":"3.0.0","paths":{"/widgets":{"get":{"operationId":"listWidgets","summary":"List widgets"}}}}"#,
+        )
+        .unwrap();
+        let system = System::new(Workspace::new(&dir).unwrap());
+
+        let decls = vec![
+            DatasourceDecl {
+                name: "docs".into(),
+                kind: "markdown".into(),
+                path: Some(".".into()),
+                settings: serde_json::Value::Null,
+            },
+            DatasourceDecl {
+                name: "api".into(),
+                kind: "openapi".into(),
+                path: Some("api.json".into()),
+                settings: serde_json::Value::Null,
+            },
+        ];
+        let backend = build_datasources(&decls, &system).await.unwrap();
+
+        // The markdown note is indexed as a `file.document`...
+        let md = backend
+            .search(&SearchInput {
+                query: "book widget appointment".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            md.iter().any(|h| h.record.entity == "file.document"),
+            "markdown ingested as a file.document record"
+        );
+        // ...and the OpenAPI operation as an `openapi.operation`.
+        let oa = backend
+            .search(&SearchInput {
+                query: "list widgets".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            oa.iter().any(|h| h.record.entity == "openapi.operation"),
+            "OpenAPI op ingested as an openapi.operation record"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// `flux plugin install` scans a directory for `flux-plugin-<name>` executables: it picks those up
     /// (sorted, by stripped name) and skips sidecars (`*.d`), non-prefixed files, and an empty name.
     #[test]

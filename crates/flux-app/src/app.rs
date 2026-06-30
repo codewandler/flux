@@ -122,8 +122,8 @@ impl App {
     /// uses to serve a program agent over HTTP/A2A. The engine shares this app's `EventStore`, so a
     /// session opened over HTTP and one woken by an agent-bound trigger live in the same log. Errors if
     /// the agent is undeclared or has no model provider.
-    pub fn agent_engine(&self, name: &str) -> Result<Arc<FlowEngine>> {
-        self.engine.agent_engine(name)
+    pub async fn agent_engine(&self, name: &str) -> Result<Arc<FlowEngine>> {
+        self.engine.agent_engine(name).await
     }
 
     /// Look up a declared agent by name (e.g. for its A2A card metadata).
@@ -363,9 +363,11 @@ impl Engine {
 
     /// Get (build + cache) the [`FlowEngine`] for a declared agent. Built lazily on first use; an
     /// `agent`-bound trigger naming an undeclared agent, or one with no model provider, is a clear error.
-    fn agent_engine(&self, name: &str) -> Result<Arc<FlowEngine>> {
-        let mut cache = self.agents.lock().expect("agents cache poisoned");
-        if let Some(engine) = cache.get(name) {
+    async fn agent_engine(&self, name: &str) -> Result<Arc<FlowEngine>> {
+        // Fast path: a cached engine. Scope the guard so it is dropped before the build await — engine
+        // construction reads persona files through the guarded System (async IO), and a std `MutexGuard`
+        // must never be held across an `.await`.
+        if let Some(engine) = self.agents.lock().expect("agents cache poisoned").get(name) {
             return Ok(engine.clone());
         }
         let decl = self
@@ -378,15 +380,20 @@ impl Engine {
             .provider
             .clone()
             .ok_or_else(|| Error::Other(format!("agent `{name}` needs a model provider")))?;
-        let engine = Arc::new(build_agent_engine(
-            decl,
-            provider,
-            self.registry.clone(),
-            self.events.clone(),
-            &self.default_model,
-        )?);
-        cache.insert(name.to_string(), engine.clone());
-        Ok(engine)
+        let engine = Arc::new(
+            build_agent_engine(
+                decl,
+                provider,
+                self.registry.clone(),
+                self.events.clone(),
+                &self.default_model,
+            )
+            .await?,
+        );
+        // A concurrent caller may have built+inserted the same agent while we were off-lock; keep the
+        // first-inserted instance so every thread shares one engine.
+        let mut cache = self.agents.lock().expect("agents cache poisoned");
+        Ok(cache.entry(name.to_string()).or_insert(engine).clone())
     }
 
     /// Resolve the persistent session for `(agent, conversation)`: reuse the bound session (multi-turn
@@ -417,7 +424,7 @@ impl Engine {
     /// thread's persistent session, and the assistant's reply becomes the run result (the channel posts
     /// it). The conversation id (a Slack thread ts) binds repeated events to one session.
     async fn run_agent(&self, name: &str, label: &str, payload: &Value) -> Result<JourneyRun> {
-        let engine = self.agent_engine(name)?;
+        let engine = self.agent_engine(name).await?;
         let conversation = payload
             .get("conversation")
             .or_else(|| payload.get("thread"))
@@ -483,20 +490,53 @@ fn build_executor(registry: ToolRegistry, auto_approve: bool) -> Result<Executor
 
 /// Map a program-level [`AgentDecl`] to an [`AgentSpec`]. Its declared `tools` become **both** the visible
 /// op subset *and* the pre-allow grants (`permissions.allow`), so under a [`DenyApprover`] only granted ops
-/// run and everything else is denied — declared grants without a blanket `--yes`. The `description` (or a
-/// `settings.system_prompt` string) seeds the persona; `model` falls back to the host default.
-fn agent_spec_from_decl(decl: &AgentDecl, default_model: &str, cwd: PathBuf) -> AgentSpec {
-    let system_prompt = decl
-        .description
-        .clone()
-        .or_else(|| {
-            decl.settings
-                .get("system_prompt")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| AgentSpec::default().system_prompt);
-    AgentSpec {
+/// run and everything else is denied — declared grants without a blanket `--yes`. The persona is the
+/// `description` (or a `settings.system_prompt` string), followed by the contents of any
+/// `settings.system_prompt_files` paths — read through the guarded, workspace-confined `system` so a
+/// declarative bot can keep a long persona in `bot/PERSONA.md` instead of inlining it (flux D-11). A
+/// non-string entry or an unreadable path is a clean error. `model` falls back to the host default.
+async fn agent_spec_from_decl(
+    decl: &AgentDecl,
+    default_model: &str,
+    cwd: PathBuf,
+    system: &System,
+) -> Result<AgentSpec> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(base) = decl.description.clone().or_else(|| {
+        decl.settings
+            .get("system_prompt")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }) {
+        parts.push(base);
+    }
+    if let Some(files) = decl
+        .settings
+        .get("system_prompt_files")
+        .and_then(|v| v.as_array())
+    {
+        for f in files {
+            let path = f.as_str().ok_or_else(|| {
+                Error::Other(format!(
+                    "agent `{}`: settings.system_prompt_files entries must be strings",
+                    decl.name
+                ))
+            })?;
+            let text = system.read_file(path).await.map_err(|e| {
+                Error::Other(format!(
+                    "agent `{}`: read system_prompt_files `{path}`: {e}",
+                    decl.name
+                ))
+            })?;
+            parts.push(text);
+        }
+    }
+    let system_prompt = if parts.is_empty() {
+        AgentSpec::default().system_prompt
+    } else {
+        parts.join("\n\n")
+    };
+    Ok(AgentSpec {
         model: decl
             .model
             .clone()
@@ -509,13 +549,13 @@ fn agent_spec_from_decl(decl: &AgentDecl, default_model: &str, cwd: PathBuf) -> 
         },
         cwd,
         ..AgentSpec::default()
-    }
+    })
 }
 
 /// Assemble an agent-target [`FlowEngine`] from a declaration: a guarded [`System`] rooted at the cwd, the
 /// host's op registry (subset to the agent's tools), the spec's grants, and a headless [`DenyApprover`] —
 /// so the agent runs only its granted ops with no human at a prompt.
-fn build_agent_engine(
+async fn build_agent_engine(
     decl: &AgentDecl,
     provider: Arc<dyn Provider>,
     registry: ToolRegistry,
@@ -525,8 +565,10 @@ fn build_agent_engine(
     let root = std::env::current_dir().map_err(other)?;
     let workspace = Workspace::new(&root).map_err(other)?;
     let system = Arc::new(System::new(workspace));
+    // Build the spec (which may read persona files through the guarded `system`) before moving the
+    // `system` into the tool context.
+    let spec = agent_spec_from_decl(decl, default_model, root, &system).await?;
     let ctx = ToolContext::new(system);
-    let spec = agent_spec_from_decl(decl, default_model, root);
     let approver: Arc<dyn Approver> = Arc::new(DenyApprover);
     // The agent loop's planner reads the turn's conversation via the FlowStore (`store.conversation()`),
     // which delegates to the FlowStore's *internal* event log. Back it with the SAME `events` store the
@@ -644,7 +686,7 @@ impl AgentSink for RecordingSink {
 mod agent_target_tests {
     use super::*;
     use async_trait::async_trait;
-    use flux_core::{Chunk, StopReason};
+    use flux_core::{Chunk, Role, StopReason};
     use flux_lang::program::Module;
     use flux_provider::{ChunkStream, Request};
 
@@ -661,6 +703,32 @@ mod agent_target_tests {
         async fn stream(&self, _req: Request) -> Result<ChunkStream> {
             let chunks = vec![
                 Chunk::TextDelta(self.reply.clone()),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::EndTurn),
+                },
+            ];
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    /// A provider that echoes the latest user message straight back, so a test can observe the exact
+    /// turn input the engine fed the model.
+    struct EchoProvider;
+    #[async_trait]
+    impl Provider for EchoProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            let echo = req
+                .messages
+                .iter()
+                .rev()
+                .find(|m| matches!(m.role, Role::User))
+                .map(|m| m.text())
+                .unwrap_or_default();
+            let chunks = vec![
+                Chunk::TextDelta(echo),
                 Chunk::Done {
                     stop_reason: Some(StopReason::EndTurn),
                 },
@@ -694,8 +762,8 @@ trigger t1
         App::with_options(program(src), Some(provider), "mock", false)
     }
 
-    #[test]
-    fn agent_spec_maps_tools_to_grants_and_persona() {
+    #[tokio::test]
+    async fn agent_spec_maps_tools_to_grants_and_persona() {
         let decl = AgentDecl {
             name: "a".into(),
             model: None,
@@ -704,7 +772,10 @@ trigger t1
             description: Some("be terse".into()),
             settings: Value::Null,
         };
-        let spec = agent_spec_from_decl(&decl, "host-model", PathBuf::from("."));
+        let system = System::new(Workspace::new(".").unwrap());
+        let spec = agent_spec_from_decl(&decl, "host-model", PathBuf::from("."), &system)
+            .await
+            .unwrap();
         assert_eq!(spec.model, "host-model"); // falls back to the host default
         assert_eq!(spec.system_prompt, "be terse");
         // tools are the visible subset AND the pre-allow grants — under DenyApprover only these run.
@@ -717,6 +788,55 @@ trigger t1
             vec!["read".to_string(), "now".to_string()]
         );
         assert!(spec.permissions.deny.is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_spec_appends_system_prompt_files() {
+        // A declarative bot keeps its long persona in a file rather than inlining it (flux D-11):
+        // `settings.system_prompt_files` paths are read (workspace-confined) and concatenated after the
+        // base persona.
+        let dir = std::env::temp_dir().join(format!("flux-persona-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("persona.md"), "PERSONA-MARKER: talk like a pirate").unwrap();
+
+        let decl = AgentDecl {
+            name: "a".into(),
+            model: None,
+            tools: vec![],
+            datasources: vec![],
+            description: Some("be terse".into()),
+            settings: json!({ "system_prompt_files": ["persona.md"] }),
+        };
+        let system = System::new(Workspace::new(&dir).unwrap());
+        let spec = agent_spec_from_decl(&decl, "m", dir.clone(), &system)
+            .await
+            .unwrap();
+        assert!(
+            spec.system_prompt.contains("be terse"),
+            "the base description is kept: {}",
+            spec.system_prompt
+        );
+        assert!(
+            spec.system_prompt.contains("PERSONA-MARKER"),
+            "the persona file is appended: {}",
+            spec.system_prompt
+        );
+
+        // A missing file is a clean, attributed error — not a silently-empty persona.
+        let bad = AgentDecl {
+            name: "b".into(),
+            settings: json!({ "system_prompt_files": ["nope.md"] }),
+            ..decl.clone()
+        };
+        assert!(
+            agent_spec_from_decl(&bad, "m", dir.clone(), &system)
+                .await
+                .is_err(),
+            "an unreadable system_prompt_files path is an error"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -787,5 +907,39 @@ journey pong
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].journey, "pong");
         assert_eq!(runs[0].result, "pong!");
+    }
+
+    #[tokio::test]
+    async fn scheduled_agent_turn_receives_event_context() {
+        // An event carrying no user `text` (a `startup` / schedule tick, vs. a Slack mention) must still
+        // wake the agent with a concrete turn that names the firing trigger and carries the payload (e.g.
+        // the tick's `at`), so a monitor can branch startup-vs-tick and read the time (flux D-11). The
+        // echo provider surfaces the exact turn input as the reply.
+        let src = "\
+agent monitor
+  description \"watch\"
+  tools []
+
+trigger tick
+  on \"schedule\"
+  run _
+  agent monitor
+";
+        let provider: Arc<dyn Provider> = Arc::new(EchoProvider);
+        let app = App::with_options(program(src), Some(provider), "mock", false);
+        let runs = app
+            .deliver("schedule", json!({ "at": "2026-06-30T12:00:00Z" }))
+            .await
+            .expect("deliver");
+        assert_eq!(runs.len(), 1);
+        let reply = &runs[0].result;
+        assert!(
+            reply.contains("schedule"),
+            "the turn names the firing trigger/event: {reply}"
+        );
+        assert!(
+            reply.contains("2026-06-30T12:00:00Z"),
+            "the turn carries the schedule `at`: {reply}"
+        );
     }
 }

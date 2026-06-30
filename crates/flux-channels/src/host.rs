@@ -35,7 +35,7 @@ pub async fn serve(
         .collect();
     let mut a2a_channels: Vec<Box<dyn Channel>> = Vec::with_capacity(a2a_decls.len());
     for decl in &a2a_decls {
-        a2a_channels.push(Box::new(A2aChannel::from_decl_and_app(decl, &app)?));
+        a2a_channels.push(Box::new(A2aChannel::from_decl_and_app(decl, &app).await?));
     }
 
     let deliverer: Arc<dyn Deliverer> = Arc::new(AppDeliverer::new(app));

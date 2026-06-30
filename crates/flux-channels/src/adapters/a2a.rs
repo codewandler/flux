@@ -32,7 +32,7 @@ impl A2aChannel {
     /// Build the channel from its declaration, resolving the target agent's engine from `app`. The
     /// engine must come from the live `App` (not the decl alone), so this is built by the host rather
     /// than the decl-only [`build_channels`](crate::build_channels).
-    pub fn from_decl_and_app(decl: &ChannelDecl, app: &App) -> anyhow::Result<Self> {
+    pub async fn from_decl_and_app(decl: &ChannelDecl, app: &App) -> anyhow::Result<Self> {
         let s: A2aSettings = serde_json::from_value(decl.settings.clone())
             .map_err(|e| anyhow::anyhow!("channel `{}` settings: {e}", decl.name))?;
         let addr = SocketAddr::from_str(&s.addr)
@@ -61,6 +61,7 @@ impl A2aChannel {
         };
         let engine = app
             .agent_engine(&agent_name)
+            .await
             .map_err(|e| anyhow::anyhow!("channel `{}`: {e}", decl.name))?;
         let description = app
             .agent_decl(&agent_name)

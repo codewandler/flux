@@ -6,6 +6,21 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **App-runner ergonomics for declarative bots (D-11).** `flux app run` is now a viable host for a
+  real declarative bot, not just a demo. An agent's persona can live in files: an `agent` declaration's
+  `settings.system_prompt_files` (a list of workspace-relative paths) is read through the guarded,
+  workspace-confined `System` and concatenated after the base persona — so a bot keeps a long
+  `bot/PERSONA.md` in a file instead of inlining it into `bot.flux` (a non-string entry or an unreadable
+  path is a clean, attributed error). Reading the persona files made the agent spec/engine-build chain
+  async; the per-agent engine cache is built off-lock so no lock is held across the file read. This
+  completes the two ingest/event gaps that had landed earlier without tests — the program-declared
+  `datasource` ingest already covers markdown **and** OpenAPI JSON (`build_datasources` → the existing
+  `ingest_openapi`), and an event-woken agent already receives synthesized event context (the firing
+  trigger's label + payload, e.g. a schedule tick's `at`) as its turn input when the event carries no
+  user text — both now locked by tests.
+
 ### Fixed
 
 - **Endpoint discovery resolves cluster aliases and relays structured `cluster`/`namespace` (D-33).**
