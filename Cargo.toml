@@ -41,7 +41,7 @@ exclude = ["plugins"]
 
 [workspace.package]
 edition = "2021"
-version = "0.2.5"
+version = "0.2.6"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/codewandler/flux"
 homepage = "https://github.com/codewandler/flux"
@@ -54,34 +54,34 @@ rust-version = "1.85"
 # local builds and the version in the *published* manifest, so `cargo publish` can resolve them from
 # crates.io. Keep these versions in lockstep with `[workspace.package].version` on every release (see
 # crates/flux-sdk/PUBLISHING.md). Crates NOT in the closure stay path-only — they are not published.
-flux-core = { path = "crates/flux-core", version = "0.2.5" }
-flux-policy = { path = "crates/flux-policy", version = "0.2.5" }
-flux-secret = { path = "crates/flux-secret", version = "0.2.5" }
-flux-spec = { path = "crates/flux-spec", version = "0.2.5" }
+flux-core = { path = "crates/flux-core", version = "0.2.6" }
+flux-policy = { path = "crates/flux-policy", version = "0.2.6" }
+flux-secret = { path = "crates/flux-secret", version = "0.2.6" }
+flux-spec = { path = "crates/flux-spec", version = "0.2.6" }
 flux-config = { path = "crates/flux-config" }
-flux-system = { path = "crates/flux-system", version = "0.2.5" }
-flux-runtime = { path = "crates/flux-runtime", version = "0.2.5" }
-flux-tools = { path = "crates/flux-tools", version = "0.2.5" }
-flux-events = { path = "crates/flux-events", version = "0.2.5" }
-flux-agent = { path = "crates/flux-agent", version = "0.2.5" }
-flux-skill = { path = "crates/flux-skill", version = "0.2.5" }
+flux-system = { path = "crates/flux-system", version = "0.2.6" }
+flux-runtime = { path = "crates/flux-runtime", version = "0.2.6" }
+flux-tools = { path = "crates/flux-tools", version = "0.2.6" }
+flux-events = { path = "crates/flux-events", version = "0.2.6" }
+flux-agent = { path = "crates/flux-agent", version = "0.2.6" }
+flux-skill = { path = "crates/flux-skill", version = "0.2.6" }
 flux-orchestrate = { path = "crates/flux-orchestrate" }
-flux-lang = { path = "crates/flux-lang", version = "0.2.5" }
-flux-flow = { path = "crates/flux-flow", version = "0.2.5" }
+flux-lang = { path = "crates/flux-lang", version = "0.2.6" }
+flux-flow = { path = "crates/flux-flow", version = "0.2.6" }
 flux-eval = { path = "crates/flux-eval" }
 flux-plugin = { path = "crates/flux-plugin" }
 flux-auth = { path = "crates/flux-auth" }
-flux-evidence = { path = "crates/flux-evidence", version = "0.2.5" }
-flux-datasource = { path = "crates/flux-datasource", version = "0.2.5" }
+flux-evidence = { path = "crates/flux-evidence", version = "0.2.6" }
+flux-datasource = { path = "crates/flux-datasource", version = "0.2.6" }
 flux-a2a = { path = "crates/flux-a2a" }
 flux-server = { path = "crates/flux-server" }
 flux-capabilities = { path = "crates/flux-capabilities" }
-flux-sdk = { path = "crates/flux-sdk", version = "0.2.5" }
+flux-sdk = { path = "crates/flux-sdk", version = "0.2.6" }
 flux-tui = { path = "crates/flux-tui" }
-flux-provider = { path = "crates/flux-provider", version = "0.2.5" }
+flux-provider = { path = "crates/flux-provider", version = "0.2.6" }
 flux-providers = { path = "crates/flux-providers" }
 flux-credentials = { path = "crates/flux-credentials" }
-flux-cognition = { path = "crates/flux-cognition", version = "0.2.5" }
+flux-cognition = { path = "crates/flux-cognition", version = "0.2.6" }
 flux-app = { path = "crates/flux-app" }
 flux-markdown = { path = "crates/flux-markdown" }
 flux-channels = { path = "crates/flux-channels" }

@@ -10,6 +10,8 @@ All notable changes to this project are documented in this file. The format is b
 
 - Nothing yet.
 
+## [0.2.6] - 2026-06-30
+
 ### Changed
 
 - **Agent-loop retry efficiency (I-02).** Cargo wrapper ops now normalize model-supplied duplicate scope
