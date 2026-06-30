@@ -185,10 +185,12 @@ impl Tool for RegisterCompositeOp {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "op.register".into(),
-            description: "Register exactly one Flux-Lang composite op from `source` for later reuse. \
-                          `scope` chooses the lifetime: turn, session, project, or global. The registered \
-                          op can only call existing ops, and every inner call still runs through the same \
-                          approval and guarded-IO envelope."
+            description: "Define a reusable Flux-Lang operation from `source`. Use this when a \
+                          requested operation can be composed from existing ops instead of adding a \
+                          native Rust tool. `scope` chooses the lifetime: turn, session, project, \
+                          or global; use session for ordinary user-requested helpers unless persistence \
+                          is requested. The registered op can only call existing ops, and every inner \
+                          call still runs through the same approval and guarded-IO envelope."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -200,7 +202,7 @@ impl Tool for RegisterCompositeOp {
                     "scope": {
                         "type": "string",
                         "enum": ["turn", "session", "project", "global"],
-                        "description": "where the op is reusable"
+                        "description": "where the op is reusable; use session by default for ad-hoc user-created operations, project/global only when explicitly requested"
                     },
                     "replace": {
                         "type": "boolean",
