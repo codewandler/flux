@@ -84,12 +84,13 @@ host-kit derives the schema + parses the call in one typed step.
   `render` (svg) + `route` deferred (recorded in DRIFT).
 - **`gitlab` migrated** (64 ops, the largest surface). All `so(...)` → schemars structs; `so`
   helper deleted; `r#ref` raw-ident for the `ref` keyword; contract test locks all 64 schemas.
-  `gitlab` in `MIGRATED_PLUGINS`. Fluxplane parity re-audit deferred (D-14 ported the surface).
+  `gitlab` in `MIGRATED_PLUGINS`. **Fluxplane parity re-audit done (D-38)** — 7 gaps ported (list pagination/filter, index.build selector, byte caps, mr.merge drift).
 - **`slack` migrated** (30 ops). slack used an inline `json!({"type":"object",...})` shape
   (no `so`); all 30 → schemars structs; `slack.channel.mark-read` → `ChannelMarkReadInput`
   (hyphen). The guard was **strengthened** to flag both hand-written shapes (`so(json!{...})`
   and inline `json!({"type":"object",...})`), failing-first for both. `slack` in
-  `MIGRATED_PLUGINS`. Fluxplane parity re-audit deferred (D-14 ported the surface).
+  `MIGRATED_PLUGINS`. **Fluxplane parity re-audit done (D-39)** — 14 gaps ported (Block Kit
+  messaging, text_format, ticket extraction, file content_bytes, list filters).
 - **Guard landed.** `plugins/host-kit/tests/no_manual_plugin_schema.rs` (scoped to
   `MIGRATED_PLUGINS = ["homer"]`) fails on a reintroduced `fn so(` / `so(json!{...})` and on a
   partial migration (no `*_op_typed::<`); verified failing-first by reintroducing `so`.
