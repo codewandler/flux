@@ -64,3 +64,11 @@ legible and managed through one envelope" by making the lifecycle complete and i
   rather than adding a second introspection path.
 - Small, self-contained, no design doc. Surfaced by the D-08/C-02 plugin pack work; see the plugin README's
   "Installing + invoking plugins" section, which currently has no documented uninstall path.
+- **Hardening follow-up filed (D-35):** an xhigh review of this commit (`27b1c10`) found that
+  `descriptor_path` joins the user-typed plugin name into `dir.join(format!("{name}.toml"))` with no
+  sanitization, so `flux plugin uninstall ../../config` (or an absolute name) can `remove_file` a
+  path outside the plugins directory — a destructive traversal. The same `descriptor_path` backs
+  `load` / `add` / `set_pinned` / `remove`. D-19's acceptance (clean error on a missing name, no
+  panic) is met; the traversal is a distinct hardening concern this story never enumerated, so it
+  is tracked separately as [D-35](D-35-plugin-descriptor-path-traversal.md) under
+  `plugin-platform-hardening` rather than reopening this committed story.

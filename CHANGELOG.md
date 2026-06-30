@@ -34,6 +34,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Plugin descriptor names are sanitized against path traversal (D-35).** `flux plugin
+  uninstall` (and `add` / `pin` / `rollback` / `status`) fed the user-typed plugin name straight into
+  `Path::join` for `<dir>/<name>.toml`, and `remove_descriptor` handed the result to
+  `std::fs::remove_file`. `Path::join` treats `..` and absolute components literally, so a name like
+  `flux plugin uninstall ../../config` resolved to `<dir>/../../config.toml` and an absolute name
+  replaced the base entirely — a destructive delete of a file that was never a plugin descriptor.
+  The single `descriptor_path` seam now validates the name first (no path separators, no `..`/`.`
+  component, no absolute/Windows-prefix component, not empty) and returns a clean `Err` before any
+  filesystem op, covering `add_descriptor` / `load_descriptor` / `set_pinned` / `remove_descriptor`
+  from one guard. Legitimate names (alphanumeric, `-`, `_`, `.`) are unaffected. Surfaced by an xhigh
+  review of D-19 (`27b1c10`), which shipped the unsanitized `uninstall`.
+
 - **Endpoint discovery resolves cluster aliases and relays structured `cluster`/`namespace` (D-33).**
   The `endpoint.discover` spine no longer requires the agent to hand-recover a wrong cluster. A short
   `cluster` alias (e.g. `dev`) is resolved against kubeconfig context names (case-insensitive

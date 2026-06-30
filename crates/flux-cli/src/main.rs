@@ -78,8 +78,10 @@ struct AgentFlags {
     ///   (OpenAI Chat wire), `openrouter-anthropic` (OpenRouter's native Messages endpoint —
     ///   leak-proof tool calls), `ollama` (local, OpenAI Chat wire), `ollama-anthropic` (local
     ///   Messages endpoint). Short aliases `sonnet`, `opus`, `haiku` are shorthands for
-    ///   `anthropic/<model>`.
-    /// Examples: `claude/claude-sonnet-4-6`, `openai/gpt-4o`, `openrouter-anthropic/z-ai/glm-4.6`.
+    ///   `anthropic/<model>`; bare `codex` is shorthand for `codex/gpt-5.5` (the ChatGPT-
+    ///   subscription main model; the legacy `*-codex` ids are rejected by the backend).
+    /// Examples: `claude/claude-sonnet-4-6`, `openai/gpt-4o`, `codex/gpt-5.5`,
+    ///   `openrouter-anthropic/z-ai/glm-4.6`.
     /// Overrides `model` in `.flux/config.toml`; falls back to `sonnet` (= `anthropic/claude-sonnet-4-6`).
     #[arg(short = 'm', long)]
     model: Option<String>,
@@ -482,6 +484,11 @@ fn resolve_anthropic_alias(alias: &str) -> String {
     .to_string()
 }
 
+// Codex model resolution is backend knowledge (which ids the ChatGPT-subscription Codex backend
+// serves vs. rejects) and lives with the rest of the codex wire quirks in `flux-providers`. The
+// CLI owns only the *shorthand policy* — bare `codex` means "use the default" — and delegates the
+// concrete id to `resolve_codex_model` so the SDK/server/TUI/sub-agent spawner share one owner.
+
 /// Resolve the model spec with precedence: `--model` flag > config `model` > `sonnet`.
 fn resolve_model_spec(cli_model: &Option<String>, cfg: &flux_config::Config) -> String {
     cli_model
@@ -535,7 +542,11 @@ fn build_provider(spec: &str) -> Result<(NativeProvider, String)> {
         None => {
             // Allow bare short aliases only; everything else requires an explicit provider prefix.
             match spec {
-                "sonnet" | "opus" | "haiku" | "mock" => ("anthropic".to_string(), spec.to_string()),
+                "sonnet" | "opus" | "haiku" | "mock" => {
+                    ("anthropic".to_string(), spec.to_string())
+                }
+                // Bare `codex` → the ChatGPT-subscription main model (resolved in `build_provider`).
+                "codex" => ("codex".to_string(), String::new()),
                 other => bail!(
                     "model spec `{other}` has no provider prefix — use `provider/model`, e.g. \
                      `anthropic/{other}` or `claude/{other}` (providers: {})",
@@ -572,6 +583,7 @@ fn build_provider(spec: &str) -> Result<(NativeProvider, String)> {
 
     let model = match provider.as_str() {
         "anthropic" | "claude" => resolve_anthropic_alias(&model),
+        "codex" => flux_providers::openai::resolve_codex_model(&model),
         _ => model,
     };
     Ok((native, model))
@@ -4843,6 +4855,58 @@ mod tests {
         .await;
         assert!(err.is_err(), "uninstall of a missing name is a clean error");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `flux plugin uninstall <name>` rejects a path-traversal name (non-zero) and deletes nothing
+    /// outside the plugins dir (D-35). A name like `../../config` would otherwise `remove_file` a
+    /// path outside `dir`.
+    #[tokio::test]
+    async fn plugin_uninstall_rejects_traversal_names() {
+        let dir =
+            std::env::temp_dir().join(format!("flux-uninstall-traversal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A sentinel file *outside* `dir`, reachable via `..`. An unsanitized `uninstall` would
+        // delete `<dir>/../../flux-uninstall-traversal-sentinel.toml`.
+        let outside = dir
+            .parent()
+            .unwrap()
+            .join("flux-uninstall-traversal-sentinel.toml");
+        std::fs::write(&outside, b"keep me").unwrap();
+
+        let err = run_plugin_in(
+            &dir,
+            Some(PluginAction::Uninstall {
+                name: "../../flux-uninstall-traversal-sentinel".into(),
+            }),
+        )
+        .await;
+        assert!(
+            err.is_err(),
+            "uninstall of a traversal name is a clean error, not a destructive delete"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "keep me",
+            "the traversal name did not delete a file outside the plugins dir"
+        );
+
+        // An absolute name is also rejected.
+        let err = run_plugin_in(
+            &dir,
+            Some(PluginAction::Uninstall {
+                name: "/etc/passwd".into(),
+            }),
+        )
+        .await;
+        assert!(
+            err.is_err(),
+            "uninstall of an absolute name is a clean error"
+        );
+
+        std::fs::remove_file(&outside).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 

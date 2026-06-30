@@ -1743,8 +1743,35 @@ pub struct DiscoveredPlugin {
     pub descriptor: PluginDescriptor,
 }
 
-fn descriptor_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
-    dir.join(format!("{name}.toml"))
+/// The path a plugin descriptor for `name` would live at, after rejecting names that could
+/// escape `dir` when joined. `Path::join` treats `..` and absolute components literally, so an
+/// unsanitized name like `../../config` or `/etc/passwd` would resolve outside the plugins
+/// directory — a destructive traversal for `remove_descriptor`. The single guard here covers
+/// every caller (`add`/`load`/`set_pinned`/`remove`): a valid plugin name is a bare file name with
+/// no path separators, no `..`/`.` component, and no absolute/prefix component.
+fn descriptor_path(dir: &std::path::Path, name: &str) -> Result<std::path::PathBuf> {
+    invalid_plugin_name(name)?;
+    Ok(dir.join(format!("{name}.toml")))
+}
+
+/// Reject a plugin name that is not a bare file name. Empty, a path separator (`/` / `\`),
+/// `..`, `.`, or an absolute / Windows-prefix component all fail — `Path::join` would otherwise
+/// carry them literally out of the plugins directory.
+fn invalid_plugin_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return Err(Error::Other(format!(
+            "invalid plugin name `{name}`: must be a bare file name (no path separators, `..`, or absolute components)"
+        )));
+    }
+    use std::path::Component;
+    for comp in std::path::Path::new(name).components() {
+        if !matches!(comp, Component::Normal(_)) {
+            return Err(Error::Other(format!(
+                "invalid plugin name `{name}`: must be a bare file name (no path separators, `..`, or absolute components)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Read every `<dir>/*.toml` plugin descriptor (sorted by name). Missing dir → empty; malformed
@@ -1781,13 +1808,13 @@ pub fn add_descriptor(
     std::fs::create_dir_all(dir).map_err(Error::Io)?;
     let body = toml::to_string_pretty(descriptor)
         .map_err(|e| Error::Other(format!("serialize descriptor: {e}")))?;
-    std::fs::write(descriptor_path(dir, name), body).map_err(Error::Io)?;
+    std::fs::write(descriptor_path(dir, name)?, body).map_err(Error::Io)?;
     Ok(())
 }
 
 /// Load a single named descriptor, if present.
 pub fn load_descriptor(dir: &std::path::Path, name: &str) -> Result<Option<PluginDescriptor>> {
-    match std::fs::read_to_string(descriptor_path(dir, name)) {
+    match std::fs::read_to_string(descriptor_path(dir, name)?) {
         Ok(text) => {
             Ok(Some(toml::from_str(&text).map_err(|e| {
                 Error::Other(format!("parse descriptor: {e}"))
@@ -1810,7 +1837,7 @@ pub fn set_pinned(dir: &std::path::Path, name: &str, version: Option<String>) ->
 /// (a missing name is `Ok(false)` — a clean "nothing to uninstall", not an error). Other IO
 /// failures (permissions, etc.) propagate as `Err`.
 pub fn remove_descriptor(dir: &std::path::Path, name: &str) -> Result<bool> {
-    match std::fs::remove_file(descriptor_path(dir, name)) {
+    match std::fs::remove_file(descriptor_path(dir, name)?) {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(Error::Io(e)),
@@ -1847,6 +1874,76 @@ mod tests {
             "the descriptor is gone after uninstall"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A plugin name with `..`, a path separator, or an absolute component must be rejected before
+    /// any filesystem op — `remove_descriptor` is a destructive `remove_file`, so an escaped name
+    /// would delete a file outside the plugins dir (D-35). One guard in `descriptor_path` covers
+    /// `add` / `load` / `set_pinned` / `remove`.
+    #[test]
+    fn descriptor_path_rejects_traversal_names() {
+        let dir = std::env::temp_dir().join(format!("flux-desc-traversal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A sentinel file *outside* `dir` (a sibling, reachable via `..`). Every traversal name
+        // below would, if joined literally, point at or past it. The guard must refuse before any
+        // filesystem op touches it.
+        let outside = dir.parent().unwrap().join("flux-desc-traversal-sentinel");
+        std::fs::write(&outside, b"keep me").unwrap();
+
+        let desc = PluginDescriptor {
+            program: "/bin/true".into(),
+            args: vec![],
+            pinned: None,
+        };
+        let bad_names = [
+            "../sentinel",
+            "../../flux-desc-traversal-sentinel",
+            "/etc/passwd",
+            "a/b",
+            "..",
+            ".",
+            "",
+        ];
+        for name in bad_names {
+            assert!(
+                remove_descriptor(&dir, name).is_err(),
+                "remove_descriptor(`{name}`) must be rejected"
+            );
+            assert!(
+                add_descriptor(&dir, name, &desc).is_err(),
+                "add_descriptor(`{name}`) must be rejected"
+            );
+            assert!(
+                load_descriptor(&dir, name).is_err(),
+                "load_descriptor(`{name}`) must be rejected"
+            );
+            assert!(
+                set_pinned(&dir, name, None).is_err(),
+                "set_pinned(`{name}`) must be rejected"
+            );
+        }
+
+        // The sentinel outside `dir` is untouched — no traversal reached it.
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "keep me",
+            "no traversal name reached a file outside the plugins dir"
+        );
+        // And nothing was written *inside* `dir` either.
+        assert!(
+            discover(&dir).is_empty(),
+            "no descriptor was created for a rejected name"
+        );
+
+        // Legitimate names still work (the guard must not over-reach).
+        add_descriptor(&dir, "my-plugin_v2.0", &desc).unwrap();
+        assert!(load_descriptor(&dir, "my-plugin_v2.0").unwrap().is_some());
+        assert!(remove_descriptor(&dir, "my-plugin_v2.0").unwrap());
+
+        std::fs::remove_file(&outside).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 
