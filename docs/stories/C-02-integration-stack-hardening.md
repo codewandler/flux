@@ -3,7 +3,7 @@ id: C-02
 title: Integration-stack hardening — embeddings backend, plugin install/call + CI, live smoke
 pillar: Core
 status: done
-theme: downstream-managed-agents
+theme: downstream-managed-services
 design: docs/designs/integration-plugins.md
 ---
 
@@ -50,4 +50,4 @@ in CI, and nothing exercises a plugin against a live API. These are the gaps bet
   `discover`/`add_descriptor`/`PluginHost`/`load_plugin_tools`; the L5 `DatasourceHostCaps` bridge;
   `crates/flux-plugin/tests/host.rs` spawn pattern; the `scripts/smoke-live.sh` harness.
 - Vectors are in-memory (rebuilt on ingest) in v1 — durable embedding storage is a follow-up. Builds on
-  [[Slack-channel assistant-integration-stack]] (D-07/D-08/D-09/D-10).
+  [[slack-assistant-integration-stack]] (D-07/D-08/D-09/D-10).

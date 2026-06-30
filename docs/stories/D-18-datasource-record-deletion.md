@@ -3,7 +3,7 @@ id: D-18
 title: Datasource record deletion — delete_source + delete-by-id on DatasourceBackend
 pillar: Core
 status: done
-theme: downstream-managed-agents
+theme: downstream-managed-services
 ---
 
 # Datasource record deletion
@@ -26,6 +26,6 @@ the global `clear()`, which makes per-source CRUD impossible on a shared backend
 - Done. Trait + three impls + tests; `cargo test -p flux-capabilities` green.
 
 ## Notes
-- Downstream driver: managed-agents **A-04** (customer-managed knowledge sources) needs per-source replace/delete to
+- Downstream driver: customer-managed knowledge sources need per-source replace/delete to
   CRUD an account's knowledge in one persistent `SqliteBackend`. See `flux-capabilities/src/datasource/`.
 - Account/tenant scoping stays a consumer concern (as in D-07); this only adds the removal primitive.

@@ -3,7 +3,7 @@ id: D-07
 title: Knowledge datasource — a real RAG layer (record schema, persistent index, retrieval ops)
 pillar: Core
 status: done
-theme: downstream-managed-agents
+theme: downstream-managed-services
 design: docs/designs/datasource-rag.md
 ---
 
@@ -16,13 +16,13 @@ retrieval ops `search` / `list` / `get` / `relation` / `batch_get`, and a **rein
 app can ground answers in local docs and OpenAPI specs. v1 ships keyword/BM25 retrieval behind a
 **pluggable embeddings seam** (a semantic backend is deferred, not wired).
 
-## Why (downstream: Slack-channel assistant, managed-agents)
-The downstream Slack-channel assistant is, at its core, a **knowledge-grounded Q&A assistant** over a help-center
+## Why (downstream: Slack-channel assistants, managed services)
+A downstream Slack-channel assistant is, at its core, a **knowledge-grounded Q&A assistant** over a help-center
 snapshot + bundled OpenAPI references + skills (its `bot/data/knowledge/**`). The fluxplane bot leaned on
 `fluxplane-datasource` (semantic + keyword indexing, datasource records, freshness). flux today only has an
 **in-memory keyword TF index + a `search` tool** (`flux-capabilities::datasource`) — no record schema, no
 persistence, no `list`/`get`/`relation`/`batch_get`, no OpenAPI ingest. This is the largest *un-storied*
-gap behind the Slack-channel assistant's v0 (journey RAG) and v1 (agentic) milestones.
+gap behind the assistant's v0 (journey RAG) and v1 (agentic) milestones.
 
 ## flux gap
 `flux-capabilities` `datasource` provides an `Index` (term-frequency keyword scoring) + a `SearchTool`
@@ -61,5 +61,5 @@ ops, an ingester for markdown + OpenAPI, and any embeddings seam.
 - The shared `flux-datasource` crate is the record contract: integration plugins (**D-08**, over the
   **D-10** protocol) contribute records (e.g. `gitlab.merge_request`, `slack.channel`) into this same
   schema via the L5 `DatasourceHostCaps` bridge — keep it plugin-friendly.
-- Serves Slack-channel assistant **S-01/S-03**. Non-goal (v1): vector/embedding retrieval, hybrid rerank, a cross-source
+- Serves downstream Slack-channel assistant knowledge flows. Non-goal (v1): vector/embedding retrieval, hybrid rerank, a cross-source
   lookup-fanout resolver (those land behind the embeddings seam on demand).

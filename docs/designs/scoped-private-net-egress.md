@@ -21,7 +21,7 @@ That boolean is all-or-nothing. To let one trusted internal GitLab through, the 
 `web_fetch` and every other plugin. The integration pack (gitlab/jira/confluence/prometheus/loki/kubernetes) is
 precisely the surface that points at internal infra, so in any real enterprise deployment the pack is either
 unusable (guard on) or the SSRF protection is globally defeated (guard off). `scripts/smoke-plugins.sh` shows
-the failure mode: `gitlab.internal.example` → `10.0.0.1` → refused.
+the failure mode: an internal GitLab host resolves to a private address and is refused.
 
 **This is not a bypass-path story.** AGENTS.md's invariant ("there are no bypass paths; don't add one") stays
 intact: we are making the *existing* envelope finer-grained, keeping deny-by-default, and routing every

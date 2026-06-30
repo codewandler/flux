@@ -22,8 +22,8 @@ Today the only way to reach a private/loopback/link-local address is `allow_priv
 **both** the web-fetch tool and the plugin host (`crates/flux-cli/src/main.rs:957,976,3335`). It is a single
 global boolean: flipping it on to reach one trusted internal GitLab simultaneously re-opens `169.254.169.254`
 (cloud metadata) and the entire RFC-1918 range to **any** attacker-influenced URL — including `web_fetch` and
-every other plugin. The `scripts/smoke-plugins.sh` gitlab case (`gitlab.internal.example` → `10.0.0.1`,
-refused) is the symptom: the integration pack is effectively unusable against the enterprise infra it targets
+every other plugin. The `scripts/smoke-plugins.sh` gitlab case (an internal host resolving to a private
+address and being refused) is the symptom: the integration pack is effectively unusable against the enterprise infra it targets
 unless the operator accepts that global blast radius.
 
 ## Acceptance

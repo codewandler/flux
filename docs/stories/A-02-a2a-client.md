@@ -30,7 +30,7 @@ the client is thin — **one user turn = one remote A2A task** — and does NOT 
       prove the new request shape.
 - [x] `flux a2a <URL>` opens an interactive REPL; `flux a2a <URL> <prompt…>` and piped stdin run a
       single turn and exit. Streamed deltas render live; Ctrl-C cancels a turn.
-- [x] End-to-end: the client talks to our own `flux serve` (card discovery + streamed chat).
+- [x] End-to-end: the client talks to our own `flux app run --serve` endpoint (card discovery + streamed chat).
 - [x] Gate green: `cargo test --workspace`, `clippy -D warnings`, `fmt`, `flux-codegate` lint (the
       new crate is classified in the `layer()` map).
 
@@ -48,7 +48,7 @@ the client is thin — **one user turn = one remote A2A task** — and does NOT 
   a multi-token streaming check; server-side statefulness per `contextId` (deferred, see Notes).
 
 ## Notes
-- Stateless MVP (one turn = one task, matching today's stateless `flux serve`), but the client
+- Stateless MVP (one turn = one task, matching today's stateless served flux endpoint), but the client
   carries the spec identifiers so a stateful remote keeps memory and server-side statefulness can be
   added later **without client changes**.
 - Reuses CLI primitives: `repl_history_path()`/a sibling, `run_interruptible()`,

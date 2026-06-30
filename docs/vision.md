@@ -64,10 +64,10 @@ The Agent pillar ships in this order, and ambiguity is resolved in favor of the 
 3. **Multi-user platform** — a deployable server with per-user identity and policy. The seams exist
    (HTTP API, OIDC identity); they are hardened as the first two tiers solidify.
 
-**Downstream consumers validate tiers 2–3 in practice.** The managed-agents managed-agents service and the
-downstream Slack-channel assistant both build on `flux-sdk` by path-dependency, and drive two platform-tier surfaces flux
-now carries: **event-trigger channels** (an agent *woken by* a schedule, webhook, or Slack mention — not
-only reached request/response) and a **knowledge/datasource layer** (answers grounded in an indexed corpus).
+**Downstream consumers validate tiers 2–3 in practice.** Managed-agent services and Slack-channel assistants
+build on `flux-sdk` by path-dependency, and drive two platform-tier surfaces flux now carries:
+**event-trigger channels** (an agent *woken by* a schedule, webhook, or Slack mention — not only reached
+request/response) and a **knowledge/datasource layer** (answers grounded in an indexed corpus).
 Both sit **behind the same envelope — no new bypass** — and the personal-coding-agent-first priority above
 is unchanged; these are platform-tier capabilities, hardened as the earlier tiers solidify.
 

@@ -6,9 +6,8 @@
 ## Why
 
 `flux-events` is flux's one append-only log; the conversation / run-trace / turn-metrics views are
-*projections* over it. A downstream **multi-tenant** service (the managed **managed-agents** service: run
-persistence **R-04**, the **M4** transparency surface) wants to persist and replay runs as *projections over
-this same log* — "flux is already event-sourced … build on that substrate, not a new one." For that the log
+*projections* over it. A downstream **multi-tenant** service wants to persist and replay runs as
+*projections over this same log* — "flux is already event-sourced … build on that substrate, not a new one." For that the log
 must record **whose** run each stream is. Tagging it when the run is written is cheap; tagging it after R-01
 already writes untagged runs is a migration. So this lands **now**, additively — the single-tenant CLI path
 is byte-for-byte unchanged.

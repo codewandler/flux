@@ -3,7 +3,7 @@ id: D-09
 title: Agentic channel target — wake an AgentSpec (not just a journey) on an event
 pillar: Agent
 status: done
-theme: downstream-managed-agents
+theme: downstream-managed-services
 design: docs/designs/agentic-channel-target.md
 ---
 
@@ -16,10 +16,10 @@ memory** and **declared op grants**. This is what lets `flux-channels` host an o
 assistant* (a Slack DevOps bot that picks among many integrations and iterates), not only a fixed
 Flux-Lang DAG.
 
-## Why (downstream: Slack-channel assistant, managed-agents)
-The downstream **Slack-channel assistant rewrite** (second downstream flux consumer; replacing the fluxplane Go bot) is a
+## Why (downstream: Slack-channel assistants, managed services)
+A downstream **Slack-channel assistant** is a
 tool-using assistant: on a Slack mention it must decide which of ~8 integrations to query, call them, maybe
-iterate, and answer — an **agent loop**, not a pre-authored DAG. managed-agents wants the same "background agent
+iterate, and answer — an **agent loop**, not a pre-authored DAG. Managed services want the same "background agent
 woken by events" breadth. The shipped journey route (D-04) is the right fit for a **scheduled monitor** (cron
 → summary journey) but cannot express open-ended model-driven tool use.
 
@@ -77,5 +77,5 @@ The clean injection point already exists: the **`Deliverer` trait**
   design doc's `EngineDeliverer`-in-flux-channels is recorded there as the *considered alternative*.
 - Reuse, don't reimplement: `FlowEngine::run_turn` + `EventStore` sessions; `AgentSpec::assemble` for
   assembly. The op-grant seam pairs with — but does not require — **D-02** (tenant-tagged events).
-- Serves the Slack-channel assistant **S-02/S-04** stories and managed-agents' background-agent direction. Non-goal: per-event
+- Serves downstream Slack-channel assistant and background-agent use cases. Non-goal: per-event
   trust/policy variation (the D-04 design's named follow-up).

@@ -4,7 +4,7 @@ title: Harden the sub-agent primitive for multi-tenant production
 pillar: Agent
 status: done
 priority:
-theme: downstream-managed-agents
+theme: downstream-managed-services
 design: docs/designs/sub-agent-hardening.md
 ---
 
@@ -14,12 +14,12 @@ design: docs/designs/sub-agent-hardening.md
 Take the sub-agent primitive (`flux-orchestrate`: `LocalSpawner` + `task` tool + `Role`) from
 "works in the CLI and the self-improvement loop" to "safe for a multi-tenant service to consume through
 `flux-sdk`." Close the five gaps between today's single-tenant, fire-and-forget primitive and the bar
-managed-agents **R-03 → A-05** sets: a consumable SDK seam, lifecycle limits, a pluggable approver + tested
+downstream multi-tenant consumers need: a consumable SDK seam, lifecycle limits, a pluggable approver + tested
 account isolation, child activity in the tenant audit log, and the ergonomics a programmatic consumer
 needs.
 
-## Why (managed-agents)
-managed-agents **R-03** (sub-agent support) is the platform primitive A-05's `managed-agents-builder` sub-agent is
+## Why (downstream managed services)
+Sub-agent support is the platform primitive that builder-style control-plane sub-agents are
 the first consumer of. Its acceptance — invoke a named sub-agent from a flow, child tool calls through the
 **same `Executor` envelope and account scope**, child **cannot exceed the parent's account/authorization**
 (failing-first isolation test), **built on flux's primitive, not re-implemented** — cannot be met by the
@@ -83,7 +83,7 @@ Verified in [`crates/flux-orchestrate/src/lib.rs`](../../crates/flux-orchestrate
   - WS4 explicit parent-session-id link (`create_child_session(model, parent)`) → folded into
     [D-02](D-02-tenant-event-substrate.md) so the link + account tag land as one session-entry change.
   - WS5 structured `task` output (`result_schema` param) — design permits deferral; no consumer needs it
-    for v1 (the `managed-agents-builder` returns text the caller persists).
+    for v1 (builder-style sub-agents return text the caller persists).
   - WS3 surface (b) dedicated account-tagged-subject test (policy inheritance itself is covered).
   - WS2 aggregate token budget (stretch); `max_depth > 1` is implemented + tested but stays opt-in.
 - **Publish-closure note:** `flux-sdk` now depends on `flux-orchestrate`, widening the crates.io publish
@@ -95,7 +95,7 @@ Verified in [`crates/flux-orchestrate/src/lib.rs`](../../crates/flux-orchestrate
   default 10-min `wall_clock` in `FlowClient::with_sub_agents` (the one-shot SDK path has no other kill
   switch). Two lifecycle gaps **documented, not fixed** (see the design's "Known limitations"):
   parent-turn cancel drops an in-flight child without finalizing it (matters under `with_audit`), and the
-  per-turn cancel slot assumes one active turn per engine (a latent `flux serve` concern, same assumption
+  per-turn cancel slot assumes one active turn per engine (a latent served-agent concern, same assumption
   `loop_host.set_turn` already makes).
 
 ## Notes
@@ -106,6 +106,6 @@ Verified in [`crates/flux-orchestrate/src/lib.rs`](../../crates/flux-orchestrate
   `LocalSpawner` per request/account scope, bound to that account's policy + caller + workspace.
 - **Couples with [D-02](D-02-tenant-event-substrate.md)** (WS4 ships the threading seam; D-02 adds the
   account tag + projections) and **complements [D-01](D-01-flow-input-seeding.md)** (the behaviour runner a
-  sub-agent-invoking flow runs on). Serves managed-agents **R-03** + **A-05**.
+  sub-agent-invoking flow runs on). Serves downstream multi-tenant sub-agent use cases.
 - Non-goal: remote/distributed sub-agents (a future `Spawner` impl), a new sandbox boundary, or D-02's
   tagging itself.

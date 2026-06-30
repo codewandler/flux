@@ -16,7 +16,7 @@
 
 ## Why
 
-A downstream service (the multi-tenant **managed-agents** product) needs to run a **stored, validated**
+A downstream multi-tenant service needs to run a **stored, validated**
 Flux-Lang flow as a reusable agent *behaviour*: parse it once, then execute it **per invocation** with
 **effective settings** injected — author-time settings merged with validated invocation-time settings,
 as a plain JSON object — while registering its own custom ops and reading structured output back. The
@@ -104,11 +104,11 @@ impl FlowStore {
 
 ## Multi-turn decision
 
-managed-agents conversations (RTVBP voice, A2A) are multi-turn, but `FlowClient::execute*` is one-shot — a
+Downstream conversations (RTVBP voice, A2A) are multi-turn, but `FlowClient::execute*` is one-shot — a
 top-level `await` is rejected (flow.rs:284). Two options:
 
 - **(A) Keep `execute_with` one-shot.** Each turn = one `parse`-once + `execute_with(settings)` call;
-  cross-turn state lives in the caller (managed-agents owns the conversation/session). Simplest; matches how
+  cross-turn state lives in the caller (the downstream service owns the conversation/session). Simplest; matches how
   the behaviour runner threads *effective settings* per call anyway.
 - **(B) Route multi-turn through `FlowEngine`.** For flows that genuinely `await` across turns, the
   engine (not the one-shot SDK path) already supports suspend/resume; expose a seeded entry there.

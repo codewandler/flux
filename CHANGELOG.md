@@ -8,6 +8,28 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Single guarded process-spawn path + plugin authoring guide (D-22).** All OS-process creation now funnels
+  through one `flux_system::System` constructor (`build_command`: argv-only, workspace-pinned cwd, env
+  **cleared** to a minimal non-secret allow-list) — `run_with_env`, the streamed runner, `spawn_background`,
+  and a new **`spawn_interactive`** (piped stdin/stdout, inherited stderr, `kill_on_drop`) all layer only
+  their own stdio on top. `PluginHost::spawn` now launches plugins through `spawn_interactive`, so the
+  **plugin process is env-cleared**: a plugin can no longer read the host's secrets via `std::env`, closing a
+  bypass of the deny-by-default `secret` gating (regression test `plugin_cannot_read_host_env`).
+  `flux-runtime`'s git-context call is routed through `System::run` too (gaining a wall-clock timeout). New
+  **`plugins/AUTHORING.md`** — the canonical plugin guide (lifecycle, the host-does-all-IO invariant, the
+  capability set, the rules) — linked from `AGENTS.md` and `plugins/README.md`.
+- **One daemon command for served agents (D-23).** The standalone `flux serve` command is removed; use
+  `flux app run --serve <addr> --yes` to expose the built-in coding agent over the same REST/SSE/A2A HTTP
+  surface. A `.flux` program can declare an `a2a` channel, and `flux app run <program.flux> --serve <addr>`
+  injects an ad-hoc A2A channel for a sole-agent program. The HTTP implementation is shared through
+  `flux-server`, including bearer-token enforcement for non-loopback binds.
+- **Provider schema + CLI daemon hardening (D-24).** Added `flux_spec::tool_input_schema` for
+  schemars-derived tool input contracts and switched the planner's synthetic `emit_plan`/`ask_user` tools
+  to typed schemas; `emit_plan` now advertises the full `DraftAst`/`Node` JSON Schema instead of a bare
+  object placeholder. `flux plugin call <plugin> <op>` now accepts short op names by resolving them against
+  the plugin manifest's fully qualified operation names, while still preserving explicit full names.
+  `flux-server` and `flux app run` channel hosts now honor SIGTERM as well as Ctrl-C, and `flux tui` fails
+  early with a clear error when stdin/stdout are not real terminals.
 - **Plugin host protocol — managed background processes + binary HTTP body (D-14 enabler).** Two additive
   capabilities on `flux.plugin.v1`, extending the host the way D-12 added auth/conn/blob:
   - **Managed background processes** — `process.spawn`/`read`/`status`/`kill`, a per-session registry in
@@ -55,15 +77,23 @@ All notable changes to this project are documented in this file. The format is b
   slack `mentions`/`unreads` `since`/`unhandled`/`tickets`. New **plugin-local** dependencies: `regex`
   (gitlab `diff.lines`), `pulldown-cmark` + `quick-xml` (confluence storage↔markdown), `sha1` + `time`
   (loki). See [docs/designs/fluxplane-plugins-parity.md](docs/designs/fluxplane-plugins-parity.md).
+- **fluxplane-plugins parity — the 9 missing portable plugins are native (D-15/D-16/D-17).** Added the
+  remaining single-vendor plugins from the fluxplane pack: **alertmanager** (5 ops), **grafana** (20),
+  **opsgenie** (8), **huggingface** (9), **aws** (11 read-only ops via the host-managed `aws` CLI),
+  **docker** (33 core Docker Engine REST ops over the guarded Unix `conn.*` stream), **sql** (6 PostgreSQL
+  read/introspection ops over `host-kit::ConnStream`), **asterisk** (8 AMI ops over guarded TCP), and
+  **homer** (8 Homer SIP-capture ops with JWT login + blob-backed PCAP export). The plugin smoke script now
+  has skip-safe entries for the new pack. Honest residuals are documented: Docker's streaming/hijack ops need
+  a later stream design, SQL live Postgres interop still needs an env-gated smoke, MySQL is a clear unsupported
+  error, and SQLite is unsupported by design because plugins have no host file capability.
 - **Reusable A2A server protocol — `flux_a2a::server` (D-03).** Lifted the duplicated A2A server-side
   logic out of `flux-server/src/a2a.rs` into a reusable, **axum-free** module on the L1 `flux-a2a` crate:
   the `A2aTurn` runner seam, `dispatch` (`message/send` → a completed `Task`; JSON-RPC errors),
   `agent_card`, `extract_text`/`extract_context_id`, `rpc_ok`/`rpc_err`, `now_rfc3339`, and
   `status_update_value` (the `message/stream` frame `result`). `flux-server` now consumes it (keeping its
-  axum routes + SSE + engine wiring); downstream's `managed-agents` re-homes its `channel-a2a` onto the same
-  module — one definition for the A2A *server* the way `flux-a2a`'s types give the *wire* one. Current
-  spec only (no `tasks/send`); `flux-codegate` confirms `flux-a2a` stays L1 (only new dep: `async-trait`).
-  Serves managed-agents **E-02**.
+  axum routes + SSE + engine wiring); downstream services can mount the same module instead of
+  re-implementing the protocol. Current spec only (no `tasks/send`); `flux-codegate` confirms `flux-a2a`
+  stays L1 (only new dep: `async-trait`). Serves downstream A2A consumers.
 - **`.flux` does all of it — native-text module declarations (L-03).** A `.flux` app is now written
   entirely in native flux-lang: `agent` / `channel` / `datasource` / `trigger` / `journey` declarations
   (each with an indented `key value` settings block) plus the journey flows, replacing the JSON program
@@ -87,9 +117,8 @@ All notable changes to this project are documented in this file. The format is b
   `EventStore::create_session_with_context` (the 1-arg `create_session` delegates with an empty envelope, so
   the single-tenant path and every existing call site are unchanged). The context is surfaced on
   `StoredEvent` / `SessionInfo` / `SessionSummary`, and new account-scoped reads `list_for_account` /
-  `account_streams` return only one tenant's runs — so a downstream multi-tenant service (managed-agents R-04 run
-  persistence + the M4 transparency surface) replays per-account transcripts as *projections over the same
-  log* (via the unchanged `conversation`/`turns` projections), not a parallel store. Additive, idempotent
+  `account_streams` return only one tenant's runs — so a downstream multi-tenant service replays per-account
+  transcripts as *projections over the same log* (via the unchanged `conversation`/`turns` projections), not a parallel store. Additive, idempotent
   column migration; the `events` table and all projections are untouched. See
   [docs/designs/tenant-event-substrate.md](docs/designs/tenant-event-substrate.md).
 - **Integration-stack hardening (C-02).** Three follow-ups over the shipped D-07/D-08/D-09/D-10 stack:
@@ -160,8 +189,8 @@ All notable changes to this project are documented in this file. The format is b
   - `FlowClient::execute_with(ast, inputs)` + `run_flow(text, inputs)` — execute a flow with `inputs`
     seeded as `$vars`, through the **same `Executor` safety envelope** (seeding injects *data*, never a
     capability). Each call runs against a **fresh store** (per-run isolation); a flow-local `bind` shadows
-    a seed. One-shot — genuine cross-turn `await` flows stay on `FlowEngine`. Serves managed-agents R-01
-    (behaviour runner) + A-03 (presets as flows). Hermetic example: `examples/parameterized_flow.rs`.
+    a seed. One-shot — genuine cross-turn `await` flows stay on `FlowEngine`. Serves downstream
+    behaviour-runner and preset-framework consumers. Hermetic example: `examples/parameterized_flow.rs`.
 - **Realtime voice-to-voice as a first-class provider (D-06).** A **sibling, session-oriented** model seam
   beside the half-duplex `Provider`, so a full-duplex speech-to-speech model (OpenAI Realtime) is a flux
   provider whose tool calls run through the **same `Executor` safety envelope** as a text turn — declared
@@ -171,7 +200,7 @@ All notable changes to this project are documented in this file. The format is b
   - `flux_provider::realtime` (L1) — `RealtimeProvider`/`RealtimeSession`/`RealtimeEvent`/`RealtimeConfig`/
     `TurnDetection`; events carry decoded bytes and plain strings only (the seam never names a runtime type).
   - `flux_providers::realtime` (L1, behind the **`realtime`** Cargo feature) — the OpenAI-Realtime WebSocket
-    impl lifted from the managed-agents `realtime` crate (GA shape; one `openai_realtime(...)` constructor;
+    impl ported from a downstream realtime client (GA shape; one `openai_realtime(...)` constructor;
     idempotent barge-in cancel).
   - `flux_flow::voice` (L3) — `VoiceSessionDriver` (routes `ToolCall` → `Executor::dispatch` off the audio
     loop; debounced `create_response`; idempotent barge-in), `VoiceSink`, `tool_defs_from_registry`, plus a
@@ -179,7 +208,7 @@ All notable changes to this project are documented in this file. The format is b
     drives turns; per-turn `run_turn`, not yet cross-turn `await`).
   - `flux_sdk::flow::FlowClient::run_voice_session(...)` (L6) — the one-call consumer seam (mirrors
     `with_sub_agents`). Audio resampling stays in the consumer/channel (model-native format only). The
-    managed-agents rewiring lands in that repo as a follow-up.
+    downstream consumer rewiring lands outside this repo as a follow-up.
 - **Event-trigger channels — background agents woken by events (D-04).** A new `flux-channels` (L6) crate
   lets a `.flux` **program** be woken by external events: a cron schedule, an inbound webhook, or a Slack
   mention. Channels are declared in the program as ordinary `ChannelDecl`s and run by the **app runner** —
@@ -201,8 +230,8 @@ All notable changes to this project are documented in this file. The format is b
     10 hermetic tests + 3 feature-gated Slack unit tests; `examples/channels-app.flux`. See
     [`docs/designs/event-trigger-channels.md`](docs/designs/event-trigger-channels.md).
 - **Sub-agents are production-hardened for multi-tenant consumption (D-05).** The `flux-orchestrate`
-  sub-agent primitive — single-tenant and wired only in the CLI — now has the seams a downstream service
-  (managed-agents R-03/A-05) needs:
+  sub-agent primitive — single-tenant and wired only in the CLI — now has the seams downstream
+  multi-tenant SDK consumers need:
   - **SDK seam.** `FlowClient::with_sub_agents(SubAgents { … })` registers the `task` tool and installs
     the spawner into every run's context, so a consumer drives sub-agents without re-assembling the
     executor/registry/context by hand. `SubAgents::into_spawner` is the single construction path; the CLI

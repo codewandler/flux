@@ -4,7 +4,7 @@ title: App-runner ergonomics for declarative bots (knowledge-ingest config, Open
 pillar: Agent
 status: backlog
 priority:
-theme: downstream-managed-agents
+theme: downstream-managed-services
 design:
 ---
 
@@ -12,7 +12,7 @@ design:
 
 ## Goal
 Make `flux app run <program.flux>` a viable host for a real declarative bot/app, not just a demo. Three small,
-additive app-runner gaps surfaced by the downstream Slack-channel assistant (`bot.flux`, the second downstream consumer):
+additive app-runner gaps surfaced by a downstream Slack-channel assistant:
 boot knowledge ingest is hardcoded, an agent's system prompt can't come from a file, and an event-woken agent
 gets no event context.
 
@@ -40,7 +40,7 @@ gets no event context.
 - [ ] Additive — existing programs/agents unchanged; full gate green.
 
 ## Progress
-- Backlog. Surfaced by Slack-channel assistant S-01/S-03/S-06 (`bot.flux` interim workarounds: inline personas, generic
+- Backlog. Surfaced by downstream Slack-channel assistant flows (interim workarounds: inline personas, generic
   markdown walk, best-effort monitor). Sibling: **L-03** (native-text program grammar).
 
 ## Notes

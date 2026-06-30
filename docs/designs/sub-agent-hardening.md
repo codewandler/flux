@@ -7,8 +7,8 @@
 
 The sub-agent primitive (`flux-orchestrate`: `LocalSpawner` + `TaskTool` + `Role`/`RoleRegistry`) works,
 but it was built and proven in exactly **one** shape: the **CLI** and the **self-improvement loop** —
-single process, single tenant, file-defined roles, fire-and-forget. The downstream consumer (managed-agents
-story **R-03 → A-05**, the manager agent's `managed-agents-builder` sub-agent) is **multi-tenant** and consumes
+single process, single tenant, file-defined roles, fire-and-forget. Downstream managed-agent consumers are
+**multi-tenant** and consume
 flux **by path dependency through `flux-sdk`**. Both roadmaps
 label the primitive *"ready to consume"* — that is true at the *primitive* level and false at the *seam,
 lifecycle, isolation, and audit* levels.
@@ -55,7 +55,7 @@ the spawner must be threaded.
 ### WS1 — SDK consumption seam (closes the "re-implementation" gap; R-03 #3)
 
 **Gap.** A consumer that wants sub-agents must hand-reassemble ~140 lines of CLI wiring (`load roles →
-LocalSpawner → register TaskTool → with_spawner`). `flux-sdk` has no seam, so managed-agents would
+LocalSpawner → register TaskTool → with_spawner`). `flux-sdk` has no seam, so downstream services would
 re-implement the assembly the criterion forbids.
 
 **Design.** Lift the assembly into a reusable config + builder in `flux-orchestrate` (the home crate), and
@@ -147,8 +147,8 @@ with a typed timeout error and a valid session log.
 ### WS3 — Pluggable approver + explicit account scope (R-03 #1 & #2)
 
 **Gap A — approver.** The approver is nailed to `SubAgentApprover` (`:135`), which auto-approves anything
-non-destructive. But A-05's `managed-agents-builder` calls **control-plane CRUD mutations** that the managed-agents
-design says must be **approval-gated by the envelope**. A "create/modify customer agent" call won't trip
+non-destructive. But builder-style sub-agents call **control-plane CRUD mutations** that downstream
+designs require to be **approval-gated by the envelope**. A "create/modify customer agent" call won't trip
 `is_destructive()`, so today it sails through. The parent's policy/approver must be able to govern the
 child.
 
@@ -159,7 +159,7 @@ scoped `LocalSpawner`.
 **Design.**
 - **Injectable approver.** `LocalSpawner::with_approver(Arc<dyn Approver>)`; default stays
   `SubAgentApprover` (behaviour-preserving). The `task` line `Arc::new(SubAgentApprover)` becomes
-  `self.approver.clone().unwrap_or_else(|| Arc::new(SubAgentApprover))`. managed-agents injects an approver
+  `self.approver.clone().unwrap_or_else(|| Arc::new(SubAgentApprover))`. Downstream services inject an approver
   that gates mutations; the self-improvement loop keeps the default.
 - **Account scope = one spawner per request scope (contract, not new machinery).** Formalize the
   supported multi-tenant pattern: a server builds **one `LocalSpawner` per request/account**, bound to
@@ -170,7 +170,7 @@ scoped `LocalSpawner`.
   and test**. Two enforcement surfaces, both already in the envelope, both relevant:
   - **Guarded-IO confinement** — for filesystem/process/network effects (the coding-style sub-agents:
     scout/worker). `flux-system` rejects cross-workspace paths and arbitrary egress.
-  - **Policy + caller-scope on custom tools** — the surface the **`managed-agents-builder` actually relies on**.
+  - **Policy + caller-scope on custom tools** — the surface builder-style sub-agents rely on.
     Its effects are CRUD-API calls, not file paths; isolation is the consumer scoping those tools to the
     authenticated caller's account/scopes, gated by the same `Executor::dispatch` the child runs under.
     flux provides the gate; the consumer must register account-scoped tools (a documented obligation).
@@ -190,7 +190,7 @@ scoped `LocalSpawner`.
 **Gap.** Each spawn gets a **throwaway `EventStore::in_memory()` + `FlowStore::in_memory()`**
 (`:150–152`). The parent records only a coarse `task(...) → <final text>` evidence marker; the child's
 individual guarded effects (reads/writes/bash/CRUD) **never reach the parent/tenant event store**. This
-undercuts managed-agents **R-04** (run persistence) and **M4** transparency, and contradicts the docs' "sub-agent
+undercuts downstream run persistence and transparency, and contradicts the docs' "sub-agent
 runs recorded in flux-events" claim.
 
 **Design.**
@@ -255,7 +255,7 @@ existing flux mechanisms, made explicit and tested:
    invariants). One account = one workspace-scoped `System` = one `LocalSpawner`. *This is the surface for
    filesystem/process/network effects.*
 3. **Policy + caller-scope on custom tools.** For a consumer whose effects are **API calls, not file
-   paths** — the `managed-agents-builder`'s control-plane CRUD — isolation rides the same `Executor::dispatch`
+   paths** — builder-style control-plane CRUD — isolation rides the same `Executor::dispatch`
    gate evaluating the tool's `permission_subjects` against an account-scoped policy + inherited `Caller`.
    flux owns the gate; **the consumer must register account-scoped tools** (subjects that carry the account
    so a cross-account target is denied). This obligation is documented, and WS3's test (b) demonstrates it.
@@ -295,7 +295,7 @@ Plus the full gate: `cargo build/test/clippy -D warnings/fmt` + `cargo test -p f
 
 ## Sequencing
 
-managed-agents R-03 is **M3 (backlog)** — nothing is blocked *today*. Recommended order by leverage-per-risk:
+Downstream sub-agent consumption is backlog work — nothing is blocked *today*. Recommended order by leverage-per-risk:
 **WS1 → WS2** (pure upside; unblock consumption + close the DoS/cost surface; enable isolation testing),
 then **WS3** (the production isolation bar), then **WS4** (transparency; do the seam now even though D-02
 tagging lands separately), then **WS5** (polish; structured-output and depth>1 may defer). Each WS is an
@@ -327,7 +327,7 @@ multi-tenant surface wires real cancellation.
 - **The per-turn cancel slot assumes one active turn per engine.** `ToolContext::set_cancel` writes into a
   single interior-mutable slot on the engine's shared context — the **same** one-active-turn-per-engine
   assumption `loop_host.set_turn` already relies on. A surface that drives two turns concurrently on one
-  engine (e.g. `flux serve` via `tokio::spawn`) would clobber the slot; once real cancellation is wired
+  engine (e.g. a served agent via `tokio::spawn`) would clobber the slot; once real cancellation is wired
   there, cancelling tenant B could stop tenant A's sub-agent. Benign today (serve uses non-cancellable
   `run_turn` with fresh never-cancelled tokens). *Fix when needed:* one engine per concurrent turn
   (per-tenant engines), or move per-turn state onto a per-turn handle. The SDK path is already safe

@@ -5,7 +5,7 @@
 
 ## Why
 
-`flux-capabilities::datasource` today is an **in-memory keyword TF index** + a `search` tool. The
+`flux-capabilities::datasource` today is an **in-memory keyword TF index** + a `search` tool. A
 downstream Slack-channel assistant is a knowledge-grounded assistant over a help-center snapshot + OpenAPI references +
 skills; it needs durable retrieval with a record model and several retrieval verbs — the shape
 `fluxplane-datasource` had. This lifts that shape into flux, additively (the existing in-memory `Index`/
@@ -64,7 +64,7 @@ Each implements `flux_runtime::Tool` with an input JSON Schema and dispatches th
 ### 4. Ingester + freshness
 - `ingest_dir(path, globs, source, entity)` — markdown → chunked `file.document` records.
 - `ingest_openapi(json, source)` — operations/schemas/params → `openapi.*` records.
-- `reindex(source)` + a `freshness(source)` staleness check (an `updated_at` watermark). The Slack-channel assistant calls
+- `reindex(source)` + a `freshness(source)` staleness check (an `updated_at` watermark). The assistant calls
   these at boot over `bot/data/knowledge/**`.
 
 ### 5. Embeddings seam — wired behind a feature gate (C-02)

@@ -18,7 +18,7 @@
 [D-04](event-trigger-channels.md) shipped event-trigger channels routing each event to a **journey** (a
 Flux-Lang DAG) via `flux_app::App::deliver` — deliberately the App-runner route, superseding D-04's
 originally-spec'd `EngineTarget`. That is the right fit for a **scheduled/declarative** background agent
-(cron → summary journey). It is the *wrong* fit for an **open-ended conversational assistant** — the
+(cron → summary journey). It is the *wrong* fit for an **open-ended conversational assistant** — a
 downstream Slack-channel assistant, which on a Slack mention must let the **model drive**: pick among ~8 integration
 tools, call them, iterate, and answer. That is an agent loop (`FlowEngine::run_turn`), not a DAG.
 

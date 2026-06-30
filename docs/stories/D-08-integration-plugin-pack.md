@@ -3,7 +3,7 @@ id: D-08
 title: Integration plugin pack — native flux plugins for the DevOps surface
 pillar: Agent
 status: done
-theme: downstream-managed-agents
+theme: downstream-managed-services
 design: docs/designs/integration-plugins.md
 ---
 
@@ -15,7 +15,7 @@ the integration surface the fluxplane Go bot had: Slack ops, web search, GitLab,
 Kubernetes, Loki, Prometheus. Each plugin declares a manifest, exposes **ops** and **datasource records**
 (feeding D-07), and is denied-by-default per the host capability model. **Epic** — ship per integration.
 
-## Why (downstream: Slack-channel assistant)
+## Why (downstream: Slack-channel assistants)
 The Slack-channel assistant's "DevOps assistant" scope is exactly this surface. flux has a production-ready plugin
 **runtime** (`flux-plugin`) but **zero integration plugins** ship with it. The chosen mechanism is **native
 flux plugins** (not MCP). **Home (decided this session — reverses the original sibling-repo plan):** an
@@ -31,7 +31,7 @@ plugin yet, and no bridge from a plugin's contributed records into D-07's index.
 ## Acceptance (per slice)
 - [ ] Slice 1 — **Slack ops** (post/edit/react/search/users/channels/thread) + **websearch**
       (Tavily + DuckDuckGo): manifests + ops; secrets via `flux-secret` env refs; capability-deny-by-default
-      proven by test; one hermetic round-trip per plugin through the runtime. (Unblocks the Slack-channel assistant MVP.)
+      proven by test; one hermetic round-trip per plugin through the runtime. (Unblocks the assistant MVP.)
 - [ ] Slice 2 — **GitLab** (projects/MRs/issues/users/groups/CI) ops + datasource records into D-07.
 - [ ] Slice 3 — **Jira + Confluence** (issues/projects; pages/spaces).
 - [ ] Slice 4 — **Kubernetes** (namespaced inventory, allow-listed).
@@ -43,7 +43,7 @@ plugin yet, and no bridge from a plugin's contributed records into D-07's index.
       `SystemHostCaps` and services the datasource record/search/get host commands against the D-07
       persistent index — so a plugin's contributed records become searchable knowledge. Failing-first test:
       a plugin emits a record → it is retrievable via the datasource `search`/`get` ops.
-- [ ] Each slice: full gate green in the `plugins/` workspace; the Slack-channel assistant's **D-09 op-grant** list
+- [ ] Each slice: full gate green in the `plugins/` workspace; the assistant's **D-09 op-grant** list
       names the ops.
 
 ## Progress
@@ -58,6 +58,6 @@ plugin yet, and no bridge from a plugin's contributed records into D-07's index.
 - Reuse, don't reimplement: D-10's protocol + binding SDK + capability manifest; `flux-secret` refs
   (`env/…`, `plugin/<name>/<instance>/<key>`). Prior art for the op/datasource shapes (copy shapes, not
   code): `fluxplane-plugins/{slack,gitlab,jira,confluence,kubernetes,loki,prometheus,websearch}`.
-- Records contributed here match **D-07**'s `flux-datasource` schema. Serves Slack-channel assistant **S-04**. Non-goal
+- Records contributed here match **D-07**'s `flux-datasource` schema. Serves downstream assistant integration flows. Non-goal
   (v1): an OpenAPI dynamic-tool plugin (the bot indexes OpenAPI as RAG docs via D-07 instead); a plugin
   marketplace/`.dex`-style endpoint registry.

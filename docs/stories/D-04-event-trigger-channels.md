@@ -4,7 +4,7 @@ title: Event-trigger channels — cron/timed, webhook, Slack (background agents)
 pillar: Agent
 status: done
 priority:
-theme: downstream-managed-agents
+theme: downstream-managed-services
 design: docs/designs/event-trigger-channels.md
 ---
 
@@ -23,10 +23,10 @@ the entry point is **`flux app run <program.flux>`** (with `flux run <app.flux>`
 expressions** (the `cron` crate). This replaced an earlier standalone-host / `flux channels run` / TOML /
 single-agent-`EngineTarget` draft — the Program's bus/triggers/journeys already do the routing.
 
-## Why (managed-agents)
-Today an managed-agents agent only responds over voice (RTVBP) or A2A request/response. The product wants
+## Why (downstream managed services)
+Today downstream agents commonly respond over voice (RTVBP) or A2A request/response. The product direction wants
 **background agents that wake on events** — scheduled checks, inbound webhooks, Slack mentions. This is
-the channel breadth behind managed-agents' M5 and the "agents that aren't just request/response" direction.
+the channel breadth behind "agents that aren't just request/response".
 
 ## flux gap
 `flux-app` (L6) has only in-process channels (cli stdin/stdout) + `{on: startup/user_input}` triggers +
@@ -71,4 +71,4 @@ agents on cron/webhook/Slack.
   events — concurrent deliveries would double-process via fan-out. Journeys are independent; cross-channel
   concurrency is a follow-up.
 - Pairs with **D-01** (a journey can run a parameterized flow) and **D-02** (triggered runs persist to the
-  tagged event log). Serves the managed-agents channel-breadth direction and the fluxplane use case directly.
+  tagged event log). Serves downstream channel-breadth needs and the fluxplane use case directly.

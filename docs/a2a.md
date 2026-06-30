@@ -2,8 +2,9 @@
 
 flux speaks the [A2A protocol](https://a2a-protocol.org/) in **both directions**:
 
-- **Server** — `flux serve` exposes the local agent over A2A, so any A2A client (Claude Code,
-  other agents, custom scripts) can call flux as a first-class agent.
+- **Server** — `flux app run --serve` exposes a flux agent over A2A, so any A2A client (Claude Code,
+  other agents, custom scripts) can call flux as a first-class agent. A `.flux` program can also declare an
+  `a2a` channel directly.
 - **Client** — `flux a2a <URL>` connects out to any spec-conformant A2A agent and drives it from
   the CLI exactly like a local agent (interactive REPL or one-shot).
 
@@ -11,8 +12,7 @@ Both directions share one wire definition (the `flux-a2a` crate) and speak the c
 `message/send` (blocking) and `message/stream` (SSE), with message parts keyed by `kind`. The
 **server-side** protocol logic (JSON-RPC dispatch, the agent-card builder, message/event shaping) is
 itself reusable — `flux_a2a::server`, an axum-free module over a small `A2aTurn` seam — so `flux-server`
-and downstream surfaces (e.g. downstream's `managed-agents`) mount the same A2A endpoint on their own HTTP
-server without re-implementing the protocol.
+and downstream HTTP surfaces can mount the same A2A endpoint without re-implementing the protocol.
 
 ---
 
@@ -46,24 +46,30 @@ On connect, the client fetches the agent card (`/.well-known/agent-card.json`, f
 The `<URL>` may be a base origin (`http://host:port` → the client targets `<origin>/a2a`) or a full
 JSON-RPC endpoint URL. The client adopts the endpoint advertised by the agent card when present.
 
-> **Continuity.** Each turn is sent as an independent task, matching today's stateless `flux serve`.
+> **Continuity.** Each turn is sent as an independent task, matching today's stateless `flux app run --serve`.
 > The client carries the A2A `contextId`/`messageId`/`taskId` identifiers, so a *stateful* remote
 > keeps conversation memory and server-side statefulness can be added later without client changes.
 
 ---
 
-## Server — `flux serve`
+## Server — `flux app run --serve`
 
 ```bash
 # Listen on all interfaces, auto-approve all tool calls
-flux serve 0.0.0.0:3000 --yes
+flux app run --serve 0.0.0.0:3000 --yes
 
 # Loopback only (no token required)
-flux serve 127.0.0.1:3000 --yes
+flux app run --serve 127.0.0.1:3000 --yes
 
 # With a bearer token (required for non-loopback)
-FLUX_SERVER_TOKEN=mysecret flux serve 0.0.0.0:3000 --yes
+FLUX_SERVER_TOKEN=mysecret flux app run --serve 0.0.0.0:3000 --yes
+
+# Serve the sole agent declared in a program
+flux app run support.flux --serve 127.0.0.1:3000 --yes
 ```
+
+Without a program file, `--serve` exposes the built-in coding agent. With a program file, it exposes the
+program's sole declared agent; multi-agent programs should declare an `a2a` channel with an explicit `agent`.
 
 On startup flux prints:
 
@@ -204,7 +210,7 @@ whether accessed directly or through a reverse proxy.
 
 ### Calling flux from Claude Code
 
-1. Start flux with a token: `FLUX_SERVER_TOKEN=mytoken flux serve 0.0.0.0:3000 --yes`.
+1. Start flux with a token: `FLUX_SERVER_TOKEN=mytoken flux app run --serve 0.0.0.0:3000 --yes`.
 2. In Claude Code, add flux as an A2A agent pointing at `http://<your-host>:3000`. The card at
    `/.well-known/agent-card.json` is fetched automatically to learn flux's capabilities.
 3. Pass the bearer token as the connection credential.

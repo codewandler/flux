@@ -71,8 +71,8 @@ flux run -c                   # continue the most recent session
 # ratatui TUI with live token streaming and an in-UI approval modal
 flux tui
 
-# HTTP daemon (REST + SSE streaming)
-flux serve 127.0.0.1:8787 --yes
+# HTTP/A2A daemon (REST + SSE streaming)
+flux app run --serve 127.0.0.1:8787 --yes
 ```
 
 No API key needed to try the engine: `-m mock` runs an offline provider through the full pipeline.
@@ -191,7 +191,11 @@ Long sessions are **compacted** automatically: older turns are summarized once t
 
 ---
 
-## HTTP API (`flux serve`)
+## HTTP API (`flux app run --serve`)
+
+`flux app run --serve <addr> --yes` exposes the built-in coding agent over HTTP/A2A. With a
+`<program.flux>` argument, the same flag exposes that program's sole agent; programs can also declare an
+`a2a` channel directly.
 
 | Route | Purpose |
 |---|---|
@@ -202,7 +206,8 @@ Long sessions are **compacted** automatically: older turns are summarized once t
 | `GET  /sessions/:id/stream?input=…` | **Server-Sent Events**: `text` / `tool` / `done` |
 | `POST /webhook` | external trigger → fresh session + one turn |
 
-Every route except `GET /health` requires `Authorization: Bearer $FLUX_SERVER_TOKEN`. A non-loopback bind without the token set is refused (the daemon auto-approves tools, so an open listener is RCE).
+Every route except `GET /health` requires `Authorization: Bearer $FLUX_SERVER_TOKEN`. A non-loopback bind
+without the token set is refused (the daemon auto-approves tools, so an open listener is RCE).
 
 ---
 

@@ -7,7 +7,7 @@ redesigned `flux-plugin` (L4, [D-10](process-plugin-protocol.md)) + `flux-dataso
 
 ## Why
 
-flux ships a production-ready plugin **host** (`flux-plugin`) but **no integration plugins**. The
+flux ships a production-ready plugin **host** (`flux-plugin`) but **no integration plugins**. A
 Slack-channel assistant's "DevOps assistant" scope needs the surface the fluxplane Go bot had: Slack ops, web search,
 GitLab, Jira, Confluence, Kubernetes, Loki, Prometheus. Mechanism (decided): **native flux plugins**, not
 MCP — each a subprocess speaking flux's protocol. **Prerequisite:** that protocol is redesigned first
@@ -44,7 +44,7 @@ a new plugin is mostly "declare ops/datasources + implement each against the ven
 - **Secrets** are fetched by purpose via the host protocol (the plugin never reads state files); the host
   resolves a purpose → `flux-secret` material — `env/GITLAB_PERSONAL_TOKEN`, `plugin/slack/main/bot_token`,
   etc. — and can inject it into a host HTTP call (e.g. bearer).
-- Ops become policy-gated tools in the consuming agent; the Slack-channel assistant's **D-09 op-grant** list names the
+- Ops become policy-gated tools in the consuming agent; the assistant's **D-09 op-grant** list names the
   ops it allows (e.g. `gitlab.*`, `slack.post`), so they run under the headless approver without `--yes`.
 
 ## Datasource records (feed D-07) — via the L5 bridge
@@ -65,7 +65,7 @@ dedicated **`plugins` CI job** (it's excluded from the root workspace). See
 
 ## Slices (ship per integration)
 1. **Slack ops** (post/edit/react/search/users/channels/thread) + **websearch** (Tavily + DuckDuckGo
-   aggregation) — unblocks the Slack-channel assistant MVP (the bot can *answer*, not just receive).
+   aggregation) — unblocks the assistant MVP (the bot can *answer*, not just receive).
 2. **GitLab** (projects, MRs, issues, users, groups, CI/CD) + datasource records.
 3. **Jira + Confluence** (issues/projects; pages/spaces).
 4. **Kubernetes** (namespaced inventory, allow-listed namespaces).

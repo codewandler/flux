@@ -22,31 +22,24 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
   grader-confirmed run is **staged** on a funded provider key
 
 ## Next (ready — take the top one unless the user named a story)
-- The **fluxplane-plugins parity epic** continues: **D-14 shipped** (all 8 plugins at op + behavioural
-  parity; see Done). **D-15** (observability/AI), **D-16** (datastore/infra), **D-17** (telephony) are the
-  ready follow-ons — all unblocked now D-12 (+ the D-14 host extensions: managed processes, binary body)
-  shipped. See the epic in Backlog below.
 - [D-11 — App-runner ergonomics](D-11-app-runner-ergonomics.md) · Agent · the alternate ready pick (makes
-  `flux app run` a viable host for a declarative bot; unblocks Slack-channel assistant S-01/S-03/S-06).
+  `flux app run` a viable host for a declarative bot; unblocks Slack-channel assistant flows).
 
 ## Blocked
 _(none)_
 
 ## Backlog (unranked — promote to **Next** with a `priority` when ready)
 - [L-02 — flux-markdown engine + progressive-disclosure skills](L-02-flux-markdown-engine.md) · Language · AST parser, body-on-demand activation
-- [D-11 — App-runner ergonomics for declarative bots](D-11-app-runner-ergonomics.md) · Agent · configurable `flux app run` knowledge ingest + OpenAPI + persona/event-context-from-file; blocks Slack-channel assistant S-03/S-06
+- [D-11 — App-runner ergonomics for declarative bots](D-11-app-runner-ergonomics.md) · Agent · configurable `flux app run` knowledge ingest + OpenAPI + persona/event-context-from-file; blocks declarative assistant flows
 
 ### fluxplane-plugins parity (epic) — full native parity with the 26-plugin fluxplane pack
 The integration breadth+depth push: every *portable* fluxplane plugin rewritten natively at full op coverage,
-gated by D-12. See [epic design](../designs/fluxplane-plugins-parity.md). **D-12/D-13 shipped** (see Done);
-**D-14 leads** (in progress above). D-12 is landed, so D-15/D-16/D-17 are all unblocked.
-- [D-15 — Observability & AI plugin pack](D-15-observability-ai-plugins.md) · Agent · alertmanager, grafana, opsgenie, huggingface (HTTP; D-12 Slice A auth ready)
-- [D-16 — Datastore & infra plugin pack](D-16-datastore-infra-plugins.md) · Agent · sql, docker, aws (D-12 Slice B conn + blob ready)
-- [D-17 — Telephony plugin pack](D-17-telephony-plugins.md) · Agent · asterisk, homer — serves the managed-agents voice surface (D-12 Slice B conn ready)
+gated by D-12. See [epic design](../designs/fluxplane-plugins-parity.md). **D-12 through D-17 shipped** (see
+Done); **D-22** added the single guarded spawn path + plugin authoring guide.
 
 ### Plugin platform hardening — lifecycle, internal-network reach, distribution
 Gaps surfaced while verifying the plugin install + running `scripts/smoke-plugins.sh` (the gitlab case fails
-only because the SSRF guard refuses the internal downstream GitLab — see D-20).
+only because the SSRF guard refuses a private-network GitLab fixture — see D-20).
 - [D-19 — Complete the `flux plugin` lifecycle surface](D-19-plugin-lifecycle-cli.md) · Core · add `uninstall`
   + a richer `status`/`info` (version, pin, liveness, declared surface); small, no design doc
 - [D-20 — Scope private-network egress to declared plugins/endpoints](D-20-scoped-private-net-egress.md) · Core ·
@@ -57,10 +50,10 @@ only because the SSRF guard refuses the internal downstream GitLab — see D-20)
   a non-repo user obtains the pack (bundled binaries / fetch-on-install / marketplace); produces a design + the
   follow-on stories, no code
 
-### Downstream enablement (managed-agents) — queued behind the active Slack-channel assistant stack above
-These support the multi-tenant **managed-agents** service (path-dep consumer). **D-02 and D-03 both shipped**
-(see Done); the remaining managed-agents items are not yet filed. See
-[roadmap → Downstream enablement](../roadmap.md#downstream-enablement-managed-agents-Slack-channel assistant).
+### Downstream enablement — queued behind the active Slack-channel assistant stack above
+These support multi-tenant managed-agent services (path-dep consumers). **D-02 and D-03 both shipped**
+(see Done); the remaining consumer-specific items are not yet filed. See
+[roadmap → Downstream enablement](../roadmap.md#downstream-enablement).
 
 ### Subscription providers & cross-provider cost (epic) — claude-code/codex hardening + usage/cost
 Harden the two **subscription/passthrough** providers (reuse the desktop apps' tokens + refresh, no full
@@ -82,10 +75,20 @@ all providers**. Most plumbing already exists (`flux-credentials` import/refresh
   stage; import + refresh cover the near term
 
 ## Done
+- [D-24 — Harden provider schemas and CLI daemon ergonomics](D-24-provider-schema-and-cli-hardening.md) ·
+  Agent · `emit_plan` now advertises the derived `DraftAst` schema, `flux plugin call` resolves short op
+  names, served daemons honor SIGTERM, and `flux tui` fails clearly without a TTY
+- [D-23 — Serve agents through flux app run](D-23-app-run-serve-a2a.md) · Agent · removed the standalone
+  `flux serve` command; `flux app run --serve <addr> --yes` now serves the built-in coding agent, `.flux`
+  programs can declare an `a2a` channel, and one-agent programs can be exposed ad hoc with `--serve`
+- [D-22 — One guarded process-spawn path + plugin authoring guide](D-22-guarded-spawn-and-plugin-authoring.md) · Core · funneled all OS-process creation through one `flux_system` `build_command` (+ new `spawn_interactive`); `PluginHost::spawn` routed through it so the **plugin process is env-cleared** — a plugin can no longer read the host's secrets via `std::env` (gated `secret` is the only path), closing a bypass of the deny-by-default model; flux-runtime git-context also via `System::run`; new `plugins/AUTHORING.md` (linked from AGENTS.md + README); env-isolation regression test; full root gate green
+- [D-17 — Telephony plugin pack](D-17-telephony-plugins.md) · Agent · added native `asterisk` (8 AMI ops over guarded `conn.*`) and `homer` (8 HTTP/JWT ops, including SIP search/call/QoS/PCAP export); full `plugins/` gate green
+- [D-16 — Datastore & infra plugin pack](D-16-datastore-infra-plugins.md) · Agent · added native `sql` (6 PostgreSQL read/introspection ops over `ConnStream`, MySQL/SQLite explicit residuals), `docker` (33 core Docker Engine REST ops over Unix socket), and `aws` (11 read-only ops via host-managed `aws` CLI); full `plugins/` gate green
+- [D-15 — Observability & AI plugin pack](D-15-observability-ai-plugins.md) · Agent · added native `alertmanager` (5 ops), `grafana` (20), `opsgenie` (8), and `huggingface` (9), with datasource contributions and env-gated smoke coverage; full `plugins/` gate green
 - [D-14 — Deepen the 8 native plugins to full op-parity](D-14-deepen-native-plugins.md) · Agent · all 8 `plugins/` at fluxplane op + **behavioural** parity (+~160 ops): gitlab 6→64, slack 5→30, kubernetes 5→24, jira 3→21, confluence 3→15, prometheus 4→8, loki 3→5, websearch +`provider.list`. Added two **host protocol** capabilities (managed background processes `process.spawn/read/status/kill`; binary HTTP body `body_b64`/`response_binary`). jira/confluence auth re-ported to the reference (Bearer/`cloud_id` gateway + Basic fallback); k8s port-forward on managed processes; byte-exact attachments/files; jira ADF + transition scorer, slack mentions/unreads, gitlab `diff.lines` regex ported faithfully. One MockHost test per op; `plugins/` + host gate green
 - [D-13 — Generated plugin skill (`flux plugin skill`)](D-13-plugin-skill-command.md) · Core · renders installed-plugin manifests into a trigger-activated `flux-plugins` SKILL.md + `references/` (the flux analogue of fluxplane's `fluxplane-plugin skill`); flux-markdown frontmatter writer (commit `7030261`)
 - [D-12 — Plugin protocol parity extensions](D-12-plugin-protocol-parity.md) · Core · additive host caps for the missing fluxplane plugins — non-Bearer auth injection (A: Basic/header/query by purpose) + raw `conn.*` dialer (B) + `blob.*` store (C); clean extension of `flux.plugin.v1`, unblocks D-14..D-17 (commit `a21bc47`)
-- [D-03 — Reusable A2A server helpers](D-03-a2a-server-helpers.md) · Agent · lifted flux-server's A2A routes into the reusable `flux_a2a::server` helper; unblocks managed-agents E-02 + fixed the `tasks/send` drift (commit `7dcc6b3`)
+- [D-03 — Reusable A2A server helpers](D-03-a2a-server-helpers.md) · Agent · lifted flux-server's A2A routes into the reusable `flux_a2a::server` helper; unblocks downstream A2A consumers + fixed the `tasks/send` drift (commit `7dcc6b3`)
 - [D-02 — Tenant/context-taggable event substrate](D-02-tenant-event-substrate.md) · Core · optional stream-level account/agent/correlation context envelope on `flux-events` runs + account-scoped reads (`list_for_account`/`account_streams`) (commit `c97c8a4`)
 - [L-03 — Native-text module declarations (`.flux` does all of it)](L-03-native-text-program-grammar.md) · Language · the whole app — `agent`/`channel`/`datasource`/`trigger`/`journey` + flows — in native flux-lang text (settings inline, secrets as `secret "ENV"` refs); JSON-program path deleted (clean cutover); `flux app run`/`flux flow run` load native text; supersedes the JSON manifest (see [design](../designs/native-text-modules.md))
 - [C-02 — Integration-stack hardening](C-02-integration-stack-hardening.md) · Core · `flux plugin call`/`install` + a `plugins/` CI job (`a8092dc`); feature-gated embeddings/semantic backend — `OpenAiEmbedder` + a `SemanticIndex` hybrid-rerank decorator, default build unchanged (`f912c24`); a live env-gated `scripts/smoke-plugins.sh` (`5fda8be`)
@@ -93,10 +96,10 @@ all providers**. Most plumbing already exists (`flux-credentials` import/refresh
 - [D-09 — Agentic channel target](D-09-agentic-channel-target.md) · Agent · `trigger.agent` wakes an `AgentSpec` turn (per-thread session memory + declared grants, `0d8ac58`) + the registry wiring (`App::with_tools` loads datasource + plugin tools on the `flux app run` path, `e4710ad`)
 - [D-10 — Process-plugin protocol redesign](D-10-process-plugin-protocol.md) · Core · enriched the plugin manifest (auth-by-purpose, datasource declarations, endpoints) + host capabilities (HTTP method/headers/body + bearer injection, secret-by-purpose, endpoint, datasource-record contribution) over the existing unified frame; `DatasourceHostCaps` L5 bridge (commits `f389bc7`/`7db537a`)
 - [D-07 — Knowledge datasource (a real RAG layer)](D-07-knowledge-datasource-rag.md) · Core · new L0 `flux-datasource` schema crate + a `DatasourceBackend` trait with in-memory + **SQLite-FTS5** backends, the five retrieval ops (`search`/`get`/`list`/`relation`/`batch_get`), markdown + OpenAPI ingesters, reindex/freshness, and an unwired embeddings seam (commits `2642479`/`e6d7279`/`5241c97`)
-- [D-01 — Parameterized flow execution (the behaviour-runner seam)](D-01-flow-input-seeding.md) · Agent · deterministic `FlowClient::parse` (no model round-trip) + a per-run input-seeding seam (`FlowStore::seed` + `FlowClient::execute_with`/`run_flow`) so a stored flow runs per invocation with injected `$var` settings — fresh-store isolation, flow-local binds shadow seeds, envelope unchanged; modules, zero new crates; serves managed-agents R-01/A-03 (see [CHANGELOG](../../CHANGELOG.md))
-- [D-06 — Realtime voice-to-voice as a first-class flux provider](D-06-realtime-voice-provider.md) · Agent · sibling `RealtimeProvider`/`RealtimeSession` seam (modules in flux-provider/flux-providers/flux-flow — zero new crates) + OpenAI-Realtime impl lifted from managed-agents; realtime tool calls run through `Executor` declared once; SDK `FlowClient::run_voice_session` + a Phase-2 engine-owned-turns spike (see [CHANGELOG](../../CHANGELOG.md))
+- [D-01 — Parameterized flow execution (the behaviour-runner seam)](D-01-flow-input-seeding.md) · Agent · deterministic `FlowClient::parse` (no model round-trip) + a per-run input-seeding seam (`FlowStore::seed` + `FlowClient::execute_with`/`run_flow`) so a stored flow runs per invocation with injected `$var` settings — fresh-store isolation, flow-local binds shadow seeds, envelope unchanged; modules, zero new crates; serves downstream behaviour-runner/preset consumers (see [CHANGELOG](../../CHANGELOG.md))
+- [D-06 — Realtime voice-to-voice as a first-class flux provider](D-06-realtime-voice-provider.md) · Agent · sibling `RealtimeProvider`/`RealtimeSession` seam (modules in flux-provider/flux-providers/flux-flow — zero new crates) + OpenAI-Realtime impl ported from a downstream realtime client; realtime tool calls run through `Executor` declared once; SDK `FlowClient::run_voice_session` + a Phase-2 engine-owned-turns spike (see [CHANGELOG](../../CHANGELOG.md))
 - [D-04 — Event-trigger channels (cron/webhook/Slack)](D-04-event-trigger-channels.md) · Agent · new `flux-channels` L6 crate; channels declared in the Program + run by `flux app run` (each fires a bus event → trigger → journey via `App::deliver`); schedule/webhook/Slack adapters (see [CHANGELOG](../../CHANGELOG.md))
-- [D-05 — Harden the sub-agent primitive for multi-tenant production](D-05-sub-agent-hardening.md) · Agent · SDK seam (`FlowClient::with_sub_agents`) + lifecycle limits (cancel/wall-clock) + pluggable approver + tested isolation + child audit; the primitive managed-agents R-03/A-05 consume (see [CHANGELOG](../../CHANGELOG.md))
+- [D-05 — Harden the sub-agent primitive for multi-tenant production](D-05-sub-agent-hardening.md) · Agent · SDK seam (`FlowClient::with_sub_agents`) + lifecycle limits (cancel/wall-clock) + pluggable approver + tested isolation + child audit; the primitive downstream multi-tenant consumers use (see [CHANGELOG](../../CHANGELOG.md))
 - [C-01 — Crate consolidation, phases 2–4](C-01-crate-consolidation.md) · Core · hooks→plugin, browser+datasource→capabilities, context→runtime; removed dead integrations (35 → 31 crates)
 - [A-02 — A2A client (`flux a2a <URL>`)](A-02-a2a-client.md) · Agent · consume a remote A2A agent like a local one; server clean-cutover to the current spec (see [CHANGELOG](../../CHANGELOG.md))
 - [A-01 — Unify on FlowEngine, retire the classic Agent loop](A-01-unify-flowengine.md) · Agent · one loop everywhere; `flux-agent` repurposed as the `AgentSpec` home (see [CHANGELOG](../../CHANGELOG.md))

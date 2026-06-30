@@ -133,7 +133,7 @@ deny  = []                                    # always-blocked tools
 flux run -v "..."                # show tool output in full (no truncation); also FLUX_VERBOSE=1
 flux --color always|auto|never   # colorize output (auto = a terminal, NO_COLOR unset; global flag)
 flux tui                         # ratatui chat UI (in-UI approval modal)
-flux serve 127.0.0.1:8787 --yes  # HTTP API daemon (REST + SSE)
+flux app run --serve 127.0.0.1:8787 --yes  # HTTP/A2A daemon (REST + SSE)
 flux run app.flux                # run a multi-agent program (event bus + triggers + journeys); deny-destructive unless --yes
 flux sessions                    # list recent sessions
 flux plugin ls                   # manage subprocess plugins (any-language ops)

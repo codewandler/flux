@@ -6,14 +6,14 @@ crate `flux-channels`) · **Owner:** Timo
 > The originally-spec'd agentic **`EngineTarget`** (route an event to an `AgentSpec` `run_turn` so the model
 > drives RAG + tools, with per-conversation memory) was deferred in favour of the journey route below; it is
 > now tracked as **[D-09](../stories/D-09-agentic-channel-target.md)** (agentic channel target — a new
-> `Deliverer` alongside the journey route), driven by the downstream Slack-channel assistant.
+> `Deliverer` alongside the journey route), driven by downstream Slack-channel assistant use cases.
 
 ## Why
 
 flux agents are reached request/response — the CLI/REPL, the HTTP `webhook`/A2A endpoints, voice
 downstream. There was no way to run an agent that is **idle and woken by an external event**: a nightly
-cron summary, an inbound webhook, a Slack mention. This is the channel breadth behind the downstream
-managed-agents product (which has only RTVBP + A2A channels) and the "background agents" use case directly.
+cron summary, an inbound webhook, a Slack mention. This is the channel breadth behind downstream managed
+services and the "background agents" use case directly.
 
 ## Approach — channels are Program-declared and run by the app runner
 

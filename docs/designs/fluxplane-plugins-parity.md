@@ -1,6 +1,6 @@
 # Design: fluxplane-plugins parity (the integration-plugin epic)
 
-**Status:** D-12 / D-13 / **D-14 shipped** (the 8 native plugins are at full op-parity); D-15–D-17 next ·
+**Status:** D-12 / D-13 / **D-14–D-17 shipped** (all portable native plugins are implemented) ·
 **Pillar:** Agent · **Layer:** L4 (`flux-plugin`) + the `plugins/` workspace ·
 **Owner:** Timo · **Stories:** [D-12](../stories/D-12-plugin-protocol-parity.md) ·
 [D-13](../stories/D-13-plugin-skill-command.md) · [D-14](../stories/D-14-deepen-native-plugins.md) ·
@@ -25,9 +25,9 @@ same safety envelope as the agent's own tools.
 | Disposition | fluxplane plugins | Story |
 |---|---|---|
 | **Native, shallow** — port-deepen to full op set ✅ **done (D-14)** | confluence, gitlab, jira, kubernetes, loki, prometheus, slack, websearch | **D-14** |
-| **Missing — HTTP** (needs non-Bearer auth) | alertmanager, grafana, opsgenie, huggingface | **D-15** |
-| **Missing — raw-conn / SDK** | sql, docker, aws | **D-16** |
-| **Missing — telephony** | asterisk, homer | **D-17** |
+| **Native — HTTP pack** ✅ **done (D-15)** | alertmanager, grafana, opsgenie, huggingface | **D-15** |
+| **Native — datastore/infra pack** ✅ **done (D-16)** | sql, docker, aws | **D-16** |
+| **Native — telephony pack** ✅ **done (D-17)** | asterisk, homer | **D-17** |
 | **Covered differently — NOT ported** | clock→`now`, system→`sys_info`, sleep→builtin, git→tool group, openai/ollama→providers, duckduckgo/tavily→folded into flux `websearch` | — |
 | **Deliberate divergence — NOT ported** | vision/websearch *aggregators*, openapi *generator* | — |
 
@@ -79,10 +79,10 @@ D-12 (protocol: auth → conn → blob)         D-13 (flux plugin skill)   ← t
         └── D-17 (asterisk, homer)                               [needs conn]
 ```
 
-D-13 is independent (no protocol dependency) and ships first. D-12's auth slice is the first protocol
-deliverable; conn + blob follow. **D-14 has shipped** (all 8 plugins deepened to op-parity, ~160 ops, via
-one sub-agent per plugin in parallel — each gated package-scoped, then the full `plugins/` workspace gate
-together). The remaining plugin-pack stories (D-15…D-17) consume D-12 next.
+D-13 is independent (no protocol dependency) and shipped first. D-12's auth/conn/blob slices unlocked the
+native ports. **D-14 through D-17 have shipped**: the original 8 plugins were deepened to op-parity, then the
+9 remaining portable plugins were ported natively. Each plugin slice was developed package-scoped, then the
+full `plugins/` workspace gate was run together.
 
 ### Host protocol extensions landed with D-14
 The fidelity pass added two capabilities to `flux.plugin.v1` (the way D-12 added auth/conn/blob):
@@ -97,7 +97,7 @@ The fidelity pass added two capabilities to `flux.plugin.v1` (the way D-12 added
   bytes as `body_b64` (16 MiB cap); host-kit `Host::http_bytes`. Byte-exact upload **and** download (the
   earlier `String`-body lossiness is gone).
 
-## Authoring pattern (for the port stories)
+## Authoring pattern
 
 Each plugin is a `plugins/<name>/` crate in the nested workspace (excluded from the root gate), binary
 `flux-plugin-<name>`, built on `host-kit`'s `PluginBuilder` + `read_op`/`write_op` + `MockHost` (reference:
@@ -105,6 +105,15 @@ Each plugin is a `plugins/<name>/` crate in the nested workspace (excluded from 
 code) from `~/projects/fluxplane/fluxplane-plugins/<plugin>/manifest.go`. Each slice: full gate green in
 `plugins/`, a smoke entry in `scripts/smoke-plugins.sh`, and `flux plugin skill refresh` to regenerate the
 catalog.
+
+## Accepted residuals
+
+- **Docker streaming/hijack ops** (`exec`, `stats`, log follow, image build/push, event stream) are not faked:
+  the shipped Docker plugin covers the core Engine REST lifecycle over the guarded Unix `conn.*` stream, while
+  those operations need a later long-lived stream/hijack design.
+- **SQL** supports PostgreSQL over a hand-rolled protocol client with SCRAM/MD5/cleartext auth and MockHost
+  frame tests. MySQL is a clear unsupported error; SQLite is unsupported by design because plugins have no host
+  file capability. A live Postgres smoke remains the release confidence step.
 
 ## Non-goals
 - Wrapping fluxplane's Go binaries, or any MCP bridge — plugins are native Rust.

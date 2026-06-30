@@ -4,7 +4,7 @@ title: Reusable A2A server helpers on the current spec
 pillar: Agent
 status: backlog
 priority:
-theme: downstream-managed-agents
+theme: downstream-managed-services
 ---
 
 # Reusable A2A server helpers on the current spec
@@ -15,10 +15,10 @@ a **reusable helper** that binds an `AgentSpec`/`FlowEngine` to those routes, so
 mounts a spec-conformant A2A endpoint on its own HTTP server instead of hand-rolling one — and so the two
 codebases stop drifting on the wire protocol.
 
-## Why (managed-agents)
-managed-agents **E-02** wants to thin-wrap flux's A2A server rather than maintain its own. And there is a
+## Why (downstream managed services)
+Downstream A2A consumers want to thin-wrap flux's A2A server rather than maintain their own. And there is a
 **live divergence**: flux cut over (commit `06065f6`) to `message/send` / `message/stream` / `tasks/get`
-and **deleted** the draft `tasks/send` / `tasks/sendSubscribe`, but managed-agents' `channel-a2a` still serves
+and **deleted** the draft `tasks/send` / `tasks/sendSubscribe`, but an older downstream channel still serves
 `tasks/send` — it now speaks a dialect flux answers with `-32601 Method not found`. A shared helper fixes
 both the duplication and the drift.
 
@@ -34,7 +34,7 @@ nothing exposes them for reuse by a downstream binary. The client side already i
 - [x] `flux-server` consumes the helper instead of its inline copy — same behaviour, proving reuse
       (the auth-gate tests still pass; the A2A wire output is unchanged).
 - [x] The helper speaks the **current** spec only (no `tasks/send`); round-trip is covered by the
-      `flux_a2a::server` unit tests and, end-to-end over HTTP, by managed-agents' `a2a_routing` integration
+      `flux_a2a::server` unit tests and, end-to-end over HTTP, by downstream A2A routing integration
       test driving `message/send` → a completed `Task` through the shared `dispatch`.
 - [x] Gate green (scoped: `flux-a2a` + `flux-server` + the `flux-codegate` layering lint).
 
@@ -50,12 +50,12 @@ nothing exposes them for reuse by a downstream binary. The client side already i
   dep is `async-trait`).
 - **Shape decision (vs the original framing).** The acceptance first imagined a helper that *mounts the
   full route set (incl. `tasks/get`) for a single engine/spec*. That shape does **not** serve the primary
-  consumer: managed-agents (**E-02**) needs **multi-tenant, per-request** engines (per-agent path, per-request
+  consumer: downstream services need **multi-tenant, per-request** engines (per-agent path, per-request
   auth + embed tokens, a fresh engine built after auth), so it must mount its **own** routes over the
   shared protocol — exactly what the axum-free `flux_a2a::server` form enables. flux-server likewise keeps
   its own routes. So the reusable unit is the **protocol core**, not a route-mounter. `tasks/get` is not
   served by flux-server today (stateless/blocking `message/send`), so it stays out of scope here.
-- **`tasks/send` drift:** already resolved upstream — managed-agents' `channel-a2a` migrated to `message/send`
+- **`tasks/send` drift:** already resolved upstream — downstream A2A channels migrated to `message/send`
   in its E-06; this change keeps it there.
 
 ## Notes
@@ -64,6 +64,6 @@ nothing exposes them for reuse by a downstream binary. The client side already i
   would cross a boundary — confirm against `flux-codegate` before placing it. **Resolved:** the helper is
   axum-free pure-`Value`/trait logic, so it stays in `flux-a2a` (L1) with no boundary crossing; each
   surface keeps its own axum glue. `flux-codegate` green.
-- Serves managed-agents story **E-02** (A2A re-home).
-- Cross-repo follow-up (the consuming half, in managed-agents' E-02): `channel-a2a` + the multi-tenant
+- Serves downstream A2A re-home use cases.
+- Cross-repo follow-up (the consuming half): `channel-a2a` + the multi-tenant
   `A2aRouter` adopt `flux_a2a::server`.

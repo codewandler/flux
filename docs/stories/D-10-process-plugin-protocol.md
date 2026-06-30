@@ -3,7 +3,7 @@ id: D-10
 title: Process-plugin protocol redesign — a clean, unified plugin wire protocol
 pillar: Core
 status: done
-theme: downstream-managed-agents
+theme: downstream-managed-services
 design: docs/designs/process-plugin-protocol.md
 ---
 
@@ -18,7 +18,7 @@ blob, conn) — over **one clean, self-consistent frame**. Informed by fluxplane
 v1/v2 modes, three overlapping command families, per-call grant negotiation). Clean cutover of the current
 `flux.plugin.v1` — no dual protocol.
 
-## Why (downstream: Slack-channel assistant)
+## Why (downstream: Slack-channel assistants)
 flux's plugin runtime today (`flux.plugin.v1`) is host-complete but **cannot let a plugin contribute
 datasource records** to the knowledge layer, has **no auth-by-purpose** (secrets are raw env keys), and
 **no endpoint** concept — all of which D-08's Slack/GitLab/Jira/… plugins need to feed D-07 and reach

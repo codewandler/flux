@@ -4,7 +4,7 @@ title: Tenant/context-taggable event substrate for downstream run persistence
 pillar: Core
 status: in progress
 priority: high
-theme: downstream-managed-agents
+theme: downstream-managed-services
 ---
 
 # Tenant/context-taggable event substrate for downstream run persistence
@@ -14,8 +14,8 @@ Make `flux-events` carry an account/agent **context** on appended events and exp
 **projection read API**, so a downstream multi-tenant service can persist and replay runs as projections
 over flux's append-only log — not a parallel store bolted on beside it.
 
-## Why (managed-agents)
-managed-agents **R-04** (run persistence) and its **M4 transparency** surface are designed to be *projections
+## Why (downstream managed services)
+Downstream run-persistence and transparency surfaces are designed to be *projections
 over `flux-events`* (their `docs/designs/transparency.md`: "flux is already event-sourced … we build on
 that substrate, not a new one"). That is a **"build it in, not on"** decision: the context envelope must
 exist while R-01 lands, or audit/transparency becomes an expensive retrofit over an untagged log.
@@ -55,10 +55,11 @@ turn-metrics projections (`conversation`, `run_trace`, `turns`), but:
   layering lint (flux-events stays L2, no new deps).
 - **Out of scope (follow-ups):** wiring real context values at call sites — the A2A `context_id` (today
   read by `extract_context_id` and only echoed) is the natural `correlation_id` source; persona/
-  context-from-file at `flux app run` time is **D-11**. managed-agents consumes this for R-04 + M4 transparency.
+  context-from-file at `flux app run` time is **D-11**. Downstream services consume this for run persistence
+  and transparency.
 
 ## Notes
 - Touch points: `EventStore::append` / `append_batch`, `create_session`, `list`, `SessionSummary`, and
   the projections in `crates/flux-events/src/projection.rs`.
-- Serves managed-agents story **R-04** (run persistence) and the M4 transparency surface (**E-05**).
+- Serves downstream run-persistence and transparency surfaces.
 - Decide early **because** it is cheap now and a migration later; the value is the timing, not the size.

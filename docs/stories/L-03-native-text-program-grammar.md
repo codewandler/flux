@@ -4,7 +4,7 @@ title: Native-text module declarations (the whole app in flux-lang — `.flux` d
 pillar: Language
 status: done
 priority:
-theme: downstream-managed-agents
+theme: downstream-managed-services
 design: ../designs/native-text-modules.md
 ---
 
@@ -17,9 +17,9 @@ layer. Channels / datasources / auth are configured as **typed module declaratio
 flux-lang; `.flux` means exactly one language.
 
 ## Why (motivating consumer: Slack-channel assistant)
-The downstream **Slack-channel assistant** (second downstream flux consumer) is a declarative app — a `slack` channel
+A downstream **Slack-channel assistant** is a declarative app — a `slack` channel
 + an agent-bound trigger + an `assistant` agent + a docs datasource. It should be the human-authored,
-version-controlled artifact native flux-lang is for, not JSON. The whole ecosystem (managed-agents) already
+version-controlled artifact native flux-lang is for, not JSON. The surrounding ecosystem already
 authors flows as native text via `flux_lang::parse::parse`; this makes the app layer match.
 
 ## Acceptance
@@ -49,5 +49,5 @@ authors flows as native text via `flux_lang::parse::parse`; this makes the app l
 ## Notes
 - No new node kinds — module declarations are pure data; the flow language is unchanged.
 - Pairs with the shipped native value-template syntax (records/lists) for settings bags.
-- Sibling-pillar context: [[L-01]] global skills, L-02 flux-markdown. Downstream theme: the Slack-channel assistant
+- Sibling-pillar context: [[L-01]] global skills, L-02 flux-markdown. Downstream theme: the Slack assistant
   integration stack (D-07/D-08/D-09/D-10, all shipped).

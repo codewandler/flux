@@ -25,18 +25,15 @@ modules" preference and the crate-consolidation precedent:
   No engine-suspension work — per-turn `run_turn`, not cross-turn `await` (still future).
 - **SDK seam** = `FlowClient::run_voice_session(provider, config, sink, cancel)` (mirrors `with_sub_agents`).
 - **`ContentBlock::Audio`** stayed deferred (not needed by the voice hot path).
-- managed-agents rewiring is a **separate pass in that repo** (the "Changed (managed-agents consumer)" list is the
-  guide).
+- Downstream consumer rewiring is a **separate pass outside this repo**.
 
 ## Why
 
-The downstream managed-agents service runs a **voice-to-voice** model (OpenAI Realtime) to power phone agents
-over the RTVBP channel. Today that model runs **entirely outside flux**. managed-agents owns a hand-rolled
+Downstream managed-agent services run a **voice-to-voice** model (OpenAI Realtime) to power phone agents
+over the RTVBP channel. Today that model can run **entirely outside flux** in a hand-rolled
 WebSocket client (`crates/realtime`), audio resampling (`crates/audio`), and the whole acoustic turn loop
 (`channel-rtvbp/src/backend.rs`); flux is reached **only** behind the function-call seam — one-shot
-`flux_sdk::FlowClient::execute` per tool call (the "behaviour runner"). That split is deliberate and
-documented (managed-agents `docs/designs/behaviour-runner.md`: *"realtime drives voice; the behaviour runner
-drives logic"*), but it costs:
+`flux_sdk::FlowClient::execute` per tool call (the "behaviour runner"). That split is deliberate, but it costs:
 
 - A **parallel model stack** flux would otherwise own — WS client, GA event parsing, key handling — that
   gets **none** of flux's provider infrastructure (credential seam, model resolution, the `Executor`
@@ -50,7 +47,7 @@ drives logic"*), but it costs:
 The goal: make a voice-to-voice model a **first-class flux provider**, so its tool calls flow through the
 **same `Executor::dispatch` envelope** and its tools are declared **once** from the live `ToolRegistry` —
 giving voice agents the same permission / approval / redaction / evidence guarantees as text agents, and
-letting managed-agents delete the parallel stack.
+letting downstream consumers delete parallel stacks.
 
 ## The crux: half-duplex vs. full-duplex
 
@@ -101,7 +98,7 @@ flux, verified:
   `flux-a2a`; **L2** `flux-system` / `flux-runtime` / `flux-tools` / `flux-events`; **L3** `flux-agent` /
   `flux-orchestrate` / `flux-flow` / `flux-eval` / `flux-cognition`.
 
-managed-agents stack to lift/generalize (outside this repo, `downstream-managed-services`):
+Downstream stack shape to lift/generalize:
 - `crates/realtime/src/{lib,event,config}.rs` — the hand-rolled OpenAI Realtime WS client
   (`RealtimeHandle` outbound; `mpsc::Receiver<ServerEvent>` inbound; `SessionConfig::to_ga_session()`,
   GA shape, server-VAD, `Tool::function(...)`). Targets **GA** (beta header rejected).
@@ -195,13 +192,13 @@ pub enum TurnDetection {
 ```
 
 Two boundary decisions are baked into the trait: **(a)** `AudioDelta`/`send_audio` carry **decoded
-bytes**, not base64 — encoding is the impl's wire detail (today managed-agents leaks it as
+bytes**, not base64 — encoding is the impl's wire detail (some downstream clients leak it as
 `ServerEvent::AudioDelta(String)`); **(b)** `ToolCall` carries only strings, so the L1 enum never names an
 L2 runtime type. Both keep the layering honest.
 
 ### L1 — the OpenAI Realtime impl (new crate `flux-realtime`)
 
-The concrete provider, **lifted from managed-agents `crates/realtime`** (`lib`/`event`/`config`). It is a
+The concrete provider, **ported from a downstream realtime client** (`lib`/`event`/`config`). It is a
 persistent **WebSocket** (tokio-tungstenite) with a writer task + reader task; it does **not** compose with
 the HTTP `NativeProvider = WireCodec × Credential` pipeline (`flux-providers`' identity), so it is a
 **sibling L1 crate**, not a `flux-providers` module — keeping that crate's "HTTP family" identity crisp and
@@ -214,7 +211,7 @@ isolating the tungstenite dep.
   is not a shared type today — it's per-provider — so we copy the pattern, not the type.)
 - GA endpoint `wss://api.openai.com/v1/realtime?model=…`, **no** `OpenAI-Beta` header; parse both GA and
   beta event names defensively (as the lifted code already does).
-- A single `openai_realtime(secret)` constructor consolidates managed-agents' three scattered key reads.
+- A single `openai_realtime(secret)` constructor consolidates scattered downstream key reads.
 - The benign `response_cancel_not_active` race is swallowed **here**, so the trait can promise
   `cancel_response` is idempotent and the L3 driver stays clean.
 
@@ -234,8 +231,8 @@ pub fn tool_defs_from_registry(registry: &ToolRegistry) -> Vec<ToolDef> {
 }
 ```
 
-`RealtimeConfig.tools = tool_defs_from_registry(executor.registry())` — one source of truth. (Today
-managed-agents builds `realtime::Tool` in `spec.rs` *and* registers ops in `presets.rs`, hand-synced.)
+`RealtimeConfig.tools = tool_defs_from_registry(executor.registry())` — one source of truth. (Some downstream
+clients build model-facing tools and runtime ops in separate, hand-synced places.)
 
 **Off-loop dispatch through the full envelope** — `VoiceSessionDriver::run` is a `tokio::select!` loop that
 keeps the audio arm hot and, on a `ToolCall`, **spawns** the dispatch so a slow tool never stalls audio or
@@ -257,8 +254,8 @@ tokio::spawn(async move {
 ```
 
 `Executor::dispatch` is `&self` async behind an `Arc`, so cloning into the task is free and the full
-6-stage envelope runs on **every** voice tool call — identical to text agents. This mirrors managed-agents'
-existing off-thread dispatch, but lands on the real envelope instead of one-shot `FlowClient::execute`.
+6-stage envelope runs on **every** voice tool call — identical to text agents. This mirrors downstream
+off-thread dispatch, but lands on the real envelope instead of one-shot `FlowClient::execute`.
 
 **The sink** — a symmetric cousin of `AgentSink`:
 
@@ -275,7 +272,7 @@ pub trait VoiceSink: Send {
 }
 ```
 
-managed-agents' RTVBP channel implements `VoiceSink` (or a thin mpsc adapter to its existing `BotEvent`s) and
+The downstream RTVBP channel implements `VoiceSink` (or a thin mpsc adapter to its existing `BotEvent`s) and
 pushes caller audio through the `Arc<dyn RealtimeSession>` it also holds — mirroring today's
 `(BackendHandle, Receiver<BotEvent>)` split.
 
@@ -286,8 +283,8 @@ consumer/channel — RTVBP=8 kHz, WebRTC=48 kHz, local mic=16 kHz all differ and
 `RealtimeConfig.input_format/output_format` is the seam: the consumer declares what it sends/receives and
 the impl tags the wire. **Sharpener:** OpenAI Realtime accepts `g711_ulaw` natively, so the RTVBP 8 kHz
 path can set `input/output_format = TELEPHONY_ULAW` and let the model resample **server-side** — the
-channel then needs **zero** client resampling and `crates/audio` becomes optional. `crates/audio` **stays
-in managed-agents**; if flux ever grows a second in-tree voice consumer, lift it as a pure `flux-audio` utility
+channel then needs **zero** client resampling and a downstream audio crate becomes optional. Audio resampling **stays
+in the consumer**; if flux ever grows a second in-tree voice consumer, lift it as a pure `flux-audio` utility
 (L0/L1) offered à la carte — never wired into the provider or driver.
 
 ## Reconciliation with "the LLM is not the runtime"
@@ -310,17 +307,17 @@ correct for a latency-bound voice surface.
 **Phase 1 — the provider primitive (the model becomes a flux provider):**
 - L0 `AudioFormat`/`AudioEncoding` (`ContentBlock::Audio` deferred).
 - L1 `flux-provider::realtime` seam.
-- L1 `flux-realtime` OpenAI impl (lifted; decoded-bytes boundary; idempotent cancel; debounced
+- L1 `flux-realtime` OpenAI impl (ported; decoded-bytes boundary; idempotent cancel; debounced
   `create_response`; one `openai_realtime` constructor).
 - L3 `flux-voice` `VoiceSessionDriver` + `VoiceSink` + `tool_defs_from_registry`.
-- managed-agents keeps `crates/audio` + the RTVBP transport, **rewires** `RealtimeBackend` onto
+- Downstream consumers keep audio transport/resampling, **rewire** realtime backends onto
   `flux-voice`/`flux-realtime`, and **deletes** the model-facing `Tool` list in `spec.rs` in favour of
   `tool_defs_from_registry`.
 
 **Phase 2 — engine-owned voice turns (spike):**
 - A `VoiceSessionDriver` mode where turn boundaries + `ToolCall`s drive a **suspendable `FlowEngine`
   flow** instead of dispatching ops directly — a flux-lang flow owns the conversation across turns. This
-  is the deferred cross-turn `await` from managed-agents' `behaviour-runner.md`; it needs flux-lang top-level
+  is the deferred cross-turn `await` from downstream behaviour-runner designs; it needs flux-lang top-level
   `await` / cross-turn suspension, which one-shot `FlowClient::execute` cannot do today. The spike proves
   the seam (drive a 2-turn scripted flow against a mock `RealtimeProvider`) without committing the engine
   work.
@@ -332,7 +329,7 @@ correct for a latency-bound voice surface.
 |---|---|---|
 | `AudioFormat` / `AudioEncoding` / `AudioSource` | `flux-core` (new `audio.rs`) | **L0** |
 | `RealtimeProvider` / `RealtimeSession` / `RealtimeEvent` / `RealtimeConfig` / `TurnDetection` | `flux-provider` (new `realtime.rs`) | **L1** |
-| OpenAI Realtime impl (lifted from managed-agents `crates/realtime`) | `flux-providers::realtime` (feature `realtime`) | **L1** |
+| OpenAI Realtime impl (ported from a downstream realtime client) | `flux-providers::realtime` (feature `realtime`) | **L1** |
 | `VoiceSessionDriver` / `VoiceSink` / `VoiceTurnHandler` / `tool_defs_from_registry` | `flux-flow::voice` | **L3** |
 
 > **As built:** modules in existing L1/L3 crates (not new crates) — so `flux-codegate::layer()` and
@@ -347,7 +344,7 @@ correct for a latency-bound voice surface.
 - **`cancel_response` idempotency:** GA server-VAD auto-cancels then rejects an explicit cancel with
   `response_cancel_not_active`. The benign-race handling lives in `flux-realtime` so the trait can promise
   idempotency.
-- **Multiple tool calls per response (latent bug the abstraction fixes):** managed-agents calls
+- **Multiple tool calls per response (latent bug the abstraction fixes):** downstream clients may call
   `create_response()` once **per** function call, which can fire conflicting responses when a turn emits
   several. The driver should **debounce** to one `create_response` per `ResponseDone`, sending all
   `send_tool_result`s first. Open question: detect "all tool calls for this response are in" by counting
@@ -383,7 +380,7 @@ correct for a latency-bound voice surface.
 - root `Cargo.toml` — add `tokio-tungstenite` to `[workspace.dependencies]`
 - (no `flux-codegate` / workspace-member change — modules, not crates)
 
-**Changed (managed-agents consumer, outside this repo — separate follow-up pass):**
+**Changed (downstream consumer — separate follow-up pass):**
 - `crates/channel-rtvbp/src/backend.rs` — consume `flux_flow::voice` + `flux_providers::realtime`
   (`flux-providers` with the `realtime` feature); resampling stays here (or drop it via `g711`)
 - `crates/agent-core/src/spec.rs` — delete the model-facing `Tool` list; source from
@@ -410,13 +407,12 @@ correct for a latency-bound voice surface.
 
 ## Notes
 
-- **Reuse, don't reinvent:** lifts managed-agents' proven `crates/realtime` (WS client, GA event model) and
+- **Reuse, don't reinvent:** ports a proven realtime client shape (WS client, GA event model) and
   `RealtimeBackend` patterns; reuses `flux_provider::{TokenSource, ToolDef}`, `flux_spec::ToolSpec`,
   `flux_runtime::{Executor, ToolRegistry, ToolResult}`, and mirrors `AgentSink`. No redesign of `Provider`,
   the engine, or the safety envelope.
 - **Couples with** [D-01](../stories/D-01-flow-input-seeding.md) (the behaviour-runner flow a Phase-2
   voice flow would run on) and [D-02](../stories/D-02-tenant-event-substrate.md) (voice tool calls become
-  audited events once D-02 tags the substrate). Serves managed-agents **R-03**-adjacent voice work and the
-  managed-agents voice surface.
+  audited events once D-02 tags the substrate). Serves downstream voice work and managed-agent voice surfaces.
 - **Non-goals:** a new sandbox boundary; in-tree audio resampling; remote/distributed realtime; replacing
   the half-duplex `Provider` (the two coexist).

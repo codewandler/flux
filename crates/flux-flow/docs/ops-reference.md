@@ -30,11 +30,11 @@ optional arguments are in `[brackets]`.
 | `now` | | Low | Current wall-clock time: unix seconds + UTC string (replaces `date`) |
 | `cwd` | | Low | Absolute path of the workspace root (replaces `pwd`) |
 | `sys_info` | | Low | Host metadata: os, arch, family, hostname (replaces `uname`) |
-| `cargo_check` | `[package, args]` | Medium | `cargo check` (type-check only, no codegen) |
-| `cargo_build` | `[package, release, args]` | Medium | `cargo build` |
-| `cargo_test` | `[package, filter, args]` | Medium | `cargo test` |
-| `cargo_clippy` | `[package, args]` | Medium | `cargo clippy` |
-| `cargo_fmt` | `[package, check]` | Medium | `cargo fmt` (pass `check: true` to only verify) |
+| `cargo_check` | `[package, manifest_path, args]` | Medium | `cargo check` (type-check only, no codegen; `manifest_path` targets nested workspaces) |
+| `cargo_build` | `[package, manifest_path, release, args]` | Medium | `cargo build` (`manifest_path` targets nested workspaces) |
+| `cargo_test` | `[package, manifest_path, filter, args]` | Medium | `cargo test` (`manifest_path` targets nested workspaces) |
+| `cargo_clippy` | `[package, manifest_path, deny_warnings, args]` | Medium | `cargo clippy` (`manifest_path` targets nested workspaces) |
+| `cargo_fmt` | `[package, manifest_path, check]` | Medium | `cargo fmt` (pass `check: true` to only verify; `manifest_path` targets nested workspaces) |
 | `python_run` | `[script, module, args]` | Medium | Run a Python script or `-m module` (python group) |
 | `pytest` | `[path, args]` | Medium | Run `pytest` (python group) |
 | `npm` | `args` | Medium | Run an `npm` command, e.g. `["run","build"]` (node group) |

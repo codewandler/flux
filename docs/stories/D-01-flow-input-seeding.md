@@ -4,7 +4,7 @@ title: Parameterized flow execution — the behaviour-runner seam
 pillar: Agent
 status: done
 priority:
-theme: downstream-managed-agents
+theme: downstream-managed-services
 design: docs/designs/flow-input-seeding.md
 ---
 
@@ -16,8 +16,8 @@ at call time — so a downstream service can drive one flow as a reusable agent 
 re-compiling from natural language or baking inputs into the AST. This is the deepest near-term
 integration surface and the highest-leverage downstream item.
 
-## Why (managed-agents)
-The managed-agents **R-01 behaviour runner** + **A-03 preset framework** (their next milestone) must take a
+## Why (downstream managed services)
+A downstream **behaviour runner** plus **preset framework** must take a
 stored flow (custom or preset) and execute it with **effective settings** — author-time ⊕ validated
 invocation-time JSON — threaded in, custom ops registered, control actions out. Today that is awkward:
 `FlowClient::compile` is a model round-trip (wrong for a stored, already-valid flow), and the only way to
@@ -60,5 +60,5 @@ and return structured output (`ExecutionResult`), but:
 ## Notes
 - Reuse, don't reimplement: `flux_lang`'s `parse`/`format`, `flux_flow::state::FlowStore` (already holds
   values/symbols), `flux_flow::runtime::execute_flow`. The work is two thin additions + an example.
-- Serves managed-agents stories **R-01** (behaviour runner) and **A-03** (presets as static flows).
+- Serves downstream behaviour-runner and preset-as-static-flow use cases.
 - Non-goal: a config/secrets system or a new store — just per-run variable injection.
