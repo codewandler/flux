@@ -426,6 +426,53 @@ pub struct BlobInfo {
     pub sha256: String,
 }
 
+/// A blocking [`std::io::Read`] + [`std::io::Write`] adapter over an open host connection
+/// ([`Host::conn_dial`]). Lets a plugin run a hand-rolled wire protocol — a minimal SQL client, the
+/// Asterisk AMI line protocol, HTTP/1.1 over the Docker unix socket — on top of standard buffered IO
+/// (`BufReader::new(stream)`, `read_line`, `write_all`, …), while every byte still crosses the guarded
+/// `conn.*` host capability. `read` returns `Ok(0)` at EOF. Usage: `conn_dial` to get the id, scope a
+/// `ConnStream` for the exchange, then [`Host::conn_close`] the id once the stream is dropped.
+pub struct ConnStream<'h, 'a> {
+    host: &'h mut Host<'a>,
+    conn_id: u64,
+}
+
+impl<'h, 'a> ConnStream<'h, 'a> {
+    /// Wrap an open `conn_id` (from [`Host::conn_dial`]) as a blocking byte stream.
+    pub fn new(host: &'h mut Host<'a>, conn_id: u64) -> Self {
+        Self { host, conn_id }
+    }
+
+    /// The underlying connection id.
+    pub fn conn_id(&self) -> u64 {
+        self.conn_id
+    }
+}
+
+impl std::io::Read for ConnStream<'_, '_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let data = self
+            .host
+            .conn_read(self.conn_id, buf.len())
+            .map_err(std::io::Error::other)?;
+        let n = data.len().min(buf.len());
+        buf[..n].copy_from_slice(&data[..n]);
+        Ok(n)
+    }
+}
+
+impl std::io::Write for ConnStream<'_, '_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.host
+            .conn_write(self.conn_id, buf)
+            .map_err(std::io::Error::other)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// A handler closure for one operation: `(input, host) -> result`.
 type OpFn = Box<dyn Fn(Value, &mut Host) -> Result<Value, String> + Send + Sync>;
 
@@ -578,6 +625,10 @@ pub struct MockHost {
     pub contributed: std::cell::RefCell<Vec<Record>>,
     /// An in-memory `conn.*` byte buffer: `conn.write` appends, `conn.read` drains (a loopback echo).
     pub conn_buf: std::cell::RefCell<Vec<u8>>,
+    /// Canned server bytes the next `conn.read`s return (FIFO, one chunk per call). When non-empty it
+    /// takes priority over the loopback echo — the simulated server side of a `conn.*` exchange, so a
+    /// hand-rolled wire-protocol client (SQL/AMI/Docker) can be tested without a real socket.
+    pub conn_script: std::cell::RefCell<std::collections::VecDeque<Vec<u8>>>,
     /// An in-memory `blob.*` store: `blob_ref -> (name, bytes)`.
     pub blobs: std::cell::RefCell<HashMap<String, (String, Vec<u8>)>>,
 }
@@ -596,6 +647,7 @@ impl Default for MockHost {
             http_bytes: Vec::new(),
             contributed: std::cell::RefCell::new(Vec::new()),
             conn_buf: std::cell::RefCell::new(Vec::new()),
+            conn_script: std::cell::RefCell::new(std::collections::VecDeque::new()),
             blobs: std::cell::RefCell::new(HashMap::new()),
         }
     }
@@ -636,6 +688,12 @@ impl MockHost {
     /// Canned raw bytes for any binary `http.do` (response_binary) whose URL contains `url_substr`.
     pub fn with_http_bytes(mut self, url_substr: &str, bytes: Vec<u8>) -> Self {
         self.http_bytes.push((url_substr.into(), bytes));
+        self
+    }
+    /// Queue canned server bytes the next `conn.read`(s) return (FIFO, one chunk per call) — the
+    /// simulated server side of a `conn.*` exchange, for testing a hand-rolled wire-protocol client.
+    pub fn with_conn_response(mut self, bytes: impl Into<Vec<u8>>) -> Self {
+        self.conn_script.get_mut().push_back(bytes.into());
         self
     }
 }
@@ -749,9 +807,20 @@ impl GuestHost for MockHost {
             }
             "conn.read" => {
                 let max = payload.get("max").and_then(|v| v.as_u64()).unwrap_or(65536) as usize;
-                let mut buf = self.conn_buf.borrow_mut();
-                let take = buf.len().min(max);
-                let out: Vec<u8> = buf.drain(..take).collect();
+                // Canned server responses (FIFO) take priority; fall back to the loopback echo.
+                let mut script = self.conn_script.borrow_mut();
+                let out: Vec<u8> = if let Some(front) = script.front_mut() {
+                    let take = front.len().min(max);
+                    let chunk: Vec<u8> = front.drain(..take).collect();
+                    if front.is_empty() {
+                        script.pop_front();
+                    }
+                    chunk
+                } else {
+                    let mut buf = self.conn_buf.borrow_mut();
+                    let take = buf.len().min(max);
+                    buf.drain(..take).collect()
+                };
                 Ok(json!({
                     "data_b64": base64::engine::general_purpose::STANDARD.encode(&out),
                     "eof": out.is_empty()

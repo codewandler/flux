@@ -16,6 +16,15 @@
 #   PROMETHEUS_URL                          → prometheus.targets
 #   LOKI_URL                                → loki.labels
 #   FLUX_SMOKE_KUBERNETES=1 (needs kubectl) → kubernetes.namespace.list
+#   ALERTMANAGER_URL                        → alertmanager.test
+#   GRAFANA_URL (+ token/basic env)          → grafana.test
+#   OPSGENIE_API_KEY                        → opsgenie.test
+#   HF_TOKEN or HUGGING_FACE_HUB_TOKEN       → huggingface.test
+#   AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY (needs aws CLI) → aws.test
+#   FLUX_SMOKE_DOCKER=1 (needs Docker socket) → docker.info
+#   SQL_DSN or SQL_URL (+ optional SQL_USERNAME/PASSWORD) → sql.test
+#   ASTERISK_AMI_USERNAME + ASTERISK_AMI_SECRET (+ host/port) → asterisk.ami.ping
+#   HOMER_URL + HOMER_USERNAME + HOMER_PASSWORD → homer.test
 #   FLUX_EMBEDDINGS_API_KEY (or OPENAI_API_KEY) → an embeddings build note (see end)
 #
 # Override the flux binary with FLUX_BIN. Run before releasing anything that touches the plugins.
@@ -72,6 +81,55 @@ run_case confluence confluence.test      '{}'                                   
 run_case slack      slack.channel.list   '{}'                                         SLACK_BOT_TOKEN
 run_case prometheus prometheus.targets   '{}'                                         PROMETHEUS_URL
 run_case loki       loki.labels          '{}'                                         LOKI_URL
+run_case alertmanager alertmanager.test  '{}'                                         ALERTMANAGER_URL
+run_case grafana    grafana.test         '{}'                                         GRAFANA_URL
+run_case opsgenie   opsgenie.test        '{}'                                         OPSGENIE_API_KEY
+
+if [ -n "${HF_TOKEN:-}" ]; then
+  run_case huggingface huggingface.test '{}' HF_TOKEN
+elif [ -n "${HUGGING_FACE_HUB_TOKEN:-}" ]; then
+  run_case huggingface huggingface.test '{}' HUGGING_FACE_HUB_TOKEN
+else
+  skip "huggingface.test (HF_TOKEN / HUGGING_FACE_HUB_TOKEN not set)"
+fi
+
+if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+  if command -v aws >/dev/null 2>&1; then
+    run_case aws aws.test '{}' AWS_ACCESS_KEY_ID
+  else
+    skip "aws.test (aws CLI not on PATH)"
+  fi
+else
+  skip "aws.test (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY not set)"
+fi
+
+if [ -n "${FLUX_SMOKE_DOCKER:-}" ]; then
+  run_case docker docker.info '{}' FLUX_SMOKE_DOCKER
+else
+  skip "docker.info (set FLUX_SMOKE_DOCKER=1 + a reachable Docker socket)"
+fi
+
+if [ -n "${SQL_DSN:-}${SQL_URL:-}" ]; then
+  if [ -n "${SQL_DSN:-}" ]; then
+    run_case sql sql.test '{}' SQL_DSN
+  else
+    run_case sql sql.test '{}' SQL_URL
+  fi
+else
+  skip "sql.test (SQL_DSN / SQL_URL not set)"
+fi
+
+if [ -n "${ASTERISK_AMI_USERNAME:-}" ] && [ -n "${ASTERISK_AMI_SECRET:-}" ]; then
+  run_case asterisk asterisk.ami.ping '{}' ASTERISK_AMI_USERNAME
+else
+  skip "asterisk.ami.ping (ASTERISK_AMI_USERNAME / ASTERISK_AMI_SECRET not set)"
+fi
+
+if [ -n "${HOMER_URL:-}" ] && [ -n "${HOMER_USERNAME:-}" ] && [ -n "${HOMER_PASSWORD:-}" ]; then
+  run_case homer homer.test '{}' HOMER_URL
+else
+  skip "homer.test (HOMER_URL / HOMER_USERNAME / HOMER_PASSWORD not set)"
+fi
 
 # kubernetes needs a reachable cluster + kubectl; opt in explicitly.
 if [ -n "${FLUX_SMOKE_KUBERNETES:-}" ]; then

@@ -14,6 +14,17 @@ members = [
     "loki",
     "prometheus",
     "slack",
+    # fluxplane-plugins parity — observability/AI pack (D-15) + telephony/infra HTTP (D-16/D-17)
+    "alertmanager",
+    "grafana",
+    "opsgenie",
+    "huggingface",
+    "aws",
+    "homer",
+    # conn-wave (D-16 sql/docker + D-17 asterisk) — hand-rolled wire clients over the host-kit ConnStream
+    "sql",
+    "docker",
+    "asterisk",
 ]
 
 [workspace.package]

@@ -650,7 +650,12 @@ fn mentions(input: Value, host: &mut Host) -> Result<Value, String> {
     // Returns the unix lower bound (for client-side filtering) and the `after:` search
     // term (`since - 1 day` as `YYYY-MM-DD`) — mirrors fluxplane's `mentionSince`.
     let (since_unix, after_query) = mention_since(&raw_since)?;
-    let limit = input.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
+    let limit = input
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .filter(|n| *n > 0)
+        .map(|n| n.min(50))
+        .unwrap_or(20);
     let unhandled = input
         .get("unhandled")
         .and_then(|v| v.as_bool())
@@ -664,6 +669,7 @@ fn mentions(input: Value, host: &mut Host) -> Result<Value, String> {
         .get("max_thread")
         .and_then(|v| v.as_i64())
         .filter(|n| *n > 0)
+        .map(|n| n.min(50))
         .unwrap_or(50);
     let mut query = format!("<@{target}>");
     if !after_query.is_empty() {
@@ -709,7 +715,7 @@ fn mentions(input: Value, host: &mut Host) -> Result<Value, String> {
             .filter(|s| !s.is_empty())
             .or_else(|| m.get("username").and_then(|u| u.as_str()))
             .unwrap_or_default();
-        let (status, files) = classify_mention(host, &channel, &ts, &thread_ts, &own, max_thread);
+        let (status, files) = classify_mention(host, &channel, &ts, &thread_ts, &own, max_thread)?;
         if unhandled && status != "pending" {
             continue;
         }
@@ -988,10 +994,10 @@ fn classify_mention(
     thread_ts: &str,
     own: &std::collections::HashSet<String>,
     max_thread: i64,
-) -> (&'static str, Value) {
+) -> Result<(&'static str, Value), String> {
     let root_ts = if thread_ts.is_empty() { ts } else { thread_ts };
     if root_ts.is_empty() || channel.is_empty() {
-        return ("pending", json!([]));
+        return Ok(("pending", json!([])));
     }
     let url = format!(
         "{}/conversations.replies?channel={}&ts={}&limit={max_thread}&inclusive=true",
@@ -999,17 +1005,14 @@ fn classify_mention(
         urlencode(channel),
         urlencode(root_ts),
     );
-    let thread = match host.get_json(&url, Some("user_token")) {
-        Ok(v) if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) => v,
-        _ => return ("pending", json!([])),
-    };
+    let thread = check_ok(host.get_json(&url, Some("user_token"))?)?;
     let replies = thread
         .get("messages")
         .and_then(|m| m.as_array())
         .cloned()
         .unwrap_or_default();
     if replies.is_empty() {
-        return ("pending", json!([]));
+        return Ok(("pending", json!([])));
     }
     let mut files = json!([]);
     for (index, reply) in replies.iter().enumerate() {
@@ -1021,7 +1024,7 @@ fn classify_mention(
         if reply.get("ts").and_then(|t| t.as_str()) == Some(ts) {
             files = reply.get("files").cloned().unwrap_or_else(|| json!([]));
             if own.contains(reply_user) {
-                return ("replied", files);
+                return Ok(("replied", files));
             }
             if let Some(reactions) = reply.get("reactions").and_then(|r| r.as_array()) {
                 for reaction in reactions {
@@ -1031,17 +1034,17 @@ fn classify_mention(
                             .filter_map(|u| u.as_str())
                             .any(|u| own.contains(u.trim()))
                         {
-                            return ("acked", files);
+                            return Ok(("acked", files));
                         }
                     }
                 }
             }
         }
         if index > 0 && own.contains(reply_user) {
-            return ("replied", files);
+            return Ok(("replied", files));
         }
     }
-    ("pending", files)
+    Ok(("pending", files))
 }
 
 fn unreads(input: Value, host: &mut Host) -> Result<Value, String> {
@@ -1049,20 +1052,50 @@ fn unreads(input: Value, host: &mut Host) -> Result<Value, String> {
     // `since` for unreads: empty defaults to `14d`; a positive lower bound raises the
     // history `oldest` floor (never below the `last_read` cursor). Mirrors `unreadSince`.
     let (since_unix, since_label) = unread_since(opt_str(&input, "since").unwrap_or(""))?;
-    let limit = input.get("limit").and_then(|v| v.as_i64()).unwrap_or(100);
-    // Membership-scoped channel list: only conversations the user token is a member of (or open
-    // DMs/MPIMs), so a `last_read` cursor is meaningful for each.
-    let list_url = format!(
-        "{}/users.conversations?types=public_channel,private_channel,mpim,im&exclude_archived=true&limit=200",
-        base_url(host),
-    );
-    let listed = check_ok(host.get_json(&list_url, Some("user_token"))?)?;
-    let channels = listed
-        .get("channels")
-        .and_then(|c| c.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let limit = input
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .filter(|n| *n > 0)
+        .map(|n| n.min(100))
+        .unwrap_or(50);
+    let channel_cap = if filter.is_some() { 200 } else { 50 };
+
+    let mut channels = Vec::new();
+    let mut cursor = String::new();
+    while channels.len() < channel_cap {
+        let mut list_url = format!(
+            "{}/users.conversations?types=public_channel,private_channel,mpim,im&exclude_archived=true&limit=200",
+            base_url(host),
+        );
+        if !cursor.is_empty() {
+            list_url.push_str(&format!("&cursor={}", urlencode(&cursor)));
+        }
+        let listed = check_ok(host.get_json(&list_url, Some("user_token"))?)?;
+        let page = listed
+            .get("channels")
+            .and_then(|c| c.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for ch in page {
+            channels.push(ch);
+            if channels.len() >= channel_cap {
+                break;
+            }
+        }
+        let next_cursor = listed
+            .get("response_metadata")
+            .and_then(|m| m.get("next_cursor"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if next_cursor.is_empty() || next_cursor == cursor {
+            break;
+        }
+        cursor = next_cursor;
+    }
+
     let mut out = Vec::new();
+    let mut skipped = Vec::new();
     for ch in channels.iter() {
         let Some(id) = ch.get("id").and_then(|v| v.as_str()) else {
             continue;
@@ -1077,24 +1110,30 @@ fn unreads(input: Value, host: &mut Host) -> Result<Value, String> {
                 continue;
             }
         }
-        // Genuine unreads only: read history strictly *after* the channel's `last_read` cursor
-        // (falling back to the latest message ts, then 0). `inclusive=false` excludes the
-        // already-read boundary message itself.
-        let last_read = ch
+        let latest = ch
+            .get("latest")
+            .and_then(|l| l.get("ts"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let Some(last_read) = ch
             .get("last_read")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
-            .or_else(|| {
-                ch.get("latest")
-                    .and_then(|l| l.get("ts"))
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| "0".to_string());
+        else {
+            skipped.push(json!({
+                "id": id,
+                "reason": "missing_last_read",
+                "latest": latest,
+            }));
+            continue;
+        };
+        if latest.as_ref().is_some_and(|ts| ts <= &last_read) {
+            continue;
+        }
         // Raise the `oldest` floor to the `since` window when it is newer than the
         // `last_read` cursor (string compare is safe: both are fixed-form Slack ts).
         let oldest = if since_unix > 0 {
@@ -1113,9 +1152,7 @@ fn unreads(input: Value, host: &mut Host) -> Result<Value, String> {
             urlencode(id),
             urlencode(&oldest),
         );
-        let Ok(hist) = host.get_json(&hist_url, Some("user_token")) else {
-            continue;
-        };
+        let hist = check_ok(host.get_json(&hist_url, Some("user_token"))?)?;
         let raw = hist
             .get("messages")
             .and_then(|m| m.as_array())
@@ -1141,7 +1178,13 @@ fn unreads(input: Value, host: &mut Host) -> Result<Value, String> {
             "messages": msgs,
         }));
     }
-    Ok(json!({ "since": since_label, "count": out.len(), "channels": out }))
+    Ok(json!({
+        "since": since_label,
+        "count": out.len(),
+        "channels": out,
+        "skipped": skipped,
+        "scanned": channels.len(),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1888,6 +1931,44 @@ mod tests {
     }
 
     #[test]
+    fn mentions_surfaces_search_errors() {
+        let mut h = host().with_http(
+            "search.messages",
+            json!({ "ok": false, "error": "invalid_auth" }),
+        );
+        let err = plugin()
+            .call("slack.mentions", json!({ "user": "U_me" }), &mut h)
+            .unwrap_err();
+        assert!(err.contains("invalid_auth"));
+    }
+
+    #[test]
+    fn mentions_surfaces_thread_errors() {
+        let now = unix_now();
+        let matched = format!("{now}.000001");
+        let mut h = host()
+            .with_http(
+                "search.messages",
+                json!({ "ok": true, "messages": { "total": 1, "matches": [{
+                    "ts": matched,
+                    "user": "U2",
+                    "text": "<@U_me> ping",
+                    "permalink": "https://acme.slack.com/archives/C1/p2001000000",
+                    "channel": { "id": "C1" }
+                }] } }),
+            )
+            .with_http("auth.test", json!({ "ok": true, "user_id": "U_me" }))
+            .with_http(
+                "conversations.replies",
+                json!({ "ok": false, "error": "ratelimited" }),
+            );
+        let err = plugin()
+            .call("slack.mentions", json!({ "user": "U_me" }), &mut h)
+            .unwrap_err();
+        assert!(err.contains("ratelimited"));
+    }
+
+    #[test]
     fn unreads_counts_genuine_unreads_after_last_read() {
         // The channel's `last_read` cursor drives the `oldest` history window so only messages
         // genuinely after the cursor count; Slack returns newest-first so we reverse them.
@@ -1931,6 +2012,83 @@ mod tests {
         assert_eq!(out["since"], "7d");
         assert_eq!(out["channels"][0]["last_read"], "1.0");
         assert_eq!(out["channels"][0]["unread_count"], 1);
+    }
+
+    #[test]
+    fn unreads_surfaces_history_errors() {
+        let mut h = host()
+            .with_http(
+                "users.conversations",
+                json!({ "ok": true, "channels": [{
+                    "id": "C1",
+                    "name": "dev",
+                    "last_read": "1.0",
+                    "latest": { "ts": "2.0" }
+                }] }),
+            )
+            .with_http(
+                "conversations.history",
+                json!({ "ok": false, "error": "ratelimited" }),
+            );
+        let err = plugin()
+            .call("slack.unreads", json!({}), &mut h)
+            .unwrap_err();
+        assert!(err.contains("ratelimited"));
+    }
+
+    #[test]
+    fn unreads_paginates_conversations() {
+        let mut h = host()
+            .with_http(
+                "cursor=page-2",
+                json!({
+                    "ok": true,
+                    "channels": [{
+                        "id": "C2",
+                        "name": "ops",
+                        "last_read": "1.0",
+                        "latest": { "ts": "2.0" }
+                    }],
+                    "response_metadata": { "next_cursor": "" }
+                }),
+            )
+            .with_http(
+                "users.conversations",
+                json!({
+                    "ok": true,
+                    "channels": [{
+                        "id": "C1",
+                        "name": "dev",
+                        "last_read": "1.0",
+                        "latest": { "ts": "1.0" }
+                    }],
+                    "response_metadata": { "next_cursor": "page-2" }
+                }),
+            )
+            .with_http(
+                "conversations.history",
+                json!({ "ok": true, "messages": [{ "ts": "2.0", "text": "page two" }] }),
+            );
+        let out = plugin().call("slack.unreads", json!({}), &mut h).unwrap();
+        assert_eq!(out["scanned"], 2);
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["channels"][0]["id"], "C2");
+    }
+
+    #[test]
+    fn unreads_does_not_treat_missing_last_read_as_empty() {
+        let mut h = host().with_http(
+            "users.conversations",
+            json!({ "ok": true, "channels": [{
+                "id": "C1",
+                "name": "dev",
+                "latest": { "ts": "2.0" }
+            }] }),
+        );
+        let out = plugin().call("slack.unreads", json!({}), &mut h).unwrap();
+        assert_eq!(out["count"], 0);
+        assert_eq!(out["skipped"][0]["id"], "C1");
+        assert_eq!(out["skipped"][0]["reason"], "missing_last_read");
     }
 
     #[test]
