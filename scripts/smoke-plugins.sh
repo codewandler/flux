@@ -55,8 +55,18 @@ echo "  building plugins (release)…"
 # Isolated registry — do NOT touch the user's ~/.flux/plugins.
 SMOKE_HOME="$(mktemp -d)"
 trap 'rm -rf "$SMOKE_HOME"' EXIT
-export HOME="$SMOKE_HOME"
 mkdir -p "$SMOKE_HOME/.flux/plugins"
+
+# The Kubernetes plugin intentionally relies on kubectl's ambient default kubeconfig. Since this
+# smoke isolates HOME for the plugin registry, mirror just the kubeconfig into that temp home when
+# the Kubernetes smoke is explicitly requested.
+if [ -n "${FLUX_SMOKE_KUBERNETES:-}" ] && command -v kubectl >/dev/null 2>&1; then
+  mkdir -p "$SMOKE_HOME/.kube"
+  if ! kubectl config view --raw --flatten >"$SMOKE_HOME/.kube/config" 2>/dev/null; then
+    rm -f "$SMOKE_HOME/.kube/config"
+  fi
+fi
+export HOME="$SMOKE_HOME"
 
 # run_case <name> <op> <json> <gate-env-var>
 run_case() {
