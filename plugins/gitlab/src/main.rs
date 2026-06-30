@@ -14,6 +14,709 @@ use host_kit::*;
 use regex::Regex;
 use serde_json::{json, Map, Value};
 
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+// ─── op input schemas (D-36) ───────────────────────────────────────────────
+// Each op's `input_schema` is schemars-derived (`host_kit::read_op_typed::<T>` /
+// `write_op_typed::<T>`) instead of a hand-written `so(json!{...}, json![...])` literal,
+// so the schema the model sees cannot drift. The structs are schema-only: handlers
+// keep their existing `flex_str`/`flex_i64`/`Value` extraction (D-34 precedent).
+
+/// `gitlab.project.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ProjectListInput {
+    search: Option<String>,
+}
+
+/// `gitlab.project.show`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ProjectShowInput {
+    project: String,
+}
+
+/// `gitlab.mr.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct MrListInput {
+    project: String,
+    state: Option<String>,
+}
+
+/// `gitlab.mr.show`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct MrShowInput {
+    r#ref: Option<String>,
+    project: Option<String>,
+    iid: Option<i64>,
+}
+
+/// `gitlab.issue.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct IssueListInput {
+    project: String,
+    state: Option<String>,
+}
+
+/// `gitlab.pipeline.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PipelineListInput {
+    project: String,
+}
+
+/// `gitlab.test`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct TestInput {}
+
+/// `gitlab.index.build`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct IndexBuildInput {
+    limit: Option<i64>,
+}
+
+/// `gitlab.project.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ProjectCreateInput {
+    name: String,
+    path: Option<String>,
+    namespace: Option<String>,
+    description: Option<String>,
+    visibility: Option<String>,
+    initialize_with_readme: Option<bool>,
+}
+
+/// `gitlab.mr.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct MrCreateInput {
+    project: String,
+    title: String,
+    source_branch: String,
+    target_branch: String,
+    description: Option<String>,
+    labels: Option<Vec<Value>>,
+    assignee_id: Option<i64>,
+    assignee_ids: Option<Vec<Value>>,
+    reviewer_ids: Option<Vec<Value>>,
+    target_project_id: Option<i64>,
+    milestone_id: Option<i64>,
+    remove_source_branch: Option<bool>,
+    squash: Option<bool>,
+    allow_collaboration: Option<bool>,
+}
+
+/// `gitlab.mr.update`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct MrUpdateInput {
+    r#ref: Option<String>,
+    project: Option<String>,
+    iid: Option<i64>,
+    title: Option<String>,
+    description: Option<String>,
+    target_branch: Option<String>,
+    state_event: Option<String>,
+    labels: Option<Vec<Value>>,
+}
+
+/// `gitlab.mr.approve`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct MrApproveInput {
+    r#ref: Option<String>,
+    project: Option<String>,
+    iid: Option<i64>,
+    sha: Option<String>,
+}
+
+/// `gitlab.mr.merge`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct MrMergeInput {
+    r#ref: Option<String>,
+    project: Option<String>,
+    iid: Option<i64>,
+    auto_merge: Option<bool>,
+    merge_commit_message: Option<String>,
+    squash_commit_message: Option<String>,
+    squash: Option<bool>,
+    should_remove_source_branch: Option<bool>,
+    sha: Option<String>,
+}
+
+/// `gitlab.issue.show`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct IssueShowInput {
+    r#ref: Option<String>,
+    project: Option<String>,
+    iid: Option<i64>,
+}
+
+/// `gitlab.issue.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct IssueCreateInput {
+    project: String,
+    title: String,
+    description: Option<String>,
+    labels: Option<Vec<Value>>,
+    assignee_ids: Option<Vec<Value>>,
+    milestone_id: Option<i64>,
+    confidential: Option<bool>,
+}
+
+/// `gitlab.issue.update`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct IssueUpdateInput {
+    r#ref: Option<String>,
+    project: Option<String>,
+    iid: Option<i64>,
+    title: Option<String>,
+    description: Option<String>,
+    labels: Option<Vec<Value>>,
+    add_labels: Option<Vec<Value>>,
+    remove_labels: Option<Vec<Value>>,
+    state_event: Option<String>,
+    assignee_ids: Option<Vec<Value>>,
+}
+
+/// `gitlab.issue.note.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct IssueNoteListInput {
+    r#ref: Option<String>,
+    project: Option<String>,
+    iid: Option<i64>,
+    sort: Option<String>,
+    order_by: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `gitlab.issue.note.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct IssueNoteCreateInput {
+    r#ref: Option<String>,
+    project: Option<String>,
+    iid: Option<i64>,
+    body: String,
+}
+
+/// `gitlab.branch.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct BranchCreateInput {
+    project: String,
+    branch: String,
+    r#ref: String,
+}
+
+/// `gitlab.branch.delete`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct BranchDeleteInput {
+    project: String,
+    branch: String,
+}
+
+/// `gitlab.branch.delete_merged`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct BranchDeleteMergedInput {
+    project: String,
+}
+
+/// `gitlab.repository.file.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct RepositoryFileCreateInput {
+    project: String,
+    file_path: String,
+    branch: String,
+    content: String,
+    commit_message: String,
+    encoding: Option<String>,
+    start_branch: Option<String>,
+    author_email: Option<String>,
+    author_name: Option<String>,
+    execute_filemode: Option<bool>,
+}
+
+/// `gitlab.repository.file.update`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct RepositoryFileUpdateInput {
+    project: String,
+    file_path: String,
+    branch: String,
+    content: String,
+    commit_message: String,
+    encoding: Option<String>,
+    start_branch: Option<String>,
+    author_email: Option<String>,
+    author_name: Option<String>,
+    last_commit_id: Option<String>,
+    execute_filemode: Option<bool>,
+}
+
+/// `gitlab.repository.file.delete`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct RepositoryFileDeleteInput {
+    project: String,
+    file_path: String,
+    branch: String,
+    commit_message: String,
+    start_branch: Option<String>,
+    author_email: Option<String>,
+    author_name: Option<String>,
+    last_commit_id: Option<String>,
+}
+
+/// `gitlab.repository.file.show`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct RepositoryFileShowInput {
+    project: String,
+    path: String,
+    r#ref: Option<String>,
+}
+
+/// `gitlab.repository.tree`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct RepositoryTreeInput {
+    project: String,
+    path: Option<String>,
+    r#ref: Option<String>,
+    recursive: Option<bool>,
+    limit: Option<i64>,
+}
+
+/// `gitlab.repository.commit.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct RepositoryCommitCreateInput {
+    project: String,
+    branch: String,
+    commit_message: String,
+    actions: Vec<Value>,
+    start_branch: Option<String>,
+    start_sha: Option<String>,
+    start_project: Option<String>,
+    author_email: Option<String>,
+    author_name: Option<String>,
+    force: Option<bool>,
+}
+
+/// `gitlab.repository.commit.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct RepositoryCommitListInput {
+    project: String,
+    r#ref: Option<String>,
+    file_path: Option<String>,
+    author: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `gitlab.repository.tag.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct RepositoryTagCreateInput {
+    project: String,
+    tag_name: String,
+    r#ref: String,
+    message: Option<String>,
+}
+
+/// `gitlab.repository.tag.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct RepositoryTagListInput {
+    project: String,
+    search: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `gitlab.repository.tag.show`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct RepositoryTagShowInput {
+    project: String,
+    tag_name: String,
+}
+
+/// `gitlab.repository.tag.delete`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct RepositoryTagDeleteInput {
+    project: String,
+    tag_name: String,
+}
+
+/// `gitlab.snippet.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct SnippetCreateInput {
+    title: String,
+    description: Option<String>,
+    visibility: Option<String>,
+    files: Vec<Value>,
+}
+
+/// `gitlab.snippet.delete`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct SnippetDeleteInput {
+    snippet_id: Option<i64>,
+}
+
+/// `gitlab.search.blobs`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct SearchBlobsInput {
+    query: String,
+    project: Option<String>,
+    group: Option<String>,
+    r#ref: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `gitlab.mr.changes`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct MrChangesInput {
+    r#ref: Option<String>,
+    project: Option<String>,
+    iid: Option<i64>,
+    file: Option<String>,
+    max_files: Option<i64>,
+    max_diff_bytes: Option<i64>,
+}
+
+/// `gitlab.mr.diff.lines`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct MrDiffLinesInput {
+    r#ref: Option<String>,
+    project: Option<String>,
+    iid: Option<i64>,
+    file: String,
+    line: Option<i64>,
+    context: Option<i64>,
+    search: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `gitlab.compare`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CompareInput {
+    project: String,
+    from: String,
+    to: String,
+    straight: Option<bool>,
+    max_files: Option<i64>,
+    max_diff_bytes: Option<i64>,
+}
+
+/// `gitlab.mr.discussion.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct MrDiscussionListInput {
+    r#ref: Option<String>,
+    project: Option<String>,
+    iid: Option<i64>,
+    limit: Option<i64>,
+}
+
+/// `gitlab.mr.note.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct MrNoteCreateInput {
+    r#ref: Option<String>,
+    project: Option<String>,
+    iid: Option<i64>,
+    body: String,
+}
+
+/// `gitlab.mr.discussion.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct MrDiscussionCreateInput {
+    r#ref: Option<String>,
+    project: Option<String>,
+    iid: Option<i64>,
+    body: String,
+    path: Option<String>,
+    new_line: Option<i64>,
+    old_line: Option<i64>,
+    dry_run: Option<bool>,
+}
+
+/// `gitlab.mr.discussion.reply`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct MrDiscussionReplyInput {
+    r#ref: Option<String>,
+    project: Option<String>,
+    iid: Option<i64>,
+    discussion_id: String,
+    body: String,
+}
+
+/// `gitlab.mr.discussion.resolve`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct MrDiscussionResolveInput {
+    r#ref: Option<String>,
+    project: Option<String>,
+    iid: Option<i64>,
+    discussion_id: String,
+    resolved: Option<bool>,
+}
+
+/// `gitlab.ci.variable.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CiVariableCreateInput {
+    project: String,
+    key: String,
+    value: String,
+    description: Option<String>,
+    environment_scope: Option<String>,
+    masked: Option<bool>,
+    masked_and_hidden: Option<bool>,
+    protected: Option<bool>,
+    raw: Option<bool>,
+    variable_type: Option<String>,
+}
+
+/// `gitlab.ci.variable.update`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CiVariableUpdateInput {
+    project: String,
+    key: String,
+    value: String,
+    description: Option<String>,
+    environment_scope: Option<String>,
+    masked: Option<bool>,
+    protected: Option<bool>,
+    raw: Option<bool>,
+    variable_type: Option<String>,
+}
+
+/// `gitlab.ci.variable.delete`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CiVariableDeleteInput {
+    project: String,
+    key: String,
+    environment_scope: Option<String>,
+}
+
+/// `gitlab.pipeline.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PipelineCreateInput {
+    project: String,
+    r#ref: String,
+    variables: Option<Vec<Value>>,
+}
+
+/// `gitlab.pipeline.retry`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PipelineRetryInput {
+    project: String,
+    pipeline_id: i64,
+}
+
+/// `gitlab.pipeline.cancel`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PipelineCancelInput {
+    project: String,
+    pipeline_id: i64,
+}
+
+/// `gitlab.job.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct JobListInput {
+    project: String,
+    pipeline_id: i64,
+    scope: Option<Vec<Value>>,
+    limit: Option<i64>,
+}
+
+/// `gitlab.environment.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct EnvironmentListInput {
+    project: String,
+    search: Option<String>,
+    states: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `gitlab.deployment.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct DeploymentListInput {
+    project: String,
+    environment: Option<String>,
+    status: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `gitlab.release.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ReleaseListInput {
+    project: String,
+    limit: Option<i64>,
+}
+
+/// `gitlab.release.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ReleaseCreateInput {
+    project: String,
+    tag_name: String,
+    r#ref: Option<String>,
+    name: Option<String>,
+    description: Option<String>,
+    tag_message: Option<String>,
+    milestones: Option<Vec<Value>>,
+    released_at: Option<String>,
+    assets_links: Option<Vec<Value>>,
+}
+
+/// `gitlab.release.show`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ReleaseShowInput {
+    project: String,
+    tag_name: String,
+}
+
+/// `gitlab.release.update`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ReleaseUpdateInput {
+    project: String,
+    tag_name: String,
+    name: Option<String>,
+    description: Option<String>,
+    milestones: Option<Vec<Value>>,
+    released_at: Option<String>,
+}
+
+/// `gitlab.release.delete`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ReleaseDeleteInput {
+    project: String,
+    tag_name: String,
+}
+
+/// `gitlab.release.link.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ReleaseLinkListInput {
+    project: String,
+    tag_name: String,
+    limit: Option<i64>,
+}
+
+/// `gitlab.release.link.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ReleaseLinkCreateInput {
+    project: String,
+    tag_name: String,
+    name: String,
+    url: String,
+    direct_asset_path: Option<String>,
+    link_type: Option<String>,
+}
+
+/// `gitlab.release.link.update`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ReleaseLinkUpdateInput {
+    project: String,
+    tag_name: String,
+    link_id: i64,
+    name: Option<String>,
+    url: Option<String>,
+    direct_asset_path: Option<String>,
+    link_type: Option<String>,
+}
+
+/// `gitlab.release.link.delete`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ReleaseLinkDeleteInput {
+    project: String,
+    tag_name: String,
+    link_id: i64,
+}
+
+/// `gitlab.repository.changelog.generate`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct RepositoryChangelogGenerateInput {
+    project: String,
+    version: String,
+    from: Option<String>,
+    to: Option<String>,
+    date: Option<String>,
+    trailer: Option<String>,
+    config_file: Option<String>,
+}
+
+/// `gitlab.repository.changelog.add`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct RepositoryChangelogAddInput {
+    project: String,
+    version: String,
+    branch: Option<String>,
+    file: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    date: Option<String>,
+    message: Option<String>,
+    trailer: Option<String>,
+    config_file: Option<String>,
+}
+
+/// `gitlab.repository.archive`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct RepositoryArchiveInput {
+    project: String,
+    r#ref: Option<String>,
+    path: Option<String>,
+    format: Option<String>,
+}
+
 fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("gitlab", "0.1.0")
         .capabilities(Caps {
@@ -51,756 +754,465 @@ fn manifest_builder() -> PluginBuilder {
         .datasource(ds("gitlab.issues", "gitlab.issue", "GitLab issues."))
         // ---- reads: projects / merge requests / issues / pipelines ----
         .operation(
-            read_op(
+            read_op_typed::<ProjectListInput>(
                 "gitlab.project.list",
                 "List/search projects the token can see.",
-                so(json!({"search": {"type": "string"}}), json!([])),
             ),
             project_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<ProjectShowInput>(
                 "gitlab.project.show",
                 "Show one project by id or path.",
-                so(json!({"project": {"type": "string"}}), json!(["project"])),
             ),
             project_show,
         )
         .operation(
-            read_op(
+            read_op_typed::<MrListInput>(
                 "gitlab.mr.list",
                 "List a project's merge requests (state: opened|closed|merged|all).",
-                so(
-                    json!({"project": {"type": "string"}, "state": {"type": "string"}}),
-                    json!(["project"]),
-                ),
             ),
             mr_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<MrShowInput>(
                 "gitlab.mr.show",
                 "Show one merge request by ref (PROJECT!IID) or project + iid.",
-                so(
-                    json!({"ref": {"type": "string"}, "project": {"type": "string"}, "iid": {"type": "integer"}}),
-                    json!([]),
-                ),
             ),
             mr_show,
         )
         .operation(
-            read_op(
+            read_op_typed::<IssueListInput>(
                 "gitlab.issue.list",
                 "List a project's issues (state: opened|closed|all).",
-                so(
-                    json!({"project": {"type": "string"}, "state": {"type": "string"}}),
-                    json!(["project"]),
-                ),
             ),
             issue_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<PipelineListInput>(
                 "gitlab.pipeline.list",
                 "List a project's recent CI pipelines.",
-                so(json!({"project": {"type": "string"}}), json!(["project"])),
             ),
             pipeline_list,
         )
         // ---- auth test + index ----
         .operation(
-            read_op(
+            read_op_typed::<TestInput>(
                 "gitlab.test",
                 "Test GitLab authentication by fetching the current user.",
-                so(json!({}), json!([])),
             ),
             auth_test,
         )
         .operation(
-            read_op(
+            read_op_typed::<IndexBuildInput>(
                 "gitlab.index.build",
                 "Build GitLab index records across projects, merge requests, and issues.",
-                so(json!({"limit": {"type": "integer"}}), json!([])),
             ),
             index_build,
         )
         // ---- project create ----
         .operation(
-            write_op(
+            write_op_typed::<ProjectCreateInput>(
                 "gitlab.project.create",
                 "Create a project, optionally inside a group namespace (resolved by path).",
-                so(
-                    json!({
-                        "name": {"type": "string"}, "path": {"type": "string"},
-                        "namespace": {"type": "string"}, "description": {"type": "string"},
-                        "visibility": {"type": "string"}, "initialize_with_readme": {"type": "boolean"}
-                    }),
-                    json!(["name"]),
-                ),
             ),
             project_create,
         )
         // ---- merge request writes ----
         .operation(
-            write_op(
+            write_op_typed::<MrCreateInput>(
                 "gitlab.mr.create",
                 "Create a GitLab merge request.",
-                so(
-                    json!({
-                        "project": {"type": "string"}, "title": {"type": "string"},
-                        "source_branch": {"type": "string"}, "target_branch": {"type": "string"},
-                        "description": {"type": "string"}, "labels": {"type": "array"},
-                        "assignee_id": {"type": "integer"}, "assignee_ids": {"type": "array"},
-                        "reviewer_ids": {"type": "array"}, "target_project_id": {"type": "integer"},
-                        "milestone_id": {"type": "integer"}, "remove_source_branch": {"type": "boolean"},
-                        "squash": {"type": "boolean"}, "allow_collaboration": {"type": "boolean"}
-                    }),
-                    json!(["project", "title", "source_branch", "target_branch"]),
-                ),
             ),
             mr_create,
         )
         .operation(
-            write_op(
+            write_op_typed::<MrUpdateInput>(
                 "gitlab.mr.update",
                 "Update merge request fields (title, description, target branch, labels) or close/reopen via state_event.",
-                so(
-                    json!({
-                        "ref": {"type": "string"}, "project": {"type": "string"}, "iid": {"type": "integer"},
-                        "title": {"type": "string"}, "description": {"type": "string"},
-                        "target_branch": {"type": "string"}, "state_event": {"type": "string"},
-                        "labels": {"type": "array"}
-                    }),
-                    json!([]),
-                ),
             ),
             mr_update,
         )
         .operation(
-            write_op(
+            write_op_typed::<MrApproveInput>(
                 "gitlab.mr.approve",
                 "Approve a GitLab merge request.",
-                so(
-                    json!({"ref": {"type": "string"}, "project": {"type": "string"}, "iid": {"type": "integer"}, "sha": {"type": "string"}}),
-                    json!([]),
-                ),
             ),
             mr_approve,
         )
         .operation(
-            write_op(
+            write_op_typed::<MrMergeInput>(
                 "gitlab.mr.merge",
                 "Merge a GitLab merge request.",
-                so(
-                    json!({
-                        "ref": {"type": "string"}, "project": {"type": "string"}, "iid": {"type": "integer"},
-                        "auto_merge": {"type": "boolean"}, "merge_commit_message": {"type": "string"},
-                        "squash_commit_message": {"type": "string"}, "squash": {"type": "boolean"},
-                        "should_remove_source_branch": {"type": "boolean"}, "sha": {"type": "string"}
-                    }),
-                    json!([]),
-                ),
             ),
             mr_merge,
         )
         // ---- issues ----
         .operation(
-            read_op(
+            read_op_typed::<IssueShowInput>(
                 "gitlab.issue.show",
                 "Show one GitLab issue, including its Markdown description.",
-                so(
-                    json!({"ref": {"type": "string"}, "project": {"type": "string"}, "iid": {"type": "integer"}}),
-                    json!([]),
-                ),
             ),
             issue_show,
         )
         .operation(
-            write_op(
+            write_op_typed::<IssueCreateInput>(
                 "gitlab.issue.create",
                 "Create a GitLab issue. Description is GitLab-flavored Markdown.",
-                so(
-                    json!({
-                        "project": {"type": "string"}, "title": {"type": "string"},
-                        "description": {"type": "string"}, "labels": {"type": "array"},
-                        "assignee_ids": {"type": "array"}, "milestone_id": {"type": "integer"},
-                        "confidential": {"type": "boolean"}
-                    }),
-                    json!(["project", "title"]),
-                ),
             ),
             issue_create,
         )
         .operation(
-            write_op(
+            write_op_typed::<IssueUpdateInput>(
                 "gitlab.issue.update",
                 "Update a GitLab issue (title/description/labels/assignees) or transition it via state_event.",
-                so(
-                    json!({
-                        "ref": {"type": "string"}, "project": {"type": "string"}, "iid": {"type": "integer"},
-                        "title": {"type": "string"}, "description": {"type": "string"},
-                        "labels": {"type": "array"}, "add_labels": {"type": "array"},
-                        "remove_labels": {"type": "array"}, "state_event": {"type": "string"},
-                        "assignee_ids": {"type": "array"}
-                    }),
-                    json!([]),
-                ),
             ),
             issue_update,
         )
         .operation(
-            read_op(
+            read_op_typed::<IssueNoteListInput>(
                 "gitlab.issue.note.list",
                 "List comments (notes) on a GitLab issue. Bodies are Markdown.",
-                so(
-                    json!({"ref": {"type": "string"}, "project": {"type": "string"}, "iid": {"type": "integer"}, "sort": {"type": "string"}, "order_by": {"type": "string"}, "limit": {"type": "integer"}}),
-                    json!([]),
-                ),
             ),
             issue_note_list,
         )
         .operation(
-            write_op(
+            write_op_typed::<IssueNoteCreateInput>(
                 "gitlab.issue.note.create",
                 "Add a comment (note) to a GitLab issue. Body is Markdown.",
-                so(
-                    json!({"ref": {"type": "string"}, "project": {"type": "string"}, "iid": {"type": "integer"}, "body": {"type": "string"}}),
-                    json!(["body"]),
-                ),
             ),
             issue_note_create,
         )
         // ---- branches ----
         .operation(
-            write_op(
+            write_op_typed::<BranchCreateInput>(
                 "gitlab.branch.create",
                 "Create a GitLab repository branch.",
-                so(
-                    json!({"project": {"type": "string"}, "branch": {"type": "string"}, "ref": {"type": "string"}}),
-                    json!(["project", "branch", "ref"]),
-                ),
             ),
             branch_create,
         )
         .operation(
-            write_op(
+            write_op_typed::<BranchDeleteInput>(
                 "gitlab.branch.delete",
                 "Delete a GitLab repository branch.",
-                so(
-                    json!({"project": {"type": "string"}, "branch": {"type": "string"}}),
-                    json!(["project", "branch"]),
-                ),
             ),
             branch_delete,
         )
         .operation(
-            write_op(
+            write_op_typed::<BranchDeleteMergedInput>(
                 "gitlab.branch.delete_merged",
                 "Delete all merged branches in a GitLab project.",
-                so(json!({"project": {"type": "string"}}), json!(["project"])),
             ),
             branch_delete_merged,
         )
         // ---- repository files ----
         .operation(
-            write_op(
+            write_op_typed::<RepositoryFileCreateInput>(
                 "gitlab.repository.file.create",
                 "Create a file in a GitLab repository.",
-                so(
-                    json!({
-                        "project": {"type": "string"}, "file_path": {"type": "string"},
-                        "branch": {"type": "string"}, "content": {"type": "string"},
-                        "commit_message": {"type": "string"}, "encoding": {"type": "string"},
-                        "start_branch": {"type": "string"}, "author_email": {"type": "string"},
-                        "author_name": {"type": "string"}, "execute_filemode": {"type": "boolean"}
-                    }),
-                    json!(["project", "file_path", "branch", "content", "commit_message"]),
-                ),
             ),
             repo_file_create,
         )
         .operation(
-            write_op(
+            write_op_typed::<RepositoryFileUpdateInput>(
                 "gitlab.repository.file.update",
                 "Update a file in a GitLab repository.",
-                so(
-                    json!({
-                        "project": {"type": "string"}, "file_path": {"type": "string"},
-                        "branch": {"type": "string"}, "content": {"type": "string"},
-                        "commit_message": {"type": "string"}, "encoding": {"type": "string"},
-                        "start_branch": {"type": "string"}, "author_email": {"type": "string"},
-                        "author_name": {"type": "string"}, "last_commit_id": {"type": "string"},
-                        "execute_filemode": {"type": "boolean"}
-                    }),
-                    json!(["project", "file_path", "branch", "content", "commit_message"]),
-                ),
             ),
             repo_file_update,
         )
         .operation(
-            write_op(
+            write_op_typed::<RepositoryFileDeleteInput>(
                 "gitlab.repository.file.delete",
                 "Delete a file from a GitLab repository.",
-                so(
-                    json!({
-                        "project": {"type": "string"}, "file_path": {"type": "string"},
-                        "branch": {"type": "string"}, "commit_message": {"type": "string"},
-                        "start_branch": {"type": "string"}, "author_email": {"type": "string"},
-                        "author_name": {"type": "string"}, "last_commit_id": {"type": "string"}
-                    }),
-                    json!(["project", "file_path", "branch", "commit_message"]),
-                ),
             ),
             repo_file_delete,
         )
         .operation(
-            read_op(
+            read_op_typed::<RepositoryFileShowInput>(
                 "gitlab.repository.file.show",
                 "Read a file's content at a ref (default branch when omitted).",
-                so(
-                    json!({"project": {"type": "string"}, "path": {"type": "string"}, "ref": {"type": "string"}}),
-                    json!(["project", "path"]),
-                ),
             ),
             repo_file_show,
         )
         .operation(
-            read_op(
+            read_op_typed::<RepositoryTreeInput>(
                 "gitlab.repository.tree",
                 "List a repository tree at a ref (optionally recursive).",
-                so(
-                    json!({"project": {"type": "string"}, "path": {"type": "string"}, "ref": {"type": "string"}, "recursive": {"type": "boolean"}, "limit": {"type": "integer"}}),
-                    json!(["project"]),
-                ),
             ),
             repo_tree,
         )
         // ---- commits ----
         .operation(
-            write_op(
+            write_op_typed::<RepositoryCommitCreateInput>(
                 "gitlab.repository.commit.create",
                 "Create a GitLab commit with one or more file actions.",
-                so(
-                    json!({
-                        "project": {"type": "string"}, "branch": {"type": "string"},
-                        "commit_message": {"type": "string"}, "actions": {"type": "array"},
-                        "start_branch": {"type": "string"}, "start_sha": {"type": "string"},
-                        "start_project": {"type": "string"}, "author_email": {"type": "string"},
-                        "author_name": {"type": "string"}, "force": {"type": "boolean"}
-                    }),
-                    json!(["project", "branch", "commit_message", "actions"]),
-                ),
             ),
             commit_create,
         )
         .operation(
-            read_op(
+            read_op_typed::<RepositoryCommitListInput>(
                 "gitlab.repository.commit.list",
                 "List a ref's commit history, newest first; filter by path, author, or a since/until window.",
-                so(
-                    json!({"project": {"type": "string"}, "ref": {"type": "string"}, "file_path": {"type": "string"}, "author": {"type": "string"}, "since": {"type": "string"}, "until": {"type": "string"}, "limit": {"type": "integer"}}),
-                    json!(["project"]),
-                ),
             ),
             commit_list,
         )
         // ---- tags ----
         .operation(
-            write_op(
+            write_op_typed::<RepositoryTagCreateInput>(
                 "gitlab.repository.tag.create",
                 "Create a GitLab repository tag.",
-                so(
-                    json!({"project": {"type": "string"}, "tag_name": {"type": "string"}, "ref": {"type": "string"}, "message": {"type": "string"}}),
-                    json!(["project", "tag_name", "ref"]),
-                ),
             ),
             tag_create,
         )
         .operation(
-            read_op(
+            read_op_typed::<RepositoryTagListInput>(
                 "gitlab.repository.tag.list",
                 "List a project's git tags with their target commits, newest first.",
-                so(
-                    json!({"project": {"type": "string"}, "search": {"type": "string"}, "limit": {"type": "integer"}}),
-                    json!(["project"]),
-                ),
             ),
             tag_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<RepositoryTagShowInput>(
                 "gitlab.repository.tag.show",
                 "Show one git tag with its target commit and any annotation message.",
-                so(
-                    json!({"project": {"type": "string"}, "tag_name": {"type": "string"}}),
-                    json!(["project", "tag_name"]),
-                ),
             ),
             tag_show,
         )
         .operation(
-            write_op(
+            write_op_typed::<RepositoryTagDeleteInput>(
                 "gitlab.repository.tag.delete",
                 "Delete a git tag from a project.",
-                so(
-                    json!({"project": {"type": "string"}, "tag_name": {"type": "string"}}),
-                    json!(["project", "tag_name"]),
-                ),
             ),
             tag_delete,
         )
         // ---- snippets ----
         .operation(
-            write_op(
+            write_op_typed::<SnippetCreateInput>(
                 "gitlab.snippet.create",
                 "Create a personal GitLab snippet.",
-                so(
-                    json!({"title": {"type": "string"}, "description": {"type": "string"}, "visibility": {"type": "string"}, "files": {"type": "array"}}),
-                    json!(["title", "files"]),
-                ),
             ),
             snippet_create,
         )
         .operation(
-            write_op(
+            write_op_typed::<SnippetDeleteInput>(
                 "gitlab.snippet.delete",
                 "Delete a personal GitLab snippet.",
-                so(json!({"snippet_id": {"type": "integer"}}), json!([])),
             ),
             snippet_delete,
         )
         // ---- search ----
         .operation(
-            read_op(
+            read_op_typed::<SearchBlobsInput>(
                 "gitlab.search.blobs",
                 "Search file contents (GitLab scope=blobs) across a project, a group, or the instance.",
-                so(
-                    json!({"query": {"type": "string"}, "project": {"type": "string"}, "group": {"type": "string"}, "ref": {"type": "string"}, "limit": {"type": "integer"}}),
-                    json!(["query"]),
-                ),
             ),
             search_blobs,
         )
         // ---- review / diff ----
         .operation(
-            read_op(
+            read_op_typed::<MrChangesInput>(
                 "gitlab.mr.changes",
                 "List a merge request's changed files with bounded unified diffs, plus the base/start/head diff refs.",
-                so(
-                    json!({"ref": {"type": "string"}, "project": {"type": "string"}, "iid": {"type": "integer"}, "file": {"type": "string"}, "max_files": {"type": "integer"}, "max_diff_bytes": {"type": "integer"}}),
-                    json!([]),
-                ),
             ),
             mr_changes,
         )
         .operation(
-            read_op(
+            read_op_typed::<MrDiffLinesInput>(
                 "gitlab.mr.diff.lines",
                 "Parse one changed file's diff into typed lines (added/deleted/context with old/new line numbers).",
-                so(
-                    json!({"ref": {"type": "string"}, "project": {"type": "string"}, "iid": {"type": "integer"}, "file": {"type": "string"}, "line": {"type": "integer"}, "context": {"type": "integer"}, "search": {"type": "string"}, "limit": {"type": "integer"}}),
-                    json!(["file"]),
-                ),
             ),
             mr_diff_lines,
         )
         .operation(
-            read_op(
+            read_op_typed::<CompareInput>(
                 "gitlab.compare",
                 "Compare two refs (branches, tags, or commits): commits between them and bounded file diffs.",
-                so(
-                    json!({"project": {"type": "string"}, "from": {"type": "string"}, "to": {"type": "string"}, "straight": {"type": "boolean"}, "max_files": {"type": "integer"}, "max_diff_bytes": {"type": "integer"}}),
-                    json!(["project", "from", "to"]),
-                ),
             ),
             compare,
         )
         .operation(
-            read_op(
+            read_op_typed::<MrDiscussionListInput>(
                 "gitlab.mr.discussion.list",
                 "List a merge request's discussion threads with resolution state and inline line positions.",
-                so(
-                    json!({"ref": {"type": "string"}, "project": {"type": "string"}, "iid": {"type": "integer"}, "limit": {"type": "integer"}}),
-                    json!([]),
-                ),
             ),
             mr_discussion_list,
         )
         .operation(
-            write_op(
+            write_op_typed::<MrNoteCreateInput>(
                 "gitlab.mr.note.create",
                 "Post a top-level merge request note.",
-                so(
-                    json!({"ref": {"type": "string"}, "project": {"type": "string"}, "iid": {"type": "integer"}, "body": {"type": "string"}}),
-                    json!(["body"]),
-                ),
             ),
             mr_note_create,
         )
         .operation(
-            write_op(
+            write_op_typed::<MrDiscussionCreateInput>(
                 "gitlab.mr.discussion.create",
                 "Open a merge request discussion, optionally anchored to a diff line (path + new_line/old_line). dry_run previews the resolved position without posting.",
-                so(
-                    json!({"ref": {"type": "string"}, "project": {"type": "string"}, "iid": {"type": "integer"}, "body": {"type": "string"}, "path": {"type": "string"}, "new_line": {"type": "integer"}, "old_line": {"type": "integer"}, "dry_run": {"type": "boolean"}}),
-                    json!(["body"]),
-                ),
             ),
             mr_discussion_create,
         )
         .operation(
-            write_op(
+            write_op_typed::<MrDiscussionReplyInput>(
                 "gitlab.mr.discussion.reply",
                 "Reply into an existing merge request discussion thread.",
-                so(
-                    json!({"ref": {"type": "string"}, "project": {"type": "string"}, "iid": {"type": "integer"}, "discussion_id": {"type": "string"}, "body": {"type": "string"}}),
-                    json!(["discussion_id", "body"]),
-                ),
             ),
             mr_discussion_reply,
         )
         .operation(
-            write_op(
+            write_op_typed::<MrDiscussionResolveInput>(
                 "gitlab.mr.discussion.resolve",
                 "Resolve (or unresolve with resolved=false) a merge request discussion thread.",
-                so(
-                    json!({"ref": {"type": "string"}, "project": {"type": "string"}, "iid": {"type": "integer"}, "discussion_id": {"type": "string"}, "resolved": {"type": "boolean"}}),
-                    json!(["discussion_id"]),
-                ),
             ),
             mr_discussion_resolve,
         )
         // ---- CI/CD ----
         .operation(
-            write_op(
+            write_op_typed::<CiVariableCreateInput>(
                 "gitlab.ci.variable.create",
                 "Create a GitLab project CI/CD variable.",
-                so(
-                    json!({
-                        "project": {"type": "string"}, "key": {"type": "string"}, "value": {"type": "string"},
-                        "description": {"type": "string"}, "environment_scope": {"type": "string"},
-                        "masked": {"type": "boolean"}, "masked_and_hidden": {"type": "boolean"},
-                        "protected": {"type": "boolean"}, "raw": {"type": "boolean"}, "variable_type": {"type": "string"}
-                    }),
-                    json!(["project", "key", "value"]),
-                ),
             ),
             ci_variable_create,
         )
         .operation(
-            write_op(
+            write_op_typed::<CiVariableUpdateInput>(
                 "gitlab.ci.variable.update",
                 "Update a GitLab project CI/CD variable.",
-                so(
-                    json!({
-                        "project": {"type": "string"}, "key": {"type": "string"}, "value": {"type": "string"},
-                        "description": {"type": "string"}, "environment_scope": {"type": "string"},
-                        "masked": {"type": "boolean"}, "protected": {"type": "boolean"},
-                        "raw": {"type": "boolean"}, "variable_type": {"type": "string"}
-                    }),
-                    json!(["project", "key", "value"]),
-                ),
             ),
             ci_variable_update,
         )
         .operation(
-            write_op(
+            write_op_typed::<CiVariableDeleteInput>(
                 "gitlab.ci.variable.delete",
                 "Delete a GitLab project CI/CD variable.",
-                so(
-                    json!({"project": {"type": "string"}, "key": {"type": "string"}, "environment_scope": {"type": "string"}}),
-                    json!(["project", "key"]),
-                ),
             ),
             ci_variable_delete,
         )
         .operation(
-            write_op(
+            write_op_typed::<PipelineCreateInput>(
                 "gitlab.pipeline.create",
                 "Create a GitLab CI pipeline.",
-                so(
-                    json!({"project": {"type": "string"}, "ref": {"type": "string"}, "variables": {"type": "array"}}),
-                    json!(["project", "ref"]),
-                ),
             ),
             pipeline_create,
         )
         .operation(
-            write_op(
+            write_op_typed::<PipelineRetryInput>(
                 "gitlab.pipeline.retry",
                 "Retry a GitLab CI pipeline.",
-                so(
-                    json!({"project": {"type": "string"}, "pipeline_id": {"type": "integer"}}),
-                    json!(["project", "pipeline_id"]),
-                ),
             ),
             pipeline_retry,
         )
         .operation(
-            write_op(
+            write_op_typed::<PipelineCancelInput>(
                 "gitlab.pipeline.cancel",
                 "Cancel a GitLab CI pipeline.",
-                so(
-                    json!({"project": {"type": "string"}, "pipeline_id": {"type": "integer"}}),
-                    json!(["project", "pipeline_id"]),
-                ),
             ),
             pipeline_cancel,
         )
         .operation(
-            read_op(
+            read_op_typed::<JobListInput>(
                 "gitlab.job.list",
                 "List one pipeline's jobs with stage, status, duration, and failure_reason.",
-                so(
-                    json!({"project": {"type": "string"}, "pipeline_id": {"type": "integer"}, "scope": {"type": "array"}, "limit": {"type": "integer"}}),
-                    json!(["project", "pipeline_id"]),
-                ),
             ),
             job_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<EnvironmentListInput>(
                 "gitlab.environment.list",
                 "List a project's environments with state, tier, external URL, and last deployment.",
-                so(
-                    json!({"project": {"type": "string"}, "search": {"type": "string"}, "states": {"type": "string"}, "limit": {"type": "integer"}}),
-                    json!(["project"]),
-                ),
             ),
             environment_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<DeploymentListInput>(
                 "gitlab.deployment.list",
                 "List a project's deployments, newest first, filterable by environment and status.",
-                so(
-                    json!({"project": {"type": "string"}, "environment": {"type": "string"}, "status": {"type": "string"}, "limit": {"type": "integer"}}),
-                    json!(["project"]),
-                ),
             ),
             deployment_list,
         )
         // ---- releases ----
         .operation(
-            read_op(
+            read_op_typed::<ReleaseListInput>(
                 "gitlab.release.list",
                 "List a project's releases, newest first.",
-                so(json!({"project": {"type": "string"}, "limit": {"type": "integer"}}), json!(["project"])),
             ),
             release_list,
         )
         .operation(
-            write_op(
+            write_op_typed::<ReleaseCreateInput>(
                 "gitlab.release.create",
                 "Create a GitLab release for a tag, cutting the tag from ref when it does not yet exist.",
-                so(
-                    json!({
-                        "project": {"type": "string"}, "tag_name": {"type": "string"}, "ref": {"type": "string"},
-                        "name": {"type": "string"}, "description": {"type": "string"}, "tag_message": {"type": "string"},
-                        "milestones": {"type": "array"}, "released_at": {"type": "string"}, "assets_links": {"type": "array"}
-                    }),
-                    json!(["project", "tag_name"]),
-                ),
             ),
             release_create,
         )
         .operation(
-            read_op(
+            read_op_typed::<ReleaseShowInput>(
                 "gitlab.release.show",
                 "Show one GitLab release with its description, milestones, and asset links.",
-                so(json!({"project": {"type": "string"}, "tag_name": {"type": "string"}}), json!(["project", "tag_name"])),
             ),
             release_show,
         )
         .operation(
-            write_op(
+            write_op_typed::<ReleaseUpdateInput>(
                 "gitlab.release.update",
                 "Update a GitLab release's title, notes, milestones, or release date.",
-                so(
-                    json!({"project": {"type": "string"}, "tag_name": {"type": "string"}, "name": {"type": "string"}, "description": {"type": "string"}, "milestones": {"type": "array"}, "released_at": {"type": "string"}}),
-                    json!(["project", "tag_name"]),
-                ),
             ),
             release_update,
         )
         .operation(
-            write_op(
+            write_op_typed::<ReleaseDeleteInput>(
                 "gitlab.release.delete",
                 "Delete a GitLab release. The underlying git tag is left in place.",
-                so(json!({"project": {"type": "string"}, "tag_name": {"type": "string"}}), json!(["project", "tag_name"])),
             ),
             release_delete,
         )
         .operation(
-            read_op(
+            read_op_typed::<ReleaseLinkListInput>(
                 "gitlab.release.link.list",
                 "List the asset links attached to a release.",
-                so(json!({"project": {"type": "string"}, "tag_name": {"type": "string"}, "limit": {"type": "integer"}}), json!(["project", "tag_name"])),
             ),
             release_link_list,
         )
         .operation(
-            write_op(
+            write_op_typed::<ReleaseLinkCreateInput>(
                 "gitlab.release.link.create",
                 "Attach a new asset link (a download or related URL) to a release.",
-                so(
-                    json!({"project": {"type": "string"}, "tag_name": {"type": "string"}, "name": {"type": "string"}, "url": {"type": "string"}, "direct_asset_path": {"type": "string"}, "link_type": {"type": "string"}}),
-                    json!(["project", "tag_name", "name", "url"]),
-                ),
             ),
             release_link_create,
         )
         .operation(
-            write_op(
+            write_op_typed::<ReleaseLinkUpdateInput>(
                 "gitlab.release.link.update",
                 "Edit an existing release asset link.",
-                so(
-                    json!({"project": {"type": "string"}, "tag_name": {"type": "string"}, "link_id": {"type": "integer"}, "name": {"type": "string"}, "url": {"type": "string"}, "direct_asset_path": {"type": "string"}, "link_type": {"type": "string"}}),
-                    json!(["project", "tag_name", "link_id"]),
-                ),
             ),
             release_link_update,
         )
         .operation(
-            write_op(
+            write_op_typed::<ReleaseLinkDeleteInput>(
                 "gitlab.release.link.delete",
                 "Remove an asset link from a release.",
-                so(json!({"project": {"type": "string"}, "tag_name": {"type": "string"}, "link_id": {"type": "integer"}}), json!(["project", "tag_name", "link_id"])),
             ),
             release_link_delete,
         )
         // ---- changelog ----
         .operation(
-            read_op(
+            read_op_typed::<RepositoryChangelogGenerateInput>(
                 "gitlab.repository.changelog.generate",
                 "Generate Markdown release notes from the commits between two refs without committing.",
-                so(
-                    json!({"project": {"type": "string"}, "version": {"type": "string"}, "from": {"type": "string"}, "to": {"type": "string"}, "date": {"type": "string"}, "trailer": {"type": "string"}, "config_file": {"type": "string"}}),
-                    json!(["project", "version"]),
-                ),
             ),
             changelog_generate,
         )
         .operation(
-            write_op(
+            write_op_typed::<RepositoryChangelogAddInput>(
                 "gitlab.repository.changelog.add",
                 "Generate a changelog section and commit it into the repository's changelog file (default CHANGELOG.md).",
-                so(
-                    json!({"project": {"type": "string"}, "version": {"type": "string"}, "branch": {"type": "string"}, "file": {"type": "string"}, "from": {"type": "string"}, "to": {"type": "string"}, "date": {"type": "string"}, "message": {"type": "string"}, "trailer": {"type": "string"}, "config_file": {"type": "string"}}),
-                    json!(["project", "version"]),
-                ),
             ),
             changelog_add,
         )
         // ---- archive (blob) ----
         .operation(
-            read_op(
+            read_op_typed::<RepositoryArchiveInput>(
                 "gitlab.repository.archive",
                 "Download a repository archive (tar.gz/zip/tar) at a ref into the host blob store.",
-                so(
-                    json!({"project": {"type": "string"}, "ref": {"type": "string"}, "path": {"type": "string"}, "format": {"type": "string"}}),
-                    json!(["project"]),
-                ),
             ),
             repository_archive,
         )
@@ -814,11 +1226,6 @@ fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
         capabilities: vec!["search".into(), "get".into(), "index".into()],
         entity_schema: None,
     }
-}
-
-/// `{ "type": "object", "properties": <props>, "required": <required> }`.
-fn so(props: Value, required: Value) -> Value {
-    json!({ "type": "object", "properties": props, "required": required })
 }
 
 // ---------------------------------------------------------------------------
@@ -3529,5 +3936,895 @@ mod tests {
             .datasources
             .iter()
             .any(|d| d.entity == "gitlab.merge_request"));
+    }
+}
+
+// ===========================================================================
+// D-36: schema-derivation contract test.
+//
+// Each op's `input_schema` now comes from a schemars-derived struct
+// (`read_op_typed::<T>` / `write_op_typed::<T>`) instead of a hand-written
+// `so(json!{...}, json![...])` literal. schemars represents optional fields as
+// `type: ["T","null"]` and `Vec<Value>` arrays as `{"type":"array","items":{}}`,
+// so the derived JSON is not byte-identical to the legacy literal — but the
+// *contract* (which fields exist, which are required, their base type) must be
+// unchanged. This test encodes the legacy `so(...)` contract per op (transcribed
+// from the pre-migration source) and asserts the derived schema matches after
+// normalizing schemars' nullable representation. A change here is a real
+// contract change. (The legacy `so(props, required)` form wrote
+// `{"type":"<T>"}` per field + `"required": [...]`; arrays were untyped
+// `{"type":"array"}` with no `items`.)
+// ===========================================================================
+#[cfg(test)]
+mod schema_contract {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Kind {
+        Str,
+        Int,
+        Bool,
+        ArrayAny,
+    }
+
+    #[derive(Clone)]
+    struct Prop {
+        name: &'static str,
+        kind: Kind,
+    }
+    struct OpContract {
+        props: Vec<Prop>,
+        required: Vec<&'static str>,
+    }
+    fn p(name: &'static str, kind: Kind) -> Prop {
+        Prop { name, kind }
+    }
+    fn c(props: Vec<Prop>, required: Vec<&'static str>) -> OpContract {
+        OpContract { props, required }
+    }
+
+    fn contracts() -> Vec<(&'static str, OpContract)> {
+        vec![
+            (
+                "gitlab.project.list",
+                c(vec![p("search", Kind::Str)], vec![]),
+            ),
+            (
+                "gitlab.project.show",
+                c(vec![p("project", Kind::Str)], vec!["project"]),
+            ),
+            (
+                "gitlab.mr.list",
+                c(
+                    vec![p("project", Kind::Str), p("state", Kind::Str)],
+                    vec!["project"],
+                ),
+            ),
+            (
+                "gitlab.mr.show",
+                c(
+                    vec![
+                        p("ref", Kind::Str),
+                        p("project", Kind::Str),
+                        p("iid", Kind::Int),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "gitlab.issue.list",
+                c(
+                    vec![p("project", Kind::Str), p("state", Kind::Str)],
+                    vec!["project"],
+                ),
+            ),
+            (
+                "gitlab.pipeline.list",
+                c(vec![p("project", Kind::Str)], vec!["project"]),
+            ),
+            ("gitlab.test", c(vec![], vec![])),
+            ("gitlab.index.build", c(vec![p("limit", Kind::Int)], vec![])),
+            (
+                "gitlab.project.create",
+                c(
+                    vec![
+                        p("name", Kind::Str),
+                        p("path", Kind::Str),
+                        p("namespace", Kind::Str),
+                        p("description", Kind::Str),
+                        p("visibility", Kind::Str),
+                        p("initialize_with_readme", Kind::Bool),
+                    ],
+                    vec!["name"],
+                ),
+            ),
+            (
+                "gitlab.mr.create",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("title", Kind::Str),
+                        p("source_branch", Kind::Str),
+                        p("target_branch", Kind::Str),
+                        p("description", Kind::Str),
+                        p("labels", Kind::ArrayAny),
+                        p("assignee_id", Kind::Int),
+                        p("assignee_ids", Kind::ArrayAny),
+                        p("reviewer_ids", Kind::ArrayAny),
+                        p("target_project_id", Kind::Int),
+                        p("milestone_id", Kind::Int),
+                        p("remove_source_branch", Kind::Bool),
+                        p("squash", Kind::Bool),
+                        p("allow_collaboration", Kind::Bool),
+                    ],
+                    vec!["project", "title", "source_branch", "target_branch"],
+                ),
+            ),
+            (
+                "gitlab.mr.update",
+                c(
+                    vec![
+                        p("ref", Kind::Str),
+                        p("project", Kind::Str),
+                        p("iid", Kind::Int),
+                        p("title", Kind::Str),
+                        p("description", Kind::Str),
+                        p("target_branch", Kind::Str),
+                        p("state_event", Kind::Str),
+                        p("labels", Kind::ArrayAny),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "gitlab.mr.approve",
+                c(
+                    vec![
+                        p("ref", Kind::Str),
+                        p("project", Kind::Str),
+                        p("iid", Kind::Int),
+                        p("sha", Kind::Str),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "gitlab.mr.merge",
+                c(
+                    vec![
+                        p("ref", Kind::Str),
+                        p("project", Kind::Str),
+                        p("iid", Kind::Int),
+                        p("auto_merge", Kind::Bool),
+                        p("merge_commit_message", Kind::Str),
+                        p("squash_commit_message", Kind::Str),
+                        p("squash", Kind::Bool),
+                        p("should_remove_source_branch", Kind::Bool),
+                        p("sha", Kind::Str),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "gitlab.issue.show",
+                c(
+                    vec![
+                        p("ref", Kind::Str),
+                        p("project", Kind::Str),
+                        p("iid", Kind::Int),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "gitlab.issue.create",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("title", Kind::Str),
+                        p("description", Kind::Str),
+                        p("labels", Kind::ArrayAny),
+                        p("assignee_ids", Kind::ArrayAny),
+                        p("milestone_id", Kind::Int),
+                        p("confidential", Kind::Bool),
+                    ],
+                    vec!["project", "title"],
+                ),
+            ),
+            (
+                "gitlab.issue.update",
+                c(
+                    vec![
+                        p("ref", Kind::Str),
+                        p("project", Kind::Str),
+                        p("iid", Kind::Int),
+                        p("title", Kind::Str),
+                        p("description", Kind::Str),
+                        p("labels", Kind::ArrayAny),
+                        p("add_labels", Kind::ArrayAny),
+                        p("remove_labels", Kind::ArrayAny),
+                        p("state_event", Kind::Str),
+                        p("assignee_ids", Kind::ArrayAny),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "gitlab.issue.note.list",
+                c(
+                    vec![
+                        p("ref", Kind::Str),
+                        p("project", Kind::Str),
+                        p("iid", Kind::Int),
+                        p("sort", Kind::Str),
+                        p("order_by", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "gitlab.issue.note.create",
+                c(
+                    vec![
+                        p("ref", Kind::Str),
+                        p("project", Kind::Str),
+                        p("iid", Kind::Int),
+                        p("body", Kind::Str),
+                    ],
+                    vec!["body"],
+                ),
+            ),
+            (
+                "gitlab.branch.create",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("branch", Kind::Str),
+                        p("ref", Kind::Str),
+                    ],
+                    vec!["project", "branch", "ref"],
+                ),
+            ),
+            (
+                "gitlab.branch.delete",
+                c(
+                    vec![p("project", Kind::Str), p("branch", Kind::Str)],
+                    vec!["project", "branch"],
+                ),
+            ),
+            (
+                "gitlab.branch.delete_merged",
+                c(vec![p("project", Kind::Str)], vec!["project"]),
+            ),
+            (
+                "gitlab.repository.file.create",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("file_path", Kind::Str),
+                        p("branch", Kind::Str),
+                        p("content", Kind::Str),
+                        p("commit_message", Kind::Str),
+                        p("encoding", Kind::Str),
+                        p("start_branch", Kind::Str),
+                        p("author_email", Kind::Str),
+                        p("author_name", Kind::Str),
+                        p("execute_filemode", Kind::Bool),
+                    ],
+                    vec![
+                        "project",
+                        "file_path",
+                        "branch",
+                        "content",
+                        "commit_message",
+                    ],
+                ),
+            ),
+            (
+                "gitlab.repository.file.update",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("file_path", Kind::Str),
+                        p("branch", Kind::Str),
+                        p("content", Kind::Str),
+                        p("commit_message", Kind::Str),
+                        p("encoding", Kind::Str),
+                        p("start_branch", Kind::Str),
+                        p("author_email", Kind::Str),
+                        p("author_name", Kind::Str),
+                        p("last_commit_id", Kind::Str),
+                        p("execute_filemode", Kind::Bool),
+                    ],
+                    vec![
+                        "project",
+                        "file_path",
+                        "branch",
+                        "content",
+                        "commit_message",
+                    ],
+                ),
+            ),
+            (
+                "gitlab.repository.file.delete",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("file_path", Kind::Str),
+                        p("branch", Kind::Str),
+                        p("commit_message", Kind::Str),
+                        p("start_branch", Kind::Str),
+                        p("author_email", Kind::Str),
+                        p("author_name", Kind::Str),
+                        p("last_commit_id", Kind::Str),
+                    ],
+                    vec!["project", "file_path", "branch", "commit_message"],
+                ),
+            ),
+            (
+                "gitlab.repository.file.show",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("path", Kind::Str),
+                        p("ref", Kind::Str),
+                    ],
+                    vec!["project", "path"],
+                ),
+            ),
+            (
+                "gitlab.repository.tree",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("path", Kind::Str),
+                        p("ref", Kind::Str),
+                        p("recursive", Kind::Bool),
+                        p("limit", Kind::Int),
+                    ],
+                    vec!["project"],
+                ),
+            ),
+            (
+                "gitlab.repository.commit.create",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("branch", Kind::Str),
+                        p("commit_message", Kind::Str),
+                        p("actions", Kind::ArrayAny),
+                        p("start_branch", Kind::Str),
+                        p("start_sha", Kind::Str),
+                        p("start_project", Kind::Str),
+                        p("author_email", Kind::Str),
+                        p("author_name", Kind::Str),
+                        p("force", Kind::Bool),
+                    ],
+                    vec!["project", "branch", "commit_message", "actions"],
+                ),
+            ),
+            (
+                "gitlab.repository.commit.list",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("ref", Kind::Str),
+                        p("file_path", Kind::Str),
+                        p("author", Kind::Str),
+                        p("since", Kind::Str),
+                        p("until", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec!["project"],
+                ),
+            ),
+            (
+                "gitlab.repository.tag.create",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("tag_name", Kind::Str),
+                        p("ref", Kind::Str),
+                        p("message", Kind::Str),
+                    ],
+                    vec!["project", "tag_name", "ref"],
+                ),
+            ),
+            (
+                "gitlab.repository.tag.list",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("search", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec!["project"],
+                ),
+            ),
+            (
+                "gitlab.repository.tag.show",
+                c(
+                    vec![p("project", Kind::Str), p("tag_name", Kind::Str)],
+                    vec!["project", "tag_name"],
+                ),
+            ),
+            (
+                "gitlab.repository.tag.delete",
+                c(
+                    vec![p("project", Kind::Str), p("tag_name", Kind::Str)],
+                    vec!["project", "tag_name"],
+                ),
+            ),
+            (
+                "gitlab.snippet.create",
+                c(
+                    vec![
+                        p("title", Kind::Str),
+                        p("description", Kind::Str),
+                        p("visibility", Kind::Str),
+                        p("files", Kind::ArrayAny),
+                    ],
+                    vec!["title", "files"],
+                ),
+            ),
+            (
+                "gitlab.snippet.delete",
+                c(vec![p("snippet_id", Kind::Int)], vec![]),
+            ),
+            (
+                "gitlab.search.blobs",
+                c(
+                    vec![
+                        p("query", Kind::Str),
+                        p("project", Kind::Str),
+                        p("group", Kind::Str),
+                        p("ref", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec!["query"],
+                ),
+            ),
+            (
+                "gitlab.mr.changes",
+                c(
+                    vec![
+                        p("ref", Kind::Str),
+                        p("project", Kind::Str),
+                        p("iid", Kind::Int),
+                        p("file", Kind::Str),
+                        p("max_files", Kind::Int),
+                        p("max_diff_bytes", Kind::Int),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "gitlab.mr.diff.lines",
+                c(
+                    vec![
+                        p("ref", Kind::Str),
+                        p("project", Kind::Str),
+                        p("iid", Kind::Int),
+                        p("file", Kind::Str),
+                        p("line", Kind::Int),
+                        p("context", Kind::Int),
+                        p("search", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec!["file"],
+                ),
+            ),
+            (
+                "gitlab.compare",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("from", Kind::Str),
+                        p("to", Kind::Str),
+                        p("straight", Kind::Bool),
+                        p("max_files", Kind::Int),
+                        p("max_diff_bytes", Kind::Int),
+                    ],
+                    vec!["project", "from", "to"],
+                ),
+            ),
+            (
+                "gitlab.mr.discussion.list",
+                c(
+                    vec![
+                        p("ref", Kind::Str),
+                        p("project", Kind::Str),
+                        p("iid", Kind::Int),
+                        p("limit", Kind::Int),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "gitlab.mr.note.create",
+                c(
+                    vec![
+                        p("ref", Kind::Str),
+                        p("project", Kind::Str),
+                        p("iid", Kind::Int),
+                        p("body", Kind::Str),
+                    ],
+                    vec!["body"],
+                ),
+            ),
+            (
+                "gitlab.mr.discussion.create",
+                c(
+                    vec![
+                        p("ref", Kind::Str),
+                        p("project", Kind::Str),
+                        p("iid", Kind::Int),
+                        p("body", Kind::Str),
+                        p("path", Kind::Str),
+                        p("new_line", Kind::Int),
+                        p("old_line", Kind::Int),
+                        p("dry_run", Kind::Bool),
+                    ],
+                    vec!["body"],
+                ),
+            ),
+            (
+                "gitlab.mr.discussion.reply",
+                c(
+                    vec![
+                        p("ref", Kind::Str),
+                        p("project", Kind::Str),
+                        p("iid", Kind::Int),
+                        p("discussion_id", Kind::Str),
+                        p("body", Kind::Str),
+                    ],
+                    vec!["discussion_id", "body"],
+                ),
+            ),
+            (
+                "gitlab.mr.discussion.resolve",
+                c(
+                    vec![
+                        p("ref", Kind::Str),
+                        p("project", Kind::Str),
+                        p("iid", Kind::Int),
+                        p("discussion_id", Kind::Str),
+                        p("resolved", Kind::Bool),
+                    ],
+                    vec!["discussion_id"],
+                ),
+            ),
+            (
+                "gitlab.ci.variable.create",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("key", Kind::Str),
+                        p("value", Kind::Str),
+                        p("description", Kind::Str),
+                        p("environment_scope", Kind::Str),
+                        p("masked", Kind::Bool),
+                        p("masked_and_hidden", Kind::Bool),
+                        p("protected", Kind::Bool),
+                        p("raw", Kind::Bool),
+                        p("variable_type", Kind::Str),
+                    ],
+                    vec!["project", "key", "value"],
+                ),
+            ),
+            (
+                "gitlab.ci.variable.update",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("key", Kind::Str),
+                        p("value", Kind::Str),
+                        p("description", Kind::Str),
+                        p("environment_scope", Kind::Str),
+                        p("masked", Kind::Bool),
+                        p("protected", Kind::Bool),
+                        p("raw", Kind::Bool),
+                        p("variable_type", Kind::Str),
+                    ],
+                    vec!["project", "key", "value"],
+                ),
+            ),
+            (
+                "gitlab.ci.variable.delete",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("key", Kind::Str),
+                        p("environment_scope", Kind::Str),
+                    ],
+                    vec!["project", "key"],
+                ),
+            ),
+            (
+                "gitlab.pipeline.create",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("ref", Kind::Str),
+                        p("variables", Kind::ArrayAny),
+                    ],
+                    vec!["project", "ref"],
+                ),
+            ),
+            (
+                "gitlab.pipeline.retry",
+                c(
+                    vec![p("project", Kind::Str), p("pipeline_id", Kind::Int)],
+                    vec!["project", "pipeline_id"],
+                ),
+            ),
+            (
+                "gitlab.pipeline.cancel",
+                c(
+                    vec![p("project", Kind::Str), p("pipeline_id", Kind::Int)],
+                    vec!["project", "pipeline_id"],
+                ),
+            ),
+            (
+                "gitlab.job.list",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("pipeline_id", Kind::Int),
+                        p("scope", Kind::ArrayAny),
+                        p("limit", Kind::Int),
+                    ],
+                    vec!["project", "pipeline_id"],
+                ),
+            ),
+            (
+                "gitlab.environment.list",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("search", Kind::Str),
+                        p("states", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec!["project"],
+                ),
+            ),
+            (
+                "gitlab.deployment.list",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("environment", Kind::Str),
+                        p("status", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec!["project"],
+                ),
+            ),
+            (
+                "gitlab.release.list",
+                c(
+                    vec![p("project", Kind::Str), p("limit", Kind::Int)],
+                    vec!["project"],
+                ),
+            ),
+            (
+                "gitlab.release.create",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("tag_name", Kind::Str),
+                        p("ref", Kind::Str),
+                        p("name", Kind::Str),
+                        p("description", Kind::Str),
+                        p("tag_message", Kind::Str),
+                        p("milestones", Kind::ArrayAny),
+                        p("released_at", Kind::Str),
+                        p("assets_links", Kind::ArrayAny),
+                    ],
+                    vec!["project", "tag_name"],
+                ),
+            ),
+            (
+                "gitlab.release.show",
+                c(
+                    vec![p("project", Kind::Str), p("tag_name", Kind::Str)],
+                    vec!["project", "tag_name"],
+                ),
+            ),
+            (
+                "gitlab.release.update",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("tag_name", Kind::Str),
+                        p("name", Kind::Str),
+                        p("description", Kind::Str),
+                        p("milestones", Kind::ArrayAny),
+                        p("released_at", Kind::Str),
+                    ],
+                    vec!["project", "tag_name"],
+                ),
+            ),
+            (
+                "gitlab.release.delete",
+                c(
+                    vec![p("project", Kind::Str), p("tag_name", Kind::Str)],
+                    vec!["project", "tag_name"],
+                ),
+            ),
+            (
+                "gitlab.release.link.list",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("tag_name", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec!["project", "tag_name"],
+                ),
+            ),
+            (
+                "gitlab.release.link.create",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("tag_name", Kind::Str),
+                        p("name", Kind::Str),
+                        p("url", Kind::Str),
+                        p("direct_asset_path", Kind::Str),
+                        p("link_type", Kind::Str),
+                    ],
+                    vec!["project", "tag_name", "name", "url"],
+                ),
+            ),
+            (
+                "gitlab.release.link.update",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("tag_name", Kind::Str),
+                        p("link_id", Kind::Int),
+                        p("name", Kind::Str),
+                        p("url", Kind::Str),
+                        p("direct_asset_path", Kind::Str),
+                        p("link_type", Kind::Str),
+                    ],
+                    vec!["project", "tag_name", "link_id"],
+                ),
+            ),
+            (
+                "gitlab.release.link.delete",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("tag_name", Kind::Str),
+                        p("link_id", Kind::Int),
+                    ],
+                    vec!["project", "tag_name", "link_id"],
+                ),
+            ),
+            (
+                "gitlab.repository.changelog.generate",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("version", Kind::Str),
+                        p("from", Kind::Str),
+                        p("to", Kind::Str),
+                        p("date", Kind::Str),
+                        p("trailer", Kind::Str),
+                        p("config_file", Kind::Str),
+                    ],
+                    vec!["project", "version"],
+                ),
+            ),
+            (
+                "gitlab.repository.changelog.add",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("version", Kind::Str),
+                        p("branch", Kind::Str),
+                        p("file", Kind::Str),
+                        p("from", Kind::Str),
+                        p("to", Kind::Str),
+                        p("date", Kind::Str),
+                        p("message", Kind::Str),
+                        p("trailer", Kind::Str),
+                        p("config_file", Kind::Str),
+                    ],
+                    vec!["project", "version"],
+                ),
+            ),
+            (
+                "gitlab.repository.archive",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("ref", Kind::Str),
+                        p("path", Kind::Str),
+                        p("format", Kind::Str),
+                    ],
+                    vec!["project"],
+                ),
+            ),
+        ]
+    }
+
+    fn kind_of(node: &Value) -> Kind {
+        let t = node.get("type");
+        if let Some(arr) = t.and_then(|v| v.as_array()) {
+            let first = arr
+                .iter()
+                .find(|v| v.as_str() != Some("null"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("null");
+            return base_kind(first, node);
+        }
+        base_kind(t.and_then(|v| v.as_str()).unwrap_or(""), node)
+    }
+
+    fn base_kind(t: &str, _node: &Value) -> Kind {
+        match t {
+            "integer" => Kind::Int,
+            "boolean" => Kind::Bool,
+            "array" => Kind::ArrayAny,
+            "string" => Kind::Str,
+            other => panic!("unsupported property type: {other}"),
+        }
+    }
+
+    fn assert_contract(op_name: &str, schema: &Value, contract: &OpContract) {
+        assert_eq!(schema["type"], "object", "{op_name}: root type");
+        let props_obj = schema.get("properties").and_then(|v| v.as_object());
+        let mut got: BTreeMap<&str, Kind> = BTreeMap::new();
+        if let Some(props) = props_obj {
+            for (k, v) in props {
+                got.insert(k.as_str(), kind_of(v));
+            }
+        }
+        let want: BTreeMap<&str, Kind> = contract
+            .props
+            .iter()
+            .map(|Prop { name, kind }| (*name, kind.clone()))
+            .collect();
+        assert_eq!(got.len(), want.len(), "{op_name}: property count");
+        for Prop { name, kind } in &contract.props {
+            let got_kind = got.get(*name).unwrap_or_else(|| {
+                panic!("{op_name}: missing property `{name}` in derived schema")
+            });
+            assert_eq!(got_kind, kind, "{op_name}: property `{name}` kind");
+        }
+        let req: Vec<&str> = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let mut req_set: Vec<&str> = req.clone();
+        req_set.sort();
+        let mut want_req: Vec<&str> = contract.required.clone();
+        want_req.sort();
+        assert_eq!(req_set, want_req, "{op_name}: required set");
+    }
+
+    #[test]
+    fn derived_schemas_match_legacy_contract() {
+        let ops = contracts();
+        let manifest = manifest_builder().build().manifest();
+        let by_name: BTreeMap<&str, &OperationSpec> = manifest
+            .operations
+            .iter()
+            .map(|o| (o.name.as_str(), o))
+            .collect();
+        assert_eq!(by_name.len(), ops.len(), "op count changed");
+        for (name, contract) in &ops {
+            let spec = by_name
+                .get(*name)
+                .unwrap_or_else(|| panic!("missing op {name}"));
+            assert_contract(name, &spec.input_schema, contract);
+        }
     }
 }

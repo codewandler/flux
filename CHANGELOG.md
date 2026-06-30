@@ -18,6 +18,13 @@ All notable changes to this project are documented in this file. The format is b
   MockHost tests cover the from/to-seed + correlation path and the number-matching path.
   `MockHost::with_http_seq` added (host-kit) for repeated-URL test scenarios.
 
+- **gitlab schemars op schemas (D-36).** All 64 gitlab op `input_schema`s are now schemars-derived
+  via `host-kit::read_op_typed::<T>` / `write_op_typed::<T>` instead of hand-written
+  `so(json!{...}, json![...])` literals; the local `so` helper is deleted. Handlers unchanged
+  (schema-only structs, D-34 precedent). A contract test asserts all 64 derived schemas match the
+  legacy `so(...)` contract (fields / required / types); `gitlab` added to the
+  `no_manual_plugin_schema` guard. Fluxplane parity re-audit deferred (D-14 ported the surface).
+
 - **Plugin-side schemars op schemas — D-36 (in-progress).** `host-kit` now derives a plugin
   op's `input_schema` from a typed struct via `read_op_typed::<T>` / `write_op_typed::<T>`
   (+ `op_input_schema::<T>()`, a `schemars` re-export), the plugin-side counterpart of D-34.

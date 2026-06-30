@@ -187,3 +187,25 @@ overlap, and additionally by involving an extra number.
   required; `call_id` is now optional — seed-by-call_id **or** from/to).
 - `MockHost::with_http_seq` added (host-kit) for tests that hit the same URL twice with different
   responses (seed search then fan-out search).
+
+### gitlab (D-36)
+
+- **Schemars migration complete** (64 ops). All `so(json!{...}, json![...])` op schemas replaced
+  by `#[derive(Deserialize, schemars::JsonSchema)]` structs via `read_op_typed::<T>` /
+  `write_op_typed::<T>`; the local `so` helper is deleted. Handlers unchanged (schema-only
+  structs — `flex_str`/`flex_i64`/`Value` extraction stays, D-34 precedent). `gitlab` added to
+  `MIGRATED_PLUGINS`; guard green.
+- **Contract test:** `gitlab` `schema_contract::derived_schemas_match_legacy_contract` encodes
+  the pre-migration `so(...)` contract for all 64 ops (fields / required / base types) and
+  asserts the derived schema matches. No schema↔handler drift was audited here beyond the
+  contract lock (handlers kept as-is).
+- **Representation notes:** `ref` fields use a raw identifier (`r#ref`); schemars serializes the
+  JSON property as `ref` (unchanged). Untyped arrays (`{"type":"array"}` in the legacy `so(...)`)
+  become `Vec<Value>` → `{"type":"array","items":{}}` (the contract test treats these as
+  `ArrayAny`). Optional fields → `["T","null"]`, omitted from `required` (schemars default).
+- **Fluxplane parity re-audit: deferred.** The 64-op surface was ported from fluxplane in D-14
+  (gitlab 6→64); the schemars migration is verified faithful to flux's pre-migration contracts
+  (the contract test), but a fresh field-by-field re-audit against
+  `~/projects/fluxplane/fluxplane-plugins/gitlab/` Go source is a separate pass (lower risk than
+  homer — D-14 already did the port; homer's gap was found because homer was audited, and gitlab
+  deserves the same). Tracked in `.flux/plans/d36-plugin-schemars-parity-smoke.md`.

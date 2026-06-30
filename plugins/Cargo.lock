@@ -408,6 +408,8 @@ version = "0.1.0"
 dependencies = [
  "host-kit",
  "regex",
+ "schemars",
+ "serde",
  "serde_json",
 ]
 
