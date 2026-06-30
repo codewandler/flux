@@ -8,6 +8,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Cross-plugin endpoint discovery broker (D-26).** Plugin manifests can declare `discovers: [products]`
+  (and a `discover` capability); a new L5 `flux_capabilities::endpoint` broker fans a consumer plugin's
+  `endpoint.discover` host call out to every provider plugin that declares the product, aggregates and
+  ranks their weak-reference candidates, and commits them to the session `EndpointRegistry` — with a
+  re-entrancy guard and a `ProviderInvoker` seam. `EndpointBrokerHostCaps` wraps the existing host caps
+  (deny-by-default `endpoint.discover`), and the broker is wired into both `flux run` and `flux app run`.
+  Discovery results are weak references only — never a resolved URL or a secret.
 - **Scoped private-network egress, finished (D-20).** The 0.2.7 scoped model gained **per-endpoint**
   grant granularity (`PrivateNetConfig.endpoints`, keyed `"<plugin>:<endpoint>"`, merged with the
   plugin-level grant) and a **private-network-admit audit event**: a new `EventKind::PrivateNetAdmit`

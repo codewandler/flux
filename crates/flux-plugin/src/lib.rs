@@ -238,6 +238,11 @@ pub struct PluginCapabilities {
     /// Whether the `blob.*` capability (content-addressed scratch store) is permitted.
     #[serde(default)]
     pub blob: bool,
+    /// Whether the `endpoint.discover` host capability (cross-plugin endpoint discovery, D-26) is
+    /// permitted. Deny-by-default like every other capability: a consumer plugin can only ask the
+    /// host "what endpoints exist for product X?" if its manifest set this.
+    #[serde(default)]
+    pub discover: bool,
 }
 
 /// What a plugin advertises about itself — the single source of truth the host introspects (ops,
@@ -260,6 +265,11 @@ pub struct PluginManifest {
     /// Configurable API endpoints (base URLs) the host resolves from env.
     #[serde(default)]
     pub endpoints: Vec<EndpointSpec>,
+    /// Products this plugin can **discover** endpoints for as a provider (D-26): e.g. the kubernetes
+    /// plugin declares `["prometheus", "loki", "postgres", …]`. The fan-out broker matches a
+    /// consumer's discovery query for product X against every provider whose `discovers` contains X.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovers: Vec<String>,
     /// Host capabilities the plugin requests (default: none — the plugin gets no privileged IO).
     #[serde(default)]
     pub capabilities: PluginCapabilities,
@@ -1394,8 +1404,26 @@ impl Tool for PluginTool {
     }
 }
 
+/// A loaded plugin: its projected tools plus the live handles the L5 endpoint broker (D-26) needs to
+/// fan out a discovery query back to it. Returned by [`load_plugin_tools`].
+///
+/// The broker keeps the `manifest` (to match its `discovers` products), the shared `host` (to issue
+/// an `endpoint.discover` op call), and the `caps` (the same guarded host-capability set the plugin's
+/// tools were built with, so a broker-driven call is gated identically).
+pub struct LoadedPlugin {
+    /// Each plugin operation projected as an agent [`Tool`]; registering them keeps the host alive.
+    pub tools: Vec<Arc<dyn Tool>>,
+    /// The shared subprocess connection every tool (and the broker) drives behind a mutex.
+    pub host: Arc<tokio::sync::Mutex<PluginHost>>,
+    /// The plugin's fetched manifest (carries `discovers` + the requested capabilities).
+    pub manifest: PluginManifest,
+    /// The guarded host capabilities the plugin's ops run under (the output of `make_caps`).
+    pub caps: Arc<dyn HostCapabilities>,
+}
+
 /// Spawn a plugin, fetch its manifest, and project every operation as a [`PluginTool`] sharing one
-/// host connection. Returns the tools plus the shared host handle (keep it alive for the session).
+/// host connection. Returns a [`LoadedPlugin`] (the tools plus the shared host/manifest/caps the
+/// endpoint broker fans out to) — keep the host handle alive for the session.
 ///
 /// `make_caps` builds the host capabilities *from the fetched manifest*, so the caps can be scoped
 /// to exactly what the plugin declared (see [`SystemHostCaps::with_grants`]) — the binding point
@@ -1405,7 +1433,7 @@ pub async fn load_plugin_tools(
     program: &str,
     args: &[String],
     make_caps: impl FnOnce(&PluginManifest) -> Arc<dyn HostCapabilities>,
-) -> Result<(Vec<Arc<dyn Tool>>, Arc<tokio::sync::Mutex<PluginHost>>)> {
+) -> Result<LoadedPlugin> {
     let mut host = PluginHost::spawn(system, program, args).await?;
     let manifest = host.manifest().await?;
     let caps = make_caps(&manifest);
@@ -1422,7 +1450,12 @@ pub async fn load_plugin_tools(
             )) as Arc<dyn Tool>
         })
         .collect();
-    Ok((tools, host))
+    Ok(LoadedPlugin {
+        tools,
+        host,
+        manifest,
+        caps,
+    })
 }
 
 // ---------------------------------------------------------------------------

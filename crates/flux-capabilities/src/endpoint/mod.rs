@@ -8,6 +8,14 @@
 //! credential materializes host-side. Discovery + cross-plugin credential resolution layer on top in
 //! the broker (D-26/D-27).
 
+mod broker;
+mod host_caps;
+
+pub use broker::{
+    EndpointBroker, HostProviderInvoker, PluginRegistry, ProviderEntry, ProviderInvoker,
+};
+pub use host_caps::EndpointBrokerHostCaps;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};

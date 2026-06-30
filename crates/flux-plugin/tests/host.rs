@@ -112,9 +112,10 @@ async fn plugin_operations_project_as_tools() {
 
     let exe = env!("CARGO_BIN_EXE_echo_plugin");
     let system = test_system();
-    let (tools, host) = load_plugin_tools(&system, exe, &[], |_| Arc::new(DenyHostCaps))
-        .await
-        .unwrap();
+    let flux_plugin::LoadedPlugin { tools, host, .. } =
+        load_plugin_tools(&system, exe, &[], |_| Arc::new(DenyHostCaps))
+            .await
+            .unwrap();
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].spec().name, "echo.upper");
     assert_eq!(

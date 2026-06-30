@@ -1033,6 +1033,23 @@ async fn build_agent(
     // Discover subprocess plugins (~/.flux/plugins/*.toml) and project their operations as tools.
     // Each plugin's host capabilities are the guarded System (same boundary as built-in tools).
     if let Some(dir) = plugins_dir() {
+        // The cross-plugin endpoint-discovery broker (D-26): a registry of loaded plugins + the shared
+        // endpoint registry, so a consumer plugin's `endpoint.discover` capability can fan out to the
+        // providers that declared the queried product. (The agent-facing `endpoint.*` ops are wired in
+        // a later phase; here we only stand the broker up and route discovery through it.)
+        let plugin_registry = Arc::new(flux_capabilities::PluginRegistry::new());
+        let endpoint_registry = Arc::new(flux_capabilities::EndpointRegistry::with_path(
+            flux_capabilities::EndpointRegistry::default_path().unwrap_or_default(),
+        ));
+        let _ = endpoint_registry.load();
+        let invoker = Arc::new(flux_capabilities::HostProviderInvoker::new(
+            plugin_registry.clone(),
+        ));
+        let broker = Arc::new(flux_capabilities::EndpointBroker::new(
+            invoker,
+            plugin_registry.clone(),
+            endpoint_registry.clone(),
+        ));
         for p in flux_plugin::discover(&dir) {
             // Build host capabilities from the plugin's own manifest declaration, so each plugin
             // gets only the process/secret/http access it asked for (and nothing by default).
@@ -1043,14 +1060,23 @@ async fn build_agent(
                 store: events.clone(),
                 stream: session_id.clone(),
             });
+            let broker_for_caps = broker.clone();
             let make_caps = move |m: &flux_plugin::PluginManifest| {
                 let plugin_private_hosts = cfg_for_caps.plugin_private_hosts(&m.name);
-                Arc::new(
+                let inner = Arc::new(
                     flux_plugin::SystemHostCaps::new(caps_system)
                         .with_manifest(m)
                         .with_private_net_grants(plugin_private_hosts)
                         .with_egress_audit(audit),
-                ) as Arc<dyn flux_plugin::HostCapabilities>
+                ) as Arc<dyn flux_plugin::HostCapabilities>;
+                // Wrap with the endpoint broker so this plugin's `endpoint.discover` calls fan out
+                // (deny-by-default, gated by the manifest's `discover` capability).
+                Arc::new(flux_capabilities::EndpointBrokerHostCaps::new(
+                    inner,
+                    broker_for_caps,
+                    m.name.clone(),
+                    m.capabilities.discover,
+                )) as Arc<dyn flux_plugin::HostCapabilities>
             };
             match flux_plugin::load_plugin_tools(
                 &system,
@@ -1060,9 +1086,19 @@ async fn build_agent(
             )
             .await
             {
-                Ok((tools, _host)) => {
+                Ok(lp) => {
+                    // Register this plugin as a discovery provider so the broker can fan a query back
+                    // to it (matched by its manifest's `discovers` products).
+                    plugin_registry.register(
+                        lp.manifest.name.clone(),
+                        flux_capabilities::ProviderEntry {
+                            manifest: Arc::new(lp.manifest.clone()),
+                            host: lp.host.clone(),
+                            caps: lp.caps.clone(),
+                        },
+                    );
                     // The registered tools hold the host alive for the session.
-                    for t in tools {
+                    for t in lp.tools {
                         registry.register(t);
                     }
                 }
@@ -3512,18 +3548,43 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
     // per-run EventStore stream (the seam exists; `flux_app::App` owns its own store/bus, so there is
     // no `EventStore` in scope at this point to back the audit — unlike the `build_agent` path).
     if let Some(dir) = plugins_dir() {
+        // The cross-plugin endpoint-discovery broker (D-26), analogous to the `build_agent` path: a
+        // registry of loaded plugins + the shared endpoint registry, so a consumer plugin's
+        // `endpoint.discover` capability fans out to providers declaring the queried product.
+        let plugin_registry = Arc::new(flux_capabilities::PluginRegistry::new());
+        let endpoint_registry = Arc::new(flux_capabilities::EndpointRegistry::with_path(
+            flux_capabilities::EndpointRegistry::default_path().unwrap_or_default(),
+        ));
+        let _ = endpoint_registry.load();
+        let invoker = Arc::new(flux_capabilities::HostProviderInvoker::new(
+            plugin_registry.clone(),
+        ));
+        let broker = Arc::new(flux_capabilities::EndpointBroker::new(
+            invoker,
+            plugin_registry.clone(),
+            endpoint_registry.clone(),
+        ));
         for p in flux_plugin::discover(&dir) {
             let system = system.clone();
             let backend = backend.clone();
             let caps_system = system.clone();
             let cfg_for_caps = cfg.clone();
+            let broker_for_caps = broker.clone();
             let make_caps = move |m: &flux_plugin::PluginManifest| {
                 let plugin_private_hosts = cfg_for_caps.plugin_private_hosts(&m.name);
-                Arc::new(flux_capabilities::DatasourceHostCaps::new(
+                let inner = Arc::new(flux_capabilities::DatasourceHostCaps::new(
                     flux_plugin::SystemHostCaps::new(caps_system)
                         .with_manifest(m)
                         .with_private_net_grants(plugin_private_hosts),
                     backend,
+                )) as Arc<dyn flux_plugin::HostCapabilities>;
+                // Compose the endpoint broker OVER the datasource caps so this plugin's
+                // `endpoint.discover` calls fan out (deny-by-default, gated by `discover`).
+                Arc::new(flux_capabilities::EndpointBrokerHostCaps::new(
+                    inner,
+                    broker_for_caps,
+                    m.name.clone(),
+                    m.capabilities.discover,
                 )) as Arc<dyn flux_plugin::HostCapabilities>
             };
             match flux_plugin::load_plugin_tools(
@@ -3534,7 +3595,17 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
             )
             .await
             {
-                Ok((tools, _host)) => extra_tools.extend(tools),
+                Ok(lp) => {
+                    plugin_registry.register(
+                        lp.manifest.name.clone(),
+                        flux_capabilities::ProviderEntry {
+                            manifest: Arc::new(lp.manifest.clone()),
+                            host: lp.host.clone(),
+                            caps: lp.caps.clone(),
+                        },
+                    );
+                    extra_tools.extend(lp.tools);
+                }
                 Err(e) => eprintln!(
                     "{}",
                     style::dim(&format!("(plugin `{}` failed to load: {e})", p.name))

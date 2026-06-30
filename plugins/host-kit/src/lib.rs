@@ -519,6 +519,14 @@ impl PluginBuilder {
         self
     }
 
+    /// Declare a product this plugin can **discover** endpoints for as a provider (D-26). The host's
+    /// fan-out broker routes a consumer's discovery query for this product to this plugin's
+    /// `endpoint.discover` op. Call once per product.
+    pub fn discovers(mut self, product: impl Into<String>) -> Self {
+        self.manifest.discovers.push(product.into());
+        self
+    }
+
     /// Register an operation: its spec (projected to a tool) + the handler closure.
     pub fn operation(
         mut self,

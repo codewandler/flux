@@ -17,7 +17,10 @@ pub use datasource::{
     datasource_tools, freshness, ingest_markdown, ingest_openapi, register_datasource_ops, reindex,
     DatasourceBackend, DatasourceHostCaps, Embedder, MemoryBackend, SemanticIndex, SqliteBackend,
 };
-pub use endpoint::{EndpointRegistry, StaticResolver};
+pub use endpoint::{
+    EndpointBroker, EndpointBrokerHostCaps, EndpointRegistry, HostProviderInvoker, PluginRegistry,
+    ProviderEntry, ProviderInvoker, StaticResolver,
+};
 
 #[cfg(feature = "embeddings")]
 pub use datasource::OpenAiEmbedder;
