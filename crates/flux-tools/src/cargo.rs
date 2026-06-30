@@ -81,9 +81,81 @@ fn push_package_or_workspace(argv: &mut Vec<String>, params: &Value, workspace_f
     }
 }
 
-fn push_args(argv: &mut Vec<String>, params: &Value) {
-    if let Some(extra) = params.get("args").and_then(|v| v.as_array()) {
-        argv.extend(extra.iter().filter_map(|v| v.as_str()).map(str::to_string));
+#[derive(Clone, Copy, Default)]
+struct ManagedCargoArgs {
+    workspace: bool,
+    all: bool,
+    all_targets: bool,
+    package: bool,
+}
+
+#[derive(Default)]
+struct ExtraCargoArgs {
+    cargo: Vec<String>,
+    after_dash: Vec<String>,
+    had_dash: bool,
+}
+
+fn raw_args(params: &Value) -> Vec<String> {
+    params
+        .get("args")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+fn normalized_extra_args(params: &Value, managed: ManagedCargoArgs) -> ExtraCargoArgs {
+    let mut out = ExtraCargoArgs::default();
+    let mut before_dash = true;
+    let mut skip_next = false;
+    for arg in raw_args(params) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if before_dash && arg == "--" {
+            out.had_dash = true;
+            before_dash = false;
+            continue;
+        }
+        if before_dash {
+            match arg.as_str() {
+                "--workspace" if managed.workspace => continue,
+                "--all" if managed.all => continue,
+                "--all-targets" if managed.all_targets => continue,
+                "-p" | "--package" if managed.package => {
+                    skip_next = true;
+                    continue;
+                }
+                _ if managed.package && arg.starts_with("--package=") => continue,
+                _ => out.cargo.push(arg),
+            }
+        } else {
+            out.after_dash.push(arg);
+        }
+    }
+    out
+}
+
+fn remove_flag_pair(args: &mut Vec<String>, flag: &str, value: &str) {
+    let mut i = 0;
+    while i + 1 < args.len() {
+        if args[i] == flag && args[i + 1] == value {
+            args.drain(i..=i + 1);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn push_extra_args(argv: &mut Vec<String>, extra: ExtraCargoArgs) {
+    argv.extend(extra.cargo);
+    if extra.had_dash {
+        argv.push("--".to_string());
+        argv.extend(extra.after_dash);
     }
 }
 
@@ -103,7 +175,17 @@ fn cargo_check_argv(params: &Value) -> Vec<String> {
     let mut argv = vec!["cargo".to_string(), "check".to_string()];
     push_manifest_path(&mut argv, params);
     push_package_or_workspace(&mut argv, params, "--workspace");
-    push_args(&mut argv, params);
+    push_extra_args(
+        &mut argv,
+        normalized_extra_args(
+            params,
+            ManagedCargoArgs {
+                workspace: true,
+                package: true,
+                ..ManagedCargoArgs::default()
+            },
+        ),
+    );
     argv
 }
 
@@ -118,7 +200,17 @@ fn cargo_build_argv(params: &Value) -> Vec<String> {
     {
         argv.push("--release".to_string());
     }
-    push_args(&mut argv, params);
+    push_extra_args(
+        &mut argv,
+        normalized_extra_args(
+            params,
+            ManagedCargoArgs {
+                workspace: true,
+                package: true,
+                ..ManagedCargoArgs::default()
+            },
+        ),
+    );
     argv
 }
 
@@ -126,10 +218,22 @@ fn cargo_test_argv(params: &Value) -> Vec<String> {
     let mut argv = vec!["cargo".to_string(), "test".to_string()];
     push_manifest_path(&mut argv, params);
     push_package_or_workspace(&mut argv, params, "--workspace");
-    push_args(&mut argv, params);
+    let mut extra = normalized_extra_args(
+        params,
+        ManagedCargoArgs {
+            workspace: true,
+            package: true,
+            ..ManagedCargoArgs::default()
+        },
+    );
+    argv.extend(extra.cargo);
     if let Some(f) = params.get("filter").and_then(|v| v.as_str()) {
+        extra.had_dash = true;
+        extra.after_dash.push(f.to_string());
+    }
+    if extra.had_dash {
         argv.push("--".to_string());
-        argv.push(f.to_string());
+        argv.extend(extra.after_dash);
     }
     argv
 }
@@ -147,13 +251,29 @@ fn cargo_clippy_argv(params: &Value) -> Vec<String> {
             argv.push("--all-targets".to_string());
         }
     }
-    push_args(&mut argv, params);
-    if params
+    let deny_warnings = params
         .get("deny_warnings")
         .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
+        .unwrap_or(false);
+    let mut extra = normalized_extra_args(
+        params,
+        ManagedCargoArgs {
+            workspace: true,
+            all_targets: true,
+            package: true,
+            ..ManagedCargoArgs::default()
+        },
+    );
+    if deny_warnings {
+        remove_flag_pair(&mut extra.cargo, "-D", "warnings");
+        remove_flag_pair(&mut extra.after_dash, "-D", "warnings");
+    }
+    argv.extend(extra.cargo);
+    if extra.had_dash || deny_warnings {
         argv.push("--".to_string());
+        argv.extend(extra.after_dash);
+    }
+    if deny_warnings {
         argv.push("-D".to_string());
         argv.push("warnings".to_string());
     }
@@ -190,7 +310,7 @@ impl Tool for CargoCheckTool {
                 "Run `cargo check` in the workspace (or a specific package with `package`). \
                           Use `manifest_path` for a nested workspace Cargo.toml. \
                           Faster than build — only type-checks, no codegen. Optional `args` passes \
-                          extra flags (e.g. `[\"--all-targets\"]`). Risk: Medium."
+                          extra cargo flags only; use typed fields for package/workspace scope. Risk: Medium."
                     .into(),
             input_schema: json!({
                 "type": "object",
@@ -236,7 +356,8 @@ impl Tool for CargoBuildTool {
             name: "cargo_build".into(),
             description: "Run `cargo build` in the workspace (or a specific package with `package`). \
                           Use `manifest_path` for a nested workspace Cargo.toml. Pass `release: true` \
-                          for an optimised build. Optional `args` for extra flags."
+                          for an optimised build. Optional `args` for extra cargo flags only; use typed \
+                          fields for package/workspace scope."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -283,7 +404,8 @@ impl Tool for CargoTestTool {
             name: "cargo_test".into(),
             description: "Run `cargo test` in the workspace (or a specific package with `package`). \
                           Use `manifest_path` for a nested workspace Cargo.toml. \
-                          Optional `filter` is passed as the test-name filter, `args` for extra cargo flags."
+                          Optional `filter` is passed as the test-name filter, `args` for extra cargo \
+                          flags only; use typed fields for package/workspace scope."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -331,7 +453,8 @@ impl Tool for CargoClippyTool {
             description: "Run `cargo clippy` in the workspace (or a specific package). Use \
                           `manifest_path` for a nested workspace Cargo.toml. Pass \
                           `deny_warnings: true` to add `-- -D warnings` (CI-clean check). \
-                          Optional `args` for extra flags."
+                          Optional `args` for extra cargo flags only; use typed fields for package, \
+                          workspace/all-targets scope, and warning denial."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -470,6 +593,44 @@ mod tests {
                 "--workspace",
                 "--release"
             ]
+        );
+    }
+
+    #[test]
+    fn cargo_wrappers_drop_duplicate_model_supplied_scope_flags() {
+        assert_eq!(
+            cargo_build_argv(&json!({ "args": ["--workspace"] })),
+            vec!["cargo", "build", "--workspace"]
+        );
+        assert_eq!(
+            cargo_test_argv(&json!({ "args": ["--workspace"] })),
+            vec!["cargo", "test", "--workspace"]
+        );
+        assert_eq!(
+            cargo_clippy_argv(&json!({
+                "deny_warnings": true,
+                "args": ["--workspace", "--all-targets", "--", "-D", "warnings"]
+            })),
+            vec![
+                "cargo",
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings"
+            ]
+        );
+    }
+
+    #[test]
+    fn cargo_package_param_is_authoritative_over_scope_args() {
+        assert_eq!(
+            cargo_test_argv(&json!({
+                "package": "flux-cli",
+                "args": ["--workspace", "-p", "other-crate"]
+            })),
+            vec!["cargo", "test", "-p", "flux-cli"]
         );
     }
 

@@ -75,6 +75,9 @@ all providers**. Most plumbing already exists (`flux-credentials` import/refresh
   stage; import + refresh cover the near term
 
 ## Done
+- [I-02 — Reduce wasted agent-loop retries](I-02-agent-loop-retry-efficiency.md) · Improve · cargo
+  wrappers normalize duplicate model-supplied scope flags, and the loop guard fingerprints repeated
+  deterministic failures before replanning again
 - [L-07 — Generate Flux skills from live catalogs](L-07-generated-flux-skills.md) · Language ·
   `flux skill` renders Claude-format root/CLI/language/plugin/ops skills from live Clap, Flux-Lang,
   ToolRegistry/OpRegistry, and plugin-manifest sources; `--install` writes root + sections, and project

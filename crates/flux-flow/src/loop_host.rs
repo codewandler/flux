@@ -98,6 +98,25 @@ fn transcript_hash(transcript: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
+fn deterministic_failure_key(transcript: &str) -> Option<String> {
+    for line in transcript.lines() {
+        if let Some((_prefix, rest)) = line.split_once("error: the argument '") {
+            if let Some((flag, tail)) = rest.split_once('\'') {
+                if tail.contains("cannot be used multiple times") {
+                    return Some(format!("cargo.duplicate_arg:{flag}"));
+                }
+            }
+        }
+        if let Some((_prefix, path)) = line.split_once("edit: `old_string` not found in ") {
+            let path = path.trim();
+            if !path.is_empty() {
+                return Some(format!("edit.old_string_not_found:{path}"));
+            }
+        }
+    }
+    None
+}
+
 /// Per-turn loop-guard state for the retry-breaker. Reset each turn in [`EngineLoopHost::set_turn`].
 #[derive(Default)]
 struct LoopGuard {
@@ -105,7 +124,12 @@ struct LoopGuard {
     /// round made no progress; keep only the hash so large transcripts don't live in the guard.
     last_transcript_hash: Option<String>,
     /// Consecutive count of that identical transcript.
-    stall: u32,
+    transcript_stall: u32,
+    /// Stable key for deterministic failures that can be identical even when surrounding transcript
+    /// context changes (for example, the same cargo wrapper flag misuse in a different plan).
+    last_failure_key: Option<String>,
+    /// Consecutive count for [`last_failure_key`].
+    failure_stall: u32,
     /// Armed once the stall reaches [`STALL_STOP`]: the honest message the next `plan` returns (as a
     /// `chat`) to terminate the loop via the flow's existing `case "chat"`.
     force_stop: Option<String>,
@@ -234,26 +258,62 @@ impl EngineLoopHost {
         let stalled = !transcript.trim().is_empty()
             && g.last_transcript_hash.as_deref() == Some(hash.as_str());
         if stalled {
-            g.stall += 1;
+            g.transcript_stall += 1;
         } else {
             // New (or empty) transcript = progress: reset the counter and remember this round.
-            g.stall = 1;
+            g.transcript_stall = 1;
             g.last_transcript_hash = Some(hash);
         }
-        let stall = g.stall;
-        if stall >= STALL_STOP {
+
+        let failure_key = deterministic_failure_key(&transcript);
+        if let Some(key) = failure_key {
+            if g.last_failure_key.as_deref() == Some(key.as_str()) {
+                g.failure_stall += 1;
+            } else {
+                g.failure_stall = 1;
+                g.last_failure_key = Some(key);
+            }
+        } else {
+            g.failure_stall = 0;
+            g.last_failure_key = None;
+        }
+
+        let transcript_stall = g.transcript_stall;
+        let failure_stall = g.failure_stall;
+        let failure_key = g.last_failure_key.clone();
+        if let Some(key) = failure_key.as_deref() {
+            if failure_stall >= STALL_STOP {
+                g.force_stop = Some(format!(
+                    "Stopping: the same deterministic failure ({key}) repeated {failure_stall}×, \
+                     so re-running plans is not making progress."
+                ));
+                return format!(
+                    "[loop-guard] STOP — the same deterministic failure ({key}) has repeated \
+                     {failure_stall}×; the turn will now end.\n{transcript}"
+                );
+            }
+            if failure_stall >= STALL_ESCALATE {
+                return format!(
+                    "[loop-guard] The same deterministic failure ({key}) has repeated \
+                     {failure_stall}×. Do not rerun the same shape: change the failing inputs or \
+                     answer in prose if you cannot make progress.\n{transcript}"
+                );
+            }
+        }
+
+        if transcript_stall >= STALL_STOP {
             g.force_stop = Some(format!(
-                "Stopping: the last step made no progress — it ran {stall}× in a row with an \
+                "Stopping: the last step made no progress — it ran {transcript_stall}× in a row with an \
                  identical result, so I could not complete this turn."
             ));
             return format!(
-                "[loop-guard] STOP — this exact step has repeated {stall}× with no change; the turn \
+                "[loop-guard] STOP — this exact step has repeated {transcript_stall}× with no change; the turn \
                  will now end.\n{transcript}"
             );
         }
-        if stall >= STALL_ESCALATE {
+        if transcript_stall >= STALL_ESCALATE {
             return format!(
-                "[loop-guard] You have produced this EXACT same step and result {stall}× in a row — \
+                "[loop-guard] You have produced this EXACT same step and result {transcript_stall}× in a row — \
                  it is NOT making progress. Do not repeat it: change the call (e.g. supply the \
                  missing argument) or take a different approach; if you cannot, answer in prose.\n\
                  {transcript}"
@@ -830,6 +890,42 @@ mod tests {
         assert!(!host
             .guard_transcript("a different result".into())
             .contains("loop-guard"));
+    }
+
+    #[tokio::test]
+    async fn retry_breaker_escalates_on_repeated_cargo_duplicate_flag_failure() {
+        let host = guard_test_host();
+        let first = "[plan error] runtime error: step `cargo_build` failed: error: the argument \
+                     '--workspace' cannot be used multiple times\nUsage: cargo build [OPTIONS]";
+        let second = "[plan error] runtime error: step `cargo_test` failed: error: the argument \
+                      '--workspace' cannot be used multiple times\nUsage: cargo test [OPTIONS]";
+        let different =
+            "[plan error] runtime error: step `cargo_clippy` failed: error: the argument \
+                         '--all-targets' cannot be used multiple times";
+
+        assert!(!host.guard_transcript(first.into()).contains("loop-guard"));
+        let repeated = host.guard_transcript(second.into());
+        assert!(repeated.contains("[loop-guard]"));
+        assert!(repeated.contains("cargo.duplicate_arg:--workspace"));
+        assert!(repeated.contains("Do not rerun the same shape"));
+        assert!(!host
+            .guard_transcript(different.into())
+            .contains("loop-guard"));
+    }
+
+    #[tokio::test]
+    async fn retry_breaker_escalates_on_repeated_stale_edit_anchor() {
+        let host = guard_test_host();
+        let first =
+            "[plan error] runtime error: step `edit` failed: edit: `old_string` not found in \
+                     crates/flux-cli/src/skill_cmd.rs";
+        let second = "[plan error] runtime error: step `edit` failed after reread: edit: \
+                      `old_string` not found in crates/flux-cli/src/skill_cmd.rs";
+
+        assert!(!host.guard_transcript(first.into()).contains("loop-guard"));
+        let repeated = host.guard_transcript(second.into());
+        assert!(repeated.contains("[loop-guard]"));
+        assert!(repeated.contains("edit.old_string_not_found:crates/flux-cli/src/skill_cmd.rs"));
     }
 
     /// The keystone: `plan` re-enters the planner (the mock emits a one-node echo plan), `run_plan`

@@ -10,6 +10,14 @@ All notable changes to this project are documented in this file. The format is b
 
 - Nothing yet.
 
+### Changed
+
+- **Agent-loop retry efficiency (I-02).** Cargo wrapper ops now normalize model-supplied duplicate scope
+  and warning flags before invoking Cargo, preventing failures like duplicate `--workspace` or
+  `--all-targets`. The loop retry breaker also fingerprints deterministic cargo duplicate-argument and
+  stale `edit` anchor failures, so semantically repeated failures are escalated even when the full
+  transcript changes.
+
 ## [0.2.5] - 2026-06-30
 
 ### Added
