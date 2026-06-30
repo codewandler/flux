@@ -191,13 +191,20 @@ any side-effecting node runs.
 
 ### `call`
 
-Invoke a registered operation with positional argument expressions. Arguments are
-mapped to the op's named JSON-Schema parameters in `required ++ optional` order. A
-single object argument is passed straight through as the named input.
+Invoke a registered operation. Arguments are **named**: a multi-param op is called with a
+single object argument naming each parameter; a sole-required-param op accepts a bare value
+(the ergonomic sugar). A single object argument is passed straight through as the named input.
 
 ```json
 {"kind": "call", "op": "read", "args": [
   {"kind": "lit", "value": "README.md"}
+]}
+```
+
+A multi-param call uses a named object:
+```json
+{"kind": "call", "op": "write", "args": [
+  {"kind": "lit", "value": {"path": "out.txt", "content": "hi"}}
 ]}
 ```
 
@@ -209,7 +216,7 @@ there is no bypass surface.
 | field | type | required | description |
 |---|---|---|---|
 | `op` | string | yes | the registered op name (e.g. `read`, `bash`, `task`) |
-| `args` | Node[] | no | positional argument expressions (`lit` / `var` only in statement position) |
+| `args` | Node[] | no | the call's arguments: empty for a no-param op; a single bare value for a sole-required-param op; a single object literal naming each parameter for a multi-param op. Two or more bare values is the deprecated positional form (rejected by the analyzer). |
 
 A standalone `call` (not inside a `bind`) runs the op for its side effects; the result
 is discarded from the symbol table but still appears in the transcript.

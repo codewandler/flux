@@ -296,8 +296,7 @@ mod tests {
                     "body": [{
                         "kind": "call", "op": "write",
                         "args": [
-                            { "kind": "lit", "value": "sdk-plan.txt" },
-                            { "kind": "lit", "value": "from the sdk plan\n" }
+                            { "kind": "lit", "value": { "path": "sdk-plan.txt", "content": "from the sdk plan\n" } }
                         ]
                     }]
                 });

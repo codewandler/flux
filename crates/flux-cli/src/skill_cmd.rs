@@ -472,7 +472,7 @@ mod tests {
         let skill = render_ops_skill(&registry, &groups);
         let doc: Document<Meta> = parse_frontmatter(&skill.skill_md).unwrap();
         assert_eq!(doc.meta.name, "flux-ops");
-        assert!(doc.body.contains("`fixture_op(path[, limit])`"));
+        assert!(doc.body.contains("`fixture_op({path, limit})`"));
         assert!(doc.body.contains("Filesystem"));
         assert!(doc.body.contains("group `fixture` when signal `fixture`"));
     }

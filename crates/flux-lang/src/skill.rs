@@ -78,7 +78,7 @@ The op names below (`read`, `grep`, …) are illustrative — your host advertis
    "value": {"kind": "call", "op": "read", "args": [{"kind": "lit", "value": "README.md"}]}},
   {"kind": "bind", "name": "hits",
    "value": {"kind": "call", "op": "grep",
-     "args": [{"kind": "var", "name": "src"}, {"kind": "lit", "value": "TODO"}]}}
+     "args": [{"kind": "lit", "value": {"pattern": "TODO"}}]}}
 ]}
 ```
 

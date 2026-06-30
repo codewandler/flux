@@ -25,6 +25,9 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [I-01 — Statistically clean self-improvement headline gain (trials ≥ 3)](I-01-headline-gain.md) · Improve · offline half done (partial-credit scalar + durable token capture + synthetic `trials = 5` loop); the trials ≥ 5 grader-confirmed run is **staged** on a funded provider key
 
 ## Next (ready — take the top one unless the user named a story)
+- [D-31 — schemars-derive every operation schema](D-31-schemars-op-schemas.md) · Core · **top pick** · kill
+  all hand-written `input_schema: json!` in-process; now unblocked by L-09 (named-args killed
+  `x-param-order`). Worktree `flux-schemars-refactor` has foundations + half the files migrated.
 - [D-11 — App-runner ergonomics for declarative bots (knowledge-ingest config, OpenAPI, persona/event-context from file)](D-11-app-runner-ergonomics.md) · Agent · the ready pick: configurable `flux app run` knowledge ingest + OpenAPI + persona/event-context-from-file; makes it a viable host for a declarative bot, unblocking Slack-channel assistant flows
 
 ## Blocked
@@ -55,9 +58,12 @@ _flux can already drive the two **subscription / passthrough** model backends �
 - [C-08 — Full OAuth2 login — codex PKCE (+ claude parity)](C-08-full-oauth2-login.md) · Core · the explicit later stage; import + refresh cover the near term
 
 ## Done
+- [L-09 — Named-argument calls](L-09-named-argument-calls.md) · Language · `call` parameter
+  order is no longer load-bearing — multi-param ops use a single named object arg, sole-required-param
+  ops keep bare-value sugar, `x-param-order` is gone and `required` is a set. Unblocks D-31 (schemars).
+  Design: [named-argument-calls](../designs/named-argument-calls.md).
 - [A-01 — Unify SDK onto FlowEngine, retire the classic Agent loop](A-01-unify-flowengine.md) · Agent · one loop everywhere; `flux-agent` repurposed as the `AgentSpec` home (see [CHANGELOG](../../CHANGELOG.md))
-- [A-02 — A2A client — talk to a remote agent like a local one (flux a2a <URL>)](A-02-a2a-client.md) · Agent · consume a remote A2A agent like a local one; server clean-cutover to the current spec (see [CHANGELOG](../../CHANGELOG.md))
-- [C-01 — Crate consolidation, phases 2–4](C-01-crate-consolidation.md) · Core · hooks→plugin, browser+datasource→capabilities, context→runtime; removed dead integrations (35 → 31 crates)
+- [A-02 — A2A client — talk to a remote agent like a local one (flux a2a <URL>)](A-02-a2a-client.md) · Agent · consume a remote A2A agent like a local one; server clean-cutover to the current spec (see [CHANGELOG](../../CHANGELOG.md))- [C-01 — Crate consolidation, phases 2–4](C-01-crate-consolidation.md) · Core · hooks→plugin, browser+datasource→capabilities, context→runtime; removed dead integrations (35 → 31 crates)
 - [C-02 — Integration-stack hardening — embeddings backend, plugin install/call + CI, live smoke](C-02-integration-stack-hardening.md) · Core · `flux plugin call`/`install` + a `plugins/` CI job (`a8092dc`); feature-gated embeddings/semantic backend — `OpenAiEmbedder` + a `SemanticIndex` hybrid-rerank decorator, default build unchanged (`f912c24`); a live env-gated `scripts/smoke-plugins.sh` (`5fda8be`)
 - [D-01 — Parameterized flow execution — the behaviour-runner seam](D-01-flow-input-seeding.md) · Agent · deterministic `FlowClient::parse` (no model round-trip) + a per-run input-seeding seam (`FlowStore::seed` + `FlowClient::execute_with`/`run_flow`) so a stored flow runs per invocation with injected `$var` settings — fresh-store isolation, flow-local binds shadow seeds, envelope unchanged; modules, zero new crates; serves downstream behaviour-runner/preset consumers (see [CHANGELOG](../../CHANGELOG.md))
 - [D-02 — Tenant/context-taggable event substrate for downstream run persistence](D-02-tenant-event-substrate.md) · Core · optional stream-level account/agent/correlation context envelope on `flux-events` runs + account-scoped reads (`list_for_account`/`account_streams`) (commit `c97c8a4`)

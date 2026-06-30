@@ -2641,32 +2641,66 @@ fn map_args_to_input(
         .lookup(op)
         .ok_or_else(|| Error::Other(format!("unknown op `{op}`")))?;
 
-    // A lone object argument is already the named input map — pass it straight through.
+    // A lone object argument is the named input map — pass it straight through. This is the
+    // canonical multi-param form under named-args semantics.
     if let [serde_json::Value::Object(_)] = args.as_slice() {
         return Ok(args.into_iter().next().unwrap());
     }
 
-    let order: Vec<String> = sig
-        .required_params
-        .into_iter()
-        .chain(sig.optional_params)
-        .collect();
-    let mut input = serde_json::Map::new();
-    for (i, val) in args.into_iter().enumerate() {
-        match order.get(i) {
-            Some(name) => {
-                input.insert(name.clone(), val);
+    let n_params = sig.required_params.len() + sig.optional_params.len();
+    match args.len() {
+        0 => Ok(serde_json::Value::Object(serde_json::Map::new())),
+        1 => {
+            // Single bare value: bind to the sole required param (the ergonomic sugar:
+            // `read("x")`, `grep("TODO")`) when there's exactly one required, else the sole param.
+            // For an untyped catalog (n_params == 0) the op accepts a whole-input value at runtime —
+            // pass it through as the whole input so untyped single-arg calls keep working.
+            if n_params == 0 {
+                return Ok(args.into_iter().next().unwrap());
             }
-            None => {
-                return Err(FlowError::Runtime(format!(
-                    "op `{op}` accepts {} parameter(s) but {} argument(s) were supplied",
-                    order.len(),
-                    i + 1
-                )))
+            let pname = if sig.required_params.len() == 1 {
+                sig.required_params.first().cloned()
+            } else {
+                sig.required_params
+                    .first()
+                    .or(sig.optional_params.first())
+                    .cloned()
+            };
+            let pname = pname.ok_or_else(|| {
+                FlowError::Runtime(format!("op `{op}` has no parameters to bind"))
+            })?;
+            let mut input = serde_json::Map::new();
+            input.insert(pname, args.into_iter().next().unwrap());
+            Ok(serde_json::Value::Object(input))
+        }
+        _ => {
+            // Deprecated positional form (2+ bare args): bind required-then-optional by catalog
+            // order. The analyzer rejects this for *new* plans; this fallback exists so a legacy
+            // stored plan still executes rather than failing mid-flight after side effects.
+            let order: Vec<String> = sig
+                .required_params
+                .iter()
+                .chain(sig.optional_params.iter())
+                .cloned()
+                .collect();
+            let mut input = serde_json::Map::new();
+            for (i, val) in args.into_iter().enumerate() {
+                match order.get(i) {
+                    Some(name) => {
+                        input.insert(name.clone(), val);
+                    }
+                    None => {
+                        return Err(FlowError::Runtime(format!(
+                            "op `{op}` accepts {} parameter(s) but {} argument(s) were supplied",
+                            order.len(),
+                            i + 1
+                        )))
+                    }
+                }
             }
+            Ok(serde_json::Value::Object(input))
         }
     }
-    Ok(serde_json::Value::Object(input))
 }
 
 /// Evaluate a `return` expression to `(text, value_id)`: `var` → the symbol's stored value; `call`

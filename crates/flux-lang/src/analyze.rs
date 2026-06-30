@@ -125,15 +125,20 @@ pub fn lower(ast: &DraftAst, ops: &dyn OpCatalog) -> Result<HirFlow, Vec<Diagnos
 /// a string) infer precisely; everything else is `Any` (lenient — no false positives on op outputs).
 fn infer_type(node: &Node, scope: &HashMap<String, TypeRef>) -> TypeRef {
     match node {
-        Node::Lit { value } => match value {
-            serde_json::Value::String(_) => TypeRef::String,
-            serde_json::Value::Number(_) => TypeRef::Number,
-            serde_json::Value::Bool(_) => TypeRef::Bool,
-            serde_json::Value::Array(_) => TypeRef::List(Box::new(TypeRef::Any)),
-            _ => TypeRef::Any,
-        },
+        Node::Lit { value } => lit_type(value),
         Node::Var { name } => scope.get(&name.0).cloned().unwrap_or(TypeRef::Any),
         Node::Fmt { .. } => TypeRef::String,
+        _ => TypeRef::Any,
+    }
+}
+
+/// The concrete [`TypeRef`] of a JSON literal, for checking a named-arg object's field values.
+fn lit_type(value: &serde_json::Value) -> TypeRef {
+    match value {
+        serde_json::Value::String(_) => TypeRef::String,
+        serde_json::Value::Number(_) => TypeRef::Number,
+        serde_json::Value::Bool(_) => TypeRef::Bool,
+        serde_json::Value::Array(_) => TypeRef::List(Box::new(TypeRef::Any)),
         _ => TypeRef::Any,
     }
 }
@@ -156,8 +161,12 @@ fn types_conflict(arg: &TypeRef, param: &TypeRef) -> bool {
     matches!((concrete_kind(arg), concrete_kind(param)), (Some(a), Some(p)) if a != p)
 }
 
-/// Type-check a call's positional args against the op's declared param types (`required ++ optional`
-/// order). A lone object literal is the whole named input — skipped. Only hard mismatches are reported.
+/// Type-check a call's arguments under **named-args** semantics. A call names its inputs:
+/// - a lone object literal is the whole named input (checked field-by-field against `param_types`);
+/// - a single bare value binds to the op's **sole** parameter (error if the op declares more than
+///   one — ambiguous without a name);
+/// - two or more bare values is the deprecated positional form — rejected with a diagnostic that
+///   routes the model through the repair loop to emit an object instead.
 fn check_call_types(
     op: &str,
     args: &[Node],
@@ -168,31 +177,67 @@ fn check_call_types(
     let Some(sig) = ops.lookup(op) else {
         return;
     };
-    if matches!(args, [Node::Lit { value }] if value.is_object()) {
-        return;
-    }
-    let order: Vec<&String> = sig
-        .required_params
-        .iter()
-        .chain(sig.optional_params.iter())
-        .collect();
-    for (i, arg) in args.iter().enumerate() {
-        if let Some(pname) = order.get(i) {
-            if let Some(ptype) = sig.param_types.get(*pname) {
-                let atype = infer_type(arg, scope);
-                if types_conflict(&atype, ptype) {
-                    diags.push(Diagnostic::new(format!(
-                        "op `{op}` parameter `{pname}` expects {}, got {}",
-                        ptype.label(),
-                        atype.label()
-                    )));
+    // A lone object literal is the named input map. Check each field's type against the declared
+    // param types; extra/missing fields are not type errors (the runtime/op decides) but we flag
+    // hard scalar mismatches on the fields that are present and declared.
+    if let [Node::Lit { value }] = args {
+        if let Some(obj) = value.as_object() {
+            if let Some(props_types) = Some(&sig.param_types).filter(|m| !m.is_empty()) {
+                for (name, val) in obj {
+                    if let Some(ptype) = props_types.get(name) {
+                        let atype = lit_type(val);
+                        if types_conflict(&atype, ptype) {
+                            diags.push(Diagnostic::new(format!(
+                                "op `{op}` parameter `{name}` expects {}, got {}",
+                                ptype.label(),
+                                atype.label()
+                            )));
+                        }
+                    }
                 }
             }
+            return;
         }
+    }
+    let n_params = sig.required_params.len() + sig.optional_params.len();
+    // Arity (multi-bare rejection, single-bare-vs-multi) is handled in `check_node` (the structural
+    // pass). Here we only type-check the values, and only for *typed* catalogs (n_params > 0);
+    // an untyped schema (n_params == 0) gives no param types to check against, so stay lenient.
+    if n_params > 0 {
+        match args.len() {
+            0 => {} // missing-args handled in `check_node`.
+            1 => {
+                // Single bare value binds to the sole required param (the ergonomic sugar:
+                // `read("x")`, `grep("TODO")`) when there's exactly one required, else the sole param.
+                let pname = if sig.required_params.len() == 1 {
+                    sig.required_params.first().cloned()
+                } else {
+                    sig.required_params
+                        .first()
+                        .or(sig.optional_params.first())
+                        .cloned()
+                };
+                if let Some(pname) = pname {
+                    if let Some(ptype) = sig.param_types.get(&pname) {
+                        let atype = infer_type(&args[0], scope);
+                        if types_conflict(&atype, ptype) {
+                            diags.push(Diagnostic::new(format!(
+                                "op `{op}` parameter `{pname}` expects {}, got {}",
+                                ptype.label(),
+                                atype.label()
+                            )));
+                        }
+                    }
+                }
+            }
+            _ => {} // multi-bare: rejected upstream; nothing to type-check here.
+        }
+    }
+    for a in args {
         if let Node::Call {
             op: inner,
             args: iargs,
-        } = arg
+        } = a
         {
             check_call_types(inner, iargs, ops, scope, diags);
         }
@@ -493,17 +538,34 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, diags: &mut Vec<Diagnostic>) {
             match ops.lookup(op) {
                 None => diags.push(Diagnostic::new(format!("unknown operation: `{op}`"))),
                 Some(sig) => {
-                    // Arity: positional args bind to `required ++ optional`; a lone object argument
-                    // is the whole named input, so it is exempt (matches `runtime::map_args_to_input`).
+                    // Named-args semantics: a lone object is the whole input (exempt); a single bare
+                    // value binds to the sole param; two+ bare values is the deprecated positional
+                    // form — reject it so the repair loop rewrites the call with a named object.
+                    // (`max == 0` ops are skipped: the catalog may be untyped, yet the op accepts a
+                    // whole-input object at runtime and the runtime rejects a true overflow.)
                     let lone_object =
                         matches!(args.as_slice(), [Node::Lit { value }] if value.is_object());
                     let max = sig.required_params.len() + sig.optional_params.len();
-                    // `max == 0` ops are skipped: a single arg may *resolve* to the whole-input object
-                    // at runtime (exempt there), and the runtime still rejects a true 0-param overflow.
-                    if !lone_object && max > 0 && args.len() > max {
+                    if !lone_object && max > 0 && args.len() >= 2 {
                         diags.push(Diagnostic::new(format!(
-                            "op `{op}` accepts at most {max} argument(s) but {} were supplied",
-                            args.len()
+                            "op `{op}`: pass a single object argument naming its parameters \
+                             (e.g. `{{\"{}\": …}}`) instead of {n} positional arguments",
+                            sig.required_params
+                                .first()
+                                .or(sig.optional_params.first())
+                                .cloned()
+                                .unwrap_or_default(),
+                            n = args.len()
+                        )));
+                    }
+                    // A single bare value against a multi-param op is ambiguous without names —
+                    // BUT a single required param (plus optionals) is the common ergonomic sugar
+                    // (`read("x")`, `grep("TODO")`), so allow it.
+                    let single_required = sig.required_params.len() == 1;
+                    if !lone_object && max > 1 && args.len() == 1 && !single_required {
+                        diags.push(Diagnostic::new(format!(
+                            "op `{op}` takes {max} parameters; pass a single object argument naming \
+                             each (e.g. `{{…}}`) instead of one bare value"
                         )));
                     }
                     // Too few: a call with NO args can never bind a required param (zero args cannot
@@ -982,10 +1044,11 @@ mod tests {
     }
 
     #[test]
-    fn lower_gathers_effects_and_arity_is_checked() {
+    fn lower_gathers_effects_and_named_args_are_validated() {
         use crate::ast::{Node, TypeRef};
         let ops = TypedCatalog;
 
+        // `write` is a multi-param op: it must be called with a single named object argument.
         let ast = DraftAst {
             body: vec![
                 Node::Bind {
@@ -1002,14 +1065,9 @@ mod tests {
                 },
                 Node::Call {
                     op: "write".into(),
-                    args: vec![
-                        Node::Lit {
-                            value: serde_json::json!("p"),
-                        },
-                        Node::Lit {
-                            value: serde_json::json!("c"),
-                        },
-                    ],
+                    args: vec![Node::Lit {
+                        value: serde_json::json!({"path": "p", "content": "c"}),
+                    }],
                 },
             ],
             ..Default::default()
@@ -1021,23 +1079,47 @@ mod tests {
         assert!(hir.effects.contains(&FlowEffect::Model));
         let _ = TypeRef::Any;
 
-        // Too many positional args for `read` (1 param) is rejected at analysis.
-        let over = DraftAst {
+        // The deprecated positional form (2+ bare args) is rejected — the model must rewrite the
+        // call with a named object argument. (Failing-first for the named-args semantics.)
+        let positional = DraftAst {
             body: vec![Node::Call {
-                op: "read".into(),
+                op: "write".into(),
                 args: vec![
                     Node::Lit {
-                        value: serde_json::json!("a"),
+                        value: serde_json::json!("p"),
                     },
                     Node::Lit {
-                        value: serde_json::json!("b"),
+                        value: serde_json::json!("c"),
                     },
                 ],
             }],
             ..Default::default()
         };
-        let err = lower(&over, &ops).unwrap_err();
-        assert!(err.iter().any(|d| d.message.contains("at most 1 argument")));
+        let err = lower(&positional, &ops).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("single object argument")),
+            "expected a named-object-argument diagnostic, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        // A single bare value against a multi-param op is ambiguous without names — rejected.
+        let bare = DraftAst {
+            body: vec![Node::Call {
+                op: "write".into(),
+                args: vec![Node::Lit {
+                    value: serde_json::json!("p"),
+                }],
+            }],
+            ..Default::default()
+        };
+        let err = lower(&bare, &ops).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("single object argument naming each")),
+            "expected a single-bare-vs-multi-param diagnostic, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 
     /// A required-param op called with NO args is rejected at analysis — the `python_run`-class
@@ -1194,7 +1276,12 @@ mod tests {
             }],
             bind: None,
         });
-        assert!(lower(&ok, &ops).is_ok());
+        let r = lower(&ok, &ops);
+        assert!(
+            r.is_ok(),
+            "well-formed fallback should analyze clean: {:?}",
+            r.err()
+        );
     }
 
     /// `await` suspends the *whole* flow, so it is only valid as a top-level statement; nesting one is

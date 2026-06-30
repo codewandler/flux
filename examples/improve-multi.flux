@@ -63,11 +63,16 @@
         "args": [
           {
             "kind": "lit",
-            "value": "reviewer"
-          },
-          {
-            "kind": "lit",
-            "value": "These are flux's combined benchmark results (terminal-bench + synthetic riddles). Each failing case names a task, a failure_mode, and (when partial) which sub-checks failed (failed_checks). Identify flux HARNESS improvements (tools, tool output/views, system prompt, a new tool, or an agent-loop efficiency fix) that would help flux pass more. Results:\n{{baseline}}\n\nReturn ONLY a JSON array: [{\"area\":..,\"symptom\":..,\"suggested_fix\":..,\"severity\":1-5}]."
+            "value": {
+              "role": {
+                "kind": "lit",
+                "value": "reviewer"
+              },
+              "task": {
+                "kind": "lit",
+                "value": "These are flux's combined benchmark results (terminal-bench + synthetic riddles). Each failing case names a task, a failure_mode, and (when partial) which sub-checks failed (failed_checks). Identify flux HARNESS improvements (tools, tool output/views, system prompt, a new tool, or an agent-loop efficiency fix) that would help flux pass more. Results:\n{{baseline}}\n\nReturn ONLY a JSON array: [{\"area\":..,\"symptom\":..,\"suggested_fix\":..,\"severity\":1-5}]."
+              }
+            }
           }
         ]
       }
@@ -81,11 +86,16 @@
         "args": [
           {
             "kind": "lit",
-            "value": "[]"
-          },
-          {
-            "kind": "var",
-            "name": "reviewed"
+            "value": {
+              "mined": {
+                "kind": "lit",
+                "value": "[]"
+              },
+              "reviewed": {
+                "kind": "var",
+                "name": "reviewed"
+              }
+            }
           }
         ]
       }
@@ -113,11 +123,16 @@
             "args": [
               {
                 "kind": "lit",
-                "value": "planner"
-              },
-              {
-                "kind": "lit",
-                "value": "Turn these flux-harness improvement candidates into AT MOST 2 concrete, small, safe engineering tasks for the flux codebase (tool specs, tool output/views, system prompt, a new tool, or an agent-loop efficiency fix). Do NOT touch crates/flux-eval, bench/, the loop flows, or CI. Candidates:\n{{candidates}}\n\nReturn ONLY the JSON array of tasks."
+                "value": {
+                  "role": {
+                    "kind": "lit",
+                    "value": "planner"
+                  },
+                  "task": {
+                    "kind": "lit",
+                    "value": "Turn these flux-harness improvement candidates into AT MOST 2 concrete, small, safe engineering tasks for the flux codebase (tool specs, tool output/views, system prompt, a new tool, or an agent-loop efficiency fix). Do NOT touch crates/flux-eval, bench/, the loop flows, or CI. Candidates:\n{{candidates}}\n\nReturn ONLY the JSON array of tasks."
+                  }
+                }
               }
             ]
           }
@@ -139,12 +154,17 @@
             "op": "change_implement",
             "args": [
               {
-                "kind": "var",
-                "name": "tasks"
-              },
-              {
                 "kind": "lit",
-                "value": 2
+                "value": {
+                  "tasks": {
+                    "kind": "var",
+                    "name": "tasks"
+                  },
+                  "limit": {
+                    "kind": "lit",
+                    "value": 2
+                  }
+                }
               }
             ]
           }
@@ -235,12 +255,17 @@
                 "op": "score_compare_multi",
                 "args": [
                   {
-                    "kind": "var",
-                    "name": "baseline"
-                  },
-                  {
-                    "kind": "var",
-                    "name": "candidate"
+                    "kind": "lit",
+                    "value": {
+                      "baseline": {
+                        "kind": "var",
+                        "name": "baseline"
+                      },
+                      "candidate": {
+                        "kind": "var",
+                        "name": "candidate"
+                      }
+                    }
                   }
                 ]
               },

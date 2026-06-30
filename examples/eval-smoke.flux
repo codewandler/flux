@@ -5,17 +5,44 @@
     {
       "kind": "bind",
       "name": "baseline",
-      "value": { "kind": "call", "op": "eval_run", "args": [ { "kind": "lit", "value": "mock" } ] }
+      "value": {
+        "kind": "call",
+        "op": "eval_run",
+        "args": [
+          {
+            "kind": "lit",
+            "value": "mock"
+          }
+        ]
+      }
     },
     {
       "kind": "bind",
       "name": "sessions",
-      "value": { "kind": "call", "op": "eval_sessions", "args": [ { "kind": "var", "name": "baseline" } ] }
+      "value": {
+        "kind": "call",
+        "op": "eval_sessions",
+        "args": [
+          {
+            "kind": "var",
+            "name": "baseline"
+          }
+        ]
+      }
     },
     {
       "kind": "bind",
       "name": "mined",
-      "value": { "kind": "call", "op": "painpoints_collect", "args": [ { "kind": "var", "name": "sessions" } ] }
+      "value": {
+        "kind": "call",
+        "op": "painpoints_collect",
+        "args": [
+          {
+            "kind": "var",
+            "name": "sessions"
+          }
+        ]
+      }
     },
     {
       "kind": "bind",
@@ -23,9 +50,29 @@
       "value": {
         "kind": "call",
         "op": "improvements_aggregate",
-        "args": [ { "kind": "var", "name": "mined" }, { "kind": "lit", "value": "[]" } ]
+        "args": [
+          {
+            "kind": "lit",
+            "value": {
+              "mined": {
+                "kind": "var",
+                "name": "mined"
+              },
+              "reviewed": {
+                "kind": "lit",
+                "value": "[]"
+              }
+            }
+          }
+        ]
       }
     },
-    { "kind": "return", "value": { "kind": "var", "name": "candidates" } }
+    {
+      "kind": "return",
+      "value": {
+        "kind": "var",
+        "name": "candidates"
+      }
+    }
   ]
 }

@@ -33,7 +33,7 @@ journey announce
 journey tick
   flow
     $m = fmt("heartbeat at {at}")
-    send("cli", $m)
+    send({ "channel": "cli", "message": $m })
     return $m
 
 journey ci_report

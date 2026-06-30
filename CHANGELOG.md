@@ -108,6 +108,19 @@ All notable changes to this project are documented in this file. The format is b
   deferral from D-10/D-12; D-20 (scoped private-net egress) is pulled in as a hard dependency. Design +
   backlog only — no code yet.
 
+### Changed
+
+- **Named-argument calls (L-09).** Flux-Lang `call` parameter order is no longer
+  load-bearing: multi-param ops are called with a single named object argument
+  (e.g. `write({path, content})`); a sole-required-param op keeps bare-value sugar
+  (e.g. `read("README.md")`). The deprecated positional form (2+ bare args) is rejected
+  by the analyzer with a repair diagnostic, and the runtime keeps a fallback so legacy
+  stored plans still execute. `x-param-order` is gone — `required` is now a *set*, not
+  an order; `schema_params` returns sorted optional params for display only. The planner
+  prompt + catalog signature (`name({params})`) + skills/reference docs now teach the
+  named-args form. This unblocks the schemars schema migration (D-31), since `schemars`
+  does not emit `x-param-order`.
+
 ### Fixed
 
 - Preserved kubeconfig access in `scripts/smoke-plugins.sh` when the Kubernetes plugin smoke uses an

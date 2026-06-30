@@ -705,8 +705,7 @@ fn build_oneshot_prompt(instruction: &str, ops: &OpRegistry, view: Option<&Sessi
     format!(
         "You are Flux-Lang's compiler front-end. Convert the user's instruction into a Flux-Lang flow \
 AST as JSON. Do NOT execute anything. Prefer deterministic operations; minimise model-dependent \
-steps. Use ONLY operations from the catalog. Each op is shown as `name(params)`; a call's `args` are \
-positional in that parameter order ([optional] params come last).\n\nOperation catalog:\n\
+steps. Use ONLY operations from the catalog. Each op is shown as `name({{params}})` — call a multi-param op with a single object argument naming each parameter (e.g. `write({{path, content}})`); a sole-required-param op accepts a bare value (e.g. `read(\"README.md\")`). [optional] params may be omitted from the object.\n\nOperation catalog:\n\
 {catalog}{symbols}\n{grammar}\n\nOutput ONLY the JSON AST in a single ```json code block.\n\n\
 Instruction: {instruction}\n",
         catalog = ops_catalog(ops),
@@ -744,8 +743,7 @@ express control flow as Flux-Lang nodes, NOT inside shell commands, so the plan 
 existing session symbols instead of re-fetching. To embed a stored symbol's value INSIDE a string \
 argument (e.g. a `task` prompt or a message), write `{{symbol_name}}` — the runtime substitutes the \
 value at execution; to pass a symbol's value as a whole argument, use it directly as a `var` node. Each \
-op is shown as `name(params)`; a call's `args` are positional in that parameter order ([optional] \
-params come last).\n\nOperation catalog (for the AST):\n{catalog}{symbols}\n{grammar}\n",
+op is shown as `name({{params}})` — call a multi-param op with a single object argument naming each parameter (e.g. `write({{path, content}})`); a sole-required-param op accepts a bare value (e.g. `read(\"README.md\")`). [optional] params may be omitted from the object.\n\nOperation catalog (for the AST):\n{catalog}{symbols}\n{grammar}\n",
         catalog = ops_catalog(ops),
         symbols = symbols_block(view),
         grammar = ast_grammar(),
@@ -1005,7 +1003,8 @@ mod tests {
         let reg = full_registry();
         let ops = OpRegistry::new(&reg);
         // The plan may include `write` (a side-effecting op) — it's the plan, not executed here.
-        let with_write = r#"{"ast":{"body":[{"kind":"call","op":"write","args":[{"kind":"lit","value":"out.txt"}]}]}}"#;
+        // `write` has two required params, so it must be called with a named object argument.
+        let with_write = r#"{"ast":{"body":[{"kind":"call","op":"write","args":[{"kind":"lit","value":{"path":"out.txt","content":"x"}}]}]}}"#;
         let p = mock(vec![tool_call(
             "emit_plan",
             serde_json::from_str(with_write).unwrap(),

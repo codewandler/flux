@@ -527,7 +527,9 @@ fn walk_node<'a>(node: &'a Node, f: &mut impl FnMut(&'a str, &'a [Node])) {
 }
 
 /// Build a best-effort named input from a call's *literal* args only (for intent preview); non-literal
-/// args (`$symbols`) are skipped and arity is not enforced.
+/// args (`$symbols`) are skipped and arity is not enforced. Under named-args semantics: a lone
+/// object literal is the named input; a single bare literal binds to the sole param; 2+ bare literals
+/// fall back to catalog-order binding (the deprecated positional form).
 fn literal_input(args: &[Node], schema: &serde_json::Value) -> serde_json::Value {
     if let [Node::Lit { value }] = args {
         if value.is_object() {
@@ -535,6 +537,26 @@ fn literal_input(args: &[Node], schema: &serde_json::Value) -> serde_json::Value
         }
     }
     let (required, optional) = schema_params(schema);
+    let n_params = required.len() + optional.len();
+    // Single bare literal: bind to the sole required param (`read("x")` sugar) when there's
+    // exactly one required, else the sole param; untyped (n_params==0) passes the value through.
+    if args.len() == 1 {
+        if let [Node::Lit { value }] = args {
+            if n_params == 0 {
+                return value.clone();
+            }
+            let pname = if required.len() == 1 {
+                required.first().cloned()
+            } else {
+                required.first().or(optional.first()).cloned()
+            };
+            if let Some(name) = pname {
+                let mut input = serde_json::Map::new();
+                input.insert(name, value.clone());
+                return serde_json::Value::Object(input);
+            }
+        }
+    }
     let order: Vec<String> = required.into_iter().chain(optional).collect();
     let mut input = serde_json::Map::new();
     for (i, arg) in args.iter().enumerate() {

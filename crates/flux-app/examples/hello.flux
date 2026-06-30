@@ -24,5 +24,5 @@ journey echo
   agent greeter
   flow
     $reply = fmt("you said: {text}")
-    send("cli", $reply)
+    send({ "channel": "cli", "message": $reply })
     return $reply

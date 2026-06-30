@@ -40,7 +40,7 @@ flow route-call(utterance: String, caller_id: String) -> RouteResult
     $slots = $extract.slots
     assert $slots.destination, "no destination found in utterance"
     confirm "Create booking to {slots.destination} on {slots.date}?", risk: medium
-      $booking  = booking_create($slots, caller: $caller_id)
+      $booking  = booking_create({ slots: $slots, caller: $caller_id })
       $response = fmt("Booking confirmed. Reference {booking.ref}, departing {slots.date}.")
       return {
         intent:    $extract.intent,
@@ -51,7 +51,7 @@ flow route-call(utterance: String, caller_id: String) -> RouteResult
 
   when $extract.intent == "change_booking"
     assert $context, "no existing booking found for caller"
-    $response = booking_modify($context, $extract.slots)
+    $response = booking_modify({ context: $context, slots: $extract.slots })
     return {
       intent:    $extract.intent,
       slots:     $extract.slots,

@@ -16,14 +16,14 @@ use crate::program::CompositeOpDecl;
 /// A single named input parameter of an [`OpSpec`]: a `name`, its [`TypeRef`], and whether it may be
 /// omitted. Naming the param here — rather than leaving `inputs` positional — is what lets
 /// [`OpSpec::lower`] project a faithful JSON Schema whose `properties`/`required` the planner catalog
-/// and [`schema_params`] read back to recover the op's positional binding order.
+/// and [`schema_params`] read back to recover the op's parameter *set* (required vs optional).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Param {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: TypeRef,
     /// When true, the param is omitted from the schema's `required` array (it still appears in
-    /// `properties`). Optional params carry no inter-param order guarantee — JSON object keys are
+    /// `properties`). Parameter order is non-load-bearing — calls name their args via a single object.
     /// unordered.
     #[serde(default)]
     pub optional: bool,
@@ -73,7 +73,8 @@ impl OpSpec {
     /// Project the named, typed [`inputs`](Self::inputs) onto a JSON Schema object: every param
     /// becomes a `properties` entry (its [`TypeRef`] via [`type_ref_to_schema`]), and every
     /// non-`optional` param is listed in `required` **in declared order** — the array preserves order,
-    /// so [`schema_params`] reads it back to recover the op's positional binding order. Optional params
+    /// so [`schema_params`] reads it back to recover the op's required-parameter *set*. Parameter order
+    /// is non-load-bearing — calls name their args via a single object (see `map_args_to_input`).
     /// carry no order guarantee (JSON object keys are unordered), matching hand-written op schemas.
     pub fn input_schema(&self) -> serde_json::Value {
         let mut properties = serde_json::Map::new();
@@ -110,11 +111,12 @@ fn type_ref_to_schema(ty: &TypeRef) -> serde_json::Value {
     }
 }
 
-/// The input parameter names of a tool's JSON-Schema, as `(required, optional)`. The `required`
-/// array fixes the order of mandatory params. Optional params follow `x-param-order` when present,
-/// then any remaining `properties` keys. A flow's positional `Call.args` map onto
-/// `required ++ optional` at execution (see `runtime::map_args_to_input`), and the planner catalog
-/// renders the same signature so the model emits args in this order.
+/// The input parameter names of a tool's JSON-Schema, as `(required, optional)`. Treated as
+/// **sets** — membership is load-bearing ("which params must be present / which may be omitted"),
+/// order is not. `required` follows the schema's `required` array order; `optional` is the
+/// `properties` keys not in `required`, sorted for stable display. Neither order is used for
+/// positional binding — calls name their args via a single object (see `map_args_to_input`);
+/// `param_signature` renders the same names for the planner catalog.
 pub fn schema_params(schema: &serde_json::Value) -> (Vec<String>, Vec<String>) {
     let required: Vec<String> = schema
         .get("required")
@@ -127,21 +129,12 @@ pub fn schema_params(schema: &serde_json::Value) -> (Vec<String>, Vec<String>) {
         .unwrap_or_default();
     let mut optional = Vec::new();
     if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
-        if let Some(order) = schema.get("x-param-order").and_then(|v| v.as_array()) {
-            for name in order.iter().filter_map(|v| v.as_str()) {
-                if props.contains_key(name)
-                    && !required.iter().any(|r| r == name)
-                    && !optional.iter().any(|o| o == name)
-                {
-                    optional.push(name.to_string());
-                }
-            }
-        }
         for k in props.keys() {
-            if !required.contains(k) && !optional.contains(k) {
+            if !required.contains(k) {
                 optional.push(k.clone());
             }
         }
+        optional.sort();
     }
     (required, optional)
 }
@@ -215,19 +208,21 @@ impl OpSignature {
         }
     }
 
-    /// A compact parameter signature for the planner catalog, e.g. `path[, offset, limit]` or
-    /// `pattern` (empty when the op takes no declared params).
+    /// A compact parameter signature for the planner catalog, e.g. `{path, content}` or `path`
+    /// (empty when the op takes no declared params). Multi-param ops are shown with braces to signal
+    /// the named-object call form; a sole required param is shown bare (the single-value sugar).
     pub fn param_signature(&self) -> String {
-        let mut s = self.required_params.join(", ");
-        if !self.optional_params.is_empty() {
-            let opt = self.optional_params.join(", ");
-            if self.required_params.is_empty() {
-                s.push_str(&format!("[{opt}]"));
-            } else {
-                s.push_str(&format!("[, {opt}]"));
-            }
+        let req = &self.required_params;
+        let opt = &self.optional_params;
+        if req.len() == 1 && opt.is_empty() {
+            return req[0].clone();
         }
-        s
+        if req.is_empty() && opt.is_empty() {
+            return String::new();
+        }
+        let mut all: Vec<String> = req.to_vec();
+        all.extend(opt.iter().cloned());
+        format!("{{{}}}", all.join(", "))
     }
 }
 
@@ -319,7 +314,7 @@ mod tests {
 
         // And the planner-catalog signature renders names, not a generic object.
         let sig = OpSignature::from_spec(&tool);
-        assert_eq!(sig.param_signature(), "query[, limit]");
+        assert_eq!(sig.param_signature(), "{query, limit}");
     }
 
     #[test]
@@ -357,7 +352,9 @@ mod tests {
     }
 
     #[test]
-    fn optional_param_order_can_be_declared_explicitly() {
+    fn optional_params_are_a_sorted_set_not_an_order() {
+        // `x-param-order` is gone; optional params are the `properties` keys not in `required`,
+        // sorted for stable display. Order is non-binding (calls name args via an object).
         let schema = json!({
             "type": "object",
             "properties": {
@@ -365,12 +362,27 @@ mod tests {
                 "manifest_path": { "type": "string" },
                 "package": { "type": "string" },
                 "filter": { "type": "string" }
-            },
-            "x-param-order": ["package", "manifest_path", "filter", "args"]
+            }
         });
         let (required, optional) = schema_params(&schema);
         assert!(required.is_empty());
-        assert_eq!(optional, vec!["package", "manifest_path", "filter", "args"]);
+        assert_eq!(optional, vec!["args", "filter", "manifest_path", "package"]);
+    }
+
+    #[test]
+    fn required_is_a_set_membership_check() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "content": { "type": "string" },
+                "limit": { "type": "integer" }
+            },
+            "required": ["path", "content"]
+        });
+        let (required, optional) = schema_params(&schema);
+        assert_eq!(required, vec!["path", "content"]);
+        assert_eq!(optional, vec!["limit"]);
     }
 
     #[test]

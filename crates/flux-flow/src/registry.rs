@@ -334,15 +334,16 @@ mod tests {
     }
 
     #[test]
-    fn signature_carries_param_names_in_required_then_optional_order() {
+    fn signature_carries_param_names_as_a_set() {
         let mut reg = ToolRegistry::new();
         flux_tools::register_builtins(&mut reg);
         let ops = OpRegistry::new(&reg);
 
         let read = ops.get("read").unwrap();
         assert_eq!(read.required_params, vec!["path".to_string()]);
-        // `offset`/`limit` are optional; required order is fixed, so `path` always renders first.
-        assert!(read.param_signature().starts_with("path["));
+        // Multi-param (required + optional) renders as a named-object signature `{path, offset, limit}`;
+        // order is display-only (a set), not a positional binding.
+        assert_eq!(read.param_signature(), "{path, limit, offset}");
 
         let edit = ops.get("edit").unwrap();
         assert_eq!(
@@ -353,8 +354,9 @@ mod tests {
                 "new_string".to_string()
             ]
         );
-        assert!(edit
-            .param_signature()
-            .starts_with("path, old_string, new_string"));
+        assert_eq!(
+            edit.param_signature(),
+            "{path, old_string, new_string, replace_all}"
+        );
     }
 }
