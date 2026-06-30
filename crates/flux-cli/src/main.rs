@@ -387,6 +387,14 @@ enum PluginAction {
     /// Register every `flux-plugin-*` binary in a directory: `install [dir]`
     /// (default `plugins/target/release`).
     Install { dir: Option<String> },
+    /// Remove an installed plugin descriptor: `uninstall <name>`.
+    Uninstall { name: String },
+    /// Inspect installed plugins — liveness + declared surface: `status [<name>]`.
+    /// With no argument it summarizes every installed plugin; `ls` stays the terse default.
+    Status {
+        /// One plugin to inspect in full; omit for every installed plugin.
+        name: Option<String>,
+    },
     /// Generate the plugin section skill from installed plugin manifests.
     /// Alias for `flux skill plugin`; prints to stdout by default, or installs with `--install`.
     Skill {
@@ -4007,9 +4015,14 @@ fn run_endpoint(action: EndpointAction) -> Result<()> {
 /// `flux plugin add <name> <program> [args…] | ls | pin <name> <version> | rollback <name>`.
 async fn run_plugin(action: Option<PluginAction>) -> Result<()> {
     let dir = plugins_dir().ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+    run_plugin_in(&dir, action).await
+}
+
+/// The dir-parameterized body of [`run_plugin`] (tests pass a temp dir so they don't touch `HOME`).
+async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> Result<()> {
     match action.unwrap_or(PluginAction::Ls) {
         PluginAction::Ls => {
-            let found = flux_plugin::discover(&dir);
+            let found = flux_plugin::discover(dir);
             if found.is_empty() {
                 println!("no plugins (add one with `flux plugin add <name> <program> [args…]`)");
             }
@@ -4035,7 +4048,7 @@ async fn run_plugin(action: Option<PluginAction>) -> Result<()> {
             args,
         } => {
             flux_plugin::add_descriptor(
-                &dir,
+                dir,
                 &name,
                 &flux_plugin::PluginDescriptor {
                     program: program.clone(),
@@ -4048,17 +4061,17 @@ async fn run_plugin(action: Option<PluginAction>) -> Result<()> {
             Ok(())
         }
         PluginAction::Pin { name, version } => {
-            flux_plugin::set_pinned(&dir, &name, Some(version.clone())).context("pin plugin")?;
+            flux_plugin::set_pinned(dir, &name, Some(version.clone())).context("pin plugin")?;
             println!("pinned `{name}` to {version}");
             Ok(())
         }
         PluginAction::Rollback { name } => {
-            flux_plugin::set_pinned(&dir, &name, None).context("rollback plugin")?;
+            flux_plugin::set_pinned(dir, &name, None).context("rollback plugin")?;
             println!("cleared pin on `{name}`");
             Ok(())
         }
         PluginAction::Call { name, op, input } => {
-            let desc = flux_plugin::load_descriptor(&dir, &name)
+            let desc = flux_plugin::load_descriptor(dir, &name)
                 .context("load plugin descriptor")?
                 .ok_or_else(|| {
                     anyhow::anyhow!(
@@ -4111,7 +4124,7 @@ async fn run_plugin(action: Option<PluginAction>) -> Result<()> {
                 .with_context(|| format!("scan {}", bin_dir.display()))?
             {
                 flux_plugin::add_descriptor(
-                    &dir,
+                    dir,
                     &name,
                     &flux_plugin::PluginDescriptor {
                         program: program.clone(),
@@ -4136,7 +4149,196 @@ async fn run_plugin(action: Option<PluginAction>) -> Result<()> {
             install,
             global,
             out,
-        } => run_plugin_skill(&dir, install, global, out).await,
+        } => run_plugin_skill(dir, install, global, out).await,
+        PluginAction::Uninstall { name } => {
+            let removed = flux_plugin::remove_descriptor(dir, &name).context("uninstall plugin")?;
+            if removed {
+                println!("uninstalled plugin `{name}`");
+            } else {
+                bail!("no such plugin `{name}` — nothing to uninstall");
+            }
+            Ok(())
+        }
+        PluginAction::Status { name } => {
+            match name {
+                Some(n) => {
+                    let report = plugin_status_one(dir, &n).await?;
+                    print_plugin_status_report(&report);
+                }
+                None => {
+                    let reports = plugin_status_all(dir).await?;
+                    if reports.is_empty() {
+                        println!(
+                            "no plugins (add one with `flux plugin add <name> <program> [args…]`)"
+                        );
+                    }
+                    for r in reports {
+                        print_plugin_status_report(&r);
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+// --- plugin `status`: liveness + declared surface (D-19) -------------------------------
+
+/// Result of probing one plugin's health + surface. `missing` is determined without spawning
+/// (the binary does not resolve on `PATH`); `unloadable` means the binary spawned but its
+/// manifest would not load (e.g. it is not a flux plugin); `live` means the manifest loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Liveness {
+    Live,
+    Missing,
+    Unloadable(String),
+}
+
+#[derive(Debug, Clone)]
+struct PluginStatusReport {
+    name: String,
+    program: String,
+    args: Vec<String>,
+    pin: Option<String>,
+    liveness: Liveness,
+    manifest: Option<flux_plugin::PluginManifest>,
+}
+
+/// Resolve `program` (an absolute/relative path, or a bare name on `PATH`) to an existing file.
+/// Used for the `missing` vs `unloadable` split in `status` without spawning a process.
+fn program_resolves(program: &str) -> bool {
+    let p = std::path::Path::new(program);
+    if p.parent().is_some() {
+        // Absolute or relative path with a separator — check the file directly.
+        return p.is_file();
+    }
+    // Bare name — search the dirs on `PATH`.
+    let Ok(path) = std::env::var("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|d| d.join(program).is_file())
+}
+
+/// Build a status report for one plugin. A missing binary is reported without spawning (no
+/// process, no manifest round-trip); a present binary is spawned and its manifest loaded so the
+/// declared surface can be summarized. Never panics on a bad binary.
+async fn build_status_report(
+    name: &str,
+    d: flux_plugin::PluginDescriptor,
+) -> Result<PluginStatusReport> {
+    let binary_exists = program_resolves(&d.program);
+    let (liveness, manifest) = if !binary_exists {
+        (Liveness::Missing, None)
+    } else {
+        match spawn_and_load_manifest(&d).await {
+            Ok(m) => (Liveness::Live, Some(m)),
+            Err(e) => (Liveness::Unloadable(e.to_string()), None),
+        }
+    };
+    Ok(PluginStatusReport {
+        name: name.to_string(),
+        program: d.program,
+        args: d.args,
+        pin: d.pinned,
+        liveness,
+        manifest,
+    })
+}
+
+/// Inspect one installed plugin by name.
+async fn plugin_status_one(dir: &std::path::Path, name: &str) -> Result<PluginStatusReport> {
+    let d = flux_plugin::load_descriptor(dir, name)
+        .with_context(|| format!("load descriptor `{name}`"))?
+        .ok_or_else(|| anyhow::anyhow!("no such plugin `{name}`"))?;
+    build_status_report(name, d).await
+}
+
+/// Summarize every installed plugin (sorted by name, matching `discover`).
+async fn plugin_status_all(dir: &std::path::Path) -> Result<Vec<PluginStatusReport>> {
+    let mut out = Vec::new();
+    for p in flux_plugin::discover(dir) {
+        out.push(build_status_report(&p.name, p.descriptor).await?);
+    }
+    Ok(out)
+}
+
+/// Spawn the plugin and load its manifest (liveness probe). Reuses the one guarded spawn path
+/// (`PluginHost::spawn` over a workspace-rooted `System`), the same boundary `call` uses.
+async fn spawn_and_load_manifest(
+    d: &flux_plugin::PluginDescriptor,
+) -> Result<flux_plugin::PluginManifest> {
+    let system =
+        System::new(Workspace::new(&std::env::current_dir()?).map_err(|e| anyhow::anyhow!("{e}"))?);
+    let mut host = flux_plugin::PluginHost::spawn(&system, &d.program, &d.args)
+        .await
+        .with_context(|| format!("spawn `{}`", d.program))?;
+    let m = host.manifest().await.context("fetch plugin manifest")?;
+    let _ = host.shutdown().await;
+    Ok(m)
+}
+
+/// Print one plugin's status: header (name → program args, pin) + liveness label, then the
+/// declared surface (version, op/auth/endpoint/datasource counts, requested capabilities).
+fn print_plugin_status_report(r: &PluginStatusReport) {
+    let liveness_label = match &r.liveness {
+        Liveness::Live => style::green("ok"),
+        Liveness::Missing => style::red("missing"),
+        Liveness::Unloadable(msg) => style::yellow(&format!("unloadable: {msg}")),
+    };
+    let pin = r
+        .pin
+        .as_deref()
+        .map(|v| format!("  (pinned {v})"))
+        .unwrap_or_default();
+    println!(
+        "{:<16} {} {}{pin}  [{liveness_label}]",
+        r.name,
+        r.program,
+        r.args.join(" ")
+    );
+    if let Some(m) = &r.manifest {
+        let mut surface = vec![format!("{} op(s)", m.operations.len())];
+        if !m.auth.is_empty() {
+            surface.push(format!("{} auth purpose(s)", m.auth.len()));
+        }
+        if !m.endpoints.is_empty() {
+            surface.push(format!("{} endpoint(s)", m.endpoints.len()));
+        }
+        if !m.datasources.is_empty() {
+            surface.push(format!("{} datasource(s)", m.datasources.len()));
+        }
+        if !m.discovers.is_empty() {
+            surface.push(format!("discovers: {}", m.discovers.join(", ")));
+        }
+        let caps = &m.capabilities;
+        let mut cap_flags: Vec<String> = Vec::new();
+        if caps.http {
+            cap_flags.push("http".to_string());
+        }
+        if !caps.process.is_empty() {
+            cap_flags.push(format!("process({})", caps.process.len()));
+        }
+        if !caps.secrets.is_empty() {
+            cap_flags.push(format!("secret({})", caps.secrets.len()));
+        }
+        if !caps.conn.is_empty() {
+            cap_flags.push(format!("conn({})", caps.conn.len()));
+        }
+        if caps.blob {
+            cap_flags.push("blob".to_string());
+        }
+        if caps.discover {
+            cap_flags.push("endpoint.discover".to_string());
+        }
+        if !cap_flags.is_empty() {
+            surface.push(format!("caps: {}", cap_flags.join(", ")));
+        }
+        let ver = if m.version.is_empty() {
+            String::new()
+        } else {
+            format!("  v{}", m.version)
+        };
+        println!("    manifest:{ver}  {}", surface.join("  ·  "));
     }
 }
 
@@ -4469,8 +4671,9 @@ async fn run_prompt(flags: AgentFlags, prompt_words: Vec<String>) -> Result<()> 
 mod tests {
     use super::{
         build_datasources, credential_location, format_evidence, loop_machinery_label,
-        new_render_suffix, plugin_binaries_in, render_endpoint_row, resolve_plugin_operation_name,
-        tool_preview, truncate, usage_annotation, write_generated_skill,
+        new_render_suffix, plugin_binaries_in, plugin_status_one, render_endpoint_row,
+        resolve_plugin_operation_name, run_plugin_in, tool_preview, truncate, usage_annotation,
+        write_generated_skill, Liveness, PluginAction,
     };
     use serde_json::json;
 
@@ -4596,6 +4799,86 @@ mod tests {
         assert_eq!(names, vec!["gitlab", "slack"]);
         // programs are absolute (canonicalized) paths to the binaries
         assert!(found.iter().all(|(_, p)| p.contains("flux-plugin-")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `flux plugin uninstall <name>` removes the descriptor; a missing name is a clean error
+    /// (non-zero), never a panic (D-19).
+    #[tokio::test]
+    async fn plugin_uninstall_removes_descriptor() {
+        let dir = std::env::temp_dir().join(format!("flux-uninstall-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        flux_plugin::add_descriptor(
+            &dir,
+            "p",
+            &flux_plugin::PluginDescriptor {
+                program: "/bin/true".into(),
+                args: vec![],
+                pinned: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            flux_plugin::discover(&dir).len(),
+            1,
+            "the descriptor is registered"
+        );
+
+        run_plugin_in(&dir, Some(PluginAction::Uninstall { name: "p".into() }))
+            .await
+            .unwrap();
+        assert!(
+            flux_plugin::discover(&dir).is_empty(),
+            "uninstall removed the descriptor"
+        );
+
+        // A missing name is a clean error, not a panic.
+        let err = run_plugin_in(
+            &dir,
+            Some(PluginAction::Uninstall {
+                name: "ghost".into(),
+            }),
+        )
+        .await;
+        assert!(err.is_err(), "uninstall of a missing name is a clean error");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `flux plugin status <name>` reports a registered-but-missing binary as `missing`, not a
+    /// crash — and never spawns a process to find out (D-19).
+    #[tokio::test]
+    async fn plugin_status_reports_manifest_and_liveness() {
+        let dir = std::env::temp_dir().join(format!("flux-status-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        flux_plugin::add_descriptor(
+            &dir,
+            "ghost",
+            &flux_plugin::PluginDescriptor {
+                program: "/nonexistent/binary".into(),
+                args: vec![],
+                pinned: None,
+            },
+        )
+        .unwrap();
+
+        let r = plugin_status_one(&dir, "ghost").await.unwrap();
+        assert_eq!(
+            r.liveness,
+            Liveness::Missing,
+            "a missing binary is `missing`, not a crash"
+        );
+        assert!(
+            r.manifest.is_none(),
+            "no manifest is loaded for a missing binary"
+        );
+
+        // A name that is not registered at all is a clean error (the caller surfaces it).
+        let err = plugin_status_one(&dir, "nope").await;
+        assert!(err.is_err(), "an unknown name is a clean error");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

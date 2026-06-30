@@ -1806,9 +1806,49 @@ pub fn set_pinned(dir: &std::path::Path, name: &str, version: Option<String>) ->
     add_descriptor(dir, name, &d)
 }
 
+/// Remove a plugin descriptor (`flux plugin uninstall`); returns whether a descriptor existed
+/// (a missing name is `Ok(false)` — a clean "nothing to uninstall", not an error). Other IO
+/// failures (permissions, etc.) propagate as `Err`.
+pub fn remove_descriptor(dir: &std::path::Path, name: &str) -> Result<bool> {
+    match std::fs::remove_file(descriptor_path(dir, name)) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(Error::Io(e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_descriptor_deletes_file_and_reports_missing_as_false() {
+        let dir = std::env::temp_dir().join(format!("flux-rm-desc-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // No descriptor yet → `remove_descriptor` reports `false`, not an error.
+        assert!(!remove_descriptor(&dir, "ghost").unwrap());
+
+        // Add one, then remove → reports `true`, and discovery no longer lists it.
+        add_descriptor(
+            &dir,
+            "p",
+            &PluginDescriptor {
+                program: "/bin/true".into(),
+                args: vec![],
+                pinned: None,
+            },
+        )
+        .unwrap();
+        assert!(remove_descriptor(&dir, "p").unwrap());
+        assert!(
+            discover(&dir).is_empty(),
+            "the descriptor is gone after uninstall"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[tokio::test]
     async fn host_caps_deny_ungranted_and_allow_granted() {

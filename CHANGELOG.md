@@ -8,6 +8,17 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Complete `flux plugin` lifecycle — `uninstall` + `status` (D-19).** Plugin management is now
+  fully first-class from the CLI. `flux plugin uninstall <name>` removes the descriptor at
+  `~/.flux/plugins/<name>.toml` (a missing name is a clean `no such plugin — nothing to uninstall`, never
+  a panic). `flux plugin status [<name>]` reports, per plugin, the resolved binary path, a **liveness**
+  probe — `ok` / `missing` / `unloadable` — the version, the pin state, and the declared surface from
+  the manifest (op count, auth purposes, endpoints, datasources, `discovers`, requested capabilities).
+  A missing binary is detected **without spawning a process** (a path/`PATH` existence check); a present
+  binary is spawned and its manifest loaded through the same guarded `PluginHost::spawn` boundary `call`
+  uses, so a bad-but-present binary is `unloadable`, never a crash. With no argument it summarizes every
+  installed plugin; `ls` stays the terse default. New `flux_plugin::remove_descriptor` helper backs it.
+
 - **App-runner ergonomics for declarative bots (D-11).** `flux app run` is now a viable host for a
   real declarative bot, not just a demo. An agent's persona can live in files: an `agent` declaration's
   `settings.system_prompt_files` (a list of workspace-relative paths) is read through the guarded,
