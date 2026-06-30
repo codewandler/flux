@@ -31,12 +31,13 @@ use sha2::{Digest, Sha256};
 use crate::AgentSink;
 use flux_core::{Error, Message, Result, Usage};
 use flux_provider::Provider;
-use flux_runtime::{Executor, LoopHost, ToolResult};
+use flux_runtime::{CompositeRegisterRequest, CompositeRegistrar, Executor, LoopHost, ToolResult};
 
 use crate::ast::DraftAst;
 use crate::compile::{compile_turn, CompileOptions, TurnOutput};
+use crate::composites::{prepare_registration, CompositeScope, DynamicComposites};
 use crate::registry::OpRegistry;
-use crate::runtime::execute_flow;
+use crate::runtime::execute_flow_with_composites;
 use crate::state::FlowStore;
 
 /// Hard cap on reflexive reentry (flow → `run_plan` → flow → …). Mirrors `flux-app`'s `MAX_SPAWN_DEPTH`:
@@ -123,6 +124,8 @@ pub struct EngineLoopHost {
     model: Mutex<String>,
     /// Shared with the outer flow run: inner values/symbols/trace land in the SAME session.
     store: Arc<FlowStore>,
+    /// Dynamic composite ops registered by the agent or loaded from project/global/session stores.
+    composites: Arc<DynamicComposites>,
     /// Active reentry depth, guarding against runaway `run_plan` recursion.
     depth: AtomicU32,
     opts: CompileOptions,
@@ -150,6 +153,7 @@ impl EngineLoopHost {
         model: String,
         base_system: Option<String>,
         store: Arc<FlowStore>,
+        composites: Arc<DynamicComposites>,
         session_id: String,
         sink: Arc<Mutex<dyn AgentSink>>,
         opts: CompileOptions,
@@ -162,6 +166,7 @@ impl EngineLoopHost {
                 provider: Mutex::new(provider),
                 model: Mutex::new(model),
                 store,
+                composites,
                 depth: AtomicU32::new(0),
                 opts,
                 turn: Mutex::new(TurnCtx {
@@ -173,7 +178,8 @@ impl EngineLoopHost {
                 usage: Mutex::new(Usage::default()),
             });
             *slot2.lock().unwrap() = Some(host.clone());
-            executor.set_loop_host(host);
+            executor.set_loop_host(host.clone());
+            executor.set_composite_registrar(host);
             executor
         });
         let host = slot.lock().unwrap().take().expect("host captured");
@@ -294,7 +300,10 @@ impl LoopHost for EngineLoopHost {
         }
 
         let executor = self.executor()?;
-        let ops = OpRegistry::new(executor.registry());
+        self.composites
+            .ensure_session_loaded(&self.store, &session_id)?;
+        let ops = OpRegistry::new(executor.registry())
+            .with_owned_composites(self.composites.active_for_session(&session_id));
         let view = self.store.view(&session_id)?;
         let view_ref = (!view.symbols.is_empty()).then_some(&view);
         let provider = self.provider.lock().unwrap().clone();
@@ -361,13 +370,17 @@ impl LoopHost for EngineLoopHost {
             (t.session_id.clone(), t.sink.clone())
         };
         let executor = self.executor()?;
+        self.composites
+            .ensure_session_loaded(&self.store, &session_id)?;
+        let composites = self.composites.active_for_session(&session_id);
         // A fresh proxy over the shared sink: the inner run streams live, interleaved under the outer op.
         let mut sink = SharedSink(sink);
 
         // Surface the compiled plan BEFORE executing it — auditable, and so the user sees what is about
         // to run before any per-op approval prompt (the `flow.plan` observation the surfaces render as
         // the plan tree). The inner ops then stream + gate live underneath.
-        let risk = crate::runtime::plan_risk(&ast, executor.registry());
+        let risk =
+            crate::runtime::plan_risk_with_composites(&ast, executor.registry(), &composites);
         sink.observation(&flux_evidence::Observation::new(
             "flow.plan",
             flux_evidence::Phase::Turn,
@@ -406,11 +419,12 @@ impl LoopHost for EngineLoopHost {
             None
         };
 
-        let outcome = match execute_flow(
+        let outcome = match execute_flow_with_composites(
             self.store.as_ref(),
             executor.as_ref(),
             &session_id,
             &ast,
+            &composites,
             &mut sink,
         )
         .await
@@ -449,6 +463,79 @@ impl LoopHost for EngineLoopHost {
             out["suspension"] = serde_json::json!({ "source": susp.source, "node": susp.node.0 });
         }
         Ok(out)
+    }
+}
+
+#[async_trait]
+impl CompositeRegistrar for EngineLoopHost {
+    async fn register_composite(&self, request: CompositeRegisterRequest) -> Result<Value> {
+        let (scope, decl, source, replace) = prepare_registration(request)?;
+        let session_id = {
+            let t = self.turn.lock().unwrap();
+            t.session_id.clone()
+        };
+        let executor = self.executor()?;
+        self.composites
+            .ensure_session_loaded(&self.store, &session_id)?;
+        self.composites.validate_registration(
+            scope,
+            &session_id,
+            &decl,
+            replace,
+            executor.registry(),
+        )?;
+
+        let path = match scope {
+            CompositeScope::Turn => None,
+            CompositeScope::Session => {
+                self.store
+                    .save_session_composite(&session_id, &decl.name, &source)?;
+                None
+            }
+            CompositeScope::Project => {
+                let path = scope.path_for(&decl.name).expect("project has path");
+                executor.context().system.write_file(&path, &source).await?;
+                Some(path)
+            }
+            CompositeScope::Global => {
+                if !executor
+                    .context()
+                    .system
+                    .workspace()
+                    .has_named_root("global_ops")
+                {
+                    return Err(Error::Other(
+                        "op.register: global scope is unavailable because @global_ops is not \
+                         configured"
+                            .into(),
+                    ));
+                }
+                let path = scope.path_for(&decl.name).expect("global has path");
+                executor.context().system.write_file(&path, &source).await?;
+                Some(path)
+            }
+        };
+
+        self.composites
+            .install(scope, &session_id, decl.clone(), replace)?;
+        let obs = flux_evidence::Observation::new(
+            "op.registered",
+            flux_evidence::Phase::Turn,
+            serde_json::json!({
+                "name": decl.name,
+                "scope": scope.as_str(),
+                "path": path,
+                "replace": replace,
+            }),
+        );
+        executor.observe(obs);
+
+        Ok(serde_json::json!({
+            "name": decl.name,
+            "scope": scope.as_str(),
+            "persisted": matches!(scope, CompositeScope::Session | CompositeScope::Project | CompositeScope::Global),
+            "path": path,
+        }))
     }
 }
 
@@ -575,6 +662,7 @@ mod tests {
 
     use serde_json::json;
 
+    use crate::runtime::execute_flow;
     use flux_core::{Chunk, ContentBlock, StopReason};
     use flux_provider::{ChunkStream, Request};
     use flux_runtime::{
@@ -706,6 +794,7 @@ mod tests {
             "mock".into(),
             None,
             store,
+            Arc::new(DynamicComposites::default()),
             "sess".into(),
             shared,
             CompileOptions::default(),
@@ -785,6 +874,7 @@ mod tests {
             "mock".into(),
             None,
             store.clone(),
+            Arc::new(DynamicComposites::default()),
             "sess".into(),
             shared.clone(),
             CompileOptions::default(),
@@ -866,6 +956,127 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn op_register_session_composite_is_callable_and_reloads_from_store() {
+        let rec = Recorder::default();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        flux_tools::register_reflect(&mut reg);
+        let (executor, host) = setup_host(
+            reg,
+            PermissionManager::from_rules(
+                &["op.register".into(), "run_plan".into(), "echo".into()],
+                &[],
+            ),
+            Arc::new(AllowApprover),
+            rec,
+            "session-register",
+        );
+
+        let source = r#"
+op greet(name: String) -> String
+  description "greet through echo"
+  risk "low"
+  idempotency "idempotent"
+  effects [read]
+  expose true
+
+  $out = echo($name)
+  return $out
+"#;
+        let registered = executor
+            .dispatch(
+                "op.register",
+                json!({ "source": source, "scope": "session" }),
+            )
+            .await;
+        assert!(
+            !registered.is_error,
+            "registration failed: {}",
+            registered.content
+        );
+
+        let out = host
+            .run_plan(json!({"kind":"plan","ast":{"body":[
+                {"kind":"call","op":"greet","args":[{"kind":"lit","value":"Ada"}]}
+            ]}}))
+            .await
+            .unwrap();
+        assert!(
+            out["result"].as_str().unwrap_or("").contains("Ada"),
+            "{out}"
+        );
+
+        let saved = host.store.session_composites("sess").unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].0, "greet");
+
+        let reloaded = DynamicComposites::default();
+        reloaded.ensure_session_loaded(&host.store, "sess").unwrap();
+        let names: Vec<_> = reloaded
+            .active_for_session("sess")
+            .into_iter()
+            .map(|op| op.name)
+            .collect();
+        assert_eq!(names, vec!["greet"]);
+    }
+
+    #[tokio::test]
+    async fn op_register_project_writes_flux_source_and_global_requires_named_root() {
+        let tag = "project-register";
+        let dir =
+            std::env::temp_dir().join(format!("flux-planapproval-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rec = Recorder::default();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        flux_tools::register_reflect(&mut reg);
+        let (executor, _host) = setup_host(
+            reg,
+            PermissionManager::from_rules(&["op.register".into()], &[]),
+            Arc::new(AllowApprover),
+            rec,
+            tag,
+        );
+
+        let source = r#"
+op project_greet(name: String) -> String
+  risk "low"
+  idempotency "idempotent"
+  effects [read]
+
+  $out = echo($name)
+  return $out
+"#;
+        let registered = executor
+            .dispatch(
+                "op.register",
+                json!({ "source": source, "scope": "project" }),
+            )
+            .await;
+        assert!(
+            !registered.is_error,
+            "project registration failed: {}",
+            registered.content
+        );
+        let written = std::fs::read_to_string(dir.join(".flux/ops/project_greet.flux")).unwrap();
+        assert!(written.starts_with("op project_greet(name: String) -> String"));
+        assert!(written.contains("  expose true"));
+
+        let global = executor
+            .dispatch(
+                "op.register",
+                json!({ "source": source, "scope": "global", "replace": true }),
+            )
+            .await;
+        assert!(global.is_error, "global should require @global_ops");
+        assert!(
+            global.content.contains("global scope is unavailable"),
+            "{}",
+            global.content
+        );
+    }
+
     /// A provider that records the conversation each `stream()` call saw, then replays a canned response.
     struct RecordingProvider {
         responses: Mutex<VecDeque<Vec<Chunk>>>,
@@ -939,6 +1150,7 @@ mod tests {
             "rec".into(),
             None,
             store.clone(),
+            Arc::new(DynamicComposites::default()),
             "sess".into(),
             shared.clone(),
             CompileOptions::default(),
@@ -1032,6 +1244,7 @@ mod tests {
             "rec".into(),
             None,
             store.clone(),
+            Arc::new(DynamicComposites::default()),
             "sess".into(),
             shared.clone(),
             CompileOptions::default(),
@@ -1095,6 +1308,7 @@ mod tests {
             "rec".into(),
             None,
             store.clone(),
+            Arc::new(DynamicComposites::default()),
             "sess".into(),
             shared.clone(),
             CompileOptions::default(),
@@ -1216,6 +1430,7 @@ mod tests {
             "mock".into(),
             None,
             store,
+            Arc::new(DynamicComposites::default()),
             "sess".into(),
             shared,
             CompileOptions::default(),

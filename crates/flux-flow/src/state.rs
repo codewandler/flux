@@ -203,6 +203,13 @@ impl FlowStore {
                  node       INTEGER NOT NULL,
                  source     TEXT NOT NULL,
                  created_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS session_composites (
+                 session_id TEXT NOT NULL,
+                 name       TEXT NOT NULL,
+                 source     TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 PRIMARY KEY (session_id, name)
              );",
         )
         .map_err(map_sql)?;
@@ -332,6 +339,42 @@ impl FlowStore {
     /// with the real history (the loop-carried `$feedback` is layered on top, ephemerally).
     pub fn conversation(&self, session_id: &str) -> Result<Vec<flux_core::Message>> {
         self.events.conversation(session_id)
+    }
+
+    /// Persist a session-scoped composite op definition as normalized Flux-Lang source.
+    pub fn save_session_composite(&self, session_id: &str, name: &str, source: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO session_composites (session_id, name, source, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(session_id, name) DO UPDATE SET
+                 source     = excluded.source,
+                 updated_at = excluded.updated_at",
+            rusqlite::params![session_id, name, source, now_ms()],
+        )
+        .map_err(map_sql)?;
+        Ok(())
+    }
+
+    /// Load every composite op definition registered for `session_id`.
+    pub fn session_composites(&self, session_id: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT name, source FROM session_composites
+                 WHERE session_id = ?1 ORDER BY updated_at ASC, name ASC",
+            )
+            .map_err(map_sql)?;
+        let rows = stmt
+            .query_map([session_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(map_sql)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(map_sql)?);
+        }
+        Ok(out)
     }
 
     /// Persist a flow suspended on a top-level `await`: its body, the suspended node index, and the

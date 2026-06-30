@@ -29,8 +29,9 @@ use flux_runtime::Executor;
 
 use crate::ast::DraftAst;
 use crate::compile::{compile_turn, CompileOptions, TurnOutput};
+use crate::composites::DynamicComposites;
 use crate::registry::OpRegistry;
-use crate::runtime::execute_flow;
+use crate::runtime::{execute_flow, resume_flow_with_composites};
 use crate::state::FlowStore;
 
 /// flux-flow's turn engine: a provider, the tool executor (safety envelope), the unified event store
@@ -49,6 +50,8 @@ pub struct FlowEngine {
     pub agent_loop: DraftAst,
     /// The installed reflexive host; `set_turn` points it at the current session + sink before each run.
     pub loop_host: Arc<crate::loop_host::EngineLoopHost>,
+    /// Dynamic composite ops loaded from global/project stores or registered by this agent.
+    pub composites: Arc<DynamicComposites>,
     pub model: String,
     pub system_prompt: String,
     pub max_tokens: u32,
@@ -88,6 +91,7 @@ impl FlowEngine {
         cwd: std::path::PathBuf,
     ) -> Result<Self> {
         let flow = Arc::new(flow);
+        let composites = Arc::new(DynamicComposites::load(&cwd)?);
         let opts = CompileOptions {
             max_tokens,
             ..Default::default()
@@ -101,6 +105,7 @@ impl FlowEngine {
             model.clone(),
             Some(system_prompt.clone()),
             flow.clone(),
+            composites.clone(),
             String::new(),
             init_sink,
             opts,
@@ -109,6 +114,7 @@ impl FlowEngine {
         // evidence), not a user action — pre-allow it so a turn never prompts to approve `plan`/
         // `run_plan`/`observe`. The inner ops a plan runs still gate individually.
         executor.allow(&["plan", "run_plan", "observe", "evidence", "metrics"]);
+        composites.validate_base(executor.registry())?;
         let agent_loop = load_agent_loop(&cwd)?;
         Ok(FlowEngine {
             provider,
@@ -117,6 +123,7 @@ impl FlowEngine {
             flow,
             agent_loop,
             loop_host,
+            composites,
             model,
             system_prompt,
             max_tokens,
@@ -266,7 +273,9 @@ impl FlowEngine {
         prompt: &str,
         ask: Option<&dyn crate::compile::AskUser>,
     ) -> Result<TurnOutput> {
-        let ops = self.advertised_registry(None);
+        self.composites
+            .ensure_session_loaded(&self.flow, session_id)?;
+        let ops = self.advertised_registry(Some(session_id), None);
         let view = self.flow.view(session_id)?;
         let view_ref = (!view.symbols.is_empty()).then_some(&view);
         let opts = CompileOptions {
@@ -303,7 +312,9 @@ impl FlowEngine {
         self.events
             .record_message(session_id, &Message::user_text(user_input))?;
         let base_system = self.base_system_with_skills(user_input, sink);
-        let ops = self.advertised_registry(Some(sink));
+        self.composites
+            .ensure_session_loaded(&self.flow, session_id)?;
+        let ops = self.advertised_registry(Some(session_id), Some(sink));
         let view = self.flow.view(session_id)?;
         let view_ref = (!view.symbols.is_empty()).then_some(&view);
         let opts = CompileOptions {
@@ -350,7 +361,7 @@ impl FlowEngine {
         match out {
             TurnOutput::Plan(compiled) => {
                 let rendered = crate::render::render_pretty(&compiled.ast);
-                sink.observation(&self.plan_observation(&compiled.ast));
+                sink.observation(&self.plan_observation(session_id, &compiled.ast));
                 self.events.record_message(
                     session_id,
                     &Message::assistant(vec![ContentBlock::Text {
@@ -374,8 +385,14 @@ impl FlowEngine {
 
     /// The `flow.plan` observation surfaced before a plan executes: the plain-rendered tree (for any
     /// sink), the AST (so a terminal surface can syntax-highlight it), and the risk preview (for a badge).
-    fn plan_observation(&self, ast: &crate::ast::DraftAst) -> flux_evidence::Observation {
-        let risk = crate::runtime::plan_risk(ast, self.executor.registry());
+    fn plan_observation(
+        &self,
+        session_id: &str,
+        ast: &crate::ast::DraftAst,
+    ) -> flux_evidence::Observation {
+        let composites = self.composites.active_for_session(session_id);
+        let risk =
+            crate::runtime::plan_risk_with_composites(ast, self.executor.registry(), &composites);
         flux_evidence::Observation::new(
             "flow.plan",
             flux_evidence::Phase::Turn,
@@ -393,8 +410,15 @@ impl FlowEngine {
     /// Execution is unaffected — `OpRegistry::get` still resolves any registered op, so a pre-authored
     /// flow naming a hidden-group op keeps working. `sink`, when given, receives a `groups.active`
     /// observation for visibility.
-    fn advertised_registry(&self, sink: Option<&mut dyn AgentSink>) -> OpRegistry<'_> {
+    fn advertised_registry(
+        &self,
+        session_id: Option<&str>,
+        sink: Option<&mut dyn AgentSink>,
+    ) -> OpRegistry<'_> {
         let reg = self.executor.registry();
+        let composites = session_id
+            .map(|sid| self.composites.active_for_session(sid))
+            .unwrap_or_default();
         if self.groups.is_empty() {
             // Gating disabled: advertise everything EXCEPT the never-surfaced loop machinery (the
             // `reflect` group — `plan`/`run_plan`). Those are registered for dispatch (the agent loop
@@ -407,7 +431,9 @@ impl FlowEngine {
                 .filter(|s| s.group.as_deref() != Some(flux_runtime::REFLECT_GROUP))
                 .map(|s| s.name.clone())
                 .collect();
-            return OpRegistry::new(reg).with_advertised(advertised);
+            return OpRegistry::new(reg)
+                .with_owned_composites(composites)
+                .with_advertised(advertised);
         }
         let signals = flux_runtime::detect_signals(&self.cwd);
         let active = flux_evidence::resolve_active_groups(&self.groups, &signals);
@@ -415,7 +441,9 @@ impl FlowEngine {
             self.record_active_groups(&active, sink);
         }
         let advertised = flux_runtime::advertised_op_names(&reg.specs(), &self.groups, &active);
-        OpRegistry::new(reg).with_advertised(advertised)
+        OpRegistry::new(reg)
+            .with_owned_composites(composites)
+            .with_advertised(advertised)
     }
 
     /// Record (audit + surface) which evidence-gated groups are active this turn, so the user can see
@@ -480,6 +508,7 @@ impl FlowEngine {
             self.executor.observe(obs.clone());
             sink.observation(&obs);
         }
+        self.composites.clear_turn(session_id);
         self.events.record_message(
             session_id,
             &Message::assistant(vec![ContentBlock::Text {
@@ -519,13 +548,17 @@ impl FlowEngine {
         self.events
             .record_message(session_id, &Message::user_text(user_input))?;
         let input = flux_lang::ast::Value::String(user_input.to_string());
-        let outcome = match crate::runtime::resume_flow(
+        self.composites
+            .ensure_session_loaded(&self.flow, session_id)?;
+        let composites = self.composites.active_for_session(session_id);
+        let outcome = match resume_flow_with_composites(
             &self.flow,
             &self.executor,
             session_id,
             &body,
             node,
             input,
+            &composites,
             sink,
         )
         .await

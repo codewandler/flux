@@ -20,6 +20,7 @@
 
 pub mod agent_sink;
 pub mod compile;
+pub mod composites;
 pub mod engine;
 pub mod loop_host;
 pub mod registry;

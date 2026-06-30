@@ -19,6 +19,7 @@ use flux_spec::{IntentSet, Risk};
 
 use flux_lang::host::{OpHost, OpOutcome};
 use flux_lang::opspec::OpCatalog;
+use flux_lang::program::CompositeOpDecl;
 use flux_lang::sink::FlowSink;
 
 use crate::ast::{DraftAst, Node};
@@ -43,6 +44,13 @@ impl<'a> ExecutorHost<'a> {
     fn new(executor: &'a Executor) -> Self {
         Self {
             catalog: OpRegistry::new(executor.registry()),
+            executor,
+        }
+    }
+
+    fn new_with_composites(executor: &'a Executor, composites: &'a [CompositeOpDecl]) -> Self {
+        Self {
+            catalog: OpRegistry::new(executor.registry()).with_composites(composites),
             executor,
         }
     }
@@ -157,6 +165,20 @@ pub async fn execute_flow(
     flux_lang::runtime::execute_flow(store, &host, session_id, ast, &mut bridge).await
 }
 
+/// Execute a compiled flow with module-local composite ops installed in the operation catalog.
+pub async fn execute_flow_with_composites(
+    store: &FlowStore,
+    executor: &Executor,
+    session_id: &str,
+    ast: &DraftAst,
+    composites: &[CompositeOpDecl],
+    sink: &mut dyn AgentSink,
+) -> Result<FlowOutcome> {
+    let host = ExecutorHost::new_with_composites(executor, composites);
+    let mut bridge = SinkBridge { inner: sink };
+    flux_lang::runtime::execute_flow(store, &host, session_id, ast, &mut bridge).await
+}
+
 /// Resume a flow suspended on a top-level `await` — the engine wrapper over
 /// [`flux_lang::runtime::resume_flow`]. Binds `input` to the suspended `await` at `at` and continues
 /// from the next statement (the prefix is not re-run); the flow may suspend again or complete.
@@ -174,6 +196,23 @@ pub async fn resume_flow(
     flux_lang::runtime::resume_flow(store, &host, session_id, body, at, input, &mut bridge).await
 }
 
+/// Resume a flow with composite ops installed in the operation catalog.
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_flow_with_composites(
+    store: &FlowStore,
+    executor: &Executor,
+    session_id: &str,
+    body: &[flux_lang::ast::Node],
+    at: flux_lang::ast::NodeId,
+    input: flux_lang::ast::Value,
+    composites: &[CompositeOpDecl],
+    sink: &mut dyn AgentSink,
+) -> Result<FlowOutcome> {
+    let host = ExecutorHost::new_with_composites(executor, composites);
+    let mut bridge = SinkBridge { inner: sink };
+    flux_lang::runtime::resume_flow(store, &host, session_id, body, at, input, &mut bridge).await
+}
+
 /// Execute an optimizer [`flux_lang::ast::PhysicalPlan`] over a flow's top-level `body` — the engine
 /// wrapper over [`flux_lang::runtime::execute_plan`], adapting the executor/sink onto the
 /// interpreter's traits exactly as [`execute_flow`] does.
@@ -186,6 +225,21 @@ pub async fn execute_plan(
     sink: &mut dyn AgentSink,
 ) -> Result<FlowOutcome> {
     let host = ExecutorHost::new(executor);
+    let mut bridge = SinkBridge { inner: sink };
+    flux_lang::runtime::execute_plan(store, &host, session_id, body, plan, &mut bridge).await
+}
+
+/// Execute an optimizer plan with module-local composite ops installed in the operation catalog.
+pub async fn execute_plan_with_composites(
+    store: &FlowStore,
+    executor: &Executor,
+    session_id: &str,
+    body: &[flux_lang::ast::Node],
+    plan: &flux_lang::ast::PhysicalPlan,
+    composites: &[CompositeOpDecl],
+    sink: &mut dyn AgentSink,
+) -> Result<FlowOutcome> {
+    let host = ExecutorHost::new_with_composites(executor, composites);
     let mut bridge = SinkBridge { inner: sink };
     flux_lang::runtime::execute_plan(store, &host, session_id, body, plan, &mut bridge).await
 }
@@ -259,6 +313,72 @@ pub fn plan_risk(ast: &DraftAst, registry: &ToolRegistry) -> PlanRisk {
         }
     });
     risk
+}
+
+/// Like [`plan_risk`], but expands module-local composite ops so the preview includes their inner
+/// calls and transitive declared risk/effects.
+pub fn plan_risk_with_composites(
+    ast: &DraftAst,
+    registry: &ToolRegistry,
+    composites: &[CompositeOpDecl],
+) -> PlanRisk {
+    let mut risk = PlanRisk::default();
+    accumulate_risk(&ast.body, registry, composites, &mut Vec::new(), &mut risk);
+    risk
+}
+
+fn accumulate_risk(
+    body: &[Node],
+    registry: &ToolRegistry,
+    composites: &[CompositeOpDecl],
+    stack: &mut Vec<String>,
+    risk: &mut PlanRisk,
+) {
+    walk_calls(body, &mut |op, args| {
+        if !risk.ops.iter().any(|o| o == op) {
+            risk.ops.push(op.to_string());
+        }
+        if let Some(tool) = registry.get(op) {
+            let spec = tool.spec();
+            apply_risk(risk, spec.risk);
+            let intents = tool.intents(&literal_input(args, &spec.input_schema));
+            if intents.is_destructive() {
+                risk.destructive = true;
+            }
+            if intents.is_mutating() {
+                risk.mutating = true;
+            }
+            return;
+        }
+        let Some(composite) = composites.iter().find(|c| c.name == op) else {
+            return;
+        };
+        apply_risk(risk, composite.meta.risk);
+        if composite.meta.risk == Risk::Destructive {
+            risk.destructive = true;
+        }
+        if composite
+            .meta
+            .effects
+            .iter()
+            .any(|e| !matches!(e, flux_spec::Effect::Read))
+        {
+            risk.mutating = true;
+        }
+        if stack.contains(&composite.name) {
+            return;
+        }
+        stack.push(composite.name.clone());
+        accumulate_risk(&composite.body.body, registry, composites, stack, risk);
+        stack.pop();
+    });
+}
+
+fn apply_risk(risk: &mut PlanRisk, next: Risk) {
+    risk.max_risk = Some(match risk.max_risk {
+        Some(r) => r.max(next),
+        None => next,
+    });
 }
 
 /// Visit every `call` node reachable in `nodes` (recursing through binds, branches, loops, returns,
