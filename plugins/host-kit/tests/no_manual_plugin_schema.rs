@@ -22,7 +22,7 @@ use std::path::PathBuf;
 /// Plugins that have fully migrated to schemars-derived op schemas (D-36). Each is verified to
 /// contain no hand-written `so(...)` op schemas. Grow this set as more plugins migrate; a plugin
 /// must not be listed here until its `so` helper is deleted and all ops use `*_op_typed`.
-const MIGRATED_PLUGINS: &[&str] = &["homer", "gitlab"];
+const MIGRATED_PLUGINS: &[&str] = &["homer", "gitlab", "slack"];
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
@@ -50,11 +50,16 @@ fn no_hand_written_plugin_schema_remains() {
                 offenders.push(format!("{}:{}: {}", name, lineno + 1, trimmed));
                 continue;
             }
-            // A `so(...)` call passing a `json!` literal (the deprecated hand-written schema form).
-            if (trimmed.contains("so(") || line.contains("so("))
-                && (line.contains("json!(") || line.contains("json !("))
+            // A hand-written JSON Schema object literal — the deprecated form, whether passed
+            // through a `so(...)` helper (gitlab/homer-style) or inlined directly into
+            // `read_op`/`write_op` (slack-style `json!({"type":"object","properties":...})`).
+            // Flag any `json!(` literal that looks like a schema object (has `"type"` and
+            // `"object"`/`"properties"`), excluding the typed helpers.
+            if (line.contains("json!(") || line.contains("json !("))
                 && !line.contains("read_op_typed")
                 && !line.contains("write_op_typed")
+                && (line.contains("\"type\"") || line.contains("'type'"))
+                && (line.contains("\"object\"") || line.contains("\"properties\""))
             {
                 offenders.push(format!("{}:{}: {}", name, lineno + 1, trimmed));
             }

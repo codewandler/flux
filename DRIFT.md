@@ -209,3 +209,22 @@ overlap, and additionally by involving an extra number.
   `~/projects/fluxplane/fluxplane-plugins/gitlab/` Go source is a separate pass (lower risk than
   homer — D-14 already did the port; homer's gap was found because homer was audited, and gitlab
   deserves the same). Tracked in `.flux/plans/d36-plugin-schemars-parity-smoke.md`.
+
+### slack (D-36)
+
+- **Schemars migration complete** (30 ops). slack used a different hand-written shape than
+  gitlab/homer: it inlined `json!({"type":"object","properties":{...},"required":[...]})` directly
+  into `read_op`/`write_op` (no `so()` helper). All 30 inlined schemas replaced by schemars-derived
+  structs via `read_op_typed::<T>` / `write_op_typed::<T>`; handlers unchanged (schema-only,
+  `opt_str`/`Value` extraction stays, D-34 precedent). `slack` added to `MIGRATED_PLUGINS`.
+- **Guard strengthened:** `no_manual_plugin_schema` now flags **both** hand-written shapes —
+  `so(json!{...})` (gitlab/homer) and inline `json!({"type":"object",...})` (slack) — so a
+  regression in any migrated plugin is caught regardless of which form it used. Verified
+  failing-first for both shapes.
+- **Contract test:** `slack` `schema_contract::derived_schemas_match_legacy_contract` encodes the
+  pre-migration inline contract for all 30 ops and asserts the derived schema matches.
+- **`slack.channel.mark-read`** — op name has a hyphen; the struct is `ChannelMarkReadInput`
+  (hyphen stripped to a valid Rust ident). The JSON op name is unchanged.
+- **Fluxplane parity re-audit: deferred** (same as gitlab — D-14 ported the slack surface 5→30;
+  contract test locks flux's existing contracts; a fresh field-by-field re-audit against
+  `~/projects/fluxplane/fluxplane-plugins/slack/` is a separate pass).

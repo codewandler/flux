@@ -11,7 +11,262 @@
 //! host `blob_ref`, and the download ops stage the fetched bytes back into the blob store, returning a ref.
 
 use host_kit::*;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{json, Value};
+
+// ─── op input schemas (D-36) ───────────────────────────────────────────────
+// Each op's `input_schema` is schemars-derived (`host_kit::read_op_typed::<T>` /
+// `write_op_typed::<T>`) instead of an inline `json!({"type":"object",...})` literal,
+// so the schema cannot drift. The structs are schema-only: handlers keep their
+// existing `opt_str`/`Value` extraction (D-34 precedent).
+/// `slack.test`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct TestInput {}
+
+/// `slack.info`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct InfoInput {}
+
+/// `slack.message.send`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct MessageSendInput {
+    channel: String,
+    text: String,
+    thread_ts: Option<String>,
+    reply_broadcast: Option<bool>,
+}
+
+/// `slack.message.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct MessageListInput {
+    channel: String,
+    limit: Option<i64>,
+    cursor: Option<String>,
+    oldest: Option<String>,
+    latest: Option<String>,
+}
+
+/// `slack.message.edit`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct MessageEditInput {
+    r#ref: Option<String>,
+    channel: Option<String>,
+    ts: Option<String>,
+    text: String,
+}
+
+/// `slack.message.delete`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct MessageDeleteInput {
+    r#ref: Option<String>,
+    channel: Option<String>,
+    ts: Option<String>,
+}
+
+/// `slack.thread`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ThreadInput {
+    r#ref: Option<String>,
+    channel: Option<String>,
+    ts: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `slack.search`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct SearchInput {
+    query: String,
+    limit: Option<i64>,
+}
+
+/// `slack.mentions`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct MentionsInput {
+    user: Option<String>,
+    since: Option<String>,
+    limit: Option<i64>,
+    unhandled: Option<bool>,
+    max_thread: Option<i64>,
+    tickets: Option<bool>,
+    ticket_keys: Option<Vec<Value>>,
+}
+
+/// `slack.unreads`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct UnreadsInput {
+    channel: Option<String>,
+    since: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `slack.reaction.add`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ReactionAddInput {
+    r#ref: Option<String>,
+    channel: Option<String>,
+    ts: Option<String>,
+    emoji: String,
+}
+
+/// `slack.reaction.remove`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ReactionRemoveInput {
+    r#ref: Option<String>,
+    channel: Option<String>,
+    ts: Option<String>,
+    emoji: String,
+}
+
+/// `slack.channel.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ChannelListInput {}
+
+/// `slack.channel.join`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ChannelJoinInput {
+    channel: String,
+}
+
+/// `slack.channel.mark-read`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ChannelMarkReadInput {
+    r#ref: Option<String>,
+    channel: Option<String>,
+    ts: Option<String>,
+}
+
+/// `slack.file.upload`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct FileUploadInput {
+    channel: String,
+    blob_ref: String,
+    filename: Option<String>,
+    thread_ts: Option<String>,
+    initial_comment: Option<String>,
+    alt_text: Option<String>,
+}
+
+/// `slack.file.download`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct FileDownloadInput {
+    file_id: String,
+    filename: Option<String>,
+}
+
+/// `slack.download`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct DownloadInput {
+    file_id: String,
+    filename: Option<String>,
+}
+
+/// `slack.file.info`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct FileInfoInput {
+    file_id: String,
+}
+
+/// `slack.file.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct FileListInput {
+    channel: Option<String>,
+    user: Option<String>,
+    types: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `slack.file.delete`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct FileDeleteInput {
+    file_id: String,
+}
+
+/// `slack.bookmark.add`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct BookmarkAddInput {
+    channel: String,
+    title: String,
+    link: String,
+    emoji: Option<String>,
+}
+
+/// `slack.bookmark.edit`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct BookmarkEditInput {
+    channel: String,
+    bookmark_id: String,
+    title: Option<String>,
+    link: Option<String>,
+    emoji: Option<String>,
+}
+
+/// `slack.bookmark.delete`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct BookmarkDeleteInput {
+    channel: String,
+    bookmark_id: String,
+}
+
+/// `slack.bookmark.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct BookmarkListInput {
+    channel: String,
+}
+
+/// `slack.user.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct UserListInput {}
+
+/// `slack.presence.get`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PresenceGetInput {
+    user: Option<String>,
+}
+
+/// `slack.presence.set`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PresenceSetInput {
+    presence: String,
+}
+
+/// `slack.emoji.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct EmojiListInput {}
+
+/// `slack.index.build`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct IndexBuildInput {}
 
 fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("slack", "0.1.0")
@@ -44,349 +299,221 @@ fn manifest_builder() -> PluginBuilder {
         .datasource(ds("slack.users", "slack.user", "Slack workspace users."))
         // -- auth / identity ------------------------------------------------
         .operation(
-            read_op(
+            read_op_typed::<TestInput>(
                 "slack.test",
                 "Test Slack user and bot token authentication.",
-                json!({"type": "object", "properties": {}}),
             ),
             auth_test,
         )
         .operation(
-            read_op(
+            read_op_typed::<InfoInput>(
                 "slack.info",
                 "Show Slack token identity and workspace information.",
-                json!({"type": "object", "properties": {}}),
             ),
             auth_test,
         )
         // -- messages -------------------------------------------------------
         .operation(
-            write_op(
+            write_op_typed::<MessageSendInput>(
                 "slack.message.send",
                 "Send a message to a channel (channel id or DM channel; optionally as a thread reply).",
-                json!({"type": "object", "properties": {
-                    "channel": {"type": "string"},
-                    "text": {"type": "string"},
-                    "thread_ts": {"type": "string", "description": "reply in this thread"},
-                    "reply_broadcast": {"type": "boolean"}
-                }, "required": ["channel", "text"]}),
             ),
             message_send,
         )
         .operation(
-            read_op(
+            read_op_typed::<MessageListInput>(
                 "slack.message.list",
                 "Read recent messages from a channel (conversations.history); paginate with next_cursor.",
-                json!({"type": "object", "properties": {
-                    "channel": {"type": "string"},
-                    "limit": {"type": "integer", "description": "max messages (default 50)"},
-                    "cursor": {"type": "string"},
-                    "oldest": {"type": "string"},
-                    "latest": {"type": "string"}
-                }, "required": ["channel"]}),
             ),
             message_list,
         )
         .operation(
-            write_op(
+            write_op_typed::<MessageEditInput>(
                 "slack.message.edit",
                 "Edit a Slack message. Provide `ref` (permalink or channel:ts) OR `channel`+`ts`.",
-                json!({"type": "object", "properties": {
-                    "ref": {"type": "string"},
-                    "channel": {"type": "string"},
-                    "ts": {"type": "string"},
-                    "text": {"type": "string"}
-                }, "required": ["text"]}),
             ),
             message_edit,
         )
         .operation(
-            write_op(
+            write_op_typed::<MessageDeleteInput>(
                 "slack.message.delete",
                 "Delete a Slack message. Provide `ref` (permalink or channel:ts) OR `channel`+`ts`.",
-                json!({"type": "object", "properties": {
-                    "ref": {"type": "string"},
-                    "channel": {"type": "string"},
-                    "ts": {"type": "string"}
-                }}),
             ),
             message_delete,
         )
         .operation(
-            read_op(
+            read_op_typed::<ThreadInput>(
                 "slack.thread",
                 "View a Slack thread. Provide `ref` (permalink or channel:ts) OR `channel`+`ts`.",
-                json!({"type": "object", "properties": {
-                    "ref": {"type": "string"},
-                    "channel": {"type": "string"},
-                    "ts": {"type": "string", "description": "parent message timestamp"},
-                    "limit": {"type": "integer"}
-                }}),
             ),
             thread,
         )
         // -- search / mentions / unreads (user token) -----------------------
         .operation(
-            read_op(
+            read_op_typed::<SearchInput>(
                 "slack.search",
                 "Search Slack messages (search.messages; requires a user token).",
-                json!({"type": "object", "properties": {
-                    "query": {"type": "string"},
-                    "limit": {"type": "integer"}
-                }, "required": ["query"]}),
             ),
             search,
         )
         .operation(
-            read_op(
+            read_op_typed::<MentionsInput>(
                 "slack.mentions",
-                "Search Slack mentions of a user and classify whether each was handled (search.messages \
+                "Search Slack mentions of a user and classify whether each was handled (search.messages \\
                  + per-mention thread inspection; requires a user token).",
-                json!({"type": "object", "properties": {
-                    "user": {"type": "string", "description": "user id (U…/W…); defaults to the token identity"},
-                    "since": {"type": "string", "description": "time window such as 1h, 7d, or 14d; empty means today"},
-                    "limit": {"type": "integer"},
-                    "unhandled": {"type": "boolean", "description": "only return pending (unhandled) mentions"},
-                    "max_thread": {"type": "integer", "description": "max thread messages inspected for status classification (default 50)"},
-                    "tickets": {"type": "boolean", "description": "extract ticket references from mention text"},
-                    "ticket_keys": {"type": "array", "items": {"type": "string"}, "description": "optional ticket project keys to extract, e.g. DEV or TEL; empty extracts uppercase issue keys"}
-                }}),
             ),
             mentions,
         )
         .operation(
-            read_op(
+            read_op_typed::<UnreadsInput>(
                 "slack.unreads",
                 "List Slack conversations with recent (unread) messages (requires a user token).",
-                json!({"type": "object", "properties": {
-                    "channel": {"type": "string", "description": "optional channel id filter"},
-                    "since": {"type": "string", "description": "time window such as 1h, 7d, or 14d; defaults to 14d"},
-                    "limit": {"type": "integer", "description": "max messages fetched per channel"}
-                }}),
             ),
             unreads,
         )
         // -- reactions ------------------------------------------------------
         .operation(
-            write_op(
+            write_op_typed::<ReactionAddInput>(
                 "slack.reaction.add",
                 "Add a reaction to a Slack message. Provide `ref` OR `channel`+`ts`, plus `emoji`.",
-                json!({"type": "object", "properties": {
-                    "ref": {"type": "string"},
-                    "channel": {"type": "string"},
-                    "ts": {"type": "string"},
-                    "emoji": {"type": "string", "description": "emoji name without colons"}
-                }, "required": ["emoji"]}),
             ),
             reaction_add,
         )
         .operation(
-            write_op(
+            write_op_typed::<ReactionRemoveInput>(
                 "slack.reaction.remove",
                 "Remove a reaction from a Slack message. Provide `ref` OR `channel`+`ts`, plus `emoji`.",
-                json!({"type": "object", "properties": {
-                    "ref": {"type": "string"},
-                    "channel": {"type": "string"},
-                    "ts": {"type": "string"},
-                    "emoji": {"type": "string", "description": "emoji name without colons"}
-                }, "required": ["emoji"]}),
             ),
             reaction_remove,
         )
         // -- channels -------------------------------------------------------
         .operation(
-            read_op(
+            read_op_typed::<ChannelListInput>(
                 "slack.channel.list",
                 "List public and private channels (plus group/direct conversations) in the workspace.",
-                json!({"type": "object", "properties": {}}),
             ),
             channel_list,
         )
         .operation(
-            write_op(
+            write_op_typed::<ChannelJoinInput>(
                 "slack.channel.join",
                 "Join a Slack public channel.",
-                json!({"type": "object", "properties": {
-                    "channel": {"type": "string"}
-                }, "required": ["channel"]}),
             ),
             channel_join,
         )
         .operation(
-            write_op(
+            write_op_typed::<ChannelMarkReadInput>(
                 "slack.channel.mark-read",
                 "Mark a Slack channel read through a timestamp. Provide `ref` OR `channel`+`ts`.",
-                json!({"type": "object", "properties": {
-                    "ref": {"type": "string"},
-                    "channel": {"type": "string"},
-                    "ts": {"type": "string"}
-                }}),
             ),
             channel_mark,
         )
         // -- files (blobs) --------------------------------------------------
         .operation(
-            write_op(
+            write_op_typed::<FileUploadInput>(
                 "slack.file.upload",
                 "Upload a file to a Slack channel, DM, or thread. Bytes come from a host `blob_ref`.",
-                json!({"type": "object", "properties": {
-                    "channel": {"type": "string"},
-                    "blob_ref": {"type": "string", "description": "host blob ref holding the file bytes"},
-                    "filename": {"type": "string"},
-                    "thread_ts": {"type": "string"},
-                    "initial_comment": {"type": "string"},
-                    "alt_text": {"type": "string"}
-                }, "required": ["channel", "blob_ref"]}),
             ),
             file_upload,
         )
         .operation(
-            write_op(
+            write_op_typed::<FileDownloadInput>(
                 "slack.file.download",
                 "Download a Slack file to a host blob; returns the `blob_ref`.",
-                json!({"type": "object", "properties": {
-                    "file_id": {"type": "string"},
-                    "filename": {"type": "string"}
-                }, "required": ["file_id"]}),
             ),
             file_download,
         )
         .operation(
-            write_op(
+            write_op_typed::<DownloadInput>(
                 "slack.download",
                 "Download a Slack file to a host blob; returns the `blob_ref`.",
-                json!({"type": "object", "properties": {
-                    "file_id": {"type": "string"},
-                    "filename": {"type": "string"}
-                }, "required": ["file_id"]}),
             ),
             file_download,
         )
         .operation(
-            read_op(
+            read_op_typed::<FileInfoInput>(
                 "slack.file.info",
                 "Show Slack file information.",
-                json!({"type": "object", "properties": {
-                    "file_id": {"type": "string"}
-                }, "required": ["file_id"]}),
             ),
             file_info,
         )
         .operation(
-            read_op(
+            read_op_typed::<FileListInput>(
                 "slack.file.list",
                 "List Slack files (optionally filtered by channel/user/type).",
-                json!({"type": "object", "properties": {
-                    "channel": {"type": "string"},
-                    "user": {"type": "string"},
-                    "types": {"type": "string"},
-                    "limit": {"type": "integer"}
-                }}),
             ),
             file_list,
         )
         .operation(
-            write_op(
+            write_op_typed::<FileDeleteInput>(
                 "slack.file.delete",
                 "Delete a Slack file.",
-                json!({"type": "object", "properties": {
-                    "file_id": {"type": "string"}
-                }, "required": ["file_id"]}),
             ),
             file_delete,
         )
         // -- bookmarks ------------------------------------------------------
         .operation(
-            write_op(
+            write_op_typed::<BookmarkAddInput>(
                 "slack.bookmark.add",
                 "Add a Slack channel bookmark.",
-                json!({"type": "object", "properties": {
-                    "channel": {"type": "string"},
-                    "title": {"type": "string"},
-                    "link": {"type": "string"},
-                    "emoji": {"type": "string"}
-                }, "required": ["channel", "title", "link"]}),
             ),
             bookmark_add,
         )
         .operation(
-            write_op(
+            write_op_typed::<BookmarkEditInput>(
                 "slack.bookmark.edit",
                 "Edit a Slack channel bookmark.",
-                json!({"type": "object", "properties": {
-                    "channel": {"type": "string"},
-                    "bookmark_id": {"type": "string"},
-                    "title": {"type": "string"},
-                    "link": {"type": "string"},
-                    "emoji": {"type": "string"}
-                }, "required": ["channel", "bookmark_id"]}),
             ),
             bookmark_edit,
         )
         .operation(
-            write_op(
+            write_op_typed::<BookmarkDeleteInput>(
                 "slack.bookmark.delete",
                 "Delete a Slack channel bookmark.",
-                json!({"type": "object", "properties": {
-                    "channel": {"type": "string"},
-                    "bookmark_id": {"type": "string"}
-                }, "required": ["channel", "bookmark_id"]}),
             ),
             bookmark_delete,
         )
         .operation(
-            read_op(
+            read_op_typed::<BookmarkListInput>(
                 "slack.bookmark.list",
                 "List Slack channel bookmarks.",
-                json!({"type": "object", "properties": {
-                    "channel": {"type": "string"}
-                }, "required": ["channel"]}),
             ),
             bookmark_list,
         )
         // -- users / presence / emoji ---------------------------------------
         .operation(
-            read_op(
+            read_op_typed::<UserListInput>(
                 "slack.user.list",
                 "List users in the workspace.",
-                json!({"type": "object", "properties": {}}),
             ),
             user_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<PresenceGetInput>(
                 "slack.presence.get",
                 "Get Slack user presence.",
-                json!({"type": "object", "properties": {
-                    "user": {"type": "string", "description": "user id; empty asks for the token identity"}
-                }}),
             ),
             presence_get,
         )
         .operation(
-            write_op(
+            write_op_typed::<PresenceSetInput>(
                 "slack.presence.set",
                 "Set Slack user presence (auto|away; requires a user token).",
-                json!({"type": "object", "properties": {
-                    "presence": {"type": "string", "enum": ["auto", "away"]}
-                }, "required": ["presence"]}),
             ),
             presence_set,
         )
         .operation(
-            read_op(
+            read_op_typed::<EmojiListInput>(
                 "slack.emoji.list",
                 "List Slack custom emoji.",
-                json!({"type": "object", "properties": {}}),
             ),
             emoji_list,
         )
         // -- index ----------------------------------------------------------
         .operation(
-            read_op(
+            read_op_typed::<IndexBuildInput>(
                 "slack.index.build",
                 "Build the Slack channel and user reverse-lookup indexes.",
-                json!({"type": "object", "properties": {}}),
             ),
             index_build,
         )
@@ -2451,5 +2578,342 @@ mod tests {
             .datasources
             .iter()
             .all(|d| d.capabilities.iter().any(|c| c == "index")));
+    }
+}
+
+// ===========================================================================
+// D-36: schema-derivation contract test (slack).
+// Each op's `input_schema` is schemars-derived (`read_op_typed::<T>` /
+// `write_op_typed::<T>`) instead of an inline `json!({"type":"object",...})`
+// literal. Asserts the derived schema's fields/required/base-types match the
+// legacy inline contract (transcribed pre-migration). A change here is a real
+// contract change.
+// ===========================================================================
+#[cfg(test)]
+mod schema_contract {
+    use super::*;
+    use std::collections::BTreeMap;
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Kind {
+        Str,
+        Int,
+        Bool,
+        ArrayAny,
+    }
+    #[derive(Clone)]
+    struct Prop {
+        name: &'static str,
+        kind: Kind,
+    }
+    struct OpContract {
+        props: Vec<Prop>,
+        required: Vec<&'static str>,
+    }
+    fn p(name: &'static str, kind: Kind) -> Prop {
+        Prop { name, kind }
+    }
+    fn c(props: Vec<Prop>, required: Vec<&'static str>) -> OpContract {
+        OpContract { props, required }
+    }
+    fn contracts() -> Vec<(&'static str, OpContract)> {
+        vec![
+            ("slack.test", c(vec![], vec![])),
+            ("slack.info", c(vec![], vec![])),
+            (
+                "slack.message.send",
+                c(
+                    vec![
+                        p("channel", Kind::Str),
+                        p("text", Kind::Str),
+                        p("thread_ts", Kind::Str),
+                        p("reply_broadcast", Kind::Bool),
+                    ],
+                    vec!["channel", "text"],
+                ),
+            ),
+            (
+                "slack.message.list",
+                c(
+                    vec![
+                        p("channel", Kind::Str),
+                        p("limit", Kind::Int),
+                        p("cursor", Kind::Str),
+                        p("oldest", Kind::Str),
+                        p("latest", Kind::Str),
+                    ],
+                    vec!["channel"],
+                ),
+            ),
+            (
+                "slack.message.edit",
+                c(
+                    vec![
+                        p("ref", Kind::Str),
+                        p("channel", Kind::Str),
+                        p("ts", Kind::Str),
+                        p("text", Kind::Str),
+                    ],
+                    vec!["text"],
+                ),
+            ),
+            (
+                "slack.message.delete",
+                c(
+                    vec![
+                        p("ref", Kind::Str),
+                        p("channel", Kind::Str),
+                        p("ts", Kind::Str),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "slack.thread",
+                c(
+                    vec![
+                        p("ref", Kind::Str),
+                        p("channel", Kind::Str),
+                        p("ts", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "slack.search",
+                c(
+                    vec![p("query", Kind::Str), p("limit", Kind::Int)],
+                    vec!["query"],
+                ),
+            ),
+            (
+                "slack.mentions",
+                c(
+                    vec![
+                        p("user", Kind::Str),
+                        p("since", Kind::Str),
+                        p("limit", Kind::Int),
+                        p("unhandled", Kind::Bool),
+                        p("max_thread", Kind::Int),
+                        p("tickets", Kind::Bool),
+                        p("ticket_keys", Kind::ArrayAny),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "slack.unreads",
+                c(
+                    vec![
+                        p("channel", Kind::Str),
+                        p("since", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "slack.reaction.add",
+                c(
+                    vec![
+                        p("ref", Kind::Str),
+                        p("channel", Kind::Str),
+                        p("ts", Kind::Str),
+                        p("emoji", Kind::Str),
+                    ],
+                    vec!["emoji"],
+                ),
+            ),
+            (
+                "slack.reaction.remove",
+                c(
+                    vec![
+                        p("ref", Kind::Str),
+                        p("channel", Kind::Str),
+                        p("ts", Kind::Str),
+                        p("emoji", Kind::Str),
+                    ],
+                    vec!["emoji"],
+                ),
+            ),
+            ("slack.channel.list", c(vec![], vec![])),
+            (
+                "slack.channel.join",
+                c(vec![p("channel", Kind::Str)], vec!["channel"]),
+            ),
+            (
+                "slack.channel.mark-read",
+                c(
+                    vec![
+                        p("ref", Kind::Str),
+                        p("channel", Kind::Str),
+                        p("ts", Kind::Str),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "slack.file.upload",
+                c(
+                    vec![
+                        p("channel", Kind::Str),
+                        p("blob_ref", Kind::Str),
+                        p("filename", Kind::Str),
+                        p("thread_ts", Kind::Str),
+                        p("initial_comment", Kind::Str),
+                        p("alt_text", Kind::Str),
+                    ],
+                    vec!["channel", "blob_ref"],
+                ),
+            ),
+            (
+                "slack.file.download",
+                c(
+                    vec![p("file_id", Kind::Str), p("filename", Kind::Str)],
+                    vec!["file_id"],
+                ),
+            ),
+            (
+                "slack.download",
+                c(
+                    vec![p("file_id", Kind::Str), p("filename", Kind::Str)],
+                    vec!["file_id"],
+                ),
+            ),
+            (
+                "slack.file.info",
+                c(vec![p("file_id", Kind::Str)], vec!["file_id"]),
+            ),
+            (
+                "slack.file.list",
+                c(
+                    vec![
+                        p("channel", Kind::Str),
+                        p("user", Kind::Str),
+                        p("types", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "slack.file.delete",
+                c(vec![p("file_id", Kind::Str)], vec!["file_id"]),
+            ),
+            (
+                "slack.bookmark.add",
+                c(
+                    vec![
+                        p("channel", Kind::Str),
+                        p("title", Kind::Str),
+                        p("link", Kind::Str),
+                        p("emoji", Kind::Str),
+                    ],
+                    vec!["channel", "title", "link"],
+                ),
+            ),
+            (
+                "slack.bookmark.edit",
+                c(
+                    vec![
+                        p("channel", Kind::Str),
+                        p("bookmark_id", Kind::Str),
+                        p("title", Kind::Str),
+                        p("link", Kind::Str),
+                        p("emoji", Kind::Str),
+                    ],
+                    vec!["channel", "bookmark_id"],
+                ),
+            ),
+            (
+                "slack.bookmark.delete",
+                c(
+                    vec![p("channel", Kind::Str), p("bookmark_id", Kind::Str)],
+                    vec!["channel", "bookmark_id"],
+                ),
+            ),
+            (
+                "slack.bookmark.list",
+                c(vec![p("channel", Kind::Str)], vec!["channel"]),
+            ),
+            ("slack.user.list", c(vec![], vec![])),
+            ("slack.presence.get", c(vec![p("user", Kind::Str)], vec![])),
+            (
+                "slack.presence.set",
+                c(vec![p("presence", Kind::Str)], vec!["presence"]),
+            ),
+            ("slack.emoji.list", c(vec![], vec![])),
+            ("slack.index.build", c(vec![], vec![])),
+        ]
+    }
+    fn kind_of(node: &Value) -> Kind {
+        let t = node.get("type");
+        if let Some(arr) = t.and_then(|v| v.as_array()) {
+            let first = arr
+                .iter()
+                .find(|v| v.as_str() != Some("null"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("null");
+            return base_kind(first);
+        }
+        base_kind(t.and_then(|v| v.as_str()).unwrap_or(""))
+    }
+    fn base_kind(t: &str) -> Kind {
+        match t {
+            "integer" => Kind::Int,
+            "boolean" => Kind::Bool,
+            "array" => Kind::ArrayAny,
+            "string" => Kind::Str,
+            other => panic!("unsupported property type: {other}"),
+        }
+    }
+    fn assert_contract(op_name: &str, schema: &Value, contract: &OpContract) {
+        assert_eq!(schema["type"], "object", "{op_name}: root type");
+        let props_obj = schema.get("properties").and_then(|v| v.as_object());
+        let mut got: BTreeMap<&str, Kind> = BTreeMap::new();
+        if let Some(props) = props_obj {
+            for (k, v) in props {
+                got.insert(k.as_str(), kind_of(v));
+            }
+        }
+        let want: BTreeMap<&str, Kind> = contract
+            .props
+            .iter()
+            .map(|Prop { name, kind }| (*name, kind.clone()))
+            .collect();
+        assert_eq!(got.len(), want.len(), "{op_name}: property count");
+        for Prop { name, kind } in &contract.props {
+            let got_kind = got
+                .get(*name)
+                .unwrap_or_else(|| panic!("{op_name}: missing property `{name}`"));
+            assert_eq!(got_kind, kind, "{op_name}: property `{name}` kind");
+        }
+        let req: Vec<&str> = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let mut req_set: Vec<&str> = req.clone();
+        req_set.sort();
+        let mut want_req: Vec<&str> = contract.required.clone();
+        want_req.sort();
+        assert_eq!(req_set, want_req, "{op_name}: required set");
+    }
+    #[test]
+    fn derived_schemas_match_legacy_contract() {
+        let ops = contracts();
+        let manifest = manifest_builder().build().manifest();
+        let by_name: BTreeMap<&str, &OperationSpec> = manifest
+            .operations
+            .iter()
+            .map(|o| (o.name.as_str(), o))
+            .collect();
+        assert_eq!(by_name.len(), ops.len(), "op count changed");
+        for (name, contract) in &ops {
+            let spec = by_name
+                .get(*name)
+                .unwrap_or_else(|| panic!("missing op {name}"));
+            assert_contract(name, &spec.input_schema, contract);
+        }
     }
 }

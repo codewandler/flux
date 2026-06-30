@@ -25,6 +25,12 @@ All notable changes to this project are documented in this file. The format is b
   legacy `so(...)` contract (fields / required / types); `gitlab` added to the
   `no_manual_plugin_schema` guard. Fluxplane parity re-audit deferred (D-14 ported the surface).
 
+- **slack schemars op schemas (D-36).** All 30 slack op `input_schema`s are now schemars-derived
+  (slack used inlined `json!({"type":"object",...})`, not a `so()` helper). The
+  `no_manual_plugin_schema` guard now flags **both** hand-written shapes (`so(json!{...})` and
+  inline `json!({"type":"object",...})`), verified failing-first for both. Contract test locks
+  all 30 schemas. Fluxplane parity re-audit deferred (D-14 ported the surface).
+
 - **Plugin-side schemars op schemas — D-36 (in-progress).** `host-kit` now derives a plugin
   op's `input_schema` from a typed struct via `read_op_typed::<T>` / `write_op_typed::<T>`
   (+ `op_input_schema::<T>()`, a `schemars` re-export), the plugin-side counterpart of D-34.
