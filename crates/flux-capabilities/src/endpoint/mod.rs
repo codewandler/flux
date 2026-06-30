@@ -12,7 +12,8 @@ mod broker;
 mod host_caps;
 
 pub use broker::{
-    EndpointBroker, HostProviderInvoker, PluginRegistry, ProviderEntry, ProviderInvoker,
+    CredentialReader, CrossPluginApprover, CrossPluginAudit, CrossPluginGrants, EndpointBroker,
+    HostCredentialReader, HostProviderInvoker, PluginRegistry, ProviderEntry, ProviderInvoker,
 };
 pub use host_caps::EndpointBrokerHostCaps;
 

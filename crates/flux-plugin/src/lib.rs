@@ -243,6 +243,14 @@ pub struct PluginCapabilities {
     /// host "what endpoints exist for product X?" if its manifest set this.
     #[serde(default)]
     pub discover: bool,
+    /// Whether the `credential` host capability (D-27) is permitted: materializing a credential
+    /// *reference* into the raw secret value, delivered to the trusted plugin binary for in-band-auth
+    /// raw-socket protocols (e.g. Postgres SCRAM needs the password). Deny-by-default — the host
+    /// refuses `credential` unless this plugin's manifest set it. The value is registered with the
+    /// [`Redactor`](flux_secret::Redactor) so it never leaks into model-visible output, and is NEVER
+    /// returned through any discovery/endpoint path — only this explicit, audited capability.
+    #[serde(default)]
+    pub credential: bool,
 }
 
 /// What a plugin advertises about itself — the single source of truth the host introspects (ops,
@@ -414,18 +422,67 @@ pub trait HostCapabilities: Send + Sync {
 pub trait ReferenceResolver: Send + Sync {
     /// Resolve an endpoint reference to its runtime form (absolute URL + any injected auth headers).
     /// Host-only — the result has no model-visible serializer.
+    ///
+    /// This is the consumer-agnostic form. On the IO path prefer
+    /// [`resolve_endpoint_for`](Self::resolve_endpoint_for): when a discovered endpoint's credential is
+    /// owned by a *different* plugin, injecting it into the request on the caller's behalf is exactly a
+    /// cross-plugin credential *use*, which must be gated against the consuming plugin.
     async fn resolve_endpoint(
         &self,
         reference: &str,
     ) -> std::result::Result<flux_secret::endpoint::ResolvedEndpoint, String>;
 
+    /// Resolve an endpoint reference **on behalf of `consumer`** (the plugin doing the IO). Identical
+    /// to [`resolve_endpoint`](Self::resolve_endpoint), except a discovered endpoint's `credential_ref`
+    /// is materialized as `consumer` — so when that credential is owned by another plugin, the
+    /// deny-by-default cross-plugin gate (grant + first-use approval + audit) fires before the host
+    /// injects it. The default ignores the consumer and delegates to `resolve_endpoint`; the L5 broker
+    /// overrides it.
+    async fn resolve_endpoint_for(
+        &self,
+        _consumer: &str,
+        reference: &str,
+    ) -> std::result::Result<flux_secret::endpoint::ResolvedEndpoint, String> {
+        self.resolve_endpoint(reference).await
+    }
+
     /// Materialize a credential reference to secret material — for raw-socket in-band-auth protocols
     /// (e.g. Postgres SCRAM) that must speak the handshake themselves. Host-side; the value is
     /// delivered only to the trusted plugin binary, never surfaced to the model.
+    ///
+    /// This is the consumer-agnostic form (no cross-plugin gate). Prefer
+    /// [`resolve_credential_for`](Self::resolve_credential_for) on the IO path so the broker can
+    /// enforce the deny-by-default cross-plugin grant against the *consuming* plugin.
     async fn resolve_credential(
         &self,
         reference: &flux_secret::Ref,
     ) -> std::result::Result<flux_secret::Material, String>;
+
+    /// Materialize a credential reference **on behalf of `consumer`** (the plugin requesting it). When
+    /// the credential is owned by a *different* plugin (a cross-plugin `Kubernetes`/`Plugin` scheme
+    /// ref), the resolver gates the resolution against the operator's cross-plugin grant for the
+    /// `(consumer, provider)` pair, an optional first-use approval, and an audit record. The default
+    /// implementation ignores the consumer and delegates to [`resolve_credential`](Self::resolve_credential)
+    /// — overridden by the L5 broker, which alone knows the provider graph and the grants.
+    async fn resolve_credential_for(
+        &self,
+        _consumer: &str,
+        reference: &flux_secret::Ref,
+    ) -> std::result::Result<flux_secret::Material, String> {
+        self.resolve_credential(reference).await
+    }
+
+    /// The credential *reference* (a location, never a value) attached to an endpoint reference, for
+    /// the `credential`-by-`endpoint_ref` path. The default has no endpoint registry and errors;
+    /// the L5 broker overrides it (looking the record up in the [`EndpointRegistry`]).
+    async fn credential_ref_for_endpoint(
+        &self,
+        reference: &str,
+    ) -> std::result::Result<flux_secret::Ref, String> {
+        Err(format!(
+            "this resolver cannot map endpoint `{reference}` to a credential reference"
+        ))
+    }
 }
 
 /// Denies every host-capability callback (the default for `call`). A plugin that needs callbacks
@@ -450,6 +507,15 @@ pub trait EgressAudit: Send + Sync {
     fn record_private_admit(&self, caller: &str, host: &str, grant_source: &str);
 }
 
+/// A sink for secret values the host materializes at runtime (the `credential` capability path).
+/// Registering a value here ensures it is scrubbed from any model-visible output. The concrete
+/// implementation lives at a surface (L6), backed by the executor's [`Redactor`](flux_secret::Redactor);
+/// a host with no sink installed simply hands the value to the trusted plugin without registration.
+pub trait SecretSink: Send + Sync {
+    /// Register `value` as a known secret so it is redacted from captured tool output and logs.
+    fn register_secret(&self, value: &str);
+}
+
 /// Host capabilities backed by the guarded [`System`](flux_system::System): `process.run` (argv
 /// only), `http.do` (GET, loopback/private blocked unless allowed), and `secret` (env refs). This
 /// is the bridge that keeps plugin IO inside the same safety boundary as the agent's own tools.
@@ -472,6 +538,25 @@ pub struct SystemHostCaps {
     grant_source: String,
     /// Optional egress-audit hook: fires when a private host is admitted under a scoped grant.
     audit: Option<Arc<dyn EgressAudit>>,
+    /// Optional reference resolver (the L5 endpoint broker, injected as a trait object). When present,
+    /// a plugin op may pass an `endpoint_ref` to `http.do`/`conn.dial` instead of a URL/host:port, and
+    /// the host alone turns it into a connection + injected credentials — the plugin and the model
+    /// never see a resolved URL-with-credentials. Also backs the gated `credential` capability.
+    ///
+    /// LIFETIME: the resolver is the broker, which holds the `PluginRegistry`, whose entries' caps
+    /// transitively hold *this* `SystemHostCaps` → a strong `Arc` cycle. This is intentional and kept
+    /// simple: the broker/registry/caps form a **session-lived** object graph torn down at process
+    /// exit. It is not a per-request leak (the graph is built once at startup), so a strong `Arc` is
+    /// fine; engineering a `Weak` back-edge here would add complexity for no practical benefit.
+    resolver: Option<Arc<dyn ReferenceResolver>>,
+    /// The consumer plugin's name passed to the resolver on the cross-plugin credential path, so the
+    /// broker can gate a `(consumer, provider)` resolution. Defaults to [`caller`](Self::caller).
+    consumer: String,
+    /// Optional sink for credentials materialized on the `credential` capability path: the host hands
+    /// the raw value to the trusted plugin binary, and registers it here so it is scrubbed from any
+    /// model-visible output. Backed at the surface by the same [`Redactor`](flux_secret::Redactor) the
+    /// executor redacts with.
+    secret_sink: Option<Arc<dyn SecretSink>>,
     /// Open `conn.dial` connections for this call scope, keyed by an opaque id. A tokio mutex so a
     /// `conn.read`/`write` can hold the stream across its await without making the guard non-Send.
     conns: tokio::sync::Mutex<std::collections::HashMap<u64, flux_system::net::DialStream>>,
@@ -500,6 +585,9 @@ impl SystemHostCaps {
             caller: "plugin".to_string(),
             grant_source: "config:plugin".to_string(),
             audit: None,
+            resolver: None,
+            consumer: "plugin".to_string(),
+            secret_sink: None,
             conns: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             next_conn: std::sync::atomic::AtomicU64::new(1),
             blobs: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -539,6 +627,7 @@ impl SystemHostCaps {
         if !m.name.is_empty() {
             self.caller = m.name.clone();
             self.grant_source = format!("config:plugin/{}", m.name);
+            self.consumer = m.name.clone();
         }
         self
     }
@@ -547,6 +636,22 @@ impl SystemHostCaps {
     /// moment it lets a request to a private/internal host through under a scoped grant.
     pub fn with_egress_audit(mut self, audit: Arc<dyn EgressAudit>) -> Self {
         self.audit = Some(audit);
+        self
+    }
+
+    /// Inject the [`ReferenceResolver`] (the L5 endpoint broker). With a resolver installed, a plugin
+    /// op may pass an `endpoint_ref` (to `http.do`/`conn.dial`) and use the gated `credential`
+    /// capability; without one, those paths return a clear "no resolver" error and the legacy
+    /// URL-based paths are unaffected. See the field doc for the (intentional) session-lived Arc cycle.
+    pub fn with_resolver(mut self, resolver: Arc<dyn ReferenceResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
+    }
+
+    /// Install a [`SecretSink`] so credentials materialized on the `credential` capability path are
+    /// registered with the executor's redactor (scrubbed from any model-visible output).
+    pub fn with_secret_sink(mut self, sink: Arc<dyn SecretSink>) -> Self {
+        self.secret_sink = Some(sink);
         self
     }
 
@@ -859,13 +964,75 @@ impl HostCapabilities for SystemHostCaps {
                 let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 self.resolve_endpoint(name).map(|url| json!({ "url": url }))
             }
+            "credential" => {
+                // The in-band-auth path for raw-socket protocols (e.g. Postgres SCRAM needs the
+                // password value). DENY-BY-DEFAULT: only available if the plugin's manifest granted
+                // `credential`. The materialized value is delivered to the (trusted) plugin binary,
+                // registered with the redactor so it never leaks into model-visible output, and is
+                // NEVER returned through any discovery/endpoint path — only this explicit capability.
+                if !self.grants.credential {
+                    return Err("credential not granted to this plugin".into());
+                }
+                let resolver = self
+                    .resolver
+                    .as_ref()
+                    .ok_or("credential requires a reference resolver (none installed)")?;
+                // Either a direct `credential_ref` (string or object), or an `endpoint_ref` whose
+                // record carries a `credential_ref` to materialize.
+                let reference = if let Some(cr) = payload.get("credential_ref") {
+                    parse_credential_ref(cr)?
+                } else if let Some(endpoint_ref) =
+                    payload.get("endpoint_ref").and_then(|v| v.as_str())
+                {
+                    resolver.credential_ref_for_endpoint(endpoint_ref).await?
+                } else {
+                    return Err(
+                        "credential: `credential_ref` or `endpoint_ref` required".to_string()
+                    );
+                };
+                let material = resolver
+                    .resolve_credential_for(&self.consumer, &reference)
+                    .await?;
+                // Register the value with the redactor (if a sink is installed) so it is scrubbed
+                // from any captured/model-visible output even though the trusted plugin receives it.
+                if let Some(sink) = &self.secret_sink {
+                    sink.register_secret(&material.value);
+                }
+                Ok(json!({ "value": material.value }))
+            }
             "http.do" => {
                 if !self.grants.http {
                     return Err("http.do not granted to this plugin".into());
                 }
-                let raw = payload.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                let mut url = guard_http_url(raw, &self.private_net_allow())?;
-                self.ensure_http_host_allowed(&url)?;
+                // Ref-based IO (D-27): when the plugin passes an `endpoint_ref`, the host resolves it
+                // to an absolute URL + injected auth headers — the plugin (and the model) never see the
+                // URL or the credential. The composed URL still runs through the SAME egress guard +
+                // host allow-list as the legacy `url` path, so SSRF/private-net rules still apply.
+                let mut ref_injected: Vec<(String, String)> = Vec::new();
+                let mut url = if let Some(endpoint_ref) =
+                    payload.get("endpoint_ref").and_then(|v| v.as_str())
+                {
+                    let resolver = self.resolver.as_ref().ok_or(
+                        "http.do: endpoint_ref requires a reference resolver (none installed)",
+                    )?;
+                    // Resolve on behalf of THIS plugin (the real consumer): if the endpoint's
+                    // credential is owned by another plugin, host-injecting it is a cross-plugin use
+                    // and the broker's deny-by-default gate fires against `self.consumer`.
+                    let resolved = resolver
+                        .resolve_endpoint_for(&self.consumer, endpoint_ref)
+                        .await?;
+                    let path = payload.get("path").and_then(|v| v.as_str());
+                    let composed = compose_url(&resolved.url, path)?;
+                    let url = guard_http_url(&composed, &self.private_net_allow())?;
+                    self.ensure_http_host_allowed(&url)?;
+                    ref_injected = resolved.injected_headers;
+                    url
+                } else {
+                    let raw = payload.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                    let url = guard_http_url(raw, &self.private_net_allow())?;
+                    self.ensure_http_host_allowed(&url)?;
+                    url
+                };
                 // The request is admitted. If the (now-allowed) host is private/internal, the scoped
                 // grant just let through what the bare SSRF guard would refuse — audit it.
                 if let Some(host) = url.host_str() {
@@ -892,6 +1059,12 @@ impl HostCapabilities for SystemHostCaps {
                             req = req.header(k.as_str(), s);
                         }
                     }
+                }
+                // Host-injected auth from the resolved endpoint (the `endpoint_ref` path): applied
+                // host-side BEFORE the legacy `auth_purpose` injection, so a ref-resolved credential
+                // reaches the wire without the plugin ever holding the value.
+                for (name, value) in ref_injected {
+                    req = req.header(name.as_str(), value);
                 }
                 match inject {
                     AuthInjection::None | AuthInjection::Query { .. } => {}
@@ -932,33 +1105,52 @@ impl HostCapabilities for SystemHostCaps {
                 Ok(json!({ "status": status, "body": body }))
             }
             "conn.dial" => {
-                let kind = payload
-                    .get("kind")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("tcp");
-                let target = match kind {
-                    "tcp" => {
-                        let host = payload
-                            .get("host")
-                            .and_then(|v| v.as_str())
-                            .ok_or("conn.dial: `host` required for tcp")?
-                            .to_string();
-                        let port = payload
-                            .get("port")
-                            .and_then(|v| v.as_u64())
-                            .ok_or("conn.dial: `port` required for tcp")?
-                            as u16;
-                        flux_system::net::DialTarget::Tcp { host, port }
+                // Ref-based dial (D-27): when the plugin passes an `endpoint_ref`, the host resolves
+                // it and takes host:port from the resolved URL — the plugin passes the ref, not the
+                // host:port. The resolved target still runs through the same `dial_scoped` guard +
+                // grant check below.
+                let target = if let Some(endpoint_ref) =
+                    payload.get("endpoint_ref").and_then(|v| v.as_str())
+                {
+                    let resolver = self.resolver.as_ref().ok_or(
+                        "conn.dial: endpoint_ref requires a reference resolver (none installed)",
+                    )?;
+                    // Resolve on behalf of THIS plugin (the real consumer) — same cross-plugin gating
+                    // rationale as the `http.do` path (the resolved URL's host:port is what we dial;
+                    // any cross-plugin credential on the record is gated against `self.consumer`).
+                    let resolved = resolver
+                        .resolve_endpoint_for(&self.consumer, endpoint_ref)
+                        .await?;
+                    dial_target_from_url(&resolved.url)?
+                } else {
+                    let kind = payload
+                        .get("kind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("tcp");
+                    match kind {
+                        "tcp" => {
+                            let host = payload
+                                .get("host")
+                                .and_then(|v| v.as_str())
+                                .ok_or("conn.dial: `host` required for tcp")?
+                                .to_string();
+                            let port = payload
+                                .get("port")
+                                .and_then(|v| v.as_u64())
+                                .ok_or("conn.dial: `port` required for tcp")?
+                                as u16;
+                            flux_system::net::DialTarget::Tcp { host, port }
+                        }
+                        "unix" => {
+                            let path = payload
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .ok_or("conn.dial: `path` required for unix")?
+                                .to_string();
+                            flux_system::net::DialTarget::Unix { path }
+                        }
+                        other => return Err(format!("conn.dial: unknown kind `{other}`")),
                     }
-                    "unix" => {
-                        let path = payload
-                            .get("path")
-                            .and_then(|v| v.as_str())
-                            .ok_or("conn.dial: `path` required for unix")?
-                            .to_string();
-                        flux_system::net::DialTarget::Unix { path }
-                    }
-                    other => return Err(format!("conn.dial: unknown kind `{other}`")),
                 };
                 let tstr = conn_target_str(&target);
                 if !conn_granted(&self.grants.conn, &tstr) {
@@ -1135,6 +1327,48 @@ fn truncate_on_char_boundary(mut s: String, max: usize) -> String {
 /// coverage), the same SSRF policy the agent's own `web_fetch` uses.
 fn guard_http_url(raw: &str, allow: &PrivateNetAllow) -> std::result::Result<url::Url, String> {
     flux_system::net::guard_url_scoped(raw, allow).map_err(|e| e.to_string())
+}
+
+/// Compose an absolute request URL from a resolved base and an optional plugin-supplied `path`.
+/// The base is the host-resolved endpoint URL (already credential-free); `path` joins onto it
+/// (relative-resolved against the base, so a base `…/v1/` + path `query` → `…/v1/query`). A `None`
+/// or empty path returns the base unchanged.
+fn compose_url(base: &str, path: Option<&str>) -> std::result::Result<String, String> {
+    match path {
+        None | Some("") => Ok(base.to_string()),
+        Some(p) => {
+            let base = url::Url::parse(base).map_err(|e| format!("http.do: bad base url: {e}"))?;
+            let joined = base
+                .join(p)
+                .map_err(|e| format!("http.do: bad path `{p}`: {e}"))?;
+            Ok(joined.to_string())
+        }
+    }
+}
+
+/// Build a TCP [`DialTarget`](flux_system::net::DialTarget) from a resolved endpoint URL's host+port
+/// (defaulting the port to the URL scheme's known default). For the ref-based `conn.dial` path.
+fn dial_target_from_url(raw: &str) -> std::result::Result<flux_system::net::DialTarget, String> {
+    let url = url::Url::parse(raw).map_err(|e| format!("conn.dial: bad endpoint url: {e}"))?;
+    let host = url
+        .host_str()
+        .ok_or("conn.dial: resolved endpoint url has no host")?
+        .to_string();
+    let port = url
+        .port_or_known_default()
+        .ok_or("conn.dial: resolved endpoint url has no port (and scheme has no default)")?;
+    Ok(flux_system::net::DialTarget::Tcp { host, port })
+}
+
+/// Parse a credential reference from the `credential` capability payload: either a `Ref`-shaped
+/// object (`{scheme, plugin, instance, slot}`) or a `scheme/...` string.
+fn parse_credential_ref(v: &Value) -> std::result::Result<flux_secret::Ref, String> {
+    match v {
+        Value::String(s) => flux_secret::Ref::parse(s),
+        Value::Object(_) => serde_json::from_value(v.clone())
+            .map_err(|e| format!("credential: bad credential_ref object: {e}")),
+        _ => Err("credential: `credential_ref` must be a string or object".to_string()),
+    }
 }
 
 fn normalize_patterns(patterns: &[String]) -> Vec<String> {
@@ -2307,6 +2541,231 @@ mod tests {
         let err = Frame::err_response("r1", "boom");
         assert!(!err.ok);
         assert_eq!(err.error.as_deref(), Some("boom"));
+    }
+
+    /// A mock [`ReferenceResolver`] for the ref-based IO tests: a fixed endpoint resolution (URL +
+    /// one injected header) and a fixed credential materialization, recording whether each was
+    /// consulted.
+    struct MockResolver {
+        endpoint_url: String,
+        inject: (String, String),
+        credential_value: String,
+        endpoint_consulted: std::sync::atomic::AtomicBool,
+        credential_consulted: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl ReferenceResolver for MockResolver {
+        async fn resolve_endpoint(
+            &self,
+            reference: &str,
+        ) -> std::result::Result<flux_secret::endpoint::ResolvedEndpoint, String> {
+            self.endpoint_consulted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(
+                flux_secret::endpoint::ResolvedEndpoint::new(reference, &self.endpoint_url)
+                    .with_header(&self.inject.0, &self.inject.1),
+            )
+        }
+
+        async fn resolve_credential(
+            &self,
+            reference: &flux_secret::Ref,
+        ) -> std::result::Result<flux_secret::Material, String> {
+            self.credential_consulted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(flux_secret::Material {
+                reference: reference.clone(),
+                kind: flux_secret::Kind::ApiKey,
+                value: self.credential_value.clone(),
+                media_type: None,
+            })
+        }
+    }
+
+    /// A [`SecretSink`] double backed by a [`Redactor`](flux_secret::Redactor), so a test can assert a
+    /// materialized credential is registered (and thus redacted from any captured output).
+    struct RedactorSink {
+        redactor: flux_secret::Redactor,
+    }
+
+    impl SecretSink for RedactorSink {
+        fn register_secret(&self, value: &str) {
+            self.redactor.add_secret(value);
+        }
+    }
+
+    /// A throwaway HTTP/1.1 server that echoes the request's `Authorization` header value back as the
+    /// response body (or `none`). Lets a test prove the host-injected header reached the wire.
+    async fn spawn_header_echo_server() -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 2048];
+                    loop {
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    let headers = String::from_utf8_lossy(&buf);
+                    let auth = headers
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("authorization:")
+                                .map(|_| {
+                                    l.split_once(':')
+                                        .map(|(_, v)| v.trim().to_string())
+                                        .unwrap_or_default()
+                                })
+                        })
+                        .unwrap_or_else(|| "none".to_string());
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                        auth.len(),
+                        auth
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn http_by_ref_injects_host_side() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!("flux-httpref-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let port = spawn_header_echo_server().await;
+
+        // The resolver returns the loopback test server's URL + an Authorization: Bearer header. The
+        // plugin passes only an `endpoint_ref` — never the URL or the token.
+        let token = "sk-super-secret-ref-token";
+        let resolver = Arc::new(MockResolver {
+            endpoint_url: format!("http://127.0.0.1:{port}/"),
+            inject: ("Authorization".into(), format!("Bearer {token}")),
+            credential_value: String::new(),
+            endpoint_consulted: std::sync::atomic::AtomicBool::new(false),
+            credential_consulted: std::sync::atomic::AtomicBool::new(false),
+        });
+        let caps = SystemHostCaps::new(sys)
+            .with_private_net_grants(vec!["127.0.0.1".into()])
+            .with_grants(PluginCapabilities {
+                http: true,
+                http_hosts: vec!["127.0.0.1".into()],
+                private_hosts: vec!["127.0.0.1".into()],
+                ..Default::default()
+            })
+            .with_resolver(resolver.clone());
+
+        let result = caps
+            .handle(
+                "http.do",
+                &json!({ "endpoint_ref": "@endpoint/svc-1", "path": "v1/ping" }),
+            )
+            .await
+            .unwrap();
+
+        // The resolver was consulted, and the outbound request carried the host-injected header.
+        assert!(resolver
+            .endpoint_consulted
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(result["status"], 200);
+        assert_eq!(
+            result["body"],
+            format!("Bearer {token}"),
+            "the server saw the host-injected Authorization header"
+        );
+        // The frame the plugin gets back contains neither the resolved URL nor… the token would have
+        // been in `body` only because our echo server reflects it; in production the plugin gets only
+        // the real response. Assert the *frame fields* never carry the URL or the credential ref.
+        let frame = result.to_string();
+        assert!(
+            !frame.contains("127.0.0.1"),
+            "frame must not carry the URL: {frame}"
+        );
+        assert!(
+            result.get("url").is_none() && result.get("endpoint_ref").is_none(),
+            "frame must not echo the URL/ref back to the plugin"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn raw_socket_credential_gated_to_plugin_not_model() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!("flux-credgate-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+
+        let secret = "pg-scram-password-value";
+        let resolver = Arc::new(MockResolver {
+            endpoint_url: "postgres://db.internal:5432/app".into(),
+            inject: (String::new(), String::new()),
+            credential_value: secret.into(),
+            endpoint_consulted: std::sync::atomic::AtomicBool::new(false),
+            credential_consulted: std::sync::atomic::AtomicBool::new(false),
+        });
+        let redactor = flux_secret::Redactor::new();
+        let sink = Arc::new(RedactorSink {
+            redactor: redactor.clone(),
+        });
+        let cred_payload = json!({ "credential_ref": "kubernetes/monitoring/pg-creds/password" });
+
+        // WITHOUT the `credential` grant → refused (deny-by-default).
+        let ungranted = SystemHostCaps::new(sys.clone())
+            .with_resolver(resolver.clone())
+            .with_secret_sink(sink.clone());
+        let err = ungranted
+            .handle("credential", &cred_payload)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("not granted"),
+            "ungranted credential must be refused: {err}"
+        );
+        assert!(
+            !resolver
+                .credential_consulted
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the resolver must not even be consulted without the grant"
+        );
+
+        // WITH the grant → the (trusted) plugin receives the materialized value.
+        let granted = SystemHostCaps::new(sys)
+            .with_grants(PluginCapabilities {
+                credential: true,
+                ..Default::default()
+            })
+            .with_resolver(resolver.clone())
+            .with_secret_sink(sink.clone());
+        let got = granted.handle("credential", &cred_payload).await.unwrap();
+        assert_eq!(
+            got["value"], secret,
+            "the trusted plugin receives the value"
+        );
+        assert!(resolver
+            .credential_consulted
+            .load(std::sync::atomic::Ordering::SeqCst));
+
+        // The value is registered with the redactor → it would be scrubbed from any captured output.
+        assert_eq!(
+            redactor.redact(&format!("connecting with {secret} now")),
+            "connecting with [redacted] now",
+            "the materialized credential is redacted from model-visible output"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

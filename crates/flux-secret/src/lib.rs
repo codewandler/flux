@@ -172,9 +172,14 @@ const SECRET_PREFIXES: &[&str] = &[
 
 /// Scrubs registered secret values and common credential shapes from text before it is logged
 /// or shown to the model.
+///
+/// The registered-value set lives behind a shared `Arc<Mutex<…>>`, so **cloning a `Redactor` shares
+/// its value store**: a secret registered through one handle (e.g. a runtime-materialized credential
+/// the host injects on the `credential` capability path) is immediately redacted by every clone,
+/// including the one the executor uses to scrub tool output. Registration is therefore `&self`.
 #[derive(Default, Clone)]
 pub struct Redactor {
-    values: Vec<String>,
+    values: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl Redactor {
@@ -184,12 +189,14 @@ impl Redactor {
 
     /// Register a known secret value (no-op for trivially short values to avoid over-redaction).
     /// The value is stored **trimmed** — env/file-sourced secrets often carry a trailing newline,
-    /// and storing the raw value would mean the bare token never matches in tool output.
-    pub fn add_secret(&mut self, value: impl Into<String>) {
+    /// and storing the raw value would mean the bare token never matches in tool output. Takes
+    /// `&self` (interior-mutable, shared store) so a credential materialized mid-run is registered
+    /// even when only a clone of the redactor is in hand.
+    pub fn add_secret(&self, value: impl Into<String>) {
         let v = value.into();
         let trimmed = v.trim();
         if trimmed.len() >= 6 {
-            self.values.push(trimmed.to_string());
+            self.values.lock().unwrap().push(trimmed.to_string());
         }
     }
 
@@ -197,7 +204,7 @@ impl Redactor {
     pub fn redact(&self, input: &str) -> String {
         let mut out = input.to_string();
         // Longest-first so a value that contains another is replaced whole.
-        let mut vals = self.values.clone();
+        let mut vals = self.values.lock().unwrap().clone();
         vals.sort_by_key(|v| std::cmp::Reverse(v.len()));
         for v in vals {
             if !v.is_empty() {
@@ -276,7 +283,7 @@ mod tests {
 
     #[test]
     fn redacts_registered_values() {
-        let mut r = Redactor::new();
+        let r = Redactor::new();
         r.add_secret("supersecretvalue");
         assert_eq!(
             r.redact("token=supersecretvalue here"),
@@ -300,7 +307,7 @@ mod tests {
 
     #[test]
     fn redacts_glued_and_trimmed_secrets() {
-        let mut r = Redactor::new();
+        let r = Redactor::new();
         // A file-sourced value with a trailing newline must still redact the bare token in output.
         r.add_secret("topsecretvalue\n");
         assert_eq!(
@@ -312,6 +319,16 @@ mod tests {
         assert!(!out.contains("sk-ant-abc123def456"), "leaked: {out}");
         assert!(out.contains("api_key="));
         assert!(out.contains("next"));
+    }
+
+    #[test]
+    fn cloned_redactor_shares_value_store() {
+        // A secret registered through one handle is redacted by a clone — the property the
+        // `credential` capability relies on to scrub a credential materialized mid-run.
+        let a = Redactor::new();
+        let b = a.clone();
+        a.add_secret("clonedsharedsecret");
+        assert_eq!(b.redact("x clonedsharedsecret y"), "x [redacted] y");
     }
 
     #[test]

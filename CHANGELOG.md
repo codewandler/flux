@@ -8,6 +8,17 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Reference-based plugin IO + host-injected connect (D-27).** Plugin `http.do`/`conn.dial` now accept
+  an `endpoint_ref` (named or discovered `@endpoint/<id>`); the host resolves it, composes the URL
+  through the existing egress guard, and injects credentials host-side — the plugin and the model never
+  see a URL with credentials. A discovered endpoint's `credential_ref` is materialized via the owning
+  plugin's `secret.read` (e.g. a Kubernetes-scheme ref → the kubernetes plugin), gated **deny-by-default**
+  by a `[endpoint] cross_plugin_credentials` operator grant + a first-use-approval seam + a
+  `CrossPluginResolve` audit event, on both the HTTP-injection and raw-socket paths (gated by the real
+  consumer). Raw-socket protocols that must speak auth in-band (Postgres SCRAM) receive the credential via
+  a new gated `credential` capability — trusted plugin only, registered with the redactor, never the
+  model. Inline `user:pass@host` URLs are split into an injected header. The `Redactor` now shares its
+  value store across clones so a mid-run materialized secret is scrubbed everywhere.
 - **Cross-plugin endpoint discovery broker (D-26).** Plugin manifests can declare `discovers: [products]`
   (and a `discover` capability); a new L5 `flux_capabilities::endpoint` broker fans a consumer plugin's
   `endpoint.discover` host call out to every provider plugin that declares the product, aggregates and

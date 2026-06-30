@@ -2,8 +2,7 @@
 id: D-27
 title: Reference-based IO & host-injected connect (the invariant, enforced)
 pillar: Core
-status: backlog
-priority:
+status: done
 design: docs/designs/endpoint-discovery.md
 ---
 
@@ -27,30 +26,44 @@ gated, not implicit. See the [epic design](../designs/endpoint-discovery.md) —
 and *Security model*.
 
 ## Acceptance
-- [ ] **Ref-based IO** — `http`/`conn` host caps accept an `endpoint_ref` (+ relative path); the host
-      resolves the ref → absolute URL → injects the credential (reusing `resolve_auth`'s
-      Bearer/Basic/Header/Query), then performs the call. The plugin frame carries only the ref — never
-      a URL or token. Failing-first test `endpoint::http_by_ref_injects_host_side`.
-- [ ] **Cross-plugin credential injection** — a `credential_ref` with the `Kubernetes` scheme is
-      materialized via the kubernetes plugin's gated `secret.read`; the consuming plugin never receives
-      the value. Test `endpoint::cross_plugin_kubernetes_credential_injected`.
-- [ ] **Deny-by-default** — cross-plugin resolution with no operator config grant for the
-      *(consumer-plugin × product/endpoint)* is refused. Test
-      `endpoint::cross_plugin_resolution_denied_without_grant`.
-- [ ] **First-use approval + audit** — the first granted cross-plugin resolution prompts the approval
-      gate (session-scoped thereafter) and emits a `flux-events` audit record naming consumer, endpoint,
-      and grant. Test `endpoint::cross_plugin_first_use_approval_and_audit`.
-- [ ] **Inline-credential URL splitting** — a URL carrying embedded credentials is split (cred →
-      `credential_ref`) and the credential never appears in a logged/surfaced URL. Test
-      `endpoint::inline_cred_url_split_and_redacted`.
-- [ ] **Private-net via D-20** — discovered private/in-cluster hosts are reachable only under the
-      [D-20](D-20-scoped-private-net-egress.md) scoped allow, never the global `allow_private_net`.
-- [ ] Gate green: `cargo test -p flux-plugin -p flux-system` (+ schema crate), clippy `-D warnings`,
-      fmt, `flux-codegate`.
+- [x] **Ref-based IO** — `http.do`/`conn.dial` accept an `endpoint_ref` (+ relative `path`); the host
+      resolves it via the injected `ReferenceResolver`, composes the absolute URL through the existing
+      egress guard, and injects the credential host-side. The plugin frame carries only the ref. Tests
+      `http_by_ref_injects_host_side`, and the consumer-gated `resolve_endpoint_for`.
+- [x] **Cross-plugin credential** — a `Kubernetes`/`Plugin`-scheme `credential_ref` is materialized via
+      the owning plugin's `secret.read` op (the `CredentialReader` seam), reusing the broker's
+      re-entrancy guard. HTTP path: injected host-side (plugin never sees it). Raw-socket path: delivered
+      to the trusted plugin via the gated `credential` capability (`PluginCapabilities.credential`,
+      deny-by-default) for in-band auth — registered with the `Redactor`, never to the model. Tests
+      `raw_socket_credential_gated_to_plugin_not_model`, `resolve_endpoint_materializes_credential_ref_into_bearer`.
+- [x] **Deny-by-default cross-plugin gate** — no `[endpoint] cross_plugin_credentials` grant for the
+      `(consumer:provider)` pair ⇒ refused, on BOTH the raw-socket and the HTTP-injection paths
+      (consumer = the real calling plugin, not the record owner). Tests
+      `cross_plugin_resolution_denied_without_grant`, `http_ref_with_cross_plugin_credential_denied_without_grant`.
+      The consumer-agnostic `resolve_credential`/`resolve_endpoint` refuse cross-plugin injection so the
+      gate can't be bypassed.
+- [x] **First-use approval + audit** — a `CrossPluginApprover` seam (first use per `(consumer,provider)`,
+      session-cached; no approver ⇒ config grant alone authorizes headless) + a `flux-events`
+      `CrossPluginResolve { consumer, provider, reference_location }` audit (location only, never the
+      value). Tests `cross_plugin_first_use_approval_and_audit`, `cross_plugin_denied_when_approver_refuses`.
+- [x] **Inline-credential URL splitting** — a `scheme://user:pass@host` URL is split (userinfo → injected
+      `Basic` header, bare URL surfaced). Test `resolve_endpoint_strips_inline_credential_into_header`.
+- [x] **Private-net via D-20** — ref-based IO runs through the existing scoped egress guard (D-20),
+      never the global `allow_private_net`.
+- [x] Gate green: `cargo test -p flux-secret -p flux-plugin -p flux-capabilities -p flux-config`, clippy
+      `-D warnings` (+ flux-cli/flux-app), fmt, `flux-codegate`, full workspace build.
 
 ## Progress
-- (not started — needs [D-25](D-25-endpoint-reference-model.md), [D-26](D-26-endpoint-discovery-broker.md),
-  and **[D-20](D-20-scoped-private-net-egress.md)** as a hard prerequisite.)
+- **Done.** Landed `SystemHostCaps.with_resolver`/`with_secret_sink` + ref-based `http.do`/`conn.dial`
+  + the gated `credential` capability; `EndpointBroker` now implements `ReferenceResolver`
+  (`resolve_endpoint`/`resolve_endpoint_for`/`resolve_credential`/`resolve_credential_for` +
+  `credential_ref_for_endpoint`) with the cross-plugin gate (grant → approver seam → audit), the
+  `CredentialReader` seam (provider `secret.read`), and inline-credential URL splitting. `Redactor` made
+  clone-sharing (`Arc<Mutex>`, `add_secret(&self)`) so a mid-run materialized credential is scrubbed by
+  the executor's clone. Config: `EndpointConfig.cross_plugin_credentials`. Wired into `flux run`
+  (`build_agent`) fully; `flux app run` (`run_app`) wires the resolver + grants with `TODO(D-27)` for the
+  secret-sink/audit (no EventStore/redactor in scope there, mirroring the D-20 gap) + the interactive
+  approver.
 
 ## Notes
 - **Honors AGENTS.md "no bypass paths"** — resolution + IO stay behind `Executor::dispatch`; this makes

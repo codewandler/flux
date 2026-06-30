@@ -69,6 +69,16 @@ pub enum EventKind {
         host: String,
         grant_source: String,
     },
+
+    /// The host materialized a credential owned by one plugin (`provider`) on behalf of a *different*
+    /// plugin (`consumer`) under an operator cross-plugin grant — the auditable D-27 security event.
+    /// `reference_location` is the `credential_ref` string (a location, e.g.
+    /// `kubernetes/<ns>/<name>/<key>`) — **never** the secret value.
+    CrossPluginResolve {
+        consumer: String,
+        provider: String,
+        reference_location: String,
+    },
 }
 
 impl EventKind {
@@ -85,6 +95,7 @@ impl EventKind {
             EventKind::PlanAttempted { .. } => "plan_attempted",
             EventKind::TurnEnded { .. } => "turn_ended",
             EventKind::PrivateNetAdmit { .. } => "private_net_admit",
+            EventKind::CrossPluginResolve { .. } => "cross_plugin_resolve",
         }
     }
 }

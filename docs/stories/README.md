@@ -22,9 +22,10 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
   grader-confirmed run is **staged** on a funded provider key
 
 ## Next (ready — take the top one unless the user named a story)
-- [D-27 — Reference-based IO & host-injected connect](D-27-reference-based-io.md) · Core · **top pick** ·
-  the next step in the **Endpoint discovery & brokerage** epic (below): enforces the references-only
-  invariant — host IO takes an `endpoint_ref`, resolves + injects creds host-side. (D-25/D-26/D-20 landed.)
+- [D-28 — Kubernetes endpoint provider](D-28-kubernetes-endpoint-provider.md) · Agent · **top pick** ·
+  the next step in the **Endpoint discovery & brokerage** epic (below): the reference provider + the
+  agent-facing `endpoint.*` ops, enabling the "connect to my latest namespace backend RDS" demo.
+  (D-25/D-26/D-27/D-20 landed.)
 - [D-11 — App-runner ergonomics](D-11-app-runner-ergonomics.md) · Agent · the alternate ready pick (makes
   `flux app run` a viable host for a declarative bot; unblocks Slack-channel assistant flows).
 
@@ -49,10 +50,7 @@ resolves it and injects credentials host-side, so neither the plugin nor the LLM
 the `.dex`-style endpoint-registry deferral from D-10/D-12. See [epic design](../designs/endpoint-discovery.md).
 **[D-20](D-20-scoped-private-net-egress.md) is pulled in as a hard dependency** (discovered endpoints are
 usually private/in-cluster hosts). Built in this order:
-- [D-27 — Reference-based IO & host-injected connect](D-27-reference-based-io.md) · Core · **next** · the protocol
-  cutover that **enforces** the invariant: host IO takes an `endpoint_ref`, injects creds host-side (incl.
-  cross-plugin Kubernetes-scheme refs); deny-by-default + grant + first-use approval + audit
-- [D-28 — Kubernetes endpoint provider](D-28-kubernetes-endpoint-provider.md) · Agent · elevate the existing
+- [D-28 — Kubernetes endpoint provider](D-28-kubernetes-endpoint-provider.md) · Agent · **next** · elevate the existing
   k8s discover/cluster/secret ops into the reference provider (`discovers: [kubernetes, prometheus, loki,
   grafana, alertmanager, postgres, mysql]`)
 - [D-29 — Migrate native plugins to references](D-29-migrate-plugins-to-references.md) · Agent · clean-cutover
@@ -95,6 +93,11 @@ all providers**. Most plumbing already exists (`flux-credentials` import/refresh
   stage; import + refresh cover the near term
 
 ## Done
+- [D-27 — Reference-based IO & host-injected connect](D-27-reference-based-io.md) · Core · enforces the
+  references-only invariant: `http.do`/`conn.dial` take an `endpoint_ref`, the host resolves + injects
+  the credential (cross-plugin `Kubernetes`-scheme via the owning plugin's `secret.read`), gated
+  deny-by-default + operator grant + first-use-approval seam + `CrossPluginResolve` audit; the gated
+  `credential` capability serves raw-socket in-band auth (trusted plugin only, never the model)
 - [D-26 — Discovery provider role & host fan-out broker](D-26-endpoint-discovery-broker.md) · Core ·
   manifest `discovers`/`discover` + the L5 `EndpointBroker` (fan-out over a `ProviderInvoker` seam, rank,
   re-entrancy guard) + `EndpointBrokerHostCaps`; wired into both `flux run` and `flux app run` so a

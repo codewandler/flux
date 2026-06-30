@@ -821,6 +821,51 @@ impl flux_plugin::EgressAudit for EventStoreEgressAudit {
     }
 }
 
+/// L6 binding of the L4 [`flux_plugin::SecretSink`] seam: registers a credential the host materialized
+/// on the `credential` capability path with the executor's [`Redactor`](flux_secret::Redactor), so it
+/// is scrubbed from any model-visible output. The redactor shares its value store across clones, so a
+/// secret registered here is redacted by the clone the executor uses.
+struct RedactorSecretSink {
+    redactor: flux_secret::Redactor,
+}
+
+impl flux_plugin::SecretSink for RedactorSecretSink {
+    fn register_secret(&self, value: &str) {
+        self.redactor.add_secret(value);
+    }
+}
+
+/// L6 binding of the L5 [`flux_capabilities::CrossPluginAudit`] seam: appends a `CrossPluginResolve`
+/// event recording which consumer resolved which provider's credential, by *location* (the
+/// `credential_ref` string) — never the value. An append failure is logged, never fatal.
+struct EventStoreCrossPluginAudit {
+    store: Arc<EventStore>,
+    stream: String,
+}
+
+impl flux_capabilities::CrossPluginAudit for EventStoreCrossPluginAudit {
+    fn record_cross_plugin_resolve(
+        &self,
+        consumer: &str,
+        provider: &str,
+        reference_location: &str,
+    ) {
+        let ev = flux_events::NewEvent::new(flux_events::EventKind::CrossPluginResolve {
+            consumer: consumer.to_string(),
+            provider: provider.to_string(),
+            reference_location: reference_location.to_string(),
+        });
+        if let Err(e) = self.store.append(&self.stream, ev) {
+            eprintln!(
+                "{}",
+                style::dim(&format!(
+                    "(audit: failed to record cross-plugin resolve: {e})"
+                ))
+            );
+        }
+    }
+}
+
 /// Build a fresh boxed provider for a model spec (used by the sub-agent factory).
 fn provider_for(spec: &str) -> Result<Box<dyn Provider>> {
     if spec == "mock" || spec.starts_with("mock/") {
@@ -1030,13 +1075,30 @@ async fn build_agent(
         events.create_session(&model).context("create session")?
     };
 
+    // Seed the secret redactor from known credential env vars so their values are scrubbed from
+    // tool output and logs. (Credential-shaped tokens are also caught by the redactor's heuristics.)
+    // Built BEFORE the plugin block so the `credential`-capability secret sink can register
+    // host-materialized credentials with the SAME redactor the executor later redacts with — the
+    // redactor shares its value store across clones, so a credential resolved mid-run is scrubbed.
+    let redactor = flux_secret::Redactor::new();
+    let secret_refs: Vec<flux_secret::Ref> = [
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "FLUX_SECRET",
+    ]
+    .iter()
+    .map(|k| flux_secret::Ref::env(*k))
+    .collect();
+    flux_runtime::SecretResolver::new().seed_redactor(&mut redactor.clone(), &secret_refs);
+
     // Discover subprocess plugins (~/.flux/plugins/*.toml) and project their operations as tools.
     // Each plugin's host capabilities are the guarded System (same boundary as built-in tools).
     if let Some(dir) = plugins_dir() {
-        // The cross-plugin endpoint-discovery broker (D-26): a registry of loaded plugins + the shared
-        // endpoint registry, so a consumer plugin's `endpoint.discover` capability can fan out to the
-        // providers that declared the queried product. (The agent-facing `endpoint.*` ops are wired in
-        // a later phase; here we only stand the broker up and route discovery through it.)
+        // The cross-plugin endpoint-discovery broker (D-26/D-27): a registry of loaded plugins + the
+        // shared endpoint registry, so a consumer plugin's `endpoint.discover` capability fans out to
+        // providers, and (D-27) the broker is the host-side `ReferenceResolver` for ref-based IO +
+        // gated cross-plugin credential resolution.
         let plugin_registry = Arc::new(flux_capabilities::PluginRegistry::new());
         let endpoint_registry = Arc::new(flux_capabilities::EndpointRegistry::with_path(
             flux_capabilities::EndpointRegistry::default_path().unwrap_or_default(),
@@ -1045,11 +1107,33 @@ async fn build_agent(
         let invoker = Arc::new(flux_capabilities::HostProviderInvoker::new(
             plugin_registry.clone(),
         ));
-        let broker = Arc::new(flux_capabilities::EndpointBroker::new(
-            invoker,
-            plugin_registry.clone(),
-            endpoint_registry.clone(),
+        // The static config resolver (named endpoints + Env credentials) is the first link of the
+        // broker's resolver chain. (No host config endpoint bindings are wired yet — an empty map
+        // resolves named refs to "not bound"; discovered `@endpoint/*` refs resolve from the registry.)
+        let static_resolver = Arc::new(flux_capabilities::StaticResolver::new(
+            system.clone(),
+            std::collections::HashMap::new(),
         ));
+        // Cross-plugin credential audit (D-27): records consumer→provider resolutions by LOCATION.
+        let xplugin_audit: Arc<dyn flux_capabilities::CrossPluginAudit> =
+            Arc::new(EventStoreCrossPluginAudit {
+                store: events.clone(),
+                stream: session_id.clone(),
+            });
+        // TODO(D-27): wire an interactive `CrossPluginApprover` here (a modal/stdin first-use prompt).
+        // The seam exists on the broker; running headless, the operator config grant alone authorizes.
+        let broker = Arc::new(
+            flux_capabilities::EndpointBroker::new(
+                invoker,
+                plugin_registry.clone(),
+                endpoint_registry.clone(),
+            )
+            .with_static_resolver(static_resolver)
+            .with_cross_plugin_grants(flux_capabilities::CrossPluginGrants::new(
+                cfg.endpoint.cross_plugin_credentials.clone(),
+            ))
+            .with_cross_plugin_audit(xplugin_audit),
+        );
         for p in flux_plugin::discover(&dir) {
             // Build host capabilities from the plugin's own manifest declaration, so each plugin
             // gets only the process/secret/http access it asked for (and nothing by default).
@@ -1061,13 +1145,21 @@ async fn build_agent(
                 stream: session_id.clone(),
             });
             let broker_for_caps = broker.clone();
+            let resolver_for_caps = broker.clone() as Arc<dyn flux_plugin::ReferenceResolver>;
+            let secret_sink = Arc::new(RedactorSecretSink {
+                redactor: redactor.clone(),
+            }) as Arc<dyn flux_plugin::SecretSink>;
             let make_caps = move |m: &flux_plugin::PluginManifest| {
                 let plugin_private_hosts = cfg_for_caps.plugin_private_hosts(&m.name);
+                // Inject the broker as the resolver (ref-based IO + the `credential` capability) and the
+                // redactor-backed secret sink BEFORE wrapping with the broker host-caps.
                 let inner = Arc::new(
                     flux_plugin::SystemHostCaps::new(caps_system)
                         .with_manifest(m)
                         .with_private_net_grants(plugin_private_hosts)
-                        .with_egress_audit(audit),
+                        .with_egress_audit(audit)
+                        .with_resolver(resolver_for_caps)
+                        .with_secret_sink(secret_sink),
                 ) as Arc<dyn flux_plugin::HostCapabilities>;
                 // Wrap with the endpoint broker so this plugin's `endpoint.discover` calls fan out
                 // (deny-by-default, gated by the manifest's `discover` capability).
@@ -1134,20 +1226,6 @@ async fn build_agent(
     if !js_hooks.is_empty() {
         hook_vec.push(Arc::new(js_hooks));
     }
-
-    // Seed the secret redactor from known credential env vars so their values are scrubbed from
-    // tool output and logs. (Credential-shaped tokens are also caught by the redactor's heuristics.)
-    let mut redactor = flux_secret::Redactor::new();
-    let secret_refs: Vec<flux_secret::Ref> = [
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "OPENROUTER_API_KEY",
-        "FLUX_SECRET",
-    ]
-    .iter()
-    .map(|k| flux_secret::Ref::env(*k))
-    .collect();
-    flux_runtime::SecretResolver::new().seed_redactor(&mut redactor, &secret_refs);
 
     let ctx = ToolContext::new(system)
         .with_spawner(spawner.clone())
@@ -3548,9 +3626,10 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
     // per-run EventStore stream (the seam exists; `flux_app::App` owns its own store/bus, so there is
     // no `EventStore` in scope at this point to back the audit — unlike the `build_agent` path).
     if let Some(dir) = plugins_dir() {
-        // The cross-plugin endpoint-discovery broker (D-26), analogous to the `build_agent` path: a
-        // registry of loaded plugins + the shared endpoint registry, so a consumer plugin's
-        // `endpoint.discover` capability fans out to providers declaring the queried product.
+        // The cross-plugin endpoint-discovery broker (D-26/D-27), analogous to the `build_agent` path:
+        // a registry of loaded plugins + the shared endpoint registry, so a consumer plugin's
+        // `endpoint.discover` capability fans out to providers, and (D-27) the broker is the host-side
+        // `ReferenceResolver` for ref-based IO + gated cross-plugin credential resolution.
         let plugin_registry = Arc::new(flux_capabilities::PluginRegistry::new());
         let endpoint_registry = Arc::new(flux_capabilities::EndpointRegistry::with_path(
             flux_capabilities::EndpointRegistry::default_path().unwrap_or_default(),
@@ -3559,23 +3638,42 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
         let invoker = Arc::new(flux_capabilities::HostProviderInvoker::new(
             plugin_registry.clone(),
         ));
-        let broker = Arc::new(flux_capabilities::EndpointBroker::new(
-            invoker,
-            plugin_registry.clone(),
-            endpoint_registry.clone(),
+        let static_resolver = Arc::new(flux_capabilities::StaticResolver::new(
+            system.clone(),
+            std::collections::HashMap::new(),
         ));
+        // TODO(D-27): wire the cross-plugin credential AUDIT + the SECRET SINK (redactor) here once the
+        // app path exposes its per-run EventStore stream + the executor's redactor — `flux_app::App`
+        // owns its own store/bus, so neither is in scope at this point (same gap as the D-20 egress
+        // audit). The grant + resolver seams ARE wired; an interactive approver is likewise a TODO
+        // (the operator config grant alone authorizes, headless).
+        let broker = Arc::new(
+            flux_capabilities::EndpointBroker::new(
+                invoker,
+                plugin_registry.clone(),
+                endpoint_registry.clone(),
+            )
+            .with_static_resolver(static_resolver)
+            .with_cross_plugin_grants(flux_capabilities::CrossPluginGrants::new(
+                cfg.endpoint.cross_plugin_credentials.clone(),
+            )),
+        );
         for p in flux_plugin::discover(&dir) {
             let system = system.clone();
             let backend = backend.clone();
             let caps_system = system.clone();
             let cfg_for_caps = cfg.clone();
             let broker_for_caps = broker.clone();
+            let resolver_for_caps = broker.clone() as Arc<dyn flux_plugin::ReferenceResolver>;
             let make_caps = move |m: &flux_plugin::PluginManifest| {
                 let plugin_private_hosts = cfg_for_caps.plugin_private_hosts(&m.name);
+                // Inject the broker as the resolver (ref-based IO + the `credential` capability) BEFORE
+                // wrapping with the datasource + endpoint-broker host-caps.
                 let inner = Arc::new(flux_capabilities::DatasourceHostCaps::new(
                     flux_plugin::SystemHostCaps::new(caps_system)
                         .with_manifest(m)
-                        .with_private_net_grants(plugin_private_hosts),
+                        .with_private_net_grants(plugin_private_hosts)
+                        .with_resolver(resolver_for_caps),
                     backend,
                 )) as Arc<dyn flux_plugin::HostCapabilities>;
                 // Compose the endpoint broker OVER the datasource caps so this plugin's

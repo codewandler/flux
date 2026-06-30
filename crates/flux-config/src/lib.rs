@@ -76,6 +76,24 @@ impl PrivateNetConfig {
     }
 }
 
+/// Endpoint-discovery / cross-plugin credential brokerage grants (D-27). Deny-by-default: a consumer
+/// plugin can only have a credential owned by a *different* provider plugin materialized on its behalf
+/// if an operator listed the `(consumer, provider)` pair here — exactly like the `process`/`conn`/
+/// `secrets` allow-lists.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointConfig {
+    /// Cross-plugin credential grants, each `"<consumer>:<provider>"` (or `"<consumer>:*"` to let a
+    /// consumer use any provider's credentials). No matching entry → no cross-plugin resolution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cross_plugin_credentials: Vec<String>,
+}
+
+impl EndpointConfig {
+    fn is_default(&self) -> bool {
+        self.cross_plugin_credentials.is_empty()
+    }
+}
+
 /// The merged flux configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -89,6 +107,9 @@ pub struct Config {
     /// Scoped private-network egress grants.
     #[serde(default, skip_serializing_if = "PrivateNetConfig::is_default")]
     pub private_net: PrivateNetConfig,
+    /// Endpoint-discovery / cross-plugin credential brokerage grants (D-27).
+    #[serde(default, skip_serializing_if = "EndpointConfig::is_default")]
+    pub endpoint: EndpointConfig,
     /// Opt into the generic `bash` op (the `shell` group). Off by default — the agent works through
     /// the dedicated ops; setting this surfaces `bash` as an escape hatch. The CLI exports
     /// `FLUX_ENABLE_BASH` from this so the runtime's `shell` signal fires.
@@ -139,6 +160,17 @@ impl Config {
             .map(dedupe)
             .unwrap_or_default()
     }
+
+    /// Whether `consumer` is granted to have `provider`'s credentials materialized on its behalf
+    /// (deny-by-default). Matches an exact `"<consumer>:<provider>"` entry or a `"<consumer>:*"`
+    /// wildcard. Consuming a credential a plugin *owns* itself is not "cross-plugin" and is never gated
+    /// here (the caller only consults this when consumer ≠ provider).
+    pub fn cross_plugin_credential_granted(&self, consumer: &str, provider: &str) -> bool {
+        self.endpoint
+            .cross_plugin_credentials
+            .iter()
+            .any(|g| g == &format!("{consumer}:{provider}") || g == &format!("{consumer}:*"))
+    }
 }
 
 fn home_config_path() -> Option<PathBuf> {
@@ -169,6 +201,15 @@ fn merge(user: Config, project: Config) -> Config {
         model: project.model.or(user.model),
         allow_private_net: user.allow_private_net || project.allow_private_net,
         private_net: merge_private_net(user.private_net, project.private_net),
+        endpoint: EndpointConfig {
+            cross_plugin_credentials: dedupe(
+                [
+                    user.endpoint.cross_plugin_credentials,
+                    project.endpoint.cross_plugin_credentials,
+                ]
+                .concat(),
+            ),
+        },
         enable_shell: user.enable_shell || project.enable_shell,
         permissions: Permissions {
             allow: [user.permissions.allow, project.permissions.allow].concat(),
@@ -397,6 +438,31 @@ mod tests {
 
     fn write_project(cwd: &Path, body: &str) {
         std::fs::write(cwd.join(".flux").join("config.toml"), body).unwrap();
+    }
+
+    #[test]
+    fn cross_plugin_credential_grant_is_deny_by_default_and_matches_wildcard() {
+        // No config → no grant.
+        assert!(!Config::default().cross_plugin_credential_granted("sql", "kubernetes"));
+
+        let dir = temp_dir();
+        write_project(
+            &dir,
+            r#"
+[endpoint]
+cross_plugin_credentials = ["sql:kubernetes", "report:*"]
+"#,
+        );
+        let cfg = load(&dir).unwrap();
+        // Exact pair matches; an unlisted pair does not.
+        assert!(cfg.cross_plugin_credential_granted("sql", "kubernetes"));
+        assert!(!cfg.cross_plugin_credential_granted("sql", "vault"));
+        // A `<consumer>:*` wildcard matches any provider for that consumer.
+        assert!(cfg.cross_plugin_credential_granted("report", "kubernetes"));
+        assert!(cfg.cross_plugin_credential_granted("report", "anything"));
+        // The wildcard is scoped to its consumer, not global.
+        assert!(!cfg.cross_plugin_credential_granted("other", "kubernetes"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
