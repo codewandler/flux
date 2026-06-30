@@ -101,6 +101,24 @@ a hard prerequisite** (discovered endpoints are usually private/in-cluster hosts
 - **[D-30](stories/D-30-endpoint-lifecycle-cli.md) — Endpoint lifecycle: refresh runner, CLI & audit** ·
   *Core.* Periodic rediscovery + `flux endpoint list/show/resolve` (weak refs + health, never secrets) + audit.
 
+### Session `s_251` post-mortem — ctx-pack eviction & discovery aliases (epic)
+
+A live `openai/gpt-5.5` session surfaced two compounding defects: an `endpoint.discover` "check db
+connectivity" turn that returned `{"candidates": []}`, and the follow-up "analyze why it's broken" turn
+that **looped 7 iterations and was cancelled**. Post-mortem design:
+[session-s251-postmortem.md](designs/session-s251-postmortem.md). The two fixes are independent but
+both are needed for the "check db connectivity" path to be trustworthy:
+
+- **[L-08](stories/L-08-ctx-pack-eviction.md) — Fix ctx-pack eviction** · *Language.* The `ctx` packer's
+  greedy prefix-fill with a hard `break` drops every member after the first overflow, so one oversized
+  early bind (a 493k session-evidence dump) starved the `ai.reason` step of the code reads the same
+  flow had just gathered → the reasoning death spiral. Drop-and-continue + a value-aware keep priority.
+- **[D-33](stories/D-33-endpoint-discovery-aliases.md) — Resolve cluster/namespace aliases** · *Agent,
+  blocked on the in-flight positional→kwargs cutover.* `"dev"` isn't a kubeconfig context (it's a full
+  EKS ARN) and the broker never relays structured `cluster`/`namespace`; `namespace=latest` is
+  ambiguous with the newest-namespace heuristic. Provider alias resolution + broker query-parsing +
+  disambiguating `latest`.
+
 ### Downstream enablement
 
 A ranked track that exists to **unblock and de-risk downstream products** that consume flux by **path

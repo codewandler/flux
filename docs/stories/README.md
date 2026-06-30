@@ -42,6 +42,10 @@ _flux's plugins each talk to a single, statically-configured service. The fluxpl
 - [D-19 — Complete the `flux plugin` lifecycle surface (uninstall + status)](D-19-plugin-lifecycle-cli.md) · Core · add `uninstall` + a richer `status`/`info` (version, pin, liveness, declared surface); small, no design doc
 - [D-21 — Plugin distribution for non-source users (scoping)](D-21-plugin-distribution.md) · Core · scoping/epic-seed: how a non-repo user obtains the pack (bundled binaries / fetch-on-install / marketplace); produces a design + the follow-on stories, no code
 
+### Session `s_251` post-mortem — `ctx`-pack eviction & endpoint-discovery alias resolution
+_Defect 1 made the reasoning step blind; Defect 2 meant the *correct* answer (discovery returns `[]`_
+- [D-33 — Resolve cluster/namespace aliases in endpoint discovery](D-33-endpoint-discovery-aliases.md) · Agent · "dev" isn't a kubeconfig context (it's a full EKS ARN); the broker never relays cluster/namespace; and "namespace=latest" is ambiguous with the newest-namespace heuristic
+
 ### subscription providers (claude-code + codex) & cross-provider usage/cost
 _flux can already drive the two **subscription / passthrough** model backends — `claude` (Claude_
 - [C-04 — Claude provider verify + force-refresh-on-401](C-04-claude-401-refresh.md) · Core · refresh today is expiry-time-only; add a 401→refresh→retry path (shared by both subscription providers)
@@ -89,6 +93,7 @@ _flux can already drive the two **subscription / passthrough** model backends �
 - [L-05 — Publish public Docusaurus docs](L-05-public-docusaurus-docs.md) · Language · public Docusaurus site scaffold under `website/`, with Flux-Lang text syntax/semantics docs and GitHub Pages deployment to `codewandler.github.io/flux`
 - [L-06 — Let agents register reusable composite ops](L-06-agent-registered-composite-ops.md) · Language · `op.register` lets an agent install validated Flux-Lang composite ops into turn/session/project/global scope; project/global writes use guarded paths and registered ops remain scoped composite dispatch
 - [L-07 — Generate Flux skills from live catalogs](L-07-generated-flux-skills.md) · Language · `flux skill` renders Claude-format root/CLI/language/plugin/ops skills from live Clap, Flux-Lang, ToolRegistry/OpRegistry, and plugin-manifest sources; `--install` writes root + sections, and project `.claude/skills` is loaded by default after `.flux/skills`
+- [L-08 — Fix ctx-pack eviction — drop-overflow-and-continue + keep priority](L-08-ctx-pack-eviction.md) · Language · a single oversized early member drops every smaller member after it (hard `break` in build_ctx); the s_251 reasoning spiral
 
 _See [CHANGELOG.md](../../CHANGELOG.md) for the full released history._
 <!-- END track:board -->
