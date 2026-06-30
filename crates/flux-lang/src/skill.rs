@@ -153,8 +153,9 @@ In a `pipe`, each step's output becomes the next step's first argument.
 ]}
 ```
 A `ctx` selects existing symbols (`include` minus `exclude`) into a budgeted pack — shrunk by
-visibility then declared order to `budget` chars, with any drops recorded in the trace. `ctx_append`
-accretes more symbols into it. Both are pure (no IO).
+visibility then declared order to `budget` chars, with any drops recorded in the trace. Packing is
+drop-and-continue: an oversized member is skipped, not a hard stop, so smaller members after it still
+survive. `ctx_append` accretes more symbols into it. Both are pure (no IO).
 "##;
 
 const PRELUDE: &str = r##"

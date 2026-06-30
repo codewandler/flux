@@ -6,6 +6,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ctx` context packs no longer drop the working set on a single oversized member (L-08).** The
+  `ctx`/`ctx_append` packer in `flux-lang` packed members greedily with a hard `break` on the first
+  overflow, so one oversized early member (e.g. a 493k-char session-evidence bind) evicted every
+  smaller member after it — even ones that would have fit in the leftover budget — starving the
+  `ai.reason` step of the very evidence the flow had just gathered (the session `s_251` reasoning
+  death spiral). It now **drops the oversized member and continues packing** the rest, while keeping
+  the visibility-tier priority (`Pinned` > `Visible` > …, no rank inversion). Prompt caching is
+  unaffected: the `Ctx` value is a per-iteration tool result, never the cached system prompt. See
+  [docs/designs/session-s251-postmortem.md](docs/designs/session-s251-postmortem.md).
+
 ### Changed
 
 - **Board is now generated from story frontmatter (`track` plugin).** `docs/stories/README.md`'s

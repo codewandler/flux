@@ -3270,8 +3270,11 @@ fn vis_keep_rank(v: Visibility) -> u8 {
 /// Resolve a context pack's `members` (already exclude-filtered, in declared order) to a budgeted
 /// `Ctx` value bound to `name`. When `budget` is set the pack is shrunk **at evaluation**: members are
 /// kept in priority order (visibility tier, then declared order) while their cumulative char size fits
-/// the budget; the rest are dropped and recorded as a [`RunEvent::CtxShrunk`]. The interpreter stays
-/// op-agnostic — consuming ops just read the already-bounded member list.
+/// the budget; the rest are dropped and recorded as a [`RunEvent::CtxShrunk`]. Packing is
+/// **drop-and-continue**: a member that doesn't fit in the remaining budget is dropped and packing
+/// continues with the next, so a single oversized early member never evicts the smaller members after
+/// it (the s_251 death spiral). The interpreter stays op-agnostic — consuming ops just read the
+/// already-bounded member list.
 fn build_ctx(
     store: &dyn ValueStore,
     session_id: &str,
@@ -3317,10 +3320,15 @@ fn build_ctx(
 
     let mut keep = vec![true; members.len()];
     if let Some(b) = budget {
-        // Shrink by visibility tier then declared order, dropping the lowest-priority tail: keep a
-        // priority-ordered *prefix* so a pinned member is never dropped to make room for a plainer one
-        // (stable sort preserves declared order within a tier; the first member that doesn't fit stops
-        // the pack — no rank inversion).
+        // Shrink by visibility tier then declared order. We pack the priority-ordered members into the
+        // budget **drop-and-continue** style: a member that doesn't fit in the remaining budget is
+        // skipped (dropped) and packing continues with the next — so a single oversized early member
+        // never evicts the smaller members after it (the s_251 death spiral: a 493k-char evidence bind
+        // declared before the code reads triggered a hard `break` and starved `ai.reason` of every
+        // member that would have fit in the leftover). A pinned member is still never dropped to make
+        // room for a plainer one: the stable sort preserves declared order within a tier, and we walk
+        // highest tier first, so the only way a pinned member is dropped is if it doesn't fit on its
+        // own — no rank inversion.
         let mut order: Vec<usize> = (0..members.len()).collect();
         order.sort_by_key(|&i| std::cmp::Reverse(ranks[i]));
         keep = vec![false; members.len()];
@@ -3330,7 +3338,8 @@ fn build_ctx(
                 running += sizes[i];
                 keep[i] = true;
             } else {
-                break;
+                // Drop this oversized member and keep packing the rest (do NOT `break`).
+                continue;
             }
         }
     }
@@ -3751,6 +3760,107 @@ mod tests {
         assert!(
             !kept.contains(&"low".to_string()),
             "lower-priority member evicted on re-budget (no rank inversion)"
+        );
+    }
+
+    /// A single oversized early member must not drop every smaller member after it. The s_251 death
+    /// spiral: a 493k-char `session_evidence` bind declared before the code reads triggered a hard
+    /// `break`, so the 11k/24k/12k code reads that would have fit in the remaining ~159k budget were
+    /// all dropped — starving `ai.reason` of the very evidence the flow had just gathered.
+    #[test]
+    fn ctx_pack_keeps_small_members_after_an_oversized_one() {
+        let store = MemStore::new();
+        let sid = "s";
+        let put = |name: &str, val: String, vis: Visibility| {
+            let vid = store.put_value(sid, &Value::String(val.clone())).unwrap();
+            store
+                .bind(sid, &SymbolName(name.into()), &vid, None, &val, vis)
+                .unwrap();
+        };
+        // Mirror the s_251 pack shape, scaled down: a tiny status bind, a tiny recent-commits bind,
+        // then one oversized evidence bind, then several modest code reads that fit the leftover.
+        // Each `Value::String` serializes to `"<value>"` — 2 chars overhead on top of the body.
+        put("status", "ok".into(), Visibility::Visible); // 4 chars
+        put("recent", "commits".into(), Visibility::Visible); // 9 chars
+        put("evidence", "e".repeat(200), Visibility::Visible); // 202 chars (oversized vs budget)
+        put("code_ops", "o".repeat(20), Visibility::Visible); // 22 chars
+        put("code_db", "d".repeat(20), Visibility::Visible); // 22 chars
+        put("code_sql", "q".repeat(20), Visibility::Visible); // 22 chars
+
+        let mut t = Vec::new();
+        // Budget 100: status(4) + recent(9) + code_ops(22) + code_db(22) + code_sql(22) = 79 ≤ 100 all
+        // fit; evidence(202) doesn't fit. Today the hard `break` at `evidence` drops itself AND the
+        // three code reads that would have fit; after the fix only `evidence` is dropped (drop-and-
+        // continue) and the three code reads survive in the leftover ~87 chars of budget.
+        let members = vec![
+            SymbolName("status".into()),
+            SymbolName("recent".into()),
+            SymbolName("evidence".into()),
+            SymbolName("code_ops".into()),
+            SymbolName("code_db".into()),
+            SymbolName("code_sql".into()),
+        ];
+        let vid = build_ctx(
+            &store,
+            sid,
+            &SymbolName("analysis_pack".into()),
+            &Some("diagnose".into()),
+            &members,
+            Some(100),
+            &mut t,
+        )
+        .unwrap();
+        let Some(Value::Struct(fields)) = store.get_value(&vid).unwrap() else {
+            panic!("ctx produced a struct value")
+        };
+        let Value::List(kept_vals) = &fields["members"] else {
+            panic!("members is a list")
+        };
+        let kept: Vec<String> = kept_vals
+            .iter()
+            .filter_map(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            kept.contains(&"status".to_string()),
+            "small leading members kept"
+        );
+        assert!(
+            kept.contains(&"recent".to_string()),
+            "small leading members kept"
+        );
+        assert!(
+            !kept.contains(&"evidence".to_string()),
+            "the oversized member is dropped (it doesn't fit)"
+        );
+        // The core assertion: the members after the oversized one survive.
+        assert!(
+            kept.contains(&"code_ops".to_string()),
+            "small member after the oversized one is kept (drop-and-continue)"
+        );
+        assert!(
+            kept.contains(&"code_db".to_string()),
+            "small member after the oversized one is kept (drop-and-continue)"
+        );
+        assert!(
+            kept.contains(&"code_sql".to_string()),
+            "small member after the oversized one is kept (drop-and-continue)"
+        );
+        // The shrink event still records the oversized member as dropped.
+        let dropped = store
+            .events(sid)
+            .into_iter()
+            .find_map(|e| match e {
+                RunEvent::CtxShrunk { dropped, .. } => Some(dropped),
+                _ => None,
+            })
+            .expect("a CtxShrunk event was recorded");
+        assert_eq!(
+            dropped,
+            vec!["evidence".to_string()],
+            "only the oversized member is dropped; the small later members survive"
         );
     }
 

@@ -1189,6 +1189,11 @@ members are recorded as a `ctx_shrunk` run event. Binds a `Ctx` value to `name`.
 The budget counter is a **char-based heuristic** in v1 (no provider tokenizer in L0); members are sized
 by their stored value's JSON length. An unbound member contributes nothing rather than erroring.
 
+Packing is **drop-and-continue**: members are visited in priority order and kept while they fit the
+remaining budget; a member that doesn't fit is dropped and packing continues with the next, so a single
+oversized early member never evicts the smaller members after it. A `pinned` member outranks a `visible`
+one and is never dropped to make room for a plainer member (no rank inversion).
+
 ### `ctx_append`
 
 Accrete more symbols into an existing pack (the `+=` marker). Immutably rebinds `ctx` to a **new** `Ctx`
