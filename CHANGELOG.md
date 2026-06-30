@@ -8,6 +8,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- Nothing yet.
+
+## [0.2.5] - 2026-06-30
+
+### Added
+
 - **Generated Flux skills (L-07).** Added `flux skill [cli|lang|plugin|ops]` to render Claude-format
   skills for Flux itself, plus `flux skill --install` / `flux skill <type> --install` to write a root
   routing skill and focused section skills (`flux-cli`, `flux-lang`, `flux-plugin`, `flux-ops`) into
