@@ -77,6 +77,11 @@ host-kit derives the schema + parses the call in one typed step.
   is deleted; handlers unchanged. 9 existing handler tests + a new `schema_contract` test
   (asserts the derived schema's fields/required/types/enums match the legacy `so(...)` contract)
   pass.
+- **`homer.call.analyze` parity port done (D-37).** Ported the full fluxplane multi-leg
+  correlation logic (from_user+to_user seed, number fan-out, correlation groups + temporal
+  overlap, number matching) + 5 new params. The `schema_contract` test's `call.analyze` entry
+  was updated for the new contract (`call_id` now optional, `correlation_header` required).
+  `render` (svg) + `route` deferred (recorded in DRIFT).
 - **Guard landed.** `plugins/host-kit/tests/no_manual_plugin_schema.rs` (scoped to
   `MIGRATED_PLUGINS = ["homer"]`) fails on a reintroduced `fn so(` / `so(json!{...})` and on a
   partial migration (no `*_op_typed::<`); verified failing-first by reintroducing `so`.

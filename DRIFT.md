@@ -145,3 +145,45 @@ change, **not** a contract change; fixing the drift is a separate story.
 `alertmanager`, `aws`. Several use `flex_str`/`flex_i64` string-or-number coercion; their
 handlers stay (schema-only struct, D-34 precedent) and any drift they surface will be recorded
 here as they migrate.
+
+---
+
+# D-37 drift report — homer call.analyze parity port
+
+Ported `homer.call.analyze` from the fluxplane reference
+(`~/projects/fluxplane/fluxplane-plugins/homer/analyze.go`). The flux op was a stripped-down stub
+(seed-by-`call_id` only; extracted correlation values but no fan-out / multi-leg analysis). It now
+does the full multi-leg correlation: seed by `call_id` **or** `from_user`+`to_user`, fan out by the
+seed caller + extra `numbers`, confirm legs by a shared `correlation_header` value + temporal
+overlap, and additionally by involving an extra number.
+
+## Parity status
+
+- **Matched:** `from_user`, `to_user`, `numbers`, `headers`, `limit` params + the full
+  multi-leg correlation logic (seed / fan-out / correlation-groups + temporal overlap /
+  number-matching / merged multi-leg flow + ladder). Result shape matches fluxplane's
+  `CallAnalyzeResult` (`seed_call_id` / `correlation_header` / `correlation_values` /
+  `legs` / `leg_count` / `events` / `event_count` / `ladder`).
+- **Architectural split (Gap A, intentionally NOT ported):** `endpoint_ref` per-call targeting —
+  flux resolves `homer.endpoint` via `host.endpoint(...)` + `~/.flux/endpoints.toml` (D-29
+  reference-IO), not the fluxplane per-call `EndpointRef`.
+- **Deferred (real gaps, follow-up stories):**
+  - **`render: svg` → `ladder_blob`:** the SVG sequence-diagram renderer (`RenderLadderSVG` in
+    `ladder_svg.go`) is not ported. `render` stays advertised for parity but the handler ignores
+    it; the result omits `ladder_blob`. Cross-cutting — `homer.call.show` advertises `render` too
+    (and currently ignores it); one story should port the SVG renderer for both.
+  - **`route` per leg:** `DeriveRoute`/`FormatRoute` (fluxplane `calls.go`) not ported; legs omit
+    `route`. Minor.
+
+## Tests
+
+- `test_op_call_analyze_from_user_seed_and_correlation` — failing-first (old handler errored on
+  missing `call_id`); now seeds by from/to, confirms a second leg by shared X-CID + temporal
+  overlap (`matched_by: "correlation"`).
+- `test_op_call_analyze_number_matching` — a fan-out leg involving an extra `numbers` entry is
+  matched without the correlation header (`matched_by: "number"`).
+- Existing `test_op_call_analyze` (call_id seed) still passes.
+- `schema_contract` updated for the new `call.analyze` contract (10 props, `correlation_header`
+  required; `call_id` is now optional — seed-by-call_id **or** from/to).
+- `MockHost::with_http_seq` added (host-kit) for tests that hit the same URL twice with different
+  responses (seed search then fan-out search).

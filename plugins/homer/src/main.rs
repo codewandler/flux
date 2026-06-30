@@ -85,12 +85,23 @@ struct CallQosInput {
     latency_ms: Option<i64>,
 }
 
-/// `homer.call.analyze` — multi-leg call correlation.
+/// `homer.call.analyze` — multi-leg call correlation (D-37 parity port).
+///
+/// Seed by `call_id` **or** `from_user`+`to_user`; fan out by the seed caller + extra `numbers`;
+/// legs are confirmed by a shared `correlation_header` value + temporal overlap, or by involving
+/// an extra number. `render` (svg) is advertised for parity but SVG rendering is deferred (needs
+/// the `ladder_svg` port shared with `call.show`) — see `DRIFT.md` § D-37.
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
 struct CallAnalyzeInput {
-    call_id: String,
+    call_id: Option<String>,
+    from_user: Option<String>,
+    to_user: Option<String>,
     correlation_header: String,
+    numbers: Option<Vec<String>>,
+    headers: Option<Vec<String>>,
+    limit: Option<i64>,
+    render: Option<Render>,
     since: Option<String>,
     until: Option<String>,
 }
@@ -1400,21 +1411,44 @@ fn op_call_qos(input: Value, host: &mut Host) -> Result<Value, String> {
 }
 
 fn op_call_analyze(input: Value, host: &mut Host) -> Result<Value, String> {
-    let call_id = str_opt(&input, "call_id").ok_or("call_id is required")?;
-    let correlation_header = str_opt(&input, "correlation_header")
-        .ok_or("correlation_header is required (the SIP header that ties call legs)")?;
+    // D-37: ported from ~/projects/fluxplane/fluxplane-plugins/homer/analyze.go.
+    // Multi-leg correlation: seed → fan-out → correlation groups (temporal overlap) +
+    // number matching → merged multi-leg flow.
+    use std::collections::{HashMap, HashSet};
+
+    let header = str_opt(&input, "correlation_header")
+        .ok_or("correlation_header is required (the SIP header that ties call legs together)")?;
+    let call_id = str_opt(&input, "call_id");
+    let from_user = str_opt(&input, "from_user");
+    let to_user = str_opt(&input, "to_user");
+    let numbers = str_array(&input, "numbers");
+    let extra_headers = str_array(&input, "headers");
+    let limit = clamp_limit(i64_opt(&input, "limit").unwrap_or(0), 50, 200);
+    // `render` (svg) is accepted for parity but SVG rendering is deferred (DRIFT.md § D-37).
+    let _render = str_opt(&input, "render");
+
+    let seed_by_id = call_id.is_some();
+    if !seed_by_id && (from_user.is_none() || to_user.is_none()) {
+        return Err("provide call_id, or from_user and to_user".into());
+    }
 
     let base = host
         .endpoint("homer.endpoint")
         .unwrap_or_else(|_| "http://localhost:9080".into());
     let base = base.trim_end_matches('/').to_string();
     let token = login(host, &base)?;
-
     let (from_ms, to_ms) = resolve_window(&input, 6 * 3_600_000); // 6h default
 
-    // Locate the seed call
-    let seed_smart = format!("sid = '{call_id}'");
-    let seed_payload = build_search_payload(from_ms, to_ms, &seed_smart, 200);
+    // Step 1: locate the seed call (by call_id, or unambiguously by from/to).
+    let seed_payload = if let Some(cid) = &call_id {
+        build_search_payload(from_ms, to_ms, &format!("sid = '{cid}'"), 200)
+    } else {
+        let criteria = vec![
+            number_alternatives("data_header.from_user", from_user.as_deref().unwrap_or("")),
+            number_alternatives("data_header.to_user", to_user.as_deref().unwrap_or("")),
+        ];
+        build_search_payload(from_ms, to_ms, &build_smart_input(&criteria), 200)
+    };
     let seed_result = homer_post(
         host,
         &base,
@@ -1422,59 +1456,227 @@ fn op_call_analyze(input: Value, host: &mut Host) -> Result<Value, String> {
         &token,
         &seed_payload,
     )?;
-
-    let empty_arr = Value::Array(vec![]);
     let seed_data = seed_result
         .get("data")
         .and_then(|v| v.as_array())
-        .unwrap_or(empty_arr.as_array().unwrap());
-
-    if seed_data.is_empty() {
+        .cloned()
+        .unwrap_or_default();
+    let seed_groups = group_calls(&seed_data, "");
+    if seed_groups.is_empty() {
+        return Err("no seed call found — widen since/until or check the call_id".into());
+    }
+    if !seed_by_id && seed_groups.len() > 1 {
+        let candidates: Vec<String> = seed_groups
+            .iter()
+            .map(|c| {
+                format!(
+                    "{} {} {}->{}",
+                    ms_to_rfc3339(c.start_ms),
+                    c.call_id,
+                    c.caller,
+                    c.callee
+                )
+            })
+            .collect();
         return Err(format!(
-            "no messages found for call_id {call_id:?} — widen since/until"
+            "found {} calls matching from/to; re-run with one call_id: {}",
+            seed_groups.len(),
+            candidates.join(" | ")
         ));
     }
+    // Oldest matching group when several windows of the same sid (fluxplane takes last).
+    let seed_call = seed_groups.last().unwrap();
+    let seed_call_id = seed_call.call_id.clone();
+    let seed_start_ms = seed_call.start_ms;
+    let seed_end_ms = seed_call.end_ms;
 
-    // Get the full transaction to extract the correlation header values
-    let tx_payload = build_transaction_payload(from_ms, to_ms, seed_data);
+    // Step 2: fan out by the seed caller + extra numbers around the seed window (±30m).
+    let margin_ms = 30 * 60 * 1000;
+    let fan_from = seed_start_ms.saturating_sub(margin_ms);
+    let fan_to = seed_end_ms.saturating_add(margin_ms);
+    let mut fan_alts: Vec<String> = number_alternatives("data_header.from_user", &seed_call.caller);
+    for n in &numbers {
+        fan_alts.extend(number_alternatives("data_header.from_user", n));
+        fan_alts.extend(number_alternatives("data_header.to_user", n));
+    }
+    let fan_smart = if fan_alts.is_empty() {
+        String::new()
+    } else {
+        build_smart_input(&[fan_alts])
+    };
+    let fan_payload = build_search_payload(fan_from, fan_to, &fan_smart, limit);
+    let fan_result = homer_post(
+        host,
+        &base,
+        "/api/v3/search/call/data",
+        &token,
+        &fan_payload,
+    )?;
+    let fan_data = fan_result
+        .get("data")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    // Merge seed + fan records (dedup by record `id` — fluxplane's MergeSearchResults).
+    let merged = merge_records(&seed_data, &fan_data);
+
+    // Step 3: transaction on the merged candidates; extract the correlation header
+    // (and any extra headers) from each candidate INVITE.
+    let tx_payload = build_transaction_payload(fan_from, fan_to, &merged);
     let tx_result = homer_post(host, &base, "/api/v3/call/transaction", &token, &tx_payload)?;
-
     let messages = tx_result
         .pointer("/data/messages")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
 
-    // Extract correlation header values from INVITE messages
-    let mut correlation_values: Vec<String> = Vec::new();
+    let mut call_id_correlation: HashMap<String, String> = HashMap::new(); // callID -> value
+    let mut value_call_ids: HashMap<String, HashSet<String>> = HashMap::new(); // value -> callIDs
+    let mut call_id_headers: HashMap<String, HashMap<String, String>> = HashMap::new();
     for m in &messages {
         let raw = m.get("raw").and_then(|v| v.as_str()).unwrap_or("");
-        if !raw.starts_with("INVITE ") {
+        let is_invite = m.get("method").and_then(|v| v.as_str()) == Some("INVITE");
+        if !is_invite || raw.is_empty() || !raw.starts_with("INVITE ") {
             continue;
         }
-        if let Some(val) = extract_sip_header(raw, &correlation_header) {
-            if !correlation_values.contains(&val) {
-                correlation_values.push(val);
+        let cid = m
+            .get("sid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if let Some(val) = extract_sip_header(raw, &header) {
+            call_id_correlation.insert(cid.clone(), val.clone());
+            value_call_ids.entry(val).or_default().insert(cid.clone());
+        }
+        for extra in &extra_headers {
+            if let Some(val) = extract_sip_header(raw, extra) {
+                call_id_headers
+                    .entry(cid.clone())
+                    .or_default()
+                    .insert(extra.clone(), val);
             }
         }
     }
 
-    let events = flow_events(&messages, false, &[]);
+    // Step 4: keep correlation groups that temporally overlap the seed
+    // (a leg spawns within seconds of the external INVITE: start in [-5s, +30s]).
+    let all_candidates = group_calls(&merged, "");
+    let candidate_by_id: HashMap<&str, &CallGroup> = all_candidates
+        .iter()
+        .map(|c| (c.call_id.as_str(), c))
+        .collect();
+    let mut matched: HashMap<String, &str> = HashMap::new();
+    matched.insert(seed_call_id.clone(), "seed");
+    let mut correlation_values: Vec<String> = Vec::new();
+    for (value, call_ids) in &value_call_ids {
+        let overlaps = call_ids.iter().any(|cid| {
+            candidate_by_id
+                .get(cid.as_str())
+                .map(|c| {
+                    c.start_ms > seed_start_ms.saturating_sub(5_000)
+                        && c.start_ms < seed_start_ms.saturating_add(30_000)
+                })
+                .unwrap_or(false)
+        });
+        if !overlaps {
+            continue;
+        }
+        correlation_values.push(value.clone());
+        for cid in call_ids {
+            matched.entry(cid.clone()).or_insert("correlation");
+        }
+    }
+    correlation_values.sort();
+
+    // Step 5: include fan-out legs that involve an extra number even without
+    // the correlation header — the number expresses explicit user intent.
+    let extra_num_set: HashSet<String> = numbers
+        .iter()
+        .map(|n| n.trim_start_matches('+').to_string())
+        .collect();
+    if !extra_num_set.is_empty() {
+        for c in &all_candidates {
+            if matched.contains_key(&c.call_id) {
+                continue;
+            }
+            let caller = c.caller.trim_start_matches('+');
+            let callee = c.callee.trim_start_matches('+');
+            if extra_num_set.contains(caller) || extra_num_set.contains(callee) {
+                matched.insert(c.call_id.clone(), "number");
+            }
+        }
+    }
+
+    // Build the leg report (ordered by start time) and the merged flow.
+    let mut legs: Vec<Value> = Vec::new();
+    for (cid, matched_by) in &matched {
+        let Some(c) = candidate_by_id.get(cid.as_str()) else {
+            continue;
+        };
+        let mut leg = json!({
+            "call_id":    cid,
+            "seed":       cid == &seed_call_id,
+            "start_time": ms_to_rfc3339(c.start_ms),
+            "from":       c.caller,
+            "to":         c.callee,
+            "status":     c.status,
+            "matched_by": matched_by,
+            "correlation": call_id_correlation.get(cid).cloned().unwrap_or_default(),
+        });
+        if c.msg_count > 1 {
+            leg["duration"] = json!(format_duration_ms(c.end_ms - c.start_ms));
+        }
+        if let Some(h) = call_id_headers.get(cid) {
+            leg["headers"] = json!(h);
+        }
+        legs.push(leg);
+    }
+    legs.sort_by(|a, b| {
+        a["start_time"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["start_time"].as_str().unwrap_or(""))
+    });
+
+    // Merged flow across all legs: the already-fetched transaction filtered to matched Call-IDs.
+    let matched_ids: HashSet<String> = matched.keys().cloned().collect();
+    let matched_messages: Vec<Value> = messages
+        .iter()
+        .filter(|m| {
+            m.get("sid")
+                .and_then(|v| v.as_str())
+                .map(|s| matched_ids.contains(s))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    let events = flow_events(&matched_messages, false, &[]);
     let ladder = render_ladder(&events);
 
     Ok(json!({
-        "seed_call_id":        call_id,
-        "correlation_header":  correlation_header,
+        "seed_call_id":        seed_call_id,
+        "correlation_header":  header,
         "correlation_values":  correlation_values,
+        "legs":                legs,
+        "leg_count":           legs.len(),
         "events":              events,
         "event_count":         events.len(),
         "ladder":              ladder,
-        "legs": [{
-            "call_id":    call_id,
-            "seed":       true,
-            "matched_by": "seed"
-        }]
     }))
+}
+
+/// Merge two search `data` arrays, deduping by record `id` (fluxplane's `MergeSearchResults`).
+fn merge_records(a: &[Value], b: &[Value]) -> Vec<Value> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<Value> = HashSet::new();
+    let mut out: Vec<Value> = Vec::with_capacity(a.len() + b.len());
+    for rec in a.iter().chain(b) {
+        let id = rec.get("id").cloned().unwrap_or(Value::Null);
+        if seen.insert(id) {
+            out.push(rec.clone());
+        }
+    }
+    out
 }
 
 /// Extract a header value from a raw SIP message (case-insensitive, stops at blank line).
@@ -1871,6 +2073,133 @@ mod tests {
         assert_eq!(vals[0], "corr-abc");
     }
 
+    // D-37: the from_user+to_user seed path + multi-leg correlation. Before the port the handler
+    // errored on missing `call_id` ("call_id is required"); after, it seeds by from/to, fans out,
+    // and confirms a second leg by the shared X-CID + temporal overlap.
+    #[test]
+    fn test_op_call_analyze_from_user_seed_and_correlation() {
+        let plugin = manifest_builder().build();
+        let t = 1_704_067_200_000_i64;
+        // Seed leg: alice -> bob, X-CID corr-abc.
+        let seed = json!({
+            "id": 1, "create_date": t, "micro_ts": 0, "protocol": 1,
+            "srcIp": "10.0.0.1", "srcPort": 5060, "dstIp": "10.0.0.2", "dstPort": 5060,
+            "sid": "seed-call", "method": "INVITE", "method_text": "",
+            "from_user": "alice", "to_user": "bob", "ruri_user": "bob",
+            "user_agent": "Asterisk", "cseq": "1 INVITE", "status": 0,
+            "aliasSrc": "", "aliasDst": ""
+        });
+        // Second leg: alice -> charlie (same caller → found by the from_user fan-out),
+        // same X-CID, 10s later (within the [-5s, +30s] overlap window).
+        let leg2 = json!({
+            "id": 2, "create_date": t + 10_000, "micro_ts": 0, "protocol": 1,
+            "srcIp": "10.0.0.1", "srcPort": 5060, "dstIp": "10.0.0.3", "dstPort": 5060,
+            "sid": "leg2-call", "method": "INVITE", "method_text": "",
+            "from_user": "alice", "to_user": "charlie", "ruri_user": "charlie",
+            "user_agent": "Asterisk", "cseq": "1 INVITE", "status": 0,
+            "aliasSrc": "", "aliasDst": ""
+        });
+        let tx_messages = json!([
+            {"id":1,"sid":"seed-call","method":"INVITE","srcIp":"10.0.0.1","srcPort":5060,"dstIp":"10.0.0.2","dstPort":5060,"create_date":t,"micro_ts":0,"from_user":"alice","to_user":"bob","cseq":"1 INVITE","protocol":1,"profile":"1_call","dbnode":"local","raw":"INVITE sip:bob@domain SIP/2.0\r\nX-CID: corr-abc\r\n\r\n"},
+            {"id":2,"sid":"leg2-call","method":"INVITE","srcIp":"10.0.0.1","srcPort":5060,"dstIp":"10.0.0.3","dstPort":5060,"create_date":t+10_000,"micro_ts":0,"from_user":"alice","to_user":"charlie","cseq":"1 INVITE","protocol":1,"profile":"1_call","dbnode":"local","raw":"INVITE sip:charlie@domain SIP/2.0\r\nX-CID: corr-abc\r\n\r\n"}
+        ]);
+        let mut host = base_mock()
+            // login (with_http) + two sequential search/call/data responses (seed, then fan-out)
+            // + one transaction response.
+            .with_http_seq(
+                "/api/v3/search/call/data",
+                json!({ "data": [seed.clone()], "total": 1 }),
+            )
+            .with_http_seq(
+                "/api/v3/search/call/data",
+                json!({ "data": [seed.clone(), leg2.clone()], "total": 2 }),
+            )
+            .with_http(
+                "/api/v3/call/transaction",
+                json!({ "data": { "messages": tx_messages }, "total": 2 }),
+            );
+        let result = plugin
+            .call(
+                "homer.call.analyze",
+                json!({ "from_user": "alice", "to_user": "bob", "correlation_header": "X-CID" }),
+                &mut host,
+            )
+            .unwrap();
+        assert_eq!(result["seed_call_id"], "seed-call");
+        assert_eq!(result["correlation_header"], "X-CID");
+        let vals = result["correlation_values"].as_array().unwrap();
+        assert_eq!(vals, &vec!["corr-abc"]);
+        assert_eq!(result["leg_count"], 2);
+        let legs = result["legs"].as_array().unwrap();
+        let by_id: std::collections::BTreeMap<String, &serde_json::Value> = legs
+            .iter()
+            .map(|l| (l["call_id"].as_str().unwrap().to_string(), l))
+            .collect();
+        assert_eq!(by_id["seed-call"]["seed"], true);
+        assert_eq!(by_id["seed-call"]["matched_by"], "seed");
+        assert_eq!(by_id["leg2-call"]["seed"], false);
+        assert_eq!(by_id["leg2-call"]["matched_by"], "correlation");
+        assert_eq!(by_id["leg2-call"]["correlation"], "corr-abc");
+        assert!(result["event_count"].as_i64().unwrap() >= 2);
+    }
+
+    // D-37: a fan-out leg involving an extra `numbers` entry is matched even without the
+    // correlation header (explicit user intent).
+    #[test]
+    fn test_op_call_analyze_number_matching() {
+        let plugin = manifest_builder().build();
+        let t = 1_704_067_200_000_i64;
+        let seed = json!({
+            "id": 1, "create_date": t, "micro_ts": 0, "protocol": 1,
+            "srcIp": "10.0.0.1", "srcPort": 5060, "dstIp": "10.0.0.2", "dstPort": 5060,
+            "sid": "seed-call", "method": "INVITE", "method_text": "",
+            "from_user": "alice", "to_user": "bob", "ruri_user": "bob",
+            "user_agent": "Asterisk", "cseq": "1 INVITE", "status": 0,
+            "aliasSrc": "", "aliasDst": ""
+        });
+        // A leg involving the extra number "dave" (as callee), NO correlation header, 20s later.
+        let leg3 = json!({
+            "id": 3, "create_date": t + 20_000, "micro_ts": 0, "protocol": 1,
+            "srcIp": "10.0.0.1", "srcPort": 5060, "dstIp": "10.0.0.4", "dstPort": 5060,
+            "sid": "leg3-call", "method": "INVITE", "method_text": "",
+            "from_user": "alice", "to_user": "dave", "ruri_user": "dave",
+            "user_agent": "Asterisk", "cseq": "1 INVITE", "status": 0,
+            "aliasSrc": "", "aliasDst": ""
+        });
+        let tx_messages = json!([
+            {"id":1,"sid":"seed-call","method":"INVITE","srcIp":"10.0.0.1","srcPort":5060,"dstIp":"10.0.0.2","dstPort":5060,"create_date":t,"micro_ts":0,"from_user":"alice","to_user":"bob","cseq":"1 INVITE","protocol":1,"profile":"1_call","dbnode":"local","raw":"INVITE sip:bob@domain SIP/2.0\r\nX-CID: corr-abc\r\n\r\n"},
+            {"id":3,"sid":"leg3-call","method":"INVITE","srcIp":"10.0.0.1","srcPort":5060,"dstIp":"10.0.0.4","dstPort":5060,"create_date":t+20_000,"micro_ts":0,"from_user":"alice","to_user":"dave","cseq":"1 INVITE","protocol":1,"profile":"1_call","dbnode":"local","raw":"INVITE sip:dave@domain SIP/2.0\r\n\r\n"}
+        ]);
+        let mut host = base_mock()
+            .with_http_seq(
+                "/api/v3/search/call/data",
+                json!({ "data": [seed.clone()], "total": 1 }),
+            )
+            .with_http_seq(
+                "/api/v3/search/call/data",
+                json!({ "data": [seed.clone(), leg3.clone()], "total": 2 }),
+            )
+            .with_http(
+                "/api/v3/call/transaction",
+                json!({ "data": { "messages": tx_messages }, "total": 2 }),
+            );
+        let result = plugin
+            .call(
+                "homer.call.analyze",
+                json!({ "call_id": "seed-call", "correlation_header": "X-CID", "numbers": ["dave"] }),
+                &mut host,
+            )
+            .unwrap();
+        assert_eq!(result["leg_count"], 2);
+        let legs = result["legs"].as_array().unwrap();
+        let by_id: std::collections::BTreeMap<String, &serde_json::Value> = legs
+            .iter()
+            .map(|l| (l["call_id"].as_str().unwrap().to_string(), l))
+            .collect();
+        assert_eq!(by_id["seed-call"]["matched_by"], "seed");
+        assert_eq!(by_id["leg3-call"]["matched_by"], "number");
+    }
+
     // ─── homer.pcap.export ───────────────────────────────────────────────────
 
     #[test]
@@ -2051,11 +2380,17 @@ mod schema_contract {
                 OpContract {
                     props: vec![
                         p("call_id", Kind::Str),
+                        p("from_user", Kind::Str),
+                        p("to_user", Kind::Str),
                         p("correlation_header", Kind::Str),
+                        p("numbers", Kind::ArrayStr),
+                        p("headers", Kind::ArrayStr),
+                        p("limit", Kind::Int),
+                        p("render", Kind::Enum(vec!["svg".into()])),
                         p("since", Kind::Str),
                         p("until", Kind::Str),
                     ],
-                    required: vec!["call_id", "correlation_header"],
+                    required: vec!["correlation_header"],
                 },
             ),
             (

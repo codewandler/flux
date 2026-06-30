@@ -787,6 +787,11 @@ pub struct MockHost {
     pub proc_exit_code: Option<i64>,
     /// `(url-substring) -> raw bytes` for a binary `http.do` (response_binary), matched in insertion order.
     pub http_bytes: Vec<(String, Vec<u8>)>,
+    /// A FIFO queue of `(url-substring, JSON)` responses drained one-per-`http.do` call (first
+    /// matching entry popped), for tests that hit the **same URL more than once** and need
+    /// different responses per call (e.g. a seed search then a fan-out search on the same path).
+    /// Checked before [`http`](MockHost::http); falls back to `http`'s first-match when empty.
+    pub http_seq: std::cell::RefCell<Vec<(String, Value)>>,
     /// Records the plugin contributed (captured for assertions).
     pub contributed: std::cell::RefCell<Vec<Record>>,
     /// An in-memory `conn.*` byte buffer: `conn.write` appends, `conn.read` drains (a loopback echo).
@@ -813,6 +818,7 @@ impl Default for MockHost {
             proc_running: false,
             proc_exit_code: None,
             http_bytes: Vec::new(),
+            http_seq: std::cell::RefCell::new(Vec::new()),
             contributed: std::cell::RefCell::new(Vec::new()),
             conn_buf: std::cell::RefCell::new(Vec::new()),
             conn_script: std::cell::RefCell::new(std::collections::VecDeque::new()),
@@ -825,6 +831,13 @@ impl MockHost {
     /// Canned JSON response for any `http.do` whose URL contains `url_substr`.
     pub fn with_http(mut self, url_substr: &str, result: Value) -> Self {
         self.http.push((url_substr.into(), result));
+        self
+    }
+    /// A sequential canned JSON response: the first `http.do` whose URL contains `url_substr`
+    /// pops and returns this, then it's gone. Use for tests that hit the same URL multiple
+    /// times with different responses (e.g. seed search then fan-out search).
+    pub fn with_http_seq(self, url_substr: &str, result: Value) -> Self {
+        self.http_seq.borrow_mut().push((url_substr.into(), result));
         self
     }
     /// A resolvable endpoint base URL.
@@ -932,6 +945,18 @@ impl GuestHost for MockHost {
                         .to_string()
                 };
                 let url = url.as_str();
+                // Sequential responses: drain the first matching entry, then fall back to
+                // the first-match `http` table.
+                let seq_pos = {
+                    let seq = self.http_seq.borrow();
+                    seq.iter().position(|(sub, _)| url.contains(sub.as_str()))
+                };
+                if let Some(pos) = seq_pos {
+                    let (_, body) = self.http_seq.borrow_mut().remove(pos);
+                    return Ok(
+                        json!({ "status": 200, "body": serde_json::to_string(&body).unwrap() }),
+                    );
+                }
                 // Binary download path: return base64 of canned raw bytes, matching the host.
                 if payload
                     .get("response_binary")

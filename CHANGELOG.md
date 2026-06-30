@@ -8,6 +8,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **homer `call.analyze` parity port (D-37).** `homer.call.analyze` now does the full
+  multi-leg correlation analysis ported from the fluxplane reference: seed by `call_id` **or**
+  `from_user`+`to_user`, fan out by the seed caller + extra `numbers`, confirm legs by a shared
+  `correlation_header` value + temporal overlap, and additionally by involving an extra number.
+  New params: `from_user`, `to_user`, `numbers`, `headers`, `limit` (`render` advertised for
+  parity, SVG deferred). Result matches fluxplane's `CallAnalyzeResult` (legs with `matched_by` /
+  `correlation` / `headers` / `duration`, `leg_count`, merged `events` + `ladder`). Failing-first
+  MockHost tests cover the from/to-seed + correlation path and the number-matching path.
+  `MockHost::with_http_seq` added (host-kit) for repeated-URL test scenarios.
+
 - **Plugin-side schemars op schemas — D-36 (in-progress).** `host-kit` now derives a plugin
   op's `input_schema` from a typed struct via `read_op_typed::<T>` / `write_op_typed::<T>`
   (+ `op_input_schema::<T>()`, a `schemars` re-export), the plugin-side counterpart of D-34.
