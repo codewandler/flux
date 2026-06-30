@@ -15,6 +15,18 @@ fn when(signal: &str) -> Vec<SignalMatch> {
     }]
 }
 
+/// A `surface_when` predicate matching ANY of the named `project.signal`s (the resolver OR-s the
+/// `SignalMatch` list).
+fn when_any(signals: &[&str]) -> Vec<SignalMatch> {
+    signals
+        .iter()
+        .map(|s| SignalMatch {
+            kind: KIND_SIGNAL.into(),
+            signal: Some((*s).into()),
+        })
+        .collect()
+}
+
 /// The built-in tool groups and the signals that surface them. `git` is the live gated group; the
 /// language groups (`go`/`node`/`python`/`rust`) currently bundle no ops — they establish the
 /// mechanism and are filled as language tools land. The `eval` group is contributed separately by
@@ -85,6 +97,23 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
             surface_when: when("shell"),
         },
         ToolGroup {
+            name: "endpoint".into(),
+            description: "Endpoint discovery (D-28): find live service endpoints (kubernetes \
+                          clusters, in-cluster services/ingresses, RDS/SQL databases, monitoring) \
+                          as weak references — URLs + a credential location, never a secret — and \
+                          select one to connect through. Surfaced when a kubeconfig is present."
+                .into(),
+            tools: names(&[
+                "endpoint.discover",
+                "endpoint.select",
+                "endpoint.info",
+                "endpoint.list",
+            ]),
+            // Surfaced by the ambient `kubernetes` signal (a kubeconfig is present); a generic
+            // `endpoint` signal, if ever injected, surfaces it too.
+            surface_when: when_any(&["kubernetes", "endpoint"]),
+        },
+        ToolGroup {
             name: "cognition".into(),
             description: "Pure cognition helpers: needs/gaps, and list shaping (compare, dedupe, \
                           sort, top, merge, cite, len, first, last, filter)."
@@ -110,6 +139,31 @@ mod tests {
         let git = g.iter().find(|g| g.name == "git").unwrap();
         assert!(git.tools.contains(&"git_status".to_string()));
         assert_eq!(git.surface_when[0].signal.as_deref(), Some("git_repo"));
+    }
+
+    #[test]
+    fn endpoint_group_surfaces_on_kubernetes_signal() {
+        let g = builtin_groups();
+        let ep = g.iter().find(|g| g.name == "endpoint").unwrap();
+        for op in [
+            "endpoint.discover",
+            "endpoint.select",
+            "endpoint.info",
+            "endpoint.list",
+        ] {
+            assert!(
+                ep.tools.contains(&op.to_string()),
+                "endpoint carries `{op}`"
+            );
+        }
+        // The kubernetes ambient signal surfaces it (and a generic `endpoint` signal also does).
+        let signals: Vec<&str> = ep
+            .surface_when
+            .iter()
+            .filter_map(|m| m.signal.as_deref())
+            .collect();
+        assert!(signals.contains(&"kubernetes"));
+        assert!(signals.contains(&"endpoint"));
     }
 
     #[test]

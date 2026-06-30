@@ -466,7 +466,23 @@ pub fn detect_signals(cwd: &std::path::Path) -> Vec<Observation> {
     if shell_opt_in() {
         push("shell");
     }
+    // `kubernetes` is ambient (a kubeconfig is reachable), not a workspace-walk marker: it surfaces
+    // the `endpoint` discovery group (D-28). True when `KUBECONFIG` is set OR `~/.kube/config` exists.
+    if kubeconfig_present() {
+        push("kubernetes");
+    }
     out
+}
+
+/// Whether a kubeconfig is reachable: `KUBECONFIG` is set (non-empty) OR `~/.kube/config` exists. This
+/// is ambient (host environment / home dir), independent of `cwd` — kubectl finds its config this way.
+fn kubeconfig_present() -> bool {
+    if std::env::var_os("KUBECONFIG").is_some_and(|v| !v.is_empty()) {
+        return true;
+    }
+    std::env::var_os("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".kube").join("config"))
+        .is_some_and(|p| p.exists())
 }
 
 /// Walk up from `start` to the filesystem root, returning true at the first ancestor satisfying
@@ -1181,7 +1197,7 @@ mod tests {
     #[tokio::test]
     async fn secrets_redacted_from_success_output() {
         let secret = "sk-ant-supersecretvalue123456";
-        let mut ctx = test_ctx();
+        let ctx = test_ctx();
         ctx.redactor.add_secret(secret);
 
         let mut reg = ToolRegistry::new();
@@ -1589,5 +1605,27 @@ mod tests {
         assert!(has("git_repo") && has("go"));
         assert!(!has("python"));
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn kubeconfig_present_detects_env() {
+        // `KUBECONFIG` set (non-empty) → kubeconfig is reachable. We can't safely assert the negative
+        // (the host running the test may have ~/.kube/config), so only assert the positive env case.
+        let dir = std::env::temp_dir().join(format!("flux-kube-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config");
+        std::fs::write(&cfg, "apiVersion: v1\n").unwrap();
+        let prev = std::env::var_os("KUBECONFIG");
+        std::env::set_var("KUBECONFIG", &cfg);
+        assert!(kubeconfig_present());
+        let sigs = detect_signals(&dir);
+        assert!(sigs
+            .iter()
+            .any(|o| o.data.get("signal").and_then(|v| v.as_str()) == Some("kubernetes")));
+        match prev {
+            Some(v) => std::env::set_var("KUBECONFIG", v),
+            None => std::env::remove_var("KUBECONFIG"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

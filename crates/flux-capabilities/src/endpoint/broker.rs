@@ -29,6 +29,20 @@ use flux_secret::{Kind, Material, Ref, Scheme};
 
 use super::{EndpointRegistry, StaticResolver};
 
+/// Resolve the actual op name a provider advertises for the bare `suffix` (`endpoint.discover` /
+/// `secret.read`). flux plugins NAMESPACE their ops (the kubernetes plugin's ops are
+/// `kubernetes.endpoint.discover`, `kubernetes.secret.read`), so a cross-plugin call must address the
+/// provider's *real* op name, not the bare one. Pick the op whose name equals `suffix` or ends with
+/// `.<suffix>`; `None` when the provider advertises no such op.
+fn resolve_op_name(manifest: &PluginManifest, suffix: &str) -> Option<String> {
+    let dotted = format!(".{suffix}");
+    manifest
+        .operations
+        .iter()
+        .map(|o| o.name.clone())
+        .find(|n| n == suffix || n.ends_with(&dotted))
+}
+
 /// A registered provider plugin: the handles the broker needs to fan a discovery query out to it.
 pub struct ProviderEntry {
     /// The provider's manifest (its `discovers` set is matched against the queried product).
@@ -129,10 +143,14 @@ impl ProviderInvoker for HostProviderInvoker {
             .registry
             .get(name)
             .ok_or_else(|| format!("no such provider `{name}`"))?;
+        // Resolve the provider's ACTUAL op name (plugins namespace their ops, e.g.
+        // `kubernetes.endpoint.discover`); a bare `endpoint.discover` call would not match.
+        let op = resolve_op_name(&entry.manifest, "endpoint.discover")
+            .ok_or_else(|| format!("provider `{name}` advertises no `endpoint.discover` op"))?;
         let payload = json!({ "product": product, "query": query, "limit": limit });
         let result = {
             let mut host = entry.host.lock().await;
-            host.call_with_host("endpoint.discover", payload, entry.caps.as_ref())
+            host.call_with_host(&op, payload, entry.caps.as_ref())
                 .await
                 .map_err(|e| e.to_string())?
         };
@@ -206,16 +224,6 @@ impl HostCredentialReader {
     pub fn new(registry: Arc<PluginRegistry>) -> Self {
         Self { registry }
     }
-
-    /// The `secret.read` op name a provider advertises (fully-qualified if so authored).
-    fn secret_read_op_name(manifest: &PluginManifest) -> String {
-        manifest
-            .operations
-            .iter()
-            .map(|o| o.name.clone())
-            .find(|n| n == "secret.read" || n.ends_with(".secret.read"))
-            .unwrap_or_else(|| "secret.read".to_string())
-    }
 }
 
 #[async_trait]
@@ -231,7 +239,10 @@ impl CredentialReader for HostCredentialReader {
             "name": reference.instance,
             "keys": [reference.slot],
         });
-        let op = Self::secret_read_op_name(&entry.manifest);
+        // The provider's ACTUAL op name (namespaced, e.g. `kubernetes.secret.read`).
+        let op = resolve_op_name(&entry.manifest, "secret.read").ok_or_else(|| {
+            format!("provider `{provider}` advertises no `secret.read` op to resolve `{reference}`")
+        })?;
         let result = {
             let mut host = entry.host.lock().await;
             host.call_with_host(&op, payload, entry.caps.as_ref())
@@ -662,6 +673,43 @@ mod tests {
             discovers: discovers.iter().map(|s| s.to_string()).collect(),
             ..PluginManifest::default()
         })
+    }
+
+    /// A manifest with the given op names declared (for op-name resolution tests).
+    fn manifest_with_ops(ops: &[&str]) -> PluginManifest {
+        PluginManifest {
+            operations: ops
+                .iter()
+                .map(|n| flux_plugin::OperationSpec {
+                    name: (*n).to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..PluginManifest::default()
+        }
+    }
+
+    #[test]
+    fn resolve_op_name_matches_namespaced_and_bare() {
+        // A namespaced provider op (the kubernetes plugin) resolves for the bare suffix.
+        let k8s = manifest_with_ops(&["kubernetes.endpoint.discover", "kubernetes.secret.read"]);
+        assert_eq!(
+            resolve_op_name(&k8s, "endpoint.discover").as_deref(),
+            Some("kubernetes.endpoint.discover")
+        );
+        assert_eq!(
+            resolve_op_name(&k8s, "secret.read").as_deref(),
+            Some("kubernetes.secret.read")
+        );
+        // A bare op name also matches (the fakes keep bare names).
+        let bare = manifest_with_ops(&["endpoint.discover"]);
+        assert_eq!(
+            resolve_op_name(&bare, "endpoint.discover").as_deref(),
+            Some("endpoint.discover")
+        );
+        // No matching op → None (the invoker/reader turn this into a clear error).
+        let none = manifest_with_ops(&["kubernetes.pod.list"]);
+        assert_eq!(resolve_op_name(&none, "endpoint.discover"), None);
     }
 
     /// Register provider `name` (discovering `product`) in `reg`. The fake [`ProviderInvoker`] never

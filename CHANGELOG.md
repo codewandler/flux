@@ -8,6 +8,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Kubernetes endpoint provider + agent-facing discovery ops (D-28).** The kubernetes plugin is now a
+  discovery provider: `kubernetes.endpoint.discover` declares the products it can find and returns weak
+  `EndpointCandidate`s — kubeconfig contexts → cluster endpoints, in-cluster Services/Ingresses → product
+  endpoints (prometheus/loki/grafana/alertmanager), and crossplane/RDS Secrets → `postgres`/`mysql`
+  endpoints carrying a `kubernetes/<ns>/<secret>/<key>` `credential_ref` (a location, never a value), with
+  "latest namespace" selection. The broker now resolves a provider's real (namespaced) op name. New
+  agent ops `endpoint.discover`/`select`/`info`/`list` (read-only, in an `endpoint` group surfaced when a
+  `kubernetes` signal — `KUBECONFIG`/`~/.kube/config` — is present) let the model discover and select an
+  endpoint as a weak reference; the agent never sees a secret. This wires the "connect to my latest
+  namespace backend RDS" path.
 - **Reference-based plugin IO + host-injected connect (D-27).** Plugin `http.do`/`conn.dial` now accept
   an `endpoint_ref` (named or discovered `@endpoint/<id>`); the host resolves it, composes the URL
   through the existing egress guard, and injects credentials host-side — the plugin and the model never

@@ -22,10 +22,10 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
   grader-confirmed run is **staged** on a funded provider key
 
 ## Next (ready — take the top one unless the user named a story)
-- [D-28 — Kubernetes endpoint provider](D-28-kubernetes-endpoint-provider.md) · Agent · **top pick** ·
-  the next step in the **Endpoint discovery & brokerage** epic (below): the reference provider + the
-  agent-facing `endpoint.*` ops, enabling the "connect to my latest namespace backend RDS" demo.
-  (D-25/D-26/D-27/D-20 landed.)
+- [D-29 — Migrate native plugins to references](D-29-migrate-plugins-to-references.md) · Agent · **top pick** ·
+  the next step in the **Endpoint discovery & brokerage** epic (below): migrate plugin op handlers to
+  ref-based IO + let sql/observability consume discovered endpoints. (D-25..D-28 + D-20 landed; the demo
+  provider + agent ops are in.)
 - [D-11 — App-runner ergonomics](D-11-app-runner-ergonomics.md) · Agent · the alternate ready pick (makes
   `flux app run` a viable host for a declarative bot; unblocks Slack-channel assistant flows).
 
@@ -50,10 +50,7 @@ resolves it and injects credentials host-side, so neither the plugin nor the LLM
 the `.dex`-style endpoint-registry deferral from D-10/D-12. See [epic design](../designs/endpoint-discovery.md).
 **[D-20](D-20-scoped-private-net-egress.md) is pulled in as a hard dependency** (discovered endpoints are
 usually private/in-cluster hosts). Built in this order:
-- [D-28 — Kubernetes endpoint provider](D-28-kubernetes-endpoint-provider.md) · Agent · **next** · elevate the existing
-  k8s discover/cluster/secret ops into the reference provider (`discovers: [kubernetes, prometheus, loki,
-  grafana, alertmanager, postgres, mysql]`)
-- [D-29 — Migrate native plugins to references](D-29-migrate-plugins-to-references.md) · Agent · clean-cutover
+- [D-29 — Migrate native plugins to references](D-29-migrate-plugins-to-references.md) · Agent · **next** · clean-cutover
   every native plugin onto ref-based IO + let the observability/sql consumers use discovered endpoints
   (multi-instance); wire `flux app run` + agent paths
 - [D-30 — Endpoint lifecycle: refresh runner, CLI & audit](D-30-endpoint-lifecycle-cli.md) · Core · periodic
@@ -93,6 +90,11 @@ all providers**. Most plumbing already exists (`flux-credentials` import/refresh
   stage; import + refresh cover the near term
 
 ## Done
+- [D-28 — Kubernetes endpoint provider](D-28-kubernetes-endpoint-provider.md) · Agent · the reference
+  provider (`kubernetes.endpoint.discover` → cluster/Service/Ingress/RDS `EndpointCandidate`s with a
+  `credential_ref`, latest-namespace) + the broker op-name reconciliation + the agent-facing
+  `endpoint.discover/select/info/list` ops, `endpoint` group, `kubernetes` signal, and a mapping skill —
+  the "connect to my latest namespace backend RDS" demo path is now wired
 - [D-27 — Reference-based IO & host-injected connect](D-27-reference-based-io.md) · Core · enforces the
   references-only invariant: `http.do`/`conn.dial` take an `endpoint_ref`, the host resolves + injects
   the credential (cross-plugin `Kubernetes`-scheme via the owning plugin's `secret.read`), gated

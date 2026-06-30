@@ -10,12 +10,14 @@
 
 mod broker;
 mod host_caps;
+mod ops;
 
 pub use broker::{
     CredentialReader, CrossPluginApprover, CrossPluginAudit, CrossPluginGrants, EndpointBroker,
     HostCredentialReader, HostProviderInvoker, PluginRegistry, ProviderEntry, ProviderInvoker,
 };
 pub use host_caps::EndpointBrokerHostCaps;
+pub use ops::{endpoint_tools, register_endpoint_ops, ENDPOINT_GROUP};
 
 use std::collections::HashMap;
 use std::path::PathBuf;

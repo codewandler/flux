@@ -1134,6 +1134,14 @@ async fn build_agent(
             ))
             .with_cross_plugin_audit(xplugin_audit),
         );
+        // Agent-facing endpoint ops (D-28): `endpoint.discover` fans out through the broker;
+        // `endpoint.list`/`info`/`select` read the shared endpoint registry. Surfaced by the
+        // `kubernetes` signal (the `endpoint` group). Registered regardless of which plugins load.
+        flux_capabilities::register_endpoint_ops(
+            &mut registry,
+            broker.clone(),
+            endpoint_registry.clone(),
+        );
         for p in flux_plugin::discover(&dir) {
             // Build host capabilities from the plugin's own manifest declaration, so each plugin
             // gets only the process/secret/http access it asked for (and nothing by default).
@@ -3658,6 +3666,14 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
                 cfg.endpoint.cross_plugin_credentials.clone(),
             )),
         );
+        // Agent-facing endpoint ops (D-28): added to the program's tool set so the app's agent target
+        // can discover/select endpoints. TODO(D-28): the app path has no per-run EventStore in scope,
+        // so the cross-plugin audit/approver seams stay unwired here (same gap as the D-20 egress
+        // audit above); the broker + registry the ops drive are fully wired.
+        extra_tools.extend(flux_capabilities::endpoint_tools(
+            broker.clone(),
+            endpoint_registry.clone(),
+        ));
         for p in flux_plugin::discover(&dir) {
             let system = system.clone();
             let backend = backend.clone();

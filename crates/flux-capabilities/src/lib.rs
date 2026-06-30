@@ -18,9 +18,10 @@ pub use datasource::{
     DatasourceBackend, DatasourceHostCaps, Embedder, MemoryBackend, SemanticIndex, SqliteBackend,
 };
 pub use endpoint::{
-    CredentialReader, CrossPluginApprover, CrossPluginAudit, CrossPluginGrants, EndpointBroker,
-    EndpointBrokerHostCaps, EndpointRegistry, HostCredentialReader, HostProviderInvoker,
-    PluginRegistry, ProviderEntry, ProviderInvoker, StaticResolver,
+    endpoint_tools, register_endpoint_ops, CredentialReader, CrossPluginApprover, CrossPluginAudit,
+    CrossPluginGrants, EndpointBroker, EndpointBrokerHostCaps, EndpointRegistry,
+    HostCredentialReader, HostProviderInvoker, PluginRegistry, ProviderEntry, ProviderInvoker,
+    StaticResolver, ENDPOINT_GROUP,
 };
 
 #[cfg(feature = "embeddings")]

@@ -56,6 +56,17 @@ fn manifest_builder() -> PluginBuilder {
             process: vec!["kubectl".into()],
             ..Default::default()
         })
+        // Discovery products (D-28): the host's fan-out broker routes a consumer's discovery query
+        // for any of these to this plugin's `kubernetes.endpoint.discover` op. `kubernetes` yields
+        // cluster endpoints (one per kubeconfig context); the rest are matched against in-cluster
+        // Services/Ingresses (and Secrets, for the database products).
+        .discovers("kubernetes")
+        .discovers("prometheus")
+        .discovers("loki")
+        .discovers("grafana")
+        .discovers("alertmanager")
+        .discovers("postgres")
+        .discovers("mysql")
         .datasource(ds(
             "kubernetes.inventory",
             "kubernetes.resource",
@@ -81,11 +92,19 @@ fn manifest_builder() -> PluginBuilder {
         .operation(
             read_op(
                 "kubernetes.endpoint.discover",
-                "Discover product endpoints from Kubernetes services.",
+                "Discover product endpoints as weak references (URL + credential location, never a \
+                 secret). `product=kubernetes` yields one cluster endpoint per kubeconfig context; \
+                 other products match in-cluster Services and Ingresses by name or \
+                 `app.kubernetes.io/name`. `postgres`/`mysql` also scan Secrets for crossplane/RDS \
+                 connection patterns and return a database endpoint whose credential is a \
+                 `kubernetes/<ns>/<secret>/<key>` reference. Set `query` to \"latest\" (or omit \
+                 `namespace`) to target the newest namespace by creation time.",
                 json!({"type": "object", "properties": {
                     "context": s_context(),
                     "namespace": s_namespace_filter(),
-                    "product": {"type": "string", "description": "product to discover, e.g. prometheus or loki (substring-matched on service name)"},
+                    "product": {"type": "string", "description": "product to discover: kubernetes, postgres, mysql, prometheus, loki, grafana, alertmanager"},
+                    "query": {"type": "string", "description": "free-text hint; \"latest\" selects the newest namespace by creation time"},
+                    "latest_namespace": {"type": "boolean", "description": "select the newest namespace by creation time (same as query=\"latest\")"},
                     "limit": s_limit()
                 }}),
             ),
@@ -580,53 +599,441 @@ fn cluster_test(input: Value, host: &mut Host) -> Result<Value, String> {
     }))
 }
 
+/// Discover endpoints for a product as weak `EndpointCandidate`s (D-28). Each candidate is the flat
+/// JSON `EndpointRef` (`id`/`url`/`product`/`protocol?`/`source:"discovered"`/`credential_ref?`/
+/// `labels{}`) plus `score`/`reasons[]`. The host's broker deserializes these into
+/// `flux_secret::endpoint::EndpointCandidate`. Never emits a secret value — only a credential
+/// *reference* (`kubernetes/<ns>/<secret>/<key>`).
 fn endpoint_discover(input: Value, host: &mut Host) -> Result<Value, String> {
     let product = opt_str(&input, "product").unwrap_or("").to_lowercase();
     let limit = input.get("limit").and_then(|x| x.as_u64()).unwrap_or(50) as usize;
-    let mut args = vec!["get".to_string(), "services".to_string()];
-    args.extend(ctx_args(&input));
-    args.extend(scope_args(&input));
-    let v = kubectl_json_v(host, &args)?;
+
+    // `product == kubernetes` is the cluster-discovery path: one endpoint per kubeconfig context.
+    if product == "kubernetes" {
+        return discover_clusters(host, limit);
+    }
+
+    let namespaces = resolve_namespaces(&input, host)?;
     let mut candidates: Vec<Value> = Vec::new();
-    if let Some(items) = v.get("items").and_then(|x| x.as_array()) {
-        for it in items {
-            let name = it
-                .pointer("/metadata/name")
+
+    // Services + Ingresses matched to the product by name / `app.kubernetes.io/name`.
+    discover_services(&input, host, &namespaces, &product, limit, &mut candidates)?;
+    discover_ingresses(&input, host, &namespaces, &product, limit, &mut candidates)?;
+    // postgres/mysql also resolve from connection Secrets (crossplane / RDS), with a credential ref.
+    if product == "postgres" || product == "mysql" {
+        discover_db_secrets(&input, host, &namespaces, &product, limit, &mut candidates)?;
+    }
+
+    candidates.truncate(limit);
+    Ok(json!({ "candidates": candidates }))
+}
+
+/// Build a weak-reference candidate (flat `EndpointRef` + `score`/`reasons`). `credential_ref` is the
+/// serialized `flux_secret::Ref` struct (`{scheme,plugin,instance,slot}`) or `Value::Null`.
+#[allow(clippy::too_many_arguments)]
+fn candidate(
+    id: String,
+    url: String,
+    product: &str,
+    protocol: Option<&str>,
+    credential_ref: Value,
+    labels: Value,
+    score: f64,
+    reasons: Vec<String>,
+) -> Value {
+    let mut obj = json!({
+        "id": id,
+        "url": url,
+        "product": product,
+        "source": "discovered",
+        "labels": labels,
+        "score": score,
+        "reasons": reasons,
+    });
+    if let Some(p) = protocol {
+        obj["protocol"] = json!(p);
+    }
+    if !credential_ref.is_null() {
+        obj["credential_ref"] = credential_ref;
+    }
+    obj
+}
+
+/// A `flux_secret::Ref` (Kubernetes scheme) as serialized JSON: `kubernetes/<ns>/<name>/<key>` maps
+/// to `{scheme:"kubernetes", plugin:<ns>, instance:<name>, slot:<key>}` (the host deserializes this
+/// into a `Ref`). Defined inline (no flux-secret dep in the plugin sandbox).
+fn k8s_credential_ref(namespace: &str, secret: &str, key: &str) -> Value {
+    json!({
+        "scheme": "kubernetes",
+        "plugin": namespace,
+        "instance": secret,
+        "slot": key,
+    })
+}
+
+/// One cluster endpoint per kubeconfig context, `url` = the context's cluster server.
+fn discover_clusters(host: &mut Host, limit: usize) -> Result<Value, String> {
+    let v = kubectl_json(host, &["config", "view"])?;
+    // Map cluster name -> server URL so a context can resolve its server.
+    let mut servers: HashMap<String, String> = HashMap::new();
+    if let Some(clusters) = v.get("clusters").and_then(|x| x.as_array()) {
+        for c in clusters {
+            let name = c.get("name").and_then(|x| x.as_str()).unwrap_or("");
+            let server = c
+                .pointer("/cluster/server")
                 .and_then(|x| x.as_str())
                 .unwrap_or("");
-            if name.is_empty() || (!product.is_empty() && !name.to_lowercase().contains(&product)) {
+            if !name.is_empty() {
+                servers.insert(name.to_string(), server.to_string());
+            }
+        }
+    }
+    let current = v
+        .get("current-context")
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    let mut candidates: Vec<Value> = Vec::new();
+    if let Some(contexts) = v.get("contexts").and_then(|x| x.as_array()) {
+        for c in contexts {
+            let name = c.get("name").and_then(|x| x.as_str()).unwrap_or("");
+            if name.is_empty() {
                 continue;
             }
-            let ns = it
-                .pointer("/metadata/namespace")
+            let cluster = c
+                .pointer("/context/cluster")
                 .and_then(|x| x.as_str())
                 .unwrap_or("");
-            let svc_type = it
-                .pointer("/spec/type")
-                .and_then(|x| x.as_str())
-                .unwrap_or("ClusterIP");
-            if let Some(ports) = it.pointer("/spec/ports").and_then(|x| x.as_array()) {
-                for p in ports {
-                    let port = p.get("port").and_then(|x| x.as_i64()).unwrap_or(0);
-                    candidates.push(json!({
-                        "product": if product.is_empty() { Value::Null } else { json!(product) },
-                        "namespace": ns,
-                        "service": name,
-                        "type": svc_type,
-                        "port": port,
-                        "url": format!("http://{name}.{ns}.svc.cluster.local:{port}"),
-                    }));
-                    if candidates.len() >= limit {
-                        break;
-                    }
-                }
-            }
+            let server = servers.get(cluster).cloned().unwrap_or_default();
+            let is_current = name == current;
+            candidates.push(candidate(
+                format!("@endpoint/k8s-{name}"),
+                server,
+                "kubernetes",
+                None,
+                Value::Null,
+                json!({ "context": name }),
+                if is_current { 1.0 } else { 0.6 },
+                vec![if is_current {
+                    format!("kubeconfig context `{name}` (current)")
+                } else {
+                    format!("kubeconfig context `{name}`")
+                }],
+            ));
             if candidates.len() >= limit {
                 break;
             }
         }
     }
     Ok(json!({ "candidates": candidates }))
+}
+
+/// Resolve the target namespaces. An explicit `namespace` wins (single). Otherwise, if `latest` is
+/// requested (via `latest_namespace:true` or `query` containing "latest"), the single newest
+/// namespace by `creationTimestamp`. Otherwise empty = "all namespaces" (the list ops use
+/// `--all-namespaces`, so an empty vec means "do not restrict").
+fn resolve_namespaces(input: &Value, host: &mut Host) -> Result<Vec<String>, String> {
+    if let Some(ns) = opt_str(input, "namespace") {
+        return Ok(vec![ns.to_string()]);
+    }
+    if wants_latest(input) {
+        if let Some(ns) = latest_namespace(input, host)? {
+            return Ok(vec![ns]);
+        }
+    }
+    Ok(Vec::new())
+}
+
+/// Whether the caller asked for the "latest" namespace (`latest_namespace:true` or `query` ~ "latest").
+fn wants_latest(input: &Value) -> bool {
+    if input
+        .get("latest_namespace")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    opt_str(input, "query").is_some_and(|q| q.to_lowercase().contains("latest"))
+}
+
+/// The namespace with the newest `metadata.creationTimestamp` (RFC3339, lexicographically sortable).
+fn latest_namespace(input: &Value, host: &mut Host) -> Result<Option<String>, String> {
+    let mut args = vec!["get".to_string(), "namespaces".to_string()];
+    args.extend(ctx_args(input));
+    let v = kubectl_json_v(host, &args)?;
+    let mut best: Option<(String, String)> = None; // (timestamp, name)
+    if let Some(items) = v.get("items").and_then(|x| x.as_array()) {
+        for it in items {
+            let name = it
+                .pointer("/metadata/name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let ts = it
+                .pointer("/metadata/creationTimestamp")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            // RFC3339 timestamps sort lexicographically; keep the max.
+            if best.as_ref().is_none_or(|(b, _)| ts > b.as_str()) {
+                best = Some((ts.to_string(), name.to_string()));
+            }
+        }
+    }
+    Ok(best.map(|(_, name)| name))
+}
+
+/// Scope args for a discovery list call: `-n <ns>` for a single target namespace, else
+/// `--all-namespaces`.
+fn discover_scope(namespaces: &[String]) -> Vec<String> {
+    match namespaces.first() {
+        Some(ns) if namespaces.len() == 1 => vec!["-n".into(), ns.into()],
+        _ => vec!["--all-namespaces".into()],
+    }
+}
+
+/// Whether a resource (by name + `app.kubernetes.io/name` label) matches `product`. Returns the match
+/// score: exact name or label == product is 1.0; a substring name match is 0.7; no match is 0.0.
+fn product_match_score(name: &str, app_label: &str, product: &str) -> f64 {
+    let n = name.to_lowercase();
+    if product.is_empty() || n == product || app_label.eq_ignore_ascii_case(product) {
+        if product.is_empty() {
+            return 0.5; // no product filter: surface everything at a neutral score
+        }
+        return 1.0;
+    }
+    if n.contains(product) {
+        return 0.7;
+    }
+    0.0
+}
+
+/// Match in-cluster Services to the product → one HTTP endpoint per service port.
+fn discover_services(
+    input: &Value,
+    host: &mut Host,
+    namespaces: &[String],
+    product: &str,
+    limit: usize,
+    out: &mut Vec<Value>,
+) -> Result<(), String> {
+    let mut args = vec!["get".to_string(), "services".to_string()];
+    args.extend(ctx_args(input));
+    args.extend(discover_scope(namespaces));
+    let v = kubectl_json_v(host, &args)?;
+    let Some(items) = v.get("items").and_then(|x| x.as_array()) else {
+        return Ok(());
+    };
+    for it in items {
+        if out.len() >= limit {
+            break;
+        }
+        let name = it
+            .pointer("/metadata/name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let app_label = it
+            .pointer("/metadata/labels/app.kubernetes.io~1name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        let score = product_match_score(name, app_label, product);
+        if score == 0.0 {
+            continue;
+        }
+        let ns = it
+            .pointer("/metadata/namespace")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        if let Some(ports) = it.pointer("/spec/ports").and_then(|x| x.as_array()) {
+            for p in ports {
+                if out.len() >= limit {
+                    break;
+                }
+                let port = p.get("port").and_then(|x| x.as_i64()).unwrap_or(0);
+                out.push(candidate(
+                    format!("@endpoint/{ns}-{name}"),
+                    format!("http://{name}.{ns}.svc.cluster.local:{port}"),
+                    product,
+                    Some("http"),
+                    Value::Null,
+                    json!({ "namespace": ns, "service": name }),
+                    score,
+                    vec![if app_label.eq_ignore_ascii_case(product) {
+                        format!("service `{name}` labelled app.kubernetes.io/name={product}")
+                    } else {
+                        format!("service name `{name}` matches `{product}`")
+                    }],
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Match in-cluster Ingresses to the product → one endpoint per ingress host.
+fn discover_ingresses(
+    input: &Value,
+    host: &mut Host,
+    namespaces: &[String],
+    product: &str,
+    limit: usize,
+    out: &mut Vec<Value>,
+) -> Result<(), String> {
+    let mut args = vec!["get".to_string(), "ingress".to_string()];
+    args.extend(ctx_args(input));
+    args.extend(discover_scope(namespaces));
+    let v = kubectl_json_v(host, &args)?;
+    let Some(items) = v.get("items").and_then(|x| x.as_array()) else {
+        return Ok(());
+    };
+    for it in items {
+        if out.len() >= limit {
+            break;
+        }
+        let name = it
+            .pointer("/metadata/name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let app_label = it
+            .pointer("/metadata/labels/app.kubernetes.io~1name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        let score = product_match_score(name, app_label, product);
+        if score == 0.0 {
+            continue;
+        }
+        let ns = it
+            .pointer("/metadata/namespace")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        if let Some(rules) = it.pointer("/spec/rules").and_then(|x| x.as_array()) {
+            for r in rules {
+                if out.len() >= limit {
+                    break;
+                }
+                let Some(host_name) = r.get("host").and_then(|h| h.as_str()) else {
+                    continue;
+                };
+                if host_name.is_empty() {
+                    continue;
+                }
+                out.push(candidate(
+                    format!("@endpoint/{ns}-{name}"),
+                    format!("https://{host_name}"),
+                    product,
+                    Some("http"),
+                    Value::Null,
+                    json!({ "namespace": ns, "service": name, "ingress": host_name }),
+                    // Slightly below an exact service match: an ingress host is a coarser signal.
+                    (score - 0.05).max(0.1),
+                    vec![format!(
+                        "ingress `{name}` host `{host_name}` matches `{product}`"
+                    )],
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Scan Secrets for a crossplane / RDS database connection pattern: a Secret carrying a host/endpoint
+/// key plus a password-like key. Emits a `postgres`/`mysql` endpoint whose `url` is built from the
+/// host/port keys and whose credential is a `kubernetes/<ns>/<secret>/<password-key>` REFERENCE — the
+/// secret value itself is never read here.
+fn discover_db_secrets(
+    input: &Value,
+    host: &mut Host,
+    namespaces: &[String],
+    product: &str,
+    limit: usize,
+    out: &mut Vec<Value>,
+) -> Result<(), String> {
+    let mut args = vec!["get".to_string(), "secrets".to_string()];
+    args.extend(ctx_args(input));
+    args.extend(discover_scope(namespaces));
+    let v = kubectl_json_v(host, &args)?;
+    let Some(items) = v.get("items").and_then(|x| x.as_array()) else {
+        return Ok(());
+    };
+    for it in items {
+        if out.len() >= limit {
+            break;
+        }
+        let name = it
+            .pointer("/metadata/name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let ns = it
+            .pointer("/metadata/namespace")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        let Some(data) = it.get("data").and_then(|d| d.as_object()) else {
+            continue;
+        };
+        // Keys are case-insensitive; build a lookup of present data keys (lowercase -> original).
+        let keys: HashMap<String, String> =
+            data.keys().map(|k| (k.to_lowercase(), k.clone())).collect();
+        let find = |candidates: &[&str]| -> Option<String> {
+            candidates.iter().find_map(|c| keys.get(*c).cloned())
+        };
+        // A connection secret needs a host/endpoint key AND a password-like key.
+        let host_key = find(&["endpoint", "host", "hostname", "address", "server"]);
+        let pass_key = find(&["password", "passwd", "pass"]);
+        let (Some(host_key), Some(pass_key)) = (host_key, pass_key) else {
+            continue;
+        };
+        // Crossplane connection secrets are the canonical case; a `connectionSecret`/`rds`-ish name is
+        // a stronger signal but a host+password pair already qualifies.
+        let lname = name.to_lowercase();
+        let crossplane_ish = lname.contains("rds")
+            || lname.contains("connection")
+            || lname.contains("conn")
+            || lname.contains(product);
+        // Decode the host/port reference fields (these are non-secret connection coordinates — not the
+        // password). They are still base64 in a Secret's `.data`, so decode just these two keys.
+        let host_val = decode_secret_field(data, &host_key);
+        let port_val = find(&["port"]).and_then(|k| decode_secret_field(data, &k));
+        let scheme = product; // postgres / mysql
+        let url = match (&host_val, &port_val) {
+            (Some(h), Some(p)) if !h.is_empty() => format!("{scheme}://{h}:{p}"),
+            (Some(h), None) if !h.is_empty() => format!("{scheme}://{h}"),
+            _ => format!("{scheme}://{name}.{ns}"), // fall back to the secret coordinates
+        };
+        let reasons = vec![if crossplane_ish {
+            format!("secret `{name}` matches a crossplane/RDS connection pattern ({host_key}+{pass_key})")
+        } else {
+            format!("secret `{name}` has connection keys {host_key}+{pass_key}")
+        }];
+        out.push(candidate(
+            format!("@endpoint/{ns}-{name}"),
+            url,
+            product,
+            Some(scheme),
+            // The credential is a REFERENCE (location), never the value.
+            k8s_credential_ref(ns, name, &pass_key),
+            json!({ "namespace": ns, "secret": name }),
+            if crossplane_ish { 0.95 } else { 0.6 },
+            reasons,
+        ));
+    }
+    Ok(())
+}
+
+/// Decode one base64 `.data` field of a Secret to a UTF-8 string (connection coordinates only — the
+/// host/port, never surfaced as a credential). Returns `None` if absent or not decodable.
+fn decode_secret_field(data: &Map<String, Value>, key: &str) -> Option<String> {
+    let enc = data.get(key).and_then(|x| x.as_str())?;
+    let bytes = b64_decode(enc).ok()?;
+    Some(String::from_utf8_lossy(&bytes).trim().to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1472,6 +1879,31 @@ mod tests {
         forwards_lock().as_mut().unwrap().clear();
     }
 
+    /// Standard-alphabet base64 (test-only; mirrors what kubectl emits for a Secret's `.data`).
+    fn b64_encode(bytes: &[u8]) -> String {
+        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+            let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+            let n = (b0 << 16) | (b1 << 8) | b2;
+            out.push(A[((n >> 18) & 63) as usize] as char);
+            out.push(A[((n >> 12) & 63) as usize] as char);
+            out.push(if chunk.len() > 1 {
+                A[((n >> 6) & 63) as usize] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                A[(n & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
     #[test]
     fn cluster_list_reshapes_contexts() {
         let plugin = manifest_builder().build();
@@ -1505,12 +1937,16 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_discover_builds_service_candidates() {
+    fn services_become_product_endpoints() {
+        // A service matching the product becomes an EndpointCandidate (flat EndpointRef shape).
         let plugin = manifest_builder().build();
-        let mut host = MockHost::default().with_process(
-            "get services -n monitoring",
-            r#"{"items":[{"metadata":{"name":"prometheus","namespace":"monitoring"},"spec":{"type":"ClusterIP","ports":[{"port":9090}]}}]}"#,
-        );
+        let mut host = MockHost::default()
+            .with_process(
+                "get services -n monitoring",
+                r#"{"items":[{"metadata":{"name":"prometheus","namespace":"monitoring"},"spec":{"type":"ClusterIP","ports":[{"port":9090}]}}]}"#,
+            )
+            // Ingress lookup runs too (no matches here).
+            .with_process("get ingress -n monitoring", r#"{"items":[]}"#);
         let out = plugin
             .call(
                 "kubernetes.endpoint.discover",
@@ -1518,11 +1954,147 @@ mod tests {
                 &mut host,
             )
             .unwrap();
-        assert_eq!(out["candidates"][0]["service"], "prometheus");
+        let c = &out["candidates"][0];
+        assert_eq!(c["id"], "@endpoint/monitoring-prometheus");
+        assert_eq!(c["product"], "prometheus");
+        assert_eq!(c["protocol"], "http");
+        assert_eq!(c["source"], "discovered");
         assert_eq!(
-            out["candidates"][0]["url"],
+            c["url"],
             "http://prometheus.monitoring.svc.cluster.local:9090"
         );
+        assert_eq!(c["labels"]["namespace"], "monitoring");
+        assert_eq!(c["labels"]["service"], "prometheus");
+        assert_eq!(c["score"], 1.0); // exact name match
+                                     // No credential ref for a plain service endpoint.
+        assert!(c.get("credential_ref").is_none());
+    }
+
+    #[test]
+    fn contexts_become_cluster_endpoints() {
+        // product=kubernetes → one endpoint per kubeconfig context, url = the cluster server.
+        let plugin = manifest_builder().build();
+        let mut host = MockHost::default().with_process(
+            "config view",
+            r#"{"current-context":"prod","clusters":[
+                {"name":"c-prod","cluster":{"server":"https://prod.example:6443"}},
+                {"name":"c-dev","cluster":{"server":"https://dev.example:6443"}}],
+              "contexts":[
+                {"name":"prod","context":{"cluster":"c-prod"}},
+                {"name":"dev","context":{"cluster":"c-dev"}}]}"#,
+        );
+        let out = plugin
+            .call(
+                "kubernetes.endpoint.discover",
+                json!({ "product": "kubernetes" }),
+                &mut host,
+            )
+            .unwrap();
+        let cands = out["candidates"].as_array().unwrap();
+        assert_eq!(cands.len(), 2);
+        let prod = cands
+            .iter()
+            .find(|c| c["id"] == "@endpoint/k8s-prod")
+            .unwrap();
+        assert_eq!(prod["product"], "kubernetes");
+        assert_eq!(prod["url"], "https://prod.example:6443");
+        assert_eq!(prod["labels"]["context"], "prod");
+        assert_eq!(prod["score"], 1.0); // current context scores highest
+        let dev = cands
+            .iter()
+            .find(|c| c["id"] == "@endpoint/k8s-dev")
+            .unwrap();
+        assert_eq!(dev["score"], 0.6);
+    }
+
+    #[test]
+    fn rds_secret_becomes_credential_ref() {
+        // A crossplane/RDS connection secret (host+password keys) becomes a postgres endpoint whose
+        // credential is a `kubernetes/...` REFERENCE — and NO password value is in the candidate.
+        let plugin = manifest_builder().build();
+        // base64: "orders.abc.rds.amazonaws.com" / "5432" / "s3cr3t-pw"
+        let host_b64 = b64_encode(b"orders.abc.rds.amazonaws.com");
+        let port_b64 = b64_encode(b"5432");
+        let pw_b64 = b64_encode(b"s3cr3t-pw");
+        let secrets_json = format!(
+            r#"{{"items":[{{"metadata":{{"name":"orders-rds-conn","namespace":"team-orders"}},"data":{{"endpoint":"{host_b64}","port":"{port_b64}","username":"{port_b64}","password":"{pw_b64}"}}}}]}}"#
+        );
+        let mut host = MockHost::default()
+            .with_process("get services -n team-orders", r#"{"items":[]}"#)
+            .with_process("get ingress -n team-orders", r#"{"items":[]}"#)
+            .with_process("get secrets -n team-orders", &secrets_json);
+        let out = plugin
+            .call(
+                "kubernetes.endpoint.discover",
+                json!({ "namespace": "team-orders", "product": "postgres" }),
+                &mut host,
+            )
+            .unwrap();
+        let c = &out["candidates"][0];
+        assert_eq!(c["id"], "@endpoint/team-orders-orders-rds-conn");
+        assert_eq!(c["product"], "postgres");
+        assert_eq!(c["protocol"], "postgres");
+        assert_eq!(c["url"], "postgres://orders.abc.rds.amazonaws.com:5432");
+        // The credential is a REFERENCE (a location), never a value.
+        assert_eq!(c["credential_ref"]["scheme"], "kubernetes");
+        assert_eq!(c["credential_ref"]["plugin"], "team-orders");
+        assert_eq!(c["credential_ref"]["instance"], "orders-rds-conn");
+        assert_eq!(c["credential_ref"]["slot"], "password");
+        // Critically: the decoded password is NOWHERE in the candidate JSON.
+        let serialized = serde_json::to_string(c).unwrap();
+        assert!(
+            !serialized.contains("s3cr3t-pw"),
+            "candidate must never carry the password value: {serialized}"
+        );
+    }
+
+    #[test]
+    fn endpoint_discover_selects_latest_namespace() {
+        // With query="latest" and no explicit namespace, the newest namespace by creationTimestamp is
+        // chosen, then matched services in THAT namespace become candidates.
+        let plugin = manifest_builder().build();
+        let mut host = MockHost::default()
+            .with_process(
+                "get namespaces",
+                r#"{"items":[
+                    {"metadata":{"name":"team-old","creationTimestamp":"2024-01-01T00:00:00Z"}},
+                    {"metadata":{"name":"team-new","creationTimestamp":"2026-06-01T00:00:00Z"}}]}"#,
+            )
+            .with_process(
+                "get services -n team-new",
+                r#"{"items":[{"metadata":{"name":"postgres","namespace":"team-new"},"spec":{"ports":[{"port":5432}]}}]}"#,
+            )
+            .with_process("get ingress -n team-new", r#"{"items":[]}"#)
+            .with_process("get secrets -n team-new", r#"{"items":[]}"#);
+        let out = plugin
+            .call(
+                "kubernetes.endpoint.discover",
+                json!({ "product": "postgres", "query": "my latest namespace backend" }),
+                &mut host,
+            )
+            .unwrap();
+        let c = &out["candidates"][0];
+        assert_eq!(c["id"], "@endpoint/team-new-postgres");
+        assert_eq!(c["labels"]["namespace"], "team-new");
+    }
+
+    #[test]
+    fn declares_discovery_products() {
+        let m = manifest_builder().build().manifest();
+        for p in [
+            "kubernetes",
+            "prometheus",
+            "loki",
+            "grafana",
+            "alertmanager",
+            "postgres",
+            "mysql",
+        ] {
+            assert!(
+                m.discovers.iter().any(|d| d == p),
+                "manifest should declare discovery product `{p}`"
+            );
+        }
     }
 
     #[test]
