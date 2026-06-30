@@ -24,11 +24,95 @@
 //! ignores* one for forward-compatibility with hand-written headers; it is not part of the round-trip.
 
 use crate::ast::{DraftAst, FlowEffect, Node, SymbolName};
+use crate::program::CompositeOpDecl;
+use flux_spec::{Effect, Idempotency, Risk};
 
 /// Render a [`DraftAst`] as canonical Flux-Lang text. Always 2-space indentation; deterministic.
 /// Round-trips: `parse(&format(&ast)) == ast`.
 pub fn format(ast: &DraftAst) -> String {
     format_with(ast, "  ")
+}
+
+/// Render one top-level composite op declaration as canonical Flux-Lang source.
+pub fn format_composite_op(op: &CompositeOpDecl) -> String {
+    let mut out = String::new();
+    out.push_str("op ");
+    out.push_str(&op.name);
+    if !op.params.is_empty() {
+        out.push('(');
+        let ps: Vec<String> = op
+            .params
+            .iter()
+            .map(|p| format!("{}: {}", p.name.0, p.ty.label()))
+            .collect();
+        out.push_str(&ps.join(", "));
+        out.push(')');
+    }
+    if let Some(r) = &op.returns {
+        out.push_str(" -> ");
+        out.push_str(&r.label());
+    }
+    out.push('\n');
+
+    if !op.meta.description.is_empty() {
+        out.push_str("  description ");
+        out.push_str(&compact(&serde_json::Value::String(
+            op.meta.description.clone(),
+        )));
+        out.push('\n');
+    }
+    out.push_str("  risk ");
+    out.push_str(&compact(&serde_json::Value::String(
+        risk_label(op.meta.risk).to_string(),
+    )));
+    out.push('\n');
+    out.push_str("  idempotency ");
+    out.push_str(&compact(&serde_json::Value::String(
+        idempotency_label(op.meta.idempotency).to_string(),
+    )));
+    out.push('\n');
+    if !op.meta.effects.is_empty() {
+        out.push_str("  effects ");
+        let effects: Vec<_> = op
+            .meta
+            .effects
+            .iter()
+            .map(|e| serde_json::Value::String(effect_label(*e).to_string()))
+            .collect();
+        out.push_str(&compact(&serde_json::Value::Array(effects)));
+        out.push('\n');
+    }
+    if op.meta.limits.dispatches.is_some()
+        || op.meta.limits.timeout_ms.is_some()
+        || op.meta.limits.context_chars.is_some()
+    {
+        out.push_str("  limits ");
+        let mut limits = serde_json::Map::new();
+        if let Some(n) = op.meta.limits.dispatches {
+            limits.insert("dispatches".into(), serde_json::json!(n));
+        }
+        if let Some(n) = op.meta.limits.timeout_ms {
+            limits.insert("timeout_ms".into(), serde_json::json!(n));
+        }
+        if let Some(n) = op.meta.limits.context_chars {
+            limits.insert("context_chars".into(), serde_json::json!(n));
+        }
+        out.push_str(&compact(&serde_json::Value::Object(limits)));
+        out.push('\n');
+    }
+    out.push_str("  expose ");
+    out.push_str(if op.meta.expose { "true" } else { "false" });
+    out.push('\n');
+    if let Some(view) = &op.meta.view {
+        out.push_str("  view ");
+        out.push_str(&compact(&serde_json::Value::String(view.clone())));
+        out.push('\n');
+    }
+    if !op.body.body.is_empty() {
+        out.push('\n');
+        fmt_body(&op.body.body, 1, "  ", &mut out);
+    }
+    out
 }
 
 /// Render a [`DraftAst`] in the **token-efficient** display variant: the same markers as [`format`]
@@ -37,6 +121,35 @@ pub fn format(ast: &DraftAst) -> String {
 /// indentation, so this surface does not round-trip — use [`format`] for the writable, parseable form.
 pub fn format_compact(ast: &DraftAst) -> String {
     format_with(ast, " ")
+}
+
+fn risk_label(risk: Risk) -> &'static str {
+    match risk {
+        Risk::Low => "low",
+        Risk::Medium => "medium",
+        Risk::High => "high",
+        Risk::Destructive => "destructive",
+    }
+}
+
+fn idempotency_label(idempotency: Idempotency) -> &'static str {
+    match idempotency {
+        Idempotency::Idempotent => "idempotent",
+        Idempotency::NonIdempotent => "non_idempotent",
+        Idempotency::Conditional => "conditional",
+    }
+}
+
+fn effect_label(effect: Effect) -> &'static str {
+    match effect {
+        Effect::Read => "read",
+        Effect::Write => "write",
+        Effect::Network => "network",
+        Effect::Process => "process",
+        Effect::Browser => "browser",
+        Effect::Filesystem => "filesystem",
+        Effect::LocalSystem => "local_system",
+    }
 }
 
 /// Shared renderer: `indent` is the per-level indentation unit (`"  "` canonical, `" "` compact).

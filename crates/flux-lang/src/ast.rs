@@ -486,9 +486,9 @@ pub enum Node {
         #[serde(default)]
         body: Vec<Node>,
     },
-    /// Run a command and assert its output matches an expected pattern; abort the flow with a
+    /// Run a command and assert its output contains an expected substring; abort the flow with a
     /// structured error if it does not. `cmd` is any node that produces a string (typically a
-    /// `bash` call); `expect` is a substring or regex the output must contain.
+    /// `bash` call); `expect` is the substring the output must contain.
     Verify {
         cmd: Box<Node>,
         expect: Box<Node>,
@@ -617,9 +617,9 @@ pub enum Node {
     },
 
     /// Cap the cost of a scope: run `body` but allow at most `limit` op dispatches within it (checked
-    /// at statement boundaries — the body stops before a statement that would exceed the cap, and the
-    /// node errors). A first-class cost guard-rail; v1 counts dispatches (token/money budgets are a
-    /// later refinement). `bind` names the body's result.
+    /// at statement boundaries; a nested statement can consume more than one dispatch before the next
+    /// check). A first-class cost guard-rail; v1 counts dispatches (token/money budgets are a later
+    /// refinement). `bind` names the body's result.
     Budget {
         limit: u32,
         #[serde(default)]

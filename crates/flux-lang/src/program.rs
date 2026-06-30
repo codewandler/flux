@@ -13,8 +13,10 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::ast::DraftAst;
+use crate::ast::{DraftAst, Param};
 use crate::error::Result;
+
+use flux_spec::{Effect, Idempotency, Risk};
 
 /// An agent: an identity plus the model / tool / datasource access surface it runs with. A superset
 /// of an orchestration role; the L3 engine resolves the names to concrete capabilities.
@@ -90,6 +92,81 @@ pub struct JourneyDecl {
     pub flow: DraftAst,
 }
 
+/// Execution limits declared on a composite op. The language carries these as pure metadata; hosts
+/// decide how much of the limit surface they enforce.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CompositeLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatches: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_chars: Option<u64>,
+}
+
+/// Metadata that makes a Flux-Lang composite op look like a normal operation to analysis and the
+/// planner catalog.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct CompositeOpMeta {
+    #[serde(default)]
+    pub description: String,
+    #[serde(default = "default_composite_risk")]
+    #[schemars(with = "String")]
+    pub risk: Risk,
+    #[serde(default = "default_composite_idempotency")]
+    #[schemars(with = "String")]
+    pub idempotency: Idempotency,
+    #[serde(default)]
+    #[schemars(with = "Vec<String>")]
+    pub effects: Vec<Effect>,
+    #[serde(default = "default_composite_expose")]
+    pub expose: bool,
+    #[serde(default)]
+    pub limits: CompositeLimits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<String>,
+}
+
+impl Default for CompositeOpMeta {
+    fn default() -> Self {
+        Self {
+            description: String::new(),
+            risk: default_composite_risk(),
+            idempotency: default_composite_idempotency(),
+            effects: Vec::new(),
+            expose: default_composite_expose(),
+            limits: CompositeLimits::default(),
+            view: None,
+        }
+    }
+}
+
+fn default_composite_risk() -> Risk {
+    Risk::Low
+}
+
+fn default_composite_idempotency() -> Idempotency {
+    Idempotency::Idempotent
+}
+
+fn default_composite_expose() -> bool {
+    true
+}
+
+/// A module-local operation implemented as a scoped Flux-Lang body.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CompositeOpDecl {
+    pub name: String,
+    #[serde(default)]
+    pub params: Vec<Param>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returns: Option<crate::ast::TypeRef>,
+    #[serde(default)]
+    pub meta: CompositeOpMeta,
+    #[serde(default)]
+    pub body: DraftAst,
+}
+
 /// A whole multi-agent program (a module): agents, channels, triggers, journeys, and any top-level
 /// flows. Every field defaults to empty, so a minimal program is valid.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
@@ -106,6 +183,9 @@ pub struct Program {
     pub triggers: Vec<TriggerDecl>,
     #[serde(default)]
     pub journeys: Vec<JourneyDecl>,
+    /// Module-local operations implemented by composing existing Flux-Lang ops.
+    #[serde(default)]
+    pub ops: Vec<CompositeOpDecl>,
     /// Top-level flows (not owned by a journey) — e.g. an entrypoint a host may run directly.
     #[serde(default)]
     pub flows: Vec<DraftAst>,

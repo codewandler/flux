@@ -9,8 +9,10 @@
 //! concrete runtime, provider, or tool — the engine adapts its safety envelope onto these traits, so
 //! every op still runs through the same gate as any other tool (no new bypass surface).
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
 
@@ -23,8 +25,9 @@ use crate::ast::{
 };
 use crate::host::{ApprovalChoice, OpHost, OpOutcome};
 use crate::opspec::OpCatalog;
+use crate::program::CompositeOpDecl;
 use crate::sink::FlowSink;
-use crate::store::ValueStore;
+use crate::store::{DurableStore, SessionView, SymbolView, ValueStore};
 use crate::{FlowError, Result};
 
 /// How to bind a single op's result to a session symbol.
@@ -152,6 +155,129 @@ fn bind_existing(
         .map_err(FlowError::Core)
 }
 
+#[derive(Debug, Clone)]
+struct FrameBinding {
+    vid: ValueId,
+    ty: Option<String>,
+    summary: String,
+    visibility: Visibility,
+}
+
+/// A scoped symbol overlay for composite-op execution. Values and run events stay in the parent
+/// store/session, but params and locals resolve only inside this frame.
+struct FrameStore<'a> {
+    parent: &'a dyn ValueStore,
+    bindings: Mutex<HashMap<SymbolName, FrameBinding>>,
+}
+
+impl<'a> FrameStore<'a> {
+    fn new(parent: &'a dyn ValueStore) -> Self {
+        Self {
+            parent,
+            bindings: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn seed_param(
+        &self,
+        session_id: &str,
+        param: &crate::ast::Param,
+        value: &serde_json::Value,
+    ) -> Result<()> {
+        let v = Value::from_json(value);
+        let text = value_text(&v);
+        let vid = self.parent.put_value(session_id, &v)?;
+        self.bind(
+            session_id,
+            &param.name,
+            &vid,
+            Some(&param.ty.label()),
+            &summarize(&text),
+            Visibility::Hidden,
+        )?;
+        Ok(())
+    }
+}
+
+impl ValueStore for FrameStore<'_> {
+    fn put_value(&self, session_id: &str, value: &Value) -> flux_core::Result<ValueId> {
+        self.parent.put_value(session_id, value)
+    }
+
+    fn get_value(&self, id: &ValueId) -> flux_core::Result<Option<Value>> {
+        self.parent.get_value(id)
+    }
+
+    fn bind(
+        &self,
+        _session_id: &str,
+        name: &SymbolName,
+        vid: &ValueId,
+        ty: Option<&str>,
+        summary: &str,
+        visibility: Visibility,
+    ) -> flux_core::Result<()> {
+        self.bindings.lock().unwrap().insert(
+            name.clone(),
+            FrameBinding {
+                vid: vid.clone(),
+                ty: ty.map(str::to_string),
+                summary: summary.to_string(),
+                visibility,
+            },
+        );
+        Ok(())
+    }
+
+    fn resolve(&self, _session_id: &str, name: &SymbolName) -> flux_core::Result<Option<ValueId>> {
+        Ok(self
+            .bindings
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(|b| b.vid.clone()))
+    }
+
+    fn append_event(&self, session_id: &str, event: &RunEvent) -> flux_core::Result<()> {
+        self.parent.append_event(session_id, event)
+    }
+
+    fn view(&self, _session_id: &str) -> flux_core::Result<SessionView> {
+        let mut symbols: Vec<_> = self
+            .bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, binding)| binding.visibility != Visibility::Hidden)
+            .map(|(name, binding)| SymbolView {
+                name: name.clone(),
+                ty: binding.ty.clone(),
+                summary: binding.summary.clone(),
+                visibility: binding.visibility,
+            })
+            .collect();
+        symbols.sort_by(|a, b| a.name.0.cmp(&b.name.0));
+        Ok(SessionView { symbols })
+    }
+
+    fn binding(
+        &self,
+        _session_id: &str,
+        name: &SymbolName,
+    ) -> flux_core::Result<Option<SymbolView>> {
+        Ok(self.bindings.lock().unwrap().get(name).map(|b| SymbolView {
+            name: name.clone(),
+            ty: b.ty.clone(),
+            summary: b.summary.clone(),
+            visibility: b.visibility,
+        }))
+    }
+
+    fn as_durable(&self) -> Option<&dyn DurableStore> {
+        self.parent.as_durable()
+    }
+}
+
 /// Execute one registered operation through the envelope, store its result as an immutable value,
 /// optionally bind it to a symbol, and append the run-event trace.
 pub async fn execute_call(
@@ -219,6 +345,146 @@ pub async fn execute_call(
         value_id: Some(value_id),
         is_error: false,
         content: result.content,
+        view,
+    })
+}
+
+async fn execute_composite_call(
+    store: &dyn ValueStore,
+    executor: &dyn OpHost,
+    session_id: &str,
+    composite: &CompositeOpDecl,
+    input: serde_json::Value,
+    bind: Option<BindSpec<'_>>,
+    sink: &mut dyn FlowSink,
+) -> Result<CallOutcome> {
+    let input_hash = sha256_hex(&serde_json::to_string(&input).unwrap_or_default());
+    let step = StepId(format!("step_{}", &input_hash[..16]));
+    store.append_event(
+        session_id,
+        &RunEvent::StepStarted {
+            step: step.clone(),
+            op: composite.name.clone(),
+            input_hash,
+        },
+    )?;
+
+    let frame = FrameStore::new(store);
+    let args = input.as_object().ok_or_else(|| {
+        FlowError::Runtime(format!(
+            "composite op `{}` expected object input",
+            composite.name
+        ))
+    })?;
+    for param in &composite.params {
+        let Some(value) = args.get(&param.name.0) else {
+            let error = format!(
+                "composite op `{}` missing required param `{}`",
+                composite.name, param.name.0
+            );
+            store.append_event(
+                session_id,
+                &RunEvent::StepFailed {
+                    step,
+                    error: error.clone(),
+                },
+            )?;
+            return Ok(CallOutcome {
+                value_id: None,
+                is_error: true,
+                content: error.clone(),
+                view: error,
+            });
+        };
+        frame.seed_param(session_id, param, value)?;
+    }
+
+    let outcome = match execute_flow(&frame, executor, session_id, &composite.body, sink).await {
+        Ok(o) => o,
+        Err(e) => {
+            let error = e.to_string();
+            store.append_event(
+                session_id,
+                &RunEvent::StepFailed {
+                    step,
+                    error: error.clone(),
+                },
+            )?;
+            return Ok(CallOutcome {
+                value_id: None,
+                is_error: true,
+                content: error.clone(),
+                view: error,
+            });
+        }
+    };
+    if outcome.suspension.is_some() {
+        let error = format!("composite op `{}` suspended on `await`", composite.name);
+        store.append_event(
+            session_id,
+            &RunEvent::StepFailed {
+                step,
+                error: error.clone(),
+            },
+        )?;
+        return Ok(CallOutcome {
+            value_id: None,
+            is_error: true,
+            content: error.clone(),
+            view: error,
+        });
+    }
+
+    let (value_id, content) = match &outcome.returned {
+        Some(vid) => {
+            let value = store.get_value(vid)?.ok_or_else(|| {
+                FlowError::Runtime(format!(
+                    "composite op `{}` returned dangling value {}",
+                    composite.name, vid.0
+                ))
+            })?;
+            (vid.clone(), value_text(&value))
+        }
+        None => {
+            let content = outcome.result.clone();
+            let vid = store.put_value(session_id, &Value::String(content.clone()))?;
+            (vid, content)
+        }
+    };
+    store.append_event(
+        session_id,
+        &RunEvent::StepSucceeded {
+            step,
+            output: value_id.clone(),
+        },
+    )?;
+    if let Some(b) = bind {
+        store.bind(
+            session_id,
+            b.name,
+            &value_id,
+            b.ty,
+            &summarize_bound_result(&composite.name, &input, &content),
+            b.visibility,
+        )?;
+    }
+
+    let view = if let Some(name) = &composite.meta.view {
+        frame
+            .resolve(session_id, &SymbolName(name.clone()))?
+            .and_then(|vid| store.get_value(&vid).ok().flatten())
+            .map(|v| value_text(&v))
+            .unwrap_or_else(|| content.clone())
+    } else if outcome.transcript.trim().is_empty() {
+        content.clone()
+    } else {
+        format!("{}\n\n[return]\n{}", outcome.transcript, content)
+    };
+
+    Ok(CallOutcome {
+        value_id: Some(value_id),
+        is_error: false,
+        content,
         view,
     })
 }
@@ -2177,7 +2443,12 @@ async fn run_call(
         .collect::<Result<Vec<_>>>()?;
     let input = map_args_to_input(op, arg_values, executor.catalog())?;
     sink.tool_call(op, &input);
-    let outcome = execute_call(store, executor, session_id, op, input, bind).await?;
+    let composite = executor.catalog().composite(op);
+    let outcome = if let Some(composite) = composite {
+        execute_composite_call(store, executor, session_id, &composite, input, bind, sink).await?
+    } else {
+        execute_call(store, executor, session_id, op, input, bind).await?
+    };
     // Surface the model-facing VIEW (numbered read, diff, …) to the sink — what the model/user sees.
     // The canonical `outcome.content` remains what control flow and interpolation use.
     sink.tool_result(

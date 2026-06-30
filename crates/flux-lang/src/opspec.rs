@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use flux_spec::{Effect, Idempotency, Risk, ToolSpec};
 
 use crate::ast::{FlowEffect, TypeRef};
+use crate::program::CompositeOpDecl;
 
 /// A single named input parameter of an [`OpSpec`]: a `name`, its [`TypeRef`], and whether it may be
 /// omitted. Naming the param here — rather than leaving `inputs` positional — is what lets
@@ -240,6 +241,12 @@ impl OpSignature {
 pub trait OpCatalog {
     /// Resolve an op name to its signature, if registered.
     fn lookup(&self, name: &str) -> Option<OpSignature>;
+
+    /// Resolve an op name to a Flux-Lang composite definition, if one is installed. The default
+    /// keeps existing catalogs tool-only.
+    fn composite(&self, _name: &str) -> Option<CompositeOpDecl> {
+        None
+    }
 }
 
 #[cfg(test)]

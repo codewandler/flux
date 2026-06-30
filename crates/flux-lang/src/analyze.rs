@@ -352,7 +352,7 @@ fn host_effect_to_flow(e: flux_spec::Effect) -> Option<FlowEffect> {
 
 /// Visit every node in `body` and all its nested bodies (depth-first, pre-order), invoking `f` on
 /// each. A single generic traversal reused for effect gathering and future HIR passes.
-pub(crate) fn for_each_node(body: &[Node], f: &mut impl FnMut(&Node)) {
+pub fn for_each_node(body: &[Node], f: &mut impl FnMut(&Node)) {
     for node in body {
         f(node);
         match node {

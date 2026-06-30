@@ -21,8 +21,10 @@
 use crate::ast::{DraftAst, FlowEffect, Node, Param, SymbolName, TypeRef};
 use crate::error::{FlowError, Result};
 use crate::program::{
-    AgentDecl, ChannelDecl, DatasourceDecl, JourneyDecl, Module, Program, TriggerDecl,
+    AgentDecl, ChannelDecl, CompositeLimits, CompositeOpDecl, CompositeOpMeta, DatasourceDecl,
+    JourneyDecl, Module, Program, TriggerDecl,
 };
+use flux_spec::{Effect, Idempotency, Risk};
 use std::collections::BTreeMap;
 
 /// Parse a single Flux-Lang flow from text into a [`DraftAst`].
@@ -121,6 +123,9 @@ pub fn parse_program(src: &str) -> Result<Module> {
         } else if let Some(rest) = kw(header, "journey") {
             program.journeys.push(parse_journey_decl(rest, region)?);
             saw_module_decl = true;
+        } else if let Some(rest) = kw(header, "op") {
+            program.ops.push(parse_composite_op_decl(rest, region)?);
+            saw_module_decl = true;
         } else if is_flow_header(header) {
             program.flows.push(parse_flow_decl(header, region)?);
         } else if is_goal_line(header) {
@@ -128,7 +133,7 @@ pub fn parse_program(src: &str) -> Result<Module> {
         } else {
             return Err(perr(&format!(
                 "unknown top-level declaration: `{header}` (expected agent / channel / datasource / \
-                 trigger / journey / flow)"
+                 trigger / journey / op / flow)"
             )));
         }
         i += consumed;
@@ -152,6 +157,109 @@ fn parse_flow_decl(header: &str, region: &[Line]) -> Result<DraftAst> {
         returns,
         body,
     })
+}
+
+fn parse_op_header(t: &str) -> Result<(String, Vec<Param>, Option<TypeRef>)> {
+    let rest = t.trim();
+    let (name, rest) = take_while(rest, is_name_char);
+    if name.is_empty() {
+        return Err(perr("`op` needs a name"));
+    }
+    let rest = rest.trim_start();
+    let (params, rest) = if rest.starts_with('(') {
+        let close = rest
+            .find(')')
+            .ok_or_else(|| perr("unterminated op parameter list"))?;
+        let inner = &rest[1..close];
+        (parse_params(inner)?, rest[close + 1..].trim_start())
+    } else {
+        (Vec::new(), rest)
+    };
+    let returns = if let Some(r) = rest.strip_prefix("->") {
+        let ty = r.trim();
+        if ty.is_empty() {
+            return Err(perr("expected an op return type after `->`"));
+        }
+        Some(parse_type(ty))
+    } else if rest.is_empty() {
+        None
+    } else {
+        return Err(perr(&format!("unexpected text in op header: `{rest}`")));
+    };
+    Ok((name.to_string(), params, returns))
+}
+
+fn parse_composite_op_decl(name_str: &str, region: &[Line]) -> Result<CompositeOpDecl> {
+    let (name, params, returns) = parse_op_header(name_str)?;
+    let mut meta = CompositeOpMeta::default();
+    if region.is_empty() {
+        return Ok(CompositeOpDecl {
+            name,
+            params,
+            returns,
+            meta,
+            body: DraftAst::default(),
+        });
+    }
+
+    let block_indent = region[0].indent;
+    let mut body_start = 0;
+    while body_start < region.len() {
+        let line = &region[body_start];
+        if line.indent != block_indent {
+            return Err(perr(&format!(
+                "unexpected indentation in op `{name}`: `{}`",
+                line.text
+            )));
+        }
+        let (key, rest) = take_while(&line.text, is_name_char);
+        if !is_composite_meta_key(key) {
+            break;
+        }
+        parse_composite_meta_line(&mut meta, key, rest.trim_start())?;
+        body_start += 1;
+    }
+
+    let (body, _) = parse_stmts(&region[body_start..], 0)?;
+    Ok(CompositeOpDecl {
+        name: name.clone(),
+        params: params.clone(),
+        returns: returns.clone(),
+        meta,
+        body: DraftAst {
+            name: Some(name),
+            params,
+            returns,
+            body,
+        },
+    })
+}
+
+fn is_composite_meta_key(key: &str) -> bool {
+    matches!(
+        key,
+        "description" | "risk" | "idempotency" | "effects" | "limits" | "expose" | "view"
+    )
+}
+
+fn parse_composite_meta_line(meta: &mut CompositeOpMeta, key: &str, value: &str) -> Result<()> {
+    match key {
+        "description" => meta.description = string_value(value, "description")?,
+        "risk" => meta.risk = parse_risk(&string_value(value, "risk")?)?,
+        "idempotency" => {
+            meta.idempotency = parse_idempotency(&string_value(value, "idempotency")?)?
+        }
+        "effects" => meta.effects = parse_effects(&parse_setting(value)?)?,
+        "limits" => meta.limits = parse_limits(&parse_setting(value)?)?,
+        "expose" => {
+            meta.expose = parse_setting(value)?
+                .as_bool()
+                .ok_or_else(|| perr("`expose` must be a boolean"))?
+        }
+        "view" => meta.view = Some(string_value(value, "view")?),
+        _ => {}
+    }
+    Ok(())
 }
 
 /// The single-identifier name after a decl keyword (e.g. `assistant` in `agent assistant`).
@@ -357,6 +465,69 @@ fn as_string_list(v: &serde_json::Value, what: &str) -> Result<Vec<String>> {
             .collect(),
         _ => Err(perr(&format!("`{what}` must be a list of strings"))),
     }
+}
+
+fn parse_risk(s: &str) -> Result<Risk> {
+    match normalize_token(s).as_str() {
+        "low" => Ok(Risk::Low),
+        "medium" => Ok(Risk::Medium),
+        "high" => Ok(Risk::High),
+        "destructive" => Ok(Risk::Destructive),
+        other => Err(perr(&format!("unknown risk `{other}`"))),
+    }
+}
+
+fn parse_idempotency(s: &str) -> Result<Idempotency> {
+    match normalize_token(s).as_str() {
+        "idempotent" => Ok(Idempotency::Idempotent),
+        "non_idempotent" => Ok(Idempotency::NonIdempotent),
+        "conditional" => Ok(Idempotency::Conditional),
+        other => Err(perr(&format!("unknown idempotency `{other}`"))),
+    }
+}
+
+fn parse_effects(v: &serde_json::Value) -> Result<Vec<Effect>> {
+    let items = as_string_list(v, "effects")?;
+    let mut out = Vec::new();
+    for item in items {
+        let effect = match normalize_token(&item).as_str() {
+            "read" => Effect::Read,
+            "write" => Effect::Write,
+            "network" | "model" => Effect::Network,
+            "process" => Effect::Process,
+            "browser" => Effect::Browser,
+            "filesystem" | "file_system" => Effect::Filesystem,
+            "local_system" => Effect::LocalSystem,
+            other => return Err(perr(&format!("unknown effect `{other}`"))),
+        };
+        if !out.contains(&effect) {
+            out.push(effect);
+        }
+    }
+    Ok(out)
+}
+
+fn parse_limits(v: &serde_json::Value) -> Result<CompositeLimits> {
+    let serde_json::Value::Object(map) = v else {
+        return Err(perr("`limits` must be an object"));
+    };
+    let mut limits = CompositeLimits::default();
+    for (key, value) in map {
+        let n = value
+            .as_u64()
+            .ok_or_else(|| perr(&format!("limit `{key}` must be a positive integer")))?;
+        match key.as_str() {
+            "dispatches" => limits.dispatches = Some(n),
+            "timeout_ms" => limits.timeout_ms = Some(n),
+            "context_chars" => limits.context_chars = Some(n),
+            other => return Err(perr(&format!("unknown limit `{other}`"))),
+        }
+    }
+    Ok(limits)
+}
+
+fn normalize_token(s: &str) -> String {
+    s.trim().to_ascii_lowercase().replace('-', "_")
 }
 
 /// Evaluate a native-text **setting value** to a [`serde_json::Value`] (no IO): string / number /
@@ -2559,6 +2730,23 @@ datasource docs
   kind \"markdown\"
   path \"./docs\"
 
+op repo_health(path: String, prior: Ctx) -> Health
+  description \"Check git state and summarize failures\"
+  risk \"medium\"
+  idempotency \"idempotent\"
+  effects [read, process, model]
+  limits {dispatches: 20, timeout_ms: 120000, context_chars: 8000}
+  expose true
+
+  $status = git_status()
+  $tests = cargo_test({args: [\"--workspace\"]})
+  ctx $pack
+    purpose \"repo-health\"
+    budget 8000
+    include $prior, $status, $tests
+  $summary = ai.reason({ask: \"Summarize repo health\", ctx: $pack})
+  return {status: $status, tests: $tests, summary: $summary}
+
 trigger on_msg
   on \"slack\"
   run greet
@@ -2598,6 +2786,25 @@ journey greet
         assert_eq!(p.datasources.len(), 1);
         assert_eq!(p.datasources[0].kind, "markdown");
         assert_eq!(p.datasources[0].path.as_deref(), Some("./docs"));
+
+        // composite op
+        assert_eq!(p.ops.len(), 1);
+        let op = &p.ops[0];
+        assert_eq!(op.name, "repo_health");
+        assert_eq!(op.params.len(), 2);
+        assert_eq!(
+            op.returns.as_ref().map(TypeRef::label).as_deref(),
+            Some("Health")
+        );
+        assert_eq!(op.meta.risk, Risk::Medium);
+        assert_eq!(op.meta.idempotency, Idempotency::Idempotent);
+        assert_eq!(
+            op.meta.effects,
+            vec![Effect::Read, Effect::Process, Effect::Network]
+        );
+        assert_eq!(op.meta.limits.dispatches, Some(20));
+        assert!(op.meta.expose);
+        assert!(matches!(op.body.body.last(), Some(Node::Return { .. })));
 
         // trigger
         assert_eq!(p.triggers[0].on, "slack");
