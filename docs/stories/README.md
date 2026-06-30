@@ -22,10 +22,7 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
   grader-confirmed run is **staged** on a funded provider key
 
 ## Next (ready — take the top one unless the user named a story)
-- [D-30 — Endpoint lifecycle: refresh runner, CLI & audit](D-30-endpoint-lifecycle-cli.md) · Core · **top pick** ·
-  the final step in the **Endpoint discovery & brokerage** epic (below): periodic re-discovery +
-  `flux endpoint list/show/resolve/import` + audit. (D-25..D-29 + D-20 landed.)
-- [D-11 — App-runner ergonomics](D-11-app-runner-ergonomics.md) · Agent · the alternate ready pick (makes
+- [D-11 — App-runner ergonomics](D-11-app-runner-ergonomics.md) · Agent · the ready pick (makes
   `flux app run` a viable host for a declarative bot; unblocks Slack-channel assistant flows).
 
 ## Blocked
@@ -48,9 +45,14 @@ service endpoints (prometheus/loki/grafana/alertmanager/sql) and hands consumers
 resolves it and injects credentials host-side, so neither the plugin nor the LLM ever sees a secret. Reverses
 the `.dex`-style endpoint-registry deferral from D-10/D-12. See [epic design](../designs/endpoint-discovery.md).
 **[D-20](D-20-scoped-private-net-egress.md) is pulled in as a hard dependency** (discovered endpoints are
-usually private/in-cluster hosts). Built in this order:
-- [D-30 — Endpoint lifecycle: refresh runner, CLI & audit](D-30-endpoint-lifecycle-cli.md) · Core · **next** · periodic
-  rediscovery + `flux endpoint list/show/resolve` (weak refs + health, never secrets) + audit
+usually private/in-cluster hosts). **The epic core (D-25 → D-30 + D-20) is complete.** Built in this order:
+- [D-30 — Endpoint lifecycle: refresh runner, CLI & audit](D-30-endpoint-lifecycle-cli.md) · Core · **done** ·
+  periodic rediscovery + `flux endpoint list/show/resolve/import` (weak refs + health, never secrets) + audit
+- Follow-up hardenings (backlog, not epic-blocking):
+  - [D-31 — Host-terminated raw-socket auth](D-31-host-terminated-rawsocket-auth.md) · Core · the host speaks
+    the Postgres/AMI handshake so even trusted raw-socket plugins never hold a credential value
+  - [D-32 — Retire the `host.endpoint` URL-handback](D-32-retire-url-handback.md) · Core · close the last 5–6
+    residual URL-handback call sites and delete the capability (compile-enforced cutover)
 
 ### Plugin platform hardening — lifecycle, internal-network reach, distribution
 Gaps surfaced while verifying the plugin install + running `scripts/smoke-plugins.sh` (the gitlab case fails
@@ -86,6 +88,16 @@ all providers**. Most plumbing already exists (`flux-credentials` import/refresh
   stage; import + refresh cover the near term
 
 ## Done
+- [D-30 — Endpoint lifecycle: refresh runner, CLI & audit](D-30-endpoint-lifecycle-cli.md) · Core · the
+  epic's final step: `EndpointBroker::refresh` re-discovers + reconciles each owner's set via
+  `replace_owned` (stale dropped, other owners untouched) driven on-demand by `EndpointRunner::tick`
+  (no always-on ticker — it would contend with the agent's plugin-host locks); a `flux endpoint`
+  CLI (`list`/`show`/`resolve`/`import`) renders weak refs + health + the credential *location*, never
+  a value (pinned by `cli::endpoint_list_redacts`); the agent `endpoint.import` op persists a weak ref
+  to `~/.flux/endpoints.toml`; and a new `EndpointDiscovered` audit event fires per provider on
+  `discover`/`refresh` (count only — no URL, no secret). The **endpoint-discovery epic core
+  (D-25→D-30 + D-20) is complete**; D-31 (host-terminated raw-socket auth) and D-32 (retire the
+  `host.endpoint` URL-handback) are filed as backlog hardenings.
 - [D-29 — Migrate native plugins to references](D-29-migrate-plugins-to-references.md) · Agent · primary
   plugin IO is now reference-based (the `SystemHostCaps` named-vs-discovered split + host-kit `*_ref`
   helpers; 6 URL-handback callers migrated), and `sql` consumes a discovered Postgres endpoint (password

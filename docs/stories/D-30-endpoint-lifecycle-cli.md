@@ -2,7 +2,7 @@
 id: D-30
 title: Endpoint lifecycle — refresh runner, operator CLI & audit
 pillar: Core
-status: backlog
+status: done
 priority:
 design: docs/designs/endpoint-discovery.md
 ---
@@ -23,21 +23,33 @@ reference binds to without ever exposing a secret. See the
 [epic design](../designs/endpoint-discovery.md) — *Discovery protocol* (registry) and *Security model*.
 
 ## Acceptance
-- [ ] **Refresh runner** — re-runs provider discovery on an interval and reconciles each provider's set
+- [x] **Refresh runner** — re-runs provider discovery on an interval and reconciles each provider's set
       via `replace_owned`, leaving other owners' entries untouched; stale (expired TTL) entries drop.
-      Test `endpoint::runner_reconciles_owned`.
-- [ ] **`flux endpoint list` / `show`** — render the registry's weak refs + health; a credential value
+      Test `endpoint::refresh_reconciles_owned` (broker; `EndpointRunner::tick` drives one cycle — there
+      is no always-on ticker, see Notes).
+- [x] **`flux endpoint list` / `show`** — render the registry's weak refs + health; a credential value
       or env binding is **never** printed. Failing-first test `cli::endpoint_list_redacts`.
-- [ ] **`flux endpoint resolve <ref>`** — operator-only; reports what a reference *would* bind to
+- [x] **`flux endpoint resolve <ref>`** — operator-only; reports what a reference *would* bind to
       (source, host, credential-ref location) without printing secret material.
-- [ ] **Audit** — discovery and resolution emit `flux-events` records (consumer/provider, endpoint,
-      grant); reads are account-scoped where applicable (cf. D-02).
-- [ ] Gate green: `cargo test -p flux-cli -p flux-plugin` (+ schema crate), clippy `-D warnings`, fmt,
-      `flux-codegate`.
+- [x] **`flux endpoint import <id>`** (+ agent `endpoint.import` op) — persists a weak ref to
+      `~/.flux/endpoints.toml`; never a secret.
+- [x] **Audit** — discovery (`EndpointDiscovered`: product/provider/count, no URL/secret) and
+      resolution (`CrossPluginResolve`) emit `flux-events` records; reads are account-scoped where
+      applicable (cf. D-02).
+- [x] Gate green: `cargo test --workspace` (+ `-p flux-cli -p flux-plugin`), clippy `-D warnings`,
+      fmt, `flux-codegate`.
 
 ## Progress
-- (not started — needs [D-25](D-25-endpoint-reference-model.md) and
-  [D-28](D-28-kubernetes-endpoint-provider.md).)
+- Done. `EndpointBroker::refresh` re-runs the fan-out per product and reconciles each owner's set via
+  `EndpointRegistry::replace_owned` (stale dropped, fresh inserted, other owners untouched); the
+  `EndpointRunner` wraps a broker + products + interval and exposes `tick` for a future lock-aware
+  scheduler (no always-on ticker — it would contend with the agent's plugin-host locks). The discovery
+  audit (`CrossPluginAudit::record_discovery` → `EventKind::EndpointDiscovered`) fires per provider on
+  both `discover` and `refresh`. The `flux endpoint` CLI (`list`/`show`/`resolve`/`import`) renders weak
+  refs + health + the credential *location*, never a value (pinned by `endpoint_list_redacts`); the
+  agent-facing `endpoint.import` op persists a weak ref to `~/.flux/endpoints.toml`. The epic
+  (D-25→D-30 + D-20) is complete; the two remaining hardenings are filed as [D-31](D-31-host-terminated-rawsocket-auth.md)
+  and [D-32](D-32-retire-url-handback.md).
 
 ## Notes
 - CLI styling follows [D-19](D-19-plugin-lifecycle-cli.md) (the `flux plugin` lifecycle surface).

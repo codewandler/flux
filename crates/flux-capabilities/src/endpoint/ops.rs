@@ -1,5 +1,6 @@
 //! The agent-facing endpoint ops over the cross-plugin [`EndpointBroker`] + [`EndpointRegistry`]
-//! (D-28): `endpoint.discover` / `endpoint.list` / `endpoint.info` / `endpoint.select`.
+//! (D-28): `endpoint.discover` / `endpoint.list` / `endpoint.info` / `endpoint.select`, plus the
+//! D-30 `endpoint.import` (persist a known record to `~/.flux/endpoints.toml`, weak-ref only).
 //!
 //! Each is a read-only [`Tool`]. They are the planner's entry point into the discovery spine: ask
 //! *"which endpoints exist for product X?"*, inspect the registry, and **select** a weak
@@ -35,7 +36,8 @@ pub fn endpoint_tools(
         Arc::new(DiscoverOp(broker)) as Arc<dyn Tool>,
         Arc::new(ListOp(endpoints.clone())),
         Arc::new(InfoOp(endpoints.clone())),
-        Arc::new(SelectOp(endpoints)),
+        Arc::new(SelectOp(endpoints.clone())),
+        Arc::new(ImportOp(endpoints)),
     ]
 }
 
@@ -260,6 +262,47 @@ impl Tool for SelectOp {
     }
 }
 
+/// `endpoint.import` — persist a known endpoint record to `~/.flux/endpoints.toml` so it survives
+/// across sessions (weak-ref only — re-resolved live each session, never a stored secret).
+struct ImportOp(Arc<EndpointRegistry>);
+
+#[async_trait]
+impl Tool for ImportOp {
+    fn spec(&self) -> ToolSpec {
+        // Not read-only: it persists to the local endpoints store (`~/.flux/endpoints.toml`) — a
+        // `LocalSystem` effect (a weak ref, never a secret), distinct from the query ops.
+        ToolSpec::read_only(
+            "endpoint.import",
+            "Persist a discovered/known endpoint reference (by id) to your local endpoints store so it \
+             is remembered across sessions. Stores a weak reference only — URL + credential location, \
+             never a secret; the credential is re-resolved live each session. Returns the imported weak \
+             reference.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Endpoint id from endpoint.discover / endpoint.list"}
+                },
+                "required": ["id"]
+            }),
+        )
+        .with_effects(vec![flux_spec::Effect::LocalSystem])
+        .with_group(ENDPOINT_GROUP)
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let id = req_str("endpoint.import", &params, "id")?;
+        // `import` persists the record (weak ref) to the store and returns its `EndpointRef`. The
+        // returned ref is model-safe by construction (its `credential_ref` is a location, never a value).
+        let reference = self
+            .0
+            .import(&id)
+            .map_err(|e| Error::Other(format!("endpoint.import: {e}")))?;
+        let value = serde_json::to_string(&reference)
+            .map_err(|e| Error::Other(format!("endpoint.import: {e}")))?;
+        Ok(ToolResult::ok(value))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,14 +444,54 @@ mod tests {
         assert!(!i.content.to_lowercase().contains("password"));
     }
 
+    #[tokio::test]
+    async fn import_persists_a_weak_ref_and_never_a_secret() {
+        // Importing a discovered, credential-bearing record persists it to the store as a weak ref
+        // (location only) and returns the ref — never a secret value, on disk or in the result.
+        let dir = std::env::temp_dir().join(format!("flux-ep-import-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("endpoints.toml");
+        let endpoints = Arc::new(EndpointRegistry::with_path(path.clone()));
+        endpoints.put(EndpointRecord {
+            owner: "kubernetes".into(),
+            ..EndpointRecord::config(EndpointRef {
+                credential_ref: Some(Ref::kubernetes("prod", "rds-creds", "password")),
+                ..EndpointRef::discovered(
+                    "prod-orders",
+                    "postgres://orders.prod.svc:5432",
+                    "postgres",
+                )
+            })
+        });
+        let import = ImportOp(endpoints);
+        let r = import
+            .execute(&ctx(), json!({ "id": "@endpoint/prod-orders" }))
+            .await
+            .unwrap();
+        // The returned value is the weak EndpointRef (credential LOCATION, never a value).
+        let ref_json: EndpointRef = serde_json::from_str(&r.content).unwrap();
+        assert_eq!(ref_json.id, "@endpoint/prod-orders");
+        assert!(!r.content.to_lowercase().contains("password=") || r.content.contains("\"slot\""));
+        // The persisted file carries the credential *reference*, never a secret value.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("prod-orders"));
+        assert!(!on_disk.to_lowercase().contains("secret"));
+        // An unknown id is a clean error.
+        assert!(ImportOp(Arc::new(EndpointRegistry::with_path(path)))
+            .execute(&ctx(), json!({ "id": "@endpoint/nope" }))
+            .await
+            .is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn ops_declare_the_endpoint_group() {
         let endpoints = Arc::new(EndpointRegistry::new());
-        // SelectOp/ListOp/InfoOp are constructible without a broker.
+        // The query ops (SelectOp/ListOp/InfoOp) are read-only; all four are in the endpoint group.
         for tool in [
             Arc::new(ListOp(endpoints.clone())) as Arc<dyn Tool>,
             Arc::new(InfoOp(endpoints.clone())),
-            Arc::new(SelectOp(endpoints)),
+            Arc::new(SelectOp(endpoints.clone())),
         ] {
             let spec = tool.spec();
             assert_eq!(spec.group.as_deref(), Some(ENDPOINT_GROUP));
@@ -417,5 +500,9 @@ mod tests {
             assert!(!spec.has_effect(flux_spec::Effect::Write));
             assert!(!spec.has_effect(flux_spec::Effect::Process));
         }
+        // `endpoint.import` is in the same group but persists to the local store (LocalSystem effect).
+        let import = ImportOp(endpoints).spec();
+        assert_eq!(import.group.as_deref(), Some(ENDPOINT_GROUP));
+        assert!(import.has_effect(flux_spec::Effect::LocalSystem));
     }
 }

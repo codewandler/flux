@@ -262,6 +262,12 @@ enum Commands {
         #[command(subcommand)]
         action: Option<PluginAction>,
     },
+    /// Inspect the persisted endpoint store (`~/.flux/endpoints.toml`). Operator-only, weak refs only —
+    /// never prints a secret value.
+    Endpoint {
+        #[command(subcommand)]
+        action: EndpointAction,
+    },
     /// Render or install generated Claude-format Flux skills.
     Skill {
         /// Which section to render/install: cli | lang | plugin | ops. Omit for the root skill.
@@ -393,6 +399,36 @@ enum PluginAction {
         /// Write the SKILL.md to this single file (references go in a sibling `references/`).
         #[arg(long)]
         out: Option<String>,
+    },
+}
+
+/// `flux endpoint …` — the operator mirror of the agent's `endpoint.*` ops over the persisted
+/// `~/.flux/endpoints.toml` store. Every subcommand deals in weak references only: it shows the
+/// credential *location* (the `credential_ref`), never a value.
+#[derive(clap::Subcommand, Debug)]
+enum EndpointAction {
+    /// List the persisted endpoint records (id, product, bare URL, owner, ttl/health, credential
+    /// location) — never a secret value.
+    List,
+    /// Show one persisted record in full by id (still reference-only).
+    Show {
+        /// Endpoint id (e.g. `@endpoint/<ns>-<name>`).
+        id: String,
+    },
+    /// Report what a reference WOULD bind to at connect time: source, bare host/url, and the
+    /// credential-ref *location* — explicitly NOT the secret value (an operator diagnostic).
+    Resolve {
+        /// Endpoint id to diagnose.
+        id: String,
+    },
+    /// Persist a record into `~/.flux/endpoints.toml` (weak-ref only; re-resolved live each session).
+    /// Reads the record from the persisted store, or accepts `--from-json <EndpointRef>`.
+    Import {
+        /// Endpoint id to import.
+        id: String,
+        /// A weak `EndpointRef` (JSON) to import directly when the id is not already in the store.
+        #[arg(long, value_name = "JSON")]
+        from_json: Option<String>,
     },
 }
 
@@ -837,7 +873,9 @@ impl flux_plugin::SecretSink for RedactorSecretSink {
 
 /// L6 binding of the L5 [`flux_capabilities::CrossPluginAudit`] seam: appends a `CrossPluginResolve`
 /// event recording which consumer resolved which provider's credential, by *location* (the
-/// `credential_ref` string) — never the value. An append failure is logged, never fatal.
+/// `credential_ref` string) — never the value (D-27); and (D-30) an `EndpointDiscovered` event per
+/// provider whose discovery returned candidates — count only, no URL, no secret. An append failure is
+/// logged, never fatal.
 struct EventStoreCrossPluginAudit {
     store: Arc<EventStore>,
     stream: String,
@@ -860,6 +898,22 @@ impl flux_capabilities::CrossPluginAudit for EventStoreCrossPluginAudit {
                 "{}",
                 style::dim(&format!(
                     "(audit: failed to record cross-plugin resolve: {e})"
+                ))
+            );
+        }
+    }
+
+    fn record_discovery(&self, product: &str, provider: &str, count: usize) {
+        let ev = flux_events::NewEvent::new(flux_events::EventKind::EndpointDiscovered {
+            product: product.to_string(),
+            provider: provider.to_string(),
+            count,
+        });
+        if let Err(e) = self.store.append(&self.stream, ev) {
+            eprintln!(
+                "{}",
+                style::dim(&format!(
+                    "(audit: failed to record endpoint discovery: {e})"
                 ))
             );
         }
@@ -3447,6 +3501,7 @@ async fn main() -> Result<()> {
             Some(Commands::Sessions { prune }) => run_sessions(prune),
             Some(Commands::Auth { action }) => run_auth(action).await,
             Some(Commands::Plugin { action }) => run_plugin(action).await,
+            Some(Commands::Endpoint { action }) => run_endpoint(action),
             Some(Commands::Skill {
                 type_,
                 install,
@@ -3666,10 +3721,12 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
                 cfg.endpoint.cross_plugin_credentials.clone(),
             )),
         );
-        // Agent-facing endpoint ops (D-28): added to the program's tool set so the app's agent target
-        // can discover/select endpoints. TODO(D-28): the app path has no per-run EventStore in scope,
-        // so the cross-plugin audit/approver seams stay unwired here (same gap as the D-20 egress
-        // audit above); the broker + registry the ops drive are fully wired.
+        // Agent-facing endpoint ops (D-28/D-30): added to the program's tool set so the app's agent
+        // target can discover/select/import endpoints. TODO(D-30): the app path has no per-run
+        // EventStore in scope, so the cross-plugin resolution audit AND the D-30 discovery audit
+        // (`EndpointDiscovered`) stay unwired here (same gap as the D-20 egress audit above —
+        // `with_cross_plugin_audit` is not installed, so both audit hooks default to no-op); the
+        // broker + registry the ops drive are fully wired.
         extra_tools.extend(flux_capabilities::endpoint_tools(
             broker.clone(),
             endpoint_registry.clone(),
@@ -3764,6 +3821,187 @@ async fn run_tui(flags: AgentFlags) -> Result<()> {
     let auto_approve = flags.yes;
     let (agent, session_id, _spawner) = build_agent(&flags).await?;
     flux_tui::run(agent, session_id, auto_approve).await
+}
+
+/// The credential-ref **location** column for a record — the `Ref` location string (e.g.
+/// `kubernetes/ns/secret/key`) or `none`. NEVER a value: `Ref`'s `Display` is a location by
+/// construction (`flux-secret`), and the persisted record carries no material in the first place.
+fn credential_location(record: &flux_secret::endpoint::EndpointRecord) -> String {
+    record
+        .endpoint
+        .credential_ref
+        .as_ref()
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+/// One persisted record as a list row — bare URL (no creds), owner, ttl/health, and the credential
+/// *location*. Shared by the `list` renderer and tested directly so the redaction guarantee is pinned.
+fn render_endpoint_row(record: &flux_secret::endpoint::EndpointRecord) -> String {
+    let ep = &record.endpoint;
+    let product = if ep.product.is_empty() {
+        "-"
+    } else {
+        ep.product.as_str()
+    };
+    let mut ttl_health = String::new();
+    if let Some(ttl) = record.ttl_secs {
+        ttl_health.push_str(&format!("ttl={ttl}s"));
+    }
+    if let Some(h) = &record.health {
+        if !ttl_health.is_empty() {
+            ttl_health.push(' ');
+        }
+        ttl_health.push_str(&format!("health={h}"));
+    }
+    if ttl_health.is_empty() {
+        ttl_health.push('-');
+    }
+    format!(
+        "{id}  [{product}]  {url}  owner={owner}  {ttl_health}  credential: {cred}",
+        id = ep.id,
+        url = ep.url,
+        owner = record.owner,
+        cred = credential_location(record),
+    )
+}
+
+/// `flux endpoint …` — the operator mirror of the agent's `endpoint.*` ops over the persisted
+/// `~/.flux/endpoints.toml` store. Every path is reference-only: it shows the credential *location*,
+/// never a value. Synchronous (pure file IO over the store).
+fn run_endpoint(action: EndpointAction) -> Result<()> {
+    use flux_capabilities::EndpointRegistry;
+
+    // The persisted store. A standalone CLI invocation has no in-memory session registry, so every
+    // subcommand operates on `~/.flux/endpoints.toml` (loaded fresh; a missing file is empty).
+    let path = EndpointRegistry::default_path()
+        .ok_or_else(|| anyhow::anyhow!("HOME is not set (no endpoints store path)"))?;
+    let registry = EndpointRegistry::with_path(path.clone());
+    registry
+        .load()
+        .map_err(|e| anyhow::anyhow!("load endpoints store: {e}"))?;
+
+    match action {
+        EndpointAction::List => {
+            let records = registry.list();
+            if records.is_empty() {
+                eprintln!(
+                    "no persisted endpoints — import one with `flux endpoint import <id>` (store: {})",
+                    path.display()
+                );
+                return Ok(());
+            }
+            for r in &records {
+                println!("{}", render_endpoint_row(r));
+            }
+            Ok(())
+        }
+        EndpointAction::Show { id } => {
+            let r = registry
+                .resolve(&id)
+                .ok_or_else(|| anyhow::anyhow!("no persisted endpoint `{id}`"))?;
+            let ep = &r.endpoint;
+            println!("{}        {}", style::bold("id"), ep.id);
+            println!(
+                "{}   {}",
+                style::bold("product"),
+                if ep.product.is_empty() {
+                    "-"
+                } else {
+                    &ep.product
+                }
+            );
+            println!("{}       {}", style::bold("url"), ep.url); // bare URL — no embedded creds
+            if let Some(proto) = &ep.protocol {
+                println!("{}  {proto}", style::bold("protocol"));
+            }
+            println!("{}     {}", style::bold("owner"), r.owner);
+            println!("{}    {:?}", style::bold("source"), ep.source);
+            if let Some(ttl) = r.ttl_secs {
+                println!("{}       {ttl}s", style::bold("ttl"));
+            }
+            if let Some(h) = &r.health {
+                println!("{}    {h}", style::bold("health"));
+            }
+            if !ep.labels.is_empty() {
+                let labels: Vec<String> =
+                    ep.labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                println!("{}    {}", style::bold("labels"), labels.join(", "));
+            }
+            // The credential is shown only as a LOCATION (or `none`) — never a value.
+            println!("{} {}", style::bold("credential"), credential_location(&r));
+            Ok(())
+        }
+        EndpointAction::Resolve { id } => {
+            let r = registry
+                .resolve(&id)
+                .ok_or_else(|| anyhow::anyhow!("no persisted endpoint `{id}`"))?;
+            let ep = &r.endpoint;
+            // Operator diagnostic: report what the reference WOULD bind to — source, bare host/url, and
+            // the credential-ref LOCATION. The value is deliberately not shown: it is resolved host-side
+            // at connect time (and may be a cross-plugin hop), never by this read-only operator command.
+            println!(
+                "{}       {} (owner={})",
+                style::bold("source"),
+                {
+                    match ep.source {
+                        flux_secret::endpoint::SourceKind::Config => "config",
+                        flux_secret::endpoint::SourceKind::Discovered => "discovered",
+                    }
+                },
+                r.owner
+            );
+            println!("{}          {}", style::bold("url"), ep.url);
+            match &ep.credential_ref {
+                Some(cred) => {
+                    println!("{}   {cred}", style::bold("credential-ref"));
+                    println!(
+                        "{}       {}",
+                        style::bold("credential"),
+                        style::dim("<resolved at connect time, host-side>")
+                    );
+                }
+                None => println!("{}   none (unauthenticated)", style::bold("credential-ref")),
+            }
+            Ok(())
+        }
+        EndpointAction::Import { id, from_json } => {
+            // For a standalone CLI, the in-memory registry is just the loaded store. Import the record
+            // if it is already present; otherwise accept an explicit `--from-json <EndpointRef>`; else
+            // error clearly. (The agent-facing `endpoint.import` op is the primary in-session path.)
+            if registry.resolve(&id).is_none() {
+                let Some(json) = from_json else {
+                    bail!(
+                        "no endpoint `{id}` in the store — discover/select it in a session first \
+                         (the `endpoint.import` op persists it), or pass `--from-json <EndpointRef>`"
+                    );
+                };
+                let reference: flux_secret::endpoint::EndpointRef = serde_json::from_str(&json)
+                    .context("parse --from-json as a weak EndpointRef")?;
+                if reference.id != id {
+                    bail!("`--from-json` id `{}` does not match `{id}`", reference.id);
+                }
+                // Stamp the record with the source's owner semantics: a discovered ref keeps no owner
+                // info in the bare ref, so attribute an explicit import to `config` (operator-imported).
+                registry.put(flux_secret::endpoint::EndpointRecord::config(reference));
+            }
+            let reference = registry
+                .import(&id)
+                .map_err(|e| anyhow::anyhow!("import endpoint `{id}`: {e}"))?;
+            println!(
+                "imported {} → {} (weak ref persisted to {}; credential: {})",
+                reference.id,
+                reference.url,
+                path.display(),
+                reference
+                    .credential_ref
+                    .as_ref()
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+            );
+            Ok(())
+        }
+    }
 }
 
 /// `flux plugin add <name> <program> [args…] | ls | pin <name> <version> | rollback <name>`.
@@ -4230,9 +4468,9 @@ async fn run_prompt(flags: AgentFlags, prompt_words: Vec<String>) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_datasources, format_evidence, loop_machinery_label, new_render_suffix,
-        plugin_binaries_in, resolve_plugin_operation_name, tool_preview, truncate,
-        usage_annotation, write_generated_skill,
+        build_datasources, credential_location, format_evidence, loop_machinery_label,
+        new_render_suffix, plugin_binaries_in, render_endpoint_row, resolve_plugin_operation_name,
+        tool_preview, truncate, usage_annotation, write_generated_skill,
     };
     use serde_json::json;
 
@@ -4618,6 +4856,50 @@ mod tests {
         let p = tool_preview(&"x".repeat(600), true);
         assert_eq!(p.chars().count(), 600);
         assert!(!p.ends_with('…'));
+    }
+
+    #[test]
+    fn endpoint_list_redacts() {
+        // The `flux endpoint list` row renders the credential REFERENCE LOCATION, never a value: a
+        // record with a kubernetes-scheme credential_ref shows `kubernetes/<ns>/<name>/<key>` and the
+        // bare URL — and no secret-shaped string.
+        use flux_secret::endpoint::{EndpointRecord, EndpointRef};
+        use flux_secret::Ref;
+        let rec = EndpointRecord {
+            owner: "kubernetes".into(),
+            ttl_secs: Some(900),
+            health: Some("ok".into()),
+            ..EndpointRecord::config(EndpointRef {
+                credential_ref: Some(Ref::kubernetes("prod", "rds-creds", "password")),
+                protocol: Some("postgres".into()),
+                ..EndpointRef::discovered(
+                    "prod-orders",
+                    "postgres://orders.prod.svc:5432",
+                    "postgres",
+                )
+            })
+        };
+        let row = render_endpoint_row(&rec);
+        // The credential column is the LOCATION string only.
+        assert!(
+            row.contains("credential: kubernetes/prod/rds-creds/password"),
+            "row must show the credential location: {row}"
+        );
+        // The bare URL + owner + ttl/health are present.
+        assert!(row.contains("postgres://orders.prod.svc:5432"));
+        assert!(row.contains("owner=kubernetes"));
+        assert!(row.contains("ttl=900s") && row.contains("health=ok"));
+        // No secret value leaks (the location names the key, never a value; nothing "secret"-shaped).
+        assert!(!row.to_lowercase().contains("secret"));
+        assert!(!row.contains("Bearer "));
+        // A credential-less record renders `none`, not a placeholder value.
+        let plain = EndpointRecord::config(EndpointRef::discovered(
+            "svc-1",
+            "https://svc.internal",
+            "service",
+        ));
+        assert_eq!(credential_location(&plain), "none");
+        assert!(render_endpoint_row(&plain).contains("credential: none"));
     }
 
     #[test]

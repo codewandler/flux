@@ -79,6 +79,16 @@ pub enum EventKind {
         provider: String,
         reference_location: String,
     },
+
+    /// The discovery broker fanned a `product` query out to a discovery `provider` and committed
+    /// `count` weak endpoint references it returned — the auditable D-30 discovery event. Carries no
+    /// URL and no credential (weak refs only): just *which provider discovered how many endpoints for
+    /// which product*, so a refresh/reconcile leaves an auditable trail.
+    EndpointDiscovered {
+        product: String,
+        provider: String,
+        count: usize,
+    },
 }
 
 impl EventKind {
@@ -96,6 +106,7 @@ impl EventKind {
             EventKind::TurnEnded { .. } => "turn_ended",
             EventKind::PrivateNetAdmit { .. } => "private_net_admit",
             EventKind::CrossPluginResolve { .. } => "cross_plugin_resolve",
+            EventKind::EndpointDiscovered { .. } => "endpoint_discovered",
         }
     }
 }

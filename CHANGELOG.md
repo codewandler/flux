@@ -8,6 +8,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Endpoint lifecycle — refresh runner, operator CLI & audit (D-30).** The final step of the
+  endpoint-discovery epic. `EndpointBroker::refresh` re-runs the cross-plugin fan-out per product and
+  reconciles each discovering provider's set via `EndpointRegistry::replace_owned` — stale entries
+  dropped, fresh ones inserted, other owners' records left untouched — driven on demand by an
+  `EndpointRunner::tick` (no always-on ticker: it would contend with the agent's own plugin-host
+  locks). A new `flux endpoint` CLI (`list`/`show`/`resolve`/`import`) renders the persisted
+  `~/.flux/endpoints.toml` store as weak references + health + the credential *location*, **never** a
+  secret value (pinned by `cli::endpoint_list_redacts`); the agent-facing `endpoint.import` op
+  persists a weak ref across sessions. A new `EndpointDiscovered` audit event fires per provider on
+  both `discover` and `refresh` (product/provider/count only — no URL, no secret). The epic core
+  (D-25 → D-30 + D-20) is complete; D-31 (host-terminated raw-socket auth) and D-32 (retire the
+  `host.endpoint` URL-handback) are filed as backlog hardenings.
 - **Reference-based plugin IO migration (D-29).** Plugin operations now do their primary IO through
   references rather than holding URLs: `SystemHostCaps` resolves a named manifest endpoint locally (env
   binding stays a host-side resolver default) and a discovered `@endpoint/<id>` through the broker;

@@ -196,12 +196,22 @@ pub trait CrossPluginApprover: Send + Sync {
     async fn approve(&self, consumer: &str, provider: &str) -> bool;
 }
 
-/// Audit seam for cross-plugin credential resolution. Fires on every *successful* resolution. The
-/// `reference_location` is the `credential_ref` string — a location, **never** the value. The concrete
-/// `flux-events`-backed impl lives at a surface (L6), keeping flux-capabilities event-store-free.
+/// Audit seam for cross-plugin credential resolution **and** endpoint discovery. Resolution audit
+/// fires on every *successful* cross-plugin resolution; discovery audit fires per provider whose
+/// `endpoint.discover` returned candidates during `discover`/`refresh`. Both carry locations/counts
+/// only — **never** a secret or a credential value. The concrete `flux-events`-backed impl lives at a
+/// surface (L6), keeping flux-capabilities event-store-free.
 pub trait CrossPluginAudit: Send + Sync {
     /// Record that `consumer` resolved a credential owned by `provider`, located at `reference_location`.
     fn record_cross_plugin_resolve(&self, consumer: &str, provider: &str, reference_location: &str);
+
+    /// Record that discovery `provider` returned `count` weak endpoint references for `product` (during
+    /// `discover`/`refresh`). Defaulted to a no-op so existing audit impls need not change; the
+    /// `flux-events`-backed surface impl (D-30) overrides it to append an `EndpointDiscovered` event.
+    /// Carries no URL and no credential — just *which provider discovered how many endpoints*.
+    fn record_discovery(&self, product: &str, provider: &str, count: usize) {
+        let _ = (product, provider, count);
+    }
 }
 
 /// The seam the broker calls to read a credential value from a provider plugin's `secret.read` op.
@@ -362,9 +372,63 @@ impl EndpointBroker {
         limit: usize,
         requester: Option<&str>,
     ) -> Vec<EndpointCandidate> {
+        // Fan out, audit per provider, and commit each candidate via `put` (additive — does not drop
+        // another provider's stale entries; that is `refresh`'s reconcile job).
+        let found = self.fan_out(product, query, limit, requester).await;
+        for (owner, cand) in &found {
+            self.endpoints.put(EndpointRecord {
+                owner: owner.clone(),
+                ..EndpointRecord::config(cand.endpoint.clone())
+            });
+        }
+        found.into_iter().map(|(_, cand)| cand).collect()
+    }
+
+    /// Re-discover + **reconcile** the endpoints for each of `products`: for every product, run the
+    /// same fan-out as [`discover`](Self::discover) and commit each provider's set via the registry's
+    /// [`replace_owned`](EndpointRegistry::replace_owned) — so a provider's stale entries are dropped
+    /// and its fresh ones inserted, WITHOUT disturbing any other owner's records. This is the on-demand
+    /// lifecycle/reconcile primitive (driven by `flux endpoint refresh`); there is no always-on ticker
+    /// (it would contend with the agent's own plugin-host locks). The discovery audit fires per
+    /// provider, exactly as in `discover`. Returns a [`RefreshSummary`] of the per-provider counts.
+    pub async fn refresh(&self, products: &[String]) -> RefreshSummary {
+        let mut summary = RefreshSummary::default();
+        for product in products {
+            let found = self.fan_out(product, &Value::Null, usize::MAX, None).await;
+            // Group the fresh candidates by their discovering provider, then `replace_owned` each set —
+            // reconciling exactly that owner's records (stale dropped, fresh inserted), others untouched.
+            let mut by_owner: HashMap<String, Vec<EndpointRecord>> = HashMap::new();
+            for (owner, cand) in found {
+                by_owner
+                    .entry(owner.clone())
+                    .or_default()
+                    .push(EndpointRecord {
+                        owner,
+                        ..EndpointRecord::config(cand.endpoint)
+                    });
+            }
+            for (owner, records) in by_owner {
+                summary.record(&owner, records.len());
+                self.endpoints.replace_owned(&owner, records);
+            }
+        }
+        summary
+    }
+
+    /// The shared fan-out for [`discover`](Self::discover) / [`refresh`](Self::refresh): query every
+    /// matching provider (except `requester` and any already in flight), audit each provider's
+    /// discovery (count only — no URL, no secret), rank the union by score descending and truncate to
+    /// `limit`, and return each candidate paired with its discovering provider (the record's `owner`).
+    async fn fan_out(
+        &self,
+        product: &str,
+        query: &Value,
+        limit: usize,
+        requester: Option<&str>,
+    ) -> Vec<(String, EndpointCandidate)> {
         let providers = self.registry.providers_for(product);
         // Keep each candidate paired with the provider that returned it, so the committed record's
-        // `owner` is the discovering provider — `replace_owned`-able on a later refresh.
+        // `owner` is the discovering provider — `replace_owned`-able on a refresh.
         let mut found: Vec<(String, EndpointCandidate)> = Vec::new();
 
         for name in providers {
@@ -383,7 +447,14 @@ impl EndpointBroker {
             self.in_flight.lock().await.remove(&name);
 
             match outcome {
-                Ok(cands) => found.extend(cands.into_iter().map(|c| (name.clone(), c))),
+                Ok(cands) => {
+                    // Discovery audit: which provider discovered how many endpoints for this product —
+                    // count only, never a URL or a credential. Fires for every provider that ran.
+                    if let Some(audit) = &self.audit {
+                        audit.record_discovery(product, &name, cands.len());
+                    }
+                    found.extend(cands.into_iter().map(|c| (name.clone(), c)));
+                }
                 Err(e) => eprintln!("(provider `{name}` endpoint.discover failed: {e})"),
             }
         }
@@ -395,17 +466,7 @@ impl EndpointBroker {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         found.truncate(limit);
-
-        // Commit each to the registry as a discovered record owned by its discovering provider, so a
-        // later reference resolves to the same weak record (still no secret — only the credential ref).
-        for (owner, cand) in &found {
-            self.endpoints.put(EndpointRecord {
-                owner: owner.clone(),
-                ..EndpointRecord::config(cand.endpoint.clone())
-            });
-        }
-
-        found.into_iter().map(|(_, cand)| cand).collect()
+        found
     }
 
     /// The provider plugin that owns a credential `reference`, if it is a cross-plugin scheme: the
@@ -488,6 +549,71 @@ impl EndpointBroker {
             value,
             media_type: None,
         })
+    }
+}
+
+/// The outcome of an [`EndpointBroker::refresh`]: how many endpoints each provider contributed across
+/// the refreshed products (the counts that were `replace_owned`-committed). A small, secret-free
+/// summary the operator CLI renders.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefreshSummary {
+    /// `(provider, count)` pairs — one per provider that returned endpoints, in insertion order.
+    counts: Vec<(String, usize)>,
+}
+
+impl RefreshSummary {
+    /// Add `count` endpoints for `provider` (summing if the provider already appears — e.g. it
+    /// discovered for more than one of the refreshed products).
+    fn record(&mut self, provider: &str, count: usize) {
+        if let Some(entry) = self.counts.iter_mut().find(|(p, _)| p == provider) {
+            entry.1 += count;
+        } else {
+            self.counts.push((provider.to_string(), count));
+        }
+    }
+
+    /// The per-provider `(provider, count)` tallies.
+    pub fn counts(&self) -> &[(String, usize)] {
+        &self.counts
+    }
+
+    /// Total endpoints reconciled across all providers.
+    pub fn total(&self) -> usize {
+        self.counts.iter().map(|(_, n)| n).sum()
+    }
+}
+
+/// The (currently **unwired**) seam for a future *scheduled* refresh: an [`EndpointBroker`] plus an
+/// interval. [`tick`](Self::tick) runs one [`refresh`](EndpointBroker::refresh) over the configured
+/// products — a caller could drive it on a timer. Deliberately not wired into any always-on ticker:
+/// a background loop would contend with the agent's own plugin-host locks (the broker shares those
+/// hosts), so refresh stays on-demand (driven by `flux endpoint refresh`) until a future story adds a
+/// lock-aware scheduler.
+pub struct EndpointRunner {
+    broker: Arc<EndpointBroker>,
+    /// The products to re-discover on each tick.
+    products: Vec<String>,
+    /// The intended refresh interval (honored by whatever future scheduler drives `tick`).
+    pub interval: std::time::Duration,
+}
+
+impl EndpointRunner {
+    /// A runner that refreshes `products` every `interval` when ticked.
+    pub fn new(
+        broker: Arc<EndpointBroker>,
+        products: Vec<String>,
+        interval: std::time::Duration,
+    ) -> Self {
+        Self {
+            broker,
+            products,
+            interval,
+        }
+    }
+
+    /// Run one refresh cycle over the configured products, returning its [`RefreshSummary`].
+    pub async fn tick(&self) -> RefreshSummary {
+        self.broker.refresh(&self.products).await
     }
 }
 
@@ -843,6 +969,108 @@ mod tests {
         assert!(!serialized.to_lowercase().contains("bearer "));
     }
 
+    #[tokio::test]
+    async fn refresh_reconciles_owned() {
+        // A broker refreshed twice with CHANGED provider results must replace only that owner's
+        // records (reusing `replace_owned`), leave other owners untouched, and fire the discovery
+        // audit each run.
+        use std::sync::Mutex as StdMutex;
+
+        /// An invoker whose per-provider results can be swapped between refreshes.
+        struct MutInvoker {
+            by_provider: StdMutex<HashMap<String, Vec<EndpointCandidate>>>,
+        }
+        #[async_trait]
+        impl ProviderInvoker for MutInvoker {
+            async fn discover(
+                &self,
+                name: &str,
+                _product: &str,
+                _query: &Value,
+                _limit: usize,
+            ) -> Result<Vec<EndpointCandidate>, String> {
+                Ok(self
+                    .by_provider
+                    .lock()
+                    .unwrap()
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_default())
+            }
+        }
+
+        let reg = Arc::new(PluginRegistry::new());
+        register_provider(&reg, "k8s", "postgres").await;
+
+        // First round: provider `k8s` discovers pg-a + pg-b.
+        let mut first = HashMap::new();
+        first.insert(
+            "k8s".to_string(),
+            vec![
+                candidate("pg-a", "postgres", 0.9, "k8s"),
+                candidate("pg-b", "postgres", 0.5, "k8s"),
+            ],
+        );
+        let invoker = Arc::new(MutInvoker {
+            by_provider: StdMutex::new(first),
+        });
+        let endpoints = Arc::new(EndpointRegistry::new());
+        // A record owned by a DIFFERENT owner (`config`) must survive every k8s refresh untouched.
+        endpoints.put(EndpointRecord {
+            owner: "config".into(),
+            ..EndpointRecord::config(EndpointRef::named("sql.endpoint", "postgres://c:5432/x"))
+        });
+        let audit = Arc::new(RecordingAudit::default());
+        let broker = EndpointBroker::new(invoker.clone(), reg, endpoints.clone())
+            .with_cross_plugin_audit(audit.clone());
+
+        let s1 = broker.refresh(&["postgres".to_string()]).await;
+        assert_eq!(s1.counts(), &[("k8s".to_string(), 2)]);
+        assert_eq!(s1.total(), 2);
+        assert!(endpoints.resolve("@endpoint/pg-a").is_some());
+        assert!(endpoints.resolve("@endpoint/pg-b").is_some());
+        assert!(
+            endpoints.resolve("sql.endpoint").is_some(),
+            "other owner kept"
+        );
+
+        // Second round: `k8s` now discovers pg-a (changed url) + pg-c; pg-b is gone. `replace_owned`
+        // must drop the stale pg-b, update pg-a, insert pg-c — and never touch the `config` record.
+        let mut second = HashMap::new();
+        second.insert(
+            "k8s".to_string(),
+            vec![
+                candidate("pg-a", "postgres", 0.9, "k8s"),
+                candidate("pg-c", "postgres", 0.7, "k8s"),
+            ],
+        );
+        *invoker.by_provider.lock().unwrap() = second;
+
+        let s2 = broker.refresh(&["postgres".to_string()]).await;
+        assert_eq!(s2.counts(), &[("k8s".to_string(), 2)]);
+        assert!(
+            endpoints.resolve("@endpoint/pg-b").is_none(),
+            "stale owned record dropped by replace_owned"
+        );
+        assert!(endpoints.resolve("@endpoint/pg-a").is_some());
+        assert!(endpoints.resolve("@endpoint/pg-c").is_some());
+        assert!(
+            endpoints.resolve("sql.endpoint").is_some(),
+            "a different owner's record is never disturbed by a refresh"
+        );
+
+        // The discovery audit fired on each refresh (one provider that returned candidates per run).
+        let recs = audit.discoveries.lock().unwrap();
+        assert_eq!(
+            *recs,
+            vec![
+                ("postgres".to_string(), "k8s".to_string(), 2),
+                ("postgres".to_string(), "k8s".to_string(), 2),
+            ],
+            "discovery audit fires per provider on each refresh"
+        );
+    }
+
     // --- D-27: cross-plugin credential resolution gating ---
 
     /// A fake [`CredentialReader`] that returns a fixed value and records each `(provider, ref)` read,
@@ -881,10 +1109,12 @@ mod tests {
         }
     }
 
-    /// A recording [`CrossPluginAudit`] capturing `(consumer, provider, location)` — never a value.
+    /// A recording [`CrossPluginAudit`] capturing resolution `(consumer, provider, location)` — never
+    /// a value — and discovery `(product, provider, count)` records.
     #[derive(Default)]
     struct RecordingAudit {
         records: std::sync::Mutex<Vec<(String, String, String)>>,
+        discoveries: std::sync::Mutex<Vec<(String, String, usize)>>,
     }
 
     impl CrossPluginAudit for RecordingAudit {
@@ -898,6 +1128,14 @@ mod tests {
                 consumer.to_string(),
                 provider.to_string(),
                 reference_location.to_string(),
+            ));
+        }
+
+        fn record_discovery(&self, product: &str, provider: &str, count: usize) {
+            self.discoveries.lock().unwrap().push((
+                product.to_string(),
+                provider.to_string(),
+                count,
             ));
         }
     }

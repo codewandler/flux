@@ -14,7 +14,8 @@ mod ops;
 
 pub use broker::{
     CredentialReader, CrossPluginApprover, CrossPluginAudit, CrossPluginGrants, EndpointBroker,
-    HostCredentialReader, HostProviderInvoker, PluginRegistry, ProviderEntry, ProviderInvoker,
+    EndpointRunner, HostCredentialReader, HostProviderInvoker, PluginRegistry, ProviderEntry,
+    ProviderInvoker, RefreshSummary,
 };
 pub use host_caps::EndpointBrokerHostCaps;
 pub use ops::{endpoint_tools, register_endpoint_ops, ENDPOINT_GROUP};
@@ -95,6 +96,22 @@ impl EndpointRegistry {
         for r in records {
             guard.insert(r.endpoint.id.clone(), r);
         }
+    }
+
+    /// Import the in-memory record `id` into the persisted store: persist all current records (the
+    /// store is the union of the session's discovered + config-bound records — each a weak ref, never a
+    /// secret) so this id survives across sessions, re-resolved live each time. Errors if `id` is not
+    /// known to this session, or if no persistence path is configured. Returns the imported record's
+    /// weak [`EndpointRef`].
+    pub fn import(&self, id: &str) -> Result<EndpointRef, String> {
+        let record = self
+            .resolve(id)
+            .ok_or_else(|| format!("no endpoint `{id}` to import"))?;
+        if self.path.is_none() {
+            return Err("no endpoints store configured (set a path via `with_path`)".to_string());
+        }
+        self.save()?;
+        Ok(record.endpoint)
     }
 
     /// Load persisted records from `path` into memory (merge). A missing file is fine; a corrupt one
