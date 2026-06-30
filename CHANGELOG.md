@@ -6,9 +6,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
-### Added
+### Changed
 
-- Nothing yet.
+- Clarified the root docs split: `AGENTS.md` is now explicitly the operating contract for coding agents,
+  while `README.md` gives humans a faster product overview, common entry points, and contributor map.
 
 ## [0.2.6] - 2026-06-30
 

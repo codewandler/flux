@@ -22,7 +22,18 @@ flux is one platform on that thesis, with three **co-equal pillars**:
 2. **The Language (Flux-Lang)** — the typed plan format the agent compiles into: machine-generated, human-readable, lightly human-editable. Not a language you hand-write from scratch.
 3. **The Improvement Loop** — an eval + self-improvement harness (`flux-eval`) kept in-repo because it's used directly to make flux better at real coding work.
 
-All three live in one strictly-layered Cargo workspace. New here? [`docs/README.md`](docs/README.md) is the full map.
+Use flux when you want:
+- a coding agent whose proposed work can be inspected as a plan before it runs
+- a repeatable automation artifact instead of a one-off chat transcript
+- a guarded runtime for tools, plugins, sub-agents, and HTTP/server integrations
+- an SDK surface for embedding the same agent loop in your own product
+
+Start with `flux run` for day-to-day coding, `flux plan` when you want to inspect the graph first,
+`flux tui` for an interactive terminal UI, and `flux app run --serve` when you want to host an agent over
+HTTP/A2A.
+
+All three pillars live in one strictly-layered Cargo workspace. New here? [`docs/README.md`](docs/README.md)
+is the full repository map.
 
 ---
 
@@ -81,7 +92,7 @@ No API key needed to try the engine: `-m mock` runs an offline provider through 
 flux run --yes -m mock "summarise this repo"
 ```
 
-See [`docs/usage.md`](docs/usage.md) for the full guide.
+See [`docs/usage.md`](docs/usage.md) for the full CLI/TUI/SDK/server guide.
 
 ---
 
@@ -154,7 +165,7 @@ Sub-agents inherit the same policy and cannot approve destructive operations the
 
 ## Capabilities
 
-**Built-in tools:** `read`, `write`, `edit`, `bash`, `glob`, `grep`, `web_fetch` (SSRF-guarded), `search` (auto-indexed workspace docs), `task` (delegate to a sub-agent role).
+**Built-in tools:** `read`, `write`, `edit`, `glob`, `grep`, `web_fetch` (SSRF-guarded), `search` (auto-indexed workspace docs), and `task` (delegate to a sub-agent role). Language/toolchain helpers are surfaced from workspace signals. The generic `bash` op exists but is opt-in through the `shell` group (`enable_shell = true`, `FLUX_ENABLE_BASH=1`, or the REPL `/shell` toggle).
 
 **Skills** — markdown knowledge packs discovered from the project's `.flux/skills` **and** the
 user-global dirs `~/.flux/skills`, `~/.agents/skills`, and `~/.claude/skills` (project wins on a name
@@ -270,6 +281,17 @@ See [docs/architecture.md](docs/architecture.md) for the full design, [docs/visi
 ---
 
 ## Development
+
+The human contributor map:
+
+| Need | Start here |
+|---|---|
+| Product overview and user commands | this README, then [docs/usage.md](docs/usage.md) |
+| Architecture, crate layers, and safety model | [docs/architecture.md](docs/architecture.md) |
+| Current priorities | [docs/stories/README.md](docs/stories/README.md) |
+| Agent/automation operating rules | [AGENTS.md](AGENTS.md) |
+| Plugin authoring | [plugins/AUTHORING.md](plugins/AUTHORING.md) |
+| Public docs site source | [website/](website/) |
 
 ```bash
 cargo test --workspace                                   # all tests

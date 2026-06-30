@@ -1,17 +1,28 @@
-# AGENTS.md — contributing to flux
+# AGENTS.md — operating contract for agents in flux
 
-This file is the contributor contract for both human developers and AI agents. **Read it before making any change.** It is the authoritative reference for architecture, conventions, safety invariants, and the dev loop. When in doubt, this file (and the docs it links) is the tie-breaker.
+This file is written for **coding agents and automation** working in this repository. Human contributors may use it too, but the human product entry point is [README.md](README.md). **Read this before making any change.** It is the authoritative reference for repo workflow, architecture boundaries, safety invariants, and the dev loop. When in doubt, this file and the docs it links are the tie-breaker.
+
+---
+
+## Agent mandate
+
+- **Serve the newest user request first.** If the user named a task, story, file, or command, that scopes the work. If they did not name work, open the board and take the top `ready` story by priority.
+- **Protect the user's worktree.** Start with `git status --short --branch`; assume uncommitted changes are user-owned unless you made them. Do not reset, discard, rebase, rewrite history, or force-push unless the user explicitly asks.
+- **Keep the architecture honest.** The LLM is not the runtime; all real effects flow through authorization → approval → guarded IO. Never add bypass paths, even for convenience.
+- **Make changes auditable.** Non-trivial behavior needs a story or design trail, a failing-first test, and a CHANGELOG entry. If the work is purely docs/metadata, keep the scope tight and still note user-visible documentation changes in the changelog.
+- **Finish the loop.** Implement, verify with the relevant gate, report any command you could not run, and only commit when explicitly instructed.
 
 ---
 
 ## Start here (every session)
 
-1. **Product** — flux is a deterministic agent platform on one thesis (*the LLM is not the runtime*) with three co-equal pillars: the **Agent**, the **Language** (Flux-Lang), and the **Improvement** loop. If you don't already hold this, skim [docs/README.md](docs/README.md) and [docs/vision.md](docs/vision.md).
-2. **What to work on** — open the board: **[docs/stories/README.md](docs/stories/README.md)**. Take the top `ready` story by priority, unless the user named a specific story.
-3. **The contract** — read that story file (`docs/stories/<id>-*.md`); its **Goal + Acceptance** define what "done" means.
-4. **Do the work** — non-trivial design goes in [docs/designs/](docs/designs/); implement; satisfy Acceptance with a **failing-first test**; run the dev loop below until the gate is green.
-5. **On done** — set the story's `status: done`, remove its row from the board, add a CHANGELOG entry, and keep design/plan docs in sync.
-6. **New or unscoped work?** Create a story first from [docs/stories/_TEMPLATE.md](docs/stories/_TEMPLATE.md) so the next agent inherits the context.
+1. **Orient** — read the latest user request, then run `git status --short --branch`. If you are resuming prior work, also read the relevant local plan in [`.flux/plans/`](.flux/plans/) when one exists.
+2. **Product** — flux is a deterministic agent platform on one thesis (*the LLM is not the runtime*) with three co-equal pillars: the **Agent**, the **Language** (Flux-Lang), and the **Improvement** loop. If you don't already hold this, skim [docs/README.md](docs/README.md) and [docs/vision.md](docs/vision.md).
+3. **What to work on** — if the user named work, do that. Otherwise open the board: **[docs/stories/README.md](docs/stories/README.md)** and take the top `ready` story by priority.
+4. **The contract** — for story work, read `docs/stories/<id>-*.md`; its **Goal + Acceptance** define what "done" means.
+5. **Do the work** — non-trivial design goes in [docs/designs/](docs/designs/); implement; satisfy Acceptance with a **failing-first test**; run the relevant dev loop below until the gate is green.
+6. **On done** — for story work, set the story's `status: done`, remove its row from the board, add a CHANGELOG entry, and keep design/plan docs in sync. For direct user requests, update only the docs/changelog/tests that the change actually warrants.
+7. **New or unscoped work?** Create a story first from [docs/stories/_TEMPLATE.md](docs/stories/_TEMPLATE.md) so the next agent inherits the context.
 
 ---
 
@@ -36,6 +47,18 @@ cargo test -p flux-codegate                              # architecture layering
 ```
 
 CI enforces all of these. A change is not finished until every command above is green.
+
+Docs-only changes may use a narrower check, but be explicit in the final report about what was and was not run. If you touched generated docs, language catalogs, tool catalogs, or skills, run the sync tests named in the relevant section below.
+
+---
+
+## Worktree discipline
+
+- Use `rg` / `rg --files` for repo search and read the surrounding code before editing.
+- Prefer `apply_patch` for manual edits. Do not rewrite unrelated files or normalize formatting outside the scope of the task.
+- Ignored build/dependency output (`target/`, `plugins/target/`, `website/node_modules/`) is disposable local state; never add it to Git.
+- If history rewrite or force-push is explicitly requested, make a local backup first, use `--force-with-lease` when updating branches, and audit affected tags before pushing them.
+- Commit only on explicit user instruction. Use the semantic commit format in the **Commits** section.
 
 ---
 
