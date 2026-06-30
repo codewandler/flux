@@ -1,7 +1,7 @@
 //! The reusable **server** side of the A2A protocol: JSON-RPC dispatch, the agent-card builder, and
 //! the message/event shaping — all over [`serde_json::Value`] and a small [`A2aTurn`] seam, with
-//! **no HTTP-framework dependency**. A surface (axum in `flux-server`, and in downstream's
-//! `managed-agents`) supplies the route + state and calls these functions, so the *protocol* has one
+//! **no HTTP-framework dependency**. A surface (axum in `flux-server`, or another downstream HTTP
+//! host) supplies the route + state and calls these functions, so the *protocol* has one
 //! definition the way [`crate::types`] gives the *wire* one definition.
 //!
 //! The blocking [`dispatch`] handles `message/send` end-to-end (run a turn → completed [`Task`]).

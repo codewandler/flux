@@ -7,8 +7,9 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use flux_app::App;
+use flux_lang::program::ChannelDecl;
 
-use crate::{AppDeliverer, Channel, Deliverer};
+use crate::{A2aChannel, AppDeliverer, Channel, Deliverer};
 
 /// Run `channels` against `app` until Ctrl-C (or `cancel`). Fires the one-shot `startup` event first,
 /// then spawns each channel; when `run_stdin` is set, also serves the interactive `cli` stdin loop
@@ -22,13 +23,28 @@ pub async fn serve(
     run_stdin: bool,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
+    // `a2a` channels serve an agent over HTTP/A2A and need the live `App` to resolve the target agent's
+    // engine, so they are built here rather than in the decl-only `build_channels`. Collect the decls
+    // first (ending the `program()` borrow) so `app` is free to move into the deliverer below.
+    let a2a_decls: Vec<ChannelDecl> = app
+        .program()
+        .channels
+        .iter()
+        .filter(|c| c.kind == "a2a")
+        .cloned()
+        .collect();
+    let mut a2a_channels: Vec<Box<dyn Channel>> = Vec::with_capacity(a2a_decls.len());
+    for decl in &a2a_decls {
+        a2a_channels.push(Box::new(A2aChannel::from_decl_and_app(decl, &app)?));
+    }
+
     let deliverer: Arc<dyn Deliverer> = Arc::new(AppDeliverer::new(app));
 
     // Fire the one-shot startup event before any channel events, so `{on:"startup"}` triggers run first.
     deliverer.deliver("startup", json!({})).await?;
 
     let mut set: JoinSet<anyhow::Result<()>> = JoinSet::new();
-    for ch in channels {
+    for ch in channels.into_iter().chain(a2a_channels) {
         let d = deliverer.clone();
         let c = cancel.clone();
         set.spawn(async move { ch.start(d, c).await });
@@ -42,9 +58,11 @@ pub async fn serve(
     // Run until Ctrl-C / external cancel, until a channel *errors* (fatal), or until every channel has
     // finished on its own. A channel that ends normally (e.g. a one-shot `startup` schedule) must NOT
     // tear down the others, so a normal completion just continues the loop.
+    let shutdown = flux_server::shutdown_signal();
+    tokio::pin!(shutdown);
     let result = loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => break Ok(()),
+            _ = &mut shutdown => break Ok(()),
             _ = cancel.cancelled() => break Ok(()),
             joined = set.join_next() => match joined {
                 Some(Ok(Ok(()))) => continue,                 // a channel ended normally; keep the rest

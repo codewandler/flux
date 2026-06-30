@@ -7,10 +7,18 @@ use async_trait::async_trait;
 use flux_plugin::{HostCapabilities, PluginHost};
 use serde_json::{json, Value};
 
+/// A throwaway workspace-rooted `System` for spawning plugins in tests. The plugin launches through
+/// flux's one guarded spawn path, which needs a `System`; the workspace dir is irrelevant to these
+/// protocol/manifest tests (the echo/caps plugins do no file IO of their own).
+fn test_system() -> flux_system::System {
+    flux_system::System::new(flux_system::Workspace::new(std::env::temp_dir()).unwrap())
+}
+
 #[tokio::test]
 async fn host_discovers_manifest_and_calls_operation() {
     let exe = env!("CARGO_BIN_EXE_echo_plugin");
-    let mut host = PluginHost::spawn(exe, &[]).await.unwrap();
+    let system = test_system();
+    let mut host = PluginHost::spawn(&system, exe, &[]).await.unwrap();
 
     let manifest = host.manifest().await.unwrap();
     assert_eq!(manifest.name, "echo");
@@ -45,7 +53,8 @@ impl HostCapabilities for PingCaps {
 #[tokio::test]
 async fn host_services_plugin_capability_callback() {
     let exe = env!("CARGO_BIN_EXE_caps_plugin");
-    let mut host = PluginHost::spawn(exe, &[]).await.unwrap();
+    let system = test_system();
+    let mut host = PluginHost::spawn(&system, exe, &[]).await.unwrap();
 
     // The plugin's `viahost` op calls back into the host (`ping`); the round-trip returns the echo.
     let out = host
@@ -62,11 +71,48 @@ async fn host_services_plugin_capability_callback() {
 }
 
 #[tokio::test]
+async fn plugin_cannot_read_host_env() {
+    // The invariant D-22 enforces: a plugin process is launched env-cleared (the single guarded spawn
+    // path), so it cannot read the host's secrets directly — it must request them through the gated
+    // host capabilities. Set a non-allow-listed var in the host, spawn the plugin, and confirm the
+    // plugin's own `std::env` can't see it.
+    std::env::set_var("FLUX_TEST_PLUGIN_SECRET", "leak-me-not");
+    let exe = env!("CARGO_BIN_EXE_caps_plugin");
+    let system = test_system();
+    let mut host = PluginHost::spawn(&system, exe, &[]).await.unwrap();
+    std::env::remove_var("FLUX_TEST_PLUGIN_SECRET");
+
+    let leaked = host
+        .call("readenv", json!({ "key": "FLUX_TEST_PLUGIN_SECRET" }))
+        .await
+        .unwrap();
+    assert_eq!(
+        leaked["value"],
+        Value::Null,
+        "plugin inherited a host secret env var — the spawn path must clear the environment"
+    );
+
+    // Sanity anchor: an allow-listed var (PATH) DOES reach the plugin, proving the probe really reads
+    // its own env (so the null above is isolation, not a broken probe).
+    let allowed = host
+        .call("readenv", json!({ "key": "PATH" }))
+        .await
+        .unwrap();
+    assert!(
+        allowed["value"].is_string(),
+        "allow-listed PATH should pass through to the plugin"
+    );
+
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn plugin_operations_project_as_tools() {
     use flux_plugin::{load_plugin_tools, DenyHostCaps};
 
     let exe = env!("CARGO_BIN_EXE_echo_plugin");
-    let (tools, host) = load_plugin_tools(exe, &[], |_| Arc::new(DenyHostCaps))
+    let system = test_system();
+    let (tools, host) = load_plugin_tools(&system, exe, &[], |_| Arc::new(DenyHostCaps))
         .await
         .unwrap();
     assert_eq!(tools.len(), 1);

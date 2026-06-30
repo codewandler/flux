@@ -110,10 +110,10 @@ fn type_ref_to_schema(ty: &TypeRef) -> serde_json::Value {
 }
 
 /// The input parameter names of a tool's JSON-Schema, as `(required, optional)`. The `required`
-/// array fixes the order of mandatory params; the optional ones are whatever remaining `properties`
-/// the schema declares (key order is the schema map's order). A flow's positional `Call.args` map
-/// onto `required ++ optional` at execution (see `runtime::map_args_to_input`), and the planner
-/// catalog renders the same signature so the model emits args in this order.
+/// array fixes the order of mandatory params. Optional params follow `x-param-order` when present,
+/// then any remaining `properties` keys. A flow's positional `Call.args` map onto
+/// `required ++ optional` at execution (see `runtime::map_args_to_input`), and the planner catalog
+/// renders the same signature so the model emits args in this order.
 pub fn schema_params(schema: &serde_json::Value) -> (Vec<String>, Vec<String>) {
     let required: Vec<String> = schema
         .get("required")
@@ -126,8 +126,18 @@ pub fn schema_params(schema: &serde_json::Value) -> (Vec<String>, Vec<String>) {
         .unwrap_or_default();
     let mut optional = Vec::new();
     if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+        if let Some(order) = schema.get("x-param-order").and_then(|v| v.as_array()) {
+            for name in order.iter().filter_map(|v| v.as_str()) {
+                if props.contains_key(name)
+                    && !required.iter().any(|r| r == name)
+                    && !optional.iter().any(|o| o == name)
+                {
+                    optional.push(name.to_string());
+                }
+            }
+        }
         for k in props.keys() {
-            if !required.contains(k) {
+            if !required.contains(k) && !optional.contains(k) {
                 optional.push(k.clone());
             }
         }
@@ -337,6 +347,23 @@ mod tests {
         let (required, optional) = schema_params(&spec.lower().input_schema);
         assert_eq!(required, vec!["path", "old", "new"]);
         assert!(optional.is_empty());
+    }
+
+    #[test]
+    fn optional_param_order_can_be_declared_explicitly() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "args": { "type": "array" },
+                "manifest_path": { "type": "string" },
+                "package": { "type": "string" },
+                "filter": { "type": "string" }
+            },
+            "x-param-order": ["package", "manifest_path", "filter", "args"]
+        });
+        let (required, optional) = schema_params(&schema);
+        assert!(required.is_empty());
+        assert_eq!(optional, vec!["package", "manifest_path", "filter", "args"]);
     }
 
     #[test]

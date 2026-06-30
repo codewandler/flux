@@ -323,6 +323,21 @@ where
     }
 }
 
+/// A host-managed **interactive** child whose stdin and stdout are piped back to the caller for a
+/// bidirectional protocol (the plugin `flux.plugin.v1` NDJSON frames over stdin/stdout), with stderr
+/// inherited so the child's diagnostics reach the terminal. Spawned through the same safety envelope
+/// as every other flux subprocess (see [`System::spawn_interactive`]): argv-only, workspace-pinned
+/// cwd, and a **cleared + allow-listed environment** — so the child cannot read the host's secrets.
+/// `kill_on_drop`, so a dropped handle never leaks the process.
+pub struct InteractiveChild {
+    /// The child process handle (for `kill`/`wait`).
+    pub child: tokio::process::Child,
+    /// The child's stdin (the host writes request frames here).
+    pub stdin: tokio::process::ChildStdin,
+    /// The child's stdout (the host reads response frames here).
+    pub stdout: tokio::process::ChildStdout,
+}
+
 /// The guarded IO surface tools are given. All filesystem access is confined to the workspace;
 /// process execution is argv-only.
 #[derive(Debug, Clone)]
@@ -482,18 +497,9 @@ impl System {
         env: &[(String, String)],
         timeout: Duration,
     ) -> Result<ProcessOutput> {
-        let Some((program, args)) = argv.split_first() else {
-            return Err(Error::Other("empty command".to_string()));
-        };
-        let mut cmd = tokio::process::Command::new(program);
-        cmd.args(args)
-            .current_dir(self.workspace.root())
-            .stdin(std::process::Stdio::null());
-
-        // Don't leak the agent's environment (which may hold ANTHROPIC_API_KEY and other secrets)
-        // into model-spawned commands: start from an empty env and pass only a minimal, non-secret
-        // set needed for programs to function, plus the caller's explicit overrides.
-        Self::apply_safe_env(&mut cmd, env);
+        let mut cmd = self.build_command(argv, env)?;
+        cmd.stdin(std::process::Stdio::null());
+        let program = &argv[0];
 
         let fut = cmd.output();
         let output = match tokio::time::timeout(timeout, fut).await {
@@ -530,6 +536,9 @@ impl System {
             "USER",
             "LOGNAME",
             "TMPDIR",
+            // Non-secret diagnostics knobs so a plugin/subprocess author can turn on logging.
+            "RUST_LOG",
+            "RUST_BACKTRACE",
             // Non-secret toolchain locations so `cargo`/`rustup` (and the cargo_* tools) resolve a
             // toolchain even under an isolated HOME without `~/.rustup`.
             "RUSTUP_HOME",
@@ -546,6 +555,26 @@ impl System {
         }
     }
 
+    /// Build a child process command with flux's **single safety envelope** applied: argv-only (no
+    /// shell; `program = argv[0]`), working directory pinned to the workspace root, and the
+    /// environment cleared then restricted to the minimal non-secret allow-list plus the caller's
+    /// explicit (non-model) overrides. This is the **one place** flux constructs an OS process — every
+    /// spawn mode (`run_with_env`, `run_with_env_streamed`, `spawn_background`, `spawn_interactive`)
+    /// layers only its own stdio on top of the command this returns, so the envelope has no bypass.
+    fn build_command(
+        &self,
+        argv: &[String],
+        env: &[(String, String)],
+    ) -> Result<tokio::process::Command> {
+        let Some((program, args)) = argv.split_first() else {
+            return Err(Error::Other("empty command".to_string()));
+        };
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args).current_dir(self.workspace.root());
+        Self::apply_safe_env(&mut cmd, env);
+        Ok(cmd)
+    }
+
     /// Like [`run_with_env`](Self::run_with_env) but **streams** the child's stdout/stderr straight to
     /// the parent terminal (inherited) instead of capturing them — for `flux eval --watch`, where the
     /// whole point is to watch the spawned agent work live. The returned [`ProcessOutput`] carries only
@@ -557,17 +586,12 @@ impl System {
         env: &[(String, String)],
         timeout: Duration,
     ) -> Result<ProcessOutput> {
-        let Some((program, args)) = argv.split_first() else {
-            return Err(Error::Other("empty command".to_string()));
-        };
-        let mut cmd = tokio::process::Command::new(program);
-        cmd.args(args)
-            .current_dir(self.workspace.root())
-            .stdin(std::process::Stdio::null())
+        let mut cmd = self.build_command(argv, env)?;
+        cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true);
-        Self::apply_safe_env(&mut cmd, env);
+        let program = &argv[0];
 
         let mut child = cmd
             .spawn()
@@ -604,17 +628,12 @@ impl System {
         argv: &[String],
         env: &[(String, String)],
     ) -> Result<ManagedChild> {
-        let Some((program, args)) = argv.split_first() else {
-            return Err(Error::Other("empty command".to_string()));
-        };
-        let mut cmd = tokio::process::Command::new(program);
-        cmd.args(args)
-            .current_dir(self.workspace.root())
-            .stdin(std::process::Stdio::null())
+        let mut cmd = self.build_command(argv, env)?;
+        cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        Self::apply_safe_env(&mut cmd, env);
+        let program = &argv[0];
 
         let mut child = cmd
             .spawn()
@@ -639,6 +658,37 @@ impl System {
             stderr_buf,
             stdout_task: Some(stdout_task),
             stderr_task: Some(stderr_task),
+        })
+    }
+
+    /// Spawn an **interactive** child for a bidirectional stdin/stdout protocol — used to launch a
+    /// plugin subprocess for the `flux.plugin.v1` frame protocol. stdin and stdout are **piped** and
+    /// handed back to the caller; stderr is **inherited** so the plugin's diagnostics reach the
+    /// terminal. Same safety envelope as [`run_with_env`](Self::run_with_env) via
+    /// [`build_command`](Self::build_command): argv-only, workspace-pinned cwd, env cleared then
+    /// restricted to the minimal allow-list — so the plugin process **cannot read the host's
+    /// secrets**; it must request them back through the gated host capabilities. `kill_on_drop`.
+    pub fn spawn_interactive(&self, argv: &[String]) -> Result<InteractiveChild> {
+        let mut cmd = self.build_command(argv, &[])?;
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true);
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| Error::Other(format!("spawn {}: {e}", argv[0])))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::Other("interactive child stdin unavailable".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::Other("interactive child stdout unavailable".into()))?;
+        Ok(InteractiveChild {
+            child,
+            stdin,
+            stdout,
         })
     }
 }

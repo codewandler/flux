@@ -35,6 +35,21 @@ fn default_path() -> String {
     "/".to_string()
 }
 
+/// `kind = "a2a"` settings — expose a program agent over the HTTP/A2A API (sessions + SSE + A2A +
+/// agent-card), the surface formerly served by the standalone `flux serve` command.
+#[derive(Debug, Clone, Deserialize)]
+pub struct A2aSettings {
+    /// Address to bind, e.g. `"127.0.0.1:8787"`.
+    pub addr: String,
+    /// Which declared agent to serve. Optional when the program declares exactly one agent.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Optional bearer token (host-resolved — use `token secret "KEY"` in the program). Required for a
+    /// non-loopback `addr`, since the served agent has no interactive approver.
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
 // Secrets are a single mechanism: `secret "ENV"` references in the program (lowered to a
 // `{"$secret":…}` marker) are resolved from the environment once at load by `flux_app::resolve_secrets`,
 // before any adapter deserializes these settings. So the token fields above are already plain values.

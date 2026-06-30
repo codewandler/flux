@@ -1,6 +1,6 @@
 //! Configuration for an OpenAI Realtime session (provider-internal).
 //!
-//! Lifted from the managed-agents `realtime` crate. These are the OpenAI-specific wire types; the
+//! Ported from a downstream realtime client. These are the OpenAI-specific wire types; the
 //! provider maps flux's `RealtimeConfig` onto them and renders the GA `session` shape.
 
 use serde::{Deserialize, Serialize};

@@ -69,12 +69,68 @@ fn flow_key(name: Option<&str>, body: &[Node]) -> String {
 
 /// A one-line, length-bounded summary of a value for the symbol table (never the raw bytes).
 fn summarize(content: &str) -> String {
-    let line = content.lines().next().unwrap_or("").trim();
+    let first = content.lines().next().unwrap_or("").trim();
+    let line = content
+        .lines()
+        .map(str::trim)
+        .find(|line| !summary_noise_line(line))
+        .unwrap_or(first);
+    truncate_summary(line)
+}
+
+fn summary_noise_line(line: &str) -> bool {
+    if line.is_empty() {
+        return true;
+    }
+    line.trim_matches(|c| matches!(c, '{' | '}' | '[' | ']' | ','))
+        .trim()
+        .is_empty()
+}
+
+fn truncate_summary(line: &str) -> String {
     if line.chars().count() > 80 {
         let head: String = line.chars().take(77).collect();
         format!("{head}...")
     } else {
         line.to_string()
+    }
+}
+
+fn op_summary_prefix(op: &str, input: &serde_json::Value) -> Option<String> {
+    match op {
+        "read" => {
+            let path = input.get("path")?;
+            if let Some(path) = path.as_str() {
+                return Some(match (input.get("offset"), input.get("limit")) {
+                    (Some(offset), Some(limit)) => format!("read {path} lines {offset}+{limit}"),
+                    (Some(offset), None) => format!("read {path} from line {offset}"),
+                    _ => format!("read {path}"),
+                });
+            }
+            path.as_array()
+                .map(|paths| format!("read {} paths", paths.len()))
+        }
+        "grep" => input
+            .get("pattern")
+            .and_then(|p| p.as_str())
+            .map(|pattern| {
+                let scope = input
+                    .get("path")
+                    .and_then(|p| p.as_str())
+                    .or_else(|| input.get("glob").and_then(|p| p.as_str()))
+                    .unwrap_or(".");
+                format!("grep {pattern:?} in {scope}")
+            }),
+        _ => None,
+    }
+}
+
+fn summarize_bound_result(op: &str, input: &serde_json::Value, content: &str) -> String {
+    let summary = summarize(content);
+    match op_summary_prefix(op, input) {
+        Some(prefix) if summary.is_empty() => truncate_summary(&prefix),
+        Some(prefix) => truncate_summary(&format!("{prefix}: {summary}")),
+        None => summary,
     }
 }
 
@@ -118,6 +174,7 @@ pub async fn execute_call(
         },
     )?;
 
+    let summary_input = input.clone();
     let result = executor.dispatch(op, input).await;
     // The model-facing view (line numbers, diff, guidance); falls back to canonical content.
     let view = result.view().to_string();
@@ -153,7 +210,7 @@ pub async fn execute_call(
             b.name,
             &value_id,
             b.ty,
-            &summarize(&result.content),
+            &summarize_bound_result(op, &summary_input, &result.content),
             b.visibility,
         )?;
     }
@@ -3200,6 +3257,28 @@ mod tests {
         Node::Var {
             name: SymbolName(name.into()),
         }
+    }
+
+    #[test]
+    fn summarize_skips_delimiter_only_prefix_lines() {
+        assert_eq!(
+            summarize("}\n    fn useful_context() {}\n"),
+            "fn useful_context() {}"
+        );
+        assert_eq!(
+            summarize("{\n  \"channels\": [\n    {}\n"),
+            "\"channels\": ["
+        );
+    }
+
+    #[test]
+    fn summarize_bound_read_result_includes_source_hint() {
+        let summary = summarize_bound_result(
+            "read",
+            &json!({ "path": "src/lib.rs", "offset": 40, "limit": 20 }),
+            "}\nfn target() {}\n",
+        );
+        assert_eq!(summary, "read src/lib.rs lines 40+20: fn target() {}");
     }
 
     /// `ctx` budgets a pack at evaluation: it shrinks by visibility then declared order, keeps pinned

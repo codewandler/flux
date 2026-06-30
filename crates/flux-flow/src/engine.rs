@@ -188,7 +188,7 @@ impl FlowEngine {
 
         // Per-turn iteration count: snapshot the cumulative `turn.iteration` evidence now so we can
         // report only THIS turn's rounds. The executor (and its evidence log) is shared and persists
-        // across turns, so an unscoped count grows monotonically over a long-lived `flux serve`.
+        // across turns, so an unscoped count grows monotonically over a long-lived served agent.
         let iter_base = self.executor.evidence().by_kind("turn.iteration").count();
 
         let mut outer = crate::loop_host::SharedSink::new(channel.clone());

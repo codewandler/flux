@@ -49,8 +49,9 @@ use std::borrow::Cow;
     long_about = "flux — the LLM plans, the runtime runs.\n\n\
         Run the agent with `flux run <prompt>`; with no arguments, `flux` opens the interactive REPL. \
         The other entry points are subcommands too: `flux plan <prompt>` reviews a plan before running, \
-        `flux tui` is the chat UI, and `flux serve <addr>` is the HTTP daemon. Run `flux help` for the \
-        full list of commands."
+        `flux tui` is the chat UI, and `flux app run <program.flux>` runs a multi-agent program \
+        (add `--serve <addr>` to expose an agent over HTTP/A2A). Run `flux help` for the full list of \
+        commands."
 )]
 struct Cli {
     /// A subcommand (run `flux help` to list them). With none, `flux` opens the interactive REPL.
@@ -189,14 +190,6 @@ enum Commands {
         #[command(flatten)]
         agent: AgentFlags,
     },
-    /// Bind a long-running HTTP API daemon (REST + SSE). Requires `--yes` (HTTP has no interactive
-    /// approver); a non-loopback bind requires `FLUX_SERVER_TOKEN`.
-    Serve {
-        #[command(flatten)]
-        agent: AgentFlags,
-        /// Address to bind, e.g. `127.0.0.1:8787`.
-        addr: String,
-    },
     /// Connect to a remote A2A agent and chat with it like a local agent. With prompt words or
     /// piped stdin it runs a single turn and exits; otherwise it opens an interactive REPL.
     A2a {
@@ -286,11 +279,25 @@ enum Commands {
 enum AppAction {
     /// Run a `.flux` program and serve its declared channels until Ctrl-C. A program with cron/webhook/
     /// Slack channels runs as a background daemon; one with only a `cli` channel (or none) reads stdin.
+    ///
+    /// `--serve <addr>` additionally exposes an agent over the HTTP/A2A API (sessions + SSE + A2A +
+    /// agent-card) for testing. With no `<program>`, `--serve` serves flux's built-in coding agent —
+    /// the former `flux serve`.
     Run {
         #[command(flatten)]
         agent: AgentFlags,
-        /// Path to the `<program.flux>` multi-agent program.
-        program: String,
+        /// Path to the `<program.flux>` multi-agent program. Optional when `--serve` is given (then the
+        /// built-in coding agent is served).
+        program: Option<String>,
+        /// Expose an agent over the HTTP/A2A API at this address (defaults to `127.0.0.1:8787`). With a
+        /// program, serves its agent; with none, serves the built-in coding agent. Requires `--yes`.
+        #[arg(
+            long,
+            value_name = "ADDR",
+            num_args = 0..=1,
+            default_missing_value = "127.0.0.1:8787"
+        )]
+        serve: Option<String>,
     },
 }
 
@@ -970,14 +977,16 @@ async fn build_agent(
             // gets only the process/secret/http access it asked for (and nothing by default).
             let system = system.clone();
             let allow_private = cfg.allow_private_net;
+            let caps_system = system.clone();
             let make_caps = move |m: &flux_plugin::PluginManifest| {
                 Arc::new(
-                    flux_plugin::SystemHostCaps::new(system)
+                    flux_plugin::SystemHostCaps::new(caps_system)
                         .allow_private_net(allow_private)
                         .with_manifest(m),
                 ) as Arc<dyn flux_plugin::HostCapabilities>
             };
             match flux_plugin::load_plugin_tools(
+                &system,
                 &p.descriptor.program,
                 &p.descriptor.args,
                 make_caps,
@@ -3149,7 +3158,7 @@ async fn main() -> Result<()> {
                     .map(|p| p.ends_with(".flux") || std::path::Path::new(p).is_file())
                     .unwrap_or(false)
                 {
-                    return run_app_cmd(prompt, agent.model.clone(), agent.yes).await;
+                    return run_app_cmd(prompt, &agent).await;
                 }
                 // `flux run` with no prompt drops into the REPL (with the given agent flags).
                 if prompt.is_empty() {
@@ -3169,10 +3178,6 @@ async fn main() -> Result<()> {
                 apply_agent_env(&agent);
                 run_tui(agent).await
             }
-            Some(Commands::Serve { agent, addr }) => {
-                apply_agent_env(&agent);
-                run_serve(agent, addr).await
-            }
             // Non-agent subcommands.
             Some(Commands::A2a { url, prompt, token }) => run_a2a(url, prompt, token).await,
             Some(Commands::Eval {
@@ -3186,10 +3191,15 @@ async fn main() -> Result<()> {
                 watch,
             }) => run_eval_cmd(adapter, tasks, members, limit, trials, report, watch, model).await,
             Some(Commands::App {
-                action: AppAction::Run { agent, program },
+                action:
+                    AppAction::Run {
+                        agent,
+                        program,
+                        serve,
+                    },
             }) => {
                 apply_agent_env(&agent);
-                run_app(&program, agent.model.clone(), agent.yes).await
+                run_app(program.as_deref(), &agent, serve).await
             }
             Some(Commands::Flow {
                 action: FlowAction::Run { file, model, yes },
@@ -3248,29 +3258,62 @@ fn run_completion(shell: Option<&str>) -> Result<()> {
 /// (event bus + triggers + journeys). A bare single-flow file is accepted too. The provider is
 /// best-effort: a program built only from pure ops runs without credentials; model-backed ops need a
 /// resolvable `provider/model` (defaulting like the prompt path) and degrade with a clear note.
-async fn run_app_cmd(
-    prompt: Vec<String>,
-    model_spec: Option<String>,
-    auto_approve: bool,
-) -> Result<()> {
+async fn run_app_cmd(prompt: Vec<String>, flags: &AgentFlags) -> Result<()> {
     // The `.flux` path is the first token; `-m`/`--yes` were parsed as global flags.
     let path = prompt
         .first()
         .map(String::as_str)
         .ok_or_else(|| anyhow::anyhow!("usage: flux run <app.flux> [-m provider/model] [--yes]"))?;
-    run_app(path, model_spec, auto_approve).await
+    run_app(Some(path), flags, None).await
 }
 
 /// Build and run a multi-agent program together with its declared **channels**, the shared body behind
-/// both `flux run <app.flux>` (auto-detect) and `flux app run <program.flux>`. Cron/webhook/Slack
+/// both `flux run <app.flux>` (auto-detect) and `flux app run [program.flux]`. Cron/webhook/Slack
 /// channels start as background tasks that deliver events into the program's bus (→ triggers → journeys)
 /// until Ctrl-C; a program with a `cli` channel — or none at all — keeps the interactive stdin loop. By
 /// default destructive ops are DENIED (no human at a prompt); `--yes` opts into allow-all. The provider
 /// is best-effort: a pure-op program runs without credentials.
-async fn run_app(path: &str, model_spec: Option<String>, auto_approve: bool) -> Result<()> {
-    use flux_lang::program::{Module, Program};
+///
+/// `serve` exposes an agent over the HTTP/A2A API. With a `path`, it adds a synthetic `a2a` channel
+/// bound to the program's sole agent. With **no** `path`, it serves flux's built-in coding agent
+/// directly — the former `flux serve` (requires `--yes`; non-loopback needs `FLUX_SERVER_TOKEN`).
+async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) -> Result<()> {
+    use flux_lang::program::{ChannelDecl, Module, Program};
 
-    let spec = model_spec.unwrap_or_else(|| "anthropic/claude-sonnet-4-6".to_string());
+    // No program + `--serve`: serve the built-in coding agent over HTTP/A2A (the old `flux serve`).
+    let Some(path) = path else {
+        let addr = serve.ok_or_else(|| {
+            anyhow::anyhow!(
+                "usage: flux app run <program.flux>  (or `flux app run --serve <addr>` to serve the \
+                 built-in coding agent over HTTP/A2A)"
+            )
+        })?;
+        if !flags.yes {
+            bail!(
+                "`flux app run --serve` (no program) requires `--yes` (HTTP requests have no \
+                   interactive approver)"
+            );
+        }
+        // The coding agent auto-approves every tool call, so an unauthenticated listener is remote code
+        // execution. Require a bearer token (`FLUX_SERVER_TOKEN`) for any non-loopback bind.
+        let token = std::env::var("FLUX_SERVER_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty());
+        if token.is_none() && !addr_is_loopback(&addr) {
+            bail!(
+                "refusing to serve on a non-loopback address ({addr}) without authentication — set \
+                 FLUX_SERVER_TOKEN to require `Authorization: Bearer <token>`, or bind 127.0.0.1"
+            );
+        }
+        let (agent, _session_id, _spawner) = build_agent(flags).await?;
+        return flux_server::serve(&addr, agent, token).await;
+    };
+
+    let auto_approve = flags.yes;
+    let spec = flags
+        .model
+        .clone()
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4-6".to_string());
     let (provider, model): (Option<std::sync::Arc<dyn Provider>>, String) = match build_provider(
         &spec,
     ) {
@@ -3304,6 +3347,28 @@ async fn run_app(path: &str, model_spec: Option<String>, auto_approve: bool) -> 
     // never inline) before any of those settings reach a channel/datasource/agent.
     flux_app::resolve_secrets(&mut program).map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    // `--serve <addr>` injects a synthetic `a2a` channel bound to the program's sole agent, so the
+    // serving path is identical to a declared `channel … { kind = "a2a" }`. An ambiguous (multi-agent)
+    // or agent-less program must declare the channel explicitly instead.
+    if let Some(addr) = &serve {
+        let agent = match program.agents.as_slice() {
+            [only] => only.name.clone(),
+            [] => bail!("`--serve` needs an agent to serve, but `{path}` declares none"),
+            _ => bail!(
+                "`--serve` is ambiguous — `{path}` declares multiple agents; declare an `a2a` channel \
+                 with an explicit `agent` instead"
+            ),
+        };
+        let token = std::env::var("FLUX_SERVER_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty());
+        program.channels.push(ChannelDecl {
+            name: "serve".to_string(),
+            kind: "a2a".to_string(),
+            settings: serde_json::json!({ "addr": addr, "agent": agent, "token": token }),
+        });
+    }
+
     // Assemble the knowledge + integration tools the program's agent target (`trigger.agent`) and its
     // journeys can drive — the D-09 registry wiring. A guarded `System` rooted at the cwd backs both.
     let cwd = std::env::current_dir()?;
@@ -3329,15 +3394,17 @@ async fn run_app(path: &str, model_spec: Option<String>, auto_approve: bool) -> 
         for p in flux_plugin::discover(&dir) {
             let system = system.clone();
             let backend = backend.clone();
+            let caps_system = system.clone();
             let make_caps = move |m: &flux_plugin::PluginManifest| {
                 Arc::new(flux_capabilities::DatasourceHostCaps::new(
-                    flux_plugin::SystemHostCaps::new(system)
+                    flux_plugin::SystemHostCaps::new(caps_system)
                         .allow_private_net(allow_private)
                         .with_manifest(m),
                     backend,
                 )) as Arc<dyn flux_plugin::HostCapabilities>
             };
             match flux_plugin::load_plugin_tools(
+                &system,
                 &p.descriptor.program,
                 &p.descriptor.args,
                 make_caps,
@@ -3367,27 +3434,6 @@ async fn run_app(path: &str, model_spec: Option<String>, auto_approve: bool) -> 
     let run_stdin = channel_decls.is_empty() || channel_decls.iter().any(|c| c.kind == "cli");
     let cancel = tokio_util::sync::CancellationToken::new();
     flux_channels::serve(app, channels, run_stdin, cancel).await
-}
-
-/// Launch the HTTP API daemon.
-async fn run_serve(flags: AgentFlags, addr: String) -> Result<()> {
-    if !flags.yes {
-        bail!("`flux serve` requires `--yes` (HTTP requests have no interactive approver)");
-    }
-    // The daemon auto-approves every tool call, so an unauthenticated listener is remote code
-    // execution. Require a bearer token (`FLUX_SERVER_TOKEN`) for any non-loopback bind; loopback
-    // may run tokenless for local use.
-    let token = std::env::var("FLUX_SERVER_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty());
-    if token.is_none() && !addr_is_loopback(&addr) {
-        bail!(
-            "refusing to serve on a non-loopback address ({addr}) without authentication — set \
-             FLUX_SERVER_TOKEN to require `Authorization: Bearer <token>`, or bind 127.0.0.1"
-        );
-    }
-    let (agent, _session_id, _spawner) = build_agent(&flags).await?;
-    flux_server::serve(&addr, agent, token).await
 }
 
 /// Whether `addr` (host:port or bare host) binds only the loopback interface.
@@ -3483,17 +3529,19 @@ async fn run_plugin(action: Option<PluginAction>) -> Result<()> {
             ));
             let backend: Arc<dyn flux_capabilities::DatasourceBackend> =
                 Arc::new(flux_capabilities::MemoryBackend::new());
-            let mut host = flux_plugin::PluginHost::spawn(&desc.program, &desc.args)
+            let mut host = flux_plugin::PluginHost::spawn(&system, &desc.program, &desc.args)
                 .await
                 .with_context(|| format!("spawn plugin `{name}` ({})", desc.program))?;
             let manifest = host.manifest().await.context("fetch plugin manifest")?;
+            let resolved_op = resolve_plugin_operation_name(&name, &op, &manifest)?;
             let caps = flux_capabilities::DatasourceHostCaps::new(
                 flux_plugin::SystemHostCaps::new(system).with_manifest(&manifest),
                 backend.clone(),
             );
-            let result = host.call_with_host(&op, input, &caps).await;
+            let result = host.call_with_host(&resolved_op, input, &caps).await;
             let _ = host.shutdown().await;
-            let value = result.map_err(|e| anyhow::anyhow!("plugin `{name}` op `{op}`: {e}"))?;
+            let value =
+                result.map_err(|e| anyhow::anyhow!("plugin `{name}` op `{resolved_op}`: {e}"))?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
@@ -3542,6 +3590,45 @@ async fn run_plugin(action: Option<PluginAction>) -> Result<()> {
     }
 }
 
+fn resolve_plugin_operation_name(
+    plugin: &str,
+    requested: &str,
+    manifest: &flux_plugin::PluginManifest,
+) -> Result<String> {
+    if manifest.operations.iter().any(|op| op.name == requested) {
+        return Ok(requested.to_string());
+    }
+
+    let prefix = if manifest.name.trim().is_empty() {
+        plugin
+    } else {
+        manifest.name.as_str()
+    };
+    let qualified = format!("{prefix}.{requested}");
+    if manifest.operations.iter().any(|op| op.name == qualified) {
+        return Ok(qualified);
+    }
+
+    bail!(
+        "plugin `{plugin}` has no operation `{requested}` (tried `{qualified}`). Available ops: {}",
+        available_plugin_operations(manifest)
+    )
+}
+
+fn available_plugin_operations(manifest: &flux_plugin::PluginManifest) -> String {
+    let mut names: Vec<&str> = manifest
+        .operations
+        .iter()
+        .map(|op| op.name.as_str())
+        .collect();
+    names.sort_unstable();
+    if names.is_empty() {
+        "(none)".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
 /// Render the generated `flux-plugins` skill from the installed plugins' manifests (story D-13). Spawns
 /// each plugin only to fetch its manifest (no op call); a plugin that fails to spawn/manifest is skipped
 /// with a note rather than aborting the whole catalog.
@@ -3552,8 +3639,13 @@ async fn run_plugin_skill(
     out: Option<String>,
 ) -> Result<()> {
     let mut plugins: Vec<(String, flux_plugin::PluginManifest)> = Vec::new();
+    // Plugins launch through the one guarded spawn path, which needs a workspace-rooted System.
+    let system =
+        System::new(Workspace::new(&std::env::current_dir()?).map_err(|e| anyhow::anyhow!("{e}"))?);
     for p in flux_plugin::discover(dir) {
-        match flux_plugin::PluginHost::spawn(&p.descriptor.program, &p.descriptor.args).await {
+        match flux_plugin::PluginHost::spawn(&system, &p.descriptor.program, &p.descriptor.args)
+            .await
+        {
             Ok(mut host) => {
                 match host.manifest().await {
                     Ok(m) => plugins.push((p.name.clone(), m)),
@@ -3726,7 +3818,8 @@ async fn run_prompt(flags: AgentFlags, prompt_words: Vec<String>) -> Result<()> 
 mod tests {
     use super::{
         build_datasources, format_evidence, loop_machinery_label, new_render_suffix,
-        plugin_binaries_in, tool_preview, truncate, usage_annotation,
+        plugin_binaries_in, resolve_plugin_operation_name, tool_preview, truncate,
+        usage_annotation,
     };
     use serde_json::json;
 
@@ -3789,6 +3882,55 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn plugin_call_resolves_short_op_to_manifest_qualified_name() {
+        let manifest = flux_plugin::PluginManifest {
+            name: "grafana".into(),
+            operations: vec![flux_plugin::OperationSpec {
+                name: "grafana.search".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_plugin_operation_name("grafana", "search", &manifest).unwrap(),
+            "grafana.search"
+        );
+    }
+
+    #[test]
+    fn plugin_call_preserves_explicit_fully_qualified_op() {
+        let manifest = flux_plugin::PluginManifest {
+            name: "grafana".into(),
+            operations: vec![flux_plugin::OperationSpec {
+                name: "grafana.search".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_plugin_operation_name("grafana", "grafana.search", &manifest).unwrap(),
+            "grafana.search"
+        );
+    }
+
+    #[test]
+    fn plugin_call_unknown_op_lists_available_ops() {
+        let manifest = flux_plugin::PluginManifest {
+            name: "grafana".into(),
+            operations: vec![flux_plugin::OperationSpec {
+                name: "grafana.search".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let err = resolve_plugin_operation_name("grafana", "dashboards", &manifest)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tried `grafana.dashboards`"), "{err}");
+        assert!(err.contains("grafana.search"), "{err}");
+    }
+
     /// The turn-end token annotation reports all four figures the user asked for: context-window
     /// occupancy (fresh input + both cache tiers), generated output, the cached tokens, and the
     /// hit-rate (cached ÷ context). It is empty when nothing was billed (offline `-m mock`).
@@ -3836,7 +3978,7 @@ mod tests {
             "run",
             "plan",
             "tui",
-            "serve",
+            "app",
             "eval",
             "flow",
             "loop",
@@ -3854,9 +3996,9 @@ mod tests {
     }
 
     /// The top level is clean: its only declared flag is the global `--color`. No agent/turn flags or
-    /// the promoted mode flags (`serve`/`tui`/`plan`) leak onto it — they live on the subcommands now.
-    /// Inspecting the declared arguments (not the rendered text) avoids false hits on flag names that
-    /// appear inside a subcommand's *description*.
+    /// the promoted mode flags (`tui`/`plan`) leak onto it — they live on the subcommands now (`--serve`
+    /// likewise lives on `app run`, never the top level). Inspecting the declared arguments (not the
+    /// rendered text) avoids false hits on flag names that appear inside a subcommand's *description*.
     #[test]
     fn top_level_has_only_the_color_flag() {
         use clap::CommandFactory;
@@ -3919,9 +4061,9 @@ mod tests {
             );
             assert!(!h.contains("--continue"), "`{sub} --help` leaks --continue");
         }
-        // The agent-path subcommands (`run`/`plan`/`tui`/`serve`) carry the turn flags; `eval` has its
+        // The agent-path subcommands (`run`/`plan`/`tui`) carry the turn flags; `eval` has its
         // own `-m` but not `--max-tokens`.
-        for agent_cmd in ["run", "plan", "tui", "serve"] {
+        for agent_cmd in ["run", "plan", "tui"] {
             assert!(
                 help_of(agent_cmd).contains("--max-tokens"),
                 "`{agent_cmd} --help` should carry the turn flags"

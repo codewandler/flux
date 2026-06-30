@@ -101,18 +101,27 @@ impl GitContext {
 }
 
 /// Run `git -C <root> <args>` and return trimmed stdout, or `None` on any failure (incl. not-a-repo).
+///
+/// Routes through flux's **single guarded spawn path** ([`flux_system::System::run`]) rather than a
+/// raw `Command`: argv-only, environment cleared to the minimal allow-list (`PATH`/`HOME` keep git's
+/// config resolving), output captured + capped, and a wall-clock timeout so a wedged git can't hang
+/// startup. `-C <root>` keeps the query scoped to the repo regardless of the workspace-pinned cwd.
 async fn git(root: &Path, args: &[&str]) -> Option<String> {
-    let out = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()
+    let system = flux_system::System::new(flux_system::Workspace::new(root).ok()?);
+    let mut argv = vec![
+        "git".to_string(),
+        "-C".to_string(),
+        root.display().to_string(),
+    ];
+    argv.extend(args.iter().map(|a| a.to_string()));
+    let out = system
+        .run(&argv, std::time::Duration::from_secs(10))
         .await
         .ok()?;
-    if !out.status.success() {
+    if out.exit_code != 0 {
         return None;
     }
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Some(out.stdout.trim().to_string())
 }
 
 /// Keep at most `max` lines, appending a `… (+N more)` marker so a huge status/diff can't bloat the

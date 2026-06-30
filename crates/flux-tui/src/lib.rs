@@ -1008,6 +1008,7 @@ pub async fn run(agent: FlowEngine, session_id: String, auto_approve: bool) -> a
     use crossterm::terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
     };
+    use std::io::IsTerminal;
 
     let (tx, rx) = mpsc::unbounded_channel::<UiEvent>();
     // Only replace the approver with the modal when NOT auto-approving; if --yes was passed,
@@ -1020,8 +1021,12 @@ pub async fn run(agent: FlowEngine, session_id: String, auto_approve: bool) -> a
     let model = agent.model.clone();
     let agent = Arc::new(agent);
 
-    enable_raw_mode()?;
     let mut out = std::io::stdout();
+    if !std::io::stdin().is_terminal() || !out.is_terminal() {
+        anyhow::bail!("flux tui requires a real terminal on stdin and stdout");
+    }
+
+    enable_raw_mode()?;
     crossterm::execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(ratatui::backend::CrosstermBackend::new(out))?;
 

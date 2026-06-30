@@ -1,6 +1,6 @@
 //! The OpenAI Realtime WebSocket transport (provider-internal).
 //!
-//! Lifted from the managed-agents `realtime` crate, retargeted onto `flux_core::{Error, Result}`.
+//! Ported from a downstream realtime client and retargeted onto `flux_core::{Error, Result}`.
 //! [`connect_ws`] opens the session and returns a cloneable [`RealtimeHandle`] (send audio / control /
 //! tool output) plus a receiver of [`ServerEvent`]s. Audio crosses the wire as base64 PCM16 inside
 //! JSON events.

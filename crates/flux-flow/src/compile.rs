@@ -21,6 +21,8 @@ use futures::StreamExt;
 
 use flux_core::{Chunk, ContentBlock, Error, Message, Result, StopReason, Usage};
 use flux_provider::{Provider, Request, ToolDef};
+use flux_spec::tool_input_schema;
+use schemars::JsonSchema;
 
 use crate::analyze::{analyze_flow, Diagnostic};
 use crate::ast::DraftAst;
@@ -76,6 +78,32 @@ pub struct Completion {
     pub primer: Option<String>,
     /// What the final message should say, e.g. "summarize what changed and why".
     pub instructions: String,
+}
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct EmitPlanInput {
+    /// The Flux-Lang flow AST to execute.
+    ast: DraftAst,
+    /// Attach only when this plan completes the request; the runtime renders the final message after
+    /// executing the plan.
+    complete: Option<EmitPlanCompletionInput>,
+}
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct EmitPlanCompletionInput {
+    /// What the final message should say, based on the actual execution results.
+    instructions: String,
+    /// Optional one-line context the planner already knows.
+    primer: Option<String>,
+}
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct AskUserInput {
+    /// The single clarifying question to ask the user.
+    question: String,
 }
 
 /// What the planner produced for a turn: an executable plan, or a plain-prose answer (a chat turn —
@@ -737,39 +765,13 @@ fn planner_tools(interactive: bool) -> Vec<ToolDef> {
                       NOT the message itself. Omit `complete` if you must see the results before you can \
                       answer, or to keep working; then answer in prose once done."
             .to_string(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "ast": { "type": "object", "description": "The flow AST (DraftAst) as JSON" },
-                "complete": {
-                    "type": "object",
-                    "description": "Attach ONLY when this plan completes the request. Instructions for the \
-                                    final message, rendered from the real results after the plan runs.",
-                    "properties": {
-                        "instructions": {
-                            "type": "string",
-                            "description": "What the final message should say, e.g. \"summarize what changed and why\""
-                        },
-                        "primer": {
-                            "type": "string",
-                            "description": "Optional one-line context you already know (e.g. \"Build green.\")"
-                        }
-                    },
-                    "required": ["instructions"]
-                }
-            },
-            "required": ["ast"]
-        }),
+        input_schema: tool_input_schema::<EmitPlanInput>(),
     });
     if interactive {
         tools.push(ToolDef {
             name: "ask_user".to_string(),
             description: "Ask the user one clarifying question; returns their reply.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": { "question": { "type": "string" } },
-                "required": ["question"]
-            }),
+            input_schema: tool_input_schema::<AskUserInput>(),
         });
     }
     tools
@@ -875,6 +877,51 @@ mod tests {
         assert_eq!(names, vec!["emit_plan"]);
         let interactive: Vec<String> = planner_tools(true).into_iter().map(|t| t.name).collect();
         assert_eq!(interactive, vec!["emit_plan", "ask_user"]);
+    }
+
+    #[test]
+    fn planner_emit_plan_schema_is_the_real_ast_schema() {
+        let tools = planner_tools(false);
+        let emit = tools
+            .iter()
+            .find(|t| t.name == "emit_plan")
+            .expect("emit_plan tool");
+        assert_eq!(emit.input_schema["type"], "object");
+        assert_eq!(emit.input_schema["required"], json!(["ast"]));
+        assert!(emit.input_schema.get("$schema").is_none());
+        assert!(emit.input_schema.get("title").is_none());
+
+        let defs = emit
+            .input_schema
+            .get("definitions")
+            .or_else(|| emit.input_schema.get("$defs"))
+            .expect("emit_plan schema carries derived definitions");
+        assert!(
+            defs.get("DraftAst").is_some(),
+            "schema must reference the DraftAst definition"
+        );
+        assert!(
+            defs.get("Node").is_some(),
+            "schema must include the Flux-Lang node union"
+        );
+        assert!(
+            emit.input_schema.to_string().contains("\"call\""),
+            "schema should expose concrete node kinds, not a placeholder object"
+        );
+    }
+
+    #[test]
+    fn planner_ask_user_schema_is_derived() {
+        let tools = planner_tools(true);
+        let ask = tools
+            .iter()
+            .find(|t| t.name == "ask_user")
+            .expect("ask_user tool");
+        assert_eq!(ask.input_schema["type"], "object");
+        assert_eq!(ask.input_schema["required"], json!(["question"]));
+        assert_eq!(ask.input_schema["properties"]["question"]["type"], "string");
+        assert!(ask.input_schema.get("$schema").is_none());
+        assert!(ask.input_schema.get("title").is_none());
     }
 
     #[tokio::test]

@@ -1,10 +1,12 @@
 //! Channel adapters (one per `kind`) and the [`build_channels`] dispatcher.
 
+mod a2a;
 mod schedule;
 #[cfg(feature = "slack")]
 mod slack;
 mod webhook;
 
+pub use a2a::A2aChannel;
 pub use schedule::ScheduleChannel;
 #[cfg(feature = "slack")]
 pub use slack::SlackChannel;
@@ -54,6 +56,9 @@ pub fn build_channels(decls: &[ChannelDecl]) -> anyhow::Result<Vec<Box<dyn Chann
                 );
             }
             "cli" => { /* served by the host's stdin loop, not a background channel */ }
+            // `a2a` is built by the host ([`crate::serve`]), which can resolve the target agent's
+            // engine from the live `App` — it cannot be constructed from the decl alone.
+            "a2a" => { /* built by the host, not here */ }
             other => anyhow::bail!("unknown channel kind `{other}` for channel `{}`", d.name),
         }
     }

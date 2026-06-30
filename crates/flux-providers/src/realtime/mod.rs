@@ -1,6 +1,6 @@
 //! OpenAI Realtime — the concrete full-duplex (voice-to-voice) provider.
 //!
-//! Implements [`flux_provider::RealtimeProvider`] over a WebSocket (lifted from the managed-agents
+//! Implements [`flux_provider::RealtimeProvider`] over a WebSocket (ported from a downstream
 //! `realtime` crate). The half-duplex HTTP family in this crate (`messages`/`openai`/…) is unrelated;
 //! this is the WebSocket sibling, behind the `realtime` Cargo feature so the default build stays lean.
 //!
@@ -53,7 +53,7 @@ pub fn openai_realtime(api_key: impl Into<String>) -> OpenAiRealtime {
 }
 
 /// `openai-realtime` provider from `OPENAI_KEY` (then `OPENAI_API_KEY`) — the single key read that
-/// replaces managed-agents' three scattered ones.
+/// replaces scattered downstream key reads.
 pub fn openai_realtime_from_env() -> Result<OpenAiRealtime> {
     let key = std::env::var("OPENAI_KEY")
         .or_else(|_| std::env::var("OPENAI_API_KEY"))

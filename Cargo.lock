@@ -845,7 +845,9 @@ dependencies = [
  "chrono",
  "cron",
  "flux-app",
+ "flux-flow",
  "flux-lang",
+ "flux-server",
  "serde",
  "serde_json",
  "slack-morphism",
@@ -1032,6 +1034,7 @@ dependencies = [
  "flux-tools",
  "futures",
  "rusqlite",
+ "schemars 0.8.22",
  "serde_json",
  "sha2",
  "tokio",
@@ -1235,6 +1238,7 @@ dependencies = [
 name = "flux-spec"
 version = "0.2.4"
 dependencies = [
+ "schemars 0.8.22",
  "serde",
  "serde_json",
 ]

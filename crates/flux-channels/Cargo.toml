@@ -7,6 +7,8 @@ description = "flux event-trigger channels: cron/webhook/Slack adapters that wak
 
 [dependencies]
 flux-app.workspace = true
+flux-flow.workspace = true
+flux-server.workspace = true
 flux-lang.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

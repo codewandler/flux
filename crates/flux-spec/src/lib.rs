@@ -8,6 +8,21 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Generate the provider-facing JSON Schema for a typed tool input.
+///
+/// Tool schemas are an API contract with models/providers, so keep them derived from Rust input
+/// structs rather than hand-maintained JSON. The returned value intentionally omits the root
+/// meta-schema/title noise while preserving definitions and doc-comment descriptions.
+pub fn tool_input_schema<T: schemars::JsonSchema>() -> serde_json::Value {
+    let mut schema =
+        serde_json::to_value(schemars::schema_for!(T)).expect("tool input schema serializes");
+    if let Some(obj) = schema.as_object_mut() {
+        obj.remove("$schema");
+        obj.remove("title");
+    }
+    schema
+}
+
 /// A side effect a tool may have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -94,6 +109,14 @@ impl ToolSpec {
             access: Vec::new(),
             group: None,
         }
+    }
+
+    /// A read-only spec whose input schema is derived from the Rust input type.
+    pub fn read_only_typed<T: schemars::JsonSchema>(
+        name: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        Self::read_only(name, description, tool_input_schema::<T>())
     }
 
     pub fn with_risk(mut self, risk: Risk) -> Self {
@@ -243,6 +266,35 @@ pub fn is_destructive_command(command: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[derive(schemars::JsonSchema)]
+    #[allow(dead_code)]
+    struct SampleInput {
+        /// Path to inspect.
+        path: String,
+    }
+
+    #[test]
+    fn tool_input_schema_preserves_struct_shape_without_root_noise() {
+        let schema = tool_input_schema::<SampleInput>();
+        assert_eq!(schema["type"], "object");
+        assert!(schema.get("$schema").is_none());
+        assert!(schema.get("title").is_none());
+        assert_eq!(schema["required"], json!(["path"]));
+        assert_eq!(schema["properties"]["path"]["type"], "string");
+        assert_eq!(
+            schema["properties"]["path"]["description"],
+            "Path to inspect."
+        );
+    }
+
+    #[test]
+    fn read_only_typed_uses_derived_schema() {
+        let spec = ToolSpec::read_only_typed::<SampleInput>("sample", "sample op");
+        assert_eq!(spec.name, "sample");
+        assert_eq!(spec.input_schema["required"], json!(["path"]));
+        assert!(spec.has_effect(Effect::Read));
+    }
 
     #[test]
     fn read_only_spec_defaults() {

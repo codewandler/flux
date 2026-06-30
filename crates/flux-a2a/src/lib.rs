@@ -13,7 +13,7 @@
 //!
 //! - [`server`] — the reusable, transport-agnostic server side ([`server::dispatch`],
 //!   [`server::agent_card`], the [`server::A2aTurn`] seam, and the message/event shaping). A surface
-//!   (axum in `flux-server` / downstream's `managed-agents`) provides the route + state and calls these.
+//!   (axum in `flux-server` or another downstream HTTP host) provides the route + state and calls these.
 
 mod client;
 pub mod server;

@@ -1,6 +1,6 @@
 //! Server → client events from the OpenAI Realtime API.
 //!
-//! Lifted from the managed-agents `realtime` crate, trimmed to the events the session driver acts on; the
+//! Ported from a downstream realtime client and trimmed to the events the session driver acts on; the
 //! rest fold into [`ServerEvent::Other`] so unknown/added events never break parsing. These are the
 //! provider-internal wire events; the driver sees the provider-agnostic `flux_provider::RealtimeEvent`
 //! they map to.

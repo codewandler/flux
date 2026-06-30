@@ -117,6 +117,29 @@ impl App {
         &self.engine.bus
     }
 
+    /// Build (or fetch the cached) [`FlowEngine`] for a declared agent — the seam the `a2a` channel
+    /// uses to serve a program agent over HTTP/A2A. The engine shares this app's `EventStore`, so a
+    /// session opened over HTTP and one woken by an agent-bound trigger live in the same log. Errors if
+    /// the agent is undeclared or has no model provider.
+    pub fn agent_engine(&self, name: &str) -> Result<Arc<FlowEngine>> {
+        self.engine.agent_engine(name)
+    }
+
+    /// Look up a declared agent by name (e.g. for its A2A card metadata).
+    pub fn agent_decl(&self, name: &str) -> Option<&AgentDecl> {
+        self.engine.program.agents.iter().find(|a| a.name == name)
+    }
+
+    /// The program's sole declared agent, if there is exactly one. The `a2a` channel and the `--serve`
+    /// flag bind to this when no agent is named explicitly; an ambiguous (multi-agent) or agent-less
+    /// program must name its target.
+    pub fn sole_agent(&self) -> Option<&AgentDecl> {
+        match self.engine.program.agents.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+
     /// Inject one event and run every journey its label triggers **to completion**, returning each
     /// run's result. Events the journeys `emit` are processed too (bounded by [`MAX_CASCADE`]). This is
     /// the unit of work tests and the CLI channels drive; [`App::run`] is the long-running form.

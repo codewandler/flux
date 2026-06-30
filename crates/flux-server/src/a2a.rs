@@ -30,17 +30,21 @@ use flux_a2a::server;
 use flux_a2a::{AgentCard, Message, Task, TaskState, TaskStatus};
 use flux_flow::AgentSink;
 
+use std::sync::Arc;
+
 use super::Collect;
-use crate::Shared;
+use crate::{CardInfo, Shared};
 
 // ── Agent Card ────────────────────────────────────────────────────────────────
 
 /// `GET /.well-known/agent-card.json` (and the `…/agent.json` alias) — A2A discovery.
 ///
-/// The `url` field points to the `/a2a` JSON-RPC endpoint on the same host, derived from the
-/// request's `Host` (and `X-Forwarded-Proto`) headers so the card is correct whether accessed
-/// directly or through a reverse proxy.
-pub async fn agent_card(headers: HeaderMap) -> Json<AgentCard> {
+/// The card's `name`/`description`/`skills` come from the served agent's [`CardInfo`] (the built-in
+/// coding agent by default, or a program-declared agent when mounted by the `a2a` channel). The `url`
+/// field points to the `/a2a` JSON-RPC endpoint on the same host, derived from the request's `Host`
+/// (and `X-Forwarded-Proto`) headers so the card is correct whether accessed directly or through a
+/// reverse proxy.
+pub async fn agent_card(State(card): State<Arc<CardInfo>>, headers: HeaderMap) -> Json<AgentCard> {
     let host = headers
         .get("host")
         .and_then(|h| h.to_str().ok())
@@ -52,20 +56,11 @@ pub async fn agent_card(headers: HeaderMap) -> Json<AgentCard> {
     let url = format!("{scheme}://{host}/a2a");
 
     Json(server::agent_card(
-        "flux",
-        "flux — a precise, autonomous coding agent. Reads, writes, edits, \
-         searches, and runs code in a workspace. Carries tasks from instruction to \
-         verified completion through a deterministic Flux-Lang plan + guarded safety \
-         envelope.",
+        &card.name,
+        &card.description,
         Some(url),
         env!("CARGO_PKG_VERSION"),
-        &[(
-            "coding".to_string(),
-            "Coding Agent".to_string(),
-            "Read, write, edit, search, and execute code tasks in a workspace. The \
-             agent plans, executes, and verifies — then reports back."
-                .to_string(),
-        )],
+        &card.skills,
         true,
     ))
 }
@@ -92,7 +87,7 @@ fn rpc_err(id: Option<Value>, code: i32, msg: impl Into<String>) -> Json<Value> 
 //
 // Text/contextId extraction, the agent card, the RFC-3339 stamp, and the status-update shaping are
 // the reusable A2A protocol logic — they live in `flux_a2a::server` and are shared with other A2A
-// surfaces (e.g. downstream's `managed-agents`). This module keeps only the flux-server-specific axum
+// surfaces. This module keeps only the flux-server-specific axum
 // routes, the engine wiring, and the SSE streaming control-flow.
 
 /// Build an SSE frame: a JSON-RPC response whose `result` is a `TaskStatusUpdateEvent`. The SSE

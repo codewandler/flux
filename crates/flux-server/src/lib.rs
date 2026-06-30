@@ -1,5 +1,7 @@
-//! `flux-server` — a long-running HTTP API around an [`Agent`], so flux can be driven headlessly
-//! or remotely (`flux serve <addr>`).
+//! `flux-server` — a long-running HTTP API around a [`FlowEngine`], so a flux agent can be driven
+//! headlessly or remotely. It backs the `a2a` channel (`flux app run`) and is mounted by
+//! [`router`] onto a chosen agent's engine; the standalone [`serve`] form is reused by the CLI's
+//! `flux app run --serve <addr>` (no-program) path.
 //!
 //! Routes:
 //! - `GET  /health`                       → `ok`
@@ -17,7 +19,7 @@ mod a2a;
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{FromRef, Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -32,6 +34,70 @@ use flux_flow::engine::FlowEngine;
 use flux_flow::AgentSink;
 
 type Shared = Arc<FlowEngine>;
+
+/// Discovery metadata for the served agent — what the A2A agent card advertises. The `/a2a` URL is
+/// not stored here; it is derived per-request from the `Host`/`X-Forwarded-Proto` headers.
+#[derive(Clone)]
+pub struct CardInfo {
+    /// Agent name (card `name`).
+    pub name: String,
+    /// One-paragraph description (card `description`).
+    pub description: String,
+    /// Advertised skills as `(id, name, description)` tuples.
+    pub skills: Vec<(String, String, String)>,
+}
+
+impl CardInfo {
+    /// The default card: flux's built-in coding agent (what the standalone server advertises).
+    pub fn flux_coding() -> Self {
+        Self {
+            name: "flux".to_string(),
+            description: "flux — a precise, autonomous coding agent. Reads, writes, edits, \
+                 searches, and runs code in a workspace. Carries tasks from instruction to \
+                 verified completion through a deterministic Flux-Lang plan + guarded safety \
+                 envelope."
+                .to_string(),
+            skills: vec![(
+                "coding".to_string(),
+                "Coding Agent".to_string(),
+                "Read, write, edit, search, and execute code tasks in a workspace. The \
+                 agent plans, executes, and verifies — then reports back."
+                    .to_string(),
+            )],
+        }
+    }
+
+    /// A card for a program-declared agent, named and described from its `agent` declaration.
+    pub fn for_agent(name: impl Into<String>, description: Option<String>) -> Self {
+        let name = name.into();
+        let description = description.unwrap_or_else(|| format!("flux agent `{name}`."));
+        Self {
+            skills: vec![("agent".to_string(), name.clone(), description.clone())],
+            name,
+            description,
+        }
+    }
+}
+
+/// Shared router state: the engine that runs turns plus the agent card to advertise. Handlers extract
+/// either piece via [`FromRef`], so existing `State<Arc<FlowEngine>>` handlers keep working.
+#[derive(Clone)]
+pub struct ServerState {
+    engine: Arc<FlowEngine>,
+    card: Arc<CardInfo>,
+}
+
+impl FromRef<ServerState> for Arc<FlowEngine> {
+    fn from_ref(s: &ServerState) -> Self {
+        s.engine.clone()
+    }
+}
+
+impl FromRef<ServerState> for Arc<CardInfo> {
+    fn from_ref(s: &ServerState) -> Self {
+        s.card.clone()
+    }
+}
 
 /// Bind `addr` and serve until shutdown. When `token` is `Some`, every route except `/health`
 /// requires `Authorization: Bearer <token>`; when `None`, no authentication is enforced (the CLI
@@ -51,11 +117,56 @@ pub async fn serve_on(
     agent: FlowEngine,
     token: Option<String>,
 ) -> anyhow::Result<()> {
-    axum::serve(listener, router(Arc::new(agent), token)).await?;
+    axum::serve(
+        listener,
+        router(Arc::new(agent), token, CardInfo::flux_coding()),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
 }
 
-fn router(state: Shared, token: Option<String>) -> Router {
+/// Wait for the process-level shutdown signals a daemon should honor.
+pub async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            eprintln!("failed to install Ctrl-C handler: {e}");
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        let terminate = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut signal) => {
+                    signal.recv().await;
+                }
+                Err(e) => {
+                    eprintln!("failed to install SIGTERM handler: {e}");
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = terminate => {},
+        }
+    }
+
+    #[cfg(not(unix))]
+    ctrl_c.await;
+}
+
+/// Build the API router over `engine`, advertising `card` on the A2A discovery endpoint. When `token`
+/// is `Some`, every route except `/health` and the agent card requires `Authorization: Bearer <token>`.
+/// Public so the `a2a` channel ([`flux_channels`]) can mount it onto a program agent's engine with its
+/// own graceful-shutdown serve.
+pub fn router(engine: Arc<FlowEngine>, token: Option<String>, card: CardInfo) -> Router {
+    let state = ServerState {
+        engine,
+        card: Arc::new(card),
+    };
     // Auth-exempt routes — registered outside the middleware layer so path-string comparison
     // cannot be bypassed by percent-encoding or double-slash tricks.
     let exempt = Router::new()

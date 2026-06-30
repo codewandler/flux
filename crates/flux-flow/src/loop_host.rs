@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::AgentSink;
 use flux_core::{Error, Message, Result, Usage};
@@ -58,11 +59,50 @@ struct TurnCtx {
 const STALL_ESCALATE: u32 = 2; // 2nd identical round → inject a stronger "stop repeating" directive
 const STALL_STOP: u32 = 4; // 4th identical round → end the turn honestly instead of looping
 
+/// Default max chars of `run_plan` transcript handed back into the next planner round. Per-tool output
+/// trimming happens earlier, but the loop feedback is the concatenated plan transcript and can still
+/// become large enough to crowd out useful context.
+const DEFAULT_LOOP_FEEDBACK_CAP: usize = 40_000;
+
+fn loop_feedback_cap() -> usize {
+    std::env::var("FLUX_LOOP_FEEDBACK_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_LOOP_FEEDBACK_CAP)
+}
+
+fn cap_loop_feedback_with_cap(transcript: String, cap: usize) -> String {
+    if cap == 0 {
+        return transcript;
+    }
+    let total = transcript.chars().count();
+    if total <= cap {
+        return transcript;
+    }
+    let kept: String = transcript.chars().take(cap).collect();
+    let omitted = total - cap;
+    format!(
+        "{kept}\n[loop-feedback truncated: {omitted} of {total} chars omitted - reference stored \
+         symbols or narrow follow-up reads for exact bytes]"
+    )
+}
+
+fn cap_loop_feedback(transcript: String) -> String {
+    cap_loop_feedback_with_cap(transcript, loop_feedback_cap())
+}
+
+fn transcript_hash(transcript: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(transcript.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
 /// Per-turn loop-guard state for the retry-breaker. Reset each turn in [`EngineLoopHost::set_turn`].
 #[derive(Default)]
 struct LoopGuard {
-    /// The previous `run_plan` transcript — an unchanged, non-empty one means the round made no progress.
-    last_transcript: Option<String>,
+    /// Hash of the previous raw `run_plan` transcript. An unchanged, non-empty transcript means the
+    /// round made no progress; keep only the hash so large transcripts don't live in the guard.
+    last_transcript_hash: Option<String>,
     /// Consecutive count of that identical transcript.
     stall: u32,
     /// Armed once the stall reaches [`STALL_STOP`]: the honest message the next `plan` returns (as a
@@ -184,14 +224,15 @@ impl EngineLoopHost {
     /// transcript to feed back — augmented with an explicit directive when the loop is repeating.
     fn guard_transcript(&self, transcript: String) -> String {
         let mut g = self.guard.lock().unwrap();
+        let hash = transcript_hash(&transcript);
         let stalled = !transcript.trim().is_empty()
-            && g.last_transcript.as_deref() == Some(transcript.as_str());
+            && g.last_transcript_hash.as_deref() == Some(hash.as_str());
         if stalled {
             g.stall += 1;
         } else {
             // New (or empty) transcript = progress: reset the counter and remember this round.
             g.stall = 1;
-            g.last_transcript = Some(transcript.clone());
+            g.last_transcript_hash = Some(hash);
         }
         let stall = g.stall;
         if stall >= STALL_STOP {
@@ -254,6 +295,8 @@ impl LoopHost for EngineLoopHost {
 
         let executor = self.executor()?;
         let ops = OpRegistry::new(executor.registry());
+        let view = self.store.view(&session_id)?;
+        let view_ref = (!view.symbols.is_empty()).then_some(&view);
         let provider = self.provider.lock().unwrap().clone();
         let model = self.model.lock().unwrap().clone();
         let (out, call_usage) = compile_turn(
@@ -262,7 +305,7 @@ impl LoopHost for EngineLoopHost {
             &conversation,
             base_system.as_deref(),
             &ops,
-            None,
+            view_ref,
             None,
             None,
             self.opts.clone(),
@@ -380,6 +423,7 @@ impl LoopHost for EngineLoopHost {
                 let transcript = self.guard_transcript(format!(
                     "[plan error] {e}\nAdjust and emit another plan, or answer in prose."
                 ));
+                let transcript = cap_loop_feedback(transcript);
                 return Ok(serde_json::json!({
                     "transcript": transcript,
                     "result": "",
@@ -395,6 +439,7 @@ impl LoopHost for EngineLoopHost {
         } else {
             self.guard_transcript(outcome.transcript.clone())
         };
+        let transcript = cap_loop_feedback(transcript);
         let mut out = serde_json::json!({
             "transcript": transcript,
             "result": outcome.result,
@@ -617,6 +662,26 @@ mod tests {
         ]
     }
 
+    /// One model turn that answers in prose (a chat turn).
+    fn prose(text: &str) -> Vec<Chunk> {
+        vec![
+            Chunk::TextDelta(text.to_string()),
+            Chunk::Done {
+                stop_reason: Some(StopReason::EndTurn),
+            },
+        ]
+    }
+
+    #[test]
+    fn loop_feedback_cap_bounds_long_transcripts_and_can_be_disabled() {
+        let capped = cap_loop_feedback_with_cap("abcdef".to_string(), 3);
+        assert!(capped.starts_with("abc\n[loop-feedback truncated: 3 of 6 chars omitted"));
+        assert_eq!(
+            cap_loop_feedback_with_cap("abcdef".to_string(), 0),
+            "abcdef"
+        );
+    }
+
     /// Build a minimal host (no canned plans needed) for exercising the retry-breaker directly.
     fn guard_test_host() -> Arc<EngineLoopHost> {
         let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(Recorder::default())));
@@ -654,7 +719,10 @@ mod tests {
     #[tokio::test]
     async fn retry_breaker_escalates_then_arms_a_hard_stop() {
         let host = guard_test_host();
-        let stuck = "[plan error] python_run: provide either `script` or `module`".to_string();
+        let stuck = format!(
+            "[plan error] python_run: provide either `script` or `module`\n{}",
+            "x".repeat(DEFAULT_LOOP_FEEDBACK_CAP + 1024)
+        );
         // Round 1 (stall=1): first sighting — not flagged.
         assert!(!host.guard_transcript(stuck.clone()).contains("loop-guard"));
         // Round 2 (stall=2 = STALL_ESCALATE): escalate, no stop yet.
@@ -802,6 +870,7 @@ mod tests {
     struct RecordingProvider {
         responses: Mutex<VecDeque<Vec<Chunk>>>,
         seen: Mutex<Vec<String>>,
+        systems: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -810,6 +879,10 @@ mod tests {
             "rec"
         }
         async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            self.systems
+                .lock()
+                .unwrap()
+                .push(req.system.unwrap_or_default());
             let convo = req
                 .messages
                 .iter()
@@ -856,6 +929,7 @@ mod tests {
         let provider = Arc::new(RecordingProvider {
             responses: Mutex::new(VecDeque::from(vec![emit_plan(r1), emit_plan(r2)])),
             seen: Mutex::new(Vec::new()),
+            systems: Mutex::new(Vec::new()),
         });
 
         let store = Arc::new(FlowStore::in_memory().unwrap());
@@ -908,6 +982,147 @@ mod tests {
             seen[1].contains("ROUND1-MARKER"),
             "round 2's planner saw round 1's transcript via loop-carried $feedback: {:?}",
             seen[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_includes_existing_visible_session_symbols() {
+        let rec_sink = Recorder::default();
+        let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(rec_sink.clone())));
+
+        let dir = std::env::temp_dir().join(format!("flux-loop-symbols-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        flux_tools::register_reflect(&mut reg);
+        let executor = Executor::new(
+            reg,
+            PermissionManager::from_rules(&["echo".into(), "plan".into(), "run_plan".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(system),
+        );
+
+        let provider = Arc::new(RecordingProvider {
+            responses: Mutex::new(VecDeque::from(vec![emit_plan(json!({ "body": [] }))])),
+            seen: Mutex::new(Vec::new()),
+            systems: Mutex::new(Vec::new()),
+        });
+        let store = Arc::new(FlowStore::in_memory().unwrap());
+        let vid = store
+            .put_value(
+                "sess",
+                &crate::ast::Value::String("important cached context".into()),
+            )
+            .unwrap();
+        store
+            .bind(
+                "sess",
+                &crate::ast::SymbolName("cached".into()),
+                &vid,
+                Some("text"),
+                "read src/lib.rs: important cached context",
+                crate::ast::Visibility::Visible,
+            )
+            .unwrap();
+
+        let (_executor, host) = EngineLoopHost::install(
+            executor,
+            provider.clone(),
+            "rec".into(),
+            None,
+            store.clone(),
+            "sess".into(),
+            shared.clone(),
+            CompileOptions::default(),
+        );
+
+        host.plan(json!({ "feedback": "" })).await.unwrap();
+
+        let systems = provider.systems.lock().unwrap().clone();
+        assert_eq!(systems.len(), 1);
+        assert!(
+            systems[0].contains("Existing session symbols")
+                && systems[0].contains("$cached: text = read src/lib.rs: important cached context"),
+            "planner prompt should include visible session symbols:\n{}",
+            systems[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn builtin_agent_loop_shows_symbols_created_by_prior_round_to_next_plan() {
+        let rec_sink = Recorder::default();
+        let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(rec_sink.clone())));
+
+        let dir =
+            std::env::temp_dir().join(format!("flux-loop-symbol-roundtrip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        flux_tools::register_reflect(&mut reg);
+        flux_tools::register_evidence(&mut reg);
+        let executor = Executor::new(
+            reg,
+            PermissionManager::from_rules(
+                &[
+                    "echo".into(),
+                    "plan".into(),
+                    "run_plan".into(),
+                    "observe".into(),
+                ],
+                &[],
+            ),
+            Arc::new(AllowApprover),
+            ToolContext::new(system),
+        );
+
+        let first_plan = json!({
+            "body": [{
+                "kind": "bind", "name": "g",
+                "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "ROUND-SYMBOL" }] }
+            }]
+        });
+        let provider = Arc::new(RecordingProvider {
+            responses: Mutex::new(VecDeque::from(vec![emit_plan(first_plan), prose("done")])),
+            seen: Mutex::new(Vec::new()),
+            systems: Mutex::new(Vec::new()),
+        });
+        let store = Arc::new(FlowStore::in_memory().unwrap());
+        let (executor, _host) = EngineLoopHost::install(
+            executor,
+            provider.clone(),
+            "rec".into(),
+            None,
+            store.clone(),
+            "sess".into(),
+            shared.clone(),
+            CompileOptions::default(),
+        );
+
+        let loop_ast = crate::engine::load_agent_loop(&dir).unwrap();
+        let mut outer = SharedSink::new(shared.clone());
+        execute_flow(
+            store.as_ref(),
+            executor.as_ref(),
+            "sess",
+            &loop_ast,
+            &mut outer,
+        )
+        .await
+        .unwrap();
+
+        let systems = provider.systems.lock().unwrap().clone();
+        assert_eq!(systems.len(), 2, "builtin loop should plan twice");
+        assert!(
+            !systems[0].contains("$g"),
+            "first planner call should not see a symbol before it is created"
+        );
+        assert!(
+            systems[1].contains("Existing session symbols")
+                && systems[1].contains("$g = ROUND-SYMBOL"),
+            "second planner call should see the symbol bound by round one:\n{}",
+            systems[1]
         );
     }
 

@@ -986,24 +986,26 @@ pub struct PluginHost {
 }
 
 impl PluginHost {
-    /// Spawn a plugin binary.
-    pub async fn spawn(program: &str, args: &[String]) -> Result<Self> {
-        use std::process::Stdio;
-        let mut child = tokio::process::Command::new(program)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
+    /// Spawn a plugin binary through flux's **single guarded process path**
+    /// ([`flux_system::System::spawn_interactive`]): the plugin runs argv-only, in the workspace root,
+    /// with a **cleared environment** (the minimal non-secret allow-list only) — so it cannot read the
+    /// host's secrets directly and must request them back through the gated host capabilities. The
+    /// framed `flux.plugin.v1` protocol then runs over the piped stdin/stdout.
+    pub async fn spawn(
+        system: &flux_system::System,
+        program: &str,
+        args: &[String],
+    ) -> Result<Self> {
+        let mut argv = Vec::with_capacity(args.len() + 1);
+        argv.push(program.to_string());
+        argv.extend_from_slice(args);
+        let flux_system::InteractiveChild {
+            child,
+            stdin,
+            stdout,
+        } = system
+            .spawn_interactive(&argv)
             .map_err(|e| Error::Other(format!("spawn plugin {program}: {e}")))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::Other("plugin stdin unavailable".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::Other("plugin stdout unavailable".into()))?;
         Ok(Self {
             child,
             stdin,
@@ -1215,11 +1217,12 @@ impl Tool for PluginTool {
 /// to exactly what the plugin declared (see [`SystemHostCaps::with_grants`]) — the binding point
 /// where a plugin's requested privileges are pinned to its manifest.
 pub async fn load_plugin_tools(
+    system: &flux_system::System,
     program: &str,
     args: &[String],
     make_caps: impl FnOnce(&PluginManifest) -> Arc<dyn HostCapabilities>,
 ) -> Result<(Vec<Arc<dyn Tool>>, Arc<tokio::sync::Mutex<PluginHost>>)> {
-    let mut host = PluginHost::spawn(program, args).await?;
+    let mut host = PluginHost::spawn(system, program, args).await?;
     let manifest = host.manifest().await?;
     let caps = make_caps(&manifest);
     let host = Arc::new(tokio::sync::Mutex::new(host));
