@@ -43,6 +43,44 @@ fn resolve_op_name(manifest: &PluginManifest, suffix: &str) -> Option<String> {
         .find(|n| n == suffix || n.ends_with(&dotted))
 }
 
+/// Extract `cluster=<x>` / `namespace=<y>` tokens from a free-text `query` so a caller who wrote
+/// `query="cluster=dev namespace=latest backend"` reaches the provider's structured scoping fields
+/// without hand-parsing. Returns `(cluster, namespace, stripped_query)`: the stripped query is the
+/// original with the matched tokens removed (collapsed whitespace, empty → `Value::Null`), so the
+/// provider's free-text hint no longer carries the now-structured tokens. Tokens are matched
+/// case-insensitively as whole `key=value` words; a value runs to the next whitespace. Non-string
+/// `query` (null / object) yields `(None, None, query)` unchanged.
+fn parse_query_tokens(query: &Value) -> (Option<String>, Option<String>, Value) {
+    let Some(s) = query.as_str() else {
+        return (None, None, query.clone());
+    };
+    let mut cluster: Option<String> = None;
+    let mut namespace: Option<String> = None;
+    let mut kept: Vec<&str> = Vec::new();
+    for word in s.split_whitespace() {
+        let (key, val) = match word.split_once('=') {
+            Some((k, v)) => (k.to_lowercase(), v),
+            None => {
+                kept.push(word);
+                continue;
+            }
+        };
+        match key.as_str() {
+            "cluster" if cluster.is_none() && !val.is_empty() => cluster = Some(val.to_string()),
+            "namespace" if namespace.is_none() && !val.is_empty() => {
+                namespace = Some(val.to_string());
+            }
+            _ => kept.push(word),
+        }
+    }
+    let stripped = if kept.is_empty() {
+        Value::Null
+    } else {
+        Value::String(kept.join(" "))
+    };
+    (cluster, namespace, stripped)
+}
+
 /// A registered provider plugin: the handles the broker needs to fan a discovery query out to it.
 pub struct ProviderEntry {
     /// The provider's manifest (its `discovers` set is matched against the queried product).
@@ -108,11 +146,18 @@ impl PluginRegistry {
 pub trait ProviderInvoker: Send + Sync {
     /// Invoke provider `name`'s `endpoint.discover` op for `product`, returning its candidates. A
     /// transport/provider error is returned as `Err` (the broker logs + skips it, never fatal).
+    ///
+    /// `cluster` / `namespace` are structured scoping fields the broker parsed out of the caller's
+    /// request (plus any `cluster=`/`namespace=` tokens it extracted from the free-text `query`);
+    /// `query` is the stripped free-text remainder. A provider resolves `cluster` to a concrete
+    /// context and treats `namespace` as a literal name (the s_251 alias / `latest` disambiguation).
     async fn discover(
         &self,
         name: &str,
         product: &str,
         query: &Value,
+        cluster: Option<&str>,
+        namespace: Option<&str>,
         limit: usize,
     ) -> Result<Vec<EndpointCandidate>, String>;
 }
@@ -137,6 +182,8 @@ impl ProviderInvoker for HostProviderInvoker {
         name: &str,
         product: &str,
         query: &Value,
+        cluster: Option<&str>,
+        namespace: Option<&str>,
         limit: usize,
     ) -> Result<Vec<EndpointCandidate>, String> {
         let entry = self
@@ -147,7 +194,13 @@ impl ProviderInvoker for HostProviderInvoker {
         // `kubernetes.endpoint.discover`); a bare `endpoint.discover` call would not match.
         let op = resolve_op_name(&entry.manifest, "endpoint.discover")
             .ok_or_else(|| format!("provider `{name}` advertises no `endpoint.discover` op"))?;
-        let payload = json!({ "product": product, "query": query, "limit": limit });
+        let payload = json!({
+            "product": product,
+            "query": query,
+            "cluster": cluster,
+            "namespace": namespace,
+            "limit": limit
+        });
         let result = {
             let mut host = entry.host.lock().await;
             host.call_with_host(&op, payload, entry.caps.as_ref())
@@ -363,18 +416,38 @@ impl EndpointBroker {
     /// any already in flight), aggregate, rank by `score` descending, truncate to `limit`, commit each
     /// to the endpoint registry (owner = the discovering provider), and return the **weak** candidates.
     ///
-    /// A provider error is logged and skipped — one bad provider never fails the query. The result is
-    /// references only: no `ResolvedEndpoint`, no secret value ever crosses this boundary.
+    /// `cluster` / `namespace` are structured scoping fields. Any `cluster=<x>` / `namespace=<y>`
+    /// tokens embedded in the free-text `query` are extracted into them (explicit params win), and
+    /// the stripped `query` remainder is what providers see — so a caller who wrote
+    /// `query="cluster=dev namespace=latest backend"` reaches the provider's structured
+    /// `cluster`/`namespace` path without hand-parsing. A provider error is logged and skipped — one
+    /// bad provider never fails the query. The result is references only: no `ResolvedEndpoint`, no
+    /// secret value ever crosses this boundary.
     pub async fn discover(
         &self,
         product: &str,
         query: &Value,
+        cluster: Option<&str>,
+        namespace: Option<&str>,
         limit: usize,
         requester: Option<&str>,
     ) -> Vec<EndpointCandidate> {
+        // Extract any `cluster=`/`namespace=` tokens from the free-text query; explicit params win.
+        let (q_cluster, q_namespace, stripped_query) = parse_query_tokens(query);
+        let cluster = cluster.or(q_cluster.as_deref());
+        let namespace = namespace.or(q_namespace.as_deref());
         // Fan out, audit per provider, and commit each candidate via `put` (additive — does not drop
         // another provider's stale entries; that is `refresh`'s reconcile job).
-        let found = self.fan_out(product, query, limit, requester).await;
+        let found = self
+            .fan_out(
+                product,
+                &stripped_query,
+                cluster,
+                namespace,
+                limit,
+                requester,
+            )
+            .await;
         for (owner, cand) in &found {
             self.endpoints.put(EndpointRecord {
                 owner: owner.clone(),
@@ -394,7 +467,9 @@ impl EndpointBroker {
     pub async fn refresh(&self, products: &[String]) -> RefreshSummary {
         let mut summary = RefreshSummary::default();
         for product in products {
-            let found = self.fan_out(product, &Value::Null, usize::MAX, None).await;
+            let found = self
+                .fan_out(product, &Value::Null, None, None, usize::MAX, None)
+                .await;
             // Group the fresh candidates by their discovering provider, then `replace_owned` each set —
             // reconciling exactly that owner's records (stale dropped, fresh inserted), others untouched.
             let mut by_owner: HashMap<String, Vec<EndpointRecord>> = HashMap::new();
@@ -423,6 +498,8 @@ impl EndpointBroker {
         &self,
         product: &str,
         query: &Value,
+        cluster: Option<&str>,
+        namespace: Option<&str>,
         limit: usize,
         requester: Option<&str>,
     ) -> Vec<(String, EndpointCandidate)> {
@@ -443,7 +520,10 @@ impl EndpointBroker {
                 }
                 guard.insert(name.clone());
             }
-            let outcome = self.invoker.discover(&name, product, query, limit).await;
+            let outcome = self
+                .invoker
+                .discover(&name, product, query, cluster, namespace, limit)
+                .await;
             self.in_flight.lock().await.remove(&name);
 
             match outcome {
@@ -787,6 +867,8 @@ mod tests {
             name: &str,
             _product: &str,
             _query: &Value,
+            _cluster: Option<&str>,
+            _namespace: Option<&str>,
             _limit: usize,
         ) -> Result<Vec<EndpointCandidate>, String> {
             Ok(self.by_provider.get(name).cloned().unwrap_or_default())
@@ -888,7 +970,9 @@ mod tests {
         let broker = EndpointBroker::new(invoker, reg.clone(), endpoints.clone());
 
         // Union of both providers, sorted by score descending.
-        let all = broker.discover("prometheus", &json!({}), 10, None).await;
+        let all = broker
+            .discover("prometheus", &json!({}), None, None, 10, None)
+            .await;
         let ids: Vec<&str> = all.iter().map(|c| c.endpoint.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -904,7 +988,9 @@ mod tests {
         assert_eq!(endpoints.resolve("@endpoint/pa").unwrap().owner, "a");
 
         // Truncation to `limit` keeps the top-scoring candidates.
-        let top = broker.discover("prometheus", &json!({}), 1, None).await;
+        let top = broker
+            .discover("prometheus", &json!({}), None, None, 1, None)
+            .await;
         assert_eq!(top.len(), 1);
         assert_eq!(top[0].endpoint.id, "@endpoint/pb1");
     }
@@ -929,7 +1015,7 @@ mod tests {
 
         // The requesting plugin is never fanned back into itself.
         let found = broker
-            .discover("prometheus", &json!({}), 10, Some("self"))
+            .discover("prometheus", &json!({}), None, None, 10, Some("self"))
             .await;
         let ids: Vec<&str> = found.iter().map(|c| c.endpoint.id.as_str()).collect();
         assert_eq!(ids, vec!["@endpoint/po"]);
@@ -955,7 +1041,9 @@ mod tests {
         let invoker = Arc::new(FakeInvoker { by_provider });
         let broker = EndpointBroker::new(invoker, reg, Arc::new(EndpointRegistry::new()));
 
-        let found = broker.discover("postgres", &json!({}), 10, None).await;
+        let found = broker
+            .discover("postgres", &json!({}), None, None, 10, None)
+            .await;
         let serialized = serde_json::to_string(&found).unwrap();
         // The credential is present only as a reference (a location), never a value.
         assert!(
@@ -967,6 +1055,109 @@ mod tests {
         // No injected/resolved auth material leaks into the discovery surface.
         assert!(!serialized.contains("injected_headers"));
         assert!(!serialized.to_lowercase().contains("bearer "));
+    }
+
+    /// The broker parses `cluster=`/`namespace=` tokens out of a free-text `query` and forwards them
+    /// as structured scoping fields to the provider, stripping them from the `query` the provider
+    /// sees. The s_251 failure: the agent wrote `query="cluster=dev namespace=latest backend"` but
+    /// the broker forwarded only `{product, query, limit}` — the provider never saw structured
+    /// `cluster`/`namespace`, so the alias/literal-name paths were unreachable through the broker
+    /// and the agent had to hand-parse (list → eyeball → hardcode the ARN).
+    #[tokio::test]
+    async fn broker_parses_cluster_and_namespace_tokens_from_query() {
+        use std::sync::Mutex as StdMutex;
+        /// `(provider, cluster, namespace, stripped_query)` — what the broker forwarded.
+        type RecordedCall = (String, Option<String>, Option<String>, Value);
+        struct RecordingInvoker {
+            calls: StdMutex<Vec<RecordedCall>>,
+        }
+        #[async_trait]
+        impl ProviderInvoker for RecordingInvoker {
+            async fn discover(
+                &self,
+                name: &str,
+                _product: &str,
+                query: &Value,
+                cluster: Option<&str>,
+                namespace: Option<&str>,
+                _limit: usize,
+            ) -> Result<Vec<EndpointCandidate>, String> {
+                self.calls.lock().unwrap().push((
+                    name.to_string(),
+                    cluster.map(String::from),
+                    namespace.map(String::from),
+                    query.clone(),
+                ));
+                Ok(Vec::new())
+            }
+        }
+        let reg = Arc::new(PluginRegistry::new());
+        register_provider(&reg, "kubernetes", "postgres").await;
+        let invoker = Arc::new(RecordingInvoker {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let broker = EndpointBroker::new(invoker.clone(), reg, Arc::new(EndpointRegistry::new()));
+        // Free-text query carries the structured tokens inline; the agent did not pass `cluster`/
+        // `namespace` params explicitly.
+        broker
+            .discover(
+                "postgres",
+                &json!("cluster=dev namespace=latest backend db"),
+                None,
+                None,
+                10,
+                None,
+            )
+            .await;
+        let calls = invoker.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "the broker fanned out to the one provider");
+        let (_, cluster, namespace, query) = &calls[0];
+        assert_eq!(
+            cluster.as_deref(),
+            Some("dev"),
+            "`cluster=dev` token parsed from the query and forwarded as a structured field"
+        );
+        assert_eq!(
+            namespace.as_deref(),
+            Some("latest"),
+            "`namespace=latest` token parsed from the query and forwarded as a structured field"
+        );
+        // The stripped query retains the non-token remainder; the structured tokens are gone.
+        assert_eq!(
+            query.as_str(),
+            Some("backend db"),
+            "the parsed tokens are stripped from the free-text query the provider sees"
+        );
+
+        // Explicit params win over tokens, and the un-tokenized remainder still flows through.
+        invoker.calls.lock().unwrap().clear();
+        broker
+            .discover(
+                "postgres",
+                &json!("cluster=ignored namespace=ignored prod"),
+                Some("dev"),
+                Some("backend"),
+                10,
+                None,
+            )
+            .await;
+        let calls = invoker.calls.lock().unwrap().clone();
+        let (_, cluster, namespace, query) = &calls[0];
+        assert_eq!(
+            cluster.as_deref(),
+            Some("dev"),
+            "explicit cluster param wins"
+        );
+        assert_eq!(
+            namespace.as_deref(),
+            Some("backend"),
+            "explicit namespace param wins"
+        );
+        assert_eq!(
+            query.as_str(),
+            Some("prod"),
+            "tokens still stripped from the query"
+        );
     }
 
     #[tokio::test]
@@ -987,6 +1178,8 @@ mod tests {
                 name: &str,
                 _product: &str,
                 _query: &Value,
+                _cluster: Option<&str>,
+                _namespace: Option<&str>,
                 _limit: usize,
             ) -> Result<Vec<EndpointCandidate>, String> {
                 Ok(self
@@ -1420,6 +1613,8 @@ mod tests {
                 _name: &str,
                 product: &str,
                 _query: &Value,
+                _cluster: Option<&str>,
+                _namespace: Option<&str>,
                 _limit: usize,
             ) -> Result<Vec<EndpointCandidate>, String> {
                 // The production `HostProviderInvoker` hardcodes `endpoint.discover`; record that the
@@ -1434,7 +1629,9 @@ mod tests {
             ops: std::sync::Mutex::new(Vec::new()),
         });
         let broker = EndpointBroker::new(invoker.clone(), reg, Arc::new(EndpointRegistry::new()));
-        broker.discover("prometheus", &json!({}), 10, None).await;
+        broker
+            .discover("prometheus", &json!({}), None, None, 10, None)
+            .await;
         let ops = invoker.ops.lock().unwrap();
         assert!(!ops.is_empty(), "the provider was driven");
         assert!(

@@ -8,6 +8,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Endpoint discovery resolves cluster aliases and relays structured `cluster`/`namespace` (D-33).**
+  The `endpoint.discover` spine no longer requires the agent to hand-recover a wrong cluster. A short
+  `cluster` alias (e.g. `dev`) is resolved against kubeconfig context names (case-insensitive
+  substring; exact match wins; an ambiguous >1 or unknown 0 match is a loud error, never a silent
+  empty result) — fixing the s_251 failure where `"dev"` was not a real context (the real ones are
+  long ARN-like names) and was either passed literally to `kubectl --context` (→ kubectl error) or,
+  through the broker, never set `context` at all. The agent-facing `endpoint.discover` op and the
+  broker now carry structured `cluster`/`namespace` fields, and the broker parses `cluster=<x>`/
+  `namespace=<y>` tokens out of free-text `query` (explicit params win; tokens stripped from the
+  forwarded query) so the structured path is reachable without hand-parsing. The `namespace=latest`
+  ambiguity is also fixed: the free-text `query`-substring "newest namespace" heuristic is retired —
+  only `latest_namespace: true` triggers it, and a literal namespace named `latest` is just
+  `namespace: "latest"`. See [docs/designs/session-s251-postmortem.md](docs/designs/session-s251-postmortem.md).
+
 - **`ctx` context packs no longer drop the working set on a single oversized member (L-08).** The
   `ctx`/`ctx_append` packer in `flux-lang` packed members greedily with a hard `break` on the first
   overflow, so one oversized early member (e.g. a 493k-char session-evidence bind) evicted every

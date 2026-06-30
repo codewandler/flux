@@ -62,6 +62,15 @@ fn req_str(op: &str, params: &Value, key: &str) -> Result<String> {
         .ok_or_else(|| Error::Other(format!("{op}: `{key}` (non-empty string) required")))
 }
 
+/// An optional, non-empty string field (`None` when absent or blank).
+fn opt_str(params: &Value, key: &str) -> Option<String> {
+    params
+        .get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+}
+
 /// `[product] @endpoint/id url (protocol) [owner/health] labels` — a one-line weak-ref summary.
 fn render_record(r: &EndpointRecord) -> String {
     let ep = &r.endpoint;
@@ -96,14 +105,19 @@ impl Tool for DiscoverOp {
              kubernetes). Returns weak references — a URL + display labels, never a secret; the host \
              injects credentials when you connect. Product hints: a namespace / cluster / k8s service \
              ⇒ product=\"kubernetes\"; an RDS / SQL database ⇒ product=\"postgres\" (or \"mysql\"); \
-             monitoring ⇒ \"prometheus\" / \"loki\" / \"grafana\" / \"alertmanager\". For the latest \
-             namespace, put \"latest\" in `query` (the provider picks the newest namespace by creation \
-             time). Then bind a result with endpoint.select to reuse it across turns.",
+             monitoring ⇒ \"prometheus\" / \"loki\" / \"grafana\" / \"alertmanager\". `cluster` is a short \
+             alias the provider resolves against kubeconfig context names (e.g. `dev`); `namespace` is \
+             a literal namespace name. You may also put `cluster=<x>` / `namespace=<y>` tokens in `query` \
+             — the broker extracts them into the structured fields. For the newest namespace by \
+             creation time, set `latest_namespace: true` (a literal namespace named `latest` is just \
+             `namespace: \"latest\"`). Then bind a result with endpoint.select to reuse it across turns.",
             json!({
                 "type": "object",
                 "properties": {
                     "product": {"type": "string", "description": "Product class to discover (kubernetes, postgres, mysql, prometheus, loki, grafana, alertmanager)"},
-                    "query": {"type": "string", "description": "Free-text hint (e.g. a namespace name, a service name, or \"latest\" for the newest namespace)"},
+                    "cluster": {"type": "string", "description": "Short cluster alias the provider resolves against kubeconfig context names (e.g. `dev`). May also be passed as a `cluster=<x>` token in `query`."},
+                    "namespace": {"type": "string", "description": "Literal namespace name. May also be passed as a `namespace=<y>` token in `query`."},
+                    "query": {"type": "string", "description": "Free-text hint (a service name, or `cluster=<x>`/`namespace=<y>` tokens the broker extracts into the structured fields)"},
                     "limit": {"type": "integer", "description": "Max candidates to return (default all)"}
                 },
                 "required": ["product"]
@@ -128,9 +142,22 @@ impl Tool for DiscoverOp {
             .and_then(|v| v.as_u64())
             .map(|n| n as usize)
             .unwrap_or(usize::MAX);
+        let cluster = opt_str(&params, "cluster");
+        let namespace = opt_str(&params, "namespace");
         // No `requester` — this is the agent (a host op), not a consumer plugin, so the broker fans
-        // out to every matching provider.
-        let candidates = self.0.discover(&product, &query, limit, None).await;
+        // out to every matching provider. The broker parses any `cluster=`/`namespace=` tokens out
+        // of `query` (explicit `cluster`/`namespace` params win) and forwards the structured fields.
+        let candidates = self
+            .0
+            .discover(
+                &product,
+                &query,
+                cluster.as_deref(),
+                namespace.as_deref(),
+                limit,
+                None,
+            )
+            .await;
         if candidates.is_empty() {
             return Ok(ToolResult::ok(format!(
                 "no endpoints discovered for product `{product}`"
@@ -329,6 +356,8 @@ mod tests {
             _name: &str,
             _product: &str,
             _query: &JsonValue,
+            _cluster: Option<&str>,
+            _namespace: Option<&str>,
             _limit: usize,
         ) -> std::result::Result<Vec<EndpointCandidate>, String> {
             Ok(vec![EndpointCandidate {

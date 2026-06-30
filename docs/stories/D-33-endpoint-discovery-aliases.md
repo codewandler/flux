@@ -2,7 +2,7 @@
 id: D-33
 title: Resolve cluster/namespace aliases in endpoint discovery
 pillar: Agent
-status: backlog
+status: done
 priority:
 epic: session-s251-postmortem
 design: docs/designs/session-s251-postmortem.md
@@ -23,28 +23,64 @@ point, not a manual-recovery puzzle.
 
 ## Acceptance
 
-- [ ] **Failing-first test (alias)** — `endpoint.discover` / `kubernetes.endpoint.discover` with
-      `cluster="dev"` resolves to the dev kubeconfig context (the ARN containing `/dev-`) and runs
-      against it, instead of passing `"dev"` literally to `kubectl --context` and failing. Name the
-      test `cluster_alias_resolves_to_concrete_context` (in `plugins/kubernetes`).
-- [ ] **Failing-first test (latest ambiguity)** — against a cluster that has a literal namespace
-      named `latest`, `namespace="latest"` uses it (not the newest-namespace heuristic). Name the
-      test `literal_latest_namespace_preferred_over_heuristic`.
-- [ ] **Ambiguity is loud** — an alias matching >1 context returns a clear error naming the
-      candidates, never a silent empty result.
-- [ ] **Broker relays structured fields** — `endpoint.discover` gains optional structured `cluster`
-      and `namespace` fields; the broker parses `cluster=<x>` / `namespace=<y>` tokens out of
-      free-text `query` into the structured fields and forwards them to providers. The literal-name
-      and context-resolution paths are reachable through the broker without the agent hand-parsing.
-- [ ] **Op descriptions updated** — the `endpoint.discover` and `kubernetes.endpoint.discover` specs
-      document the `cluster`/`namespace` fields and the `latest` interpretation.
-- [ ] Root gate green: `cargo test --workspace`, `clippy -D warnings`, `fmt`; the `plugins/` gate if
-      the kubernetes plugin changed; a MockHost test per changed op.
-- [ ] CHANGELOG entry under `[Unreleased]`.
+- [x] **Failing-first test (alias)** — `cluster_alias_resolves_to_concrete_context` in
+      `plugins/kubernetes/src/main.rs`. Fails on the old code (`cluster` ignored → discovery ran
+      against the current/prod context → empty); passes after `resolve_context_alias` resolves
+      `dev` → the `dev-eu` kubeconfig context.
+- [x] **Failing-first test (latest ambiguity)** — `literal_latest_namespace_preferred_over_heuristic`.
+      Fails on the old `query`-substring `wants_latest` heuristic (picked the newest namespace,
+      `team-new`, which had nothing); passes after the substring heuristic is retired (only
+      `latest_namespace: true` triggers the newest-namespace heuristic).
+- [x] **Ambiguity is loud** — `resolve_context_alias` returns a clear error naming the candidate
+      contexts on a >1 match, and naming the available contexts on a 0 match; never a silent empty.
+- [x] **Broker relays structured fields** — `endpoint.discover` gains `cluster`/`namespace` fields;
+      `parse_query_tokens` extracts `cluster=<x>`/`namespace=<y>` from free-text `query` (explicit
+      params win, tokens stripped from the forwarded query); `ProviderInvoker::discover` +
+      `EndpointBroker::discover`/`fan_out` thread them; `HostProviderInvoker` sends them in the
+      provider payload. Test `broker_parses_cluster_and_namespace_tokens_from_query`.
+- [x] **Op descriptions updated** — `endpoint.discover` and `kubernetes.endpoint.discover` specs
+      document `cluster`/`namespace` and the `latest` interpretation (`latest_namespace: true` for
+      the heuristic; a literal `latest` is `namespace: "latest"`).
+- [x] Root gate green: `cargo test --workspace`, `clippy -D warnings` (workspace + plugins), `fmt`,
+      `cargo test -p flux-codegate`, the `plugins/` gate, and both skill-sync tests.
+- [x] CHANGELOG entry under `[Unreleased]`.
 
 ## Progress
 
-- (running log — a resuming agent reads this to know where things stand)
+- **Blocker resolved.** L-09 (named-argument calls) landed (`196dbdb`); D-33 promoted to
+  `in-progress`. The structured form carries `cluster`/`namespace` as named fields throughout.
+- **Provider (kubernetes plugin):**
+  - Added `resolve_context_alias` — resolves a short `cluster` alias against kubeconfig context
+    names (exact match wins; else case-insensitive substring; 0/>1 matches are loud errors). Called
+    once at the top of `endpoint_discover`; the resolved concrete context is injected as `context`
+    so every downstream `ctx_args` call targets the resolved cluster.
+  - Added a `cluster` field to the `kubernetes.endpoint.discover` op spec + updated the description.
+  - Retired the `query`-substring `wants_latest` heuristic (the s_251 ambiguity): `wants_latest` is
+    now true **only** for `latest_namespace: true`. A literal namespace named `latest` is just
+    `namespace: "latest"`. Updated `endpoint_discover_selects_latest_namespace` to use
+    `latest_namespace: true`.
+- **Broker (`flux-capabilities/src/endpoint/broker.rs`):**
+  - `parse_query_tokens` extracts `cluster=`/`namespace=` from free-text `query` (stripped remainder
+    forwarded; non-string query unchanged).
+  - `ProviderInvoker::discover`, `EndpointBroker::discover`, `fan_out` gained `cluster`/`namespace`;
+    `HostProviderInvoker` sends them in the provider payload; `refresh` passes `None`/`None`.
+  - Updated all test fakes (`FakeInvoker`, `MutInvoker`, `OpRecordingInvoker`, `OnePg`,
+    `OneCandidate`) + call sites to the new signature.
+- **Agent-facing op (`ops.rs`):** `DiscoverOp` spec + execute read `cluster`/`namespace` and pass
+  them to the broker; added a local `opt_str` helper.
+- **Consumer-plugin path (`host_caps.rs`):** reads `cluster`/`namespace` from the plugin payload and
+  forwards them to the broker.
+- **Failing-first verified:** both provider tests fail on the pre-fix code (alias: `cluster`
+  ignored; latest: substring heuristic) and pass after; the broker test fails on the pre-fix broker
+  (no parsing → `cluster=None`) and passes after.
+- **Gate:** workspace + plugins `cargo test` green (D-33 crates stable across repeated runs);
+  `clippy -D warnings` clean (workspace + plugins); `fmt` clean; `flux-codegate` green;
+  `skill_in_sync` + `skill_docs_in_sync` green (op-description changes are in `flux-capabilities`,
+  not the generated language tables).
+- **Note (out of scope):** `flux-config::tests::loads_project_config` is a pre-existing intermittent
+  workspace-parallelism flake (latent temp-dir race in its test helper) — it passes consistently in
+  isolation and is unrelated to D-33 (`flux-config` is untouched). Surfaced here for visibility; not
+  addressed in this story.
 
 ## Notes
 

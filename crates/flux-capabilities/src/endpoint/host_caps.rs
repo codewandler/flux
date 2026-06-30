@@ -67,9 +67,26 @@ impl HostCapabilities for EndpointBrokerHostCaps {
                     .and_then(|v| v.as_u64())
                     .map(|n| n as usize)
                     .unwrap_or(usize::MAX);
+                // A consumer plugin may scope its discovery with structured `cluster`/`namespace`
+                // fields (or `cluster=`/`namespace=` tokens in `query`, which the broker extracts).
+                let cluster = payload
+                    .get("cluster")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty());
+                let namespace = payload
+                    .get("namespace")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty());
                 let candidates = self
                     .broker
-                    .discover(product, &query, limit, Some(&self.consumer))
+                    .discover(
+                        product,
+                        &query,
+                        cluster,
+                        namespace,
+                        limit,
+                        Some(&self.consumer),
+                    )
                     .await;
                 Ok(json!({ "candidates": candidates }))
             }
@@ -96,6 +113,8 @@ mod tests {
             _name: &str,
             product: &str,
             _query: &Value,
+            _cluster: Option<&str>,
+            _namespace: Option<&str>,
             _limit: usize,
         ) -> std::result::Result<Vec<EndpointCandidate>, String> {
             Ok(vec![EndpointCandidate {

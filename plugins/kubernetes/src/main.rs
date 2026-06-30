@@ -97,14 +97,19 @@ fn manifest_builder() -> PluginBuilder {
                  other products match in-cluster Services and Ingresses by name or \
                  `app.kubernetes.io/name`. `postgres`/`mysql` also scan Secrets for crossplane/RDS \
                  connection patterns and return a database endpoint whose credential is a \
-                 `kubernetes/<ns>/<secret>/<key>` reference. Set `query` to \"latest\" (or omit \
-                 `namespace`) to target the newest namespace by creation time.",
+                 `kubernetes/<ns>/<secret>/<key>` reference. `cluster` is a short alias (e.g. `dev`) \
+                 resolved against kubeconfig context names — it matches a context whose name contains \
+                 the alias (case-insensitive), and a multi-match is a loud error rather than a silent \
+                 empty result. `namespace` is a literal namespace name. Set `latest_namespace: true` to \
+                 target the newest namespace by creation time (a literal namespace named `latest` is \
+                 just `namespace: \"latest\"`; the free-text `query` no longer triggers the heuristic).",
                 json!({"type": "object", "properties": {
                     "context": s_context(),
+                    "cluster": {"type": "string", "description": "short alias resolved against kubeconfig context names (e.g. `dev` matches the context whose name contains `dev`); a multi-match is an error"},
                     "namespace": s_namespace_filter(),
                     "product": {"type": "string", "description": "product to discover: kubernetes, postgres, mysql, prometheus, loki, grafana, alertmanager"},
-                    "query": {"type": "string", "description": "free-text hint; \"latest\" selects the newest namespace by creation time"},
-                    "latest_namespace": {"type": "boolean", "description": "select the newest namespace by creation time (same as query=\"latest\")"},
+                    "query": {"type": "string", "description": "free-text hint (a service name, or scratch context); no longer magic for \"latest\" — use `latest_namespace: true`"},
+                    "latest_namespace": {"type": "boolean", "description": "select the newest namespace by creation time"},
                     "limit": s_limit()
                 }}),
             ),
@@ -491,6 +496,57 @@ fn ctx_args(input: &Value) -> Vec<String> {
     }
 }
 
+/// Resolve a short `cluster` alias (e.g. `"dev"`) against the kubeconfig context names. A context
+/// whose name *contains* the alias (case-insensitive) matches; an exact name match wins outright.
+/// A single match returns the concrete context name; zero matches or an ambiguous (>1) match return
+/// a loud error — never a silent empty result (the s_251 failure: `"dev"` is not a real context, but
+/// the op passed it literally to `kubectl --context` and kubectl failed, or — through the broker —
+/// never set `context` at all). Returns `None` when no `cluster` alias was supplied (caller falls
+/// back to the raw `context` field / the current context).
+fn resolve_context_alias(input: &Value, host: &mut Host) -> Result<Option<String>, String> {
+    let Some(alias) = opt_str(input, "cluster") else {
+        return Ok(None);
+    };
+    let alias = alias.trim();
+    if alias.is_empty() {
+        return Ok(None);
+    }
+    let v = kubectl_json(host, &["config", "view"])?;
+    let names: Vec<String> = v
+        .get("contexts")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| c.get("name").and_then(|x| x.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    // Exact match wins outright (a caller who knows the full name is honored as-is).
+    if names.iter().any(|n| n == alias) {
+        return Ok(Some(alias.to_string()));
+    }
+    let alias_lc = alias.to_lowercase();
+    let matches: Vec<&String> = names
+        .iter()
+        .filter(|n| n.to_lowercase().contains(&alias_lc))
+        .collect();
+    match matches.len() {
+        0 => Err(format!(
+            "cluster alias `{alias}` matched no kubeconfig context (contexts: {})",
+            names.join(", ")
+        )),
+        1 => Ok(Some(matches[0].clone())),
+        _ => {
+            let matched: Vec<&str> = matches.iter().map(|s| s.as_str()).collect();
+            Err(format!(
+                "cluster alias `{alias}` is ambiguous — matched {} contexts: {}; refine the alias",
+                matches.len(),
+                matched.join(", ")
+            ))
+        }
+    }
+}
+
 /// Namespace scope for list ops: `-n <ns>` when set, else `--all-namespaces`.
 fn scope_args(input: &Value) -> Vec<String> {
     match opt_str(input, "namespace") {
@@ -604,13 +660,20 @@ fn cluster_test(input: Value, host: &mut Host) -> Result<Value, String> {
 /// `labels{}`) plus `score`/`reasons[]`. The host's broker deserializes these into
 /// `flux_secret::endpoint::EndpointCandidate`. Never emits a secret value — only a credential
 /// *reference* (`kubernetes/<ns>/<secret>/<key>`).
-fn endpoint_discover(input: Value, host: &mut Host) -> Result<Value, String> {
+fn endpoint_discover(mut input: Value, host: &mut Host) -> Result<Value, String> {
     let product = opt_str(&input, "product").unwrap_or("").to_lowercase();
     let limit = input.get("limit").and_then(|x| x.as_u64()).unwrap_or(50) as usize;
 
     // `product == kubernetes` is the cluster-discovery path: one endpoint per kubeconfig context.
     if product == "kubernetes" {
         return discover_clusters(host, limit);
+    }
+
+    // Resolve a short `cluster` alias (e.g. "dev") to the concrete kubeconfig context once, then
+    // inject it as `context` so every downstream `ctx_args` call targets the resolved cluster. A
+    // multi-match / unknown alias is a loud error here rather than a silent empty result.
+    if let Some(concrete) = resolve_context_alias(&input, host)? {
+        input["context"] = json!(concrete);
     }
 
     let namespaces = resolve_namespaces(&input, host)?;
@@ -743,16 +806,16 @@ fn resolve_namespaces(input: &Value, host: &mut Host) -> Result<Vec<String>, Str
     Ok(Vec::new())
 }
 
-/// Whether the caller asked for the "latest" namespace (`latest_namespace:true` or `query` ~ "latest").
+/// Whether the caller asked for the "latest" namespace. Only the explicit `latest_namespace: true`
+/// flag triggers the newest-namespace heuristic — a free-text `query` containing "latest" no longer
+/// does (the s_251 ambiguity: "namespace=latest" meant a literal name but the substring heuristic
+/// reinterpreted it as "newest namespace"). A literal namespace named `latest` is just
+/// `namespace: "latest"`.
 fn wants_latest(input: &Value) -> bool {
-    if input
+    input
         .get("latest_namespace")
         .and_then(|x| x.as_bool())
         .unwrap_or(false)
-    {
-        return true;
-    }
-    opt_str(input, "query").is_some_and(|q| q.to_lowercase().contains("latest"))
 }
 
 /// The namespace with the newest `metadata.creationTimestamp` (RFC3339, lexicographically sortable).
@@ -2050,8 +2113,10 @@ mod tests {
 
     #[test]
     fn endpoint_discover_selects_latest_namespace() {
-        // With query="latest" and no explicit namespace, the newest namespace by creationTimestamp is
-        // chosen, then matched services in THAT namespace become candidates.
+        // With `latest_namespace: true` and no explicit namespace, the newest namespace by
+        // creationTimestamp is chosen, then matched services in THAT namespace become candidates.
+        // (The free-text `query` no longer triggers this heuristic — see
+        // `literal_latest_namespace_preferred_over_heuristic`.)
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
             .with_process(
@@ -2069,13 +2134,110 @@ mod tests {
         let out = plugin
             .call(
                 "kubernetes.endpoint.discover",
-                json!({ "product": "postgres", "query": "my latest namespace backend" }),
+                json!({ "product": "postgres", "latest_namespace": true }),
                 &mut host,
             )
             .unwrap();
         let c = &out["candidates"][0];
         assert_eq!(c["id"], "@endpoint/team-new-postgres");
         assert_eq!(c["labels"]["namespace"], "team-new");
+    }
+
+    /// A short `cluster` alias resolves to the concrete kubeconfig context and discovery runs
+    /// against *that* cluster — not the current one. The s_251 failure: `"dev"` is not a real
+    /// kubeconfig context (the real ones are long ARN-like names), so the op either passed it
+    /// literally to `kubectl --context` (→ kubectl error) or — through the broker — never set
+    /// `context` at all and queried the current cluster. Today `cluster` is ignored, so discovery
+    /// runs against the *current* context (prod here) and finds nothing.
+    #[test]
+    fn cluster_alias_resolves_to_concrete_context() {
+        let plugin = manifest_builder().build();
+        // kubeconfig: `dev-eu` and `prod-eu` contexts; `prod-eu` is current (mirrors the ARN case
+        // from s_251, shortened for readability — the resolution logic is substring-based either way).
+        let mut host = MockHost::default().with_process(
+            "config view",
+            r#"{"current-context":"prod-eu","contexts":[
+                {"name":"dev-eu","context":{"cluster":"c-dev","user":"u"}},
+                {"name":"prod-eu","context":{"cluster":"c-prod","user":"u"}}]}"#,
+        );
+        // The resolved-dev-context calls must return the backend postgres service; the no-context
+        // (current/prod) calls return nothing. MockHost matches the first registered substring, so
+        // register the dev-context-specific entries before the bare fallbacks.
+        host = host
+            .with_process(
+                "get services --context dev-eu",
+                r#"{"items":[{"metadata":{"name":"postgres","namespace":"backend"},"spec":{"ports":[{"port":5432}]}}]}"#,
+            )
+            .with_process("get ingress --context dev-eu", r#"{"items":[]}"#)
+            .with_process("get secrets --context dev-eu", r#"{"items":[]}"#)
+            // Fallbacks for the current-context (prod) path — today's behavior.
+            .with_process("get services", r#"{"items":[]}"#)
+            .with_process("get ingress", r#"{"items":[]}"#)
+            .with_process("get secrets", r#"{"items":[]}"#);
+        let out = plugin
+            .call(
+                "kubernetes.endpoint.discover",
+                json!({ "product": "postgres", "cluster": "dev" }),
+                &mut host,
+            )
+            .unwrap();
+        let cands = out["candidates"].as_array().unwrap();
+        assert!(
+            !cands.is_empty(),
+            "cluster=`dev` resolves to the dev-eu context and finds the backend postgres"
+        );
+        let c = &cands[0];
+        assert_eq!(c["id"], "@endpoint/backend-postgres");
+        assert_eq!(c["labels"]["namespace"], "backend");
+    }
+
+    /// A literal namespace named `latest` is found instead of the newest-namespace heuristic
+    /// misfiring on the word "latest". The s_251 ambiguity: the user wrote `namespace=latest` meaning
+    /// a literal namespace, but the free-text `query` substring heuristic reinterpreted it as "newest
+    /// namespace by creation time" and searched the wrong namespace. After retiring the substring
+    /// heuristic, `query` no longer triggers it — a literal `latest` namespace's endpoints surface
+    /// instead of being silently dropped.
+    #[test]
+    fn literal_latest_namespace_preferred_over_heuristic() {
+        let plugin = manifest_builder().build();
+        // `latest` is an OLDER namespace that nonetheless holds the backend postgres service; the
+        // newer `team-new` namespace has none. Today the substring heuristic picks `team-new` (newest)
+        // and finds nothing — the literal `latest` namespace is never searched.
+        let mut host = MockHost::default()
+            // The heuristic path (today) lists namespaces and picks team-new.
+            .with_process(
+                "get namespaces",
+                r#"{"items":[
+                    {"metadata":{"name":"latest","creationTimestamp":"2024-01-01T00:00:00Z"}},
+                    {"metadata":{"name":"team-new","creationTimestamp":"2026-06-01T00:00:00Z"}}]}"#,
+            )
+            // Today's heuristic searches team-new (empty).
+            .with_process("get services -n team-new", r#"{"items":[]}"#)
+            .with_process("get ingress -n team-new", r#"{"items":[]}"#)
+            .with_process("get secrets -n team-new", r#"{"items":[]}"#)
+            // After retiring the substring heuristic, `query` no longer sets a namespace, so discovery
+            // is `--all-namespaces` and the postgres in the literal `latest` namespace surfaces.
+            .with_process(
+                "get services --all-namespaces",
+                r#"{"items":[{"metadata":{"name":"postgres","namespace":"latest"},"spec":{"ports":[{"port":5432}]}}]}"#,
+            )
+            .with_process("get ingress --all-namespaces", r#"{"items":[]}"#)
+            .with_process("get secrets --all-namespaces", r#"{"items":[]}"#);
+        let out = plugin
+            .call(
+                "kubernetes.endpoint.discover",
+                json!({ "product": "postgres", "query": "latest backend" }),
+                &mut host,
+            )
+            .unwrap();
+        let cands = out["candidates"].as_array().unwrap();
+        assert!(
+            !cands.is_empty(),
+            "the literal `latest` namespace's endpoint surfaces (not the heuristic's newest)"
+        );
+        let c = &cands[0];
+        assert_eq!(c["id"], "@endpoint/latest-postgres");
+        assert_eq!(c["labels"]["namespace"], "latest");
     }
 
     #[test]
