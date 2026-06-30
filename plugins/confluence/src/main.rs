@@ -286,41 +286,56 @@ fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
 // Auth + base-URL selection (faithful to fluxplane's client.go `do`/NewLiveClient)
 // ---------------------------------------------------------------------------
 
-/// The auth purpose + base URL for one request. fluxplane chooses the gateway base when a cloud id is
-/// resolvable and otherwise the endpoint_ref; flux additionally falls back to Basic against the site URL
-/// when an email is configured but no cloud id is.
+/// Where a request is routed. The cloud_id path builds a CONSTRUCTED gateway URL from a config value
+/// (not a declared endpoint), so it can only be expressed as an absolute URL; the site path is the
+/// declared manifest endpoint, addressed by its named reference so the host (not the plugin) holds the
+/// URL.
+enum Base {
+    /// A constructed absolute base URL (no trailing slash) — the Atlassian gateway. JSON IO joins
+    /// `path` onto it; byte IO (`http_bytes`) uses it directly.
+    Url(String),
+    /// A named manifest endpoint reference (`confluence.endpoint`) the host resolves to the site base.
+    Ref(&'static str),
+}
+
+/// The auth purpose + routing base for one request. fluxplane chooses the gateway base when a cloud id
+/// is resolvable and otherwise the endpoint_ref; flux additionally falls back to Basic against the site
+/// URL when an email is configured but no cloud id is.
 struct AuthCtx {
-    /// Absolute base URL (no trailing slash) requests are joined onto.
-    base: String,
+    /// How the request is routed (constructed gateway URL vs. named site endpoint ref).
+    base: Base,
     /// The auth-method purpose the host injects (`api_token` Bearer or `basic`).
     purpose: &'static str,
 }
 
-/// Resolve the per-request auth + base URL, mirroring fluxplane's `NewLiveClient` + `do` selection.
+/// Resolve the per-request auth + routing base, mirroring fluxplane's `NewLiveClient` + `do` selection.
 fn auth_ctx(host: &mut Host) -> Result<AuthCtx, String> {
-    // cloud_id → Atlassian gateway + Bearer (the reference's primary path).
+    // cloud_id → Atlassian gateway + Bearer (the reference's primary path). The gateway base is built
+    // from the cloud-id config value, so it stays an absolute URL (not a declared endpoint ref).
     if let Ok(cloud) = host.secret("cloud_id") {
         let cloud = cloud.trim();
         if !cloud.is_empty() {
             return Ok(AuthCtx {
-                base: format!(
+                base: Base::Url(format!(
                     "https://api.atlassian.com/ex/confluence/{}",
                     urlencode(cloud)
-                ),
+                )),
                 purpose: "api_token",
             });
         }
     }
-    // No cloud id: requests target the configured site URL (endpoint_ref).
-    let base = host.endpoint("confluence.endpoint")?;
-    let base = base.trim_end_matches('/').to_string();
+    // No cloud id: requests target the configured site URL by named endpoint reference — the host
+    // resolves the ref to a base and joins the path, so the plugin never holds the URL.
     // An email being configured selects Basic (fallback); otherwise Bearer against the site URL.
     let purpose = if email_is_set(host) {
         "basic"
     } else {
         "api_token"
     };
-    Ok(AuthCtx { base, purpose })
+    Ok(AuthCtx {
+        base: Base::Ref("confluence.endpoint"),
+        purpose,
+    })
 }
 
 /// Whether a Basic-auth email is configured. Probed via the `basic_email` purpose (the same email env
@@ -375,26 +390,54 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-/// GET `{base}{path}` with the request-time auth (cloud_id→Bearer/gateway, else Basic/Bearer/site);
-/// returns the parsed JSON.
+/// Resolve a [`Base`] + relative `path` into an absolute URL for the **byte-exact** HTTP path
+/// ([`Host::http_bytes`]), which the JSON ref helpers can't cover: `http_bytes` has no ref-based
+/// variant, so a byte upload/download needs a concrete URL. The gateway base is already absolute; the
+/// site path materializes its base URL via the host's endpoint resolver. This is the one residual
+/// `host.endpoint` use — confined to attachment byte IO — until host-kit grows an `http_bytes_ref`.
+fn byte_io_url(host: &mut Host, base: &Base, path: &str) -> Result<String, String> {
+    match base {
+        Base::Url(b) => Ok(format!("{b}{path}")),
+        Base::Ref(r) => {
+            let site = host.endpoint(r)?;
+            Ok(format!("{}{path}", site.trim_end_matches('/')))
+        }
+    }
+}
+
+/// GET `path` with the request-time auth (cloud_id→Bearer/gateway, else Basic/Bearer/site); returns
+/// the parsed JSON. Site requests address the endpoint by reference (host-resolved URL); gateway
+/// requests join the path onto the constructed gateway URL.
 fn cf_get(host: &mut Host, path: &str) -> Result<Value, String> {
     let ctx = auth_ctx(host)?;
-    let url = format!("{}{}", ctx.base, path);
-    host.get_json(&url, Some(ctx.purpose))
+    match ctx.base {
+        Base::Ref(r) => host.get_json_ref(r, path, Some(ctx.purpose)),
+        Base::Url(b) => host.get_json(&format!("{b}{path}"), Some(ctx.purpose)),
+    }
 }
 
-/// Send a JSON body to `{base}{path}` with the request-time auth; returns the parsed JSON.
+/// Send a JSON body to `path` with the request-time auth; returns the parsed JSON.
 fn cf_send(host: &mut Host, method: &str, path: &str, body: &Value) -> Result<Value, String> {
     let ctx = auth_ctx(host)?;
-    let url = format!("{}{}", ctx.base, path);
-    host.send_json(method, &url, Some(ctx.purpose), body)
+    match ctx.base {
+        Base::Ref(r) => host.send_json_ref(r, method, path, Some(ctx.purpose), body),
+        Base::Url(b) => host.send_json(method, &format!("{b}{path}"), Some(ctx.purpose), body),
+    }
 }
 
-/// DELETE `{base}{path}` (Confluence returns 204 / an empty body, so we don't parse it).
+/// DELETE `path` (Confluence returns 204 / an empty body, so we don't parse it).
 fn cf_delete(host: &mut Host, path: &str) -> Result<(), String> {
     let ctx = auth_ctx(host)?;
-    let url = format!("{}{}", ctx.base, path);
-    let resp = host.http("DELETE", &url, Some(ctx.purpose), &[], None)?;
+    let resp = match ctx.base {
+        Base::Ref(r) => host.http_ref(r, "DELETE", path, Some(ctx.purpose), None)?,
+        Base::Url(b) => host.http(
+            "DELETE",
+            &format!("{b}{path}"),
+            Some(ctx.purpose),
+            &[],
+            None,
+        )?,
+    };
     if !resp.is_success() {
         return Err(format!(
             "confluence DELETE {path} → {} {}",
@@ -1623,11 +1666,15 @@ fn attachment_add(input: Value, host: &mut Host) -> Result<Value, String> {
     let body = multipart_file(boundary, &filename, content_type, &data);
     let ct = format!("multipart/form-data; boundary={boundary}");
     let ctx = auth_ctx(host)?;
-    let url = format!(
-        "{}/wiki/rest/api/content/{}/child/attachment",
-        ctx.base,
+    let path = format!(
+        "/wiki/rest/api/content/{}/child/attachment",
         urlencode(&page_id)
     );
+    // Byte uploads need an absolute URL: `http_bytes` has no ref-based variant. The gateway base is a
+    // constructed absolute URL, so it is used directly; the site path must materialize the base URL
+    // (the host resolves the named endpoint) since byte IO cannot ride the ref path — this is the one
+    // residual `host.endpoint` use, scoped to byte attachment IO, until host-kit gains `http_bytes_ref`.
+    let url = byte_io_url(host, &ctx.base, &path)?;
     let resp = host.http_bytes(
         "POST",
         &url,
@@ -1727,8 +1774,10 @@ fn attachment_get(input: Value, host: &mut Host) -> Result<Value, String> {
     };
 
     // Byte-exact download via the binary HTTP path → host blob (mirrors fluxplane's `getBytes`).
+    // Same constraint as the upload path: `http_bytes` needs an absolute URL and has no ref variant,
+    // so `byte_io_url` materializes the base (gateway directly, site via the host endpoint resolver).
     let ctx = auth_ctx(host)?;
-    let url = format!("{}{}", ctx.base, dl_path);
+    let url = byte_io_url(host, &ctx.base, &dl_path)?;
     let resp = host.http_bytes("GET", &url, Some(ctx.purpose), &[], None, true)?;
     if !(200..300).contains(&resp.status) {
         return Err(format!(
@@ -2017,7 +2066,11 @@ mod tests {
     use super::*;
 
     fn host() -> MockHost {
-        MockHost::default().with_endpoint("confluence.endpoint", "https://x.atlassian.net")
+        // JSON IO resolves the named ref (`with_endpoint_ref`); byte-exact attachment IO has no ref
+        // variant and materializes the site base via the host endpoint resolver (`with_endpoint`).
+        MockHost::default()
+            .with_endpoint_ref("confluence.endpoint", "https://x.atlassian.net")
+            .with_endpoint("confluence.endpoint", "https://x.atlassian.net")
     }
 
     #[test]
@@ -2079,6 +2132,8 @@ mod tests {
 
     #[test]
     fn attachment_add_uploads_from_a_blob() {
+        // Byte-exact uploads (no ref-based HTTP variant) materialize the site base via the host
+        // endpoint resolver — same site path as the JSON ops, exercised with no cloud_id.
         let plugin = manifest_builder().build();
         let mut host = host().with_http(
             "/child/attachment",
@@ -2139,6 +2194,7 @@ mod tests {
 
     #[test]
     fn attachment_get_downloads_into_a_blob() {
+        // Byte-exact downloads materialize the site base via the host endpoint resolver (no ref variant).
         let plugin = manifest_builder().build();
         let mut host = host()
             .with_http(

@@ -394,27 +394,19 @@ fn auth_purpose(host: &mut Host) -> Option<&'static str> {
 // HTTP plumbing
 // ---------------------------------------------------------------------------
 
-fn gf_base(host: &mut Host) -> Result<String, String> {
-    host.endpoint("grafana.endpoint")
-        .map(|u| u.trim_end_matches('/').to_string())
-}
-
 fn gf_get(host: &mut Host, path: &str) -> Result<Value, String> {
-    let base = gf_base(host)?;
     let ap = auth_purpose(host);
-    host.get_json(&format!("{base}{path}"), ap)
+    host.get_json_ref("grafana.endpoint", path, ap)
 }
 
 fn gf_post(host: &mut Host, path: &str, body: &Value) -> Result<Value, String> {
-    let base = gf_base(host)?;
     let ap = auth_purpose(host);
-    host.send_json("POST", &format!("{base}{path}"), ap, body)
+    host.send_json_ref("grafana.endpoint", "POST", path, ap, body)
 }
 
 fn gf_delete(host: &mut Host, path: &str) -> Result<(), String> {
-    let base = gf_base(host)?;
     let ap = auth_purpose(host);
-    let resp = host.http("DELETE", &format!("{base}{path}"), ap, &[], None)?;
+    let resp = host.http_ref("grafana.endpoint", "DELETE", path, ap, None)?;
     if !resp.is_success() {
         return Err(format!("DELETE {path} → {} {}", resp.status, resp.body));
     }
@@ -1429,7 +1421,6 @@ fn contribute_annotations(host: &mut Host, base_url: &str, annotations: &[Value]
 // ---------------------------------------------------------------------------
 
 fn op_test(_input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = gf_base(host)?;
     let mut healthy = false;
     let mut version = String::new();
     let mut database = String::new();
@@ -1440,7 +1431,7 @@ fn op_test(_input: Value, host: &mut Host) -> Result<Value, String> {
     let mut hint = String::new();
 
     // Unauthenticated health probe
-    match host.http("GET", &format!("{base}/api/health"), None, &[], None) {
+    match host.http_ref("grafana.endpoint", "GET", "/api/health", None, None) {
         Ok(resp) if resp.is_success() => {
             if let Ok(v) = resp.json() {
                 database = v
@@ -1468,7 +1459,7 @@ fn op_test(_input: Value, host: &mut Host) -> Result<Value, String> {
 
     // Authenticated /api/org probe
     let ap = auth_purpose(host);
-    match host.http("GET", &format!("{base}/api/org"), ap, &[], None) {
+    match host.http_ref("grafana.endpoint", "GET", "/api/org", ap, None) {
         Ok(resp) if resp.is_success() => {
             if let Ok(v) = resp.json() {
                 org_name = v
@@ -1494,14 +1485,13 @@ fn op_test(_input: Value, host: &mut Host) -> Result<Value, String> {
     }
 
     Ok(json!({
-        "url": base, "healthy": healthy, "version": version, "database": database,
+        "url": "grafana.endpoint", "healthy": healthy, "version": version, "database": database,
         "authenticated": authenticated, "org_name": org_name,
         "health_error": health_error, "auth_error": auth_error, "hint": hint
     }))
 }
 
 fn op_datasource_list(_input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = gf_base(host)?;
     let datasources = fetch_datasources(host)?;
     // Build clusters and types maps
     let mut clusters: Map<String, Value> = Map::new();
@@ -1545,19 +1535,18 @@ fn op_datasource_list(_input: Value, host: &mut Host) -> Result<Value, String> {
         })
         .collect();
     Ok(json!({
-        "url": base, "count": count,
+        "url": "grafana.endpoint", "count": count,
         "datasources": ds_with_cluster,
         "clusters": clusters, "types": types
     }))
 }
 
 fn op_datasource_health(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = gf_base(host)?;
     let uid = flex_str(&input, "uid").ok_or("`uid` required")?;
     let path = format!("/api/datasources/uid/{uid}/health");
     match gf_get(host, &path) {
         Ok(v) => Ok(json!({
-            "url": base, "uid": uid,
+            "url": "grafana.endpoint", "uid": uid,
             "status": v.get("status").and_then(|v| v.as_str()).unwrap_or(""),
             "message": v.get("message").and_then(|v| v.as_str()).unwrap_or(""),
             "source": "datasource_health"
@@ -1567,13 +1556,13 @@ fn op_datasource_health(input: Value, host: &mut Host) -> Result<Value, String> 
             let proxy = proxy_path(&uid, "/api/v2/status");
             match gf_get(host, &proxy) {
                 Ok(_) => Ok(json!({
-                    "url": base, "uid": uid,
+                    "url": "grafana.endpoint", "uid": uid,
                     "status": "OK",
                     "message": "alertmanager status endpoint reachable",
                     "source": "alertmanager_status"
                 })),
                 Err(e) => Ok(json!({
-                    "url": base, "uid": uid,
+                    "url": "grafana.endpoint", "uid": uid,
                     "status": "error", "error": e,
                     "source": "alertmanager_status"
                 })),
@@ -1583,7 +1572,6 @@ fn op_datasource_health(input: Value, host: &mut Host) -> Result<Value, String> 
 }
 
 fn op_folder_list(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = gf_base(host)?;
     let limit = flex_i64(&input, "limit").unwrap_or(0);
     let path = if limit > 0 {
         format!("/api/folders?limit={limit}")
@@ -1592,11 +1580,10 @@ fn op_folder_list(input: Value, host: &mut Host) -> Result<Value, String> {
     };
     let folders = gf_get(host, &path)?;
     let arr = folders.as_array().cloned().unwrap_or_default();
-    Ok(json!({ "url": base, "count": arr.len(), "folders": arr }))
+    Ok(json!({ "url": "grafana.endpoint", "count": arr.len(), "folders": arr }))
 }
 
 fn op_dashboard_list(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = gf_base(host)?;
     let query = flex_str(&input, "query").unwrap_or_default();
     let folder_uid = flex_str(&input, "folder_uid").unwrap_or_default();
     let tags = flex_arr(&input, "tags");
@@ -1625,12 +1612,11 @@ fn op_dashboard_list(input: Value, host: &mut Host) -> Result<Value, String> {
     };
     let dashboards_raw = gf_get(host, &path)?;
     let dashboards: Vec<Value> = dashboards_raw.as_array().cloned().unwrap_or_default();
-    contribute_dashboards(host, &base, &dashboards);
-    Ok(json!({ "url": base, "count": dashboards.len(), "dashboards": dashboards }))
+    contribute_dashboards(host, "grafana.endpoint", &dashboards);
+    Ok(json!({ "url": "grafana.endpoint", "count": dashboards.len(), "dashboards": dashboards }))
 }
 
 fn op_dashboard_get(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = gf_base(host)?;
     let uid = flex_str(&input, "uid").ok_or("`uid` required")?;
     let raw = gf_get(host, &format!("/api/dashboards/uid/{uid}"))?;
     let dashboard_raw = raw.get("dashboard").cloned().unwrap_or(raw.clone());
@@ -1651,14 +1637,13 @@ fn op_dashboard_get(input: Value, host: &mut Host) -> Result<Value, String> {
         .unwrap_or_default();
     let (panels, queries) = extract_dashboard_panels(&panels_raw, vec![]);
     Ok(json!({
-        "url": base, "uid": db_uid, "title": title,
+        "url": "grafana.endpoint", "uid": db_uid, "title": title,
         "panels": panels, "queries": queries,
         "dashboard": dashboard_raw
     }))
 }
 
 fn op_annotation_list(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = gf_base(host)?;
     let mut pairs: Vec<(&str, String)> = vec![];
     if let Some(since) = flex_str(&input, "since") {
         let t = parse_time(&since)?;
@@ -1702,12 +1687,11 @@ fn op_annotation_list(input: Value, host: &mut Host) -> Result<Value, String> {
             "panel_id": a.get("panelId").and_then(|v| v.as_i64()).unwrap_or(0)
         })
     }).collect();
-    contribute_annotations(host, &base, &annotations);
-    Ok(json!({ "url": base, "annotations": annotations, "count": annotations.len() }))
+    contribute_annotations(host, "grafana.endpoint", &annotations);
+    Ok(json!({ "url": "grafana.endpoint", "annotations": annotations, "count": annotations.len() }))
 }
 
 fn op_annotation_add(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = gf_base(host)?;
     let text = flex_str(&input, "text").ok_or("`text` required")?;
     let now = now_unix();
     let ann_time_ms = if let Some(t) = flex_str(&input, "time") {
@@ -1739,14 +1723,13 @@ fn op_annotation_add(input: Value, host: &mut Host) -> Result<Value, String> {
     }
     let resp = gf_post(host, "/api/annotations", &Value::Object(body))?;
     Ok(json!({
-        "url": base,
+        "url": "grafana.endpoint",
         "id": resp.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
         "message": resp.get("message").and_then(|v| v.as_str()).unwrap_or("")
     }))
 }
 
 fn op_loki_labels(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = gf_base(host)?;
     let cluster = flex_str(&input, "cluster").unwrap_or_default();
     let explicit_uid = flex_str(&input, "uid").unwrap_or_default();
     let label = flex_str(&input, "label").unwrap_or_default();
@@ -1784,13 +1767,12 @@ fn op_loki_labels(input: Value, host: &mut Host) -> Result<Value, String> {
         .unwrap_or_default();
     values.sort();
     Ok(json!({
-        "url": base, "uid": uid, "cluster": cluster, "label": label,
+        "url": "grafana.endpoint", "uid": uid, "cluster": cluster, "label": label,
         "values": values
     }))
 }
 
 fn op_loki_query(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = gf_base(host)?;
     let query = flex_str(&input, "query").ok_or("`query` required")?;
     let cluster = flex_str(&input, "cluster").unwrap_or_default();
     let explicit_uid = flex_str(&input, "uid").unwrap_or_default();
@@ -1819,7 +1801,12 @@ fn op_loki_query(input: Value, host: &mut Host) -> Result<Value, String> {
     let full_path = format!("{}?{}", proxy_path(&uid, "/loki/api/v1/query_range"), q);
     let raw = gf_get(host, &full_path)?;
     Ok(parse_loki_response(
-        &base, &uid, &cluster, &query, limit, &raw,
+        "grafana.endpoint",
+        &uid,
+        &cluster,
+        &query,
+        limit,
+        &raw,
     ))
 }
 
@@ -1850,7 +1837,6 @@ fn escape_logql(s: &str) -> String {
 }
 
 fn op_prometheus_query(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = gf_base(host)?;
     let query = flex_str(&input, "query").ok_or("`query` required")?;
     let cluster = flex_str(&input, "cluster").unwrap_or_default();
     let explicit_uid = flex_str(&input, "uid").unwrap_or_default();
@@ -1877,14 +1863,13 @@ fn op_prometheus_query(input: Value, host: &mut Host) -> Result<Value, String> {
     let (samples, series, truncated) = parse_promql_data(&result_type, &result);
     let count = samples.len() + series.len();
     Ok(json!({
-        "url": base, "uid": uid, "cluster": cluster, "query": query,
+        "url": "grafana.endpoint", "uid": uid, "cluster": cluster, "query": query,
         "result_type": result_type, "samples": samples, "series": series,
         "count": count, "truncated": truncated
     }))
 }
 
 fn op_prometheus_range(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = gf_base(host)?;
     let query = flex_str(&input, "query").ok_or("`query` required")?;
     let cluster = flex_str(&input, "cluster").unwrap_or_default();
     let explicit_uid = flex_str(&input, "uid").unwrap_or_default();
@@ -1920,14 +1905,13 @@ fn op_prometheus_range(input: Value, host: &mut Host) -> Result<Value, String> {
     let (samples, series, truncated) = parse_promql_data(&result_type, &result);
     let count = samples.len() + series.len();
     Ok(json!({
-        "url": base, "uid": uid, "cluster": cluster, "query": query,
+        "url": "grafana.endpoint", "uid": uid, "cluster": cluster, "query": query,
         "result_type": result_type, "samples": samples, "series": series,
         "count": count, "truncated": truncated
     }))
 }
 
 fn op_prometheus_rules(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = gf_base(host)?;
     let cluster = flex_str(&input, "cluster").unwrap_or_default();
     let explicit_uid = flex_str(&input, "uid").unwrap_or_default();
     let datasources = fetch_datasources(host)?;
@@ -1958,13 +1942,12 @@ fn op_prometheus_rules(input: Value, host: &mut Host) -> Result<Value, String> {
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
     Ok(json!({
-        "url": base, "uid": uid, "cluster": cluster,
+        "url": "grafana.endpoint", "uid": uid, "cluster": cluster,
         "groups": groups, "group_count": group_count, "rule_count": rule_count
     }))
 }
 
 fn op_alerts_active(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = gf_base(host)?;
     let cluster = flex_str(&input, "cluster").unwrap_or_default();
     let explicit_uid = flex_str(&input, "uid").unwrap_or_default();
     let severity = flex_str(&input, "severity").unwrap_or_default();
@@ -1990,12 +1973,11 @@ fn op_alerts_active(input: Value, host: &mut Host) -> Result<Value, String> {
         });
     }
     Ok(
-        json!({ "url": base, "uid": uid, "cluster": cluster, "count": alerts.len(), "alerts": alerts }),
+        json!({ "url": "grafana.endpoint", "uid": uid, "cluster": cluster, "count": alerts.len(), "alerts": alerts }),
     )
 }
 
 fn op_alerts_silences_list(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = gf_base(host)?;
     let cluster = flex_str(&input, "cluster").unwrap_or_default();
     let explicit_uid = flex_str(&input, "uid").unwrap_or_default();
     let filters = flex_arr(&input, "filter");
@@ -2017,12 +1999,11 @@ fn op_alerts_silences_list(input: Value, host: &mut Host) -> Result<Value, Strin
     let raw = gf_get(host, &full_path)?;
     let silences = parse_silences(&raw);
     Ok(
-        json!({ "url": base, "uid": uid, "cluster": cluster, "silences": silences, "count": silences.len() }),
+        json!({ "url": "grafana.endpoint", "uid": uid, "cluster": cluster, "silences": silences, "count": silences.len() }),
     )
 }
 
 fn op_alerts_silences_create(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = gf_base(host)?;
     let cluster = flex_str(&input, "cluster").unwrap_or_default();
     let explicit_uid = flex_str(&input, "uid").unwrap_or_default();
     let matchers_raw = input
@@ -2069,21 +2050,20 @@ fn op_alerts_silences_create(input: Value, host: &mut Host) -> Result<Value, Str
         "createdBy": created_by,
         "comment": comment
     });
-    let ap = auth_purpose(host);
-    let base_url = gf_base(host)?;
     let full_path = proxy_path(&uid, "/api/v2/silences");
-    let resp = host.send_json("POST", &format!("{base_url}{full_path}"), ap, &body)?;
+    let resp = gf_post(host, &full_path, &body)?;
     let silence_id = resp
         .get("silenceID")
         .or_else(|| resp.get("id"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    Ok(json!({ "url": base, "uid": uid, "cluster": cluster, "silence_id": silence_id }))
+    Ok(
+        json!({ "url": "grafana.endpoint", "uid": uid, "cluster": cluster, "silence_id": silence_id }),
+    )
 }
 
 fn op_alerts_silences_delete(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = gf_base(host)?;
     let cluster = flex_str(&input, "cluster").unwrap_or_default();
     let explicit_uid = flex_str(&input, "uid").unwrap_or_default();
     let silence_id = flex_str(&input, "silence_id").ok_or("`silence_id` required")?;
@@ -2092,12 +2072,11 @@ fn op_alerts_silences_delete(input: Value, host: &mut Host) -> Result<Value, Str
     let path = proxy_path(&uid, &format!("/api/v2/silence/{}", urlencode(&silence_id)));
     gf_delete(host, &path)?;
     Ok(
-        json!({ "url": base, "uid": uid, "cluster": cluster, "silence_id": silence_id, "deleted": true }),
+        json!({ "url": "grafana.endpoint", "uid": uid, "cluster": cluster, "silence_id": silence_id, "deleted": true }),
     )
 }
 
 fn op_tempo_search(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = gf_base(host)?;
     let explicit_uid = flex_str(&input, "uid").unwrap_or_default();
     let datasources = fetch_datasources(host)?;
     let uid = resolve_uid(&datasources, "tempo", "", &explicit_uid)?;
@@ -2132,13 +2111,12 @@ fn op_tempo_search(input: Value, host: &mut Host) -> Result<Value, String> {
     let data = unwrap_data(raw);
     let traces = parse_tempo_search(&data);
     Ok(json!({
-        "url": base, "uid": uid, "query": query,
+        "url": "grafana.endpoint", "uid": uid, "query": query,
         "traces": traces, "count": traces.len()
     }))
 }
 
 fn op_tempo_trace_get(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = gf_base(host)?;
     let trace_id = flex_str(&input, "trace_id").ok_or("`trace_id` required")?;
     let explicit_uid = flex_str(&input, "uid").unwrap_or_default();
     let datasources = fetch_datasources(host)?;
@@ -2148,7 +2126,7 @@ fn op_tempo_trace_get(input: Value, host: &mut Host) -> Result<Value, String> {
     let data = unwrap_data(raw);
     let (spans, services, root_span, duration_ms, truncated) = parse_tempo_trace(&data);
     Ok(json!({
-        "url": base, "uid": uid, "trace_id": trace_id,
+        "url": "grafana.endpoint", "uid": uid, "trace_id": trace_id,
         "root_span": root_span, "services": services,
         "span_count": spans.len(), "duration_ms": duration_ms,
         "spans": spans, "truncated": truncated
@@ -2169,7 +2147,7 @@ mod tests {
 
     fn base_host() -> MockHost {
         MockHost::default()
-            .with_endpoint("grafana.endpoint", "https://grafana.example.com")
+            .with_endpoint_ref("grafana.endpoint", "https://grafana.example.com")
             .with_secret("api_token", "glsa_test")
     }
 

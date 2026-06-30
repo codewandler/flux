@@ -1,8 +1,9 @@
 //! `slack` — a flux integration plugin for the Slack Web API: token info, messaging, threads, search,
 //! reactions, channels, files (via host blobs), bookmarks, users, presence, and emoji. Authenticates
 //! with tokens injected as bearer headers — purpose `bot_token` for most calls, `user_token` for the
-//! search-scoped reads (search/mentions/unreads) and presence writes. The base URL is the
-//! `slack.endpoint` (defaults to `https://slack.com/api`). List ops contribute datasource records
+//! search-scoped reads (search/mentions/unreads) and presence writes. Every call goes through the host
+//! by endpoint reference (`slack.endpoint`, base URL from the required `SLACK_API_URL` env) plus the
+//! method path — the plugin never composes a URL. List ops contribute datasource records
 //! (`slack.channel` / `slack.user`) so the agent can search them; `slack.index.build` rebuilds both.
 //!
 //! Slack replies are JSON carrying an `"ok": bool`; a falsey `ok` is surfaced as an error built from the
@@ -402,12 +403,22 @@ fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
     }
 }
 
-/// Resolve the Slack API base URL (config), defaulting to the public endpoint; trailing slash trimmed.
-fn base_url(host: &mut Host) -> String {
-    host.endpoint("slack.endpoint")
-        .unwrap_or_else(|_| "https://slack.com/api".into())
-        .trim_end_matches('/')
-        .to_string()
+/// GET a Slack API `path` (joined onto the host-resolved `slack.endpoint` base) and parse the JSON.
+/// The host holds the URL; the plugin only ever names the endpoint ref and the method path.
+fn sl_get(host: &mut Host, path: &str, auth: Option<&str>) -> Result<Value, String> {
+    host.get_json_ref("slack.endpoint", path, auth)
+}
+
+/// Send a JSON body to a Slack API `path` (joined onto the host-resolved `slack.endpoint` base) and
+/// parse the response. The ref-based mirror of `host.send_json` — the URL stays host-side.
+fn sl_send(
+    host: &mut Host,
+    method: &str,
+    path: &str,
+    auth: Option<&str>,
+    body: &Value,
+) -> Result<Value, String> {
+    host.send_json_ref("slack.endpoint", method, path, auth, body)
 }
 
 /// Slack returns `{"ok": bool, …}`; treat a falsey `ok` as an error built from the `"error"` field.
@@ -519,11 +530,10 @@ fn resolve_ref(input: &Value) -> Result<(String, String), String> {
 // ---------------------------------------------------------------------------
 
 fn auth_test(_input: Value, host: &mut Host) -> Result<Value, String> {
-    let url = format!("{}/auth.test", base_url(host));
     let mut tokens = Vec::new();
     let mut ok_count = 0;
     for (role, purpose) in [("user", "user_token"), ("bot", "bot_token")] {
-        let entry = match host.send_json("POST", &url, Some(purpose), &json!({})) {
+        let entry = match sl_send(host, "POST", "/auth.test", Some(purpose), &json!({})) {
             Ok(v) if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) => {
                 ok_count += 1;
                 json!({
@@ -572,51 +582,64 @@ fn message_send(input: Value, host: &mut Host) -> Result<Value, String> {
     {
         body["reply_broadcast"] = json!(true);
     }
-    let url = format!("{}/chat.postMessage", base_url(host));
-    check_ok(host.send_json("POST", &url, Some("bot_token"), &body)?)
+    check_ok(sl_send(
+        host,
+        "POST",
+        "/chat.postMessage",
+        Some("bot_token"),
+        &body,
+    )?)
 }
 
 fn message_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let channel = req_str(&input, "channel")?;
     let limit = input.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
-    let mut url = format!(
-        "{}/conversations.history?channel={}&limit={limit}&inclusive=true",
-        base_url(host),
+    let mut path = format!(
+        "/conversations.history?channel={}&limit={limit}&inclusive=true",
         urlencode(channel),
     );
     for key in ["cursor", "oldest", "latest"] {
         if let Some(val) = opt_str(&input, key) {
-            url.push_str(&format!("&{key}={}", urlencode(val)));
+            path.push_str(&format!("&{key}={}", urlencode(val)));
         }
     }
-    check_ok(host.get_json(&url, Some("bot_token"))?)
+    check_ok(sl_get(host, &path, Some("bot_token"))?)
 }
 
 fn message_edit(input: Value, host: &mut Host) -> Result<Value, String> {
     let (channel, ts) = resolve_ref(&input)?;
     let text = req_str(&input, "text")?;
     let body = json!({ "channel": channel, "ts": ts, "text": text });
-    let url = format!("{}/chat.update", base_url(host));
-    check_ok(host.send_json("POST", &url, Some("bot_token"), &body)?)
+    check_ok(sl_send(
+        host,
+        "POST",
+        "/chat.update",
+        Some("bot_token"),
+        &body,
+    )?)
 }
 
 fn message_delete(input: Value, host: &mut Host) -> Result<Value, String> {
     let (channel, ts) = resolve_ref(&input)?;
     let body = json!({ "channel": channel, "ts": ts });
-    let url = format!("{}/chat.delete", base_url(host));
-    check_ok(host.send_json("POST", &url, Some("bot_token"), &body)?)
+    check_ok(sl_send(
+        host,
+        "POST",
+        "/chat.delete",
+        Some("bot_token"),
+        &body,
+    )?)
 }
 
 fn thread(input: Value, host: &mut Host) -> Result<Value, String> {
     let (channel, ts) = resolve_ref(&input)?;
     let limit = input.get("limit").and_then(|v| v.as_i64()).unwrap_or(100);
-    let url = format!(
-        "{}/conversations.replies?channel={}&ts={}&limit={limit}&inclusive=true",
-        base_url(host),
+    let path = format!(
+        "/conversations.replies?channel={}&ts={}&limit={limit}&inclusive=true",
         urlencode(&channel),
         urlencode(&ts),
     );
-    check_ok(host.get_json(&url, Some("bot_token"))?)
+    check_ok(sl_get(host, &path, Some("bot_token"))?)
 }
 
 // ---------------------------------------------------------------------------
@@ -626,12 +649,8 @@ fn thread(input: Value, host: &mut Host) -> Result<Value, String> {
 fn search(input: Value, host: &mut Host) -> Result<Value, String> {
     let query = req_str(&input, "query")?;
     let limit = input.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
-    let url = format!(
-        "{}/search.messages?query={}&count={limit}",
-        base_url(host),
-        urlencode(query),
-    );
-    check_ok(host.get_json(&url, Some("user_token"))?)
+    let path = format!("/search.messages?query={}&count={limit}", urlencode(query));
+    check_ok(sl_get(host, &path, Some("user_token"))?)
 }
 
 fn mentions(input: Value, host: &mut Host) -> Result<Value, String> {
@@ -639,8 +658,13 @@ fn mentions(input: Value, host: &mut Host) -> Result<Value, String> {
         Some(u) => u.to_string(),
         None => {
             // Fall back to the user-token identity.
-            let url = format!("{}/auth.test", base_url(host));
-            let me = check_ok(host.send_json("POST", &url, Some("user_token"), &json!({}))?)?;
+            let me = check_ok(sl_send(
+                host,
+                "POST",
+                "/auth.test",
+                Some("user_token"),
+                &json!({}),
+            )?)?;
             me.get("user_id")
                 .and_then(|v| v.as_str())
                 .ok_or("no `user` given and could not resolve the token identity")?
@@ -677,12 +701,8 @@ fn mentions(input: Value, host: &mut Host) -> Result<Value, String> {
     if !after_query.is_empty() {
         query.push_str(&format!(" after:{after_query}"));
     }
-    let url = format!(
-        "{}/search.messages?query={}&count={limit}",
-        base_url(host),
-        urlencode(&query),
-    );
-    let v = check_ok(host.get_json(&url, Some("user_token"))?)?;
+    let path = format!("/search.messages?query={}&count={limit}", urlencode(&query));
+    let v = check_ok(sl_get(host, &path, Some("user_token"))?)?;
     let messages = v.get("messages").cloned().unwrap_or(Value::Null);
     let total = messages
         .get("total")
@@ -944,9 +964,8 @@ fn collect_ticket_mentions(mentions: &[Value]) -> Vec<Value> {
 /// used by [`classify_mention`] to decide whether *we* have already handled a mention.
 fn own_user_ids(host: &mut Host) -> std::collections::HashSet<String> {
     let mut ids = std::collections::HashSet::new();
-    let url = format!("{}/auth.test", base_url(host));
     for purpose in ["user_token", "bot_token"] {
-        if let Ok(v) = host.send_json("POST", &url, Some(purpose), &json!({})) {
+        if let Ok(v) = sl_send(host, "POST", "/auth.test", Some(purpose), &json!({})) {
             if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
                 if let Some(uid) = v.get("user_id").and_then(|u| u.as_str()) {
                     let uid = uid.trim();
@@ -1001,13 +1020,12 @@ fn classify_mention(
     if root_ts.is_empty() || channel.is_empty() {
         return Ok(("pending", json!([])));
     }
-    let url = format!(
-        "{}/conversations.replies?channel={}&ts={}&limit={max_thread}&inclusive=true",
-        base_url(host),
+    let path = format!(
+        "/conversations.replies?channel={}&ts={}&limit={max_thread}&inclusive=true",
         urlencode(channel),
         urlencode(root_ts),
     );
-    let thread = check_ok(host.get_json(&url, Some("user_token"))?)?;
+    let thread = check_ok(sl_get(host, &path, Some("user_token"))?)?;
     let replies = thread
         .get("messages")
         .and_then(|m| m.as_array())
@@ -1065,14 +1083,13 @@ fn unreads(input: Value, host: &mut Host) -> Result<Value, String> {
     let mut channels = Vec::new();
     let mut cursor = String::new();
     while channels.len() < channel_cap {
-        let mut list_url = format!(
-            "{}/users.conversations?types=public_channel,private_channel,mpim,im&exclude_archived=true&limit=200",
-            base_url(host),
+        let mut list_path = String::from(
+            "/users.conversations?types=public_channel,private_channel,mpim,im&exclude_archived=true&limit=200",
         );
         if !cursor.is_empty() {
-            list_url.push_str(&format!("&cursor={}", urlencode(&cursor)));
+            list_path.push_str(&format!("&cursor={}", urlencode(&cursor)));
         }
-        let listed = check_ok(host.get_json(&list_url, Some("user_token"))?)?;
+        let listed = check_ok(sl_get(host, &list_path, Some("user_token"))?)?;
         let page = listed
             .get("channels")
             .and_then(|c| c.as_array())
@@ -1148,13 +1165,12 @@ fn unreads(input: Value, host: &mut Host) -> Result<Value, String> {
         } else {
             last_read.clone()
         };
-        let hist_url = format!(
-            "{}/conversations.history?channel={}&oldest={}&limit={limit}&inclusive=false",
-            base_url(host),
+        let hist_path = format!(
+            "/conversations.history?channel={}&oldest={}&limit={limit}&inclusive=false",
             urlencode(id),
             urlencode(&oldest),
         );
-        let hist = check_ok(host.get_json(&hist_url, Some("user_token"))?)?;
+        let hist = check_ok(sl_get(host, &hist_path, Some("user_token"))?)?;
         let raw = hist
             .get("messages")
             .and_then(|m| m.as_array())
@@ -1205,8 +1221,13 @@ fn reaction(input: Value, host: &mut Host, method: &str) -> Result<Value, String
     let (channel, ts) = resolve_ref(&input)?;
     let emoji = req_str(&input, "emoji")?.trim_matches(':');
     let body = json!({ "channel": channel, "timestamp": ts, "name": emoji });
-    let url = format!("{}/{method}", base_url(host));
-    check_ok(host.send_json("POST", &url, Some("bot_token"), &body)?)
+    check_ok(sl_send(
+        host,
+        "POST",
+        &format!("/{method}"),
+        Some("bot_token"),
+        &body,
+    )?)
 }
 
 // ---------------------------------------------------------------------------
@@ -1214,21 +1235,21 @@ fn reaction(input: Value, host: &mut Host, method: &str) -> Result<Value, String
 // ---------------------------------------------------------------------------
 
 fn channel_list(_input: Value, host: &mut Host) -> Result<Value, String> {
-    let url = format!(
-        "{}/conversations.list?types=public_channel,private_channel,mpim,im&limit=200",
-        base_url(host),
-    );
-    let v = check_ok(host.get_json(&url, Some("bot_token"))?)?;
+    let v = check_ok(sl_get(
+        host,
+        "/conversations.list?types=public_channel,private_channel,mpim,im&limit=200",
+        Some("bot_token"),
+    )?)?;
     contribute_channels(host, &v);
     Ok(v)
 }
 
 fn channel_join(input: Value, host: &mut Host) -> Result<Value, String> {
     let channel = req_str(&input, "channel")?;
-    let url = format!("{}/conversations.join", base_url(host));
-    check_ok(host.send_json(
+    check_ok(sl_send(
+        host,
         "POST",
-        &url,
+        "/conversations.join",
         Some("bot_token"),
         &json!({ "channel": channel }),
     )?)
@@ -1236,10 +1257,10 @@ fn channel_join(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn channel_mark(input: Value, host: &mut Host) -> Result<Value, String> {
     let (channel, ts) = resolve_ref(&input)?;
-    let url = format!("{}/conversations.mark", base_url(host));
-    check_ok(host.send_json(
+    check_ok(sl_send(
+        host,
         "POST",
-        &url,
+        "/conversations.mark",
         Some("bot_token"),
         &json!({ "channel": channel, "ts": ts }),
     )?)
@@ -1258,13 +1279,12 @@ fn file_upload(input: Value, host: &mut Host) -> Result<Value, String> {
         .unwrap_or_else(|| "upload.bin".into());
 
     // 1. Reserve an external upload URL.
-    let reserve_url = format!(
-        "{}/files.getUploadURLExternal?filename={}&length={}",
-        base_url(host),
+    let reserve_path = format!(
+        "/files.getUploadURLExternal?filename={}&length={}",
         urlencode(&filename),
         bytes.len(),
     );
-    let reserved = check_ok(host.get_json(&reserve_url, Some("bot_token"))?)?;
+    let reserved = check_ok(sl_get(host, &reserve_path, Some("bot_token"))?)?;
     let upload_url = reserved
         .get("upload_url")
         .and_then(|v| v.as_str())
@@ -1298,8 +1318,13 @@ fn file_upload(input: Value, host: &mut Host) -> Result<Value, String> {
     if let Some(comment) = opt_str(&input, "initial_comment") {
         complete["initial_comment"] = json!(comment);
     }
-    let complete_url = format!("{}/files.completeUploadExternal", base_url(host));
-    let done = check_ok(host.send_json("POST", &complete_url, Some("bot_token"), &complete)?)?;
+    let done = check_ok(sl_send(
+        host,
+        "POST",
+        "/files.completeUploadExternal",
+        Some("bot_token"),
+        &complete,
+    )?)?;
     Ok(json!({
         "ok": true,
         "channel": channel,
@@ -1312,8 +1337,8 @@ fn file_upload(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn file_download(input: Value, host: &mut Host) -> Result<Value, String> {
     let file_id = req_str(&input, "file_id")?.to_string();
-    let info_url = format!("{}/files.info?file={}", base_url(host), urlencode(&file_id),);
-    let info = check_ok(host.get_json(&info_url, Some("bot_token"))?)?;
+    let info_path = format!("/files.info?file={}", urlencode(&file_id));
+    let info = check_ok(sl_get(host, &info_path, Some("bot_token"))?)?;
     let file = info.get("file").cloned().unwrap_or(Value::Null);
     let download_url = file
         .get("url_private_download")
@@ -1354,25 +1379,30 @@ fn file_download(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn file_info(input: Value, host: &mut Host) -> Result<Value, String> {
     let file_id = req_str(&input, "file_id")?;
-    let url = format!("{}/files.info?file={}", base_url(host), urlencode(file_id));
-    check_ok(host.get_json(&url, Some("bot_token"))?)
+    let path = format!("/files.info?file={}", urlencode(file_id));
+    check_ok(sl_get(host, &path, Some("bot_token"))?)
 }
 
 fn file_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let limit = input.get("limit").and_then(|v| v.as_i64()).unwrap_or(100);
-    let mut url = format!("{}/files.list?count={limit}&page=1", base_url(host));
+    let mut path = format!("/files.list?count={limit}&page=1");
     for key in ["channel", "user", "types"] {
         if let Some(val) = opt_str(&input, key) {
-            url.push_str(&format!("&{key}={}", urlencode(val)));
+            path.push_str(&format!("&{key}={}", urlencode(val)));
         }
     }
-    check_ok(host.get_json(&url, Some("bot_token"))?)
+    check_ok(sl_get(host, &path, Some("bot_token"))?)
 }
 
 fn file_delete(input: Value, host: &mut Host) -> Result<Value, String> {
     let file_id = req_str(&input, "file_id")?;
-    let url = format!("{}/files.delete", base_url(host));
-    check_ok(host.send_json("POST", &url, Some("bot_token"), &json!({ "file": file_id }))?)
+    check_ok(sl_send(
+        host,
+        "POST",
+        "/files.delete",
+        Some("bot_token"),
+        &json!({ "file": file_id }),
+    )?)
 }
 
 // ---------------------------------------------------------------------------
@@ -1387,8 +1417,13 @@ fn bookmark_add(input: Value, host: &mut Host) -> Result<Value, String> {
     if let Some(emoji) = opt_str(&input, "emoji") {
         body["emoji"] = json!(emoji.trim_matches(':'));
     }
-    let url = format!("{}/bookmarks.add", base_url(host));
-    check_ok(host.send_json("POST", &url, Some("bot_token"), &body)?)
+    check_ok(sl_send(
+        host,
+        "POST",
+        "/bookmarks.add",
+        Some("bot_token"),
+        &body,
+    )?)
 }
 
 fn bookmark_edit(input: Value, host: &mut Host) -> Result<Value, String> {
@@ -1404,26 +1439,32 @@ fn bookmark_edit(input: Value, host: &mut Host) -> Result<Value, String> {
     if let Some(emoji) = opt_str(&input, "emoji") {
         body["emoji"] = json!(emoji.trim_matches(':'));
     }
-    let url = format!("{}/bookmarks.edit", base_url(host));
-    check_ok(host.send_json("POST", &url, Some("bot_token"), &body)?)
+    check_ok(sl_send(
+        host,
+        "POST",
+        "/bookmarks.edit",
+        Some("bot_token"),
+        &body,
+    )?)
 }
 
 fn bookmark_delete(input: Value, host: &mut Host) -> Result<Value, String> {
     let channel = req_str(&input, "channel")?;
     let bookmark_id = req_str(&input, "bookmark_id")?;
     let body = json!({ "channel_id": channel, "bookmark_id": bookmark_id });
-    let url = format!("{}/bookmarks.remove", base_url(host));
-    check_ok(host.send_json("POST", &url, Some("bot_token"), &body)?)
+    check_ok(sl_send(
+        host,
+        "POST",
+        "/bookmarks.remove",
+        Some("bot_token"),
+        &body,
+    )?)
 }
 
 fn bookmark_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let channel = req_str(&input, "channel")?;
-    let url = format!(
-        "{}/bookmarks.list?channel_id={}",
-        base_url(host),
-        urlencode(channel),
-    );
-    check_ok(host.get_json(&url, Some("bot_token"))?)
+    let path = format!("/bookmarks.list?channel_id={}", urlencode(channel));
+    check_ok(sl_get(host, &path, Some("bot_token"))?)
 }
 
 // ---------------------------------------------------------------------------
@@ -1431,34 +1472,32 @@ fn bookmark_list(input: Value, host: &mut Host) -> Result<Value, String> {
 // ---------------------------------------------------------------------------
 
 fn user_list(_input: Value, host: &mut Host) -> Result<Value, String> {
-    let url = format!("{}/users.list?limit=200", base_url(host));
-    let v = check_ok(host.get_json(&url, Some("bot_token"))?)?;
+    let v = check_ok(sl_get(host, "/users.list?limit=200", Some("bot_token"))?)?;
     contribute_users(host, &v);
     Ok(v)
 }
 
 fn presence_get(input: Value, host: &mut Host) -> Result<Value, String> {
-    let mut url = format!("{}/users.getPresence", base_url(host));
+    let mut path = String::from("/users.getPresence");
     if let Some(user) = opt_str(&input, "user") {
-        url.push_str(&format!("?user={}", urlencode(user)));
+        path.push_str(&format!("?user={}", urlencode(user)));
     }
-    check_ok(host.get_json(&url, Some("bot_token"))?)
+    check_ok(sl_get(host, &path, Some("bot_token"))?)
 }
 
 fn presence_set(input: Value, host: &mut Host) -> Result<Value, String> {
     let presence = req_str(&input, "presence")?;
-    let url = format!("{}/users.setPresence", base_url(host));
-    check_ok(host.send_json(
+    check_ok(sl_send(
+        host,
         "POST",
-        &url,
+        "/users.setPresence",
         Some("user_token"),
         &json!({ "presence": presence }),
     )?)
 }
 
 fn emoji_list(_input: Value, host: &mut Host) -> Result<Value, String> {
-    let url = format!("{}/emoji.list", base_url(host));
-    check_ok(host.get_json(&url, Some("bot_token"))?)
+    check_ok(sl_get(host, "/emoji.list", Some("bot_token"))?)
 }
 
 // ---------------------------------------------------------------------------
@@ -1467,15 +1506,14 @@ fn emoji_list(_input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn index_build(_input: Value, host: &mut Host) -> Result<Value, String> {
     let mut total = 0usize;
-    let ch_url = format!(
-        "{}/conversations.list?types=public_channel,private_channel,mpim,im&limit=200",
-        base_url(host),
-    );
-    let channels = check_ok(host.get_json(&ch_url, Some("bot_token"))?)?;
+    let channels = check_ok(sl_get(
+        host,
+        "/conversations.list?types=public_channel,private_channel,mpim,im&limit=200",
+        Some("bot_token"),
+    )?)?;
     total += contribute_channels(host, &channels);
 
-    let user_url = format!("{}/users.list?limit=200", base_url(host));
-    let users = check_ok(host.get_json(&user_url, Some("bot_token"))?)?;
+    let users = check_ok(sl_get(host, "/users.list?limit=200", Some("bot_token"))?)?;
     total += contribute_users(host, &users);
 
     Ok(json!({ "indexed": total }))
@@ -1561,6 +1599,7 @@ mod tests {
 
     fn host() -> MockHost {
         MockHost::default()
+            .with_endpoint_ref("slack.endpoint", "https://slack.com/api")
             .with_secret("bot_token", "xoxb")
             .with_secret("user_token", "xoxp")
     }

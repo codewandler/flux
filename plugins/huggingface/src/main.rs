@@ -192,22 +192,6 @@ fn so(props: Value, required: Value) -> Value {
 // HTTP helpers.
 // ---------------------------------------------------------------------------
 
-/// Resolve the Hub base URL (falling back to huggingface.co).
-fn hub_base(host: &mut Host) -> String {
-    host.endpoint("huggingface.hub")
-        .unwrap_or_else(|_| "https://huggingface.co".into())
-        .trim_end_matches('/')
-        .to_string()
-}
-
-/// Resolve the router base URL (falling back to router.huggingface.co).
-fn router_base(host: &mut Host) -> String {
-    host.endpoint("huggingface.router")
-        .unwrap_or_else(|_| "https://router.huggingface.co".into())
-        .trim_end_matches('/')
-        .to_string()
-}
-
 /// True when a token is available for the `api_token` purpose.
 fn has_token(host: &mut Host) -> bool {
     host.secret("api_token").is_ok()
@@ -222,16 +206,19 @@ fn hub_auth(host: &mut Host) -> Option<&'static str> {
     }
 }
 
-/// GET `{base}{path}` with optional auth injection.
-fn hf_get(host: &mut Host, base: &str, path: &str, auth: Option<&str>) -> Result<Value, String> {
-    let url = format!("{base}{path}");
-    host.get_json(&url, auth)
+/// GET `path` on the named endpoint reference with optional auth injection.
+fn hf_get(
+    host: &mut Host,
+    endpoint_ref: &str,
+    path: &str,
+    auth: Option<&str>,
+) -> Result<Value, String> {
+    host.get_json_ref(endpoint_ref, path, auth)
 }
 
-/// POST JSON to `{base}{path}` with required auth injection.
-fn hf_post(host: &mut Host, base: &str, path: &str, body: &Value) -> Result<Value, String> {
-    let url = format!("{base}{path}");
-    host.send_json("POST", &url, Some("api_token"), body)
+/// POST JSON to `path` on the named endpoint reference with required auth injection.
+fn hf_post(host: &mut Host, endpoint_ref: &str, path: &str, body: &Value) -> Result<Value, String> {
+    host.send_json_ref(endpoint_ref, "POST", path, Some("api_token"), body)
 }
 
 /// Percent-encode a single URL path segment (not the slash separator).
@@ -327,9 +314,8 @@ fn contribute_items(host: &mut Host, items: &Value, entity: &str) {
 // ---------------------------------------------------------------------------
 
 fn op_test(_input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = hub_base(host);
     // Anonymous reachability check.
-    if let Err(e) = hf_get(host, &base, "/api/models?limit=1", None) {
+    if let Err(e) = hf_get(host, "huggingface.hub", "/api/models?limit=1", None) {
         return Ok(json!({
             "status": "unreachable",
             "error": e,
@@ -338,7 +324,7 @@ fn op_test(_input: Value, host: &mut Host) -> Result<Value, String> {
     }
     // Token validity check when a token is present.
     if has_token(host) {
-        match hf_get(host, &base, "/api/whoami-v2", Some("api_token")) {
+        match hf_get(host, "huggingface.hub", "/api/whoami-v2", Some("api_token")) {
             Ok(who) => {
                 let user = who
                     .get("name")
@@ -371,59 +357,53 @@ fn op_test(_input: Value, host: &mut Host) -> Result<Value, String> {
 }
 
 fn op_model_search(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = hub_base(host);
     let auth = hub_auth(host);
     let qs = search_qs(&input);
-    let items = hf_get(host, &base, &format!("/api/models{qs}"), auth)?;
+    let items = hf_get(host, "huggingface.hub", &format!("/api/models{qs}"), auth)?;
     contribute_items(host, &items, "huggingface.model");
     Ok(items)
 }
 
 fn op_model_get(input: Value, host: &mut Host) -> Result<Value, String> {
     let repo_id = req_repo_id(&input)?;
-    let base = hub_base(host);
     let auth = hub_auth(host);
     hf_get(
         host,
-        &base,
+        "huggingface.hub",
         &format!("/api/models/{}", repo_path(&repo_id)),
         auth,
     )
 }
 
 fn op_dataset_search(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = hub_base(host);
     let auth = hub_auth(host);
     let qs = search_qs(&input);
-    let items = hf_get(host, &base, &format!("/api/datasets{qs}"), auth)?;
+    let items = hf_get(host, "huggingface.hub", &format!("/api/datasets{qs}"), auth)?;
     contribute_items(host, &items, "huggingface.dataset");
     Ok(items)
 }
 
 fn op_dataset_get(input: Value, host: &mut Host) -> Result<Value, String> {
     let repo_id = req_repo_id(&input)?;
-    let base = hub_base(host);
     let auth = hub_auth(host);
     hf_get(
         host,
-        &base,
+        "huggingface.hub",
         &format!("/api/datasets/{}", repo_path(&repo_id)),
         auth,
     )
 }
 
 fn op_space_search(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = hub_base(host);
     let auth = hub_auth(host);
     let qs = search_qs(&input);
-    let items = hf_get(host, &base, &format!("/api/spaces{qs}"), auth)?;
+    let items = hf_get(host, "huggingface.hub", &format!("/api/spaces{qs}"), auth)?;
     contribute_items(host, &items, "huggingface.space");
     Ok(items)
 }
 
 fn op_whoami(_input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = hub_base(host);
-    hf_get(host, &base, "/api/whoami-v2", Some("api_token"))
+    hf_get(host, "huggingface.hub", "/api/whoami-v2", Some("api_token"))
 }
 
 fn op_chat(input: Value, host: &mut Host) -> Result<Value, String> {
@@ -434,7 +414,6 @@ fn op_chat(input: Value, host: &mut Host) -> Result<Value, String> {
         .filter(|a| !a.is_empty())
         .ok_or("`messages` (non-empty array) required")?
         .clone();
-    let base = router_base(host);
     let mut body = json!({
         "model": model,
         "messages": messages,
@@ -460,7 +439,7 @@ fn op_chat(input: Value, host: &mut Host) -> Result<Value, String> {
             body["stop"] = Value::Array(arr.clone());
         }
     }
-    hf_post(host, &base, "/v1/chat/completions", &body)
+    hf_post(host, "huggingface.router", "/v1/chat/completions", &body)
 }
 
 fn op_embed(input: Value, host: &mut Host) -> Result<Value, String> {
@@ -471,9 +450,8 @@ fn op_embed(input: Value, host: &mut Host) -> Result<Value, String> {
         .filter(|a| !a.is_empty())
         .ok_or("`input` (non-empty array) required")?
         .clone();
-    let base = router_base(host);
     let body = json!({ "model": model, "input": inp });
-    hf_post(host, &base, "/v1/embeddings", &body)
+    hf_post(host, "huggingface.router", "/v1/embeddings", &body)
 }
 
 // ---------------------------------------------------------------------------
@@ -523,12 +501,12 @@ mod tests {
     }
 
     fn hub_host() -> MockHost {
-        MockHost::default().with_endpoint("huggingface.hub", "https://huggingface.co")
+        MockHost::default().with_endpoint_ref("huggingface.hub", "https://huggingface.co")
     }
 
     fn router_host() -> MockHost {
         MockHost::default()
-            .with_endpoint("huggingface.router", "https://router.huggingface.co")
+            .with_endpoint_ref("huggingface.router", "https://router.huggingface.co")
             .with_secret("api_token", "hf_tok")
     }
 

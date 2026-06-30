@@ -137,12 +137,6 @@ fn manifest_builder() -> PluginBuilder {
 // HTTP plumbing.
 // ---------------------------------------------------------------------------
 
-/// Resolve the base URL and detect whether Basic auth is configured.
-fn am_base(host: &mut Host) -> Result<String, String> {
-    host.endpoint("alertmanager.endpoint")
-        .map(|u| u.trim_end_matches('/').to_string())
-}
-
 /// `auth_purpose` — `Some("basic")` when creds are present, `None` when not.
 fn am_auth(host: &mut Host) -> Option<&'static str> {
     if host.secret("basic").is_ok() {
@@ -153,25 +147,19 @@ fn am_auth(host: &mut Host) -> Option<&'static str> {
 }
 
 fn am_get(host: &mut Host, path: &str) -> Result<Value, String> {
-    let base = am_base(host)?;
     let auth = am_auth(host);
-    let url = format!("{base}{path}");
-    host.get_json(&url, auth)
+    host.get_json_ref("alertmanager.endpoint", path, auth)
 }
 
 fn am_post(host: &mut Host, path: &str, body: &Value) -> Result<Value, String> {
-    let base = am_base(host)?;
     let auth = am_auth(host);
-    let url = format!("{base}{path}");
-    host.send_json("POST", &url, auth, body)
+    host.send_json_ref("alertmanager.endpoint", "POST", path, auth, body)
 }
 
 /// DELETE request — Alertmanager replies 200 with no body.
 fn am_delete(host: &mut Host, path: &str) -> Result<(), String> {
-    let base = am_base(host)?;
     let auth = am_auth(host);
-    let url = format!("{base}{path}");
-    let resp = host.http("DELETE", &url, auth, &[], None)?;
+    let resp = host.http_ref("alertmanager.endpoint", "DELETE", path, auth, None)?;
     if !resp.is_success() {
         return Err(format!("DELETE {path} → {} {}", resp.status, resp.body));
     }
@@ -258,7 +246,6 @@ fn contribute_alerts(host: &mut Host, alerts: &[Value]) {
 // ---------------------------------------------------------------------------
 
 fn test(_input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = am_base(host)?;
     let raw = am_get(host, "/api/v2/status")?;
     let version = raw
         .get("versionInfo")
@@ -279,7 +266,7 @@ fn test(_input: Value, host: &mut Host) -> Result<Value, String> {
         .map(|a| a.len())
         .unwrap_or(0);
     Ok(json!({
-        "url": base,
+        "url": "alertmanager.endpoint",
         "ready": true,
         "version": version,
         "cluster_status": cluster_status,
@@ -288,9 +275,8 @@ fn test(_input: Value, host: &mut Host) -> Result<Value, String> {
 }
 
 fn alerts(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = am_base(host)?;
     // Build query string manually — the host's http path doesn't know Alertmanager's
-    // multi-value `filter` param, so we construct the URL ourselves.
+    // multi-value `filter` param, so we construct the query ourselves and carry it in the path.
     let active = input
         .get("active")
         .and_then(|v| v.as_bool())
@@ -326,8 +312,11 @@ fn alerts(input: Value, host: &mut Host) -> Result<Value, String> {
     }
 
     let auth = am_auth(host);
-    let url = format!("{base}/api/v2/alerts?{qs}");
-    let wire = host.get_json(&url, auth)?;
+    let wire = host.get_json_ref(
+        "alertmanager.endpoint",
+        &format!("/api/v2/alerts?{qs}"),
+        auth,
+    )?;
 
     let wire_alerts = wire.as_array().cloned().unwrap_or_default();
     let truncated = wire_alerts.len() > limit;
@@ -354,7 +343,7 @@ fn alerts(input: Value, host: &mut Host) -> Result<Value, String> {
     contribute_alerts(host, &alerts);
 
     Ok(json!({
-        "url": base,
+        "url": "alertmanager.endpoint",
         "alerts": alerts,
         "count": alerts.len(),
         "truncated": truncated
@@ -362,7 +351,6 @@ fn alerts(input: Value, host: &mut Host) -> Result<Value, String> {
 }
 
 fn silence_list(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = am_base(host)?;
     let wire = am_get(host, "/api/v2/silences")?;
     let state_filter = input
         .get("state")
@@ -389,15 +377,13 @@ fn silence_list(input: Value, host: &mut Host) -> Result<Value, String> {
         .collect();
 
     Ok(json!({
-        "url": base,
+        "url": "alertmanager.endpoint",
         "silences": silences,
         "count": silences.len()
     }))
 }
 
 fn silence_create(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = am_base(host)?;
-
     // Validate matchers.
     let raw_matchers = input
         .get("matchers")
@@ -485,7 +471,7 @@ fn silence_create(input: Value, host: &mut Host) -> Result<Value, String> {
         .to_string();
 
     Ok(json!({
-        "url": base,
+        "url": "alertmanager.endpoint",
         "silence_id": silence_id,
         "ends_at": ends_at,
         "created": !silence_id.is_empty()
@@ -493,7 +479,6 @@ fn silence_create(input: Value, host: &mut Host) -> Result<Value, String> {
 }
 
 fn silence_delete(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = am_base(host)?;
     let id = input
         .get("id")
         .and_then(|v| v.as_str())
@@ -502,7 +487,7 @@ fn silence_delete(input: Value, host: &mut Host) -> Result<Value, String> {
         .ok_or("`id` required")?;
     am_delete(host, &format!("/api/v2/silence/{}", percent_encode(id)))?;
     Ok(json!({
-        "url": base,
+        "url": "alertmanager.endpoint",
         "id": id,
         "deleted": true
     }))
@@ -634,7 +619,7 @@ mod tests {
     }
 
     fn base_host() -> MockHost {
-        MockHost::default().with_endpoint("alertmanager.endpoint", "http://am.test:9093")
+        MockHost::default().with_endpoint_ref("alertmanager.endpoint", "http://am.test:9093")
     }
 
     // -- alertmanager.test ---------------------------------------------------

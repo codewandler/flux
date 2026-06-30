@@ -362,20 +362,32 @@ fn key_schema() -> Value {
 // Auth-mode + base-URL selection (ported from fluxplane `NewLiveClient` / `liveClient.do`).
 // ---------------------------------------------------------------------------------------------------
 
-/// The auth purpose + base URL for the current request, decided from configured env:
-/// - cloud_id present → Bearer (`api_token`) against `https://api.atlassian.com/ex/jira/{cloud_id}`;
-/// - else email present → Basic (`basic`) against the configured site URL (`jira.endpoint`);
-/// - else → Bearer (`api_token`) against the configured site URL.
+/// The base a request resolves against: either a constructed URL the plugin holds (the cloud_id OAuth
+/// gateway, which is NOT a declared manifest endpoint and so has no named ref) or a named manifest
+/// endpoint reference the host resolves to a base URL (the site URL).
+enum Base {
+    /// A constructed URL the plugin holds (already trimmed of a trailing slash) — the cloud_id gateway.
+    Url(String),
+    /// A named manifest endpoint ref the host resolves host-side (the site URL, `"jira.endpoint"`).
+    Ref(&'static str),
+}
+
+/// The auth purpose + base for the current request, decided from configured env:
+/// - cloud_id present → Bearer (`api_token`) against the constructed gateway URL
+///   `https://api.atlassian.com/ex/jira/{cloud_id}` (held URL — not a declared endpoint, so no ref);
+/// - else email present → Basic (`basic`) against the site URL via the `"jira.endpoint"` ref;
+/// - else → Bearer (`api_token`) against the site URL via the `"jira.endpoint"` ref.
 struct AuthMode {
     /// The `auth_purpose` to pass to the host (`"api_token"` → Bearer, `"basic"` → Basic).
     purpose: &'static str,
-    /// The base URL (already trimmed of a trailing slash).
-    base: String,
+    /// The base the request resolves against.
+    base: Base,
 }
 
-/// Resolve the request auth mode + base URL from configured env.
+/// Resolve the request auth mode + base from configured env.
 fn auth_mode(host: &mut Host) -> Result<AuthMode, String> {
-    // cloud_id (config) → the OAuth gateway base + Bearer.
+    // cloud_id (config value, NOT an IO endpoint) → the OAuth gateway base + Bearer. The gateway URL is
+    // constructed from the cloud_id, so it is a held URL (`Base::Url`), never a named endpoint ref.
     if let Some(cloud_id) = host
         .endpoint("jira.cloud_id")
         .ok()
@@ -384,14 +396,16 @@ fn auth_mode(host: &mut Host) -> Result<AuthMode, String> {
         if !cloud_id.is_empty() {
             return Ok(AuthMode {
                 purpose: "api_token",
-                base: format!("https://api.atlassian.com/ex/jira/{}", urlencode(&cloud_id)),
+                base: Base::Url(format!(
+                    "https://api.atlassian.com/ex/jira/{}",
+                    urlencode(&cloud_id)
+                )),
             });
         }
     }
-    // No cloud_id: the configured site URL is the base.
-    let site = host.endpoint("jira.endpoint")?;
-    let site = site.trim_end_matches('/').to_string();
-    // email (config, no cloud_id) → Basic fallback; else Bearer against the site URL.
+    // No cloud_id: the site URL is the base, resolved host-side from the named `"jira.endpoint"` ref —
+    // the plugin never holds the site URL. email (config value, no cloud_id) → Basic fallback; else
+    // Bearer against the site URL.
     let email_set = host
         .endpoint("jira.email")
         .ok()
@@ -399,7 +413,7 @@ fn auth_mode(host: &mut Host) -> Result<AuthMode, String> {
         .unwrap_or(false);
     Ok(AuthMode {
         purpose: if email_set { "basic" } else { "api_token" },
-        base: site,
+        base: Base::Ref("jira.endpoint"),
     })
 }
 
@@ -408,22 +422,51 @@ fn auth_mode(host: &mut Host) -> Result<AuthMode, String> {
 // injects Bearer or Basic (the plugin never sees the token or builds the header).
 // ---------------------------------------------------------------------------------------------------
 
-/// Build `{base}/rest/api/3{path}` for the current auth mode, returning `(url, auth_purpose)`.
-fn api_url(host: &mut Host, path: &str) -> Result<(String, &'static str), String> {
-    let mode = auth_mode(host)?;
-    Ok((format!("{}/rest/api/3{}", mode.base, path), mode.purpose))
+/// Build the full API path `/rest/api/3{path}` (the `/rest/api/3` prefix the v3 API expects).
+fn api_path(path: &str) -> String {
+    format!("/rest/api/3{path}")
 }
 
-/// GET `{base}/rest/api/3{path}` and parse the JSON body.
+/// Resolve the current auth mode to a full URL + `auth_purpose` — for the **byte-exact** `http_bytes`
+/// paths only, which take a URL and have no ref equivalent (`http_bytes_ref` does not exist). The
+/// cloud_id gateway is already a held `Base::Url`; the site path materializes its base URL via the
+/// host endpoint resolver. This is the one residual `host.endpoint` use, confined to byte attachment
+/// IO, until host-kit grows an `http_bytes_ref`.
+fn api_url(host: &mut Host, path: &str) -> Result<(String, &'static str), String> {
+    let mode = auth_mode(host)?;
+    let full = api_path(path);
+    match mode.base {
+        Base::Url(base) => Ok((format!("{base}{full}"), mode.purpose)),
+        Base::Ref(r) => {
+            let site = host.endpoint(r)?;
+            Ok((
+                format!("{}{full}", site.trim_end_matches('/')),
+                mode.purpose,
+            ))
+        }
+    }
+}
+
+/// GET `/rest/api/3{path}` (against the current base) and parse the JSON body.
 fn jget(host: &mut Host, path: &str) -> Result<Value, String> {
-    let (url, purpose) = api_url(host, path)?;
-    host.get_json(&url, Some(purpose))
+    let mode = auth_mode(host)?;
+    let full = api_path(path);
+    match mode.base {
+        Base::Ref(r) => host.get_json_ref(r, &full, Some(mode.purpose)),
+        Base::Url(base) => host.get_json(&format!("{base}{full}"), Some(mode.purpose)),
+    }
 }
 
 /// Send a JSON body with `method` and parse the (non-empty) JSON response.
 fn jsend(host: &mut Host, method: &str, path: &str, body: &Value) -> Result<Value, String> {
-    let (url, purpose) = api_url(host, path)?;
-    host.send_json(method, &url, Some(purpose), body)
+    let mode = auth_mode(host)?;
+    let full = api_path(path);
+    match mode.base {
+        Base::Ref(r) => host.send_json_ref(r, method, &full, Some(mode.purpose), body),
+        Base::Url(base) => {
+            host.send_json(method, &format!("{base}{full}"), Some(mode.purpose), body)
+        }
+    }
 }
 
 /// Send a request whose response body is ignored (PUT/DELETE/POST that return 204 No Content).
@@ -433,24 +476,56 @@ fn jsend_noresp(
     path: &str,
     body: Option<&Value>,
 ) -> Result<(), String> {
-    let (url, purpose) = api_url(host, path)?;
-    let serialized = match body {
-        Some(b) => Some(serde_json::to_string(b).map_err(|e| e.to_string())?),
-        None => None,
-    };
-    let headers: &[(&str, &str)] = if body.is_some() {
-        &[("content-type", "application/json")]
-    } else {
-        &[]
-    };
-    let resp = host.http(method, &url, Some(purpose), headers, serialized.as_deref())?;
-    if !resp.is_success() {
-        return Err(format!(
-            "jira {method} {path} → {} {}",
-            resp.status, resp.body
-        ));
+    let mode = auth_mode(host)?;
+    let full = api_path(path);
+    match mode.base {
+        Base::Ref(r) => {
+            // The ref path has no `headers` arg on `http_ref`. For a JSON body, route through
+            // `send_json_ref` (it sets content-type and parses a response we ignore — the URL path
+            // ignored it too). For no body, use `http_ref` directly and check the status.
+            match body {
+                Some(b) => {
+                    host.send_json_ref(r, method, &full, Some(mode.purpose), b)?;
+                }
+                None => {
+                    let resp = host.http_ref(r, method, &full, Some(mode.purpose), None)?;
+                    if !resp.is_success() {
+                        return Err(format!(
+                            "jira {method} {path} → {} {}",
+                            resp.status, resp.body
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        Base::Url(base) => {
+            let url = format!("{base}{full}");
+            let serialized = match body {
+                Some(b) => Some(serde_json::to_string(b).map_err(|e| e.to_string())?),
+                None => None,
+            };
+            let headers: &[(&str, &str)] = if body.is_some() {
+                &[("content-type", "application/json")]
+            } else {
+                &[]
+            };
+            let resp = host.http(
+                method,
+                &url,
+                Some(mode.purpose),
+                headers,
+                serialized.as_deref(),
+            )?;
+            if !resp.is_success() {
+                return Err(format!(
+                    "jira {method} {path} → {} {}",
+                    resp.status, resp.body
+                ));
+            }
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -1778,7 +1853,9 @@ fn attachment_add(input: Value, host: &mut Host) -> Result<Value, String> {
     };
     // Assemble the multipart/form-data body as RAW BYTES (the reference uses mime/multipart), so binary
     // attachments round-trip byte-exact — no `from_utf8_lossy`. Upload via the byte-exact http_bytes
-    // path with a non-binary response (we want the JSON attachment list back as text).
+    // path with a non-binary response (we want the JSON attachment list back as text). The byte-exact
+    // path takes a URL (there is no `http_bytes_ref`), so it works on the cloud_id gateway; on the site
+    // (ref) path `api_url` errors rather than re-deriving the site URL via a `jira.endpoint` handback.
     let boundary = "----fluxjiraFormBoundary";
     let mut body: Vec<u8> = Vec::new();
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
@@ -1944,7 +2021,11 @@ mod tests {
     use super::*;
 
     fn host() -> MockHost {
-        MockHost::default().with_endpoint("jira.endpoint", "https://x.atlassian.net")
+        // JSON IO resolves the named ref (`with_endpoint_ref`); byte-exact attachment IO has no ref
+        // variant and materializes the site base via the host endpoint resolver (`with_endpoint`).
+        MockHost::default()
+            .with_endpoint_ref("jira.endpoint", "https://x.atlassian.net")
+            .with_endpoint("jira.endpoint", "https://x.atlassian.net")
     }
 
     #[test]
@@ -2255,7 +2336,9 @@ mod tests {
     #[test]
     fn attachment_add_uploads_from_blob_byte_exact() {
         let plugin = manifest_builder().build();
-        // Binary (non-UTF-8) bytes must round-trip exactly through the multipart body.
+        // Binary (non-UTF-8) bytes must round-trip exactly through the multipart body. Byte-exact
+        // upload uses the URL-based `http_bytes` (no `http_bytes_ref`); on the site path it
+        // materializes the base URL via the host endpoint resolver — exercised here with no cloud_id.
         let raw: Vec<u8> = vec![0, 159, 146, 150, 255, b'h', b'i'];
         let mut host = host().with_http(
             "/rest/api/3/issue/PROJ-1/attachments",
@@ -2278,7 +2361,9 @@ mod tests {
     #[test]
     fn attachment_get_downloads_into_blob_byte_exact() {
         let plugin = manifest_builder().build();
-        // Non-UTF-8 download bytes must survive into the blob store unchanged.
+        // Non-UTF-8 download bytes must survive into the blob store unchanged. Byte-exact download uses
+        // the URL-based `http_bytes` (no `http_bytes_ref`); on the site path it materializes the base
+        // URL via the host endpoint resolver — exercised here with no cloud_id.
         let raw: Vec<u8> = vec![0, 159, 146, 150, 255];
         let mut host = host().with_http_bytes("/rest/api/3/attachment/content/20001", raw.clone());
         let out = plugin
