@@ -1,7 +1,7 @@
-//! Render installed plugin manifests into a generated `flux-plugins` skill (story D-13).
+//! Render installed plugin manifests into a generated `flux-plugin` skill (story D-13).
 //!
 //! The flux analogue of fluxplane's `fluxplane-plugin skill`: it turns the `PluginManifest`s of the
-//! installed plugins into a trigger-activated `SKILL.md` plus one `references/<plugin>.md` per plugin,
+//! installed plugins into a Claude-format `SKILL.md` plus one `references/<plugin>.md` per plugin,
 //! so the agent's view of "which integration ops exist, their inputs, and their auth" stays in sync
 //! with what is installed — no hand-maintained catalog. The render is a pure function over
 //! `(install-name, manifest)` pairs so it is unit-testable without spawning a subprocess.
@@ -10,15 +10,13 @@ use flux_markdown::render_document;
 use flux_plugin::PluginManifest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
 
-/// Frontmatter for the generated `flux-plugins` skill (flux-native format: explicit `triggers`).
+/// Frontmatter for the generated `flux-plugin` skill (Claude / Agent Skills format).
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SkillMeta {
     pub name: String,
     pub description: String,
-    pub triggers: Vec<String>,
 }
 
 /// The render result: the `SKILL.md` contents and one `(plugin-name, reference-markdown)` per plugin.
@@ -27,15 +25,14 @@ pub struct RenderedSkill {
     pub references: Vec<(String, String)>,
 }
 
-/// Render the `flux-plugins` skill + per-plugin references from installed `(name, manifest)` pairs.
+/// Render the `flux-plugin` skill + per-plugin references from installed `(name, manifest)` pairs.
 ///
 /// `name` is the *install* name (what `flux plugin call <name> <op>` uses), which may differ from
 /// `manifest.name`. Pure — no IO.
 pub fn render_plugin_skill(plugins: &[(String, PluginManifest)]) -> RenderedSkill {
     let meta = SkillMeta {
-        name: "flux-plugins".into(),
+        name: "flux-plugin".into(),
         description: skill_description(plugins),
-        triggers: triggers_for(plugins),
     };
     let body = skill_body(plugins);
     let skill_md = render_document(&meta, &body)
@@ -60,24 +57,6 @@ fn skill_description(plugins: &[(String, PluginManifest)]) -> String {
     let head = names.iter().take(6).copied().collect::<Vec<_>>().join(", ");
     let more = if names.len() > 6 { ", …" } else { "" };
     format!("Call installed flux integration plugins ({head}{more}) via `flux plugin call`.")
-}
-
-/// Deterministic substring triggers: each install name, each operation's leading segment, plus the
-/// literal `plugin`. A turn mentioning e.g. `gitlab` or `prometheus` then activates the skill.
-fn triggers_for(plugins: &[(String, PluginManifest)]) -> Vec<String> {
-    let mut set: BTreeSet<String> = BTreeSet::new();
-    set.insert("plugin".into());
-    for (name, m) in plugins {
-        set.insert(name.clone());
-        for op in &m.operations {
-            if let Some(prefix) = op.name.split(['.', '_']).next() {
-                if !prefix.is_empty() {
-                    set.insert(prefix.to_string());
-                }
-            }
-        }
-    }
-    set.into_iter().collect()
 }
 
 /// The compact always-injected `SKILL.md` body (per-op detail lives in `references/`).
@@ -274,17 +253,12 @@ mod tests {
     }
 
     #[test]
-    fn frontmatter_round_trips_with_expected_triggers() {
+    fn frontmatter_round_trips_as_claude_format() {
         let r = render_plugin_skill(&fixture());
         let doc: Document<SkillMeta> = parse_frontmatter(&r.skill_md).unwrap();
-        assert_eq!(doc.meta.name, "flux-plugins");
-        // install names + op prefixes + literal "plugin"
-        for t in ["plugin", "gitlab", "prometheus"] {
-            assert!(
-                doc.meta.triggers.contains(&t.to_string()),
-                "missing trigger {t}"
-            );
-        }
+        assert_eq!(doc.meta.name, "flux-plugin");
+        assert!(doc.meta.description.contains("gitlab"));
+        assert!(doc.meta.description.contains("prometheus"));
         assert!(doc.body.contains("flux plugin call"));
     }
 
@@ -310,7 +284,8 @@ mod tests {
     fn empty_install_is_handled() {
         let r = render_plugin_skill(&[]);
         let doc: Document<SkillMeta> = parse_frontmatter(&r.skill_md).unwrap();
-        assert_eq!(doc.meta.triggers, vec!["plugin".to_string()]);
+        assert_eq!(doc.meta.name, "flux-plugin");
+        assert!(doc.meta.description.contains("none installed"));
         assert!(r.references.is_empty());
     }
 }

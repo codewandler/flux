@@ -2,28 +2,28 @@
 id: D-13
 title: Generated plugin skill — `flux plugin skill`
 pillar: Core
-status: in-progress
-priority: 2
+status: done
+priority:
 design: docs/designs/plugin-skill-generation.md
 ---
 
 # Generated plugin skill — `flux plugin skill`
 
 ## Goal
-A `flux plugin skill [install|refresh]` command that renders the installed flux-plugin manifests into a
-trigger-activated `flux-plugins` skill (`SKILL.md` + `references/<plugin>.md`) — the flux analogue of
-fluxplane's `fluxplane-plugin skill`. Keeps the agent's view of available integrations, their ops, inputs, and
-auth in sync with what is installed, with no hand-maintained catalog. Independent of D-12; ships first.
+A `flux plugin skill` command that renders installed flux-plugin manifests into a Claude-format
+`flux-plugin` skill (`SKILL.md` + `references/<plugin>.md`) — the flux analogue of fluxplane's
+`fluxplane-plugin skill`. Keeps the agent's view of available integrations, their ops, inputs, and auth in
+sync with what is installed, with no hand-maintained catalog.
 
 ## Acceptance
 - [x] `flux-markdown` gains a frontmatter **writer** (`compose_frontmatter` + `render_document`), re-exported
       from `lib.rs`. Test `render_round_trips_through_parse`: `parse_frontmatter(render_document(&m, b)) == (m, b)`.
-- [x] `flux plugin skill` (new `PluginAction::Skill`) discovers descriptors, fetches each `manifest()`, and
-      renders a single `flux-plugins` skill + one `references/<plugin>.md` per plugin. Default prints to
-      stdout; `--out <file>` writes there; `install` writes `<cwd>/.flux/skills/flux-plugins/`; `--global`
-      writes `~/.claude/skills/flux-plugins/`; re-running `--install` regenerates (refresh).
+- [x] `flux plugin skill` discovers descriptors, fetches each `manifest()`, and renders a single
+      `flux-plugin` skill + one `references/<plugin>.md` per plugin. Default prints to stdout; `--out <file>`
+      writes there; `--install` writes `<cwd>/.flux/skills/flux-plugin/`; `--global` writes
+      `~/.claude/skills/flux-plugin/`; re-running `--install` regenerates.
 - [x] The render is a pure `fn(&[(name, PluginManifest)]) -> RenderedSkill`. Tests
-      `frontmatter_round_trips_with_expected_triggers` + `one_reference_per_plugin_with_ops_and_required_input`
+      `frontmatter_round_trips_as_claude_format` + `one_reference_per_plugin_with_ops_and_required_input`
       + `empty_install_is_handled`.
 - [x] Manual e2e: `flux plugin install plugins/target/debug` → `flux plugin skill` prints the SKILL.md; `skill
       --install --global` wrote the tree; gitlab/prometheus references rendered op tables + auth + endpoints.

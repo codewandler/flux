@@ -65,7 +65,7 @@ Parity is **operational** (the integrations an agent can drive), not a byte-for-
 fluxplane's `fluxplane-plugin skill` command *generates* a Claude-format `SKILL.md` + `references/<plugin>.md`
 from installed-plugin manifests (that is exactly what produced `~/.claude/skills/fluxplane-plugin/`). flux
 gets the analogue **`flux plugin skill`**, designed in [plugin-skill-generation.md](plugin-skill-generation.md):
-it renders the discovered flux-plugin manifests into a trigger-activated `flux-plugins` skill so the agent
+it renders the discovered flux-plugin manifests into a Claude-format `flux-plugin` skill so the agent
 knows which `flux plugin call` ops exist, their inputs, and their auth — without hard-coding a catalog.
 
 ## Sequencing

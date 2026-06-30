@@ -1,6 +1,7 @@
 # Design: generated plugin skill — `flux plugin skill` (D-13)
 
-**Status:** in progress · **Pillar:** Core · **Layer:** L6 (`flux-cli`) + L0 (`flux-markdown` writer) ·
+**Status:** shipped; generalized by [generated-flux-skills.md](generated-flux-skills.md) ·
+**Pillar:** Core · **Layer:** L6 (`flux-cli`) + L0 (`flux-markdown` writer) ·
 **Owner:** Timo · **Story:** [D-13](../stories/D-13-plugin-skill-command.md) ·
 **Epic:** [fluxplane-plugins-parity.md](fluxplane-plugins-parity.md)
 
@@ -32,13 +33,13 @@ New `PluginAction::Skill { out: Option<PathBuf>, install: bool, global: bool }` 
 `flux plugin` tree (reuses the discovery + manifest-fetch path `Call`/`Install` already use):
 
 1. `flux_plugin::discover(plugins_dir())` → for each descriptor, `PluginHost::spawn` + `manifest()`.
-2. Render a single **`flux-plugins` skill** + one `references/<plugin>.md` per plugin.
+2. Render a single **`flux-plugin` skill** + one `references/<plugin>.md` per plugin.
 3. Output target:
    - default (no flag): print `SKILL.md` to stdout (the references are summarized inline as a list).
    - `--out <file>`: write `SKILL.md` there (references next to it).
-   - `install`: write the tree to `<cwd>/.flux/skills/flux-plugins/{SKILL.md,references/*.md}` — project-scoped,
+   - `install`: write the tree to `<cwd>/.flux/skills/flux-plugin/{SKILL.md,references/*.md}` — project-scoped,
      version-controlled, the **highest** precedence dir in `flux_skill::default_skill_dirs`.
-   - `install --global`: write to `~/.claude/skills/flux-plugins/` instead (the user-global skill dir flux
+   - `install --global`: write to `~/.claude/skills/flux-plugin/` instead (the user-global skill dir flux
      also scans).
 4. `flux plugin skill refresh` ≡ `skill install` over the current install dir (idempotent regenerate).
 
@@ -46,9 +47,8 @@ New `PluginAction::Skill { out: Option<PathBuf>, install: bool, global: bool }` 
 
 ```markdown
 ---
-name: flux-plugins
+name: flux-plugin
 description: Call installed flux integration plugins (gitlab, slack, prometheus, …) via `flux plugin call`.
-triggers: [plugin, gitlab, slack, prometheus, loki, jira, confluence, kubernetes, k8s, websearch, …]
 ---
 # Installed integration plugins
 Use `flux plugin call <plugin> <op> '<json-input>'`. Inputs/auth per integration are in `references/`.
@@ -60,10 +60,9 @@ Each plugin resolves secrets by purpose from env (listed per reference). Set the
 …
 ```
 
-`triggers` = the set of plugin names plus a few op-prefix aliases (`k8s`, `prometheus`, …), so
-`flux_skill::active_for` injects the skill deterministically when a turn mentions an integration. Per-op detail
-goes into `references/<plugin>.md` (an op table: name · description · required inputs · risk · auth purpose),
-keeping the always-injected `SKILL.md` body small.
+The current renderer emits Claude/Agent-Skills frontmatter (`name` + `description`, no `triggers`). Per-op
+detail goes into `references/<plugin>.md` (an op table: name · description · required inputs · risk · auth
+purpose), keeping the always-injected `SKILL.md` body small.
 
 ## Reuse, don't reinvent
 - `flux_plugin::discover` / `PluginHost::spawn` / `manifest` — the same path `run_plugin`'s `Call`/`Install`
@@ -75,11 +74,12 @@ keeping the always-injected `SKILL.md` body small.
 ## Testing
 - flux-markdown: `render_document` round-trips through `parse_frontmatter` (unit).
 - renderer: a 2-fake-manifest fixture → `SKILL.md` whose frontmatter parses back with the expected
-  `name`/`triggers`, and one `references/<plugin>.md` per manifest containing each op name. Hermetic — no real
+  Claude-format `name`/`description`, and one `references/<plugin>.md` per manifest containing each op name. Hermetic — no real
   subprocess (factor the render as a pure `fn(&[PluginManifest]) -> (Skill md, Vec<(name, md)>)`).
 
 ## Non-goals
-- A general `flux skill` command surface (lint/list) — out of scope; this is `flux plugin skill` only.
+- A general `flux skill` command surface was out of scope for D-13, then shipped later in
+  [L-07](../stories/L-07-generated-flux-skills.md).
 - Auto-regeneration on install/auth-change (fluxplane does this) — `refresh` is manual for now.
 - Progressive-disclosure auto-loading of `references/` — that is [L-02](../stories/L-02-flux-markdown-engine.md);
   here the agent `read`s a reference on demand.

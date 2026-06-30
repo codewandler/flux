@@ -167,7 +167,7 @@ aggregator/generator surfaces (vision/websearch-aggregator/openapi) are explicit
   jira/confluence's hand-rolled base64. Design:
   [plugin-protocol-parity.md](designs/plugin-protocol-parity.md).
 - **[D-13](stories/D-13-plugin-skill-command.md) — Generated plugin skill (`flux plugin skill`)** · *core.*
-  Renders the installed plugin manifests into a trigger-activated `flux-plugins` SKILL.md + `references/` (the
+  Renders the installed plugin manifests into a Claude-format `flux-plugin` SKILL.md + `references/` (the
   flux analogue of fluxplane's `fluxplane-plugin skill`); adds a frontmatter writer to flux-markdown.
   Independent of D-12. Design: [plugin-skill-generation.md](designs/plugin-skill-generation.md).
 - **[D-14](stories/D-14-deepen-native-plugins.md) — Deepen the 8 native plugins** to their full fluxplane op
