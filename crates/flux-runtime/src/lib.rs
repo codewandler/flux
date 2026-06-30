@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use flux_core::Result;
@@ -115,6 +116,30 @@ pub trait LoopHost: Send + Sync {
     async fn run_plan(&self, plan: serde_json::Value) -> flux_core::Result<serde_json::Value>;
 }
 
+/// A request to register a Flux-Lang composite op into a host-managed catalog.
+///
+/// Defined at the runtime layer so the root `op.register` tool can delegate without depending on
+/// `flux-flow`. The engine owns parsing, validation, storage, and catalog mutation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompositeRegisterRequest {
+    pub source: String,
+    pub scope: String,
+    #[serde(default)]
+    pub replace: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expose: Option<bool>,
+}
+
+/// Host capability for registering composite ops. Implemented by the flow engine and injected into
+/// [`ToolContext`] for `op.register`; ordinary tool-only dispatch contexts leave it absent.
+#[async_trait]
+pub trait CompositeRegistrar: Send + Sync {
+    async fn register_composite(
+        &self,
+        request: CompositeRegisterRequest,
+    ) -> flux_core::Result<serde_json::Value>;
+}
+
 /// What a tool is given at execution time: the guarded IO surface, the secret redactor, an optional
 /// sub-agent spawner, and the per-session read-set (file → mtime at last read) used by the
 /// read-before-write guard. The read-set is shared (an `Arc<Mutex<…>>`) so every op in a session sees
@@ -127,6 +152,10 @@ pub struct ToolContext {
     /// The reflexive capability (`plan`/`run_plan`), installed per turn by the engine. `None` outside a
     /// model-in-the-loop run — the ops then return a clear error rather than silently doing nothing.
     pub loop_host: Option<Arc<dyn LoopHost>>,
+    /// Root op registration capability (`op.register`), installed by a model-in-the-loop engine.
+    /// Kept separate from [`LoopHost`] so other hosts can opt into composite registration without
+    /// exposing planner/interpreter reentry.
+    pub composite_registrar: Option<Arc<dyn CompositeRegistrar>>,
     pub read_times: Arc<Mutex<HashMap<String, std::time::SystemTime>>>,
     /// The append-only evidence log, shared (an `Arc<Mutex<…>>`) so the dispatcher's `tool_call`
     /// markers, externally-recorded observations ([`Executor::observe`]), flow-emitted `observe(…)`
@@ -152,6 +181,7 @@ impl ToolContext {
             redactor: Redactor::new(),
             spawner: None,
             loop_host: None,
+            composite_registrar: None,
             read_times: Arc::new(Mutex::new(HashMap::new())),
             evidence: Arc::new(Mutex::new(EvidenceLog::new())),
             cancel: Arc::new(Mutex::new(None)),
@@ -190,6 +220,12 @@ impl ToolContext {
     /// Install the reflexive capability (the engine does this per turn before running the loop).
     pub fn with_loop_host(mut self, loop_host: Arc<dyn LoopHost>) -> Self {
         self.loop_host = Some(loop_host);
+        self
+    }
+
+    /// Install the composite-op registration capability.
+    pub fn with_composite_registrar(mut self, registrar: Arc<dyn CompositeRegistrar>) -> Self {
+        self.composite_registrar = Some(registrar);
         self
     }
 
@@ -714,6 +750,11 @@ impl Executor {
     /// executor, so it can only be wired in afterwards). Mirrors [`set_approver`](Self::set_approver).
     pub fn set_loop_host(&mut self, loop_host: Arc<dyn LoopHost>) {
         self.ctx.loop_host = Some(loop_host);
+    }
+
+    /// Install the composite registration capability onto this executor's context.
+    pub fn set_composite_registrar(&mut self, registrar: Arc<dyn CompositeRegistrar>) {
+        self.ctx.composite_registrar = Some(registrar);
     }
 
     /// Pre-allow these op names (they dispatch without an approval prompt). The engine uses this to

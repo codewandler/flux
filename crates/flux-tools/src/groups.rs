@@ -76,12 +76,12 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
         },
         ToolGroup {
             name: "shell".into(),
-            description: "The generic `bash` escape hatch — off by default. Opt in with \
+            description: "The generic process escape hatches (`bash`, `proc.run`) — off by default. Opt in with \
                           `enable_shell = true` in config or `FLUX_ENABLE_BASH=1` (which inject the \
-                          `shell` signal). Prefer the dedicated ops; reach for `bash` only when no op \
+                          `shell` signal). Prefer the dedicated ops; reach for these only when no op \
                           covers the need."
                 .into(),
-            tools: names(&["bash"]),
+            tools: names(&["bash", "proc.run"]),
             surface_when: when("shell"),
         },
         ToolGroup {

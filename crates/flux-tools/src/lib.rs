@@ -202,6 +202,7 @@ pub fn register_builtins(registry: &mut ToolRegistry) {
     registry.register(Arc::new(PatchTool));
     registry.register(Arc::new(AppendTool));
     registry.register(Arc::new(BashTool));
+    registry.register(Arc::new(ProcRunTool));
     registry.register(Arc::new(GlobTool));
     registry.register(Arc::new(GrepTool));
     registry.register(Arc::new(GitStageTool));
@@ -945,6 +946,107 @@ impl Tool for BashTool {
         let command = str_param(&params, "command", "bash")?;
         let timeout = u64_arg(&params, "timeout_secs").unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
         let argv = vec!["sh".to_string(), "-c".to_string(), command.to_string()];
+        let out = ctx.system.run(&argv, Duration::from_secs(timeout)).await?;
+        let mut body = String::new();
+        if !out.stdout.is_empty() {
+            body.push_str(&out.stdout);
+        }
+        if !out.stderr.is_empty() {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&out.stderr);
+        }
+        if out.exit_code != 0 {
+            body.push_str(&format!("\n[exit {}]", out.exit_code));
+        }
+        Ok(ToolResult {
+            content: body,
+            view: None,
+            is_error: out.exit_code != 0,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// proc.run
+// ---------------------------------------------------------------------------
+
+pub struct ProcRunTool;
+
+fn proc_args(params: &Value) -> Vec<String> {
+    params
+        .get("args")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn proc_subject(params: &Value) -> Option<String> {
+    let program = params.get("program").and_then(|v| v.as_str())?;
+    let args = proc_args(params);
+    if args.is_empty() {
+        Some(program.to_string())
+    } else {
+        Some(format!("{program}:{}", args.join(" ")))
+    }
+}
+
+#[async_trait]
+impl Tool for ProcRunTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "proc.run".into(),
+            description: "Run one argv-only process in the workspace root. This is the preferred \
+                          generic process escape hatch when a dedicated op does not exist: no shell \
+                          parsing, env cleared by flux-system, output capped, approval-gated, and \
+                          hidden by default behind the `shell` group."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "program": {"type": "string"},
+                    "args": {"type": "array", "items": {"type": "string"}},
+                    "timeout_secs": {"type": "integer"}
+                },
+                "required": ["program"]
+            }),
+            output_schema: None,
+            effects: vec![Effect::Process, Effect::LocalSystem],
+            risk: Risk::High,
+            idempotency: Idempotency::NonIdempotent,
+            access: vec![AccessKind::Process, AccessKind::LocalSystem],
+            group: Some("shell".into()),
+        }
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        proc_subject(params).into_iter().collect()
+    }
+
+    fn intents(&self, params: &Value) -> IntentSet {
+        let mut set = IntentSet::new();
+        if let Some(subject) = proc_subject(params) {
+            set.push(Intent {
+                behavior: IntentBehavior::CommandExecution,
+                target: IntentTarget::Process { command: subject },
+                role: IntentRole::ProcessCommand,
+                certainty: IntentCertainty::Certain,
+            });
+        }
+        set
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let program = str_param(&params, "program", "proc.run")?;
+        let timeout = u64_arg(&params, "timeout_secs").unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
+        let mut argv = vec![program.to_string()];
+        argv.extend(proc_args(&params));
         let out = ctx.system.run(&argv, Duration::from_secs(timeout)).await?;
         let mut body = String::new();
         if !out.stdout.is_empty() {
@@ -2971,6 +3073,37 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[tokio::test]
+    async fn proc_run_is_argv_only_and_reports_exit() {
+        let (dir, c) = ctx();
+        let r = ProcRunTool
+            .execute(&c, json!({"program": "printf", "args": ["hello"]}))
+            .await
+            .unwrap();
+        assert_eq!(r.content, "hello");
+        assert!(!r.is_error);
+
+        let r = ProcRunTool
+            .execute(&c, json!({"program": "sh", "args": ["-c", "exit 4"]}))
+            .await
+            .unwrap();
+        assert!(r.is_error);
+        assert!(r.content.contains("[exit 4]"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn proc_run_subjects() {
+        assert_eq!(
+            proc_subject(&json!({"program": "git", "args": ["status"]})).as_deref(),
+            Some("git:status")
+        );
+        assert_eq!(
+            proc_subject(&json!({"program": "cargo"})).as_deref(),
+            Some("cargo")
+        );
+    }
+
     #[test]
     fn bash_subject_parsing() {
         assert_eq!(bash_subjects("git status"), vec!["git:status"]);
@@ -3056,6 +3189,7 @@ mod tests {
                 "observe",
                 "patch",
                 "path_exists",
+                "proc.run",
                 "pytest",
                 "python_run",
                 "read",
@@ -3074,10 +3208,16 @@ mod tests {
     fn bash_is_off_by_default_and_opts_in_via_shell_signal() {
         let groups = crate::groups::builtin_groups();
         let bash = BashTool.spec();
+        let proc_run = ProcRunTool.spec();
         assert_eq!(
             bash.group.as_deref(),
             Some("shell"),
             "bash belongs to the shell group"
+        );
+        assert_eq!(
+            proc_run.group.as_deref(),
+            Some("shell"),
+            "proc.run belongs to the shell group"
         );
 
         // Default: no `shell` signal → group inactive → bash NOT advertised to the model.
@@ -3086,6 +3226,10 @@ mod tests {
         assert!(
             !flux_runtime::is_advertised(&bash, &groups, &off),
             "bash must be hidden from the catalog by default"
+        );
+        assert!(
+            !flux_runtime::is_advertised(&proc_run, &groups, &off),
+            "proc.run must be hidden from the catalog by default"
         );
 
         // Opt-in: a `shell` signal observation (what `detect_signals` emits when FLUX_ENABLE_BASH /
@@ -3100,6 +3244,10 @@ mod tests {
         assert!(
             flux_runtime::is_advertised(&bash, &groups, &on),
             "bash is advertised once shell is opted in"
+        );
+        assert!(
+            flux_runtime::is_advertised(&proc_run, &groups, &on),
+            "proc.run is advertised once shell is opted in"
         );
     }
 

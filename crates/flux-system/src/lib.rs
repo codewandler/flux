@@ -57,6 +57,11 @@ impl Workspace {
         Ok(())
     }
 
+    /// Whether a named root is configured.
+    pub fn has_named_root(&self, name: &str) -> bool {
+        self.named.contains_key(name)
+    }
+
     /// Resolve a workspace-relative (or `@name/...`) path to an absolute path guaranteed to live
     /// inside the corresponding root. Rejects `..` escapes and symlink escapes.
     pub fn resolve(&self, input: &str) -> Result<PathBuf> {
