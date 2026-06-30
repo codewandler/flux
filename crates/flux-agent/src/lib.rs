@@ -210,9 +210,9 @@ impl AgentSpec {
     }
 }
 
-/// Register the machinery ops the flux-lang agent loop (`agent-loop.flux`) calls: the reflexive
-/// `plan`/`run_plan` (`register_reflect`) and the evidence `observe`/`evidence`/`metrics`
-/// (`register_evidence`). Call on the registry before building the [`Executor`] — and crucially
+/// Register the machinery/root ops the flux-lang agent loop (`agent-loop.flux`) calls: the reflexive
+/// `plan`/`run_plan` plus model-facing `op.register` (`register_reflect`) and the evidence
+/// `observe`/`evidence`/`metrics` (`register_evidence`). Call on the registry before building the [`Executor`] — and crucially
 /// **after** any [`subset`](flux_runtime::ToolRegistry::subset), so a tool-restricted agent (a role
 /// with `tools: [read, grep]`) still has the loop machinery (these ops are the engine's own control
 /// flow, not model-facing tools, and match what [`FlowEngine::assemble`] pre-allows).

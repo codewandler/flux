@@ -24,6 +24,7 @@ use flux_agent::{AgentSpec, Permissions};
 use flux_core::{Error, Result};
 use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
+use flux_flow::registry::analyze_composites;
 use flux_flow::state::FlowStore;
 use flux_flow::AgentSink;
 use flux_lang::ast::{SymbolName, Value as FluxValue, Visibility};
@@ -335,10 +336,23 @@ impl Engine {
         let session_id = format!("{name}#{}", self.runs.fetch_add(1, Ordering::SeqCst));
         seed_payload(&store, &session_id, payload)?;
         let executor = build_executor(self.registry.clone(), self.auto_approve)?;
+        analyze_composites(&self.program.ops, &self.registry)
+            .map_err(|d| Error::Other(format!("composite ops: {}", join_diags(&d))))?;
 
-        let outcome = flux_flow::runtime::execute_flow(&store, &executor, &session_id, &ast, sink)
+        let outcome = if self.program.ops.is_empty() {
+            flux_flow::runtime::execute_flow(&store, &executor, &session_id, &ast, sink).await
+        } else {
+            flux_flow::runtime::execute_flow_with_composites(
+                &store,
+                &executor,
+                &session_id,
+                &ast,
+                &self.program.ops,
+                sink,
+            )
             .await
-            .map_err(other)?;
+        }
+        .map_err(other)?;
 
         Ok(JourneyRun {
             journey: name.to_string(),
@@ -542,6 +556,14 @@ fn event_context(label: &str, payload: &Value) -> String {
     }
     s.push_str(" Act according to your instructions for this event.");
     s
+}
+
+fn join_diags(diags: &[flux_lang::analyze::Diagnostic]) -> String {
+    diags
+        .iter()
+        .map(|d| d.message.clone())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Seed an event's payload into the journey's session so the flow can read it: the whole payload binds

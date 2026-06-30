@@ -46,12 +46,13 @@ use flux_cognition::CognitionPack;
 use flux_core::{Error, Result};
 use flux_flow::ast::SymbolName;
 use flux_flow::compile::{compile as compile_flow, CompileOptions};
-use flux_flow::registry::OpRegistry;
-use flux_flow::runtime::{execute_flow, FlowOutcome};
+use flux_flow::registry::{analyze_composites, OpRegistry};
+use flux_flow::runtime::{execute_flow, execute_flow_with_composites, FlowOutcome};
 use flux_flow::state::FlowStore;
 use flux_flow::{tool_defs_from_registry, AgentSink, VoiceSessionDriver, VoiceSink};
 use flux_lang::analyze::analyze_flow;
 use flux_lang::prelude;
+use flux_lang::program::{CompositeOpDecl, Module};
 use flux_orchestrate::{SubAgents, TaskTool};
 use flux_provider::{Provider, RealtimeConfig, RealtimeProvider};
 use flux_runtime::{
@@ -170,6 +171,7 @@ impl FlowClientBuilder {
             prelude_defs,
             session_id: "flux-sdk".to_string(),
             spawner: None,
+            composites: Vec::new(),
         })
     }
 }
@@ -193,6 +195,8 @@ pub struct FlowClient {
     /// Optional sub-agent spawner (installed by [`with_sub_agents`](Self::with_sub_agents)): when set,
     /// `build_executor` threads it into the per-run `ToolContext` so a `task` call delegates to a role.
     spawner: Option<Arc<dyn Spawner>>,
+    /// Module-local Flux-Lang composite ops installed on this client.
+    composites: Vec<CompositeOpDecl>,
 }
 
 impl FlowClient {
@@ -214,7 +218,9 @@ impl FlowClient {
     /// The names of every registered op — handy to prove the cognition pack is wired (`ai.extract`,
     /// `synth`, …) alongside the built-ins (`read`, `grep`, …).
     pub fn op_names(&self) -> Vec<String> {
-        self.registry.names()
+        OpRegistry::new(&self.registry)
+            .with_composites(&self.composites)
+            .op_names()
     }
 
     /// The merged artifact `$defs` map (the planner catalog `$defs`), for inspection or merging into
@@ -268,13 +274,19 @@ impl FlowClient {
         self
     }
 
+    /// Register module-local composite ops so stored flows can call them like ordinary ops.
+    pub fn register_composites(&mut self, composites: Vec<CompositeOpDecl>) -> &mut Self {
+        self.composites.extend(composites);
+        self
+    }
+
     // ----- the lifecycle: compile → analyze → execute -----
 
     /// Compile a natural-language `text` into a typed [`DraftAst`] via `flux-flow`'s NL→AST front-end
     /// (prompt-and-parse with a bounded repair loop). `view`, when present, lets the model reference
     /// existing session symbols instead of re-fetching.
     pub async fn compile(&self, text: &str, view: Option<&SessionView>) -> Result<DraftAst> {
-        let ops = OpRegistry::new(&self.registry);
+        let ops = OpRegistry::new(&self.registry).with_composites(&self.composites);
         let compiled = compile_flow(
             self.provider.as_ref(),
             &self.model,
@@ -295,10 +307,17 @@ impl FlowClient {
         flux_lang::parse::parse(text).map_err(|e| Error::Other(e.to_string()))
     }
 
+    /// Deterministic native module parser. Composite ops live on [`Module::Program::ops`] and can be
+    /// installed with [`register_composites`](Self::register_composites).
+    pub fn parse_module(&self, text: &str) -> Result<Module> {
+        Module::parse_str(text).map_err(|e| Error::Other(e.to_string()))
+    }
+
     /// Analyze an AST against the assembled registry's op catalog. `Ok(())` means every referenced op
     /// resolves; `Err` carries the [`Diagnostic`]s (e.g. unknown ops).
     pub fn analyze(&self, ast: &DraftAst) -> std::result::Result<(), Vec<Diagnostic>> {
-        let ops = OpRegistry::new(&self.registry);
+        analyze_composites(&self.composites, &self.registry)?;
+        let ops = OpRegistry::new(&self.registry).with_composites(&self.composites);
         analyze_flow(ast, &ops)
     }
 
@@ -309,9 +328,20 @@ impl FlowClient {
         let mut sink = ExecSink::default();
         // `execute_flow` returns `flux_flow::Result` (a `FlowError`); fold it into the SDK's
         // `flux_core::Error` so the surface speaks one error type.
-        let outcome = execute_flow(&self.store, &executor, &self.session_id, ast, &mut sink)
+        let outcome = if self.composites.is_empty() {
+            execute_flow(&self.store, &executor, &self.session_id, ast, &mut sink).await
+        } else {
+            execute_flow_with_composites(
+                &self.store,
+                &executor,
+                &self.session_id,
+                ast,
+                &self.composites,
+                &mut sink,
+            )
             .await
-            .map_err(|e| Error::Other(e.to_string()))?;
+        }
+        .map_err(|e| Error::Other(e.to_string()))?;
         finish_outcome(outcome, sink)
     }
 
@@ -340,9 +370,20 @@ impl FlowClient {
         }
         let executor = self.build_executor();
         let mut sink = ExecSink::default();
-        let outcome = execute_flow(&store, &executor, &self.session_id, ast, &mut sink)
+        let outcome = if self.composites.is_empty() {
+            execute_flow(&store, &executor, &self.session_id, ast, &mut sink).await
+        } else {
+            execute_flow_with_composites(
+                &store,
+                &executor,
+                &self.session_id,
+                ast,
+                &self.composites,
+                &mut sink,
+            )
             .await
-            .map_err(|e| Error::Other(e.to_string()))?;
+        }
+        .map_err(|e| Error::Other(e.to_string()))?;
         finish_outcome(outcome, sink)
     }
 
@@ -353,7 +394,7 @@ impl FlowClient {
         &self,
         ast: &DraftAst,
     ) -> std::result::Result<flux_flow::ast::PhysicalPlan, Vec<Diagnostic>> {
-        let ops = OpRegistry::new(&self.registry);
+        let ops = OpRegistry::new(&self.registry).with_composites(&self.composites);
         let hir = flux_flow::analyze::lower(ast, &ops)?;
         Ok(flux_flow::optimize::optimize(&hir, &ops))
     }
@@ -367,15 +408,28 @@ impl FlowClient {
             .map_err(|d| Error::Other(format!("analyze: {}", join_diags(&d))))?;
         let executor = self.build_executor();
         let mut sink = ExecSink::default();
-        let outcome = flux_flow::runtime::execute_plan(
-            &self.store,
-            &executor,
-            &self.session_id,
-            &ast.body,
-            &plan,
-            &mut sink,
-        )
-        .await
+        let outcome = if self.composites.is_empty() {
+            flux_flow::runtime::execute_plan(
+                &self.store,
+                &executor,
+                &self.session_id,
+                &ast.body,
+                &plan,
+                &mut sink,
+            )
+            .await
+        } else {
+            flux_flow::runtime::execute_plan_with_composites(
+                &self.store,
+                &executor,
+                &self.session_id,
+                &ast.body,
+                &plan,
+                &self.composites,
+                &mut sink,
+            )
+            .await
+        }
         .map_err(|e| Error::Other(e.to_string()))?;
         Ok(ExecutionResult {
             result: outcome.result,
@@ -969,6 +1023,110 @@ mod tests {
             !ran,
             "a destructive op must be gated by the default approver"
         );
+    }
+
+    #[tokio::test]
+    async fn composite_op_executes_through_dispatch_and_keeps_locals_scoped() {
+        let mut client = FlowClient::builder()
+            .auto_approve(true)
+            .build(MockProvider::one("noop"), temp_root("composite"))
+            .unwrap();
+        client.register_op(Arc::new(EchoArgsTool));
+        let module = client
+            .parse_module(
+                r#"
+op shout(value: String) -> String
+  description "echo through a composite"
+  risk "low"
+  idempotency "idempotent"
+  effects [read]
+  expose true
+
+  $local = echo_args($value)
+  return $local
+
+flow main
+  $result = shout("HELLO-COMPOSITE")
+  return $result
+"#,
+            )
+            .unwrap();
+        let Module::Program(program) = module else {
+            panic!("op declaration makes this a program");
+        };
+        client.register_composites(program.ops.clone());
+        let ast = &program.flows[0];
+
+        client.analyze(ast).expect("composite flow analyzes");
+        let out = client.execute(ast).await.unwrap();
+        assert!(out.result.contains("HELLO-COMPOSITE"), "got {}", out.result);
+        assert_eq!(out.tool_calls, vec!["shout", "echo_args"]);
+
+        let view = client.store.view("flux-sdk").unwrap();
+        assert!(
+            view.symbols.iter().any(|s| s.name.0 == "result"),
+            "caller bind should remain visible"
+        );
+        assert!(
+            view.symbols.iter().all(|s| s.name.0 != "local"),
+            "composite local must not leak into caller view: {:?}",
+            view.symbols
+        );
+    }
+
+    #[test]
+    fn composite_validation_rejects_understated_effects_await_and_recursion() {
+        let mut client = FlowClient::builder()
+            .build(MockProvider::one("noop"), temp_root("composite-invalid"))
+            .unwrap();
+        client.register_op(Arc::new(EchoArgsTool));
+
+        let module = client
+            .parse_module(
+                r#"
+op bad_effect(value: String) -> String
+  description "missing read effect"
+  risk "low"
+  idempotency "idempotent"
+  effects []
+  $x = echo_args($value)
+  return $x
+
+op waits
+  description "not allowed"
+  risk "low"
+  idempotency "idempotent"
+  effects []
+  @json {"kind":"await","source":"reply"}
+
+op a
+  description "cycle"
+  risk "low"
+  idempotency "idempotent"
+  effects []
+  b()
+
+op b
+  description "cycle"
+  risk "low"
+  idempotency "idempotent"
+  effects []
+  a()
+
+flow main
+  return "unused"
+"#,
+            )
+            .unwrap();
+        let Module::Program(program) = module else {
+            panic!("program")
+        };
+        let diags =
+            flux_flow::registry::analyze_composites(&program.ops, client.registry()).unwrap_err();
+        let joined = join_diags(&diags);
+        assert!(joined.contains("missing declared effect"), "{joined}");
+        assert!(joined.contains("cannot contain `await`"), "{joined}");
+        assert!(joined.contains("recursive composite op cycle"), "{joined}");
     }
 
     #[tokio::test]

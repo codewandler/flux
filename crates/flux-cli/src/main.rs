@@ -6,12 +6,13 @@
 
 mod plugin_skill;
 mod preset;
+mod skill_cmd;
 mod style;
 
 use std::io::{IsTerminal, Write};
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use futures::StreamExt;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -261,6 +262,18 @@ enum Commands {
         #[command(subcommand)]
         action: Option<PluginAction>,
     },
+    /// Render or install generated Claude-format Flux skills.
+    Skill {
+        /// Which section to render/install: cli | lang | plugin | ops. Omit for the root skill.
+        #[arg(value_enum, value_name = "TYPE")]
+        type_: Option<skill_cmd::SkillType>,
+        /// Install generated skill directories instead of printing SKILL.md to stdout.
+        #[arg(long)]
+        install: bool,
+        /// With `--install`, target the user-global `~/.claude/skills` instead of project `.flux/skills`.
+        #[arg(long)]
+        global: bool,
+    },
     /// Print a shell completion script to stdout (defaults to fish).
     Completion {
         /// Shell to generate for: bash | zsh | fish | powershell | elvish.
@@ -368,14 +381,13 @@ enum PluginAction {
     /// Register every `flux-plugin-*` binary in a directory: `install [dir]`
     /// (default `plugins/target/release`).
     Install { dir: Option<String> },
-    /// Generate a `flux-plugins` skill (SKILL.md + references/) from installed plugin manifests —
-    /// the flux analogue of fluxplane's `fluxplane-plugin skill`. Prints to stdout by default; rerun
-    /// with `--install` to (re)generate the skill tree (i.e. refresh).
+    /// Generate the plugin section skill from installed plugin manifests.
+    /// Alias for `flux skill plugin`; prints to stdout by default, or installs with `--install`.
     Skill {
-        /// Write the SKILL.md + references/ into a skills dir (the project `.flux/skills/flux-plugins`).
+        /// Write the SKILL.md + references/ into the project `.flux/skills/flux-plugin`.
         #[arg(long)]
         install: bool,
-        /// With `--install`, target the user-global `~/.claude/skills/flux-plugins` instead.
+        /// With `--install`, target the user-global `~/.claude/skills/flux-plugin` instead.
         #[arg(long)]
         global: bool,
         /// Write the SKILL.md to this single file (references go in a sibling `references/`).
@@ -647,9 +659,9 @@ fn compact_threshold() -> usize {
         .unwrap_or(48_000)
 }
 
-/// Discover skills from the project's `.flux/skills` plus the user/global dirs (`~/.flux/skills`,
-/// `~/.agents/skills`, `~/.claude/skills`), project winning on a name clash. Activation (triggers or
-/// a description fallback) gates which bodies are injected per turn.
+/// Discover skills from the project's `.flux/skills` and `.claude/skills` plus the user/global dirs
+/// (`~/.flux/skills`, `~/.agents/skills`, `~/.claude/skills`), project winning on a name clash.
+/// Activation (triggers or a description fallback) gates which bodies are injected per turn.
 fn load_skills(cwd: &std::path::Path) -> Vec<flux_skill::Skill> {
     flux_skill::discover_merged(&flux_skill::default_skill_dirs(cwd))
 }
@@ -884,7 +896,16 @@ async fn build_agent(
             (Box::new(native), m)
         };
 
-    let system = Arc::new(System::new(Workspace::new(&cwd).context("workspace")?));
+    let mut workspace = Workspace::new(&cwd).context("workspace")?;
+    if let Some(home) = std::env::var_os("HOME") {
+        let global_ops = std::path::PathBuf::from(home).join(".flux").join("ops");
+        std::fs::create_dir_all(&global_ops)
+            .with_context(|| format!("create {}", global_ops.display()))?;
+        workspace
+            .add_named_root("global_ops", &global_ops)
+            .with_context(|| format!("register {}", global_ops.display()))?;
+    }
+    let system = Arc::new(System::new(workspace));
 
     // Project context folded into the system prompt: environment, git working-tree state, repo
     // shape/stack, and project conventions (CLAUDE.md/AGENTS.md) — so the agent isn't cold-starting.
@@ -953,10 +974,10 @@ async fn build_agent(
     // top-level registry only — never on `sub_registry`, so worker sub-agents can't run eval/git ops.
     flux_eval::register_eval_ops(&mut registry);
 
-    // Reflexive ops (`plan`/`run_plan`): registered so a pre-authored flow (`flux flow run`, and the
-    // agent loop in flux-lang) can call them, but tagged to the never-surfaced `reflect` group so they
-    // stay OUT of the model-facing catalog in ordinary turns. They are only functional when a `LoopHost`
-    // is installed (per reflexive run — see `run_draft_ast`); without it they return a clear error.
+    // Root/reflexive ops: `plan`/`run_plan` are registered so a pre-authored flow (`flux flow run`, and
+    // the agent loop in flux-lang) can call them, but are tagged to the never-surfaced `reflect` group so
+    // they stay OUT of the model-facing catalog in ordinary turns. `op.register` is model-facing and
+    // delegates to the engine-installed composite registrar.
     flux_tools::register_reflect(&mut registry);
 
     // Guarded web access (policy-gated as network egress; private/loopback per config).
@@ -1209,15 +1230,34 @@ async fn run_flow(file: &str, model: Option<String>, yes: bool) -> Result<()> {
     let src = std::fs::read_to_string(file).with_context(|| format!("read flow {file}"))?;
     // A behavioral loop file is native flux-lang text, or a checked-in JSON `DraftAst` (sniffed by the
     // leading `{`). Both load as the same AST.
-    let ast: flux_flow::ast::DraftAst = if src.trim_start().starts_with('{') {
-        serde_json::from_str(&src)
-            .with_context(|| format!("parse {file} as a Flux-Lang DraftAst (JSON)"))?
+    let (ast, composites): (
+        flux_flow::ast::DraftAst,
+        Vec<flux_lang::program::CompositeOpDecl>,
+    ) = if src.trim_start().starts_with('{') {
+        (
+            serde_json::from_str(&src)
+                .with_context(|| format!("parse {file} as a Flux-Lang DraftAst (JSON)"))?,
+            Vec::new(),
+        )
     } else {
-        flux_lang::parse::parse(&src)
+        match flux_lang::program::Module::parse_str(&src)
             .map_err(|e| anyhow::anyhow!("parse {file} as Flux-Lang text: {e}"))?
+        {
+            flux_lang::program::Module::Flow(ast) => (ast, Vec::new()),
+            flux_lang::program::Module::Program(program) => {
+                let ast = match (program.flows.as_slice(), program.journeys.as_slice()) {
+                    ([flow], []) => flow.clone(),
+                    ([], [journey]) => journey.flow.clone(),
+                    _ => bail!(
+                        "`flux flow run` needs a bare flow or a module with exactly one flow/journey"
+                    ),
+                };
+                (ast, program.ops)
+            }
+        }
     };
 
-    run_draft_ast(&flags, &ast).await
+    run_draft_ast_with_composites(&flags, &ast, &composites).await
 }
 
 /// Execute a pre-built `DraftAst` through the full envelope — the shared core behind both
@@ -1228,14 +1268,35 @@ pub(crate) async fn run_draft_ast(
     flags: &AgentFlags,
     ast: &flux_flow::ast::DraftAst,
 ) -> Result<()> {
+    run_draft_ast_with_composites(flags, ast, &[]).await
+}
+
+pub(crate) async fn run_draft_ast_with_composites(
+    flags: &AgentFlags,
+    ast: &flux_flow::ast::DraftAst,
+    composites: &[flux_lang::program::CompositeOpDecl],
+) -> Result<()> {
     let (engine, session_id, _spawner) = build_agent(flags).await?;
     eprintln!(
         "{}",
         style::dim(&format!("flow · {} · session {session_id}", engine.model))
     );
+    engine
+        .composites
+        .ensure_session_loaded(&engine.flow, &session_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut active_composites = engine.composites.active_for_session(&session_id);
+    active_composites.extend(composites.iter().cloned());
 
     // Validate against the live op registry before running anything.
-    let oreg = flux_flow::registry::OpRegistry::new(engine.executor.registry());
+    if let Err(diags) =
+        flux_flow::registry::analyze_composites(&active_composites, engine.executor.registry())
+    {
+        print_diagnostics(&diags);
+        bail!("composite validation failed — see diagnostics above");
+    }
+    let oreg = flux_flow::registry::OpRegistry::new(engine.executor.registry())
+        .with_composites(&active_composites);
     if let Err(diags) = flux_flow::analyze::analyze_flow(ast, &oreg) {
         print_diagnostics(&diags);
         bail!("flow validation failed — see diagnostics above");
@@ -1243,7 +1304,15 @@ pub(crate) async fn run_draft_ast(
 
     // Risk preview (informational; every op still gates at dispatch through the engine's approver,
     // which `build_agent` set from `--yes`).
-    let risk = flux_flow::runtime::plan_risk(ast, engine.executor.registry());
+    let risk = if active_composites.is_empty() {
+        flux_flow::runtime::plan_risk(ast, engine.executor.registry())
+    } else {
+        flux_flow::runtime::plan_risk_with_composites(
+            ast,
+            engine.executor.registry(),
+            &active_composites,
+        )
+    };
     eprintln!(
         "\n{}  {}{}",
         style::bold("flow"),
@@ -1263,14 +1332,26 @@ pub(crate) async fn run_draft_ast(
     );
 
     let mut sink = flux_flow::loop_host::SharedSink::new(shared.clone());
-    let outcome = flux_flow::runtime::execute_flow(
-        engine.flow.as_ref(),
-        engine.executor.as_ref(),
-        &session_id,
-        ast,
-        &mut sink,
-    )
-    .await
+    let outcome = if active_composites.is_empty() {
+        flux_flow::runtime::execute_flow(
+            engine.flow.as_ref(),
+            engine.executor.as_ref(),
+            &session_id,
+            ast,
+            &mut sink,
+        )
+        .await
+    } else {
+        flux_flow::runtime::execute_flow_with_composites(
+            engine.flow.as_ref(),
+            engine.executor.as_ref(),
+            &session_id,
+            ast,
+            &active_composites,
+            &mut sink,
+        )
+        .await
+    }
     .context("execute flow")?;
     if !outcome.result.trim().is_empty() {
         println!("{}", outcome.result);
@@ -3208,6 +3289,11 @@ async fn main() -> Result<()> {
             Some(Commands::Sessions { prune }) => run_sessions(prune),
             Some(Commands::Auth { action }) => run_auth(action).await,
             Some(Commands::Plugin { action }) => run_plugin(action).await,
+            Some(Commands::Skill {
+                type_,
+                install,
+                global,
+            }) => run_skill(type_, install, global).await,
             Some(Commands::Completion { shell }) => run_completion(shell.as_deref()),
             Some(Commands::Preset { args }) => preset::run_preset(&args).await,
             // No subcommand → interactive REPL (the one implicit entry point).
@@ -3629,15 +3715,124 @@ fn available_plugin_operations(manifest: &flux_plugin::PluginManifest) -> String
     }
 }
 
-/// Render the generated `flux-plugins` skill from the installed plugins' manifests (story D-13). Spawns
-/// each plugin only to fetch its manifest (no op call); a plugin that fails to spawn/manifest is skipped
-/// with a note rather than aborting the whole catalog.
-async fn run_plugin_skill(
+/// `flux skill [type] [--install] [--global]`: render or install the generated Flux skills.
+async fn run_skill(type_: Option<skill_cmd::SkillType>, install: bool, global: bool) -> Result<()> {
+    if global && !install {
+        bail!("--global requires --install");
+    }
+
+    if !install {
+        let rendered = match type_ {
+            Some(kind) => render_generated_skill(kind).await?,
+            None => skill_cmd::render_root_skill(),
+        };
+        print!("{}", rendered.skill_md);
+        if !rendered.references.is_empty() {
+            eprintln!(
+                "{}",
+                style::dim(&format!(
+                    "({} reference file(s) omitted on stdout; rerun with --install to write them)",
+                    rendered.references.len()
+                ))
+            );
+        }
+        return Ok(());
+    }
+
+    let root = skills_root_dir(global)?;
+    let mut rendered = vec![skill_cmd::render_root_skill()];
+    match type_ {
+        Some(kind) => rendered.push(render_generated_skill(kind).await?),
+        None => {
+            for kind in skill_cmd::SkillType::all() {
+                rendered.push(render_generated_skill(kind).await?);
+            }
+        }
+    }
+
+    std::fs::create_dir_all(&root).with_context(|| format!("create {}", root.display()))?;
+    let mut paths = Vec::new();
+    for skill in &rendered {
+        paths.push(write_generated_skill(&root, skill)?);
+    }
+    println!(
+        "installed {} generated skill(s) → {}",
+        paths.len(),
+        root.display()
+    );
+    Ok(())
+}
+
+async fn render_generated_skill(kind: skill_cmd::SkillType) -> Result<skill_cmd::RenderedSkill> {
+    match kind {
+        skill_cmd::SkillType::Cli => Ok(skill_cmd::render_cli_skill(Cli::command())),
+        skill_cmd::SkillType::Lang => Ok(skill_cmd::render_lang_skill()),
+        skill_cmd::SkillType::Plugin => {
+            let dir = plugins_dir().ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+            let plugins = load_plugin_manifests(&dir).await?;
+            Ok(skill_cmd::render_plugin_skill(&plugins))
+        }
+        skill_cmd::SkillType::Ops => {
+            let (registry, groups) = skill_ops_registry()?;
+            Ok(skill_cmd::render_ops_skill(&registry, &groups))
+        }
+    }
+}
+
+/// Build the operation catalog that can be rendered without starting providers or plugin hosts.
+fn skill_ops_registry() -> Result<(ToolRegistry, Vec<flux_evidence::ToolGroup>)> {
+    let mut registry = ToolRegistry::new();
+    flux_tools::register_builtins(&mut registry);
+    flux_eval::register_eval_ops(&mut registry);
+    flux_tools::register_reflect(&mut registry);
+    registry.register(Arc::new(flux_capabilities::WebFetchTool::default()));
+    flux_capabilities::register_datasource_ops(
+        &mut registry,
+        Arc::new(flux_capabilities::MemoryBackend::new()),
+    );
+
+    let cwd = std::env::current_dir()?;
+    let mut groups = flux_tools::groups::builtin_groups();
+    groups.push(flux_eval::eval_group());
+    let groups = flux_config::merge_groups(groups, flux_config::load_groups(&cwd));
+    Ok((registry, groups))
+}
+
+/// The generated skill root directory: project `.flux/skills`, or global `~/.claude/skills`.
+fn skills_root_dir(global: bool) -> Result<std::path::PathBuf> {
+    if global {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+        Ok(home.join(".claude").join("skills"))
+    } else {
+        Ok(std::env::current_dir()?.join(".flux").join("skills"))
+    }
+}
+
+fn write_generated_skill(
+    root: &std::path::Path,
+    skill: &skill_cmd::RenderedSkill,
+) -> Result<std::path::PathBuf> {
+    let dir = root.join(&skill.name);
+    if dir.is_dir() {
+        std::fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
+    } else if dir.exists() {
+        std::fs::remove_file(&dir).with_context(|| format!("remove {}", dir.display()))?;
+    }
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let skill_file = dir.join("SKILL.md");
+    std::fs::write(&skill_file, &skill.skill_md)
+        .with_context(|| format!("write {}", skill_file.display()))?;
+    write_skill_references(&dir.join("references"), &skill.references)?;
+    Ok(dir)
+}
+
+/// Spawns each plugin only to fetch its manifest (no op call); a plugin that fails to spawn/manifest
+/// is skipped with a note rather than aborting the whole catalog.
+async fn load_plugin_manifests(
     dir: &std::path::Path,
-    install: bool,
-    global: bool,
-    out: Option<String>,
-) -> Result<()> {
+) -> Result<Vec<(String, flux_plugin::PluginManifest)>> {
     let mut plugins: Vec<(String, flux_plugin::PluginManifest)> = Vec::new();
     // Plugins launch through the one guarded spawn path, which needs a workspace-rooted System.
     let system =
@@ -3662,7 +3857,18 @@ async fn run_plugin_skill(
             ),
         }
     }
-    let rendered = plugin_skill::render_plugin_skill(&plugins);
+    Ok(plugins)
+}
+
+/// Legacy alias for `flux skill plugin`: render the generated plugin skill from installed manifests.
+async fn run_plugin_skill(
+    dir: &std::path::Path,
+    install: bool,
+    global: bool,
+    out: Option<String>,
+) -> Result<()> {
+    let plugins = load_plugin_manifests(dir).await?;
+    let rendered = skill_cmd::render_plugin_skill(&plugins);
 
     if let Some(out) = out {
         let out = std::path::PathBuf::from(out);
@@ -3682,15 +3888,12 @@ async fn run_plugin_skill(
     }
 
     if install {
-        let base = skill_install_dir(global)?;
+        let base = skills_root_dir(global)?;
         std::fs::create_dir_all(&base).with_context(|| format!("create {}", base.display()))?;
-        let skill_file = base.join("SKILL.md");
-        std::fs::write(&skill_file, &rendered.skill_md)
-            .with_context(|| format!("write {}", skill_file.display()))?;
-        write_skill_references(&base.join("references"), &rendered.references)?;
+        let dir = write_generated_skill(&base, &rendered)?;
         println!(
-            "installed flux-plugins skill → {} ({} plugin(s), {} reference(s))",
-            base.display(),
+            "installed flux-plugin skill → {} ({} plugin(s), {} reference(s))",
+            dir.display(),
             plugins.len(),
             rendered.references.len()
         );
@@ -3699,22 +3902,6 @@ async fn run_plugin_skill(
 
     print!("{}", rendered.skill_md);
     Ok(())
-}
-
-/// Where `flux plugin skill --install` writes: the project `.flux/skills/flux-plugins` (highest skill
-/// precedence) or, with `--global`, the user-global `~/.claude/skills/flux-plugins`.
-fn skill_install_dir(global: bool) -> Result<std::path::PathBuf> {
-    if global {
-        let home = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
-        Ok(home.join(".claude").join("skills").join("flux-plugins"))
-    } else {
-        Ok(std::env::current_dir()?
-            .join(".flux")
-            .join("skills")
-            .join("flux-plugins"))
-    }
 }
 
 /// Write each generated `references/<plugin>.md` into `dir` (created on demand).
@@ -3819,7 +4006,7 @@ mod tests {
     use super::{
         build_datasources, format_evidence, loop_machinery_label, new_render_suffix,
         plugin_binaries_in, resolve_plugin_operation_name, tool_preview, truncate,
-        usage_annotation,
+        usage_annotation, write_generated_skill,
     };
     use serde_json::json;
 
@@ -3931,6 +4118,25 @@ mod tests {
         assert!(err.contains("grafana.search"), "{err}");
     }
 
+    #[test]
+    fn generated_skill_install_writes_skill_dir_and_references() {
+        let root = std::env::temp_dir().join(format!("flux-skill-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let skill = super::skill_cmd::RenderedSkill {
+            name: "flux-test".into(),
+            skill_md: "---\nname: flux-test\ndescription: test\n---\nbody\n".into(),
+            references: vec![("ops".into(), "# Ops\n".into())],
+        };
+
+        let dir = write_generated_skill(&root, &skill).unwrap();
+        assert_eq!(dir, root.join("flux-test"));
+        assert!(dir.join("SKILL.md").is_file());
+        assert!(dir.join("references").join("ops.md").is_file());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// The turn-end token annotation reports all four figures the user asked for: context-window
     /// occupancy (fresh input + both cache tiers), generated output, the cached tokens, and the
     /// hit-rate (cached ÷ context). It is empty when nothing was billed (offline `-m mock`).
@@ -3985,6 +4191,7 @@ mod tests {
             "sessions",
             "auth",
             "plugin",
+            "skill",
             "completion",
             "preset",
         ] {
@@ -4026,6 +4233,18 @@ mod tests {
             longs.iter().any(|l| l == "color"),
             "top-level missing --color: {longs:?}"
         );
+    }
+
+    /// `flux skill` is the generated-skill surface: optional type plus install/global flags.
+    #[test]
+    fn skill_help_documents_types_and_install_flags() {
+        use clap::CommandFactory;
+        let cmd = super::Cli::command();
+        let skill = cmd.find_subcommand("skill").expect("skill subcommand");
+        let help = skill.clone().render_long_help().to_string();
+        for want in ["--install", "--global", "cli", "lang", "plugin", "ops"] {
+            assert!(help.contains(want), "`flux skill --help` missing {want:?}");
+        }
     }
 
     /// `flux eval --help` carries its own typed flags + the adapter list (the original ask).

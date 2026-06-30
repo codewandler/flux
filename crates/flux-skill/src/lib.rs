@@ -276,12 +276,14 @@ pub fn discover_merged(dirs: &[PathBuf]) -> Vec<Skill> {
 }
 
 /// The default skill directories, highest-precedence first: the project's `.flux/skills`, then the
-/// user-global `~/.flux/skills`, then the cross-agent conventions `~/.agents/skills` and
-/// `~/.claude/skills`. Canonicalized, de-duplicated, and filtered to existing directories (so the
-/// HOME-equals-cwd case can't scan a dir twice). Pass to [`discover_merged`].
+/// project's Claude-compatible `.claude/skills`, then the user-global `~/.flux/skills`, then the
+/// cross-agent conventions `~/.agents/skills` and `~/.claude/skills`. Canonicalized, de-duplicated,
+/// and filtered to existing directories (so the HOME-equals-cwd case can't scan a dir twice). Pass to
+/// [`discover_merged`].
 pub fn default_skill_dirs(cwd: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     push_existing(&mut dirs, cwd.join(".flux").join("skills"));
+    push_existing(&mut dirs, cwd.join(".claude").join("skills"));
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
         push_existing(&mut dirs, home.join(".flux").join("skills"));
@@ -473,6 +475,40 @@ mod tests {
 
         std::fs::remove_dir_all(&global).ok();
         std::fs::remove_dir_all(&project).ok();
+    }
+
+    #[test]
+    fn default_dirs_include_project_claude_after_project_flux() {
+        let root = temp_dir();
+        let flux = root.join(".flux").join("skills");
+        let claude = root.join(".claude").join("skills");
+        std::fs::create_dir_all(&flux).unwrap();
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(flux.join("shared.md"), "---\nname: shared\n---\nfrom flux").unwrap();
+        std::fs::write(
+            claude.join("shared.md"),
+            "---\nname: shared\n---\nfrom claude",
+        )
+        .unwrap();
+        std::fs::write(
+            claude.join("claude-only.md"),
+            "---\nname: claude-only\n---\nfrom claude",
+        )
+        .unwrap();
+
+        let dirs = default_skill_dirs(&root);
+        assert_eq!(dirs[0], flux.canonicalize().unwrap());
+        assert_eq!(dirs[1], claude.canonicalize().unwrap());
+
+        let merged = discover_merged(&dirs);
+        let shared = merged.iter().find(|s| s.name == "shared").unwrap();
+        assert_eq!(shared.body, "from flux");
+        assert!(
+            merged.iter().any(|s| s.name == "claude-only"),
+            "project .claude/skills should be discovered by default"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
