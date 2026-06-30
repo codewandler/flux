@@ -265,6 +265,12 @@ makes codex's **websocket** the default transport (HTTP fallback), and adds the 
 - **[C-08](stories/C-08-full-oauth2-login.md) — Full OAuth2 login (codex PKCE)** · *core, later stage.* A
   flux-native `flux auth login codex` to parity with claude's PKCE login. Explicitly deferred — import + refresh
   cover the near term.
+- **[C-09](stories/C-09-aws-bedrock-provider.md) — AWS Bedrock LLM provider** · *core.* Drive
+  Bedrock-provisioned Claude (`us.anthropic.claude-sonnet-4-6`, …) through the same harness. The wire is
+  native Anthropic Messages JSON (flux's `messages` codec already speaks it), so the work is SigV4 request
+  signing + the AWS credential chain (the dev account is SSO-only). Design + scoping in
+  [aws-bedrock-provider.md](designs/aws-bedrock-provider.md); smallest-first split is C-09a (SigV4 + static
+  keys), C-09b (event-stream streaming), C-09c (pricing + CLI routing).
 
 **Candidate phases (vision tail, in priority order):**
 - **Crate consolidation** ✅ **all phases shipped** — shrank the workspace by merging coherent

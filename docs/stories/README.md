@@ -33,6 +33,10 @@ _None._
 ## Backlog
 - [L-02 — flux-markdown engine + progressive-disclosure skills](L-02-flux-markdown-engine.md) · Language · AST parser, body-on-demand activation
 
+### AWS Bedrock LLM provider
+_- **Enterprise reach.** Bedrock is the compliance-friendly path to Claude (and Llama/Mistral) for_
+- [C-09 — AWS Bedrock LLM provider](C-09-aws-bedrock-provider.md) · Core · invoke-model returns native Anthropic Messages JSON — reuse the messages codec; the work is SigV4 signing + AWS credential chain (dev account is SSO-only)
+
 ### endpoint discovery & brokerage (references-only plugin IO)
 _flux's plugins each talk to a single, statically-configured service. The fluxplane pack they were_
 - [D-31 — Host-terminated raw-socket auth (no credential to the plugin)](D-31-host-terminated-rawsocket-auth.md) · Core
@@ -87,6 +91,7 @@ _flux can already drive the two **subscription / passthrough** model backends �
 - [D-33 — Resolve cluster/namespace aliases in endpoint discovery](D-33-endpoint-discovery-aliases.md) · Agent · "dev" isn't a kubeconfig context (it's a full EKS ARN); the broker never relays cluster/namespace; and "namespace=latest" is ambiguous with the newest-namespace heuristic
 - [D-34 — schemars-derive every operation schema (kill hand-written JSON Schema)](D-34-schemars-op-schemas.md) · Core
 - [D-35 — Sanitize plugin descriptor names — block path traversal in `descriptor_path`](D-35-plugin-descriptor-path-traversal.md) · Core · `flux plugin uninstall ../../x` (or an absolute name) can delete files outside the plugins dir — centralize one guard in `descriptor_path`
+- [D-37 — Port homer call.analyze multi-leg correlation logic from fluxplane (parity)](D-37-homer-call-analyze-parity.md) · Agent · the pilot "port the gap" sub-recipe from the D-36 plan — flux homer's call.analyze was a stripped-down stub (seed-by-call_id only); ported the full fluxplane multi-leg correlation analysis (from_user+to_user seed, number fan-out, correlation groups + temporal overlap, number matching, multi-leg report)
 - [I-02 — Reduce wasted agent-loop retries](I-02-agent-loop-retry-efficiency.md) · Improve · cargo wrappers normalize duplicate model-supplied scope flags, and the loop guard fingerprints repeated deterministic failures before replanning again
 - [L-01 — Global, multi-format skill loading](L-01-global-skills.md) · Language · multi-dir + Agent-Skills/Claude format + `flux-markdown` (see [CHANGELOG](../../CHANGELOG.md))
 - [L-03 — Native-text module declarations (the whole app in flux-lang — `.flux` does all of it)](L-03-native-text-program-grammar.md) · Language · the whole app — `agent`/`channel`/`datasource`/`trigger`/`journey` + flows — in native flux-lang text (settings inline, secrets as `secret "ENV"` refs); JSON-program path deleted (clean cutover); `flux app run`/`flux flow run` load native text; supersedes the JSON manifest (see [design](../designs/native-text-modules.md))
