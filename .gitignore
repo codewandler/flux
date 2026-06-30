@@ -6,6 +6,11 @@
 *.db-shm
 .env
 
+# Node / Docusaurus
+node_modules/
+website/.docusaurus/
+website/build/
+
 # IDE
 /.idea/
 
