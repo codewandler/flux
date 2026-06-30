@@ -579,6 +579,14 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, diags: &mut Vec<Diagnostic>) {
                         "`return` is not allowed inside a `parallel` branch",
                     ));
                 }
+                if b.body.is_empty() {
+                    diags.push(Diagnostic::new(format!(
+                        "`parallel` branch `${0}` has an empty body — put the op(s) that \
+                         produce its value in `body`, e.g. \
+                         {{\"name\":\"{0}\",\"body\":[{{\"kind\":\"call\",...}}]}}",
+                        b.name.0
+                    )));
+                }
                 for n in &b.body {
                     check_node(n, ops, diags);
                 }
@@ -1549,6 +1557,29 @@ mod tests {
         assert!(
             diags.iter().any(|d| d.message.contains("duplicate")),
             "a duplicate branch name is rejected"
+        );
+    }
+
+    #[test]
+    fn analyze_rejects_empty_parallel_branch() {
+        use crate::ast::{Branch, DraftAst, Node};
+        let ops = catalog();
+
+        // A `parallel` branch with an empty body binds nothing at runtime (silent no-op); the
+        // analyzer must reject it so the planner's repair loop forces the model to fill it.
+        let bad = DraftAst {
+            body: vec![Node::Parallel {
+                branches: vec![Branch {
+                    name: "spec_def".into(),
+                    body: vec![],
+                }],
+            }],
+            ..Default::default()
+        };
+        let diags = analyze_flow(&bad, &ops).unwrap_err();
+        assert!(
+            diags.iter().any(|d| d.message.contains("empty body")),
+            "an empty parallel branch body is rejected"
         );
     }
 }
