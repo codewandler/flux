@@ -132,9 +132,9 @@ All notable changes to this project are documented in this file. The format is b
   stored plans still execute. `x-param-order` is gone — `required` is now a *set*, not
   an order; `schema_params` returns sorted optional params for display only. The planner
   prompt + catalog signature (`name({params})`) + skills/reference docs now teach the
-  named-args form. This unblocks the schemars schema migration (D-31), since `schemars`
+  named-args form. This unblocks the schemars schema migration (D-34), since `schemars`
   does not emit `x-param-order`.
-- **schemars-derived op input schemas (D-31).** Every in-process `ToolSpec` operation's
+- **schemars-derived op input schemas (D-34).** Every in-process `ToolSpec` operation's
   `input_schema` is now derived from a typed Rust struct via
   `flux_spec::tool_input_schema::<T>()` (schemars), killing all hand-written
   `json!({...})` schemas across `flux-tools`, `flux-eval`, and `flux-orchestrate` — so an

@@ -13,7 +13,7 @@ design: named-argument-calls
 
 Make Flux-Lang `call` parameter **order non-load-bearing**: multi-param ops are called with a
 single named object argument; single-param ops keep bare-value sugar. Deletes `x-param-order` and
-makes `required` a set, which unblocks the schemars schema migration (story D-31) — `schemars`
+makes `required` a set, which unblocks the schemars schema migration (story D-34) — `schemars`
 doesn't emit `x-param-order`, so optional-param ordering is lost once schemas are derived.
 
 Full design: [docs/designs/named-argument-calls.md](../designs/named-argument-calls.md).
@@ -50,7 +50,7 @@ Full design: [docs/designs/named-argument-calls.md](../designs/named-argument-ca
 
 ## Notes
 
-- Blocked-on/then-unblocks: **D-31** (schemars migration). Do this first; D-31 then needs no
+- Blocked-on/then-unblocks: **D-34** (schemars migration). Do this first; D-34 then needs no
   ordering accommodation at all.
 - `pipe` keeps its positional first-arg splice — a contained, documented exception (see design).
 - Legacy stored plans: runtime keeps a deprecated positional fallback so they still execute; only
