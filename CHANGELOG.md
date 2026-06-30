@@ -8,6 +8,32 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Generated Flux skills (L-07).** Added `flux skill [cli|lang|plugin|ops]` to render Claude-format
+  skills for Flux itself, plus `flux skill --install` / `flux skill <type> --install` to write a root
+  routing skill and focused section skills (`flux-cli`, `flux-lang`, `flux-plugin`, `flux-ops`) into
+  project `.flux/skills` or user-global `~/.claude/skills` with `--global`. The renderers are grounded
+  in live sources of truth: Clap for CLI commands, `flux_lang::skill::render()` for Flux-Lang,
+  `ToolRegistry`/`OpRegistry` plus group metadata for operations, and installed plugin manifests for
+  plugin ops. Project-local `.claude/skills` is now loaded by default after `.flux/skills`; the legacy
+  `flux plugin skill` command remains as a plugin-section alias.
+- **Public Docusaurus docs site (L-05).** Added a standalone `website/` Docusaurus project for the public
+  docs at `https://codewandler.github.io/flux/`, distinct from the repository's internal contributor and
+  design docs. The initial public docs cover getting started, core concepts, CLI/provider basics,
+  Flux-Lang text syntax, execution semantics, AST reference pointers, examples, SDK `FlowClient`, plugin
+  authoring, and configuration defaults. A GitHub Pages workflow builds the site on PRs and deploys `main`.
+- **Flux-Lang composite ops (L-04).** Native `.flux` modules can now declare reusable `op` definitions:
+  typed, module-local composite operations implemented as ordinary Flux-Lang bodies. Composite calls are
+  catalog-visible, analyze like normal ops, execute in a scoped symbol frame (params/locals do not leak),
+  and every inner real op still dispatches through the existing authorization/approval/redaction/guarded-IO
+  envelope. SDK `FlowClient`, `flux flow run`, and `flux-app` install module composites; validation rejects
+  recursion, `await` in composites, duplicate/conflicting names, and understated transitive risk/effects.
+  Added the shell-group-gated `proc.run` op for argv-only process execution through `flux_system::System`.
+- **Agent-registered composite ops (L-06).** Added the model-facing root op `op.register`, letting an agent
+  register exactly one validated Flux-Lang composite op into `turn`, `session`, `project`, or `global` scope.
+  Session definitions persist in the flow store; project/global definitions are normalized `.flux` source
+  written through guarded `System` paths (`.flux/ops/<name>.flux` and `@global_ops/<name>.flux`). Registered
+  ops are folded into later planner/execution catalogs and still run as scoped composites, so every inner real
+  op continues through `Executor::dispatch`.
 - **Single guarded process-spawn path + plugin authoring guide (D-22).** All OS-process creation now funnels
   through one `flux_system::System` constructor (`build_command`: argv-only, workspace-pinned cwd, env
   **cleared** to a minimal non-secret allow-list) — `run_with_env`, the streamed runner, `spawn_background`,

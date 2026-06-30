@@ -8,7 +8,8 @@ front-end — it emits a typed Flux-Lang plan (a graph) or answers in prose; the
 `flux-flow` engine executes that plan, node by node, through the safety envelope below. The model has
 no directly-callable tools, so even a read is a plan node and a turn is always an auditable graph.
 Everything that follows — strict layers, the envelope, providers, sessions — is the substrate that
-inversion executes against.
+inversion executes against. For the compact semantic model of the language itself, see
+[Flux-Lang semantics](language.md).
 
 ## Shape: one workspace, strict layers
 

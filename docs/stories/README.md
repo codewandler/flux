@@ -75,6 +75,20 @@ all providers**. Most plumbing already exists (`flux-credentials` import/refresh
   stage; import + refresh cover the near term
 
 ## Done
+- [L-07 — Generate Flux skills from live catalogs](L-07-generated-flux-skills.md) · Language ·
+  `flux skill` renders Claude-format root/CLI/language/plugin/ops skills from live Clap, Flux-Lang,
+  ToolRegistry/OpRegistry, and plugin-manifest sources; `--install` writes root + sections, and project
+  `.claude/skills` is loaded by default after `.flux/skills`
+- [L-06 — Let agents register reusable composite ops](L-06-agent-registered-composite-ops.md) · Language ·
+  `op.register` lets an agent install validated Flux-Lang composite ops into turn/session/project/global
+  scope; project/global writes use guarded paths and registered ops remain scoped composite dispatch
+- [L-05 — Publish public Docusaurus docs](L-05-public-docusaurus-docs.md) · Language · public
+  Docusaurus site scaffold under `website/`, with Flux-Lang text syntax/semantics docs and GitHub Pages
+  deployment to `codewandler.github.io/flux`
+- [L-04 — Define custom ops by composing Flux-Lang](L-04-composite-ops.md) · Language · `.flux` modules
+  can declare scoped composite ops that chain existing ops through the normal safety envelope; SDK,
+  `flux flow run`, and `flux-app` install module composites; new argv-only `proc.run` process op is
+  shell-group gated
 - [D-24 — Harden provider schemas and CLI daemon ergonomics](D-24-provider-schema-and-cli-hardening.md) ·
   Agent · `emit_plan` now advertises the derived `DraftAst` schema, `flux plugin call` resolves short op
   names, served daemons honor SIGTERM, and `flux tui` fails clearly without a TTY
@@ -86,7 +100,9 @@ all providers**. Most plumbing already exists (`flux-credentials` import/refresh
 - [D-16 — Datastore & infra plugin pack](D-16-datastore-infra-plugins.md) · Agent · added native `sql` (6 PostgreSQL read/introspection ops over `ConnStream`, MySQL/SQLite explicit residuals), `docker` (33 core Docker Engine REST ops over Unix socket), and `aws` (11 read-only ops via host-managed `aws` CLI); full `plugins/` gate green
 - [D-15 — Observability & AI plugin pack](D-15-observability-ai-plugins.md) · Agent · added native `alertmanager` (5 ops), `grafana` (20), `opsgenie` (8), and `huggingface` (9), with datasource contributions and env-gated smoke coverage; full `plugins/` gate green
 - [D-14 — Deepen the 8 native plugins to full op-parity](D-14-deepen-native-plugins.md) · Agent · all 8 `plugins/` at fluxplane op + **behavioural** parity (+~160 ops): gitlab 6→64, slack 5→30, kubernetes 5→24, jira 3→21, confluence 3→15, prometheus 4→8, loki 3→5, websearch +`provider.list`. Added two **host protocol** capabilities (managed background processes `process.spawn/read/status/kill`; binary HTTP body `body_b64`/`response_binary`). jira/confluence auth re-ported to the reference (Bearer/`cloud_id` gateway + Basic fallback); k8s port-forward on managed processes; byte-exact attachments/files; jira ADF + transition scorer, slack mentions/unreads, gitlab `diff.lines` regex ported faithfully. One MockHost test per op; `plugins/` + host gate green
-- [D-13 — Generated plugin skill (`flux plugin skill`)](D-13-plugin-skill-command.md) · Core · renders installed-plugin manifests into a trigger-activated `flux-plugins` SKILL.md + `references/` (the flux analogue of fluxplane's `fluxplane-plugin skill`); flux-markdown frontmatter writer (commit `7030261`)
+- [D-13 — Generated plugin skill (`flux plugin skill`)](D-13-plugin-skill-command.md) · Core · renders
+  installed-plugin manifests into a Claude-format `flux-plugin` SKILL.md + `references/` (the flux analogue
+  of fluxplane's `fluxplane-plugin skill`); now also exposed through `flux skill plugin`
 - [D-12 — Plugin protocol parity extensions](D-12-plugin-protocol-parity.md) · Core · additive host caps for the missing fluxplane plugins — non-Bearer auth injection (A: Basic/header/query by purpose) + raw `conn.*` dialer (B) + `blob.*` store (C); clean extension of `flux.plugin.v1`, unblocks D-14..D-17 (commit `a21bc47`)
 - [D-03 — Reusable A2A server helpers](D-03-a2a-server-helpers.md) · Agent · lifted flux-server's A2A routes into the reusable `flux_a2a::server` helper; unblocks downstream A2A consumers + fixed the `tasks/send` drift (commit `7dcc6b3`)
 - [D-02 — Tenant/context-taggable event substrate](D-02-tenant-event-substrate.md) · Core · optional stream-level account/agent/correlation context envelope on `flux-events` runs + account-scoped reads (`list_for_account`/`account_streams`) (commit `c97c8a4`)
