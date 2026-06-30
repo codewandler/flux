@@ -38,13 +38,13 @@ hand-written grammar stays small.
 
 Flux-Lang exists at two levels:
 
-- **Wire / storage format** — JSON (`FlowAst` via serde). Used by `emit_plan`, stored
+- **Wire / storage format** — JSON (`DraftAst` via serde). Used by `emit_plan`, stored
   in `.flux/flows/`, passed between agent turns. Not meant to be hand-written.
 - **Text format** — `.flux` files. The human-writable, version-controllable surface.
   This document specifies the text format.
 
 The two formats are semantically identical: every `.flux` file compiles to exactly the
-same `FlowAst` that the JSON wire format expresses. The text format adds nothing that
+same `DraftAst` that the JSON wire format expresses. The text format adds nothing that
 the JSON format cannot represent; it only makes flows readable and writable by humans.
 
 The `render.rs` terminal display (box-drawing tree) is a third, separate thing: it is
@@ -79,6 +79,32 @@ flow summarise(text: String) -> String
 ```
 
 Flows are separated by one or more blank lines. Comments between flows are allowed.
+
+### Composite op declarations
+
+A module may also declare reusable custom ops with `op`. A composite op has typed params, optional
+metadata, and an ordinary Flux-Lang body. It is callable like any other op from flows in the same
+module, but its inner calls still run through the normal safety envelope.
+
+```flux
+op repo-health(path: String, prior: Ctx) -> Health
+  description "Check git state and summarize failures"
+  risk "medium"
+  idempotency "idempotent"
+  effects [read, process, local_system]
+  expose true
+
+  $status = git_status()
+  $tests = cargo_test({args: ["--workspace"]})
+  ctx $pack
+    purpose "repo-health"
+    budget 8000
+    include $prior, $status, $tests
+  return {status: $status, tests: $tests}
+```
+
+The supported metadata keys are `description`, `risk`, `idempotency`, `effects`, `limits`, `expose`,
+and `view`. `await` is rejected inside composite ops in v1, and direct or indirect recursion is invalid.
 
 ### Flow header
 

@@ -23,6 +23,7 @@ optional arguments are in `[brackets]`.
 | `read_many` | `paths` | Low | Read several files at once (each section headed `==> path <==`); prefer single `read` when you need to embed a file's text into a later string |
 | `task` | `role, task` | Medium | Delegate to a sub-agent role |
 | `bash` | `command[, timeout_secs]` | High | Run a shell command |
+| `proc.run` | `program[, args, timeout_secs]` | High | Run one argv-only process in the workspace root (no shell, env cleared by `flux-system`) |
 | `file_stat` | `path` | Low | File metadata: size, line count, mtime (replaces `wc -l`, `stat`, `ls -la`) |
 | `path_exists` | `path` | Low | Returns `"true"`/`"false"` — use with `when`/`unless` to branch on file presence |
 | `sqlite_query` | `db, sql[, params]` | Low | Read-only SQLite query (SELECT/PRAGMA only) |
@@ -52,7 +53,7 @@ optional arguments are in `[brackets]`.
 | `git_checkout` | `branch[, create]` | Medium | Switch/create branch |
 | `git_unstage` | `paths` | Low | Unstage files |
 
-`write`, `edit`, `patch`, `append`, `task`, `bash`, and the toolchain ops (`cargo_*`, `go_*`,
+`write`, `edit`, `patch`, `append`, `task`, `bash`, `proc.run`, and the toolchain ops (`cargo_*`, `go_*`,
 `python_run`, `pytest`, `npm`, `node_run`, `make`) may pause for user approval (controlled by the
 safety envelope and the active permission rules).
 
@@ -114,6 +115,7 @@ still dispatches through the same `Executor` envelope — no bypass.
 |---|---|---|
 | `plan` | `[feedback]` | Ask the model to emit a plan from the working conversation → a `Plan` `{kind: "plan"\|"chat"\|"error", text?, ast?, complete?}` (JSON). The model stays the planner; this wraps the compile step. |
 | `run_plan` | `plan` | Execute an emitted plan in the **current** session → an `Outcome` `{transcript, result, steps, suspension?}`. Re-validated and run through the same approval+IO envelope; bounded by a reentry-depth cap. |
+| `op.register` | `source, scope[, replace, expose]` | Register exactly one top-level Flux-Lang composite `op` for later reuse. `scope` is `turn`, `session`, `project`, or `global`; project/global writes are guarded filesystem writes, and all registered inner ops still dispatch through the normal envelope. |
 | `observe` | `kind[, data]` | Append an observation to the run's shared evidence log (the same log the runtime records `tool_call` markers into). |
 | `evidence` | `[kind]` | Read observations back as a JSON array (filtered by `kind`, or the whole log) — so a flow can branch on what has happened so far. |
 | `metrics` | | Summary counts from the evidence log: `{tool_calls, tool_errors, iterations}`. |
@@ -121,8 +123,9 @@ still dispatches through the same `Executor` envelope — no bypass.
 
 **Visibility:** `plan`/`run_plan` are tagged to a never-surfaced `reflect` group, so the model never sees
 them in its catalog — only a pre-authored flow (the agent loop, or `flux flow run`) can call them, and only
-when a `LoopHost` is installed (the engine installs one per turn). `observe`/`evidence`/`metrics` are
-ordinary builtins; `grade` is in the evidence-gated `eval` group.
+when a `LoopHost` is installed (the engine installs one per turn). `op.register` is a model-facing root op,
+available only when the engine installs a composite registrar. `observe`/`evidence`/`metrics` are ordinary
+builtins; `grade` is in the evidence-gated `eval` group.
 
 On the **user-facing** surface these machinery ops are filtered out by default so the turn shows real
 work, not plumbing. `flux run --show-loop` (or `FLUX_SHOW_LOOP=1`) reveals them so you can watch the

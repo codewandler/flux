@@ -63,7 +63,7 @@ follow are hand-written.
 | `throttle` | Rate-limit body execution: at most `max` dispatches per `window_ms` sliding window. The token bucket is tracked in the session store keyed by `name`; plan authors declare intent, runtime enforces. `name` must be unique within a session to avoid bucket collisions. |
 | `debounce` | Coalesce rapid re-invocations: wait `wait_ms` after the last trigger before running body. In a `loop`/`watch` context the body only executes when things have settled. `name` is used as a stable key so debounce state survives across turns. |
 | `unless` | Negated conditional: run `body` only when `cond` is falsey. Sugar for `when !cond`; the body may contain any nodes (reads, writes, sub-plans — anything). |
-| `verify` | Run a command and assert its output matches an expected pattern; abort the flow with a structured error if it does not. `cmd` is any node that produces a string (typically a `bash` call); `expect` is a substring or regex the output must contain. |
+| `verify` | Run a command and assert its output contains an expected substring; abort the flow with a structured error if it does not. `cmd` is any node that produces a string (typically a `bash` call); `expect` is the substring the output must contain. |
 | `return` | End the flow with a value. |
 | `peek` | Read the current in-session value of a named symbol without any filesystem IO. Returns the symbol's stored value, or null if the symbol is not yet bound. |
 | `var` | Reference a bound symbol. |
@@ -79,7 +79,7 @@ follow are hand-written.
 | `route` | Model-routed branch — the signature *bounded non-determinism* primitive. Run `selector` (typically a `!model` op) to produce a label, then run the `case` whose `label` it names. The cases are fixed and analyzer-validated: the model chooses *which* declared branch runs, never *what*. Falls back to `default` when the label matches no case (an error if `default` is empty). |
 | `fallback` | Ordered "first that succeeds wins" selector: run each branch in `branches` in turn; the first that completes without error and yields a non-empty result wins and becomes the node's result. On a branch error (or empty result) the next is tried — so a *side-effecting* branch that returns empty will still fall through and the next branch also runs (attempts stream live, as in `try`/`retry`). If every branch errors, the last error propagates. Lighter than `try` for graceful degradation (cheap path → else expensive path). `bind` names the winning result. |
 | `timeout` | Bound the wall-clock of a sub-flow: run `body` with a `ms` deadline. If it does not finish in time the node errors (an enclosing `try`/`retry` may catch it). A general reliability guard-rail you can wrap around anything. `bind` names the body's result. |
-| `budget` | Cap the cost of a scope: run `body` but allow at most `limit` op dispatches within it (checked at statement boundaries — the body stops before a statement that would exceed the cap, and the node errors). A first-class cost guard-rail; v1 counts dispatches (token/money budgets are a later refinement). `bind` names the body's result. |
+| `budget` | Cap the cost of a scope: run `body` but allow at most `limit` op dispatches within it (checked at statement boundaries; a nested statement can consume more than one dispatch before the next check). A first-class cost guard-rail; v1 counts dispatches (token/money budgets are a later refinement). `bind` names the body's result. |
 | `scope` | RAII-style **acquire → use → release** with guaranteed cleanup. Optionally run `acquire` first (binding its result to `bind`, so `body` and `finally` can name the resource), then run `body`; `finally` **always** runs afterward — on normal completion, an early `return`, or an error — so a lock is freed / a handle closed / a temp removed no matter how the body exits. The body's result, `return`, or error then propagates; a `finally` failure surfaces only when the body itself succeeded (it never masks the body's own error). If `acquire` errors the resource was never taken, so `finally` does not run. The deterministic resource-lifecycle guard-rail (RAII for flows). |
 | `saga` | Saga / **compensating transaction**: run each `step` in order; after a step's `body` succeeds, its `undo` is registered. If a *later* step fails, the runtime unwinds by running the registered `undo` bodies in **reverse** order (best-effort — an `undo` failure is recorded but does not stop the unwind), then propagates the original error. The strongest guard-rail for non-transactional external side effects (charge→refund, create→delete, reserve→release): partial work is rolled back rather than left dangling. A `return` inside a step is a successful early exit and does not compensate (use `scope` for guaranteed cleanup on every exit). |
 | `once` | **At-most-once side effect** across re-runs — an effect-level `memo`. `label` is an explicit idempotency key: the first time the body runs to success in a session its result is recorded durably; later re-runs in the same session skip the body and reuse the stored result. A failed body records nothing and is retried. `bind` optionally names the body's result. Safety under re-execution (`send_email`/`charge` never fire twice). With no durable store wired (a throwaway interpreter) it degrades to running every time. Requires a non-empty literal label. |
@@ -704,7 +704,7 @@ empty `then` for readability.
 ### `verify`
 
 Self-checking primitive: run `cmd` (any node that produces a string — typically a
-`bash` call), then check that its output contains the `expect` pattern. If the check
+`bash` call), then check that its output contains the `expect` substring. If the check
 fails the flow aborts with a structured error. Use this after edits or builds to
 guard against silent failures.
 
@@ -720,12 +720,141 @@ guard against silent failures.
 | field | type | required | description |
 |---|---|---|---|
 | `cmd` | Node | yes | any node producing a string; typically a `bash` call |
-| `expect` | Node | yes | substring (or regex) the output must contain |
+| `expect` | Node | yes | substring the output must contain |
 | `message` | string | no | human-readable error shown on failure |
 
-The check is a substring/regex search in the command's output. If `expect` is not
-found the flow aborts with `"verify failed: {message — expected '{pattern}', got '{output}'}"`.
+The check is a substring search in the command's output. If `expect` is not found the flow aborts with
+`"verify failed: {message}"` (or a default `"output did not contain ..."` message).
 Wrap `verify` in a `try` if you want to handle failure gracefully rather than aborting.
+
+---
+
+## Routing and guard-rail control flow
+
+These nodes make common branch, graceful-degradation, timeout, and cost-control patterns explicit in
+the AST. They do not let the model invent new steps at runtime; even `route` can only choose among
+declared cases.
+
+### `match`
+
+Deterministic multi-way branch. Evaluate `subject` (a literal or bound symbol), compare it to each
+case `value` by JSON equality, then run the first matching case body. If nothing matches, `default`
+runs when present; otherwise the node errors.
+
+```json
+{"kind": "match",
+ "subject": {"kind": "var", "name": "status"},
+ "cases": [
+   {"value": {"kind": "lit", "value": "ok"},
+    "body": [{"kind": "return", "value": {"kind": "lit", "value": "done"}}]}
+ ],
+ "default": [{"kind": "return", "value": {"kind": "lit", "value": "blocked"}}]}
+```
+
+**Fields**
+
+| field | type | required | description |
+|---|---|---|---|
+| `subject` | Node | yes | literal or symbol reference to compare |
+| `cases` | MatchCase[] | yes | at least one case; each case has `value` and `body` |
+| `default` | Node[] | no | branch to run when no case matches |
+
+The analyzer rejects non-value subjects and case values. To branch on a call result, bind the call
+first and match on the symbol.
+
+### `route`
+
+Bounded model-routed branch. Evaluate `selector` to a label (typically by dispatching a model op),
+then run the case whose `label` matches. The case set is fixed and analyzer-validated: the model may
+select a declared path, but it cannot create a new path.
+
+```json
+{"kind": "route",
+ "selector": {"kind": "call", "op": "classify", "args": [{"kind": "var", "name": "ticket"}]},
+ "cases": [
+   {"label": "bug", "body": [{"kind": "call", "op": "triage_bug", "args": []}]},
+   {"label": "billing", "body": [{"kind": "call", "op": "triage_billing", "args": []}]}
+ ],
+ "default": [{"kind": "call", "op": "triage_general", "args": []}]}
+```
+
+**Fields**
+
+| field | type | required | description |
+|---|---|---|---|
+| `selector` | Node | yes | node producing a label; `call`, `var`, and `lit` are common |
+| `cases` | RouteCase[] | yes | at least one unique, non-empty `label` with a `body` |
+| `default` | Node[] | no | branch to run when the label is unknown |
+
+If the selector label matches no case and `default` is empty, the route errors.
+
+### `fallback`
+
+Ordered "first useful success wins" selector. Run branches in declared order. The first branch that
+finishes successfully with a non-empty result wins; if branches succeed only with empty results, the
+first empty success is kept as a last resort. If every branch errors, the last error propagates.
+
+```json
+{"kind": "fallback", "bind": "answer", "branches": [
+  {"body": [{"kind": "bind", "name": "answer",
+             "value": {"kind": "call", "op": "cache.get", "args": []}}]},
+  {"body": [{"kind": "bind", "name": "answer",
+             "value": {"kind": "call", "op": "search", "args": []}}]}
+]}
+```
+
+**Fields**
+
+| field | type | required | description |
+|---|---|---|---|
+| `branches` | FallbackBranch[] | yes | ordered branch bodies to try |
+| `bind` | string | no | symbol to bind to the winning branch's result |
+
+Side effects in a branch happen before the runtime knows whether the branch will fall through. Use
+`try`/`scope`/`saga` when cleanup or compensation matters.
+
+### `timeout`
+
+Run a body with a wall-clock deadline. If the body finishes in time, its result may be bound. If the
+deadline expires, the node errors and an enclosing `try` or `retry` can handle it.
+
+```json
+{"kind": "timeout", "ms": 30000, "bind": "result",
+ "body": [{"kind": "call", "op": "web_fetch",
+           "args": [{"kind": "lit", "value": "https://example.com"}]}]}
+```
+
+**Fields**
+
+| field | type | required | description |
+|---|---|---|---|
+| `ms` | u64 | yes | non-zero deadline in milliseconds |
+| `body` | Node[] | no | body to run under the deadline |
+| `bind` | string | no | symbol to bind to the body's result |
+
+Completed dispatches before a timeout remain counted and traced; only buffered live sink output is
+withheld unless the body finishes successfully.
+
+### `budget`
+
+Run a body with an op-dispatch cap. v1 counts dispatches, not tokens or money. The cap is checked at
+statement boundaries, so a nested statement can consume more than one dispatch before the next check.
+
+```json
+{"kind": "budget", "limit": 5, "bind": "summary",
+ "body": [
+   {"kind": "bind", "name": "hits", "value": {"kind": "call", "op": "grep", "args": []}},
+   {"kind": "bind", "name": "summary", "value": {"kind": "call", "op": "ai.reason", "args": []}}
+ ]}
+```
+
+**Fields**
+
+| field | type | required | description |
+|---|---|---|---|
+| `limit` | u32 | yes | non-zero maximum dispatch count for this scope |
+| `body` | Node[] | no | body to run under the cap |
+| `bind` | string | no | symbol to bind to the body's result |
 
 ---
 
@@ -781,9 +910,14 @@ appropriate turn.
 | `binding` | string | no | symbol to bind the received value to |
 | `as_type` | TypeRef | no | expected type of the received value |
 
-> **Status:** `await` is defined in the AST and accepted by the analyzer, but
-> cross-turn execution is not yet implemented. Emitting an `await` node in a plan
-> currently returns a clear error. Full suspend/resume lands in a future slice.
+`await` is implemented for top-level statements. `execute_flow` records the top-level index and returns
+`FlowOutcome.suspension`; the engine persists the flow body and resumes with `resume_flow` when the
+awaited input arrives. On resume, the received value is bound to `binding` when present, leniently
+coerced through `as_type` for number/bool awaits, and execution continues after the `await`. The
+already-run prefix is not re-executed.
+
+The analyzer rejects nested `await` nodes because v1 suspend/resume has no stable nested cursor. The
+optimized-plan path also does not suspend; cross-turn flows run through `execute_flow`.
 
 ---
 
@@ -851,9 +985,9 @@ not repeated) and continues from here. Targets authored, named flows. Pairs with
 
 ## Pure expression nodes (no IO, no approval gate)
 
-These three nodes are pure — they carry no `Effect`, bypass the `OpRegistry`, and
+These nodes are pure — they carry no `Effect`, bypass the `OpRegistry`, and
 never pause for approval. Use them wherever you would otherwise shell out to
-`bash` for arithmetic, string formatting, or JSON extraction.
+`bash` for arithmetic, string formatting, JSON extraction, or value assembly.
 
 ### `expr`
 
@@ -971,8 +1105,54 @@ No IO, no approval gate.
 | `value` | Node | yes | a node producing the string to coerce (typically `jq`/`fmt`) |
 | `as` | string | yes | target type: `f64`, `i64`, `bool`, `json`, or `string` |
 
-Coercion failures (`"abc"` → `f64`) error rather than silently defaulting. An unknown
-`as_type` passes the string through unchanged.
+Numeric and JSON coercion failures (`"abc"` -> `f64`, invalid JSON -> `json`) error rather than
+silently defaulting. `bool` returns true only for `"true"` or `"1"`; other values become false. The
+analyzer rejects `as_type` values outside `f64`/`i64`/`bool`/`json`/`string`.
+
+---
+
+### `obj`
+
+Build an object value from pure sub-expressions. This is the record constructor behind native text
+like `return { ok: true, count: $n }`.
+
+```json
+{"kind": "obj", "fields": {
+  "ok": {"kind": "lit", "value": true},
+  "count": {"kind": "var", "name": "n"},
+  "status": {"kind": "jq", "path": ".status", "input": {"kind": "var", "name": "raw"}}
+}}
+```
+
+**Fields**
+
+| field | type | required | description |
+|---|---|---|---|
+| `fields` | object | no | map of field name -> pure value node |
+
+Fields may contain only pure value leaves: `var`, `lit`, `jq`, `expr`, `fmt`, `obj`, or `list`. Bind a
+call result first, then reference the symbol, if a field needs an op result.
+
+### `list`
+
+Build a list value from pure sub-expressions.
+
+```json
+{"kind": "list", "items": [
+  {"kind": "var", "name": "a"},
+  {"kind": "lit", "value": 3},
+  {"kind": "fmt", "template": "status={status}"}
+]}
+```
+
+**Fields**
+
+| field | type | required | description |
+|---|---|---|---|
+| `items` | Node[] | no | ordered pure value nodes |
+
+`obj` and `list` can appear in a `bind`, `return`, or call argument position. As bare top-level
+statements they error, because a value by itself is not executable.
 
 ---
 
@@ -1097,6 +1277,7 @@ gates on a shell exit-code wrapper or a boolean tool output work as expected.
   `retry`.
 - **`debounce` in a single sequential flow is a fixed delay**, not a true event-driven
   debounce. Combine with `loop` to get settling semantics.
-- **`race` picks the first *succeeding* branch**, not the fastest one — it is a
-  sequential fallback with a deadline, not true concurrent fan-out. Use `parallel` if
-  you want all branches to run concurrently.
+- **`race` picks the first *succeeding* branch** within its deadline and drops the losing branch
+  futures. Use `parallel` if you want all branches to complete.
+- **`await` and `checkpoint` are top-level only** — they need stable resume cursors.
+- **`obj`/`list` are pure templates** — they cannot contain `call` or control-flow leaves.
