@@ -43,7 +43,6 @@ _flux's plugins each talk to a single, statically-configured service. The fluxpl
 
 ### strict review flows and journeys
 _A skill can only advise a reviewer; a code-review protocol needs enforceable guarantees — fixed_
-- [L-12 — Strict review — typed artifacts + deterministic aggregator (Phase 3)](L-12-strict-review-typed-artifacts.md) · Language · ReviewRequest/ReviewFinding/ReviewReport + review.normalize/aggregate (fingerprint/dedupe/rank)
 - [L-13 — Strict review — app journey + flux review CLI & CI surfaces (Phase 4)](L-13-strict-review-journey-cli.md) · Agent · flux-app review_code journey + optional flux review command + CI output modes
 
 ### subscription providers (claude-code + codex) & cross-provider usage/cost
@@ -113,6 +112,7 @@ _flux can already drive the two **subscription / passthrough** model backends �
 - [L-09 — Named-argument calls (deprecate positional binding)](L-09-named-argument-calls.md) · Language
 - [L-10 — Strict review — checked-in example flow + reviewer roles (Phase 1)](L-10-strict-review-example-flow.md) · Language · proves the strict-review protocol shape with existing primitives — no language changes
 - [L-11 — Strict review — scoped capabilities (with_tools) enforced at dispatch (Phase 2)](L-11-strict-review-scoped-capabilities.md) · Language · analyzer-visible capability-scope node + runtime narrowing threaded into Executor::dispatch
+- [L-12 — Strict review — typed artifacts + deterministic aggregator (Phase 3)](L-12-strict-review-typed-artifacts.md) · Language · ReviewRequest/ReviewFinding/ReviewReport + review.normalize/aggregate (fingerprint/dedupe/rank)
 
 _See [CHANGELOG.md](../../CHANGELOG.md) for the full released history._
 <!-- END track:board -->

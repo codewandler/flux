@@ -7,6 +7,15 @@
 //! task `need`s, finding the `gaps` against gathered claims, and `compare`/`dedupe`/`sort`/`top`/
 //! `merge`/`cite`/`len`/`first`/`last`/`filter` over lists of values.
 //!
+//! `review.normalize`/`review.aggregate` (strict-review Phase 3, `docs/designs/strict-review-flows.md`
+//! "Aggregation") add a deterministic reviewer-output pipeline on top of the same primitives: parse
+//! each reviewer's raw findings, quarantine malformed entries as `gaps` (never silently dropped, never
+//! surfaced as findings), fingerprint by category/file/line/normalized-title, dedupe by fingerprint
+//! (counting reviewer `agreement`), and rank by severity/confidence/agreement with a fingerprint
+//! tiebreak so ordering is byte-identical across runs. Modeled on `flux-eval`'s
+//! `improvements_aggregate` clustering (deterministic `BTreeMap`-free but same normalize/sort shape) —
+//! not a dependency, just the same pattern.
+//!
 //! Every op is robust to missing optional params and wrong-typed input: it returns a clear
 //! [`Error::Other`] rather than panicking.
 
@@ -33,6 +42,8 @@ pub fn register_cognition(registry: &mut ToolRegistry) {
     registry.register(Arc::new(FirstTool));
     registry.register(Arc::new(LastTool));
     registry.register(Arc::new(FilterTool));
+    registry.register(Arc::new(ReviewNormalizeTool));
+    registry.register(Arc::new(ReviewAggregateTool));
 }
 
 // ---------------------------------------------------------------------------
@@ -677,6 +688,392 @@ impl Tool for FilterTool {
 }
 
 // ---------------------------------------------------------------------------
+// review.normalize / review.aggregate — strict-review Phase 3 typed artifacts
+// (docs/designs/strict-review-flows.md "Review artifacts" + "Aggregation")
+// ---------------------------------------------------------------------------
+
+/// A single review finding — the strict-review protocol's typed unit of feedback. Embedded schema
+/// first (this story); promotion to `flux_lang::prelude::PRELUDE_TYPES` is deferred until a second
+/// surface consumes it.
+#[allow(dead_code)]
+#[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema, Clone)]
+pub struct ReviewFinding {
+    /// Stable fingerprint computed from category+file+line+normalized title (never model-supplied)
+    pub fingerprint: String,
+    /// "critical" | "high" | "medium" | "low" | "info"
+    pub severity: String,
+    pub category: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<i64>,
+    pub title: String,
+    #[serde(default)]
+    pub evidence: String,
+    #[serde(default)]
+    pub recommendation: String,
+    #[serde(default)]
+    pub confidence: f64,
+    /// The reviewer that raised this finding (or the first, for a collapsed duplicate).
+    #[serde(default)]
+    pub reviewer: String,
+    /// Number of distinct reviewers that raised this fingerprint (>1 after dedupe collapses agreeing
+    /// reviewers into one finding).
+    #[serde(default = "one")]
+    pub agreement: u32,
+}
+
+fn one() -> u32 {
+    1
+}
+
+/// The full aggregated review artifact `review.aggregate` returns.
+#[allow(dead_code)]
+#[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct ReviewReport {
+    /// Short generated summary (counts).
+    pub summary: String,
+    /// Deduped, ranked findings (severity desc, then confidence desc, then agreement desc, then
+    /// fingerprint asc as a stable tiebreak).
+    pub findings: Vec<ReviewFinding>,
+    pub checked_files: Vec<String>,
+    pub reviewers: Vec<String>,
+    /// Human-readable descriptions of malformed reviewer entries that were quarantined rather than
+    /// silently dropped or surfaced as findings.
+    pub gaps: Vec<String>,
+}
+
+/// Numeric rank for severity ordering (higher = more severe): critical>high>medium>low>info. An
+/// unrecognized/missing severity sorts as the lowest tier (below "info") rather than erroring —
+/// malformed severities are still ranked deterministically, never panicking.
+fn severity_rank(sev: &str) -> u8 {
+    match sev {
+        "critical" => 4,
+        "high" => 3,
+        "medium" => 2,
+        "low" => 1,
+        "info" => 0,
+        _ => 0,
+    }
+}
+
+const REQUIRED_SEVERITIES: &[&str] = &["critical", "high", "medium", "low", "info"];
+
+/// Normalize a title the same way `flux-eval`'s `aggregate.rs::normalize` does: lowercase,
+/// alphanumeric-only (other chars become a space), collapse whitespace — but joined with spaces
+/// (not hyphens) since this feeds a fingerprint string, not an id slug.
+fn normalize_title(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Deterministic fingerprint: category + file + line + normalized title, joined by a separator that
+/// cannot naturally appear in any part (so distinct inputs cannot collide by concatenation), then
+/// stably hashed. Same inputs -> same fingerprint on every run (no randomness, no HashMap iteration
+/// order, no wall-clock).
+fn compute_fingerprint(
+    category: &str,
+    file: Option<&str>,
+    line: Option<i64>,
+    title: &str,
+) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let key = format!(
+        "{category}\u{1}{}\u{1}{}\u{1}{}",
+        file.unwrap_or(""),
+        line.map(|l| l.to_string()).unwrap_or_default(),
+        normalize_title(title)
+    );
+    // `DefaultHasher` (SipHash-1-3 with a fixed zero key) is deterministic across runs and processes
+    // for a given input — it is only randomized per-`HashMap` via `RandomState`, which this bypasses
+    // by constructing the hasher directly.
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Parse one raw reviewer entry into a `ReviewFinding`, or a human-readable gap description if it is
+/// malformed (not an object, or missing a required string field, or an unrecognized `severity`).
+/// Never panics; never silently drops — every malformed entry becomes exactly one gap string.
+fn parse_finding(raw: &Value) -> std::result::Result<ReviewFinding, String> {
+    let obj = raw
+        .as_object()
+        .ok_or_else(|| format!("dropped malformed finding: not an object: {}", compact(raw)))?;
+
+    let title = obj
+        .get("title")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "dropped malformed finding: missing `title`: {}",
+                compact(raw)
+            )
+        })?;
+    let category = obj
+        .get("category")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "dropped malformed finding: missing `category`: {}",
+                compact(raw)
+            )
+        })?;
+    let severity = obj
+        .get("severity")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            format!(
+                "dropped malformed finding: missing `severity`: {}",
+                compact(raw)
+            )
+        })?;
+    if !REQUIRED_SEVERITIES.contains(&severity) {
+        return Err(format!(
+            "dropped malformed finding: invalid `severity` {:?} (want one of {REQUIRED_SEVERITIES:?}): {}",
+            severity,
+            compact(raw)
+        ));
+    }
+
+    let file = obj.get("file").and_then(|v| v.as_str()).map(String::from);
+    let line = obj.get("line").and_then(|v| v.as_i64());
+    let evidence = obj
+        .get("evidence")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let recommendation = obj
+        .get("recommendation")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let confidence = obj
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let reviewer = obj
+        .get("reviewer")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let fingerprint = compute_fingerprint(category, file.as_deref(), line, title);
+
+    Ok(ReviewFinding {
+        fingerprint,
+        severity: severity.to_string(),
+        category: category.to_string(),
+        file,
+        line,
+        title: title.to_string(),
+        evidence,
+        recommendation,
+        confidence,
+        reviewer,
+        agreement: 1,
+    })
+}
+
+/// A short, capped rendering of a JSON value for a gap message (avoid dumping huge payloads).
+fn compact(v: &Value) -> String {
+    let s = v.to_string();
+    if s.chars().count() > 200 {
+        let head: String = s.chars().take(200).collect();
+        format!("{head}…")
+    } else {
+        s
+    }
+}
+
+/// `review.normalize`: parse each raw reviewer entry into a well-formed `ReviewFinding` (computing
+/// its fingerprint), quarantining malformed entries as `gaps`. Does NOT dedupe or rank — that is
+/// `review.aggregate`'s job. Pure and order-preserving (first-seen order retained).
+fn normalize_findings(raw: &[Value]) -> (Vec<ReviewFinding>, Vec<String>) {
+    let mut findings = Vec::with_capacity(raw.len());
+    let mut gaps = Vec::new();
+    for entry in raw {
+        match parse_finding(entry) {
+            Ok(f) => findings.push(f),
+            Err(gap) => gaps.push(gap),
+        }
+    }
+    (findings, gaps)
+}
+
+/// Dedupe by fingerprint, merging duplicates into one finding whose `agreement` counts the number of
+/// DISTINCT `reviewer`s that raised it (an empty/blank reviewer string counts as one distinct source
+/// per occurrence — it never merges with a named reviewer). Keeps the first-seen finding's fields
+/// (title/evidence/recommendation/etc.) as the representative; `confidence` becomes the max across the
+/// group (the most confident reviewer's assessment wins), matching "rank by severity, confidence,
+/// agreement" using the strongest signal available.
+fn dedupe_by_fingerprint(findings: Vec<ReviewFinding>) -> Vec<ReviewFinding> {
+    use std::collections::BTreeMap;
+    // BTreeMap keyed by fingerprint keeps the merge deterministic and independent of any hashmap
+    // iteration order; insertion order within a bucket is preserved via the `Vec` we build first.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: BTreeMap<String, Vec<ReviewFinding>> = BTreeMap::new();
+    for f in findings {
+        if !groups.contains_key(&f.fingerprint) {
+            order.push(f.fingerprint.clone());
+        }
+        groups.entry(f.fingerprint.clone()).or_default().push(f);
+    }
+
+    order
+        .into_iter()
+        .map(|fp| {
+            let group = groups.remove(&fp).unwrap_or_default();
+            let mut reviewers: Vec<&str> = group
+                .iter()
+                .map(|f| f.reviewer.as_str())
+                .filter(|r| !r.is_empty())
+                .collect();
+            reviewers.sort_unstable();
+            reviewers.dedup();
+            // Distinct non-empty reviewers, plus one occurrence per blank-reviewer entry (each an
+            // independently-unnamed source rather than a shared identity).
+            let blank_occurrences = group.iter().filter(|f| f.reviewer.is_empty()).count();
+            let agreement = (reviewers.len() + blank_occurrences).max(1) as u32;
+            let confidence = group.iter().map(|f| f.confidence).fold(f64::MIN, f64::max);
+            let mut rep = group.into_iter().next().expect("group is non-empty");
+            rep.confidence = if confidence.is_finite() {
+                confidence
+            } else {
+                rep.confidence
+            };
+            rep.agreement = agreement;
+            rep
+        })
+        .collect()
+}
+
+/// Rank findings deterministically: severity desc, then confidence desc, then agreement desc, then
+/// fingerprint asc as a final stable tiebreak — so ordering is byte-identical across runs regardless
+/// of input order or platform (`sort_by` is stable, but the explicit fingerprint tiebreak means the
+/// comparator alone fully orders any two distinct findings, so stability doesn't even need to be
+/// relied on).
+fn rank_findings(mut findings: Vec<ReviewFinding>) -> Vec<ReviewFinding> {
+    findings.sort_by(|a, b| {
+        severity_rank(&b.severity)
+            .cmp(&severity_rank(&a.severity))
+            .then_with(|| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| b.agreement.cmp(&a.agreement))
+            .then_with(|| a.fingerprint.cmp(&b.fingerprint))
+    });
+    findings
+}
+
+/// Arguments for `review.normalize`.
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReviewNormalizeInput {
+    /// Raw reviewer output entries (each SHOULD be a finding object)
+    findings: Vec<Value>,
+}
+
+pub struct ReviewNormalizeTool;
+
+#[async_trait]
+impl Tool for ReviewNormalizeTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "review.normalize",
+            "Parse raw reviewer output into well-formed findings, computing each finding's stable \
+             fingerprint (category+file+line+normalized-title) and quarantining malformed entries as \
+             human-readable `gaps` strings instead of silently dropping or surfacing them as \
+             findings. Returns `{ findings, gaps }`. Does not dedupe or rank — see `review.aggregate`.",
+            flux_spec::tool_input_schema::<ReviewNormalizeInput>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let raw = arr_or_empty(&params, "findings", "review.normalize")?;
+        let (findings, gaps) = normalize_findings(&raw);
+        let out = json!({ "findings": findings, "gaps": gaps });
+        Ok(ToolResult::ok(serde_json::to_string(&out)?))
+    }
+}
+
+/// Arguments for `review.aggregate`.
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReviewAggregateInput {
+    /// Raw reviewer output entries (each SHOULD be a finding object)
+    findings: Vec<Value>,
+    /// Files that were checked (echoed into the report as `checked_files`)
+    #[serde(default)]
+    files: Vec<String>,
+    /// Reviewer names that participated (echoed into the report as `reviewers`)
+    #[serde(default)]
+    reviewers: Vec<String>,
+}
+
+pub struct ReviewAggregateTool;
+
+#[async_trait]
+impl Tool for ReviewAggregateTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "review.aggregate",
+            "Deterministically aggregate strict-review reviewer output into a full `ReviewReport`: \
+             normalizes raw findings (quarantining malformed entries as `gaps`), dedupes by \
+             fingerprint (counting distinct-reviewer `agreement`), and ranks by severity, then \
+             confidence, then agreement, with a fingerprint tiebreak for byte-identical ordering \
+             across runs. Returns `{ summary, findings, checked_files, reviewers, gaps }`.",
+            flux_spec::tool_input_schema::<ReviewAggregateInput>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let raw = arr_or_empty(&params, "findings", "review.aggregate")?;
+        let files: Vec<String> = arr_or_empty(&params, "files", "review.aggregate")?
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        let reviewers: Vec<String> = arr_or_empty(&params, "reviewers", "review.aggregate")?
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+
+        let (parsed, gaps) = normalize_findings(&raw);
+        let deduped = dedupe_by_fingerprint(parsed);
+        let ranked = rank_findings(deduped);
+
+        let summary = format!(
+            "strict review of {} file(s): {} ranked finding(s) from {} reviewer(s) ({} raw, {} gap(s))",
+            files.len(),
+            ranked.len(),
+            reviewers.len(),
+            raw.len(),
+            gaps.len()
+        );
+
+        let report = ReviewReport {
+            summary,
+            findings: ranked,
+            checked_files: files,
+            reviewers,
+            gaps,
+        };
+        Ok(ToolResult::ok(serde_json::to_string(&report)?))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // cite
 // ---------------------------------------------------------------------------
 
@@ -788,8 +1185,20 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "cite", "compare", "dedupe", "filter", "first", "gaps", "last", "len", "merge",
-                "need", "sort", "top"
+                "cite",
+                "compare",
+                "dedupe",
+                "filter",
+                "first",
+                "gaps",
+                "last",
+                "len",
+                "merge",
+                "need",
+                "review.aggregate",
+                "review.normalize",
+                "sort",
+                "top"
             ]
         );
     }
@@ -1069,5 +1478,191 @@ mod tests {
         let expected =
             "- \"sky is blue\" (wiki: p2)\n- \"no source here\"\n- \"a bare string claim\"";
         assert_eq!(r.content, expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // review.normalize / review.aggregate (L-12)
+    // -----------------------------------------------------------------------
+
+    fn finding(
+        severity: &str,
+        category: &str,
+        file: &str,
+        line: i64,
+        title: &str,
+        confidence: f64,
+        reviewer: &str,
+    ) -> Value {
+        json!({
+            "severity": severity,
+            "category": category,
+            "file": file,
+            "line": line,
+            "title": title,
+            "evidence": "some evidence",
+            "recommendation": "fix it",
+            "confidence": confidence,
+            "reviewer": reviewer,
+        })
+    }
+
+    #[tokio::test]
+    async fn review_aggregate_is_stable_and_quarantines_malformed_entries() {
+        let c = ctx();
+        let raw = json!([
+            finding("high", "security", "a.rs", 10, "sql injection", 0.9, "security"),
+            finding("medium", "correctness", "b.rs", 5, "off by one", 0.7, "correctness"),
+            "this is not a finding object",
+            {"category": "security", "severity": "high"}, // missing title
+        ]);
+
+        let r1 = ReviewAggregateTool
+            .execute(&c, json!({"findings": raw, "files": ["a.rs", "b.rs"], "reviewers": ["security", "correctness"]}))
+            .await
+            .unwrap();
+        let r2 = ReviewAggregateTool
+            .execute(&c, json!({"findings": raw, "files": ["a.rs", "b.rs"], "reviewers": ["security", "correctness"]}))
+            .await
+            .unwrap();
+
+        // Byte-identical across two independent runs on the same inputs.
+        assert_eq!(r1.content, r2.content, "aggregation must be deterministic");
+
+        let report: Value = serde_json::from_str(&r1.content).unwrap();
+        let findings = report["findings"].as_array().unwrap();
+        assert_eq!(
+            findings.len(),
+            2,
+            "only the 2 well-formed findings: {findings:?}"
+        );
+
+        let gaps = report["gaps"].as_array().unwrap();
+        assert_eq!(
+            gaps.len(),
+            2,
+            "the 2 malformed entries become gaps: {gaps:?}"
+        );
+        for g in gaps {
+            let s = g.as_str().unwrap();
+            assert!(
+                s.starts_with("dropped malformed finding:"),
+                "gap must be human-readable, got: {s}"
+            );
+        }
+        // Malformed entries never surface as findings.
+        assert!(!findings.iter().any(|f| f.as_str().is_some()));
+    }
+
+    #[tokio::test]
+    async fn fingerprint_is_stable_and_duplicate_across_reviewers_collapses_with_agreement() {
+        let c = ctx();
+        // Same category+file+line+title from two different reviewers -> same fingerprint -> one
+        // finding with agreement == 2.
+        let raw = json!([
+            finding(
+                "high",
+                "security",
+                "a.rs",
+                10,
+                "SQL Injection!!",
+                0.8,
+                "security"
+            ),
+            finding(
+                "high",
+                "security",
+                "a.rs",
+                10,
+                "  sql   injection  ",
+                0.6,
+                "correctness"
+            ),
+        ]);
+        let r = ReviewAggregateTool
+            .execute(&c, json!({"findings": raw}))
+            .await
+            .unwrap();
+        let report: Value = serde_json::from_str(&r.content).unwrap();
+        let findings = report["findings"].as_array().unwrap();
+        assert_eq!(
+            findings.len(),
+            1,
+            "duplicate fingerprints collapse: {findings:?}"
+        );
+        assert_eq!(findings[0]["agreement"], 2);
+        // The stronger (max) confidence wins.
+        assert_eq!(findings[0]["confidence"], 0.8);
+
+        // Differing title/category/file/line all yield a DIFFERENT fingerprint.
+        let a = ReviewNormalizeTool
+            .execute(
+                &c,
+                json!({"findings": [finding("high", "security", "a.rs", 10, "x", 0.5, "r")]}),
+            )
+            .await
+            .unwrap();
+        let a_report: Value = serde_json::from_str(&a.content).unwrap();
+        let fp_a = a_report["findings"][0]["fingerprint"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let variants = [
+            finding("high", "correctness", "a.rs", 10, "x", 0.5, "r"), // category differs
+            finding("high", "security", "b.rs", 10, "x", 0.5, "r"),    // file differs
+            finding("high", "security", "a.rs", 11, "x", 0.5, "r"),    // line differs
+            finding("high", "security", "a.rs", 10, "y", 0.5, "r"),    // title differs
+        ];
+        for v in variants {
+            let r = ReviewNormalizeTool
+                .execute(&c, json!({"findings": [v]}))
+                .await
+                .unwrap();
+            let rep: Value = serde_json::from_str(&r.content).unwrap();
+            let fp = rep["findings"][0]["fingerprint"].as_str().unwrap();
+            assert_ne!(fp, fp_a, "a variant must yield a different fingerprint");
+        }
+    }
+
+    #[tokio::test]
+    async fn ranking_order_is_severity_then_confidence_then_agreement() {
+        let c = ctx();
+        // Tier 1: severity disambiguates (critical beats high regardless of confidence).
+        // Tier 2: same severity, confidence disambiguates.
+        // Tier 3: same severity+confidence, agreement disambiguates (needs a duplicate to raise it).
+        let raw = json!([
+            finding("high", "cat", "f.rs", 1, "high conf", 0.5, "r1"),
+            finding("critical", "cat", "f.rs", 2, "critical low conf", 0.1, "r1"),
+            finding("high", "cat", "f.rs", 3, "high high conf", 0.9, "r1"),
+            // two entries sharing a fingerprint (same category/file/line/title) at medium severity,
+            // same confidence, to produce agreement == 2 for the tier-3 case.
+            finding("medium", "cat", "f.rs", 4, "agreed twice", 0.5, "r1"),
+            finding("medium", "cat", "f.rs", 4, "agreed twice", 0.5, "r2"),
+            finding("medium", "cat", "f.rs", 5, "agreed once", 0.5, "r3"),
+        ]);
+        let r = ReviewAggregateTool
+            .execute(&c, json!({"findings": raw}))
+            .await
+            .unwrap();
+        let report: Value = serde_json::from_str(&r.content).unwrap();
+        let findings = report["findings"].as_array().unwrap();
+
+        let titles: Vec<&str> = findings
+            .iter()
+            .map(|f| f["title"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            titles,
+            vec![
+                "critical low conf", // severity wins over confidence
+                "high high conf",    // same severity as next: higher confidence first
+                "high conf",
+                "agreed twice", // medium tier: agreement 2 beats agreement 1
+                "agreed once",
+            ],
+            "unexpected ranking order: {titles:?}"
+        );
+        assert_eq!(findings[3]["agreement"], 2);
+        assert_eq!(findings[4]["agreement"], 1);
     }
 }

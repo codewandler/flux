@@ -131,41 +131,40 @@ The concrete AST can initially lower `with_tools` to a new block node such as `c
 
 ## Review artifacts
 
-Add typed prelude artifacts once the flow stabilizes:
+**Built (L-12):** `ReviewFinding` and `ReviewReport` are `schemars`-derived Rust structs in
+`crates/flux-tools/src/cognition.rs` (embedded schema via `flux_spec::tool_input_schema`/
+`serde_json` derive — not hand-written JSON), matching the shape below with one deliberate
+simplification: no `id`/`span` fields (unused by the current reviewers; add if a future surface
+needs them), and `agreement: u32` was added (not in the original sketch) to carry the "reviewer
+disagreement merged into a count" decision from Open questions. No `ReviewRequest` struct exists —
+reviewer input is just the role's task prompt string built via `fmt` in the flow, so there was no
+aggregator-facing shape to schema; add one if a future caller needs a typed request. Promotion to
+`flux_lang::prelude::PRELUDE_TYPES` is deferred until a second surface consumes these types (tracked
+in L-12's story notes, not yet started).
 
 ```rust
-ReviewRequest {
-  context: Ctx,
-  focus: String,
-  files: List<String>,
-  schema_version: String,
-}
-
 ReviewFinding {
-  id: String,
-  fingerprint: String,
+  fingerprint: String,       // computed by review.normalize/aggregate — never model-supplied
   severity: "critical" | "high" | "medium" | "low" | "info",
   category: String,
   file: String?,
   line: Number?,
-  span: Span?,
   title: String,
   evidence: String,
   recommendation: String,
   confidence: Number,
   reviewer: String,
+  agreement: Number,         // distinct reviewers that raised this fingerprint (>=1)
 }
 
 ReviewReport {
   summary: String,
-  findings: List<ReviewFinding>,
+  findings: List<ReviewFinding>,  // deduped + ranked
   checked_files: List<String>,
   reviewers: List<String>,
-  gaps: List<String>,
+  gaps: List<String>,             // quarantined malformed reviewer entries, human-readable
 }
 ```
-
-The first implementation can keep these as JSON schemas embedded in the review flow. Promotion to prelude types should happen when multiple surfaces consume them.
 
 ## Capability scoping
 
@@ -214,6 +213,34 @@ Aggregation should be deterministic by default:
 6. Produce a report with stable ordering.
 
 A model may be used for final prose synthesis, but only after deterministic aggregation and with a fixed schema. The model should not decide which extra tools to run or which reviewers to spawn.
+
+**Built (L-12):** two native Rust ops in `crates/flux-tools/src/cognition.rs` (the `cognition` group,
+force-on like `dedupe`/`sort`), not flow-level composite ops — fingerprinting needs a stable hash
+that composite `dedupe`/`sort` over a model-supplied field cannot provide deterministically (a model
+`rank`/`fingerprint` is exactly what L-10 shipped and L-12 replaces).
+
+- `review.normalize({ findings: Value[] })` → `{ findings: ReviewFinding[], gaps: String[] }`. Each
+  raw entry is parsed (step 1); an entry that is not an object, or is missing `title`/`category`, or
+  has a missing/unrecognized `severity`, becomes a `"dropped malformed finding: …"` gap string instead
+  of an error or a silent drop (step 2). A well-formed entry's fingerprint is
+  `hash(category + "\u{1}" + file + "\u{1}" + line + "\u{1}" + normalize(title))` via a fixed-key
+  `DefaultHasher` (step 3) — deterministic across processes and runs because the key is fixed (not
+  `RandomState`'s per-process seed) and the input string uses a separator byte (`\u{1}`) that cannot
+  appear in any field, so distinct inputs cannot collide by concatenation.
+- `review.aggregate({ findings, files, reviewers })` → a full `ReviewReport`. Runs `review.normalize`
+  internally, then dedupes by fingerprint via a `BTreeMap` keyed on the fingerprint string (step 4;
+  order-independent and hashmap-iteration-free), counting **distinct non-empty `reviewer` values** in
+  each group as `agreement` and keeping the group's max `confidence`. Ranks (step 5) severity desc →
+  confidence desc → agreement desc → **fingerprint asc** as a final stable tiebreak, so two findings
+  can never compare equal and ordering is byte-identical run over run regardless of input order (step
+  6). `summary` is a generated one-line count string; `checked_files`/`reviewers` are echoed from the
+  input.
+
+The migrated `examples/strict_review.flux` calls only `review.aggregate` for its whole aggregation
+tail; the model still decides nothing about ranking, dedup, or reviewer selection — those three
+reviewer roles are hardcoded in the flow, not model-chosen. Prose synthesis on top of the typed
+`ReviewReport` (the "model may be used for final prose synthesis" line above) is not yet built —
+tracked as Phase 4 (journey/CLI surfaces).
 
 ## Journey integration
 
@@ -283,11 +310,26 @@ Landed as described below rather than left as an open design; see [L-11](../stor
   and a sub-agent-intersection test — all in `flux-runtime`, `flux-lang`, `flux-flow`, and
   `flux-orchestrate`.
 
-### Phase 3: typed review artifacts and aggregator
+### Phase 3: typed review artifacts and aggregator — BUILT (L-12)
 
-- Add `ReviewRequest`, `ReviewFinding`, and `ReviewReport` as schemas or prelude types.
-- Implement `review.normalize` / `review.aggregate` as deterministic composite ops first.
-- Promote to native Rust only if schema validation, fingerprinting, or ranking needs a stable built-in.
+Landed as native Rust ops rather than composite-ops-first, per the escape hatch this plan itself
+named; see [L-12](../stories/L-12-strict-review-typed-artifacts.md) for the acceptance mapping and
+the "Review artifacts" / "Aggregation" sections above for the exact shapes and algorithm.
+
+- `ReviewFinding` and `ReviewReport` landed as `schemars`-derived embedded schemas in
+  `crates/flux-tools/src/cognition.rs` (no `ReviewRequest` — not needed yet); prelude-type promotion
+  is still deferred (no second surface consumes them yet).
+- `review.normalize` / `review.aggregate` landed as native Rust ops directly (not composite ops first)
+  — fingerprinting needs a hash that is stable independent of `HashMap`/process-random iteration
+  order, which a flow-level composite over existing ops (`dedupe`/`sort`/etc.) cannot guarantee; this
+  is exactly the "native Rust only if fingerprinting/ranking needs a stable built-in" condition this
+  plan named, so Phase 3 skipped straight to it rather than landing an intermediate composite-op
+  version.
+- `examples/strict_review.flux`'s aggregation tail is now the single `review.aggregate(...)` call;
+  the three reviewer roles no longer emit `fingerprint`/`rank` (computed by the aggregator).
+- Tests: 3 new `flux-tools` unit tests (stable-ordering + malformed→gap, fingerprint stability +
+  duplicate-collapse-with-agreement, severity→confidence→agreement ranking), plus the updated L-10
+  `crates/flux-sdk/tests/strict_review.rs` integration test.
 
 ### Phase 4: app journey and surfaces
 

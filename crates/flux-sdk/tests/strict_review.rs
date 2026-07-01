@@ -1,10 +1,14 @@
-//! Integration test for the checked-in `strict_review` example flow (L-10; design
-//! `docs/designs/strict-review-flows.md`, Phase 1). Drives the REAL native-text flow
+//! Integration test for the checked-in `strict_review` example flow (L-10 Phase 1 + L-12 Phase 3;
+//! design `docs/designs/strict-review-flows.md`). Drives the REAL native-text flow
 //! (`examples/strict_review.flux`) and the REAL checked-in reviewer role files
 //! (`.flux/agents/review-*.md`) through a `FlowClient` with sub-agents wired to a mock provider that
 //! returns different canned JSON findings per reviewer role — hermetic, no API key.
 //!
 //! Added RED first (the flow + role files didn't exist), then made GREEN by L-10's implementation.
+//! L-12 migrated the aggregation from inline `filter`/`dedupe`/`sort` over a model-emitted `rank` to
+//! the native `review.aggregate` op: reviewers no longer emit `fingerprint`/`rank` (the aggregator
+//! computes both), a malformed entry is quarantined into `gaps` instead of silently dropped, and
+//! ranking is severity -> confidence -> agreement.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,13 +35,15 @@ fn read_flow() -> String {
 
 /// A provider that returns different canned reviewer JSON depending on which role's system prompt it
 /// is asked to drive. Every reply is a single JSON array of findings — the exact shape a reviewer role
-/// is instructed to emit.
+/// is instructed to emit (no `fingerprint`/`rank` — the aggregator computes both now).
 ///
-/// Findings are rigged to exercise both required aggregation behaviors:
-/// - `dup-1` is emitted by BOTH the security and correctness reviewer (same fingerprint) — must
-///   collapse to one finding after `dedupe`.
+/// Findings are rigged to exercise the required aggregation behaviors:
+/// - "shared finding" is emitted by BOTH the security and correctness reviewer with the same
+///   category/file/line/title (so it fingerprints identically) — must collapse to one finding with
+///   `agreement == 2` after `review.aggregate`.
 /// - the maintainability reviewer's array contains one MALFORMED entry (a bare string, not an object)
-///   alongside a well-formed finding — the pipeline must not crash on it.
+///   alongside a well-formed finding — it must land in `gaps`, not crash the pipeline and not be
+///   surfaced as a finding.
 struct ReviewerMockProvider;
 
 #[async_trait]
@@ -51,10 +57,8 @@ impl Provider for ReviewerMockProvider {
         let text = if system.contains("SECURITY reviewer") {
             json!([
                 {
-                    "fingerprint": "dup-1",
                     "severity": "high",
-                    "rank": 3,
-                    "category": "security",
+                    "category": "shared-cat",
                     "file": "crates/flux-lang/src/ast.rs",
                     "line": 10,
                     "title": "shared finding",
@@ -64,9 +68,7 @@ impl Provider for ReviewerMockProvider {
                     "reviewer": "security"
                 },
                 {
-                    "fingerprint": "sec-only",
                     "severity": "critical",
-                    "rank": 4,
                     "category": "security",
                     "file": "crates/flux-lang/src/ast.rs",
                     "line": 20,
@@ -81,10 +83,8 @@ impl Provider for ReviewerMockProvider {
         } else if system.contains("CORRECTNESS reviewer") {
             json!([
                 {
-                    "fingerprint": "dup-1",
                     "severity": "high",
-                    "rank": 3,
-                    "category": "correctness",
+                    "category": "shared-cat",
                     "file": "crates/flux-lang/src/ast.rs",
                     "line": 10,
                     "title": "shared finding",
@@ -94,9 +94,7 @@ impl Provider for ReviewerMockProvider {
                     "reviewer": "correctness"
                 },
                 {
-                    "fingerprint": "corr-only",
                     "severity": "medium",
-                    "rank": 2,
                     "category": "correctness",
                     "file": "crates/flux-lang/src/ast.rs",
                     "line": 30,
@@ -112,9 +110,7 @@ impl Provider for ReviewerMockProvider {
             json!([
                 "this entry is malformed — a bare string, not a finding object",
                 {
-                    "fingerprint": "maint-only",
                     "severity": "low",
-                    "rank": 1,
                     "category": "maintainability",
                     "file": "crates/flux-lang/src/ast.rs",
                     "line": 40,
@@ -193,7 +189,7 @@ fn seed_files() -> Map<String, Value> {
 }
 
 #[tokio::test]
-async fn strict_review_produces_a_structured_report_with_bounded_deterministic_aggregation() {
+async fn strict_review_produces_a_typed_report_with_bounded_deterministic_aggregation() {
     let client = build_client();
     let text = read_flow();
 
@@ -210,8 +206,8 @@ async fn strict_review_produces_a_structured_report_with_bounded_deterministic_a
         out.tool_calls
     );
 
-    let report: Value =
-        serde_json::from_str(&out.result).expect("strict_review must return a JSON report object");
+    let report: Value = serde_json::from_str(&out.result)
+        .expect("strict_review must return a JSON ReviewReport object");
 
     // Structured report shape.
     assert!(report.get("summary").is_some(), "report missing `summary`");
@@ -250,19 +246,33 @@ async fn strict_review_produces_a_structured_report_with_bounded_deterministic_a
         "missing maintainability reviewer findings: {findings:?}"
     );
 
-    // Deduplication: `dup-1` was emitted by BOTH the security and correctness reviewer with the same
-    // fingerprint — it must collapse to exactly one finding.
-    let dup_count = findings
+    // Deduplication: "shared finding" was emitted by BOTH the security and correctness reviewer with
+    // the same category/file/line/title — it must collapse to exactly one finding, with agreement
+    // counting the 2 distinct reviewers that raised it (the aggregator computes the fingerprint; the
+    // mock reviewers never emit one).
+    let shared: Vec<&Value> = findings
         .iter()
-        .filter(|f| f.get("fingerprint").and_then(|v| v.as_str()) == Some("dup-1"))
-        .count();
+        .filter(|f| f.get("title").and_then(|v| v.as_str()) == Some("shared finding"))
+        .collect();
     assert_eq!(
-        dup_count, 1,
-        "the shared fingerprint `dup-1` must dedupe to exactly one finding, found {dup_count}"
+        shared.len(),
+        1,
+        "the shared finding must dedupe to exactly one entry, found {}: {findings:?}",
+        shared.len()
     );
+    assert_eq!(
+        shared[0]["agreement"], 2,
+        "the shared finding must record agreement == 2 (security + correctness): {shared:?}"
+    );
+    // Every other finding was raised by exactly one reviewer.
+    for f in findings {
+        if f["title"] != "shared finding" {
+            assert_eq!(f["agreement"], 1, "unexpected agreement for {f:?}");
+        }
+    }
 
-    // The malformed bare-string entry from the maintainability reviewer must not appear as a finding
-    // and must not have crashed the pipeline — the well-formed findings still made it through.
+    // The malformed bare-string entry from the maintainability reviewer must be quarantined into
+    // `gaps` — never surfaced verbatim as a finding, never silently dropped.
     assert!(
         !findings
             .iter()
@@ -270,27 +280,65 @@ async fn strict_review_produces_a_structured_report_with_bounded_deterministic_a
                 == Some("this entry is malformed — a bare string, not a finding object")),
         "the malformed entry must not be surfaced verbatim as a finding: {findings:?}"
     );
+    let gaps = report["gaps"]
+        .as_array()
+        .expect("report.gaps must be an array");
+    assert_eq!(
+        gaps.len(),
+        1,
+        "the one malformed maintainability entry must produce exactly one gap: {gaps:?}"
+    );
+    assert!(
+        gaps[0]
+            .as_str()
+            .unwrap()
+            .contains("this entry is malformed — a bare string, not a finding object"),
+        "the gap must describe the dropped malformed entry: {gaps:?}"
+    );
 
-    // Expect exactly the well-formed findings: dup-1 (collapsed), sec-only, corr-only, maint-only.
+    // Expect exactly the well-formed findings: shared (collapsed), sec-only, corr-only, maint-only.
     assert_eq!(
         findings.len(),
         4,
-        "expected 4 well-formed findings after dedupe (dup-1 collapsed once + 3 unique), got {}: {findings:?}",
+        "expected 4 well-formed findings after dedupe (shared collapsed once + 3 unique), got {}: {findings:?}",
         findings.len()
     );
 
-    // Ranked (descending `rank`): sec-only(4) first, dup-1(3) — wherever it landed by role
-    // ordering — then corr-only(2), then maint-only(1) last, and the whole list must be
-    // non-increasing by rank.
-    let ranks: Vec<i64> = findings
+    // Ranked severity -> confidence -> agreement: security-only(critical) first, then the shared
+    // finding and correctness-only both at distinct severities (high, medium), then
+    // maintainability-only(low) last. The whole list must be non-increasing by severity rank.
+    fn severity_rank(sev: &str) -> u8 {
+        match sev {
+            "critical" => 4,
+            "high" => 3,
+            "medium" => 2,
+            "low" => 1,
+            _ => 0,
+        }
+    }
+    let titles: Vec<&str> = findings
         .iter()
-        .map(|f| f.get("rank").and_then(|v| v.as_i64()).unwrap_or(-1))
+        .map(|f| f["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        titles,
+        vec![
+            "security-only finding",        // critical
+            "shared finding",               // high
+            "correctness-only finding",     // medium
+            "maintainability-only finding"  // low
+        ],
+        "unexpected ranking order: {titles:?}"
+    );
+    let ranks: Vec<u8> = findings
+        .iter()
+        .map(|f| severity_rank(f["severity"].as_str().unwrap()))
         .collect();
     let mut sorted_desc = ranks.clone();
     sorted_desc.sort_by(|a, b| b.cmp(a));
     assert_eq!(
         ranks, sorted_desc,
-        "findings must be ranked in non-increasing `rank` order, got {ranks:?}"
+        "findings must be ranked in non-increasing severity order, got {ranks:?}"
     );
 }
 

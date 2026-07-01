@@ -15,9 +15,7 @@ randomness use.
 Respond on your FIRST message with ONLY a JSON array (no prose, no code fences, no tool calls, no
 trailing text) of findings, each shaped:
 
-[{"fingerprint": "<stable id derived from category+file+line+title>",
-  "severity": "critical" | "high" | "medium" | "low" | "info",
-  "rank": <4=critical, 3=high, 2=medium, 1=low, 0=info>,
+[{"severity": "critical" | "high" | "medium" | "low" | "info",
   "category": "security",
   "file": "<path or null>",
   "line": <number or null>,

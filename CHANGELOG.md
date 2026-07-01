@@ -8,6 +8,28 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Strict review: typed artifacts + deterministic aggregator — `review.normalize`/`review.aggregate`
+  (L-12, Phase 3).** `examples/strict_review.flux`'s aggregation tail (`merge` → `filter` → `dedupe` →
+  `sort` over a **model-emitted** `rank`) is replaced by a single deterministic native call,
+  `review.aggregate({ findings, files, reviewers })`, returning a typed `ReviewReport`. Two new ops in
+  `crates/flux-tools/src/cognition.rs` (registered in `register_cognition` + the `cognition` tool
+  group), with `schemars`-derived embedded schemas (`ReviewFinding`/`ReviewReport` — prelude-type
+  promotion deferred to when a second surface consumes them): `review.normalize({ findings })` parses
+  raw reviewer entries into well-formed findings, computing a stable fingerprint
+  (`category+file+line+normalized-title`, hashed with a fixed-key `DefaultHasher` so it never depends
+  on `HashMap` iteration order) and quarantining malformed entries as human-readable `gaps` strings —
+  never silently dropped, never surfaced as findings. `review.aggregate` runs normalize, dedupes by
+  fingerprint (counting distinct reviewers as `agreement`, keeping the max `confidence` across the
+  group), and ranks severity desc → confidence desc → agreement desc → fingerprint asc (a stable
+  tiebreak, so ordering is byte-identical across runs). The three reviewer roles
+  (`.flux/agents/review-{security,correctness,maintainability}.md`) no longer emit
+  `fingerprint`/`rank` — the aggregator computes both now, not the model. The L-10 integration test
+  (`crates/flux-sdk/tests/strict_review.rs`) is updated: a cross-reviewer duplicate now asserts
+  `agreement == 2`, the malformed mock entry asserts a `gaps` entry instead of a silently-dropped
+  finding, and ranking is asserted severity → confidence → agreement. 3 new failing-first unit tests
+  in `flux-tools` (stable-ordering + malformed→gap, fingerprint stability/distinctness +
+  duplicate-collapse, ranking-order disambiguation).
+
 - **Runtime-enforced capability scoping — `with_tools` (L-11, Phase 2).** Per-block tool restriction
   is now enforced, not advisory: a new `Node::CapScope` AST node (native text
   `with_tools ["a", "b"] { … }`) narrows the tool-name allowlist for its body, checked as the FIRST

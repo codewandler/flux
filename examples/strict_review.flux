@@ -1,11 +1,15 @@
 # strict_review.flux — the strict code-review protocol as a real, checked-in Flux-Lang flow
-# (docs/designs/strict-review-flows.md, Phase 1; story docs/stories/L-10-strict-review-example-flow.md).
+# (docs/designs/strict-review-flows.md; story docs/stories/L-10-strict-review-example-flow.md
+# [Phase 1] + docs/stories/L-12-strict-review-typed-artifacts.md [Phase 3]).
 #
 # Gathers context read-only (git_status/git_diff/read_many), packs it into a budgeted `ctx` for the
 # audit trail, fans out to a FIXED set of three restricted reviewer roles (security / correctness /
 # maintainability — no filesystem/shell tools, see .flux/agents/review-*.md), then aggregates their
-# JSON findings deterministically: merge -> filter (drop malformed entries) -> dedupe (by
-# fingerprint) -> sort (by rank desc).
+# raw JSON findings with a single deterministic native op: `review.aggregate` normalizes each entry
+# (quarantining malformed ones as `gaps` — never silently dropped, never surfaced as findings),
+# dedupes by a computed fingerprint (category+file+line+normalized-title; counting reviewer
+# `agreement`), and ranks by severity -> confidence -> agreement with a fingerprint tiebreak for
+# byte-identical ordering across runs. Returns a typed `ReviewReport`.
 #
 # Run with: `flux run examples/strict_review.flux --input '{"files": ["crates/flux-lang/src/ast.rs"]}'`
 
@@ -44,16 +48,9 @@ flow strict_review(files: List<String>)
   # mechanism a `jq`/`parse` step relies on), which is what lets `merge` (an array-of-arrays op) see
   # real arrays instead of opaque strings.
   $all_findings = merge({ lists: [$security, $correctness, $maintainability] })
-  $raw_count = len({ items: $all_findings })
 
-  # Quarantine malformed entries instead of silently accepting them: `filter`'s `by: "fingerprint"`
-  # keeps only items with a truthy `fingerprint` field, so a well-formed finding object survives and
-  # a malformed entry (not an object, or missing `fingerprint`) is dropped.
-  $well_formed = filter({ items: $all_findings, by: "fingerprint" })
-  $well_formed_count = len({ items: $well_formed })
-
-  $unique = dedupe({ items: $well_formed, by: "fingerprint" })
-  $ranked = sort({ items: $unique, by: "rank", order: "desc" })
-  $finding_count = len({ items: $ranked })
-
-  return { summary: fmt("strict review of {files}: {finding_count} ranked finding(s) from 3 reviewers ({raw_count} raw, {well_formed_count} well-formed)"), findings: $ranked, reviewers: [ "security", "correctness", "maintainability" ], checked_files: $files }
+  # A single native, deterministic op replaces the inline filter/dedupe/sort: normalize (quarantine
+  # malformed entries as gaps, compute each finding's fingerprint) -> dedupe by fingerprint (counting
+  # reviewer agreement) -> rank by severity, then confidence, then agreement (fingerprint tiebreak).
+  # The model never ranks — `review.aggregate` is the runtime, not the LLM.
+  return review.aggregate({ findings: $all_findings, files: $files, reviewers: [ "security", "correctness", "maintainability" ] })

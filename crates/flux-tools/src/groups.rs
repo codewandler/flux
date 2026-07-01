@@ -115,12 +115,25 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
         },
         ToolGroup {
             name: "cognition".into(),
-            description: "Pure cognition helpers: needs/gaps, and list shaping (compare, dedupe, \
-                          sort, top, merge, cite, len, first, last, filter)."
+            description: "Pure cognition helpers: needs/gaps, list shaping (compare, dedupe, sort, \
+                          top, merge, cite, len, first, last, filter), and strict-review \
+                          normalize/aggregate."
                 .into(),
             tools: names(&[
-                "need", "gaps", "compare", "dedupe", "sort", "top", "merge", "cite", "len",
-                "first", "last", "filter",
+                "need",
+                "gaps",
+                "compare",
+                "dedupe",
+                "sort",
+                "top",
+                "merge",
+                "cite",
+                "len",
+                "first",
+                "last",
+                "filter",
+                "review.normalize",
+                "review.aggregate",
             ]),
             // Force-on (empty predicate): these deterministic helpers are useful in any session, so
             // they are always advertised rather than gated on a workspace signal.

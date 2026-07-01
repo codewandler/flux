@@ -3282,6 +3282,8 @@ mod tests {
                 "python_run",
                 "read",
                 "read_many",
+                "review.aggregate",
+                "review.normalize",
                 "sort",
                 "sqlite_query",
                 "sys_info",
