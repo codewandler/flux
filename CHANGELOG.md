@@ -93,6 +93,18 @@ All notable changes to this project are documented in this file. The format is b
   streaming/hijack/tar ops (`container.exec`/`stats`/`copy_*`, `image.push`/`build`, `events`,
   `context.*`) flagged as a residual scope boundary. 19/11/42 tests.
 
+- **Final cluster schemars migration + parity (D-44) — D-36 COMPLETE.** websearch (2 ops), jira
+  (21), confluence (15), kubernetes (24), aws (11) all schemars-derived in parallel. **All 17
+  in-repo plugins now derive every op `input_schema` via `host-kit::read_op_typed`/
+  `write_op_typed`; the `no_manual_plugin_schema` guard (all 17) enforces it.** Fluxplane parity
+  ports: websearch `limit`/`queries`/`NormalizeMax`; jira `body_format` (ADF→Markdown) +
+  `fields`/raw `fields`/`update` + `content_bytes`; confluence `content_bytes` + pagination
+  tokens + error extraction; kubernetes `query`/`limit` inventory filters + `pod.logs` `until` +
+  `deployment.scale`/`restart` + `portforward.start` `duration_seconds`; aws
+  integer→RFC3339 timestamp formatting + `latency_ms`. Residuals (docker streaming ops,
+  confluence `index.build` paging, aws `inspect` env lookup, jira ADF-image) flagged for future
+  passes. 8/34/38/42/22 tests.
+
 - **Plugin-side schemars op schemas — D-36 (in-progress).** `host-kit` now derives a plugin
   op's `input_schema` from a typed struct via `read_op_typed::<T>` / `write_op_typed::<T>`
   (+ `op_input_schema::<T>()`, a `schemars` re-export), the plugin-side counterpart of D-34.

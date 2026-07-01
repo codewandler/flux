@@ -53,6 +53,8 @@ name = "aws"
 version = "0.1.0"
 dependencies = [
  "host-kit",
+ "schemars",
+ "serde",
  "serde_json",
 ]
 
@@ -115,9 +117,12 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 name = "confluence"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "host-kit",
  "pulldown-cmark",
  "quick-xml",
+ "schemars",
+ "serde",
  "serde_json",
 ]
 
@@ -712,7 +717,10 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 name = "jira"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "host-kit",
+ "schemars",
+ "serde",
  "serde_json",
 ]
 
@@ -732,6 +740,8 @@ name = "kubernetes"
 version = "0.1.0"
 dependencies = [
  "host-kit",
+ "schemars",
+ "serde",
  "serde_json",
 ]
 
@@ -1863,6 +1873,8 @@ name = "websearch"
 version = "0.1.0"
 dependencies = [
  "host-kit",
+ "schemars",
+ "serde",
  "serde_json",
 ]
 

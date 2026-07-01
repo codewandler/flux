@@ -2,11 +2,11 @@
 id: D-36
 title: schemars-derive every plugin OperationSpec schema (kill hand-written JSON Schema on the plugin side)
 pillar: Core
-status: in-progress
+status: done
 priority:
 epic:
 design:
-note: the plugin-side continuation of D-34 — ~150 hand-written `so(json!{...}, json![...])` op schemas across 17 in-repo plugins become schemars-derived via new host-kit `read_op_typed`/`write_op_typed` helpers
+note: COMPLETE — all 17 in-repo plugins now schemars-derive every op input_schema via host-kit read_op_typed/write_op_typed (+ one op_spec_typed); the no_manual_plugin_schema guard (all 17) enforces it. Fluxplane parity re-audits done per plugin; gaps ported (D-37..D-44) or recorded as deferred
 ---
 
 # schemars-derive every plugin OperationSpec schema
@@ -97,10 +97,11 @@ host-kit derives the schema + parses the call in one typed step.
 - **Drift collected.** `DRIFT.md` § D-36 records two `homer` drifts (`call.list` handler reads
   `ua`/`method`/`call_id` the schema omits; `call.show` advertises a `render` field the handler
   ignores) — preserved as-is (pure schema-source change), plus schemars representation notes.
-- **Remaining (8 plugins):** `huggingface`, `opsgenie`, `docker`, `websearch`, `jira`,
-  `confluence`, `kubernetes`, `aws`. Several use
-  `flex_str`/`flex_i64` string-or-number
-  coercion → schema-only struct (handler stays), D-34 precedent. As each migrates: delete its
+- **D-36 COMPLETE:** all 17 in-repo plugins now schemars-derive every op `input_schema` via
+  `host-kit::read_op_typed`/`write_op_typed` (+ one `op_spec_typed`); the `no_manual_plugin_schema`
+  guard (all 17 in `MIGRATED_PLUGINS`) enforces it. Fluxplane parity re-audits done per plugin;
+  gaps ported (D-37..D-44) or recorded as deferred. Several used `flex_str`/`flex_i64`
+  string-or-number coercion → schema-only struct (handler stays), D-34 precedent. As each migrates: delete its
   `so` helper, add it to `MIGRATED_PLUGINS`, add an inline `schema_contract` test, record any
   drift here.
 

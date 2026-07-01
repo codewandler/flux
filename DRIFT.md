@@ -398,3 +398,56 @@ Full D-36 per-plugin loop for huggingface, opsgenie, docker (run in parallel).
 
 All 3: `endpoint_ref`/Docker-daemon architectural splits (do-not-port) — flux resolves the
 endpoint via `host.endpoint(...)` + reference-IO (D-29).
+
+---
+
+# D-44 — final cluster schemars migration + parity ports (D-36 COMPLETE)
+
+Full D-36 per-plugin loop for websearch, jira, confluence, kubernetes, aws (run in parallel). This
+completes the schemars migration of all 17 in-repo plugins.
+
+## websearch (2 ops)
+- Schemars migration complete; inline schema deleted; `schema_contract` test. Ported: `limit`
+  alias, `queries` array (≤5, ≤500 chars), default max 10 (cap 20, fluxplane `NormalizeMax`).
+- Architectural splits (do-not-port): flux folds Tavily+DuckDuckGo into one plugin (vs fluxplane's
+  aggregator+separate providers); flux hardcodes the two public API hosts (no `host.endpoint` for
+  websearch); `websearch.context` not ported.
+
+## jira (21 ops)
+- Schemars migration complete; `key_schema()` deleted; `schema_contract` test. Ported: `body_format`
+  (markdown/adf/both) with ADF→Markdown rendering on `issue.search`/`show`/`comment.list`;
+  `issue.search` `fields` override; raw `fields`/`update` maps on `issue.create`/`edit`;
+  `attachment.add` `content_bytes` (base64 inline).
+- Deferred (host-capability-constrained / large): `attachment.get` caller-supplied `blob_ref` (host
+  `blob_put` allocates a new ref); ADF→Markdown image-upload rewriting; `verifyTypedFieldsApplied`
+  warnings; link-direction validation; browse `web_url`.
+
+## confluence (15 ops)
+- Schemars migration complete; inline schemas deleted; `schema_contract` test. Ported:
+  `attachment.add` `content_bytes`; `page.list`/`comment.list` pagination tokens
+  (`next_start`/`has_more`); JSON error-message extraction.
+- Deferred: `index.build` multi-page iteration (Go iterates all pages via `All=true`; flux does a
+  single fetch — non-trivial paging loop).
+
+## kubernetes (24 ops)
+- Schemars migration complete; inline helpers (`s_context`/`s_namespace`/`s_limit`/
+  `inventory_list_schema`/`show_schema`/old `op_spec`) deleted; `schema_contract` test (+ a new
+  `op_spec_typed::<T>` helper for the one op that needed it). Ported: `query`/`limit` on inventory
+  list ops, `pod.logs` `until` bound, `deployment.scale` `previous_replicas`, `deployment.restart`
+  `restarted_at`, `portforward.start` `duration_seconds`/`expires_at` (default 3600, cap 28800).
+- Architectural splits (do-not-port): `endpoint_ref`/`URL` per-call (flux uses ambient kubeconfig +
+  `--context`); direct client-go (fluxplane) vs `kubectl` subprocess (flux); portforward stored in
+  a plugin-local registry (host has no `process.list`).
+
+## aws (11 ops)
+- Schemars migration complete; `s_region()` deleted; `schema_contract` test. Ported:
+  `logs.tail`/`logs.groups` integer→RFC3339 timestamp formatting; `aws.test` `latency_ms`.
+- Deferred: `aws.inspect` `profile`/`profile_env`/`region_env` — host-kit exposes no `EnvLookup`
+  capability and the subprocess is env-cleared, so only the explicit `region` field is surfaced.
+
+## D-36 status: COMPLETE
+All 17 in-repo plugins now schemars-derive every op `input_schema` via `host-kit::read_op_typed`/
+`write_op_typed` (+ the one `op_spec_typed`); the `no_manual_plugin_schema` guard (all 17 in
+`MIGRATED_PLUGINS`) enforces it. Fluxplane parity re-audits done per plugin; gaps ported or recorded
+as deferred. Two cross-cutting residuals remain for future passes: docker's streaming/hijack/tar
+ops, and the confluence `index.build` / aws `inspect` / jira ADF-image gaps noted above.

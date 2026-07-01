@@ -8,6 +8,8 @@
 //!   logs.groups, logs.tail, logs.query, cloudwatch.metrics
 
 use host_kit::*;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 // ---------------------------------------------------------------------------
@@ -18,6 +20,128 @@ const PURPOSE_SECRET_ACCESS_KEY: &str = "secret_access_key";
 const PURPOSE_SESSION_TOKEN: &str = "session_token";
 
 const DEFAULT_REGION: &str = "eu-central-1";
+
+// ===========================================================================
+// Schema-only op input structs (D-36)
+// ===========================================================================
+// Each op's `input_schema` is derived from the structs below via schemars
+// (`host_kit::read_op_typed::<T>`), instead of a hand-written `json!({...})`
+// object, so the schema the model sees cannot drift from a separately-maintained
+// literal. The structs are schema-only: handlers keep their existing Value
+// extractors (the D-34 schema-only precedent).
+
+/// `aws.test`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct TestInput {
+    region: Option<String>,
+}
+
+/// `aws.inspect`.
+///
+/// Architectural split vs fluxplane: fluxplane resolves profile/region from the
+/// host environment (`AWS_PROFILE`, `AWS_REGION`, ...). The flux plugin is
+/// spawned with an env-cleared subprocess and no host env-lookup capability, so
+/// only the explicit `region` field is honored.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct InspectInput {
+    region: Option<String>,
+}
+
+/// `aws.ec2.instances`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct Ec2InstancesInput {
+    region: Option<String>,
+    name: Option<String>,
+    states: Option<Vec<String>>,
+    ids: Option<Vec<String>>,
+    limit: Option<i64>,
+}
+
+/// `aws.eks.clusters`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct EksClustersInput {
+    region: Option<String>,
+    name: Option<String>,
+}
+
+/// `aws.rds.instances`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct RdsInstancesInput {
+    region: Option<String>,
+    engine: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `aws.s3.buckets`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct S3BucketsInput {
+    region: Option<String>,
+    prefix: Option<String>,
+}
+
+/// `aws.s3.objects`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct S3ObjectsInput {
+    region: Option<String>,
+    bucket: String,
+    prefix: Option<String>,
+    limit: Option<i64>,
+    next_token: Option<String>,
+}
+
+/// `aws.logs.groups`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct LogsGroupsInput {
+    region: Option<String>,
+    prefix: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `aws.logs.tail`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct LogsTailInput {
+    region: Option<String>,
+    group: String,
+    since: Option<String>,
+    until: Option<String>,
+    pattern: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `aws.logs.query`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct LogsQueryInput {
+    region: Option<String>,
+    groups: Vec<String>,
+    query: String,
+    since: Option<String>,
+    until: Option<String>,
+    timeout_seconds: Option<i64>,
+}
+
+/// `aws.cloudwatch.metrics`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CloudWatchMetricsInput {
+    region: Option<String>,
+    namespace: String,
+    metric: String,
+    dimensions: Option<Map<String, Value>>,
+    stat: Option<String>,
+    period: Option<i64>,
+    since: Option<String>,
+    until: Option<String>,
+}
 
 // ---------------------------------------------------------------------------
 // Manifest.
@@ -41,150 +165,86 @@ fn manifest_builder() -> PluginBuilder {
         ))
         // --- connectivity / setup ---------------------------------------------
         .operation(
-            read_op(
+            read_op_typed::<TestInput>(
                 "aws.test",
                 "Verify AWS connectivity and credential validity via STS GetCallerIdentity.",
-                json!({"type": "object", "properties": {
-                    "region": s_region()
-                }}),
             ),
             aws_test,
         )
         .operation(
-            read_op(
+            read_op_typed::<InspectInput>(
                 "aws.inspect",
                 "Inspect non-secret AWS environment configuration and credential presence \
                  (reports which credentials are set, effective region, no secret values returned).",
-                json!({"type": "object", "properties": {
-                    "region": s_region()
-                }}),
             ),
             aws_inspect,
         )
         // --- EC2 ---------------------------------------------------------------
         .operation(
-            read_op(
+            read_op_typed::<Ec2InstancesInput>(
                 "aws.ec2.instances",
                 "List EC2 instances with Name-tag wildcard and state filters.",
-                json!({"type": "object", "properties": {
-                    "region": s_region(),
-                    "name": {"type": "string", "description": "Filter by the Name tag; * wildcards supported (e.g. *kamailio*)."},
-                    "states": {"type": "array", "items": {"type": "string"}, "description": "Instance state filters such as running or stopped."},
-                    "ids": {"type": "array", "items": {"type": "string"}, "description": "Exact instance IDs."},
-                    "limit": {"type": "integer", "description": "Maximum instances returned. Defaults to 50, capped at 500.", "minimum": 0, "maximum": 500}
-                }}),
             ),
             ec2_instances,
         )
         // --- EKS ---------------------------------------------------------------
         .operation(
-            read_op(
+            read_op_typed::<EksClustersInput>(
                 "aws.eks.clusters",
                 "List and describe EKS clusters (version, status, endpoint, VPC).",
-                json!({"type": "object", "properties": {
-                    "region": s_region(),
-                    "name": {"type": "string", "description": "Exact cluster name to describe. Default lists and describes all (bounded)."}
-                }}),
             ),
             eks_clusters,
         )
         // --- RDS ---------------------------------------------------------------
         .operation(
-            read_op(
+            read_op_typed::<RdsInstancesInput>(
                 "aws.rds.instances",
                 "List RDS/Aurora clusters (writer/reader endpoints, members) and database instances.",
-                json!({"type": "object", "properties": {
-                    "region": s_region(),
-                    "engine": {"type": "string", "description": "Filter by engine such as aurora-mysql or postgres."},
-                    "limit": {"type": "integer", "description": "Maximum instances returned. Defaults to 100, capped at 500.", "minimum": 0, "maximum": 500}
-                }}),
             ),
             rds_instances,
         )
         // --- S3 ----------------------------------------------------------------
         .operation(
-            read_op(
+            read_op_typed::<S3BucketsInput>(
                 "aws.s3.buckets",
                 "List S3 buckets, optionally filtered by name prefix.",
-                json!({"type": "object", "properties": {
-                    "region": s_region(),
-                    "prefix": {"type": "string", "description": "Only buckets whose name starts with this prefix."}
-                }}),
             ),
             s3_buckets,
         )
         .operation(
-            read_op(
+            read_op_typed::<S3ObjectsInput>(
                 "aws.s3.objects",
                 "List S3 objects under a prefix with continuation-token pagination.",
-                json!({"type": "object", "properties": {
-                    "region": s_region(),
-                    "bucket": {"type": "string", "description": "Bucket name."},
-                    "prefix": {"type": "string", "description": "Key prefix filter."},
-                    "limit": {"type": "integer", "description": "Maximum objects returned. Defaults to 100, capped at 1000.", "minimum": 0, "maximum": 1000},
-                    "next_token": {"type": "string", "description": "Continuation token from a previous truncated call."}
-                }, "required": ["bucket"]}),
             ),
             s3_objects,
         )
         // --- CloudWatch Logs ---------------------------------------------------
         .operation(
-            read_op(
+            read_op_typed::<LogsGroupsInput>(
                 "aws.logs.groups",
                 "List CloudWatch log groups with retention and size.",
-                json!({"type": "object", "properties": {
-                    "region": s_region(),
-                    "prefix": {"type": "string", "description": "Log group name prefix filter (e.g. /aws/eks/)."},
-                    "limit": {"type": "integer", "description": "Maximum groups returned. Defaults to 100, capped at 500.", "minimum": 0, "maximum": 500}
-                }}),
             ),
             logs_groups,
         )
         .operation(
-            read_op(
+            read_op_typed::<LogsTailInput>(
                 "aws.logs.tail",
                 "Read recent events from a CloudWatch log group (FilterLogEvents over a time window).",
-                json!({"type": "object", "properties": {
-                    "region": s_region(),
-                    "group": {"type": "string", "description": "Log group name."},
-                    "since": {"type": "string", "description": "Start time as RFC3339, unix seconds, or duration ago (e.g. 15m). Defaults to 15m."},
-                    "until": {"type": "string", "description": "End time as RFC3339, unix seconds, or duration ago. Defaults to now."},
-                    "pattern": {"type": "string", "description": "CloudWatch filter pattern (e.g. ERROR or a JSON term)."},
-                    "limit": {"type": "integer", "description": "Maximum events returned. Defaults to 200, capped at 1000.", "minimum": 0, "maximum": 1000}
-                }, "required": ["group"]}),
             ),
             logs_tail,
         )
         .operation(
-            read_op(
+            read_op_typed::<LogsQueryInput>(
                 "aws.logs.query",
                 "Run a bounded CloudWatch Logs Insights query and wait for its results.",
-                json!({"type": "object", "properties": {
-                    "region": s_region(),
-                    "groups": {"type": "array", "items": {"type": "string"}, "description": "Log group names to query."},
-                    "query": {"type": "string", "description": "CloudWatch Logs Insights query (e.g. fields @timestamp, @message | limit 20)."},
-                    "since": {"type": "string", "description": "Start time as RFC3339, unix seconds, or duration ago. Defaults to 1h."},
-                    "until": {"type": "string", "description": "End time as RFC3339, unix seconds, or duration ago. Defaults to now."},
-                    "timeout_seconds": {"type": "integer", "description": "Maximum seconds to wait for completion. Defaults to 30, capped at 120.", "minimum": 0, "maximum": 120}
-                }, "required": ["groups", "query"]}),
             ),
             logs_query,
         )
         // --- CloudWatch Metrics ------------------------------------------------
         .operation(
-            read_op(
+            read_op_typed::<CloudWatchMetricsInput>(
                 "aws.cloudwatch.metrics",
                 "Fetch one CloudWatch metric series (GetMetricData) over a time window.",
-                json!({"type": "object", "properties": {
-                    "region": s_region(),
-                    "namespace": {"type": "string", "description": "Metric namespace such as AWS/RDS or AWS/EC2."},
-                    "metric": {"type": "string", "description": "Metric name such as CPUUtilization."},
-                    "dimensions": {"type": "object", "description": "Dimension name/value pairs, e.g. {\"DBClusterIdentifier\": \"dev-aurora2-mysql\"}."},
-                    "stat": {"type": "string", "description": "Statistic: Average, Sum, Minimum, Maximum, SampleCount, or a percentile like p99. Defaults to Average."},
-                    "period": {"type": "integer", "description": "Period in seconds. Defaults to 300.", "minimum": 0},
-                    "since": {"type": "string", "description": "Start time as RFC3339, unix seconds, or duration ago. Defaults to 3h."},
-                    "until": {"type": "string", "description": "End time as RFC3339, unix seconds, or duration ago. Defaults to now."}
-                }, "required": ["namespace", "metric"]}),
             ),
             cloudwatch_metrics,
         )
@@ -193,10 +253,6 @@ fn manifest_builder() -> PluginBuilder {
 // ---------------------------------------------------------------------------
 // Schema helpers.
 // ---------------------------------------------------------------------------
-
-fn s_region() -> Value {
-    json!({"type": "string", "description": "AWS region. Defaults to eu-central-1."})
-}
 
 fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
     Declaration {
@@ -307,6 +363,7 @@ fn req_str<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
 fn aws_test(input: Value, host: &mut Host) -> Result<Value, String> {
     let rgn = region(&input);
     let (key_id, secret, token) = resolve_creds(host)?;
+    let start = std::time::Instant::now();
     let v = aws_json(
         host,
         &["sts", "get-caller-identity"],
@@ -315,11 +372,13 @@ fn aws_test(input: Value, host: &mut Host) -> Result<Value, String> {
         token.as_deref(),
         &rgn,
     )?;
+    let latency_ms = start.elapsed().as_millis() as i64;
     Ok(json!({
         "account": v.get("Account").and_then(|x| x.as_str()).unwrap_or(""),
         "arn": v.get("Arn").and_then(|x| x.as_str()).unwrap_or(""),
         "user_id": v.get("UserId").and_then(|x| x.as_str()).unwrap_or(""),
         "region": rgn,
+        "latency_ms": latency_ms,
     }))
 }
 
@@ -892,7 +951,7 @@ fn logs_groups(input: Value, host: &mut Host) -> Result<Value, String> {
                 "name": g.get("logGroupName").and_then(|x| x.as_str()).unwrap_or(""),
                 "retention_days": g.get("retentionInDays").and_then(|x| x.as_i64()).unwrap_or(0),
                 "stored_bytes": g.get("storedBytes").and_then(|x| x.as_i64()).unwrap_or(0),
-                "created": g.get("creationTime").and_then(|x| x.as_str()).unwrap_or(""),
+                "created": format_log_timestamp(g.get("creationTime").unwrap_or(&Value::Null)),
             }));
         }
     }
@@ -971,7 +1030,7 @@ fn logs_tail(input: Value, host: &mut Host) -> Result<Value, String> {
                 break;
             }
             events.push(json!({
-                "time": e.get("timestamp").and_then(|x| x.as_str()).unwrap_or(""),
+                "time": format_log_timestamp(e.get("timestamp").unwrap_or(&Value::Null)),
                 "stream": e.get("logStreamName").and_then(|x| x.as_str()).unwrap_or(""),
                 "message": e.get("message").and_then(|x| x.as_str()).unwrap_or("").trim_end_matches('\n'),
             }));
@@ -1319,6 +1378,62 @@ fn parse_duration_ago(v: &str) -> Option<u64> {
         "d" => Some(n * 86400 * 1_000),
         _ => None,
     }
+}
+
+/// CloudWatch Logs and some other AWS SDK outputs encode timestamps as Unix
+/// milliseconds (integer). The AWS CLI echoes those integers. Fluxplane returns
+/// them as RFC3339 — mirror that by treating integers as ms and leaving strings
+/// already formatted by the CLI (e.g. S3 LastModified) unchanged.
+fn format_log_timestamp(value: &Value) -> String {
+    let ms: i64 = match value {
+        Value::Number(n) => n.as_i64().unwrap_or(0),
+        Value::String(s) if s.trim().is_empty() => return String::new(),
+        Value::String(s) => {
+            // Likely already RFC3339 from the CLI (S3/EKS/EC2). Keep as-is.
+            return s.trim().to_string();
+        }
+        _ => return String::new(),
+    };
+    if ms <= 0 {
+        return String::new();
+    }
+    format_unix_ms_rfc3339(ms)
+}
+
+fn format_unix_ms_rfc3339(ms: i64) -> String {
+    let secs = ms / 1000;
+    let frac_ms = (ms % 1000).unsigned_abs() as u32;
+    let secs_per_day: i64 = 86400;
+    let days_since_epoch = if ms >= 0 {
+        secs / secs_per_day
+    } else {
+        // Negative timestamps are not expected from AWS, but handle without panic.
+        (secs + 1 - secs_per_day) / secs_per_day
+    };
+    let seconds_of_day: u64 = (secs - days_since_epoch * secs_per_day).unsigned_abs();
+    let (year, month, day) = civil_from_days(days_since_epoch);
+    let hour = seconds_of_day / 3600;
+    let min = (seconds_of_day % 3600) / 60;
+    let sec = seconds_of_day % 60;
+    if frac_ms == 0 {
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+    } else {
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}.{frac_ms:03}Z")
+    }
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 /// Minimal RFC3339 parser for `YYYY-MM-DDTHH:MM:SSZ` (UTC, Z suffix).
@@ -1780,5 +1895,300 @@ mod tests {
         assert!(parse_duration_ago("1d").is_some());
         assert!(parse_duration_ago("30s").is_some());
         assert!(parse_duration_ago("bad").is_none());
+    }
+
+    // ---- D-36: ported parity gaps (failing-first) ----
+
+    /// Gap 1: fluxplane returns RFC3339 for CloudWatch Logs integer timestamps.
+    /// Before the fix, integer timestamps were emitted as empty strings.
+    #[test]
+    fn logs_tail_formats_integer_timestamp_as_rfc3339() {
+        let plugin = manifest_builder().build();
+        // AWS CLI filter-log-events emits `timestamp` as Unix epoch milliseconds (integer).
+        let mut host = host_with_creds_and_proc(
+            r#"{"events":[{"timestamp":1704067200000,"logStreamName":"stream-1","message":"error"}]}"#,
+        );
+        let out = plugin
+            .call(
+                "aws.logs.tail",
+                json!({"group": "/aws/eks/dev", "since": "15m"}),
+                &mut host,
+            )
+            .unwrap();
+        assert_eq!(out["events"][0]["time"], "2024-01-01T00:00:00Z");
+    }
+
+    /// Gap 2: log group `creationTime` is also a Unix-ms integer in CLI output.
+    #[test]
+    fn logs_groups_formats_integer_creation_time_as_rfc3339() {
+        let plugin = manifest_builder().build();
+        let mut host = host_with_creds_and_proc(
+            r#"{"logGroups":[{"logGroupName":"/aws/eks/dev","retentionInDays":30,"storedBytes":102400,"creationTime":1704067200000}]}"#,
+        );
+        let out = plugin
+            .call("aws.logs.groups", json!({}), &mut host)
+            .unwrap();
+        assert_eq!(out["groups"][0]["created"], "2024-01-01T00:00:00Z");
+    }
+
+    /// Gap 3: fluxplane `aws.test` returns `latency_ms` for the STS call.
+    #[test]
+    fn test_returns_latency_ms() {
+        let plugin = manifest_builder().build();
+        let mut host = host_with_creds_and_proc(
+            r#"{"Account":"123456789","Arn":"arn:aws:iam::123456789:user/test","UserId":"AIDATEST"}"#,
+        );
+        let out = plugin.call("aws.test", json!({}), &mut host).unwrap();
+        assert!(
+            out["latency_ms"].is_number(),
+            "latency_ms should be present and numeric: {out}"
+        );
+        assert!(out["latency_ms"].as_i64().unwrap() >= 0);
+    }
+}
+
+// ===========================================================================
+// D-36: schema-derivation contract test (aws).
+// Locks each op's derived schemars schema to its intended input contract.
+// ===========================================================================
+#[cfg(test)]
+mod schema_contract {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Kind {
+        Str,
+        Int,
+        ArrayStr,
+        Object,
+    }
+
+    #[derive(Clone)]
+    struct Prop {
+        name: &'static str,
+        kind: Kind,
+    }
+
+    struct OpContract {
+        props: Vec<Prop>,
+        required: Vec<&'static str>,
+    }
+
+    fn p(name: &'static str, kind: Kind) -> Prop {
+        Prop { name, kind }
+    }
+
+    fn c(props: Vec<Prop>, required: Vec<&'static str>) -> OpContract {
+        OpContract { props, required }
+    }
+
+    fn contracts() -> Vec<(&'static str, OpContract)> {
+        vec![
+            ("aws.test", c(vec![p("region", Kind::Str)], vec![])),
+            ("aws.inspect", c(vec![p("region", Kind::Str)], vec![])),
+            (
+                "aws.ec2.instances",
+                c(
+                    vec![
+                        p("region", Kind::Str),
+                        p("name", Kind::Str),
+                        p("states", Kind::ArrayStr),
+                        p("ids", Kind::ArrayStr),
+                        p("limit", Kind::Int),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "aws.eks.clusters",
+                c(vec![p("region", Kind::Str), p("name", Kind::Str)], vec![]),
+            ),
+            (
+                "aws.rds.instances",
+                c(
+                    vec![
+                        p("region", Kind::Str),
+                        p("engine", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "aws.s3.buckets",
+                c(vec![p("region", Kind::Str), p("prefix", Kind::Str)], vec![]),
+            ),
+            (
+                "aws.s3.objects",
+                c(
+                    vec![
+                        p("region", Kind::Str),
+                        p("bucket", Kind::Str),
+                        p("prefix", Kind::Str),
+                        p("limit", Kind::Int),
+                        p("next_token", Kind::Str),
+                    ],
+                    vec!["bucket"],
+                ),
+            ),
+            (
+                "aws.logs.groups",
+                c(
+                    vec![
+                        p("region", Kind::Str),
+                        p("prefix", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "aws.logs.tail",
+                c(
+                    vec![
+                        p("region", Kind::Str),
+                        p("group", Kind::Str),
+                        p("since", Kind::Str),
+                        p("until", Kind::Str),
+                        p("pattern", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec!["group"],
+                ),
+            ),
+            (
+                "aws.logs.query",
+                c(
+                    vec![
+                        p("region", Kind::Str),
+                        p("groups", Kind::ArrayStr),
+                        p("query", Kind::Str),
+                        p("since", Kind::Str),
+                        p("until", Kind::Str),
+                        p("timeout_seconds", Kind::Int),
+                    ],
+                    vec!["groups", "query"],
+                ),
+            ),
+            (
+                "aws.cloudwatch.metrics",
+                c(
+                    vec![
+                        p("region", Kind::Str),
+                        p("namespace", Kind::Str),
+                        p("metric", Kind::Str),
+                        p("dimensions", Kind::Object),
+                        p("stat", Kind::Str),
+                        p("period", Kind::Int),
+                        p("since", Kind::Str),
+                        p("until", Kind::Str),
+                    ],
+                    vec!["namespace", "metric"],
+                ),
+            ),
+        ]
+    }
+
+    fn resolve<'a>(node: &'a Value, defs: &'a Value) -> &'a Value {
+        if let Some(obj) = node.as_object() {
+            if let Some(r) = obj.get("$ref").and_then(|v| v.as_str()) {
+                if let Some(name) = r.strip_prefix("#/definitions/") {
+                    return defs.get(name).unwrap_or(node);
+                }
+            }
+            if let Some(any) = obj.get("anyOf").and_then(|v| v.as_array()) {
+                for m in any {
+                    if m.get("type").and_then(|v| v.as_str()) != Some("null") {
+                        return resolve(m, defs);
+                    }
+                }
+            }
+        }
+        node
+    }
+
+    fn kind_of(node: &Value) -> Kind {
+        let t = node.get("type");
+        if let Some(arr) = t.and_then(|v| v.as_array()) {
+            let first = arr
+                .iter()
+                .find(|v| v.as_str() != Some("null"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("null");
+            return base_kind(first, node);
+        }
+        base_kind(t.and_then(|v| v.as_str()).unwrap_or(""), node)
+    }
+
+    fn base_kind(t: &str, node: &Value) -> Kind {
+        match t {
+            "integer" => Kind::Int,
+            "string" => Kind::Str,
+            "array" => {
+                let items = node.get("items").cloned().unwrap_or(Value::Null);
+                if items.get("type").and_then(|v| v.as_str()) == Some("string") {
+                    Kind::ArrayStr
+                } else {
+                    panic!("unsupported array item type: {items}");
+                }
+            }
+            "object" | "" => Kind::Object,
+            other => panic!("unsupported property type: {other} ({node})"),
+        }
+    }
+
+    fn assert_contract(op_name: &str, schema: &Value, contract: &OpContract) {
+        let defs = schema.get("definitions").cloned().unwrap_or(json!({}));
+        assert_eq!(schema["type"], "object", "{op_name}: root type");
+
+        let props_obj = schema.get("properties").and_then(|v| v.as_object());
+        let mut got: BTreeMap<&str, Kind> = BTreeMap::new();
+        if let Some(props) = props_obj {
+            for (k, v) in props {
+                got.insert(k.as_str(), kind_of(resolve(v, &defs)));
+            }
+        }
+        let want: BTreeMap<&str, Kind> = contract
+            .props
+            .iter()
+            .map(|Prop { name, kind }| (*name, kind.clone()))
+            .collect();
+        assert_eq!(got.len(), want.len(), "{op_name}: property count");
+        for Prop { name, kind } in &contract.props {
+            let got_kind = got.get(*name).unwrap_or_else(|| {
+                panic!("{op_name}: missing property `{name}` in derived schema")
+            });
+            assert_eq!(got_kind, kind, "{op_name}: property `{name}` kind");
+        }
+
+        let req: Vec<&str> = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let mut req_set: Vec<&str> = req.clone();
+        req_set.sort();
+        let mut want_req: Vec<&str> = contract.required.clone();
+        want_req.sort();
+        assert_eq!(req_set, want_req, "{op_name}: required set");
+    }
+
+    #[test]
+    fn derived_schemas_match_contract() {
+        let ops = contracts();
+        let manifest = manifest_builder().build().manifest();
+        let by_name: BTreeMap<&str, &OperationSpec> = manifest
+            .operations
+            .iter()
+            .map(|o| (o.name.as_str(), o))
+            .collect();
+        assert_eq!(by_name.len(), ops.len(), "op count changed");
+        for (name, contract) in &ops {
+            let spec = by_name
+                .get(*name)
+                .unwrap_or_else(|| panic!("missing op {name}"));
+            assert_contract(name, &spec.input_schema, contract);
+        }
     }
 }

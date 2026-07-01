@@ -21,8 +21,226 @@
 //! Three auth methods back this: `api_token` (Bearer secret), `basic` (Basic, email user_env + token
 //! secret), and `cloud_id` (Bearer, used only to *resolve* the cloud id at request time — never injected).
 
+use base64::Engine as _;
 use host_kit::*;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{json, Value};
+
+// ===========================================================================
+// Schema-only op input structs (D-36)
+// ===========================================================================
+// Each op's `input_schema` is derived from the structs below via schemars
+// (`host_kit::read_op_typed::<T>` / `host_kit::write_op_typed::<T>`), instead of a
+// hand-written `json!({...})` object, so the schema the model sees cannot drift
+// from a separately-maintained literal. The structs are schema-only: handlers keep
+// their existing `first_str` / `req_first` / `clamp_limit` extractors (the D-34
+// schema-only precedent).
+
+/// `confluence.test`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct TestInput {}
+
+/// `confluence.index.build`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct IndexBuildInput {
+    /// Page fetch page size (default 100, max 100).
+    page_limit: Option<i64>,
+    /// Page text query.
+    page_query: Option<String>,
+    /// Page CQL query.
+    page_cql: Option<String>,
+    /// Exact page title filter.
+    title: Option<String>,
+    /// Confluence space key filter.
+    space_key: Option<String>,
+    /// User fetch page size (default 100, max 100).
+    user_limit: Option<i64>,
+    /// User search query.
+    user_query: Option<String>,
+    /// User CQL query.
+    user_cql: Option<String>,
+}
+
+/// `confluence.page.attachment.add`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct AttachmentAddInput {
+    /// Confluence page id.
+    page_id: Option<String>,
+    /// Alias for page_id.
+    id: Option<String>,
+    /// Host blob ref holding the file bytes.
+    blob_ref: Option<String>,
+    /// Base64-encoded inline bytes (alternative to blob_ref).
+    content_bytes: Option<String>,
+    /// Filename shown in Confluence.
+    filename: Option<String>,
+    /// Attachment MIME type.
+    content_type: Option<String>,
+}
+
+/// `confluence.page.attachment.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct AttachmentListInput {
+    /// Confluence page id.
+    page_id: String,
+    /// Alias for page_id.
+    id: Option<String>,
+}
+
+/// `confluence.attachment.get`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct AttachmentGetInput {
+    /// Confluence attachment id.
+    attachment_id: String,
+    /// Optional page id used for the download endpoint.
+    page_id: Option<String>,
+    /// Download bytes into a blob (default true).
+    download: Option<bool>,
+}
+
+/// `confluence.attachment.delete`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct AttachmentDeleteInput {
+    /// Confluence attachment id.
+    attachment_id: String,
+}
+
+/// `confluence.page.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PageCreateInput {
+    /// Confluence space key.
+    space_key: String,
+    /// Page title.
+    title: String,
+    /// Page body as Markdown (preferred).
+    body_markdown: Option<String>,
+    /// Page body as storage-format XHTML.
+    body_storage: Option<String>,
+    /// Optional parent page id.
+    parent_id: Option<String>,
+}
+
+/// `confluence.page.update`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PageUpdateInput {
+    /// Page id.
+    id: String,
+    /// Alias for id.
+    page_id: Option<String>,
+    /// New title (empty keeps the current one).
+    title: Option<String>,
+    /// New body as Markdown (replaces whole body).
+    body_markdown: Option<String>,
+    /// New body as storage-format XHTML.
+    body_storage: Option<String>,
+    /// Returned body format: markdown (default), storage, or both.
+    body_format: Option<String>,
+}
+
+/// `confluence.page.delete`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PageDeleteInput {
+    /// Page id.
+    id: String,
+    /// Alias for id.
+    page_id: Option<String>,
+}
+
+/// `confluence.page.search`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PageSearchInput {
+    /// Raw CQL query.
+    cql: Option<String>,
+    /// Free-text query.
+    query: Option<String>,
+    /// Title filter.
+    title: Option<String>,
+    /// Maximum results (default 25, max 100).
+    limit: Option<i64>,
+}
+
+/// `confluence.page.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PageListInput {
+    /// Space key filter.
+    space_key: Option<String>,
+    /// Exact title filter.
+    title: Option<String>,
+    /// Page status (default current).
+    status: Option<String>,
+    /// Maximum results (default 25, max 100).
+    limit: Option<i64>,
+    /// Pagination offset.
+    start: Option<String>,
+}
+
+/// `confluence.page.show`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PageShowInput {
+    /// Page id.
+    id: String,
+    /// Alias for id.
+    page_id: Option<String>,
+    /// Body format: markdown (default), storage, or both.
+    body_format: Option<String>,
+}
+
+/// `confluence.page.comment.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CommentListInput {
+    /// Confluence page id.
+    page_id: String,
+    /// Alias for page_id.
+    id: Option<String>,
+    /// Maximum comments (default 25, max 100).
+    limit: Option<i64>,
+    /// Pagination offset.
+    start: Option<String>,
+    /// Body format: markdown (default), storage, or both.
+    body_format: Option<String>,
+}
+
+/// `confluence.page.comment.add`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CommentAddInput {
+    /// Confluence page id.
+    page_id: String,
+    /// Alias for page_id.
+    id: Option<String>,
+    /// Comment body as Markdown.
+    body_markdown: Option<String>,
+    /// Alias for body_markdown.
+    body: Option<String>,
+    /// Comment body as storage-format XHTML.
+    body_storage: Option<String>,
+}
+
+/// `confluence.user.search`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct UserSearchInput {
+    /// User full-name query.
+    query: Option<String>,
+    /// Raw user CQL query.
+    cql: Option<String>,
+    /// Maximum results (default 25, max 100).
+    limit: Option<i64>,
+}
 
 fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("confluence", "0.1.0")
@@ -80,193 +298,107 @@ fn manifest_builder() -> PluginBuilder {
         .datasource(ds("confluence.pages", "confluence.page", "Confluence pages."))
         .datasource(ds("confluence.users", "confluence.user", "Confluence users."))
         .operation(
-            read_op(
+            read_op_typed::<TestInput>(
                 "confluence.test",
                 "Test Confluence authentication by fetching the current user.",
-                json!({"type": "object", "properties": {}}),
             ),
             test,
         )
         .operation(
-            read_op(
+            read_op_typed::<IndexBuildInput>(
                 "confluence.index.build",
                 "Build Confluence page and user index records (contributes to the datasource index).",
-                json!({"type": "object", "properties": {
-                    "page_limit": {"type": "integer", "description": "page fetch size (default 100, max 100)"},
-                    "page_query": {"type": "string", "description": "page text query"},
-                    "page_cql": {"type": "string", "description": "page CQL query"},
-                    "title": {"type": "string", "description": "exact page title filter"},
-                    "space_key": {"type": "string", "description": "space key filter (e.g. OPS)"},
-                    "user_limit": {"type": "integer", "description": "user fetch size (default 100, max 100)"},
-                    "user_query": {"type": "string", "description": "user search query"},
-                    "user_cql": {"type": "string", "description": "user CQL query"}
-                }}),
             ),
             index_build,
         )
         .operation(
-            write_op(
+            write_op_typed::<AttachmentAddInput>(
                 "confluence.page.attachment.add",
-                "Upload an attachment to a Confluence page from a host blob ref.",
-                json!({"type": "object", "properties": {
-                    "page_id": {"type": "string", "description": "Confluence page id"},
-                    "id": {"type": "string", "description": "alias for page_id"},
-                    "blob_ref": {"type": "string", "description": "host blob ref holding the file bytes"},
-                    "filename": {"type": "string", "description": "filename shown in Confluence (defaults to the blob name)"},
-                    "content_type": {"type": "string", "description": "attachment MIME type"}
-                }, "required": ["blob_ref"]}),
+                "Upload an attachment to a Confluence page from a host blob ref or base64 content_bytes.",
             ),
             attachment_add,
         )
         .operation(
-            read_op(
+            read_op_typed::<AttachmentListInput>(
                 "confluence.page.attachment.list",
                 "List the attachments on a Confluence page.",
-                json!({"type": "object", "properties": {
-                    "page_id": {"type": "string", "description": "Confluence page id"},
-                    "id": {"type": "string", "description": "alias for page_id"}
-                }, "required": ["page_id"]}),
             ),
             attachment_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<AttachmentGetInput>(
                 "confluence.attachment.get",
                 "Download a Confluence attachment into a host blob (or return its metadata).",
-                json!({"type": "object", "properties": {
-                    "attachment_id": {"type": "string", "description": "Confluence attachment id"},
-                    "page_id": {"type": "string", "description": "page id for the download endpoint"},
-                    "download": {"type": "boolean", "description": "download bytes into a blob (default true)"}
-                }, "required": ["attachment_id"]}),
             ),
             attachment_get,
         )
         .operation(
-            write_op(
+            write_op_typed::<AttachmentDeleteInput>(
                 "confluence.attachment.delete",
                 "Delete a Confluence attachment.",
-                json!({"type": "object", "properties": {
-                    "attachment_id": {"type": "string", "description": "Confluence attachment id"}
-                }, "required": ["attachment_id"]}),
             ),
             attachment_delete,
         )
         .operation(
-            write_op(
+            write_op_typed::<PageCreateInput>(
                 "confluence.page.create",
                 "Create a Confluence page from Markdown (body_markdown) or storage XHTML (body_storage).",
-                json!({"type": "object", "properties": {
-                    "space_key": {"type": "string", "description": "Confluence space key"},
-                    "title": {"type": "string", "description": "page title"},
-                    "body_markdown": {"type": "string", "description": "page body as Markdown (preferred)"},
-                    "body_storage": {"type": "string", "description": "page body as storage-format XHTML"},
-                    "parent_id": {"type": "string", "description": "optional parent page id"}
-                }, "required": ["space_key", "title"]}),
             ),
             page_create,
         )
         .operation(
-            write_op(
+            write_op_typed::<PageUpdateInput>(
                 "confluence.page.update",
                 "Update a page's title and/or body (replaces the whole body), bumping the version.",
-                json!({"type": "object", "properties": {
-                    "id": {"type": "string", "description": "page id"},
-                    "page_id": {"type": "string", "description": "alias for id"},
-                    "title": {"type": "string", "description": "new title (empty keeps the current one)"},
-                    "body_markdown": {"type": "string", "description": "new body as Markdown (preferred)"},
-                    "body_storage": {"type": "string", "description": "new body as storage-format XHTML"},
-                    "body_format": {"type": "string", "description": "returned body format: markdown (default), storage, or both", "enum": ["markdown", "storage", "both"]}
-                }, "required": ["id"]}),
             ),
             page_update,
         )
         .operation(
-            write_op(
+            write_op_typed::<PageDeleteInput>(
                 "confluence.page.delete",
                 "Delete a Confluence page.",
-                json!({"type": "object", "properties": {
-                    "id": {"type": "string", "description": "page id"},
-                    "page_id": {"type": "string", "description": "alias for id"}
-                }, "required": ["id"]}),
             ),
             page_delete,
         )
         .operation(
-            read_op(
+            read_op_typed::<PageSearchInput>(
                 "confluence.page.search",
                 "Search Confluence pages with CQL (or a text/title query).",
-                json!({"type": "object", "properties": {
-                    "cql": {"type": "string", "description": "raw CQL query"},
-                    "query": {"type": "string", "description": "free-text query (text ~ ...)"},
-                    "title": {"type": "string", "description": "title filter (title ~ ...)"},
-                    "limit": {"type": "integer", "description": "max results (default 25, max 100)"}
-                }}),
             ),
             page_search,
         )
         .operation(
-            read_op(
+            read_op_typed::<PageListInput>(
                 "confluence.page.list",
-                "List Confluence pages, filterable by space and title.",
-                json!({"type": "object", "properties": {
-                    "space_key": {"type": "string", "description": "space key filter"},
-                    "title": {"type": "string", "description": "exact title filter"},
-                    "status": {"type": "string", "description": "page status (default current)"},
-                    "limit": {"type": "integer", "description": "max results (default 25, max 100)"},
-                    "start": {"type": "string", "description": "pagination offset"}
-                }}),
+                "List Confluence pages, filterable by space and title; returns next_start for pagination.",
             ),
             page_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<PageShowInput>(
                 "confluence.page.show",
                 "Show one page by id with its body as Markdown (body_format selects markdown/storage/both).",
-                json!({"type": "object", "properties": {
-                    "id": {"type": "string", "description": "page id"},
-                    "page_id": {"type": "string", "description": "alias for id"},
-                    "body_format": {"type": "string", "description": "body format: markdown (default), storage, or both", "enum": ["markdown", "storage", "both"]}
-                }, "required": ["id"]}),
             ),
             page_show,
         )
         .operation(
-            read_op(
+            read_op_typed::<CommentListInput>(
                 "confluence.page.comment.list",
-                "List the comments on a Confluence page as Markdown (body_format selects markdown/storage/both).",
-                json!({"type": "object", "properties": {
-                    "page_id": {"type": "string", "description": "Confluence page id"},
-                    "id": {"type": "string", "description": "alias for page_id"},
-                    "limit": {"type": "integer", "description": "max comments (default 25, max 100)"},
-                    "start": {"type": "string", "description": "pagination offset"},
-                    "body_format": {"type": "string", "description": "body format: markdown (default), storage, or both", "enum": ["markdown", "storage", "both"]}
-                }, "required": ["page_id"]}),
+                "List the comments on a Confluence page as Markdown; returns next_start and has_more.",
             ),
             comment_list,
         )
         .operation(
-            write_op(
+            write_op_typed::<CommentAddInput>(
                 "confluence.page.comment.add",
                 "Add a comment to a Confluence page (Markdown or storage XHTML).",
-                json!({"type": "object", "properties": {
-                    "page_id": {"type": "string", "description": "Confluence page id"},
-                    "id": {"type": "string", "description": "alias for page_id"},
-                    "body_markdown": {"type": "string", "description": "comment body as Markdown (preferred)"},
-                    "body": {"type": "string", "description": "alias for body_markdown"},
-                    "body_storage": {"type": "string", "description": "comment body as storage-format XHTML"}
-                }, "required": ["page_id"]}),
             ),
             comment_add,
         )
         .operation(
-            read_op(
+            read_op_typed::<UserSearchInput>(
                 "confluence.user.search",
                 "Search Confluence users (returns the current user when no query is given).",
-                json!({"type": "object", "properties": {
-                    "query": {"type": "string", "description": "user full-name query"},
-                    "cql": {"type": "string", "description": "raw user CQL query"},
-                    "limit": {"type": "integer", "description": "max results (default 25, max 100)"}
-                }}),
             ),
             user_search,
         )
@@ -405,24 +537,145 @@ fn byte_io_url(host: &mut Host, base: &Base, path: &str) -> Result<String, Strin
     }
 }
 
+/// Parse the Confluence `_links.next` URL and extract the `start` query parameter, which is the
+/// pagination token used by `/content` and `/child/comment`. Mirrors fluxplane's `startFromNext`.
+fn start_from_next(result: &Value) -> Option<String> {
+    next_link_param(result, "start")
+}
+
+/// Parse the Confluence `_links.next` URL and extract the `cursor` query parameter used by `/search`.
+/// Mirrors fluxplane's `cursorFromNext`. Currently unused but reserved for search/user pagination.
+#[allow(dead_code)]
+fn cursor_from_next(result: &Value) -> Option<String> {
+    next_link_param(result, "cursor")
+}
+
+fn next_link_param(result: &Value, key: &str) -> Option<String> {
+    let next = result
+        .get("_links")
+        .and_then(|l| l.get("next"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if next.is_empty() {
+        return None;
+    }
+    // `_links.next` is frequently a relative path such as
+    // `/wiki/rest/api/content?limit=25&start=25`. Split on `?` and parse the query string.
+    let query = next.split_once('?').map(|(_, q)| q).unwrap_or("");
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == key {
+                return Some(urldecode(v));
+            }
+        }
+    }
+    None
+}
+
+/// Minimal percent-decode for query values Confluence puts in `_links.next`.
+fn urldecode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push((h * 16 + l) as char);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Extract a human-readable message from a Confluence JSON error body, mirroring fluxplane's
+/// `confluenceHTTPError`: prefer `.message`, then `.errorMessages` joined, then fall back to the
+/// raw body text.
+fn confluence_error(status: u16, body: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<Value>(body) {
+        if let Some(msg) = v
+            .get("message")
+            .and_then(|m| m.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            return format!("confluence returned status {status}: {msg}");
+        }
+        if let Some(arr) = v.get("errorMessages").and_then(|a| a.as_array()) {
+            let msgs: Vec<String> = arr
+                .iter()
+                .filter_map(|m| m.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !msgs.is_empty() {
+                return format!("confluence returned status {status}: {}", msgs.join("; "));
+            }
+        }
+    }
+    let msg = body.trim();
+    if msg.is_empty() {
+        format!("confluence returned status {status}: request failed")
+    } else {
+        format!("confluence returned status {status}: {msg}")
+    }
+}
+
+fn cf_err(status: u16, body: &str) -> String {
+    confluence_error(status, body)
+}
+
 /// GET `path` with the request-time auth (cloud_id→Bearer/gateway, else Basic/Bearer/site); returns
 /// the parsed JSON. Site requests address the endpoint by reference (host-resolved URL); gateway
 /// requests join the path onto the constructed gateway URL.
 fn cf_get(host: &mut Host, path: &str) -> Result<Value, String> {
     let ctx = auth_ctx(host)?;
-    match ctx.base {
-        Base::Ref(r) => host.get_json_ref(r, path, Some(ctx.purpose)),
-        Base::Url(b) => host.get_json(&format!("{b}{path}"), Some(ctx.purpose)),
+    let resp = match ctx.base {
+        Base::Ref(r) => host.http_ref(r, "GET", path, Some(ctx.purpose), None)?,
+        Base::Url(b) => host.http("GET", &format!("{b}{path}"), Some(ctx.purpose), &[], None)?,
+    };
+    if !resp.is_success() {
+        return Err(cf_err(resp.status, &resp.body));
     }
+    resp.json()
 }
 
 /// Send a JSON body to `path` with the request-time auth; returns the parsed JSON.
 fn cf_send(host: &mut Host, method: &str, path: &str, body: &Value) -> Result<Value, String> {
     let ctx = auth_ctx(host)?;
-    match ctx.base {
-        Base::Ref(r) => host.send_json_ref(r, method, path, Some(ctx.purpose), body),
-        Base::Url(b) => host.send_json(method, &format!("{b}{path}"), Some(ctx.purpose), body),
+    let body_str = serde_json::to_string(body).map_err(|e| e.to_string())?;
+    let resp = match ctx.base {
+        Base::Ref(r) => host.http_ref(
+            r,
+            method,
+            path,
+            Some(ctx.purpose),
+            Some(body_str.as_bytes()),
+        )?,
+        Base::Url(b) => host.http(
+            method,
+            &format!("{b}{path}"),
+            Some(ctx.purpose),
+            &[("Content-Type", "application/json")],
+            Some(&body_str),
+        )?,
+    };
+    if !resp.is_success() {
+        return Err(cf_err(resp.status, &resp.body));
     }
+    resp.json()
 }
 
 /// DELETE `path` (Confluence returns 204 / an empty body, so we don't parse it).
@@ -439,10 +692,7 @@ fn cf_delete(host: &mut Host, path: &str) -> Result<(), String> {
         )?,
     };
     if !resp.is_success() {
-        return Err(format!(
-            "confluence DELETE {path} → {} {}",
-            resp.status, resp.body
-        ));
+        return Err(cf_err(resp.status, &resp.body));
     }
     Ok(())
 }
@@ -1647,14 +1897,32 @@ fn index_build(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn attachment_add(input: Value, host: &mut Host) -> Result<Value, String> {
     let page_id = req_first(&input, &["page_id", "id"])?.to_string();
-    let blob_ref = req_first(&input, &["blob_ref"])?.to_string();
-    let data = host.blob_get(&blob_ref)?;
+    let (data, filename_default) = match (
+        first_str(&input, &["blob_ref"]),
+        first_str(&input, &["content_bytes"]),
+    ) {
+        (Some(blob_ref), _) => {
+            let data = host.blob_get(blob_ref)?;
+            let name = host
+                .blob_info(blob_ref)
+                .map(|i| i.name)
+                .ok()
+                .filter(|n| !n.is_empty());
+            (data, name)
+        }
+        (None, Some(b64)) => {
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(b64.trim())
+                .map_err(|e| format!("invalid content_bytes: {e}"))?;
+            (data, None)
+        }
+        (None, None) => {
+            return Err("provide exactly one of blob_ref or content_bytes".into());
+        }
+    };
     let filename = match first_str(&input, &["filename"]) {
         Some(f) => f.to_string(),
-        None => host
-            .blob_info(&blob_ref)
-            .map(|i| i.name)
-            .ok()
+        None => filename_default
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| "attachment".to_string()),
     };
@@ -1956,7 +2224,13 @@ fn page_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let result = cf_get(host, &path)?;
     let pages = collect_pages(&result);
     contribute_page_values(host, &pages);
-    Ok(json!({ "pages": pages, "count": pages.len() }))
+    let next_start = start_from_next(&result).unwrap_or_default();
+    Ok(json!({
+        "pages": pages,
+        "count": pages.len(),
+        "next_start": next_start,
+        "has_more": !next_start.is_empty()
+    }))
 }
 
 fn page_show(input: Value, host: &mut Host) -> Result<Value, String> {
@@ -2010,7 +2284,14 @@ fn comment_list(input: Value, host: &mut Host) -> Result<Value, String> {
         })
         .unwrap_or_default();
     let count = comments.len();
-    Ok(json!({ "page_id": page_id, "count": count, "comments": comments }))
+    let next_start = start_from_next(&result).unwrap_or_default();
+    Ok(json!({
+        "page_id": page_id,
+        "count": count,
+        "comments": comments,
+        "next_start": next_start,
+        "has_more": !next_start.is_empty()
+    }))
 }
 
 fn comment_add(input: Value, host: &mut Host) -> Result<Value, String> {
@@ -2634,6 +2915,120 @@ mod tests {
     }
 
     #[test]
+    fn attachment_add_uploads_from_content_bytes() {
+        // Ported gap: fluxplane accepts base64-encoded inline bytes (alternative to blob_ref).
+        let plugin = manifest_builder().build();
+        let mut host = host().with_http(
+            "/child/attachment",
+            json!({"results": [{"id": "att6", "title": "inline.txt"}]}),
+        );
+        let bytes = b"hello from bytes";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let out = plugin
+            .call(
+                "confluence.page.attachment.add",
+                json!({ "page_id": "123", "content_bytes": b64, "filename": "inline.txt" }),
+                &mut host,
+            )
+            .unwrap();
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["attachments"][0]["id"], "att6");
+    }
+
+    #[test]
+    fn attachment_add_rejects_missing_blob_and_bytes() {
+        let plugin = manifest_builder().build();
+        let mut host = host();
+        let err = plugin
+            .call(
+                "confluence.page.attachment.add",
+                json!({ "page_id": "123" }),
+                &mut host,
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("blob_ref") && err.contains("content_bytes"),
+            "err = {err}"
+        );
+    }
+
+    #[test]
+    fn page_list_returns_pagination_tokens() {
+        // Ported gap: fluxplane's page list surfaces the `start` token from `_links.next`.
+        let plugin = manifest_builder().build();
+        let mut host = host().with_http(
+            "/wiki/rest/api/content?type=page",
+            json!({
+                "results": [{"id": "p1", "title": "A", "space": {"key": "OPS"}}],
+                "_links": {"next": "/wiki/rest/api/content?limit=25&start=25"}
+            }),
+        );
+        let out = plugin
+            .call("confluence.page.list", json!({}), &mut host)
+            .unwrap();
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["next_start"], "25");
+        assert_eq!(out["has_more"], true);
+    }
+
+    #[test]
+    fn comment_list_returns_pagination_tokens() {
+        // Ported gap: fluxplane's comment list surfaces `next_start`/`has_more`.
+        let plugin = manifest_builder().build();
+        let mut host = host().with_http(
+            "/child/comment",
+            json!({
+                "results": [
+                    {"id": "c1", "title": "Re: runbook",
+                     "body": {"storage": {"value": "<p>ok</p>"}},
+                     "history": {"createdBy": {"accountId": "u1", "displayName": "Alice"}, "createdDate": "2026-01-01"}}
+                ],
+                "_links": {"next": "/wiki/rest/api/content/123/child/comment?limit=25&start=25"}
+            }),
+        );
+        let out = plugin
+            .call(
+                "confluence.page.comment.list",
+                json!({ "page_id": "123" }),
+                &mut host,
+            )
+            .unwrap();
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["next_start"], "25");
+        assert_eq!(out["has_more"], true);
+    }
+
+    #[test]
+    fn confluence_error_body_extracts_message() {
+        // Ported gap: Confluence JSON error bodies expose `.message`.
+        let plugin = manifest_builder().build();
+        let mut host =
+            host().with_http_status_body("/content/123", 403, r#"{"message":"No permission"}"#);
+        let err = plugin
+            .call("confluence.page.delete", json!({"id": "123"}), &mut host)
+            .unwrap_err();
+        assert!(
+            err.contains("confluence returned status 403: No permission"),
+            "err = {err}"
+        );
+    }
+
+    #[test]
+    fn confluence_error_body_extracts_error_messages() {
+        // Ported gap: Confluence JSON error bodies expose `.errorMessages` when `.message` is absent.
+        let plugin = manifest_builder().build();
+        let mut host = host().with_http_status_body(
+            "/content/123",
+            500,
+            r#"{"errorMessages":["detail one","detail two"]}"#,
+        );
+        let err = plugin
+            .call("confluence.page.delete", json!({"id": "123"}), &mut host)
+            .unwrap_err();
+        assert!(err.contains("detail one; detail two"), "err = {err}");
+    }
+
+    #[test]
     fn manifest_declares_dual_auth_ops_datasources_and_blob() {
         let m = manifest_builder().build().manifest();
         assert_eq!(m.operations.len(), 15);
@@ -2655,5 +3050,300 @@ mod tests {
             .datasources
             .iter()
             .all(|d| d.capabilities.iter().any(|c| c == "index")));
+    }
+}
+
+// ===========================================================================
+// D-36: schema-derivation contract test (confluence).
+// Locks each op's derived schemars schema to its intended field/required/type
+// contract, including the ported gap params (content_bytes, pagination tokens are
+// outputs and not in schemas). A change here is a real contract change.
+// ===========================================================================
+#[cfg(test)]
+mod schema_contract {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Kind {
+        Str,
+        Int,
+        Bool,
+    }
+
+    #[derive(Clone)]
+    struct Prop {
+        name: &'static str,
+        kind: Kind,
+    }
+
+    struct OpContract {
+        props: Vec<Prop>,
+        required: Vec<&'static str>,
+    }
+
+    fn p(name: &'static str, kind: Kind) -> Prop {
+        Prop { name, kind }
+    }
+
+    fn c(props: Vec<Prop>, required: Vec<&'static str>) -> OpContract {
+        OpContract { props, required }
+    }
+
+    fn contracts() -> Vec<(&'static str, OpContract)> {
+        vec![
+            ("confluence.test", c(vec![], vec![])),
+            (
+                "confluence.index.build",
+                c(
+                    vec![
+                        p("page_limit", Kind::Int),
+                        p("page_query", Kind::Str),
+                        p("page_cql", Kind::Str),
+                        p("title", Kind::Str),
+                        p("space_key", Kind::Str),
+                        p("user_limit", Kind::Int),
+                        p("user_query", Kind::Str),
+                        p("user_cql", Kind::Str),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "confluence.page.attachment.add",
+                c(
+                    vec![
+                        p("page_id", Kind::Str),
+                        p("id", Kind::Str),
+                        p("blob_ref", Kind::Str),
+                        p("content_bytes", Kind::Str),
+                        p("filename", Kind::Str),
+                        p("content_type", Kind::Str),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "confluence.page.attachment.list",
+                c(
+                    vec![p("page_id", Kind::Str), p("id", Kind::Str)],
+                    vec!["page_id"],
+                ),
+            ),
+            (
+                "confluence.attachment.get",
+                c(
+                    vec![
+                        p("attachment_id", Kind::Str),
+                        p("page_id", Kind::Str),
+                        p("download", Kind::Bool),
+                    ],
+                    vec!["attachment_id"],
+                ),
+            ),
+            (
+                "confluence.attachment.delete",
+                c(vec![p("attachment_id", Kind::Str)], vec!["attachment_id"]),
+            ),
+            (
+                "confluence.page.create",
+                c(
+                    vec![
+                        p("space_key", Kind::Str),
+                        p("title", Kind::Str),
+                        p("body_markdown", Kind::Str),
+                        p("body_storage", Kind::Str),
+                        p("parent_id", Kind::Str),
+                    ],
+                    vec!["space_key", "title"],
+                ),
+            ),
+            (
+                "confluence.page.update",
+                c(
+                    vec![
+                        p("id", Kind::Str),
+                        p("page_id", Kind::Str),
+                        p("title", Kind::Str),
+                        p("body_markdown", Kind::Str),
+                        p("body_storage", Kind::Str),
+                        p("body_format", Kind::Str),
+                    ],
+                    vec!["id"],
+                ),
+            ),
+            (
+                "confluence.page.delete",
+                c(
+                    vec![p("id", Kind::Str), p("page_id", Kind::Str)],
+                    vec!["id"],
+                ),
+            ),
+            (
+                "confluence.page.search",
+                c(
+                    vec![
+                        p("cql", Kind::Str),
+                        p("query", Kind::Str),
+                        p("title", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "confluence.page.list",
+                c(
+                    vec![
+                        p("space_key", Kind::Str),
+                        p("title", Kind::Str),
+                        p("status", Kind::Str),
+                        p("limit", Kind::Int),
+                        p("start", Kind::Str),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "confluence.page.show",
+                c(
+                    vec![
+                        p("id", Kind::Str),
+                        p("page_id", Kind::Str),
+                        p("body_format", Kind::Str),
+                    ],
+                    vec!["id"],
+                ),
+            ),
+            (
+                "confluence.page.comment.list",
+                c(
+                    vec![
+                        p("page_id", Kind::Str),
+                        p("id", Kind::Str),
+                        p("limit", Kind::Int),
+                        p("start", Kind::Str),
+                        p("body_format", Kind::Str),
+                    ],
+                    vec!["page_id"],
+                ),
+            ),
+            (
+                "confluence.page.comment.add",
+                c(
+                    vec![
+                        p("page_id", Kind::Str),
+                        p("id", Kind::Str),
+                        p("body_markdown", Kind::Str),
+                        p("body", Kind::Str),
+                        p("body_storage", Kind::Str),
+                    ],
+                    vec!["page_id"],
+                ),
+            ),
+            (
+                "confluence.user.search",
+                c(
+                    vec![
+                        p("query", Kind::Str),
+                        p("cql", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec![],
+                ),
+            ),
+        ]
+    }
+
+    fn kind_of(node: &Value) -> Kind {
+        let t = node.get("type");
+        if let Some(arr) = t.and_then(|v| v.as_array()) {
+            let first = arr
+                .iter()
+                .find(|v| v.as_str() != Some("null"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("null");
+            return base_kind(first);
+        }
+        base_kind(t.and_then(|v| v.as_str()).unwrap_or(""))
+    }
+
+    fn base_kind(t: &str) -> Kind {
+        match t {
+            "integer" => Kind::Int,
+            "boolean" => Kind::Bool,
+            "string" => Kind::Str,
+            other => panic!("unsupported property type: {other}"),
+        }
+    }
+
+    fn resolve<'a>(node: &'a Value, defs: &'a Value) -> &'a Value {
+        if let Some(obj) = node.as_object() {
+            if let Some(r) = obj.get("$ref").and_then(|v| v.as_str()) {
+                if let Some(name) = r.strip_prefix("#/definitions/") {
+                    return defs.get(name).unwrap_or(node);
+                }
+            }
+            if let Some(any) = obj.get("anyOf").and_then(|v| v.as_array()) {
+                for m in any {
+                    if m.get("type").and_then(|v| v.as_str()) != Some("null") {
+                        return resolve(m, defs);
+                    }
+                }
+            }
+        }
+        node
+    }
+
+    fn assert_contract(op_name: &str, schema: &Value, contract: &OpContract) {
+        assert_eq!(schema["type"], "object", "{op_name}: root type");
+        let defs = schema.get("definitions").cloned().unwrap_or(json!({}));
+        let props_obj = schema.get("properties").and_then(|v| v.as_object());
+        let mut got: BTreeMap<&str, Kind> = BTreeMap::new();
+        if let Some(props) = props_obj {
+            for (k, v) in props {
+                got.insert(k.as_str(), kind_of(resolve(v, &defs)));
+            }
+        }
+        let want: BTreeMap<&str, Kind> = contract
+            .props
+            .iter()
+            .map(|Prop { name, kind }| (*name, kind.clone()))
+            .collect();
+        assert_eq!(got.len(), want.len(), "{op_name}: property count");
+        for Prop { name, kind } in &contract.props {
+            let got_kind = got
+                .get(*name)
+                .unwrap_or_else(|| panic!("{op_name}: missing property `{name}`"));
+            assert_eq!(got_kind, kind, "{op_name}: property `{name}` kind");
+        }
+        let req: Vec<&str> = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let mut req_set = req.clone();
+        req_set.sort();
+        let mut want_req = contract.required.clone();
+        want_req.sort();
+        assert_eq!(req_set, want_req, "{op_name}: required set");
+    }
+
+    #[test]
+    fn derived_schemas_match_contract() {
+        let ops = contracts();
+        let manifest = manifest_builder().build().manifest();
+        let by_name: BTreeMap<&str, &OperationSpec> = manifest
+            .operations
+            .iter()
+            .map(|o| (o.name.as_str(), o))
+            .collect();
+        assert_eq!(by_name.len(), ops.len(), "op count changed");
+        for (name, contract) in &ops {
+            let spec = by_name
+                .get(*name)
+                .unwrap_or_else(|| panic!("missing op {name}"));
+            assert_contract(name, &spec.input_schema, contract);
+        }
     }
 }

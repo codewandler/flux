@@ -14,8 +14,11 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::SystemTime;
 
 use host_kit::*;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 /// Metadata for one managed port-forward, tracked in the module-level [`FORWARDS`] registry so
@@ -50,6 +53,198 @@ fn forwards_lock() -> std::sync::MutexGuard<'static, Option<HashMap<u64, Forward
     guard
 }
 
+// ===========================================================================
+// Schema-only op input structs (D-36)
+// ===========================================================================
+// Each op's `input_schema` is derived from the structs below via schemars
+// (`host_kit::read_op_typed::<T>` / `write_op_typed::<T>` / `op_spec_typed::<T>`)
+// instead of hand-written `json!({...})` literals. The structs are schema-only:
+// handlers keep their existing `flex_str` / `flex_i64` / `flex_arr` extractors
+// (the D-34 schema-only precedent).
+
+/// `kubernetes.cluster.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ClusterListInput {}
+
+/// `kubernetes.test`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ClusterTestInput {
+    /// Kubeconfig context override.
+    context: Option<String>,
+}
+
+/// `kubernetes.endpoint.discover`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct EndpointDiscoverInput {
+    context: Option<String>,
+    /// Short alias resolved against kubeconfig context names.
+    cluster: Option<String>,
+    namespace: Option<String>,
+    product: Option<String>,
+    query: Option<String>,
+    latest_namespace: Option<bool>,
+    limit: Option<i64>,
+}
+
+/// `kubernetes.secret.read`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct SecretReadInput {
+    context: Option<String>,
+    namespace: String,
+    name: String,
+    keys: Option<Vec<String>>,
+}
+
+/// Shared inventory-list params: `kubernetes.namespace.list`, `kubernetes.service.list`,
+/// `kubernetes.pod.list`, `kubernetes.deployment.list`, `kubernetes.ingress.list`,
+/// `kubernetes.container.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct InventoryListInput {
+    context: Option<String>,
+    namespace: Option<String>,
+    query: Option<String>,
+    limit: Option<i64>,
+}
+
+/// Shared inventory-show params: `kubernetes.service.show`, `kubernetes.pod.show`,
+/// `kubernetes.deployment.show`, `kubernetes.container.show`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct InventoryShowInput {
+    context: Option<String>,
+    namespace: Option<String>,
+    name: String,
+}
+
+/// `kubernetes.pod.logs`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PodLogsInput {
+    context: Option<String>,
+    namespace: String,
+    name: Option<String>,
+    selector: Option<String>,
+    container: Option<String>,
+    tail_lines: Option<i64>,
+    limit_bytes: Option<i64>,
+    since: Option<String>,
+    /// Absolute RFC3339 timestamp upper bound; filtered client-side.
+    until: Option<String>,
+    previous: Option<bool>,
+    timestamps: Option<bool>,
+}
+
+/// Resource type for the `resource_type` field of `kubernetes.portforward.start`.
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+enum ResourceType {
+    Service,
+    Pod,
+    Deployment,
+}
+
+/// `kubernetes.portforward.start`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PortForwardStartInput {
+    context: Option<String>,
+    namespace: String,
+    resource: Option<String>,
+    name: Option<String>,
+    resource_type: Option<ResourceType>,
+    remote_port: i64,
+    local_port: Option<i64>,
+    address: Option<String>,
+    /// Auto-cleanup timeout in seconds (default 3600, capped at 28800).
+    duration_seconds: Option<i64>,
+}
+
+/// `kubernetes.portforward.stop`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PortForwardStopInput {
+    id: String,
+    process_group: Option<i64>,
+    pid: Option<i64>,
+}
+
+/// `kubernetes.portforward.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PortForwardListInput {
+    namespace: Option<String>,
+    context: Option<String>,
+    live: Option<bool>,
+}
+
+/// `kubernetes.deployment.history`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct DeploymentHistoryInput {
+    context: Option<String>,
+    namespace: Option<String>,
+    name: String,
+    limit: Option<i64>,
+}
+
+/// `kubernetes.deployment.scale`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct DeploymentScaleInput {
+    context: Option<String>,
+    namespace: String,
+    name: String,
+    replicas: i64,
+}
+
+/// `kubernetes.deployment.restart`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct DeploymentRestartInput {
+    context: Option<String>,
+    namespace: String,
+    name: String,
+}
+
+/// `kubernetes.event.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct EventListInput {
+    context: Option<String>,
+    namespace: Option<String>,
+    name: Option<String>,
+    kind: Option<String>,
+    warnings_only: Option<bool>,
+    limit: Option<i64>,
+}
+
+/// `kubernetes.node.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct NodeListInput {
+    context: Option<String>,
+    query: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `kubernetes.pod.exec`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PodExecInput {
+    context: Option<String>,
+    namespace: String,
+    name: String,
+    container: Option<String>,
+    command: Vec<String>,
+    timeout_seconds: Option<i64>,
+}
+
 fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("kubernetes", "0.2.0")
         .capabilities(Caps {
@@ -74,23 +269,18 @@ fn manifest_builder() -> PluginBuilder {
         ))
         // --- cluster discovery -------------------------------------------------
         .operation(
-            read_op(
-                "kubernetes.cluster.list",
-                "List kubeconfig contexts.",
-                json!({"type": "object", "properties": {}}),
-            ),
+            read_op_typed::<ClusterListInput>("kubernetes.cluster.list", "List kubeconfig contexts."),
             cluster_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<ClusterTestInput>(
                 "kubernetes.test",
                 "Probe Kubernetes cluster reachability through kubeconfig.",
-                json!({"type": "object", "properties": {"context": s_context()}}),
             ),
             cluster_test,
         )
         .operation(
-            read_op(
+            read_op_typed::<EndpointDiscoverInput>(
                 "kubernetes.endpoint.discover",
                 "Discover product endpoints as weak references (URL + credential location, never a \
                  secret). `product=kubernetes` yields one cluster endpoint per kubeconfig context; \
@@ -103,30 +293,15 @@ fn manifest_builder() -> PluginBuilder {
                  empty result. `namespace` is a literal namespace name. Set `latest_namespace: true` to \
                  target the newest namespace by creation time (a literal namespace named `latest` is \
                  just `namespace: \"latest\"`; the free-text `query` no longer triggers the heuristic).",
-                json!({"type": "object", "properties": {
-                    "context": s_context(),
-                    "cluster": {"type": "string", "description": "short alias resolved against kubeconfig context names (e.g. `dev` matches the context whose name contains `dev`); a multi-match is an error"},
-                    "namespace": s_namespace_filter(),
-                    "product": {"type": "string", "description": "product to discover: kubernetes, postgres, mysql, prometheus, loki, grafana, alertmanager"},
-                    "query": {"type": "string", "description": "free-text hint (a service name, or scratch context); no longer magic for \"latest\" — use `latest_namespace: true`"},
-                    "latest_namespace": {"type": "boolean", "description": "select the newest namespace by creation time"},
-                    "limit": s_limit()
-                }}),
             ),
             endpoint_discover,
         )
         // --- secrets (sensitive) ----------------------------------------------
         .operation(
-            op_spec(
+            op_spec_typed::<SecretReadInput>(
                 "kubernetes.secret.read",
                 "Read one Kubernetes secret's decoded values. Sensitive: the result is secret \
                  material intended for piping into auth or secret stores, not for display.",
-                json!({"type": "object", "properties": {
-                    "context": s_context(),
-                    "namespace": s_namespace(),
-                    "name": {"type": "string", "description": "secret name"},
-                    "keys": {"type": "array", "items": {"type": "string"}, "description": "data keys to read; empty means all keys"}
-                }, "required": ["namespace", "name"]}),
                 vec![Effect::Read, Effect::Network],
                 Risk::High,
                 Idempotency::Idempotent,
@@ -135,93 +310,57 @@ fn manifest_builder() -> PluginBuilder {
         )
         // --- inventory ---------------------------------------------------------
         .operation(
-            read_op(
-                "kubernetes.namespace.list",
-                "List Kubernetes namespaces.",
-                json!({"type": "object", "properties": {"context": s_context()}}),
-            ),
+            read_op_typed::<InventoryListInput>("kubernetes.namespace.list", "List Kubernetes namespaces."),
             namespace_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<InventoryListInput>(
                 "kubernetes.service.list",
                 "List Kubernetes services (all namespaces unless `namespace` is set).",
-                inventory_list_schema(),
             ),
             service_list,
         )
         .operation(
-            read_op(
-                "kubernetes.service.show",
-                "Show one Kubernetes service.",
-                show_schema(),
-            ),
+            read_op_typed::<InventoryShowInput>("kubernetes.service.show", "Show one Kubernetes service."),
             service_show,
         )
         .operation(
-            read_op(
+            read_op_typed::<InventoryListInput>(
                 "kubernetes.pod.list",
                 "List Kubernetes pods (all namespaces unless `namespace` is set).",
-                inventory_list_schema(),
             ),
             pod_list,
         )
         .operation(
-            read_op(
-                "kubernetes.pod.show",
-                "Show one Kubernetes pod.",
-                show_schema(),
-            ),
+            read_op_typed::<InventoryShowInput>("kubernetes.pod.show", "Show one Kubernetes pod."),
             pod_show,
         )
         .operation(
-            read_op(
+            read_op_typed::<PodLogsInput>(
                 "kubernetes.pod.logs",
                 "Read bounded logs for one Kubernetes pod (by name) or label selector.",
-                json!({"type": "object", "properties": {
-                    "context": s_context(),
-                    "namespace": s_namespace(),
-                    "name": {"type": "string", "description": "pod name (provide name or selector)"},
-                    "selector": {"type": "string", "description": "label selector (e.g. app=web) — merges logs from matching pods"},
-                    "container": {"type": "string", "description": "container name; empty uses Kubernetes default"},
-                    "tail_lines": {"type": "integer", "description": "number of trailing log lines (default 100)"},
-                    "limit_bytes": {"type": "integer", "description": "maximum bytes to return"},
-                    "since": {"type": "string", "description": "relative duration such as 2h, or RFC3339 timestamp"},
-                    "previous": {"type": "boolean", "description": "return previous terminated container logs"},
-                    "timestamps": {"type": "boolean", "description": "include Kubernetes log timestamps"}
-                }, "required": ["namespace"]}),
             ),
             pod_logs,
         )
         // --- port-forward (held by the host's managed-process registry) --------
         .operation(
-            write_op(
+            op_spec_typed::<PortForwardStartInput>(
                 "kubernetes.portforward.start",
                 "Start a managed Kubernetes port-forward for a service, pod, or deployment. The \
                  forward is held by the host as a long-lived `kubectl port-forward` process that \
                  persists across calls; list with kubernetes.portforward.list and stop with \
                  kubernetes.portforward.stop.",
-                json!({"type": "object", "properties": {
-                    "context": s_context(),
-                    "namespace": s_namespace(),
-                    "resource": {"type": "string", "description": "resource ref such as service/loki, pod/api-123, or deployment/api"},
-                    "name": {"type": "string", "description": "resource name when `resource` is not used"},
-                    "resource_type": {"type": "string", "enum": ["service", "pod", "deployment"], "description": "resource type when `name` is used"},
-                    "remote_port": {"type": "integer", "description": "remote service or pod port to forward"},
-                    "local_port": {"type": "integer", "description": "local port; 0 lets kubectl allocate an available port"},
-                    "address": {"type": "string", "description": "local bind address (default 127.0.0.1)"}
-                }, "required": ["namespace", "remote_port"]}),
+                vec![Effect::Write, Effect::Network],
+                Risk::Medium,
+                Idempotency::NonIdempotent,
             ),
             portforward_start,
         )
         .operation(
-            op_spec(
+            op_spec_typed::<PortForwardStopInput>(
                 "kubernetes.portforward.stop",
                 "Stop a managed Kubernetes port-forward by ID (the `id` returned by \
                  kubernetes.portforward.start).",
-                json!({"type": "object", "properties": {
-                    "id": {"type": "string", "description": "managed port-forward ID returned by kubernetes.portforward.start"}
-                }, "required": ["id"]}),
                 vec![Effect::Write, Effect::Process],
                 Risk::Medium,
                 Idempotency::Idempotent,
@@ -229,59 +368,37 @@ fn manifest_builder() -> PluginBuilder {
             portforward_stop,
         )
         .operation(
-            read_op(
+            read_op_typed::<PortForwardListInput>(
                 "kubernetes.portforward.list",
                 "List the managed Kubernetes port-forwards this plugin started, each probed for \
                  liveness, with local URL and target metadata. Filterable by namespace/context.",
-                json!({"type": "object", "properties": {
-                    "namespace": s_namespace_filter(),
-                    "context": s_context(),
-                    "live": {"type": "boolean", "description": "only list forwards whose process is still alive"}
-                }}),
             ),
             portforward_list,
         )
         // --- deployments -------------------------------------------------------
         .operation(
-            read_op(
+            read_op_typed::<InventoryListInput>(
                 "kubernetes.deployment.list",
                 "List Kubernetes deployments (all namespaces unless `namespace` is set).",
-                inventory_list_schema(),
             ),
             deployment_list,
         )
         .operation(
-            read_op(
-                "kubernetes.deployment.show",
-                "Show one Kubernetes deployment.",
-                show_schema(),
-            ),
+            read_op_typed::<InventoryShowInput>("kubernetes.deployment.show", "Show one Kubernetes deployment."),
             deployment_show,
         )
         .operation(
-            read_op(
+            read_op_typed::<DeploymentHistoryInput>(
                 "kubernetes.deployment.history",
                 "List a deployment's rollout revisions (ReplicaSets, newest first) with images, \
                  replica counts, and creation timestamps. `name` is the deployment.",
-                json!({"type": "object", "properties": {
-                    "context": s_context(),
-                    "namespace": s_namespace_filter(),
-                    "name": {"type": "string", "description": "deployment name"},
-                    "limit": s_limit()
-                }, "required": ["name"]}),
             ),
             deployment_history,
         )
         .operation(
-            op_spec(
+            op_spec_typed::<DeploymentScaleInput>(
                 "kubernetes.deployment.scale",
                 "Scale a Kubernetes deployment to a desired replica count.",
-                json!({"type": "object", "properties": {
-                    "context": s_context(),
-                    "namespace": s_namespace(),
-                    "name": {"type": "string", "description": "deployment name"},
-                    "replicas": {"type": "integer", "description": "desired replica count (>= 0)"}
-                }, "required": ["namespace", "name", "replicas"]}),
                 vec![Effect::Write, Effect::Network],
                 Risk::High,
                 Idempotency::Idempotent,
@@ -289,14 +406,9 @@ fn manifest_builder() -> PluginBuilder {
             deployment_scale,
         )
         .operation(
-            op_spec(
+            op_spec_typed::<DeploymentRestartInput>(
                 "kubernetes.deployment.restart",
                 "Rolling-restart a Kubernetes deployment (kubectl rollout restart).",
-                json!({"type": "object", "properties": {
-                    "context": s_context(),
-                    "namespace": s_namespace(),
-                    "name": {"type": "string", "description": "deployment name"}
-                }, "required": ["namespace", "name"]}),
                 vec![Effect::Write, Effect::Network],
                 Risk::High,
                 Idempotency::NonIdempotent,
@@ -305,110 +417,53 @@ fn manifest_builder() -> PluginBuilder {
         )
         // --- ingresses / containers / nodes -----------------------------------
         .operation(
-            read_op(
+            read_op_typed::<InventoryListInput>(
                 "kubernetes.ingress.list",
                 "List Kubernetes ingresses (all namespaces unless `namespace` is set).",
-                inventory_list_schema(),
             ),
             ingress_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<InventoryListInput>(
                 "kubernetes.container.list",
                 "List Kubernetes containers derived from pods.",
-                inventory_list_schema(),
             ),
             container_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<InventoryShowInput>(
                 "kubernetes.container.show",
                 "Show one Kubernetes container (by name) derived from a pod.",
-                show_schema(),
             ),
             container_show,
         )
         .operation(
-            read_op(
+            read_op_typed::<EventListInput>(
                 "kubernetes.event.list",
                 "List Kubernetes events (newest-first via the API), filterable by namespace, \
                  involved object name/kind, and Warning type.",
-                json!({"type": "object", "properties": {
-                    "context": s_context(),
-                    "namespace": s_namespace_filter(),
-                    "name": {"type": "string", "description": "filter to events about this object (involvedObject.name)"},
-                    "kind": {"type": "string", "description": "filter to this object kind (e.g. Pod, Deployment, Node)"},
-                    "warnings_only": {"type": "boolean", "description": "only return Warning events"},
-                    "limit": {"type": "integer", "description": "maximum events to return (default 50)"}
-                }}),
             ),
             event_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<NodeListInput>(
                 "kubernetes.node.list",
                 "List Kubernetes nodes with readiness, roles, kubelet version, and capacity.",
-                json!({"type": "object", "properties": {"context": s_context()}}),
             ),
             node_list,
         )
         // --- exec (sensitive) --------------------------------------------------
         .operation(
-            op_spec(
+            op_spec_typed::<PodExecInput>(
                 "kubernetes.pod.exec",
                 "Run a one-shot command in a pod container and return bounded stdout/stderr with \
                  the exit code. No TTY or stdin.",
-                json!({"type": "object", "properties": {
-                    "context": s_context(),
-                    "namespace": s_namespace(),
-                    "name": {"type": "string", "description": "pod name"},
-                    "container": {"type": "string", "description": "container name; empty uses Kubernetes default"},
-                    "command": {"type": "array", "items": {"type": "string"}, "description": "command argv to run (no shell; use [\"sh\",\"-c\",\"...\"] for shell syntax)"},
-                    "timeout_seconds": {"type": "integer", "description": "command timeout in seconds (default 30, max 300)"}
-                }, "required": ["namespace", "name", "command"]}),
                 vec![Effect::Process, Effect::Network],
                 Risk::High,
                 Idempotency::NonIdempotent,
             ),
             pod_exec,
         )
-}
-
-// ---------------------------------------------------------------------------
-// Schema helpers (shared property fragments).
-// ---------------------------------------------------------------------------
-
-fn s_context() -> Value {
-    json!({"type": "string", "description": "kubeconfig context override"})
-}
-
-fn s_namespace() -> Value {
-    json!({"type": "string", "description": "Kubernetes namespace"})
-}
-
-fn s_namespace_filter() -> Value {
-    json!({"type": "string", "description": "namespace filter; empty means all namespaces"})
-}
-
-fn s_limit() -> Value {
-    json!({"type": "integer", "description": "maximum records to return"})
-}
-
-/// Schema for the list ops: optional context + namespace filter.
-fn inventory_list_schema() -> Value {
-    json!({"type": "object", "properties": {
-        "context": s_context(),
-        "namespace": s_namespace_filter()
-    }})
-}
-
-/// Schema for the show ops: required `name`, optional context + namespace.
-fn show_schema() -> Value {
-    json!({"type": "object", "properties": {
-        "context": s_context(),
-        "namespace": s_namespace(),
-        "name": {"type": "string", "description": "resource name"}
-    }, "required": ["name"]})
 }
 
 fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
@@ -421,12 +476,11 @@ fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
     }
 }
 
-/// An operation spec with explicit effects/risk/idempotency (for the high-impact ops where the
-/// generic [`read_op`]/[`write_op`] presets are not accurate enough).
-fn op_spec(
+/// A typed operation spec with explicit effects/risk/idempotency (for the high-impact ops where
+/// the generic [`read_op_typed`]/[`write_op_typed`] presets are not accurate enough).
+fn op_spec_typed<T: JsonSchema>(
     name: &str,
     description: &str,
-    input_schema: Value,
     effects: Vec<Effect>,
     risk: Risk,
     idempotency: Idempotency,
@@ -434,12 +488,117 @@ fn op_spec(
     OperationSpec {
         name: name.into(),
         description: description.into(),
-        input_schema,
+        input_schema: op_input_schema::<T>(),
         effects,
         risk: Some(risk),
         idempotency: Some(idempotency),
         secret_purposes: Vec::new(),
     }
+}
+
+/// Apply optional `query` substring filtering and `limit` truncation to a `kubectl -o json`
+/// `items` array in-place. Matching is case-insensitive and considers the whole object JSON.
+fn apply_query_limit(items_array: &mut Vec<Value>, query: Option<&str>, limit: Option<i64>) {
+    if let Some(q) = query.filter(|s| !s.trim().is_empty()) {
+        let qlc = q.trim().to_lowercase();
+        items_array.retain(|it| it.to_string().to_lowercase().contains(&qlc));
+    }
+    if let Some(l) = limit.filter(|l| *l > 0) {
+        let l = l as usize;
+        if items_array.len() > l {
+            items_array.truncate(l);
+        }
+    }
+}
+
+/// Parse an RFC3339 timestamp to unix seconds (minimal, matching the fluxplane `until` bound)
+/// and to a nanosecond count for ordering.
+fn parse_rfc3339_seconds(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.len() < 20 {
+        return None;
+    }
+    let year: i64 = s[0..4].parse().ok()?;
+    let month: i64 = s[5..7].parse().ok()?;
+    let day: i64 = s[8..10].parse().ok()?;
+    let hour: i64 = s[11..13].parse().ok()?;
+    let min: i64 = s[14..16].parse().ok()?;
+    let sec: i64 = s[17..19].parse().ok()?;
+    // Days since epoch (Rata Die).
+    let y = if month <= 2 { year - 1 } else { year };
+    let m = if month <= 2 { month + 12 } else { month };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (m - 3) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86400 + hour * 3600 + min * 60 + sec)
+}
+
+/// Current UTC time as an RFC3339 string (second precision).
+fn now_rfc3339() -> String {
+    let ts = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    format_rfc3339(ts)
+}
+
+fn format_rfc3339(ts: i64) -> String {
+    let mut rem = ts;
+    let secs = rem % 60;
+    rem /= 60;
+    let mins = rem % 60;
+    rem /= 60;
+    let hrs = rem % 24;
+    let days = rem / 24;
+    let (y, mo, d) = days_from_civil(days);
+    format!("{y:04}-{mo:02}-{d:02}T{hrs:02}:{mins:02}:{secs:02}Z")
+}
+
+fn days_from_civil(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// Split log output into lines, optionally filtering to those whose RFC3339 timestamp is not after
+/// `until` (fluxplane parity). When `until` is set, kubectl is forced to emit timestamps; we strip
+/// them from the returned line unless `keep_timestamps` is true.
+fn filter_log_lines(
+    stdout: &str,
+    until: Option<&str>,
+    keep_timestamps: bool,
+) -> Result<Vec<String>, String> {
+    let until_ts = until.and_then(parse_rfc3339_seconds);
+    let stdout = stdout.trim_end_matches('\n');
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        if let Some(limit_ts) = until_ts {
+            // kubectl log timestamps are RFC3339Nano: "2006-01-02T15:04:05.999999999Z ...".
+            let (head, rest) = line.split_once(' ').unwrap_or((line, ""));
+            let ts = parse_rfc3339_seconds(head);
+            if matches!(ts, Some(ts) if ts > limit_ts) {
+                continue;
+            }
+            if keep_timestamps || rest.is_empty() {
+                out.push(line.to_string());
+            } else {
+                out.push(rest.to_string());
+            }
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -486,6 +645,10 @@ fn opt_str<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
         .get(key)
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
+}
+
+fn flex_i64(input: &Value, key: &str) -> Option<i64> {
+    input.get(key).and_then(|v| v.as_i64())
 }
 
 /// `--context <ctx>` when a non-empty context is given.
@@ -1151,7 +1314,10 @@ fn secret_read(input: Value, host: &mut Host) -> Result<Value, String> {
 fn namespace_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let mut args = vec!["get".to_string(), "namespaces".to_string()];
     args.extend(ctx_args(&input));
-    let v = kubectl_json_v(host, &args)?;
+    let mut v = kubectl_json_v(host, &args)?;
+    if let Some(items) = v.get_mut("items").and_then(|x| x.as_array_mut()) {
+        apply_query_limit(items, opt_str(&input, "query"), flex_i64(&input, "limit"));
+    }
     contribute_simple(host, &v, "kubernetes.namespace", |it| {
         let name = it.pointer("/metadata/name").and_then(|x| x.as_str())?;
         let phase = it
@@ -1171,7 +1337,10 @@ fn service_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let mut args = vec!["get".to_string(), "services".to_string()];
     args.extend(ctx_args(&input));
     args.extend(scope_args(&input));
-    let v = kubectl_json_v(host, &args)?;
+    let mut v = kubectl_json_v(host, &args)?;
+    if let Some(items) = v.get_mut("items").and_then(|x| x.as_array_mut()) {
+        apply_query_limit(items, opt_str(&input, "query"), flex_i64(&input, "limit"));
+    }
     contribute_namespaced(host, &v, "kubernetes.service", |it| {
         let svc_type = it
             .pointer("/spec/type")
@@ -1198,7 +1367,10 @@ fn pod_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let mut args = vec!["get".to_string(), "pods".to_string()];
     args.extend(ctx_args(&input));
     args.extend(scope_args(&input));
-    let v = kubectl_json_v(host, &args)?;
+    let mut v = kubectl_json_v(host, &args)?;
+    if let Some(items) = v.get_mut("items").and_then(|x| x.as_array_mut()) {
+        apply_query_limit(items, opt_str(&input, "query"), flex_i64(&input, "limit"));
+    }
     contribute_namespaced(host, &v, "kubernetes.pod", |it| {
         let phase = it
             .pointer("/status/phase")
@@ -1225,7 +1397,10 @@ fn deployment_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let mut args = vec!["get".to_string(), "deployments".to_string()];
     args.extend(ctx_args(&input));
     args.extend(scope_args(&input));
-    let v = kubectl_json_v(host, &args)?;
+    let mut v = kubectl_json_v(host, &args)?;
+    if let Some(items) = v.get_mut("items").and_then(|x| x.as_array_mut()) {
+        apply_query_limit(items, opt_str(&input, "query"), flex_i64(&input, "limit"));
+    }
     contribute_namespaced(host, &v, "kubernetes.deployment", deployment_summary);
     Ok(v)
 }
@@ -1246,7 +1421,10 @@ fn ingress_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let mut args = vec!["get".to_string(), "ingress".to_string()];
     args.extend(ctx_args(&input));
     args.extend(scope_args(&input));
-    let v = kubectl_json_v(host, &args)?;
+    let mut v = kubectl_json_v(host, &args)?;
+    if let Some(items) = v.get_mut("items").and_then(|x| x.as_array_mut()) {
+        apply_query_limit(items, opt_str(&input, "query"), flex_i64(&input, "limit"));
+    }
     contribute_namespaced(host, &v, "kubernetes.ingress", |it| {
         let hosts: Vec<&str> = it
             .pointer("/spec/rules")
@@ -1313,7 +1491,12 @@ fn container_list(input: Value, host: &mut Host) -> Result<Value, String> {
     args.extend(ctx_args(&input));
     args.extend(scope_args(&input));
     let v = kubectl_json_v(host, &args)?;
-    let containers = containers_from_pods(&v);
+    let mut containers = containers_from_pods(&v);
+    apply_query_limit(
+        &mut containers,
+        opt_str(&input, "query"),
+        flex_i64(&input, "limit"),
+    );
     let records: Vec<Record> = containers
         .iter()
         .filter_map(|c| {
@@ -1402,6 +1585,10 @@ fn pod_logs(input: Value, host: &mut Host) -> Result<Value, String> {
     {
         argv.push("--timestamps".into());
     }
+    let until = opt_str(&input, "until");
+    if until.is_some() {
+        argv.push("--timestamps".into());
+    }
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let out = host.run(&refs, 30)?;
     if out.exit_code != 0 {
@@ -1411,7 +1598,11 @@ fn pod_logs(input: Value, host: &mut Host) -> Result<Value, String> {
             out.stderr.trim()
         ));
     }
-    let lines: Vec<&str> = out.stdout.lines().collect();
+    let keep_timestamps = input
+        .get("timestamps")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let lines: Vec<String> = filter_log_lines(&out.stdout, until, keep_timestamps)?;
     Ok(json!({
         "namespace": ns,
         "name": name.unwrap_or(""),
@@ -1457,7 +1648,11 @@ fn event_list(input: Value, host: &mut Host) -> Result<Value, String> {
 fn node_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let mut args = vec!["get".to_string(), "nodes".to_string()];
     args.extend(ctx_args(&input));
-    kubectl_json_v(host, &args)
+    let mut v = kubectl_json_v(host, &args)?;
+    if let Some(items) = v.get_mut("items").and_then(|x| x.as_array_mut()) {
+        apply_query_limit(items, opt_str(&input, "query"), flex_i64(&input, "limit"));
+    }
+    Ok(v)
 }
 
 fn deployment_history(input: Value, host: &mut Host) -> Result<Value, String> {
@@ -1589,6 +1784,10 @@ fn deployment_scale(input: Value, host: &mut Host) -> Result<Value, String> {
     if replicas < 0 {
         return Err("`replicas` must be >= 0".into());
     }
+
+    // Capture the previous replica count before scaling (fluxplane parity).
+    let previous_replicas = fetch_deployment_replicas(host, name, ns, &input)?;
+
     let mut argv: Vec<String> = vec![
         "kubectl".into(),
         "scale".into(),
@@ -1611,14 +1810,44 @@ fn deployment_scale(input: Value, host: &mut Host) -> Result<Value, String> {
         "ok": true,
         "namespace": ns,
         "name": name,
+        "previous_replicas": previous_replicas,
         "replicas": replicas,
         "output": out.stdout.trim(),
     }))
 }
 
+fn fetch_deployment_replicas(
+    host: &mut Host,
+    name: &str,
+    ns: &str,
+    input: &Value,
+) -> Result<i64, String> {
+    let mut argv: Vec<String> = vec![
+        "kubectl".into(),
+        "get".into(),
+        format!("deployment/{name}"),
+        "-n".into(),
+        ns.into(),
+    ];
+    argv.extend(ctx_args(input));
+    argv.push("-o".into());
+    argv.push("json".into());
+    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let out = host.run(&refs, 30)?;
+    if out.exit_code != 0 {
+        // Scaling itself will fail if the deployment does not exist; don't hard-fail here.
+        return Ok(0);
+    }
+    let v: Value = serde_json::from_str(&out.stdout).unwrap_or(Value::Null);
+    Ok(v.pointer("/spec/replicas")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(0))
+}
+
 fn deployment_restart(input: Value, host: &mut Host) -> Result<Value, String> {
     let ns = req_nonempty(&input, "namespace")?;
     let name = req_nonempty(&input, "name")?;
+    let restarted_at = now_rfc3339();
     let mut argv: Vec<String> = vec![
         "kubectl".into(),
         "rollout".into(),
@@ -1641,6 +1870,7 @@ fn deployment_restart(input: Value, host: &mut Host) -> Result<Value, String> {
         "ok": true,
         "namespace": ns,
         "name": name,
+        "restarted_at": restarted_at,
         "output": out.stdout.trim(),
     }))
 }
@@ -1692,6 +1922,11 @@ fn portforward_start(input: Value, host: &mut Host) -> Result<Value, String> {
         .unwrap_or("127.0.0.1")
         .to_string();
     let context = opt_str(&input, "context").unwrap_or("").to_string();
+    let duration_seconds = input
+        .get("duration_seconds")
+        .and_then(|x| x.as_i64())
+        .map(|d| if d <= 0 { 3600 } else { d.min(28800) })
+        .unwrap_or(3600);
 
     // kubectl port-forward <resource> [<local>]:<remote> -n <ns> [--address <a>] [--context <c>].
     // A local of 0 becomes `:<remote>` so kubectl picks a free port (recovered from the readiness line).
@@ -1767,6 +2002,14 @@ fn portforward_start(input: Value, host: &mut Host) -> Result<Value, String> {
     }
 
     let id = format!("kpf-{proc_id}");
+    let started_at = now_rfc3339();
+    let expires_at = format_rfc3339(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+            + duration_seconds,
+    );
     forwards_lock().as_mut().unwrap().insert(
         proc_id,
         ForwardMeta {
@@ -1789,6 +2032,9 @@ fn portforward_start(input: Value, host: &mut Host) -> Result<Value, String> {
         "local_port": ready_local,
         "remote_port": remote_port,
         "local_url": format!("http://{address}:{ready_local}"),
+        "duration_seconds": duration_seconds,
+        "started_at": started_at,
+        "expires_at": expires_at,
         "command": argv,
     }))
 }
@@ -1941,6 +2187,11 @@ mod tests {
     fn clear_forwards() {
         forwards_lock().as_mut().unwrap().clear();
     }
+
+    /// Serialize port-forward tests that touch the shared `FORWARDS` registry. The registry is
+    /// global state, and tests that `clear_forwards()` at start/end can otherwise race when run
+    /// in parallel by the test harness.
+    static PF_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// Standard-alphabet base64 (test-only; mirrors what kubectl emits for a Secret's `.data`).
     fn b64_encode(bytes: &[u8]) -> String {
@@ -2326,6 +2577,32 @@ mod tests {
     }
 
     #[test]
+    fn service_list_filters_by_query_and_limit() {
+        let plugin = manifest_builder().build();
+        let mut host = MockHost::default().with_process(
+            "get services --all-namespaces",
+            r#"{"items":[
+                {"metadata":{"name":"api","namespace":"prod"}},
+                {"metadata":{"name":"billing","namespace":"prod"}},
+                {"metadata":{"name":"api-canary","namespace":"prod"}}
+            ]}"#,
+        );
+        let out = plugin
+            .call(
+                "kubernetes.service.list",
+                json!({ "query": "api", "limit": 1 }),
+                &mut host,
+            )
+            .unwrap();
+        let items = out["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0]["metadata"]["name"]
+            .as_str()
+            .unwrap()
+            .contains("api"));
+    }
+
+    #[test]
     fn service_show_targets_one_resource() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default().with_process(
@@ -2393,6 +2670,24 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out["line_count"], 2);
+        assert_eq!(out["lines"][0], "line1");
+    }
+
+    #[test]
+    fn pod_logs_filters_until_bound_and_strips_timestamps() {
+        let plugin = manifest_builder().build();
+        let logs = "2024-01-01T00:00:00Z line1\n2024-01-01T00:00:02Z line2\n";
+        // `--timestamps` is forced when `until` is provided, so the canned command substring still
+        // matches "logs -n prod api-1".
+        let mut host = MockHost::default().with_process("logs -n prod api-1", logs);
+        let out = plugin
+            .call(
+                "kubernetes.pod.logs",
+                json!({ "namespace": "prod", "name": "api-1", "until": "2024-01-01T00:00:01Z" }),
+                &mut host,
+            )
+            .unwrap();
+        assert_eq!(out["line_count"], 1);
         assert_eq!(out["lines"][0], "line1");
     }
 
@@ -2475,10 +2770,15 @@ mod tests {
     #[test]
     fn deployment_scale_invokes_kubectl_scale() {
         let plugin = manifest_builder().build();
-        let mut host = MockHost::default().with_process(
-            "scale deployment/web --replicas=5",
-            "deployment.apps/web scaled\n",
-        );
+        let mut host = MockHost::default()
+            .with_process(
+                "get deployment/web -n prod",
+                r#"{"spec":{"replicas":2},"status":{}}"#,
+            )
+            .with_process(
+                "scale deployment/web --replicas=5",
+                "deployment.apps/web scaled\n",
+            );
         let out = plugin
             .call(
                 "kubernetes.deployment.scale",
@@ -2487,6 +2787,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out["ok"], true);
+        assert_eq!(out["previous_replicas"], 2);
         assert_eq!(out["replicas"], 5);
     }
 
@@ -2519,6 +2820,10 @@ mod tests {
             .unwrap();
         assert_eq!(out["ok"], true);
         assert_eq!(out["name"], "web");
+        assert!(
+            out["restarted_at"].as_str().unwrap().starts_with("20"),
+            "restarted_at should be an RFC3339 timestamp"
+        );
     }
 
     #[test]
@@ -2617,6 +2922,31 @@ mod tests {
     }
 
     #[test]
+    fn node_list_filters_by_query_and_limit() {
+        let plugin = manifest_builder().build();
+        let mut host = MockHost::default().with_process(
+            "get nodes",
+            r#"{"items":[
+                {"metadata":{"name":"node-1"}},
+                {"metadata":{"name":"node-2"}},
+                {"metadata":{"name":"worker-3"}}
+            ]}"#,
+        );
+        let out = plugin
+            .call(
+                "kubernetes.node.list",
+                json!({ "query": "node", "limit": 2 }),
+                &mut host,
+            )
+            .unwrap();
+        let items = out["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(items
+            .iter()
+            .all(|n| n["metadata"]["name"].as_str().unwrap().contains("node")));
+    }
+
+    #[test]
     fn pod_exec_captures_output_and_exit() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default().with_process("exec -n prod", "/tmp\n");
@@ -2650,6 +2980,7 @@ mod tests {
         // start spawns `kubectl port-forward` and parses kubectl's readiness line for the local port,
         // then list reports it (alive), then stop kills it and drops it from the registry. Uses the
         // module-level FORWARDS registry, so isolate the proc_id from other tests via a unique value.
+        let _guard = PF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_forwards();
         let plugin = manifest_builder().build();
         let mut host = MockHost::default().with_spawn(4242).with_proc_output(
@@ -2718,6 +3049,7 @@ mod tests {
     #[test]
     fn portforward_start_auto_allocates_local_port_from_readiness_line() {
         // local_port=0 → kubectl allocates; the actual port is recovered from "Forwarding from".
+        let _guard = PF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_forwards();
         let plugin = manifest_builder().build();
         let mut host = MockHost::default().with_spawn(77).with_proc_output(
@@ -2738,8 +3070,34 @@ mod tests {
     }
 
     #[test]
+    fn portforward_start_honors_duration_seconds() {
+        let _guard = PF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_forwards();
+        let plugin = manifest_builder().build();
+        let mut host = MockHost::default().with_spawn(88).with_proc_output(
+            "Forwarding from 127.0.0.1:8080 -> 80\n",
+            "",
+            true,
+        );
+        let start = plugin
+            .call(
+                "kubernetes.portforward.start",
+                json!({ "namespace": "prod", "resource": "service/web", "remote_port": 80, "duration_seconds": 1800 }),
+                &mut host,
+            )
+            .unwrap();
+        assert_eq!(start["duration_seconds"], 1800);
+        assert!(
+            start["expires_at"].as_str().unwrap().starts_with("20"),
+            "expires_at should be an RFC3339 timestamp"
+        );
+        clear_forwards();
+    }
+
+    #[test]
     fn portforward_start_errors_when_kubectl_exits_before_ready() {
         // A process that exits without ever printing the readiness line is a startup failure.
+        let _guard = PF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_forwards();
         let plugin = manifest_builder().build();
         let mut host = MockHost::default().with_spawn(9).with_proc_output(
@@ -2824,5 +3182,356 @@ mod tests {
             .unwrap();
         assert_eq!(exec.risk, Some(Risk::High));
         assert!(exec.effects.contains(&Effect::Process));
+    }
+}
+
+// ===========================================================================
+// D-36: schema-derivation contract test (kubernetes).
+// Locks each op's derived schemars schema to its intended field/required/type
+// contract after the migration + gap-ports.
+// ===========================================================================
+#[cfg(test)]
+mod schema_contract {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Kind {
+        Str,
+        Int,
+        Bool,
+        ArrayStr,
+        Enum(Vec<String>),
+    }
+
+    #[derive(Clone)]
+    struct Prop {
+        name: &'static str,
+        kind: Kind,
+    }
+
+    struct OpContract {
+        props: Vec<Prop>,
+        required: Vec<&'static str>,
+    }
+
+    fn p(name: &'static str, kind: Kind) -> Prop {
+        Prop { name, kind }
+    }
+
+    fn c(props: Vec<Prop>, required: Vec<&'static str>) -> OpContract {
+        OpContract { props, required }
+    }
+
+    fn inventory_list_contract() -> OpContract {
+        c(
+            vec![
+                p("context", Kind::Str),
+                p("namespace", Kind::Str),
+                p("query", Kind::Str),
+                p("limit", Kind::Int),
+            ],
+            vec![],
+        )
+    }
+
+    fn inventory_show_contract() -> OpContract {
+        c(
+            vec![
+                p("context", Kind::Str),
+                p("namespace", Kind::Str),
+                p("name", Kind::Str),
+            ],
+            vec!["name"],
+        )
+    }
+
+    fn contracts() -> Vec<(&'static str, OpContract)> {
+        vec![
+            ("kubernetes.cluster.list", c(vec![], vec![])),
+            ("kubernetes.test", c(vec![p("context", Kind::Str)], vec![])),
+            (
+                "kubernetes.endpoint.discover",
+                c(
+                    vec![
+                        p("context", Kind::Str),
+                        p("cluster", Kind::Str),
+                        p("namespace", Kind::Str),
+                        p("product", Kind::Str),
+                        p("query", Kind::Str),
+                        p("latest_namespace", Kind::Bool),
+                        p("limit", Kind::Int),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "kubernetes.secret.read",
+                c(
+                    vec![
+                        p("context", Kind::Str),
+                        p("namespace", Kind::Str),
+                        p("name", Kind::Str),
+                        p("keys", Kind::ArrayStr),
+                    ],
+                    vec!["namespace", "name"],
+                ),
+            ),
+            ("kubernetes.namespace.list", inventory_list_contract()),
+            ("kubernetes.service.list", inventory_list_contract()),
+            ("kubernetes.service.show", inventory_show_contract()),
+            ("kubernetes.pod.list", inventory_list_contract()),
+            ("kubernetes.pod.show", inventory_show_contract()),
+            (
+                "kubernetes.pod.logs",
+                c(
+                    vec![
+                        p("context", Kind::Str),
+                        p("namespace", Kind::Str),
+                        p("name", Kind::Str),
+                        p("selector", Kind::Str),
+                        p("container", Kind::Str),
+                        p("tail_lines", Kind::Int),
+                        p("limit_bytes", Kind::Int),
+                        p("since", Kind::Str),
+                        p("until", Kind::Str),
+                        p("previous", Kind::Bool),
+                        p("timestamps", Kind::Bool),
+                    ],
+                    vec!["namespace"],
+                ),
+            ),
+            (
+                "kubernetes.portforward.start",
+                c(
+                    vec![
+                        p("context", Kind::Str),
+                        p("namespace", Kind::Str),
+                        p("resource", Kind::Str),
+                        p("name", Kind::Str),
+                        p(
+                            "resource_type",
+                            Kind::Enum(vec!["service".into(), "pod".into(), "deployment".into()]),
+                        ),
+                        p("remote_port", Kind::Int),
+                        p("local_port", Kind::Int),
+                        p("address", Kind::Str),
+                        p("duration_seconds", Kind::Int),
+                    ],
+                    vec!["namespace", "remote_port"],
+                ),
+            ),
+            (
+                "kubernetes.portforward.stop",
+                c(
+                    vec![
+                        p("id", Kind::Str),
+                        p("process_group", Kind::Int),
+                        p("pid", Kind::Int),
+                    ],
+                    vec!["id"],
+                ),
+            ),
+            (
+                "kubernetes.portforward.list",
+                c(
+                    vec![
+                        p("namespace", Kind::Str),
+                        p("context", Kind::Str),
+                        p("live", Kind::Bool),
+                    ],
+                    vec![],
+                ),
+            ),
+            ("kubernetes.deployment.list", inventory_list_contract()),
+            ("kubernetes.deployment.show", inventory_show_contract()),
+            (
+                "kubernetes.deployment.history",
+                c(
+                    vec![
+                        p("context", Kind::Str),
+                        p("namespace", Kind::Str),
+                        p("name", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec!["name"],
+                ),
+            ),
+            (
+                "kubernetes.deployment.scale",
+                c(
+                    vec![
+                        p("context", Kind::Str),
+                        p("namespace", Kind::Str),
+                        p("name", Kind::Str),
+                        p("replicas", Kind::Int),
+                    ],
+                    vec!["namespace", "name", "replicas"],
+                ),
+            ),
+            (
+                "kubernetes.deployment.restart",
+                c(
+                    vec![
+                        p("context", Kind::Str),
+                        p("namespace", Kind::Str),
+                        p("name", Kind::Str),
+                    ],
+                    vec!["namespace", "name"],
+                ),
+            ),
+            ("kubernetes.ingress.list", inventory_list_contract()),
+            ("kubernetes.container.list", inventory_list_contract()),
+            ("kubernetes.container.show", inventory_show_contract()),
+            (
+                "kubernetes.event.list",
+                c(
+                    vec![
+                        p("context", Kind::Str),
+                        p("namespace", Kind::Str),
+                        p("name", Kind::Str),
+                        p("kind", Kind::Str),
+                        p("warnings_only", Kind::Bool),
+                        p("limit", Kind::Int),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "kubernetes.node.list",
+                c(
+                    vec![
+                        p("context", Kind::Str),
+                        p("query", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "kubernetes.pod.exec",
+                c(
+                    vec![
+                        p("context", Kind::Str),
+                        p("namespace", Kind::Str),
+                        p("name", Kind::Str),
+                        p("container", Kind::Str),
+                        p("command", Kind::ArrayStr),
+                        p("timeout_seconds", Kind::Int),
+                    ],
+                    vec!["namespace", "name", "command"],
+                ),
+            ),
+        ]
+    }
+
+    fn resolve<'a>(node: &'a Value, defs: &'a Value) -> &'a Value {
+        if let Some(obj) = node.as_object() {
+            if let Some(r) = obj.get("$ref").and_then(|v| v.as_str()) {
+                if let Some(name) = r.strip_prefix("#/definitions/") {
+                    return defs.get(name).unwrap_or(node);
+                }
+            }
+            if let Some(any) = obj.get("anyOf").and_then(|v| v.as_array()) {
+                for m in any {
+                    if m.get("type").and_then(|v| v.as_str()) != Some("null") {
+                        return resolve(m, defs);
+                    }
+                }
+            }
+            if let Some(one) = obj.get("oneOf").and_then(|v| v.as_array()) {
+                for m in one {
+                    if m.get("type").and_then(|v| v.as_str()) != Some("null") {
+                        return resolve(m, defs);
+                    }
+                }
+            }
+        }
+        node
+    }
+
+    fn kind_of(node: &Value) -> Kind {
+        let t = node.get("type");
+        if let Some(arr) = t.and_then(|v| v.as_array()) {
+            let first = arr
+                .iter()
+                .find(|v| v.as_str() != Some("null"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("null");
+            return base_kind(first, node);
+        }
+        base_kind(t.and_then(|v| v.as_str()).unwrap_or(""), node)
+    }
+
+    fn base_kind(t: &str, node: &Value) -> Kind {
+        match t {
+            "integer" => Kind::Int,
+            "boolean" => Kind::Bool,
+            "string" => {
+                if let Some(e) = node.get("enum").and_then(|v| v.as_array()) {
+                    Kind::Enum(
+                        e.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect(),
+                    )
+                } else {
+                    Kind::Str
+                }
+            }
+            "array" => Kind::ArrayStr,
+            other => panic!("unsupported property type: {other} ({node})"),
+        }
+    }
+
+    fn assert_contract(op_name: &str, schema: &Value, contract: &OpContract) {
+        assert_eq!(schema["type"], "object", "{op_name}: root type");
+        let defs = schema.get("definitions").cloned().unwrap_or(json!({}));
+        let props_obj = schema.get("properties").and_then(|v| v.as_object());
+        let mut got: BTreeMap<&str, Kind> = BTreeMap::new();
+        if let Some(props) = props_obj {
+            for (k, v) in props {
+                let resolved = resolve(v, &defs);
+                got.insert(k.as_str(), kind_of(resolved));
+            }
+        }
+        let want: BTreeMap<&str, Kind> = contract
+            .props
+            .iter()
+            .map(|Prop { name, kind }| (*name, kind.clone()))
+            .collect();
+        assert_eq!(got.len(), want.len(), "{op_name}: property count");
+        for Prop { name, kind } in &contract.props {
+            let got_kind = got
+                .get(*name)
+                .unwrap_or_else(|| panic!("{op_name}: missing property `{name}`"));
+            assert_eq!(got_kind, kind, "{op_name}: property `{name}` kind");
+        }
+        let mut req: Vec<&str> = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        req.sort();
+        let mut want_req = contract.required.clone();
+        want_req.sort();
+        assert_eq!(req, want_req, "{op_name}: required set");
+    }
+
+    #[test]
+    fn derived_schemas_match_contract() {
+        let ops = contracts();
+        let manifest = manifest_builder().build().manifest();
+        let by_name: BTreeMap<&str, &OperationSpec> = manifest
+            .operations
+            .iter()
+            .map(|o| (o.name.as_str(), o))
+            .collect();
+        assert_eq!(by_name.len(), ops.len(), "op count changed");
+        for (name, contract) in &ops {
+            let spec = by_name
+                .get(*name)
+                .unwrap_or_else(|| panic!("missing op {name}"));
+            assert_contract(name, &spec.input_schema, contract);
+        }
     }
 }

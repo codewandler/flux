@@ -29,11 +29,382 @@
 //! content-addressed blob store using the byte-exact `http_bytes` path so binary files round-trip
 //! exactly (no `from_utf8_lossy`). Markdown bodies are converted to faithful Atlassian Document Format.
 
+use base64::Engine as _;
 use host_kit::*;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 /// The issue fields requested on issue reads (so status/links/attachments/etc. are present).
 const FIELDS: &str = "summary,description,status,assignee,reporter,creator,updated,created,project,issuetype,priority,labels,parent,issuelinks,attachment";
+
+// ===========================================================================
+// Schema-only op input structs (D-36)
+// ===========================================================================
+// Each op's `input_schema` is derived from the structs below via schemars
+// (`host_kit::read_op_typed::<T>` / `host_kit::write_op_typed::<T>`), instead of a hand-written
+// `json!({...})` object, so the schema the model sees cannot drift from a separately-maintained
+// literal. The structs are schema-only: handlers keep their existing `opt_str` / `clamp_limit`
+// / `issue_key` extractors (the D-34 schema-only precedent).
+
+/// How rich-text bodies (issue descriptions, comments) are rendered. The default keeps agents
+/// away from raw ADF by returning readable Markdown.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[allow(dead_code)]
+enum BodyFormat {
+    /// Render rich-text bodies as Markdown (default).
+    Markdown,
+    /// Return the raw Atlassian Document Format object.
+    Adf,
+    /// Return both Markdown (`description` / `body`) and the raw ADF object
+    /// (`description_adf` / `body_adf`).
+    Both,
+}
+
+impl BodyFormat {
+    fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "adf" => BodyFormat::Adf,
+            "both" => BodyFormat::Both,
+            _ => BodyFormat::Markdown,
+        }
+    }
+}
+
+fn body_format_from_input(input: &Value) -> BodyFormat {
+    match input.get("body_format").and_then(|v| v.as_str()) {
+        Some(s) => BodyFormat::parse(s),
+        None => BodyFormat::Markdown,
+    }
+}
+
+/// `jira.test`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct TestInput {}
+
+/// `jira.index.build`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct IndexBuildInput {
+    /// Issue JQL query.
+    issue_jql: Option<String>,
+    /// Issue text query.
+    issue_query: Option<String>,
+    /// Issue page size (max 100).
+    issue_limit: Option<i64>,
+    /// Issue project key filter.
+    project: Option<String>,
+    /// Issue status filter.
+    status: Option<String>,
+    /// User search query.
+    user_query: Option<String>,
+    /// User page size (max 100).
+    user_limit: Option<i64>,
+}
+
+/// `jira.issue.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct IssueCreateInput {
+    /// Project key such as DEV.
+    project_key: String,
+    /// Alias for project_key.
+    project: Option<String>,
+    /// Issue type name such as Task or Bug.
+    issue_type: String,
+    /// Issue summary.
+    summary: String,
+    /// Description as Markdown (converted to Jira ADF).
+    description_markdown: Option<String>,
+    /// Labels to set.
+    labels: Option<Vec<String>>,
+    /// Assignee Atlassian account ID.
+    assignee_account_id: Option<String>,
+    /// Reporter Atlassian account ID.
+    reporter_account_id: Option<String>,
+    /// Priority name.
+    priority: Option<String>,
+    /// Parent issue key for subtasks.
+    parent_key: Option<String>,
+    /// Raw Jira fields. Explicit typed inputs override matching fields.
+    fields: Option<Map<String, Value>>,
+    /// Raw Jira update instructions.
+    update: Option<Map<String, Value>>,
+}
+
+/// `jira.issue.edit`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct IssueEditInput {
+    /// Issue key (e.g. PROJ-123).
+    key: String,
+    /// Alias for key.
+    id: Option<String>,
+    /// Alias for key.
+    issue_key: Option<String>,
+    /// Issue summary.
+    summary: Option<String>,
+    /// Description as Markdown (converted to Jira ADF).
+    description_markdown: Option<String>,
+    /// Labels to set.
+    labels: Option<Vec<String>>,
+    /// Assignee Atlassian account ID.
+    assignee_account_id: Option<String>,
+    /// Priority name.
+    priority: Option<String>,
+    /// Parent issue key to reparent under.
+    parent_key: Option<String>,
+    /// Raw Jira fields. Explicit typed inputs override matching fields.
+    fields: Option<Map<String, Value>>,
+    /// Raw Jira update instructions.
+    update: Option<Map<String, Value>>,
+}
+
+/// `jira.issue.delete`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct IssueDeleteInput {
+    /// Issue key (e.g. PROJ-123).
+    key: String,
+    /// Alias for key.
+    id: Option<String>,
+    /// Also delete subtasks when deleting a parent issue.
+    delete_subtasks: Option<bool>,
+}
+
+/// `jira.issue.search`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct IssueSearchInput {
+    /// JQL query.
+    jql: Option<String>,
+    /// Project key filter.
+    project: Option<String>,
+    /// Status filter.
+    status: Option<String>,
+    /// Free-text filter (JQL `text ~`).
+    query: Option<String>,
+    /// JQL order-by expression (default `updated DESC`).
+    order_by: Option<String>,
+    /// Max results (default 25, cap 100).
+    max: Option<i64>,
+    /// Jira fields to request on issues.
+    fields: Option<Vec<String>>,
+    /// Rich-text body format for issue descriptions.
+    body_format: Option<BodyFormat>,
+}
+
+/// `jira.issue.show`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct IssueShowInput {
+    /// Issue key (e.g. PROJ-123).
+    key: String,
+    /// Alias for key.
+    id: Option<String>,
+    /// Alias for key.
+    issue_key: Option<String>,
+    /// Rich-text body format for the issue description.
+    body_format: Option<BodyFormat>,
+}
+
+/// `jira.issue.create_meta`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct IssueCreateMetaInput {
+    /// Project key filter.
+    project_key: Option<String>,
+    /// Issue type name filter.
+    issue_type: Option<String>,
+}
+
+/// `jira.issue.edit_meta`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct IssueEditMetaInput {
+    /// Issue key (e.g. PROJ-123).
+    key: String,
+    /// Alias for key.
+    id: Option<String>,
+    /// Alias for key.
+    issue_key: Option<String>,
+}
+
+/// `jira.issue.transition.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct IssueTransitionListInput {
+    /// Issue key (e.g. PROJ-123).
+    key: String,
+    /// Alias for key.
+    id: Option<String>,
+    /// Alias for key.
+    issue_key: Option<String>,
+}
+
+/// `jira.issue.transition.run`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct IssueTransitionRunInput {
+    /// Issue key (e.g. PROJ-123).
+    key: String,
+    /// Alias for key.
+    id: Option<String>,
+    /// Alias for key.
+    issue_key: Option<String>,
+    /// Jira transition ID to apply.
+    transition_id: Option<String>,
+    /// Jira transition name to apply.
+    transition_name: Option<String>,
+    /// Desired status name or ID.
+    target_status: Option<String>,
+    /// Take intermediate transitions to reach target_status.
+    auto_transition: Option<bool>,
+    /// Maximum transitions for auto_transition (default 5, max 20).
+    max_steps: Option<i64>,
+}
+
+/// `jira.issue.comment.add`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CommentAddInput {
+    /// Issue key (e.g. PROJ-123).
+    key: String,
+    /// Alias for key.
+    id: Option<String>,
+    /// Alias for key.
+    issue_key: Option<String>,
+    /// Comment body as Markdown (converted to Jira ADF).
+    body_markdown: String,
+}
+
+/// `jira.issue.comment.edit`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CommentEditInput {
+    /// Issue key (e.g. PROJ-123).
+    key: String,
+    /// Alias for key.
+    id: Option<String>,
+    /// Alias for key.
+    issue_key: Option<String>,
+    /// Jira comment ID.
+    comment_id: String,
+    /// Comment body as Markdown (converted to Jira ADF).
+    body_markdown: String,
+}
+
+/// `jira.issue.comment.delete`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CommentDeleteInput {
+    /// Issue key (e.g. PROJ-123).
+    key: String,
+    /// Alias for key.
+    id: Option<String>,
+    /// Alias for key.
+    issue_key: Option<String>,
+    /// Jira comment ID.
+    comment_id: String,
+}
+
+/// `jira.issue.comment.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CommentListInput {
+    /// Issue key (e.g. PROJ-123).
+    key: String,
+    /// Alias for key.
+    id: Option<String>,
+    /// Alias for key.
+    issue_key: Option<String>,
+    /// Max comments (default 20, cap 100).
+    limit: Option<i64>,
+    /// Zero-based pagination offset.
+    start_at: Option<i64>,
+    /// Sort order by creation time: `created` (oldest first) or `-created` (newest first).
+    order: Option<String>,
+    /// Rich-text body format for comments.
+    body_format: Option<BodyFormat>,
+}
+
+/// `jira.issue.attachment.add`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct AttachmentAddInput {
+    /// Issue key (e.g. PROJ-123).
+    key: String,
+    /// Alias for key.
+    id: Option<String>,
+    /// Alias for key.
+    issue_key: Option<String>,
+    /// Host blob ref to upload. Mutually exclusive with content_bytes.
+    blob_ref: Option<String>,
+    /// Base64-encoded inline bytes. Mutually exclusive with blob_ref.
+    content_bytes: Option<String>,
+    /// Filename shown in Jira.
+    filename: Option<String>,
+    /// Attachment MIME type.
+    content_type: Option<String>,
+}
+
+/// `jira.issue.attachment.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct AttachmentListInput {
+    /// Issue key (e.g. PROJ-123).
+    key: String,
+    /// Alias for key.
+    id: Option<String>,
+    /// Alias for key.
+    issue_key: Option<String>,
+}
+
+/// `jira.issue.attachment.get`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct AttachmentGetInput {
+    /// Jira attachment ID.
+    attachment_id: String,
+    /// Optional filename metadata.
+    filename: Option<String>,
+    /// Optional MIME type metadata.
+    mime_type: Option<String>,
+    /// Optional host blob ref for downloaded attachment bytes.
+    blob_ref: Option<String>,
+}
+
+/// `jira.issue.attachment.delete`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct AttachmentDeleteInput {
+    /// Jira attachment ID.
+    attachment_id: String,
+}
+
+/// `jira.issue.link.add`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct IssueLinkAddInput {
+    /// Issue key on the verb side of the link (the blocker in Blocks).
+    key: String,
+    /// Issue key the verb points at (the blocked issue in Blocks).
+    to_key: String,
+    /// Link type name such as Blocks or Relates.
+    r#type: String,
+}
+
+/// `jira.user.search`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct UserSearchInput {
+    /// User search query.
+    query: Option<String>,
+    /// Max users (default 20, cap 100).
+    limit: Option<i64>,
+}
 
 fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("jira", "0.1.0")
@@ -86,257 +457,158 @@ fn manifest_builder() -> PluginBuilder {
         .datasource(ds("jira.users", "jira.user", "Jira users."))
         // --- auth + index -------------------------------------------------------------------------
         .operation(
-            read_op(
+            read_op_typed::<TestInput>(
                 "jira.test",
                 "Test Jira authentication by fetching the current user.",
-                json!({"type": "object", "properties": {}}),
             ),
             auth_test,
         )
         .operation(
-            read_op(
+            read_op_typed::<IndexBuildInput>(
                 "jira.index.build",
                 "Build Jira issue and user index records for reverse lookup.",
-                json!({"type": "object", "properties": {
-                    "issue_jql": {"type": "string", "description": "issue JQL query"},
-                    "issue_query": {"type": "string", "description": "issue text query"},
-                    "issue_limit": {"type": "integer", "description": "issue page size (max 100)"},
-                    "project": {"type": "string", "description": "issue project key filter"},
-                    "status": {"type": "string", "description": "issue status filter"},
-                    "user_query": {"type": "string", "description": "user search query"},
-                    "user_limit": {"type": "integer", "description": "user page size (max 100)"}
-                }}),
             ),
             index_build,
         )
         // --- issue CRUD ---------------------------------------------------------------------------
         .operation(
-            write_op(
+            write_op_typed::<IssueCreateInput>(
                 "jira.issue.create",
-                "Create a Jira issue from structured fields and Markdown.",
-                json!({"type": "object", "properties": {
-                    "project_key": {"type": "string", "description": "project key such as DEV"},
-                    "project": {"type": "string", "description": "alias for project_key"},
-                    "issue_type": {"type": "string", "description": "issue type name such as Task or Bug"},
-                    "summary": {"type": "string", "description": "issue summary"},
-                    "description_markdown": {"type": "string", "description": "description as Markdown (converted to Jira ADF)"},
-                    "labels": {"type": "array", "items": {"type": "string"}, "description": "labels to set"},
-                    "assignee_account_id": {"type": "string", "description": "assignee Atlassian account ID"},
-                    "reporter_account_id": {"type": "string", "description": "reporter Atlassian account ID"},
-                    "priority": {"type": "string", "description": "priority name"},
-                    "parent_key": {"type": "string", "description": "parent issue key for subtasks"}
-                }, "required": ["project_key", "issue_type", "summary"]}),
+                "Create a Jira issue from structured fields and Markdown. Raw `fields` and `update` \
+                 maps are passed through; typed inputs override matching raw fields.",
             ),
             issue_create,
         )
         .operation(
-            write_op(
+            write_op_typed::<IssueEditInput>(
                 "jira.issue.edit",
-                "Edit a Jira issue's structured fields and Markdown, including reparenting via parent_key.",
-                json!({"type": "object", "properties": {
-                    "key": {"type": "string", "description": "issue key (e.g. PROJ-123)"},
-                    "summary": {"type": "string"},
-                    "description_markdown": {"type": "string", "description": "description as Markdown (converted to Jira ADF)"},
-                    "labels": {"type": "array", "items": {"type": "string"}},
-                    "assignee_account_id": {"type": "string"},
-                    "priority": {"type": "string"},
-                    "parent_key": {"type": "string", "description": "parent issue key to reparent under"}
-                }, "required": ["key"]}),
+                "Edit a Jira issue's structured fields and Markdown, including reparenting via parent_key. \
+                 Raw `fields` and `update` maps are passed through; typed inputs override matching raw fields.",
             ),
             issue_edit,
         )
         .operation(
-            write_op(
+            write_op_typed::<IssueDeleteInput>(
                 "jira.issue.delete",
                 "Delete a Jira issue.",
-                json!({"type": "object", "properties": {
-                    "key": {"type": "string", "description": "issue key (e.g. PROJ-123)"},
-                    "delete_subtasks": {"type": "boolean", "description": "also delete subtasks"}
-                }, "required": ["key"]}),
             ),
             issue_delete,
         )
         .operation(
-            read_op(
+            read_op_typed::<IssueSearchInput>(
                 "jira.issue.search",
                 "Search issues with a JQL query (or project/status/query filters).",
-                json!({"type": "object", "properties": {
-                    "jql": {"type": "string", "description": "JQL query"},
-                    "project": {"type": "string", "description": "project key filter"},
-                    "status": {"type": "string", "description": "status filter"},
-                    "query": {"type": "string", "description": "free-text filter (JQL `text ~`)"},
-                    "order_by": {"type": "string", "description": "JQL order-by expression (default `updated DESC`)"},
-                    "max": {"type": "integer", "description": "max results (default 25, cap 100)"}
-                }}),
             ),
             issue_search,
         )
         .operation(
-            read_op(
+            read_op_typed::<IssueShowInput>(
                 "jira.issue.show",
                 "Show one issue by key (e.g. PROJ-123).",
-                key_schema(),
             ),
             issue_show,
         )
         .operation(
-            read_op(
+            read_op_typed::<IssueCreateMetaInput>(
                 "jira.issue.create_meta",
                 "Show Jira issue create metadata (settable fields per project/issue type).",
-                json!({"type": "object", "properties": {
-                    "project_key": {"type": "string", "description": "project key filter"},
-                    "issue_type": {"type": "string", "description": "issue type name filter"}
-                }}),
             ),
             create_meta,
         )
         .operation(
-            read_op(
+            read_op_typed::<IssueEditMetaInput>(
                 "jira.issue.edit_meta",
                 "Show Jira issue edit metadata (settable fields for one issue).",
-                key_schema(),
             ),
             edit_meta,
         )
         // --- transitions --------------------------------------------------------------------------
         .operation(
-            read_op(
+            read_op_typed::<IssueTransitionListInput>(
                 "jira.issue.transition.list",
                 "Show a Jira issue's current status and currently available transitions.",
-                key_schema(),
             ),
             transition_list,
         )
         .operation(
-            write_op(
+            write_op_typed::<IssueTransitionRunInput>(
                 "jira.issue.transition.run",
                 "Run a Jira issue transition. Provide exactly one of transition_id, transition_name, or \
                  target_status. With auto_transition, walks intermediate transitions until target_status.",
-                json!({"type": "object", "properties": {
-                    "key": {"type": "string", "description": "issue key (e.g. PROJ-123)"},
-                    "transition_id": {"type": "string"},
-                    "transition_name": {"type": "string"},
-                    "target_status": {"type": "string", "description": "desired status name or ID"},
-                    "auto_transition": {"type": "boolean", "description": "take intermediate transitions to reach target_status"},
-                    "max_steps": {"type": "integer", "description": "max transitions for auto_transition (default 5, max 20)"}
-                }, "required": ["key"]}),
             ),
             transition_run,
         )
         // --- comments -----------------------------------------------------------------------------
         .operation(
-            write_op(
+            write_op_typed::<CommentAddInput>(
                 "jira.issue.comment.add",
                 "Add a Markdown comment to a Jira issue.",
-                json!({"type": "object", "properties": {
-                    "key": {"type": "string", "description": "issue key (e.g. PROJ-123)"},
-                    "body_markdown": {"type": "string", "description": "comment body as Markdown (converted to Jira ADF)"}
-                }, "required": ["key", "body_markdown"]}),
             ),
             comment_add,
         )
         .operation(
-            write_op(
+            write_op_typed::<CommentEditInput>(
                 "jira.issue.comment.edit",
                 "Edit a Jira issue comment with Markdown.",
-                json!({"type": "object", "properties": {
-                    "key": {"type": "string", "description": "issue key (e.g. PROJ-123)"},
-                    "comment_id": {"type": "string"},
-                    "body_markdown": {"type": "string", "description": "comment body as Markdown (converted to Jira ADF)"}
-                }, "required": ["key", "comment_id", "body_markdown"]}),
             ),
             comment_edit,
         )
         .operation(
-            write_op(
+            write_op_typed::<CommentDeleteInput>(
                 "jira.issue.comment.delete",
                 "Delete a Jira issue comment.",
-                json!({"type": "object", "properties": {
-                    "key": {"type": "string", "description": "issue key (e.g. PROJ-123)"},
-                    "comment_id": {"type": "string"}
-                }, "required": ["key", "comment_id"]}),
             ),
             comment_delete,
         )
         .operation(
-            read_op(
+            read_op_typed::<CommentListInput>(
                 "jira.issue.comment.list",
-                "List comments on a Jira issue.",
-                json!({"type": "object", "properties": {
-                    "key": {"type": "string", "description": "issue key (e.g. PROJ-123)"},
-                    "limit": {"type": "integer", "description": "max comments (default 20, cap 100)"},
-                    "start_at": {"type": "integer", "description": "zero-based pagination offset"},
-                    "order": {"type": "string", "description": "created (oldest first) or -created (newest first)"}
-                }, "required": ["key"]}),
+                "List comments on a Jira issue as Markdown, with raw ADF available via body_format.",
             ),
             comment_list,
         )
         // --- attachments (blob, byte-exact via http_bytes) ----------------------------------------
         .operation(
-            write_op(
+            write_op_typed::<AttachmentAddInput>(
                 "jira.issue.attachment.add",
-                "Upload an attachment to a Jira issue from a host blob ref.",
-                json!({"type": "object", "properties": {
-                    "key": {"type": "string", "description": "issue key (e.g. PROJ-123)"},
-                    "blob_ref": {"type": "string", "description": "host blob ref to upload"},
-                    "filename": {"type": "string", "description": "filename shown in Jira"},
-                    "content_type": {"type": "string", "description": "attachment MIME type"}
-                }, "required": ["key", "blob_ref"]}),
+                "Upload an attachment to a Jira issue. Provide exactly one of blob_ref or content_bytes.",
             ),
             attachment_add,
         )
         .operation(
-            read_op(
+            read_op_typed::<AttachmentGetInput>(
                 "jira.issue.attachment.get",
                 "Download a Jira attachment into the host blob store and return its ref.",
-                json!({"type": "object", "properties": {
-                    "attachment_id": {"type": "string"},
-                    "filename": {"type": "string", "description": "optional filename metadata"},
-                    "mime_type": {"type": "string", "description": "optional MIME type metadata"}
-                }, "required": ["attachment_id"]}),
             ),
             attachment_get,
         )
         .operation(
-            read_op(
+            read_op_typed::<AttachmentListInput>(
                 "jira.issue.attachment.list",
                 "List a Jira issue's attachments.",
-                key_schema(),
             ),
             attachment_list,
         )
         .operation(
-            write_op(
+            write_op_typed::<AttachmentDeleteInput>(
                 "jira.issue.attachment.delete",
                 "Delete a Jira issue attachment.",
-                json!({"type": "object", "properties": {
-                    "attachment_id": {"type": "string"}
-                }, "required": ["attachment_id"]}),
             ),
             attachment_delete,
         )
         // --- links + users ------------------------------------------------------------------------
         .operation(
-            write_op(
+            write_op_typed::<IssueLinkAddInput>(
                 "jira.issue.link.add",
                 "Link two Jira issues (key <type-verb> to_key, e.g. DEV-1 blocks DEV-2 with type Blocks). \
                  Returns the issue's links read back from Jira so the new link is verified.",
-                json!({"type": "object", "properties": {
-                    "key": {"type": "string", "description": "issue key on the verb side (the blocker in Blocks)"},
-                    "to_key": {"type": "string", "description": "issue key the verb points at (the blocked issue)"},
-                    "type": {"type": "string", "description": "link type name such as Blocks or Relates"}
-                }, "required": ["key", "to_key", "type"]}),
             ),
             issue_link_add,
         )
         .operation(
-            read_op(
+            read_op_typed::<UserSearchInput>(
                 "jira.user.search",
                 "Search Jira users.",
-                json!({"type": "object", "properties": {
-                    "query": {"type": "string", "description": "user search query"},
-                    "limit": {"type": "integer", "description": "max users (default 20, cap 100)"}
-                }}),
             ),
             user_search,
         )
@@ -350,12 +622,6 @@ fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
         capabilities: vec!["search".into(), "get".into(), "index".into()],
         entity_schema: None,
     }
-}
-
-fn key_schema() -> Value {
-    json!({"type": "object", "properties": {
-        "key": {"type": "string", "description": "issue key (e.g. PROJ-123)"}
-    }, "required": ["key"]})
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -534,6 +800,11 @@ fn jsend_noresp(
 
 fn opt_str<'a>(input: &'a Value, key: &str) -> &'a str {
     input.get(key).and_then(|v| v.as_str()).unwrap_or("")
+}
+
+/// Raw JSON object from `key`, if it is an object.
+fn raw_obj(input: &Value, key: &str) -> Option<Map<String, Value>> {
+    input.get(key).and_then(|v| v.as_object()).cloned()
 }
 
 /// The issue key from `key` / `id` / `issue_key` (in order), trimmed.
@@ -1056,6 +1327,240 @@ fn parse_link(chars: &[char], i: usize) -> Option<(String, String, usize)> {
 }
 
 // ---------------------------------------------------------------------------------------------------
+// ADF → Markdown rendering (for body_format parity)
+// ---------------------------------------------------------------------------------------------------
+
+/// Render an issue's description according to `body_format`.
+fn render_issue_body_format(issue: &mut Value, format: BodyFormat) {
+    if format == BodyFormat::Adf {
+        return;
+    }
+    if let Some(fields) = issue.get_mut("fields") {
+        let description = fields.get("description").cloned().unwrap_or(Value::Null);
+        let rendered = render_body_format(&description, format);
+        if let Some(obj) = fields.as_object_mut() {
+            if format == BodyFormat::Both {
+                obj.insert("description_adf".into(), description);
+            }
+            obj.insert("description".into(), rendered);
+        }
+    }
+}
+
+/// Render a comment's body according to `body_format`.
+fn render_comment_body_format(comment: &mut Value, format: BodyFormat) {
+    if format == BodyFormat::Adf {
+        return;
+    }
+    let body = comment.get("body").cloned().unwrap_or(Value::Null);
+    let rendered = render_body_format(&body, format);
+    if let Some(obj) = comment.as_object_mut() {
+        if format == BodyFormat::Both {
+            obj.insert("body_adf".into(), body);
+        }
+        obj.insert("body".into(), rendered);
+    }
+}
+
+/// Render a single rich-text body value to Markdown (or return it as-is when already a string).
+fn render_body_format(body: &Value, format: BodyFormat) -> Value {
+    match format {
+        BodyFormat::Adf => body.clone(),
+        BodyFormat::Markdown | BodyFormat::Both => {
+            if let Some(s) = body.as_str() {
+                return Value::String(s.to_string());
+            }
+            let doc = body.as_object();
+            if doc.and_then(|o| o.get("type")).and_then(|v| v.as_str()) == Some("doc") {
+                if let Some(content) = doc.unwrap().get("content").and_then(|v| v.as_array()) {
+                    return Value::String(adf_doc_to_markdown(content).trim().to_string());
+                }
+            }
+            body.clone()
+        }
+    }
+}
+
+fn adf_doc_to_markdown(content: &[Value]) -> String {
+    let parts: Vec<String> = content
+        .iter()
+        .map(|b| adf_block_to_markdown(b, "", None))
+        .filter(|s| !s.is_empty())
+        .collect();
+    parts.join("\n\n")
+}
+
+fn adf_block_to_markdown(block: &Value, indent: &str, list_prefix: Option<&str>) -> String {
+    let typ = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let content = block.get("content").and_then(|v| v.as_array());
+    match typ {
+        "paragraph" => {
+            let text =
+                adf_inline_nodes_to_markdown(content.map_or(&[] as &[Value], |v| v.as_slice()));
+            if text.is_empty() {
+                String::new()
+            } else {
+                prefix_first_line(&text, list_prefix, indent)
+            }
+        }
+        "heading" => {
+            let level = block
+                .get("attrs")
+                .and_then(|a| a.get("level"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as usize;
+            let level = level.clamp(1, 6);
+            let text =
+                adf_inline_nodes_to_markdown(content.map_or(&[] as &[Value], |v| v.as_slice()));
+            let line = format!("{} {}", "#".repeat(level), text);
+            prefix_first_line(&line, list_prefix, indent)
+        }
+        "codeBlock" => {
+            let lang = block
+                .get("attrs")
+                .and_then(|a| a.get("language"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let code: String = content
+                .map_or(&[] as &[Value], |v| v.as_slice())
+                .iter()
+                .filter_map(|n| n.get("text").and_then(|v| v.as_str()))
+                .collect();
+            let fenced = format!("```{lang}\n{code}\n```");
+            prefix_first_line(&fenced, list_prefix, indent)
+        }
+        "blockquote" => {
+            let inner = adf_doc_to_markdown(content.map_or(&[] as &[Value], |v| v.as_slice()));
+            let mut out = String::new();
+            for line in inner.lines() {
+                out.push_str(indent);
+                out.push_str("> ");
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.trim_end().to_string()
+        }
+        "bulletList" => {
+            let items = content.map_or(&[] as &[Value], |v| v.as_slice());
+            let item_indent = format!("{indent}  ");
+            items
+                .iter()
+                .map(|item| adf_block_to_markdown(item, &item_indent, Some("-")))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        "orderedList" => {
+            let items = content.map_or(&[] as &[Value], |v| v.as_slice());
+            let item_indent = format!("{indent}  ");
+            items
+                .iter()
+                .enumerate()
+                .map(|(idx, item)| {
+                    adf_block_to_markdown(item, &item_indent, Some(&format!("{}.", idx + 1)))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        "listItem" => {
+            let parts: Vec<String> = content
+                .map_or(&[] as &[Value], |v| v.as_slice())
+                .iter()
+                .enumerate()
+                .map(|(idx, b)| {
+                    if idx == 0 {
+                        adf_block_to_markdown(b, indent, list_prefix)
+                    } else {
+                        adf_block_to_markdown(b, indent, None)
+                    }
+                })
+                .filter(|s| !s.is_empty())
+                .collect();
+            parts.join("\n")
+        }
+        "rule" => prefix_first_line("---", list_prefix, indent),
+        _ => String::new(),
+    }
+}
+
+fn prefix_first_line(text: &str, prefix: Option<&str>, indent: &str) -> String {
+    let mut lines = text.lines();
+    let first = lines.next().unwrap_or("");
+    let mut out = if let Some(p) = prefix {
+        format!("{indent}{p} {first}")
+    } else {
+        format!("{indent}{first}")
+    };
+    for line in lines {
+        out.push('\n');
+        out.push_str(indent);
+        out.push_str("  ");
+        out.push_str(line);
+    }
+    out
+}
+
+fn adf_inline_nodes_to_markdown(nodes: &[Value]) -> String {
+    nodes.iter().map(adf_inline_to_markdown).collect()
+}
+
+fn adf_inline_to_markdown(node: &Value) -> String {
+    let typ = node.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match typ {
+        "text" => {
+            let text = node.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let marks = node
+                .get("marks")
+                .and_then(|v| v.as_array())
+                .map_or(&[] as &[Value], |v| v.as_slice());
+            apply_adf_marks(text, marks)
+        }
+        "hardBreak" => "\n".to_string(),
+        _ => String::new(),
+    }
+}
+
+fn apply_adf_marks(text: &str, marks: &[Value]) -> String {
+    if let Some(link) = marks
+        .iter()
+        .find(|m| m.get("type").and_then(|v| v.as_str()) == Some("link"))
+    {
+        let href = link
+            .get("attrs")
+            .and_then(|a| a.get("href"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        return format!("[{text}]({href})");
+    }
+    let mut has_code = false;
+    let mut has_strong = false;
+    let mut has_em = false;
+    let mut has_strike = false;
+    for m in marks {
+        match m.get("type").and_then(|v| v.as_str()) {
+            Some("code") => has_code = true,
+            Some("strong") => has_strong = true,
+            Some("em") => has_em = true,
+            Some("strike") => has_strike = true,
+            _ => {}
+        }
+    }
+    if has_code {
+        return format!("`{text}`");
+    }
+    let mut out = text.to_string();
+    if has_strike {
+        out = format!("~~{out}~~");
+    }
+    if has_strong {
+        out = format!("**{out}**");
+    }
+    if has_em {
+        out = format!("*{out}*");
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------------------------------
 // Datasource contribution
 // ---------------------------------------------------------------------------------------------------
 
@@ -1180,7 +1685,7 @@ fn issue_create(input: Value, host: &mut Host) -> Result<Value, String> {
     if project.is_empty() || issue_type.is_empty() || summary.is_empty() {
         return Err("project_key (or project), issue_type, and summary are required".into());
     }
-    let mut fields = Map::new();
+    let mut fields = raw_obj(&input, "fields").unwrap_or_default();
     fields.insert("project".into(), json!({"key": project}));
     fields.insert("issuetype".into(), json!({"name": issue_type}));
     fields.insert("summary".into(), json!(summary));
@@ -1193,7 +1698,13 @@ fn issue_create(input: Value, host: &mut Host) -> Result<Value, String> {
     if !parent.is_empty() {
         fields.insert("parent".into(), json!({"key": parent}));
     }
-    let resp = jsend(host, "POST", "/issue", &json!({"fields": fields}))?;
+    let update = raw_obj(&input, "update").unwrap_or_default();
+    let mut body = Map::new();
+    body.insert("fields".into(), Value::Object(fields));
+    if !update.is_empty() {
+        body.insert("update".into(), Value::Object(update));
+    }
+    let resp = jsend(host, "POST", "/issue", &Value::Object(body))?;
     Ok(json!({
         "ok": true,
         "id": resp.get("id").cloned().unwrap_or(Value::Null),
@@ -1204,7 +1715,7 @@ fn issue_create(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn issue_edit(input: Value, host: &mut Host) -> Result<Value, String> {
     let key = issue_key(&input)?;
-    let mut fields = Map::new();
+    let mut fields = raw_obj(&input, "fields").unwrap_or_default();
     let summary = opt_str(&input, "summary").trim();
     if !summary.is_empty() {
         fields.insert("summary".into(), json!(summary));
@@ -1214,19 +1725,26 @@ fn issue_edit(input: Value, host: &mut Host) -> Result<Value, String> {
     if !parent.is_empty() {
         fields.insert("parent".into(), json!({"key": parent}));
     }
-    if fields.is_empty() {
-        return Err("at least one field to edit is required".into());
+    let update = raw_obj(&input, "update").unwrap_or_default();
+    if fields.is_empty() && update.is_empty() {
+        return Err("at least one field or update instruction is required".into());
+    }
+    let mut body = Map::new();
+    body.insert("fields".into(), Value::Object(fields));
+    if !update.is_empty() {
+        body.insert("update".into(), Value::Object(update));
     }
     jsend_noresp(
         host,
         "PUT",
         &format!("/issue/{}", urlencode(&key)),
-        Some(&json!({"fields": fields})),
+        Some(&Value::Object(body)),
     )?;
-    let issue = jget(
+    let mut issue = jget(
         host,
         &format!("/issue/{}?fields={}", urlencode(&key), urlencode(FIELDS)),
     )?;
+    render_issue_body_format(&mut issue, body_format_from_input(&input));
     Ok(json!({"ok": true, "key": key, "issue": issue}))
 }
 
@@ -1247,24 +1765,45 @@ fn issue_delete(input: Value, host: &mut Host) -> Result<Value, String> {
 fn issue_search(input: Value, host: &mut Host) -> Result<Value, String> {
     let jql = build_jql(&input);
     let max = clamp_limit(&input, &["max", "limit"], 25, 100);
-    let result = jget(
+    let fields_param: Option<String> = input
+        .get("fields")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .filter(|s| !s.is_empty());
+    let fields_str = fields_param.as_deref().unwrap_or(FIELDS);
+    let mut result = jget(
         host,
         &format!(
             "/search/jql?jql={}&maxResults={max}&fields={}",
             urlencode(&jql),
-            urlencode(FIELDS)
+            urlencode(fields_str)
         ),
     )?;
+    let format = body_format_from_input(&input);
+    if let Some(issues) = result.get_mut("issues").and_then(|v| v.as_array_mut()) {
+        for issue in issues {
+            render_issue_body_format(issue, format);
+        }
+    }
     contribute_issues(host, &result);
     Ok(result)
 }
 
 fn issue_show(input: Value, host: &mut Host) -> Result<Value, String> {
     let key = issue_key(&input)?;
-    jget(
+    let mut issue = jget(
         host,
         &format!("/issue/{}?fields={}", urlencode(&key), urlencode(FIELDS)),
-    )
+    )?;
+    render_issue_body_format(&mut issue, body_format_from_input(&input));
+    Ok(issue)
 }
 
 fn create_meta(input: Value, host: &mut Host) -> Result<Value, String> {
@@ -1816,7 +2355,13 @@ fn comment_list(input: Value, host: &mut Host) -> Result<Value, String> {
     if !order.is_empty() {
         path.push_str(&format!("&orderBy={}", urlencode(order)));
     }
-    let page = jget(host, &path)?;
+    let format = body_format_from_input(&input);
+    let mut page = jget(host, &path)?;
+    if let Some(comments) = page.get_mut("comments").and_then(|v| v.as_array_mut()) {
+        for comment in comments {
+            render_comment_body_format(comment, format);
+        }
+    }
     let comments = page.get("comments").cloned().unwrap_or(json!([]));
     let count = comments.as_array().map(|a| a.len()).unwrap_or(0);
     Ok(json!({
@@ -1831,10 +2376,19 @@ fn comment_list(input: Value, host: &mut Host) -> Result<Value, String> {
 fn attachment_add(input: Value, host: &mut Host) -> Result<Value, String> {
     let key = issue_key(&input)?;
     let blob_ref = opt_str(&input, "blob_ref").trim();
-    if blob_ref.is_empty() {
-        return Err("`blob_ref` (host blob ref) required".into());
+    let content_bytes_b64 = opt_str(&input, "content_bytes").trim();
+    let has_blob = !blob_ref.is_empty();
+    let has_bytes = !content_bytes_b64.is_empty();
+    if has_blob == has_bytes {
+        return Err("provide exactly one of blob_ref or content_bytes".into());
     }
-    let bytes = host.blob_get(blob_ref)?;
+    let bytes = if has_blob {
+        host.blob_get(blob_ref)?
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(content_bytes_b64)
+            .map_err(|e| format!("content_bytes is not valid base64: {e}"))?
+    };
     let filename = {
         let f = opt_str(&input, "filename").trim();
         if f.is_empty() {
@@ -2512,5 +3066,642 @@ mod tests {
         assert!(m.capabilities.blob);
         assert!(m.datasources.iter().any(|d| d.entity == "jira.issue"));
         assert!(m.datasources.iter().any(|d| d.entity == "jira.user"));
+    }
+
+    // ---------------------------------------------------------------------------
+    // D-36 parity gap tests (failing-first on the pre-port tree)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn issue_show_renders_description_adf_to_markdown() {
+        let plugin = manifest_builder().build();
+        let description = markdown_to_adf("Hello **world**");
+        let mut host = host().with_http(
+            "/rest/api/3/issue/PROJ-1",
+            json!({
+                "key": "PROJ-1",
+                "fields": {
+                    "summary": "ADF test",
+                    "description": description
+                }
+            }),
+        );
+        let out = plugin
+            .call("jira.issue.show", json!({"key": "PROJ-1"}), &mut host)
+            .unwrap();
+        assert_eq!(out["fields"]["description"], "Hello **world**");
+    }
+
+    #[test]
+    fn issue_search_renders_each_issue_description() {
+        let plugin = manifest_builder().build();
+        let description = markdown_to_adf("A *list*:\n\n- one\n- two");
+        let mut host = host().with_http(
+            "/rest/api/3/search/jql",
+            json!({
+                "issues": [
+                    {"key": "PROJ-1", "fields": {"summary": "S", "description": description}}
+                ]
+            }),
+        );
+        let out = plugin
+            .call(
+                "jira.issue.search",
+                json!({"jql": "project = PROJ"}),
+                &mut host,
+            )
+            .unwrap();
+        let desc = out["issues"][0]["fields"]["description"].as_str().unwrap();
+        assert!(desc.contains("*list*"));
+        assert!(desc.contains("- one"));
+    }
+
+    #[test]
+    fn comment_list_renders_comment_bodies() {
+        let plugin = manifest_builder().build();
+        let body = markdown_to_adf("Check the `logs`");
+        let mut host = host().with_http(
+            "/rest/api/3/issue/PROJ-1/comment",
+            json!({
+                "comments": [{"id": "1001", "body": body}],
+                "total": 1,
+                "startAt": 0
+            }),
+        );
+        let out = plugin
+            .call(
+                "jira.issue.comment.list",
+                json!({"key": "PROJ-1"}),
+                &mut host,
+            )
+            .unwrap();
+        assert_eq!(out["comments"][0]["body"], "Check the `logs`");
+    }
+
+    #[test]
+    fn issue_show_returns_raw_adf_when_requested() {
+        let plugin = manifest_builder().build();
+        let adf = markdown_to_adf("Hello **world**");
+        let mut host = host().with_http(
+            "/rest/api/3/issue/PROJ-1",
+            json!({
+                "key": "PROJ-1",
+                "fields": {"summary": "ADF test", "description": adf.clone()}
+            }),
+        );
+        let out = plugin
+            .call(
+                "jira.issue.show",
+                json!({"key": "PROJ-1", "body_format": "adf"}),
+                &mut host,
+            )
+            .unwrap();
+        assert_eq!(out["fields"]["description"]["type"], "doc");
+    }
+
+    #[test]
+    fn attachment_add_accepts_inline_content_bytes() {
+        let plugin = manifest_builder().build();
+        let bytes = b"hello from base64";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let mut host = host().with_http(
+            "/rest/api/3/issue/PROJ-1/attachments",
+            json!([{"id": "20001", "filename": "report.txt"}]),
+        );
+        let out = plugin
+            .call(
+                "jira.issue.attachment.add",
+                json!({
+                    "key": "PROJ-1",
+                    "content_bytes": b64,
+                    "filename": "report.txt",
+                    "content_type": "text/plain"
+                }),
+                &mut host,
+            )
+            .unwrap();
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["attachments"][0]["id"], "20001");
+    }
+
+    #[test]
+    fn attachment_add_rejects_both_blob_ref_and_content_bytes() {
+        let plugin = manifest_builder().build();
+        let mut host = host().with_http(
+            "/rest/api/3/issue/PROJ-1/attachments",
+            json!([{"id": "20001"}]),
+        );
+        host.blobs
+            .borrow_mut()
+            .insert("blob-1".into(), ("x.bin".into(), vec![1, 2, 3]));
+        let err = plugin
+            .call(
+                "jira.issue.attachment.add",
+                json!({
+                    "key": "PROJ-1",
+                    "blob_ref": "blob-1",
+                    "content_bytes": "aGVsbG8="
+                }),
+                &mut host,
+            )
+            .unwrap_err();
+        assert!(err.contains("exactly one of blob_ref or content_bytes"));
+    }
+
+    #[test]
+    fn issue_edit_accepts_update_only() {
+        let plugin = manifest_builder().build();
+        let mut host = host().with_http(
+            "/rest/api/3/issue/PROJ-1",
+            json!({"key": "PROJ-1", "fields": {"summary": "Updated"}}),
+        );
+        let out = plugin
+            .call(
+                "jira.issue.edit",
+                json!({
+                    "key": "PROJ-1",
+                    "update": {"summary": [{"set": "Updated"}]}
+                }),
+                &mut host,
+            )
+            .unwrap();
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["key"], "PROJ-1");
+    }
+
+    #[test]
+    fn issue_create_accepts_raw_fields_and_update() {
+        let plugin = manifest_builder().build();
+        let mut host = host().with_http(
+            "/rest/api/3/issue",
+            json!({"id": "10001", "key": "PROJ-1", "self": "https://x/issue/10001"}),
+        );
+        let out = plugin
+            .call(
+                "jira.issue.create",
+                json!({
+                    "project_key": "DEV",
+                    "issue_type": "Task",
+                    "summary": "New",
+                    "fields": {"customfield_10001": "custom value"},
+                    "update": {"labels": [{"add": "triaged"}]}
+                }),
+                &mut host,
+            )
+            .unwrap();
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["key"], "PROJ-1");
+    }
+}
+
+#[cfg(test)]
+mod schema_contract {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Kind {
+        Str,
+        Int,
+        Bool,
+        ArrayStr,
+        ArrayAny,
+        Object,
+        Enum(Vec<String>),
+    }
+
+    #[derive(Clone)]
+    struct Prop {
+        name: &'static str,
+        kind: Kind,
+    }
+
+    struct OpContract {
+        props: Vec<Prop>,
+        required: Vec<&'static str>,
+    }
+
+    fn p(name: &'static str, kind: Kind) -> Prop {
+        Prop { name, kind }
+    }
+    fn c(props: Vec<Prop>, required: Vec<&'static str>) -> OpContract {
+        OpContract { props, required }
+    }
+
+    fn contracts() -> Vec<(&'static str, OpContract)> {
+        let key_aliases = || vec![p("id", Kind::Str), p("issue_key", Kind::Str)];
+        vec![
+            ("jira.test", c(vec![], vec![])),
+            (
+                "jira.index.build",
+                c(
+                    vec![
+                        p("issue_jql", Kind::Str),
+                        p("issue_query", Kind::Str),
+                        p("issue_limit", Kind::Int),
+                        p("project", Kind::Str),
+                        p("status", Kind::Str),
+                        p("user_query", Kind::Str),
+                        p("user_limit", Kind::Int),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "jira.issue.create",
+                c(
+                    vec![
+                        p("project_key", Kind::Str),
+                        p("project", Kind::Str),
+                        p("issue_type", Kind::Str),
+                        p("summary", Kind::Str),
+                        p("description_markdown", Kind::Str),
+                        p("labels", Kind::ArrayStr),
+                        p("assignee_account_id", Kind::Str),
+                        p("reporter_account_id", Kind::Str),
+                        p("priority", Kind::Str),
+                        p("parent_key", Kind::Str),
+                        p("fields", Kind::Object),
+                        p("update", Kind::Object),
+                    ],
+                    vec!["project_key", "issue_type", "summary"],
+                ),
+            ),
+            (
+                "jira.issue.edit",
+                c(
+                    {
+                        let mut v = key_aliases();
+                        v.extend_from_slice(&[
+                            p("key", Kind::Str),
+                            p("summary", Kind::Str),
+                            p("description_markdown", Kind::Str),
+                            p("labels", Kind::ArrayStr),
+                            p("assignee_account_id", Kind::Str),
+                            p("priority", Kind::Str),
+                            p("parent_key", Kind::Str),
+                            p("fields", Kind::Object),
+                            p("update", Kind::Object),
+                        ]);
+                        v
+                    },
+                    vec!["key"],
+                ),
+            ),
+            (
+                "jira.issue.delete",
+                c(
+                    vec![
+                        p("key", Kind::Str),
+                        p("id", Kind::Str),
+                        p("delete_subtasks", Kind::Bool),
+                    ],
+                    vec!["key"],
+                ),
+            ),
+            (
+                "jira.issue.search",
+                c(
+                    vec![
+                        p("jql", Kind::Str),
+                        p("project", Kind::Str),
+                        p("status", Kind::Str),
+                        p("query", Kind::Str),
+                        p("order_by", Kind::Str),
+                        p("max", Kind::Int),
+                        p("fields", Kind::ArrayStr),
+                        p(
+                            "body_format",
+                            Kind::Enum(vec!["markdown".into(), "adf".into(), "both".into()]),
+                        ),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "jira.issue.show",
+                c(
+                    {
+                        let mut v = key_aliases();
+                        v.push(p("key", Kind::Str));
+                        v.push(p(
+                            "body_format",
+                            Kind::Enum(vec!["markdown".into(), "adf".into(), "both".into()]),
+                        ));
+                        v
+                    },
+                    vec!["key"],
+                ),
+            ),
+            (
+                "jira.issue.create_meta",
+                c(
+                    vec![p("project_key", Kind::Str), p("issue_type", Kind::Str)],
+                    vec![],
+                ),
+            ),
+            (
+                "jira.issue.edit_meta",
+                c(
+                    {
+                        let mut v = key_aliases();
+                        v.push(p("key", Kind::Str));
+                        v
+                    },
+                    vec!["key"],
+                ),
+            ),
+            (
+                "jira.issue.transition.list",
+                c(
+                    {
+                        let mut v = key_aliases();
+                        v.push(p("key", Kind::Str));
+                        v
+                    },
+                    vec!["key"],
+                ),
+            ),
+            (
+                "jira.issue.transition.run",
+                c(
+                    {
+                        let mut v = key_aliases();
+                        v.extend_from_slice(&[
+                            p("key", Kind::Str),
+                            p("transition_id", Kind::Str),
+                            p("transition_name", Kind::Str),
+                            p("target_status", Kind::Str),
+                            p("auto_transition", Kind::Bool),
+                            p("max_steps", Kind::Int),
+                        ]);
+                        v
+                    },
+                    vec!["key"],
+                ),
+            ),
+            (
+                "jira.issue.comment.add",
+                c(
+                    {
+                        let mut v = key_aliases();
+                        v.push(p("key", Kind::Str));
+                        v.push(p("body_markdown", Kind::Str));
+                        v
+                    },
+                    vec!["key", "body_markdown"],
+                ),
+            ),
+            (
+                "jira.issue.comment.edit",
+                c(
+                    {
+                        let mut v = key_aliases();
+                        v.extend_from_slice(&[
+                            p("key", Kind::Str),
+                            p("comment_id", Kind::Str),
+                            p("body_markdown", Kind::Str),
+                        ]);
+                        v
+                    },
+                    vec!["key", "comment_id", "body_markdown"],
+                ),
+            ),
+            (
+                "jira.issue.comment.delete",
+                c(
+                    {
+                        let mut v = key_aliases();
+                        v.extend_from_slice(&[p("key", Kind::Str), p("comment_id", Kind::Str)]);
+                        v
+                    },
+                    vec!["key", "comment_id"],
+                ),
+            ),
+            (
+                "jira.issue.comment.list",
+                c(
+                    {
+                        let mut v = key_aliases();
+                        v.extend_from_slice(&[
+                            p("key", Kind::Str),
+                            p("limit", Kind::Int),
+                            p("start_at", Kind::Int),
+                            p("order", Kind::Str),
+                            p(
+                                "body_format",
+                                Kind::Enum(vec!["markdown".into(), "adf".into(), "both".into()]),
+                            ),
+                        ]);
+                        v
+                    },
+                    vec!["key"],
+                ),
+            ),
+            (
+                "jira.issue.attachment.add",
+                c(
+                    {
+                        let mut v = key_aliases();
+                        v.extend_from_slice(&[
+                            p("key", Kind::Str),
+                            p("blob_ref", Kind::Str),
+                            p("content_bytes", Kind::Str),
+                            p("filename", Kind::Str),
+                            p("content_type", Kind::Str),
+                        ]);
+                        v
+                    },
+                    vec!["key"],
+                ),
+            ),
+            (
+                "jira.issue.attachment.list",
+                c(
+                    {
+                        let mut v = key_aliases();
+                        v.push(p("key", Kind::Str));
+                        v
+                    },
+                    vec!["key"],
+                ),
+            ),
+            (
+                "jira.issue.attachment.get",
+                c(
+                    vec![
+                        p("attachment_id", Kind::Str),
+                        p("filename", Kind::Str),
+                        p("mime_type", Kind::Str),
+                        p("blob_ref", Kind::Str),
+                    ],
+                    vec!["attachment_id"],
+                ),
+            ),
+            (
+                "jira.issue.attachment.delete",
+                c(vec![p("attachment_id", Kind::Str)], vec!["attachment_id"]),
+            ),
+            (
+                "jira.issue.link.add",
+                c(
+                    vec![
+                        p("key", Kind::Str),
+                        p("to_key", Kind::Str),
+                        p("type", Kind::Str),
+                    ],
+                    vec!["key", "to_key", "type"],
+                ),
+            ),
+            (
+                "jira.user.search",
+                c(vec![p("query", Kind::Str), p("limit", Kind::Int)], vec![]),
+            ),
+        ]
+    }
+
+    fn resolve<'a>(node: &'a Value, defs: &'a Value) -> &'a Value {
+        if let Some(obj) = node.as_object() {
+            if let Some(r) = obj.get("$ref").and_then(|v| v.as_str()) {
+                if let Some(name) = r.strip_prefix("#/definitions/") {
+                    return defs.get(name).unwrap_or(node);
+                }
+            }
+            if let Some(any) = obj.get("anyOf").and_then(|v| v.as_array()) {
+                for m in any {
+                    if m.get("type").and_then(|v| v.as_str()) != Some("null") {
+                        return resolve(m, defs);
+                    }
+                }
+            }
+        }
+        node
+    }
+
+    fn kind_of(node: &Value) -> Kind {
+        if let Some(one) = node.get("oneOf").and_then(|v| v.as_array()) {
+            let vals: Vec<String> = one
+                .iter()
+                .filter_map(|v| {
+                    if v.get("type").and_then(|t| t.as_str()) == Some("string") {
+                        v.get("enum")
+                            .and_then(|e| e.as_array())
+                            .and_then(|arr| arr.iter().next())
+                            .and_then(|x| x.as_str())
+                            .map(String::from)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !vals.is_empty() {
+                return Kind::Enum(vals);
+            }
+        }
+        let t = node.get("type");
+        if let Some(arr) = t.and_then(|v| v.as_array()) {
+            let first = arr
+                .iter()
+                .find(|v| v.as_str() != Some("null"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("null");
+            return base_kind(first, node);
+        }
+        base_kind(t.and_then(|v| v.as_str()).unwrap_or(""), node)
+    }
+
+    fn base_kind(t: &str, node: &Value) -> Kind {
+        match t {
+            "integer" => Kind::Int,
+            "boolean" => Kind::Bool,
+            "array" => {
+                let items = node.get("items").cloned().unwrap_or(Value::Null);
+                if items.get("type").and_then(|v| v.as_str()) == Some("string") {
+                    Kind::ArrayStr
+                } else {
+                    Kind::ArrayAny
+                }
+            }
+            "string" => {
+                if let Some(e) = node.get("enum").and_then(|v| v.as_array()) {
+                    let mut vals: Vec<String> = e
+                        .iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect();
+                    vals.sort();
+                    return Kind::Enum(vals);
+                }
+                Kind::Str
+            }
+            "object" | "" => Kind::Object,
+            other => panic!("unsupported property type: {other} ({node})"),
+        }
+    }
+
+    fn normalize_enum(kind: &Kind) -> Kind {
+        match kind {
+            Kind::Enum(vals) => {
+                let mut v = vals.clone();
+                v.sort();
+                Kind::Enum(v)
+            }
+            _ => kind.clone(),
+        }
+    }
+
+    fn assert_contract(op_name: &str, schema: &Value, contract: &OpContract) {
+        assert_eq!(schema["type"], "object", "{op_name}: root type");
+        let defs = schema.get("definitions").cloned().unwrap_or(json!({}));
+        let props_obj = schema.get("properties").and_then(|v| v.as_object());
+        let mut got: BTreeMap<&str, Kind> = BTreeMap::new();
+        if let Some(props) = props_obj {
+            for (k, v) in props {
+                got.insert(k.as_str(), kind_of(resolve(v, &defs)));
+            }
+        }
+        let want: BTreeMap<&str, Kind> = contract
+            .props
+            .iter()
+            .map(|Prop { name, kind }| (*name, kind.clone()))
+            .collect();
+        assert_eq!(got.len(), want.len(), "{op_name}: property count");
+        for Prop { name, kind } in &contract.props {
+            let got_kind = got
+                .get(*name)
+                .unwrap_or_else(|| panic!("{op_name}: missing property `{name}`"));
+            assert_eq!(
+                normalize_enum(got_kind),
+                normalize_enum(kind),
+                "{op_name}: property `{name}` kind"
+            );
+        }
+        let req: Vec<&str> = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let mut req_set: Vec<&str> = req.clone();
+        req_set.sort();
+        let mut want_req: Vec<&str> = contract.required.clone();
+        want_req.sort();
+        assert_eq!(req_set, want_req, "{op_name}: required set");
+    }
+
+    #[test]
+    fn derived_schemas_match_contract() {
+        let ops = contracts();
+        let manifest = manifest_builder().build().manifest();
+        let by_name: BTreeMap<&str, &OperationSpec> = manifest
+            .operations
+            .iter()
+            .map(|o| (o.name.as_str(), o))
+            .collect();
+        assert_eq!(by_name.len(), ops.len(), "op count changed");
+        for (name, contract) in &ops {
+            let spec = by_name
+                .get(*name)
+                .unwrap_or_else(|| panic!("missing op {name}"));
+            assert_contract(name, &spec.input_schema, contract);
+        }
     }
 }
