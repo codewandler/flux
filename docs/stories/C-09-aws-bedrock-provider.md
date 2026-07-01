@@ -42,6 +42,20 @@ a new-protocol story.
       shipped `flux-cli` enables it. Dev/prod auth + the feature flag are documented in README + CLI help.
 
 ## Progress
+- **C-09a (plugin protocol knobs) LANDED** — `commit ececbc6`. Two deny-by-default
+  L4 surfaces for the aws-bedrock plugin (C-09b) to resolve the AWS credential chain without an
+  `aws` CLI, each with failing-first tests:
+  - **`internal`/host-only op flag** (`OperationSpec::internal`): an op marked `internal: true` is
+    NOT advertised to the LLM (the aws-bedrock `auth` op returning raw keys is the canonical case —
+    the model must never call it). `visible_ops(manifest)` is the single filter `load_plugin_tools`
+    applies; host-kit gains `internal_op`/`internal_op_typed`. Defaults `false` (no behavior change
+    for existing manifests).
+  - **path-scoped deny-by-default `fs.read` capability** (`PluginCapabilities.fs: Vec<FsReadScope>`):
+    reads HOST files outside the workspace jail (`~/.aws/config` + `~/.aws/sso/cache`) — globs
+    (`/**` nested, `/*` children, exact), `~`→`$HOME`, `..` rejected, 256KB cap, `secret: true`
+    scopes Redactor-registered. Binary → `body_b64`, text → `body`.
+  - **Piece 3** (`aws-types::HttpClient`-over-`host.http.do`) is C-09b: `http.do` already carries the
+    buffered shape STS/SSO need, so the adapter is a plugin-side impl, not a new host knob.
 - **C-09c (L1 core) + C-09e (pricing + CLI routing) LANDED** — the non-colliding wave. `flux run -m aws`
   works end-to-end against the dev account (live-verified: `say ok`→"ok"; opus alias; a real read-file
   tool-use turn). SigV4 + codec + resolver + resolve_model + pricing + CLI routing all in.

@@ -17,6 +17,20 @@ All notable changes to this project are documented in this file. The format is b
   `--no-validate` skips coercion and passes args through as strings. Live-smoke-verified against
   a migrated plugin's schemars-derived schema. 7 flux-cli unit tests.
 
+- **Plugin protocol: host-only ops + path-scoped `fs.read` capability (C-09a).** Two
+  deny-by-default L4 surfaces for the `aws-bedrock` plugin (C-09b) to resolve the AWS credential
+  chain without an `aws` CLI. (1) `OperationSpec::internal` — an op marked `internal: true` is NOT
+  advertised to the LLM as a callable tool (the aws-bedrock `auth` op returning raw keys is the
+  canonical case; the model must never call it). It stays host-dispatchable via the shared
+  `PluginHost` handle; `visible_ops(manifest)` is the single projection filter. Defaults `false`
+  (no behavior change for existing manifests). host-kit gains `internal_op`/`internal_op_typed`.
+  (2) `PluginCapabilities.fs: Vec<FsReadScope>` — path-scoped deny-by-default reads of HOST files
+  outside the workspace jail (`~/.aws/config` + `~/.aws/sso/cache`): globs (`/**` nested, `/*`
+  children, exact), `~`→`$HOME`, `..` rejected, 256KB cap, `secret: true` scopes
+  Redactor-registered (the SSO refresh-token privilege boundary). Binary → `body_b64`, text →
+  `body`. Each ships with failing-first tests (internal op absent from the tool catalog; out-of-scope
+  `fs.read` denied; `..` rejected; secret scopes redactor-registered).
+
 - **AWS Bedrock LLM provider — L1 core + CLI routing (C-09, in-progress).** `flux run -m aws` now
   drives Bedrock-provisioned Claude through the same harness. The load-bearing reuse: Bedrock's
   `invoke-model` on an Anthropic model returns **native Anthropic Messages JSON** — the exact shape
