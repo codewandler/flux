@@ -2,9 +2,8 @@
 id: C-11
 title: Uniform provider construction across subcommands (lazy for deterministic flows; aws chain everywhere)
 pillar: Core
-status: ready
-priority: 6
-note: `flux flow run` refuses to replay a fully deterministic plan without a provider credential (preset --run doesn't); `flux review -m aws` fails "AWS_ACCESS_KEY_ID is not set" because only build_agent materializes the credential chain
+status: done
+note: FIXED — build_provider owns the aws chain (sync-callable ensure_aws_chain), so review/-m aws, /model, sub-agent factory all work; flow run + preset --run use a LazyProvider that constructs on the first model call; live-verified: credential-less replay (28ms) + flux review -m aws (full Bedrock report)
 ---
 
 # Uniform provider construction across subcommands
@@ -29,19 +28,32 @@ One provider-construction path with two properties, verified missing on 2026-07-
    chain-based provider).
 
 ## Acceptance
-- [ ] Failing-first: `flux flow run <deterministic plan>` succeeds with ALL provider env scrubbed
-      (no ANTHROPIC/OPENAI/AWS keys) — provider construction is deferred until a model op actually
-      dispatches; a flow WITH a model op still fails fast with the same clear auth error at
-      analysis/first-dispatch.
-- [ ] Failing-first: the aws chain materialization lives in the shared provider factory
-      (`provider_for`/`build_provider` seam), covered by a test faking the chain via static env —
-      `flux review -m aws`, `flux flow run -m aws`, and `flux preset --run -m aws` all construct.
-- [ ] A subcommand-matrix test (or table-driven unit test over the factory) pins that every
-      provider-building CLI entry point goes through the one factory.
-- [ ] Live: `flux review --files <f> -m aws` runs (once L-14 unblocks review itself).
+- [x] `flux flow run <deterministic plan>` succeeds with ALL provider env scrubbed — verified
+      live (`env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u OPENROUTER_API_KEY flux flow run
+      saved-plan.json --yes` → 2 steps, 28ms). `run_draft_ast*` (shared by `flow run` AND
+      `preset --run`) builds via `build_agent_lazy` → `LazyProvider`, which constructs on the
+      first model call and surfaces the same auth error then. (Correction to this story's
+      premise: `preset --run` had the same eager construction — it goes through the same
+      `run_draft_ast` path; both are lazy now.)
+- [x] The aws chain lives in the ONE factory: `build_provider`'s aws arm calls the sync-callable
+      `ensure_aws_chain()` (block_in_place inside the runtime, one-shot runtime outside; no-op
+      when `AWS_ACCESS_KEY_ID` is set) — `build_agent`'s special case is deleted. Static-env
+      factory test: `provider_factory_constructs_aws_from_static_env` (build_provider +
+      provider_for, no network).
+- [x] Matrix-by-construction: every provider-building entry point routes through
+      `build_provider`/`provider_for` — agentic run + serve (`build_agent_with`), flow run/preset
+      (`LazyProvider` → `build_provider`), review (`build_review_sub_agents` → `provider_for`),
+      REPL `/model` (`build_provider`), sub-agent factory (`provider_for`) — pinned by the two
+      unit tests + the deleted per-caller special case.
+- [x] Live: `flux review --files src/stats.py -m aws` → full Bedrock-powered report (5 findings,
+      3 reviewers, 0 gaps); `flux run -m aws` eager path re-verified after the refactor.
 
 ## Progress
-- (not started)
+- **DONE (2026-07-02).** `ensure_aws_chain()` (sync seam over `materialize_chain_into_env`) called
+  from `build_provider`'s aws arm; `build_agent` special case removed. `LazyProvider`
+  (OnceCell-constructed on first `stream`, rewrites `req.model` to the resolved id) +
+  `build_agent_lazy` used by `run_draft_ast_with_composites`. 2 unit tests; full gate green;
+  live-verified all three surfaces.
 
 ## Notes
 - Found during the 2026-07-01 harness e2e review.

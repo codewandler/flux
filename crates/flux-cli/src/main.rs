@@ -646,12 +646,14 @@ fn build_provider(spec: &str) -> Result<(NativeProvider, String, String)> {
             let ts = flux_credentials::codex_token_source().context("codex provider")?;
             flux_providers::codex::oauth(ts)
         }
-        // AWS Bedrock (Anthropic over SigV4), streaming via invoke-with-response-stream. Reads
-        // AWS_* env — the async `build_agent` path materializes the full credential chain (env →
-        // SSO → IRSA → EKS Pod Identity) into env first via `materialize_chain_into_env`, so this
-        // sync constructor works on every path (REPL /model, sub-agent factory, server).
-        // Bedrock bakes the model id into the credential (it's in the invoke URL), so resolve first.
+        // AWS Bedrock (Anthropic over SigV4), streaming via invoke-with-response-stream. The full
+        // credential chain (env → SSO → IRSA → EKS Pod Identity) is materialized into `AWS_*` env
+        // HERE, in the one factory — so every subcommand that builds a provider (`flux review`,
+        // `flow run`, `preset --run`, the REPL `/model` swap, the sub-agent factory) gets the
+        // chain, not just `build_agent` (C-11). Bedrock bakes the model id into the credential
+        // (it's in the invoke URL), so resolve after the chain sets the region.
         "aws" => {
+            ensure_aws_chain()?;
             let m = flux_providers::bedrock::resolve_model(&model);
             flux_providers::bedrock::bedrock_with_env(m).context("aws provider")?
         }
@@ -1100,6 +1102,31 @@ impl flux_capabilities::CrossPluginAudit for EventStoreCrossPluginAudit {
     }
 }
 
+/// Materialize the AWS credential chain into env from a **sync** context (C-11): `build_provider`
+/// must stay sync (the sub-agent `Spawner` closure demands it), but the chain resolution (SSO/IRSA
+/// HTTP) is async. Inside the CLI's multi-thread tokio runtime this hops through `block_in_place`;
+/// with no runtime (plain sync callers, tests) it spins a one-shot current-thread runtime. A no-op
+/// when `AWS_ACCESS_KEY_ID` is already set (static env / already materialized).
+fn ensure_aws_chain() -> Result<()> {
+    if std::env::var("AWS_ACCESS_KEY_ID")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(flux_providers::bedrock::materialize_chain_into_env())
+        })?,
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("aws chain: build runtime")?
+            .block_on(flux_providers::bedrock::materialize_chain_into_env())?,
+    }
+    Ok(())
+}
+
 /// Build a fresh boxed provider for a model spec (used by the sub-agent factory).
 fn provider_for(spec: &str) -> Result<Box<dyn Provider>> {
     if spec == "mock" || spec.starts_with("mock/") {
@@ -1111,6 +1138,55 @@ fn provider_for(spec: &str) -> Result<Box<dyn Provider>> {
         )
         })?;
         Ok(Box::new(native))
+    }
+}
+
+/// A provider constructed on FIRST use (C-11). The deterministic execution paths (`flux flow run`,
+/// `flux preset --run`) replay pre-authored plans that often contain no model op at all — demanding
+/// a credential up front broke credential-less replay (CI boxes re-running a saved plan). The
+/// construction error, when the flow DOES reach a model op, is the same one the eager path raises.
+struct LazyProvider {
+    spec: String,
+    /// The provider prefix of `spec`, for `Provider::name` (a `&str` getter needs owned storage).
+    display: String,
+    cell: tokio::sync::OnceCell<(Box<dyn Provider>, String)>,
+}
+
+impl LazyProvider {
+    fn new(spec: String) -> Self {
+        let display = spec.split('/').next().unwrap_or("model").to_string();
+        Self {
+            spec,
+            display,
+            cell: tokio::sync::OnceCell::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for LazyProvider {
+    fn name(&self) -> &str {
+        &self.display
+    }
+
+    async fn stream(
+        &self,
+        mut req: flux_provider::Request,
+    ) -> flux_core::Result<flux_provider::ChunkStream> {
+        let (provider, resolved_model) = self
+            .cell
+            .get_or_try_init(|| async {
+                let (native, _provider, model) = build_provider(&self.spec)
+                    .map_err(|e| flux_core::Error::Other(e.to_string()))?;
+                Ok::<_, flux_core::Error>((Box::new(native) as Box<dyn Provider>, model))
+            })
+            .await?;
+        // The engine carried the UNRESOLVED model spec (resolution normally happens at eager
+        // construction) — swap in the resolved id for the wire.
+        if req.model != *resolved_model {
+            req.model = resolved_model.clone();
+        }
+        provider.stream(req).await
     }
 }
 
@@ -1186,8 +1262,26 @@ fn load_roles(cwd: &std::path::Path) -> RoleRegistry {
 
 /// Agentic mode: run a tool-enabled, policy-gated, session-persisted turn.
 /// Build a tool-enabled agent (provider + safety envelope + session) for agentic mode / the REPL.
+/// Eager provider construction: an agentic turn always calls the model, so a credential problem
+/// should fail fast here. Deterministic execution paths use [`build_agent_lazy`].
 async fn build_agent(
     flags: &AgentFlags,
+) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
+    build_agent_with(flags, true).await
+}
+
+/// [`build_agent`] with a LAZY provider (C-11): `flux flow run` / `flux preset --run` replay
+/// pre-authored plans that may contain no model op — they must not demand a credential up front.
+/// The provider constructs on the first actual model call (same error, surfaced only if needed).
+async fn build_agent_lazy(
+    flags: &AgentFlags,
+) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
+    build_agent_with(flags, false).await
+}
+
+async fn build_agent_with(
+    flags: &AgentFlags,
+    eager_provider: bool,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
     // Guarded system rooted at the current directory; layered config loaded from it.
     let cwd = std::env::current_dir().context("current dir")?;
@@ -1208,16 +1302,22 @@ async fn build_agent(
                 "mock".to_string(),
                 "mock".to_string(),
             )
+        } else if !eager_provider {
+            // C-11 lazy: no credential read, no chain resolution, no model-id resolution — all of
+            // it happens inside `LazyProvider` on the first model call. The unresolved model part
+            // serves for display; `LazyProvider` swaps the resolved id onto the wire.
+            let display_model = model_spec
+                .split_once('/')
+                .map(|(_, m)| m.to_string())
+                .unwrap_or_else(|| model_spec.clone());
+            (
+                Box::new(LazyProvider::new(model_spec.clone())),
+                display_model,
+                model_spec.clone(),
+            )
         } else {
-            // AWS Bedrock: resolve the credential chain once here (async — SSO/IRSA need HTTP),
-            // materializing into `AWS_*` env so the sync `bedrock_with_env` (below + every other
-            // sync path: REPL `/model`, sub-agent factory, server) reads the resolved creds. The
-            // chain tries static env → SSO (`aws sso login`) → IRSA (k8s) → EKS Pod Identity — no
-            // `aws` CLI binary needed. (`build_provider` itself stays sync because the sub-agent
-            // `Spawner` closure is sync; this pre-resolution is the one async seam.)
-            if model_spec == "aws" || model_spec.starts_with("aws/") {
-                flux_providers::bedrock::materialize_chain_into_env().await?;
-            }
+            // The one provider factory (C-11): `build_provider` owns the whole construction,
+            // including the aws credential-chain materialization — no per-caller special cases.
             let (native, provider, m) = build_provider(&model_spec)?;
             // The canonical `provider/model` spec (resolved) — what cost/subscription detection
             // reads. The raw `model_spec` input may be a bare alias (`codex`, `sonnet`) that neither
@@ -1856,7 +1956,9 @@ pub(crate) async fn run_draft_ast_with_composites(
     ast: &flux_flow::ast::DraftAst,
     composites: &[flux_lang::program::CompositeOpDecl],
 ) -> Result<()> {
-    let (engine, session_id, _spec, _spawner) = build_agent(flags).await?;
+    // Lazy provider (C-11): a pre-authored flow is deterministic unless it actually reaches a
+    // model op — replaying one must not demand credentials.
+    let (engine, session_id, _spec, _spawner) = build_agent_lazy(flags).await?;
     eprintln!(
         "{}",
         style::dim(&format!("flow · {} · session {session_id}", engine.model))
@@ -5356,6 +5458,38 @@ mod tests {
         ReviewSeverity,
     };
     use serde_json::json;
+
+    /// C-11: every subcommand builds providers through the ONE factory (`build_provider` /
+    /// `provider_for`), and the factory owns the aws chain — with static env creds present the
+    /// chain no-ops (no network) and the `aws` provider constructs from any (sync) caller, which
+    /// is exactly the `flux review` sub-agent-factory path that used to fail
+    /// "AWS_ACCESS_KEY_ID is not set".
+    #[test]
+    fn provider_factory_constructs_aws_from_static_env() {
+        // Serialized implicitly: this is the only flux-cli test touching AWS_* env.
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIATEST");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret");
+        std::env::set_var("AWS_REGION", "us-east-1");
+        let (native, provider, model) =
+            super::build_provider("aws/sonnet").expect("factory constructs aws from static env");
+        assert_eq!(provider, "aws");
+        assert_eq!(model, "us.anthropic.claude-sonnet-4-6");
+        drop(native);
+        let boxed = super::provider_for("aws/sonnet").expect("sub-agent factory path too");
+        drop(boxed);
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+        std::env::remove_var("AWS_REGION");
+    }
+
+    /// C-11: the lazy provider used by deterministic execution paths (`flow run`, `preset --run`)
+    /// constructs WITHOUT touching any credential; its display name is the provider prefix.
+    #[test]
+    fn lazy_provider_constructs_without_credentials() {
+        use flux_provider::Provider as _;
+        let p = super::LazyProvider::new("anthropic/claude-sonnet-4-6".to_string());
+        assert_eq!(p.name(), "anthropic");
+    }
 
     /// `build_datasources` walks a `markdown` datasource's directory and ingests its docs into a shared
     /// backend; an unknown `kind` is a clean error.
