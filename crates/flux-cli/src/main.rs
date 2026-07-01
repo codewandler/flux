@@ -1887,10 +1887,13 @@ pub(crate) async fn run_draft_ast_with_composites(
     // shared so the outer flow and any inner `run_plan` stream live onto one surface, sub-steps interleaved.
     let shared: Arc<std::sync::Mutex<dyn AgentSink>> =
         Arc::new(std::sync::Mutex::new(CliSink::new(0)));
+    // `None` advertised set: this is the pre-authored `flow run` path, which is deliberately
+    // unrestricted by surfacing (the file names its ops explicitly; only model-emitted plans gate).
     engine.loop_host.set_turn(
         session_id.clone(),
         Some(engine.system_prompt.clone()),
         shared.clone(),
+        None,
     );
 
     let mut sink = flux_flow::loop_host::SharedSink::new(shared.clone());

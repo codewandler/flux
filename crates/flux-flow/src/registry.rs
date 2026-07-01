@@ -102,6 +102,30 @@ impl<'a> OpRegistry<'a> {
         signatures
     }
 
+    /// The ops a **model-emitted** plan names that are registered but not advertised this turn — the
+    /// enforcement side of evidence-gated surfacing (A-04). Advertisement alone doesn't stop a model
+    /// that *names* a hidden op (the planner prompt itself mentions `bash`), so the compiler rejects
+    /// plans calling these. Empty when the registry is unrestricted (`advertised: None` — the
+    /// pre-authored `flow run` / composite paths) or when every named op is surfaced. Unknown names
+    /// are not reported here — `analyze_flow`'s unknown-operation diagnostic owns those. Composites
+    /// are never hidden: they are user/agent-registered compositions of already-gated ops.
+    pub fn hidden_ops_in(&self, body: &[Node]) -> Vec<String> {
+        if self.advertised.is_none() {
+            return Vec::new();
+        }
+        let mut out: Vec<String> = Vec::new();
+        for_each_node(body, &mut |node| {
+            if let Node::Call { op, .. } = node {
+                let registered = self.tools.get(op).is_some();
+                let composite = self.composites.iter().any(|c| c.name == *op);
+                if registered && !composite && !self.is_advertised(op) && !out.contains(op) {
+                    out.push(op.clone());
+                }
+            }
+        });
+        out
+    }
+
     /// The signature of one operation, if registered. Not filtered by surfacing — resolution must
     /// succeed for any registered op a flow names.
     pub fn get(&self, name: &str) -> Option<OpSignature> {

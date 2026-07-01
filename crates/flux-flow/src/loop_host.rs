@@ -52,6 +52,10 @@ struct TurnCtx {
     session_id: String,
     base_system: Option<String>,
     sink: Arc<Mutex<dyn AgentSink>>,
+    /// This turn's evidence-gated advertised op set (A-04). `Some` ⇒ the planner catalog is
+    /// restricted to these names and a model-emitted plan naming a hidden op is rejected at
+    /// compile; `None` ⇒ unrestricted (tests / hosts that opt out of gating).
+    advertised: Option<std::collections::HashSet<String>>,
 }
 
 /// Retry-breaker thresholds. Without a guard the agent loop can replay a byte-identical failing (or
@@ -203,6 +207,7 @@ impl EngineLoopHost {
                     session_id,
                     base_system,
                     sink,
+                    advertised: None,
                 }),
                 guard: Mutex::new(LoopGuard::default()),
                 usage: Mutex::new(Usage::default()),
@@ -224,11 +229,13 @@ impl EngineLoopHost {
         session_id: String,
         base_system: Option<String>,
         sink: Arc<Mutex<dyn AgentSink>>,
+        advertised: Option<std::collections::HashSet<String>>,
     ) {
         *self.turn.lock().unwrap() = TurnCtx {
             session_id,
             base_system,
             sink,
+            advertised,
         };
         // Fresh turn → reset the retry-breaker so a prior turn's stall never bleeds in.
         *self.guard.lock().unwrap() = LoopGuard::default();
@@ -358,10 +365,15 @@ impl LoopHost for EngineLoopHost {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        // Snapshot the per-turn session + base system (drop the lock before the model call).
-        let (session_id, base_system) = {
+        // Snapshot the per-turn session + base system + advertised set (drop the lock before the
+        // model call).
+        let (session_id, base_system, advertised) = {
             let t = self.turn.lock().unwrap();
-            (t.session_id.clone(), t.base_system.clone())
+            (
+                t.session_id.clone(),
+                t.base_system.clone(),
+                t.advertised.clone(),
+            )
         };
         // Working conversation = persisted history + the loop-carried feedback (ephemeral). This is
         // engine.rs's `working` vector, relocated into the op so the loop itself stays in flux-lang.
@@ -377,8 +389,14 @@ impl LoopHost for EngineLoopHost {
         let executor = self.executor()?;
         self.composites
             .ensure_session_loaded(&self.store, &session_id)?;
-        let ops = OpRegistry::new(executor.registry())
+        // The evidence-gated catalog (A-04): the engine computes the turn's advertised set once
+        // (`surfaced_for_turn`) and every loop iteration plans against it — advertisement filters
+        // what the model sees, and `compile_turn` rejects a plan naming a hidden op.
+        let mut ops = OpRegistry::new(executor.registry())
             .with_owned_composites(self.composites.active_for_session(&session_id));
+        if let Some(advertised) = advertised {
+            ops = ops.with_advertised(advertised);
+        }
         let view = self.store.view(&session_id)?;
         let view_ref = (!view.symbols.is_empty()).then_some(&view);
         let provider = self.provider.lock().unwrap().clone();
@@ -879,6 +897,59 @@ mod tests {
             CompileOptions::default(),
         );
         host
+    }
+
+    /// A-04: the loop-host planner advertises only the turn's surfaced op set. Before the fix,
+    /// `plan` built an UNGATED `OpRegistry` — every registered op (incl. `bash` with the `shell`
+    /// group off) was rendered into the planner catalog every iteration.
+    #[tokio::test]
+    async fn plan_advertises_only_the_turn_surfaced_ops() {
+        let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(Recorder::default())));
+        let dir = std::env::temp_dir().join(format!("flux-loop-adv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let mut reg = ToolRegistry::new();
+        flux_tools::register_builtins(&mut reg); // includes `bash` (group: shell) and `read`
+        let executor = Executor::new(
+            reg,
+            PermissionManager::from_rules(&["plan".into(), "run_plan".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(system),
+        );
+        let provider = Arc::new(RecordingProvider {
+            responses: Mutex::new(VecDeque::from(vec![prose("nothing to do")])),
+            seen: Mutex::new(Vec::new()),
+            systems: Mutex::new(Vec::new()),
+        });
+        let store = Arc::new(FlowStore::in_memory().unwrap());
+        let (_executor, host) = EngineLoopHost::install(
+            executor,
+            provider.clone(),
+            "mock".into(),
+            None,
+            store,
+            Arc::new(DynamicComposites::default()),
+            "sess".into(),
+            shared.clone(),
+            CompileOptions::default(),
+        );
+        // The engine hands the turn's surfaced set to the host: everything except `bash`.
+        let advertised: std::collections::HashSet<String> = {
+            let ex = host.executor().unwrap();
+            let names = OpRegistry::new(ex.registry()).op_names();
+            names.into_iter().filter(|n| n != "bash").collect()
+        };
+        host.set_turn("sess".into(), None, shared, Some(advertised));
+
+        let out = host.plan(json!({ "feedback": "" })).await.unwrap();
+        assert_eq!(out["kind"], "chat");
+        let systems = provider.systems.lock().unwrap();
+        let sys = systems.first().expect("one planner call");
+        assert!(sys.contains("- read("), "surfaced ops stay in the catalog");
+        assert!(
+            !sys.contains("- bash("),
+            "a hidden op must not be advertised to the model"
+        );
     }
 
     /// Fix 2: an identical `run_plan` transcript repeating means the loop is not progressing. The

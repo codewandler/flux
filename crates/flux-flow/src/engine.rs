@@ -177,6 +177,10 @@ impl FlowEngine {
         // the planner's own instructions inside `compile_turn`.
         let base_system = self.base_system_with_skills(user_input, sink);
 
+        // Evidence-gated surfacing for this turn: probe the workspace signals once and hand the
+        // advertised op set to the loop host, so every planner iteration sees the gated catalog.
+        let advertised = self.surfaced_for_turn(sink);
+
         // Compact the persisted session if it has grown past the budget.
         self.maybe_compact(session_id, sink, cancel).await?;
 
@@ -187,8 +191,12 @@ impl FlowEngine {
         let channel: Arc<std::sync::Mutex<dyn AgentSink>> = Arc::new(std::sync::Mutex::new(
             crate::loop_host::ChannelSink::new(tx),
         ));
-        self.loop_host
-            .set_turn(session_id.to_string(), Some(base_system), channel.clone());
+        self.loop_host.set_turn(
+            session_id.to_string(),
+            Some(base_system),
+            channel.clone(),
+            Some(advertised),
+        );
         // Thread this turn's cancellation into the tool context so a spawning tool (`task`) can hand a
         // child token to its sub-agent — cancelling the parent turn then cancels the child.
         self.executor.context().set_cancel(cancel.clone());
@@ -429,31 +437,27 @@ impl FlowEngine {
         let composites = session_id
             .map(|sid| self.composites.active_for_session(sid))
             .unwrap_or_default();
-        if self.groups.is_empty() {
-            // Gating disabled: advertise everything EXCEPT the never-surfaced loop machinery (the
-            // `reflect` group — `plan`/`run_plan`). Those are registered for dispatch (the agent loop
-            // calls them) but must never enter the model-facing catalog. With a groups manifest,
-            // `advertised_op_names` already excludes `reflect`; this keeps that true for the
-            // gating-off agents (the SDK `Client`, sub-agents) that carry no manifest.
-            let advertised = reg
-                .specs()
-                .iter()
-                .filter(|s| s.group.as_deref() != Some(flux_runtime::REFLECT_GROUP))
-                .map(|s| s.name.clone())
-                .collect();
-            return OpRegistry::new(reg)
-                .with_owned_composites(composites)
-                .with_advertised(advertised);
+        let (advertised, active) = surfaced_op_names(reg, &self.groups, &self.cwd);
+        if let (Some(sink), Some(active)) = (sink, active.as_ref()) {
+            self.record_active_groups(active, sink);
         }
-        let signals = flux_runtime::detect_signals(&self.cwd);
-        let active = flux_evidence::resolve_active_groups(&self.groups, &signals);
-        if let Some(sink) = sink {
-            self.record_active_groups(&active, sink);
-        }
-        let advertised = flux_runtime::advertised_op_names(&reg.specs(), &self.groups, &active);
         OpRegistry::new(reg)
             .with_owned_composites(composites)
             .with_advertised(advertised)
+    }
+
+    /// This turn's advertised op-name set, computed once per turn and handed to the loop host so the
+    /// self-hosted loop's `plan` op advertises (and enforces) the SAME gated catalog as the preview
+    /// paths — before A-04 the loop built an ungated registry, so every op (incl. `bash`) was
+    /// advertised every turn and the opt-in `shell` group gated nothing. Records the `groups.active`
+    /// observation when gating is on.
+    fn surfaced_for_turn(&self, sink: &mut dyn AgentSink) -> std::collections::HashSet<String> {
+        let (advertised, active) =
+            surfaced_op_names(self.executor.registry(), &self.groups, &self.cwd);
+        if let Some(active) = active.as_ref() {
+            self.record_active_groups(active, sink);
+        }
+        advertised
     }
 
     /// Record (audit + surface) which evidence-gated groups are active this turn, so the user can see
@@ -765,6 +769,36 @@ pub enum LoopSource {
     Builtin,
     /// A workspace override read from this path (`.flux/agent-loop.flux`).
     Override(std::path::PathBuf),
+}
+
+/// The advertised op-name set for a turn, plus the active group set when gating is on (`None` when
+/// the manifest is empty = gating disabled). The ONE computation both catalog paths share — the
+/// engine's preview registries and the loop host's per-iteration planner — so they can't drift.
+///
+/// Gating disabled still excludes the never-surfaced loop machinery (the `reflect` group —
+/// `plan`/`run_plan`): those are registered for dispatch (the agent loop calls them) but must never
+/// enter the model-facing catalog. With a manifest, `advertised_op_names` already excludes them.
+pub(crate) fn surfaced_op_names(
+    reg: &flux_runtime::ToolRegistry,
+    groups: &[flux_evidence::ToolGroup],
+    cwd: &std::path::Path,
+) -> (
+    std::collections::HashSet<String>,
+    Option<std::collections::HashSet<String>>,
+) {
+    if groups.is_empty() {
+        let advertised = reg
+            .specs()
+            .iter()
+            .filter(|s| s.group.as_deref() != Some(flux_runtime::REFLECT_GROUP))
+            .map(|s| s.name.clone())
+            .collect();
+        return (advertised, None);
+    }
+    let signals = flux_runtime::detect_signals(cwd);
+    let active = flux_evidence::resolve_active_groups(groups, &signals);
+    let advertised = flux_runtime::advertised_op_names(&reg.specs(), groups, &active);
+    (advertised, Some(active))
 }
 
 /// The compiled-in default agent loop, as readable Flux-Lang text. This is the loop every turn runs

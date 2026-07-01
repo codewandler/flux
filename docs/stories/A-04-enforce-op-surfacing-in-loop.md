@@ -2,9 +2,8 @@
 id: A-04
 title: Enforce evidence-gated op surfacing in the self-hosted loop (bash escaped its opt-in)
 pillar: Agent
-status: ready
-priority: 1
-note: the loop-host planner builds an UNGATED OpRegistry — every op (incl. `bash`) is advertised every turn, and a model-named hidden op resolves + executes; README's "bash is opt-in" is currently false on the main path
+status: done
+note: FIXED — the engine computes the turn's surfaced set once (`surfaced_for_turn`) and hands it to the loop host; `compile_turn` rejects model-emitted plans naming hidden ops (unconditionally, even on the last repair step); pre-authored `flow run` stays unrestricted; live-verified (bash refused without opt-in, works with FLUX_ENABLE_BASH=1; catalog shrank 34.5k→32.5k ctx)
 ---
 
 # Enforce evidence-gated op surfacing in the self-hosted loop (bash escaped its opt-in)
@@ -28,23 +27,37 @@ consequences, both observed live (2026-07-01, scratch python repo, no `.flux/` c
    fixed prompt every planner call pays (see A-03).
 
 ## Acceptance
-- [ ] Failing-first: a `run_turn` through the self-hosted loop in a workspace with **no** shell
-      signal produces a planner catalog WITHOUT `bash` (assert on the ops the loop-host `plan` op
-      hands `compile_turn` — e.g. a test seam exposing the advertised set, or a mock provider that
-      records the system prompt and asserts `- bash(` is absent).
-- [ ] Failing-first: a **model-emitted** plan naming a grouped, non-surfaced op (e.g. `bash` with
-      shell off) is rejected at analysis with a clear diagnostic ("op `bash` is not enabled: opt in
-      via `enable_shell`…") and fed back to the model — it must NOT dispatch. Reuse the L-11
-      capability-scoping seam rather than a new mechanism.
-- [ ] Pre-authored flows (`flux flow run <file>`, composites, the agent-loop itself) still resolve
-      hidden-group ops — the enforcement applies to model-emitted plans only.
-- [ ] `groups.active` observation is recorded per loop iteration (it silently disappeared with the
-      cutover too — `record_active_groups` is only called from the preview path).
-- [ ] Live re-check: `flux run --yes "delete the file x.txt"` in a fresh scratch repo either uses a
-      dedicated op or reports that shell is disabled — `bash` does not execute.
+- [x] Failing-first: a `run_turn` through the self-hosted loop in a workspace with **no** shell
+      signal produces a planner catalog WITHOUT `bash`
+      (`loop_host::tests::plan_advertises_only_the_turn_surfaced_ops` — a recording provider
+      asserts `- bash(` is absent and `- read(` present).
+- [x] Failing-first: a **model-emitted** plan naming a grouped, non-surfaced op is rejected at
+      compile with a clear diagnostic and fed back for repair
+      (`compile::tests::hidden_op_plan_is_rejected_and_repaired`), and — beyond the original
+      criterion — rejected even on the FINAL repair step where ordinary diagnostics are tolerated
+      (`hidden_op_plan_is_rejected_even_on_the_final_repair_step`): safety can't depend on the
+      repair budget. Enforcement is `OpRegistry::hidden_ops_in` consulted by `compile_turn`
+      (the registry's existing advertised-set seam, not a new mechanism).
+- [x] Pre-authored flows stay unrestricted: `flow run` passes `advertised: None` explicitly, and
+      `hidden_ops_in` returns nothing for an unrestricted registry
+      (`hidden_ops_in_reports_only_registered_unadvertised_calls`); composites are never hidden.
+- [x] `groups.active` is recorded once per turn on the loop path (`surfaced_for_turn` →
+      `record_active_groups`), restoring the observation the cutover dropped. (Recorded per turn,
+      not per iteration — signals are probed per turn by design, matching the pre-cutover engine.)
+- [x] Live re-check: `flux run --yes -m aws "delete the file victim3.txt"` now reports shell is
+      disabled and suggests `FLUX_ENABLE_BASH=1` — `bash` did not execute; with
+      `FLUX_ENABLE_BASH=1` it is advertised and executes. Bonus: the gated catalog shrank the
+      fixed prompt (ctx 34.5k → 32.5k in the scratch repo).
 
 ## Progress
-- (not started)
+- **DONE (2026-07-02).** `engine.rs`: extracted the shared `surfaced_op_names` computation (one
+  source of truth for the preview registries AND the loop); `run_turn_cancellable` computes the
+  turn's advertised set once, records `groups.active`, and hands it to
+  `EngineLoopHost::set_turn(…, advertised)`. `loop_host.rs`: `TurnCtx.advertised` +
+  `plan()` applies `.with_advertised(…)`. `registry.rs`: `hidden_ops_in(&[Node]) -> Vec<String>`
+  (registered ∧ not composite ∧ not advertised). `compile.rs`: emit_plan branch rejects hidden-op
+  plans unconditionally with an actionable diagnostic. CLI `flow run` passes `None` (pre-authored
+  path unrestricted). 4 new tests; full gate green.
 
 ## Notes
 - Found during the 2026-07-01 harness e2e review. Root cause pinned: `loop_host.rs` `plan()`

@@ -320,6 +320,27 @@ pub async fn compile_turn(
                     let ast_val = input.get("ast").cloned().unwrap_or(input);
                     match serde_json::from_value::<DraftAst>(ast_val) {
                         Ok(ast) => {
+                            // Surfacing enforcement (A-04): a model-emitted plan may only call ops
+                            // advertised this turn. A registered-but-hidden op (e.g. `bash` with the
+                            // `shell` group off) is rejected unconditionally — including on the last
+                            // repair step, where ordinary diagnostics would be tolerated: a gated op
+                            // must never execute because the model ran out of repair budget.
+                            let hidden = ops.hidden_ops_in(&ast.body);
+                            if !hidden.is_empty() {
+                                results.push(ContentBlock::tool_result_text(
+                                    id,
+                                    format!(
+                                        "invalid plan: operation(s) `{}` exist but are not enabled \
+                                         in this workspace (their tool group is not active — e.g. \
+                                         `bash` requires `enable_shell = true` in .flux/config.toml \
+                                         or FLUX_ENABLE_BASH=1). Re-plan using only operations from \
+                                         the catalog, then call emit_plan again.",
+                                        hidden.join("`, `")
+                                    ),
+                                    true,
+                                ));
+                                continue;
+                            }
                             match analyze_flow(&ast, ops) {
                                 Ok(()) => {
                                     results.push(ContentBlock::tool_result_text(
@@ -951,6 +972,92 @@ mod tests {
         .unwrap();
         assert_eq!(out.attempts, 2);
         assert_eq!(out.ast.body.len(), 1);
+    }
+
+    // -- A-04: surfacing enforcement (hidden ops in model-emitted plans) -------------------------
+
+    /// The advertised set = everything except `bash` — the shape a turn has when the `shell` group
+    /// is off (its op registered for pre-authored flows, hidden from the model).
+    fn ops_without_bash(reg: &ToolRegistry) -> OpRegistry<'_> {
+        let advertised: std::collections::HashSet<String> = OpRegistry::new(reg)
+            .op_names()
+            .into_iter()
+            .filter(|n| n != "bash")
+            .collect();
+        OpRegistry::new(reg).with_advertised(advertised)
+    }
+
+    const BASH_AST: &str =
+        r#"{"ast":{"body":[{"kind":"call","op":"bash","args":[{"kind":"lit","value":"rm x"}]}]}}"#;
+
+    #[tokio::test]
+    async fn hidden_op_plan_is_rejected_and_repaired() {
+        // A model-emitted plan calling a registered-but-not-advertised op (`bash`, shell group off)
+        // is rejected with the "not enabled" diagnostic — it must never reach dispatch. The model
+        // then recovers with a plan using surfaced ops.
+        let reg = full_registry();
+        let ops = ops_without_bash(&reg);
+        let p = mock(vec![
+            tool_call("emit_plan", serde_json::from_str(BASH_AST).unwrap()),
+            tool_call("emit_plan", serde_json::from_str(VALID_AST).unwrap()),
+        ]);
+        let out = plan(
+            &p,
+            "mock",
+            "delete x",
+            &ops,
+            None,
+            None,
+            CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.attempts, 2, "the bash plan must cost a repair round");
+        assert_eq!(out.ast.body.len(), 1);
+        assert!(
+            matches!(&out.ast.body[0], crate::ast::Node::Call { op, .. } if op == "read"),
+            "the accepted plan is the repaired one"
+        );
+    }
+
+    #[tokio::test]
+    async fn hidden_op_plan_is_rejected_even_on_the_final_repair_step() {
+        // Ordinary diagnostics are tolerated on the last step ("accepted with diagnostics"); a
+        // hidden op must NOT be — safety can't depend on the repair budget running out.
+        let reg = full_registry();
+        let ops = ops_without_bash(&reg);
+        let p = mock(vec![tool_call(
+            "emit_plan",
+            serde_json::from_str(BASH_AST).unwrap(),
+        )]);
+        let opts = CompileOptions {
+            max_steps: 1,
+            ..Default::default()
+        };
+        let res = plan(&p, "mock", "delete x", &ops, None, None, opts).await;
+        assert!(
+            res.is_err(),
+            "a hidden-op plan must never be accepted, even on the last step"
+        );
+    }
+
+    #[test]
+    fn hidden_ops_in_reports_only_registered_unadvertised_calls() {
+        let reg = full_registry();
+        let ops = ops_without_bash(&reg);
+        let ast: DraftAst = serde_json::from_str(
+            r#"{"body":[
+                {"kind":"call","op":"bash","args":[{"kind":"lit","value":"ls"}]},
+                {"kind":"call","op":"read","args":[{"kind":"lit","value":"x"}]},
+                {"kind":"call","op":"totally.unknown","args":[]}
+            ]}"#,
+        )
+        .unwrap();
+        // `bash` is registered but hidden → reported. `read` is advertised → not reported.
+        // `totally.unknown` is not registered → analyze_flow's unknown-op diagnostic owns it.
+        assert_eq!(ops.hidden_ops_in(&ast.body), vec!["bash".to_string()]);
+        // An unrestricted registry (pre-authored paths) reports nothing.
+        assert!(OpRegistry::new(&reg).hidden_ops_in(&ast.body).is_empty());
     }
 
     #[tokio::test]
