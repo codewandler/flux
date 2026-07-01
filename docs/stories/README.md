@@ -25,7 +25,10 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [I-01 — Statistically clean self-improvement headline gain (trials ≥ 3)](I-01-headline-gain.md) · Improve · offline half done (partial-credit scalar + durable token capture + synthetic `trials = 5` loop); the trials ≥ 5 grader-confirmed run is **staged** on a funded provider key
 
 ## Next (ready — take the top one unless the user named a story)
-_None._
+
+### strict review flows and journeys
+_A skill can only advise a reviewer; a code-review protocol needs enforceable guarantees — fixed_
+- [L-10 — Strict review — checked-in example flow + reviewer roles (Phase 1)](L-10-strict-review-example-flow.md) · Language · proves the strict-review protocol shape with existing primitives — no language changes
 
 ## Blocked
 _None._
@@ -40,6 +43,12 @@ _flux's plugins each talk to a single, statically-configured service. The fluxpl
 
 ### Plugin Platform Hardening
 - [D-21 — Plugin distribution for non-source users (scoping)](D-21-plugin-distribution.md) · Core · scoping/epic-seed: how a non-repo user obtains the pack (bundled binaries / fetch-on-install / marketplace); produces a design + the follow-on stories, no code
+
+### strict review flows and journeys
+_A skill can only advise a reviewer; a code-review protocol needs enforceable guarantees — fixed_
+- [L-11 — Strict review — scoped capabilities (with_tools) enforced at dispatch (Phase 2)](L-11-strict-review-scoped-capabilities.md) · Language · analyzer-visible capability-scope node + runtime narrowing threaded into Executor::dispatch
+- [L-12 — Strict review — typed artifacts + deterministic aggregator (Phase 3)](L-12-strict-review-typed-artifacts.md) · Language · ReviewRequest/ReviewFinding/ReviewReport + review.normalize/aggregate (fingerprint/dedupe/rank)
+- [L-13 — Strict review — app journey + flux review CLI & CI surfaces (Phase 4)](L-13-strict-review-journey-cli.md) · Agent · flux-app review_code journey + optional flux review command + CI output modes
 
 ### subscription providers (claude-code + codex) & cross-provider usage/cost
 _flux can already drive the two **subscription / passthrough** model backends — `claude` (Claude_

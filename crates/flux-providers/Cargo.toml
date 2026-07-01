@@ -21,6 +21,7 @@ reqwest.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 hex.workspace = true
+sha1 = "0.10"
 chrono.workspace = true
 
 # Realtime (voice-to-voice) provider — WebSocket transport, off by default so the HTTP family stays lean.

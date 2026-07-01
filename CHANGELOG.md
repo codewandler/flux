@@ -38,6 +38,17 @@ All notable changes to this project are documented in this file. The format is b
   `body`. Each ships with failing-first tests (internal op absent from the tool catalog; out-of-scope
   `fs.read` denied; `..` rejected; secret scopes redactor-registered).
 
+- **AWS Bedrock: full credential chain (no `aws` CLI) (C-09b).** `flux run -m aws` now works
+  with SSO / IRSA / EKS Pod Identity — no `aws configure export-credentials` dance, no `aws` binary.
+  The chain (env → SSO → IRSA → EKS Pod Identity) is hand-rolled in `flux-providers::bedrock` over
+  direct `std::fs` + `reqwest` (the flux-credentials precedent — credential bootstrap is a separate
+  trust boundary from agent-tool IO). SSO: reads `~/.aws/config` + `~/.aws/sso/cache/<sha1(session)>.json`,
+  refreshs expired tokens via SSO-OIDC `CreateToken` (JSON/camelCase, persisted back 0600 atomic),
+  calls `GetRoleCredentials` (access token in the `x-amz-sso_bearer_token` header). IRSA:
+  `AssumeRoleWithWebIdentity`. EKS Pod Identity: `AWS_CONTAINER_CREDENTIALS_FULL_URI`. The CLI
+  resolves once in `build_agent` (async) into `AWS_*` env so every sync path (REPL `/model`,
+  sub-agent, server) reads the resolved creds.
+
 - **AWS Bedrock LLM provider — L1 core + CLI routing (C-09, in-progress).** `flux run -m aws` now
   drives Bedrock-provisioned Claude through the same harness. The load-bearing reuse: Bedrock's
   `invoke-model` on an Anthropic model returns **native Anthropic Messages JSON** — the exact shape

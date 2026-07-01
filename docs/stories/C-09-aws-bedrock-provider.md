@@ -42,6 +42,34 @@ a new-protocol story.
       shipped `flux-cli` enables it. Dev/prod auth + the feature flag are documented in README + CLI help.
 
 ## Progress
+- **C-09b (AWS credential chain — env → SSO → IRSA → EKS Pod Identity) LANDED.** `flux run -m aws`
+  now works with **no `aws` CLI and no manual `export-credentials` dance** — the chain is hand-rolled
+  in `flux-providers::bedrock` over direct `std::fs` + `reqwest` (the established flux-credentials
+  precedent: the credential-bootstrap path is a separate trust boundary from agent-tool IO). Sources
+  tried in order: (1) static env; (2) SSO — reads `~/.aws/config` for the profile's `sso_session`/
+  `sso_account_id`/`sso_role_name`, reads `~/.aws/sso/cache/<sha1(session)>.json`, refreshs the access
+  token via SSO-OIDC `CreateToken` (JSON, camelCase — verified against botocore) if expired and
+  persists the refreshed token back to the cache (0600 atomic write), then calls
+  `sso:GetRoleCredentials` (access token in the `x-amz-sso_bearer_token` header, not a query param —
+  verified against botocore); (3) IRSA — `AWS_ROLE_ARN`+`AWS_WEB_IDENTITY_TOKEN_FILE` →
+  `sts:AssumeRoleWithWebIdentity` (XML response, tiny tag-scan extract); (4) EKS Pod Identity —
+  `AWS_CONTAINER_CREDENTIALS_FULL_URI` → HTTP GET. `materialize_chain_into_env()` resolves once in
+  `build_agent` (async) into `AWS_*` env so the sync `bedrock_with_env` (and every sync path: REPL
+  `/model`, sub-agent, server) reads them. `AwsChainResolver` (impl `BedrockCredentialsResolver`)
+  is stored for the C-04 401-refresh path.
+  - **Live-verified (dev SSO):** `flux run -m aws` with an EXPIRED token → JSON refresh →
+    GetRoleCredentials → Bedrock turn ($0.1515); refreshed token persisted (2nd run skips refresh,
+    3.3s); `aws/opus` alias ($0.2534).
+  - **Live bugs the chain caught (botocore cross-verification):** (1) the OIDC endpoint is
+    `oidc.<region>.amazonaws.com` (not `sso-oidc.` — DNS won't resolve); (2) `CreateToken` is a JSON
+    POST with camelCase keys (form-encoded snake_case → 400 `invalid_request`); (3) the GetRole-
+    Credentials access token goes in the `x-amz-sso_bearer_token` HEADER (query param → 401).
+  - **Why not the plugin (Option C):** the plugin sandbox env-clears the process (AGENTS.md safety
+    invariant), so `aws-config`'s env-driven chain sees nothing, and its `~/.aws/sso/cache` reads
+    bypass the C-09a `fs.read` gate (std::fs). The L1 chain avoids both — the flux process is the
+    trusted host, reading credential caches via std::fs exactly as flux-credentials reads
+    `~/.flux/credentials.toml`. The C-09a `internal` op + `fs.read` capability remain useful for
+    OTHER plugins needing host file reads.
 - **C-09a (plugin protocol knobs) LANDED** — `commit ececbc6`. Two deny-by-default
   L4 surfaces for the aws-bedrock plugin (C-09b) to resolve the AWS credential chain without an
   `aws` CLI, each with failing-first tests:

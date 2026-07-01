@@ -1059,6 +1059,15 @@ async fn build_agent(
                 "mock".to_string(),
             )
         } else {
+            // AWS Bedrock: resolve the credential chain once here (async — SSO/IRSA need HTTP),
+            // materializing into `AWS_*` env so the sync `bedrock_with_env` (below + every other
+            // sync path: REPL `/model`, sub-agent factory, server) reads the resolved creds. The
+            // chain tries static env → SSO (`aws sso login`) → IRSA (k8s) → EKS Pod Identity — no
+            // `aws` CLI binary needed. (`build_provider` itself stays sync because the sub-agent
+            // `Spawner` closure is sync; this pre-resolution is the one async seam.)
+            if model_spec == "aws" || model_spec.starts_with("aws/") {
+                flux_providers::bedrock::materialize_chain_into_env().await?;
+            }
             let (native, provider, m) = build_provider(&model_spec)?;
             // The canonical `provider/model` spec (resolved) — what cost/subscription detection
             // reads. The raw `model_spec` input may be a bare alias (`codex`, `sonnet`) that neither

@@ -538,6 +538,515 @@ pub async fn bedrock_with(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// AWS credential chain (C-09b) — env → SSO → IRSA → EKS Pod Identity
+// ---------------------------------------------------------------------------
+//
+// Resolves `BedrockCreds` from the full AWS default chain WITHOUT an `aws` CLI binary — the same
+// sources `aws-config` walks, hand-rolled over direct `std::fs` + `reqwest`. This follows the
+// established flux-credentials precedent: the credential-bootstrap path (reading `~/.flux/...` or
+// `~/.aws/...` token caches, refreshing OAuth/SSO tokens) is a separate trust boundary from the
+// agent-tool IO path (which goes through `flux_system::net::guard`). flux-credentials already reads
+// `~/.flux/credentials.toml` via `std::fs` and refreshes OAuth tokens via `reqwest` directly; the
+// AWS chain does the same for `~/.aws/sso/cache` and STS/SSO-OIDC.
+//
+// Sources tried in order (first wins): (1) static env (`AWS_ACCESS_KEY_ID` + friends); (2) SSO —
+// reads `~/.aws/config` for the profile's `sso_session`/`sso_account_id`/`sso_role_name`, reads the
+// cached access token from `~/.aws/sso/cache/<sha1(session)>.json`, refreshs it via SSO-OIDC
+// `CreateToken` if expired, then calls `sso:GetRoleCredentials`; (3) IRSA (k8s web-identity) —
+// `AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE` → `sts:AssumeRoleWithWebIdentity`; (4) EKS Pod
+// Identity — `AWS_CONTAINER_CREDENTIALS_FULL_URI` → HTTP GET. IMDS (EC2 instance role) is not
+// implemented (flux doesn't run on bare EC2); add it if ever needed.
+
+/// Resolve AWS credentials via the default chain (env → SSO → IRSA → EKS Pod Identity), without an
+/// `aws` CLI. The async-aware path used by the CLI's `aws` provider arm; falls back to static env
+/// (the sync `bedrock_with_env` path) when the chain has nothing.
+pub async fn resolve_default_chain() -> Result<BedrockCreds> {
+    // 1. Static env (fast path — covers prod with env-injected creds and `aws configure
+    // export-credentials` materialized into env).
+    if let Ok(c) = creds_from_env() {
+        return Ok(c);
+    }
+    // 2. SSO (dev laptop — `aws sso login` once, then this reads the cached token + refreshes).
+    if let Some(c) = resolve_sso().await? {
+        return Ok(c);
+    }
+    // 3. IRSA (k8s — webhook injects AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE).
+    if let Some(c) = resolve_irsa().await? {
+        return Ok(c);
+    }
+    // 4. EKS Pod Identity (k8s — webhook injects AWS_CONTAINER_CREDENTIALS_FULL_URI).
+    if let Some(c) = resolve_eks_pod_identity().await? {
+        return Ok(c);
+    }
+    Err(Error::Auth(
+        "no AWS credentials: set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, run `aws sso login` \
+         (with AWS_PROFILE), or inject IRSA/EKS-Pod-Identity env"
+            .to_string(),
+    ))
+}
+
+/// Resolve the default chain and materialize the result into `AWS_*` env vars (idempotent: a no-op
+/// when `AWS_ACCESS_KEY_ID` is already set). The CLI's async `build_agent` calls this for the `aws`
+/// provider arm before the sync `build_provider` → `bedrock_with_env` reads env — so the resolved
+/// creds reach every sync path (REPL `/model`, sub-agent factory, server) without making
+/// `build_provider` async (the sub-agent `Spawner` closure is sync). The session token + region are
+/// set too.creds stay in the process env for the session.
+pub async fn materialize_chain_into_env() -> Result<()> {
+    // Idempotent: if env is already populated (e.g. `aws configure export-credentials` ran, or
+    // prod injected env creds), don't re-resolve / overwrite.
+    if std::env::var("AWS_ACCESS_KEY_ID")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let creds = resolve_default_chain().await?;
+    std::env::set_var("AWS_ACCESS_KEY_ID", &creds.access_key);
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", &creds.secret_key);
+    if let Some(t) = &creds.session_token {
+        std::env::set_var("AWS_SESSION_TOKEN", t);
+    }
+    std::env::set_var("AWS_REGION", &creds.region);
+    Ok(())
+}
+
+/// A [`BedrockCredentialsResolver`] backed by the default chain ([`resolve_default_chain`]). Stored
+/// in [`BedrockCredential`] for the C-04 401-refresh path (re-resolves the chain on refresh).
+pub struct AwsChainResolver;
+
+#[async_trait]
+impl BedrockCredentialsResolver for AwsChainResolver {
+    async fn resolve(&self) -> Result<BedrockCreds> {
+        resolve_default_chain().await
+    }
+}
+
+/// Build the `aws` Bedrock provider from the default credential chain (async — resolves SSO/IRSA).
+/// The full-chain counterpart to [`bedrock_with_env`] (env-only, sync): tries env → SSO → IRSA →
+/// EKS Pod Identity, stores the [`AwsChainResolver`] for the 401-refresh path.
+pub async fn bedrock_with_default_chain(model_id: String) -> Result<NativeProvider> {
+    bedrock_with(model_id, Arc::new(AwsChainResolver)).await
+}
+
+// --- minimal `~/.aws/config` INI parser -------------------------------------
+
+/// A parsed `~/.aws/config`: section → `key → value`. Sections are `[default]`, `[profile <name>]`,
+/// `[sso-session <name>]`. Keys are lowercased; values trimmed. A tiny INI subset (no nesting,
+// no escapes) — the AWS config format is flat `key = value` under bracketed sections.
+fn parse_aws_config(
+    text: &str,
+) -> std::collections::HashMap<String, std::collections::HashMap<String, String>> {
+    let mut out: std::collections::HashMap<String, std::collections::HashMap<String, String>> =
+        std::collections::HashMap::new();
+    let mut cur = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(s) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            cur = s.trim().to_string();
+            out.entry(cur.clone()).or_default();
+        } else if let Some((k, v)) = line.split_once('=') {
+            out.entry(cur.clone())
+                .or_default()
+                .insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+        }
+    }
+    out
+}
+
+/// The section name for a profile in `~/.aws/config`: `"default"` for `[default]`, `"profile <name>"`
+/// for `[profile <name>]`.
+fn profile_section(profile: &str) -> String {
+    if profile == "default" {
+        "default".to_string()
+    } else {
+        format!("profile {profile}")
+    }
+}
+
+/// `$HOME/.aws/config` (or `AWS_CONFIG_FILE`).
+fn aws_config_path() -> Result<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("AWS_CONFIG_FILE") {
+        return Ok(std::path::PathBuf::from(p));
+    }
+    Ok(home_dir()?.join(".aws").join("config"))
+}
+
+/// `$HOME/.aws/sso/cache/<sha1(hex)>.json`.
+fn sso_cache_path(cache_key: &str) -> Result<std::path::PathBuf> {
+    let mut h = sha1::Sha1::new();
+    h.update(cache_key.as_bytes());
+    let digest = hex::encode(h.finalize());
+    Ok(home_dir()?
+        .join(".aws")
+        .join("sso")
+        .join("cache")
+        .join(format!("{digest}.json")))
+}
+
+fn home_dir() -> Result<std::path::PathBuf> {
+    std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .map_err(|_| Error::Auth("HOME is not set (cannot locate ~/.aws)".to_string()))
+}
+
+/// `Ok(true)` if the token expired (expiresAt < now). Tolerates the `Z` suffix and fractional secs.
+fn token_expired(expires_at: &str) -> bool {
+    match chrono::DateTime::parse_from_rfc3339(expires_at) {
+        Ok(t) => t.with_timezone(&chrono::Utc) < chrono::Utc::now(),
+        Err(_) => true, // unparseable → treat as expired (refresh)
+    }
+}
+
+// --- SSO -----------------------------------------------------------------------------------------
+
+/// Resolve SSO credentials: read the profile's sso_session, read/refresh the cached access token,
+/// call `sso:GetRoleCredentials`. Returns `None` (not an error) if no SSO profile is configured —
+/// the chain falls through to the next source.
+async fn resolve_sso() -> Result<Option<BedrockCreds>> {
+    let profile = std::env::var("AWS_PROFILE")
+        .or_else(|_| std::env::var("AWS_DEFAULT_PROFILE"))
+        .unwrap_or_else(|_| "default".to_string());
+    let cfg_text = match std::fs::read_to_string(aws_config_path()?) {
+        Ok(t) => t,
+        Err(_) => return Ok(None), // no ~/.aws/config → not an SSO setup
+    };
+    let cfg = parse_aws_config(&cfg_text);
+    let prof = match cfg.get(&profile_section(&profile)) {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    // Modern sso-session format: `sso_session = <name>` (+ `sso_account_id`, `sso_role_name`).
+    // Legacy: `sso_start_url` + `sso_region` directly in the profile.
+    let (session_name, start_url, sso_region) = if let Some(session) = prof.get("sso_session") {
+        let sec = cfg.get(&format!("sso-session {session}")).ok_or_else(|| {
+            Error::Auth(format!("~/.aws/config: [sso-session {session}] missing"))
+        })?;
+        (
+            session.clone(),
+            sec.get("sso_start_url")
+                .ok_or_else(|| {
+                    Error::Auth(format!("sso-session {session}: sso_start_url missing"))
+                })?
+                .clone(),
+            sec.get("sso_region")
+                .or_else(|| prof.get("sso_region"))
+                .cloned()
+                .unwrap_or_else(|| "us-east-1".to_string()),
+        )
+    } else if let Some(url) = prof.get("sso_start_url") {
+        // Legacy: cache key is the start_url, region from the profile's sso_region.
+        (
+            url.clone(),
+            url.clone(),
+            prof.get("sso_region")
+                .cloned()
+                .unwrap_or_else(|| "us-east-1".to_string()),
+        )
+    } else {
+        return Ok(None); // not an SSO profile
+    };
+    let account_id = prof
+        .get("sso_account_id")
+        .ok_or_else(|| Error::Auth(format!("profile {profile}: sso_account_id missing")))?
+        .clone();
+    let role_name = prof
+        .get("sso_role_name")
+        .ok_or_else(|| Error::Auth(format!("profile {profile}: sso_role_name missing")))?
+        .clone();
+    // The profile's `region` (for the Bedrock endpoint) — falls back to the sso_region then env.
+    let region = prof
+        .get("region")
+        .cloned()
+        .or_else(|| {
+            std::env::var("AWS_REGION")
+                .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+                .ok()
+        })
+        .unwrap_or_else(|| sso_region.clone());
+
+    // Cache key: sha1(session_name) for sso-session format, sha1(start_url) for legacy.
+    let cache_key = if prof.contains_key("sso_session") {
+        &session_name
+    } else {
+        &start_url
+    };
+    let cache_path = sso_cache_path(cache_key)?;
+    let cache_text = std::fs::read_to_string(&cache_path).map_err(|e| {
+        Error::Auth(format!(
+            "SSO token cache {} unreadable ({e}); run `aws sso login --profile {profile}` first",
+            cache_path.display()
+        ))
+    })?;
+    let mut cache: serde_json::Value = serde_json::from_str(&cache_text)
+        .map_err(|e| Error::Auth(format!("SSO token cache corrupt ({e})")))?;
+
+    // Refresh if the access token is expired (or missing).
+    let expires_at = cache
+        .get("expiresAt")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if token_expired(expires_at) {
+        refresh_sso_token(&mut cache, &cache_path, &sso_region).await?;
+    }
+    let access_token = cache
+        .get("accessToken")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Auth("SSO cache: accessToken missing".to_string()))?
+        .to_string();
+
+    // GetRoleCredentials: GET portal.sso.<region>.amazonaws.com/federation/credentials?account_id=…
+    // &role_name=… — the access token goes in the `x-amz-sso_bearer_token` HEADER (not a query
+    // param), matching botocore (verified against its serialized request). A query-param access
+    // token is rejected with 401 "Session token not found or invalid".
+    let url = format!(
+        "https://portal.sso.{sso_region}.amazonaws.com/federation/credentials?account_id={account_id}&role_name={role_name}"
+    );
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("x-amz-sso_bearer_token", &access_token)
+        .send()
+        .await
+        .map_err(|e| Error::Auth(format!("SSO GetRoleCredentials: {e}")))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(Error::Auth(format!(
+            "SSO GetRoleCredentials → {status}: {}",
+            truncate(&body, 300)
+        )));
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| Error::Auth(format!("SSO GetRoleCredentials: bad JSON ({e})")))?;
+    let rc = v.get("roleCredentials").ok_or_else(|| {
+        Error::Auth("SSO GetRoleCredentials: roleCredentials missing".to_string())
+    })?;
+    Ok(Some(BedrockCreds {
+        access_key: rc
+            .get("accessKeyId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Auth("SSO: accessKeyId missing".to_string()))?
+            .to_string(),
+        secret_key: rc
+            .get("secretAccessKey")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Auth("SSO: secretAccessKey missing".to_string()))?
+            .to_string(),
+        session_token: rc
+            .get("sessionToken")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        region,
+    }))
+}
+
+/// Refresh an expired SSO access token via SSO-OIDC `CreateToken` (refresh_token grant) and persist
+/// the new token + refresh token back to the cache file (so `aws sso login` need not run again
+/// until the refresh token itself expires).
+async fn refresh_sso_token(
+    cache: &mut serde_json::Value,
+    cache_path: &std::path::Path,
+    sso_region: &str,
+) -> Result<()> {
+    let client_id = cache
+        .get("clientId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Auth("SSO refresh: clientId missing".to_string()))?;
+    let client_secret = cache
+        .get("clientSecret")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Auth("SSO refresh: clientSecret missing".to_string()))?;
+    let refresh_token = cache
+        .get("refreshToken")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            Error::Auth("SSO refresh: refreshToken missing — run `aws sso login` again".to_string())
+        })?;
+    let url = format!("https://oidc.{sso_region}.amazonaws.com/token");
+    // CreateToken is a JSON POST (application/json) with camelCase keys — matching the AWS SSO-OIDC
+    // API the `aws` CLI speaks (verified against botocore's serialized request). A form-encoded
+    // body with snake_case keys is rejected with 400 `invalid_request`.
+    let body = serde_json::json!({
+        "clientId": client_id,
+        "clientSecret": client_secret,
+        "grantType": "refresh_token",
+        "refreshToken": refresh_token,
+    });
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| Error::Auth(format!("SSO CreateToken: {e}")))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(Error::Auth(format!(
+            "SSO CreateToken → {status}: {}",
+            truncate(&body, 300)
+        )));
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| Error::Auth(format!("SSO CreateToken: bad JSON ({e})")))?;
+    let new_access = v
+        .get("accessToken")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Auth("SSO CreateToken: accessToken missing".to_string()))?;
+    let new_refresh = v.get("refreshToken").and_then(|v| v.as_str());
+    let expires_in = v.get("expiresIn").and_then(|v| v.as_u64()).unwrap_or(28800);
+    // Update the cache in place + persist (atomic write, 0600 — the cache holds refresh tokens).
+    cache["accessToken"] = serde_json::Value::String(new_access.to_string());
+    if let Some(r) = new_refresh {
+        cache["refreshToken"] = serde_json::Value::String(r.to_string());
+    }
+    let new_expires = chrono::Utc::now() + chrono::Duration::seconds(expires_in as i64);
+    cache["expiresAt"] =
+        serde_json::Value::String(new_expires.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+    let dir = cache_path
+        .parent()
+        .ok_or_else(|| Error::Auth("SSO cache: no parent dir".to_string()))?;
+    std::fs::create_dir_all(dir).map_err(|e| Error::Auth(format!("SSO cache mkdir: {e}")))?;
+    let tmp = cache_path.with_extension("json.tmp");
+    let bytes =
+        serde_json::to_vec_pretty(cache).map_err(|e| Error::Auth(format!("SSO cache: {e}")))?;
+    // Write 0600 + rename (atomic; matches aws CLI's own cache perms).
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| Error::Auth(format!("SSO cache write: {e}")))?;
+        use std::io::Write;
+        f.write_all(&bytes)
+            .map_err(|e| Error::Auth(format!("SSO cache write: {e}")))?;
+    }
+    std::fs::rename(&tmp, cache_path).map_err(|e| Error::Auth(format!("SSO cache rename: {e}")))?;
+    Ok(())
+}
+
+// --- IRSA (k8s web-identity) --------------------------------------------------------------------
+
+/// Resolve IRSA credentials: `AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE` →
+/// `sts:AssumeRoleWithWebIdentity`. Returns `None` if the IRSA env vars aren't set.
+async fn resolve_irsa() -> Result<Option<BedrockCreds>> {
+    let (role_arn, token_file) = match (
+        std::env::var("AWS_ROLE_ARN").ok(),
+        std::env::var("AWS_WEB_IDENTITY_TOKEN_FILE").ok(),
+    ) {
+        (Some(r), Some(t)) => (r, t),
+        _ => return Ok(None),
+    };
+    let region = std::env::var("AWS_REGION")
+        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+        .unwrap_or_else(|_| "us-east-1".to_string());
+    let token = std::fs::read_to_string(&token_file)
+        .map_err(|e| Error::Auth(format!("IRSA token file {token_file}: {e}")))?;
+    let url = format!(
+        "https://sts.{region}.amazonaws.com/?Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn={role_arn}&RoleSessionName=flux-bedrock&WebIdentityToken={token}"
+    );
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| Error::Auth(format!("STS AssumeRoleWithWebIdentity: {e}")))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(Error::Auth(format!(
+            "STS AssumeRoleWithWebIdentity → {status}: {}",
+            truncate(&body, 300)
+        )));
+    }
+    // The response is XML; extract the credential fields with a tiny tag scan (avoid an XML dep).
+    let access_key = extract_xml_text(&body, "AccessKeyId")
+        .ok_or_else(|| Error::Auth("STS: AccessKeyId missing".to_string()))?;
+    let secret_key = extract_xml_text(&body, "SecretAccessKey")
+        .ok_or_else(|| Error::Auth("STS: SecretAccessKey missing".to_string()))?;
+    let session_token = extract_xml_text(&body, "SessionToken");
+    Ok(Some(BedrockCreds {
+        access_key,
+        secret_key,
+        session_token,
+        region,
+    }))
+}
+
+// --- EKS Pod Identity ---------------------------------------------------------------------------
+
+/// Resolve EKS Pod Identity credentials: `AWS_CONTAINER_CREDENTIALS_FULL_URI` (+ optional auth
+/// token) → HTTP GET. Returns `None` if the env var isn't set.
+async fn resolve_eks_pod_identity() -> Result<Option<BedrockCreds>> {
+    let uri = match std::env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI").ok() {
+        Some(u) => u,
+        None => return Ok(None),
+    };
+    let region = std::env::var("AWS_REGION")
+        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+        .unwrap_or_else(|_| "us-east-1".to_string());
+    let mut req = reqwest::Client::new().get(&uri);
+    // The auth token: AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE (file) or AWS_TOKEN_AUTHORIZATION (literal).
+    if let Ok(tok_file) = std::env::var("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE") {
+        if let Ok(tok) = std::fs::read_to_string(&tok_file) {
+            req = req.header("Authorization", tok.trim());
+        }
+    } else if let Ok(tok) = std::env::var("AWS_TOKEN_AUTHORIZATION") {
+        req = req.header("Authorization", tok);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| Error::Auth(format!("EKS Pod Identity: {e}")))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(Error::Auth(format!(
+            "EKS Pod Identity → {status}: {}",
+            truncate(&body, 300)
+        )));
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| Error::Auth(format!("EKS Pod Identity: bad JSON ({e})")))?;
+    Ok(Some(BedrockCreds {
+        access_key: v
+            .get("AccessKeyId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Auth("EKS Pod Identity: AccessKeyId missing".to_string()))?
+            .to_string(),
+        secret_key: v
+            .get("SecretAccessKey")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Auth("EKS Pod Identity: SecretAccessKey missing".to_string()))?
+            .to_string(),
+        session_token: v.get("Token").and_then(|v| v.as_str()).map(String::from),
+        region,
+    }))
+}
+
+/// Extract the text of the first `<tag>...</tag>` from an XML blob (no XML dep — STS responses are
+/// simple enough for a tag scan).
+fn extract_xml_text(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(xml[start..end].to_string())
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        s[..max].to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,5 +1248,88 @@ mod tests {
     #[allow(dead_code)]
     fn _example_creds_for_doctest() -> BedrockCreds {
         example_creds()
+    }
+
+    // --- C-09b: AWS credential chain pure helpers ----------------------------------------------
+
+    #[test]
+    fn parse_aws_config_handles_sections_and_profiles() {
+        let text = r#"
+[default]
+region = us-east-1
+
+[profile babelforce-dev]
+sso_session = babelforce
+sso_account_id = 123456789012
+sso_role_name = DeveloperAccess
+
+[sso-session babelforce]
+sso_start_url = https://d-xxxxxxxxxx.awsapps.com/start
+sso_region = eu-central-1
+"#;
+        let cfg = parse_aws_config(text);
+        assert_eq!(cfg["default"]["region"], "us-east-1");
+        assert_eq!(cfg["profile babelforce-dev"]["sso_session"], "babelforce");
+        assert_eq!(
+            cfg["profile babelforce-dev"]["sso_account_id"],
+            "123456789012"
+        );
+        assert_eq!(
+            cfg["sso-session babelforce"]["sso_start_url"],
+            "https://d-xxxxxxxxxx.awsapps.com/start"
+        );
+        assert_eq!(cfg["sso-session babelforce"]["sso_region"], "eu-central-1");
+    }
+
+    #[test]
+    fn profile_section_is_default_or_profile_prefix() {
+        assert_eq!(profile_section("default"), "default");
+        assert_eq!(profile_section("babelforce-dev"), "profile babelforce-dev");
+    }
+
+    #[test]
+    fn token_expired_detects_past_and_future() {
+        let past = "2020-01-01T00:00:00Z";
+        let future = "2099-01-01T00:00:00Z";
+        assert!(token_expired(past), "past expiry → expired");
+        assert!(!token_expired(future), "future expiry → valid");
+        // Unparseable → treat as expired (forces a refresh rather than using a bad token).
+        assert!(token_expired("not-a-date"));
+    }
+
+    #[test]
+    fn sso_cache_path_is_sha1_of_session_under_home() {
+        // The cache filename for an sso-session profile is sha1(session_name).hex — matching the
+        // `aws` CLI's own cache layout (verified live against the dev account).
+        std::env::set_var("HOME", "/tmp/flux-sso-test-home");
+        let p = sso_cache_path("babelforce").unwrap();
+        let mut h = sha1::Sha1::new();
+        h.update(b"babelforce");
+        let digest = hex::encode(h.finalize());
+        assert_eq!(
+            p,
+            std::path::PathBuf::from(format!(
+                "/tmp/flux-sso-test-home/.aws/sso/cache/{digest}.json"
+            ))
+        );
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn extract_xml_text_pulls_tag_content() {
+        let xml = r#"<AssumeRoleWithWebIdentityResponse><Credentials><AccessKeyId>AKIAFOO</AccessKeyId><SecretAccessKey>SECRET</SecretAccessKey><SessionToken>TOK</SessionToken></Credentials></AssumeRoleWithWebIdentityResponse>"#;
+        assert_eq!(
+            extract_xml_text(xml, "AccessKeyId"),
+            Some("AKIAFOO".to_string())
+        );
+        assert_eq!(
+            extract_xml_text(xml, "SecretAccessKey"),
+            Some("SECRET".to_string())
+        );
+        assert_eq!(
+            extract_xml_text(xml, "SessionToken"),
+            Some("TOK".to_string())
+        );
+        assert_eq!(extract_xml_text(xml, "Missing"), None);
     }
 }
