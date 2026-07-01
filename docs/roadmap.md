@@ -265,17 +265,19 @@ makes codex's **websocket** the default transport (HTTP fallback), and adds the 
 - **[C-08](stories/C-08-full-oauth2-login.md) — Full OAuth2 login (codex PKCE)** · *core, later stage.* A
   flux-native `flux auth login codex` to parity with claude's PKCE login. Explicitly deferred — import + refresh
   cover the near term.
-- **[C-09](stories/C-09-aws-bedrock-provider.md) — AWS Bedrock LLM provider** · *core, in-progress.* Drive
-  Bedrock-provisioned Claude (`us.anthropic.claude-sonnet-4-6`, …) through the same harness. The wire is
-  native Anthropic Messages JSON (flux's `messages` codec already speaks it), so SigV4 + the codec +
-  a `BedrockCredentialsResolver` trait are hand-rolled in L1 (`flux-providers::bedrock`). **Decision:
-  Option C** — the credential chain lives in a new `aws-bedrock` plugin embedding `aws-config` over
-  host callbacks (no `aws` CLI in prod; all AWS IO through `net::guard`; host-only `auth` op so keys
-  don't leak). Design + the three-way fork in [aws-bedrock-provider.md](designs/aws-bedrock-provider.md);
-  smallest-first split is C-09a (3 plugin protocol knobs), C-09b (aws-bedrock plugin), C-09c (L1
-  SigV4+codec+resolver), C-09d (event-stream streaming), C-09e (pricing+CLI+docs). The L1 core (C-09c)
-  ships first with an env-static resolver stand-in; the plugin (C-09a/b) follows once the `plugins/`
-  workspace is free.
+- **[C-09](stories/C-09-aws-bedrock-provider.md) — AWS Bedrock LLM provider** · *core, DONE.* Drives
+  Bedrock-provisioned Claude (`us.`/`eu.`/`global.` inference profiles) through the same harness:
+  `flux run -m aws`. The wire is native Anthropic Messages (streaming `invoke-with-response-stream`;
+  a CRC-checked event-stream deframer feeds the shared SSE mapper), SigV4 + codec +
+  `BedrockCredentialsResolver` hand-rolled in L1 (`flux-providers::bedrock`). The Option-C plugin
+  was **reversed in implementation**: the credential chain (env → SSO w/ OIDC refresh → IRSA → EKS
+  Pod Identity) is hand-rolled in L1 over `std::fs`+`reqwest` (the flux-credentials trust-boundary
+  precedent — the plugin sandbox env-clears and can't walk the chain), so flux ships **zero AWS SDK
+  deps** and needs no `aws` CLI in dev or prod. Pricing keys the region-less Bedrock id (every
+  regional profile prices identically, metered). The C-09a protocol knobs (`internal` op flag,
+  path-scoped `fs.read`) landed for other plugins' benefit. Live-verified e2e on the dev account
+  (SSO, eu-central-1) incl. tool-use turns and cost suffixes.
+  Design + implementation status in [aws-bedrock-provider.md](designs/aws-bedrock-provider.md).
 
 ### Strict review flows & journeys (epic)
 

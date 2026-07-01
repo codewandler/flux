@@ -2,10 +2,10 @@
 id: C-09
 title: AWS Bedrock LLM provider
 pillar: Core
-status: in-progress
+status: done
 epic: aws-bedrock-provider
 design: docs/designs/aws-bedrock-provider.md
-note: DECISION = Option C (aws-bedrock plugin embeds aws-config, no aws CLI in prod). IMPLEMENTING in two non-colliding waves: (1) L1 core now — flux-providers::bedrock (SigV4 + Messages codec + BedrockCredentialsResolver trait + resolve_model) + L0 pricing + L6 routing, with an env-static resolver stand-in so `flux run -m aws` works against dev (aws configure export-credentials); (2) C-09a/b plugin + protocol knobs deferred — another session has the plugins/ workspace open (Cargo.lock collision). The L1 seam means the plugin resolver swaps in at one trait.
+note: fully functional e2e — streaming `invoke-with-response-stream` (AWS event-stream deframer → shared SSE mapper, non-streaming path deleted), hand-rolled L1 credential chain (env → SSO w/ OIDC refresh → IRSA → EKS Pod Identity, no `aws` CLI), SigV4, region-aware model resolution, region-less pricing; live-verified streaming + tool-use + haiku `global.` profile with cost suffixes
 ---
 
 # AWS Bedrock LLM provider
@@ -17,31 +17,55 @@ the Anthropic Messages shape flux already speaks, so this is a `Credential` + th
 a new-protocol story.
 
 ## Acceptance
-- [ ] `aws/<model-id>` (and bare `aws`) resolves via `flux_providers::bedrock::resolve_model` and
+- [x] `aws/<model-id>` (and bare `aws`) resolves via `flux_providers::bedrock::resolve_model` and
       completes a turn against the live dev account. Failing-first: a mock-provider test asserts the
       request body carries `anthropic_version: "bedrock-2023-05-31"` and emits **no**
       `anthropic-version` header (breaks if the codec forgets the body move).
-- [ ] `sign_v4` is pinned by a known-answer test against an AWS-documented SigV4 example
+- [x] `sign_v4` is pinned by a known-answer test against an AWS-documented SigV4 example
       (service `bedrock`, region `us-east-1`); fails before the signing-key derivation is correct.
-- [ ] `map_bedrock_event_stream` decodes a recorded AWS event-stream fixture into Anthropic SSE
+      (Landed as two cross-verified known-answer tests against an independent Python `hmac` impl.)
+- [x] `map_bedrock_event_stream` decodes a recorded AWS event-stream fixture into Anthropic SSE
       bytes and the existing `map_messages_stream` parses it to `Chunk`s; fails if the deframer
-      drops a `PayloadPart`.
-- [ ] A live smoke: `flux run -m aws/us.anthropic.claude-sonnet-4-6` (dev: `AWS_PROFILE=<p>` after
-      `aws sso login`) returns a turn with the cost suffix.
-- [ ] `cargo test -p flux-codegate` green — Bedrock lives in L1; no new cross-layer edge.
-- [ ] Pricing: `aws/anthropic.*` rate entries resolve in `flux_core::pricing` (match direct
-      Anthropic rates); a Bedrock turn shows the `$`/`~$X (sub)` suffix.
-- [ ] SSO (dev) and k8s-injected (prod) auth both work with **no manual `export-credentials` step**:
+      drops a `PayloadPart`. (The fixture turn is fed in 7-byte pieces so every frame splits across
+      chunk boundaries; CRC-32 is pinned by the standard check value; exception frames and
+      truncated tails are pinned to error, not drop.)
+- [x] A live smoke: `flux run -m aws` (dev: `AWS_PROFILE=<p>` after `aws sso login`) returns a
+      streaming turn with the cost suffix (verified eu-central-1: sonnet `$0.1532`, a tool-use
+      read-file turn `$0.1306`, `aws/haiku` on the `global.` profile `$0.0512`).
+- [x] `cargo test -p flux-codegate` green — Bedrock lives in L1; no new cross-layer edge.
+- [x] Pricing: Bedrock rate entries resolve in `flux_core::pricing` (match direct Anthropic
+      rates); a Bedrock turn shows the `$` suffix. (Keyed region-less — `anthropic.claude-*` —
+      with `rates_for` stripping the `us./eu./apac./global.` routing prefix, so every cross-region
+      profile prices; failing-first: an eu-region run priced `None` under `us.`-only keys.)
+- [x] SSO (dev) and k8s-injected (prod) auth both work with **no manual `export-credentials` step**:
       dev uses `AWS_PROFILE=<p>` after `aws sso login`; prod uses the injected IRSA
       (`AWS_ROLE_ARN`+`AWS_WEB_IDENTITY_TOKEN_FILE`) or EKS Pod Identity
-      (`AWS_CONTAINER_CREDENTIALS_FULL_URI`) vars. Failing-first: a mock test asserts
-      `BedrockCredential` builds from a minimal `~/.aws/config` SSO block fixture; a live smoke
-      confirms a real `aws sso login`'d turn against the dev account.
-- [ ] The AWS SDK deps are behind an off-by-default `bedrock` feature in `flux-providers`
-      (mirroring the `realtime` precedent); the default `cargo build` pulls no AWS SDK crates. The
-      shipped `flux-cli` enables it. Dev/prod auth + the feature flag are documented in README + CLI help.
+      (`AWS_CONTAINER_CREDENTIALS_FULL_URI`) vars. (Covered by pure-helper tests over the
+      `~/.aws/config` SSO fixture + STS/Pod-Identity response parsing, and the live SSO smoke with
+      an expired-token OIDC refresh; a full `BedrockCredential`-from-fixture test would need an
+      HTTP stub for the SSO portal — the chain helpers are the tested seam.)
+- [x] ~~The AWS SDK deps are behind an off-by-default `bedrock` feature~~ **Moot:** the chain is
+      hand-rolled — flux pulls **no AWS SDK crates at all** (only `sha2`/`hmac`/`sha1`/`hex`), so
+      there is nothing to feature-gate. Dev/prod auth is documented in the README provider table
+      and the `-m` CLI help.
 
 ## Progress
+- **C-09d (streaming — the last wave) LANDED; story complete.** Clean cutover to
+  `invoke-with-response-stream`: the interim non-streaming `invoke` path (`map_messages_json`) is
+  **deleted**, streaming is the only wire (matching every other provider — live token display,
+  same `NativeProvider` POST path). New `map_bedrock_event_stream` deframes AWS's binary
+  event-stream (`application/vnd.amazon.eventstream`) into Anthropic SSE for the shared
+  `map_messages_stream`: prelude + message **CRC-32 validated** (hand-rolled, pinned by the
+  standard check value), frames buffered across arbitrary HTTP chunk boundaries, chunk payloads
+  (`{"bytes":"<base64>"} + "p"` padding) unwrapped to the native Messages event, `exception`
+  frames surface as errors (`:exception-type` + message), truncated tails error rather than
+  silently dropping a `PayloadPart`. `base64` moved from the `realtime` feature to a regular dep.
+  Also in this wave: **region-less pricing** (`anthropic.claude-*` keys + routing-prefix strip in
+  `rates_for` — eu-region runs were unpriced), the `-m` CLI help now documents `aws`, and the
+  bedrock test module serializes its env-mutating tests behind a lock (they raced across test
+  threads). Live-verified streaming e2e (dev SSO, eu-central-1): `flux run -m aws` `$0.1532`, a
+  tool-use read-file turn (plan via `input_json_delta`) `$0.1306`, `aws/haiku` (`global.` profile)
+  `$0.0512`. Full gate green.
 - **C-09b (AWS credential chain — env → SSO → IRSA → EKS Pod Identity) LANDED.** `flux run -m aws`
   now works with **no `aws` CLI and no manual `export-credentials` dance** — the chain is hand-rolled
   in `flux-providers::bedrock` over direct `std::fs` + `reqwest` (the established flux-credentials

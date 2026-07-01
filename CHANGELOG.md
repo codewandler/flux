@@ -8,6 +8,29 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **AWS Bedrock LLM provider — `flux run -m aws`, streaming, full credential chain, priced (C-09).**
+  New `aws` provider (`flux_providers::bedrock`, L1) drives Bedrock-provisioned Claude through the
+  same agent harness: the wire is the Anthropic Messages shape flux already speaks, wrapped in a
+  thin codec that moves `anthropic_version` into the body and signs every request with hand-rolled
+  **SigV4** (pinned by known-answer tests; no AWS SDK crates anywhere). Turns stream over
+  `invoke-with-response-stream`: `map_bedrock_event_stream` deframes AWS's binary event-stream
+  (CRC-32-validated frames, split-safe buffering across HTTP chunk boundaries, exception frames
+  surfaced as errors) into SSE for the shared `map_messages_stream` mapper — the interim
+  non-streaming `invoke` path was deleted, streaming is the only wire. Credentials resolve through
+  a hand-rolled AWS default chain — static env → **SSO** (reads `~/.aws/config` +
+  `~/.aws/sso/cache`, refreshes expired access tokens via SSO-OIDC `CreateToken` and persists them
+  back 0600-atomic) → **IRSA** (`sts:AssumeRoleWithWebIdentity`) → **EKS Pod Identity** — so dev
+  (`aws sso login` + `AWS_PROFILE`) and k8s-injected prod both work with no `aws` CLI and no
+  manual `export-credentials` step; the `BedrockCredentialsResolver` trait is the swappable seam,
+  and the resolved chain is materialized into env once so every sync path (REPL `/model`,
+  sub-agent factory, server) builds the provider. Model aliases resolve region-aware
+  (`aws`/`aws/sonnet` → `us.`/`eu.` cross-region inference profiles by `AWS_REGION`; `aws/haiku`
+  → the `global.` profile), and pricing keys the **region-less** Bedrock id with a routing-prefix
+  strip in `rates_for`, so every regional profile prices identically (metered, `$` suffix).
+  Live-verified e2e (dev SSO, eu-central-1): streaming turn, tool-use turn, and the haiku
+  `global.` profile, each with the cost suffix; expired-token OIDC refresh confirmed against the
+  live portal. README provider table + `-m` CLI help document the auth modes.
+
 - **Usage & cost accounting — attribution, sub-agent rollup, `cost_summary`, `flux usage`, server
   endpoint, cache-aware surfacing (C-06).** Turns C-05's captured tokens into the full user-facing
   surface. New `EventKind::CallUsage { model, usage }` (`flux-events`) records EVERY provider call

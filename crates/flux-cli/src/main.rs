@@ -74,14 +74,17 @@ struct AgentFlags {
     print: bool,
 
     /// Fully-qualified `provider/model` spec. Provider must be one of:
-    ///   `anthropic` (API key), `claude` (OAuth/subscription), `openai`, `codex`, `openrouter`
-    ///   (OpenAI Chat wire), `openrouter-anthropic` (OpenRouter's native Messages endpoint —
-    ///   leak-proof tool calls), `ollama` (local, OpenAI Chat wire), `ollama-anthropic` (local
-    ///   Messages endpoint). Short aliases `sonnet`, `opus`, `haiku` are shorthands for
-    ///   `anthropic/<model>`; bare `codex` is shorthand for `codex/gpt-5.5` (the ChatGPT-
-    ///   subscription main model; the legacy `*-codex` ids are rejected by the backend).
+    ///   `anthropic` (API key), `claude` (OAuth/subscription), `openai`, `codex`, `aws` (Claude
+    ///   via AWS Bedrock; credentials from the AWS chain — env, `aws sso login` + `AWS_PROFILE`,
+    ///   IRSA, or EKS Pod Identity — no `aws` CLI needed), `openrouter` (OpenAI Chat wire),
+    ///   `openrouter-anthropic` (OpenRouter's native Messages endpoint — leak-proof tool calls),
+    ///   `ollama` (local, OpenAI Chat wire), `ollama-anthropic` (local Messages endpoint).
+    ///   Short aliases `sonnet`, `opus`, `haiku` are shorthands for `anthropic/<model>`; bare
+    ///   `codex` is shorthand for `codex/gpt-5.5` (the ChatGPT-subscription main model; the
+    ///   legacy `*-codex` ids are rejected by the backend); bare `aws` (or `aws/sonnet`,
+    ///   `aws/opus`, `aws/haiku`) resolves to the region's Bedrock inference profile.
     /// Examples: `claude/claude-sonnet-4-6`, `openai/gpt-4o`, `codex/gpt-5.5`,
-    ///   `openrouter-anthropic/z-ai/glm-4.6`.
+    ///   `aws/us.anthropic.claude-sonnet-4-6`, `openrouter-anthropic/z-ai/glm-4.6`.
     /// Overrides `model` in `.flux/config.toml`; falls back to `sonnet` (= `anthropic/claude-sonnet-4-6`).
     #[arg(short = 'm', long)]
     model: Option<String>,
@@ -643,9 +646,10 @@ fn build_provider(spec: &str) -> Result<(NativeProvider, String, String)> {
             let ts = flux_credentials::codex_token_source().context("codex provider")?;
             flux_providers::codex::oauth(ts)
         }
-        // AWS Bedrock (Anthropic over SigV4). Static-creds stand-in: reads AWS_* env. The full SSO /
-        // IRSA / EKS Pod Identity chain lands via the aws-bedrock plugin (C-09a/b, Option C) at the
-        // `BedrockCredentialsResolver` seam — this arm's constructor is the only thing that changes.
+        // AWS Bedrock (Anthropic over SigV4), streaming via invoke-with-response-stream. Reads
+        // AWS_* env — the async `build_agent` path materializes the full credential chain (env →
+        // SSO → IRSA → EKS Pod Identity) into env first via `materialize_chain_into_env`, so this
+        // sync constructor works on every path (REPL /model, sub-agent factory, server).
         // Bedrock bakes the model id into the credential (it's in the invoke URL), so resolve first.
         "aws" => {
             let m = flux_providers::bedrock::resolve_model(&model);

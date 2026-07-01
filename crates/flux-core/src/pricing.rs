@@ -128,6 +128,16 @@ fn resolve_alias(model: &str) -> &str {
     }
 }
 
+/// Strip a Bedrock cross-region inference-profile routing prefix (`us.`/`eu.`/`apac.`/`global.`)
+/// from an `anthropic.*` model id. The prefix picks the serving region, not the price — every
+/// region bills the same rate — so pricing keys the region-less id.
+fn strip_bedrock_region_prefix(model: &str) -> Option<&str> {
+    ["us.", "eu.", "apac.", "global."]
+        .iter()
+        .find_map(|p| model.strip_prefix(p))
+        .filter(|rest| rest.starts_with("anthropic."))
+}
+
 /// `true` when a model spec bills against a subscription (claude/codex), so any computed cost is the
 /// *equivalent* metered figure rather than an incremental charge. Requires the `provider/` prefix —
 /// a bare model id (e.g. `claude-opus-4-8`) is ambiguous between the metered `anthropic` provider and
@@ -178,10 +188,12 @@ impl PricingTable {
         rates.insert("claude-haiku-4-5".to_string(), haiku);
 
         // --- AWS Bedrock (Anthropic models behind the SigV4 gate; rates match direct Anthropic) -----
-        // Keyed by the Bedrock model id (the `us.`/`global.` cross-region inference-profile form
-        // `resolve_model` emits). Bedrock is metered (pay-per-token via AWS), not a subscription.
+        // Keyed by the **region-less** Bedrock model id: `resolve_model` emits cross-region
+        // inference-profile ids (`us.`/`eu.`/`global.` + the id) whose price is the same in every
+        // region, and `rates_for` strips that routing prefix before this lookup. Bedrock is
+        // metered (pay-per-token via AWS), not a subscription.
         rates.insert(
-            "us.anthropic.claude-sonnet-4-6".to_string(),
+            "anthropic.claude-sonnet-4-6".to_string(),
             Rates {
                 input: 3.0,
                 output: 15.0,
@@ -190,9 +202,9 @@ impl PricingTable {
                 reasoning: 0.0,
             },
         );
-        rates.insert("us.anthropic.claude-opus-4-6-v1".to_string(), opus);
+        rates.insert("anthropic.claude-opus-4-6-v1".to_string(), opus);
         rates.insert(
-            "global.anthropic.claude-haiku-4-5-20251001-v1:0".to_string(),
+            "anthropic.claude-haiku-4-5-20251001-v1:0".to_string(),
             haiku,
         );
 
@@ -245,6 +257,13 @@ impl PricingTable {
         let (_, model) = split_provider(spec);
         if let Some(r) = self.rates.get(model) {
             return Some(r);
+        }
+        // Bedrock cross-region inference profiles (`us.`/`eu.`/`apac.`/`global.`) share one price;
+        // the table keys the region-less id, so strip the routing prefix.
+        if let Some(rest) = strip_bedrock_region_prefix(model) {
+            if let Some(r) = self.rates.get(rest) {
+                return Some(r);
+            }
         }
         let alias = resolve_alias(model);
         if alias != model {
@@ -376,7 +395,7 @@ mod tests {
         assert!(!table.cost(&usage, "claude-opus-4-8").unwrap().subscription);
 
         // AWS Bedrock (metered via AWS, not a sub): the canonical spec `aws/<bedrock-id>` must
-        // price against the Bedrock model-id entries. Failing-first: before the `us.anthropic.*`
+        // price against the Bedrock model-id entries. Failing-first: before the `anthropic.*`
         // entries were added this returned `None` (Bedrock spend unpriced).
         let aws_cost = table
             .cost(&usage, "aws/us.anthropic.claude-sonnet-4-6")
@@ -386,6 +405,19 @@ mod tests {
             "Bedrock is metered, not a subscription"
         );
         assert!(aws_cost.usd > 0.0);
+        // Every cross-region routing prefix prices identically — the region picks the serving
+        // stack, not the rate. Failing-first: with rates keyed `us.anthropic.*` an eu-region run
+        // (resolve_model emits `eu.anthropic.*`) showed no cost suffix.
+        for spec in [
+            "aws/eu.anthropic.claude-sonnet-4-6",
+            "aws/global.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "aws/eu.anthropic.claude-opus-4-6-v1",
+        ] {
+            let c = table
+                .cost(&usage, spec)
+                .unwrap_or_else(|| panic!("{spec} must price via region-prefix stripping"));
+            assert!(c.usd > 0.0 && !c.subscription, "{spec}");
+        }
 
         // The free function agrees.
         assert!(is_subscription("claude/sonnet"));

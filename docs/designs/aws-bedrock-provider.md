@@ -1,11 +1,34 @@
 # Design: AWS Bedrock LLM provider
 
-**Status:** planned (scoping) · **Pillar:** Core · **Layer:** L1 (`flux-providers` + `flux-credentials`)
+**Status:** implemented (C-09) · **Pillar:** Core · **Layer:** L1 (`flux-providers` + `flux-credentials`)
 + L0 (`flux-core`) + L6 (`flux-cli`) · **Owner:** Timo
 
 This design documents **what it takes** to add an `aws` (AWS Bedrock) provider to flux, grounded in
 live exploration against the dev account (IAM Identity Center / SSO). It does not commit to an
 implementation; it scopes the work, names the two design forks, and lists the smallest-first cut.
+
+## Implementation status (what actually landed — C-09, 2026-07)
+
+All in `crates/flux-providers/src/bedrock.rs` (L1) + `flux_core::pricing` (L0) + CLI routing (L6);
+the story's Progress log has the blow-by-blow. Two deviations from the scoping below:
+
+- **Fork 2 resolved *against* Option C's plugin.** The credential chain (env → SSO w/ OIDC refresh
+  → IRSA → EKS Pod Identity) is **hand-rolled in L1** over `std::fs` + `reqwest` — the
+  flux-credentials precedent (credential bootstrap is a separate trust boundary from agent-tool
+  IO). The plugin sandbox env-clears the process and its `std::fs` reads would bypass the C-09a
+  `fs.read` gate, so a plugin resolver can't walk the chain; the `BedrockCredentialsResolver` seam
+  stands should that ever change. No AWS SDK deps at all → **no `bedrock` feature flag needed**
+  (the scoping's Option A/C footprint concern dissolved). The C-09a protocol knobs (`internal` op
+  flag, path-scoped `fs.read`) landed anyway — useful to other plugins (commit `ececbc6`).
+- **Streaming is the only wire (C-09d, clean cutover).** `invoke-with-response-stream` + the
+  binary event-stream deframer (`map_bedrock_event_stream`: CRC-32-checked frames, split-safe
+  buffering, exception frames surface as errors, chunk `bytes` → SSE) feeding the shared
+  `map_messages_stream`; the interim non-streaming `invoke`/`map_messages_json` path was deleted.
+  Pricing keys the **region-less** Bedrock id (`anthropic.claude-*`) and `rates_for` strips the
+  `us./eu./apac./global.` routing prefix — an eu-region run priced `None` before that.
+
+Live-verified (dev SSO, eu-central-1): streaming turn + tool-use turn + `aws/haiku` (`global.`
+profile), all with `$` cost suffixes; SSO OIDC token refresh + cache persist on an expired token.
 
 ## TL;DR
 

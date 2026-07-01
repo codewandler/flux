@@ -1,22 +1,19 @@
 //! The `aws` (AWS Bedrock) provider.
 //!
 //! Bedrock serves Anthropic models behind an AWS Signature-V4 gate. The load-bearing reuse:
-//! `bedrock-runtime invoke-model` on an Anthropic model returns **native Anthropic Messages JSON**
-//! — the exact shape flux's [`crate::messages`] codec already produces and parses — so the wire
-//! codec is a thin wrapper over [`build_messages_body`] that moves `anthropic_version` from a header
-//! into the body (Bedrock's one wire quirk) and parses the single non-streaming response JSON into
-//! [`Chunk`](flux_core::Chunk)s.
+//! `bedrock-runtime invoke-with-response-stream` on an Anthropic model streams **native Anthropic
+//! Messages events** — the exact shape flux's [`crate::messages`] codec already produces and parses
+//! — so the wire codec is a thin wrapper over [`build_messages_body`] that moves
+//! `anthropic_version` from a header into the body (Bedrock's one wire quirk) and a deframer
+//! ([`map_bedrock_event_stream`]) that unwraps AWS's binary event-stream framing into the SSE bytes
+//! the shared [`map_messages_stream`] mapper parses.
 //!
 //! The credential side is **SigV4 signing** (hand-rolled here, ~150 lines, pinned by a known-answer
 //! test) over an injected [`BedrockCredentialsResolver`] — the seam that lets the credential source
-//! be swapped without touching L1. The shipped stand-in is [`EnvStaticResolver`] (reads
-//! `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN`/`AWS_REGION`); the design's
-//! Option C replaces it with an `aws-bedrock` plugin that embeds `aws-config` (full SSO / IRSA /
-//! EKS Pod Identity chain) at this same trait. See `docs/designs/aws-bedrock-provider.md`.
-//!
-//! Non-streaming `invoke-model` ships first (the response is one Messages JSON object, mapped by
-//! [`map_messages_json`]). Streaming (`invoke-with-response-stream` → AWS binary event-stream →
-//! the existing [`map_messages_stream`]) is C-09d.
+//! be swapped without touching L1. The shipped resolvers: [`EnvStaticResolver`] (reads
+//! `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN`/`AWS_REGION`) and
+//! [`AwsChainResolver`] (the full env → SSO → IRSA → EKS Pod Identity chain, below). See
+//! `docs/designs/aws-bedrock-provider.md`.
 //!
 //! Layering: L1, no flux deps above L0/L1. Crypto (`sha2`/`hmac`) is pure; the credential reads
 //! env (the established L1 pattern — `anthropic_from_env` reads `ANTHROPIC_API_KEY`).
@@ -24,14 +21,16 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use chrono::Utc;
 use futures::StreamExt;
 use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::messages::{build_messages_body, MessagesQuirks, ProviderProfile};
-use flux_core::{Chunk, ContentBlock, Error, Result, StopReason, Usage};
+use crate::messages::{build_messages_body, map_messages_stream, MessagesQuirks, ProviderProfile};
+use flux_core::{Error, Result};
 use flux_provider::{ByteStream, ChunkStream, Credential, NativeProvider, Request, WireCodec};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -64,9 +63,10 @@ impl ProviderProfile for BedrockProfile {
 // Wire codec
 // ---------------------------------------------------------------------------
 
-/// The Bedrock Anthropic wire protocol: `POST /model/{modelId}/invoke` (non-streaming), body is the
-/// Anthropic Messages shape with `anthropic_version: "bedrock-2023-05-31"` in the body (not a
-/// header), response is a single native Messages JSON object.
+/// The Bedrock Anthropic wire protocol: `POST /model/{modelId}/invoke-with-response-stream`, body
+/// is the Anthropic Messages shape with `anthropic_version: "bedrock-2023-05-31"` in the body (not
+/// a header), response is an AWS binary event-stream whose chunk payloads are native Messages
+/// streaming events.
 pub struct BedrockAnthropic;
 
 impl WireCodec for BedrockAnthropic {
@@ -74,9 +74,9 @@ impl WireCodec for BedrockAnthropic {
         let mut body = build_messages_body(req, &BedrockProfile.quirks_for(&req.model))?;
         // Bedrock's one wire quirk: the version lives in the body, not a header.
         body["anthropic_version"] = json!(BEDROCK_ANTHROPIC_VERSION);
-        // Bedrock invoke-model (non-streaming) rejects `model` (it's in the URL path via the
-        // model id) and `stream` (streaming is a *different* URL). Both are emitted by the shared
-        // Messages body builder; strip them.
+        // Bedrock rejects `model` (it's in the URL path via the model id) and `stream` (streaming
+        // is expressed by the URL, not a body flag). Both are emitted by the shared Messages body
+        // builder; strip them.
         body.as_object_mut()
             .expect("messages body is an object")
             .remove("model");
@@ -87,7 +87,7 @@ impl WireCodec for BedrockAnthropic {
     }
 
     fn map_stream(&self, bytes: ByteStream) -> ChunkStream {
-        map_messages_json(bytes)
+        map_messages_stream(map_bedrock_event_stream(bytes))
     }
 
     fn wire_headers(&self) -> Vec<(&'static str, String)> {
@@ -96,82 +96,212 @@ impl WireCodec for BedrockAnthropic {
     }
 }
 
-/// Map a single Bedrock `invoke-model` response (one native Messages JSON object) into [`Chunk`]s.
-///
-/// The response shape is `{"model","content":[{"type":"text"|"thinking"|...}],"stop_reason",
-/// "usage":{"input_tokens","output_tokens","cache_creation_input_tokens","cache_read_input_tokens"}}`.
-/// `flux_core::ContentBlock` already deserializes from the Messages content shape, so the content
-/// array maps directly; usage maps field-for-field. Emits `MessageStart` → one `TextDelta` per text
-/// block (live display) + the assembled `Block` per content block → `Usage` → `Done`.
-fn map_messages_json(byte_stream: ByteStream) -> ChunkStream {
+// ---------------------------------------------------------------------------
+// AWS event-stream → Anthropic SSE (C-09d)
+// ---------------------------------------------------------------------------
+//
+// `invoke-with-response-stream` responds with `application/vnd.amazon.eventstream`: binary frames
+// of `[total_len u32 | headers_len u32 | prelude_crc u32 | headers | payload | message_crc u32]`
+// (big-endian, CRC-32/IEEE). Each `chunk` event's payload is `{"bytes":"<base64>"}` where the
+// decoded bytes are one native Anthropic Messages streaming event (`message_start`,
+// `content_block_delta`, ...) — Bedrock's stream is the Anthropic stream, wrapped in AWS framing.
+// The deframer re-frames each event as SSE (`event: <type>\ndata: <json>\n\n`) so the shared
+// [`map_messages_stream`] parses it unchanged.
+
+/// The smallest possible frame: a 12-byte prelude + a 4-byte message CRC (no headers, no payload).
+const MIN_FRAME_LEN: usize = 16;
+/// Corrupt-length guard — no legitimate Bedrock frame (a model delta) approaches this.
+const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+
+/// CRC-32/IEEE (reflected, poly `0xEDB88320`) — the checksum AWS event-stream frames carry.
+/// Bitwise (no table): frames are small. Pinned by the standard check value
+/// (`crc32(b"123456789") == 0xCBF43926`).
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+fn read_u32_be(buf: &[u8], at: usize) -> u32 {
+    u32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]])
+}
+
+/// The total length of the frame at the head of `buf` once it is fully buffered (`None` = need
+/// more bytes). Validates the prelude (length bounds + CRC) as soon as its 12 bytes arrive, so
+/// corrupt framing fails fast instead of stalling on a bogus length.
+fn buffered_frame_len(buf: &[u8]) -> Result<Option<usize>> {
+    if buf.len() < 12 {
+        return Ok(None);
+    }
+    let total = read_u32_be(buf, 0) as usize;
+    if !(MIN_FRAME_LEN..=MAX_FRAME_LEN).contains(&total) {
+        return Err(Error::Provider(format!(
+            "bedrock event-stream: implausible frame length {total}"
+        )));
+    }
+    if read_u32_be(buf, 8) != crc32(&buf[..8]) {
+        return Err(Error::Provider(
+            "bedrock event-stream: prelude CRC mismatch".to_string(),
+        ));
+    }
+    Ok((buf.len() >= total).then_some(total))
+}
+
+/// Parse an event-stream header block into (name, value) pairs. The routing headers Bedrock sends
+/// (`:message-type`, `:event-type`, `:exception-type`, `:content-type`) are all strings (type 7);
+/// non-string value types are length-skipped.
+fn parse_event_headers(block: &[u8]) -> Result<Vec<(String, String)>> {
+    fn take<'a>(b: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
+        if b.len() < n {
+            return Err(Error::Provider(
+                "bedrock event-stream: truncated header block".to_string(),
+            ));
+        }
+        let (head, tail) = b.split_at(n);
+        *b = tail;
+        Ok(head)
+    }
+    let mut b = block;
+    let mut out = Vec::new();
+    while !b.is_empty() {
+        let name_len = take(&mut b, 1)?[0] as usize;
+        let name = std::str::from_utf8(take(&mut b, name_len)?)
+            .map_err(|_| Error::Provider("bedrock event-stream: non-utf8 header name".to_string()))?
+            .to_string();
+        let value_type = take(&mut b, 1)?[0];
+        match value_type {
+            0 | 1 => {}                      // bool true / false — no value bytes
+            2 => drop(take(&mut b, 1)?),     // byte
+            3 => drop(take(&mut b, 2)?),     // short
+            4 => drop(take(&mut b, 4)?),     // int
+            5 | 8 => drop(take(&mut b, 8)?), // long / timestamp
+            9 => drop(take(&mut b, 16)?),    // uuid
+            6 | 7 => {
+                // byte-buffer / string: u16 length + bytes.
+                let len =
+                    u16::from_be_bytes(take(&mut b, 2)?.try_into().expect("2 bytes")) as usize;
+                let value = take(&mut b, len)?;
+                if value_type == 7 {
+                    let v = std::str::from_utf8(value).map_err(|_| {
+                        Error::Provider("bedrock event-stream: non-utf8 header value".to_string())
+                    })?;
+                    out.push((name, v.to_string()));
+                }
+            }
+            t => {
+                return Err(Error::Provider(format!(
+                    "bedrock event-stream: unknown header value type {t}"
+                )))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Map one complete frame to a synthesized SSE event (`Ok(None)` = a non-chunk event to skip).
+/// A `chunk` event's payload is `{"bytes":"<base64 of one Anthropic stream event>"}` (plus a `p`
+/// padding field, ignored); `exception`/`error` frames surface as errors carrying their
+/// `:exception-type` and payload message.
+fn frame_to_sse(frame: &[u8]) -> Result<Option<String>> {
+    let total = frame.len();
+    if read_u32_be(frame, total - 4) != crc32(&frame[..total - 4]) {
+        return Err(Error::Provider(
+            "bedrock event-stream: message CRC mismatch".to_string(),
+        ));
+    }
+    let headers_len = read_u32_be(frame, 4) as usize;
+    let headers_end = 12usize
+        .checked_add(headers_len)
+        .filter(|&e| e <= total - 4)
+        .ok_or_else(|| {
+            Error::Provider("bedrock event-stream: header block overruns frame".to_string())
+        })?;
+    let headers = parse_event_headers(&frame[12..headers_end])?;
+    let payload = &frame[headers_end..total - 4];
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    };
+
+    match header(":message-type") {
+        Some("event") if header(":event-type") == Some("chunk") => {
+            let wrapper: Value = serde_json::from_slice(payload).map_err(|e| {
+                Error::Provider(format!(
+                    "bedrock event-stream: chunk payload is not JSON ({e})"
+                ))
+            })?;
+            let b64 = wrapper
+                .get("bytes")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    Error::Provider("bedrock event-stream: chunk without `bytes`".to_string())
+                })?;
+            let event_bytes = BASE64.decode(b64).map_err(|e| {
+                Error::Provider(format!(
+                    "bedrock event-stream: chunk bytes are not base64 ({e})"
+                ))
+            })?;
+            let event_json = String::from_utf8(event_bytes).map_err(|_| {
+                Error::Provider("bedrock event-stream: chunk bytes are not utf8".to_string())
+            })?;
+            // The decoded bytes are one Anthropic Messages stream event; its `type` becomes the
+            // SSE event name (the shared mapper dispatches on the JSON `type` tag anyway).
+            let event_type = serde_json::from_str::<Value>(&event_json)
+                .ok()
+                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
+                .unwrap_or_else(|| "message".to_string());
+            Ok(Some(format!("event: {event_type}\ndata: {event_json}\n\n")))
+        }
+        Some("event") => Ok(None), // no other event types today; tolerate future additions
+        Some(other) => {
+            // `exception` / `error` frames: the payload is `{"message": "..."}`.
+            let kind = header(":exception-type")
+                .or_else(|| header(":error-code"))
+                .unwrap_or(other);
+            let message = serde_json::from_slice::<Value>(payload)
+                .ok()
+                .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
+                .unwrap_or_else(|| String::from_utf8_lossy(payload).into_owned());
+            Err(Error::Provider(format!("bedrock stream {kind}: {message}")))
+        }
+        None => Err(Error::Provider(
+            "bedrock event-stream: frame without :message-type".to_string(),
+        )),
+    }
+}
+
+/// Decode an AWS binary event-stream into Anthropic SSE bytes. Stateful: frames arrive split
+/// across arbitrary HTTP chunk boundaries, so bytes accumulate until a complete frame is buffered.
+/// A truncated tail (connection cut mid-frame) is an error — silently dropping it would swallow a
+/// `PayloadPart`.
+pub fn map_bedrock_event_stream(byte_stream: ByteStream) -> ByteStream {
     Box::pin(async_stream::try_stream! {
-        // Buffer the whole body — invoke-model returns one JSON object, not a stream of events.
-        let mut buf: Vec<u8> = Vec::new();
         let mut s = byte_stream;
+        let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = s.next().await {
             buf.extend_from_slice(&chunk?);
-        }
-        let resp: Value = serde_json::from_slice(&buf).map_err(|e| {
-            Error::Provider(format!("bedrock: bad response JSON ({e}); raw head: {}", String::from_utf8_lossy(&buf[..buf.len().min(400)])))
-        })?;
-
-        let model = resp
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        yield Chunk::MessageStart { model };
-
-        if let Some(content) = resp.get("content").and_then(|v| v.as_array()) {
-            for block in content {
-                // Text deltas feed live display; the assembled Block is emitted for the loop host.
-                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                    if block.get("type").and_then(|v| v.as_str()) == Some("text") {
-                        yield Chunk::TextDelta(text.to_string());
-                    }
-                }
-                match serde_json::from_value::<ContentBlock>(block.clone()) {
-                    Ok(b) => yield Chunk::Block(b),
-                    Err(_) => {}
+            while let Some(len) = buffered_frame_len(&buf)? {
+                let frame: Vec<u8> = buf.drain(..len).collect();
+                if let Some(sse) = frame_to_sse(&frame)? {
+                    yield bytes::Bytes::from(sse);
                 }
             }
         }
-
-        if let Some(u) = resp.get("usage") {
-            yield Chunk::Usage(Usage {
-                input_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                output_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                cache_creation_input_tokens: u
-                    .get("cache_creation_input_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0),
-                cache_read_input_tokens: u
-                    .get("cache_read_input_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0),
-                reasoning_tokens: 0,
-            });
+        if !buf.is_empty() {
+            Err(Error::Provider(format!(
+                "bedrock event-stream: {} trailing bytes (truncated frame)",
+                buf.len()
+            )))?;
         }
-
-        let stop = resp
-            .get("stop_reason")
-            .and_then(|v| v.as_str())
-            .map(map_stop_reason)
-            .unwrap_or(StopReason::Unknown);
-        yield Chunk::Done { stop_reason: Some(stop) };
     })
-}
-
-fn map_stop_reason(s: &str) -> StopReason {
-    match s {
-        "end_turn" => StopReason::EndTurn,
-        "max_tokens" => StopReason::MaxTokens,
-        "stop_sequence" => StopReason::StopSequence,
-        "tool_use" => StopReason::ToolUse,
-        "pause_turn" => StopReason::PauseTurn,
-        "refusal" => StopReason::Refusal,
-        _ => StopReason::Unknown,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -254,21 +384,13 @@ pub struct BedrockCredential {
 
 impl BedrockCredential {
     fn endpoint_url(&self, creds: &BedrockCreds) -> String {
-        // Non-streaming invoke-model. The model id may contain `.`/`:`/`-` — percent-encode the
-        // path segment (not the slashes between segments).
-        let encoded = percent_encode_segment(&creds.model_id_placeholder(&self.model_id));
+        // Streaming invoke. The model id may contain `.`/`:`/`-` — percent-encode the path
+        // segment (not the slashes between segments).
+        let encoded = percent_encode_segment(&self.model_id);
         format!(
-            "https://bedrock-runtime.{}.amazonaws.com/model/{}/invoke",
+            "https://bedrock-runtime.{}.amazonaws.com/model/{}/invoke-with-response-stream",
             creds.region, encoded
         )
-    }
-}
-
-// `BedrockCreds` carries the region but not the model id (the model is the credential's, not the
-// chain's); thread it through the URL builder via a tiny helper so `endpoint()` reads only creds.
-impl BedrockCreds {
-    fn model_id_placeholder<'a>(&'a self, model_id: &'a str) -> String {
-        model_id.to_string()
     }
 }
 
@@ -1072,6 +1194,15 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flux_core::{Chunk, ContentBlock, StopReason};
+
+    /// Serializes the tests that mutate process-global env (`AWS_REGION` + friends) — without it
+    /// they race across test threads (e.g. `resolve_model` sees another test's region).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     // -- SigV4 known-answer test ---------------------------------------------------------------
     //
@@ -1180,46 +1311,194 @@ mod tests {
         assert!(BedrockAnthropic.wire_headers().is_empty());
     }
 
+    // -- C-09d: AWS event-stream deframer --------------------------------------------------------
+
+    fn encode_string_header(name: &str, value: &str) -> Vec<u8> {
+        let mut b = vec![name.len() as u8];
+        b.extend_from_slice(name.as_bytes());
+        b.push(7); // value type: string
+        b.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        b.extend_from_slice(value.as_bytes());
+        b
+    }
+
+    /// Encode one AWS event-stream frame — the test-side inverse of the deframer. (Not circular:
+    /// `crc32` itself is pinned by `crc32_matches_check_value`.)
+    fn encode_frame(headers: &[(&str, &str)], payload: &[u8]) -> Vec<u8> {
+        let hb: Vec<u8> = headers
+            .iter()
+            .flat_map(|(n, v)| encode_string_header(n, v))
+            .collect();
+        let total = 12 + hb.len() + payload.len() + 4;
+        let mut f = Vec::with_capacity(total);
+        f.extend_from_slice(&(total as u32).to_be_bytes());
+        f.extend_from_slice(&(hb.len() as u32).to_be_bytes());
+        let prelude_crc = crc32(&f[..8]);
+        f.extend_from_slice(&prelude_crc.to_be_bytes());
+        f.extend_from_slice(&hb);
+        f.extend_from_slice(payload);
+        let msg_crc = crc32(&f);
+        f.extend_from_slice(&msg_crc.to_be_bytes());
+        f
+    }
+
+    /// A `chunk` event frame carrying one Anthropic stream event, matching the recorded live wire:
+    /// the payload wraps base64 `bytes` plus the `p` padding field Bedrock adds.
+    fn chunk_frame(event_json: &str) -> Vec<u8> {
+        let payload =
+            json!({ "bytes": BASE64.encode(event_json), "p": "abcdefghijklmnop" }).to_string();
+        encode_frame(
+            &[
+                (":message-type", "event"),
+                (":event-type", "chunk"),
+                (":content-type", "application/json"),
+            ],
+            payload.as_bytes(),
+        )
+    }
+
+    fn byte_stream_from(wire: Vec<u8>, piece_len: usize) -> ByteStream {
+        let pieces: Vec<_> = wire
+            .chunks(piece_len)
+            .map(|c| Ok::<_, Error>(bytes::Bytes::copy_from_slice(c)))
+            .collect();
+        Box::pin(futures::stream::iter(pieces))
+    }
+
+    #[test]
+    fn crc32_matches_check_value() {
+        // The standard CRC-32/IEEE check value (see the CRC catalog): crc32("123456789").
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
     #[tokio::test]
-    async fn map_messages_json_parses_one_response_into_chunks() {
-        let resp = json!({
-            "model": "claude-sonnet-4-6",
-            "content": [{"type":"text","text":"ok"}],
-            "stop_reason": "end_turn",
-            "usage": {
-                "input_tokens": 14, "output_tokens": 4,
-                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0
-            }
-        });
-        let bytes = futures::stream::once(async move {
-            Ok::<_, flux_core::Error>(bytes::Bytes::from(resp.to_string()))
-        });
-        let stream = map_messages_json(Box::pin(bytes));
-        let chunks: Vec<Chunk> = stream
+    async fn event_stream_emits_anthropic_sse() {
+        let wire = chunk_frame(r#"{"type":"message_stop"}"#);
+        let out: Vec<bytes::Bytes> = map_bedrock_event_stream(byte_stream_from(wire, 4096))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        let sse = String::from_utf8(out.concat()).unwrap();
+        assert_eq!(
+            sse,
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_stream_deframes_a_full_turn_split_across_boundaries() {
+        // A full invoke-with-response-stream turn: each frame's `bytes` is one native Anthropic
+        // Messages stream event.
+        let events = [
+            r#"{"type":"message_start","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":1}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#,
+            r#"{"type":"message_stop"}"#,
+        ];
+        let wire: Vec<u8> = events.iter().flat_map(|e| chunk_frame(e)).collect();
+        // Feed the bytes in 7-byte pieces: every frame arrives split across chunk boundaries, so a
+        // deframer that assumes frame-aligned reads drops PayloadParts (the failing-first mode).
+        let chunks: Vec<Chunk> = BedrockAnthropic
+            .map_stream(byte_stream_from(wire, 7))
             .collect::<Vec<_>>()
             .await
             .into_iter()
             .map(|c| c.unwrap())
             .collect();
-        // MessageStart → TextDelta("ok") → Block(Text) → Usage → Done.
         assert!(
             matches!(chunks[0], Chunk::MessageStart { ref model } if model == "claude-sonnet-4-6")
         );
-        assert!(matches!(chunks[1], Chunk::TextDelta(ref t) if t == "ok"));
-        assert!(matches!(chunks[2], Chunk::Block(ContentBlock::Text { ref text }) if text == "ok"));
-        assert!(matches!(chunks[3], Chunk::Usage(_)));
+        let text: String = chunks
+            .iter()
+            .filter_map(|c| match c {
+                Chunk::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Hello", "a dropped PayloadPart loses a delta");
+        assert!(chunks
+            .iter()
+            .any(|c| matches!(c, Chunk::Block(ContentBlock::Text { text }) if text == "Hello")));
         assert!(matches!(
-            chunks[4],
+            chunks.last().unwrap(),
             Chunk::Done {
                 stop_reason: Some(StopReason::EndTurn)
             }
         ));
     }
 
+    #[tokio::test]
+    async fn event_stream_surfaces_exception_frames() {
+        let wire = encode_frame(
+            &[
+                (":message-type", "exception"),
+                (":exception-type", "throttlingException"),
+            ],
+            br#"{"message":"Too many requests"}"#,
+        );
+        let results: Vec<_> = map_bedrock_event_stream(byte_stream_from(wire, 4096))
+            .collect::<Vec<_>>()
+            .await;
+        let err = results
+            .into_iter()
+            .find_map(|r| r.err())
+            .expect("an exception frame must surface as an error");
+        let msg = err.to_string();
+        assert!(msg.contains("throttlingException"), "kind in: {msg}");
+        assert!(msg.contains("Too many requests"), "message in: {msg}");
+    }
+
+    #[tokio::test]
+    async fn event_stream_errors_on_truncated_tail() {
+        let mut wire = chunk_frame(r#"{"type":"message_stop"}"#);
+        let next = chunk_frame(r#"{"type":"ping"}"#);
+        wire.extend_from_slice(&next[..10]); // connection cut mid-frame
+        let results: Vec<_> = map_bedrock_event_stream(byte_stream_from(wire, 4096))
+            .collect::<Vec<_>>()
+            .await;
+        assert!(results[0].is_ok(), "the complete frame still decodes");
+        let err = results
+            .last()
+            .unwrap()
+            .as_ref()
+            .expect_err("trailing bytes must error, not be dropped");
+        assert!(err.to_string().contains("truncated"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn event_stream_rejects_corrupt_prelude_crc() {
+        let mut wire = chunk_frame(r#"{"type":"message_stop"}"#);
+        wire[8] ^= 0xFF; // flip a prelude-CRC byte
+        let results: Vec<_> = map_bedrock_event_stream(byte_stream_from(wire, 4096))
+            .collect::<Vec<_>>()
+            .await;
+        let err = results[0].as_ref().expect_err("corrupt prelude must error");
+        assert!(err.to_string().contains("prelude CRC"), "{err}");
+    }
+
+    #[test]
+    fn endpoint_is_streaming_invoke() {
+        let cred = BedrockCredential {
+            model_id: "us.anthropic.claude-sonnet-4-6".to_string(),
+            creds: Mutex::new(example_creds()),
+            resolver: Arc::new(EnvStaticResolver),
+        };
+        assert_eq!(
+            cred.endpoint(),
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/us.anthropic.claude-sonnet-4-6/invoke-with-response-stream"
+        );
+    }
+
     // -- resolve_model --------------------------------------------------------------------------
 
     #[test]
     fn resolve_model_maps_aliases_to_cross_region_profiles() {
+        let _env = env_guard();
         // Default (no AWS_REGION set) → us-prefix.
         unsafe {
             std::env::remove_var("AWS_REGION");
@@ -1242,6 +1521,7 @@ mod tests {
 
     #[test]
     fn resolve_model_is_region_aware() {
+        let _env = env_guard();
         // Failing-first for the region-prefix bug: the cross-region inference-profile id must
         // match the Bedrock region — `us.anthropic.*` is invalid in eu-central-1 (Bedrock 400
         // "The provided model identifier is invalid"), and vice versa. The credential chain sets
@@ -1267,10 +1547,12 @@ mod tests {
 
     // -- EnvStaticResolver ----------------------------------------------------------------------
 
+    // Holding the env lock across the resolver's await is the point: it blocks the other
+    // env-mutating test threads (each #[tokio::test] runs its own runtime, so no deadlock).
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn env_static_resolver_reads_aws_env() {
-        // SAFETY: these env reads/writes are confined to this test; std::env is process-global but
-        // tests don't run the resolver concurrently against these keys.
+        let _env = env_guard();
         unsafe {
             std::env::set_var("AWS_ACCESS_KEY_ID", "AKIATEST");
             std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret");
@@ -1289,8 +1571,10 @@ mod tests {
         }
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn env_static_resolver_errors_without_access_key() {
+        let _env = env_guard();
         unsafe {
             std::env::remove_var("AWS_ACCESS_KEY_ID");
         }
