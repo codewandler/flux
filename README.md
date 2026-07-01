@@ -107,6 +107,7 @@ A provider is a **wire codec × credential** cell. Select one with `-m <provider
 | `claude` | Anthropic Messages | Claude subscription OAuth | imports `~/.claude/.credentials.json`; opt-in |
 | `openai` | OpenAI Chat | `OPENAI_API_KEY` | API key |
 | `codex` | OpenAI Responses | ChatGPT/Codex OAuth | imports `~/.codex/auth.json`; opt-in |
+| `aws` | Anthropic Messages (Bedrock) | AWS env / SSO / IRSA / EKS Pod Identity | Claude via AWS Bedrock; full credential chain, no `aws` CLI; metered |
 | `openrouter` | OpenAI Chat | `OPENROUTER_API_KEY` | API key |
 
 ```bash
