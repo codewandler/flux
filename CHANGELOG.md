@@ -8,6 +8,28 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Strict review: app journey + `flux review` CLI + CI output modes (L-13, Phase 4).** Strict review
+  is now a product surface, with ONE shared `strict_review` definition consumed identically by both:
+  `crates/flux-app/src/review.rs` embeds the checked-in `examples/strict_review.flux` via
+  `include_str!` and wraps its parsed `DraftAst`, unmodified, as a `strict_review` composite op —
+  never a second hand-maintained copy. `flux_app::App` grew `with_sub_agents` (a `TaskTool` +
+  `SubAgents`-built spawner installed on every journey run's executor, mirroring
+  `FlowClient::with_sub_agents`), so the new `review_code` journey (pure plumbing: `return
+  strict_review(files: $files)`) can delegate to the bounded 3-role reviewer fan-out via `task`.
+  `flux app run strict-review` (a built-in program name) runs it. The new `flux review --files
+  <path>… [--format md|json] [--fail-on <severity>]` CLI command wires roles + sub-agents exactly like
+  `build_agent` (shared `build_review_sub_agents` helper) and runs the same embedded flow text through
+  `flux_sdk::FlowClient::run_flow` — printing a markdown findings summary (default) or raw
+  `ReviewReport` JSON, and exiting 1 when a finding's severity meets `--fail-on` (`info|low|medium|
+  high|critical`; an unrecognized severity string fails safe as `critical` rather than silently
+  bypassing the gate). Self-contained: the built-in reviewer roles + the embedded flow text ship in
+  the binary, so `flux review` works in any repo (a project's own `.flux/agents/review-*.md` still
+  overrides). The strict-review core stays read-only — no write/network/publishing effect was added.
+  New headline test `crates/flux-app/tests/strict_review_journey.rs` asserts the journey path and the
+  direct `FlowClient` path produce the byte-identical `ReviewReport` for the same inputs (added RED,
+  made GREEN); 10 new `flux-cli` unit tests cover the `should_fail` exit-code decision and markdown
+  rendering.
+
 - **Strict review: typed artifacts + deterministic aggregator — `review.normalize`/`review.aggregate`
   (L-12, Phase 3).** `examples/strict_review.flux`'s aggregation tail (`merge` → `filter` → `dedupe` →
   `sort` over a **model-emitted** `rank`) is replaced by a single deterministic native call,

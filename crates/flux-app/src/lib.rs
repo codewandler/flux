@@ -35,8 +35,10 @@
 mod app;
 mod bus;
 mod ops;
+pub mod review;
 mod secrets;
 
 pub use app::{App, JourneyRun, RecordingSink};
 pub use bus::{Bus, Event, SentMessage};
+pub use review::{review_code_journey, strict_review_op, strict_review_program};
 pub use secrets::resolve_secrets;

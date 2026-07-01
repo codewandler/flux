@@ -1,7 +1,7 @@
 # Design: strict review flows and journeys
 
-**Status:** proposed (epic) · **Pillar:** Language (Flux-Lang protocol) + Core (capability
-enforcement) · **Stories:** [L-10](../stories/L-10-strict-review-example-flow.md) ·
+**Status:** landed (epic; all four phases built) · **Pillar:** Language (Flux-Lang protocol) + Core
+(capability enforcement) · **Stories:** [L-10](../stories/L-10-strict-review-example-flow.md) ·
 [L-11](../stories/L-11-strict-review-scoped-capabilities.md) ·
 [L-12](../stories/L-12-strict-review-typed-artifacts.md) ·
 [L-13](../stories/L-13-strict-review-journey-cli.md)
@@ -244,17 +244,10 @@ tracked as Phase 4 (journey/CLI surfaces).
 
 ## Journey integration
 
-A `flux-app` journey is the right product surface once the flow is reusable:
-
-```flux
-journey review_code(input) {
-  run strict_review(
-    files: input.files,
-    diff: input.diff,
-    reviewers: input.reviewers ?? ["security", "correctness", "maintainability"]
-  )
-}
-```
+A `flux-app` journey is the right product surface once the flow is reusable. The conceptual syntax
+above is illustrative; see Phase 4 below for the exact shape that landed (a composite `op` wrapping the
+checked-in flow text, not a `journey` with typed keyword args — native-text `call` args are positional,
+and a journey's body reads payload-seeded symbols the same way `hello.flux`'s `echo` journey does).
 
 The journey owns trigger and input mapping. The flow owns execution semantics. This keeps app routing separate from review correctness.
 
@@ -331,11 +324,53 @@ the "Review artifacts" / "Aggregation" sections above for the exact shapes and a
   duplicate-collapse-with-agreement, severity→confidence→agreement ranking), plus the updated L-10
   `crates/flux-sdk/tests/strict_review.rs` integration test.
 
-### Phase 4: app journey and surfaces
+### Phase 4: app journey and surfaces — BUILT (L-13)
 
-- Add a `flux-app` example journey.
-- Optionally expose a CLI convenience command that invokes the flow.
-- Add CI-friendly output modes: markdown, JSON, and nonzero exit on high severity.
+Landed with ONE shared `strict_review` definition structurally guaranteed (not by convention) to be
+identical on both surfaces; see [L-13](../stories/L-13-strict-review-journey-cli.md) for the
+acceptance mapping.
+
+- **Shared definition:** `crates/flux-app/src/review.rs` `include_str!`s the checked-in
+  `examples/strict_review.flux` (`STRICT_REVIEW_FLOW_SRC`) — the same file L-10/L-12 landed and
+  `crates/flux-sdk/tests/strict_review.rs` drives directly. `strict_review_op()` parses that exact text
+  once into a `DraftAst` and wraps it, unmodified, as a `strict_review` `CompositeOpDecl` (risk
+  `Medium`, effects `[Read, Filesystem, Process]` — matching what `task`/`git_status`/`git_diff`/
+  `read_many` actually require, or `analyze_composites` rejects the declaration with a clear
+  diagnostic). There is no second, hand-maintained copy of the protocol anywhere.
+- **Journey:** `review_code_journey()` is pure plumbing — `return strict_review(files: $files)` — with
+  no review logic of its own; `$files` is the payload-seeded symbol (`App`'s `seed_payload`, the same
+  mechanism `hello.flux`'s `echo` journey uses for `$text`). `strict_review_program()` assembles the
+  full `Program` (the op + the journey + an `on "review"` trigger). `flux_app::App` grew
+  `with_sub_agents` (mirrors `FlowClient::with_sub_agents`: registers `TaskTool` and installs a
+  `SubAgents`-built spawner on every journey run's executor, sharing ONE `System` built once in
+  `Engine::new` rather than a second independently-resolved instance) — this is what lets a journey's
+  composite-op body delegate to reviewers via `task`. `flux app run strict-review` (a built-in program
+  name, no file needed) runs it.
+- **CLI:** `flux review --files <path>… [--format md|json] [--fail-on <severity>]`
+  (`crates/flux-cli/src/main.rs`) wires roles + sub-agents via a shared `build_review_sub_agents`
+  helper (exactly like `build_agent`'s construction — `load_roles` + `SubAgents::new` — and shared with
+  the `flux app run strict-review` branch so the two call sites can't drift), then runs
+  `STRICT_REVIEW_FLOW_SRC` through `flux_sdk::FlowClient::run_flow` (`parse` → `analyze` →
+  `execute_with`, deterministic, no model round-trip for the flow itself — only the reviewer
+  sub-agents call a model). Markdown (default, a readable findings + gaps summary) or raw
+  `ReviewReport` JSON (`--format json`). `--fail-on <severity>` (`info|low|medium|high|critical`) is
+  decided by a pure, unit-tested `should_fail(report, threshold) -> bool`; `run_review` calls
+  `std::process::exit(1)` only at the top level. An unrecognized/malformed severity string maps to
+  `Critical` for this gate (fail-safe — it can never silently slip under a threshold), the opposite
+  convention from `flux_tools::cognition`'s ranking (which sorts an unknown severity as the *lowest*
+  tier, safe for stable ordering but wrong for a security gate).
+- **Self-contained:** `load_roles`'s existing `DEFAULT_ROLES` fallback pattern already covers the
+  built-in review roles (a project's own `.flux/agents/review-*.md` still overrides), and the flow text
+  ships in the binary via `include_str!` — so `flux review` and `flux app run strict-review` work in
+  any repo, not just this one.
+- **Security:** unchanged from L-11/L-12 — reviewer roles keep `tools: []`; the strict-review core
+  stays read-only; the CLI only ever prints to stdout (no write/network/report-publishing effect was
+  added).
+- Tests: `crates/flux-app/tests/strict_review_journey.rs` (the headline test — `App::deliver("review",
+  …)`'s journey result equals `FlowClient::run_flow`'s direct result, byte for byte, against the same
+  mock reviewer fixture; added RED before the sub-agent wiring existed, GREEN after), `flux-app/src/
+  review.rs`'s unit tests (the composite op wraps the checked-in file verbatim), and 10 new `flux-cli`
+  unit tests for `should_fail` + `render_review_markdown`.
 
 ## Tests and acceptance
 
@@ -366,7 +401,10 @@ the "Review artifacts" / "Aggregation" sections above for the exact shapes and a
   `parallel` fan-out and covers non-`task` calls too; a `task(tools:)` param would not.
 - Where should review artifact schemas live before they become prelude types?
 - Should reviewer disagreement be preserved as separate findings or merged with agreement counts?
-- Should strict review be a built-in sample, a project template, or a first-class CLI command?
+- ~~Should strict review be a built-in sample, a project template, or a first-class CLI command?~~
+  **Resolved (L-13): a first-class CLI command (`flux review`) plus a built-in app journey**
+  (`flux app run strict-review`), both self-contained (roles + flow text embedded in the binary) so
+  neither depends on being run from within the flux repo.
 
 ## Recommendation
 

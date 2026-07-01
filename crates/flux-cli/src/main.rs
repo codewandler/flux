@@ -243,6 +243,26 @@ enum Commands {
         #[command(subcommand)]
         action: FlowAction,
     },
+    /// Run the strict-review protocol over `--files` and print a `ReviewReport` (flux L-13; design
+    /// `docs/designs/strict-review-flows.md`). Self-contained: the reviewer roles and the
+    /// `strict_review` flow are embedded in the binary, so this works in any repo — a project's own
+    /// `.flux/agents/review-*.md` still overrides the built-in role definitions. Read-only: this never
+    /// posts anywhere, it only prints to stdout.
+    Review {
+        #[command(flatten)]
+        agent: AgentFlags,
+        /// Files to review (at least one).
+        #[arg(long = "files", required = true, num_args = 1..)]
+        files: Vec<String>,
+        /// Output format: `md` (a readable findings summary, the default) or `json` (the raw
+        /// `ReviewReport`).
+        #[arg(long, value_enum, default_value_t)]
+        format: ReviewFormat,
+        /// Exit 1 if any finding's severity is at or above this threshold (`info`|`low`|`medium`|
+        /// `high`|`critical`). Omit to always exit 0 regardless of findings.
+        #[arg(long, value_enum)]
+        fail_on: Option<ReviewSeverity>,
+    },
     /// Inspect or customize the agent loop (`assets/agent-loop.flux`).
     Loop {
         #[command(subcommand)]
@@ -476,6 +496,43 @@ impl From<EffortArg> for Effort {
             EffortArg::High => Effort::High,
             EffortArg::Xhigh => Effort::Xhigh,
             EffortArg::Max => Effort::Max,
+        }
+    }
+}
+
+/// `flux review --format` output mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+enum ReviewFormat {
+    /// A readable markdown findings summary (the default).
+    #[default]
+    Md,
+    /// The raw `ReviewReport` JSON.
+    Json,
+}
+
+/// `flux review --fail-on` severity threshold, ordered low → high so `>=` comparisons are meaningful.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+enum ReviewSeverity {
+    Info,
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl ReviewSeverity {
+    /// Parse a `ReviewFinding.severity` string into the same ordering. Unlike
+    /// `flux_tools::cognition`'s ranking (which sorts an unrecognized severity as the *lowest* tier,
+    /// safe for stable ordering), an unrecognized value here maps to `Critical` — the *highest* tier
+    /// — so a malformed or unexpected severity string can never silently slip under a `--fail-on`
+    /// threshold; the gate fails safe (an unparseable severity trips it) rather than failing open.
+    fn from_finding_str(s: &str) -> Self {
+        match s {
+            "info" => Self::Info,
+            "low" => Self::Low,
+            "medium" => Self::Medium,
+            "high" => Self::High,
+            _ => Self::Critical,
         }
     }
 }
@@ -1489,6 +1546,168 @@ async fn run_eval_cmd(
         println!("report written to {path}");
     }
     Ok(())
+}
+
+/// Build the `SubAgents` bundle for the strict-review protocol's reviewer fan-out: the same
+/// `load_roles` + `SubAgents::new` construction `build_agent` uses for the top-level agent, shared by
+/// both `flux review` ([`run_review`]) and `flux app run strict-review` (the built-in-program branch
+/// of [`run_app`]) so the two call sites can't drift.
+fn build_review_sub_agents(
+    cwd: &std::path::Path,
+    model_spec: &str,
+    model: impl Into<String>,
+    max_tokens: u32,
+) -> SubAgents {
+    let roles = load_roles(cwd);
+    let mut child_base = ToolRegistry::new();
+    flux_tools::register_builtins(&mut child_base);
+    let factory: ProviderFactory = {
+        let spec = model_spec.to_string();
+        Arc::new(move || provider_for(&spec).map_err(|e| flux_core::Error::Other(e.to_string())))
+    };
+    SubAgents::new(roles, child_base, factory, model, max_tokens)
+}
+
+/// `flux review --files <path>… [--format md|json] [--fail-on <severity>]` — run the strict-review
+/// protocol (flux L-13; `docs/designs/strict-review-flows.md` "Phase 4") over `files` and print the
+/// resulting `ReviewReport`. Runs the SAME embedded `strict_review` flow text
+/// (`flux_app::review::STRICT_REVIEW_FLOW_SRC` — the checked-in `examples/strict_review.flux`, the
+/// identical source the `review_code` app journey wraps as a composite op) through
+/// `flux_sdk::FlowClient::run_flow` — the deterministic `parse` → `analyze` → `execute_with` path, no
+/// model round-trip for the flow itself (only the reviewer sub-agents call a model). Self-contained:
+/// [`load_roles`] already falls back to built-in role definitions when a project's own
+/// `.flux/agents/review-*.md` is absent, and the flow text ships in the binary — so this works in any
+/// repo. Read-only: `strict_review`'s reviewer roles all declare `tools: []`, and this command never
+/// writes anywhere but stdout.
+async fn run_review(
+    flags: &AgentFlags,
+    files: Vec<String>,
+    format: ReviewFormat,
+    fail_on: Option<ReviewSeverity>,
+) -> Result<()> {
+    let cwd = std::env::current_dir().context("current dir")?;
+    let cfg = flux_config::load(&cwd).context("load .flux/config.toml")?;
+    let model_spec = resolve_model_spec(&flags.model, &cfg);
+
+    let (provider, model): (Arc<dyn Provider>, String) =
+        if model_spec == "mock" || model_spec.starts_with("mock/") {
+            (Arc::new(MockCliProvider::default()), "mock".to_string())
+        } else {
+            let (native, _provider_name, m) = build_provider(&model_spec)?;
+            (Arc::new(native), m)
+        };
+
+    // Wire roles + sub-agents exactly like `build_agent`: `strict_review`'s bounded 3-role reviewer
+    // fan-out (via `task`) delegates through the identical envelope the top-level agent uses.
+    let sub_agents = build_review_sub_agents(&cwd, &model_spec, model.clone(), flags.max_tokens);
+
+    // `strict_review`'s core is read-only by construction (git_status/git_diff/read_many + `task`
+    // against `tools: []` reviewer roles — see the design's security considerations); auto-approving
+    // this specific, fixed flow's own ops is not the same authority `--yes` grants an arbitrary
+    // prompt-compiled plan, so it does not consult `flags.yes`.
+    let mut client = flux_sdk::FlowClient::builder()
+        .model(model)
+        .auto_approve(true)
+        .build(provider, cwd)
+        .context("build flow client")?;
+    client.with_sub_agents(sub_agents);
+
+    let mut inputs = serde_json::Map::new();
+    inputs.insert("files".to_string(), serde_json::json!(files));
+
+    let out = client
+        .run_flow(flux_app::review::STRICT_REVIEW_FLOW_SRC, inputs)
+        .await
+        .map_err(|e| anyhow::anyhow!("strict_review: {e}"))?;
+    let report: flux_tools::cognition::ReviewReport = serde_json::from_str(&out.result)
+        .with_context(|| {
+            format!(
+                "strict_review did not return a ReviewReport: {}",
+                out.result
+            )
+        })?;
+
+    match format {
+        ReviewFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).context("serialize ReviewReport")?
+            );
+        }
+        ReviewFormat::Md => println!("{}", render_review_markdown(&report)),
+    }
+
+    if should_fail(&report, fail_on) {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Render a [`flux_tools::cognition::ReviewReport`] as a readable markdown findings summary — the
+/// default `flux review` output mode.
+fn render_review_markdown(report: &flux_tools::cognition::ReviewReport) -> String {
+    let mut out = String::new();
+    out.push_str("# Strict review\n\n");
+    out.push_str(&format!("{}\n\n", report.summary));
+    out.push_str(&format!(
+        "Checked {} file(s) · reviewers: {}\n\n",
+        report.checked_files.len(),
+        report.reviewers.join(", ")
+    ));
+    if report.findings.is_empty() {
+        out.push_str("No findings.\n");
+    } else {
+        out.push_str("## Findings\n\n");
+        for f in &report.findings {
+            out.push_str(&format!(
+                "### [{}] {} ({})\n\n",
+                f.severity.to_uppercase(),
+                f.title,
+                f.category
+            ));
+            if let Some(file) = &f.file {
+                match f.line {
+                    Some(line) => out.push_str(&format!("- **location:** `{file}:{line}`\n")),
+                    None => out.push_str(&format!("- **location:** `{file}`\n")),
+                }
+            }
+            out.push_str(&format!(
+                "- **reviewer:** {} (agreement: {})\n",
+                f.reviewer, f.agreement
+            ));
+            out.push_str(&format!("- **confidence:** {:.2}\n", f.confidence));
+            if !f.evidence.is_empty() {
+                out.push_str(&format!("- **evidence:** {}\n", f.evidence));
+            }
+            if !f.recommendation.is_empty() {
+                out.push_str(&format!("- **recommendation:** {}\n", f.recommendation));
+            }
+            out.push('\n');
+        }
+    }
+    if !report.gaps.is_empty() {
+        out.push_str("## Gaps\n\n");
+        for gap in &report.gaps {
+            out.push_str(&format!("- {gap}\n"));
+        }
+    }
+    out
+}
+
+/// The exit-code decision, factored out as a pure function so it is unit-testable without going
+/// through `std::process::exit`: `true` iff `threshold` is set AND at least one finding's severity is
+/// at or above it. `None` (no `--fail-on`) never fails, regardless of findings.
+fn should_fail(
+    report: &flux_tools::cognition::ReviewReport,
+    threshold: Option<ReviewSeverity>,
+) -> bool {
+    let Some(threshold) = threshold else {
+        return false;
+    };
+    report
+        .findings
+        .iter()
+        .any(|f| ReviewSeverity::from_finding_str(&f.severity) >= threshold)
 }
 
 async fn run_flow(file: &str, model: Option<String>, yes: bool) -> Result<()> {
@@ -3604,6 +3823,15 @@ async fn main() -> Result<()> {
             Some(Commands::Flow {
                 action: FlowAction::Run { file, model, yes },
             }) => run_flow(&file, model, yes).await,
+            Some(Commands::Review {
+                agent,
+                files,
+                format,
+                fail_on,
+            }) => {
+                apply_agent_env(&agent);
+                run_review(&agent, files, format, fail_on).await
+            }
             Some(Commands::Loop { action }) => run_loop_cmd(action),
             Some(Commands::Sessions { prune }) => run_sessions(prune),
             Some(Commands::Auth { action }) => run_auth(action).await,
@@ -3740,14 +3968,25 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
         }
     };
 
-    let src =
-        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("read program `{path}`: {e}"))?;
-    let mut program = match Module::parse_str(&src).map_err(|e| anyhow::anyhow!("{e}"))? {
-        Module::Program(p) => p,
-        Module::Flow(flow) => Program {
-            flows: vec![flow],
-            ..Default::default()
-        },
+    // `strict-review` is a built-in program name (no file): the L-13 `review_code` journey, wrapping
+    // the ONE checked-in `examples/strict_review.flux` protocol as a composite op
+    // (`flux_app::review::strict_review_program`) — the same construction the hermetic
+    // `crates/flux-app/tests/strict_review_journey.rs` test drives. `flux review --files …` (the
+    // direct/CLI surface) runs the identical embedded source through a different path
+    // (`FlowClient::run_flow`), never a second hand-written copy.
+    let is_builtin_strict_review = path == "strict-review";
+    let mut program = if is_builtin_strict_review {
+        flux_app::review::strict_review_program().map_err(|e| anyhow::anyhow!("{e}"))?
+    } else {
+        let src = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("read program `{path}`: {e}"))?;
+        match Module::parse_str(&src).map_err(|e| anyhow::anyhow!("{e}"))? {
+            Module::Program(p) => p,
+            Module::Flow(flow) => Program {
+                flows: vec![flow],
+                ..Default::default()
+            },
+        }
     };
     // Resolve `secret "ENV_NAME"` references in declaration settings from the environment (plaintext is
     // never inline) before any of those settings reach a channel/datasource/agent.
@@ -3893,12 +4132,18 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
     }
 
     let channel_decls = program.channels.clone();
-    let app = std::sync::Arc::new(flux_app::App::with_tools(
+    // The built-in `strict-review` program's `review_code` journey calls `strict_review`, which fans
+    // out to reviewer sub-agents via `task` — the same `build_review_sub_agents` helper `flux review`
+    // uses, so the two surfaces delegate through the identical envelope, never a re-derived one.
+    let sub_agents = is_builtin_strict_review
+        .then(|| build_review_sub_agents(&cwd, &spec, model.clone(), flags.max_tokens));
+    let app = std::sync::Arc::new(flux_app::App::with_sub_agents(
         program,
         provider,
         model,
         auto_approve,
         extra_tools,
+        sub_agents,
     ));
     let channels = flux_channels::build_channels(&channel_decls)?;
     // Serve stdin when an interactive `cli` channel is declared, or when the program declares no
@@ -4994,9 +5239,9 @@ mod tests {
     use super::{
         build_datasources, build_invoke_input, coerce_arg_value, cost_annotation,
         credential_location, format_evidence, loop_machinery_label, new_render_suffix,
-        plugin_binaries_in, plugin_status_one, render_endpoint_row, resolve_plugin_operation_name,
-        run_plugin_in, tool_preview, truncate, usage_annotation, write_generated_skill, Liveness,
-        PluginAction,
+        plugin_binaries_in, plugin_status_one, render_endpoint_row, render_review_markdown,
+        resolve_plugin_operation_name, run_plugin_in, should_fail, tool_preview, truncate,
+        usage_annotation, write_generated_skill, Liveness, PluginAction, ReviewSeverity,
     };
     use serde_json::json;
 
@@ -5572,6 +5817,7 @@ mod tests {
             "app",
             "eval",
             "flow",
+            "review",
             "loop",
             "sessions",
             "auth",
@@ -5665,9 +5911,9 @@ mod tests {
             );
             assert!(!h.contains("--continue"), "`{sub} --help` leaks --continue");
         }
-        // The agent-path subcommands (`run`/`plan`/`tui`) carry the turn flags; `eval` has its
-        // own `-m` but not `--max-tokens`.
-        for agent_cmd in ["run", "plan", "tui"] {
+        // The agent-path subcommands (`run`/`plan`/`tui`/`review`) carry the turn flags; `eval` has
+        // its own `-m` but not `--max-tokens`.
+        for agent_cmd in ["run", "plan", "tui", "review"] {
             assert!(
                 help_of(agent_cmd).contains("--max-tokens"),
                 "`{agent_cmd} --help` should carry the turn flags"
@@ -5833,5 +6079,113 @@ mod tests {
         assert_eq!(new_render_suffix("Hello world", "Hello world"), "");
         // A delta that coincidentally doesn't extend the prefix is rendered verbatim.
         assert_eq!(new_render_suffix("abc", "xyz"), "xyz");
+    }
+
+    // -----------------------------------------------------------------------
+    // `flux review` (L-13): exit-code logic + output rendering
+    // -----------------------------------------------------------------------
+
+    fn finding(severity: &str) -> flux_tools::cognition::ReviewFinding {
+        flux_tools::cognition::ReviewFinding {
+            fingerprint: format!("fp-{severity}"),
+            severity: severity.to_string(),
+            category: "correctness".to_string(),
+            file: Some("src/lib.rs".to_string()),
+            line: Some(42),
+            title: format!("a {severity} finding"),
+            evidence: "some evidence".to_string(),
+            recommendation: "fix it".to_string(),
+            confidence: 0.8,
+            reviewer: "correctness".to_string(),
+            agreement: 1,
+        }
+    }
+
+    fn report_with(severities: &[&str]) -> flux_tools::cognition::ReviewReport {
+        flux_tools::cognition::ReviewReport {
+            summary: "test report".to_string(),
+            findings: severities.iter().map(|s| finding(s)).collect(),
+            checked_files: vec!["src/lib.rs".to_string()],
+            reviewers: vec!["correctness".to_string()],
+            gaps: Vec::new(),
+        }
+    }
+
+    /// `should_fail` is the pure decision factored out of `run_review` so the exit-code logic is
+    /// unit-testable without going through `std::process::exit`: `None` (no `--fail-on`) never fails;
+    /// a threshold fails iff some finding's severity is at or above it.
+    #[test]
+    fn should_fail_is_off_by_default() {
+        let report = report_with(&["critical"]);
+        assert!(
+            !should_fail(&report, None),
+            "no --fail-on must never fail, regardless of findings"
+        );
+    }
+
+    #[test]
+    fn should_fail_trips_at_or_above_the_threshold_only() {
+        let report = report_with(&["low", "medium"]);
+        assert!(
+            !should_fail(&report, Some(ReviewSeverity::High)),
+            "no finding reaches High"
+        );
+        assert!(
+            should_fail(&report, Some(ReviewSeverity::Medium)),
+            "the medium finding meets a Medium threshold"
+        );
+        assert!(
+            should_fail(&report, Some(ReviewSeverity::Low)),
+            "Low is at-or-above the Low threshold too"
+        );
+    }
+
+    #[test]
+    fn should_fail_is_false_when_there_are_no_findings() {
+        let report = report_with(&[]);
+        assert!(!should_fail(&report, Some(ReviewSeverity::Info)));
+    }
+
+    /// An unrecognized/malformed severity string must fail safe: it trips even the strictest
+    /// (`Critical`) threshold rather than silently being ranked as harmless.
+    #[test]
+    fn should_fail_treats_an_unrecognized_severity_as_critical() {
+        let report = report_with(&["not-a-real-severity"]);
+        assert!(should_fail(&report, Some(ReviewSeverity::Critical)));
+    }
+
+    /// `--format json` must emit valid, round-trippable `ReviewReport` JSON — the CLI's own
+    /// `serde_json::to_string_pretty` output parses back into an equivalent report.
+    #[test]
+    fn review_report_serializes_to_valid_json() {
+        let report = report_with(&["high", "low"]);
+        let s = serde_json::to_string_pretty(&report).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
+        assert_eq!(parsed["findings"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["summary"], "test report");
+    }
+
+    /// `render_review_markdown`'s default output mode names each finding's severity/title/category
+    /// and reports the checked files + reviewers — a human-readable summary, not raw JSON.
+    #[test]
+    fn render_review_markdown_lists_findings_and_metadata() {
+        let report = report_with(&["critical", "low"]);
+        let md = render_review_markdown(&report);
+        assert!(md.contains("# Strict review"));
+        assert!(md.contains("test report"));
+        assert!(md.contains("CRITICAL"));
+        assert!(md.contains("a critical finding"));
+        assert!(md.contains("correctness"));
+        assert!(md.contains("src/lib.rs:42"));
+    }
+
+    #[test]
+    fn render_review_markdown_reports_no_findings_and_gaps() {
+        let mut report = report_with(&[]);
+        report.gaps.push("dropped malformed entry".to_string());
+        let md = render_review_markdown(&report);
+        assert!(md.contains("No findings."));
+        assert!(md.contains("## Gaps"));
+        assert!(md.contains("dropped malformed entry"));
     }
 }

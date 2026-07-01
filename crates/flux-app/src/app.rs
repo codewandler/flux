@@ -29,9 +29,10 @@ use flux_flow::state::FlowStore;
 use flux_flow::AgentSink;
 use flux_lang::ast::{SymbolName, Value as FluxValue, Visibility};
 use flux_lang::program::{AgentDecl, Program};
+use flux_orchestrate::{SubAgents, TaskTool};
 use flux_provider::Provider;
 use flux_runtime::{
-    AllowApprover, Approver, DenyApprover, Executor, PermissionManager, Tool, ToolContext,
+    AllowApprover, Approver, DenyApprover, Executor, PermissionManager, Spawner, Tool, ToolContext,
     ToolRegistry,
 };
 use flux_system::{System, Workspace};
@@ -98,8 +99,32 @@ impl App {
         auto_approve: bool,
         extra_tools: Vec<Arc<dyn Tool>>,
     ) -> Self {
+        Self::with_sub_agents(program, provider, model, auto_approve, extra_tools, None)
+    }
+
+    /// Like [`with_tools`](Self::with_tools) but also wires a sub-agent [`SubAgents`] bundle: the
+    /// `task` tool is registered into the host registry and every journey run installs the built
+    /// spawner on its executor's [`ToolContext`], so a journey (or a composite op it calls, e.g.
+    /// `strict_review`'s bounded reviewer fan-out — flux L-13) can delegate to a named role exactly as
+    /// the CLI's `build_agent`/the SDK's `FlowClient::with_sub_agents` do — the same construction path
+    /// (`SubAgents::into_spawner`), not a re-implementation.
+    pub fn with_sub_agents(
+        program: Program,
+        provider: Option<Arc<dyn Provider>>,
+        model: impl Into<String>,
+        auto_approve: bool,
+        extra_tools: Vec<Arc<dyn Tool>>,
+        sub_agents: Option<SubAgents>,
+    ) -> Self {
         App {
-            engine: Engine::new(program, provider, model.into(), auto_approve, extra_tools),
+            engine: Engine::new(
+                program,
+                provider,
+                model.into(),
+                auto_approve,
+                extra_tools,
+                sub_agents,
+            ),
         }
     }
 
@@ -204,6 +229,11 @@ pub(crate) struct Engine {
     /// When true, journeys run under an allow-all approver (`--yes`); otherwise destructive ops
     /// outside the pre-allowed safe set are **denied** (the safe headless default).
     auto_approve: bool,
+    /// The sub-agent spawner (when [`App::with_sub_agents`] wired one) — installed on every journey
+    /// run's executor so a `task` call (e.g. inside the `strict_review` composite op's reviewer
+    /// fan-out) can delegate. `None` leaves journeys exactly as before (`task` errors with "no
+    /// sub-agent spawner configured").
+    spawner: Option<Arc<dyn Spawner>>,
     /// The model provider (when wired); needed to assemble an agent-target engine lazily. An
     /// `agent`-bound trigger with no provider is a clear error.
     provider: Option<Arc<dyn Provider>>,
@@ -215,6 +245,10 @@ pub(crate) struct Engine {
     agents: Mutex<HashMap<String, Arc<FlowEngine>>>,
     /// `(agent, conversation)` → persistent session id (in-memory; a restart starts threads fresh).
     sessions: Mutex<HashMap<(String, String), String>>,
+    /// The guarded `System` every journey run's executor + (when wired) the sub-agent spawner share —
+    /// built once here rather than a fresh instance per journey run, so a journey and the sub-agents
+    /// it spawns always resolve paths against the identical workspace root.
+    system: Arc<System>,
 }
 
 impl Engine {
@@ -224,12 +258,21 @@ impl Engine {
         model: String,
         auto_approve: bool,
         extra_tools: Vec<Arc<dyn Tool>>,
+        sub_agents: Option<SubAgents>,
     ) -> Arc<Self> {
         let bus = Bus::new();
         let channels = Arc::new(program.channels.clone());
         // Agent-target turns persist per-thread conversation memory here; in-memory is fine for v1
         // (a restart starts threads fresh — flagged, pairs with D-02 later).
         let events = Arc::new(EventStore::in_memory().expect("flux-app: in-memory event store"));
+        // A guarded `System` rooted at the cwd, built ONCE and shared by every journey run's executor
+        // and, when `sub_agents` is set, the spawner it builds — so a journey and the sub-agents it
+        // spawns always resolve paths against the identical workspace root (never two independent
+        // `System`s from separate `current_dir()` calls).
+        let system = Arc::new(System::new(
+            Workspace::new(std::env::current_dir().unwrap_or_else(|_| ".".into()))
+                .expect("flux-app: workspace"),
+        ));
         // `new_cyclic`: the `spawn` op needs a back-reference to the engine it re-enters, but the
         // engine owns the registry that owns the op — a `Weak` breaks the cycle.
         Arc::new_cyclic(|weak: &Weak<Engine>| {
@@ -245,6 +288,13 @@ impl Engine {
             for tool in extra_tools {
                 registry.register(tool);
             }
+            // Sub-agents (L-13): register `task` and build the spawner over the shared `system` — the
+            // same `SubAgents::into_spawner` construction path the CLI's `build_agent` and the SDK's
+            // `FlowClient::with_sub_agents` use, so a journey delegates through the identical envelope.
+            let spawner = sub_agents.map(|sa| {
+                registry.register(Arc::new(TaskTool));
+                sa.into_spawner(system.clone())
+            });
             Engine {
                 program,
                 registry,
@@ -252,11 +302,13 @@ impl Engine {
                 depth: AtomicU32::new(0),
                 runs: AtomicU64::new(0),
                 auto_approve,
+                spawner,
                 provider,
                 default_model: model,
                 events,
                 agents: Mutex::new(HashMap::new()),
                 sessions: Mutex::new(HashMap::new()),
+                system,
             }
         })
     }
@@ -335,7 +387,12 @@ impl Engine {
         let store = FlowStore::in_memory().map_err(other)?;
         let session_id = format!("{name}#{}", self.runs.fetch_add(1, Ordering::SeqCst));
         seed_payload(&store, &session_id, payload)?;
-        let executor = build_executor(self.registry.clone(), self.auto_approve)?;
+        let executor = build_executor(
+            self.registry.clone(),
+            self.auto_approve,
+            self.spawner.clone(),
+            self.system.clone(),
+        )?;
         analyze_composites(&self.program.ops, &self.registry)
             .map_err(|d| Error::Other(format!("composite ops: {}", join_diags(&d))))?;
 
@@ -458,21 +515,30 @@ impl JourneyHost for Engine {
     }
 }
 
-/// Build the execution envelope for a journey: a guarded [`System`] rooted at the current working
-/// directory, the shared op registry, and an approver chosen by `auto_approve`. Every op dispatches
-/// through this `Executor`, so permission rules and effect gating apply exactly as in the interactive
-/// engine.
+/// Build the execution envelope for a journey: the shared `system` (built once by [`Engine::new`] and
+/// passed in — never a second, independently-`current_dir()`-resolved instance), the shared op
+/// registry, and an approver chosen by `auto_approve`. Every op dispatches through this `Executor`, so
+/// permission rules and effect gating apply exactly as in the interactive engine.
 ///
 /// **Safe headless default (`auto_approve = false`):** the orchestration verbs + read-only builtins are
 /// pre-allowed (they run without prompting); anything else (`bash`, `write`, `git_*`, …) falls to a
 /// [`DenyApprover`] and is **denied** — there is no human at a prompt, so destructive ops in an
 /// untrusted program cannot execute. `auto_approve = true` (the CLI's `--yes`) swaps in an
 /// [`AllowApprover`] for trusted, pre-authored programs.
-fn build_executor(registry: ToolRegistry, auto_approve: bool) -> Result<Executor> {
-    let root = std::env::current_dir().map_err(other)?;
-    let workspace = Workspace::new(&root).map_err(other)?;
-    let system = Arc::new(System::new(workspace));
-    let ctx = ToolContext::new(system);
+///
+/// `spawner`, when [`App::with_sub_agents`] wired one, is installed on the returned executor's
+/// [`ToolContext`] so a `task` call inside the journey (or a composite op it calls) can delegate —
+/// the same seam [`ToolContext::with_spawner`] provides everywhere else.
+fn build_executor(
+    registry: ToolRegistry,
+    auto_approve: bool,
+    spawner: Option<Arc<dyn Spawner>>,
+    system: Arc<System>,
+) -> Result<Executor> {
+    let mut ctx = ToolContext::new(system);
+    if let Some(spawner) = spawner {
+        ctx = ctx.with_spawner(spawner);
+    }
     let allow: Vec<String> = [
         "emit", "send", "ask", "spawn", "read", "glob", "grep", "search",
     ]
