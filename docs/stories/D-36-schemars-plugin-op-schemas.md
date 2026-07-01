@@ -97,8 +97,8 @@ host-kit derives the schema + parses the call in one typed step.
 - **Drift collected.** `DRIFT.md` § D-36 records two `homer` drifts (`call.list` handler reads
   `ua`/`method`/`call_id` the schema omits; `call.show` advertises a `render` field the handler
   ignores) — preserved as-is (pure schema-source change), plus schemars representation notes.
-- **Remaining (12 plugins):** `grafana`, `prometheus`, `loki`, `alertmanager`, `huggingface`,
-  `opsgenie`, `docker`, `websearch`, `jira`, `confluence`, `kubernetes`, `aws`. Several use
+- **Remaining (8 plugins):** `huggingface`, `opsgenie`, `docker`, `websearch`, `jira`,
+  `confluence`, `kubernetes`, `aws`. Several use
   `flex_str`/`flex_i64` string-or-number
   coercion → schema-only struct (handler stays), D-34 precedent. As each migrates: delete its
   `so` helper, add it to `MIGRATED_PLUGINS`, add an inline `schema_contract` test, record any
