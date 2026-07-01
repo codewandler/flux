@@ -23,7 +23,6 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 ## Now (in progress)
 - [C-09 — AWS Bedrock LLM provider](C-09-aws-bedrock-provider.md) · Core · DECISION = Option C (aws-bedrock plugin embeds aws-config, no aws CLI in prod). IMPLEMENTING in two non-colliding waves: (1) L1 core now — flux-providers::bedrock (SigV4 + Messages codec + BedrockCredentialsResolver trait + resolve_model) + L0 pricing + L6 routing, with an env-static resolver stand-in so `flux run -m aws` works against dev (aws configure export-credentials); (2) C-09a/b plugin + protocol knobs deferred — another session has the plugins/ workspace open (Cargo.lock collision). The L1 seam means the plugin resolver swaps in at one trait.
 - [I-01 — Statistically clean self-improvement headline gain (trials ≥ 3)](I-01-headline-gain.md) · Improve · offline half done (partial-credit scalar + durable token capture + synthetic `trials = 5` loop); the trials ≥ 5 grader-confirmed run is **staged** on a funded provider key
-- [L-10 — Strict review — checked-in example flow + reviewer roles (Phase 1)](L-10-strict-review-example-flow.md) · Language · proves the strict-review protocol shape with existing primitives — no language changes
 
 ## Next (ready — take the top one unless the user named a story)
 _None._
@@ -113,6 +112,7 @@ _flux can already drive the two **subscription / passthrough** model backends �
 - [L-07 — Generate Flux skills from live catalogs](L-07-generated-flux-skills.md) · Language · `flux skill` renders Claude-format root/CLI/language/plugin/ops skills from live Clap, Flux-Lang, ToolRegistry/OpRegistry, and plugin-manifest sources; `--install` writes root + sections, and project `.claude/skills` is loaded by default after `.flux/skills`
 - [L-08 — Fix ctx-pack eviction — drop-overflow-and-continue + keep priority](L-08-ctx-pack-eviction.md) · Language · a single oversized early member drops every smaller member after it (hard `break` in build_ctx); the s_251 reasoning spiral
 - [L-09 — Named-argument calls (deprecate positional binding)](L-09-named-argument-calls.md) · Language
+- [L-10 — Strict review — checked-in example flow + reviewer roles (Phase 1)](L-10-strict-review-example-flow.md) · Language · proves the strict-review protocol shape with existing primitives — no language changes
 
 _See [CHANGELOG.md](../../CHANGELOG.md) for the full released history._
 <!-- END track:board -->

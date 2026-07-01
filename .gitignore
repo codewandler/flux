@@ -1,6 +1,13 @@
 /target
 **/*.rs.bk
-.flux/
+# `.flux/` is local scaffolding (session state, seeded self-improvement roles, …) and stays
+# gitignored — EXCEPT the strict-review example's reviewer roles (L-10), which are a checked-in
+# part of examples/strict_review.flux, not local scaffolding, so ship them with the repo. A
+# directory-level `.flux/` pattern would block re-inclusion entirely, so exclude by content instead.
+.flux/*
+!.flux/agents/
+.flux/agents/*
+!.flux/agents/review-*.md
 *.db
 *.db-wal
 *.db-shm

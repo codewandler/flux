@@ -8,6 +8,25 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Strict code review as a checked-in Flux-Lang flow (L-10, Phase 1).** `examples/strict_review.flux`
+  gathers context read-only (`git_status`/`git_diff`/`read_many`), packs it into a budgeted `ctx` for
+  the audit trail, fans out via `parallel` to a FIXED set of three restricted reviewer roles
+  (`.flux/agents/review-{security,correctness,maintainability}.md`, each `tools: []` — no filesystem/
+  shell access, JSON-only output contract), then aggregates deterministically: `merge` → `filter`
+  (quarantines malformed entries) → `dedupe` (by `fingerprint`) → `sort` (by `rank` desc) → a
+  structured report. Proves the strict-review protocol shape (design
+  `docs/designs/strict-review-flows.md`) using only existing primitives — no language/runtime
+  changes. New integration test `crates/flux-sdk/tests/strict_review.rs` drives the real flow + role
+  files through a mock sub-agent provider, asserting bounded fan-out (exactly 3 `task` calls),
+  cross-reviewer dedup, malformed-entry quarantine, and stable ordering across runs.
+  - Fixed two narrow upstream bugs surfaced while building this flow: the `flux-lang` analyzer now
+    accepts a lone `obj` **template** argument (a dynamic field, e.g. `task({role: "x", task:
+    $prompt})`) as the named-input map, matching how the runtime already treats it — previously only
+    a lone literal object was exempt from the "ambiguous bare value" arity check. The `flux-flow`
+    planner's prose-embedded-AST fallback now requires a non-empty plan `body`, so a sub-agent's
+    JSON-array reply (as this protocol requires reviewers to emit) is no longer misdetected as an
+    empty no-op plan merely because it contains a balanced `{…}` substring.
+
 - **sql/asterisk per-call read timeout is now wire-enforced (D-45).** The `timeout` input (parsed
   since D-40/D-41 but previously discarded) is now plumbed through the host `conn.read`
   (`timeout_ms`) and `host-kit`'s `ConnStream::set_read_deadline`, surfacing
