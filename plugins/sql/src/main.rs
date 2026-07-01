@@ -24,8 +24,11 @@
 //! the RFC 5802 / RFC 7677 client-key derivation, but first contact with a real server is unverified.
 
 use host_kit::*;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::io::{Read, Write};
+use std::time::Duration;
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -38,6 +41,125 @@ type HmacSha256 = Hmac<Sha256>;
 
 const PG_DEFAULT_PORT: u16 = 5432;
 const MYSQL_DEFAULT_PORT: u16 = 3306;
+
+// ===========================================================================
+// Schema-only op input structs (D-36)
+// ===========================================================================
+// Each op's `input_schema` is derived from the structs below via schemars
+// (`host_kit::read_op_typed::<T>`), instead of a hand-written `json!({...})` object, so the
+// schema the model sees cannot drift from a separately-maintained literal. The structs are
+// schema-only: handlers keep their existing `flex_str` / `flex_i64` / `flex_bool` extractors
+// (the D-34 schema-only precedent).
+
+/// SQL dialects. Matches the legacy `"enum": ["postgres", "mysql", "sqlite"]`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+enum Driver {
+    Postgres,
+    Mysql,
+    Sqlite,
+}
+
+/// Shared connection fields surfaced on every SQL op via `#[serde(flatten)]`.
+///
+/// Architectural split: `endpoint_ref` is optional in flux (defaults to `sql.endpoint`) and
+/// `endpoint` carries a discovered endpoint object; fluxplane makes `endpoint_ref` required,
+/// but flux resolves endpoints by either field.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ConnProps {
+    /// A discovered endpoint reference (from `endpoint.select`). Secret-free; preferred
+    /// for discovered endpoints.
+    endpoint: Option<Value>,
+    /// A discovered `@endpoint/<id>` ref, or a registered SQL endpoint name
+    /// (default `sql.endpoint`).
+    endpoint_ref: Option<String>,
+    /// Dialect override: `postgres`, `mysql`, or `sqlite`.
+    driver: Option<Driver>,
+    /// Database override.
+    database: Option<String>,
+    /// Timeout as a duration such as `5s` or `1m`. Defaults to 10s if omitted.
+    /// The flux `conn.*` host capability does not currently expose a per-call timeout,
+    /// so this is parsed and validated but not enforced on the wire.
+    timeout: Option<String>,
+}
+
+/// `sql.test`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct TestInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    conn: ConnProps,
+}
+
+/// `sql.query`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct QueryInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    conn: ConnProps,
+    /// Read-only SQL query.
+    query: String,
+    /// Max rows (default 100, capped 1000).
+    max_rows: Option<i64>,
+}
+
+/// `sql.database.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct DatabaseListInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    conn: ConnProps,
+}
+
+/// `sql.table.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct TableListInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    conn: ConnProps,
+    /// Schema filter.
+    schema: Option<String>,
+    /// Include views (and postgres materialized views).
+    include_views: Option<bool>,
+    /// Max tables (default 200, capped 1000).
+    max_results: Option<i64>,
+}
+
+/// `sql.table.show`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct TableShowInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    conn: ConnProps,
+    /// Schema holding the table (postgres defaults to `public`).
+    schema: Option<String>,
+    /// Table or view name.
+    table: String,
+}
+
+/// `sql.index.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct IndexListInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    conn: ConnProps,
+    /// Schema filter.
+    schema: Option<String>,
+    /// Limit to one table (default lists indexes across the schema).
+    table: Option<String>,
+}
+
+// ===========================================================================
+// Manifest
+// ===========================================================================
 
 fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("sql", "0.1.0")
@@ -92,112 +214,47 @@ fn manifest_builder() -> PluginBuilder {
             entity_schema: None,
         })
         .operation(
-            read_op(
+            read_op_typed::<TestInput>(
                 "sql.test",
                 "Test SQL endpoint connectivity with a SELECT 1 round trip; reports the server version.",
-                so(conn_props(), json!([])),
             ),
             op_test,
         )
         .operation(
-            read_op(
+            read_op_typed::<QueryInput>(
                 "sql.query",
                 "Run a bounded, read-only SQL query (SELECT/SHOW/DESCRIBE/EXPLAIN/WITH only) against the endpoint.",
-                so(
-                    merge(
-                        conn_props(),
-                        json!({
-                            "query": {"type": "string", "description": "Read-only SQL query."},
-                            "max_rows": {"type": "integer", "description": "Max rows (default 100, capped 1000)."},
-                        }),
-                    ),
-                    json!(["query"]),
-                ),
             ),
             op_query,
         )
         .operation(
-            read_op(
+            read_op_typed::<DatabaseListInput>(
                 "sql.database.list",
                 "List databases and the connected database's non-system schemas.",
-                so(conn_props(), json!([])),
             ),
             op_database_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<TableListInput>(
                 "sql.table.list",
                 "List tables (optionally views) with a cheap row estimate where the engine keeps statistics.",
-                so(
-                    merge(
-                        conn_props(),
-                        json!({
-                            "schema": {"type": "string"},
-                            "include_views": {"type": "boolean"},
-                            "max_results": {"type": "integer", "description": "Max tables (default 200, capped 1000)."},
-                        }),
-                    ),
-                    json!([]),
-                ),
             ),
             op_table_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<TableShowInput>(
                 "sql.table.show",
                 "Describe a table: columns with types and nullability, the primary key, and foreign keys.",
-                so(
-                    merge(
-                        conn_props(),
-                        json!({"schema": {"type": "string"}, "table": {"type": "string"}}),
-                    ),
-                    json!(["table"]),
-                ),
             ),
             op_table_show,
         )
         .operation(
-            read_op(
+            read_op_typed::<IndexListInput>(
                 "sql.index.list",
                 "List indexes across a schema or for one table, with columns and uniqueness.",
-                so(
-                    merge(
-                        conn_props(),
-                        json!({"schema": {"type": "string"}, "table": {"type": "string"}}),
-                    ),
-                    json!([]),
-                ),
             ),
             op_index_list,
         )
-}
-
-/// The connection fields every op accepts. An endpoint can be addressed three ways (priority order):
-/// `endpoint` (a discovered endpoint reference object, from `endpoint.select` — preferred for a
-/// discovered postgres endpoint), `endpoint_ref` (a discovered `@endpoint/<id>` id, or a registered
-/// endpoint name; defaults to `sql.endpoint`). `driver`/`database` override the dialect/database.
-fn conn_props() -> Value {
-    json!({
-        "endpoint": {"type": "object", "description": "A discovered endpoint reference (from endpoint.select). Secret-free; preferred for discovered endpoints."},
-        "endpoint_ref": {"type": "string", "description": "A discovered @endpoint/<id> ref, or a registered SQL endpoint name (default sql.endpoint)."},
-        "driver": {"type": "string", "description": "Dialect override: postgres|mysql|sqlite.", "enum": ["postgres", "mysql", "sqlite"]},
-        "database": {"type": "string", "description": "Database override."}
-    })
-}
-
-/// `{ "type": "object", "properties": <props>, "required": <required> }`.
-fn so(props: Value, required: Value) -> Value {
-    json!({ "type": "object", "properties": props, "required": required })
-}
-
-/// Shallow-merge two JSON objects (right wins) — used to extend `conn_props()` per op.
-fn merge(mut base: Value, extra: Value) -> Value {
-    if let (Some(b), Some(e)) = (base.as_object_mut(), extra.as_object()) {
-        for (k, v) in e {
-            b.insert(k.clone(), v.clone());
-        }
-    }
-    base
 }
 
 fn main() {
@@ -242,6 +299,11 @@ struct SqlTarget {
     /// resolves it: the plugin dials and fetches the password by reference, never holding a URL with
     /// a password. `None` = a static/named endpoint resolved the legacy way (DSN + `secret`).
     discovered: Option<DiscoveredSource>,
+    /// Operation timeout parsed from the input `timeout` field. Stored for parity with the
+    /// fluxplane reference, which uses it as a context deadline; flux's `conn.*` host capability
+    /// does not currently expose a per-call timeout, so this is parsed/validated but not
+    /// enforced on the wire.
+    timeout: Option<Duration>,
 }
 
 /// The host-resolved references a discovered-endpoint [`SqlTarget`] carries. The plugin passes these
@@ -284,37 +346,46 @@ fn normalize_dialect(value: &str) -> Option<Dialect> {
 fn resolve_target(input: &Value, host: &mut Host) -> Result<SqlTarget, String> {
     let driver = flex_str(input, "driver");
     let db_override = flex_str(input, "database");
+    // Parse `timeout` once for every op; invalid values fail fast before any dial.
+    let timeout = parse_duration_default(
+        flex_str(input, "timeout").as_deref(),
+        Duration::from_secs(10),
+    )?;
 
-    // (1) A full weak EndpointRef object passed inline by the agent.
-    if let Some(obj) = input.get("endpoint").filter(|v| v.is_object()) {
-        return target_from_endpoint_ref(obj, driver.as_deref(), db_override.as_deref());
-    }
+    let mut target = if let Some(obj) = input.get("endpoint").filter(|v| v.is_object()) {
+        // (1) A full weak EndpointRef object passed inline by the agent.
+        target_from_endpoint_ref(obj, driver.as_deref(), db_override.as_deref())?
+    } else {
+        let endpoint_ref = flex_str(input, "endpoint_ref").unwrap_or_else(|| "sql.endpoint".into());
 
-    let endpoint_ref = flex_str(input, "endpoint_ref").unwrap_or_else(|| "sql.endpoint".into());
-
-    // (2) A discovered `@endpoint/<id>` ref id: resolve the bare URL host-side via the `endpoint`
-    // capability (no password in it), and carry the ref for the dial + credential references.
-    if is_discovered_ref(&endpoint_ref) {
-        let raw_url = host.endpoint(&endpoint_ref)?;
-        let raw_url = raw_url.trim();
-        if raw_url.is_empty() {
-            return Err("discovered endpoint has no url".into());
+        // (2) A discovered `@endpoint/<id>` ref id: resolve the bare URL host-side via the
+        // `endpoint` capability (no password in it), and carry the ref for the dial + credential
+        // references.
+        if is_discovered_ref(&endpoint_ref) {
+            let raw_url = host.endpoint(&endpoint_ref)?;
+            let raw_url = raw_url.trim();
+            if raw_url.is_empty() {
+                return Err("discovered endpoint has no url".into());
+            }
+            let mut t = target_from_url(driver.as_deref(), raw_url, db_override.as_deref())?;
+            t.discovered = Some(DiscoveredSource {
+                endpoint_ref,
+                credential_ref: None,
+            });
+            t
+        } else {
+            // (3) A static/named endpoint: the legacy DSN-handback path.
+            let raw_url = host.endpoint(&endpoint_ref)?;
+            let raw_url = raw_url.trim();
+            if raw_url.is_empty() {
+                return Err("endpoint has no url".into());
+            }
+            target_from_url(driver.as_deref(), raw_url, db_override.as_deref())?
         }
-        let mut target = target_from_url(driver.as_deref(), raw_url, db_override.as_deref())?;
-        target.discovered = Some(DiscoveredSource {
-            endpoint_ref,
-            credential_ref: None,
-        });
-        return Ok(target);
-    }
+    };
 
-    // (3) A static/named endpoint: the legacy DSN-handback path.
-    let raw_url = host.endpoint(&endpoint_ref)?;
-    let raw_url = raw_url.trim();
-    if raw_url.is_empty() {
-        return Err("endpoint has no url".into());
-    }
-    target_from_url(driver.as_deref(), raw_url, db_override.as_deref())
+    target.timeout = timeout;
+    Ok(target)
 }
 
 /// Canonical prefix for a discovered endpoint id (`@endpoint/<id>`), matching
@@ -493,6 +564,7 @@ fn target_from_url(
         dsn_password,
         safe_url,
         discovered: None,
+        timeout: None,
     })
 }
 
@@ -610,6 +682,83 @@ fn opt_nonempty(s: String) -> Option<String> {
     } else {
         Some(s)
     }
+}
+
+/// Parse a duration string in the style of Go's `time.ParseDuration` (`5s`, `1m`, `1h30m`).
+/// Returns `fallback` when `value` is missing or empty. Errors on invalid syntax.
+fn parse_duration_default(
+    value: Option<&str>,
+    fallback: Duration,
+) -> Result<Option<Duration>, String> {
+    match value.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(Some(fallback)),
+        Some(s) => parse_duration(s).map(Some),
+    }
+}
+
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let mut nanos: u128 = 0;
+    let mut i = 0;
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if start == i {
+            return Err(format!("timeout: invalid duration {s:?}"));
+        }
+        let n: u64 = s[start..i]
+            .parse()
+            .map_err(|_| format!("timeout: invalid duration {s:?}"))?;
+
+        // Parse the unit at the current position, preferring longer tokens.
+        let unit = if bytes[i..].starts_with(b"ns") {
+            i += 2;
+            "ns"
+        } else if bytes[i..].starts_with(b"us") || bytes[i..].starts_with("µs".as_bytes()) {
+            i += 2;
+            "us"
+        } else if bytes[i..].starts_with(b"ms") {
+            i += 2;
+            "ms"
+        } else if bytes.get(i) == Some(&b's') {
+            i += 1;
+            "s"
+        } else if bytes.get(i) == Some(&b'm') {
+            i += 1;
+            "m"
+        } else if bytes.get(i) == Some(&b'h') {
+            i += 1;
+            "h"
+        } else {
+            return Err(format!("timeout: invalid duration {s:?}"));
+        };
+
+        let unit_nanos: u128 = match unit {
+            "ns" => 1,
+            "us" => 1_000,
+            "ms" => 1_000_000,
+            "s" => 1_000_000_000,
+            "m" => 60_000_000_000,
+            "h" => 3_600_000_000_000,
+            _ => return Err(format!("timeout: invalid duration {s:?}")),
+        };
+        nanos = nanos
+            .checked_add(
+                u128::from(n)
+                    .checked_mul(unit_nanos)
+                    .ok_or_else(|| format!("timeout: duration overflow {s:?}"))?,
+            )
+            .ok_or_else(|| format!("timeout: duration overflow {s:?}"))?;
+    }
+    if i == 0 {
+        return Err(format!("timeout: invalid duration {s:?}"));
+    }
+    if nanos > u128::from(u64::MAX) {
+        return Err(format!("timeout: duration overflow {s:?}"));
+    }
+    Ok(Duration::from_nanos(nanos as u64))
 }
 
 /// Minimal percent-decode for DSN userinfo (e.g. `p%40ss` → `p@ss`).
@@ -2435,5 +2584,243 @@ mod tests {
     fn md5_digest_matches_known_vectors() {
         assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
         assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn timeout_is_parsed_and_invalid_timeout_fails_fast() {
+        // No server response is queued: an invalid timeout must fail before the plugin dials.
+        let mut host = host_with(vec![]);
+        let err = run("sql.test", json!({"timeout": "not-a-duration"}), &mut host).unwrap_err();
+        assert!(err.contains("timeout"), "err = {err}");
+    }
+
+    #[test]
+    fn parse_duration_accepts_go_style_durations() {
+        assert_eq!(parse_duration("5s").unwrap(), Duration::from_secs(5));
+        assert_eq!(parse_duration("1m").unwrap(), Duration::from_secs(60));
+        assert_eq!(parse_duration("1h30m").unwrap(), Duration::from_secs(5400));
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("5x").is_err());
+    }
+}
+
+// ===========================================================================
+#[cfg(test)]
+mod schema_contract {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// The normalized kind of one input property.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Kind {
+        Str,
+        Int,
+        Bool,
+        Object,
+        Enum(Vec<String>),
+    }
+
+    #[derive(Clone)]
+    struct Prop {
+        name: &'static str,
+        kind: Kind,
+    }
+
+    struct OpContract {
+        props: Vec<Prop>,
+        required: Vec<&'static str>,
+    }
+
+    fn p(name: &'static str, kind: Kind) -> Prop {
+        Prop { name, kind }
+    }
+
+    /// The authoritative contract (post-D-36 re-audit + timeout port). All 7 ops carry the
+    /// flattened `ConnProps` connection fields plus op-specific params.
+    fn contracts() -> Vec<(&'static str, OpContract)> {
+        let conn_props = || {
+            vec![
+                p("endpoint", Kind::Object),
+                p("endpoint_ref", Kind::Str),
+                p(
+                    "driver",
+                    Kind::Enum(vec!["postgres".into(), "mysql".into(), "sqlite".into()]),
+                ),
+                p("database", Kind::Str),
+                p("timeout", Kind::Str),
+            ]
+        };
+        vec![
+            (
+                "sql.test",
+                OpContract {
+                    props: conn_props(),
+                    required: vec![],
+                },
+            ),
+            (
+                "sql.query",
+                OpContract {
+                    props: {
+                        let mut v = conn_props();
+                        v.push(p("query", Kind::Str));
+                        v.push(p("max_rows", Kind::Int));
+                        v
+                    },
+                    required: vec!["query"],
+                },
+            ),
+            (
+                "sql.database.list",
+                OpContract {
+                    props: conn_props(),
+                    required: vec![],
+                },
+            ),
+            (
+                "sql.table.list",
+                OpContract {
+                    props: {
+                        let mut v = conn_props();
+                        v.push(p("schema", Kind::Str));
+                        v.push(p("include_views", Kind::Bool));
+                        v.push(p("max_results", Kind::Int));
+                        v
+                    },
+                    required: vec![],
+                },
+            ),
+            (
+                "sql.table.show",
+                OpContract {
+                    props: {
+                        let mut v = conn_props();
+                        v.push(p("schema", Kind::Str));
+                        v.push(p("table", Kind::Str));
+                        v
+                    },
+                    required: vec!["table"],
+                },
+            ),
+            (
+                "sql.index.list",
+                OpContract {
+                    props: {
+                        let mut v = conn_props();
+                        v.push(p("schema", Kind::Str));
+                        v.push(p("table", Kind::Str));
+                        v
+                    },
+                    required: vec![],
+                },
+            ),
+        ]
+    }
+
+    fn resolve<'a>(node: &'a Value, defs: &'a Value) -> &'a Value {
+        if let Some(obj) = node.as_object() {
+            if let Some(r) = obj.get("$ref").and_then(|v| v.as_str()) {
+                if let Some(name) = r.strip_prefix("#/definitions/") {
+                    return defs.get(name).unwrap_or(node);
+                }
+            }
+            if let Some(any) = obj.get("anyOf").and_then(|v| v.as_array()) {
+                for m in any {
+                    if m.get("type").and_then(|v| v.as_str()) != Some("null") {
+                        return resolve(m, defs);
+                    }
+                }
+            }
+        }
+        node
+    }
+
+    fn kind_of(node: &Value) -> Kind {
+        let t = node.get("type");
+        if let Some(arr) = t.and_then(|v| v.as_array()) {
+            let first = arr
+                .iter()
+                .find(|v| v.as_str() != Some("null"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("null");
+            return base_kind(first, node);
+        }
+        base_kind(t.and_then(|v| v.as_str()).unwrap_or(""), node)
+    }
+
+    fn base_kind(t: &str, node: &Value) -> Kind {
+        match t {
+            "integer" => Kind::Int,
+            "boolean" => Kind::Bool,
+            "string" => {
+                if let Some(e) = node.get("enum").and_then(|v| v.as_array()) {
+                    let vals: Vec<String> = e
+                        .iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect();
+                    return Kind::Enum(vals);
+                }
+                Kind::Str
+            }
+            "object" | "" => Kind::Object,
+            other => panic!("unsupported property type: {other} ({node})"),
+        }
+    }
+
+    fn assert_contract(op_name: &str, schema: &Value, contract: &OpContract) {
+        let defs = schema.get("definitions").cloned().unwrap_or(json!({}));
+        assert_eq!(schema["type"], "object", "{op_name}: root type");
+
+        let props_obj = schema.get("properties").and_then(|v| v.as_object());
+        let mut got: BTreeMap<&str, Kind> = BTreeMap::new();
+        if let Some(props) = props_obj {
+            for (k, v) in props {
+                let resolved = resolve(v, &defs);
+                got.insert(k.as_str(), kind_of(resolved));
+            }
+        }
+        let want: BTreeMap<&str, Kind> = contract
+            .props
+            .iter()
+            .map(|Prop { name, kind }| (*name, kind.clone()))
+            .collect();
+        assert_eq!(got.len(), want.len(), "{op_name}: property count");
+        for Prop { name, kind } in &contract.props {
+            let got_kind = got.get(*name).unwrap_or_else(|| {
+                panic!("{op_name}: missing property `{name}` in derived schema")
+            });
+            assert_eq!(got_kind, kind, "{op_name}: property `{name}` kind");
+        }
+
+        let req: Vec<&str> = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let mut req_set: Vec<&str> = req.clone();
+        req_set.sort();
+        let mut want_req: Vec<&str> = contract.required.clone();
+        want_req.sort();
+        assert_eq!(req_set, want_req, "{op_name}: required set");
+    }
+
+    #[test]
+    fn derived_schemas_match_legacy_contract() {
+        let ops = contracts();
+        let manifest = manifest_builder().build().manifest();
+        let by_name: BTreeMap<&str, &OperationSpec> = manifest
+            .operations
+            .iter()
+            .map(|o| (o.name.as_str(), o))
+            .collect();
+        assert_eq!(by_name.len(), ops.len(), "op count changed");
+        for (name, contract) in &ops {
+            let spec = by_name
+                .get(*name)
+                .unwrap_or_else(|| panic!("missing op {name}"));
+            assert_contract(name, &spec.input_schema, contract);
+        }
     }
 }

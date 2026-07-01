@@ -1387,6 +1387,8 @@ dependencies = [
  "hmac",
  "host-kit",
  "rand 0.8.6",
+ "schemars",
+ "serde",
  "serde_json",
  "sha2",
 ]

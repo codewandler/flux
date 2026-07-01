@@ -46,6 +46,14 @@ All notable changes to this project are documented in this file. The format is b
   `blob_ref` seed, and `query`/`limit` filters on the list ops (`emoji.list` also `mode`/
   `include_aliases`). `schema_contract` gained `Kind::ArrayStr`. Failing-first tests; 65 slack tests.
 
+- **sql schemars migration + timeout parity (D-40).** All 7 sql op schemas schemars-derived via
+  `read_op_typed::<T>`; shared connection fields factored into a `ConnProps` struct embedded with
+  `#[serde(flatten)]`/`#[schemars(flatten)]`, `Driver` as a derived enum; `so()`/`merge()`/
+  `conn_props()` helpers deleted. Fluxplane re-audit ported the missing `timeout` param (default
+  10s, Go-duration) to all 7 ops, parsed/validated in `resolve_target`. Honest limitation: the host
+  `conn.*` capability exposes no per-call timeout, so it's validated but not enforced as a
+  deadline. 17 sql tests.
+
 - **Plugin-side schemars op schemas — D-36 (in-progress).** `host-kit` now derives a plugin
   op's `input_schema` from a typed struct via `read_op_typed::<T>` / `write_op_typed::<T>`
   (+ `op_input_schema::<T>()`, a `schemars` re-export), the plugin-side counterpart of D-34.

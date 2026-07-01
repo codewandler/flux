@@ -266,3 +266,34 @@ per change.
   `emoji.list` `mode`/`include_aliases`. `schema_contract` gained `Kind::ArrayStr`.
 
 Both: `endpoint_ref` + (slack) per-call `role` architectural splits left as-is (do-not-port).
+
+---
+
+# D-40 — sql schemars migration + timeout parity port
+
+Full D-36 per-plugin loop for `sql` (the conn-wave plugin).
+
+## Schemars migration
+- 7 ops (`test`/`query`/`database.list`/`table.list`/`table.show`/`index.list`) schemars-derived
+  via `read_op_typed::<T>`; `so()`/`merge()`/`conn_props()` helpers deleted. Handlers unchanged
+  (schema-only structs; `flex_str`/`flex_i64`/`flex_bool` extraction stays, D-34 precedent).
+- Shared connection fields factored into a `ConnProps` struct embedded via `#[serde(flatten)]`
+  `#[schemars(flatten)]` (no 4×7 repetition); `Driver` is a derived enum (`postgres|mysql|sqlite`)
+  so the schema emits the legacy enum. `schema_contract` test locks the pre-migration contract;
+  `sql` in `MIGRATED_PLUGINS`.
+
+## Parity re-audit vs ~/projects/fluxplane/fluxplane-plugins/sql/
+- Matched: `driver`/`database`/`schema`/`table`/`include_views`/`max_results`/`max_rows`/`query`.
+- Architectural split (do-not-port): `endpoint_ref` (flux makes it optional defaulting to
+  `sql.endpoint`; fluxplane makes it required) + the flux-only `endpoint` object (a discovered
+  endpoint reference from `endpoint.select`).
+
+## Ported gap
+- **`timeout`** — fluxplane `ConnInput.Timeout` (default 10s, Go duration) was missing from flux's
+  `conn_props()`. Added `timeout: Option<String>` to `ConnProps` (all 7 ops); `parse_duration`/
+  `parse_duration_default` helpers; threaded through `resolve_target` (parsed once per op,
+  defaults 10s, invalid values error before dialing). Failing-first tests.
+- **Host timeout limitation:** `Host::conn_dial`/`conn_dial_ref` and `flux_system::net::dial_scoped`
+  do not accept a per-call timeout, so the parsed duration is validated at input time but cannot be
+  enforced as a dial/query deadline. Reported honestly; a follow-up could plumb a timeout through
+  the host `conn.*` capability (host-protocol change, out of scope).
