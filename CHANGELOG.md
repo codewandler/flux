@@ -8,6 +8,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **`flux plugin call/run --arg` — schema-coerced plugin op invocation (Track A1).** `flux plugin
+  call <name> <op> [json-input]` (now aliased `run`) accepts repeatable `--arg key=value` flags,
+  coercing each value to the op's declared `input_schema` type (string/integer/boolean/array/
+  object/enum — resolving schemars' `$ref`/`anyOf` nullable forms) and merging over the
+  `<json-input>` base. `--dry-run` validates locally against the schema and prints the coerced
+  input + problems without calling the op (mirrors the fluxplane `operation invoke` ergonomics);
+  `--no-validate` skips coercion and passes args through as strings. Live-smoke-verified against
+  a migrated plugin's schemars-derived schema. 7 flux-cli unit tests.
+
 - **AWS Bedrock LLM provider — L1 core + CLI routing (C-09, in-progress).** `flux run -m aws` now
   drives Bedrock-provisioned Claude through the same harness. The load-bearing reuse: Bedrock's
   `invoke-model` on an Anthropic model returns **native Anthropic Messages JSON** — the exact shape

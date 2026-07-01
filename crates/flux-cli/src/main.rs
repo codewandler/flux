@@ -379,12 +379,28 @@ enum PluginAction {
     Pin { name: String, version: String },
     /// Clear a plugin's version pin: `rollback <name>`.
     Rollback { name: String },
-    /// Invoke one operation of an installed plugin directly: `call <name> <op> [json-input]`.
+    /// Invoke one operation of an installed plugin directly: `call <name> <op> [json-input]`
+    /// (alias: `run`). Input is built from the optional `<json-input>` object plus any
+    /// `--arg key=value` flags (coerced to the op's declared `input_schema` types and merged
+    /// over the JSON base). `--dry-run` validates locally against the schema and prints the
+    /// coerced input without spawning the plugin; `--no-validate` skips schema coercion/validation.
+    #[command(alias = "run")]
     Call {
         name: String,
         op: String,
-        /// JSON input object for the operation (default `{}`).
+        /// JSON input object for the operation (default `{}`; `--arg` values merge over this).
         input: Option<String>,
+        /// `key=value` arg coerced to the op's declared schema type (string/integer/boolean/
+        /// array/object). Repeatable; values merge over `<json-input>`.
+        #[arg(long = "arg", value_name = "KEY=VALUE")]
+        arg: Vec<String>,
+        /// Validate the input against the op's schema locally and print the coerced input +
+        /// any problems — never spawn the plugin.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Skip schema coercion/validation of `--arg` values (pass them through as strings).
+        #[arg(long = "no-validate")]
+        no_validate: bool,
     },
     /// Register every `flux-plugin-*` binary in a directory: `install [dir]`
     /// (default `plugins/target/release`).
@@ -4144,7 +4160,14 @@ async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> R
             println!("cleared pin on `{name}`");
             Ok(())
         }
-        PluginAction::Call { name, op, input } => {
+        PluginAction::Call {
+            name,
+            op,
+            input,
+            arg,
+            dry_run,
+            no_validate,
+        } => {
             let desc = flux_plugin::load_descriptor(dir, &name)
                 .context("load plugin descriptor")?
                 .ok_or_else(|| {
@@ -4152,9 +4175,9 @@ async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> R
                         "no such plugin `{name}` — add it with `flux plugin add`/`install` first"
                     )
                 })?;
-            let input: serde_json::Value = match input {
-                Some(s) => serde_json::from_str(&s).context("parse <json-input>")?,
-                None => serde_json::json!({}),
+            let base: Option<Value> = match input {
+                Some(s) => Some(serde_json::from_str(&s).context("parse <json-input>")?),
+                None => None,
             };
             // The same guarded boundary + datasource bridge the agent path uses, over a scratch index.
             let cwd = std::env::current_dir()?;
@@ -4169,6 +4192,41 @@ async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> R
                 .with_context(|| format!("spawn plugin `{name}` ({})", desc.program))?;
             let manifest = host.manifest().await.context("fetch plugin manifest")?;
             let resolved_op = resolve_plugin_operation_name(&name, &op, &manifest)?;
+            // Build the op input from <json-input> + --arg, coercing args to the op's declared
+            // input_schema types (Track A1 — fluxplane `operation invoke` ergonomics).
+            let schema = manifest
+                .operations
+                .iter()
+                .find(|o| o.name == resolved_op)
+                .map(|o| o.input_schema.clone())
+                .unwrap_or_else(|| serde_json::json!({}));
+            let validate = !no_validate;
+            let (input, problems) = build_invoke_input(&schema, base, &arg, validate);
+
+            if dry_run {
+                // Validate-locally: print the coerced input + problems; never call the op.
+                let _ = host.shutdown().await;
+                let dry = serde_json::json!({
+                    "plugin": name,
+                    "operation": resolved_op,
+                    "valid": problems.is_empty(),
+                    "problems": problems,
+                    "input": input,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&dry).unwrap_or_else(|_| dry.to_string())
+                );
+                return Ok(());
+            }
+            if validate && !problems.is_empty() {
+                let _ = host.shutdown().await;
+                bail!(
+                    "invalid input for `{name}.{resolved_op}` ({} problem(s); --no-validate to invoke anyway):\n  - {}",
+                    problems.len(),
+                    problems.join("\n  - ")
+                );
+            }
             let caps = flux_capabilities::DatasourceHostCaps::new(
                 flux_plugin::SystemHostCaps::new(system)
                     .with_manifest(&manifest)
@@ -4439,6 +4497,187 @@ fn resolve_plugin_operation_name(
         "plugin `{plugin}` has no operation `{requested}` (tried `{qualified}`). Available ops: {}",
         available_plugin_operations(manifest)
     )
+}
+
+// ---------------------------------------------------------------------------
+// `flux plugin call/run` — schema-coerced `--arg` input building (Track A1).
+//
+// Mirrors the fluxplane `operation invoke` ergonomics: build the op input from `--arg key=value`
+// flags, coercing each value to the field's declared `input_schema` type, then validate required
+// fields. `<json-input>` is the base object; `--arg` values merge over it. `--dry-run` validates
+// locally and prints the coerced input without spawning the plugin.
+// ---------------------------------------------------------------------------
+
+/// Resolve a property's JSON-schema node, following `$ref` → `definitions` and `anyOf`
+/// (schemars' nullable-Option form) to the concrete field schema.
+fn resolve_field_schema<'a>(node: &'a Value, defs: &'a Value) -> &'a Value {
+    if let Some(obj) = node.as_object() {
+        if let Some(r) = obj.get("$ref").and_then(|v| v.as_str()) {
+            if let Some(name) = r.strip_prefix("#/definitions/") {
+                return defs.get(name).unwrap_or(node);
+            }
+        }
+        if let Some(any) = obj.get("anyOf").and_then(|v| v.as_array()) {
+            for m in any {
+                if m.get("type").and_then(|v| v.as_str()) != Some("null") {
+                    return resolve_field_schema(m, defs);
+                }
+            }
+        }
+    }
+    node
+}
+
+/// The base JSON-Schema "type" of a resolved field, ignoring schemars' nullable wrapping
+/// (`type: ["string","null"]` → `"string"`). Returns `None` if the field has no `type`.
+fn field_base_type(node: &Value) -> Option<String> {
+    match node.get("type") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .find(|v| v.as_str() != Some("null"))
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Coerce a raw `--arg` string value to the type declared by `field_schema`. Returns the coerced
+/// JSON value or an error message describing the coercion failure (surfaced as a validation
+/// problem by the caller).
+fn coerce_arg_value(field_schema: &Value, defs: &Value, raw: &str) -> Result<Value, String> {
+    let resolved = resolve_field_schema(field_schema, defs);
+    let ty = field_base_type(resolved).unwrap_or_else(|| "string".to_string());
+    match ty.as_str() {
+        "integer" => raw
+            .trim()
+            .parse::<i64>()
+            .map(Value::from)
+            .map_err(|_| format!("expected an integer, got `{raw}`")),
+        "number" => raw
+            .trim()
+            .parse::<f64>()
+            .map(Value::from)
+            .map_err(|_| format!("expected a number, got `{raw}`")),
+        "boolean" => match raw.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" => Ok(Value::Bool(true)),
+            "false" | "0" => Ok(Value::Bool(false)),
+            _ => Err(format!("expected a boolean (true/false), got `{raw}`")),
+        },
+        "array" => {
+            // A JSON array literal is parsed verbatim; otherwise comma-split into trimmed
+            // strings (the common CLI ergonomics for a list arg).
+            let trimmed = raw.trim();
+            if trimmed.starts_with('[') {
+                serde_json::from_str(trimmed)
+                    .map_err(|e| format!("expected a JSON array, got `{raw}` ({e})"))
+            } else {
+                let items: Vec<Value> = trimmed
+                    .split(',')
+                    .map(|s| Value::String(s.trim().to_string()))
+                    .filter(|v| !v.as_str().unwrap_or("").is_empty())
+                    .collect();
+                Ok(Value::Array(items))
+            }
+        }
+        "object" => serde_json::from_str(raw.trim())
+            .map_err(|e| format!("expected a JSON object, got `{raw}` ({e})")),
+        _ => {
+            // string (default). Validate enum membership if the field declares one.
+            if let Some(en) = resolved.get("enum").and_then(|v| v.as_array()) {
+                if !en.iter().any(|v| v.as_str() == Some(raw)) {
+                    let allowed: Vec<String> = en
+                        .iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect();
+                    return Err(format!("`{raw}` is not one of: {}", allowed.join(", ")));
+                }
+            }
+            Ok(Value::String(raw.to_string()))
+        }
+    }
+}
+
+/// Build the op input from a base JSON object (the positional `<json-input>`) plus `--arg key=value`
+/// flags, coercing each arg to its declared schema type and merging over the base. Returns the
+/// coerced input plus a list of validation problems (unknown fields, type-coercion failures,
+/// missing required fields). `validate: false` skips coercion (args pass through as strings) and
+/// the required-field check — degraded discovery must never block a valid call.
+fn build_invoke_input(
+    schema: &Value,
+    base: Option<Value>,
+    args: &[String],
+    validate: bool,
+) -> (Value, Vec<String>) {
+    let mut problems: Vec<String> = Vec::new();
+    let mut input = match base {
+        Some(Value::Object(m)) => m,
+        Some(other) => {
+            problems.push(format!("<json-input> must be a JSON object, got {other}"));
+            serde_json::Map::new()
+        }
+        None => serde_json::Map::new(),
+    };
+    let defs = schema
+        .get("definitions")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let properties = schema.get("properties").and_then(|v| v.as_object());
+
+    for arg in args {
+        let eq = match arg.find('=') {
+            Some(i) => i,
+            None => {
+                problems.push(format!("--arg `{arg}` is not `key=value`"));
+                continue;
+            }
+        };
+        let key = arg[..eq].to_string();
+        let raw_val = arg[eq + 1..].to_string();
+        let Some(props) = properties else {
+            // No schema properties: pass through as a string (lenient).
+            input.insert(key.clone(), Value::String(raw_val));
+            continue;
+        };
+        let Some(field_schema) = props.get(&key) else {
+            // Unknown field. Under validation, flag it; still insert as a string (handlers may
+            // read leniently, like the flux runtime).
+            if validate {
+                problems.push(format!("--arg `{key}` is not a declared field"));
+            }
+            input.insert(key.clone(), Value::String(raw_val));
+            continue;
+        };
+        let value = if validate {
+            match coerce_arg_value(field_schema, &defs, &raw_val) {
+                Ok(v) => v,
+                Err(e) => {
+                    problems.push(format!("--arg `{key}`: {e}"));
+                    // Insert the raw string so the call can still proceed under --no-validate
+                    // or so the user sees the value in --dry-run.
+                    Value::String(raw_val)
+                }
+            }
+        } else {
+            Value::String(raw_val)
+        };
+        input.insert(key.clone(), value);
+    }
+
+    if validate {
+        let required: Vec<&str> = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        for req in required {
+            if !input.contains_key(req) {
+                problems.push(format!("missing required field `{req}`"));
+            }
+        }
+    }
+
+    (Value::Object(input), problems)
 }
 
 fn available_plugin_operations(manifest: &flux_plugin::PluginManifest) -> String {
@@ -4744,10 +4983,11 @@ async fn run_prompt(flags: AgentFlags, prompt_words: Vec<String>) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_datasources, cost_annotation, credential_location, format_evidence,
-        loop_machinery_label, new_render_suffix, plugin_binaries_in, plugin_status_one,
-        render_endpoint_row, resolve_plugin_operation_name, run_plugin_in, tool_preview, truncate,
-        usage_annotation, write_generated_skill, Liveness, PluginAction,
+        build_datasources, build_invoke_input, coerce_arg_value, cost_annotation,
+        credential_location, format_evidence, loop_machinery_label, new_render_suffix,
+        plugin_binaries_in, plugin_status_one, render_endpoint_row, resolve_plugin_operation_name,
+        run_plugin_in, tool_preview, truncate, usage_annotation, write_generated_skill, Liveness,
+        PluginAction,
     };
     use serde_json::json;
 
@@ -5055,6 +5295,129 @@ mod tests {
             .to_string();
         assert!(err.contains("tried `grafana.dashboards`"), "{err}");
         assert!(err.contains("grafana.search"), "{err}");
+    }
+
+    // ─── Track A1: `flux plugin call/run --arg` schema-coerced input building ──────────
+
+    /// A representative schemars-derived op schema (a string field, a required integer, a
+    /// nullable boolean, an enum, a string-array, and an unknown/extra field path).
+    fn sample_op_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "count": {"type": "integer"},
+                "flag": {"type": ["boolean", "null"]},
+                "mode": {"type": "string", "enum": ["a", "b"]},
+                "tags": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["count"]
+        })
+    }
+
+    #[test]
+    fn build_invoke_input_coerces_arg_types() {
+        let schema = sample_op_schema();
+        let args = vec![
+            "count=42".to_string(),
+            "flag=true".to_string(),
+            "mode=b".to_string(),
+            "tags=foo,bar,baz".to_string(),
+        ];
+        let (input, problems) = build_invoke_input(&schema, None, &args, true);
+        assert!(problems.is_empty(), "problems: {problems:?}");
+        assert_eq!(input["count"], 42);
+        assert_eq!(input["flag"], true);
+        assert_eq!(input["mode"], "b");
+        assert_eq!(input["tags"], serde_json::json!(["foo", "bar", "baz"]));
+    }
+
+    #[test]
+    fn build_invoke_input_reports_type_and_enum_and_required_problems() {
+        let schema = sample_op_schema();
+        let args = vec![
+            "count=notanint".to_string(),
+            "mode=zzz".to_string(),
+            "unknownfield=x".to_string(),
+        ];
+        let (input, problems) = build_invoke_input(&schema, None, &args, true);
+        // Required `count` is present (as a string fallback), so only the coercion/enum/unknown
+        // problems fire — not the missing-required one.
+        assert_eq!(problems.len(), 3, "problems: {problems:?}");
+        assert!(problems
+            .iter()
+            .any(|p| p.contains("`count`") && p.contains("integer")));
+        assert!(problems
+            .iter()
+            .any(|p| p.contains("`mode`") && p.contains("not one of")));
+        assert!(problems
+            .iter()
+            .any(|p| p.contains("`unknownfield`") && p.contains("not a declared field")));
+        // The count fallback is inserted as a string so the call can still proceed under --no-validate.
+        assert_eq!(input["count"], "notanint");
+    }
+
+    #[test]
+    fn build_invoke_input_flags_missing_required() {
+        let schema = sample_op_schema();
+        let (input, problems) = build_invoke_input(&schema, None, &[], true);
+        assert_eq!(input, serde_json::json!({}));
+        assert!(problems
+            .iter()
+            .any(|p| p.contains("missing required field `count`")));
+    }
+
+    #[test]
+    fn build_invoke_input_merges_args_over_json_base() {
+        let schema = sample_op_schema();
+        let base = serde_json::json!({"count": 1, "name": "base"});
+        let args = vec!["count=99".to_string(), "flag=false".to_string()];
+        let (input, problems) = build_invoke_input(&schema, Some(base), &args, true);
+        assert!(problems.is_empty(), "problems: {problems:?}");
+        assert_eq!(input["count"], 99); // arg overrides base
+        assert_eq!(input["name"], "base"); // base preserved
+        assert_eq!(input["flag"], false);
+    }
+
+    #[test]
+    fn build_invoke_input_no_validate_passes_strings_through() {
+        let schema = sample_op_schema();
+        let args = vec!["count=notanint".to_string(), "unknownfield=x".to_string()];
+        let (input, problems) = build_invoke_input(&schema, None, &args, false);
+        assert!(
+            problems.is_empty(),
+            "--no-validate should produce no problems: {problems:?}"
+        );
+        assert_eq!(input["count"], "notanint");
+        assert_eq!(input["unknownfield"], "x");
+    }
+
+    #[test]
+    fn build_invoke_input_parses_json_array_literal() {
+        let schema = sample_op_schema();
+        let args = vec!["count=1".to_string(), "tags=[\"x\",\"y\"]".to_string()];
+        let (input, problems) = build_invoke_input(&schema, None, &args, true);
+        assert!(problems.is_empty(), "problems: {problems:?}");
+        assert_eq!(input["tags"], serde_json::json!(["x", "y"]));
+    }
+
+    #[test]
+    fn coerce_arg_value_handles_nullable_and_refs() {
+        // schemars nullable form: type: ["string","null"].
+        let nullable = serde_json::json!({"type": ["string", "null"]});
+        assert_eq!(
+            coerce_arg_value(&nullable, &serde_json::json!({}), "hi").unwrap(),
+            "hi"
+        );
+        // enum via anyOf → $ref → definitions (schemars Option<Enum> shape).
+        let schema = serde_json::json!({
+            "definitions": { "Mode": {"type": "string", "enum": ["on", "off"]} },
+            "anyOf": [{"$ref": "#/definitions/Mode"}, {"type": "null"}]
+        });
+        let defs = schema["definitions"].clone();
+        assert_eq!(coerce_arg_value(&schema, &defs, "on").unwrap(), "on");
+        let err = coerce_arg_value(&schema, &defs, "nope").unwrap_err();
+        assert!(err.contains("not one of"));
     }
 
     #[test]

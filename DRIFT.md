@@ -451,3 +451,35 @@ All 17 in-repo plugins now schemars-derive every op `input_schema` via `host-kit
 `MIGRATED_PLUGINS`) enforces it. Fluxplane parity re-audits done per plugin; gaps ported or recorded
 as deferred. Two cross-cutting residuals remain for future passes: docker's streaming/hijack/tar
 ops, and the confluence `index.build` / aws `inspect` / jira ADF-image gaps noted above.
+
+---
+
+# Track A1 — `flux plugin call/run --arg` schema-coerced invocation (DONE)
+
+The CLI ergonomics gap that blocked ergonomic live smoke (the plan's Track A1) is closed.
+`flux plugin call <name> <op> [json-input]` (aliased `run`) now accepts repeatable
+`--arg key=value` flags, coercing each to the op's declared `input_schema` type and merging over
+the `<json-input>` base — mirroring the fluxplane `operation invoke` (`run`/`call`) ergonomics.
+
+## Behavior
+- **Type coercion** (`coerce_arg_value`): string → as-is (enum membership validated);
+  integer → `i64`; number → `f64`; boolean → true/false/1/0; array → JSON-array literal parsed
+  verbatim, else comma-split into trimmed strings; object → JSON parse. Resolves schemars'
+  `["T","null"]` nullable + `$ref`→`definitions` + `anyOf` (Option<Enum>) forms.
+- **`build_invoke_input`**: base JSON object + `--arg` merge; unknown fields flagged under
+  validation (still inserted as strings — handlers may read leniently, like the flux runtime);
+  required-field check.
+- **`--dry-run`**: prints `{plugin, operation, valid, problems, input}` and never calls the op
+  (still spawns the plugin once to fetch the manifest/schema — there's no out-of-band manifest).
+- **`--no-validate`**: skips coercion + required check; args pass through as strings.
+
+## Verification
+- 7 `flux-cli` unit tests (`build_invoke_input_*` + `coerce_arg_value_handles_nullable_and_refs`).
+- Live smoke against the migrated `homer` plugin's schemars-derived `call.analyze` schema:
+  `--dry-run` with valid args → coerced (`limit=50`→int, `render=svg`→enum) + `valid:true`;
+  invalid args → enum/type/missing-required problems + `valid:false`; `run` alias; JSON-base +
+  `--arg` merge; `--no-validate` string pass-through. End-to-end schema fetch → coerce → validate.
+
+This unblocks the plan's step 5 (live smoke) for every migrated plugin: `flux plugin run <p>
+<op> --arg k=v …` is now ergonomic (no hand-written JSON blob), and `--dry-run` lets you confirm
+the input without touching the network.
