@@ -990,6 +990,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_flow_transcript_marks_silent_successes() {
+        // A-05: an op succeeding with EMPTY output must read as an explicit success in the round
+        // feedback — a blank entry is indistinguishable from "nothing happened", and the model
+        // re-runs the (possibly non-idempotent) op.
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        let ast = DraftAst {
+            body: vec![flow_bind("quiet", "echo", vec![flow_lit(json!(""))])],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert!(
+            outcome
+                .transcript
+                .contains("[$quiet = echo]\n✓ ok (no output)"),
+            "an empty view must render a success marker, got: {:?}",
+            outcome.transcript
+        );
+    }
+
+    #[tokio::test]
     async fn execute_flow_when_takes_the_true_branch() {
         let store = FlowStore::in_memory().unwrap();
         let ex = temp_executor(true);

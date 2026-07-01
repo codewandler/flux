@@ -2,9 +2,8 @@
 id: A-05
 title: Legible silent-success feedback — stop the loop re-running ops that already succeeded
 pillar: Agent
-status: ready
-priority: 3
-note: a zero-output success feeds back as `[bash]\n` + nothing — indistinguishable from "didn't run", so the model re-plans the identical op; observed 3 model calls / 13.5s / $0.14 for one `rm`
+status: done
+note: FIXED — transcript renders `✓ ok (no output)` for empty views (all ops), bash emits `[exit 0] (no output)`, and run_plan skips a byte-identical plan re-emitted after a successful run; live rm task: 1 execution, 2.1s, $0.0137 (was 2 executions, 13.5s, $0.14)
 ---
 
 # Legible silent-success feedback — stop the loop re-running ops that already succeeded
@@ -25,20 +24,24 @@ distinguish that from "nothing happened" and retries. (Same failure family as th
 empty-parallel-branch bug: empty evidence spins the loop.)
 
 ## Acceptance
-- [ ] Failing-first: a plan whose only op succeeds with empty output produces a `run_plan`
-      transcript containing an explicit success marker (e.g. `[bash] ✓ exit 0 (no output)` /
-      `(ok — no output)`), asserted at the transcript-renderer level so it covers EVERY op with an
-      empty view, not just `bash`.
-- [ ] `BashTool` success output includes the exit status when the body is empty (`[exit 0] (no
-      output)`), so even raw content consumers see it.
-- [ ] Loop-guard extension: an identical plan re-emitted immediately after that plan **succeeded**
-      is fingerprinted (today only identical failures / identical transcripts stall) — one escalate
-      nudge, "the previous identical plan succeeded; do not re-run it".
-- [ ] Live re-check: the `rm` scenario completes in 2 provider calls (one plan + one prose/complete
-      round), not 3, and the command executes exactly once.
+- [x] Failing-first: the transcript renderer marks every empty view `✓ ok (no output)` — asserted
+      at the renderer level (`flux-flow::runtime::execute_flow_transcript_marks_silent_successes`,
+      via `flux-lang::runtime::legible_view`), so it covers every op, not just `bash`.
+- [x] `BashTool` appends `[exit 0] (no output)` when a successful command produced no output.
+- [x] Loop-guard extension: `run_plan` fingerprints the plan AST; a byte-identical plan re-emitted
+      right after a SUCCESSFUL run is **not re-executed** (stronger than the planned nudge — a
+      non-idempotent op must not run twice) and the model is told the previous run succeeded
+      (`loop_host::tests::run_plan_skips_an_identical_plan_after_success`). A failed or suspended
+      plan stays retryable; if the model insists, the informational transcript repeats and the
+      existing stall guard escalates/stops.
+- [x] Live re-check: `rm` scenario → one plan, command executed once (`✓ exit 0` in the step
+      display), grounded summary; 2.1s / $0.0137 (was 3 calls, double execution, 13.5s / $0.14).
 
 ## Progress
-- (not started)
+- **DONE (2026-07-02).** `flux-lang::runtime::legible_view` (empty view → `✓ ok (no output)`) on
+  both transcript entry shapes; `BashTool` `[exit 0] (no output)`; `LoopGuard.last_plan_hash/ok` +
+  the skip in `run_plan` (recorded on success/failure, suspension counts as not-ok). 3 new tests;
+  full gate green; live-verified.
 
 ## Notes
 - Found during the 2026-07-01 harness e2e review.

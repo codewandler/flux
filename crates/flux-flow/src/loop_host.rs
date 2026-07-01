@@ -137,6 +137,12 @@ struct LoopGuard {
     /// Armed once the stall reaches [`STALL_STOP`]: the honest message the next `plan` returns (as a
     /// `chat`) to terminate the loop via the flow's existing `case "chat"`.
     force_stop: Option<String>,
+    /// Hash of the previous round's plan AST, with whether it ran to success. A byte-identical plan
+    /// re-emitted right after a SUCCESSFUL run is the silent-success confusion (A-05): the model
+    /// couldn't tell the op ran (e.g. an empty-output command) and tries again. `run_plan` skips the
+    /// re-execution and says so instead of re-running a possibly destructive op.
+    last_plan_hash: Option<String>,
+    last_plan_ok: bool,
 }
 
 /// The engine-side reflexive host. Holds the stable machinery the two ops need that a `ToolContext`
@@ -462,6 +468,26 @@ impl LoopHost for EngineLoopHost {
         let ast: DraftAst = serde_json::from_value(ast_val)
             .map_err(|e| Error::Other(format!("run_plan: invalid plan ast: {e}")))?;
 
+        // Silent-success guard (A-05): a byte-identical plan re-emitted right after a SUCCESSFUL
+        // run means the model couldn't read the success (e.g. an empty-output command) — don't
+        // re-run it (it may be non-idempotent, like `rm`); tell the model instead. If the model
+        // insists, this same informational transcript repeats and the transcript-stall guard
+        // escalates/stops the turn.
+        let plan_fingerprint = transcript_hash(&serde_json::to_string(&ast).unwrap_or_default());
+        {
+            let g = self.guard.lock().unwrap();
+            if g.last_plan_ok && g.last_plan_hash.as_deref() == Some(plan_fingerprint.as_str()) {
+                return Ok(serde_json::json!({
+                    "transcript": "[loop-guard] This EXACT plan already ran SUCCESSFULLY in the \
+                                   previous round — it was NOT re-run. An empty result there means \
+                                   the operation succeeded with no output. Use those results, or \
+                                   answer in prose to finish the turn.",
+                    "result": "",
+                    "steps": 0,
+                }));
+            }
+        }
+
         let (session_id, sink) = {
             let t = self.turn.lock().unwrap();
             (t.session_id.clone(), t.sink.clone())
@@ -531,6 +557,11 @@ impl LoopHost for EngineLoopHost {
             // the outcome transcript so the loop re-plans (model-in-the-loop self-correction), exactly as
             // the old Rust loop did — rather than letting it abort the whole turn.
             Err(e) => {
+                {
+                    let mut g = self.guard.lock().unwrap();
+                    g.last_plan_hash = Some(plan_fingerprint);
+                    g.last_plan_ok = false; // a failed plan may legitimately be retried (repaired)
+                }
                 let transcript = self.guard_transcript(format!(
                     "[plan error] {e}\nAdjust and emit another plan, or answer in prose."
                 ));
@@ -542,6 +573,12 @@ impl LoopHost for EngineLoopHost {
                 }));
             }
         };
+        {
+            let mut g = self.guard.lock().unwrap();
+            g.last_plan_hash = Some(plan_fingerprint);
+            // A suspension is not a completed success — a repeat after resume is legitimate.
+            g.last_plan_ok = outcome.suspension.is_none();
+        }
 
         // A suspension means the turn is awaiting input — real progress, not a stall — so skip the
         // retry-breaker and feed back the raw transcript.
@@ -950,6 +987,78 @@ mod tests {
             !sys.contains("- bash("),
             "a hidden op must not be advertised to the model"
         );
+    }
+
+    /// A-05: a byte-identical plan re-emitted right after a SUCCESSFUL run (the silent-success
+    /// confusion) is NOT re-executed — `run_plan` returns an informational transcript instead, so a
+    /// non-idempotent op (`rm`) can't run twice because its empty output looked like "nothing
+    /// happened".
+    #[tokio::test]
+    async fn run_plan_skips_an_identical_plan_after_success() {
+        let rec = Recorder::default();
+        let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(rec.clone())));
+        let dir = std::env::temp_dir().join(format!("flux-loop-a05-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        flux_tools::register_reflect(&mut reg);
+        let executor = Executor::new(
+            reg,
+            PermissionManager::from_rules(&["plan".into(), "run_plan".into(), "echo".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(system),
+        );
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider {
+            responses: Mutex::new(VecDeque::new()),
+        });
+        let store = Arc::new(FlowStore::in_memory().unwrap());
+        let (_executor, host) = EngineLoopHost::install(
+            executor,
+            provider,
+            "mock".into(),
+            None,
+            store,
+            Arc::new(DynamicComposites::default()),
+            "sess".into(),
+            shared,
+            CompileOptions::default(),
+        );
+        // An echo of "" — a silent success (empty view).
+        let plan = json!({
+            "kind": "plan",
+            "ast": { "body": [
+                { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "" }] }
+            ]}
+        });
+        let first = host.run_plan(plan.clone()).await.unwrap();
+        assert_eq!(first["steps"], 1);
+        assert!(
+            first["transcript"]
+                .as_str()
+                .unwrap()
+                .contains("✓ ok (no output)"),
+            "the silent success must be legible in the feedback: {}",
+            first["transcript"]
+        );
+        let second = host.run_plan(plan).await.unwrap();
+        assert_eq!(second["steps"], 0, "the identical plan must not re-run");
+        assert!(
+            second["transcript"]
+                .as_str()
+                .unwrap()
+                .contains("already ran SUCCESSFULLY"),
+            "{}",
+            second["transcript"]
+        );
+        let echoes = rec
+            .tools
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.as_str() == "echo")
+            .count();
+        assert_eq!(echoes, 1, "echo dispatched exactly once across both rounds");
     }
 
     /// Fix 2: an identical `run_plan` transcript repeating means the loop is not progressing. The

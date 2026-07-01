@@ -1158,6 +1158,10 @@ impl Tool for BashTool {
         }
         if out.exit_code != 0 {
             body.push_str(&format!("\n[exit {}]", out.exit_code));
+        } else if body.is_empty() {
+            // A silent success must stay legible: an empty result is indistinguishable from
+            // "nothing ran", and the loop re-plans the already-succeeded command (A-05).
+            body.push_str("[exit 0] (no output)");
         }
         Ok(ToolResult {
             content: body,

@@ -784,6 +784,18 @@ async fn run_top_level(
 /// Coerce a resume `input` against the `await`'s declared `as_type` — lenient, like the type checker:
 /// a string reply is parsed to a number/bool when the await asked for one; everything else is kept
 /// verbatim (no hard failures — an un-coercible value flows through as-is).
+/// A transcript-legible rendering of an op's view: an empty view (a command that succeeded with no
+/// output — `rm`, a clean formatter, an empty match set) becomes an explicit success marker instead
+/// of a blank line. Without it the loop feedback for a silent success reads exactly like "nothing
+/// happened", and the model re-runs the already-succeeded op (A-05).
+fn legible_view(view: &str) -> &str {
+    if view.trim().is_empty() {
+        "✓ ok (no output)"
+    } else {
+        view
+    }
+}
+
 fn coerce_await_input(input: Value, as_type: &Option<TypeRef>) -> Value {
     match (as_type, &input) {
         (Some(TypeRef::Number), Value::String(s)) => {
@@ -1139,7 +1151,7 @@ fn exec_body<'a>(
                     // a plan's reads, not just the last one. Oversized views are trimmed so one huge
                     // result can't blow the round's context budget (the canonical value is untouched).
                     let view = executor.trim_output(outcome.view.clone(), op);
-                    transcript.push(format!("[${} = {op}]\n{view}", name.0));
+                    transcript.push(format!("[${} = {op}]\n{}", name.0, legible_view(&view)));
                     last = outcome.view;
                     last_value = outcome.value_id;
                 }
@@ -1157,7 +1169,7 @@ fn exec_body<'a>(
                     // (line-numbered read, diff, …). Control flow (`when`/`return`) stays canonical.
                     // Oversized views are trimmed (canonical value untouched).
                     let view = executor.trim_output(outcome.view.clone(), op);
-                    transcript.push(format!("[{op}]\n{view}"));
+                    transcript.push(format!("[{op}]\n{}", legible_view(&view)));
                     last = outcome.view;
                     last_value = outcome.value_id;
                 }
