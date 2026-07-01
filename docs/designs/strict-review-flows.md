@@ -1,8 +1,19 @@
 # Design: strict review flows and journeys
 
-## Status
+**Status:** proposed (epic) · **Pillar:** Language (Flux-Lang protocol) + Core (capability
+enforcement) · **Stories:** [L-10](../stories/L-10-strict-review-example-flow.md) ·
+[L-11](../stories/L-11-strict-review-scoped-capabilities.md) ·
+[L-12](../stories/L-12-strict-review-typed-artifacts.md) ·
+[L-13](../stories/L-13-strict-review-journey-cli.md)
 
-Proposed.
+## Why
+
+A skill can only advise a reviewer; a code-review protocol needs enforceable guarantees — fixed
+step order, a bounded tool set per phase, sub-agents on a frozen context instead of ambient
+workspace authority, and deterministic aggregation. This epic expresses **strict code review as an
+enforced Flux-Lang flow**, not prompt convention, matching the project invariant that *the LLM is
+not the runtime*: prompt guidance may inspire the protocol, but the executable flow and runtime
+policy enforce it. See the detailed problem statement and phased approach below.
 
 ## Problem
 

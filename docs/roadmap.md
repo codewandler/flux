@@ -277,6 +277,34 @@ makes codex's **websocket** the default transport (HTTP fallback), and adds the 
   ships first with an env-static resolver stand-in; the plugin (C-09a/b) follows once the `plugins/`
   workspace is free.
 
+### Strict review flows & journeys (epic)
+
+A skill can *advise* a reviewer, but a review protocol needs guarantees — fixed step order, a bounded
+tool set per phase, sub-agents on a frozen context instead of ambient workspace authority, and
+deterministic aggregation. This epic expresses **strict code review as an enforced Flux-Lang flow**
+rather than prompt convention, matching the project invariant that *the LLM is not the runtime*:
+prompt guidance may inspire the protocol, but the executable flow and runtime policy enforce it.
+"Done" is a reusable `strict_review` flow that reads only the requested context read-only, fans out
+to capped reviewer sub-agents, aggregates typed findings deterministically into a `ReviewReport`, and
+fails closed on any undeclared tool — reachable both directly and as a `flux-app` journey. Epic
+design: [strict-review-flows.md](designs/strict-review-flows.md). Built in four phases:
+
+- **[L-10](stories/L-10-strict-review-example-flow.md) — Example flow + reviewer roles** · *Language,
+  leads (ready).* The `strict_review` flow + role files using only existing primitives (context
+  gather → capped fan-out → deterministic dedupe/rank), proving the runtime contract with no language
+  change. Sub-agent tool restriction stays at the role level here.
+- **[L-11](stories/L-11-strict-review-scoped-capabilities.md) — Scoped capabilities (`with_tools`)** ·
+  *Language.* An analyzer-visible capability-scope node threaded into `Executor::dispatch` so a tool
+  outside the active scope fails closed (session ∩ AgentSpec ∩ flow ∩ block ∩ sub-agent), with
+  entry/exit and denials in the evidence log. The feature that makes this not-just-a-skill.
+- **[L-12](stories/L-12-strict-review-typed-artifacts.md) — Typed artifacts + deterministic
+  aggregator** · *Language.* `ReviewRequest`/`ReviewFinding`/`ReviewReport` + `review.normalize`/
+  `review.aggregate` (fingerprint/dedupe/rank, malformed→gap, stable ordering); the model does prose
+  synthesis only, against a fixed schema.
+- **[L-13](stories/L-13-strict-review-journey-cli.md) — App journey + CLI & CI surfaces** · *Agent.* A
+  `flux-app` `review_code` journey + optional `flux review` command + CI output modes (markdown/JSON/
+  nonzero exit on high severity); the journey path and the direct flow path produce the same report.
+
 **Candidate phases (vision tail, in priority order):**
 - **Crate consolidation** ✅ **all phases shipped** — shrank the workspace by merging coherent
   *same-layer* siblings (layering lint stayed green throughout). Phase 1 collapsed the five L1 provider
