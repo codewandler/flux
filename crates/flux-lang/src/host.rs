@@ -80,6 +80,20 @@ pub trait OpHost: Send + Sync {
     async fn resolve_thing(&self, thing: &ThingRef) -> std::result::Result<ResolvedThing, String> {
         default_resolve_thing(thing)
     }
+
+    /// Open a capability scope for the duration of a `with_tools` block, narrowing subsequent
+    /// [`dispatch`](Self::dispatch) calls to `tools` (intersected with any scope already open — the
+    /// real runtime implementation enforces narrow-only nesting). The interpreter's `CapScope` node
+    /// calls this before running its body and [`pop_cap_scope`](Self::pop_cap_scope) unconditionally
+    /// afterward, mirroring the `Scope` node's acquire/body/finally discipline. The default is a no-op:
+    /// a host that never overrides it (e.g. a test double with no real safety envelope) simply doesn't
+    /// enforce scoping — production hosts (`flux-flow`'s `ExecutorHost`) forward this to the real
+    /// `Executor`, which is where enforcement actually happens (at `dispatch`, not here).
+    async fn push_cap_scope(&self, _tools: &[String]) {}
+
+    /// Close the innermost open capability scope. Must be called exactly once for each
+    /// [`push_cap_scope`](Self::push_cap_scope), even when the block's body errored.
+    async fn pop_cap_scope(&self) {}
 }
 
 /// Deterministically resolve the **self-identifying** thing selectors — an explicit `Id`/`Key`, a

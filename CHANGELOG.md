@@ -8,6 +8,21 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Runtime-enforced capability scoping — `with_tools` (L-11, Phase 2).** Per-block tool restriction
+  is now enforced, not advisory: a new `Node::CapScope` AST node (native text
+  `with_tools ["a", "b"] { … }`) narrows the tool-name allowlist for its body, checked as the FIRST
+  gate in `Executor::dispatch` (before pre-tool hooks and the policy/permission layers) — a call
+  outside the active scope fails closed even when the outer session policy would allow it. The gate
+  runs on every dispatch, so a composite op's inner calls and a sub-agent's own dispatches are caught
+  identically to a direct call (non-bypassable). Capabilities only ever narrow on descent: nesting
+  intersects with the enclosing scope, and `Spawner::spawn_scoped` intersects a `task` role's own
+  `tools` with the caller's active block scope (`role.tools ∩ active_block_scope`), wired through
+  `TaskTool` reading `ToolContext::active_cap_scope()`. Scope entry/exit and every denial are recorded
+  in the evidence log (`cap_scope_enter`/`cap_scope_denied`/`cap_scope_exit`). The analyzer also flags
+  a literal-op `call` statically provable to be outside its enclosing `with_tools` scope. Resolves the
+  design's two Phase 2 open questions: scopes narrow by tool **name** (not effects), and sub-agent
+  restriction is a **surrounding block scope**, not a `task(tools:)` parameter.
+
 - **Strict code review as a checked-in Flux-Lang flow (L-10, Phase 1).** `examples/strict_review.flux`
   gathers context read-only (`git_status`/`git_diff`/`read_many`), packs it into a budgeted `ctx` for
   the audit trail, fans out via `parallel` to a FIXED set of three restricted reviewer roles

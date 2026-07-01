@@ -2169,6 +2169,40 @@ fn exec_body<'a>(
                         bind_existing(store, session_id, name, vid)?;
                     }
                 }
+                Node::CapScope {
+                    tools,
+                    body: csbody,
+                    bind,
+                } => {
+                    // Push → run body → ALWAYS pop, mirroring `Scope`'s acquire/body/finally RAII: the
+                    // enforcement itself lives entirely in `executor.dispatch` (through `push_cap_scope`
+                    // narrowing the host's cap-scope stack), so this node's only job is to open/close
+                    // the window around its body — even when the body errors or returns early. The pop
+                    // runs via `?`-transparent early return below, exactly like `finally` always running.
+                    executor.push_cap_scope(tools).await;
+                    let body_res = exec_body(
+                        store,
+                        executor,
+                        session_id,
+                        csbody,
+                        &mut *sink,
+                        &mut *steps,
+                        &mut *transcript,
+                    )
+                    .await;
+                    executor.pop_cap_scope().await;
+                    let (blast, bvid, step) = body_res?;
+                    if !blast.is_empty() {
+                        last = blast;
+                    }
+                    last_value = bvid.clone();
+                    if let (Some(name), Some(vid)) = (bind, &bvid) {
+                        bind_existing(store, session_id, name, vid)?;
+                    }
+                    if let Step::Return(v) = step {
+                        return Ok((last, v.clone(), Step::Return(v)));
+                    }
+                }
                 Node::Scope {
                     acquire,
                     bind,
@@ -3524,6 +3558,7 @@ fn node_kind(node: &Node) -> &'static str {
         Node::Fallback { .. } => "fallback",
         Node::Timeout { .. } => "timeout",
         Node::Budget { .. } => "budget",
+        Node::CapScope { .. } => "cap_scope",
         Node::Obj { .. } => "obj",
         Node::List { .. } => "list",
     }

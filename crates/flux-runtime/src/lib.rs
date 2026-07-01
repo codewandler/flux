@@ -96,6 +96,26 @@ pub trait Spawner: Send + Sync {
         task: &str,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> flux_core::Result<String>;
+
+    /// Like [`spawn`](Self::spawn), but additionally narrows the child's tool set to `cap_scope` (the
+    /// caller's active `with_tools` allowlist, if any) — so a `task` invoked from *inside* a capability
+    /// scope can't hand the sub-agent a broader tool set than the block that spawned it, even when the
+    /// role itself declares more. `None` means no scope is active (the default, unrestricted `spawn`
+    /// behaviour). The default implementation ignores `cap_scope` and delegates to [`spawn`](Self::spawn)
+    /// — a `Spawner` that doesn't override this simply doesn't narrow by block scope (still bounded by
+    /// the role's own `tools` and, once inside the child, by the child's own [`Executor::dispatch`]).
+    /// The `task` tool (`flux-orchestrate`) is the one caller with a live [`ToolContext`] to read
+    /// `cap_scope` from, so it calls this instead of `spawn` directly.
+    async fn spawn_scoped(
+        &self,
+        role: &str,
+        task: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+        cap_scope: Option<&[String]>,
+    ) -> flux_core::Result<String> {
+        let _ = cap_scope;
+        self.spawn(role, task, cancel).await
+    }
 }
 
 /// The reflexive capability: re-enter the planner and the interpreter from *within* a flow. Defined
@@ -172,6 +192,14 @@ pub struct ToolContext {
     /// that fan out concurrently (e.g. a server) must use one engine per concurrent turn; the SDK's
     /// `FlowClient` is already safe (a fresh `ToolContext` per `execute`).
     cancel: Arc<Mutex<Option<tokio_util::sync::CancellationToken>>>,
+    /// The **capability-scope stack**: each entry is the effective tool-name allowlist of one active
+    /// `with_tools` block, narrow-only (an entry is always the intersection of its own declared set
+    /// with the one below it — see [`Executor::push_cap_scope`]). Empty stack = no scope active = every
+    /// tool the policy/permission layers already allow stays allowed (a strict no-op, so flows that
+    /// never use `with_tools` are unaffected). Shared (not `Executor`-private) so a spawned sub-agent's
+    /// `TaskTool` can read the *parent's* active scope at the moment it delegates — the same `Arc` the
+    /// dispatch gate checks, which is what makes the sub-agent intersection non-bypassable too.
+    cap_scopes: Arc<Mutex<Vec<Vec<String>>>>,
 }
 
 impl ToolContext {
@@ -185,7 +213,16 @@ impl ToolContext {
             read_times: Arc::new(Mutex::new(HashMap::new())),
             evidence: Arc::new(Mutex::new(EvidenceLog::new())),
             cancel: Arc::new(Mutex::new(None)),
+            cap_scopes: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// The effective tool-name allowlist of the innermost active capability scope, if any. `None`
+    /// means no scope is active (every tool stays subject only to policy/permission rules). Used by
+    /// [`Executor::dispatch`]'s gate and by [`Spawner`] implementations to intersect a sub-agent role's
+    /// tools with the block it was invoked from.
+    pub fn active_cap_scope(&self) -> Option<Vec<String>> {
+        self.cap_scopes.lock().unwrap().last().cloned()
     }
 
     /// Install the turn's cancellation token (the engine calls this per turn before running the loop).
@@ -694,6 +731,28 @@ impl Drop for PlanScopeGuard<'_> {
     }
 }
 
+/// Holds a capability scope open (see [`Executor::push_cap_scope`]). `Drop` pops it unconditionally —
+/// on normal completion, an early `return`, or a propagating error — so the stack always unwinds to
+/// the outer scope's allowlist no matter how the `with_tools` body exits. Also records the
+/// `cap_scope_exit` evidence observation on drop, mirroring `push_cap_scope`'s `cap_scope_enter` — so
+/// enter/exit bracket the body exactly like the stack push/pop do, with the same unconditional
+/// guarantee.
+pub struct CapScopeGuard<'a> {
+    cap_scopes: &'a Mutex<Vec<Vec<String>>>,
+    evidence: &'a Mutex<EvidenceLog>,
+}
+
+impl Drop for CapScopeGuard<'_> {
+    fn drop(&mut self) {
+        let popped = self.cap_scopes.lock().unwrap().pop();
+        self.evidence.lock().unwrap().record(Observation::new(
+            "cap_scope_exit",
+            Phase::Turn,
+            json!({ "scope": popped }),
+        ));
+    }
+}
+
 impl Executor {
     pub fn new(
         registry: ToolRegistry,
@@ -745,6 +804,43 @@ impl Executor {
                 Some(self.enter_approved_scope())
             }
             ApprovalChoice::Deny => None,
+        }
+    }
+
+    /// The effective tool-name allowlist of the innermost active `with_tools` scope, or `None` when no
+    /// scope is active. Delegates to the shared [`ToolContext::active_cap_scope`] so a spawned
+    /// sub-agent (built over a fresh `Executor` but a context that still carries this same `Arc`) sees
+    /// the identical set [`Executor::dispatch`] just checked.
+    pub fn active_cap_scope(&self) -> Option<Vec<String>> {
+        self.ctx.active_cap_scope()
+    }
+
+    /// Push a new capability scope, **narrowing** the effective allowlist: the pushed set is
+    /// intersected with the current top-of-stack (if any), so capabilities can only shrink as scopes
+    /// nest — an inner `with_tools` can never re-grant a tool an outer scope removed. Records a
+    /// `cap_scope_enter` evidence observation, and returns the guard that pops the scope (and records
+    /// `cap_scope_exit`) on drop; hold it across the scope's body so the pop is guaranteed even if the
+    /// body errors (mirrors [`PlanScopeGuard`]/the flux-lang `Scope` node's RAII discipline).
+    pub fn push_cap_scope(&self, tools: &[String]) -> CapScopeGuard<'_> {
+        let mut stack = self.ctx.cap_scopes.lock().unwrap();
+        let effective: Vec<String> = match stack.last() {
+            Some(outer) => tools
+                .iter()
+                .filter(|t| outer.contains(t))
+                .cloned()
+                .collect(),
+            None => tools.to_vec(),
+        };
+        stack.push(effective.clone());
+        drop(stack);
+        self.ctx.evidence.lock().unwrap().record(Observation::new(
+            "cap_scope_enter",
+            Phase::Turn,
+            json!({ "requested": tools, "effective": effective }),
+        ));
+        CapScopeGuard {
+            cap_scopes: &self.ctx.cap_scopes,
+            evidence: &self.ctx.evidence,
         }
     }
 
@@ -836,6 +932,27 @@ impl Executor {
         let Some(tool) = self.registry.get(name) else {
             return ToolResult::error(format!("unknown tool: {name}"));
         };
+
+        // 0. Capability-scope floor — checked FIRST, before pre-tool hooks or the policy/permission
+        //    layers below, and on EVERY dispatch (there is no other path to a tool's `execute`), so a
+        //    composite op, a sub-agent's inner call, or any nested reentry that eventually calls
+        //    `dispatch` again is caught exactly like a direct call. An empty stack (no `with_tools`
+        //    scope active) is a strict no-op — every existing flow that never opens a scope is
+        //    unaffected. A denial here can never be a false negative: the top of stack is always the
+        //    *narrowed* effective set (see `push_cap_scope`), so this can only ever be as strict as, or
+        //    stricter than, the outer session policy — never looser.
+        if let Some(scope) = self.active_cap_scope() {
+            if !scope.iter().any(|t| t == name) {
+                self.ctx.evidence.lock().unwrap().record(Observation::new(
+                    "cap_scope_denied",
+                    Phase::Turn,
+                    json!({ "tool": name, "scope": scope }),
+                ));
+                return ToolResult::error(format!(
+                    "`{name}` denied by capability scope (not in the active with_tools allowlist)"
+                ));
+            }
+        }
 
         // Pre-tool hooks (system-priority first): may modify the input or deny the call.
         let mut params = params;
@@ -1005,9 +1122,32 @@ mod tests {
         }
     }
 
+    /// A second read-only tool, distinct from `echo`, used to prove capability-scope narrowing (one
+    /// tool allowed inside the scope, the other denied).
+    struct PingTool;
+    #[async_trait]
+    impl Tool for PingTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only("ping", "ping", json!({"type": "object"}))
+        }
+        async fn execute(&self, _ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
+            Ok(ToolResult::ok("pong"))
+        }
+    }
+
     fn registry() -> ToolRegistry {
         let mut r = ToolRegistry::new();
         r.register(Arc::new(EchoTool));
+        r
+    }
+
+    /// Like [`registry`], plus [`PingTool`] — used only by the capability-scope tests below, which
+    /// need two distinct tools to prove narrowing (one allowed inside a scope, the other denied). Kept
+    /// separate from `registry()` so the many pre-existing tests asserting the registry's exact name
+    /// set (e.g. `subset_none_inherits_all_some_empty_grants_none`) are unaffected.
+    fn registry_two_tools() -> ToolRegistry {
+        let mut r = registry();
+        r.register(Arc::new(PingTool));
         r
     }
 
@@ -1112,6 +1252,166 @@ mod tests {
             "a deny rule still blocks inside an approved plan"
         );
         assert!(r.content.contains("denied by permission rules"));
+    }
+
+    // ---- capability scopes (`with_tools` / L-11) ----
+
+    #[tokio::test]
+    async fn no_active_scope_is_a_strict_no_op() {
+        // Empty stack: every existing flow that never opens a `with_tools` scope is unaffected.
+        let ex = Executor::new(
+            registry_two_tools(),
+            PermissionManager::new(),
+            Arc::new(AllowApprover),
+            test_ctx(),
+        );
+        assert_eq!(ex.active_cap_scope(), None);
+        let r = ex.dispatch("echo", json!({"text": "hi"})).await;
+        assert!(!r.is_error);
+        let r = ex.dispatch("ping", json!({})).await;
+        assert!(!r.is_error);
+    }
+
+    #[tokio::test]
+    async fn scope_allows_the_named_tool_and_denies_the_rest() {
+        let ex = Executor::new(
+            registry_two_tools(),
+            PermissionManager::new(),
+            Arc::new(AllowApprover),
+            test_ctx(),
+        );
+        let _scope = ex.push_cap_scope(&["ping".to_string()]);
+
+        let allowed = ex.dispatch("ping", json!({})).await;
+        assert!(!allowed.is_error, "ping is in the scope's allowlist");
+        assert_eq!(allowed.content, "pong");
+
+        let denied = ex.dispatch("echo", json!({"text": "hi"})).await;
+        assert!(denied.is_error, "echo is outside the scope's allowlist");
+        assert!(
+            denied.content.contains("denied by capability scope"),
+            "got: {}",
+            denied.content
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_denial_wins_even_when_policy_and_permissions_would_allow() {
+        // The permission rules explicitly allow `echo`, and there's no policy floor configured — the
+        // outer session would allow the call. The active scope must still deny it: capabilities only
+        // ever narrow, never widen, what the outer layers already permit.
+        let perms = PermissionManager::from_rules(&["echo".into()], &[]);
+        let ex = Executor::new(
+            registry_two_tools(),
+            perms,
+            Arc::new(AllowApprover),
+            test_ctx(),
+        );
+        let _scope = ex.push_cap_scope(&["ping".to_string()]);
+        let r = ex.dispatch("echo", json!({"text": "hi"})).await;
+        assert!(r.is_error, "scope denies even a permission-allowed tool");
+        assert!(r.content.contains("denied by capability scope"));
+    }
+
+    #[tokio::test]
+    async fn scope_closes_on_guard_drop_and_restores_the_outer_set() {
+        let ex = Executor::new(
+            registry_two_tools(),
+            PermissionManager::new(),
+            Arc::new(AllowApprover),
+            test_ctx(),
+        );
+        {
+            let _scope = ex.push_cap_scope(&["ping".to_string()]);
+            assert!(ex.dispatch("echo", json!({"text": "hi"})).await.is_error);
+        }
+        // Guard dropped: the scope stack is empty again, so echo is allowed once more.
+        assert_eq!(ex.active_cap_scope(), None);
+        assert!(!ex.dispatch("echo", json!({"text": "hi"})).await.is_error);
+    }
+
+    #[tokio::test]
+    async fn scope_pops_even_when_the_body_errors() {
+        // A denial inside the scope must not leak/corrupt the stack — the guard's `Drop` runs
+        // regardless of how the caller's scope block exits.
+        let ex = Executor::new(
+            registry_two_tools(),
+            PermissionManager::new(),
+            Arc::new(AllowApprover),
+            test_ctx(),
+        );
+        {
+            let _scope = ex.push_cap_scope(&["ping".to_string()]);
+            let _ = ex.dispatch("echo", json!({"text": "hi"})).await; // denied, body "errors"
+        }
+        assert_eq!(
+            ex.active_cap_scope(),
+            None,
+            "pop happened despite the denial"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_scope_narrows_and_never_widens() {
+        let ex = Executor::new(
+            registry_two_tools(),
+            PermissionManager::new(),
+            Arc::new(AllowApprover),
+            test_ctx(),
+        );
+        let _outer = ex.push_cap_scope(&["ping".to_string()]);
+        // Inner scope asks for BOTH tools, but the outer only allowed `ping` — the intersection must
+        // still exclude `echo`, proving nesting can only narrow.
+        let _inner = ex.push_cap_scope(&["ping".to_string(), "echo".to_string()]);
+        assert_eq!(ex.active_cap_scope(), Some(vec!["ping".to_string()]));
+        let r = ex.dispatch("echo", json!({"text": "hi"})).await;
+        assert!(
+            r.is_error,
+            "inner scope cannot re-grant what the outer removed"
+        );
+        let r = ex.dispatch("ping", json!({})).await;
+        assert!(!r.is_error);
+    }
+
+    #[tokio::test]
+    async fn denial_and_scope_boundaries_are_recorded_in_evidence() {
+        let ex = Executor::new(
+            registry_two_tools(),
+            PermissionManager::new(),
+            Arc::new(AllowApprover),
+            test_ctx(),
+        );
+        {
+            let _scope = ex.push_cap_scope(&["ping".to_string()]);
+            let _ = ex.dispatch("echo", json!({"text": "hi"})).await;
+        }
+        let log = ex.evidence();
+        assert!(
+            log.all().iter().any(|o| o.kind == "cap_scope_enter"),
+            "scope entry must be recorded"
+        );
+        assert!(
+            log.all().iter().any(|o| o.kind == "cap_scope_denied"),
+            "denial must be recorded"
+        );
+        assert!(
+            log.all().iter().any(|o| o.kind == "cap_scope_exit"),
+            "scope exit must be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_scope_denies_every_tool() {
+        // `with_tools []` — the strictest scope: no tool at all, mirroring `subset(Some(&[]))`.
+        let ex = Executor::new(
+            registry_two_tools(),
+            PermissionManager::new(),
+            Arc::new(AllowApprover),
+            test_ctx(),
+        );
+        let _scope = ex.push_cap_scope(&[]);
+        assert!(ex.dispatch("ping", json!({})).await.is_error);
+        assert!(ex.dispatch("echo", json!({"text": "hi"})).await.is_error);
     }
 
     #[tokio::test]

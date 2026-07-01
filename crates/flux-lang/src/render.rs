@@ -172,7 +172,7 @@ fn children(node: &Node) -> Vec<Branch<'_>> {
             .iter()
             .flat_map(|b| b.body.iter().map(Branch::Node))
             .collect(),
-        Node::Timeout { body, .. } | Node::Budget { body, .. } => {
+        Node::Timeout { body, .. } | Node::Budget { body, .. } | Node::CapScope { body, .. } => {
             body.iter().map(Branch::Node).collect()
         }
         Node::Scope { body, finally, .. } => {
@@ -390,6 +390,13 @@ fn head(node: &Node, p: &Palette) -> String {
             Some(b) => format!("{} {limit} -> {}", paint(p.keyword, "budget"), sym(p, &b.0)),
             None => format!("{} {limit}", paint(p.keyword, "budget")),
         },
+        Node::CapScope { tools, bind, .. } => {
+            let t = format!("[{}]", tools.join(", "));
+            match bind {
+                Some(b) => format!("{} {t} -> {}", paint(p.keyword, "with_tools"), sym(p, &b.0)),
+                None => format!("{} {t}", paint(p.keyword, "with_tools")),
+            }
+        }
         Node::Scope { bind, .. } => match bind {
             Some(b) => format!("{} -> {}", paint(p.keyword, "scope"), sym(p, &b.0)),
             None => paint(p.keyword, "scope"),
@@ -449,6 +456,7 @@ fn expr(node: &Node, p: &Palette) -> String {
         | Node::Fallback { .. }
         | Node::Timeout { .. }
         | Node::Budget { .. }
+        | Node::CapScope { .. }
         | Node::Scope { .. }
         | Node::Saga { .. }
         | Node::Once { .. }

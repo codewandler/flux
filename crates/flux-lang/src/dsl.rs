@@ -731,6 +731,23 @@ impl Block {
         })
     }
 
+    /// `with_tools [tools…]: …` — restrict op dispatch inside the body to `tools`, enforced at the
+    /// runtime's dispatch gate (never widening a scope it nests inside). Configure body / `bind` on
+    /// the [`WrapBuilder`].
+    pub fn with_tools(
+        &mut self,
+        tools: impl IntoIterator<Item = impl Into<String>>,
+        build: impl FnOnce(&mut WrapBuilder),
+    ) -> &mut Self {
+        let mut w = WrapBuilder::default();
+        build(&mut w);
+        self.add(Node::CapScope {
+            tools: tools.into_iter().map(Into::into).collect(),
+            body: w.body,
+            bind: w.bind,
+        })
+    }
+
     /// `scope: acquire … / body / finally …` — RAII acquire→use→release with guaranteed cleanup.
     /// Configure the optional `acquire` (+ bind), the `body`, and the `finally` on the [`ScopeBuilder`].
     pub fn scope(&mut self, build: impl FnOnce(&mut ScopeBuilder)) -> &mut Self {
@@ -1374,6 +1391,12 @@ mod tests {
                     b.call("bounded", []);
                 });
             });
+            b.with_tools(["read_many", "git_status"], |w| {
+                w.bind("scoped");
+                w.body(|b| {
+                    b.call("read_many", []);
+                });
+            });
         });
         let ast = ast.build();
 
@@ -1595,6 +1618,13 @@ mod tests {
                 });
             }),
             one(|b| {
+                b.with_tools(["n"], |w| {
+                    w.body(|b| {
+                        b.call("n", []);
+                    });
+                });
+            }),
+            one(|b| {
                 b.scope(|s| {
                     s.acquire("h", call("lock", []));
                     s.body(|b| {
@@ -1642,6 +1672,6 @@ mod tests {
             catalog.difference(&built).collect::<Vec<_>>(),
             built.difference(&catalog).collect::<Vec<_>>(),
         );
-        assert_eq!(built.len(), 42, "expected all 42 node kinds");
+        assert_eq!(built.len(), 43, "expected all 43 node kinds");
     }
 }

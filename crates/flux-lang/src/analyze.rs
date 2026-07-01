@@ -41,10 +41,112 @@ pub fn analyze_flow(ast: &DraftAst, ops: &dyn OpCatalog) -> Result<(), Vec<Diagn
     }
     check_await_position(&ast.body, &mut diags);
     check_checkpoint_position(&ast.body, &mut diags);
+    check_cap_scopes(&ast.body, None, &mut diags);
     if diags.is_empty() {
         Ok(())
     } else {
         Err(diags)
+    }
+}
+
+/// Statically flag a literal-op `call` that is provably outside the enclosing `with_tools`
+/// allowlist(s) — the analyzer-visible half of capability scoping (the runtime dispatch gate is the
+/// enforcement authority; this is best-effort early feedback so a plan is rejected before it runs).
+/// `active` is the narrowed allowlist in effect at this point (`None` = no scope open, everything is
+/// analyzer-permitted here). A `CapScope`'s own `tools` is intersected with `active` on descent — the
+/// same narrow-only rule the runtime's `push_cap_scope` enforces — so a nested scope is checked against
+/// the *effective*, already-narrowed set, never the outer scope's original one. Non-literal call sites
+/// don't exist in this grammar (`op` is always a literal `String`), so every `call` site is checkable.
+fn check_cap_scopes(body: &[Node], active: Option<&[String]>, diags: &mut Vec<Diagnostic>) {
+    for node in body {
+        match node {
+            Node::Call { op, .. } => check_call_in_scope(op, active, diags),
+            Node::Bind { value, .. } | Node::Memo { value, .. } => {
+                if let Node::Call { op, .. } = value.as_ref() {
+                    check_call_in_scope(op, active, diags);
+                }
+            }
+            Node::CapScope {
+                tools, body: inner, ..
+            } => {
+                let narrowed: Vec<String> = match active {
+                    Some(outer) => tools
+                        .iter()
+                        .filter(|t| outer.contains(t))
+                        .cloned()
+                        .collect(),
+                    None => tools.clone(),
+                };
+                check_cap_scopes(inner, Some(&narrowed), diags);
+                continue;
+            }
+            _ => {}
+        }
+        // Recurse into every OTHER nested body under the same active scope — a `when`/`each`/`repeat`/
+        // `try`/… inside a `with_tools` block is still inside it. `CapScope` already recursed above
+        // with its own narrowed set and `continue`d, so it never reaches here.
+        for nested in nested_bodies(node) {
+            check_cap_scopes(nested, active, diags);
+        }
+    }
+}
+
+/// Flag `op` if a capability scope is active and `op` is not in its allowlist.
+fn check_call_in_scope(op: &str, active: Option<&[String]>, diags: &mut Vec<Diagnostic>) {
+    let Some(allowed) = active else { return };
+    if !allowed.iter().any(|t| t == op) {
+        diags.push(Diagnostic::new(format!(
+            "op `{op}` is outside the enclosing `with_tools` scope ({})",
+            if allowed.is_empty() {
+                "which allows no tools".to_string()
+            } else {
+                format!("which allows only [{}]", allowed.join(", "))
+            }
+        )));
+    }
+}
+
+/// The direct child statement-bodies of `node` (one level, not recursive) that can themselves contain
+/// `call`/`with_tools` sites — used by [`check_cap_scopes`] to recurse while threading an explicit
+/// (possibly narrowed) active allowlist, which the generic [`for_each_node`] callback can't carry.
+fn nested_bodies(node: &Node) -> Vec<&[Node]> {
+    match node {
+        Node::When {
+            then, otherwise, ..
+        } => vec![then, otherwise],
+        Node::Unless { body, .. }
+        | Node::Each { body, .. }
+        | Node::Repeat { body, .. }
+        | Node::Loop { body, .. }
+        | Node::Seq { body, .. }
+        | Node::Retry { body, .. }
+        | Node::Confirm { body, .. }
+        | Node::Throttle { body, .. }
+        | Node::Debounce { body, .. }
+        | Node::Timeout { body, .. }
+        | Node::Budget { body, .. }
+        | Node::Once { body, .. } => vec![body],
+        Node::Try { body, handler, .. } => vec![body, handler],
+        Node::Parallel { branches } | Node::Race { branches, .. } => {
+            branches.iter().map(|b| b.body.as_slice()).collect()
+        }
+        Node::Scope { body, finally, .. } => vec![body, finally],
+        Node::Saga { steps } => steps
+            .iter()
+            .flat_map(|s| [s.body.as_slice(), s.undo.as_slice()])
+            .collect(),
+        Node::Match { cases, default, .. } => cases
+            .iter()
+            .map(|c| c.body.as_slice())
+            .chain(std::iter::once(default.as_slice()))
+            .collect(),
+        Node::Route { cases, default, .. } => cases
+            .iter()
+            .map(|c| c.body.as_slice())
+            .chain(std::iter::once(default.as_slice()))
+            .collect(),
+        Node::Fallback { branches, .. } => branches.iter().map(|b| b.body.as_slice()).collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -489,7 +591,9 @@ pub fn for_each_node(body: &[Node], f: &mut impl FnMut(&Node)) {
                     for_each_node(&b.body, f);
                 }
             }
-            Node::Timeout { body, .. } | Node::Budget { body, .. } => for_each_node(body, f),
+            Node::Timeout { body, .. }
+            | Node::Budget { body, .. }
+            | Node::CapScope { body, .. } => for_each_node(body, f),
             Node::Scope {
                 acquire,
                 body,
@@ -841,6 +945,15 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, diags: &mut Vec<Diagnostic>) {
             if *limit == 0 {
                 diags.push(Diagnostic::new("`budget` requires a non-zero `limit`"));
             }
+            for n in body {
+                check_node(n, ops, diags);
+            }
+        }
+        Node::CapScope { body, .. } => {
+            // Op-name/type validation is unconditional (same as every other block); the *scope*-aware
+            // "this literal op is outside the allowlist" diagnostic is a separate pass
+            // (`check_cap_scopes`) run once over the whole flow, since it must thread the narrowing
+            // allowlist through nested scopes — information `check_node`'s signature doesn't carry.
             for n in body {
                 check_node(n, ops, diags);
             }
@@ -1723,5 +1836,106 @@ mod tests {
             diags.iter().any(|d| d.message.contains("empty body")),
             "an empty parallel branch body is rejected"
         );
+    }
+
+    // ---- capability scopes (`with_tools` / L-11 acceptance #5: static analyzer check) ----
+
+    /// A literal-op `call` naming a tool outside the enclosing `with_tools` allowlist is flagged at
+    /// analysis time — the static echo of the runtime dispatch gate (which is still the enforcement
+    /// authority; this is early feedback so a bad plan is rejected before it runs).
+    #[test]
+    fn call_outside_with_tools_scope_is_flagged_statically() {
+        let ops = catalog();
+        let bad = DraftAst {
+            body: vec![Node::CapScope {
+                tools: vec!["read".into()],
+                body: vec![Node::Call {
+                    op: "grep".into(),
+                    args: vec![],
+                }],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        let diags = analyze_flow(&bad, &ops).unwrap_err();
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("`grep`") && d.message.contains("with_tools")),
+            "expected a with_tools scope diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A call to a tool that IS in the scope's allowlist analyzes cleanly.
+    #[test]
+    fn call_inside_with_tools_scope_is_not_flagged() {
+        let ops = catalog();
+        let good = DraftAst {
+            body: vec![Node::CapScope {
+                tools: vec!["read".into(), "grep".into()],
+                body: vec![Node::Call {
+                    op: "grep".into(),
+                    args: vec![],
+                }],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        assert!(analyze_flow(&good, &ops).is_ok());
+    }
+
+    /// Nesting narrows: an inner `with_tools` cannot re-grant a tool the outer scope removed, and the
+    /// analyzer must flag a call to it even though the inner scope's own literal list names it.
+    #[test]
+    fn nested_with_tools_cannot_statically_widen() {
+        let ops = catalog();
+        let bad = DraftAst {
+            body: vec![Node::CapScope {
+                tools: vec!["read".into()],
+                body: vec![Node::CapScope {
+                    // Inner scope asks for BOTH — but the outer only allowed `read`.
+                    tools: vec!["read".into(), "grep".into()],
+                    body: vec![Node::Call {
+                        op: "grep".into(),
+                        args: vec![],
+                    }],
+                    bind: None,
+                }],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        let diags = analyze_flow(&bad, &ops).unwrap_err();
+        assert!(
+            diags.iter().any(|d| d.message.contains("`grep`")),
+            "inner scope must not re-grant what the outer removed: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A call OUTSIDE any `with_tools` scope is never flagged by this pass (only ordinary catalog
+    /// validation applies there) — proving the check is scope-local, not a blanket restriction.
+    #[test]
+    fn call_outside_any_scope_is_unaffected() {
+        let ops = catalog();
+        let good = DraftAst {
+            body: vec![
+                Node::CapScope {
+                    tools: vec!["read".into()],
+                    body: vec![Node::Call {
+                        op: "read".into(),
+                        args: vec![],
+                    }],
+                    bind: None,
+                },
+                Node::Call {
+                    op: "grep".into(),
+                    args: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(analyze_flow(&good, &ops).is_ok());
     }
 }

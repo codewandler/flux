@@ -628,6 +628,23 @@ pub enum Node {
         bind: Option<SymbolName>,
     },
 
+    /// **Capability scope**: run `body`, but restrict op dispatch to the tool names in `tools` — a
+    /// call to anything outside that allowlist fails closed at the runtime's dispatch gate, even when
+    /// the outer session policy would allow it. Capabilities only ever narrow on descent: a nested
+    /// `with_tools` is intersected with the scope it's nested in, so an inner block can never re-grant
+    /// a tool an outer one removed. This is the runtime-enforced counterpart of an advisory tool
+    /// restriction — the analyzer also flags a literal-op `call` here that provably names a tool absent
+    /// from `tools` (a static echo of the same rule dispatch enforces dynamically). `bind` names the
+    /// body's result. Native text: `with_tools ["read", "grep"]` + an indented body.
+    CapScope {
+        #[serde(default)]
+        tools: Vec<String>,
+        #[serde(default)]
+        body: Vec<Node>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bind: Option<SymbolName>,
+    },
+
     /// RAII-style **acquire → use → release** with guaranteed cleanup. Optionally run `acquire`
     /// first (binding its result to `bind`, so `body` and `finally` can name the resource), then run
     /// `body`; `finally` **always** runs afterward — on normal completion, an early `return`, or an

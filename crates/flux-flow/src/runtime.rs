@@ -38,6 +38,14 @@ pub use flux_lang::runtime::{BindSpec, CallOutcome, FlowOutcome, Suspension};
 struct ExecutorHost<'a> {
     executor: &'a Executor,
     catalog: OpRegistry<'a>,
+    /// The currently-open `with_tools` scope guards, LIFO. `OpHost::push_cap_scope`/`pop_cap_scope`
+    /// are two separate async calls (not RAII) — the interpreter's `CapScope` node calls them across
+    /// an `await` boundary around its body — so the guard [`Executor::push_cap_scope`] returns has to
+    /// live somewhere between the two calls. A stack (not a single slot) makes nested `with_tools`
+    /// blocks safe: each push adds a guard, each pop drops exactly the innermost one, matching the
+    /// executor's own stack discipline. `Executor::dispatch` is the actual enforcement point; dropping
+    /// a guard here only pops the shared stack it also reads.
+    cap_scope_guards: std::sync::Mutex<Vec<flux_runtime::CapScopeGuard<'a>>>,
 }
 
 impl<'a> ExecutorHost<'a> {
@@ -45,6 +53,7 @@ impl<'a> ExecutorHost<'a> {
         Self {
             catalog: OpRegistry::new(executor.registry()),
             executor,
+            cap_scope_guards: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -52,6 +61,7 @@ impl<'a> ExecutorHost<'a> {
         Self {
             catalog: OpRegistry::new(executor.registry()).with_composites(composites),
             executor,
+            cap_scope_guards: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -94,6 +104,22 @@ impl OpHost for ExecutorHost<'_> {
 
     fn trim_output(&self, view: String, op: &str) -> String {
         flux_runtime::trim_tool_output(view, flux_runtime::tool_output_cap(), op)
+    }
+
+    async fn push_cap_scope(&self, tools: &[String]) {
+        // Forwards straight to the executor's own stack — the SAME `Arc` `Executor::dispatch` checks,
+        // so pushing here immediately narrows every dispatch from this point on (including a nested
+        // composite op or a sub-agent reading the same context). Holding the guard is just bookkeeping
+        // to defer the pop to the matching `pop_cap_scope` call.
+        let guard = self.executor.push_cap_scope(tools);
+        self.cap_scope_guards.lock().unwrap().push(guard);
+    }
+
+    async fn pop_cap_scope(&self) {
+        // Drop the innermost guard — its `Drop` pops the executor's stack. A missing push (a bug in
+        // the caller) is a silent no-op rather than a panic, matching `pop_cap_scope`'s "close the
+        // innermost scope" contract when there happens to be none open.
+        self.cap_scope_guards.lock().unwrap().pop();
     }
 }
 
@@ -485,7 +511,9 @@ fn walk_node<'a>(node: &'a Node, f: &mut impl FnMut(&'a str, &'a [Node])) {
                 walk_calls(&b.body, f);
             }
         }
-        Node::Timeout { body, .. } | Node::Budget { body, .. } => walk_calls(body, f),
+        Node::Timeout { body, .. } | Node::Budget { body, .. } | Node::CapScope { body, .. } => {
+            walk_calls(body, f)
+        }
         Node::Scope {
             acquire,
             body,
@@ -621,6 +649,10 @@ mod tests {
     use flux_spec::ToolSpec;
     use flux_system::{System, Workspace};
 
+    /// Unique-directory suffix for tests that need their own isolated workspace (not shared with
+    /// `temp_executor`'s fixed per-allow-flag directory).
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     /// A tool that echoes its `text` param back as content.
     struct EchoTool;
 
@@ -649,6 +681,24 @@ mod tests {
                     .unwrap_or("")
                     .to_string(),
             ))
+        }
+    }
+
+    /// A second read-only tool, distinct from `echo` — used to prove capability-scope narrowing (one
+    /// tool allowed inside a `with_tools` block, the other denied purely by the scope).
+    struct GrepTool;
+
+    #[async_trait]
+    impl Tool for GrepTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only("grep", "grep text", json!({"type": "object"}))
+        }
+        async fn execute(
+            &self,
+            _ctx: &ToolContext,
+            _params: serde_json::Value,
+        ) -> flux_core::Result<ToolResult> {
+            Ok(ToolResult::ok("match"))
         }
     }
 
@@ -687,6 +737,28 @@ mod tests {
         } else {
             PermissionManager::from_rules(&[], &["echo".into()])
         };
+        Executor::new(
+            reg,
+            perms,
+            Arc::new(AllowApprover),
+            ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap()))),
+        )
+    }
+
+    /// An executor with BOTH `echo` and `grep` registered and explicitly allowed by the permission
+    /// rules (no policy floor either) — so the only thing that can ever deny a call in the tests below
+    /// is an active `with_tools` capability scope, never the outer session's own permissiveness.
+    fn temp_executor_two_tools() -> Executor {
+        let dir = std::env::temp_dir().join(format!(
+            "flux-flow-rt-capscope-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        reg.register(Arc::new(GrepTool));
+        let perms = PermissionManager::from_rules(&["echo".into(), "grep".into()], &[]);
         Executor::new(
             reg,
             perms,
@@ -1821,5 +1893,183 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.result, "debounced");
         assert_eq!(sink.calls, vec!["echo"]);
+    }
+
+    // ---- capability scopes (`with_tools` / L-11) ----
+
+    /// **The headline test.** A flow with `with_tools ["grep"] { grep(...) }` can call `grep`, but a
+    /// call to `echo` (allowed by the outer session's permission rules) inside the SAME block is
+    /// denied — proving it's the scope, not policy: `echo` succeeds when the same op runs OUTSIDE the
+    /// block, in the same session, on the same executor.
+    #[tokio::test]
+    async fn with_tools_scope_allows_the_named_tool_and_denies_the_rest() {
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor_two_tools();
+        let ast = DraftAst {
+            body: vec![
+                Node::CapScope {
+                    tools: vec!["grep".into()],
+                    body: vec![
+                        flow_bind("hit", "grep", vec![]),
+                        // `echo` is permission-allowed at the session level, but NOT in this scope.
+                        flow_bind("leak", "echo", vec![flow_lit(json!("hi"))]),
+                    ],
+                    bind: None,
+                },
+                // Outside the block, on the SAME executor/session: echo succeeds — proving the earlier
+                // denial came from the scope, not from a policy/permission-level block on `echo`.
+                flow_bind("after", "echo", vec![flow_lit(json!("outside"))]),
+            ],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let err = execute_flow(&store, &ex, "sess_headline", &ast, &mut sink)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("echo")
+                && err.to_string().contains("denied by capability scope"),
+            "got: {err}"
+        );
+
+        // The SAME `echo` call, outside any scope, on a fresh flow over the same executor/session,
+        // succeeds — proving the block (not the permission rules) denied it above.
+        let ast2 = DraftAst {
+            body: vec![flow_bind("after", "echo", vec![flow_lit(json!("outside"))])],
+            ..Default::default()
+        };
+        let outcome = execute_flow(&store, &ex, "sess_headline_2", &ast2, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(outcome.result, "outside");
+    }
+
+    /// **Non-bypassable.** The denial holds even when the disallowed call is reached indirectly,
+    /// through a composite op invoked inside the scope — proving the gate is at `Executor::dispatch`,
+    /// not just the `CapScope` node's own handler (which never sees the composite's inner calls
+    /// directly; only `dispatch` does, on every recursive `execute_flow` the composite runs).
+    #[tokio::test]
+    async fn with_tools_scope_denies_a_call_reached_through_a_composite_op() {
+        use flux_lang::program::CompositeOpDecl;
+
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor_two_tools();
+        // A composite op whose OWN body calls `echo` — the scope only names the composite's name, not
+        // `echo`, so the composite is reachable but its inner call is not.
+        let composite = CompositeOpDecl {
+            name: "wraps_echo".into(),
+            body: DraftAst {
+                body: vec![flow_bind(
+                    "inner",
+                    "echo",
+                    vec![flow_lit(json!("indirect"))],
+                )],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ast = DraftAst {
+            body: vec![Node::CapScope {
+                tools: vec!["wraps_echo".into()],
+                body: vec![flow_bind("r", "wraps_echo", vec![])],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let err = execute_flow_with_composites(
+            &store,
+            &ex,
+            "sess_composite_bypass",
+            &ast,
+            std::slice::from_ref(&composite),
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("echo") && err.to_string().contains("capability scope"),
+            "the scope must catch the composite's INNER call, got: {err}"
+        );
+    }
+
+    /// **Evidence.** After a denied call inside a scope, the evidence log carries `cap_scope_enter`,
+    /// `cap_scope_denied`, and `cap_scope_exit` observations.
+    #[tokio::test]
+    async fn with_tools_scope_records_enter_denial_and_exit_in_evidence() {
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor_two_tools();
+        let ast = DraftAst {
+            body: vec![Node::CapScope {
+                tools: vec!["grep".into()],
+                body: vec![flow_bind("leak", "echo", vec![flow_lit(json!("hi"))])],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let _ = execute_flow(&store, &ex, "sess_evidence", &ast, &mut sink).await;
+
+        let log = ex.evidence();
+        let kinds: Vec<&str> = log.all().iter().map(|o| o.kind.as_str()).collect();
+        assert!(kinds.contains(&"cap_scope_enter"), "got: {kinds:?}");
+        assert!(kinds.contains(&"cap_scope_denied"), "got: {kinds:?}");
+        assert!(kinds.contains(&"cap_scope_exit"), "got: {kinds:?}");
+        // Enter must precede the denial, and the denial must precede exit (pop only happens once the
+        // body — including its failing step — has finished running).
+        let enter_i = kinds.iter().position(|k| *k == "cap_scope_enter").unwrap();
+        let denied_i = kinds.iter().position(|k| *k == "cap_scope_denied").unwrap();
+        let exit_i = kinds.iter().position(|k| *k == "cap_scope_exit").unwrap();
+        assert!(enter_i < denied_i, "enter must come before the denial");
+        assert!(denied_i < exit_i, "denial must come before exit");
+    }
+
+    /// **Nesting narrows, never widens.** An inner `with_tools` cannot re-grant a tool the outer scope
+    /// removed, even though the inner scope's own literal list names it.
+    #[tokio::test]
+    async fn nested_with_tools_cannot_widen_past_the_outer_scope() {
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor_two_tools();
+        let ast = DraftAst {
+            body: vec![Node::CapScope {
+                tools: vec!["grep".into()],
+                body: vec![Node::CapScope {
+                    // Inner scope asks for BOTH — the outer only allowed `grep`.
+                    tools: vec!["grep".into(), "echo".into()],
+                    body: vec![flow_bind("leak", "echo", vec![flow_lit(json!("hi"))])],
+                    bind: None,
+                }],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let err = execute_flow(&store, &ex, "sess_nested_narrow", &ast, &mut sink)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("echo") && err.to_string().contains("capability scope"),
+            "inner scope must not re-grant what the outer removed, got: {err}"
+        );
+    }
+
+    /// A no-op empty stack: a flow that never opens a `with_tools` scope is completely unaffected —
+    /// every existing behavior (both tools, unrestricted) keeps working exactly as before this feature.
+    #[tokio::test]
+    async fn no_active_scope_leaves_every_flow_unaffected() {
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor_two_tools();
+        let ast = DraftAst {
+            body: vec![
+                flow_bind("a", "echo", vec![flow_lit(json!("hi"))]),
+                flow_bind("b", "grep", vec![]),
+            ],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess_no_scope", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(outcome.result, "match");
     }
 }

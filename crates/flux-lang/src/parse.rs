@@ -942,6 +942,9 @@ fn parse_stmt(lines: &[Line], indent: usize) -> Result<(Node, usize)> {
     if let Some(rest) = kw(t, "budget") {
         return parse_budget(rest, lines, indent);
     }
+    if let Some(rest) = kw(t, "with_tools") {
+        return parse_with_tools(rest, lines, indent);
+    }
     if let Some(rest) = kw(t, "retry") {
         return parse_retry(rest, lines, indent);
     }
@@ -1340,6 +1343,19 @@ fn parse_budget(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usiz
     let region = child_region(lines, indent);
     let (body, _) = parse_stmts(region, indent)?;
     Ok((Node::Budget { limit, body, bind }, 1 + region.len()))
+}
+
+/// `with_tools ["a", "b"] [-> $bind]` + indented body — the capability-scope block. The tool-name
+/// list uses the same bracket-list literal grammar as a setting value (`parse_setting_list`).
+fn parse_with_tools(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
+    let rest = rest.trim_start();
+    let (list, r) = parse_setting_list(rest)
+        .map_err(|_| perr("`with_tools` expects a list of tool-name strings, e.g. `[\"read\"]`"))?;
+    let tools = as_string_list(&list, "with_tools")?;
+    let bind = parse_optional_arrow_bind(r, "with_tools")?;
+    let region = child_region(lines, indent);
+    let (body, _) = parse_stmts(region, indent)?;
+    Ok((Node::CapScope { tools, body, bind }, 1 + region.len()))
 }
 
 fn parse_seq(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
@@ -2295,6 +2311,41 @@ mod tests {
         assert!(text.contains("timeout 5000"), "{text}");
         assert!(text.contains("budget 10 -> $used"), "{text}");
         assert!(!text.contains("@json"), "all native: {text}");
+        assert_round_trips(&ast);
+    }
+
+    #[test]
+    fn with_tools_round_trips_natively() {
+        let ast = DraftAst {
+            body: vec![Node::CapScope {
+                tools: vec!["read_many".into(), "git_status".into()],
+                body: vec![call("read_many", vec![])],
+                bind: Some("scoped".into()),
+            }],
+            ..Default::default()
+        };
+        let text = format(&ast);
+        assert!(
+            text.contains(r#"with_tools ["read_many","git_status"] -> $scoped"#),
+            "{text}"
+        );
+        assert!(!text.contains("@json"), "with_tools native: {text}");
+        assert_round_trips(&ast);
+    }
+
+    #[test]
+    fn with_tools_empty_allowlist_round_trips() {
+        // `with_tools []` — the strictest scope (no tool at all).
+        let ast = DraftAst {
+            body: vec![Node::CapScope {
+                tools: vec![],
+                body: vec![call("noop", vec![])],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        let text = format(&ast);
+        assert!(text.contains("with_tools []"), "{text}");
         assert_round_trips(&ast);
     }
 

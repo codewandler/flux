@@ -185,6 +185,13 @@ fn compact<T: serde::Serialize>(v: &T) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "null".to_string())
 }
 
+/// Render a list of plain strings as a compact JSON array (`["a", "b"]`) — the native `with_tools`
+/// header's tool-name list, using the same escaping as [`compact`] so a name with a quote or
+/// backslash still round-trips through `parse_setting_list`/`as_string_list`.
+fn fmt_string_list(items: &[String]) -> String {
+    compact(&items)
+}
+
 /// Render a node *inline* (as a bind value, call argument, condition, or return value). Only `var`,
 /// `lit` and `call` have a native inline form; everything else falls back to `@json`.
 fn fmt_expr(node: &Node) -> String {
@@ -581,6 +588,17 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
             out.push_str(&ind);
             out.push_str("budget ");
             out.push_str(&limit.to_string());
+            if let Some(b) = bind {
+                out.push_str(" -> $");
+                out.push_str(&b.0);
+            }
+            out.push('\n');
+            fmt_body(body, level + 1, indent, out);
+        }
+        Node::CapScope { tools, body, bind } => {
+            out.push_str(&ind);
+            out.push_str("with_tools ");
+            out.push_str(&fmt_string_list(tools));
             if let Some(b) = bind {
                 out.push_str(" -> $");
                 out.push_str(&b.0);

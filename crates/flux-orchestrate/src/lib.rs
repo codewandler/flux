@@ -202,6 +202,35 @@ impl Spawner for LocalSpawner {
         task: &str,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<String> {
+        self.spawn_with_scope(role_name, task, cancel, None).await
+    }
+
+    async fn spawn_scoped(
+        &self,
+        role_name: &str,
+        task: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+        cap_scope: Option<&[String]>,
+    ) -> Result<String> {
+        self.spawn_with_scope(role_name, task, cancel, cap_scope)
+            .await
+    }
+}
+
+impl LocalSpawner {
+    /// Shared implementation behind [`Spawner::spawn`]/[`Spawner::spawn_scoped`]. `cap_scope` is the
+    /// caller's active `with_tools` allowlist, if any — intersected into the role's own `tools` so a
+    /// `task` invoked from inside a capability scope can never hand the child a broader tool set than
+    /// the block that spawned it (capabilities only ever narrow on descent: role ∩ block scope). `None`
+    /// (the `spawn` path, or `spawn_scoped` with no active scope) leaves the role's `tools` as the sole
+    /// bound, exactly as before this method existed.
+    async fn spawn_with_scope(
+        &self,
+        role_name: &str,
+        task: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+        cap_scope: Option<&[String]>,
+    ) -> Result<String> {
         let role = self
             .roles
             .get(role_name)
@@ -213,7 +242,24 @@ impl Spawner for LocalSpawner {
         // (auto-approve scoped, policy-permitted calls; refuse destructive ones — unless an approver
         // is injected). `register_agent_ops` adds the reflexive ops (`plan`/`run_plan`/…) the flux-lang
         // agent loop calls — sub-agents run the same audited loop as the top-level agent.
-        let mut registry = self.base_registry.subset(role.tools.as_deref());
+        //
+        // `effective_tools` is the role's own allowlist further intersected with the caller's active
+        // capability scope (if any) — narrow-only, same rule as `Executor::push_cap_scope`. A role with
+        // no `tools` restriction (`None` = "everything the base registry offers") still gets narrowed
+        // down to exactly `cap_scope` when one is active, rather than staying unrestricted.
+        let effective_tools: Option<Vec<String>> = match (role.tools.as_deref(), cap_scope) {
+            (None, None) => None,
+            (Some(role_tools), None) => Some(role_tools.to_vec()),
+            (None, Some(scope)) => Some(scope.to_vec()),
+            (Some(role_tools), Some(scope)) => Some(
+                role_tools
+                    .iter()
+                    .filter(|t| scope.contains(t))
+                    .cloned()
+                    .collect(),
+            ),
+        };
+        let mut registry = self.base_registry.subset(effective_tools.as_deref());
         register_agent_ops(&mut registry);
 
         // Recursion bound: a child at the leaf depth must never spawn further sub-agents, so `task` is
@@ -627,7 +673,15 @@ impl Tool for TaskTool {
             .cancel_token()
             .map(|t| t.child_token())
             .unwrap_or_default();
-        match spawner.spawn(&args.role, &args.task, &cancel).await {
+        // The active `with_tools` block scope (if any) narrows the child's tool set too — capabilities
+        // only ever narrow on descent, and a sub-agent invocation is a descent step like any other.
+        // `active_cap_scope` reads the SAME shared stack `Executor::dispatch` checks, so this call site
+        // sees exactly the scope this `task` call itself is subject to.
+        let cap_scope = ctx.active_cap_scope();
+        match spawner
+            .spawn_scoped(&args.role, &args.task, &cancel, cap_scope.as_deref())
+            .await
+        {
             Ok(text) => Ok(ToolResult::ok(text)),
             Err(e) => Ok(ToolResult::error(e.to_string())),
         }
@@ -780,6 +834,156 @@ mod tests {
         assert!(
             system.read_file("PINGED.marker").await.is_ok(),
             "the plan's op executed through the loop"
+        );
+    }
+
+    // ---- sub-agent capability-scope intersection (L-11 acceptance #4) ----
+    //
+    // Reuses the module-level `Ping` (a marker-writing op) / `PingPlanMock` (plans one `ping` call then
+    // finishes with prose) defined below for `injected_approver_governs_the_sub_agent` — same shape
+    // `restricted_sub_agent_runs_a_plan_with_loop_machinery` uses locally, promoted to module scope
+    // there already, so these tests just reuse it instead of redefining a third copy.
+
+    /// A role whose OWN `tools` grant `ping` can still be blocked from using it once `spawn_scoped` is
+    /// called with an active capability scope that excludes it — the sub-agent intersection: effective
+    /// tools = `role.tools ∩ active_block_scope`, not just `role.tools`.
+    #[tokio::test]
+    async fn spawn_scoped_intersects_the_active_block_scope_with_the_roles_tools() {
+        // A unique workspace (not the shared `temp_system()`) — this test asserts the marker file is
+        // ABSENT, which a `Ping`-using test running concurrently in the shared dir would falsify.
+        let system = unique_system("cap-scope-narrows");
+        let mut base = ToolRegistry::new();
+        base.register(Arc::new(Ping));
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role(
+            "---\ntools: [ping]\n---\nYou are a scout.",
+            "scout",
+        ));
+        let spawner = LocalSpawner::new(
+            Arc::new(|| {
+                Ok(Box::new(PingPlanMock {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }))
+            }),
+            Arc::new(roles),
+            base,
+            system.clone(),
+            "mock",
+            1024,
+        );
+
+        // The block scope `["read_only_other"]` does not include `ping` — even though the role grants
+        // it — so the child's registry must not contain `ping` and the marker must never be written.
+        let scope = vec!["read_only_other".to_string()];
+        let out = spawner
+            .spawn_scoped(
+                "scout",
+                "scout the repo",
+                &CancellationToken::new(),
+                Some(&scope),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, "done");
+        assert!(
+            system.read_file("PINGED.marker").await.is_err(),
+            "the block scope must narrow the role's own tools away from `ping`"
+        );
+    }
+
+    /// The counterpart: when the active scope DOES include the tool, the role ∩ scope intersection
+    /// still lets it through — proving the intersection doesn't accidentally deny everything.
+    #[tokio::test]
+    async fn spawn_scoped_allows_a_tool_present_in_both_role_and_scope() {
+        let system = unique_system("cap-scope-allows");
+        let mut base = ToolRegistry::new();
+        base.register(Arc::new(Ping));
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role(
+            "---\ntools: [ping]\n---\nYou are a scout.",
+            "scout",
+        ));
+        let spawner = LocalSpawner::new(
+            Arc::new(|| {
+                Ok(Box::new(PingPlanMock {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }))
+            }),
+            Arc::new(roles),
+            base,
+            system.clone(),
+            "mock",
+            1024,
+        );
+        let scope = vec!["ping".to_string()];
+        let out = spawner
+            .spawn_scoped(
+                "scout",
+                "scout the repo",
+                &CancellationToken::new(),
+                Some(&scope),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, "done");
+        assert!(
+            system.read_file("PINGED.marker").await.is_ok(),
+            "ping is in both the role's tools and the active scope, so it must run"
+        );
+    }
+
+    /// End-to-end through the real seam: `TaskTool::execute` reads the active scope off the live
+    /// `ToolContext` (the same one `Executor::dispatch`'s gate reads) and passes it to `spawn_scoped` —
+    /// so a `task` call issued from inside a `with_tools` block that excludes `ping` cannot let a
+    /// `tools: [ping]` role touch the filesystem, with NO code in the flow itself naming the restriction
+    /// beyond the surrounding scope.
+    #[tokio::test]
+    async fn task_tool_forwards_the_contexts_active_cap_scope_to_the_spawner() {
+        let system = unique_system("cap-scope-task-tool");
+        let mut base = ToolRegistry::new();
+        base.register(Arc::new(Ping));
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role(
+            "---\ntools: [ping]\n---\nYou are a scout.",
+            "scout",
+        ));
+        let spawner: Arc<dyn Spawner> = Arc::new(LocalSpawner::new(
+            Arc::new(|| {
+                Ok(Box::new(PingPlanMock {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }))
+            }),
+            Arc::new(roles),
+            base,
+            system.clone(),
+            "mock",
+            1024,
+        ));
+
+        // Build an executor whose dispatch we can push a cap scope onto, then read that SAME context
+        // via `TaskTool::execute` — proving `task` sees exactly the scope `dispatch` would enforce.
+        let ctx = ToolContext::new(system.clone()).with_spawner(spawner);
+        let mut task_registry = ToolRegistry::new();
+        task_registry.register(Arc::new(TaskTool));
+        let executor = Executor::new(
+            task_registry,
+            PermissionManager::new(),
+            Arc::new(flux_runtime::AllowApprover),
+            ctx,
+        );
+
+        // The active scope includes `task` itself (so the `task` call reaches `TaskTool::execute`) but
+        // NOT `ping` — the tool the role would otherwise grant the child.
+        let _scope = executor.push_cap_scope(&["task".to_string()]);
+        let r = executor
+            .dispatch("task", json!({"role": "scout", "task": "recon"}))
+            .await;
+        assert!(!r.is_error, "task itself succeeds: {}", r.content);
+        assert_eq!(r.content, "done");
+        assert!(
+            system.read_file("PINGED.marker").await.is_err(),
+            "the with_tools scope active at the `task` call site must narrow the child, \
+             even though the role alone would allow `ping`"
         );
     }
 

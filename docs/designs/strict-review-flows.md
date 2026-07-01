@@ -183,6 +183,12 @@ If a block only allows `read_many`, a call to `grep` fails even if the outer ses
 
 This must be enforced in the runtime dispatch path, not by prompt text. A denied call should produce a normal policy/capability error and be visible in the evidence log.
 
+**Built (L-11):** the `flow-declared tools/effects ∩ block capability scope` step is `with_tools [...] { … }`
+(`Node::CapScope`), enforced by `Executor::dispatch`'s capability-scope stack — see Phase 2 below for
+the exact locus. The `∩ sub-agent invocation scope` step is `Spawner::spawn_scoped` intersecting the
+role's `tools` with the caller's active block scope; `task` does **not** carry its own `tools:`
+parameter (that idea is superseded — see Open questions).
+
 ## Sub-agent behavior
 
 Sub-agents should be treated as effectful model calls with explicit inputs and tool caps:
@@ -236,12 +242,46 @@ The journey owns trigger and input mapping. The flow owns execution semantics. T
 
 This proves the shape without language changes.
 
-### Phase 2: scoped capabilities
+### Phase 2: scoped capabilities — BUILT (L-11)
 
-- Add an analyzer-visible capability-scope node or metadata on block nodes.
-- Thread the narrowed tool/effect set through `flux-flow` into `Executor::dispatch`.
-- Emit evidence for capability entry/exit and denials.
-- Add tests that an allowed outer tool is denied inside a narrower block.
+Landed as described below rather than left as an open design; see [L-11](../stories/L-11-strict-review-scoped-capabilities.md) for the acceptance mapping.
+
+- **Language:** a new `Node::CapScope { tools: Vec<String>, body, bind }` AST node (native text
+  `with_tools ["a", "b"] { … }`), not a field on the RAII `Scope` node and not a `task(tools:)` param —
+  a block composes with `parallel`/any call, and a role's own `tools` still layers on top for
+  sub-agents (see below). The analyzer walks it like any other block and additionally flags a
+  literal-op `call` whose name is provably outside the enclosing (already-narrowed) allowlist —
+  early, static feedback; the runtime gate below is still the enforcement authority.
+- **Enforcement locus:** `flux-runtime`'s `Executor` grew an interior-mutable capability-scope stack
+  (`ToolContext::cap_scopes: Arc<Mutex<Vec<Vec<String>>>>`, mirroring the existing `plan_scope`/
+  `trust_all` pattern). `Executor::push_cap_scope(tools)` intersects `tools` with the current
+  top-of-stack (narrow-only) and returns a `CapScopeGuard` whose `Drop` pops it unconditionally.
+  `Executor::dispatch` checks the top of stack as its **first** gate, before pre-tool hooks and the
+  policy/permission layers — so every dispatch is covered, including one reached through a composite
+  op's recursive `execute_flow` or a sub-agent's own inner calls. A denial returns a normal
+  `ToolResult::error` (`` `{name}` denied by capability scope ``) and records a `cap_scope_denied`
+  observation; `push_cap_scope`/the guard's `Drop` record `cap_scope_enter`/`cap_scope_exit`.
+- **flux-lang seam:** the `OpHost` trait (the existing seam `flux-flow`'s `ExecutorHost` already
+  bridges to the real `Executor`) grew two default-no-op methods, `push_cap_scope`/`pop_cap_scope`.
+  `ExecutorHost` overrides them to forward to `Executor::push_cap_scope`, holding the returned guard
+  in a small internal stack (the two `OpHost` calls aren't RAII — they're separate `await` points
+  around the `CapScope` node's body). The interpreter's `CapScope` handler pushes, runs its body, and
+  **always** pops (mirroring `Scope`'s acquire/body/finally discipline) — the pop is unconditional even
+  on an error or an early `return`. No new `flux-lang` → `flux-runtime` dependency: the language only
+  knows the `OpHost` trait, same as `dispatch`/`request_approval`.
+- **Sub-agent intersection:** `Spawner` grew a `spawn_scoped(role, task, cancel, cap_scope)` method
+  (default delegates to `spawn`, so existing `Spawner` implementors and the unrelated
+  `plan_and_dispatch` caller in `flux-eval` are unaffected). `TaskTool::execute` reads
+  `ctx.active_cap_scope()` — the same shared stack `Executor::dispatch` checks — and calls
+  `spawn_scoped` instead of `spawn`. `LocalSpawner` intersects the role's own `tools` with the
+  incoming `cap_scope` before subsetting the child's registry, so `role.tools ∩ active_block_scope`
+  bounds the child, not just `role.tools`.
+- Evidence: `cap_scope_enter`/`cap_scope_denied`/`cap_scope_exit` observations, tested end to end
+  (order: enter precedes any denial, denial precedes exit).
+- Tests: an allowed-outer-tool-denied-inside-a-narrower-block headline test, a non-bypassable test via
+  a composite op's inner call, a nesting-cannot-widen test, a no-active-scope-is-a-no-op regression,
+  and a sub-agent-intersection test — all in `flux-runtime`, `flux-lang`, `flux-flow`, and
+  `flux-orchestrate`.
 
 ### Phase 3: typed review artifacts and aggregator
 
@@ -275,8 +315,13 @@ This proves the shape without language changes.
 
 ## Open questions
 
-- Should capability scopes be expressed as allowed tools, allowed effects, or both?
-- Should `task` grow a typed `tools` parameter, or should sub-agent capability restriction be represented as a surrounding block scope?
+- ~~Should capability scopes be expressed as allowed tools, allowed effects, or both?~~ **Resolved
+  (L-11): tool-NAME allowlist**, matching `ToolRegistry::subset(role.tools)` and the `with_tools
+  ["git_status", …]` syntax. Effect-based narrowing is an explicit future refinement, not built here.
+- ~~Should `task` grow a typed `tools` parameter, or should sub-agent capability restriction be
+  represented as a surrounding block scope?~~ **Resolved (L-11): a surrounding `with_tools` block
+  scope**, intersected into the role's own `tools` via `Spawner::spawn_scoped`. A block composes with
+  `parallel` fan-out and covers non-`task` calls too; a `task(tools:)` param would not.
 - Where should review artifact schemas live before they become prelude types?
 - Should reviewer disagreement be preserved as separate findings or merged with agreement counts?
 - Should strict review be a built-in sample, a project template, or a first-class CLI command?

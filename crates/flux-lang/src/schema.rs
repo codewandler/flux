@@ -98,6 +98,7 @@ mod tests {
             "fallback",
             "timeout",
             "budget",
+            "cap_scope",
             "scope",
             "saga",
             "once",
@@ -111,10 +112,10 @@ mod tests {
             );
         }
 
-        // 42 variants + 2 header lines, and no description bleeds onto its own line (newlines collapsed).
+        // 43 variants + 2 header lines, and no description bleeds onto its own line (newlines collapsed).
         assert_eq!(
             catalog.lines().count(),
-            42 + 2,
+            43 + 2,
             "every variant is exactly one row"
         );
     }
