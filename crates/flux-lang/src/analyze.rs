@@ -543,8 +543,11 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, diags: &mut Vec<Diagnostic>) {
                     // form — reject it so the repair loop rewrites the call with a named object.
                     // (`max == 0` ops are skipped: the catalog may be untyped, yet the op accepts a
                     // whole-input object at runtime and the runtime rejects a true overflow.)
-                    let lone_object =
-                        matches!(args.as_slice(), [Node::Lit { value }] if value.is_object());
+                    // A lone `obj` **template** (e.g. `{role: "x", task: $prompt}`, a dynamic field)
+                    // is exempt exactly like a lone `lit` object — `eval_arg`/`map_args_to_input`
+                    // treat both identically at runtime (a template just resolves its fields first).
+                    let lone_object = matches!(args.as_slice(), [Node::Lit { value }] if value.is_object())
+                        || matches!(args.as_slice(), [Node::Obj { .. }]);
                     let max = sig.required_params.len() + sig.optional_params.len();
                     if !lone_object && max > 0 && args.len() >= 2 {
                         diags.push(Diagnostic::new(format!(
@@ -1142,6 +1145,58 @@ mod tests {
                 .any(|d| d.message.contains("requires argument(s)") && d.message.contains("`path`")),
             "expected a missing-required-arg diagnostic, got: {:?}",
             err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A lone `obj` **template** argument (a dynamic field, e.g. `{path: "p", content: $x}`) is the
+    /// named-input map exactly like a lone `lit` object — `eval_arg`/`map_args_to_input` treat both
+    /// identically at runtime (a template just resolves its fields first). The analyzer must not
+    /// reject it as an ambiguous "single bare value against a multi-param op": that misclassification
+    /// blocked any multi-param op call whose object literal embeds so much as one `$var`/`fmt` field
+    /// (e.g. `task({role: "x", task: $prompt})` — L-10's strict-review flow needed exactly this shape).
+    #[test]
+    fn lone_obj_template_argument_is_the_named_input_not_a_bare_value() {
+        use crate::ast::{Node, SymbolName};
+        let ops = TypedCatalog;
+        let ast = DraftAst {
+            body: vec![
+                Node::Bind {
+                    name: "c".into(),
+                    value: Box::new(Node::Lit {
+                        value: serde_json::json!("dynamic content"),
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+                Node::Call {
+                    op: "write".into(),
+                    args: vec![Node::Obj {
+                        fields: [
+                            (
+                                "path".to_string(),
+                                Box::new(Node::Lit {
+                                    value: serde_json::json!("p"),
+                                }),
+                            ),
+                            (
+                                "content".to_string(),
+                                Box::new(Node::Var {
+                                    name: SymbolName("c".into()),
+                                }),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    }],
+                },
+            ],
+            ..Default::default()
+        };
+        let hir = lower(&ast, &ops);
+        assert!(
+            hir.is_ok(),
+            "a lone obj-template arg with a dynamic field must analyze cleanly, got: {:?}",
+            hir.err()
         );
     }
 
