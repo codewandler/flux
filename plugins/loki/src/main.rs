@@ -15,6 +15,8 @@
 //! contributes `loki.label` records to the host index (the `loki.log_entries`/`loki.labels` datasources).
 
 use host_kit::*;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
@@ -26,6 +28,93 @@ use time::OffsetDateTime;
 const DEFAULT_LIMIT: i64 = 100;
 /// Hard cap on `limit` so a single page stays bounded.
 const MAX_LIMIT: i64 = 1000;
+
+// ===========================================================================
+// Schema-only op input structs (D-36)
+// ===========================================================================
+// Each op's `input_schema` is derived from the structs below via schemars
+// (`host_kit::read_op_typed::<T>`) instead of a hand-written `json!({...})`
+// object, so the schema the model sees cannot drift from a separately-
+// maintained literal. The structs are schema-only: handlers keep their existing
+// `Value` extraction (the D-34 schema-only precedent).
+
+/// Query direction. Matches the legacy `"enum": ["backward", "forward"]`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+enum Direction {
+    Backward,
+    Forward,
+}
+
+/// `loki.test`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct TestInput {}
+
+/// `loki.query`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct QueryInput {
+    /// LogQL stream query.
+    query: String,
+    /// Start time: RFC3339, unix seconds, duration ago, or now. Defaults to 1h.
+    since: Option<String>,
+    /// End time: RFC3339, unix seconds, duration ago, or now. Defaults to now.
+    until: Option<String>,
+    /// Max entries (default 100, capped at 1000).
+    limit: Option<i64>,
+    /// backward (default) or forward.
+    direction: Option<Direction>,
+}
+
+/// `loki.metric`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct MetricInput {
+    /// LogQL metric query.
+    query: String,
+    /// Start time: RFC3339, unix seconds, duration ago, or now. Defaults to 24h.
+    since: Option<String>,
+    /// End time: RFC3339, unix seconds, duration ago, or now. Defaults to now.
+    until: Option<String>,
+    /// Resolution step (15s, 5m, 1h, 1d). Defaults to ~100 points across the window.
+    step: Option<String>,
+}
+
+/// `loki.labels`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct LabelsInput {
+    /// Optional label name; when set, returns its values instead of label names.
+    label: Option<String>,
+    /// Optional LogQL stream selector to scope the labels.
+    query: Option<String>,
+    /// Optional start time: RFC3339, unix seconds, duration ago, or now.
+    since: Option<String>,
+    /// Optional end time: RFC3339, unix seconds, duration ago, or now.
+    until: Option<String>,
+}
+
+/// `loki.recent_logs`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct RecentLogsInput {
+    /// Exact app label filter.
+    app: Option<String>,
+    /// Exact namespace label filter.
+    namespace: Option<String>,
+    /// Exact pod label filter.
+    pod: Option<String>,
+    /// Exact container label filter.
+    container: Option<String>,
+    /// Line substring filter.
+    contains: Option<String>,
+    /// Start time: RFC3339, unix seconds, duration ago, or now. Defaults to 1h.
+    since: Option<String>,
+    /// Max entries (default 100, capped at 1000).
+    limit: Option<i64>,
+}
 
 fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("loki", "0.1.0")
@@ -65,67 +154,38 @@ fn manifest_builder() -> PluginBuilder {
         ))
         .datasource(ds("loki.labels", "loki.label", "Loki label names or values."))
         .operation(
-            read_op(
+            read_op_typed::<TestInput>(
                 "loki.test",
                 "Check Loki readiness (GET /ready) and report latency.",
-                json!({"type": "object", "properties": {}}),
             ),
             test,
         )
         .operation(
-            read_op(
+            read_op_typed::<QueryInput>(
                 "loki.query",
                 "Run a LogQL stream query over a time window (query_range) and return the matching log entries.",
-                json!({"type": "object", "properties": {
-                    "query": {"type": "string", "description": "a LogQL stream query, e.g. {namespace=\"core\"} |= \"error\""},
-                    "since": {"type": "string", "description": "start time: RFC3339, unix seconds, duration ago (30m, 24h), or now. Defaults to 1h."},
-                    "until": {"type": "string", "description": "end time: RFC3339, unix seconds, duration ago, or now. Defaults to now."},
-                    "limit": {"type": "integer", "description": "max entries (default 100, capped at 1000)"},
-                    "direction": {"type": "string", "description": "backward (default) or forward", "enum": ["backward", "forward"]}
-                }, "required": ["query"]}),
             ),
             query,
         )
         .operation(
-            read_op(
+            read_op_typed::<MetricInput>(
                 "loki.metric",
                 "Run a LogQL metric query over a window (query_range, matrix result) — one call for rate/count \
                  questions like \"when did this error start and how many per day\" instead of paging raw streams.",
-                json!({"type": "object", "properties": {
-                    "query": {"type": "string", "description": "a LogQL metric query, e.g. sum(count_over_time({namespace=\"core\"} |= \"error\" [1d])). A bare stream selector is rejected."},
-                    "since": {"type": "string", "description": "start time: RFC3339, unix seconds, duration ago, or now. Defaults to 24h."},
-                    "until": {"type": "string", "description": "end time: RFC3339, unix seconds, duration ago, or now. Defaults to now."},
-                    "step": {"type": "string", "description": "resolution step (15s, 5m, 1h, 1d). Defaults to ~100 points across the window."}
-                }, "required": ["query"]}),
             ),
             metric,
         )
         .operation(
-            read_op(
+            read_op_typed::<LabelsInput>(
                 "loki.labels",
                 "List Loki label names, or the values of one label.",
-                json!({"type": "object", "properties": {
-                    "label": {"type": "string", "description": "optional label name; when set, returns its values instead of label names"},
-                    "query": {"type": "string", "description": "optional LogQL stream selector to scope the labels"},
-                    "since": {"type": "string", "description": "optional start time: RFC3339, unix seconds, duration ago, or now"},
-                    "until": {"type": "string", "description": "optional end time: RFC3339, unix seconds, duration ago, or now"}
-                }}),
             ),
             labels,
         )
         .operation(
-            read_op(
+            read_op_typed::<RecentLogsInput>(
                 "loki.recent_logs",
                 "Query recent logs by app, pod, container, namespace, or text filter (builds the LogQL selector for you).",
-                json!({"type": "object", "properties": {
-                    "app": {"type": "string", "description": "exact app label filter"},
-                    "namespace": {"type": "string", "description": "exact namespace label filter"},
-                    "pod": {"type": "string", "description": "exact pod label filter"},
-                    "container": {"type": "string", "description": "exact container label filter"},
-                    "contains": {"type": "string", "description": "line substring filter"},
-                    "since": {"type": "string", "description": "start time: RFC3339, unix seconds, duration ago, or now. Defaults to 1h."},
-                    "limit": {"type": "integer", "description": "max entries (default 100, capped at 1000)"}
-                }}),
             ),
             recent_logs,
         )
@@ -264,7 +324,13 @@ fn metric(input: Value, host: &mut Host) -> Result<Value, String> {
                     let Ok(value) = raw.parse::<f64>() else {
                         continue;
                     };
-                    samples.push(json!({ "timestamp": ts as i64, "value": value }));
+                    // Match the fluxplane reference: metric sample timestamps are RFC3339
+                    // strings (whole-second resolution), not raw unix seconds.
+                    let ts_str = OffsetDateTime::from_unix_timestamp(ts as i64)
+                        .ok()
+                        .and_then(|dt| dt.format(&Rfc3339).ok())
+                        .unwrap_or_default();
+                    samples.push(json!({ "timestamp": ts_str, "value": value }));
                 }
             }
             series.push(json!({ "labels": labels, "samples": samples }));
@@ -984,6 +1050,34 @@ mod tests {
     }
 
     #[test]
+    fn metric_samples_use_rfc3339_timestamps() {
+        // Failing-first: the fluxplane reference formats metric sample timestamps as
+        // RFC3339 strings, not raw unix seconds.
+        let plugin = manifest_builder().build();
+        let mut host = MockHost::default()
+            .with_endpoint("loki.endpoint", "https://loki.x")
+            .with_http(
+                "/loki/api/v1/query_range",
+                json!({"status": "success", "data": {"resultType": "matrix", "result": [
+                    {"metric": {"namespace": "core"}, "values": [[1710000000, "42"]]}
+                ]}}),
+            );
+        let out = plugin
+            .call(
+                "loki.metric",
+                json!({ "query": "sum(count_over_time({namespace=\"core\"} |= \"error\" [1d]))" }),
+                &mut host,
+            )
+            .unwrap();
+        let ts = &out["series"][0]["samples"][0]["timestamp"];
+        assert!(
+            ts.is_string(),
+            "timestamp should be a string RFC3339 value, got {ts}"
+        );
+        assert_eq!(ts.as_str().unwrap(), "2024-03-09T16:00:00Z");
+    }
+
+    #[test]
     fn labels_lists_and_sorts_names_and_contributes() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
@@ -1143,5 +1237,199 @@ mod tests {
         assert!(m.datasources.iter().any(|d| d.entity == "loki.log_entry"));
         assert!(m.datasources.iter().any(|d| d.entity == "loki.label"));
         assert!(m.operations.iter().all(|o| o.effects == vec![Effect::Read]));
+    }
+}
+
+#[cfg(test)]
+mod schema_contract {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Kind {
+        Str,
+        Int,
+        Enum(Vec<String>),
+    }
+
+    #[derive(Clone)]
+    struct Prop {
+        name: &'static str,
+        kind: Kind,
+    }
+
+    struct OpContract {
+        props: Vec<Prop>,
+        required: Vec<&'static str>,
+    }
+
+    fn p(name: &'static str, kind: Kind) -> Prop {
+        Prop { name, kind }
+    }
+
+    fn c(props: Vec<Prop>, required: Vec<&'static str>) -> OpContract {
+        OpContract { props, required }
+    }
+
+    fn contracts() -> Vec<(&'static str, OpContract)> {
+        vec![
+            ("loki.test", c(vec![], vec![])),
+            (
+                "loki.query",
+                c(
+                    vec![
+                        p("query", Kind::Str),
+                        p("since", Kind::Str),
+                        p("until", Kind::Str),
+                        p("limit", Kind::Int),
+                        p(
+                            "direction",
+                            Kind::Enum(vec!["backward".into(), "forward".into()]),
+                        ),
+                    ],
+                    vec!["query"],
+                ),
+            ),
+            (
+                "loki.metric",
+                c(
+                    vec![
+                        p("query", Kind::Str),
+                        p("since", Kind::Str),
+                        p("until", Kind::Str),
+                        p("step", Kind::Str),
+                    ],
+                    vec!["query"],
+                ),
+            ),
+            (
+                "loki.labels",
+                c(
+                    vec![
+                        p("label", Kind::Str),
+                        p("query", Kind::Str),
+                        p("since", Kind::Str),
+                        p("until", Kind::Str),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "loki.recent_logs",
+                c(
+                    vec![
+                        p("app", Kind::Str),
+                        p("namespace", Kind::Str),
+                        p("pod", Kind::Str),
+                        p("container", Kind::Str),
+                        p("contains", Kind::Str),
+                        p("since", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec![],
+                ),
+            ),
+        ]
+    }
+
+    fn resolve<'a>(node: &'a Value, defs: &'a Value) -> &'a Value {
+        if let Some(obj) = node.as_object() {
+            if let Some(r) = obj.get("$ref").and_then(|v| v.as_str()) {
+                if let Some(name) = r.strip_prefix("#/definitions/") {
+                    return defs.get(name).unwrap_or(node);
+                }
+            }
+            if let Some(any) = obj.get("anyOf").and_then(|v| v.as_array()) {
+                for m in any {
+                    if m.get("type").and_then(|v| v.as_str()) != Some("null") {
+                        return resolve(m, defs);
+                    }
+                }
+            }
+        }
+        node
+    }
+
+    fn kind_of(node: &Value) -> Kind {
+        let t = node.get("type");
+        if let Some(arr) = t.and_then(|v| v.as_array()) {
+            let first = arr
+                .iter()
+                .find(|v| v.as_str() != Some("null"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("null");
+            return base_kind(first, node);
+        }
+        base_kind(t.and_then(|v| v.as_str()).unwrap_or(""), node)
+    }
+
+    fn base_kind(t: &str, node: &Value) -> Kind {
+        match t {
+            "integer" => Kind::Int,
+            "string" => {
+                if let Some(e) = node.get("enum").and_then(|v| v.as_array()) {
+                    let mut vals: Vec<String> = e
+                        .iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect();
+                    vals.sort();
+                    return Kind::Enum(vals);
+                }
+                Kind::Str
+            }
+            other => panic!("unsupported property type: {other} ({node})"),
+        }
+    }
+
+    fn assert_contract(op_name: &str, schema: &Value, contract: &OpContract) {
+        let defs = schema.get("definitions").cloned().unwrap_or(json!({}));
+        assert_eq!(schema["type"], "object", "{op_name}: root type");
+
+        let props_obj = schema.get("properties").and_then(|v| v.as_object());
+        let mut got: BTreeMap<&str, Kind> = BTreeMap::new();
+        if let Some(props) = props_obj {
+            for (k, v) in props {
+                let resolved = resolve(v, &defs);
+                got.insert(k.as_str(), kind_of(resolved));
+            }
+        }
+        let want: BTreeMap<&str, Kind> = contract
+            .props
+            .iter()
+            .map(|Prop { name, kind }| (*name, kind.clone()))
+            .collect();
+        assert_eq!(got.len(), want.len(), "{op_name}: property count");
+        for Prop { name, kind } in &contract.props {
+            let got_kind = got.get(*name).unwrap_or_else(|| {
+                panic!("{op_name}: missing property `{name}` in derived schema")
+            });
+            assert_eq!(got_kind, kind, "{op_name}: property `{name}` kind");
+        }
+
+        let mut req: Vec<&str> = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        req.sort();
+        let mut want_req: Vec<&str> = contract.required.clone();
+        want_req.sort();
+        assert_eq!(req, want_req, "{op_name}: required set");
+    }
+
+    #[test]
+    fn derived_schemas_match_legacy_contract() {
+        let manifest = manifest_builder().build().manifest();
+        let mut schemas: BTreeMap<&str, Value> = BTreeMap::new();
+        for op in &manifest.operations {
+            schemas.insert(op.name.as_str(), op.input_schema.clone());
+        }
+        for (op_name, contract) in contracts() {
+            let schema = schemas
+                .get(op_name)
+                .unwrap_or_else(|| panic!("operation {op_name} missing from manifest"));
+            assert_contract(op_name, schema, &contract);
+        }
+        assert_eq!(schemas.len(), contracts().len());
     }
 }

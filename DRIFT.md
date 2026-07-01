@@ -330,3 +330,39 @@ Full D-36 per-plugin loop for `asterisk` (the AMI plugin).
 ## Not ported (honest)
 - A `last_call` queue-member output field needs reliable RFC3339 UTC date rendering; the crate has no
   `chrono`/`time` dep and an ad-hoc calendar converter would be worse than leaving the gap explicit.
+
+---
+
+# D-42 — observability cluster schemars migration + parity ports
+
+Full D-36 per-plugin loop for the 4 observability plugins (run in parallel). Each: schemars
+migration of every op + a fluxplane parity re-audit + ported gaps.
+
+## Shared infra
+- **MockHost::with_http_status_body** (host-kit) — a canned `http.do` response with a custom
+  status code + raw string body (for error paths, e.g. a 503 from a readiness endpoint). Checked
+  before `http_seq`/`http`. Reusable test infra, like `with_http_seq`.
+
+## grafana (21 ops)
+- Schemars migration complete; `so()` helper deleted; `schema_contract` test locks all 21
+  contracts (fields/required/types, with `Kind::ArrayStr`/`ArrayAny`/`Str`/`Int`/`Bool`).
+- Fluxplane re-audit: core shape matched; `endpoint_ref` architectural split (do-not-port).
+  (Ported gaps as the worker surfaced them — see the grafana source for the ported param/logic
+  details; the contract test locks the resulting contract.)
+
+## prometheus (16 ops)
+- Schemars migration complete; `so()` helper deleted; `schema_contract` test (`#[cfg(test)]`).
+- Fluxplane re-audit + ported: the `.test` op now checks the `/-/ready` endpoint's status and
+  reports `ready` + `error` (parity with fluxplane's readiness check); `duration_ms`/`latency_ms`.
+  The `not-ready` path tested via the new `with_http_status_body` (503).
+
+## loki (9 ops)
+- Schemars migration complete; `so()` helper deleted; `schema_contract` test.
+- Fluxplane re-audit: `endpoint_ref` architectural split (do-not-port).
+
+## alertmanager (7 ops)
+- Schemars migration complete; `so()`/inline schemas deleted; `schema_contract` test.
+- Fluxplane re-audit: `endpoint_ref` architectural split (do-not-port).
+
+All 4: `endpoint_ref` per-call targeting left as-is (flux resolves `<plugin>.endpoint` via
+`host.endpoint(...)` + reference-IO, D-29).

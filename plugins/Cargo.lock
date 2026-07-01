@@ -16,6 +16,8 @@ name = "alertmanager"
 version = "0.1.0"
 dependencies = [
  "host-kit",
+ "schemars",
+ "serde",
  "serde_json",
 ]
 
@@ -421,6 +423,8 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "host-kit",
+ "schemars",
+ "serde",
  "serde_json",
  "sha1",
 ]
@@ -759,6 +763,8 @@ name = "loki"
 version = "0.1.0"
 dependencies = [
  "host-kit",
+ "schemars",
+ "serde",
  "serde_json",
  "sha1",
  "time",
@@ -880,6 +886,8 @@ name = "prometheus"
 version = "0.1.0"
 dependencies = [
  "host-kit",
+ "schemars",
+ "serde",
  "serde_json",
 ]
 

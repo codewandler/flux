@@ -60,6 +60,12 @@ All notable changes to this project are documented in this file. The format is b
   `channel_id`/`other_channel_id` AMI fields, `peer.list` output `comment`, `ami.ping` output
   `duration_ms`. 12 asterisk tests.
 
+- **Observability cluster schemars migration + parity (D-42).** grafana (21 ops), prometheus
+  (16), loki (9), alertmanager (7) all schemars-derived in parallel; `so()`/inline helpers
+  deleted; `schema_contract` tests lock all contracts. Fluxplane re-audit per plugin;
+  prometheus `.test` now checks `/-/ready` status (`ready`/`error`/`latency_ms`). MockHost
+  gained `with_http_status_body` (host-kit) for error-path tests. 21/16/19/7 tests.
+
 - **Plugin-side schemars op schemas — D-36 (in-progress).** `host-kit` now derives a plugin
   op's `input_schema` from a typed struct via `read_op_typed::<T>` / `write_op_typed::<T>`
   (+ `op_input_schema::<T>()`, a `schemars` re-export), the plugin-side counterpart of D-34.

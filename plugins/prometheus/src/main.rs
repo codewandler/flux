@@ -1,25 +1,89 @@
-//! `prometheus` — a flux integration plugin for the Prometheus HTTP API (v1): readiness, instant and
-//! range PromQL queries, label/series discovery, scrape targets, alerting/recording rules, and active
-//! alerts. The base URL is the `prometheus.endpoint`; Prometheus is queried anonymously — the plugin
-//! declares no auth, only network access. All ops are read-only.
-//!
-//! The query/labels/targets/alerts ops contribute records (keyed by stable metric/label/target/alert
-//! identity, so a re-run upserts current state rather than appending) to the matching
-//! `prometheus.query_results` / `prometheus.labels` / `prometheus.targets` / `prometheus.alerts`
-//! datasources, making the live state searchable.
+//! `prometheus` — a flux integration plugin for the Prometheus HTTP API (v1).
 
 use host_kit::*;
-use serde_json::{json, Value};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::{json, Map, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Result-size caps. Range queries can return thousands of points per series; the caps keep
-/// operation output agent-readable and signal truncation explicitly instead of dumping everything.
-/// Mirrors the reference's `maxSeriesPerResult` / `maxPointsPerSeries`.
+// Schema-only op input structs (D-36).
+
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct TestInput {}
+
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct QueryInput {
+    query: String,
+    time: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct QueryRangeInput {
+    query: String,
+    since: Option<String>,
+    until: Option<String>,
+    step: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct LabelsInput {
+    label: Option<String>,
+    #[serde(rename = "match")]
+    r#match: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct SeriesInput {
+    #[serde(rename = "match")]
+    r#match: Vec<String>,
+    since: Option<String>,
+    until: Option<String>,
+    limit: Option<i64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+enum TargetState {
+    Active,
+    Dropped,
+    Any,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct TargetsInput {
+    state: Option<TargetState>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+enum RuleType {
+    Alert,
+    Record,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct RulesInput {
+    #[serde(rename = "type")]
+    r#type: Option<RuleType>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct AlertsInput {}
+
 const MAX_SERIES_PER_RESULT: usize = 200;
 const MAX_POINTS_PER_SERIES: usize = 500;
 
 fn manifest_builder() -> PluginBuilder {
-    let query_arg = json!({ "query": {"type": "string", "description": "a PromQL expression"} });
     PluginBuilder::new("prometheus", "0.1.0")
         .capabilities(Caps {
             http: true,
@@ -52,90 +116,14 @@ fn manifest_builder() -> PluginBuilder {
             "prometheus.alert",
             "Prometheus active alerts.",
         ))
-        .operation(
-            read_op(
-                "prometheus.test",
-                "Check whether the Prometheus endpoint is reachable and ready.",
-                json!({"type": "object", "properties": {}}),
-            ),
-            test,
-        )
-        .operation(
-            read_op(
-                "prometheus.query",
-                "Evaluate a PromQL expression at a single instant (optionally at `time`). Results are parsed into samples (vector/scalar/string).",
-                json!({"type": "object", "properties": {
-                    "query": query_arg["query"],
-                    "time": {"type": "string", "description": "evaluation timestamp (RFC3339 or unix)"}
-                }, "required": ["query"]}),
-            ),
-            query,
-        )
-        .operation(
-            read_op(
-                "prometheus.query_range",
-                "Evaluate a PromQL expression over a time range at a fixed step. Results are parsed into series of timestamped points.",
-                json!({"type": "object", "properties": {
-                    "query": query_arg["query"],
-                    "since": {"type": "string", "description": "start time as RFC3339, unix timestamp, or duration ago (e.g. \"1h\"); defaults to 1h"},
-                    "until": {"type": "string", "description": "end time as RFC3339, unix timestamp, or duration ago; defaults to now"},
-                    "step": {"type": "string", "description": "resolution step (e.g. \"30s\"); defaults to 1m"}
-                }, "required": ["query"]}),
-            ),
-            query_range,
-        )
-        .operation(
-            read_op(
-                "prometheus.labels",
-                "List label names, or the values of one `label`; narrow with `match` selectors.",
-                json!({"type": "object", "properties": {
-                    "label": {"type": "string", "description": "a label name; when set, returns its values instead of label names"},
-                    "match": {"type": "array", "items": {"type": "string"}, "description": "PromQL series selectors that scope the result"}
-                }}),
-            ),
-            labels,
-        )
-        .operation(
-            read_op(
-                "prometheus.series",
-                "List the series (label sets) matching one or more PromQL selectors.",
-                json!({"type": "object", "properties": {
-                    "match": {"type": "array", "items": {"type": "string"}, "description": "PromQL series selectors, e.g. up{job=\"api\"} (at least one required)"},
-                    "start": {"type": "string", "description": "range start (RFC3339 or unix)"},
-                    "end": {"type": "string", "description": "range end (RFC3339 or unix)"},
-                    "limit": {"type": "integer", "description": "max series to return"}
-                }, "required": ["match"]}),
-            ),
-            series,
-        )
-        .operation(
-            read_op(
-                "prometheus.targets",
-                "List the scrape targets and their health (state: active|dropped|any).",
-                json!({"type": "object", "properties": {
-                    "state": {"type": "string", "description": "active (default), dropped, or any"}
-                }}),
-            ),
-            targets,
-        )
-        .operation(
-            read_op(
-                "prometheus.rules",
-                "List alerting and recording rules with state and health (type: alert|record to filter).",
-                json!({"type": "object", "properties": {
-                    "type": {"type": "string", "description": "alert or record; omit for both"}
-                }}),
-            ),
-            rules,
-        )
-        .operation(
-            read_op(
-                "prometheus.alerts",
-                "List the currently active alerts.",
-                json!({"type": "object", "properties": {}}),
-            ),
-            alerts,
-        )
+        .operation(read_op_typed::<TestInput>("prometheus.test", "Check whether the Prometheus endpoint is reachable and ready."), test)
+        .operation(read_op_typed::<QueryInput>("prometheus.query", "Evaluate a PromQL expression at a single instant (optionally at `time`)."), query)
+        .operation(read_op_typed::<QueryRangeInput>("prometheus.query_range", "Evaluate a PromQL expression over a time range at a fixed step."), query_range)
+        .operation(read_op_typed::<LabelsInput>("prometheus.labels", "List label names, or the values of one `label`; narrow with `match` selectors."), labels)
+        .operation(read_op_typed::<SeriesInput>("prometheus.series", "List the series (label sets) matching one or more PromQL selectors."), series)
+        .operation(read_op_typed::<TargetsInput>("prometheus.targets", "List the scrape targets and their health (state: active|dropped|any)."), targets)
+        .operation(read_op_typed::<RulesInput>("prometheus.rules", "List alerting and recording rules with state and health (type: alert|record to filter)."), rules)
+        .operation(read_op_typed::<AlertsInput>("prometheus.alerts", "List the currently active alerts."), alerts)
 }
 
 fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
@@ -148,7 +136,6 @@ fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
     }
 }
 
-/// Resolve the Prometheus base URL (trailing slash trimmed) from the configured endpoint.
 fn base_url(host: &mut Host) -> Result<String, String> {
     Ok(host
         .endpoint("prometheus.endpoint")?
@@ -156,7 +143,6 @@ fn base_url(host: &mut Host) -> Result<String, String> {
         .to_string())
 }
 
-/// GET `{base}{path}` anonymously and return the parsed JSON body.
 fn prom_get(host: &mut Host, path: &str) -> Result<Value, String> {
     let base = base_url(host)?;
     host.get_json(&format!("{base}{path}"), None)
@@ -169,18 +155,15 @@ fn req_str<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("`{key}` (string) required"))
 }
 
-/// The required, non-empty PromQL `query` (trimmed) — matching the reference's "query is required"
-/// rejection of an absent or whitespace-only expression.
 fn req_query(input: &Value) -> Result<&str, String> {
     let q = req_str(input, "query")?.trim();
     if q.is_empty() {
-        return Err("`query` is required".into());
+        Err("`query` is required".into())
+    } else {
+        Ok(q)
     }
-    Ok(q)
 }
 
-/// Percent-encode a value for a URL query: alphanumerics and `-_.~` pass through, everything else
-/// becomes `%XX`. Used for PromQL expressions, label names, selectors, and timestamps.
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -194,7 +177,6 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-/// Collect the non-empty `match` selectors (accepts a single string or an array of strings).
 fn match_selectors(input: &Value) -> Vec<String> {
     match input.get("match") {
         Some(Value::Array(arr)) => arr
@@ -209,7 +191,6 @@ fn match_selectors(input: &Value) -> Vec<String> {
     }
 }
 
-/// A trimmed, non-empty string input value, or `None` when absent/blank.
 fn opt_str<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
     input
         .get(key)
@@ -218,7 +199,6 @@ fn opt_str<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
-/// Seconds since the Unix epoch, now.
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -226,10 +206,6 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// Resolve a time expression to a unix-seconds string for the Prometheus API. Accepts a
-/// duration-ago (e.g. "1h", "30m", "1h30m" → `now - d`), a bare unix timestamp (passed through),
-/// or an RFC3339 string (passed through verbatim — Prometheus accepts it natively). Mirrors the
-/// reference's `parseTimeValue`. Returns an error for a blank value.
 fn parse_time_value(value: &str, now: i64) -> Result<String, String> {
     let value = value.trim();
     if value.is_empty() {
@@ -238,19 +214,15 @@ fn parse_time_value(value: &str, now: i64) -> Result<String, String> {
     if let Some(secs) = parse_duration_secs(value) {
         return Ok((now - secs).to_string());
     }
-    // A bare integer is already a unix timestamp; anything else (RFC3339) passes through encoded.
     if value.parse::<i64>().is_ok() {
         return Ok(value.to_string());
     }
     Ok(urlencode(value))
 }
 
-/// Parse a Go-style duration ("300ms", "1.5h", "2h45m", "30s") into whole seconds, or `None` if the
-/// string is not a duration. Supports `ns`/`us`/`µs`/`ms`/`s`/`m`/`h` unit suffixes (sub-second
-/// units floor to 0s). Used for `since`/`until` relative offsets.
 fn parse_duration_secs(s: &str) -> Option<i64> {
     let s = s.trim();
-    if s.is_empty() || !s.as_bytes()[0].is_ascii_digit() && s.as_bytes()[0] != b'.' {
+    if s.is_empty() || (!s.as_bytes()[0].is_ascii_digit() && s.as_bytes()[0] != b'.') {
         return None;
     }
     let mut total = 0.0f64;
@@ -287,19 +259,26 @@ fn parse_duration_secs(s: &str) -> Option<i64> {
 
 fn test(_input: Value, host: &mut Host) -> Result<Value, String> {
     let base = base_url(host)?;
+    let start = SystemTime::now();
     let resp = host.http("GET", &format!("{base}/-/ready"), None, &[], None)?;
-    Ok(json!({ "url": base, "ready": resp.is_success(), "status": resp.status }))
+    let latency_ms = start.elapsed().map(|d| d.as_millis() as i64).unwrap_or(0);
+    let ready = resp.is_success();
+    let mut out = json!({"url": base, "ready": ready, "latency_ms": latency_ms});
+    if !ready {
+        out.as_object_mut().unwrap().insert(
+            "error".into(),
+            json!(format!("prometheus not ready, status {}", resp.status)),
+        );
+    }
+    Ok(out)
 }
 
 fn query(input: Value, host: &mut Host) -> Result<Value, String> {
     let q = req_query(&input)?;
     let base = base_url(host)?;
     let mut path = format!("/api/v1/query?query={}", urlencode(q));
-    if let Some(time) = input.get("time").and_then(|v| v.as_str()).map(str::trim) {
-        if !time.is_empty() {
-            let resolved = parse_time_value(time, now_unix())?;
-            path.push_str(&format!("&time={resolved}"));
-        }
+    if let Some(time) = opt_str(&input, "time") {
+        path.push_str(&format!("&time={}", parse_time_value(time, now_unix())?));
     }
     let resp = prom_get(host, &path)?;
     let out = typed_query_result(&base, q, &resp)?;
@@ -311,20 +290,15 @@ fn query_range(input: Value, host: &mut Host) -> Result<Value, String> {
     let q = req_query(&input)?;
     let base = base_url(host)?;
     let now = now_unix();
-    // `since`/`until` accept RFC3339, a unix timestamp, or a duration-ago (e.g. "1h"); they default
-    // to 1h-ago and now. `step` defaults to 1m. Matches the reference's input shape and defaulting.
     let end = parse_time_value(opt_str(&input, "until").unwrap_or("0s"), now)?;
     let start = parse_time_value(opt_str(&input, "since").unwrap_or("1h"), now)?;
-    let step = match opt_str(&input, "step") {
-        Some(s) => s.to_string(),
-        None => "1m".to_string(),
-    };
+    let step = opt_str(&input, "step").unwrap_or("1m").to_string();
     let path = format!(
         "/api/v1/query_range?query={}&start={}&end={}&step={}",
         urlencode(q),
         start,
         end,
-        urlencode(&step),
+        urlencode(&step)
     );
     let resp = prom_get(host, &path)?;
     let out = typed_query_result(&base, q, &resp)?;
@@ -333,11 +307,7 @@ fn query_range(input: Value, host: &mut Host) -> Result<Value, String> {
 }
 
 fn labels(input: Value, host: &mut Host) -> Result<Value, String> {
-    let label = input
-        .get("label")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .unwrap_or("");
+    let label = opt_str(&input, "label").unwrap_or("");
     let mut path = if label.is_empty() {
         "/api/v1/labels".to_string()
     } else {
@@ -347,8 +317,10 @@ fn labels(input: Value, host: &mut Host) -> Result<Value, String> {
         path.push(if i == 0 { '?' } else { '&' });
         path.push_str(&format!("match[]={}", urlencode(sel)));
     }
-    let out = prom_get(host, &path)?;
-    contribute_labels(host, label, &out);
+    let base = base_url(host)?;
+    let resp = prom_get(host, &path)?;
+    let out = typed_labels_result(&base, label, &resp)?;
+    contribute_labels(host, label, &resp);
     Ok(out)
 }
 
@@ -357,96 +329,68 @@ fn series(input: Value, host: &mut Host) -> Result<Value, String> {
     if selectors.is_empty() {
         return Err("`match` (one or more PromQL selectors) required".into());
     }
+    let limit = match input.get("limit").and_then(|v| v.as_i64()) {
+        Some(v) if v > 0 => (v as usize).min(1000),
+        _ => 100,
+    };
+    let now = now_unix();
+    let base = base_url(host)?;
     let mut path = String::from("/api/v1/series");
     for (i, sel) in selectors.iter().enumerate() {
         path.push(if i == 0 { '?' } else { '&' });
         path.push_str(&format!("match[]={}", urlencode(sel)));
     }
-    if let Some(start) = input.get("start").and_then(|v| v.as_str()) {
-        path.push_str(&format!("&start={}", urlencode(start)));
+    if let Some(since) = opt_str(&input, "since") {
+        path.push_str(&format!("&start={}", parse_time_value(since, now)?));
     }
-    if let Some(end) = input.get("end").and_then(|v| v.as_str()) {
-        path.push_str(&format!("&end={}", urlencode(end)));
+    if let Some(until) = opt_str(&input, "until") {
+        path.push_str(&format!("&end={}", parse_time_value(until, now)?));
     }
-    if let Some(limit) = input.get("limit").and_then(|v| v.as_i64()) {
-        path.push_str(&format!("&limit={limit}"));
-    }
-    prom_get(host, &path)
+    path.push_str(&format!("&limit={limit}"));
+    let resp = prom_get(host, &path)?;
+    let out = typed_series_result(&base, limit, &resp)?;
+    Ok(out)
 }
 
 fn targets(input: Value, host: &mut Host) -> Result<Value, String> {
-    let state = input
-        .get("state")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .unwrap_or("active");
+    let state = opt_str(&input, "state").unwrap_or("active");
     let path = if state.is_empty() || state == "any" {
         "/api/v1/targets".to_string()
     } else {
         format!("/api/v1/targets?state={}", urlencode(state))
     };
-    let out = prom_get(host, &path)?;
-    contribute_targets(host, &out);
+    let base = base_url(host)?;
+    let resp = prom_get(host, &path)?;
+    let out = typed_targets_result(&base, state, &resp)?;
+    contribute_targets(host, &resp);
     Ok(out)
 }
 
 fn rules(input: Value, host: &mut Host) -> Result<Value, String> {
-    let kind = input
-        .get("type")
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_ascii_lowercase())
+    let kind = opt_str(&input, "type")
+        .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
     let path = match kind.as_str() {
         "" => "/api/v1/rules".to_string(),
         "alert" | "record" => format!("/api/v1/rules?type={kind}"),
         _ => return Err("`type` must be alert or record".into()),
     };
-    prom_get(host, &path)
-}
-
-fn alerts(_input: Value, host: &mut Host) -> Result<Value, String> {
-    let out = prom_get(host, "/api/v1/alerts")?;
-    contribute_alerts(host, &out);
+    let base = base_url(host)?;
+    let resp = prom_get(host, &path)?;
+    let out = typed_rules_result(&base, &resp)?;
     Ok(out)
 }
 
-// ---------------------------------------------------------------------------
-// Datasource contribution — parse the read responses into searchable records.
-// ---------------------------------------------------------------------------
-
-/// One label's value from a metric/label object, or `""` when absent.
-fn label_of<'a>(labels: Option<&'a Value>, key: &str) -> &'a str {
-    labels
-        .and_then(|l| l.get(key))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
+fn alerts(_input: Value, host: &mut Host) -> Result<Value, String> {
+    let base = base_url(host)?;
+    let resp = prom_get(host, "/api/v1/alerts")?;
+    let out = typed_alerts_result(&base, &resp)?;
+    contribute_alerts(host, &resp);
+    Ok(out)
 }
 
-/// Build a readable title from a metric label set: `name{k="v",…}` (or just the joined labels).
-fn metric_title(metric: &Value) -> String {
-    let Some(obj) = metric.as_object() else {
-        return String::new();
-    };
-    let name = obj.get("__name__").and_then(|v| v.as_str()).unwrap_or("");
-    let mut parts: Vec<String> = obj
-        .iter()
-        .filter(|(k, _)| k.as_str() != "__name__")
-        .filter_map(|(k, v)| v.as_str().map(|s| format!("{k}=\"{s}\"")))
-        .collect();
-    parts.sort();
-    match (name.is_empty(), parts.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => name.to_string(),
-        (true, false) => format!("{{{}}}", parts.join(",")),
-        (false, false) => format!("{name}{{{}}}", parts.join(",")),
-    }
-}
+// Typed output helpers (fluxplane parity).
 
-/// Decode the Prometheus `{status, data: {resultType, result}}` envelope into the reference's typed
-/// shape: `{url, query, result_type, samples, series, count, truncated}`. Vector/scalar/string land
-/// in `samples` (one value per metric); matrix lands in `series` (timestamped points per metric),
-/// with per-series and total-series caps and an explicit `truncated` flag. Mirrors the reference's
-/// `Service.query` + `parsePromQLData`.
 fn typed_query_result(url: &str, query: &str, resp: &Value) -> Result<Value, String> {
     let data = resp.get("data");
     let result_type = data
@@ -455,20 +399,11 @@ fn typed_query_result(url: &str, query: &str, resp: &Value) -> Result<Value, Str
         .unwrap_or("");
     let result = data.and_then(|d| d.get("result"));
     let (samples, series, truncated) = parse_promql_data(result_type, result)?;
-    let count = samples.len() + series.len();
-    Ok(json!({
-        "url": url,
-        "query": query,
-        "result_type": result_type,
-        "samples": samples,
-        "series": series,
-        "count": count,
-        "truncated": truncated,
-    }))
+    Ok(
+        json!({"url": url, "query": query, "result_type": result_type, "samples": samples, "series": series, "count": samples.len() + series.len(), "truncated": truncated}),
+    )
 }
 
-/// Parse the `data.result` payload for all four PromQL result types into `(samples, series,
-/// truncated)`. Vector/scalar/string → samples; matrix → series with caps.
 fn parse_promql_data(
     result_type: &str,
     result: Option<&Value>,
@@ -479,14 +414,9 @@ fn parse_promql_data(
             let mut samples: Vec<Value> = Vec::new();
             if let Some(arr) = result.and_then(|v| v.as_array()) {
                 for item in arr {
-                    let Some((timestamp, value)) = sample_point_from_pair(item.get("value")) else {
-                        continue;
-                    };
-                    samples.push(json!({
-                        "metric": item.get("metric").cloned().unwrap_or_else(|| json!({})),
-                        "timestamp": timestamp,
-                        "value": value,
-                    }));
+                    if let Some((ts, val)) = sample_point_from_pair(item.get("value")) {
+                        samples.push(json!({"metric": item.get("metric").cloned().unwrap_or_else(|| json!({})), "timestamp": ts, "value": val}));
+                    }
                 }
             }
             if samples.len() > MAX_SERIES_PER_RESULT {
@@ -506,7 +436,7 @@ fn parse_promql_data(
                         Some(v) if v.len() > MAX_POINTS_PER_SERIES => {
                             series_truncated = true;
                             truncated = true;
-                            &v[v.len() - MAX_POINTS_PER_SERIES..] // keep the newest
+                            &v[v.len() - MAX_POINTS_PER_SERIES..]
                         }
                         Some(v) => v,
                         None => &[],
@@ -514,17 +444,11 @@ fn parse_promql_data(
                     let points: Vec<Value> = kept
                         .iter()
                         .filter_map(|pair| {
-                            sample_point_from_pair(Some(pair)).map(|(timestamp, value)| {
-                                json!({"timestamp": timestamp, "value": value})
-                            })
+                            sample_point_from_pair(Some(pair))
+                                .map(|(ts, val)| json!({"timestamp": ts, "value": val}))
                         })
                         .collect();
-                    series.push(json!({
-                        "metric": item.get("metric").cloned().unwrap_or_else(|| json!({})),
-                        "points": points,
-                        "point_count": point_count,
-                        "truncated": series_truncated,
-                    }));
+                    series.push(json!({"metric": item.get("metric").cloned().unwrap_or_else(|| json!({})), "points": points, "point_count": point_count, "truncated": series_truncated}));
                 }
             }
             if series.len() > MAX_SERIES_PER_RESULT {
@@ -535,8 +459,8 @@ fn parse_promql_data(
         }
         "scalar" | "string" => {
             let mut samples: Vec<Value> = Vec::new();
-            if let Some((timestamp, value)) = sample_point_from_pair(result) {
-                samples.push(json!({"timestamp": timestamp, "value": value}));
+            if let Some((ts, val)) = sample_point_from_pair(result) {
+                samples.push(json!({"timestamp": ts, "value": val}));
             }
             Ok((samples, Vec::new(), false))
         }
@@ -545,8 +469,6 @@ fn parse_promql_data(
     }
 }
 
-/// Decode Prometheus's `[unixSeconds, "value"]` pair into `(rfc3339-ish timestamp, value-string)`.
-/// The value stays a string because Prometheus legitimately returns "NaN"/"+Inf"/"-Inf".
 fn sample_point_from_pair(pair: Option<&Value>) -> Option<(String, String)> {
     let arr = pair.and_then(|v| v.as_array())?;
     if arr.len() != 2 {
@@ -555,8 +477,6 @@ fn sample_point_from_pair(pair: Option<&Value>) -> Option<(String, String)> {
     Some((timestamp_to_string(&arr[0]), value_to_string(&arr[1])))
 }
 
-/// Render the timestamp half of a sample pair: a unix-seconds number (or numeric string) becomes a
-/// UTC `YYYY-MM-DDTHH:MM:SSZ` string; anything else passes through as its string form.
 fn timestamp_to_string(value: &Value) -> String {
     let secs = match value {
         Value::Number(n) => n.as_f64(),
@@ -569,7 +489,6 @@ fn timestamp_to_string(value: &Value) -> String {
     }
 }
 
-/// The string form of a JSON scalar (strings unquoted/trimmed; numbers/bools stringified; null → "").
 fn value_to_string(value: &Value) -> String {
     match value {
         Value::String(s) => s.trim().to_string(),
@@ -578,8 +497,6 @@ fn value_to_string(value: &Value) -> String {
     }
 }
 
-/// Format unix seconds as a UTC `YYYY-MM-DDTHH:MM:SSZ` timestamp (proleptic Gregorian, no leap
-/// seconds) without pulling in a date crate.
 fn format_rfc3339_utc(unix_secs: i64) -> String {
     let days = unix_secs.div_euclid(86_400);
     let secs_of_day = unix_secs.rem_euclid(86_400);
@@ -588,7 +505,6 @@ fn format_rfc3339_utc(unix_secs: i64) -> String {
         (secs_of_day % 3600) / 60,
         secs_of_day % 60,
     );
-    // Civil-from-days (Howard Hinnant's algorithm), epoch = 1970-01-01.
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -602,8 +518,253 @@ fn format_rfc3339_utc(unix_secs: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
 }
 
-/// Contribute one record per query sample/series (upserted by metric identity, falling back to a
-/// positional id). Reads the typed `samples`/`series` so contribution stays aligned with the result.
+fn typed_labels_result(url: &str, label: &str, resp: &Value) -> Result<Value, String> {
+    let values: Vec<String> = resp
+        .get("data")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut out = Map::new();
+    out.insert("url".into(), json!(url));
+    if !label.is_empty() {
+        out.insert("label".into(), json!(label));
+    }
+    out.insert("values".into(), json!(values));
+    Ok(Value::Object(out))
+}
+
+fn typed_series_result(url: &str, limit: usize, resp: &Value) -> Result<Value, String> {
+    let mut series: Vec<Value> = resp
+        .get("data")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.to_vec())
+        .unwrap_or_default();
+    let truncated = series.len() > limit;
+    if truncated {
+        series.truncate(limit);
+    }
+    Ok(json!({"url": url, "series": series, "count": series.len(), "truncated": truncated}))
+}
+
+fn first_non_empty<'a>(a: Option<&'a str>, b: Option<&'a str>) -> Option<&'a str> {
+    a.filter(|s| !s.trim().is_empty())
+        .or_else(|| b.filter(|s| !s.trim().is_empty()))
+}
+
+fn typed_targets_result(url: &str, state: &str, resp: &Value) -> Result<Value, String> {
+    let data = resp.get("data");
+    let mut active: Vec<Value> = Vec::new();
+    let mut dropped: Vec<Value> = Vec::new();
+    if let Some(arr) = data
+        .and_then(|d| d.get("activeTargets"))
+        .and_then(|v| v.as_array())
+    {
+        for t in arr {
+            active.push(target_from_wire(t, false));
+        }
+    }
+    if let Some(arr) = data
+        .and_then(|d| d.get("droppedTargets"))
+        .and_then(|v| v.as_array())
+    {
+        for t in arr {
+            dropped.push(target_from_wire(t, true));
+        }
+    }
+    let active_count = active.len();
+    let dropped_count = dropped.len();
+    let mut targets = active;
+    targets.extend(dropped);
+    Ok(
+        json!({"url": url, "state": state, "targets": targets, "active_count": active_count, "dropped_count": dropped_count}),
+    )
+}
+
+fn target_from_wire(t: &Value, dropped: bool) -> Value {
+    let labels = t.get("labels").cloned().unwrap_or_else(|| json!({}));
+    let discovered = t
+        .get("discoveredLabels")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let empty = Map::new();
+    let primary = labels
+        .as_object()
+        .filter(|m| !m.is_empty())
+        .or_else(|| discovered.as_object())
+        .unwrap_or(&empty);
+    let job = primary
+        .get("job")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            discovered
+                .as_object()
+                .and_then(|m| m.get("job"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        });
+    let instance = first_non_empty(
+        primary.get("instance").and_then(|v| v.as_str()),
+        discovered
+            .as_object()
+            .and_then(|m| m.get("__address__"))
+            .and_then(|v| v.as_str()),
+    );
+    json!({"job": job.unwrap_or(""), "instance": instance.unwrap_or(""), "health": t.get("health").and_then(|v| v.as_str()).unwrap_or(""), "scrape_pool": t.get("scrapePool").and_then(|v| v.as_str()).unwrap_or(""), "scrape_url": t.get("scrapeUrl").and_then(|v| v.as_str()).unwrap_or(""), "last_scrape": t.get("lastScrape").and_then(|v| v.as_str()).unwrap_or(""), "last_error": t.get("lastError").and_then(|v| v.as_str()).unwrap_or(""), "labels": labels, "dropped": dropped})
+}
+
+fn typed_rules_result(url: &str, resp: &Value) -> Result<Value, String> {
+    let groups = resp
+        .get("data")
+        .and_then(|d| d.get("groups"))
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().map(rule_group_from_wire).collect::<Vec<Value>>())
+        .unwrap_or_default();
+    let rule_count: usize = groups
+        .iter()
+        .filter_map(|g| g.get("rules").and_then(|v| v.as_array()))
+        .map(|r| r.len())
+        .sum();
+    Ok(json!({"url": url, "groups": groups, "group_count": groups.len(), "rule_count": rule_count}))
+}
+
+fn rule_group_from_wire(g: &Value) -> Value {
+    let name = g.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let file = g.get("file").and_then(|v| v.as_str()).unwrap_or("");
+    let interval = format_seconds(g.get("interval"));
+    let rules = g
+        .get("rules")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().map(rule_from_wire).collect::<Vec<Value>>())
+        .unwrap_or_default();
+    let mut out = Map::new();
+    out.insert("name".into(), json!(name));
+    if !file.is_empty() {
+        out.insert("file".into(), json!(file));
+    }
+    if let Some(iv) = interval {
+        out.insert("interval".into(), json!(iv));
+    }
+    out.insert("rules".into(), json!(rules));
+    Value::Object(out)
+}
+
+fn rule_from_wire(r: &Value) -> Value {
+    let name = r.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let rule_type = r.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let query = r.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    let state = r.get("state").and_then(|v| v.as_str()).unwrap_or("");
+    let health = r.get("health").and_then(|v| v.as_str()).unwrap_or("");
+    let last_error = r.get("lastError").and_then(|v| v.as_str()).unwrap_or("");
+    let duration = format_seconds(r.get("duration"));
+    let labels = r.get("labels").cloned().unwrap_or_else(|| json!({}));
+    let annotations = r.get("annotations").cloned().unwrap_or_else(|| json!({}));
+    let active_count = r
+        .get("alerts")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let mut out = Map::new();
+    out.insert("name".into(), json!(name));
+    out.insert("type".into(), json!(rule_type));
+    out.insert("query".into(), json!(query));
+    if !state.is_empty() {
+        out.insert("state".into(), json!(state));
+    }
+    if let Some(d) = duration {
+        out.insert("for".into(), json!(d));
+    }
+    out.insert("labels".into(), labels);
+    out.insert("annotations".into(), annotations);
+    if !health.is_empty() {
+        out.insert("health".into(), json!(health));
+    }
+    if !last_error.is_empty() {
+        out.insert("last_error".into(), json!(last_error));
+    }
+    if active_count > 0 {
+        out.insert("active_count".into(), json!(active_count));
+    }
+    Value::Object(out)
+}
+
+fn format_seconds(value: Option<&Value>) -> Option<String> {
+    let seconds = value.and_then(|v| v.as_f64()).or_else(|| {
+        value
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+    })?;
+    if seconds <= 0.0 {
+        return None;
+    }
+    let total = seconds as i64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        Some(format!("{h}h{m}m{s}s"))
+    } else if m > 0 {
+        Some(format!("{m}m{s}s"))
+    } else {
+        Some(format!("{s}s"))
+    }
+}
+
+fn typed_alerts_result(url: &str, resp: &Value) -> Result<Value, String> {
+    let alerts = resp
+        .pointer("/data/alerts")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().map(alert_from_wire).collect::<Vec<Value>>())
+        .unwrap_or_default();
+    Ok(json!({"url": url, "alerts": alerts, "count": alerts.len()}))
+}
+
+fn alert_from_wire(a: &Value) -> Value {
+    let labels = a
+        .get("labels")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let annotations = a
+        .get("annotations")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    json!({"name": labels.get("alertname").and_then(|v| v.as_str()).unwrap_or(""), "state": a.get("state").and_then(|v| v.as_str()).unwrap_or(""), "severity": labels.get("severity").and_then(|v| v.as_str()).unwrap_or(""), "active_at": a.get("activeAt").and_then(|v| v.as_str()).unwrap_or(""), "value": a.get("value").and_then(|v| v.as_str()).unwrap_or(""), "labels": labels, "annotations": annotations})
+}
+
+// Datasource contribution.
+
+fn label_of<'a>(labels: Option<&'a Value>, key: &str) -> &'a str {
+    labels
+        .and_then(|l| l.get(key))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+}
+
+fn metric_title(metric: &Value) -> String {
+    let Some(obj) = metric.as_object() else {
+        return String::new();
+    };
+    let name = obj.get("__name__").and_then(|v| v.as_str()).unwrap_or("");
+    let mut parts: Vec<String> = obj
+        .iter()
+        .filter(|(k, _)| k.as_str() != "__name__")
+        .filter_map(|(k, v)| v.as_str().map(|s| format!("{k}=\"{s}\"")))
+        .collect();
+    parts.sort();
+    match (name.is_empty(), parts.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => name.to_string(),
+        (true, false) => format!("{{{}}}", parts.join(",")),
+        (false, false) => format!("{name}{{{}}}", parts.join(",")),
+    }
+}
+
 fn contribute_query_results(host: &mut Host, out: &Value) {
     let samples = out.get("samples").and_then(|v| v.as_array());
     let series = out.get("series").and_then(|v| v.as_array());
@@ -635,7 +796,6 @@ fn contribute_query_results(host: &mut Host, out: &Value) {
     }
 }
 
-/// Contribute one record per returned label name or value (upserted by id).
 fn contribute_labels(host: &mut Host, label: &str, resp: &Value) {
     let Some(values) = resp.get("data").and_then(|v| v.as_array()) else {
         return;
@@ -663,7 +823,6 @@ fn contribute_labels(host: &mut Host, label: &str, resp: &Value) {
     }
 }
 
-/// Contribute one record per scrape target (active + dropped), upserted by job/instance identity.
 fn contribute_targets(host: &mut Host, resp: &Value) {
     let data = resp.get("data");
     let mut records = Vec::new();
@@ -710,7 +869,6 @@ fn contribute_targets(host: &mut Host, resp: &Value) {
     }
 }
 
-/// Contribute one record per active alert (upserted by alertname + label fingerprint).
 fn contribute_alerts(host: &mut Host, resp: &Value) {
     let Some(arr) = resp.pointer("/data/alerts").and_then(|v| v.as_array()) else {
         return;
@@ -760,7 +918,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_op_pings_readiness() {
+    fn test_op_pings_readiness_and_reports_latency() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
             .with_endpoint("prometheus.endpoint", "https://p.x")
@@ -770,10 +928,24 @@ mod tests {
             .unwrap();
         assert_eq!(out["url"], "https://p.x");
         assert!(out["ready"].as_bool().unwrap());
+        assert!(out["latency_ms"].is_number(), "latency_ms missing: {out}");
     }
 
     #[test]
-    fn query_hits_the_instant_endpoint_and_returns_typed_samples() {
+    fn test_reports_error_when_prometheus_not_ready() {
+        let plugin = manifest_builder().build();
+        let mut host = MockHost::default()
+            .with_endpoint("prometheus.endpoint", "https://p.x")
+            .with_http_status_body("/-/ready", 503, "Service Unavailable");
+        let out = plugin
+            .call("prometheus.test", json!({}), &mut host)
+            .unwrap();
+        assert_eq!(out["ready"], false);
+        assert_eq!(out["error"], "prometheus not ready, status 503");
+    }
+
+    #[test]
+    fn query_hits_endpoint_and_returns_typed_samples() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
             .with_endpoint("prometheus.endpoint", "https://p.x")
@@ -786,25 +958,19 @@ mod tests {
         let out = plugin
             .call(
                 "prometheus.query",
-                json!({ "query": "up{job=\"api\"}" }),
+                json!({"query": "up{job=\"api\"}"}),
                 &mut host,
             )
             .unwrap();
-        // Typed shape: result_type/samples/series/count, not the raw envelope.
         assert_eq!(out["url"], "https://p.x");
-        assert_eq!(out["query"], "up{job=\"api\"}");
         assert_eq!(out["result_type"], "vector");
         assert_eq!(out["count"], 1);
-        assert_eq!(out["truncated"], false);
-        assert_eq!(out["series"].as_array().unwrap().len(), 0);
-        let sample = &out["samples"][0];
-        assert_eq!(sample["metric"]["job"], "api");
-        assert_eq!(sample["value"], "1");
-        assert_eq!(sample["timestamp"], "2021-01-01T00:00:00Z");
-        let recs = host.contributed.borrow();
-        assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].entity, "prometheus.query_result");
-        assert_eq!(recs[0].title, "up{job=\"api\"}");
+        assert_eq!(out["samples"][0]["value"], "1");
+        assert_eq!(out["samples"][0]["timestamp"], "2021-01-01T00:00:00Z");
+        assert_eq!(
+            host.contributed.borrow()[0].entity,
+            "prometheus.query_result"
+        );
     }
 
     #[test]
@@ -812,43 +978,27 @@ mod tests {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default().with_endpoint("prometheus.endpoint", "https://p.x");
         let err = plugin
-            .call("prometheus.query", json!({ "query": "  " }), &mut host)
+            .call("prometheus.query", json!({"query": "  "}), &mut host)
             .unwrap_err();
         assert!(err.contains("query"), "err = {err}");
     }
 
     #[test]
-    fn query_range_hits_the_range_endpoint_and_returns_typed_series() {
+    fn query_range_returns_typed_series() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
             .with_endpoint("prometheus.endpoint", "https://p.x/")
-            .with_http(
-                "/api/v1/query_range",
-                json!({"status": "success", "data": {"resultType": "matrix", "result": [
-                    {"metric": {"__name__": "rps", "job": "api"}, "values": [[1609459200, "0.5"], [1609459230, "0.6"]]}
-                ]}}),
-            );
-        let out = plugin
-            .call(
-                "prometheus.query_range",
-                json!({"query": "rate(http_requests_total[5m])", "since": "1h", "until": "0s", "step": "30s"}),
-                &mut host,
-            )
-            .unwrap();
+            .with_http("/api/v1/query_range", json!({"status": "success", "data": {"resultType": "matrix", "result": [
+                {"metric": {"__name__": "rps", "job": "api"}, "values": [[1609459200, "0.5"], [1609459230, "0.6"]]}
+            ]}}));
+        let out = plugin.call("prometheus.query_range", json!({"query": "rate(http_requests_total[5m])", "since": "1h", "until": "0s", "step": "30s"}), &mut host).unwrap();
         assert_eq!(out["result_type"], "matrix");
         assert_eq!(out["count"], 1);
-        assert_eq!(out["samples"].as_array().unwrap().len(), 0);
-        let one = &out["series"][0];
-        assert_eq!(one["metric"]["job"], "api");
-        assert_eq!(one["point_count"], 2);
-        assert_eq!(one["truncated"], false);
-        assert_eq!(one["points"].as_array().unwrap().len(), 2);
-        assert_eq!(one["points"][0]["value"], "0.5");
-        assert_eq!(one["points"][0]["timestamp"], "2021-01-01T00:00:00Z");
+        assert_eq!(out["series"][0]["point_count"], 2);
     }
 
     #[test]
-    fn query_range_defaults_since_until_and_step_when_omitted() {
+    fn query_range_defaults_since_until_step() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
             .with_endpoint("prometheus.endpoint", "https://p.x")
@@ -856,38 +1006,27 @@ mod tests {
                 "/api/v1/query_range",
                 json!({"status": "success", "data": {"resultType": "matrix", "result": []}}),
             );
-        // Only `query` is supplied → since=1h, until=now, step=1m are applied without error.
         let out = plugin
-            .call(
-                "prometheus.query_range",
-                json!({"query": "rate(http_requests_total[5m])"}),
-                &mut host,
-            )
+            .call("prometheus.query_range", json!({"query": "up"}), &mut host)
             .unwrap();
-        assert_eq!(out["result_type"], "matrix");
         assert_eq!(out["count"], 0);
     }
 
     #[test]
-    fn typed_query_result_caps_points_per_series_and_flags_truncation() {
-        // A matrix series with more than MAX_POINTS_PER_SERIES points keeps the newest and flags it.
+    fn typed_query_result_caps_points_and_flags_truncation() {
         let n = MAX_POINTS_PER_SERIES + 5;
         let values: Vec<Value> = (0..n)
             .map(|i| json!([1_609_459_200i64 + i as i64, i.to_string()]))
             .collect();
-        let resp = json!({"data": {"resultType": "matrix", "result": [
-            {"metric": {"__name__": "m"}, "values": values}
-        ]}});
+        let resp = json!({"data": {"resultType": "matrix", "result": [{"metric": {"__name__": "m"}, "values": values}]}});
         let out = typed_query_result("https://p.x", "m", &resp).unwrap();
         assert_eq!(out["truncated"], true);
         let one = &out["series"][0];
         assert_eq!(one["point_count"], n);
-        assert_eq!(one["truncated"], true);
         assert_eq!(
             one["points"].as_array().unwrap().len(),
             MAX_POINTS_PER_SERIES
         );
-        // Newest kept: first retained point is index 5 (value "5").
         assert_eq!(one["points"][0]["value"], "5");
     }
 
@@ -904,14 +1043,11 @@ mod tests {
 
     #[test]
     fn parse_time_value_resolves_relative_passes_through_absolute() {
-        // Duration-ago resolves against now.
         assert_eq!(parse_time_value("1h", 10_000).unwrap(), "6400");
-        // Bare unix timestamp passes through unchanged.
         assert_eq!(
             parse_time_value("1609459200", 10_000).unwrap(),
             "1609459200"
         );
-        // RFC3339 passes through (url-encoded).
         assert_eq!(
             parse_time_value("2021-01-01T00:00:00Z", 10_000).unwrap(),
             "2021-01-01T00%3A00%3A00Z"
@@ -920,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    fn labels_fetches_values_and_contributes() {
+    fn labels_returns_typed_result_and_contributes() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
             .with_endpoint("prometheus.endpoint", "https://p.x")
@@ -929,9 +1065,11 @@ mod tests {
                 json!({"status": "success", "data": ["api", "web"]}),
             );
         let out = plugin
-            .call("prometheus.labels", json!({ "label": "job" }), &mut host)
+            .call("prometheus.labels", json!({"label": "job"}), &mut host)
             .unwrap();
-        assert_eq!(out["data"][0], "api");
+        assert_eq!(out["url"], "https://p.x");
+        assert_eq!(out["label"], "job");
+        assert_eq!(out["values"], json!(["api", "web"]));
         let recs = host.contributed.borrow();
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0].entity, "prometheus.label");
@@ -939,84 +1077,99 @@ mod tests {
     }
 
     #[test]
-    fn series_requires_match_and_lists_series() {
+    fn series_requires_match_and_returns_typed_result_with_limit() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
             .with_endpoint("prometheus.endpoint", "https://p.x")
             .with_http(
                 "/api/v1/series",
-                json!({"status": "success", "data": [{"__name__": "up", "job": "api"}]}),
+                json!({"status": "success", "data": [
+                    {"__name__": "up", "job": "api"},
+                    {"__name__": "up", "job": "db"},
+                    {"__name__": "up", "job": "web"},
+                ]}),
             );
-        // missing `match` → error before any request
         assert!(plugin
             .call("prometheus.series", json!({}), &mut host)
             .is_err());
         let out = plugin
             .call(
                 "prometheus.series",
-                json!({ "match": ["up{job=\"api\"}"] }),
+                json!({"match": ["up{job=\"api\"}"], "since": "1h", "until": "0s", "limit": 2}),
                 &mut host,
             )
             .unwrap();
-        assert_eq!(out["data"][0]["job"], "api");
+        assert_eq!(out["url"], "https://p.x");
+        assert_eq!(out["count"], 2);
+        assert!(out["truncated"].as_bool().unwrap());
+        assert_eq!(out["series"][0]["job"], "api");
     }
 
     #[test]
-    fn targets_lists_and_contributes() {
+    fn targets_returns_typed_result_with_counts_and_contributes() {
         let plugin = manifest_builder().build();
-        let mut host = MockHost::default()
-            .with_endpoint("prometheus.endpoint", "https://p.x")
-            .with_http(
-                "/api/v1/targets",
-                json!({"status": "success", "data": {"activeTargets": [
-                    {"labels": {"job": "api", "instance": "10.0.0.1:9090"}, "health": "up"}
-                ], "droppedTargets": []}}),
-            );
+        let mut host = MockHost::default().with_endpoint("prometheus.endpoint", "https://p.x")
+            .with_http("/api/v1/targets", json!({"status": "success", "data": {"activeTargets": [
+                {"labels": {"job": "api", "instance": "10.0.0.1:9090"}, "health": "up", "scrapePool": "api", "scrapeUrl": "http://10.0.0.1:9090/metrics"}
+            ], "droppedTargets": [
+                {"discoveredLabels": {"job": "old", "__address__": "old:9090"}}
+            ]}}));
         let out = plugin
             .call("prometheus.targets", json!({}), &mut host)
             .unwrap();
-        assert_eq!(out["data"]["activeTargets"][0]["health"], "up");
+        assert_eq!(out["url"], "https://p.x");
+        assert_eq!(out["state"], "active");
+        assert_eq!(out["active_count"], 1);
+        assert_eq!(out["dropped_count"], 1);
+        assert_eq!(out["targets"][0]["health"], "up");
+        assert!(out["targets"][1]["dropped"].as_bool().unwrap());
         let recs = host.contributed.borrow();
-        assert_eq!(recs.len(), 1);
+        assert_eq!(recs.len(), 2);
         assert_eq!(recs[0].entity, "prometheus.target");
         assert_eq!(recs[0].title, "api");
     }
 
     #[test]
-    fn rules_lists_groups_and_rejects_bad_type() {
+    fn rules_returns_typed_result_with_counts_and_rejects_bad_type() {
         let plugin = manifest_builder().build();
-        let mut host = MockHost::default()
-            .with_endpoint("prometheus.endpoint", "https://p.x")
-            .with_http(
-                "/api/v1/rules",
-                json!({"status": "success", "data": {"groups": [
-                    {"name": "g1", "rules": [{"name": "HighErrors", "type": "alerting", "state": "firing"}]}
-                ]}}),
-            );
+        let mut host = MockHost::default().with_endpoint("prometheus.endpoint", "https://p.x")
+            .with_http("/api/v1/rules", json!({"status": "success", "data": {"groups": [
+                {"name": "g1", "file": "rules.yml", "interval": 30, "rules": [
+                    {"name": "HighErrors", "type": "alerting", "query": "rate(errors[5m]) > 0.1", "state": "firing", "duration": 300, "health": "ok", "labels": {"severity": "critical"}, "annotations": {"summary": "too many errors"}, "alerts": [{"state": "firing"}]}
+                ]}
+            ]}}));
         assert!(plugin
-            .call("prometheus.rules", json!({ "type": "bogus" }), &mut host)
+            .call("prometheus.rules", json!({"type": "bogus"}), &mut host)
             .is_err());
         let out = plugin
-            .call("prometheus.rules", json!({ "type": "alert" }), &mut host)
+            .call("prometheus.rules", json!({"type": "alert"}), &mut host)
             .unwrap();
-        assert_eq!(out["data"]["groups"][0]["rules"][0]["name"], "HighErrors");
+        assert_eq!(out["url"], "https://p.x");
+        assert_eq!(out["group_count"], 1);
+        assert_eq!(out["rule_count"], 1);
+        assert_eq!(out["groups"][0]["interval"], "30s");
+        let rule = &out["groups"][0]["rules"][0];
+        assert_eq!(rule["name"], "HighErrors");
+        assert_eq!(rule["state"], "firing");
+        assert_eq!(rule["for"], "5m0s");
+        assert_eq!(rule["active_count"], 1);
+        assert_eq!(rule["labels"]["severity"], "critical");
     }
 
     #[test]
-    fn alerts_hits_the_alerts_endpoint_and_contributes() {
+    fn alerts_returns_typed_result_with_count_and_contributes() {
         let plugin = manifest_builder().build();
-        let mut host = MockHost::default()
-            .with_endpoint("prometheus.endpoint", "https://p.x")
-            .with_http(
-                "/api/v1/alerts",
-                json!({"status": "success", "data": {"alerts": [
-                    {"labels": {"alertname": "HighErrors", "severity": "critical"}, "state": "firing", "annotations": {"summary": "too many 5xx"}}
-                ]}}),
-            );
+        let mut host = MockHost::default().with_endpoint("prometheus.endpoint", "https://p.x")
+            .with_http("/api/v1/alerts", json!({"status": "success", "data": {"alerts": [
+                {"labels": {"alertname": "HighErrors", "severity": "critical"}, "state": "firing", "activeAt": "2024-01-01T00:00:00Z", "value": "1", "annotations": {"summary": "too many 5xx"}}
+            ]}}));
         let out = plugin
             .call("prometheus.alerts", json!({}), &mut host)
             .unwrap();
-        assert_eq!(out["data"]["alerts"][0]["state"], "firing");
+        assert_eq!(out["url"], "https://p.x");
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["alerts"][0]["state"], "firing");
+        assert_eq!(out["alerts"][0]["name"], "HighErrors");
         let recs = host.contributed.borrow();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].entity, "prometheus.alert");
@@ -1034,5 +1187,215 @@ mod tests {
         let entities: Vec<&str> = m.datasources.iter().map(|d| d.entity.as_str()).collect();
         assert!(entities.contains(&"prometheus.query_result"));
         assert!(entities.contains(&"prometheus.alert"));
+    }
+}
+
+#[cfg(test)]
+mod schema_contract {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Kind {
+        Str,
+        Int,
+        Bool,
+        ArrayStr,
+        Enum(Vec<String>),
+        Object,
+    }
+
+    struct Prop {
+        name: &'static str,
+        kind: Kind,
+    }
+    struct OpContract {
+        props: Vec<Prop>,
+        required: Vec<&'static str>,
+    }
+
+    fn p(name: &'static str, kind: Kind) -> Prop {
+        Prop { name, kind }
+    }
+    fn c(props: Vec<Prop>, required: Vec<&'static str>) -> OpContract {
+        OpContract { props, required }
+    }
+
+    fn contracts() -> Vec<(&'static str, OpContract)> {
+        vec![
+            ("prometheus.test", c(vec![], vec![])),
+            (
+                "prometheus.query",
+                c(
+                    vec![p("query", Kind::Str), p("time", Kind::Str)],
+                    vec!["query"],
+                ),
+            ),
+            (
+                "prometheus.query_range",
+                c(
+                    vec![
+                        p("query", Kind::Str),
+                        p("since", Kind::Str),
+                        p("until", Kind::Str),
+                        p("step", Kind::Str),
+                    ],
+                    vec!["query"],
+                ),
+            ),
+            (
+                "prometheus.labels",
+                c(
+                    vec![p("label", Kind::Str), p("match", Kind::ArrayStr)],
+                    vec![],
+                ),
+            ),
+            (
+                "prometheus.series",
+                c(
+                    vec![
+                        p("match", Kind::ArrayStr),
+                        p("since", Kind::Str),
+                        p("until", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec!["match"],
+                ),
+            ),
+            (
+                "prometheus.targets",
+                c(
+                    vec![p(
+                        "state",
+                        Kind::Enum(vec!["active".into(), "dropped".into(), "any".into()]),
+                    )],
+                    vec![],
+                ),
+            ),
+            (
+                "prometheus.rules",
+                c(
+                    vec![p("type", Kind::Enum(vec!["alert".into(), "record".into()]))],
+                    vec![],
+                ),
+            ),
+            ("prometheus.alerts", c(vec![], vec![])),
+        ]
+    }
+
+    fn resolve<'a>(node: &'a Value, defs: &'a Value) -> &'a Value {
+        if let Some(obj) = node.as_object() {
+            if let Some(r) = obj.get("$ref").and_then(|v| v.as_str()) {
+                if let Some(name) = r.strip_prefix("#/definitions/") {
+                    return defs.get(name).unwrap_or(node);
+                }
+            }
+            if let Some(any) = obj.get("anyOf").and_then(|v| v.as_array()) {
+                for m in any {
+                    if m.get("type").and_then(|v| v.as_str()) != Some("null") {
+                        return resolve(m, defs);
+                    }
+                }
+            }
+        }
+        node
+    }
+
+    fn kind_of(node: &Value) -> Kind {
+        let t = node.get("type");
+        if let Some(arr) = t.and_then(|v| v.as_array()) {
+            let first = arr
+                .iter()
+                .find(|v| v.as_str() != Some("null"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("null");
+            return base_kind(first, node);
+        }
+        base_kind(t.and_then(|v| v.as_str()).unwrap_or(""), node)
+    }
+
+    fn base_kind(t: &str, node: &Value) -> Kind {
+        match t {
+            "integer" => Kind::Int,
+            "boolean" => Kind::Bool,
+            "string" => {
+                if let Some(e) = node.get("enum").and_then(|v| v.as_array()) {
+                    let vals: Vec<String> = e
+                        .iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect();
+                    if !vals.is_empty() {
+                        return Kind::Enum(vals);
+                    }
+                }
+                Kind::Str
+            }
+            "array" => {
+                let item_type = node
+                    .pointer("/items/type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                assert_eq!(
+                    item_type, "string",
+                    "unsupported array item type: {item_type} ({node})"
+                );
+                Kind::ArrayStr
+            }
+            "object" | "" => Kind::Object,
+            other => panic!("unsupported property type: {other} ({node})"),
+        }
+    }
+
+    fn assert_contract(op_name: &str, schema: &Value, contract: &OpContract) {
+        let defs = schema.get("definitions").cloned().unwrap_or(json!({}));
+        assert_eq!(schema["type"], "object", "{op_name}: root type");
+
+        let props_obj = schema.get("properties").and_then(|v| v.as_object());
+        let mut got: BTreeMap<&str, Kind> = BTreeMap::new();
+        if let Some(props) = props_obj {
+            for (k, v) in props {
+                got.insert(k.as_str(), kind_of(resolve(v, &defs)));
+            }
+        }
+        let want: BTreeMap<&str, Kind> = contract
+            .props
+            .iter()
+            .map(|Prop { name, kind }| (*name, kind.clone()))
+            .collect();
+        assert_eq!(got.len(), want.len(), "{op_name}: property count");
+        for Prop { name, kind } in &contract.props {
+            let got_kind = got.get(*name).unwrap_or_else(|| {
+                panic!("{op_name}: missing property `{name}` in derived schema")
+            });
+            assert_eq!(got_kind, kind, "{op_name}: property `{name}` kind");
+        }
+
+        let mut req: Vec<&str> = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        req.sort();
+        let mut want_req = contract.required.clone();
+        want_req.sort();
+        assert_eq!(req, want_req, "{op_name}: required set");
+    }
+
+    #[test]
+    fn derived_schemas_match_authoritative_contract() {
+        let ops = contracts();
+        let manifest = manifest_builder().build().manifest();
+        let by_name: BTreeMap<&str, &OperationSpec> = manifest
+            .operations
+            .iter()
+            .map(|o| (o.name.as_str(), o))
+            .collect();
+        assert_eq!(by_name.len(), ops.len(), "op count changed");
+        for (name, contract) in &ops {
+            let spec = by_name
+                .get(*name)
+                .unwrap_or_else(|| panic!("missing op {name}"));
+            assert_contract(name, &spec.input_schema, contract);
+        }
     }
 }

@@ -792,6 +792,9 @@ pub struct MockHost {
     /// different responses per call (e.g. a seed search then a fan-out search on the same path).
     /// Checked before [`http`](MockHost::http); falls back to `http`'s first-match when empty.
     pub http_seq: std::cell::RefCell<Vec<(String, Value)>>,
+    /// `(url-substring, status, body)` canned responses with a custom status code (for error
+    /// paths). Checked first (before `http_seq`/`http`); first substring match wins.
+    pub http_status: Vec<(String, u16, String)>,
     /// Records the plugin contributed (captured for assertions).
     pub contributed: std::cell::RefCell<Vec<Record>>,
     /// An in-memory `conn.*` byte buffer: `conn.write` appends, `conn.read` drains (a loopback echo).
@@ -819,6 +822,7 @@ impl Default for MockHost {
             proc_exit_code: None,
             http_bytes: Vec::new(),
             http_seq: std::cell::RefCell::new(Vec::new()),
+            http_status: Vec::new(),
             contributed: std::cell::RefCell::new(Vec::new()),
             conn_buf: std::cell::RefCell::new(Vec::new()),
             conn_script: std::cell::RefCell::new(std::collections::VecDeque::new()),
@@ -831,6 +835,14 @@ impl MockHost {
     /// Canned JSON response for any `http.do` whose URL contains `url_substr`.
     pub fn with_http(mut self, url_substr: &str, result: Value) -> Self {
         self.http.push((url_substr.into(), result));
+        self
+    }
+    /// A canned `http.do` response with a custom **status code** + raw string body (not JSON),
+    /// for testing error paths (e.g. a 503 from a readiness endpoint). Matched by URL substring,
+    /// first-match like [`with_http`](MockHost::with_http); checked before `http_seq`/`http`.
+    pub fn with_http_status_body(mut self, url_substr: &str, status: u16, body: &str) -> Self {
+        self.http_status
+            .push((url_substr.into(), status, body.to_string()));
         self
     }
     /// A sequential canned JSON response: the first `http.do` whose URL contains `url_substr`
@@ -945,6 +957,15 @@ impl GuestHost for MockHost {
                         .to_string()
                 };
                 let url = url.as_str();
+                // Custom-status canned responses (error paths) — checked first.
+                if let Some((_, status, body)) = self
+                    .http_status
+                    .iter()
+                    .find(|(sub, _, _)| url.contains(sub.as_str()))
+                    .cloned()
+                {
+                    return Ok(json!({ "status": status, "body": body }));
+                }
                 // Sequential responses: drain the first matching entry, then fall back to
                 // the first-match `http` table.
                 let seq_pos = {

@@ -5,10 +5,224 @@
 //! (`GRAFANA_USERNAME`/`GRAFANA_PASSWORD`). All IO is through the host; never direct HTTP.
 
 use host_kit::*;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// ===========================================================================
+// Schema-only op input structs (D-36)
+// ===========================================================================
+// Each op's `input_schema` is derived from the structs below via schemars
+// (`host_kit::read_op_typed::<T>` / `write_op_typed::<T>`), instead of a hand-written
+// `json!({...})` object via the local `so()` helper, so the schema the model sees cannot drift
+// from a separately-maintained literal. The structs are schema-only: handlers keep their
+// existing `flex_str` / `flex_i64` / `flex_arr` extractors (the D-34 schema-only precedent).
+
+/// `grafana.test`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct TestInput {}
+
+/// `grafana.datasource.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct DatasourceListInput {}
+
+/// `grafana.datasource.health`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct DatasourceHealthInput {
+    /// Grafana datasource UID.
+    uid: String,
+}
+
+/// `grafana.folder.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct FolderListInput {
+    /// Maximum folders.
+    limit: Option<i64>,
+}
+
+/// `grafana.dashboard.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct DashboardListInput {
+    query: Option<String>,
+    folder_uid: Option<String>,
+    tags: Option<Vec<String>>,
+    limit: Option<i64>,
+}
+
+/// `grafana.dashboard.get`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct DashboardGetInput {
+    /// Dashboard UID.
+    uid: String,
+}
+
+/// `grafana.annotation.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct AnnotationListInput {
+    since: Option<String>,
+    until: Option<String>,
+    tags: Option<Vec<String>>,
+    dashboard_uid: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `grafana.annotation.add`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct AnnotationAddInput {
+    /// Annotation text.
+    text: String,
+    time: Option<String>,
+    time_end: Option<String>,
+    tags: Option<Vec<String>>,
+    dashboard_uid: Option<String>,
+    panel_id: Option<i64>,
+}
+
+/// `grafana.loki.labels`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct LokiLabelsInput {
+    /// Cluster alias from datasource.list or datasource UID suffix.
+    cluster: Option<String>,
+    /// Grafana datasource UID override.
+    uid: Option<String>,
+    label: Option<String>,
+    query: Option<String>,
+}
+
+/// `grafana.loki.query`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct LokiQueryInput {
+    cluster: Option<String>,
+    uid: Option<String>,
+    /// LogQL query.
+    query: String,
+    since: Option<String>,
+    until: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `grafana.loki.recent_logs`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct LokiRecentLogsInput {
+    cluster: Option<String>,
+    uid: Option<String>,
+    app: Option<String>,
+    namespace: Option<String>,
+    contains: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `grafana.prometheus.query`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PrometheusQueryInput {
+    cluster: Option<String>,
+    uid: Option<String>,
+    /// PromQL query.
+    query: String,
+    time: Option<String>,
+}
+
+/// `grafana.prometheus.range`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PrometheusRangeInput {
+    cluster: Option<String>,
+    uid: Option<String>,
+    query: String,
+    since: Option<String>,
+    until: Option<String>,
+    step: Option<String>,
+}
+
+/// `grafana.prometheus.rules`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PrometheusRulesInput {
+    cluster: Option<String>,
+    uid: Option<String>,
+    /// alert or record.
+    r#type: Option<String>,
+}
+
+/// `grafana.alerts.active`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct AlertsActiveInput {
+    cluster: Option<String>,
+    uid: Option<String>,
+    severity: Option<String>,
+    namespace: Option<String>,
+}
+
+/// `grafana.alerts.silences.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct AlertsSilencesListInput {
+    cluster: Option<String>,
+    uid: Option<String>,
+    filter: Option<Vec<String>>,
+}
+
+/// `grafana.alerts.silences.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct AlertsSilencesCreateInput {
+    cluster: Option<String>,
+    uid: Option<String>,
+    /// Array of {name, value, is_regex?} matchers.
+    matchers: Vec<Value>,
+    starts_at: Option<String>,
+    /// End time as RFC3339, unix, or duration (e.g. 2h).
+    ends_at: String,
+    created_by: Option<String>,
+    comment: String,
+}
+
+/// `grafana.alerts.silences.delete`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct AlertsSilencesDeleteInput {
+    cluster: Option<String>,
+    uid: Option<String>,
+    silence_id: String,
+}
+
+/// `grafana.tempo.search`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct TempoSearchInput {
+    /// Tempo datasource UID.
+    uid: Option<String>,
+    query: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `grafana.tempo.trace.get`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct TempoTraceGetInput {
+    uid: Option<String>,
+    trace_id: String,
+}
 
 // ---------------------------------------------------------------------------
 // Manifest
@@ -54,308 +268,149 @@ fn manifest_builder() -> PluginBuilder {
         ))
         // ---- connectivity / auth ----
         .operation(
-            read_op(
+            read_op_typed::<TestInput>(
                 "grafana.test",
                 "Probe Grafana reachability (/api/health, no auth) then credential validity (/api/org).",
-                so(json!({}), json!([])),
             ),
             op_test,
         )
         // ---- datasources ----
         .operation(
-            read_op(
+            read_op_typed::<DatasourceListInput>(
                 "grafana.datasource.list",
                 "List Grafana datasources with derived cluster aliases.",
-                so(json!({}), json!([])),
             ),
             op_datasource_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<DatasourceHealthInput>(
                 "grafana.datasource.health",
                 "Check health of one Grafana datasource by UID.",
-                so(
-                    json!({"uid": {"type": "string", "description": "Grafana datasource UID."}}),
-                    json!(["uid"]),
-                ),
             ),
             op_datasource_health,
         )
         // ---- folders / dashboards ----
         .operation(
-            read_op(
+            read_op_typed::<FolderListInput>(
                 "grafana.folder.list",
                 "List Grafana folders.",
-                so(
-                    json!({"limit": {"type": "integer", "description": "Maximum folders."}}),
-                    json!([]),
-                ),
             ),
             op_folder_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<DashboardListInput>(
                 "grafana.dashboard.list",
                 "Search Grafana dashboards; optionally filter by query, folder_uid, or tags.",
-                so(
-                    json!({
-                        "query":      {"type": "string"},
-                        "folder_uid": {"type": "string"},
-                        "tags":       {"type": "array", "items": {"type": "string"}},
-                        "limit":      {"type": "integer"}
-                    }),
-                    json!([]),
-                ),
             ),
             op_dashboard_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<DashboardGetInput>(
                 "grafana.dashboard.get",
                 "Fetch a Grafana dashboard by UID and extract panel target queries.",
-                so(
-                    json!({"uid": {"type": "string", "description": "Dashboard UID."}}),
-                    json!(["uid"]),
-                ),
             ),
             op_dashboard_get,
         )
         // ---- annotations ----
         .operation(
-            read_op(
+            read_op_typed::<AnnotationListInput>(
                 "grafana.annotation.list",
                 "List Grafana annotations; filter by tags, dashboard_uid, and time window.",
-                so(
-                    json!({
-                        "since":         {"type": "string"},
-                        "until":         {"type": "string"},
-                        "tags":          {"type": "array", "items": {"type": "string"}},
-                        "dashboard_uid": {"type": "string"},
-                        "limit":         {"type": "integer"}
-                    }),
-                    json!([]),
-                ),
             ),
             op_annotation_list,
         )
         .operation(
-            write_op(
+            write_op_typed::<AnnotationAddInput>(
                 "grafana.annotation.add",
                 "Create a Grafana annotation.",
-                so(
-                    json!({
-                        "text":          {"type": "string", "description": "Annotation text."},
-                        "time":          {"type": "string"},
-                        "time_end":      {"type": "string"},
-                        "tags":          {"type": "array", "items": {"type": "string"}},
-                        "dashboard_uid": {"type": "string"},
-                        "panel_id":      {"type": "integer"}
-                    }),
-                    json!(["text"]),
-                ),
             ),
             op_annotation_add,
         )
         // ---- Loki (proxied) ----
         .operation(
-            read_op(
+            read_op_typed::<LokiLabelsInput>(
                 "grafana.loki.labels",
                 "List Loki labels (or values for one label) through the Grafana datasource proxy.",
-                so(
-                    json!({
-                        "cluster": {"type": "string", "description": "Cluster alias from datasource.list or datasource UID suffix."},
-                        "uid":     {"type": "string", "description": "Grafana datasource UID override."},
-                        "label":   {"type": "string"},
-                        "query":   {"type": "string"}
-                    }),
-                    json!([]),
-                ),
             ),
             op_loki_labels,
         )
         .operation(
-            read_op(
+            read_op_typed::<LokiQueryInput>(
                 "grafana.loki.query",
                 "Run a Loki range query through the Grafana datasource proxy.",
-                so(
-                    json!({
-                        "cluster": {"type": "string"},
-                        "uid":     {"type": "string"},
-                        "query":   {"type": "string", "description": "LogQL query."},
-                        "since":   {"type": "string"},
-                        "until":   {"type": "string"},
-                        "limit":   {"type": "integer"}
-                    }),
-                    json!(["query"]),
-                ),
             ),
             op_loki_query,
         )
         .operation(
-            read_op(
+            read_op_typed::<LokiRecentLogsInput>(
                 "grafana.loki.recent_logs",
                 "Query recent Loki logs by cluster, app, namespace, and optional contains filter.",
-                so(
-                    json!({
-                        "cluster":   {"type": "string"},
-                        "uid":       {"type": "string"},
-                        "app":       {"type": "string"},
-                        "namespace": {"type": "string"},
-                        "contains":  {"type": "string"},
-                        "since":     {"type": "string"},
-                        "until":     {"type": "string"},
-                        "limit":     {"type": "integer"}
-                    }),
-                    json!([]),
-                ),
             ),
             op_loki_recent_logs,
         )
         // ---- Prometheus (proxied) ----
         .operation(
-            read_op(
+            read_op_typed::<PrometheusQueryInput>(
                 "grafana.prometheus.query",
                 "Run an instant Prometheus query through the Grafana datasource proxy.",
-                so(
-                    json!({
-                        "cluster": {"type": "string"},
-                        "uid":     {"type": "string"},
-                        "query":   {"type": "string", "description": "PromQL query."},
-                        "time":    {"type": "string"}
-                    }),
-                    json!(["query"]),
-                ),
             ),
             op_prometheus_query,
         )
         .operation(
-            read_op(
+            read_op_typed::<PrometheusRangeInput>(
                 "grafana.prometheus.range",
                 "Run a Prometheus range query through the Grafana datasource proxy.",
-                so(
-                    json!({
-                        "cluster": {"type": "string"},
-                        "uid":     {"type": "string"},
-                        "query":   {"type": "string"},
-                        "since":   {"type": "string"},
-                        "until":   {"type": "string"},
-                        "step":    {"type": "string"}
-                    }),
-                    json!(["query"]),
-                ),
             ),
             op_prometheus_range,
         )
         .operation(
-            read_op(
+            read_op_typed::<PrometheusRulesInput>(
                 "grafana.prometheus.rules",
                 "List Prometheus alerting and recording rules through the Grafana datasource proxy.",
-                so(
-                    json!({
-                        "cluster": {"type": "string"},
-                        "uid":     {"type": "string"},
-                        "type":    {"type": "string", "description": "alert or record."}
-                    }),
-                    json!([]),
-                ),
             ),
             op_prometheus_rules,
         )
         // ---- Alertmanager (proxied) ----
         .operation(
-            read_op(
+            read_op_typed::<AlertsActiveInput>(
                 "grafana.alerts.active",
                 "List active Alertmanager alerts through the Grafana datasource proxy.",
-                so(
-                    json!({
-                        "cluster":   {"type": "string"},
-                        "uid":       {"type": "string"},
-                        "severity":  {"type": "string"},
-                        "namespace": {"type": "string"}
-                    }),
-                    json!([]),
-                ),
             ),
             op_alerts_active,
         )
         .operation(
-            read_op(
+            read_op_typed::<AlertsSilencesListInput>(
                 "grafana.alerts.silences.list",
                 "List Alertmanager silences through the Grafana datasource proxy.",
-                so(
-                    json!({
-                        "cluster": {"type": "string"},
-                        "uid":     {"type": "string"},
-                        "filter":  {"type": "array", "items": {"type": "string"}}
-                    }),
-                    json!([]),
-                ),
             ),
             op_alerts_silences_list,
         )
         .operation(
-            write_op(
+            write_op_typed::<AlertsSilencesCreateInput>(
                 "grafana.alerts.silences.create",
                 "Create an Alertmanager silence through the Grafana datasource proxy.",
-                so(
-                    json!({
-                        "cluster":    {"type": "string"},
-                        "uid":        {"type": "string"},
-                        "matchers":   {"type": "array",  "description": "Array of {name, value, is_regex?} matchers."},
-                        "starts_at":  {"type": "string"},
-                        "ends_at":    {"type": "string", "description": "End time as RFC3339, unix, or duration (e.g. 2h)."},
-                        "created_by": {"type": "string"},
-                        "comment":    {"type": "string"}
-                    }),
-                    json!(["matchers", "ends_at", "comment"]),
-                ),
             ),
             op_alerts_silences_create,
         )
         .operation(
-            write_op(
+            write_op_typed::<AlertsSilencesDeleteInput>(
                 "grafana.alerts.silences.delete",
                 "Delete an Alertmanager silence through the Grafana datasource proxy.",
-                so(
-                    json!({
-                        "cluster":    {"type": "string"},
-                        "uid":        {"type": "string"},
-                        "silence_id": {"type": "string"}
-                    }),
-                    json!(["silence_id"]),
-                ),
             ),
             op_alerts_silences_delete,
         )
         // ---- Tempo (proxied) ----
         .operation(
-            read_op(
+            read_op_typed::<TempoSearchInput>(
                 "grafana.tempo.search",
                 "Search Tempo traces through the Grafana datasource proxy.",
-                so(
-                    json!({
-                        "uid":   {"type": "string", "description": "Tempo datasource UID."},
-                        "query": {"type": "string"},
-                        "since": {"type": "string"},
-                        "until": {"type": "string"},
-                        "limit": {"type": "integer"}
-                    }),
-                    json!([]),
-                ),
             ),
             op_tempo_search,
         )
         .operation(
-            read_op(
+            read_op_typed::<TempoTraceGetInput>(
                 "grafana.tempo.trace.get",
                 "Fetch a Tempo trace by ID through the Grafana datasource proxy.",
-                so(
-                    json!({
-                        "uid":      {"type": "string"},
-                        "trace_id": {"type": "string"}
-                    }),
-                    json!(["trace_id"]),
-                ),
             ),
             op_tempo_trace_get,
         )
@@ -369,10 +424,6 @@ fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
         capabilities: vec!["search".into(), "get".into(), "index".into()],
         entity_schema: None,
     }
-}
-
-fn so(props: Value, required: Value) -> Value {
-    json!({ "type": "object", "properties": props, "required": required })
 }
 
 // ---------------------------------------------------------------------------
@@ -2657,5 +2708,343 @@ mod tests {
         assert_eq!(v["spans"][0]["service"], json!("api"));
         assert_eq!(v["spans"][0]["status_code"], json!("ok"));
         assert_eq!(v["root_span"], json!("GET /users"));
+    }
+}
+
+// ===========================================================================
+// D-36: schema-derivation contract test (grafana).
+// Locks each op's derived schemars schema to its intended field/required/type
+// contract (encoded from the struct definitions). A change here is a real
+// contract change.
+// ===========================================================================
+#[cfg(test)]
+mod schema_contract {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Kind {
+        Str,
+        Int,
+        Bool,
+        ArrayAny,
+        ArrayStr,
+    }
+    #[derive(Clone)]
+    struct Prop {
+        name: &'static str,
+        kind: Kind,
+    }
+    struct OpContract {
+        props: Vec<Prop>,
+        required: Vec<&'static str>,
+    }
+    fn p(name: &'static str, kind: Kind) -> Prop {
+        Prop { name, kind }
+    }
+    fn c(props: Vec<Prop>, required: Vec<&'static str>) -> OpContract {
+        OpContract { props, required }
+    }
+
+    fn contracts() -> Vec<(&'static str, OpContract)> {
+        vec![
+            ("grafana.test", c(vec![], vec![])),
+            ("grafana.datasource.list", c(vec![], vec![])),
+            (
+                "grafana.datasource.health",
+                c(vec![p("uid", Kind::Str)], vec!["uid"]),
+            ),
+            (
+                "grafana.folder.list",
+                c(vec![p("limit", Kind::Int)], vec![]),
+            ),
+            (
+                "grafana.dashboard.list",
+                c(
+                    vec![
+                        p("query", Kind::Str),
+                        p("folder_uid", Kind::Str),
+                        p("tags", Kind::ArrayStr),
+                        p("limit", Kind::Int),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "grafana.dashboard.get",
+                c(vec![p("uid", Kind::Str)], vec!["uid"]),
+            ),
+            (
+                "grafana.annotation.list",
+                c(
+                    vec![
+                        p("since", Kind::Str),
+                        p("until", Kind::Str),
+                        p("tags", Kind::ArrayStr),
+                        p("dashboard_uid", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "grafana.annotation.add",
+                c(
+                    vec![
+                        p("text", Kind::Str),
+                        p("time", Kind::Str),
+                        p("time_end", Kind::Str),
+                        p("tags", Kind::ArrayStr),
+                        p("dashboard_uid", Kind::Str),
+                        p("panel_id", Kind::Int),
+                    ],
+                    vec!["text"],
+                ),
+            ),
+            (
+                "grafana.loki.labels",
+                c(
+                    vec![
+                        p("cluster", Kind::Str),
+                        p("uid", Kind::Str),
+                        p("label", Kind::Str),
+                        p("query", Kind::Str),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "grafana.loki.query",
+                c(
+                    vec![
+                        p("cluster", Kind::Str),
+                        p("uid", Kind::Str),
+                        p("query", Kind::Str),
+                        p("since", Kind::Str),
+                        p("until", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec!["query"],
+                ),
+            ),
+            (
+                "grafana.loki.recent_logs",
+                c(
+                    vec![
+                        p("cluster", Kind::Str),
+                        p("uid", Kind::Str),
+                        p("app", Kind::Str),
+                        p("namespace", Kind::Str),
+                        p("contains", Kind::Str),
+                        p("since", Kind::Str),
+                        p("until", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "grafana.prometheus.query",
+                c(
+                    vec![
+                        p("cluster", Kind::Str),
+                        p("uid", Kind::Str),
+                        p("query", Kind::Str),
+                        p("time", Kind::Str),
+                    ],
+                    vec!["query"],
+                ),
+            ),
+            (
+                "grafana.prometheus.range",
+                c(
+                    vec![
+                        p("cluster", Kind::Str),
+                        p("uid", Kind::Str),
+                        p("query", Kind::Str),
+                        p("since", Kind::Str),
+                        p("until", Kind::Str),
+                        p("step", Kind::Str),
+                    ],
+                    vec!["query"],
+                ),
+            ),
+            (
+                "grafana.prometheus.rules",
+                c(
+                    vec![
+                        p("cluster", Kind::Str),
+                        p("uid", Kind::Str),
+                        p("type", Kind::Str),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "grafana.alerts.active",
+                c(
+                    vec![
+                        p("cluster", Kind::Str),
+                        p("uid", Kind::Str),
+                        p("severity", Kind::Str),
+                        p("namespace", Kind::Str),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "grafana.alerts.silences.list",
+                c(
+                    vec![
+                        p("cluster", Kind::Str),
+                        p("uid", Kind::Str),
+                        p("filter", Kind::ArrayStr),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "grafana.alerts.silences.create",
+                c(
+                    vec![
+                        p("cluster", Kind::Str),
+                        p("uid", Kind::Str),
+                        p("matchers", Kind::ArrayAny),
+                        p("starts_at", Kind::Str),
+                        p("ends_at", Kind::Str),
+                        p("created_by", Kind::Str),
+                        p("comment", Kind::Str),
+                    ],
+                    vec!["matchers", "ends_at", "comment"],
+                ),
+            ),
+            (
+                "grafana.alerts.silences.delete",
+                c(
+                    vec![
+                        p("cluster", Kind::Str),
+                        p("uid", Kind::Str),
+                        p("silence_id", Kind::Str),
+                    ],
+                    vec!["silence_id"],
+                ),
+            ),
+            (
+                "grafana.tempo.search",
+                c(
+                    vec![
+                        p("uid", Kind::Str),
+                        p("query", Kind::Str),
+                        p("since", Kind::Str),
+                        p("until", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "grafana.tempo.trace.get",
+                c(
+                    vec![p("uid", Kind::Str), p("trace_id", Kind::Str)],
+                    vec!["trace_id"],
+                ),
+            ),
+        ]
+    }
+
+    fn kind_of(node: &Value) -> Kind {
+        let t = node.get("type");
+        if let Some(arr) = t.and_then(|v| v.as_array()) {
+            let first = arr
+                .iter()
+                .find(|v| v.as_str() != Some("null"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("null");
+            return base_kind(first, node);
+        }
+        base_kind(t.and_then(|v| v.as_str()).unwrap_or(""), node)
+    }
+    fn base_kind(t: &str, node: &Value) -> Kind {
+        match t {
+            "integer" => Kind::Int,
+            "boolean" => Kind::Bool,
+            "array" => {
+                let items = node.get("items").cloned().unwrap_or(Value::Null);
+                if items.get("type").and_then(|v| v.as_str()) == Some("string") {
+                    Kind::ArrayStr
+                } else {
+                    Kind::ArrayAny
+                }
+            }
+            "string" => Kind::Str,
+            other => panic!("unsupported property type: {other}"),
+        }
+    }
+    fn resolve<'a>(node: &'a Value, defs: &'a Value) -> &'a Value {
+        if let Some(obj) = node.as_object() {
+            if let Some(r) = obj.get("$ref").and_then(|v| v.as_str()) {
+                if let Some(name) = r.strip_prefix("#/definitions/") {
+                    return defs.get(name).unwrap_or(node);
+                }
+            }
+            if let Some(any) = obj.get("anyOf").and_then(|v| v.as_array()) {
+                for m in any {
+                    if m.get("type").and_then(|v| v.as_str()) != Some("null") {
+                        return resolve(m, defs);
+                    }
+                }
+            }
+        }
+        node
+    }
+    fn assert_contract(op_name: &str, schema: &Value, contract: &OpContract) {
+        assert_eq!(schema["type"], "object", "{op_name}: root type");
+        let defs = schema.get("definitions").cloned().unwrap_or(json!({}));
+        let props_obj = schema.get("properties").and_then(|v| v.as_object());
+        let mut got: BTreeMap<&str, Kind> = BTreeMap::new();
+        if let Some(props) = props_obj {
+            for (k, v) in props {
+                got.insert(k.as_str(), kind_of(resolve(v, &defs)));
+            }
+        }
+        let want: BTreeMap<&str, Kind> = contract
+            .props
+            .iter()
+            .map(|Prop { name, kind }| (*name, kind.clone()))
+            .collect();
+        assert_eq!(got.len(), want.len(), "{op_name}: property count");
+        for Prop { name, kind } in &contract.props {
+            let got_kind = got
+                .get(*name)
+                .unwrap_or_else(|| panic!("{op_name}: missing property `{name}`"));
+            assert_eq!(got_kind, kind, "{op_name}: property `{name}` kind");
+        }
+        let req: Vec<&str> = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let mut req_set: Vec<&str> = req.clone();
+        req_set.sort();
+        let mut want_req: Vec<&str> = contract.required.clone();
+        want_req.sort();
+        assert_eq!(req_set, want_req, "{op_name}: required set");
+    }
+    #[test]
+    fn derived_schemas_match_contract() {
+        let ops = contracts();
+        let manifest = manifest_builder().build().manifest();
+        let by_name: BTreeMap<&str, &OperationSpec> = manifest
+            .operations
+            .iter()
+            .map(|o| (o.name.as_str(), o))
+            .collect();
+        assert_eq!(by_name.len(), ops.len(), "op count changed");
+        for (name, contract) in &ops {
+            let spec = by_name
+                .get(*name)
+                .unwrap_or_else(|| panic!("missing op {name}"));
+            assert_contract(name, &spec.input_schema, contract);
+        }
     }
 }

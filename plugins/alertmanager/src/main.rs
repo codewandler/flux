@@ -8,7 +8,94 @@
 //! Alert list ops contribute `alertmanager.alert` datasource records so the agent can search them.
 
 use host_kit::*;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{json, Value};
+
+// ===========================================================================
+// Schema-only op input structs (D-36)
+// ===========================================================================
+// Each op's `input_schema` is derived from the typed structs below via schemars
+// (`host_kit::read_op_typed::<T>` / `write_op_typed::<T>`) instead of a hand-written
+// `json!({...})` literal, so the schema the model sees cannot drift from the handler
+// contract. Handlers keep their existing `Value` extraction (D-34 schema-only precedent).
+
+/// `alertmanager.test`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct TestInput {}
+
+/// `alertmanager.alerts`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct AlertsInput {
+    /// Label matchers e.g. ["severity=\"critical\"", "namespace=~\"prod-.*\""]
+    filter: Option<Vec<String>>,
+    /// Include active alerts (default true).
+    active: Option<bool>,
+    /// Include silenced alerts (default false).
+    silenced: Option<bool>,
+    /// Include inhibited alerts (default false).
+    inhibited: Option<bool>,
+    /// Maximum alerts to return (default 200).
+    limit: Option<i64>,
+}
+
+/// Silence state filter.
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[allow(dead_code)]
+enum SilenceState {
+    Active,
+    Pending,
+    Expired,
+}
+
+/// `alertmanager.silence.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct SilenceListInput {
+    /// Filter by silence state.
+    state: Option<SilenceState>,
+}
+
+/// A label matcher for a silence.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct SilenceMatcherInput {
+    /// Label name to match.
+    name: String,
+    /// Value (or regex when is_regex) to match.
+    value: String,
+    /// Treat value as a regular expression.
+    is_regex: Option<bool>,
+    /// Equality matcher. Defaults to true; false negates.
+    is_equal: Option<bool>,
+}
+
+/// `alertmanager.silence.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct SilenceCreateInput {
+    /// Label matchers selecting the alerts to silence.
+    matchers: Vec<SilenceMatcherInput>,
+    /// Duration from now e.g. 30m, 2h (default 1h). Ignored when ends_at is set.
+    duration: Option<String>,
+    /// Explicit RFC3339 end time. Overrides duration.
+    ends_at: Option<String>,
+    /// Why this silence exists (shown in the Alertmanager UI).
+    comment: String,
+    /// Creator label (default flux-plugin).
+    created_by: Option<String>,
+}
+
+/// `alertmanager.silence.delete`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct SilenceDeleteInput {
+    /// Silence id to expire.
+    id: String,
+}
 
 fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("alertmanager", "0.1.0")
@@ -41,93 +128,37 @@ fn manifest_builder() -> PluginBuilder {
         })
         // ---- ops ----
         .operation(
-            read_op(
+            read_op_typed::<TestInput>(
                 "alertmanager.test",
                 "Check Alertmanager readiness and return version/cluster status.",
-                json!({"type": "object", "properties": {}}),
             ),
             test,
         )
         .operation(
-            read_op(
+            read_op_typed::<AlertsInput>(
                 "alertmanager.alerts",
                 "List alerts from Alertmanager with optional label matchers and state filters (active/silenced/inhibited).",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "filter": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Label matchers e.g. [\"severity=\\\"critical\\\"\", \"namespace=~\\\"prod-.*\\\"\"]"
-                        },
-                        "active":    {"type": "boolean", "description": "Include active alerts (default true)."},
-                        "silenced":  {"type": "boolean", "description": "Include silenced alerts (default false)."},
-                        "inhibited": {"type": "boolean", "description": "Include inhibited alerts (default false)."},
-                        "limit":     {"type": "integer", "description": "Maximum alerts to return (default 200)."}
-                    }
-                }),
             ),
             alerts,
         )
         .operation(
-            read_op(
+            read_op_typed::<SilenceListInput>(
                 "alertmanager.silence.list",
                 "List silences with their matchers, state (active/pending/expired), creator, and comment.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "state": {
-                            "type": "string",
-                            "enum": ["active", "pending", "expired"],
-                            "description": "Filter by silence state."
-                        }
-                    }
-                }),
             ),
             silence_list,
         )
         .operation(
-            write_op(
+            write_op_typed::<SilenceCreateInput>(
                 "alertmanager.silence.create",
                 "Create a silence: label matchers, duration or explicit end time, creator, and comment.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "matchers": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "name":     {"type": "string"},
-                                    "value":    {"type": "string"},
-                                    "is_regex": {"type": "boolean"},
-                                    "is_equal": {"type": "boolean"}
-                                },
-                                "required": ["name", "value"]
-                            },
-                            "description": "Label matchers selecting the alerts to silence."
-                        },
-                        "duration":    {"type": "string", "description": "Duration from now e.g. 30m, 2h (default 1h). Ignored when ends_at is set."},
-                        "ends_at":     {"type": "string", "description": "Explicit RFC3339 end time. Overrides duration."},
-                        "comment":     {"type": "string", "description": "Why this silence exists (required)."},
-                        "created_by":  {"type": "string", "description": "Creator label (default flux-plugin)."}
-                    },
-                    "required": ["matchers", "comment"]
-                }),
             ),
             silence_create,
         )
         .operation(
-            write_op(
+            write_op_typed::<SilenceDeleteInput>(
                 "alertmanager.silence.delete",
                 "Expire (delete) a silence by id.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string", "description": "Silence id to expire."}
-                    },
-                    "required": ["id"]
-                }),
             ),
             silence_delete,
         )
@@ -246,7 +277,9 @@ fn contribute_alerts(host: &mut Host, alerts: &[Value]) {
 // ---------------------------------------------------------------------------
 
 fn test(_input: Value, host: &mut Host) -> Result<Value, String> {
+    let start = std::time::Instant::now();
     let raw = am_get(host, "/api/v2/status")?;
+    let latency_ms: i64 = start.elapsed().as_millis().try_into().unwrap_or(i64::MAX);
     let version = raw
         .get("versionInfo")
         .and_then(|v| v.get("version"))
@@ -270,7 +303,8 @@ fn test(_input: Value, host: &mut Host) -> Result<Value, String> {
         "ready": true,
         "version": version,
         "cluster_status": cluster_status,
-        "cluster_peers": peers
+        "cluster_peers": peers,
+        "latency_ms": latency_ms
     }))
 }
 
@@ -642,6 +676,24 @@ mod tests {
         assert_eq!(out["cluster_peers"], 1);
     }
 
+    #[test]
+    fn test_op_reports_latency_ms() {
+        let mut host = base_host().with_http(
+            "/api/v2/status",
+            json!({
+                "versionInfo": {"version": "0.26.0"},
+                "cluster": {"status": "ready", "peers": []}
+            }),
+        );
+        let out = plugin()
+            .call("alertmanager.test", json!({}), &mut host)
+            .unwrap();
+        let latency = out["latency_ms"]
+            .as_i64()
+            .expect("latency_ms should be a number");
+        assert!(latency >= 0, "latency_ms should be non-negative");
+    }
+
     // -- alertmanager.alerts -------------------------------------------------
 
     #[test]
@@ -759,5 +811,207 @@ mod tests {
             .unwrap();
         assert_eq!(out["id"], "deadbeef-1234");
         assert_eq!(out["deleted"], true);
+    }
+}
+
+// ===========================================================================
+// Schema contract regression guard
+// ===========================================================================
+// The `read_op_typed::<T>` / `write_op_typed::<T>` migration changes the
+// schema authorship from hand-written `json!({...})` literals to schemars
+// derivation. This module encodes the *legacy* contract (fields, types,
+// required set) and asserts the derived schemas are equivalent. Any drift is
+// a contract change that needs explicit review.
+#[cfg(test)]
+mod schema_contract {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// Normalized kind of one top-level input property.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Kind {
+        Str,
+        Int,
+        Bool,
+        Array,
+        Object,
+        Enum(Vec<String>),
+    }
+
+    #[derive(Clone)]
+    struct Prop {
+        name: &'static str,
+        kind: Kind,
+    }
+
+    struct OpContract {
+        props: Vec<Prop>,
+        required: Vec<&'static str>,
+    }
+
+    fn p(name: &'static str, kind: Kind) -> Prop {
+        Prop { name, kind }
+    }
+
+    /// The authoritative pre-migration contract for all 5 alertmanager ops.
+    fn contracts() -> Vec<(&'static str, OpContract)> {
+        vec![
+            (
+                "alertmanager.test",
+                OpContract {
+                    props: vec![],
+                    required: vec![],
+                },
+            ),
+            (
+                "alertmanager.alerts",
+                OpContract {
+                    props: vec![
+                        p("filter", Kind::Array),
+                        p("active", Kind::Bool),
+                        p("silenced", Kind::Bool),
+                        p("inhibited", Kind::Bool),
+                        p("limit", Kind::Int),
+                    ],
+                    required: vec![],
+                },
+            ),
+            (
+                "alertmanager.silence.list",
+                OpContract {
+                    props: vec![p(
+                        "state",
+                        Kind::Enum(vec!["active".into(), "pending".into(), "expired".into()]),
+                    )],
+                    required: vec![],
+                },
+            ),
+            (
+                "alertmanager.silence.create",
+                OpContract {
+                    props: vec![
+                        p("matchers", Kind::Array),
+                        p("duration", Kind::Str),
+                        p("ends_at", Kind::Str),
+                        p("comment", Kind::Str),
+                        p("created_by", Kind::Str),
+                    ],
+                    required: vec!["matchers", "comment"],
+                },
+            ),
+            (
+                "alertmanager.silence.delete",
+                OpContract {
+                    props: vec![p("id", Kind::Str)],
+                    required: vec!["id"],
+                },
+            ),
+        ]
+    }
+
+    fn resolve<'a>(node: &'a Value, defs: &'a Value) -> &'a Value {
+        if let Some(obj) = node.as_object() {
+            if let Some(r) = obj.get("$ref").and_then(|v| v.as_str()) {
+                if let Some(name) = r.strip_prefix("#/definitions/") {
+                    return defs.get(name).unwrap_or(node);
+                }
+            }
+            if let Some(any) = obj.get("anyOf").and_then(|v| v.as_array()) {
+                for m in any {
+                    if m.get("type").and_then(|v| v.as_str()) != Some("null") {
+                        return resolve(m, defs);
+                    }
+                }
+            }
+        }
+        node
+    }
+
+    fn kind_of(node: &Value) -> Kind {
+        let t = node.get("type");
+        if let Some(arr) = t.and_then(|v| v.as_array()) {
+            let first = arr
+                .iter()
+                .find(|v| v.as_str() != Some("null"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("null");
+            return base_kind(first, node);
+        }
+        base_kind(t.and_then(|v| v.as_str()).unwrap_or(""), node)
+    }
+
+    fn base_kind(t: &str, node: &Value) -> Kind {
+        match t {
+            "integer" => Kind::Int,
+            "boolean" => Kind::Bool,
+            "string" => {
+                if let Some(e) = node.get("enum").and_then(|v| v.as_array()) {
+                    let vals: Vec<String> = e
+                        .iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect();
+                    return Kind::Enum(vals);
+                }
+                Kind::Str
+            }
+            "array" => Kind::Array,
+            "object" | "" => Kind::Object,
+            other => panic!("unsupported property type: {other} ({node})"),
+        }
+    }
+
+    fn assert_contract(op_name: &str, schema: &Value, contract: &OpContract) {
+        let defs = schema.get("definitions").cloned().unwrap_or(json!({}));
+        assert_eq!(schema["type"], "object", "{op_name}: root type");
+
+        let props_obj = schema.get("properties").and_then(|v| v.as_object());
+        let mut got: BTreeMap<&str, Kind> = BTreeMap::new();
+        if let Some(props) = props_obj {
+            for (k, v) in props {
+                let resolved = resolve(v, &defs);
+                got.insert(k.as_str(), kind_of(resolved));
+            }
+        }
+        let want: BTreeMap<&str, Kind> = contract
+            .props
+            .iter()
+            .map(|Prop { name, kind }| (*name, kind.clone()))
+            .collect();
+        assert_eq!(got.len(), want.len(), "{op_name}: property count");
+        for Prop { name, kind } in &contract.props {
+            let got_kind = got.get(*name).unwrap_or_else(|| {
+                panic!("{op_name}: missing property `{name}` in derived schema")
+            });
+            assert_eq!(got_kind, kind, "{op_name}: property `{name}` kind");
+        }
+
+        let req: Vec<&str> = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let mut req_set: Vec<&str> = req.clone();
+        req_set.sort();
+        let mut want_req: Vec<&str> = contract.required.clone();
+        want_req.sort();
+        assert_eq!(req_set, want_req, "{op_name}: required set");
+    }
+
+    #[test]
+    fn derived_schemas_match_legacy_contract() {
+        let ops = contracts();
+        let manifest = manifest_builder().build().manifest();
+        let by_name: BTreeMap<&str, &OperationSpec> = manifest
+            .operations
+            .iter()
+            .map(|o| (o.name.as_str(), o))
+            .collect();
+        assert_eq!(by_name.len(), ops.len(), "op count changed");
+        for (name, contract) in &ops {
+            let spec = by_name
+                .get(*name)
+                .unwrap_or_else(|| panic!("missing op {name}"));
+            assert_contract(name, &spec.input_schema, contract);
+        }
     }
 }

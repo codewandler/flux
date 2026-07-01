@@ -11,3 +11,5 @@ path = "src/main.rs"
 [dependencies]
 host-kit.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+schemars.workspace = true
