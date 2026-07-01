@@ -68,7 +68,10 @@ pub fn build_messages_body(req: &Request, q: &MessagesQuirks) -> Result<Value> {
         "stream": true,
     });
 
-    if let Some(s) = system {
+    if !req.system_segments.is_empty() {
+        body["system"] =
+            segmented_system_field(&req.system_segments, system.as_deref(), q.prompt_caching);
+    } else if let Some(s) = system {
         body["system"] = system_field(&s, q.prompt_caching);
     }
     if !req.tools.is_empty() {
@@ -114,6 +117,40 @@ fn system_field(s: &str, caching: bool) -> Value {
         json!([{ "type": "text", "text": s, "cache_control": { "type": "ephemeral" } }])
     } else {
         json!(s)
+    }
+}
+
+/// A segmented system prompt (A-03 cache-first layout): with caching, one text block per segment,
+/// `cache_control: ephemeral` on the segments marked as breakpoints — so a change in a later
+/// (dynamic) segment can't invalidate the cached prefix. `folded` (system-role conversation
+/// messages) lands as a trailing uncached block. Without caching, everything joins to the plain
+/// string form, order preserved.
+fn segmented_system_field(
+    segments: &[flux_provider::SystemSegment],
+    folded: Option<&str>,
+    caching: bool,
+) -> Value {
+    if caching {
+        let mut blocks: Vec<Value> = segments
+            .iter()
+            .map(|seg| {
+                let mut b = json!({ "type": "text", "text": seg.text });
+                if seg.cache {
+                    b["cache_control"] = json!({ "type": "ephemeral" });
+                }
+                b
+            })
+            .collect();
+        if let Some(s) = folded {
+            blocks.push(json!({ "type": "text", "text": s }));
+        }
+        Value::Array(blocks)
+    } else {
+        let mut parts: Vec<&str> = segments.iter().map(|s| s.text.as_str()).collect();
+        if let Some(s) = folded {
+            parts.push(s);
+        }
+        json!(parts.join("\n\n"))
     }
 }
 
@@ -443,6 +480,58 @@ mod tests {
             .insert("provider".into(), json!({ "require_parameters": true }));
         let body = build_messages_body(&req, &q).unwrap();
         assert_eq!(body["provider"]["require_parameters"], true);
+    }
+
+    #[test]
+    fn segmented_system_renders_breakpoints_on_cached_segments_only() {
+        use flux_provider::SystemSegment;
+        let mut req = Request::new("claude-sonnet-4-6", "hi");
+        req.system_segments = vec![
+            SystemSegment {
+                text: "catalog".into(),
+                cache: true,
+            },
+            SystemSegment {
+                text: "identity".into(),
+                cache: true,
+            },
+            SystemSegment {
+                text: "symbols".into(),
+                cache: false,
+            },
+        ];
+        let body = build_messages_body(&req, &anthropic_quirks()).unwrap();
+        let sys = body["system"].as_array().expect("block array");
+        assert_eq!(sys.len(), 3);
+        assert_eq!(sys[0]["text"], "catalog");
+        assert_eq!(sys[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(sys[1]["cache_control"]["type"], "ephemeral");
+        assert!(
+            sys[2].get("cache_control").is_none(),
+            "the dynamic tail must not carry a breakpoint"
+        );
+    }
+
+    #[test]
+    fn segmented_system_joins_plain_when_caching_is_off() {
+        use flux_provider::SystemSegment;
+        let mut req = Request::new("z-ai/glm-4.6", "hi");
+        req.system_segments = vec![
+            SystemSegment {
+                text: "a".into(),
+                cache: true,
+            },
+            SystemSegment {
+                text: "b".into(),
+                cache: false,
+            },
+        ];
+        let q = MessagesQuirks {
+            prompt_caching: false,
+            ..anthropic_quirks()
+        };
+        let body = build_messages_body(&req, &q).unwrap();
+        assert_eq!(body["system"], "a\n\nb");
     }
 
     #[tokio::test]

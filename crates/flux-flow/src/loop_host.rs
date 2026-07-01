@@ -1276,10 +1276,12 @@ op project_greet(name: String) -> String
             "rec"
         }
         async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            // `system_text()` joins the segmented system (A-03) — the planner carries its catalog
+            // in segments, so recording `req.system` alone would capture nothing.
             self.systems
                 .lock()
                 .unwrap()
-                .push(req.system.unwrap_or_default());
+                .push(req.system_text().unwrap_or_default());
             let convo = req
                 .messages
                 .iter()

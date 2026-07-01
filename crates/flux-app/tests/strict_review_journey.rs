@@ -44,7 +44,9 @@ impl Provider for ReviewerMockProvider {
     }
 
     async fn stream(&self, req: Request) -> Result<ChunkStream> {
-        let system = req.system.unwrap_or_default();
+        // `system_text()` joins the segmented system prompt (A-03) — the role prompt now rides in
+        // a segment, so `req.system` alone is empty.
+        let system = req.system_text().unwrap_or_default();
         let text = if system.contains("SECURITY reviewer") {
             json!([{
                 "severity": "critical",

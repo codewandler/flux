@@ -61,6 +61,17 @@ pub struct ToolDef {
     pub input_schema: serde_json::Value,
 }
 
+/// One segment of a segmented system prompt. Segments render in order; `cache: true` marks a
+/// prompt-cache breakpoint AFTER this segment (Anthropic `cache_control`), so callers can lay the
+/// prompt out cache-first: byte-stable material (op catalog, grammar, identity) in cached segments,
+/// per-turn material (session symbols) in a trailing uncached one. Codecs without segment support
+/// join the texts in order (see [`Request::system_text`]).
+#[derive(Debug, Clone)]
+pub struct SystemSegment {
+    pub text: String,
+    pub cache: bool,
+}
+
 /// A provider-agnostic inference request.
 #[derive(Debug, Clone)]
 pub struct Request {
@@ -68,6 +79,9 @@ pub struct Request {
     pub model: String,
     /// Optional system prompt.
     pub system: Option<String>,
+    /// Segmented system prompt (takes precedence over `system` when non-empty). Lets the engine
+    /// separate cache-stable prompt material from per-turn material — see [`SystemSegment`].
+    pub system_segments: Vec<SystemSegment>,
     /// Conversation messages.
     pub messages: Vec<Message>,
     /// Tools available to the model.
@@ -94,6 +108,7 @@ impl Request {
         Self {
             model: model.into(),
             system: None,
+            system_segments: Vec::new(),
             messages: vec![Message::user_text(prompt)],
             tools: Vec::new(),
             max_tokens: 4096,
@@ -104,6 +119,23 @@ impl Request {
             effort: None,
             metadata: serde_json::Map::new(),
         }
+    }
+
+    /// The full system prompt as one string: the joined segments when segmented, else `system`.
+    /// The fallback for codecs (OpenAI Chat/Responses) whose wire has no cache-breakpoint notion —
+    /// segment order is preserved so the prefix stays byte-stable for providers that prefix-cache
+    /// implicitly.
+    pub fn system_text(&self) -> Option<String> {
+        if !self.system_segments.is_empty() {
+            return Some(
+                self.system_segments
+                    .iter()
+                    .map(|s| s.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            );
+        }
+        self.system.clone()
     }
 
     pub fn with_system(mut self, system: impl Into<String>) -> Self {
@@ -264,10 +296,22 @@ impl Provider for NativeProvider {
 
     async fn stream(&self, mut req: Request) -> Result<ChunkStream> {
         if let Some(prefix) = self.cred.system_prefix() {
-            req.system = Some(match req.system.take() {
-                Some(s) => format!("{prefix}\n\n{s}"),
-                None => prefix,
-            });
+            if !req.system_segments.is_empty() {
+                // The transport-required prefix is constant per credential → its own cached
+                // segment at the very front, keeping the segments after it prefix-stable.
+                req.system_segments.insert(
+                    0,
+                    SystemSegment {
+                        text: prefix,
+                        cache: true,
+                    },
+                );
+            } else {
+                req.system = Some(match req.system.take() {
+                    Some(s) => format!("{prefix}\n\n{s}"),
+                    None => prefix,
+                });
+            }
         }
 
         let body = self.codec.build_body(&req)?;

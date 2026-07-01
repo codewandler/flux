@@ -2,9 +2,8 @@
 id: A-03
 title: Cache-stable prompt layout — stop re-writing the ~34k prefix on every call
 pillar: Agent
-status: ready
-priority: 2
-note: prompt caching NEVER hits — HashMap-ordered op catalog shuffles the prompt per process, and per-turn symbols sit inside the single cache_control block; every provider call pays ~34k cache-WRITE (1.25× input), ~10× cost overhead
+status: done
+note: FIXED — name-sorted registry/catalog + segmented cache-first system prompt (`SystemSegment` on `Request`; planner catalog/grammar and identity blocks carry breakpoints, per-turn symbols ride uncached after them); live-verified 99% cross-process cache hit ($0.1199 → $0.0106, 11.3×) and 96% in-session hit on a 12-step turn
 ---
 
 # Cache-stable prompt layout — stop re-writing the ~34k prefix on every call
@@ -33,24 +32,38 @@ Root causes (all verified in code):
    of the breakpoint.
 
 ## Acceptance
-- [ ] Failing-first: `ToolRegistry::specs()`/`names()` (and `OpRegistry::signatures()`) return
-      name-sorted results — a test registers ops and asserts sorted order (fails on HashMap order
-      whenever the seed differs).
-- [ ] Failing-first: build the planner system prompt twice for the same session with a *changed
-      symbol set* — the static prefix (identity + instructions + catalog + grammar) must be
-      byte-identical, with per-turn material (symbols, skills-if-changing, context) placed after the
-      cache breakpoint or in messages. Assert on the block structure the codec emits (multi-block
-      `system` array with `cache_control` on the last *static* block).
-- [ ] The Messages body builder supports a static/dynamic system split (array of blocks, breakpoint
-      on the static head) — unit test pins the emitted JSON shape.
-- [ ] Live: second `flux run --yes "say ok"` in the same workspace within the cache TTL reports
-      `cache_read ≈ prefix size` and `cache_creation ≈ 0` (visible in the turn annotation /
-      `flux usage`); in-session turn 2 likewise.
-- [ ] The turn annotation renders cache reads AND writes distinctly (today a session line shows only
-      `cache write`, and `flux usage` labels writes ambiguously as `cache`).
+- [x] Failing-first: `ToolRegistry::specs()`/`names()`/`active_specs()` and
+      `OpRegistry::signatures()`/`op_names()` return name-sorted results
+      (`flux-runtime::tests::registry_specs_and_names_are_name_sorted`; registration order is
+      deliberately non-alphabetical).
+- [x] Failing-first: the planner system is assembled twice with a *changed symbol set* — segments A
+      (planner instructions + catalog + grammar) and B (base system) are byte-identical, symbols
+      ride in a trailing UNCACHED segment
+      (`compile::tests::system_segments_keep_the_static_prefix_stable_across_symbol_changes`).
+- [x] The Messages body builder renders segmented system prompts as a block array with
+      `cache_control` on the marked segments only, and joins plain when caching is off
+      (`segmented_system_renders_breakpoints_on_cached_segments_only`,
+      `segmented_system_joins_plain_when_caching_is_off`). Implemented as
+      `flux_provider::SystemSegment` + `Request.system_segments` (+ `Request::system_text()` for
+      codecs without a breakpoint notion — OpenAI Chat/Responses join in order, preserving the
+      stable-first prefix for their implicit caching; the subscription `system_prefix` prepends as
+      its own cached segment).
+- [x] Live (Bedrock sonnet, same workspace): first `flux run "say ok"` writes 31.7k ($0.1199); the
+      second run seconds later reads **99%** from cache ($0.0106 — **11.3× cheaper**). In-session:
+      a 12-step multi-plan turn ends at **96% hit**, $0.0681 total.
+- [x] `flux usage` rows now label `cache read` and `cache write` distinctly (the CLI turn
+      annotation already did).
 
 ## Progress
-- (not started)
+- **DONE (2026-07-02).** Registry sort in `flux-runtime` (`specs`/`names`/`active_specs`) +
+  `OpRegistry` (`signatures`/`op_names`). New `SystemSegment` seam: `Request.system_segments`
+  (flux-provider), rendered by `build_messages_body::segmented_system_field` (breakpoints per
+  marked segment; plain join when caching off); `compile_turn` assembles
+  `assemble_system_segments` = [A planner-static (cached), B base-system (cached), C symbols
+  (uncached)] — `build_planner_prompt` no longer takes the view, so segment A is byte-stable.
+  OpenAI codecs read `system_text()`. Mock/test providers matching on `req.system` updated to
+  `system_text()` (strict-review journey/SDK fixtures, orchestrate delegator probe, loop-host
+  recorder). `flux usage` labels reads vs writes. Full gate green.
 
 ## Notes
 - Found during the 2026-07-01 harness e2e review; numbers from Bedrock (`aws`) but the layout defect

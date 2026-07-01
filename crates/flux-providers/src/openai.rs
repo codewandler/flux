@@ -67,7 +67,9 @@ fn tool_result_text(content: &[ToolResultContent]) -> String {
 fn build_chat_body(req: &Request) -> Result<Value> {
     let mut messages: Vec<Value> = Vec::new();
 
-    if let Some(sys) = &req.system {
+    // `system_text` joins segmented prompts in order (OpenAI has no cache-breakpoint notion; its
+    // implicit prefix caching still benefits from the segments' stable-first layout).
+    if let Some(sys) = req.system_text() {
         messages.push(json!({ "role": "system", "content": sys }));
     }
 
@@ -705,7 +707,7 @@ fn map_effort_responses(e: Effort, codex: bool) -> &'static str {
 /// Build the Responses request body. Content blocks map to typed `input` items; tool results
 /// become `function_call_output`, assistant tool_use becomes `function_call`.
 fn build_responses_body(req: &Request, codex: bool) -> Result<Value> {
-    let mut instructions = req.system.clone();
+    let mut instructions = req.system_text();
     let mut input: Vec<Value> = Vec::new();
 
     for m in &req.messages {

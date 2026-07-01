@@ -20,7 +20,7 @@
 use futures::StreamExt;
 
 use flux_core::{Chunk, ContentBlock, Error, Message, Result, StopReason, Usage};
-use flux_provider::{Provider, Request, ToolDef};
+use flux_provider::{Provider, Request, SystemSegment, ToolDef};
 use flux_spec::tool_input_schema;
 use schemars::JsonSchema;
 
@@ -209,13 +209,7 @@ pub async fn compile_turn(
 ) -> Result<(TurnOutput, Usage)> {
     let steps = opts.max_steps.max(1);
     let interactive = ask.is_some();
-    let planner = build_planner_prompt(ops, view, interactive);
-    // The engine prepends its agent identity + project context + active skills; the CLI surfaces pass
-    // `None` (the planner block alone, as before).
-    let system = match base_system {
-        Some(b) if !b.trim().is_empty() => format!("{b}\n\n{planner}"),
-        _ => planner,
-    };
+    let segments = assemble_system_segments(base_system, ops, view, interactive);
     // Pure DAG: the model's ONLY tools are `emit_plan` (+ `ask_user`). Every op — reads included — is a
     // node in the emitted graph, so a turn is always an auditable plan, never a free-form tool call.
     let tools = planner_tools(interactive);
@@ -231,7 +225,8 @@ pub async fn compile_turn(
     for step in 1..=steps {
         let req = Request {
             model: model.to_string(),
-            system: Some(system.clone()),
+            system: None,
+            system_segments: segments.clone(),
             messages: messages.clone(),
             tools: tools.clone(),
             max_tokens: opts.max_tokens,
@@ -535,6 +530,7 @@ pub async fn render_completion(
     let req = Request {
         model: model.to_string(),
         system: Some(system),
+        system_segments: Vec::new(),
         messages: conversation.to_vec(),
         tools: Vec::new(),
         max_tokens,
@@ -741,7 +737,47 @@ Instruction: {instruction}\n",
     )
 }
 
-fn build_planner_prompt(ops: &OpRegistry, view: Option<&SessionView>, interactive: bool) -> String {
+/// The planner's cache-first system layout (A-03), most-stable material first so provider prompt
+/// caching hits:
+///   A (cached) — planner instructions + sorted op catalog + grammar: byte-stable per
+///       workspace/groups, the bulk of the prompt.
+///   B (cached) — agent identity + project context + active skills (the engine's base system):
+///       stable within a turn, drifts across turns/invocations (git status, skills) — its own
+///       breakpoint keeps a B-only change from invalidating A's segment.
+///   C (uncached) — the per-iteration session symbols: they change every plan round, so they live
+///       AFTER the last breakpoint where they can't invalidate anything.
+fn assemble_system_segments(
+    base_system: Option<&str>,
+    ops: &OpRegistry,
+    view: Option<&SessionView>,
+    interactive: bool,
+) -> Vec<SystemSegment> {
+    let mut segments = vec![SystemSegment {
+        text: build_planner_prompt(ops, interactive),
+        cache: true,
+    }];
+    if let Some(b) = base_system {
+        if !b.trim().is_empty() {
+            segments.push(SystemSegment {
+                text: b.to_string(),
+                cache: true,
+            });
+        }
+    }
+    let symbols = symbols_block(view);
+    if !symbols.trim().is_empty() {
+        segments.push(SystemSegment {
+            text: symbols,
+            cache: false,
+        });
+    }
+    segments
+}
+
+/// The **static** planner block (segment A): instructions + sorted op catalog + grammar. Contains
+/// nothing per-turn — the session symbols render separately (an uncached trailing segment in
+/// `compile_turn`) so this block stays byte-stable and prompt-cacheable across calls (A-03).
+fn build_planner_prompt(ops: &OpRegistry, interactive: bool) -> String {
     let ask_line = if interactive {
         " and `ask_user` (ask ONE clarifying question only if the request is genuinely ambiguous)"
     } else {
@@ -770,9 +806,8 @@ express control flow as Flux-Lang nodes, NOT inside shell commands, so the plan 
 existing session symbols instead of re-fetching. To embed a stored symbol's value INSIDE a string \
 argument (e.g. a `task` prompt or a message), write `{{symbol_name}}` — the runtime substitutes the \
 value at execution; to pass a symbol's value as a whole argument, use it directly as a `var` node. Each \
-op is shown as `name({{params}})` — call a multi-param op with a single object argument naming each parameter (e.g. `write({{path, content}})`); a sole-required-param op accepts a bare value (e.g. `read(\"README.md\")`). [optional] params may be omitted from the object.\n\nOperation catalog (for the AST):\n{catalog}{symbols}\n{grammar}\n",
+op is shown as `name({{params}})` — call a multi-param op with a single object argument naming each parameter (e.g. `write({{path, content}})`); a sole-required-param op accepts a bare value (e.g. `read(\"README.md\")`). [optional] params may be omitted from the object.\n\nOperation catalog (for the AST):\n{catalog}\n{grammar}\n",
         catalog = ops_catalog(ops),
-        symbols = symbols_block(view),
         grammar = ast_grammar(),
     )
 }
@@ -972,6 +1007,48 @@ mod tests {
         .unwrap();
         assert_eq!(out.attempts, 2);
         assert_eq!(out.ast.body.len(), 1);
+    }
+
+    // -- A-03: cache-first system segmentation ----------------------------------------------------
+
+    #[test]
+    fn system_segments_keep_the_static_prefix_stable_across_symbol_changes() {
+        // The whole point of the layout: per-turn symbols must not perturb the cached segments.
+        // Segments A (planner) and B (base system) are byte-identical whether or not symbols exist;
+        // the symbols ride in a trailing UNCACHED segment.
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let view = SessionView {
+            symbols: vec![crate::state::SymbolView {
+                name: crate::ast::SymbolName("notes".into()),
+                ty: None,
+                summary: "the gathered notes".into(),
+                visibility: crate::ast::Visibility::Visible,
+            }],
+        };
+        let without = assemble_system_segments(Some("identity"), &ops, None, false);
+        let with = assemble_system_segments(Some("identity"), &ops, Some(&view), false);
+
+        assert_eq!(without.len(), 2, "planner + base, no symbols segment");
+        assert_eq!(with.len(), 3, "planner + base + symbols");
+        assert_eq!(
+            with[0].text, without[0].text,
+            "segment A must be byte-stable"
+        );
+        assert_eq!(
+            with[1].text, without[1].text,
+            "segment B must be byte-stable"
+        );
+        assert!(
+            with[0].cache && with[1].cache,
+            "static segments carry breakpoints"
+        );
+        assert!(!with[2].cache, "the symbols segment must be uncached");
+        assert!(with[2].text.contains("$notes"));
+        assert!(
+            !with[0].text.contains("$notes") && !with[1].text.contains("$notes"),
+            "symbols must not leak into the cached segments"
+        );
     }
 
     // -- A-04: surfacing enforcement (hidden ops in model-emitted plans) -------------------------

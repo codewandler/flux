@@ -2073,7 +2073,7 @@ mod tests {
                 let n = self
                     .calls
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let is_delegator = req.system.unwrap_or_default().contains("DELEGATE");
+                let is_delegator = req.system_text().unwrap_or_default().contains("DELEGATE");
                 let chunks = if n == 0 {
                     let ast = if is_delegator {
                         json!({ "body": [{ "kind": "call", "op": "task", "args": [

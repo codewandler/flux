@@ -369,9 +369,14 @@ impl ToolRegistry {
         self.tools.remove(name)
     }
 
-    /// Specs for every registered tool (e.g. to advertise to the model).
+    /// Specs for every registered tool (e.g. to advertise to the model), **name-sorted**: the
+    /// backing map is a `HashMap` whose iteration order changes per process, and anything rendered
+    /// into the model prompt from here must be byte-stable or the provider prompt cache can never
+    /// hit across invocations (A-03).
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools.values().map(|t| t.spec()).collect()
+        let mut specs: Vec<ToolSpec> = self.tools.values().map(|t| t.spec()).collect();
+        specs.sort_by(|a, b| a.name.cmp(&b.name));
+        specs
     }
 
     /// A registry scoped to a sub-agent's allowed tools. `None` (the role declared no `tools` key)
@@ -391,23 +396,30 @@ impl ToolRegistry {
         ToolRegistry { tools }
     }
 
+    /// Every registered tool name, sorted (see [`specs`](Self::specs) for why order must be stable).
     pub fn names(&self) -> Vec<String> {
-        self.tools.keys().cloned().collect()
+        let mut names: Vec<String> = self.tools.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     /// Specs for the ops that should be **advertised to the model** given the group manifest and the
     /// active group set: core ops (in no group) always; a grouped op only when its group is active.
     /// See [`is_advertised`]. An empty manifest with no group-tagged specs advertises everything.
+    /// Name-sorted, like [`specs`](Self::specs).
     pub fn active_specs(
         &self,
         groups: &[flux_evidence::ToolGroup],
         active: &HashSet<String>,
     ) -> Vec<ToolSpec> {
-        self.tools
+        let mut specs: Vec<ToolSpec> = self
+            .tools
             .values()
             .map(|t| t.spec())
             .filter(|s| is_advertised(s, groups, active))
-            .collect()
+            .collect();
+        specs.sort_by(|a, b| a.name.cmp(&b.name));
+        specs
     }
 }
 
@@ -1151,6 +1163,19 @@ mod tests {
         let mut r = ToolRegistry::new();
         r.register(Arc::new(EchoTool));
         r
+    }
+
+    /// A-03: everything rendered into the model prompt must be byte-stable — the backing `HashMap`'s
+    /// iteration order changes per process, so `specs()`/`names()` must sort. (Registration order is
+    /// deliberately non-alphabetical here.)
+    #[test]
+    fn registry_specs_and_names_are_name_sorted() {
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(PingTool));
+        r.register(Arc::new(EchoTool));
+        assert_eq!(r.names(), vec!["echo".to_string(), "ping".to_string()]);
+        let spec_names: Vec<String> = r.specs().into_iter().map(|s| s.name).collect();
+        assert_eq!(spec_names, vec!["echo".to_string(), "ping".to_string()]);
     }
 
     /// Like [`registry`], plus [`PingTool`] — used only by the capability-scope tests below, which

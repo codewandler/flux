@@ -67,7 +67,7 @@ impl<'a> OpRegistry<'a> {
         self.advertised.as_ref().is_none_or(|a| a.contains(name))
     }
 
-    /// The names of every **advertised** operation.
+    /// The names of every **advertised** operation, sorted (prompt-rendered — must be byte-stable).
     pub fn op_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self
             .tools
@@ -81,10 +81,12 @@ impl<'a> OpRegistry<'a> {
                 .filter(|c| c.meta.expose)
                 .map(|c| c.name.clone()),
         );
+        names.sort();
         names
     }
 
-    /// The signature of every **advertised** operation.
+    /// The signature of every **advertised** operation, name-sorted: the catalog is rendered into
+    /// the planner system prompt, and an unstable order breaks provider prompt caching (A-03).
     pub fn signatures(&self) -> Vec<OpSignature> {
         let mut signatures: Vec<OpSignature> = self
             .tools
@@ -99,6 +101,7 @@ impl<'a> OpRegistry<'a> {
                 .filter(|c| c.meta.expose)
                 .map(composite_signature),
         );
+        signatures.sort_by(|a, b| a.name.cmp(&b.name));
         signatures
     }
 

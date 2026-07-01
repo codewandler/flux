@@ -901,8 +901,10 @@ fn print_usage_rows(rows: &[flux_events::ModelCost]) {
             }
             None => String::new(),
         };
+        // Reads and writes are different money (reads ≈ 0.1× input, writes ≈ 1.25×) — label them
+        // distinctly so a cache-thrash pattern (all writes, no reads) is visible at a glance.
         println!(
-            "  {:<28} {:>3} call{}  ctx {} · out {}{}{}",
+            "  {:<28} {:>3} call{}  ctx {} · out {}{}{}{}",
             row.model,
             row.calls,
             if row.calls == 1 { " " } else { "s" },
@@ -910,8 +912,16 @@ fn print_usage_rows(rows: &[flux_events::ModelCost]) {
             style::fmt_tokens(row.usage.output_tokens),
             if row.usage.cache_read_input_tokens > 0 {
                 format!(
-                    " · cache {}",
+                    " · cache read {}",
                     style::fmt_tokens(row.usage.cache_read_input_tokens)
+                )
+            } else {
+                String::new()
+            },
+            if row.usage.cache_creation_input_tokens > 0 {
+                format!(
+                    " · cache write {}",
+                    style::fmt_tokens(row.usage.cache_creation_input_tokens)
                 )
             } else {
                 String::new()
