@@ -8,6 +8,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **sql/asterisk per-call read timeout is now wire-enforced (D-45).** The `timeout` input (parsed
+  since D-40/D-41 but previously discarded) is now plumbed through the host `conn.read`
+  (`timeout_ms`) and `host-kit`'s `ConnStream::set_read_deadline`, surfacing
+  `std::io::ErrorKind::TimedOut` instead of a silent hang when a PostgreSQL or AMI server stops
+  responding. The connection stays open on timeout (the plugin decides to retry or close). 5
+  failing-first tests (1 live-loopback host test + 2 sql + 2 asterisk).
+
 - **`flux plugin call/run --arg` — schema-coerced plugin op invocation (Track A1).** `flux plugin
   call <name> <op> [json-input]` (now aliased `run`) accepts repeatable `--arg key=value` flags,
   coercing each value to the op's declared `input_schema` type (string/integer/boolean/array/

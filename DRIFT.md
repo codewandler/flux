@@ -293,10 +293,12 @@ Full D-36 per-plugin loop for `sql` (the conn-wave plugin).
   `conn_props()`. Added `timeout: Option<String>` to `ConnProps` (all 7 ops); `parse_duration`/
   `parse_duration_default` helpers; threaded through `resolve_target` (parsed once per op,
   defaults 10s, invalid values error before dialing). Failing-first tests.
-- **Host timeout limitation:** `Host::conn_dial`/`conn_dial_ref` and `flux_system::net::dial_scoped`
-  do not accept a per-call timeout, so the parsed duration is validated at input time but cannot be
-  enforced as a dial/query deadline. Reported honestly; a follow-up could plumb a timeout through
-  the host `conn.*` capability (host-protocol change, out of scope).
+- **Host timeout limitation (RESOLVED by D-45):** the parsed duration is now wire-enforced. D-45
+  plumbed a per-read deadline through the host `conn.read` (`timeout_ms`) and `ConnStream`
+  (`set_read_deadline` → `ErrorKind::TimedOut`); sql's `PgClient::connect` forwards `target.timeout`
+  to the stream. (Originally: `Host::conn_dial`/`conn_dial_ref` and `flux_system::net::dial_scoped`
+  do not accept a per-call timeout, so the parsed duration was validated at input time but could
+  not be enforced.)
 
 ---
 
@@ -319,8 +321,10 @@ Full D-36 per-plugin loop for `asterisk` (the AMI plugin).
   `host.endpoint(...)`.
 
 ## Ported gaps
-- **`timeout`** on every op (Go-duration) — parsed/validated (same host-limitation as sql: `conn.*`
-  exposes no per-call timeout, so validated not enforced).
+- **`timeout`** on every op (Go-duration) — parsed/validated, and now **wire-enforced** (D-45):
+  `with_ami` + `ami.ping` forward `ami_timeout(&input)?` to `ConnStream::set_read_deadline`, so a
+  hung AMI server surfaces `ErrorKind::TimedOut` instead of a silent hang. (Originally noted the
+  same host-limitation as sql: `conn.*` exposed no per-call timeout, so validated not enforced.)
 - **`call.originate`** missing params `early_media`/`channel_id`/`other_channel_id` — handler now
   sends `EarlyMedia`/`ChannelId`/`OtherChannelId` AMI fields.
 - **`peer.list` output `comment`** — PJSIP from `ActiveChannels` ("N active channel(s)"); SIP/IAX
@@ -483,3 +487,53 @@ the `<json-input>` base — mirroring the fluxplane `operation invoke` (`run`/`c
 This unblocks the plan's step 5 (live smoke) for every migrated plugin: `flux plugin run <p>
 <op> --arg k=v …` is now ergonomic (no hand-written JSON blob), and `--dry-run` lets you confirm
 the input without touching the network.
+
+---
+
+# D-45 — sql/asterisk `timeout` wire-enforcement (DONE)
+
+The D-40/D-41 deferred item ("host `conn.*` exposes no per-call timeout, so `timeout` is
+parsed/validated but not enforced") is closed. The parsed `timeout` is now wire-enforced end-to-end.
+
+## Path
+`input.timeout` (Go duration string) → `parse_duration` → `Option<Duration>` →
+`ConnStream::set_read_deadline` → forwarded on every `Host::conn_read_timed` call as `timeout_ms` →
+host `conn.read` races `tokio::time::timeout(dur, stream.read(max))`.
+
+## Host (`flux-plugin/src/lib.rs`)
+`conn.read` arm: reads optional `timeout_ms` from the payload; on elapsed returns
+`{data_b64:"", eof:false, timed_out:true}` and **leaves the connection open** (the connection map
+entry is untouched — the plugin decides to retry or close).
+
+## host-kit
+- `Host::conn_read_timed(conn_id, max, timeout_ms)`: adds `timeout_ms` to the `conn.read` request;
+  maps a `timed_out` response to `Err("conn.read: timed out after Nms")`.
+- `ConnStream`: gains `read_deadline: Option<Duration>` + `set_read_deadline`; its `Read` impl
+  forwards the deadline and maps the "timed out" host error to `ErrorKind::TimedOut` (other errors
+  stay `Error::other`), so a wire-protocol loop can distinguish a deadline from a clean EOF (`Ok(0)`).
+- `MockHost` `conn.read`: returns `timed_out:true` when a deadline is set and no data is ready.
+
+## Plugins
+- **sql**: `PgClient::connect` takes `timeout: Option<Duration>`, calls `set_read_deadline` before
+  the handshake; all 6 op handlers pass `target.timeout`.
+- **asterisk**: `with_ami(host, timeout, …)` sets the deadline on the stream; the 7 `with_ami`
+  callers + `ami.ping` pass `ami_timeout(&input)?`.
+
+## Semantics
+A timeout does NOT close the connection. The wire protocols (PostgreSQL v3, AMI) are
+request/response, so a deadline on every read bounds each round-trip; on elapsed the plugin
+surfaces the error and the outer handler's `conn_close` cleans up. Closing on timeout would
+complicate retry semantics.
+
+## Tests (failing-first)
+- `flux-plugin`: `conn_read_timeout_returns_timed_out_without_closing` (live loopback server that
+  accepts but never writes → `timed_out:true`, empty body, connection still usable for a write).
+- `sql`: `timeout_is_enforced_on_read_when_no_server_data` (no server frames + `timeout:"1ms"` →
+  "timed out", not the pre-wiring "connection closed mid-message (EOF)").
+- `asterisk`: `test_ami_ping_timeout_is_enforced_when_no_greeting` (no greeting + `timeout:"1ms"` →
+  "timed out" via the greeting read).
+
+## Concurrent WIP
+The user's C-09a WIP (`internal` op flag across `flux-plugin`/`host-kit`/`kubernetes`) was stashed
+together before this work, consistency restored, then re-applied untouched. D-45's changes are
+orthogonal (the `conn.read` arm + `ConnStream` deadline).

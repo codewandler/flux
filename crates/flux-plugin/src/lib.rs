@@ -2762,6 +2762,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conn_read_timeout_returns_timed_out_without_closing() {
+        // D-45: a `conn.read` with `timeout_ms` that elapses before data arrives returns
+        // `timed_out: true` (and an empty body) while leaving the connection open — the plugin
+        // can retry or close. A server that accepts but never writes exercises the deadline path.
+        use flux_system::{System, Workspace};
+        use tokio::io::AsyncReadExt;
+        let dir = std::env::temp_dir().join(format!("flux-conn-timeout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+
+        // A loopback server that accepts but never writes (so the client's read blocks until the
+        // deadline). It holds the socket open for the whole test so the read doesn't get a clean
+        // EOF — only the timeout fires.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept_task = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Keep the socket open (no write) so the client's read blocks; drain until closed.
+            let mut buf = [0u8; 64];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        let caps = SystemHostCaps::new(sys)
+            .with_private_net_grants(vec!["127.0.0.1".into()])
+            .with_grants(PluginCapabilities {
+                conn: vec!["tcp:127.0.0.1:*".into()],
+                private_hosts: vec!["127.0.0.1".into()],
+                ..Default::default()
+            });
+        let dial = json!({"kind": "tcp", "host": "127.0.0.1", "port": port});
+        let id = caps.handle("conn.dial", &dial).await.unwrap()["conn_id"]
+            .as_u64()
+            .unwrap();
+
+        // A 10ms deadline on a read against a server that never writes → timed_out, empty body.
+        let read = caps
+            .handle(
+                "conn.read",
+                &json!({"conn_id": id, "max": 64, "timeout_ms": 10}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read["timed_out"], true, "the read should time out: {read}");
+        let body = base64::engine::general_purpose::STANDARD
+            .decode(read["data_b64"].as_str().unwrap())
+            .unwrap();
+        assert!(body.is_empty(), "no data should arrive before the deadline");
+        // The connection stays open (not closed by the timeout): a write still succeeds.
+        let ping = base64::engine::general_purpose::STANDARD.encode(b"ping");
+        let wrote = caps
+            .handle("conn.write", &json!({"conn_id": id, "data_b64": ping}))
+            .await
+            .unwrap();
+        assert_eq!(
+            wrote["written"], 4,
+            "the connection is still usable after a timeout"
+        );
+
+        caps.handle("conn.close", &json!({"conn_id": id}))
+            .await
+            .unwrap();
+        accept_task.await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn blob_put_get_info_round_trips_and_is_gated() {
         use flux_system::{System, Workspace};
         let dir = std::env::temp_dir().join(format!("flux-blob-test-{}", std::process::id()));

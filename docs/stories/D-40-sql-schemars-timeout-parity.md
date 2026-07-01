@@ -38,10 +38,13 @@ fluxplane parity re-audit, and porting the gaps surfaced.
 - [x] Dev loop green: `cargo build/test/clippy -D warnings/fmt` for `sql` (17 tests).
 
 ## Notes
-- **Host timeout limitation:** `Host::conn_dial`/`conn_dial_ref` and `flux_system::net::dial_scoped`
-  do not accept a per-call timeout, so the parsed duration is validated at input time but cannot be
-  enforced as a dial/query deadline. The worker reported this honestly rather than adding a fake
-  enforcement path. A follow-up could plumb a timeout through the host `conn.*` capability — out of
-  scope here (host-protocol change).
+- **Host timeout limitation (RESOLVED by D-45):** the parsed duration is now wire-enforced.
+  D-45 plumbed a per-read deadline through the host `conn.read` (`timeout_ms`) +
+  `ConnStream::set_read_deadline`; sql's `PgClient::connect` forwards `target.timeout` to the
+  stream. (Originally: `Host::conn_dial`/`conn_dial_ref` and `flux_system::net::dial_scoped` do
+  not accept a per-call timeout, so the parsed duration was validated at input time but could not
+  be enforced as a dial/query deadline. The worker reported this honestly rather than adding a
+  fake enforcement path. A follow-up could plumb a timeout through the host `conn.*` capability —
+  out of scope here (host-protocol change).)
 - The flux-only `endpoint` object (a discovered endpoint reference from `endpoint.select`) has no
   fluxplane equivalent; kept as flux's reference-IO extension.

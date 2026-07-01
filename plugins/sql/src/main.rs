@@ -936,7 +936,7 @@ fn op_test(input: Value, host: &mut Host) -> Result<Value, String> {
 
     let cid = dial(&target, host)?;
     let result = (|| -> Result<Value, String> {
-        let mut pg = PgClient::connect(host, cid, &user, &password, &database)?;
+        let mut pg = PgClient::connect(host, cid, &user, &password, &database, target.timeout)?;
         let res = pg.simple_query("SELECT 1")?;
         let _ = res; // connectivity only; the value is unused
         Ok(json!({
@@ -963,7 +963,7 @@ fn op_query(input: Value, host: &mut Host) -> Result<Value, String> {
 
     let cid = dial(&target, host)?;
     let shaped = (|| -> Result<Value, String> {
-        let mut pg = PgClient::connect(host, cid, &user, &password, &database)?;
+        let mut pg = PgClient::connect(host, cid, &user, &password, &database, target.timeout)?;
         let result = pg.simple_query(&query)?;
         let (rows, truncated) = bounded_rows(&result, max_rows);
         Ok(json!({
@@ -991,7 +991,7 @@ fn op_database_list(input: Value, host: &mut Host) -> Result<Value, String> {
 
     let cid = dial(&target, host)?;
     let result = (|| -> Result<Value, String> {
-        let mut pg = PgClient::connect(host, cid, &user, &password, &database)?;
+        let mut pg = PgClient::connect(host, cid, &user, &password, &database, target.timeout)?;
         let mut databases: Vec<Value> = Vec::new();
         // Databases.
         let db_res = pg.simple_query(
@@ -1045,7 +1045,7 @@ fn op_table_list(input: Value, host: &mut Host) -> Result<Value, String> {
 
     let cid = dial(&target, host)?;
     let result = (|| -> Result<Value, String> {
-        let mut pg = PgClient::connect(host, cid, &user, &password, &database)?;
+        let mut pg = PgClient::connect(host, cid, &user, &password, &database, target.timeout)?;
         let relkinds = if include_views {
             "('r','p','v','m')"
         } else {
@@ -1108,7 +1108,7 @@ fn op_table_show(input: Value, host: &mut Host) -> Result<Value, String> {
 
     let cid = dial(&target, host)?;
     let result = (|| -> Result<Value, String> {
-        let mut pg = PgClient::connect(host, cid, &user, &password, &database)?;
+        let mut pg = PgClient::connect(host, cid, &user, &password, &database, target.timeout)?;
 
         // Columns.
         let col_sql = format!(
@@ -1215,7 +1215,7 @@ fn op_index_list(input: Value, host: &mut Host) -> Result<Value, String> {
 
     let cid = dial(&target, host)?;
     let result = (|| -> Result<Value, String> {
-        let mut pg = PgClient::connect(host, cid, &user, &password, &database)?;
+        let mut pg = PgClient::connect(host, cid, &user, &password, &database, target.timeout)?;
         let sql = format!(
             "SELECT n.nspname AS table_schema, t.relname AS table_name, i.relname AS index_name, \
              ix.indisunique, ix.indisprimary, am.amname, pg_get_indexdef(ix.indexrelid) AS definition \
@@ -1457,11 +1457,17 @@ impl<'h, 'a> PgClient<'h, 'a> {
         user: &str,
         password: &str,
         database: &str,
+        timeout: Option<std::time::Duration>,
     ) -> Result<PgClient<'h, 'a>, String> {
         let mut client = PgClient {
             stream: ConnStream::new(host, conn_id),
             server_version: None,
         };
+        // D-45: forward the per-call `timeout` to the host's `conn.read` as a read deadline.
+        // The PostgreSQL wire protocol is request/response, so a deadline on every read bounds
+        // the whole handshake + query exchange; on elapsed the host returns ErrorKind::TimedOut
+        // (the connection stays open — closed by the outer handler's conn_close).
+        client.stream.set_read_deadline(timeout);
         client.startup(user, database)?;
         client.authenticate(user, password)?;
         client.drain_to_ready()?;
@@ -2592,6 +2598,20 @@ mod tests {
         let mut host = host_with(vec![]);
         let err = run("sql.test", json!({"timeout": "not-a-duration"}), &mut host).unwrap_err();
         assert!(err.contains("timeout"), "err = {err}");
+    }
+
+    #[test]
+    fn timeout_is_enforced_on_read_when_no_server_data() {
+        // Failing-first for D-45: a valid `timeout` forwards a per-read deadline to the host's
+        // `conn.read`. With no server frames queued, the handshake's first read returns
+        // ErrorKind::TimedOut (not a silent hang or a clean EOF) — surfaced as "timed out".
+        // Before the deadline wiring, the read would return EOF ("connection closed mid-message").
+        let mut host = MockHost::default()
+            .with_endpoint("sql.endpoint", "postgres://app@db.test:5432/warehouse")
+            .with_secret("username", "app")
+            .with_secret("password", "secret");
+        let err = run("sql.test", json!({"timeout": "1ms"}), &mut host).unwrap_err();
+        assert!(err.contains("timed out"), "err = {err}");
     }
 
     #[test]

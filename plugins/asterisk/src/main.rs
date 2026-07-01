@@ -510,8 +510,9 @@ fn ami_address(host: &mut Host) -> Result<(String, u16), String> {
 // ---------------------------------------------------------------------------
 
 /// Run a closure that uses an authenticated AMI session, then close the connection.
-/// The closure receives: (reader, action_counter).
-fn with_ami<F, T>(host: &mut Host, f: F) -> Result<T, String>
+/// The closure receives: (reader, action_counter). The `timeout` (D-45) is forwarded to the
+/// host's `conn.read` as a per-read deadline bounding the AMI request/response exchange.
+fn with_ami<F, T>(host: &mut Host, timeout: Option<Duration>, f: F) -> Result<T, String>
 where
     F: FnOnce(&mut BufReader<ConnStream>, &mut u32) -> Result<T, String>,
 {
@@ -525,7 +526,8 @@ where
     })?;
 
     let result = {
-        let stream = ConnStream::new(host, cid);
+        let mut stream = ConnStream::new(host, cid);
+        stream.set_read_deadline(timeout);
         let mut reader = BufReader::new(stream);
         let mut counter: u32 = 0;
 
@@ -721,7 +723,7 @@ fn active_channels_comment(value: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn ami_ping(input: Value, host: &mut Host) -> Result<Value, String> {
-    let _timeout = ami_timeout(&input)?;
+    let timeout = ami_timeout(&input)?;
     let start = Instant::now();
     let username = host.secret("username")?;
     let secret = host.secret("secret")?;
@@ -733,7 +735,8 @@ fn ami_ping(input: Value, host: &mut Host) -> Result<Value, String> {
     })?;
 
     let result = (|| {
-        let stream = ConnStream::new(host, cid);
+        let mut stream = ConnStream::new(host, cid);
+        stream.set_read_deadline(timeout);
         let mut reader = BufReader::new(stream);
         let mut counter: u32 = 0;
 
@@ -802,10 +805,10 @@ fn ami_ping(input: Value, host: &mut Host) -> Result<Value, String> {
 }
 
 fn channel_list(input: Value, host: &mut Host) -> Result<Value, String> {
-    let _timeout = ami_timeout(&input)?;
+    let timeout = ami_timeout(&input)?;
     let limit = flex_i64(&input, "limit").unwrap_or(0);
 
-    with_ami(host, |reader, counter| {
+    with_ami(host, timeout, |reader, counter| {
         let (_, events) = ami_collect(
             reader,
             &[("Action", "CoreShowChannels")],
@@ -849,7 +852,7 @@ fn channel_list(input: Value, host: &mut Host) -> Result<Value, String> {
 }
 
 fn peer_list(input: Value, host: &mut Host) -> Result<Value, String> {
-    let _timeout = ami_timeout(&input)?;
+    let timeout = ami_timeout(&input)?;
     let technology = flex_str(&input, "technology")
         .map(|s| s.to_lowercase())
         .unwrap_or_else(|| "pjsip".into());
@@ -866,7 +869,7 @@ fn peer_list(input: Value, host: &mut Host) -> Result<Value, String> {
         }
     };
 
-    with_ami(host, |reader, counter| {
+    with_ami(host, timeout, |reader, counter| {
         let collect_result = ami_collect(reader, &[("Action", action)], counter, complete_events);
 
         let events = match collect_result {
@@ -941,10 +944,10 @@ fn peer_list(input: Value, host: &mut Host) -> Result<Value, String> {
 }
 
 fn queue_status(input: Value, host: &mut Host) -> Result<Value, String> {
-    let _timeout = ami_timeout(&input)?;
+    let timeout = ami_timeout(&input)?;
     let queue_filter = flex_str(&input, "queue").unwrap_or_default();
 
-    with_ami(host, |reader, counter| {
+    with_ami(host, timeout, |reader, counter| {
         let mut action_fields = vec![("Action", "QueueStatus")];
         let queue_filter_ref: &str = &queue_filter;
         if !queue_filter_ref.is_empty() {
@@ -1073,13 +1076,13 @@ fn queue_status(input: Value, host: &mut Host) -> Result<Value, String> {
 }
 
 fn devicestate_list(input: Value, host: &mut Host) -> Result<Value, String> {
-    let _timeout = ami_timeout(&input)?;
+    let timeout = ami_timeout(&input)?;
     let device_filter = flex_str(&input, "device")
         .map(|s| s.to_lowercase())
         .unwrap_or_default();
     let limit = flex_i64(&input, "limit").unwrap_or(0);
 
-    with_ami(host, |reader, counter| {
+    with_ami(host, timeout, |reader, counter| {
         let (_, events) = ami_collect(
             reader,
             &[("Action", "DeviceStateList")],
@@ -1113,11 +1116,11 @@ fn devicestate_list(input: Value, host: &mut Host) -> Result<Value, String> {
 }
 
 fn channel_hangup(input: Value, host: &mut Host) -> Result<Value, String> {
-    let _timeout = ami_timeout(&input)?;
+    let timeout = ami_timeout(&input)?;
     let channel = flex_str(&input, "channel").ok_or("`channel` (string) required")?;
     let cause = flex_i64(&input, "cause").unwrap_or(0);
 
-    with_ami(host, |reader, counter| {
+    with_ami(host, timeout, |reader, counter| {
         let cause_str = cause.to_string();
         let mut fields = vec![("Action", "Hangup"), ("Channel", channel.as_str())];
         if cause > 0 {
@@ -1154,7 +1157,7 @@ fn channel_hangup(input: Value, host: &mut Host) -> Result<Value, String> {
 }
 
 fn call_originate(input: Value, host: &mut Host) -> Result<Value, String> {
-    let _timeout = ami_timeout(&input)?;
+    let timeout = ami_timeout(&input)?;
     let channel = flex_str(&input, "channel").ok_or("`channel` (string) required")?;
     let exten = flex_str(&input, "exten").unwrap_or_default();
     let context = flex_str(&input, "context").unwrap_or_default();
@@ -1194,7 +1197,7 @@ fn call_originate(input: Value, host: &mut Host) -> Result<Value, String> {
     let timeout_str = timeout_ms.to_string();
     let priority_str = priority.to_string();
 
-    with_ami(host, |reader, counter| {
+    with_ami(host, timeout, |reader, counter| {
         let mut fields: Vec<(&str, &str)> =
             vec![("Action", "Originate"), ("Channel", channel.as_str())];
 
@@ -1269,10 +1272,10 @@ fn call_originate(input: Value, host: &mut Host) -> Result<Value, String> {
 }
 
 fn ami_command(input: Value, host: &mut Host) -> Result<Value, String> {
-    let _timeout = ami_timeout(&input)?;
+    let timeout = ami_timeout(&input)?;
     let command = flex_str(&input, "command").ok_or("`command` (string) required")?;
 
-    with_ami(host, |reader, counter| {
+    with_ami(host, timeout, |reader, counter| {
         let resp = ami_do(
             reader,
             &[("Action", "Command"), ("Command", command.as_str())],
@@ -1667,6 +1670,23 @@ mod tests {
         assert!(
             result.unwrap_err().contains("timeout"),
             "error should mention timeout"
+        );
+    }
+
+    #[test]
+    fn test_ami_ping_timeout_is_enforced_when_no_greeting() {
+        // Failing-first for D-45: a valid `timeout` forwards a per-read deadline to the host's
+        // `conn.read`. With no greeting queued, the first read returns ErrorKind::TimedOut (not a
+        // silent hang) — surfaced via the greeting read's error. Before the wiring it would be a
+        // clean EOF ("AMI greeting: ... failed to fill whole buffer" or empty).
+        let mut mock = MockHost::default()
+            .with_secret("username", "admin")
+            .with_secret("secret", "s3cret");
+        let result = call("asterisk.ami.ping", json!({"timeout": "1ms"}), &mut mock);
+        assert!(result.is_err(), "expected a timeout error");
+        assert!(
+            result.unwrap_err().contains("timed out"),
+            "error should mention timed out"
         );
     }
 

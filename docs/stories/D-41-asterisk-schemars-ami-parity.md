@@ -43,5 +43,7 @@ fluxplane parity re-audit, and porting the gaps surfaced.
 - A `last_call` queue-member output field was intentionally NOT ported — it needs reliable RFC3339
   UTC date rendering and the crate has no `chrono`/`time` dependency; adding an ad-hoc calendar
   converter would be worse than leaving the gap explicit. Reported honestly.
-- Same host-timeout limitation as sql (D-40): `Host::conn_dial`/`conn_dial_ref` + `dial_scoped`
-  expose no per-call timeout, so `timeout` is parsed/validated but not wire-enforced.
+- Same host-timeout limitation as sql (D-40), **now RESOLVED by D-45**: `ConnStream::set_read_deadline`
+  + `with_ami`/`ami.ping` forward `ami_timeout(&input)?` to the host `conn.read` `timeout_ms`, so
+  `timeout` is wire-enforced (was: parsed/validated but not wire-enforced because
+  `Host::conn_dial`/`conn_dial_ref` + `dial_scoped` expose no per-call timeout).
