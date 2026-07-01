@@ -493,6 +493,7 @@ fn op_spec_typed<T: JsonSchema>(
         risk: Some(risk),
         idempotency: Some(idempotency),
         secret_purposes: Vec::new(),
+        internal: false,
     }
 }
 

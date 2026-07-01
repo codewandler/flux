@@ -479,9 +479,34 @@ impl Host<'_> {
 
     /// Read up to `max` bytes from an open connection; an empty `Vec` means EOF.
     pub fn conn_read(&mut self, conn_id: u64, max: usize) -> Result<Vec<u8>, String> {
-        let v = self
-            .inner
-            .host_call("conn.read", json!({ "conn_id": conn_id, "max": max }))?;
+        self.conn_read_timed(conn_id, max, None)
+    }
+
+    /// Read up to `max` bytes from an open connection with an optional per-call deadline
+    /// (`timeout_ms`, milliseconds). On timeout the host returns an empty `Vec` plus the connection
+    /// left open — `ConnStream` surfaces this as an [`std::io::ErrorKind::TimedOut`] so a plugin's
+    /// wire-protocol loop can distinguish a deadline from a clean EOF (D-45: sql/asterisk `timeout`).
+    pub fn conn_read_timed(
+        &mut self,
+        conn_id: u64,
+        max: usize,
+        timeout_ms: Option<u64>,
+    ) -> Result<Vec<u8>, String> {
+        let mut req = json!({ "conn_id": conn_id, "max": max });
+        if let Some(ms) = timeout_ms {
+            req["timeout_ms"] = json!(ms);
+        }
+        let v = self.inner.host_call("conn.read", req)?;
+        let timed_out = v
+            .get("timed_out")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        if timed_out {
+            return Err(format!(
+                "conn.read: timed out after {}ms",
+                timeout_ms.unwrap_or(0)
+            ));
+        }
         let b64 = v.get("data_b64").and_then(|x| x.as_str()).unwrap_or("");
         base64::engine::general_purpose::STANDARD
             .decode(b64)
@@ -564,29 +589,56 @@ pub struct BlobInfo {
 /// (`BufReader::new(stream)`, `read_line`, `write_all`, …), while every byte still crosses the guarded
 /// `conn.*` host capability. `read` returns `Ok(0)` at EOF. Usage: `conn_dial` to get the id, scope a
 /// `ConnStream` for the exchange, then [`Host::conn_close`] the id once the stream is dropped.
+///
+/// An optional **per-read deadline** ([`ConnStream::set_read_deadline`], D-45) is forwarded to the
+/// host's `conn.read` as `timeout_ms`: on elapsed the host returns a [`std::io::ErrorKind::TimedOut`]
+/// (the connection stays open — the plugin decides to retry or close) instead of hanging.
 pub struct ConnStream<'h, 'a> {
     host: &'h mut Host<'a>,
     conn_id: u64,
+    read_deadline: Option<std::time::Duration>,
 }
 
 impl<'h, 'a> ConnStream<'h, 'a> {
     /// Wrap an open `conn_id` (from [`Host::conn_dial`]) as a blocking byte stream.
     pub fn new(host: &'h mut Host<'a>, conn_id: u64) -> Self {
-        Self { host, conn_id }
+        Self {
+            host,
+            conn_id,
+            read_deadline: None,
+        }
     }
 
     /// The underlying connection id.
     pub fn conn_id(&self) -> u64 {
         self.conn_id
     }
+
+    /// Set the per-read deadline forwarded to the host's `conn.read` as `timeout_ms` (D-45).
+    /// `None` clears it (unbounded, the default). On elapsed, [`read`](std::io::Read::read)
+    /// returns [`std::io::ErrorKind::TimedOut`] without closing the connection.
+    pub fn set_read_deadline(&mut self, deadline: Option<std::time::Duration>) {
+        self.read_deadline = deadline;
+    }
 }
 
 impl std::io::Read for ConnStream<'_, '_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let timeout_ms = self
+            .read_deadline
+            .map(|d| d.as_millis().min(u64::MAX as u128) as u64);
         let data = self
             .host
-            .conn_read(self.conn_id, buf.len())
-            .map_err(std::io::Error::other)?;
+            .conn_read_timed(self.conn_id, buf.len(), timeout_ms)
+            .map_err(|e| {
+                // Surface a host timeout as ErrorKind::TimedOut so a wire-protocol loop can
+                // distinguish it from a clean EOF (Ok(0)) or a hard read error.
+                if e.contains("timed out") {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, e)
+                } else {
+                    std::io::Error::other(e)
+                }
+            })?;
         let n = data.len().min(buf.len());
         buf[..n].copy_from_slice(&data[..n]);
         Ok(n)
@@ -720,6 +772,7 @@ pub fn read_op(name: &str, description: &str, input_schema: Value) -> OperationS
         risk: Some(Risk::Low),
         idempotency: Some(Idempotency::Idempotent),
         secret_purposes: Vec::new(),
+        internal: false,
     }
 }
 
@@ -733,6 +786,7 @@ pub fn write_op(name: &str, description: &str, input_schema: Value) -> Operation
         risk: Some(Risk::Medium),
         idempotency: Some(Idempotency::NonIdempotent),
         secret_purposes: Vec::new(),
+        internal: false,
     }
 }
 
@@ -753,6 +807,31 @@ pub fn read_op_typed<T: schemars::JsonSchema>(name: &str, description: &str) -> 
 /// Medium, NonIdempotent). See [`read_op_typed`] for the `T` contract.
 pub fn write_op_typed<T: schemars::JsonSchema>(name: &str, description: &str) -> OperationSpec {
     write_op(name, description, op_input_schema::<T>())
+}
+
+/// A **host-only** op (C-09a): not advertised to the LLM as a callable tool. The canonical case is
+/// the `aws-bedrock` plugin's `auth` op, which returns raw AWS credentials — the model must never
+/// call it, or the keys would appear in the tool result. The op stays dispatchable by the host via
+/// the shared `PluginHost` handle; [`flux_plugin::visible_ops`] excludes it from the projected tool
+/// catalog. Effects default to `Process`+`Network` (the conservative authorization floor
+/// [`flux_plugin::PluginTool::new`] applies to an undeclared op) — override via the returned spec.
+pub fn internal_op(name: &str, description: &str, input_schema: Value) -> OperationSpec {
+    OperationSpec {
+        name: name.into(),
+        description: description.into(),
+        input_schema,
+        effects: Vec::new(),
+        risk: Some(Risk::Low),
+        idempotency: Some(Idempotency::Idempotent),
+        secret_purposes: Vec::new(),
+        internal: true,
+    }
+}
+
+/// A **typed** host-only op: `input_schema` derived from `T` via `schemars` ([`op_input_schema`]).
+/// See [`internal_op`] for the host-only contract.
+pub fn internal_op_typed<T: schemars::JsonSchema>(name: &str, description: &str) -> OperationSpec {
+    internal_op(name, description, op_input_schema::<T>())
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,9 +1180,14 @@ impl GuestHost for MockHost {
                     let take = buf.len().min(max);
                     buf.drain(..take).collect()
                 };
+                // D-45: when a per-call deadline is set and no data was ready, surface a
+                // timeout (the connection stays open) so a ConnStream surfaces ErrorKind::TimedOut.
+                let timeout_ms = payload.get("timeout_ms").and_then(|v| v.as_u64());
+                let timed_out = timeout_ms.is_some() && out.is_empty();
                 Ok(json!({
                     "data_b64": base64::engine::general_purpose::STANDARD.encode(&out),
-                    "eof": out.is_empty()
+                    "eof": out.is_empty() && !timed_out,
+                    "timed_out": timed_out
                 }))
             }
             "conn.close" => Ok(json!({ "ok": true })),
@@ -1348,5 +1432,42 @@ mod tests {
         assert_eq!(up.status, 200);
         // the mock echoes the canned JSON as the text body, whose bytes we get back
         assert_eq!(up.bytes, b"{\"ok\":true}");
+    }
+
+    /// C-09a: `internal_op`/`internal_op_typed` build an op with `internal: true`, and the host's
+    /// `visible_ops` filter excludes it from the projected tool catalog — the model never sees an
+    /// `auth` op that returns raw credentials. The op is still in the manifest (host-dispatchable).
+    #[test]
+    fn internal_op_is_host_only_and_excluded_from_visible_tools() {
+        let typed = internal_op_typed::<serde_json::Value>("aws-bedrock.auth", "resolve creds");
+        assert!(typed.internal, "internal_op_typed sets internal: true");
+        let plain = internal_op(
+            "aws-bedrock.auth",
+            "resolve creds",
+            json!({"type":"object"}),
+        );
+        assert!(plain.internal, "internal_op sets internal: true");
+
+        // A manifest carrying one public + one internal op projects only the public one.
+        let manifest = PluginBuilder::new("aws-bedrock", "0.1.0")
+            .operation(
+                read_op("aws-bedrock.chat", "run a turn", json!({})),
+                |_, _| Ok(json!({"ok": true})),
+            )
+            .operation(
+                internal_op("aws-bedrock.auth", "resolve creds", json!({})),
+                |_, _| Ok(json!({"access_key": "AKID"})),
+            )
+            .build()
+            .manifest;
+        let visible: Vec<&str> = flux_plugin::visible_ops(&manifest)
+            .map(|o| o.name.as_str())
+            .collect();
+        assert_eq!(visible, vec!["aws-bedrock.chat"]);
+        // The internal op is still in the manifest (host-dispatchable), just not projected.
+        assert!(manifest
+            .operations
+            .iter()
+            .any(|o| o.name == "aws-bedrock.auth"));
     }
 }

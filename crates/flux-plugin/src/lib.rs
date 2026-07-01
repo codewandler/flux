@@ -118,6 +118,24 @@ pub struct OperationSpec {
     /// Secret purposes (auth-method names) this op needs the host to resolve (e.g. `"api_token"`).
     #[serde(default)]
     pub secret_purposes: Vec<String>,
+    /// **Host-only op** (C-09a): when `true` this op is NOT advertised to the LLM as a callable
+    /// tool — it is an internal host-dispatched channel. The canonical case is the `aws-bedrock`
+    /// plugin's `auth` op, which returns raw AWS credentials: the model must never call it, or the
+    /// keys would appear in the tool result (a leak). The op stays callable by the host via the
+    /// shared `PluginHost` handle (exactly how the endpoint broker calls `endpoint.discover`);
+    /// only the *projection* as an agent tool is suppressed (see [`visible_ops`]). Defaults
+    /// `false`, so every existing manifest that says nothing about `internal` projects all its
+    /// ops unchanged.
+    #[serde(default)]
+    pub internal: bool,
+}
+
+/// The manifest-declared, deny-by-default operations that are projected as agent tools: every
+/// op whose [`OperationSpec::internal`] flag is `false`. Host-only (`internal: true`) ops are
+/// excluded — they are still dispatchable by the host via the shared `PluginHost` handle, just
+/// not advertised to the model. This is the single filter [`load_plugin_tools`] applies.
+pub fn visible_ops(manifest: &PluginManifest) -> impl Iterator<Item = &OperationSpec> {
+    manifest.operations.iter().filter(|op| !op.internal)
 }
 
 /// How the host injects a resolved secret into an `http.do` request for an auth method. Default
@@ -251,6 +269,30 @@ pub struct PluginCapabilities {
     /// returned through any discovery/endpoint path — only this explicit, audited capability.
     #[serde(default)]
     pub credential: bool,
+    /// **Path-scoped host-file reads** (C-09a): a deny-by-default `fs.read` capability for reading
+    /// HOST files outside the workspace jail (which `System::read_file` cannot reach) — e.g. the
+    /// `aws-bedrock` plugin reading `~/.aws/config` + `~/.aws/sso/cache` (the SSO refresh-token
+    /// cache) to resolve the credential chain without an `aws` CLI. The host reads ONLY paths that
+    /// match a declared [`FsReadScope`]; anything out of scope is refused; `..` traversal is
+    /// rejected; and a scope marked `secret: true` has its content registered with the
+    /// [`Redactor`](flux_secret::Redactor) so refresh tokens can never leak into model-visible
+    /// output. Empty = `fs.read` denied (the default).
+    #[serde(default)]
+    pub fs: Vec<FsReadScope>,
+}
+
+/// One path scope the host may read on a plugin's behalf via the `fs.read` capability (C-09a).
+/// `path` is a glob: an exact path, or a directory prefix with `/**` (matches the dir itself +
+/// everything under it, incl. nested subdirs) or `/*` (direct children only). `~` expands to
+/// `$HOME`. `secret: true` registers the read content with the [`Redactor`](flux_secret::Redactor)
+/// — for `~/.aws/sso/cache` refresh tokens and `~/.aws/credentials` static keys.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct FsReadScope {
+    /// The path/glob this scope permits (e.g. `"~/.aws/config"`, `"~/.aws/sso/cache/**"`).
+    pub path: String,
+    /// Whether read content is registered with the Redactor (scrubbed from model-visible output).
+    #[serde(default)]
+    pub secret: bool,
 }
 
 /// What a plugin advertises about itself — the single source of truth the host introspects (ops,
@@ -712,6 +754,18 @@ impl SystemHostCaps {
         ))
     }
 
+    /// Find the manifest-declared [`FsReadScope`] matching an expanded absolute path, returning
+    /// `(scope.path, scope.secret)`. Deny-by-default: `None` if no scope matches (the `fs.read`
+    /// handler refuses the read). The scope's `path` is home-expanded before matching, so manifest
+    /// authors write `~/.aws/sso/cache/**`.
+    fn fs_scope_for(&self, abs_path: &str) -> Option<(&String, bool)> {
+        self.grants
+            .fs
+            .iter()
+            .find(|s| fs_path_matches(&expand_home(&s.path), abs_path))
+            .map(|s| (&s.path, s.secret))
+    }
+
     fn private_net_allow(&self) -> PrivateNetAllow {
         let declared = normalize_patterns(&self.grants.private_hosts);
         let grants = normalize_patterns(&self.private_net_grants);
@@ -1000,6 +1054,67 @@ impl HostCapabilities for SystemHostCaps {
                 }
                 Ok(json!({ "value": material.value }))
             }
+            "fs.read" => {
+                // Path-scoped HOST-file read (C-09a). For the `aws-bedrock` plugin to read
+                // `~/.aws/config` + `~/.aws/sso/cache` (the SSO refresh-token cache) without an
+                // `aws` CLI. These are HOST paths OUTSIDE the workspace jail (which `System::read_file`
+                // cannot reach), so the capability has its own manifest-declared scope: the host reads
+                // ONLY paths matching a declared [`FsReadScope`], denies anything out of scope, rejects
+                // `..` traversal, caps the size, and registers `secret: true` reads with the
+                // [`Redactor`](flux_secret::Redactor) so refresh tokens never leak into model-visible
+                // output. Deny-by-default: an empty `fs` grant refuses every read.
+                let raw_path = payload
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or("fs.read: `path` (string) required")?;
+                let expanded = expand_home(raw_path);
+                // Reject `..` traversal before matching (defense-in-depth; the scope match is the
+                // primary gate, but a naive glob join could otherwise reach outside the scope dir).
+                if path_has_traversal(&expanded) {
+                    return Err(format!(
+                        "fs.read: path `{raw_path}` contains a `..` traversal; denied"
+                    ));
+                }
+                let (scope, secret) = match self.fs_scope_for(&expanded) {
+                    Some(s) => (s.0.clone(), s.1),
+                    None => {
+                        return Err(format!(
+                            "fs.read: path `{raw_path}` not in this plugin's fs.read scope"
+                        ))
+                    }
+                };
+                let bytes = match tokio::fs::read(&expanded).await {
+                    Ok(b) => b,
+                    Err(e) => return Err(format!("fs.read: {raw_path}: {e} (scope: {scope})")),
+                };
+                let size = bytes.len();
+                // Binary (NUL-bearing or invalid UTF-8) -> base64; else UTF-8 text. Same shape as
+                // `http.do`'s body/body_b64 split, and byte-capped on a char boundary.
+                let is_binary = bytes.contains(&0) || std::str::from_utf8(&bytes).is_err();
+                if is_binary {
+                    let capped = if size > 256 * 1024 {
+                        bytes[..256 * 1024].to_vec()
+                    } else {
+                        bytes
+                    };
+                    let body_b64 = base64::engine::general_purpose::STANDARD.encode(&capped);
+                    if secret {
+                        if let Some(sink) = &self.secret_sink {
+                            sink.register_secret(&String::from_utf8_lossy(&capped));
+                        }
+                    }
+                    Ok(json!({ "path": raw_path, "size": size, "body_b64": body_b64 }))
+                } else {
+                    let text = String::from_utf8(bytes).expect("checked UTF-8 above");
+                    let text = truncate_on_char_boundary(text, 256 * 1024);
+                    if secret {
+                        if let Some(sink) = &self.secret_sink {
+                            sink.register_secret(&text);
+                        }
+                    }
+                    Ok(json!({ "path": raw_path, "size": size, "body": text }))
+                }
+            }
             "http.do" => {
                 if !self.grants.http {
                     return Err("http.do not granted to this plugin".into());
@@ -1209,15 +1324,32 @@ impl HostCapabilities for SystemHostCaps {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(64 * 1024)
                     .min(1024 * 1024) as usize;
+                // Optional per-call read deadline (D-45: sql/asterisk `timeout` parity). When set,
+                // `stream.read` is raced against the deadline; on elapsed the connection stays open
+                // (the plugin decides to retry or close) and a `timed_out` flag is returned so the
+                // plugin's wire-protocol loop can surface a timeout error rather than a silent hang.
+                let timeout_ms = payload.get("timeout_ms").and_then(|v| v.as_u64());
                 let mut guard = self.conns.lock().await;
                 let stream = guard
                     .get_mut(&id)
                     .ok_or_else(|| format!("conn.read: no open connection {id}"))?;
-                let data = stream.read(max).await.map_err(|e| e.to_string())?;
-                let eof = data.is_empty();
+                let read_fut = stream.read(max);
+                let (data, timed_out) = match timeout_ms {
+                    Some(ms) => {
+                        let dur = std::time::Duration::from_millis(ms);
+                        match tokio::time::timeout(dur, read_fut).await {
+                            Ok(Ok(data)) => (data, false),
+                            Ok(Err(e)) => return Err(format!("conn.read: {e}")),
+                            Err(_) => (Vec::new(), true),
+                        }
+                    }
+                    None => (read_fut.await.map_err(|e| e.to_string())?, false),
+                };
+                let eof = data.is_empty() && !timed_out;
                 Ok(json!({
                     "data_b64": base64::engine::general_purpose::STANDARD.encode(&data),
-                    "eof": eof
+                    "eof": eof,
+                    "timed_out": timed_out
                 }))
             }
             "conn.write" => {
@@ -1404,6 +1536,53 @@ fn normalize_patterns(patterns: &[String]) -> Vec<String> {
         .map(|p| p.trim().to_ascii_lowercase())
         .filter(|p| !p.is_empty())
         .collect()
+}
+
+// --- C-09a `fs.read` path helpers -------------------------------------------------------------
+
+/// Expand a leading `~` to `$HOME` (matching `Workspace::resolve`). `~` alone or `~/...` expands;
+/// `~user/...` is left as-is.
+fn expand_home(input: &str) -> String {
+    if let Some(rest) = input.strip_prefix('~') {
+        if rest.is_empty() || rest.starts_with('/') {
+            let home = std::env::var("HOME").unwrap_or_default();
+            return format!("{home}{rest}");
+        }
+    }
+    input.to_string()
+}
+
+/// Whether a path contains a `..` path component (traversal). Rejects `..` as any segment, not
+/// just a leading one, so `a/../b` and `/x/..` both trip it — defense-in-depth before the scope
+/// match (a naive glob join could otherwise reach outside the scope dir).
+fn path_has_traversal(path: &str) -> bool {
+    std::path::Path::new(path)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
+/// Match an expanded absolute path against a `/**` / `/*` / exact glob. `/**` matches the dir
+/// itself + everything under it (incl. nested subdirs); `/*` matches direct children only; an
+/// exact path matches itself. Trailing-slash-insensitive.
+fn fs_path_matches(pattern: &str, abs_path: &str) -> bool {
+    let pat = pattern.trim_end_matches('/');
+    let p = abs_path.trim_end_matches('/');
+    if pat == p {
+        return true;
+    }
+    if let Some(dir) = pat.strip_suffix("/**") {
+        let dir = dir.trim_end_matches('/');
+        p == dir || p.starts_with(&format!("{dir}/"))
+    } else if let Some(dir) = pat.strip_suffix("/*") {
+        let dir = dir.trim_end_matches('/');
+        if !p.starts_with(&format!("{dir}/")) || p.len() <= dir.len() + 1 {
+            return false;
+        }
+        let rest = &p[dir.len() + 1..];
+        !rest.contains('/')
+    } else {
+        false
+    }
 }
 
 fn host_matches(patterns: &[String], host: &str) -> bool {
@@ -1699,9 +1878,12 @@ pub async fn load_plugin_tools(
     let manifest = host.manifest().await?;
     let caps = make_caps(&manifest);
     let host = Arc::new(tokio::sync::Mutex::new(host));
-    let tools: Vec<Arc<dyn Tool>> = manifest
-        .operations
-        .iter()
+    // Project only the non-`internal` ops as agent tools (C-09a). A host-only op (`internal: true`,
+    // e.g. the aws-bedrock plugin's `auth` op returning raw AWS keys) stays dispatchable by the host
+    // via the shared `PluginHost` handle, but is NOT advertised to the LLM — the model must never
+    // call it, or the keys would appear in the tool result. The filter is a single free function
+    // ([`visible_ops`]) so the projection rule is unit-testable without spawning a subprocess.
+    let tools: Vec<Arc<dyn Tool>> = visible_ops(&manifest)
         .map(|op| {
             Arc::new(PluginTool::new(
                 host.clone(),
@@ -2003,6 +2185,277 @@ mod tests {
                 .is_err(),
             "secret not in the grant list must be denied"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- C-09a piece 1: the `internal`/host-only op flag ------------------------------------------
+    // An op marked `internal: true` is NOT advertised to the LLM as a callable tool — it is a
+    // host-only channel (the aws-bedrock plugin's `auth` op returning raw AWS keys is the canonical
+    // case: the model must never call it, or the keys would appear in the tool result). The op stays
+    // dispatchable by the host (via the shared `PluginHost` handle, like the broker calls
+    // `endpoint.discover`); only the *projection* as an agent tool is suppressed.
+
+    #[test]
+    fn internal_op_is_not_projected_as_a_tool() {
+        // Failing-first for C-09a piece 1: before the `internal` flag existed every manifest op
+        // became an LLM-callable tool, so an `auth` op returning raw keys would be model-callable.
+        let manifest = PluginManifest {
+            name: "aws-bedrock".into(),
+            operations: vec![
+                OperationSpec {
+                    name: "aws-bedrock.chat".into(),
+                    description: "run a bedrock turn".into(),
+                    ..Default::default()
+                },
+                OperationSpec {
+                    name: "aws-bedrock.auth".into(),
+                    description: "resolve AWS creds (host-only)".into(),
+                    internal: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let visible: Vec<&str> = visible_ops(&manifest).map(|o| o.name.as_str()).collect();
+        assert_eq!(
+            visible,
+            vec!["aws-bedrock.chat"],
+            "only the non-internal op projects"
+        );
+        assert!(
+            !visible.contains(&"aws-bedrock.auth"),
+            "the internal `auth` op must NOT be advertised to the LLM"
+        );
+    }
+
+    #[test]
+    fn internal_flag_defaults_false_so_existing_plugins_unchanged() {
+        // Backwards compat: a manifest that says nothing about `internal` (every existing plugin)
+        // projects all its ops — the flag is opt-in, not a behavior change for current manifests.
+        let op = serde_json::from_value::<OperationSpec>(serde_json::json!({
+            "name": "kubernetes.pod.list",
+            "description": "list pods"
+        }))
+        .unwrap();
+        assert!(!op.internal);
+    }
+
+    // --- C-09a piece 2: the path-scoped deny-by-default `fs.read` capability ----------------------
+    // For the aws-bedrock plugin to read `~/.aws/config` + `~/.aws/sso/cache` (the SSO refresh-token
+    // cache) without an `aws` CLI. These are HOST paths outside the workspace jail, so they can't go
+    // through `System::read_file`; the capability has its own manifest-declared scope, denies anything
+    // out of scope, rejects `..` traversal, and registers secret-bearing reads with the Redactor.
+
+    #[tokio::test]
+    async fn fs_read_denies_out_of_scope_paths() {
+        let dir = std::env::temp_dir().join(format!("flux-fs-deny-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("aws/config");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"[default]").unwrap();
+        let outside = dir.join("secret.txt");
+        std::fs::write(&outside, b"TOPSECRET").unwrap();
+
+        let sys = Arc::new(flux_system::System::new(
+            flux_system::Workspace::new(&dir).unwrap(),
+        ));
+        let caps = SystemHostCaps::new(sys).with_grants(PluginCapabilities {
+            fs: vec![FsReadScope {
+                path: format!("{}/aws/config", dir.display()),
+                secret: false,
+            }],
+            ..Default::default()
+        });
+
+        // In-scope: allowed.
+        assert!(
+            caps.handle(
+                "fs.read",
+                &serde_json::json!({"path": target.to_str().unwrap()})
+            )
+            .await
+            .is_ok(),
+            "in-scope fs.read must be allowed"
+        );
+        // Out-of-scope: denied (deny-by-default — not a silent empty read).
+        let err = caps
+            .handle(
+                "fs.read",
+                &serde_json::json!({"path": outside.to_str().unwrap()}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("not in this plugin's fs.read scope"),
+            "out-of-scope read must be denied with a clear error, got: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fs_read_recursive_glob_matches_nested_files() {
+        let dir = std::env::temp_dir().join(format!("flux-fs-glob-{}", std::process::id()));
+        let cache = dir.join("aws/sso/cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let token_file = cache.join("abc.json");
+        std::fs::write(&token_file, b"{\"refreshToken\":\"rt\"}").unwrap();
+        let nested = cache.join("sub/deep.json");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::write(&nested, b"{}").unwrap();
+
+        let sys = Arc::new(flux_system::System::new(
+            flux_system::Workspace::new(&dir).unwrap(),
+        ));
+        let caps = SystemHostCaps::new(sys).with_grants(PluginCapabilities {
+            fs: vec![FsReadScope {
+                // `/**` matches the dir itself + everything under it (incl. nested subdirs).
+                path: format!("{}/aws/sso/cache/**", dir.display()),
+                secret: true,
+            }],
+            ..Default::default()
+        });
+
+        let got = caps
+            .handle(
+                "fs.read",
+                &serde_json::json!({"path": token_file.to_str().unwrap()}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(got["body"], "{\"refreshToken\":\"rt\"}");
+        // A nested file under the cache dir also matches.
+        assert!(
+            caps.handle(
+                "fs.read",
+                &serde_json::json!({"path": nested.to_str().unwrap()})
+            )
+            .await
+            .is_ok(),
+            "`/**` must match nested files"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fs_read_secret_scope_registers_content_with_redactor() {
+        // A `secret: true` scope's content is registered with the SecretSink (the executor's
+        // Redactor) so that if it ever flows into model-visible output it is scrubbed. This is the
+        // `~/.aws/sso/cache` refresh-token privilege boundary.
+        let dir = std::env::temp_dir().join(format!("flux-fs-secret-{}", std::process::id()));
+        let cache = dir.join("aws/sso/cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let token_file = cache.join("token.json");
+        // The full file content is what `fs.read` registers with the Redactor (the capability
+        // registers what it READ; the consumer — the aws-bedrock plugin in C-09b — registers the
+        // specific secrets it EXTRACTS). So the redaction guarantee is: if the raw file content is
+        // ever echoed into model-visible output, it is scrubbed.
+        let file_content = "{\"accessToken\":\"super-secret-refresh-token-xyz\"}";
+        std::fs::write(&token_file, file_content).unwrap();
+
+        let sys = Arc::new(flux_system::System::new(
+            flux_system::Workspace::new(&dir).unwrap(),
+        ));
+        let redactor = flux_secret::Redactor::new();
+        let sink = Arc::new(RedactorSink {
+            redactor: redactor.clone(),
+        });
+        let caps = SystemHostCaps::new(sys)
+            .with_grants(PluginCapabilities {
+                fs: vec![FsReadScope {
+                    path: format!("{}/aws/sso/cache/**", dir.display()),
+                    secret: true,
+                }],
+                ..Default::default()
+            })
+            .with_secret_sink(sink);
+
+        let _ = caps
+            .handle(
+                "fs.read",
+                &serde_json::json!({"path": token_file.to_str().unwrap()}),
+            )
+            .await
+            .unwrap();
+
+        // The refresh-token value the host just read must be registered with the Redactor — so a
+        // later capture that echoes it back is scrubbed, not leaked.
+        let leaked = format!("the cache file reads: {file_content}");
+        let scrubbed = redactor.redact(&leaked);
+        assert_ne!(
+            &scrubbed, &leaked,
+            "secret fs.read content must be redactor-registered"
+        );
+        assert!(!scrubbed.contains(file_content));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fs_read_rejects_path_traversal_even_when_pattern_could_match() {
+        let dir = std::env::temp_dir().join(format!("flux-fs-trav-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = dir.parent().unwrap().join("flux-fs-trav-sentinel");
+        std::fs::write(&outside, b"keep me").unwrap();
+
+        let sys = Arc::new(flux_system::System::new(
+            flux_system::Workspace::new(&dir).unwrap(),
+        ));
+        // A wildcard scope that, naively joined, could reach outside via `..`.
+        let caps = SystemHostCaps::new(sys).with_grants(PluginCapabilities {
+            fs: vec![FsReadScope {
+                path: format!("{}/aws/**", dir.display()),
+                secret: false,
+            }],
+            ..Default::default()
+        });
+
+        let traversal = format!("{}/aws/../../flux-fs-trav-sentinel", dir.display());
+        let err = caps
+            .handle("fs.read", &serde_json::json!({"path": &traversal}))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("traversal") || err.contains("not in this plugin's fs.read scope"),
+            "`..` traversal must be rejected, got: {err}"
+        );
+        // The sentinel outside the scope is untouched.
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep me");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&outside).ok();
+    }
+
+    #[tokio::test]
+    async fn fs_read_returns_binary_as_base64() {
+        let dir = std::env::temp_dir().join(format!("flux-fs-bin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin_file = dir.join("aws/blob");
+        std::fs::create_dir_all(bin_file.parent().unwrap()).unwrap();
+        std::fs::write(&bin_file, [0u8, 255, 0, 128]).unwrap();
+
+        let sys = Arc::new(flux_system::System::new(
+            flux_system::Workspace::new(&dir).unwrap(),
+        ));
+        let caps = SystemHostCaps::new(sys).with_grants(PluginCapabilities {
+            fs: vec![FsReadScope {
+                path: format!("{}/aws/**", dir.display()),
+                secret: false,
+            }],
+            ..Default::default()
+        });
+
+        let got = caps
+            .handle(
+                "fs.read",
+                &serde_json::json!({"path": bin_file.to_str().unwrap()}),
+            )
+            .await
+            .unwrap();
+        // Binary (NUL-bearing) content comes back base64-encoded, not as a UTF-8-mangled `body`.
+        assert!(
+            got.get("body_b64").is_some(),
+            "binary read must return body_b64"
+        );
+        assert!(got.get("body").is_none());
+        assert_eq!(got["size"], 4);
         std::fs::remove_dir_all(&dir).ok();
     }
 
