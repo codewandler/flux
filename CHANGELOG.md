@@ -8,6 +8,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **AWS Bedrock LLM provider — L1 core + CLI routing (C-09, in-progress).** `flux run -m aws` now
+  drives Bedrock-provisioned Claude through the same harness. The load-bearing reuse: Bedrock's
+  `invoke-model` on an Anthropic model returns **native Anthropic Messages JSON** — the exact shape
+  flux's `messages` codec already speaks — so the wire codec is a thin wrapper. The new
+  `flux_providers::bedrock` module (L1, no AWS SDK deps) hand-rolls **SigV4 signing** (~150 lines,
+  pinned by two known-answer tests cross-verified against an independent Python `hmac` impl) over an
+  injected `BedrockCredentialsResolver` trait — the seam that lets the credential source swap without
+  touching L1. The shipped stand-in is `EnvStaticResolver` (reads `AWS_*` env); per the design's
+  **Option C decision**, an `aws-bedrock` plugin embedding `aws-config` (full SSO / IRSA / EKS Pod
+  Identity chain, no `aws` CLI in prod) replaces it at this trait in a follow-up (C-09a/b). Non-streaming
+  `invoke-model` ships first (one Messages JSON object → `Chunk`s); event-stream streaming (C-09d) and
+  the plugin (C-09a/b) follow. Live-verified against the dev account: `say ok`→"ok" ($0.1522 metered),
+  the `opus` alias, and a real read-file tool-use turn. Three live-caught bugs (unit tests couldn't):
+  Bedrock rejects `model`+`stream` in the body; the model id was empty in the URL (resolution ran
+  after credential construction); the L0 `known_provider` pricing mirror didn't include `aws`.
+  Pricing: `aws/anthropic.*` entries (match direct Anthropic rates, metered not subscription).
+
 - **homer `call.analyze` parity port (D-37).** `homer.call.analyze` now does the full
   multi-leg correlation analysis ported from the fluxplane reference: seed by `call_id` **or**
   `from_user`+`to_user`, fan out by the seed caller + extra `numbers`, confirm legs by a shared

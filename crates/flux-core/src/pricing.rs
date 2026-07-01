@@ -93,6 +93,7 @@ fn known_provider(p: &str) -> bool {
             | "claude"
             | "openai"
             | "codex"
+            | "aws"
             | "openrouter"
             | "openrouter-anthropic"
             | "ollama"
@@ -175,6 +176,25 @@ impl PricingTable {
         };
         rates.insert("claude-haiku-4-5-20251001".to_string(), haiku);
         rates.insert("claude-haiku-4-5".to_string(), haiku);
+
+        // --- AWS Bedrock (Anthropic models behind the SigV4 gate; rates match direct Anthropic) -----
+        // Keyed by the Bedrock model id (the `us.`/`global.` cross-region inference-profile form
+        // `resolve_model` emits). Bedrock is metered (pay-per-token via AWS), not a subscription.
+        rates.insert(
+            "us.anthropic.claude-sonnet-4-6".to_string(),
+            Rates {
+                input: 3.0,
+                output: 15.0,
+                cache_write: 3.75,
+                cache_read: 0.30,
+                reasoning: 0.0,
+            },
+        );
+        rates.insert("us.anthropic.claude-opus-4-6-v1".to_string(), opus);
+        rates.insert(
+            "global.anthropic.claude-haiku-4-5-20251001-v1:0".to_string(),
+            haiku,
+        );
 
         // --- OpenAI / Codex (GPT-5 family; cache_write == input, no write premium) ----------------
         let gpt5 = Rates {
@@ -354,6 +374,18 @@ mod tests {
         assert!(!table.cost(&usage, "openai/gpt-5").unwrap().subscription);
         // A bare model id (no provider prefix) is reported as non-subscription.
         assert!(!table.cost(&usage, "claude-opus-4-8").unwrap().subscription);
+
+        // AWS Bedrock (metered via AWS, not a sub): the canonical spec `aws/<bedrock-id>` must
+        // price against the Bedrock model-id entries. Failing-first: before the `us.anthropic.*`
+        // entries were added this returned `None` (Bedrock spend unpriced).
+        let aws_cost = table
+            .cost(&usage, "aws/us.anthropic.claude-sonnet-4-6")
+            .expect("aws/us.anthropic.claude-sonnet-4-6 must price — Bedrock Anthropic rates");
+        assert!(
+            !aws_cost.subscription,
+            "Bedrock is metered, not a subscription"
+        );
+        assert!(aws_cost.usd > 0.0);
 
         // The free function agrees.
         assert!(is_subscription("claude/sonnet"));

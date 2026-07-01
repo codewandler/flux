@@ -511,6 +511,7 @@ const KNOWN_PROVIDERS: &[&str] = &[
     "claude",
     "openai",
     "codex",
+    "aws",
     "openrouter",
     "openrouter-anthropic",
     "ollama",
@@ -537,6 +538,8 @@ fn build_provider(spec: &str) -> Result<(NativeProvider, String, String)> {
                 "sonnet" | "opus" | "haiku" | "mock" => ("anthropic".to_string(), spec.to_string()),
                 // Bare `codex` → the ChatGPT-subscription main model (resolved in `build_provider`).
                 "codex" => ("codex".to_string(), String::new()),
+                // Bare `aws` → the Bedrock default (sonnet cross-region profile, resolved below).
+                "aws" => ("aws".to_string(), String::new()),
                 other => bail!(
                     "model spec `{other}` has no provider prefix — use `provider/model`, e.g. \
                      `anthropic/{other}` or `claude/{other}` (providers: {})",
@@ -565,6 +568,14 @@ fn build_provider(spec: &str) -> Result<(NativeProvider, String, String)> {
             let ts = flux_credentials::codex_token_source().context("codex provider")?;
             flux_providers::codex::oauth(ts)
         }
+        // AWS Bedrock (Anthropic over SigV4). Static-creds stand-in: reads AWS_* env. The full SSO /
+        // IRSA / EKS Pod Identity chain lands via the aws-bedrock plugin (C-09a/b, Option C) at the
+        // `BedrockCredentialsResolver` seam — this arm's constructor is the only thing that changes.
+        // Bedrock bakes the model id into the credential (it's in the invoke URL), so resolve first.
+        "aws" => {
+            let m = flux_providers::bedrock::resolve_model(&model);
+            flux_providers::bedrock::bedrock_with_env(m).context("aws provider")?
+        }
         other => bail!(
             "unknown provider `{other}` (known: {})",
             KNOWN_PROVIDERS.join(", ")
@@ -574,6 +585,7 @@ fn build_provider(spec: &str) -> Result<(NativeProvider, String, String)> {
     let model = match provider.as_str() {
         "anthropic" | "claude" => flux_providers::anthropic::resolve_model(&model),
         "codex" => flux_providers::codex::resolve_model(&model),
+        "aws" => flux_providers::bedrock::resolve_model(&model),
         _ => model,
     };
     Ok((native, provider, model))

@@ -24,6 +24,7 @@
 pub mod messages;
 
 pub mod anthropic;
+pub mod bedrock;
 pub mod codex;
 pub mod ollama;
 pub mod openai;

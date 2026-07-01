@@ -2,10 +2,10 @@
 id: C-09
 title: AWS Bedrock LLM provider
 pillar: Core
-status: backlog
+status: in-progress
 epic: aws-bedrock-provider
 design: docs/designs/aws-bedrock-provider.md
-note: invoke-model returns native Anthropic Messages JSON — reuse the messages codec; SigV4 is hand-rolled in L1, the credential chain lives in a new aws-bedrock plugin embedding aws-config over host callbacks (no aws CLI in prod; all AWS IO through net::guard; host-only auth op so keys don't leak)
+note: DECISION = Option C (aws-bedrock plugin embeds aws-config, no aws CLI in prod). IMPLEMENTING in two non-colliding waves: (1) L1 core now — flux-providers::bedrock (SigV4 + Messages codec + BedrockCredentialsResolver trait + resolve_model) + L0 pricing + L6 routing, with an env-static resolver stand-in so `flux run -m aws` works against dev (aws configure export-credentials); (2) C-09a/b plugin + protocol knobs deferred — another session has the plugins/ workspace open (Cargo.lock collision). The L1 seam means the plugin resolver swaps in at one trait.
 ---
 
 # AWS Bedrock LLM provider
@@ -42,7 +42,35 @@ a new-protocol story.
       shipped `flux-cli` enables it. Dev/prod auth + the feature flag are documented in README + CLI help.
 
 ## Progress
-- (scoping complete — design doc filed; implementation not started)
+- **C-09c (L1 core) + C-09e (pricing + CLI routing) LANDED** — the non-colliding wave. `flux run -m aws`
+  works end-to-end against the dev account (live-verified: `say ok`→"ok"; opus alias; a real read-file
+  tool-use turn). SigV4 + codec + resolver + resolve_model + pricing + CLI routing all in.
+  - `crates/flux-providers/src/bedrock.rs` (new): `BedrockAnthropic` codec (reuses `messages`, injects
+    `anthropic_version` in the body, **strips `model`+`stream`** — Bedrock invoke-model rejects both,
+    caught by the live smoke), non-streaming `map_messages_json` (invoke-model returns one Messages
+    JSON object → `Chunk`s), hand-rolled `sign_v4` (pinned by two cross-verified known-answer tests
+    against an independent Python `hmac` impl), `BedrockCredentialsResolver` trait + `BedrockCreds`,
+    `BedrockCredential` (Credential impl; model id baked into the URL), `EnvStaticResolver` (the
+    stand-in), `bedrock_with_env` (sync constructor for the sync CLI), `resolve_model`.
+  - `crates/flux-core/src/pricing.rs`: `aws/anthropic.*` rate entries (match direct Anthropic) + `aws`
+    added to the L0 `known_provider` mirror (without it `split_provider` left the whole `aws/<id>`
+    spec unsplit → `rates_for` missed). Failing-first test asserts `aws/us.anthropic.*` prices as
+    metered, not subscription.
+  - `crates/flux-cli/src/main.rs`: `aws` in `KNOWN_PROVIDERS`, bare `aws` shorthand, `build_provider`
+    arm (resolves the model **before** constructing the credential — Bedrock bakes the id into the
+    URL; the resolution match runs after the native-construction match, caught by the live smoke).
+  - **Live bugs the smoke caught** (unit tests couldn't): (1) Bedrock rejects `model`+`stream` in the
+    body; (2) the model id was empty in the URL because resolution ran after construction; (3) the
+    L0 `known_provider` mirror didn't include `aws` so cost returned `None`. All fixed with
+    failing-first tests.
+  - Gate green: build/test --workspace, clippy -D warnings, fmt, flux-codegate.
+- **C-09a/b (plugin + protocol knobs) DEFERRED** — another session has the `plugins/` workspace open
+  (Cargo.lock collision: D-36 schemars migration across alertmanager/grafana/loki/prometheus). The L1
+  seam (`BedrockCredentialsResolver`) means the `aws-bedrock` plugin resolver swaps in at one trait;
+  `EnvStaticResolver` is the documented stand-in (dev: `aws configure export-credentials --profile <p>`).
+- **C-09d (event-stream streaming) DEFERRED** — non-streaming `invoke-model` ships first (one Messages
+  JSON object → chunks); the deframer (`invoke-with-response-stream` → AWS binary event-stream →
+  existing `map_messages_stream`) is the follow-up.
 
 ## Notes
 - Design + full scoping, the two forks, and the smallest-first breakdown (C-09a/b/c) live in

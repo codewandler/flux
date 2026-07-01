@@ -265,12 +265,17 @@ makes codex's **websocket** the default transport (HTTP fallback), and adds the 
 - **[C-08](stories/C-08-full-oauth2-login.md) — Full OAuth2 login (codex PKCE)** · *core, later stage.* A
   flux-native `flux auth login codex` to parity with claude's PKCE login. Explicitly deferred — import + refresh
   cover the near term.
-- **[C-09](stories/C-09-aws-bedrock-provider.md) — AWS Bedrock LLM provider** · *core.* Drive
+- **[C-09](stories/C-09-aws-bedrock-provider.md) — AWS Bedrock LLM provider** · *core, in-progress.* Drive
   Bedrock-provisioned Claude (`us.anthropic.claude-sonnet-4-6`, …) through the same harness. The wire is
-  native Anthropic Messages JSON (flux's `messages` codec already speaks it), so the work is SigV4 request
-  signing + the AWS credential chain (the dev account is SSO-only). Design + scoping in
-  [aws-bedrock-provider.md](designs/aws-bedrock-provider.md); smallest-first split is C-09a (SigV4 + static
-  keys), C-09b (event-stream streaming), C-09c (pricing + CLI routing).
+  native Anthropic Messages JSON (flux's `messages` codec already speaks it), so SigV4 + the codec +
+  a `BedrockCredentialsResolver` trait are hand-rolled in L1 (`flux-providers::bedrock`). **Decision:
+  Option C** — the credential chain lives in a new `aws-bedrock` plugin embedding `aws-config` over
+  host callbacks (no `aws` CLI in prod; all AWS IO through `net::guard`; host-only `auth` op so keys
+  don't leak). Design + the three-way fork in [aws-bedrock-provider.md](designs/aws-bedrock-provider.md);
+  smallest-first split is C-09a (3 plugin protocol knobs), C-09b (aws-bedrock plugin), C-09c (L1
+  SigV4+codec+resolver), C-09d (event-stream streaming), C-09e (pricing+CLI+docs). The L1 core (C-09c)
+  ships first with an env-static resolver stand-in; the plugin (C-09a/b) follows once the `plugins/`
+  workspace is free.
 
 **Candidate phases (vision tail, in priority order):**
 - **Crate consolidation** ✅ **all phases shipped** — shrank the workspace by merging coherent

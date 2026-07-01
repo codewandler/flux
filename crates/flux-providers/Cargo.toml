@@ -17,6 +17,12 @@ eventsource-stream.workspace = true
 bytes.workspace = true
 reqwest.workspace = true
 
+# AWS Bedrock SigV4 signing (hand-rolled — HMAC-SHA256 over the canonical request).
+sha2.workspace = true
+hmac.workspace = true
+hex.workspace = true
+chrono.workspace = true
+
 # Realtime (voice-to-voice) provider — WebSocket transport, off by default so the HTTP family stays lean.
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
