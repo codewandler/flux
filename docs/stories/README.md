@@ -24,7 +24,15 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [I-01 — Statistically clean self-improvement headline gain (trials ≥ 3)](I-01-headline-gain.md) · Improve · offline half done (partial-credit scalar + durable token capture + synthetic `trials = 5` loop); the trials ≥ 5 grader-confirmed run is **staged** on a funded provider key
 
 ## Next (ready — take the top one unless the user named a story)
-_None._
+- [A-04 — Enforce evidence-gated op surfacing in the self-hosted loop (bash escaped its opt-in)](A-04-enforce-op-surfacing-in-loop.md) · Agent · the loop-host planner builds an UNGATED OpRegistry — every op (incl. `bash`) is advertised every turn, and a model-named hidden op resolves + executes; README's "bash is opt-in" is currently false on the main path
+- [A-03 — Cache-stable prompt layout — stop re-writing the ~34k prefix on every call](A-03-cache-stable-prompt-layout.md) · Agent · prompt caching NEVER hits — HashMap-ordered op catalog shuffles the prompt per process, and per-turn symbols sit inside the single cache_control block; every provider call pays ~34k cache-WRITE (1.25× input), ~10× cost overhead
+- [A-05 — Legible silent-success feedback — stop the loop re-running ops that already succeeded](A-05-legible-silent-success-feedback.md) · Agent · a zero-output success feeds back as `[bash]\n` + nothing — indistinguishable from "didn't run", so the model re-plans the identical op; observed 3 model calls / 13.5s / $0.14 for one `rm`
+- [C-10 — Structured op outputs — list-producing ops return arrays, not joined strings](C-10-structured-op-outputs.md) · Core · `glob` returns matches.join("\n") — so `merge`/`each` can't consume it and the model wastes a repair round-trip; the "typed plan" composability story breaks at stringly op values
+- [C-11 — Uniform provider construction across subcommands (lazy for deterministic flows; aws chain everywhere)](C-11-uniform-provider-wiring.md) · Core · `flux flow run` refuses to replay a fully deterministic plan without a provider credential (preset --run doesn't); `flux review -m aws` fails "AWS_ACCESS_KEY_ID is not set" because only build_agent materializes the credential chain
+
+### strict review flows and journeys
+_A skill can only advise a reviewer; a code-review protocol needs enforceable guarantees — fixed_
+- [L-14 — Make `flux review` work out of the box (roles missing from the binary; aggregation dies on real reviewer output)](L-14-fix-flux-review-out-of-box.md) · Language · broken everywhere today — outside this repo it fails "unknown role review-security" (roles never embedded); inside it the flow dies at `merge` on real (fenced/prose) reviewer output AFTER paying for 3 sub-agent calls
 
 ## Blocked
 _None._
