@@ -19,9 +19,149 @@
 //! `Response: Success`.  List actions accumulate `Event:` blocks until a named "complete" event.
 
 use host_kit::*;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
+use std::time::{Duration, Instant};
+
+/// Shared per-call AMI connection fields. Fluxplane embeds `AMITargetInput` (endpoint_ref/url)
+/// on every op; those are an architectural split (flux resolves the AMI host from the manifest
+/// endpoint), so only the portable `timeout` field is shared. The timeout is parsed/validated
+/// for parity but is not wire-enforced because the host `conn.*` capability does not currently
+/// expose a per-call timeout.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct AMIConn {
+    /// AMI connection timeout, e.g. `5s` or `1m`. Defaults to 10s if omitted.
+    timeout: Option<String>,
+}
+
+/// `asterisk.ami.ping`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PingInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    ami: AMIConn,
+}
+
+/// `asterisk.channel.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ChannelListInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    ami: AMIConn,
+    /// Maximum channels to return.
+    limit: Option<i64>,
+}
+
+/// `asterisk.peer.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PeerListInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    ami: AMIConn,
+    /// Channel technology: `pjsip`, `sip`, or `iax` (default `pjsip`).
+    technology: Option<String>,
+    /// Maximum peers to return.
+    limit: Option<i64>,
+}
+
+/// `asterisk.queue.status`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct QueueStatusInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    ami: AMIConn,
+    /// Limit status to this queue.
+    queue: Option<String>,
+}
+
+/// `asterisk.devicestate.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct DeviceStateListInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    ami: AMIConn,
+    /// Substring filter on the device name (e.g. `PJSIP/agent-7`).
+    device: Option<String>,
+    /// Maximum device states to return.
+    limit: Option<i64>,
+}
+
+/// `asterisk.channel.hangup`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct HangupInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    ami: AMIConn,
+    /// Exact channel name to hang up.
+    channel: String,
+    /// ISDN hangup cause code (e.g. 16 normal clearing).
+    cause: Option<i64>,
+}
+
+/// `asterisk.call.originate`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct OriginateInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    ami: AMIConn,
+    /// Channel to call first.
+    channel: String,
+    /// Extension to connect to (requires `context`; mutually exclusive with `application`).
+    exten: Option<String>,
+    /// Dialplan context for `exten`.
+    context: Option<String>,
+    /// Application to run on answer (mutually exclusive with `exten`).
+    application: Option<String>,
+    /// Application argument data.
+    data: Option<String>,
+    /// Caller ID for the originated call.
+    #[serde(rename = "caller_id")]
+    caller_id: Option<String>,
+    /// Answer timeout in milliseconds (default 30000).
+    #[serde(rename = "timeout_ms")]
+    timeout_ms: Option<i64>,
+    /// Originate asynchronously (default true).
+    #[serde(rename = "async")]
+    do_async: Option<bool>,
+    /// Channel variables to set on the originated channel.
+    variables: Option<HashMap<String, String>>,
+    /// Account code for the call.
+    #[serde(rename = "account_code")]
+    account_code: Option<String>,
+    /// Dialplan priority (default 1).
+    priority: Option<i64>,
+    /// Connect on early media instead of answer.
+    #[serde(rename = "early_media")]
+    early_media: Option<bool>,
+    /// Explicit unique id for the first channel.
+    #[serde(rename = "channel_id")]
+    channel_id: Option<String>,
+    /// Explicit unique id for the second channel.
+    #[serde(rename = "other_channel_id")]
+    other_channel_id: Option<String>,
+}
+
+/// `asterisk.command`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CommandInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    ami: AMIConn,
+    /// Asterisk CLI command to run.
+    command: String,
+}
 
 fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("asterisk", "0.1.0")
@@ -57,61 +197,46 @@ fn manifest_builder() -> PluginBuilder {
         })
         // ---- reads ----
         .operation(
-            read_op(
+            read_op_typed::<PingInput>(
                 "asterisk.ami.ping",
                 "Ping an Asterisk Manager Interface endpoint and return the greeting + pong.",
-                so(json!({}), json!([])),
             ),
             ami_ping,
         )
         .operation(
-            read_op(
+            read_op_typed::<ChannelListInput>(
                 "asterisk.channel.list",
                 "List active Asterisk channels (live calls) with state, caller ID, dialplan position, application, and duration.",
-                so(json!({"limit": {"type": "integer"}}), json!([])),
             ),
             channel_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<PeerListInput>(
                 "asterisk.peer.list",
                 "List Asterisk peers/endpoints (pjsip default, sip, or iax) with registration address and device status.",
-                so(
-                    json!({"technology": {"type": "string"}, "limit": {"type": "integer"}}),
-                    json!([]),
-                ),
             ),
             peer_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<QueueStatusInput>(
                 "asterisk.queue.status",
                 "Show Asterisk call queues: stats, members with status/pause, and waiting callers.",
-                so(json!({"queue": {"type": "string"}}), json!([])),
             ),
             queue_status,
         )
         .operation(
-            read_op(
+            read_op_typed::<DeviceStateListInput>(
                 "asterisk.devicestate.list",
                 "List Asterisk device states (NOT_INUSE, INUSE, RINGING, …), filterable by device-name substring.",
-                so(
-                    json!({"device": {"type": "string"}, "limit": {"type": "integer"}}),
-                    json!([]),
-                ),
             ),
             devicestate_list,
         )
         // ---- writes (destructive) ----
         .operation(
             {
-                let mut op = write_op(
+                let mut op = write_op_typed::<HangupInput>(
                     "asterisk.channel.hangup",
                     "Hang up one active Asterisk channel by exact name (terminates a live call).",
-                    so(
-                        json!({"channel": {"type": "string"}, "cause": {"type": "integer"}}),
-                        json!(["channel"]),
-                    ),
                 );
                 op.risk = Some(Risk::Destructive);
                 op
@@ -120,25 +245,9 @@ fn manifest_builder() -> PluginBuilder {
         )
         .operation(
             {
-                let mut op = write_op(
+                let mut op = write_op_typed::<OriginateInput>(
                     "asterisk.call.originate",
                     "Originate a call: dial channel first, then connect to exten+context or run application. Places a real call.",
-                    so(
-                        json!({
-                            "channel":    {"type": "string"},
-                            "exten":      {"type": "string"},
-                            "context":    {"type": "string"},
-                            "application":{"type": "string"},
-                            "data":       {"type": "string"},
-                            "caller_id":  {"type": "string"},
-                            "timeout_ms": {"type": "integer"},
-                            "async":      {"type": "boolean"},
-                            "variables":  {"type": "object"},
-                            "account_code":{"type": "string"},
-                            "priority":   {"type": "integer"}
-                        }),
-                        json!(["channel"]),
-                    ),
                 );
                 op.risk = Some(Risk::Destructive);
                 op
@@ -147,10 +256,9 @@ fn manifest_builder() -> PluginBuilder {
         )
         .operation(
             {
-                let mut op = write_op(
+                let mut op = write_op_typed::<CommandInput>(
                     "asterisk.command",
                     "Run an Asterisk CLI command over AMI and return its output. Powerful — CLI commands can mutate the PBX.",
-                    so(json!({"command": {"type": "string"}}), json!(["command"])),
                 );
                 op.risk = Some(Risk::High);
                 op
@@ -159,16 +267,8 @@ fn manifest_builder() -> PluginBuilder {
         )
 }
 
-// ---------------------------------------------------------------------------
-// Schema helper.
-// ---------------------------------------------------------------------------
-
 /// AMI key:value block.
 type AmiBlock = HashMap<String, String>;
-
-fn so(props: Value, required: Value) -> Value {
-    json!({ "type": "object", "properties": props, "required": required })
-}
 
 // ---------------------------------------------------------------------------
 // AMI session: connect → greeting → login → execute → close.
@@ -505,6 +605,79 @@ fn flex_bool(input: &Value, key: &str) -> Option<bool> {
     }
 }
 
+/// Parse and validate the optional `timeout` field shared by all ops. The host `conn.*`
+/// capability does not currently expose a per-call timeout, so the duration is validated for
+/// parity but not wired to the connection.
+fn ami_timeout(input: &Value) -> Result<Option<Duration>, String> {
+    match flex_str(input, "timeout") {
+        Some(s) if !s.trim().is_empty() => parse_duration(&s).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// Tiny Go-style duration parser (`5s`, `1m30s`, `1h`). Errors on invalid/overflow input.
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let mut nanos: u128 = 0;
+    let mut i = 0;
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if start == i {
+            return Err(format!("timeout: invalid duration {s:?}"));
+        }
+        let n: u64 = s[start..i]
+            .parse()
+            .map_err(|_| format!("timeout: invalid duration {s:?}"))?;
+        let unit = if bytes[i..].starts_with(b"ns") {
+            i += 2;
+            "ns"
+        } else if bytes[i..].starts_with(b"us") || bytes[i..].starts_with("µs".as_bytes()) {
+            i += 2;
+            "us"
+        } else if bytes[i..].starts_with(b"ms") {
+            i += 2;
+            "ms"
+        } else if bytes.get(i) == Some(&b's') {
+            i += 1;
+            "s"
+        } else if bytes.get(i) == Some(&b'm') {
+            i += 1;
+            "m"
+        } else if bytes.get(i) == Some(&b'h') {
+            i += 1;
+            "h"
+        } else {
+            return Err(format!("timeout: invalid duration {s:?}"));
+        };
+        let unit_nanos: u128 = match unit {
+            "ns" => 1,
+            "us" => 1_000,
+            "ms" => 1_000_000,
+            "s" => 1_000_000_000,
+            "m" => 60_000_000_000,
+            "h" => 3_600_000_000_000,
+            _ => return Err(format!("timeout: invalid duration {s:?}")),
+        };
+        nanos = nanos
+            .checked_add(
+                u128::from(n)
+                    .checked_mul(unit_nanos)
+                    .ok_or_else(|| format!("timeout: duration overflow {s:?}"))?,
+            )
+            .ok_or_else(|| format!("timeout: duration overflow {s:?}"))?;
+    }
+    if i == 0 {
+        return Err(format!("timeout: invalid duration {s:?}"));
+    }
+    if nanos > u128::from(u64::MAX) {
+        return Err(format!("timeout: duration overflow {s:?}"));
+    }
+    Ok(Duration::from_nanos(nanos as u64))
+}
+
 // ---------------------------------------------------------------------------
 // Queue member status decoder (mirrors fluxplane source).
 // ---------------------------------------------------------------------------
@@ -536,11 +709,20 @@ fn first_non_empty<'a>(a: &'a str, b: &'a str) -> &'a str {
     }
 }
 
+fn active_channels_comment(value: &str) -> String {
+    match value.trim() {
+        "" | "0" => String::new(),
+        other => format!("{other} active channel(s)"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Op handlers.
 // ---------------------------------------------------------------------------
 
-fn ami_ping(_input: Value, host: &mut Host) -> Result<Value, String> {
+fn ami_ping(input: Value, host: &mut Host) -> Result<Value, String> {
+    let _timeout = ami_timeout(&input)?;
+    let start = Instant::now();
     let username = host.secret("username")?;
     let secret = host.secret("secret")?;
     let (ami_host, ami_port) = ami_address(host)?;
@@ -611,6 +793,7 @@ fn ami_ping(_input: Value, host: &mut Host) -> Result<Value, String> {
             "pong": ok,
             "response": response,
             "message": first_non_empty(&ping_val, &msg),
+            "duration_ms": start.elapsed().as_millis() as i64,
         }))
     })();
 
@@ -619,6 +802,7 @@ fn ami_ping(_input: Value, host: &mut Host) -> Result<Value, String> {
 }
 
 fn channel_list(input: Value, host: &mut Host) -> Result<Value, String> {
+    let _timeout = ami_timeout(&input)?;
     let limit = flex_i64(&input, "limit").unwrap_or(0);
 
     with_ami(host, |reader, counter| {
@@ -665,6 +849,7 @@ fn channel_list(input: Value, host: &mut Host) -> Result<Value, String> {
 }
 
 fn peer_list(input: Value, host: &mut Host) -> Result<Value, String> {
+    let _timeout = ami_timeout(&input)?;
     let technology = flex_str(&input, "technology")
         .map(|s| s.to_lowercase())
         .unwrap_or_else(|| "pjsip".into());
@@ -713,6 +898,9 @@ fn peer_list(input: Value, host: &mut Host) -> Result<Value, String> {
                                        event.get("State").map(|s| s.as_str()).unwrap_or(""),
                                    ),
                         "dynamic": false,
+                        "comment": active_channels_comment(
+                                       event.get("ActiveChannels").map(|s| s.as_str()).unwrap_or(""),
+                                   ),
                     }));
                 }
                 "peerentry" => {
@@ -736,6 +924,7 @@ fn peer_list(input: Value, host: &mut Host) -> Result<Value, String> {
                         "address": address,
                         "status":  event.get("Status").map(|s| s.as_str()).unwrap_or(""),
                         "dynamic": event.get("Dynamic").map(|s| s.eq_ignore_ascii_case("yes")).unwrap_or(false),
+                        "comment": event.get("Description").map(|s| s.as_str()).unwrap_or(""),
                     }));
                 }
                 _ => {}
@@ -752,6 +941,7 @@ fn peer_list(input: Value, host: &mut Host) -> Result<Value, String> {
 }
 
 fn queue_status(input: Value, host: &mut Host) -> Result<Value, String> {
+    let _timeout = ami_timeout(&input)?;
     let queue_filter = flex_str(&input, "queue").unwrap_or_default();
 
     with_ami(host, |reader, counter| {
@@ -883,6 +1073,7 @@ fn queue_status(input: Value, host: &mut Host) -> Result<Value, String> {
 }
 
 fn devicestate_list(input: Value, host: &mut Host) -> Result<Value, String> {
+    let _timeout = ami_timeout(&input)?;
     let device_filter = flex_str(&input, "device")
         .map(|s| s.to_lowercase())
         .unwrap_or_default();
@@ -922,6 +1113,7 @@ fn devicestate_list(input: Value, host: &mut Host) -> Result<Value, String> {
 }
 
 fn channel_hangup(input: Value, host: &mut Host) -> Result<Value, String> {
+    let _timeout = ami_timeout(&input)?;
     let channel = flex_str(&input, "channel").ok_or("`channel` (string) required")?;
     let cause = flex_i64(&input, "cause").unwrap_or(0);
 
@@ -962,6 +1154,7 @@ fn channel_hangup(input: Value, host: &mut Host) -> Result<Value, String> {
 }
 
 fn call_originate(input: Value, host: &mut Host) -> Result<Value, String> {
+    let _timeout = ami_timeout(&input)?;
     let channel = flex_str(&input, "channel").ok_or("`channel` (string) required")?;
     let exten = flex_str(&input, "exten").unwrap_or_default();
     let context = flex_str(&input, "context").unwrap_or_default();
@@ -972,6 +1165,9 @@ fn call_originate(input: Value, host: &mut Host) -> Result<Value, String> {
     let do_async = flex_bool(&input, "async").unwrap_or(true);
     let account_code = flex_str(&input, "account_code").unwrap_or_default();
     let priority = flex_i64(&input, "priority").unwrap_or(1).max(1);
+    let early_media = flex_bool(&input, "early_media").unwrap_or(false);
+    let channel_id = flex_str(&input, "channel_id").unwrap_or_default();
+    let other_channel_id = flex_str(&input, "other_channel_id").unwrap_or_default();
 
     // Validate
     if exten.is_empty() && application.is_empty() {
@@ -1024,6 +1220,15 @@ fn call_originate(input: Value, host: &mut Host) -> Result<Value, String> {
         if !account_code.is_empty() {
             fields.push(("Account", account_code.as_str()));
         }
+        if early_media {
+            fields.push(("EarlyMedia", "true"));
+        }
+        if !channel_id.is_empty() {
+            fields.push(("ChannelId", channel_id.as_str()));
+        }
+        if !other_channel_id.is_empty() {
+            fields.push(("OtherChannelId", other_channel_id.as_str()));
+        }
         if !variable_str.is_empty() {
             fields.push(("Variable", variable_str.as_str()));
         }
@@ -1064,6 +1269,7 @@ fn call_originate(input: Value, host: &mut Host) -> Result<Value, String> {
 }
 
 fn ami_command(input: Value, host: &mut Host) -> Result<Value, String> {
+    let _timeout = ami_timeout(&input)?;
     let command = flex_str(&input, "command").ok_or("`command` (string) required")?;
 
     with_ami(host, |reader, counter| {
@@ -1439,5 +1645,341 @@ mod tests {
         );
         assert!(output.contains("Last reload: 2 days"), "output={output:?}");
         assert_eq!(result["lines"].as_array().unwrap().len(), 2);
+
+        // Timeout field is accepted without changing behavior.
+        let mut mock2 = mock_with(&server);
+        let result2 = call(
+            "asterisk.command",
+            json!({"command": "core show uptime", "timeout": "5s"}),
+            &mut mock2,
+        )
+        .expect("command with timeout");
+        assert_eq!(result2["command"], "core show uptime");
+    }
+
+    // ---- parity / D-36 tests -----------------------------------------------
+
+    #[test]
+    fn test_ami_ping_rejects_invalid_timeout() {
+        let mut mock = MockHost::default();
+        let result = call("asterisk.ami.ping", json!({"timeout": "5x"}), &mut mock);
+        assert!(result.is_err(), "expected invalid timeout to fail");
+        assert!(
+            result.unwrap_err().contains("timeout"),
+            "error should mention timeout"
+        );
+    }
+
+    #[test]
+    fn test_peer_list_pjsip_includes_active_channels_comment() {
+        let action_resp = frame(&["Response: Success", "ActionID: flux-1", "EventList: start"]);
+        let ep_event = frame(&[
+            "Event: EndpointList",
+            "ActionID: flux-1",
+            "ObjectName: agent-7",
+            "Contacts: agent-7/sip:agent-7@10.0.0.9:5060",
+            "DeviceState: Not in use",
+            "ActiveChannels: 3",
+        ]);
+        let complete = frame(&[
+            "Event: EndpointListComplete",
+            "ActionID: flux-1",
+            "EventList: Complete",
+            "ListItems: 1",
+        ]);
+        let logoff = frame(&["Response: Goodbye"]);
+        let server = frames(&[&action_resp, &ep_event, &complete, &logoff]);
+        let mut mock = mock_with(&server);
+
+        let result = call("asterisk.peer.list", json!({}), &mut mock).expect("peer.list");
+        assert_eq!(result["count"], 1);
+        let peer = &result["peers"][0];
+        assert_eq!(peer["name"], "agent-7");
+        assert_eq!(peer["comment"], "3 active channel(s)");
+    }
+
+    #[test]
+    fn test_call_originate_sends_extra_ami_fields() {
+        let action_resp = frame(&[
+            "Response: Success",
+            "ActionID: flux-1",
+            "Message: Originate successfully queued",
+            "Uniqueid: 1717920000.55",
+        ]);
+        let logoff = frame(&["Response: Goodbye"]);
+        let server = frames(&[&action_resp, &logoff]);
+        let mut mock = mock_with(&server);
+
+        let result = call(
+            "asterisk.call.originate",
+            json!({
+                "channel":          "PJSIP/agent-7",
+                "application":      "Playback",
+                "data":             "hello",
+                "early_media":      true,
+                "channel_id":       "chan-1",
+                "other_channel_id": "chan-2"
+            }),
+            &mut mock,
+        )
+        .expect("call.originate extra fields");
+        assert_eq!(result["ok"], true);
+
+        let written = String::from_utf8(mock.conn_buf.borrow().clone()).unwrap();
+        assert!(
+            written.contains("EarlyMedia: true"),
+            "missing EarlyMedia in AMI request: {written}"
+        );
+        assert!(
+            written.contains("ChannelId: chan-1"),
+            "missing ChannelId in AMI request: {written}"
+        );
+        assert!(
+            written.contains("OtherChannelId: chan-2"),
+            "missing OtherChannelId in AMI request: {written}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod schema_contract {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Kind {
+        Str,
+        Int,
+        Bool,
+        Object,
+    }
+
+    #[derive(Clone)]
+    struct Prop {
+        name: &'static str,
+        kind: Kind,
+    }
+
+    struct OpContract {
+        props: Vec<Prop>,
+        required: Vec<&'static str>,
+    }
+
+    fn p(name: &'static str, kind: Kind) -> Prop {
+        Prop { name, kind }
+    }
+
+    fn c(props: Vec<Prop>, required: Vec<&'static str>) -> OpContract {
+        OpContract { props, required }
+    }
+
+    fn shared() -> Vec<Prop> {
+        vec![p("timeout", Kind::Str)]
+    }
+
+    fn contracts() -> Vec<(&'static str, OpContract)> {
+        vec![
+            ("asterisk.ami.ping", c(shared(), vec![])),
+            (
+                "asterisk.channel.list",
+                c(
+                    {
+                        let mut v = shared();
+                        v.push(p("limit", Kind::Int));
+                        v
+                    },
+                    vec![],
+                ),
+            ),
+            (
+                "asterisk.peer.list",
+                c(
+                    {
+                        let mut v = shared();
+                        v.push(p("technology", Kind::Str));
+                        v.push(p("limit", Kind::Int));
+                        v
+                    },
+                    vec![],
+                ),
+            ),
+            (
+                "asterisk.queue.status",
+                c(
+                    {
+                        let mut v = shared();
+                        v.push(p("queue", Kind::Str));
+                        v
+                    },
+                    vec![],
+                ),
+            ),
+            (
+                "asterisk.devicestate.list",
+                c(
+                    {
+                        let mut v = shared();
+                        v.push(p("device", Kind::Str));
+                        v.push(p("limit", Kind::Int));
+                        v
+                    },
+                    vec![],
+                ),
+            ),
+            (
+                "asterisk.channel.hangup",
+                c(
+                    {
+                        let mut v = shared();
+                        v.push(p("channel", Kind::Str));
+                        v.push(p("cause", Kind::Int));
+                        v
+                    },
+                    vec!["channel"],
+                ),
+            ),
+            (
+                "asterisk.call.originate",
+                c(
+                    {
+                        let mut v = shared();
+                        v.push(p("channel", Kind::Str));
+                        v.push(p("exten", Kind::Str));
+                        v.push(p("context", Kind::Str));
+                        v.push(p("application", Kind::Str));
+                        v.push(p("data", Kind::Str));
+                        v.push(p("caller_id", Kind::Str));
+                        v.push(p("timeout_ms", Kind::Int));
+                        v.push(p("async", Kind::Bool));
+                        v.push(p("variables", Kind::Object));
+                        v.push(p("account_code", Kind::Str));
+                        v.push(p("priority", Kind::Int));
+                        v.push(p("early_media", Kind::Bool));
+                        v.push(p("channel_id", Kind::Str));
+                        v.push(p("other_channel_id", Kind::Str));
+                        v
+                    },
+                    vec!["channel"],
+                ),
+            ),
+            (
+                "asterisk.command",
+                c(
+                    {
+                        let mut v = shared();
+                        v.push(p("command", Kind::Str));
+                        v
+                    },
+                    vec!["command"],
+                ),
+            ),
+        ]
+    }
+
+    fn resolve<'a>(node: &'a Value, defs: &'a Value) -> &'a Value {
+        if let Some(obj) = node.as_object() {
+            if let Some(r) = obj.get("$ref").and_then(|v| v.as_str()) {
+                if let Some(name) = r.strip_prefix("#/definitions/") {
+                    return defs.get(name).unwrap_or(node);
+                }
+            }
+            if let Some(any) = obj.get("anyOf").and_then(|v| v.as_array()) {
+                for m in any {
+                    if m.get("type").and_then(|v| v.as_str()) != Some("null") {
+                        return resolve(m, defs);
+                    }
+                }
+            }
+        }
+        node
+    }
+
+    fn kind_of(node: &Value) -> Kind {
+        let t = node.get("type");
+        if let Some(arr) = t.and_then(|v| v.as_array()) {
+            let first = arr
+                .iter()
+                .find(|v| v.as_str() != Some("null"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("null");
+            return base_kind(first, node);
+        }
+        base_kind(t.and_then(|v| v.as_str()).unwrap_or(""), node)
+    }
+
+    fn base_kind(t: &str, node: &Value) -> Kind {
+        match t {
+            "integer" => Kind::Int,
+            "boolean" => Kind::Bool,
+            "string" => {
+                if let Some(e) = node.get("enum").and_then(|v| v.as_array()) {
+                    let vals: Vec<String> = e
+                        .iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect();
+                    if !vals.is_empty() {
+                        return Kind::Str; // contract normalizes enums to base string types
+                    }
+                }
+                Kind::Str
+            }
+            "object" | "" => Kind::Object,
+            other => panic!("unsupported property type: {other} ({node})"),
+        }
+    }
+
+    fn assert_contract(op_name: &str, schema: &Value, contract: &OpContract) {
+        let defs = schema.get("definitions").cloned().unwrap_or(json!({}));
+        assert_eq!(schema["type"], "object", "{op_name}: root type");
+
+        let props_obj = schema.get("properties").and_then(|v| v.as_object());
+        let mut got: BTreeMap<&str, Kind> = BTreeMap::new();
+        if let Some(props) = props_obj {
+            for (k, v) in props {
+                let resolved = resolve(v, &defs);
+                got.insert(k.as_str(), kind_of(resolved));
+            }
+        }
+        let want: BTreeMap<&str, Kind> = contract
+            .props
+            .iter()
+            .map(|Prop { name, kind }| (*name, kind.clone()))
+            .collect();
+        assert_eq!(got.len(), want.len(), "{op_name}: property count");
+        for Prop { name, kind } in &contract.props {
+            let got_kind = got.get(*name).unwrap_or_else(|| {
+                panic!("{op_name}: missing property `{name}` in derived schema")
+            });
+            assert_eq!(got_kind, kind, "{op_name}: property `{name}` kind");
+        }
+
+        let req: Vec<&str> = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let mut req_set: Vec<&str> = req.clone();
+        req_set.sort();
+        let mut want_req: Vec<&str> = contract.required.clone();
+        want_req.sort();
+        assert_eq!(req_set, want_req, "{op_name}: required set");
+    }
+
+    #[test]
+    fn derived_schemas_match_legacy_contract() {
+        let ops = contracts();
+        let manifest = manifest_builder().build().manifest();
+        let by_name: BTreeMap<&str, &OperationSpec> = manifest
+            .operations
+            .iter()
+            .map(|o| (o.name.as_str(), o))
+            .collect();
+        assert_eq!(by_name.len(), ops.len(), "op count changed");
+        for (name, contract) in &ops {
+            let spec = by_name
+                .get(*name)
+                .unwrap_or_else(|| panic!("missing op {name}"));
+            assert_contract(name, &spec.input_schema, contract);
+        }
     }
 }

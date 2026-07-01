@@ -297,3 +297,36 @@ Full D-36 per-plugin loop for `sql` (the conn-wave plugin).
   do not accept a per-call timeout, so the parsed duration is validated at input time but cannot be
   enforced as a dial/query deadline. Reported honestly; a follow-up could plumb a timeout through
   the host `conn.*` capability (host-protocol change, out of scope).
+
+---
+
+# D-41 — asterisk schemars migration + AMI parity ports
+
+Full D-36 per-plugin loop for `asterisk` (the AMI plugin).
+
+## Schemars migration
+- 8 ops (`ami.ping`/`channel.list`/`peer.list`/`queue.status`/`devicestate.list`/`command`/
+  `call.originate`/`channel.hangup`) schemars-derived via `read_op_typed::<T>`/`write_op_typed::<T>`;
+  `so()` helper deleted. `Risk::Destructive`/`Risk::High` preserved on the write ops. Handlers
+  unchanged (schema-only structs; `flex_str`/`flex_i64`/`flex_bool` extraction stays, D-34 precedent).
+- Shared `AMIConn` struct (`timeout`) embedded via `#[serde(flatten)]`/`#[schemars(flatten)]`.
+  `schema_contract` test locks the post-migration contract; `asterisk` in `MIGRATED_PLUGINS`.
+
+## Parity re-audit vs ~/projects/fluxplane/fluxplane-plugins/asterisk/
+- Core shape/semantics matched 1:1 across the 8 ops.
+- Architectural split (do-not-port): fluxplane's per-call `endpoint_ref`/`URL`/`credential_ref` in
+  `AMITargetInput` — flux resolves the AMI host via the manifest `asterisk.ami` endpoint +
+  `host.endpoint(...)`.
+
+## Ported gaps
+- **`timeout`** on every op (Go-duration) — parsed/validated (same host-limitation as sql: `conn.*`
+  exposes no per-call timeout, so validated not enforced).
+- **`call.originate`** missing params `early_media`/`channel_id`/`other_channel_id` — handler now
+  sends `EarlyMedia`/`ChannelId`/`OtherChannelId` AMI fields.
+- **`peer.list` output `comment`** — PJSIP from `ActiveChannels` ("N active channel(s)"); SIP/IAX
+  from `Description`.
+- **`ami.ping` output `duration_ms`**.
+
+## Not ported (honest)
+- A `last_call` queue-member output field needs reliable RFC3339 UTC date rendering; the crate has no
+  `chrono`/`time` dep and an ad-hoc calendar converter would be worse than leaving the gap explicit.

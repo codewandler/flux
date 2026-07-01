@@ -22,7 +22,7 @@ use std::path::PathBuf;
 /// Plugins that have fully migrated to schemars-derived op schemas (D-36). Each is verified to
 /// contain no hand-written `so(...)` op schemas. Grow this set as more plugins migrate; a plugin
 /// must not be listed here until its `so` helper is deleted and all ops use `*_op_typed`.
-const MIGRATED_PLUGINS: &[&str] = &["homer", "gitlab", "slack", "sql"];
+const MIGRATED_PLUGINS: &[&str] = &["homer", "gitlab", "slack", "sql", "asterisk"];
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")

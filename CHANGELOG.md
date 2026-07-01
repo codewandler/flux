@@ -54,6 +54,12 @@ All notable changes to this project are documented in this file. The format is b
   `conn.*` capability exposes no per-call timeout, so it's validated but not enforced as a
   deadline. 17 sql tests.
 
+- **asterisk schemars migration + AMI parity ports (D-41).** All 8 asterisk op schemas
+  schemars-derived (shared `AMIConn` via flatten; `Risk::Destructive`/`High` preserved). Fluxplane
+  re-audit ported: `timeout` (all ops, validated), `call.originate` `early_media`/
+  `channel_id`/`other_channel_id` AMI fields, `peer.list` output `comment`, `ami.ping` output
+  `duration_ms`. 12 asterisk tests.
+
 - **Plugin-side schemars op schemas — D-36 (in-progress).** `host-kit` now derives a plugin
   op's `input_schema` from a typed struct via `read_op_typed::<T>` / `write_op_typed::<T>`
   (+ `op_input_schema::<T>()`, a `schemars` re-export), the plugin-side counterpart of D-34.

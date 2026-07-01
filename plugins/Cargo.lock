@@ -24,6 +24,8 @@ name = "asterisk"
 version = "0.1.0"
 dependencies = [
  "host-kit",
+ "schemars",
+ "serde",
  "serde_json",
 ]
 
