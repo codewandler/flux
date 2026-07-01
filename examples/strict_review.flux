@@ -43,14 +43,14 @@ flow strict_review(files: List<String>)
       $maintainability = task({ role: "review-maintainability", task: $maintainability_prompt })
 
   # ---- deterministic aggregation ----
-  # Each reviewer's `task` result is stored as a JSON-string. Wrapping the three symbols in a `lists`
-  # list-template makes the runtime re-parse each string leaf into a real JSON array (the same
-  # mechanism a `jq`/`parse` step relies on), which is what lets `merge` (an array-of-arrays op) see
-  # real arrays instead of opaque strings.
-  $all_findings = merge({ lists: [$security, $correctness, $maintainability] })
-
-  # A single native, deterministic op replaces the inline filter/dedupe/sort: normalize (quarantine
-  # malformed entries as gaps, compute each finding's fingerprint) -> dedupe by fingerprint (counting
-  # reviewer agreement) -> rank by severity, then confidence, then agreement (fingerprint tiebreak).
-  # The model never ranks — `review.aggregate` is the runtime, not the LLM.
-  return review.aggregate({ findings: $all_findings, files: $files, reviewers: [ "security", "correctness", "maintainability" ] })
+  # Each reviewer's `task` result is raw model text: a clean JSON array when the reviewer obeyed its
+  # prompt, fenced/prose-wrapped when it didn't. The three raw outputs go straight to
+  # `review.aggregate`, whose normalizer flattens arrays and leniently recovers JSON from string
+  # blobs (fences/prose stripped), quarantining anything unrecoverable as `gaps` — a sloppy reviewer
+  # degrades the report, it never aborts the flow after the sub-agent spend. (An earlier revision
+  # merged the three outputs with `merge` first, which hard-failed on any non-array reviewer blob.)
+  #
+  # normalize -> dedupe by fingerprint (counting reviewer agreement) -> rank by severity, then
+  # confidence, then agreement (fingerprint tiebreak). The model never ranks — `review.aggregate`
+  # is the runtime, not the LLM.
+  return review.aggregate({ findings: [$security, $correctness, $maintainability], files: $files, reviewers: [ "security", "correctness", "maintainability" ] })

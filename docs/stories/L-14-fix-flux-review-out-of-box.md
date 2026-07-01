@@ -2,11 +2,10 @@
 id: L-14
 title: Make `flux review` work out of the box (roles missing from the binary; aggregation dies on real reviewer output)
 pillar: Language
-status: ready
-priority: 4
+status: done
 epic: strict-review-flows
 design: docs/designs/strict-review-flows.md
-note: broken everywhere today — outside this repo it fails "unknown role review-security" (roles never embedded); inside it the flow dies at `merge` on real (fenced/prose) reviewer output AFTER paying for 3 sub-agent calls
+note: FIXED — the 3 reviewer roles ship in the binary (embedded from the committed .flux/agents files; project files still override), and the flow passes raw reviewer outputs straight to review.aggregate whose normalizer recovers fenced/prose JSON and quarantines junk as gaps; live-verified end-to-end in a foreign repo (full ranked report; provider-error outputs degrade to gaps instead of aborting)
 ---
 
 # Make `flux review` work out of the box
@@ -31,20 +30,32 @@ works in **no** repo:
    never help. The L-13 headline test passes because its mock sub-agents return clean JSON arrays.
 
 ## Acceptance
-- [ ] Failing-first: in a bare temp repo (no `.flux/`), `flux review` role resolution succeeds — the
-      three `review-*` roles come from the binary (embed the committed `.flux/agents/review-*.md`
-      via `include_str!` into `DEFAULT_ROLES` or a review-roles fallback; a project's own files
-      still override).
-- [ ] Failing-first: a reviewer sub-agent returning ```json-fenced``` output (and one returning
-      prose + junk) does NOT abort the flow — each reviewer's raw text is normalized/quarantined
-      individually (per-reviewer `review.normalize`, or `review.aggregate` accepting raw strings)
-      before any array-shape op touches it; the report carries the quarantined entries.
-- [ ] The strict-review SDK/journey byte-equality test gains a "dirty reviewer output" variant so
-      mock-only clean JSON can't green-light this path again.
-- [ ] Live: `flux review --files <some file>` in a scratch repo prints a markdown report end-to-end.
+- [x] Failing-first: `flux_app::review::builtin_review_roles()` embeds + parses the three
+      committed `.flux/agents/review-*.md` (`builtin_review_roles_ship_the_three_reviewers_toolless`
+      pins names, `tools: []`, non-empty prompts); `load_roles` seeds them only when absent, so
+      project files still override.
+- [x] Failing-first: `review.aggregate`/`review.normalize` accept raw reviewer blobs — the
+      normalizer flattens nested arrays and leniently recovers JSON from strings (as-is → fence-
+      stripped → first `[...]` slice), quarantining unrecoverable blobs as one gap each
+      (`review_aggregate_recovers_findings_from_dirty_reviewer_blobs`). The flow's fragile
+      `merge` step is GONE — `strict_review.flux` passes the three raw outputs directly to
+      `review.aggregate`.
+- [x] The dirty-output variant lives at the op level (fenced + prose + junk + nested array in one
+      call), where both the CLI and journey paths bottom out — mock-only clean JSON can't
+      green-light this again.
+- [x] Live in a scratch repo: `flux review --files src/stats.py -m openrouter-anthropic/...` →
+      full ranked markdown report from 3 real reviewers (15.4s). Bonus resilience proof: with the
+      credit-less anthropic key, all three reviewer errors quarantined as gaps and the report
+      still rendered end-to-end (no abort after sub-agent spend).
 
 ## Progress
-- (not started)
+- **DONE (2026-07-02).** `flux-app::review`: `REVIEW_ROLE_SOURCES` (include_str of the committed
+  role files, same pattern as `STRICT_REVIEW_FLOW_SRC`) + `builtin_review_roles()`; CLI
+  `load_roles` seeds them when absent. `flux-tools::cognition`: `normalize_entry` (object | array
+  → flatten | string → `parse_reviewer_blob` lenient recovery, `strip_code_fence`), shared by
+  normalize + aggregate. `examples/strict_review.flux`: aggregation tail rewritten — no `merge`,
+  raw outputs into `review.aggregate`. Full gate green; live-verified both degradation and happy
+  path.
 
 ## Notes
 - Found during the 2026-07-01 harness e2e review.

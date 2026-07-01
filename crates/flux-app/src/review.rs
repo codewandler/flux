@@ -23,6 +23,34 @@ use flux_spec::{Effect, Risk};
 /// command and the `review_code` journey ship it in the binary (no filesystem dependency at runtime).
 pub const STRICT_REVIEW_FLOW_SRC: &str = include_str!("../../../examples/strict_review.flux");
 
+/// The three built-in reviewer roles the flow's `task` fan-out targets, embedded from the SAME
+/// committed `.flux/agents/review-*.md` files a project can override (L-14). Without these in the
+/// binary, `flux review` failed "unknown role: review-security" in every repo but this one — the
+/// "self-contained, works in any repo" claim depends on the roles shipping alongside the flow.
+pub const REVIEW_ROLE_SOURCES: &[(&str, &str)] = &[
+    (
+        "review-security",
+        include_str!("../../../.flux/agents/review-security.md"),
+    ),
+    (
+        "review-correctness",
+        include_str!("../../../.flux/agents/review-correctness.md"),
+    ),
+    (
+        "review-maintainability",
+        include_str!("../../../.flux/agents/review-maintainability.md"),
+    ),
+];
+
+/// The parsed built-in reviewer [`Role`](flux_agent::Role)s. Callers seed these into their role
+/// registry only when absent, so a project's own `.flux/agents/review-*.md` still wins.
+pub fn builtin_review_roles() -> Vec<flux_agent::Role> {
+    REVIEW_ROLE_SOURCES
+        .iter()
+        .map(|(name, src)| flux_agent::parse_role(src, name))
+        .collect()
+}
+
 /// Parse [`STRICT_REVIEW_FLOW_SRC`] and wrap it as a `strict_review` [`CompositeOpDecl`] — the exact
 /// same params/body a bare `flux flow run examples/strict_review.flux` would execute, just addressable
 /// as a callable op from a journey. Fails only if the checked-in file itself fails to parse (it is
@@ -124,6 +152,36 @@ mod tests {
             Module::Program(_) => panic!("must be a bare flow"),
         };
         assert_eq!(op.body.body.len(), bare.body.len());
+    }
+
+    #[test]
+    fn builtin_review_roles_ship_the_three_reviewers_toolless() {
+        // L-14: `flux review` must work in ANY repo — the three reviewer roles the flow's `task`
+        // fan-out targets ship in the binary. Each is the committed `.flux/agents/review-*.md`
+        // (project files still override), declaring `tools: []` (read-nothing reviewers).
+        let roles = builtin_review_roles();
+        let names: Vec<&str> = roles.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "review-security",
+                "review-correctness",
+                "review-maintainability"
+            ]
+        );
+        for r in &roles {
+            assert_eq!(
+                r.tools.as_deref(),
+                Some(&[][..]),
+                "{}: reviewers are toolless by contract",
+                r.name
+            );
+            assert!(
+                !r.prompt.trim().is_empty(),
+                "{}: prompt body must be embedded",
+                r.name
+            );
+        }
     }
 
     #[test]

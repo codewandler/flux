@@ -27,10 +27,6 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [C-10 — Structured op outputs — list-producing ops return arrays, not joined strings](C-10-structured-op-outputs.md) · Core · `glob` returns matches.join("\n") — so `merge`/`each` can't consume it and the model wastes a repair round-trip; the "typed plan" composability story breaks at stringly op values
 - [C-11 — Uniform provider construction across subcommands (lazy for deterministic flows; aws chain everywhere)](C-11-uniform-provider-wiring.md) · Core · `flux flow run` refuses to replay a fully deterministic plan without a provider credential (preset --run doesn't); `flux review -m aws` fails "AWS_ACCESS_KEY_ID is not set" because only build_agent materializes the credential chain
 
-### strict review flows and journeys
-_A skill can only advise a reviewer; a code-review protocol needs enforceable guarantees — fixed_
-- [L-14 — Make `flux review` work out of the box (roles missing from the binary; aggregation dies on real reviewer output)](L-14-fix-flux-review-out-of-box.md) · Language · broken everywhere today — outside this repo it fails "unknown role review-security" (roles never embedded); inside it the flow dies at `merge` on real (fenced/prose) reviewer output AFTER paying for 3 sub-agent calls
-
 ## Blocked
 _None._
 
@@ -118,6 +114,7 @@ _flux can already drive the two **subscription / passthrough** model backends �
 - [L-11 — Strict review — scoped capabilities (with_tools) enforced at dispatch (Phase 2)](L-11-strict-review-scoped-capabilities.md) · Language · analyzer-visible capability-scope node + runtime narrowing threaded into Executor::dispatch
 - [L-12 — Strict review — typed artifacts + deterministic aggregator (Phase 3)](L-12-strict-review-typed-artifacts.md) · Language · ReviewRequest/ReviewFinding/ReviewReport + review.normalize/aggregate (fingerprint/dedupe/rank)
 - [L-13 — Strict review — app journey + flux review CLI & CI surfaces (Phase 4)](L-13-strict-review-journey-cli.md) · Agent · flux-app review_code journey + optional flux review command + CI output modes
+- [L-14 — Make `flux review` work out of the box (roles missing from the binary; aggregation dies on real reviewer output)](L-14-fix-flux-review-out-of-box.md) · Language · FIXED — the 3 reviewer roles ship in the binary (embedded from the committed .flux/agents files; project files still override), and the flow passes raw reviewer outputs straight to review.aggregate whose normalizer recovers fenced/prose JSON and quarantines junk as gaps; live-verified end-to-end in a foreign repo (full ranked report; provider-error outputs degrade to gaps instead of aborting)
 
 _See [CHANGELOG.md](../../CHANGELOG.md) for the full released history._
 <!-- END track:board -->

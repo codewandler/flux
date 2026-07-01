@@ -1173,6 +1173,14 @@ fn load_roles(cwd: &std::path::Path) -> RoleRegistry {
             });
         }
     }
+    // The strict-review reviewer roles ship in the binary (L-14) — `flux review` and the
+    // `review_code` journey must work in ANY repo, not just one carrying `.flux/agents/review-*.md`
+    // (a project's own files, loaded above, still win).
+    for role in flux_app::review::builtin_review_roles() {
+        if reg.get(&role.name).is_none() {
+            reg.insert(role);
+        }
+    }
     reg
 }
 

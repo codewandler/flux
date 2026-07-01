@@ -896,16 +896,75 @@ fn compact(v: &Value) -> String {
 /// `review.normalize`: parse each raw reviewer entry into a well-formed `ReviewFinding` (computing
 /// its fingerprint), quarantining malformed entries as `gaps`. Does NOT dedupe or rank — that is
 /// `review.aggregate`'s job. Pure and order-preserving (first-seen order retained).
+///
+/// Entries come in three shapes (L-14): a finding **object** (parsed directly), an **array** (a
+/// whole reviewer output — flattened), or a **string** (a raw reviewer blob: real reviewers wrap
+/// their JSON in ```fences``` or prose despite instructions). Strings are recovered leniently; an
+/// unrecoverable blob becomes ONE quarantined gap — a sloppy reviewer degrades the report, it never
+/// aborts the flow after the sub-agent spend.
 fn normalize_findings(raw: &[Value]) -> (Vec<ReviewFinding>, Vec<String>) {
     let mut findings = Vec::with_capacity(raw.len());
     let mut gaps = Vec::new();
     for entry in raw {
-        match parse_finding(entry) {
-            Ok(f) => findings.push(f),
-            Err(gap) => gaps.push(gap),
-        }
+        normalize_entry(entry, &mut findings, &mut gaps);
     }
     (findings, gaps)
+}
+
+fn normalize_entry(entry: &Value, findings: &mut Vec<ReviewFinding>, gaps: &mut Vec<String>) {
+    match entry {
+        Value::Array(items) => {
+            for item in items {
+                normalize_entry(item, findings, gaps);
+            }
+        }
+        Value::String(s) => match parse_reviewer_blob(s) {
+            Some(v) => normalize_entry(&v, findings, gaps),
+            None => gaps.push(format!(
+                "unparseable reviewer output (quarantined): {}",
+                s.chars().take(200).collect::<String>()
+            )),
+        },
+        other => match parse_finding(other) {
+            Ok(f) => findings.push(f),
+            Err(gap) => gaps.push(gap),
+        },
+    }
+}
+
+/// Leniently recover the JSON from a raw reviewer blob: an as-is parse first, then with a
+/// ```json``` / ``` ``` code fence stripped, then the first `[...]` array slice in the text
+/// (prose-wrapped output). `None` = nothing recoverable.
+fn parse_reviewer_blob(s: &str) -> Option<Value> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(t) {
+        return Some(v);
+    }
+    if let Some(fenced) = strip_code_fence(t) {
+        if let Ok(v) = serde_json::from_str::<Value>(fenced.trim()) {
+            return Some(v);
+        }
+    }
+    if let (Some(start), Some(end)) = (t.find('['), t.rfind(']')) {
+        if start < end {
+            if let Ok(v) = serde_json::from_str::<Value>(&t[start..=end]) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// The content of the first ``` code fence in `t` (tolerating a language tag on the opening line),
+/// or `None` when there is no complete fence.
+fn strip_code_fence(t: &str) -> Option<&str> {
+    let open = t.find("```")?;
+    let after_tag = t[open + 3..].find('\n').map(|n| open + 3 + n + 1)?;
+    let close = t[after_tag..].find("```")?;
+    Some(&t[after_tag..after_tag + close])
 }
 
 /// Dedupe by fingerprint, merging duplicates into one finding whose `agreement` counts the number of
@@ -1545,12 +1604,74 @@ mod tests {
         for g in gaps {
             let s = g.as_str().unwrap();
             assert!(
-                s.starts_with("dropped malformed finding:"),
+                s.starts_with("dropped malformed finding:")
+                    || s.starts_with("unparseable reviewer output"),
                 "gap must be human-readable, got: {s}"
             );
         }
         // Malformed entries never surface as findings.
         assert!(!findings.iter().any(|f| f.as_str().is_some()));
+    }
+
+    #[tokio::test]
+    async fn review_aggregate_recovers_findings_from_dirty_reviewer_blobs() {
+        // L-14: real reviewers wrap their JSON in fences or prose despite instructions. Each raw
+        // `task` output arrives as ONE entry (string or parsed array); findings must be recovered —
+        // not hard-fail the flow after the sub-agent spend — and unrecoverable blobs quarantine.
+        let c = ctx();
+        let fenced = format!(
+            "```json\n{}\n```",
+            json!([finding(
+                "high", "security", "a.rs", 10, "sqli", 0.9, "security"
+            )])
+        );
+        let prose = format!(
+            "Here are my findings:\n\n{}\n\nLet me know if you need more.",
+            json!([finding(
+                "medium",
+                "correctness",
+                "b.rs",
+                5,
+                "off by one",
+                0.7,
+                "correctness"
+            )])
+        );
+        let raw = json!([
+            fenced,                               // fenced JSON blob
+            prose,                                // prose-wrapped array
+            "I found no issues worth reporting.", // unrecoverable → one gap
+            [finding(
+                "low",
+                "maintainability",
+                "c.rs",
+                2,
+                "long fn",
+                0.5,
+                "maintainability"
+            )],
+        ]);
+        let r = ReviewAggregateTool
+            .execute(
+                &c,
+                json!({"findings": raw, "files": ["a.rs"], "reviewers": ["security", "correctness", "maintainability"]}),
+            )
+            .await
+            .unwrap();
+        assert!(!r.is_error);
+        let report: Value = serde_json::from_str(&r.content).unwrap();
+        let findings = report["findings"].as_array().unwrap();
+        assert_eq!(
+            findings.len(),
+            3,
+            "fenced + prose + nested-array findings all recovered: {findings:?}"
+        );
+        let gaps = report["gaps"].as_array().unwrap();
+        assert_eq!(gaps.len(), 1, "the junk blob quarantines: {gaps:?}");
+        assert!(gaps[0]
+            .as_str()
+            .unwrap()
+            .starts_with("unparseable reviewer output"));
     }
 
     #[tokio::test]
