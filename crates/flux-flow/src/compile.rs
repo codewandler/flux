@@ -262,9 +262,15 @@ pub async fn compile_turn(
         }
 
         if tool_uses.is_empty() {
-            // No tool call. Perhaps the model emitted the AST as plain text → a plan.
+            // No tool call. Perhaps the model emitted the AST as plain text → a plan. Require a
+            // non-empty `body`: `DraftAst`'s fields all default (no `deny_unknown_fields`), so an
+            // UNRELATED JSON object embedded in ordinary prose (e.g. a reviewer's structured-JSON
+            // finding, `{"fingerprint": …, "reviewer": "security"}`) parses "successfully" as a
+            // trivially-empty, trivially-analyzed plan — misclassifying a legitimate prose/JSON
+            // answer as a no-op `Plan` instead of `Chat`. A genuinely empty plan achieves nothing a
+            // model would intentionally emit outside `emit_plan`, so require at least one node.
             if let Ok(ast) = parse_draft_ast(&assistant.text()) {
-                if analyze_flow(&ast, ops).is_ok() {
+                if !ast.body.is_empty() && analyze_flow(&ast, ops).is_ok() {
                     return Ok((
                         TurnOutput::Plan(Compiled {
                             ast,
@@ -1070,6 +1076,40 @@ mod tests {
         match out {
             TurnOutput::Chat(t) => assert!(t.contains("explanation")),
             TurnOutput::Plan(_) => panic!("expected a chat answer, got a plan"),
+        }
+    }
+
+    #[tokio::test]
+    async fn compile_turn_does_not_mistake_structured_json_prose_for_an_empty_plan() {
+        // Regression (found while building L-10's strict-review flow): `DraftAst`'s fields all
+        // default (no `deny_unknown_fields`), so ANY balanced `{ … }` embedded in ordinary prose
+        // parses "successfully" as a trivially-empty plan. A sub-agent instructed to reply with pure
+        // JSON (e.g. a code-reviewer role returning `[{"fingerprint": …, "reviewer": "security"}]`)
+        // would have that first finding object misdetected as an empty `Plan` instead of `Chat` — the
+        // turn then executes a no-op plan and the loop stalls instead of surfacing the JSON answer.
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let findings_json = r#"[{"fingerprint":"dup-1","severity":"high","category":"security","file":"a.rs","line":10,"title":"t","evidence":"e","recommendation":"r","confidence":0.9,"reviewer":"security"}]"#;
+        let p = mock(vec![text_chunk(findings_json)]);
+        let (out, _usage) = compile_turn(
+            &p,
+            "mock",
+            &[Message::user_text("review this and reply with ONLY JSON")],
+            None,
+            &ops,
+            None,
+            None,
+            None,
+            CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+        match out {
+            TurnOutput::Chat(t) => assert_eq!(t, findings_json),
+            TurnOutput::Plan(_) => panic!(
+                "a JSON-array reply with an embedded balanced-brace object must not be \
+                 misclassified as a plan"
+            ),
         }
     }
 
