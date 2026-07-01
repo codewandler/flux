@@ -15,8 +15,482 @@
 //!   docker.events            — long-poll event stream
 
 use host_kit::*;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
+
+// ===========================================================================
+// Schema-only op input structs (D-36)
+// ===========================================================================
+// Each op's `input_schema` is derived from the structs below via schemars
+// (`host_kit::read_op_typed::<T>` / `write_op_typed::<T>`), instead of a
+// hand-written `json!({...})` object via the local `so()` helper. The structs are
+// schema-only: handlers keep their existing `opt_str` / `opt_i64` / `opt_bool`
+// extractors (the D-34 schema-only precedent).
+
+/// Shared per-call Docker daemon socket override.
+///
+/// Architectural split: fluxplane resolves the Docker daemon through plugin
+/// context (`host.endpoint(...)` / `host.conn_dial(...)`); flux exposes the
+/// socket path per-call so callers can target a remote/docker-context
+/// endpoint resolved by the host.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct SocketProps {
+    /// Docker daemon Unix socket path.
+    socket: Option<String>,
+}
+
+/// `docker.info`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct InfoInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+}
+
+/// `docker.system.df`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct SystemDfInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Object types to include in disk usage: image, container, volume, build-cache.
+    types: Option<Vec<String>>,
+}
+
+/// `docker.container.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ContainerListInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Include stopped containers.
+    all: Option<bool>,
+    /// Maximum containers to return.
+    limit: Option<i64>,
+    /// Container status filters.
+    status: Option<Vec<String>>,
+    /// Container name filters.
+    name: Option<Vec<String>>,
+    /// Container label filters.
+    label: Option<Vec<String>>,
+}
+
+/// `docker.container.show`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ContainerShowInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Container ID or name.
+    id: String,
+}
+
+/// `docker.container.logs`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ContainerLogsInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Container ID or name.
+    id: String,
+    /// Number of log lines to return (default 200).
+    tail: Option<i64>,
+    /// Show logs since timestamp or duration supported by Docker.
+    since: Option<String>,
+    /// Show logs until timestamp or duration supported by Docker.
+    until: Option<String>,
+    /// Include log timestamps.
+    timestamps: Option<bool>,
+}
+
+/// `docker.container.top`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ContainerTopInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Container ID or name.
+    id: String,
+    /// Optional `ps` arguments (e.g. `-ef`).
+    args: Option<Vec<String>>,
+}
+
+/// `docker.container.inspect.raw`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ContainerInspectRawInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Container ID or name.
+    id: String,
+}
+
+/// `docker.container.start`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ContainerStartInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Container ID or name.
+    id: String,
+}
+
+/// `docker.container.stop`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ContainerStopInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Container ID or name.
+    id: String,
+    /// Seconds to wait before killing.
+    timeout: Option<i64>,
+    /// Signal to send before killing, for example SIGTERM.
+    signal: Option<String>,
+}
+
+/// `docker.container.restart`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ContainerRestartInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Container ID or name.
+    id: String,
+    /// Seconds to wait before killing during restart.
+    timeout: Option<i64>,
+    /// Signal to send before killing, for example SIGTERM.
+    signal: Option<String>,
+}
+
+/// `docker.container.remove`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ContainerRemoveInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Container ID or name.
+    id: String,
+    /// Force removal of a running container.
+    force: Option<bool>,
+    /// Remove anonymous volumes associated with the container.
+    volumes: Option<bool>,
+}
+
+/// `docker.container.create` and `docker.container.run`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ContainerCreateInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Image to create the container from.
+    image: String,
+    /// Container name.
+    name: Option<String>,
+    /// Container command argv.
+    cmd: Option<Vec<String>>,
+    /// Container entrypoint argv.
+    entrypoint: Option<Vec<String>>,
+    /// Environment variables in KEY=value form.
+    env: Option<Vec<String>>,
+    /// Container labels.
+    labels: Option<Value>,
+    /// Working directory inside the container.
+    workdir: Option<String>,
+    /// User to run as.
+    user: Option<String>,
+    /// Container hostname.
+    hostname: Option<String>,
+    /// Network mode or network name.
+    network: Option<String>,
+    /// Restart policy: no, always, on-failure, unless-stopped.
+    restart: Option<String>,
+    /// Automatically remove the container when it exits.
+    auto_remove: Option<bool>,
+    /// Allocate a TTY.
+    tty: Option<bool>,
+    /// Keep stdin open.
+    open_stdin: Option<bool>,
+    /// Run container in privileged mode.
+    privileged: Option<bool>,
+    /// Bind mounts in Docker -v syntax.
+    binds: Option<Vec<String>>,
+    /// Structured mounts.
+    mounts: Option<Vec<Value>>,
+    /// Port bindings.
+    ports: Option<Vec<Value>>,
+    /// Image platform, for example linux/amd64.
+    platform: Option<String>,
+}
+
+/// `docker.container.prune`, `docker.network.prune`, `docker.volume.prune`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct PruneInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Prune objects created before this timestamp or duration.
+    until: Option<String>,
+    /// Only prune objects with these labels.
+    label: Option<Vec<String>>,
+}
+
+/// `docker.image.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ImageListInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Include intermediate images.
+    all: Option<bool>,
+    /// Maximum images to return.
+    limit: Option<i64>,
+    /// Image reference filters.
+    reference: Option<Vec<String>>,
+    /// Image label filters.
+    label: Option<Vec<String>>,
+}
+
+/// `docker.image.show`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ImageShowInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Image ID, digest, or reference.
+    id: String,
+}
+
+/// `docker.image.inspect.raw`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ImageInspectRawInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Image ID, digest, or reference.
+    id: String,
+}
+
+/// `docker.image.pull`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ImagePullInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Image reference to pull.
+    reference: String,
+    /// Optional platform, for example linux/amd64.
+    platform: Option<String>,
+    /// Maximum pull progress events to return.
+    limit: Option<i64>,
+}
+
+/// `docker.image.tag`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ImageTagInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Source image ID or reference.
+    source: String,
+    /// Target image reference.
+    target: String,
+}
+
+/// `docker.image.remove`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ImageRemoveInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Image ID, digest, or reference.
+    id: String,
+    /// Force image removal.
+    force: Option<bool>,
+    /// Do not prune untagged parent images.
+    noprune: Option<bool>,
+}
+
+/// `docker.image.prune`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ImagePruneInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Prune all unused images, not only dangling images.
+    all: Option<bool>,
+    /// Prune images created before this timestamp or duration.
+    until: Option<String>,
+    /// Only prune images with these labels.
+    label: Option<Vec<String>>,
+}
+
+/// `docker.network.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct NetworkListInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Maximum networks to return.
+    limit: Option<i64>,
+    /// Network name filters.
+    name: Option<Vec<String>>,
+    /// Network label filters.
+    label: Option<Vec<String>>,
+}
+
+/// `docker.network.show`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct NetworkShowInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Network ID or name.
+    id: String,
+}
+
+/// `docker.network.inspect.raw`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct NetworkInspectRawInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Network ID or name.
+    id: String,
+}
+
+/// `docker.network.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct NetworkCreateInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Network name.
+    name: String,
+    /// Network driver.
+    driver: Option<String>,
+    /// Network scope.
+    scope: Option<String>,
+    /// Restrict external access to the network.
+    internal: Option<bool>,
+    /// Allow standalone containers to attach to swarm-scoped network.
+    attachable: Option<bool>,
+    /// Create ingress routing mesh network.
+    ingress: Option<bool>,
+    /// Enable IPv4.
+    enable_ipv4: Option<bool>,
+    /// Enable IPv6.
+    enable_ipv6: Option<bool>,
+    /// Driver options.
+    options: Option<Value>,
+    /// Network labels.
+    labels: Option<Value>,
+}
+
+/// `docker.network.remove`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct NetworkRemoveInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Network ID or name.
+    id: String,
+}
+
+/// `docker.volume.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct VolumeListInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Maximum volumes to return.
+    limit: Option<i64>,
+    /// Volume name filters.
+    name: Option<Vec<String>>,
+    /// Volume label filters.
+    label: Option<Vec<String>>,
+}
+
+/// `docker.volume.show`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct VolumeShowInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Volume name.
+    id: String,
+}
+
+/// `docker.volume.inspect.raw`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct VolumeInspectRawInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Volume name.
+    id: String,
+}
+
+/// `docker.volume.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct VolumeCreateInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Volume name. Empty lets Docker generate one.
+    name: Option<String>,
+    /// Volume driver.
+    driver: Option<String>,
+    /// Volume driver options.
+    driver_opts: Option<Value>,
+    /// Volume labels.
+    labels: Option<Value>,
+}
+
+/// `docker.volume.remove`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct VolumeRemoveInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    socket: SocketProps,
+    /// Volume name.
+    id: String,
+    /// Force volume removal.
+    force: Option<bool>,
+}
 
 // ---------------------------------------------------------------------------
 // HTTP/1.1 over ConnStream — one connection per request, Connection: close.
@@ -235,18 +709,6 @@ fn short_id(id: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn manifest_builder() -> PluginBuilder {
-    let so = |props: Value, req: Value| -> Value {
-        json!({ "type": "object", "properties": props, "required": req })
-    };
-    let id_schema = so(
-        json!({"id": {"type": "string"}, "socket": {"type": "string"}}),
-        json!(["id"]),
-    );
-    let prune_schema = so(
-        json!({"until": {"type": "string"}, "label": {"type": "array"}, "socket": {"type": "string"}}),
-        json!([]),
-    );
-
     PluginBuilder::new("docker", "0.1.0")
         .capabilities(Caps {
             conn: vec![
@@ -265,95 +727,54 @@ fn manifest_builder() -> PluginBuilder {
         .datasource(ds("docker.volumes", "docker.volume", "Docker volumes."))
         // ---- system ----
         .operation(
-            read_op(
-                "docker.info",
-                "Show Docker daemon and server information.",
-                so(json!({"socket": {"type": "string"}}), json!([])),
-            ),
+            read_op_typed::<InfoInput>("docker.info", "Show Docker daemon and server information."),
             system_info,
         )
         .operation(
-            read_op(
+            read_op_typed::<SystemDfInput>(
                 "docker.system.df",
                 "Show Docker disk usage by object type.",
-                so(json!({"socket": {"type": "string"}}), json!([])),
             ),
             system_df,
         )
         // ---- containers ----
         .operation(
-            read_op(
-                "docker.container.list",
-                "List Docker containers.",
-                so(
-                    json!({
-                        "all": {"type": "boolean"},
-                        "limit": {"type": "integer"},
-                        "status": {"type": "array"},
-                        "name": {"type": "array"},
-                        "label": {"type": "array"},
-                        "socket": {"type": "string"}
-                    }),
-                    json!([]),
-                ),
-            ),
+            read_op_typed::<ContainerListInput>("docker.container.list", "List Docker containers."),
             container_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<ContainerShowInput>(
                 "docker.container.show",
                 "Show one Docker container by ID or name.",
-                id_schema.clone(),
             ),
             container_show,
         )
         .operation(
-            read_op(
+            read_op_typed::<ContainerLogsInput>(
                 "docker.container.logs",
                 "Read recent Docker container logs (non-streaming).",
-                so(
-                    json!({
-                        "id": {"type": "string"},
-                        "tail": {"type": "integer"},
-                        "since": {"type": "string"},
-                        "until": {"type": "string"},
-                        "timestamps": {"type": "boolean"},
-                        "socket": {"type": "string"}
-                    }),
-                    json!(["id"]),
-                ),
             ),
             container_logs,
         )
         .operation(
-            read_op(
+            read_op_typed::<ContainerTopInput>(
                 "docker.container.top",
                 "Show processes running inside a Docker container.",
-                so(
-                    json!({
-                        "id": {"type": "string"},
-                        "args": {"type": "string"},
-                        "socket": {"type": "string"}
-                    }),
-                    json!(["id"]),
-                ),
             ),
             container_top,
         )
         .operation(
-            read_op(
+            read_op_typed::<ContainerInspectRawInput>(
                 "docker.container.inspect.raw",
                 "Show raw Docker container inspect data.",
-                id_schema.clone(),
             ),
             container_inspect_raw,
         )
         .operation(
             {
-                let mut op = write_op(
+                let mut op = write_op_typed::<ContainerStartInput>(
                     "docker.container.start",
                     "Start a Docker container.",
-                    id_schema.clone(),
                 );
                 op.risk = Some(Risk::Medium);
                 op
@@ -362,18 +783,9 @@ fn manifest_builder() -> PluginBuilder {
         )
         .operation(
             {
-                let mut op = write_op(
+                let mut op = write_op_typed::<ContainerStopInput>(
                     "docker.container.stop",
                     "Stop a Docker container.",
-                    so(
-                        json!({
-                            "id": {"type": "string"},
-                            "timeout": {"type": "integer"},
-                            "signal": {"type": "string"},
-                            "socket": {"type": "string"}
-                        }),
-                        json!(["id"]),
-                    ),
                 );
                 op.risk = Some(Risk::Medium);
                 op
@@ -382,17 +794,9 @@ fn manifest_builder() -> PluginBuilder {
         )
         .operation(
             {
-                let mut op = write_op(
+                let mut op = write_op_typed::<ContainerRestartInput>(
                     "docker.container.restart",
                     "Restart a Docker container.",
-                    so(
-                        json!({
-                            "id": {"type": "string"},
-                            "timeout": {"type": "integer"},
-                            "socket": {"type": "string"}
-                        }),
-                        json!(["id"]),
-                    ),
                 );
                 op.risk = Some(Risk::Medium);
                 op
@@ -401,18 +805,9 @@ fn manifest_builder() -> PluginBuilder {
         )
         .operation(
             {
-                let mut op = write_op(
+                let mut op = write_op_typed::<ContainerRemoveInput>(
                     "docker.container.remove",
                     "Remove a Docker container.",
-                    so(
-                        json!({
-                            "id": {"type": "string"},
-                            "force": {"type": "boolean"},
-                            "volumes": {"type": "boolean"},
-                            "socket": {"type": "string"}
-                        }),
-                        json!(["id"]),
-                    ),
                 );
                 op.risk = Some(Risk::Destructive);
                 op
@@ -421,10 +816,9 @@ fn manifest_builder() -> PluginBuilder {
         )
         .operation(
             {
-                let mut op = write_op(
+                let mut op = write_op_typed::<ContainerCreateInput>(
                     "docker.container.create",
                     "Create a Docker container.",
-                    container_create_schema(),
                 );
                 op.risk = Some(Risk::Medium);
                 op
@@ -433,10 +827,9 @@ fn manifest_builder() -> PluginBuilder {
         )
         .operation(
             {
-                let mut op = write_op(
+                let mut op = write_op_typed::<ContainerCreateInput>(
                     "docker.container.run",
                     "Create and start a Docker container.",
-                    container_create_schema(),
                 );
                 op.risk = Some(Risk::Medium);
                 op
@@ -445,10 +838,9 @@ fn manifest_builder() -> PluginBuilder {
         )
         .operation(
             {
-                let mut op = write_op(
+                let mut op = write_op_typed::<PruneInput>(
                     "docker.container.prune",
                     "Prune stopped Docker containers.",
-                    prune_schema.clone(),
                 );
                 op.risk = Some(Risk::Destructive);
                 op
@@ -457,52 +849,27 @@ fn manifest_builder() -> PluginBuilder {
         )
         // ---- images ----
         .operation(
-            read_op(
-                "docker.image.list",
-                "List local Docker images.",
-                so(
-                    json!({
-                        "all": {"type": "boolean"},
-                        "limit": {"type": "integer"},
-                        "reference": {"type": "array"},
-                        "label": {"type": "array"},
-                        "socket": {"type": "string"}
-                    }),
-                    json!([]),
-                ),
-            ),
+            read_op_typed::<ImageListInput>("docker.image.list", "List local Docker images."),
             image_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<ImageShowInput>(
                 "docker.image.show",
                 "Show one Docker image by ID, digest, or reference.",
-                id_schema.clone(),
             ),
             image_show,
         )
         .operation(
-            read_op(
+            read_op_typed::<ImageInspectRawInput>(
                 "docker.image.inspect.raw",
                 "Show raw Docker image inspect data.",
-                id_schema.clone(),
             ),
             image_inspect_raw,
         )
         .operation(
             {
-                let mut op = write_op(
-                    "docker.image.pull",
-                    "Pull a Docker image.",
-                    so(
-                        json!({
-                            "reference": {"type": "string"},
-                            "platform": {"type": "string"},
-                            "socket": {"type": "string"}
-                        }),
-                        json!(["reference"]),
-                    ),
-                );
+                let mut op =
+                    write_op_typed::<ImagePullInput>("docker.image.pull", "Pull a Docker image.");
                 op.risk = Some(Risk::Medium);
                 op
             },
@@ -510,18 +877,8 @@ fn manifest_builder() -> PluginBuilder {
         )
         .operation(
             {
-                let mut op = write_op(
-                    "docker.image.tag",
-                    "Tag a Docker image.",
-                    so(
-                        json!({
-                            "source": {"type": "string"},
-                            "target": {"type": "string"},
-                            "socket": {"type": "string"}
-                        }),
-                        json!(["source", "target"]),
-                    ),
-                );
+                let mut op =
+                    write_op_typed::<ImageTagInput>("docker.image.tag", "Tag a Docker image.");
                 op.risk = Some(Risk::Medium);
                 op
             },
@@ -529,18 +886,9 @@ fn manifest_builder() -> PluginBuilder {
         )
         .operation(
             {
-                let mut op = write_op(
+                let mut op = write_op_typed::<ImageRemoveInput>(
                     "docker.image.remove",
                     "Remove a Docker image.",
-                    so(
-                        json!({
-                            "id": {"type": "string"},
-                            "force": {"type": "boolean"},
-                            "noprune": {"type": "boolean"},
-                            "socket": {"type": "string"}
-                        }),
-                        json!(["id"]),
-                    ),
                 );
                 op.risk = Some(Risk::Destructive);
                 op
@@ -549,18 +897,9 @@ fn manifest_builder() -> PluginBuilder {
         )
         .operation(
             {
-                let mut op = write_op(
+                let mut op = write_op_typed::<ImagePruneInput>(
                     "docker.image.prune",
                     "Prune unused Docker images.",
-                    so(
-                        json!({
-                            "all": {"type": "boolean"},
-                            "until": {"type": "string"},
-                            "label": {"type": "array"},
-                            "socket": {"type": "string"}
-                        }),
-                        json!([]),
-                    ),
                 );
                 op.risk = Some(Risk::Destructive);
                 op
@@ -569,53 +908,28 @@ fn manifest_builder() -> PluginBuilder {
         )
         // ---- networks ----
         .operation(
-            read_op(
-                "docker.network.list",
-                "List Docker networks.",
-                so(
-                    json!({
-                        "name": {"type": "array"},
-                        "label": {"type": "array"},
-                        "socket": {"type": "string"}
-                    }),
-                    json!([]),
-                ),
-            ),
+            read_op_typed::<NetworkListInput>("docker.network.list", "List Docker networks."),
             network_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<NetworkShowInput>(
                 "docker.network.show",
                 "Show one Docker network by ID or name.",
-                id_schema.clone(),
             ),
             network_show,
         )
         .operation(
-            read_op(
+            read_op_typed::<NetworkInspectRawInput>(
                 "docker.network.inspect.raw",
                 "Show raw Docker network inspect data.",
-                id_schema.clone(),
             ),
             network_inspect_raw,
         )
         .operation(
             {
-                let mut op = write_op(
+                let mut op = write_op_typed::<NetworkCreateInput>(
                     "docker.network.create",
                     "Create a Docker network.",
-                    so(
-                        json!({
-                            "name": {"type": "string"},
-                            "driver": {"type": "string"},
-                            "internal": {"type": "boolean"},
-                            "attachable": {"type": "boolean"},
-                            "options": {"type": "object"},
-                            "labels": {"type": "object"},
-                            "socket": {"type": "string"}
-                        }),
-                        json!(["name"]),
-                    ),
                 );
                 op.risk = Some(Risk::Medium);
                 op
@@ -624,10 +938,9 @@ fn manifest_builder() -> PluginBuilder {
         )
         .operation(
             {
-                let mut op = write_op(
+                let mut op = write_op_typed::<NetworkRemoveInput>(
                     "docker.network.remove",
                     "Remove a Docker network.",
-                    id_schema.clone(),
                 );
                 op.risk = Some(Risk::Destructive);
                 op
@@ -636,10 +949,9 @@ fn manifest_builder() -> PluginBuilder {
         )
         .operation(
             {
-                let mut op = write_op(
+                let mut op = write_op_typed::<PruneInput>(
                     "docker.network.prune",
                     "Prune unused Docker networks.",
-                    prune_schema.clone(),
                 );
                 op.risk = Some(Risk::Destructive);
                 op
@@ -648,51 +960,28 @@ fn manifest_builder() -> PluginBuilder {
         )
         // ---- volumes ----
         .operation(
-            read_op(
-                "docker.volume.list",
-                "List Docker volumes.",
-                so(
-                    json!({
-                        "name": {"type": "array"},
-                        "label": {"type": "array"},
-                        "socket": {"type": "string"}
-                    }),
-                    json!([]),
-                ),
-            ),
+            read_op_typed::<VolumeListInput>("docker.volume.list", "List Docker volumes."),
             volume_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<VolumeShowInput>(
                 "docker.volume.show",
                 "Show one Docker volume by name.",
-                id_schema.clone(),
             ),
             volume_show,
         )
         .operation(
-            read_op(
+            read_op_typed::<VolumeInspectRawInput>(
                 "docker.volume.inspect.raw",
                 "Show raw Docker volume inspect data.",
-                id_schema.clone(),
             ),
             volume_inspect_raw,
         )
         .operation(
             {
-                let mut op = write_op(
+                let mut op = write_op_typed::<VolumeCreateInput>(
                     "docker.volume.create",
                     "Create a Docker volume.",
-                    so(
-                        json!({
-                            "name": {"type": "string"},
-                            "driver": {"type": "string"},
-                            "driver_opts": {"type": "object"},
-                            "labels": {"type": "object"},
-                            "socket": {"type": "string"}
-                        }),
-                        json!([]),
-                    ),
                 );
                 op.risk = Some(Risk::Medium);
                 op
@@ -701,17 +990,9 @@ fn manifest_builder() -> PluginBuilder {
         )
         .operation(
             {
-                let mut op = write_op(
+                let mut op = write_op_typed::<VolumeRemoveInput>(
                     "docker.volume.remove",
                     "Remove a Docker volume.",
-                    so(
-                        json!({
-                            "id": {"type": "string"},
-                            "force": {"type": "boolean"},
-                            "socket": {"type": "string"}
-                        }),
-                        json!(["id"]),
-                    ),
                 );
                 op.risk = Some(Risk::Destructive);
                 op
@@ -720,10 +1001,9 @@ fn manifest_builder() -> PluginBuilder {
         )
         .operation(
             {
-                let mut op = write_op(
+                let mut op = write_op_typed::<PruneInput>(
                     "docker.volume.prune",
                     "Prune unused Docker volumes.",
-                    prune_schema,
                 );
                 op.risk = Some(Risk::Destructive);
                 op
@@ -740,33 +1020,6 @@ fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
         capabilities: vec!["search".into(), "get".into(), "index".into()],
         entity_schema: None,
     }
-}
-
-fn container_create_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "image": {"type": "string"},
-            "name": {"type": "string"},
-            "cmd": {"type": "array"},
-            "entrypoint": {"type": "array"},
-            "env": {"type": "array"},
-            "labels": {"type": "object"},
-            "workdir": {"type": "string"},
-            "user": {"type": "string"},
-            "hostname": {"type": "string"},
-            "network": {"type": "string"},
-            "restart": {"type": "string"},
-            "auto_remove": {"type": "boolean"},
-            "tty": {"type": "boolean"},
-            "privileged": {"type": "boolean"},
-            "binds": {"type": "array"},
-            "ports": {"type": "array"},
-            "platform": {"type": "string"},
-            "socket": {"type": "string"}
-        },
-        "required": ["image"]
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -820,7 +1073,23 @@ fn system_info(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn system_df(input: Value, host: &mut Host) -> Result<Value, String> {
     let sock = get_sock(&input);
-    docker_json(host, &sock, "GET", "/v1.43/system/df", None)
+    let mut pairs: Vec<(&str, String)> = Vec::new();
+    if let Some(types) = input.get("types").and_then(|v| v.as_array()) {
+        if !types.is_empty() {
+            let mut map = serde_json::Map::new();
+            for t in types {
+                if let Some(s) = t.as_str() {
+                    map.insert(s.to_string(), json!(true));
+                }
+            }
+            pairs.push((
+                "type",
+                serde_json::to_string(&Value::Object(map)).unwrap_or_default(),
+            ));
+        }
+    }
+    let path = format!("/v1.43/system/df{}", qs(&pairs));
+    docker_json(host, &sock, "GET", &path, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -922,7 +1191,14 @@ fn strip_docker_log_frames(data: &[u8]) -> String {
 fn container_top(input: Value, host: &mut Host) -> Result<Value, String> {
     let sock = get_sock(&input);
     let id = req_str(&input, "id")?;
-    let ps_args = opt_str(&input, "args").unwrap_or_default();
+    let ps_args = if let Some(args) = input.get("args").and_then(|v| v.as_array()) {
+        args.iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        opt_str(&input, "args").unwrap_or_default()
+    };
     let path = format!(
         "/v1.43/containers/{}/top{}",
         enc(&id),
@@ -998,6 +1274,9 @@ fn container_restart(input: Value, host: &mut Host) -> Result<Value, String> {
     if let Some(t) = opt_i64(&input, "timeout") {
         pairs.push(("t", t.to_string()));
     }
+    if let Some(sig) = opt_str(&input, "signal") {
+        pairs.push(("signal", sig));
+    }
     let path = format!(
         "/v1.43/containers/{}/restart{}",
         enc(&id),
@@ -1044,6 +1323,22 @@ fn build_container_body(input: &Value) -> Value {
     if opt_bool(input, "privileged").unwrap_or(false) {
         host_config.insert("Privileged".into(), json!(true));
     }
+    // Mounts.
+    if let Some(mounts) = input.get("mounts").and_then(|v| v.as_array()) {
+        let mapped: Vec<Value> = mounts
+            .iter()
+            .map(|m| {
+                json!({
+                    "Type": m.get("type").and_then(|v| v.as_str()).unwrap_or("bind"),
+                    "Source": m.get("source").and_then(|v| v.as_str()).unwrap_or(""),
+                    "Target": m.get("target").and_then(|v| v.as_str()).unwrap_or(""),
+                    "ReadOnly": m.get("read_only").and_then(|v| v.as_bool()).unwrap_or(false),
+                })
+            })
+            .collect();
+        host_config.insert("Mounts".into(), Value::Array(mapped));
+    }
+
     // Port bindings.
     if let Some(ports) = input.get("ports").and_then(|v| v.as_array()) {
         let mut bindings = serde_json::Map::new();
@@ -1064,10 +1359,15 @@ fn build_container_body(input: &Value) -> Value {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let protocol = p
+                .get("protocol")
+                .and_then(|v| v.as_str())
+                .unwrap_or("tcp")
+                .to_string();
             let key = if container_port.contains('/') {
                 container_port.clone()
             } else {
-                format!("{container_port}/tcp")
+                format!("{container_port}/{protocol}")
             };
             exposed.insert(key.clone(), json!({}));
             let bind = json!([{"HostIp": host_ip, "HostPort": host_port}]);
@@ -1113,6 +1413,9 @@ fn build_container_body(input: &Value) -> Value {
     }
     if opt_bool(input, "tty").unwrap_or(false) {
         body.insert("Tty".into(), json!(true));
+    }
+    if opt_bool(input, "open_stdin").unwrap_or(false) {
+        body.insert("OpenStdin".into(), json!(true));
     }
     if let Some(network) = opt_str(input, "network") {
         host_config.insert("NetworkMode".into(), json!(network));
@@ -1243,6 +1546,7 @@ fn image_pull(input: Value, host: &mut Host) -> Result<Value, String> {
     let sock = get_sock(&input);
     let reference = req_str(&input, "reference")?;
     let platform = opt_str(&input, "platform").unwrap_or_default();
+    let limit = opt_i64(&input, "limit").map(|n| n.max(0) as usize);
     let path = format!(
         "/v1.43/images/create{}",
         qs(&[("fromImage", reference.clone()), ("platform", platform)])
@@ -1253,8 +1557,9 @@ fn image_pull(input: Value, host: &mut Host) -> Result<Value, String> {
         return Err(format!("docker image pull {reference} → {status}"));
     }
     let text = String::from_utf8_lossy(&bytes);
-    // Count lines as events.
-    let count = text.lines().filter(|l| !l.trim().is_empty()).count();
+    // Count lines as events, honoring the caller-specified limit.
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let count = limit.map(|n| lines.len().min(n)).unwrap_or(lines.len());
     Ok(json!({ "reference": reference, "count": count, "ok": true }))
 }
 
@@ -1347,11 +1652,15 @@ fn image_prune(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn network_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let sock = get_sock(&input);
+    let limit = opt_i64(&input, "limit").map(|n| n.max(0) as usize);
     let filters = filters_qs(&input, &[("name", "name"), ("label", "label")]);
     let path = format!("/v1.43/networks{}", qs(&[("filters", filters)]));
     let raw = docker_json(host, &sock, "GET", &path, None)?;
     let arr = raw.as_array().cloned().unwrap_or_default();
-    let networks: Vec<Value> = arr.iter().map(normalize_network).collect();
+    let mut networks: Vec<Value> = arr.iter().map(normalize_network).collect();
+    if let Some(limit) = limit {
+        networks.truncate(limit);
+    }
     contribute_networks(host, &networks);
     Ok(Value::Array(networks))
 }
@@ -1390,11 +1699,23 @@ fn network_create(input: Value, host: &mut Host) -> Result<Value, String> {
     if let Some(driver) = opt_str(&input, "driver") {
         body.insert("Driver".into(), json!(driver));
     }
+    if let Some(scope) = opt_str(&input, "scope") {
+        body.insert("Scope".into(), json!(scope));
+    }
     if opt_bool(&input, "internal").unwrap_or(false) {
         body.insert("Internal".into(), json!(true));
     }
     if opt_bool(&input, "attachable").unwrap_or(false) {
         body.insert("Attachable".into(), json!(true));
+    }
+    if opt_bool(&input, "ingress").unwrap_or(false) {
+        body.insert("Ingress".into(), json!(true));
+    }
+    if let Some(v) = opt_bool(&input, "enable_ipv4") {
+        body.insert("EnableIPv4".into(), json!(v));
+    }
+    if let Some(v) = opt_bool(&input, "enable_ipv6") {
+        body.insert("EnableIPv6".into(), json!(v));
     }
     if let Some(opts) = input.get("options") {
         body.insert("Options".into(), opts.clone());
@@ -1449,6 +1770,7 @@ fn network_prune(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn volume_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let sock = get_sock(&input);
+    let limit = opt_i64(&input, "limit").map(|n| n.max(0) as usize);
     let filters = filters_qs(&input, &[("name", "name"), ("label", "label")]);
     let path = format!("/v1.43/volumes{}", qs(&[("filters", filters)]));
     let resp = docker_json(host, &sock, "GET", &path, None)?;
@@ -1457,7 +1779,10 @@ fn volume_list(input: Value, host: &mut Host) -> Result<Value, String> {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let volumes: Vec<Value> = arr.iter().map(normalize_volume).collect();
+    let mut volumes: Vec<Value> = arr.iter().map(normalize_volume).collect();
+    if let Some(limit) = limit {
+        volumes.truncate(limit);
+    }
     contribute_volumes(host, &volumes);
     Ok(Value::Array(volumes))
 }
@@ -2266,5 +2591,606 @@ mod tests {
             .unwrap();
         assert_eq!(out["count"], 2);
         assert_eq!(out["space_reclaimed_bytes"], 2048);
+    }
+
+    // -----------------------------------------------------------------------
+    // D-36 real-gap tests (failing-first): params/behaviour present in
+    // fluxplane Go but missing from the flux docker plugin before this pass.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_system_df_types_filter() {
+        let body = r#"{"Images":[],"Containers":[],"Volumes":[],"BuildCache":[]}"#;
+        let mut host = MockHost::default().with_conn_response(http_200(body));
+        plugin()
+            .call(
+                "docker.system.df",
+                json!({"types": ["image", "container"]}),
+                &mut host,
+            )
+            .unwrap();
+        let buf = host.conn_buf.borrow();
+        let requests = String::from_utf8_lossy(&buf);
+        assert!(requests.contains("type=%7B"), "got {requests}");
+        assert!(requests.contains("%22image%22%3Atrue"), "got {requests}");
+        assert!(
+            requests.contains("%22container%22%3Atrue"),
+            "got {requests}"
+        );
+    }
+
+    #[test]
+    fn test_container_top_args_array() {
+        let body = r#"{"Titles":["PID","COMMAND"],"Processes":[["1","nginx"]]}"#;
+        let mut host = MockHost::default().with_conn_response(http_200(body));
+        plugin()
+            .call(
+                "docker.container.top",
+                json!({"id": "abc123", "args": ["-e", "-f"]}),
+                &mut host,
+            )
+            .unwrap();
+        let buf = host.conn_buf.borrow();
+        let requests = String::from_utf8_lossy(&buf);
+        assert!(requests.contains("ps_args=-e%20-f"), "got {requests}");
+    }
+
+    #[test]
+    fn test_container_restart_signal() {
+        let mut host = MockHost::default().with_conn_response(http_204());
+        plugin()
+            .call(
+                "docker.container.restart",
+                json!({"id": "abc123", "signal": "SIGKILL"}),
+                &mut host,
+            )
+            .unwrap();
+        let buf = host.conn_buf.borrow();
+        let requests = String::from_utf8_lossy(&buf);
+        assert!(requests.contains("signal=SIGKILL"), "got {requests}");
+    }
+
+    #[test]
+    fn test_container_create_mounts_and_open_stdin() {
+        let body = r#"{"Id":"new","Warnings":[]}"#;
+        let mut host = MockHost::default().with_conn_response(http_201(body));
+        plugin()
+            .call(
+                "docker.container.create",
+                json!({
+                    "image": "nginx:alpine",
+                    "name": "dev",
+                    "open_stdin": true,
+                    "mounts": [{"type": "bind", "source": "/host", "target": "/container", "read_only": true}]
+                }),
+                &mut host,
+            )
+            .unwrap();
+        let buf = host.conn_buf.borrow();
+        let requests = String::from_utf8_lossy(&buf);
+        assert!(requests.contains(r#""OpenStdin":true"#), "got {requests}");
+        assert!(requests.contains(r#""Mounts":["#), "got {requests}");
+        assert!(requests.contains(r#""ReadOnly":true"#), "got {requests}");
+    }
+
+    #[test]
+    fn test_network_create_extra_fields() {
+        let body = r#"{"Id":"net123"}"#;
+        let mut host = MockHost::default().with_conn_response(http_201(body));
+        plugin()
+            .call(
+                "docker.network.create",
+                json!({
+                    "name": "mynet",
+                    "scope": "global",
+                    "ingress": true,
+                    "enable_ipv6": true
+                }),
+                &mut host,
+            )
+            .unwrap();
+        let buf = host.conn_buf.borrow();
+        let requests = String::from_utf8_lossy(&buf);
+        assert!(requests.contains(r#""Scope":"global""#), "got {requests}");
+        assert!(requests.contains(r#""Ingress":true"#), "got {requests}");
+        assert!(requests.contains(r#""EnableIPv6":true"#), "got {requests}");
+    }
+
+    #[test]
+    fn test_network_list_limit() {
+        let body = r#"[{"Id":"n1","Name":"net1","Driver":"bridge","Scope":"local","Internal":false,"Attachable":false,"Labels":{}},{"Id":"n2","Name":"net2","Driver":"bridge","Scope":"local","Internal":false,"Attachable":false,"Labels":{}}]"#;
+        let mut host = MockHost::default().with_conn_response(http_200(body));
+        let out = plugin()
+            .call("docker.network.list", json!({"limit": 1}), &mut host)
+            .unwrap();
+        let arr = out.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], "net1");
+    }
+
+    #[test]
+    fn test_volume_list_limit() {
+        let body = r#"{"Volumes":[{"Name":"v1","Driver":"local","Scope":"local","Labels":{}},{"Name":"v2","Driver":"local","Scope":"local","Labels":{}}],"Warnings":[]}"#;
+        let mut host = MockHost::default().with_conn_response(http_200(body));
+        let out = plugin()
+            .call("docker.volume.list", json!({"limit": 1}), &mut host)
+            .unwrap();
+        let arr = out.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], "v1");
+    }
+
+    #[test]
+    fn test_image_pull_limit() {
+        let body = "{\"status\":\"a\"}\n{\"status\":\"b\"}\n{\"status\":\"c\"}\n";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .into_bytes();
+        let mut host = MockHost::default().with_conn_response(resp);
+        let out = plugin()
+            .call(
+                "docker.image.pull",
+                json!({"reference": "nginx", "limit": 2}),
+                &mut host,
+            )
+            .unwrap();
+        assert_eq!(out["count"], 2);
+    }
+}
+
+// ===========================================================================
+// D-36: schema-derivation contract test.
+// Locks each op's derived schemars schema to its intended field/required/type
+// contract (encoded from the struct definitions). A change here is a real
+// contract change.
+// ===========================================================================
+#[cfg(test)]
+mod schema_contract {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Kind {
+        Str,
+        Int,
+        Bool,
+        ArrayStr,
+        ArrayAny,
+        Object,
+    }
+
+    #[derive(Clone)]
+    struct Prop {
+        name: &'static str,
+        kind: Kind,
+    }
+
+    #[derive(Clone)]
+    struct OpContract {
+        props: Vec<Prop>,
+        required: Vec<&'static str>,
+    }
+
+    fn p(name: &'static str, kind: Kind) -> Prop {
+        Prop { name, kind }
+    }
+
+    fn c(props: Vec<Prop>, required: Vec<&'static str>) -> OpContract {
+        OpContract { props, required }
+    }
+
+    fn socket_prop() -> Prop {
+        p("socket", Kind::Str)
+    }
+
+    fn container_create_contract() -> OpContract {
+        c(
+            vec![
+                socket_prop(),
+                p("image", Kind::Str),
+                p("name", Kind::Str),
+                p("cmd", Kind::ArrayStr),
+                p("entrypoint", Kind::ArrayStr),
+                p("env", Kind::ArrayStr),
+                p("labels", Kind::Object),
+                p("workdir", Kind::Str),
+                p("user", Kind::Str),
+                p("hostname", Kind::Str),
+                p("network", Kind::Str),
+                p("restart", Kind::Str),
+                p("auto_remove", Kind::Bool),
+                p("tty", Kind::Bool),
+                p("open_stdin", Kind::Bool),
+                p("privileged", Kind::Bool),
+                p("binds", Kind::ArrayStr),
+                p("mounts", Kind::ArrayAny),
+                p("ports", Kind::ArrayAny),
+                p("platform", Kind::Str),
+            ],
+            vec!["image"],
+        )
+    }
+
+    fn contracts() -> Vec<(&'static str, OpContract)> {
+        vec![
+            ("docker.info", c(vec![socket_prop()], vec![])),
+            (
+                "docker.system.df",
+                c(vec![socket_prop(), p("types", Kind::ArrayStr)], vec![]),
+            ),
+            (
+                "docker.container.list",
+                c(
+                    vec![
+                        socket_prop(),
+                        p("all", Kind::Bool),
+                        p("limit", Kind::Int),
+                        p("status", Kind::ArrayStr),
+                        p("name", Kind::ArrayStr),
+                        p("label", Kind::ArrayStr),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "docker.container.show",
+                c(vec![socket_prop(), p("id", Kind::Str)], vec!["id"]),
+            ),
+            (
+                "docker.container.logs",
+                c(
+                    vec![
+                        socket_prop(),
+                        p("id", Kind::Str),
+                        p("tail", Kind::Int),
+                        p("since", Kind::Str),
+                        p("until", Kind::Str),
+                        p("timestamps", Kind::Bool),
+                    ],
+                    vec!["id"],
+                ),
+            ),
+            (
+                "docker.container.top",
+                c(
+                    vec![socket_prop(), p("id", Kind::Str), p("args", Kind::ArrayStr)],
+                    vec!["id"],
+                ),
+            ),
+            (
+                "docker.container.inspect.raw",
+                c(vec![socket_prop(), p("id", Kind::Str)], vec!["id"]),
+            ),
+            (
+                "docker.container.start",
+                c(vec![socket_prop(), p("id", Kind::Str)], vec!["id"]),
+            ),
+            (
+                "docker.container.stop",
+                c(
+                    vec![
+                        socket_prop(),
+                        p("id", Kind::Str),
+                        p("timeout", Kind::Int),
+                        p("signal", Kind::Str),
+                    ],
+                    vec!["id"],
+                ),
+            ),
+            (
+                "docker.container.restart",
+                c(
+                    vec![
+                        socket_prop(),
+                        p("id", Kind::Str),
+                        p("timeout", Kind::Int),
+                        p("signal", Kind::Str),
+                    ],
+                    vec!["id"],
+                ),
+            ),
+            (
+                "docker.container.remove",
+                c(
+                    vec![
+                        socket_prop(),
+                        p("id", Kind::Str),
+                        p("force", Kind::Bool),
+                        p("volumes", Kind::Bool),
+                    ],
+                    vec!["id"],
+                ),
+            ),
+            ("docker.container.create", container_create_contract()),
+            ("docker.container.run", container_create_contract()),
+            (
+                "docker.container.prune",
+                c(
+                    vec![
+                        socket_prop(),
+                        p("until", Kind::Str),
+                        p("label", Kind::ArrayStr),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "docker.image.list",
+                c(
+                    vec![
+                        socket_prop(),
+                        p("all", Kind::Bool),
+                        p("limit", Kind::Int),
+                        p("reference", Kind::ArrayStr),
+                        p("label", Kind::ArrayStr),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "docker.image.show",
+                c(vec![socket_prop(), p("id", Kind::Str)], vec!["id"]),
+            ),
+            (
+                "docker.image.inspect.raw",
+                c(vec![socket_prop(), p("id", Kind::Str)], vec!["id"]),
+            ),
+            (
+                "docker.image.pull",
+                c(
+                    vec![
+                        socket_prop(),
+                        p("reference", Kind::Str),
+                        p("platform", Kind::Str),
+                        p("limit", Kind::Int),
+                    ],
+                    vec!["reference"],
+                ),
+            ),
+            (
+                "docker.image.tag",
+                c(
+                    vec![
+                        socket_prop(),
+                        p("source", Kind::Str),
+                        p("target", Kind::Str),
+                    ],
+                    vec!["source", "target"],
+                ),
+            ),
+            (
+                "docker.image.remove",
+                c(
+                    vec![
+                        socket_prop(),
+                        p("id", Kind::Str),
+                        p("force", Kind::Bool),
+                        p("noprune", Kind::Bool),
+                    ],
+                    vec!["id"],
+                ),
+            ),
+            (
+                "docker.image.prune",
+                c(
+                    vec![
+                        socket_prop(),
+                        p("all", Kind::Bool),
+                        p("until", Kind::Str),
+                        p("label", Kind::ArrayStr),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "docker.network.list",
+                c(
+                    vec![
+                        socket_prop(),
+                        p("limit", Kind::Int),
+                        p("name", Kind::ArrayStr),
+                        p("label", Kind::ArrayStr),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "docker.network.show",
+                c(vec![socket_prop(), p("id", Kind::Str)], vec!["id"]),
+            ),
+            (
+                "docker.network.inspect.raw",
+                c(vec![socket_prop(), p("id", Kind::Str)], vec!["id"]),
+            ),
+            (
+                "docker.network.create",
+                c(
+                    vec![
+                        socket_prop(),
+                        p("name", Kind::Str),
+                        p("driver", Kind::Str),
+                        p("scope", Kind::Str),
+                        p("internal", Kind::Bool),
+                        p("attachable", Kind::Bool),
+                        p("ingress", Kind::Bool),
+                        p("enable_ipv4", Kind::Bool),
+                        p("enable_ipv6", Kind::Bool),
+                        p("options", Kind::Object),
+                        p("labels", Kind::Object),
+                    ],
+                    vec!["name"],
+                ),
+            ),
+            (
+                "docker.network.remove",
+                c(vec![socket_prop(), p("id", Kind::Str)], vec!["id"]),
+            ),
+            (
+                "docker.network.prune",
+                c(
+                    vec![
+                        socket_prop(),
+                        p("until", Kind::Str),
+                        p("label", Kind::ArrayStr),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "docker.volume.list",
+                c(
+                    vec![
+                        socket_prop(),
+                        p("limit", Kind::Int),
+                        p("name", Kind::ArrayStr),
+                        p("label", Kind::ArrayStr),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "docker.volume.show",
+                c(vec![socket_prop(), p("id", Kind::Str)], vec!["id"]),
+            ),
+            (
+                "docker.volume.inspect.raw",
+                c(vec![socket_prop(), p("id", Kind::Str)], vec!["id"]),
+            ),
+            (
+                "docker.volume.create",
+                c(
+                    vec![
+                        socket_prop(),
+                        p("name", Kind::Str),
+                        p("driver", Kind::Str),
+                        p("driver_opts", Kind::Object),
+                        p("labels", Kind::Object),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "docker.volume.remove",
+                c(
+                    vec![socket_prop(), p("id", Kind::Str), p("force", Kind::Bool)],
+                    vec!["id"],
+                ),
+            ),
+            (
+                "docker.volume.prune",
+                c(
+                    vec![
+                        socket_prop(),
+                        p("until", Kind::Str),
+                        p("label", Kind::ArrayStr),
+                    ],
+                    vec![],
+                ),
+            ),
+        ]
+    }
+
+    fn resolve<'a>(node: &'a Value, defs: &'a Value) -> &'a Value {
+        if let Some(obj) = node.as_object() {
+            if let Some(r) = obj.get("$ref").and_then(|v| v.as_str()) {
+                if let Some(name) = r.strip_prefix("#/definitions/") {
+                    return defs.get(name).unwrap_or(node);
+                }
+            }
+            if let Some(any) = obj.get("anyOf").and_then(|v| v.as_array()) {
+                for m in any {
+                    if m.get("type").and_then(|v| v.as_str()) != Some("null") {
+                        return resolve(m, defs);
+                    }
+                }
+            }
+        }
+        node
+    }
+
+    fn kind_of(node: &Value) -> Kind {
+        let t = node.get("type");
+        if let Some(arr) = t.and_then(|v| v.as_array()) {
+            let first = arr
+                .iter()
+                .find(|v| v.as_str() != Some("null"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("null");
+            return base_kind(first, node);
+        }
+        base_kind(t.and_then(|v| v.as_str()).unwrap_or(""), node)
+    }
+
+    fn base_kind(t: &str, node: &Value) -> Kind {
+        match t {
+            "integer" => Kind::Int,
+            "boolean" => Kind::Bool,
+            "string" => Kind::Str,
+            "array" => {
+                let items = node.get("items").cloned().unwrap_or(Value::Null);
+                if items.get("type").and_then(|v| v.as_str()) == Some("string") {
+                    Kind::ArrayStr
+                } else {
+                    Kind::ArrayAny
+                }
+            }
+            "object" | "" => Kind::Object,
+            other => panic!("unsupported property type: {other} ({node})"),
+        }
+    }
+
+    fn assert_contract(op_name: &str, schema: &Value, contract: &OpContract) {
+        let defs = schema.get("definitions").cloned().unwrap_or(json!({}));
+        assert_eq!(schema["type"], "object", "{op_name}: root type");
+        let props_obj = schema.get("properties").and_then(|v| v.as_object());
+        let mut got: BTreeMap<&str, Kind> = BTreeMap::new();
+        if let Some(props) = props_obj {
+            for (k, v) in props {
+                let resolved = resolve(v, &defs);
+                got.insert(k.as_str(), kind_of(resolved));
+            }
+        }
+        let want: BTreeMap<&str, Kind> = contract
+            .props
+            .iter()
+            .map(|Prop { name, kind }| (*name, kind.clone()))
+            .collect();
+        assert_eq!(got.len(), want.len(), "{op_name}: property count");
+        for Prop { name, kind } in &contract.props {
+            let got_kind = got
+                .get(*name)
+                .unwrap_or_else(|| panic!("{op_name}: missing property `{name}`"));
+            assert_eq!(got_kind, kind, "{op_name}: property `{name}` kind");
+        }
+        let mut req: Vec<&str> = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        req.sort();
+        let mut want_req: Vec<&str> = contract.required.clone();
+        want_req.sort();
+        assert_eq!(req, want_req, "{op_name}: required set");
+    }
+
+    #[test]
+    fn derived_schemas_match_contract() {
+        let ops = contracts();
+        let manifest = manifest_builder().build().manifest();
+        let by_name: BTreeMap<&str, &OperationSpec> = manifest
+            .operations
+            .iter()
+            .map(|o| (o.name.as_str(), o))
+            .collect();
+        assert_eq!(by_name.len(), ops.len(), "op count changed");
+        for (name, contract) in &ops {
+            let spec = by_name
+                .get(*name)
+                .unwrap_or_else(|| panic!("missing op {name}"));
+            assert_contract(name, &spec.input_schema, contract);
+        }
     }
 }

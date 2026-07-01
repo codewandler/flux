@@ -366,3 +366,35 @@ migration of every op + a fluxplane parity re-audit + ported gaps.
 
 All 4: `endpoint_ref` per-call targeting left as-is (flux resolves `<plugin>.endpoint` via
 `host.endpoint(...)` + reference-IO, D-29).
+
+---
+
+# D-43 — medium cluster schemars migration + parity ports
+
+Full D-36 per-plugin loop for huggingface, opsgenie, docker (run in parallel).
+
+## huggingface (9 ops)
+- Schemars migration complete (shared `SearchInput` flattened into model/dataset/space search);
+  `so()` deleted; `schema_contract` test.
+- Ported: `chat.stop` + `embed.input` enforced as `[]string` (Go rejects non-string elements;
+  flux forwarded arbitrary arrays).
+
+## opsgenie (8 ops)
+- Schemars migration complete; `so()` deleted; `schema_contract` test.
+- Ported: `401`/`403` auth-rejection error message (actionable — "rejected the api key (status
+  …): … — check the key's permissions") + the `Accept: application/json` header (fluxplane sends
+  it; flux didn't). Tested via `with_http_status_body`.
+
+## docker (33 ops — largest of the batch)
+- Schemars migration complete (shared `SocketProps.socket` flattened); `so()` +
+  `container_create_schema()` deleted; `schema_contract` test.
+- Ported gaps: `system.df` `types` filter; `container.top` `args` array; `container.restart`
+  `signal`; `container.create`/`run` `mounts`/`open_stdin`/port `protocol`; `network.create`
+  `scope`/`ingress`/`enable_ipv4`/`enable_ipv6`; `network.list`/`volume.list`/`image.pull` `limit`.
+- Residual fluxplane-only ops intentionally NOT ported (need streaming/hijack/tar/fs flux's host
+  model doesn't cleanly carry): `container.exec`/`stats`/`copy_from`/`copy_to`, `image.push`/
+  `build`, `system.prune`/`build_cache.prune`, `events`, `context.list`/`context.show`. Flagged
+  for a future pass, not a regression.
+
+All 3: `endpoint_ref`/Docker-daemon architectural splits (do-not-port) — flux resolves the
+endpoint via `host.endpoint(...)` + reference-IO (D-29).

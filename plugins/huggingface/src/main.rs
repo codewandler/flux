@@ -9,7 +9,117 @@
 //! `https://router.huggingface.co`); auth is always required there.
 
 use host_kit::*;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{json, Value};
+
+// ===========================================================================
+// Schema-only op input structs (D-36)
+// ===========================================================================
+// Each op's `input_schema` is derived from the structs below via schemars
+// (`host_kit::read_op_typed::<T>` / `write_op_typed::<T>`), instead of a hand-written
+// `json!({...})` object via the local `so()` helper, so the schema the model sees cannot drift
+// from a separately-maintained literal. The structs are schema-only: handlers keep their existing
+// `req_str` / `req_repo_id` / `Value` extraction except where a real fluxplane parity gap is ported.
+
+/// Shared catalog search fields (model / dataset / space search).
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct SearchInput {
+    /// Free-text search over repo id and metadata.
+    search: Option<String>,
+    /// Filter by owner or organization.
+    author: Option<String>,
+    /// Filter by tag or task.
+    filter: Option<String>,
+    /// Sort field.
+    sort: Option<String>,
+    /// Sort direction. Use `-1` for descending; omit for ascending.
+    direction: Option<String>,
+    /// Maximum results to return.
+    limit: Option<i64>,
+}
+
+/// `huggingface.test`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct TestInput {}
+
+/// `huggingface.model.search`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ModelSearchInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    search: SearchInput,
+}
+
+/// `huggingface.dataset.search`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct DatasetSearchInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    search: SearchInput,
+}
+
+/// `huggingface.space.search`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct SpaceSearchInput {
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    search: SearchInput,
+}
+
+/// `huggingface.model.get`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ModelGetInput {
+    /// Model repo id (e.g. meta-llama/Llama-3.1-8B-Instruct).
+    repo_id: String,
+}
+
+/// `huggingface.dataset.get`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct DatasetGetInput {
+    /// Dataset repo id (e.g. rajpurkar/squad).
+    repo_id: String,
+}
+
+/// `huggingface.whoami`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct WhoamiInput {}
+
+/// `huggingface.chat`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ChatInput {
+    /// Model id.
+    model: String,
+    /// Chat message history in order.
+    messages: Vec<Value>,
+    /// Maximum tokens to generate.
+    max_tokens: Option<i64>,
+    /// Sampling temperature.
+    temperature: Option<f64>,
+    /// Nucleus sampling probability mass.
+    top_p: Option<f64>,
+    /// Stop sequences that end generation.
+    stop: Option<Vec<String>>,
+}
+
+/// `huggingface.embed`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct EmbedInput {
+    /// Embedding model id.
+    model: String,
+    /// One or more input strings to embed.
+    input: Vec<String>,
+}
 
 // ---------------------------------------------------------------------------
 // Manifest.
@@ -46,125 +156,70 @@ fn manifest_builder() -> PluginBuilder {
         .datasource(ds("huggingface.spaces", "huggingface.space", "Hugging Face Hub spaces."))
         // ---- reachability / auth test ----
         .operation(
-            read_op(
+            read_op_typed::<TestInput>(
                 "huggingface.test",
                 "Test reachability of the Hub (anonymous) and, when a token is present, validate it via whoami.",
-                so(json!({}), json!([])),
             ),
             op_test,
         )
         // ---- model ops ----
         .operation(
-            read_op(
+            read_op_typed::<ModelSearchInput>(
                 "huggingface.model.search",
                 "Search the Hugging Face Hub for models (GET /api/models).",
-                so(
-                    json!({
-                        "search":    {"type": "string"},
-                        "author":    {"type": "string"},
-                        "filter":    {"type": "string"},
-                        "sort":      {"type": "string"},
-                        "direction": {"type": "string"},
-                        "limit":     {"type": "integer"}
-                    }),
-                    json!([]),
-                ),
             ),
             op_model_search,
         )
         .operation(
-            read_op(
+            read_op_typed::<ModelGetInput>(
                 "huggingface.model.get",
                 "Get metadata for a single Hugging Face model repo (GET /api/models/{repo_id}).",
-                so(json!({"repo_id": {"type": "string"}}), json!(["repo_id"])),
             ),
             op_model_get,
         )
         // ---- dataset ops ----
         .operation(
-            read_op(
+            read_op_typed::<DatasetSearchInput>(
                 "huggingface.dataset.search",
                 "Search the Hugging Face Hub for datasets (GET /api/datasets).",
-                so(
-                    json!({
-                        "search":    {"type": "string"},
-                        "author":    {"type": "string"},
-                        "filter":    {"type": "string"},
-                        "sort":      {"type": "string"},
-                        "direction": {"type": "string"},
-                        "limit":     {"type": "integer"}
-                    }),
-                    json!([]),
-                ),
             ),
             op_dataset_search,
         )
         .operation(
-            read_op(
+            read_op_typed::<DatasetGetInput>(
                 "huggingface.dataset.get",
                 "Get metadata for a single Hugging Face dataset repo (GET /api/datasets/{repo_id}).",
-                so(json!({"repo_id": {"type": "string"}}), json!(["repo_id"])),
             ),
             op_dataset_get,
         )
         // ---- space ops ----
         .operation(
-            read_op(
+            read_op_typed::<SpaceSearchInput>(
                 "huggingface.space.search",
                 "Search the Hugging Face Hub for spaces (GET /api/spaces).",
-                so(
-                    json!({
-                        "search":    {"type": "string"},
-                        "author":    {"type": "string"},
-                        "filter":    {"type": "string"},
-                        "sort":      {"type": "string"},
-                        "direction": {"type": "string"},
-                        "limit":     {"type": "integer"}
-                    }),
-                    json!([]),
-                ),
             ),
             op_space_search,
         )
         // ---- identity ----
         .operation(
-            read_op(
+            read_op_typed::<WhoamiInput>(
                 "huggingface.whoami",
                 "Show the identity associated with the stored Hugging Face token (GET /api/whoami-v2).",
-                so(json!({}), json!([])),
             ),
             op_whoami,
         )
         // ---- inference ----
         .operation(
-            write_op(
+            write_op_typed::<ChatInput>(
                 "huggingface.chat",
                 "Run a chat completion via the Hugging Face inference router (OpenAI-compatible POST /v1/chat/completions, non-streaming).",
-                so(
-                    json!({
-                        "model":       {"type": "string"},
-                        "messages":    {"type": "array"},
-                        "max_tokens":  {"type": "integer"},
-                        "temperature": {"type": "number"},
-                        "top_p":       {"type": "number"},
-                        "stop":        {"type": "array"}
-                    }),
-                    json!(["model", "messages"]),
-                ),
             ),
             op_chat,
         )
         .operation(
-            write_op(
+            write_op_typed::<EmbedInput>(
                 "huggingface.embed",
                 "Create embeddings via the Hugging Face inference router (OpenAI-compatible POST /v1/embeddings).",
-                so(
-                    json!({
-                        "model": {"type": "string"},
-                        "input": {"type": "array"}
-                    }),
-                    json!(["model", "input"]),
-                ),
             ),
             op_embed,
         )
@@ -182,10 +237,6 @@ fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
         capabilities: vec!["search".into(), "get".into(), "index".into()],
         entity_schema: None,
     }
-}
-
-fn so(props: Value, required: Value) -> Value {
-    json!({ "type": "object", "properties": props, "required": required })
 }
 
 // ---------------------------------------------------------------------------
@@ -436,7 +487,12 @@ fn op_chat(input: Value, host: &mut Host) -> Result<Value, String> {
     }
     if let Some(arr) = input.get("stop").and_then(|v| v.as_array()) {
         if !arr.is_empty() {
-            body["stop"] = Value::Array(arr.clone());
+            let mut stops: Vec<String> = Vec::with_capacity(arr.len());
+            for v in arr {
+                let s = v.as_str().ok_or("`stop` elements must be strings")?;
+                stops.push(s.to_string());
+            }
+            body["stop"] = json!(stops);
         }
     }
     hf_post(host, "huggingface.router", "/v1/chat/completions", &body)
@@ -448,9 +504,13 @@ fn op_embed(input: Value, host: &mut Host) -> Result<Value, String> {
         .get("input")
         .and_then(|v| v.as_array())
         .filter(|a| !a.is_empty())
-        .ok_or("`input` (non-empty array) required")?
-        .clone();
-    let body = json!({ "model": model, "input": inp });
+        .ok_or("`input` (non-empty array) required")?;
+    let mut inputs: Vec<String> = Vec::with_capacity(inp.len());
+    for v in inp {
+        let s = v.as_str().ok_or("`input` elements must be strings")?;
+        inputs.push(s.to_string());
+    }
+    let body = json!({ "model": model, "input": inputs });
     hf_post(host, "huggingface.router", "/v1/embeddings", &body)
 }
 
@@ -703,6 +763,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn chat_rejects_non_string_stop_sequences() {
+        let mut host = router_host();
+        let err = run_err(
+            "huggingface.chat",
+            json!({
+                "model": "meta-llama/Llama-3.1-8B-Instruct",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stop": [123]
+            }),
+            &mut host,
+        );
+        assert!(
+            err.contains("stop") && err.contains("string"),
+            "error should mention stop strings: {err}"
+        );
+    }
+
     // ---- huggingface.embed ----
 
     #[test]
@@ -740,5 +818,211 @@ mod tests {
             &mut host,
         );
         assert!(err.contains("input"), "error should mention input: {err}");
+    }
+
+    #[test]
+    fn embed_rejects_non_string_input() {
+        let mut host = router_host();
+        let err = run_err(
+            "huggingface.embed",
+            json!({"model": "intfloat/multilingual-e5-large", "input": [123]}),
+            &mut host,
+        );
+        assert!(
+            err.contains("input") && err.contains("string"),
+            "error should mention input strings: {err}"
+        );
+    }
+}
+
+// ===========================================================================
+// D-36: schema-derivation contract test (huggingface).
+// Locks each op's derived schemars schema to its intended field/required/base
+// type contract (encoded from the struct definitions). A change here is a
+// real contract change.
+// ===========================================================================
+#[cfg(test)]
+mod schema_contract {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Kind {
+        Str,
+        Int,
+        Number,
+        Bool,
+        ArrayAny,
+        ArrayStr,
+    }
+
+    #[derive(Clone)]
+    struct Prop {
+        name: &'static str,
+        kind: Kind,
+    }
+
+    struct OpContract {
+        props: Vec<Prop>,
+        required: Vec<&'static str>,
+    }
+
+    fn p(name: &'static str, kind: Kind) -> Prop {
+        Prop { name, kind }
+    }
+
+    fn c(props: Vec<Prop>, required: Vec<&'static str>) -> OpContract {
+        OpContract { props, required }
+    }
+
+    fn search_props() -> Vec<Prop> {
+        vec![
+            p("search", Kind::Str),
+            p("author", Kind::Str),
+            p("filter", Kind::Str),
+            p("sort", Kind::Str),
+            p("direction", Kind::Str),
+            p("limit", Kind::Int),
+        ]
+    }
+
+    fn contracts() -> Vec<(&'static str, OpContract)> {
+        vec![
+            ("huggingface.test", c(vec![], vec![])),
+            ("huggingface.model.search", c(search_props(), vec![])),
+            (
+                "huggingface.model.get",
+                c(vec![p("repo_id", Kind::Str)], vec!["repo_id"]),
+            ),
+            ("huggingface.dataset.search", c(search_props(), vec![])),
+            (
+                "huggingface.dataset.get",
+                c(vec![p("repo_id", Kind::Str)], vec!["repo_id"]),
+            ),
+            ("huggingface.space.search", c(search_props(), vec![])),
+            ("huggingface.whoami", c(vec![], vec![])),
+            (
+                "huggingface.chat",
+                c(
+                    vec![
+                        p("model", Kind::Str),
+                        p("messages", Kind::ArrayAny),
+                        p("max_tokens", Kind::Int),
+                        p("temperature", Kind::Number),
+                        p("top_p", Kind::Number),
+                        p("stop", Kind::ArrayStr),
+                    ],
+                    vec!["model", "messages"],
+                ),
+            ),
+            (
+                "huggingface.embed",
+                c(
+                    vec![p("model", Kind::Str), p("input", Kind::ArrayStr)],
+                    vec!["model", "input"],
+                ),
+            ),
+        ]
+    }
+
+    fn resolve<'a>(node: &'a Value, defs: &'a Value) -> &'a Value {
+        if let Some(obj) = node.as_object() {
+            if let Some(r) = obj.get("$ref").and_then(|v| v.as_str()) {
+                if let Some(name) = r.strip_prefix("#/definitions/") {
+                    return defs.get(name).unwrap_or(node);
+                }
+            }
+            if let Some(any) = obj.get("anyOf").and_then(|v| v.as_array()) {
+                for m in any {
+                    if m.get("type").and_then(|v| v.as_str()) != Some("null") {
+                        return resolve(m, defs);
+                    }
+                }
+            }
+        }
+        node
+    }
+
+    fn kind_of(node: &Value) -> Kind {
+        let t = node.get("type");
+        if let Some(arr) = t.and_then(|v| v.as_array()) {
+            let first = arr
+                .iter()
+                .find(|v| v.as_str() != Some("null"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("null");
+            return base_kind(first, node);
+        }
+        base_kind(t.and_then(|v| v.as_str()).unwrap_or(""), node)
+    }
+
+    fn base_kind(t: &str, node: &Value) -> Kind {
+        match t {
+            "integer" => Kind::Int,
+            "number" => Kind::Number,
+            "boolean" => Kind::Bool,
+            "string" => Kind::Str,
+            "array" => {
+                let items = node.get("items").cloned().unwrap_or(Value::Null);
+                if items.get("type").and_then(|v| v.as_str()) == Some("string") {
+                    Kind::ArrayStr
+                } else {
+                    Kind::ArrayAny
+                }
+            }
+            other => panic!("unsupported property type: {other} ({node})"),
+        }
+    }
+
+    fn assert_contract(op_name: &str, schema: &Value, contract: &OpContract) {
+        assert_eq!(schema["type"], "object", "{op_name}: root type");
+        let defs = schema.get("definitions").cloned().unwrap_or(json!({}));
+        let props_obj = schema.get("properties").and_then(|v| v.as_object());
+        let mut got: BTreeMap<&str, Kind> = BTreeMap::new();
+        if let Some(props) = props_obj {
+            for (k, v) in props {
+                got.insert(k.as_str(), kind_of(resolve(v, &defs)));
+            }
+        }
+        let want: BTreeMap<&str, Kind> = contract
+            .props
+            .iter()
+            .map(|Prop { name, kind }| (*name, kind.clone()))
+            .collect();
+        assert_eq!(got.len(), want.len(), "{op_name}: property count");
+        for Prop { name, kind } in &contract.props {
+            let got_kind = got
+                .get(*name)
+                .unwrap_or_else(|| panic!("{op_name}: missing property `{name}`"));
+            assert_eq!(got_kind, kind, "{op_name}: property `{name}` kind");
+        }
+        let req: Vec<&str> = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let mut req_set: Vec<&str> = req.clone();
+        req_set.sort();
+        let mut want_req: Vec<&str> = contract.required.clone();
+        want_req.sort();
+        assert_eq!(req_set, want_req, "{op_name}: required set");
+    }
+
+    #[test]
+    fn derived_schemas_match_contract() {
+        let ops = contracts();
+        let manifest = manifest_builder().build().manifest();
+        let by_name: BTreeMap<&str, &OperationSpec> = manifest
+            .operations
+            .iter()
+            .map(|o| (o.name.as_str(), o))
+            .collect();
+        assert_eq!(by_name.len(), ops.len(), "op count changed");
+        for (name, contract) in &ops {
+            let spec = by_name
+                .get(*name)
+                .unwrap_or_else(|| panic!("missing op {name}"));
+            assert_contract(name, &spec.input_schema, contract);
+        }
     }
 }

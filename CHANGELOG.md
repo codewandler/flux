@@ -83,6 +83,16 @@ All notable changes to this project are documented in this file. The format is b
   prometheus `.test` now checks `/-/ready` status (`ready`/`error`/`latency_ms`). MockHost
   gained `with_http_status_body` (host-kit) for error-path tests. 21/16/19/7 tests.
 
+- **Medium cluster schemars migration + parity (D-43).** huggingface (9 ops), opsgenie (8),
+  docker (33, largest of the batch) all schemars-derived in parallel; `so()` helpers deleted;
+  `schema_contract` tests. Fluxplane parity ports: huggingface `chat.stop`/`embed.input` enforced
+  as `[]string`; opsgenie `401`/`403` auth-rejection message + `Accept: application/json` header;
+  docker `system.df` `types` filter, `container.top` `args` array, `container.restart` `signal`,
+  `container.create`/`run` `mounts`/`open_stdin`/port `protocol`, `network.create`
+  `scope`/`ingress`/`enable_ipv4`/`enable_ipv6`, list-op `limit` caps. Docker's
+  streaming/hijack/tar ops (`container.exec`/`stats`/`copy_*`, `image.push`/`build`, `events`,
+  `context.*`) flagged as a residual scope boundary. 19/11/42 tests.
+
 - **Plugin-side schemars op schemas — D-36 (in-progress).** `host-kit` now derives a plugin
   op's `input_schema` from a typed struct via `read_op_typed::<T>` / `write_op_typed::<T>`
   (+ `op_input_schema::<T>()`, a `schemars` re-export), the plugin-side counterpart of D-34.

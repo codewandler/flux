@@ -6,7 +6,88 @@
 //! so the agent can search them.
 
 use host_kit::*;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{json, Value};
+
+// ===========================================================================
+// Schema-only op input structs (D-36)
+// ===========================================================================
+// Each op's `input_schema` is derived from the structs below via schemars
+// (`host_kit::read_op_typed::<T>` / `write_op_typed::<T>`), instead of a hand-written
+// `json!({...})` object via the local `so()` helper, so the schema the model sees cannot drift
+// from a separately-maintained literal. The structs are schema-only: handlers keep their
+// existing `flex_str` extractors (the D-34 schema-only precedent).
+
+/// `opsgenie.test`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct TestInput {}
+
+/// `opsgenie.alert.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct AlertListInput {
+    /// Opsgenie query language, e.g. 'status: open AND priority: P1'.
+    query: Option<String>,
+    /// Max alerts to return (1-100, default 20).
+    limit: Option<i64>,
+}
+
+/// `opsgenie.alert.get`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct AlertGetInput {
+    /// Alert id, alias, or tiny id (see identifier_type).
+    id: String,
+    /// How to interpret id: id (default), alias, or tiny.
+    identifier_type: Option<String>,
+}
+
+/// Shared fields for `opsgenie.alert.ack` and `opsgenie.alert.close`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct AlertActionInput {
+    /// Alert id, alias, or tiny id (see identifier_type).
+    id: String,
+    /// How to interpret id: id (default), alias, or tiny.
+    identifier_type: Option<String>,
+    /// Optional note attached to the action.
+    note: Option<String>,
+    /// Display name of the actor.
+    user: Option<String>,
+}
+
+/// `opsgenie.alert.note`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct AlertNoteInput {
+    /// Alert id, alias, or tiny id (see identifier_type).
+    id: String,
+    /// How to interpret id: id (default), alias, or tiny.
+    identifier_type: Option<String>,
+    /// The note text (required).
+    note: String,
+    /// Display name of the actor.
+    user: Option<String>,
+}
+
+/// `opsgenie.schedule.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ScheduleListInput {}
+
+/// `opsgenie.oncall`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct OnCallInput {
+    /// Case-insensitive substring filter on schedule name.
+    schedule: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Manifest
+// ---------------------------------------------------------------------------
 
 fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("opsgenie", "0.1.0")
@@ -38,110 +119,61 @@ fn manifest_builder() -> PluginBuilder {
         ))
         // ---- auth test ----
         .operation(
-            read_op(
+            read_op_typed::<TestInput>(
                 "opsgenie.test",
                 "Validate the Opsgenie API key and report account name, user count, and plan.",
-                so(json!({}), json!([])),
             ),
             op_test,
         )
         // ---- alert reads ----
         .operation(
-            read_op(
+            read_op_typed::<AlertListInput>(
                 "opsgenie.alert.list",
                 "List Opsgenie alerts (newest first) using the Opsgenie query language. Contributes records.",
-                so(
-                    json!({
-                        "query": {"type": "string", "description": "Opsgenie query language, e.g. 'status: open AND priority: P1'"},
-                        "limit": {"type": "integer", "description": "Max alerts to return (1-100, default 20)"}
-                    }),
-                    json!([]),
-                ),
             ),
             op_alert_list,
         )
         .operation(
-            read_op(
+            read_op_typed::<AlertGetInput>(
                 "opsgenie.alert.get",
                 "Show one Opsgenie alert by id, alias, or tiny id — full details, status, owner, acknowledgement state.",
-                so(
-                    json!({
-                        "id": {"type": "string", "description": "Alert id, alias, or tiny id (see identifier_type)"},
-                        "identifier_type": {"type": "string", "description": "How to interpret id: id (default), alias, or tiny"}
-                    }),
-                    json!(["id"]),
-                ),
             ),
             op_alert_get,
         )
         // ---- alert writes ----
         .operation(
-            write_op(
+            write_op_typed::<AlertActionInput>(
                 "opsgenie.alert.ack",
                 "Acknowledge an Opsgenie alert (stops escalation). The API is async — returns Accepted + RequestId.",
-                so(
-                    json!({
-                        "id": {"type": "string", "description": "Alert id, alias, or tiny id (see identifier_type)"},
-                        "identifier_type": {"type": "string", "description": "How to interpret id: id (default), alias, or tiny"},
-                        "note": {"type": "string", "description": "Optional note attached to the acknowledgement"},
-                        "user": {"type": "string", "description": "Display name of the actor"}
-                    }),
-                    json!(["id"]),
-                ),
             ),
             op_alert_ack,
         )
         .operation(
-            write_op(
+            write_op_typed::<AlertActionInput>(
                 "opsgenie.alert.close",
                 "Close an Opsgenie alert, optionally with a note. The API is async — returns Accepted + RequestId.",
-                so(
-                    json!({
-                        "id": {"type": "string", "description": "Alert id, alias, or tiny id (see identifier_type)"},
-                        "identifier_type": {"type": "string", "description": "How to interpret id: id (default), alias, or tiny"},
-                        "note": {"type": "string", "description": "Optional note attached to the close"},
-                        "user": {"type": "string", "description": "Display name of the actor"}
-                    }),
-                    json!(["id"]),
-                ),
             ),
             op_alert_close,
         )
         .operation(
-            write_op(
+            write_op_typed::<AlertNoteInput>(
                 "opsgenie.alert.note",
                 "Add a note to an Opsgenie alert. The API is async — returns Accepted + RequestId.",
-                so(
-                    json!({
-                        "id": {"type": "string", "description": "Alert id, alias, or tiny id (see identifier_type)"},
-                        "identifier_type": {"type": "string", "description": "How to interpret id: id (default), alias, or tiny"},
-                        "note": {"type": "string", "description": "The note text (required)"},
-                        "user": {"type": "string", "description": "Display name of the actor"}
-                    }),
-                    json!(["id", "note"]),
-                ),
             ),
             op_alert_note,
         )
         // ---- schedules / on-call ----
         .operation(
-            read_op(
+            read_op_typed::<OnCallInput>(
                 "opsgenie.oncall",
                 "Who is on call right now: every enabled schedule with its current on-call participants. Optionally filter by schedule name.",
-                so(
-                    json!({
-                        "schedule": {"type": "string", "description": "Case-insensitive substring filter on schedule name"}
-                    }),
-                    json!([]),
-                ),
             ),
             op_oncall,
         )
         .operation(
-            read_op(
+            read_op_typed::<ScheduleListInput>(
                 "opsgenie.schedule.list",
                 "List Opsgenie schedules with id, name, timezone, and enabled state.",
-                so(json!({}), json!([])),
             ),
             op_schedule_list,
         )
@@ -161,11 +193,6 @@ fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
     }
 }
 
-/// `{ "type": "object", "properties": <props>, "required": <required> }`.
-fn so(props: Value, required: Value) -> Value {
-    json!({ "type": "object", "properties": props, "required": required })
-}
-
 // ---------------------------------------------------------------------------
 // HTTP plumbing — Opsgenie uses `Authorization: GenieKey <key>` (prefixed, not
 // bare Bearer), so we fetch the key ourselves and set the header manually.
@@ -180,17 +207,34 @@ fn og_creds(host: &mut Host) -> Result<(String, String), String> {
     Ok((base.trim_end_matches('/').to_string(), key))
 }
 
+/// Format a non-2xx Opsgenie response as an actionable error.
+fn og_error(path: &str, status: u16, body: &str) -> String {
+    let body = body.trim();
+    match status {
+        401 | 403 => format!(
+            "opsgenie rejected the api key (status {status}): {body} — check the key's permissions or reconnect the api key"
+        ),
+        _ => format!("opsgenie returned status {status} for {path}: {body}"),
+    }
+}
+
 /// GET `{base}{path}` with the GenieKey header; parse JSON; error on non-2xx.
 fn og_get(host: &mut Host, path: &str) -> Result<Value, String> {
     let (base, key) = og_creds(host)?;
     let url = format!("{base}{path}");
     let auth = format!("GenieKey {key}");
-    let resp = host.http("GET", &url, None, &[("authorization", auth.as_str())], None)?;
+    let resp = host.http(
+        "GET",
+        &url,
+        None,
+        &[
+            ("authorization", auth.as_str()),
+            ("accept", "application/json"),
+        ],
+        None,
+    )?;
     if !resp.is_success() {
-        return Err(format!(
-            "opsgenie GET {path} → {} {}",
-            resp.status, resp.body
-        ));
+        return Err(og_error(path, resp.status, &resp.body));
     }
     resp.json()
 }
@@ -209,14 +253,12 @@ fn og_post(host: &mut Host, path: &str, body: &Value) -> Result<Value, String> {
         &[
             ("authorization", auth.as_str()),
             ("content-type", "application/json"),
+            ("accept", "application/json"),
         ],
         Some(body_str.as_str()),
     )?;
     if !resp.is_success() {
-        return Err(format!(
-            "opsgenie POST {path} → {} {}",
-            resp.status, resp.body
-        ));
+        return Err(og_error(path, resp.status, &resp.body));
     }
     resp.json()
 }
@@ -651,6 +693,17 @@ mod tests {
         assert_eq!(result["plan"], json!("Enterprise"));
     }
 
+    #[test]
+    fn test_op_test_auth_rejected() {
+        let mut host = mock().with_http_status_body("/v2/account", 401, "Authentication failed");
+        let result = plugin().call("opsgenie.test", json!({}), &mut host);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("rejected the api key"), "err={err}");
+        assert!(err.contains("401"), "err={err}");
+        assert!(err.contains("Authentication failed"), "err={err}");
+    }
+
     // ---- opsgenie.alert.list ----
 
     #[test]
@@ -876,5 +929,192 @@ mod tests {
         let on_call = entries[0]["on_call"].as_array().unwrap();
         assert_eq!(on_call.len(), 2);
         assert!(on_call.iter().any(|v| v == "alice@example.com"));
+    }
+}
+
+// ===========================================================================
+// D-36: schema-derivation contract test (opsgenie).
+// Locks each op's derived schemars schema to its intended field/required/type
+// contract (encoded from the struct definitions). A change here is a real
+// contract change.
+// ===========================================================================
+#[cfg(test)]
+mod schema_contract {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Kind {
+        Str,
+        Int,
+        Bool,
+        ArrayAny,
+        ArrayStr,
+    }
+    #[derive(Clone)]
+    struct Prop {
+        name: &'static str,
+        kind: Kind,
+    }
+    struct OpContract {
+        props: Vec<Prop>,
+        required: Vec<&'static str>,
+    }
+    fn p(name: &'static str, kind: Kind) -> Prop {
+        Prop { name, kind }
+    }
+    fn c(props: Vec<Prop>, required: Vec<&'static str>) -> OpContract {
+        OpContract { props, required }
+    }
+
+    fn contracts() -> Vec<(&'static str, OpContract)> {
+        vec![
+            ("opsgenie.test", c(vec![], vec![])),
+            (
+                "opsgenie.alert.list",
+                c(vec![p("query", Kind::Str), p("limit", Kind::Int)], vec![]),
+            ),
+            (
+                "opsgenie.alert.get",
+                c(
+                    vec![p("id", Kind::Str), p("identifier_type", Kind::Str)],
+                    vec!["id"],
+                ),
+            ),
+            (
+                "opsgenie.alert.ack",
+                c(
+                    vec![
+                        p("id", Kind::Str),
+                        p("identifier_type", Kind::Str),
+                        p("note", Kind::Str),
+                        p("user", Kind::Str),
+                    ],
+                    vec!["id"],
+                ),
+            ),
+            (
+                "opsgenie.alert.close",
+                c(
+                    vec![
+                        p("id", Kind::Str),
+                        p("identifier_type", Kind::Str),
+                        p("note", Kind::Str),
+                        p("user", Kind::Str),
+                    ],
+                    vec!["id"],
+                ),
+            ),
+            (
+                "opsgenie.alert.note",
+                c(
+                    vec![
+                        p("id", Kind::Str),
+                        p("identifier_type", Kind::Str),
+                        p("note", Kind::Str),
+                        p("user", Kind::Str),
+                    ],
+                    vec!["id", "note"],
+                ),
+            ),
+            ("opsgenie.oncall", c(vec![p("schedule", Kind::Str)], vec![])),
+            ("opsgenie.schedule.list", c(vec![], vec![])),
+        ]
+    }
+
+    fn kind_of(node: &Value) -> Kind {
+        let t = node.get("type");
+        if let Some(arr) = t.and_then(|v| v.as_array()) {
+            let first = arr
+                .iter()
+                .find(|v| v.as_str() != Some("null"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("null");
+            return base_kind(first, node);
+        }
+        base_kind(t.and_then(|v| v.as_str()).unwrap_or(""), node)
+    }
+    fn base_kind(t: &str, node: &Value) -> Kind {
+        match t {
+            "integer" => Kind::Int,
+            "boolean" => Kind::Bool,
+            "array" => {
+                let items = node.get("items").cloned().unwrap_or(Value::Null);
+                if items.get("type").and_then(|v| v.as_str()) == Some("string") {
+                    Kind::ArrayStr
+                } else {
+                    Kind::ArrayAny
+                }
+            }
+            "string" => Kind::Str,
+            other => panic!("unsupported property type: {other}"),
+        }
+    }
+    fn resolve<'a>(node: &'a Value, defs: &'a Value) -> &'a Value {
+        if let Some(obj) = node.as_object() {
+            if let Some(r) = obj.get("$ref").and_then(|v| v.as_str()) {
+                if let Some(name) = r.strip_prefix("#/definitions/") {
+                    return defs.get(name).unwrap_or(node);
+                }
+            }
+            if let Some(any) = obj.get("anyOf").and_then(|v| v.as_array()) {
+                for m in any {
+                    if m.get("type").and_then(|v| v.as_str()) != Some("null") {
+                        return resolve(m, defs);
+                    }
+                }
+            }
+        }
+        node
+    }
+    fn assert_contract(op_name: &str, schema: &Value, contract: &OpContract) {
+        assert_eq!(schema["type"], "object", "{op_name}: root type");
+        let defs = schema.get("definitions").cloned().unwrap_or(json!({}));
+        let props_obj = schema.get("properties").and_then(|v| v.as_object());
+        let mut got: BTreeMap<&str, Kind> = BTreeMap::new();
+        if let Some(props) = props_obj {
+            for (k, v) in props {
+                got.insert(k.as_str(), kind_of(resolve(v, &defs)));
+            }
+        }
+        let want: BTreeMap<&str, Kind> = contract
+            .props
+            .iter()
+            .map(|Prop { name, kind }| (*name, kind.clone()))
+            .collect();
+        assert_eq!(got.len(), want.len(), "{op_name}: property count");
+        for Prop { name, kind } in &contract.props {
+            let got_kind = got
+                .get(*name)
+                .unwrap_or_else(|| panic!("{op_name}: missing property `{name}`"));
+            assert_eq!(got_kind, kind, "{op_name}: property `{name}` kind");
+        }
+        let req: Vec<&str> = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let mut req_set: Vec<&str> = req.clone();
+        req_set.sort();
+        let mut want_req: Vec<&str> = contract.required.clone();
+        want_req.sort();
+        assert_eq!(req_set, want_req, "{op_name}: required set");
+    }
+    #[test]
+    fn derived_schemas_match_contract() {
+        let ops = contracts();
+        let manifest = manifest_builder().build().manifest();
+        let by_name: BTreeMap<&str, &OperationSpec> = manifest
+            .operations
+            .iter()
+            .map(|o| (o.name.as_str(), o))
+            .collect();
+        assert_eq!(by_name.len(), ops.len(), "op count changed");
+        for (name, contract) in &ops {
+            let spec = by_name
+                .get(*name)
+                .unwrap_or_else(|| panic!("missing op {name}"));
+            assert_contract(name, &spec.input_schema, contract);
+        }
     }
 }
