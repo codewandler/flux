@@ -487,14 +487,36 @@ fn hmac_bytes(key: &[u8], msg: &[u8]) -> Vec<u8> {
 /// Resolve a flux alias to a Bedrock model id. Cross-region inference-profile ids (`us.`/`global.`)
 /// are the only form newer Claude 4/5 models accept on-demand (direct foundation-model ids are
 /// rejected); legacy claude-3 ids are marked "Legacy" and not aliased to.
+/// Resolve a flux model alias to a Bedrock inference-profile id. Region-aware: the cross-region
+/// inference-profile prefix (`us.`/`eu.`/`global.`) must match the Bedrock region the request
+/// targets, or Bedrock returns 400 "The provided model identifier is invalid" (the profile isn't
+/// registered in that region's catalog). `global.` profiles (haiku) work in every region; `us.`/
+/// `eu.` profiles are region-specific. The region is read from `AWS_REGION`/`AWS_DEFAULT_REGION`
+/// (set by the credential chain before this runs) and defaults to `us` for unknown regions.
 pub fn resolve_model(alias: &str) -> String {
+    let region = std::env::var("AWS_REGION")
+        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+        .unwrap_or_default();
+    let prefix = region_prefix(&region);
     match alias {
-        "" | "sonnet" => "us.anthropic.claude-sonnet-4-6",
-        "opus" => "us.anthropic.claude-opus-4-6-v1",
-        "haiku" => "global.anthropic.claude-haiku-4-5-20251001-v1:0",
-        other => other,
+        // The active Claude 4-6 generation. Region-prefixed (us./eu.) — both exist in their
+        // respective region catalogs. `global.` is not available for sonnet-4-6 in all regions.
+        "" | "sonnet" => format!("{prefix}.anthropic.claude-sonnet-4-6"),
+        "opus" => format!("{prefix}.anthropic.claude-opus-4-6-v1"),
+        // Haiku is a `global.` profile (works in every region) — don't region-prefix it.
+        "haiku" => "global.anthropic.claude-haiku-4-5-20251001-v1:0".to_string(),
+        other => other.to_string(),
     }
-    .to_string()
+}
+
+/// Map an AWS region to its cross-region inference-profile prefix. `eu-*` → `eu`, everything else
+/// (including `us-*` and unknown) → `us`.
+fn region_prefix(region: &str) -> &'static str {
+    if region.starts_with("eu-") {
+        "eu"
+    } else {
+        "us"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1198,6 +1220,11 @@ mod tests {
 
     #[test]
     fn resolve_model_maps_aliases_to_cross_region_profiles() {
+        // Default (no AWS_REGION set) → us-prefix.
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+            std::env::remove_var("AWS_DEFAULT_REGION");
+        }
         assert_eq!(resolve_model("sonnet"), "us.anthropic.claude-sonnet-4-6");
         assert_eq!(resolve_model("opus"), "us.anthropic.claude-opus-4-6-v1");
         assert_eq!(
@@ -1211,6 +1238,31 @@ mod tests {
             resolve_model("us.anthropic.claude-opus-4-8"),
             "us.anthropic.claude-opus-4-8"
         );
+    }
+
+    #[test]
+    fn resolve_model_is_region_aware() {
+        // Failing-first for the region-prefix bug: the cross-region inference-profile id must
+        // match the Bedrock region — `us.anthropic.*` is invalid in eu-central-1 (Bedrock 400
+        // "The provided model identifier is invalid"), and vice versa. The credential chain sets
+        // AWS_REGION before resolve_model runs; the prefix follows it.
+        unsafe {
+            std::env::set_var("AWS_REGION", "eu-central-1");
+        }
+        assert_eq!(resolve_model("sonnet"), "eu.anthropic.claude-sonnet-4-6");
+        assert_eq!(resolve_model("opus"), "eu.anthropic.claude-opus-4-6-v1");
+        // Haiku stays `global.` regardless of region (it's a global profile).
+        assert_eq!(
+            resolve_model("haiku"),
+            "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+        );
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+        }
+        assert_eq!(resolve_model("sonnet"), "us.anthropic.claude-sonnet-4-6");
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+        }
     }
 
     // -- EnvStaticResolver ----------------------------------------------------------------------

@@ -38,6 +38,13 @@ All notable changes to this project are documented in this file. The format is b
   `body`. Each ships with failing-first tests (internal op absent from the tool catalog; out-of-scope
   `fs.read` denied; `..` rejected; secret scopes redactor-registered).
 
+- **AWS Bedrock: region-aware model resolution (C-09b fix).** `resolve_model` now picks the
+  cross-region inference-profile prefix (`us.`/`eu.`) from `AWS_REGION` — `us.anthropic.*` is
+  invalid in `eu-central-1` (Bedrock 400 "The provided model identifier is invalid"), and the
+  SSO chain resolves the region from `~/.aws/config`. Haiku stays `global.` (a global profile).
+  Fixed `flux run -m aws` failing on real agentic turns in non-us regions (the `say ok` smoke
+  had masked it by setting `AWS_REGION=us-east-1` explicitly).
+
 - **AWS Bedrock: full credential chain (no `aws` CLI) (C-09b).** `flux run -m aws` now works
   with SSO / IRSA / EKS Pod Identity — no `aws configure export-credentials` dance, no `aws` binary.
   The chain (env → SSO → IRSA → EKS Pod Identity) is hand-rolled in `flux-providers::bedrock` over
