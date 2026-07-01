@@ -1308,7 +1308,12 @@ impl Tool for GlobTool {
         if matches.is_empty() {
             return Ok(ToolResult::ok("no files match"));
         }
-        Ok(ToolResult::ok(matches.join("\n")))
+        // C-10: the canonical VALUE is a JSON array so list-consuming plan nodes (`each`, `merge`)
+        // compose on a glob result; the model-facing view stays the readable joined lines.
+        Ok(ToolResult::ok_view(
+            serde_json::to_string(&matches)?,
+            matches.join("\n"),
+        ))
     }
 }
 
@@ -2569,12 +2574,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(none.content, "no matches");
-        // glob scoped to a single file lists exactly that file.
+        // glob scoped to a single file lists exactly that file (canonical value = JSON array, C-10).
         let g = GlobTool
             .execute(&c, json!({"pattern": "*", "path": "a.rs"}))
             .await
             .unwrap();
-        assert_eq!(g.content.trim(), "a.rs");
+        assert_eq!(g.content.trim(), r#"["a.rs"]"#);
+        assert_eq!(g.view.as_deref(), Some("a.rs"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3493,9 +3499,15 @@ mod tests {
             .execute(&c, json!({"pattern": "*.rs"}))
             .await
             .unwrap();
-        assert!(r.content.contains("src/main.rs"));
-        assert!(r.content.contains("src/lib.rs"));
-        assert!(!r.content.contains("README.md"));
+        // C-10: the canonical value is a JSON ARRAY (list-consuming plan nodes compose on it)…
+        let files: Vec<String> =
+            serde_json::from_str(&r.content).expect("glob content must be a JSON array of paths");
+        assert!(files.iter().any(|f| f == "src/main.rs"));
+        assert!(files.iter().any(|f| f == "src/lib.rs"));
+        assert!(!files.iter().any(|f| f == "README.md"));
+        // …while the model-facing view stays the readable joined lines.
+        let view = r.view.expect("glob carries a readable view");
+        assert!(view.contains("src/main.rs") && !view.contains('['));
 
         let none = GlobTool
             .execute(&c, json!({"pattern": "*.py"}))

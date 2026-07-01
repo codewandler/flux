@@ -512,6 +512,9 @@ impl Tool for MergeTool {
         let lists = arr_param(&params, "lists", "merge")?;
         let mut out: Vec<Value> = Vec::new();
         for (i, l) in lists.into_iter().enumerate() {
+            // A string element that IS a JSON array (values are stored as JSON strings) counts —
+            // the same string-leaf re-parse rule the runtime's templates apply (C-10).
+            let l = parse_json_array_string(l);
             match l {
                 Value::Array(a) => out.extend(a),
                 _ => {
@@ -523,6 +526,19 @@ impl Tool for MergeTool {
         }
         Ok(ToolResult::ok(serde_json::to_string(&out)?))
     }
+}
+
+/// Re-parse a string that holds a serialized JSON array (the store's JSON-as-string form) into the
+/// array itself; anything else passes through unchanged.
+fn parse_json_array_string(v: Value) -> Value {
+    if let Value::String(s) = &v {
+        if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+            if parsed.is_array() {
+                return parsed;
+            }
+        }
+    }
+    v
 }
 
 // ---------------------------------------------------------------------------

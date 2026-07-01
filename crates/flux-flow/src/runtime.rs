@@ -989,6 +989,84 @@ mod tests {
         );
     }
 
+    /// C-10: a `glob` result is a real LIST value — `each` iterates it and `merge` concatenates
+    /// it. This exact composition (the one the planner prompt teaches) failed live when `glob`
+    /// bound a newline-joined string ("merge: element 0 of `lists` is not an array").
+    #[tokio::test]
+    async fn glob_results_compose_with_each_and_merge() {
+        let dir = std::env::temp_dir().join(format!("flux-flow-c10-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.md"), "alpha").unwrap();
+        std::fs::write(dir.join("b.md"), "beta").unwrap();
+        let mut reg = ToolRegistry::new();
+        flux_tools::register_builtins(&mut reg);
+        reg.register(Arc::new(EchoTool));
+        let ex = Executor::new(
+            reg,
+            PermissionManager::from_rules(&["glob".into(), "merge".into(), "echo".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap()))),
+        );
+        let store = FlowStore::in_memory().unwrap();
+        let var = |n: &str| Node::Var {
+            name: SymbolName(n.into()),
+        };
+        let ast = DraftAst {
+            body: vec![
+                // $files = glob("*.md")
+                flow_bind("files", "glob", vec![flow_lit(json!({"pattern": "*.md"}))]),
+                // $all = merge({ lists: [$files, $files] })
+                Node::Bind {
+                    name: SymbolName("all".into()),
+                    ty: None,
+                    effect: None,
+                    value: Box::new(Node::Call {
+                        op: "merge".into(),
+                        args: vec![Node::Obj {
+                            fields: [(
+                                "lists".to_string(),
+                                Box::new(Node::List {
+                                    items: vec![var("files"), var("files")],
+                                }),
+                            )]
+                            .into_iter()
+                            .collect(),
+                        }],
+                    }),
+                },
+                // each $f in $files { echo($f) } collect $names
+                Node::Each {
+                    source: Box::new(var("files")),
+                    item: SymbolName("f".into()),
+                    body: vec![flow_bind("x", "echo", vec![var("f")])],
+                    collect: Some(SymbolName("names".into())),
+                    flat: false,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess", &ast, &mut sink)
+            .await
+            .expect("glob → merge/each must compose");
+        assert!(outcome.steps >= 4, "glob + merge + 2 echo iterations");
+        // $all = the two glob lists concatenated (4 entries).
+        let vid = store
+            .resolve("sess", &SymbolName("all".into()))
+            .unwrap()
+            .expect("$all bound");
+        // Values are stored as JSON strings (the store quirk) — consumers re-parse string leaves,
+        // so the assertion does the same.
+        let merged = match store.get_value(&vid).unwrap().unwrap().to_json() {
+            serde_json::Value::String(s) => {
+                serde_json::from_str::<serde_json::Value>(&s).expect("merge content is JSON")
+            }
+            other => other,
+        };
+        let arr = merged.as_array().expect("merge produced a JSON array");
+        assert_eq!(arr.len(), 4, "2 files × 2 lists: {arr:?}");
+    }
+
     #[tokio::test]
     async fn execute_flow_transcript_marks_silent_successes() {
         // A-05: an op succeeding with EMPTY output must read as an explicit success in the round

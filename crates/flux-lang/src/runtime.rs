@@ -72,6 +72,30 @@ fn flow_key(name: Option<&str>, body: &[Node]) -> String {
 
 /// A one-line, length-bounded summary of a value for the symbol table (never the raw bytes).
 fn summarize(content: &str) -> String {
+    // A JSON-array value (e.g. a `glob` result) summarizes by SHAPE: the planner composes on
+    // "a list of N" (`each`/`merge`), which the first 80 chars of serialized JSON don't convey
+    // (C-10).
+    if content.trim_start().starts_with('[') {
+        if let Ok(serde_json::Value::Array(items)) =
+            serde_json::from_str::<serde_json::Value>(content.trim())
+        {
+            let preview: Vec<String> = items
+                .iter()
+                .take(3)
+                .map(|v| match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .collect();
+            let more = if items.len() > 3 { ", …" } else { "" };
+            return truncate_summary(&format!(
+                "list ({}): {}{}",
+                items.len(),
+                preview.join(", "),
+                more
+            ));
+        }
+    }
     let first = content.lines().next().unwrap_or("").trim();
     let line = content
         .lines()
@@ -1283,7 +1307,10 @@ fn exec_body<'a>(
                     collect,
                     flat,
                 } => {
-                    let list = eval_arg(source, store, session_id)?;
+                    // Same string-leaf re-parse rule as templates/`jq` (C-10): a symbol holding a
+                    // JSON array (values are stored as JSON *strings* — e.g. a `glob` result) is a
+                    // valid `each` source.
+                    let list = jq_parse_input(eval_arg(source, store, session_id)?);
                     let serde_json::Value::Array(elems) = list else {
                         return Err(crate::FlowError::Runtime(
                             "`each` source must evaluate to a list".to_string(),
