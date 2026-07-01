@@ -160,6 +160,12 @@ pub struct EngineLoopHost {
     /// Token usage accumulated across every planner call this turn (the loop calls `plan` once per
     /// iteration). Reset per turn in [`set_turn`]; read by the engine at turn-end for `sink.turn_end`.
     usage: Mutex<Usage>,
+    /// Every planner call this turn, individually — `(model, usage)` per [`plan`](Self::plan)
+    /// invocation, in call order. This is the attribution record [`usage`] can't give you: `usage` is
+    /// the turn TOTAL (replace-style `accumulate`), which loses which model produced which slice once
+    /// a mid-turn `/model` switch changes the active planner. Reset per turn in [`set_turn`]; read by
+    /// the engine at turn-end to emit one `EventKind::CallUsage` per call (C-06 attribution).
+    calls: Mutex<Vec<(String, Usage)>>,
 }
 
 impl EngineLoopHost {
@@ -200,6 +206,7 @@ impl EngineLoopHost {
                 }),
                 guard: Mutex::new(LoopGuard::default()),
                 usage: Mutex::new(Usage::default()),
+                calls: Mutex::new(Vec::new()),
             });
             *slot2.lock().unwrap() = Some(host.clone());
             executor.set_loop_host(host.clone());
@@ -227,12 +234,20 @@ impl EngineLoopHost {
         *self.guard.lock().unwrap() = LoopGuard::default();
         // …and the per-turn token tally, so usage reflects only this turn's planner calls.
         *self.usage.lock().unwrap() = Usage::default();
+        self.calls.lock().unwrap().clear();
     }
 
     /// The token usage accumulated across this turn's planner calls (every `plan` re-entry). The
     /// engine reads it once the agent loop completes and hands it to `sink.turn_end`.
     pub fn turn_usage(&self) -> Usage {
         self.usage.lock().unwrap().clone()
+    }
+
+    /// Every planner call this turn, individually: `(resolved model, that call's usage)`, in call
+    /// order. The engine reads this at turn-end to append one `EventKind::CallUsage` per call — the
+    /// per-model attribution `turn_usage`'s single replace-style total can't express (C-06).
+    pub fn turn_calls(&self) -> Vec<(String, Usage)> {
+        self.calls.lock().unwrap().clone()
     }
 
     /// Swap the planner (provider + model) — the REPL `/model` command, applied to the shared host so
@@ -383,8 +398,12 @@ impl LoopHost for EngineLoopHost {
         // Surface a provider failure (credit/auth/rate-limit/transport) as a readable sentence — the
         // error flows out through the op envelope and becomes the turn's answer, never raw JSON.
         .map_err(|e| Error::Other(crate::engine::planner_error(&e)))?;
-        // Fold this planner call's tokens into the per-turn tally the engine reports at turn-end.
+        // Fold this planner call's tokens into the per-turn tally the engine reports at turn-end, AND
+        // record it individually (with the model that was ACTIVE for this call) so a mid-turn `/model`
+        // switch attributes tokens/cost to the right model (C-06 attribution) rather than being lost in
+        // the turn's single replace-style total.
         self.usage.lock().unwrap().accumulate(&call_usage);
+        self.calls.lock().unwrap().push((model.clone(), call_usage));
 
         let plan = match out {
             TurnOutput::Plan(c) => serde_json::json!({

@@ -218,6 +218,20 @@ pub struct ChatState {
     /// Cumulative input/output tokens this session.
     tokens_in: u64,
     tokens_out: u64,
+    /// Cumulative cache tokens this session (read + write) — C-06: the header used to ignore cache
+    /// entirely, so a heavily-cached session looked no different from an uncached one.
+    tokens_cache_read: u64,
+    tokens_cache_write: u64,
+    /// Cumulative reasoning tokens this session (a subset of `tokens_out`, tracked separately only
+    /// for display — mirrors `Usage::reasoning_tokens`'s own accounting).
+    tokens_reasoning: u64,
+    /// Cumulative dollar cost this session, when a model spec + pricing table are attached
+    /// ([`with_cost`](Self::with_cost)); `None` when cost can't be computed (e.g. `-m mock`, or an
+    /// unpriced model), so the header shows tokens only rather than a misleading `$0.00`.
+    cost_usd: Option<f64>,
+    /// The resolved `provider/model` spec + pricing table for cost computation, attached by
+    /// [`with_cost`](Self::with_cost). `None` when the TUI wasn't given one (cost stays hidden).
+    cost_model: Option<(String, flux_core::PricingTable)>,
     /// Tool ops run during the in-progress / most recent turn.
     steps: usize,
     /// Wall-clock of the most recent finished turn.
@@ -262,6 +276,11 @@ impl ChatState {
             slash_sel: 0,
             tokens_in: 0,
             tokens_out: 0,
+            tokens_cache_read: 0,
+            tokens_cache_write: 0,
+            tokens_reasoning: 0,
+            cost_usd: None,
+            cost_model: None,
             steps: 0,
             last_elapsed: None,
             history: Vec::new(),
@@ -271,6 +290,29 @@ impl ChatState {
             follow: true,
             last_max_scroll: Cell::new(0),
             last_page: Cell::new(1),
+        }
+    }
+
+    /// Attach a resolved `provider/model` spec + pricing table so the header can show a running
+    /// dollar cost alongside tokens (C-06) — mirrors the CLI's `CliSink::with_cost`.
+    pub fn with_cost(mut self, model_spec: String, pricing: flux_core::PricingTable) -> Self {
+        self.cost_model = Some((model_spec, pricing));
+        self
+    }
+
+    /// Fold one turn's [`Usage`] into the session's cumulative header metrics — EVERY tier (C-06:
+    /// the header used to sum only input/output, silently dropping cache reads/writes and
+    /// reasoning), and the running dollar cost when a model spec + pricing table are attached.
+    fn record_usage(&mut self, u: &Usage) {
+        self.tokens_in += u.input_tokens;
+        self.tokens_out += u.output_tokens;
+        self.tokens_cache_read += u.cache_read_input_tokens;
+        self.tokens_cache_write += u.cache_creation_input_tokens;
+        self.tokens_reasoning += u.reasoning_tokens;
+        if let Some((spec, pricing)) = &self.cost_model {
+            if let Some(money) = pricing.cost(u, spec) {
+                *self.cost_usd.get_or_insert(0.0) += money.usd;
+            }
         }
     }
 
@@ -623,15 +665,24 @@ impl ChatState {
             Span::styled(format!("  {}", self.model), t.muted_style()),
         ];
         let mut right = Vec::new();
-        if self.tokens_in + self.tokens_out > 0 {
-            right.push(Span::styled(
-                format!(
-                    "Σ ↑{} ↓{} tok ",
-                    fmt_count(self.tokens_in),
-                    fmt_count(self.tokens_out)
-                ),
-                t.muted_style(),
-            ));
+        // C-06: the header used to sum only input/output, silently ignoring cache read/write
+        // tokens — a heavily-cached session looked identical to an uncached one. `cache` here is
+        // BOTH tiers combined (read + write); a session with either shows the segment.
+        let cache = self.tokens_cache_read + self.tokens_cache_write;
+        if self.tokens_in + self.tokens_out + cache > 0 {
+            let mut s = format!(
+                "Σ ↑{} ↓{} tok",
+                fmt_count(self.tokens_in),
+                fmt_count(self.tokens_out)
+            );
+            if cache > 0 {
+                s.push_str(&format!(" · cache {}", fmt_count(cache)));
+            }
+            if let Some(usd) = self.cost_usd {
+                s.push_str(&format!(" · ${usd:.4}"));
+            }
+            s.push(' ');
+            right.push(Span::styled(s, t.muted_style()));
         }
         bar_line(left, right, width)
     }
@@ -1002,8 +1053,16 @@ type Tui = Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
 
 /// Run the interactive TUI against `agent`/`session_id`. Requires a real terminal. Installs a modal
 /// approver unless `auto_approve` is set (i.e. `--yes` was passed), then always restores the
-/// terminal (raw mode + alternate screen + mouse capture) even on error.
-pub async fn run(agent: FlowEngine, session_id: String, auto_approve: bool) -> anyhow::Result<()> {
+/// terminal (raw mode + alternate screen + mouse capture) even on error. `model_spec` is the
+/// resolved `provider/model` (e.g. `codex/gpt-5.5`, mirroring the CLI's `CliSink::with_cost`); when
+/// given, the header shows a running dollar cost alongside tokens (C-06). Pricing is the builtin
+/// table overlaid by `~/.flux/pricing.toml` (same loader the CLI uses).
+pub async fn run(
+    agent: FlowEngine,
+    session_id: String,
+    auto_approve: bool,
+    model_spec: Option<String>,
+) -> anyhow::Result<()> {
     use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
     use crossterm::terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -1031,6 +1090,9 @@ pub async fn run(agent: FlowEngine, session_id: String, auto_approve: bool) -> a
     let mut terminal = Terminal::new(ratatui::backend::CrosstermBackend::new(out))?;
 
     let mut state = ChatState::new(model);
+    if let Some(spec) = model_spec {
+        state = state.with_cost(spec, flux_credentials::load_pricing_table());
+    }
     state.history = load_history();
     let result = event_loop(&mut terminal, agent, &session_id, &mut state, tx, rx).await;
 
@@ -1098,10 +1160,7 @@ async fn event_loop(
                     content,
                     is_error,
                 } => state.finish_tool(&name, content, is_error),
-                UiEvent::Usage(u) => {
-                    state.tokens_in += u.input_tokens;
-                    state.tokens_out += u.output_tokens;
-                }
+                UiEvent::Usage(u) => state.record_usage(&u),
                 UiEvent::Notice { text, sev } => state.push(Entry::Notice { text, sev }),
                 UiEvent::Approval {
                     tool,
@@ -1494,6 +1553,63 @@ mod tests {
         assert!(content.contains("anthropic/opus"));
         assert!(content.contains("12.3k")); // cumulative tokens in the header
         assert!(content.contains("3 steps")); // last-turn metrics in the footer
+    }
+
+    /// C-06 cache-aware surfacing: the TUI header must show cache tokens (previously ignored
+    /// entirely — `UiEvent::Usage` only summed input/output) and a running dollar cost when a model
+    /// spec + pricing table are attached via `with_cost`. The story's named failing-first test.
+    #[test]
+    fn usage_annotation_includes_cache_and_cost() {
+        let mut state = ChatState::new("claude-sonnet-4-6".into()).with_cost(
+            "anthropic/claude-sonnet-4-6".into(),
+            flux_core::PricingTable::builtin(),
+        );
+        state.record_usage(&Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+            cache_creation_input_tokens: 200_000,
+            cache_read_input_tokens: 500_000,
+            reasoning_tokens: 0,
+        });
+
+        // Tokens are accumulated across EVERY tier, not just input/output.
+        assert_eq!(state.tokens_in, 1_000_000);
+        assert_eq!(state.tokens_out, 100_000);
+        assert_eq!(state.tokens_cache_read, 500_000);
+        assert_eq!(state.tokens_cache_write, 200_000);
+        // cost = 1·3 + 0.1·15 + 0.2·3.75 + 0.5·0.30 = 3 + 1.5 + 0.75 + 0.15 = 5.4
+        assert!(
+            (state.cost_usd.unwrap() - 5.4).abs() < 1e-9,
+            "got {:?}",
+            state.cost_usd
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(
+            content.contains("cache"),
+            "the header must show cache tokens, not just input/output: {content}"
+        );
+        assert!(
+            content.contains("$5.4"),
+            "the header must show the running dollar cost: {content}"
+        );
+
+        // Without `with_cost`, no cost segment appears (no model spec/pricing to compute from) —
+        // tokens (incl. cache) still show.
+        let mut plain = ChatState::new("mock".into());
+        plain.record_usage(&Usage {
+            input_tokens: 100,
+            cache_read_input_tokens: 50,
+            ..Default::default()
+        });
+        assert!(plain.cost_usd.is_none());
+        let mut terminal2 = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal2.draw(|f| render(f, &plain)).unwrap();
+        let content2 = screen(&terminal2);
+        assert!(content2.contains("cache"));
+        assert!(!content2.contains('$'));
     }
 
     #[test]

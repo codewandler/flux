@@ -573,6 +573,30 @@ impl EventStore {
         Ok(())
     }
 
+    /// Record one provider call's usage, attributed to the `model` that was active for that call —
+    /// the per-call granularity `TurnEnded.usage` (a single turn-total) can't express. A negative
+    /// `turn_id` is a no-op, mirroring [`record_plan_attempt`](Self::record_plan_attempt).
+    pub fn record_call_usage(
+        &self,
+        stream: &str,
+        turn_id: i64,
+        model: &str,
+        usage: Usage,
+    ) -> Result<()> {
+        if turn_id < 0 {
+            return Ok(());
+        }
+        self.append(
+            stream,
+            NewEvent::new(EventKind::CallUsage {
+                model: model.to_string(),
+                usage,
+            })
+            .in_turn(turn_id),
+        )?;
+        Ok(())
+    }
+
     /// Close a turn with its final outcome, iteration count, assistant answer, and token `usage`
     /// tally (`None` when the provider reported none). A negative `turn_id` is a no-op.
     pub fn end_turn(
@@ -615,6 +639,68 @@ impl EventStore {
     /// The turn telemetry for a session (replaces `turn_log` + `plan_attempts`).
     pub fn turns(&self, stream: &str) -> Result<Vec<projection::TurnSummary>> {
         Ok(projection::turns(&self.load_stream(stream, None)?))
+    }
+
+    /// Token spend + cost for one session, rolled up by model (see [`projection::cost_summary`]).
+    pub fn cost_summary(
+        &self,
+        stream: &str,
+        pricing: &flux_core::PricingTable,
+    ) -> Result<Vec<projection::ModelCost>> {
+        Ok(projection::cost_summary(
+            &self.load_stream(stream, None)?,
+            pricing,
+        ))
+    }
+
+    /// Token spend + cost across every session, rolled up by model. Folds each stream's events
+    /// through the SAME [`projection::cost_summary`] logic, then re-sums the per-model rows across
+    /// streams — so a model that appears in several sessions reports one aggregate row.
+    pub fn cost_summary_all(
+        &self,
+        pricing: &flux_core::PricingTable,
+    ) -> Result<Vec<projection::ModelCost>> {
+        let streams = self.all_streams()?;
+        let mut per_model: std::collections::BTreeMap<String, (flux_core::Usage, u64)> =
+            std::collections::BTreeMap::new();
+        for stream in &streams {
+            for row in self.cost_summary(stream, pricing)? {
+                let entry = per_model.entry(row.model).or_default();
+                entry.0.input_tokens += row.usage.input_tokens;
+                entry.0.output_tokens += row.usage.output_tokens;
+                entry.0.cache_creation_input_tokens += row.usage.cache_creation_input_tokens;
+                entry.0.cache_read_input_tokens += row.usage.cache_read_input_tokens;
+                entry.0.reasoning_tokens += row.usage.reasoning_tokens;
+                entry.1 += row.calls;
+            }
+        }
+        Ok(per_model
+            .into_iter()
+            .map(|(model, (usage, calls))| {
+                let cost = pricing.cost(&usage, &model);
+                projection::ModelCost {
+                    model,
+                    usage,
+                    calls,
+                    cost,
+                }
+            })
+            .collect())
+    }
+
+    /// Every session id (`s_<n>`), oldest first — the unfiltered enumeration primitive
+    /// [`cost_summary_all`](Self::cost_summary_all) folds over. Unlike [`list`](Self::list) (which
+    /// truncates to a limit and orders by recency for display), this returns everything.
+    pub fn all_streams(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT n FROM streams ORDER BY n")
+            .map_err(map_sql)?;
+        let rows = stmt
+            .query_map([], |r| Ok(format!("s_{}", r.get::<_, i64>(0)?)))
+            .map_err(map_sql)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_sql)
     }
 }
 
@@ -902,6 +988,108 @@ mod tests {
         store.set_model(&a, "opus").unwrap();
         assert_eq!(store.list(1).unwrap()[0].model, "opus");
         assert_eq!(store.info(&a).unwrap().model, "opus");
+    }
+
+    #[test]
+    fn record_call_usage_is_turn_scoped_and_a_noop_on_negative_turn_id() {
+        let store = EventStore::in_memory().unwrap();
+        let a = store.create_session("m").unwrap();
+        let turn_id = store.begin_turn(&a, "hi", "m").unwrap();
+        store
+            .record_call_usage(
+                &a,
+                turn_id,
+                "m",
+                Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // A no-op on a negative turn_id (mirrors record_plan_attempt/end_turn) — never fatal.
+        store
+            .record_call_usage(&a, -1, "m", Usage::default())
+            .unwrap();
+
+        let events = store.load_stream(&a, None).unwrap();
+        let calls: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::CallUsage { .. }))
+            .collect();
+        assert_eq!(calls.len(), 1, "the negative-turn_id call recorded nothing");
+    }
+
+    #[test]
+    fn cost_summary_wraps_the_projection_over_one_stream() {
+        let store = EventStore::in_memory().unwrap();
+        let a = store.create_session("claude-sonnet-4-6").unwrap();
+        let turn_id = store.begin_turn(&a, "hi", "claude-sonnet-4-6").unwrap();
+        store
+            .record_call_usage(
+                &a,
+                turn_id,
+                "claude-sonnet-4-6",
+                Usage {
+                    input_tokens: 1_000_000,
+                    output_tokens: 1_000_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .end_turn(&a, turn_id, "accepted", 1, "done", None)
+            .unwrap();
+
+        let pricing = flux_core::PricingTable::builtin();
+        let summary = store.cost_summary(&a, &pricing).unwrap();
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].model, "claude-sonnet-4-6");
+        assert_eq!(summary[0].usage.input_tokens, 1_000_000);
+        // 1·3 + 1·15 = 18
+        assert!((summary[0].cost.unwrap().usd - 18.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cost_summary_all_aggregates_across_sessions() {
+        let store = EventStore::in_memory().unwrap();
+        let a = store.create_session("claude-sonnet-4-6").unwrap();
+        let ta = store.begin_turn(&a, "hi", "claude-sonnet-4-6").unwrap();
+        store
+            .record_call_usage(
+                &a,
+                ta,
+                "claude-sonnet-4-6",
+                Usage {
+                    input_tokens: 1_000_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let b = store.create_session("claude-sonnet-4-6").unwrap();
+        let tb = store.begin_turn(&b, "hi", "claude-sonnet-4-6").unwrap();
+        store
+            .record_call_usage(
+                &b,
+                tb,
+                "claude-sonnet-4-6",
+                Usage {
+                    input_tokens: 500_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(store.all_streams().unwrap(), vec![a.clone(), b.clone()]);
+
+        let pricing = flux_core::PricingTable::builtin();
+        let summary = store.cost_summary_all(&pricing).unwrap();
+        assert_eq!(summary.len(), 1, "one model across both sessions");
+        assert_eq!(
+            summary[0].usage.input_tokens, 1_500_000,
+            "the two sessions' spend is summed, not just the last one's"
+        );
     }
 
     #[test]

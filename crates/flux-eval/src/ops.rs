@@ -809,7 +809,9 @@ impl Tool for ChangeImplementTool {
                 "Implement exactly this task and nothing else, then report what you changed:\n{desc}"
             );
             match spawner.spawn("worker", &prompt, &cancel).await {
-                Ok(text) => results.push(json!({ "task": desc, "ok": true, "result": text })),
+                Ok(outcome) => {
+                    results.push(json!({ "task": desc, "ok": true, "result": outcome.text }))
+                }
                 Err(e) => {
                     results.push(json!({ "task": desc, "ok": false, "error": e.to_string() }))
                 }

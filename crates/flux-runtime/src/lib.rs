@@ -84,7 +84,19 @@ impl ToolResult {
     }
 }
 
-/// Runs a sub-agent (by role name) and returns its final text. Implemented by `flux-orchestrate`
+/// What a sub-agent run produced: its final text plus enough to roll its spend into the parent turn
+/// (C-06). `model` is the role's resolved model (whatever `AgentSpec::into_engine` ran it as —
+/// the role's own override, or the spawner's default); `usage` is the child's accumulated per-turn
+/// tally from [`crate::LoopHost`]'s equivalent on the engine side, `None` when the child billed
+/// nothing (e.g. a `mock` sub-agent, or a role whose provider reported no usage).
+#[derive(Debug, Clone, Default)]
+pub struct SpawnOutcome {
+    pub text: String,
+    pub model: String,
+    pub usage: Option<flux_core::Usage>,
+}
+
+/// Runs a sub-agent (by role name) and returns its outcome. Implemented by `flux-orchestrate`
 /// and injected into [`ToolContext`] so a `task` tool can delegate without `flux-runtime`
 /// depending on the agent loop. The `cancel` token aborts the sub-agent turn (so autopilot loops
 /// and plan-and-dispatch stay interruptible).
@@ -95,7 +107,7 @@ pub trait Spawner: Send + Sync {
         role: &str,
         task: &str,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> flux_core::Result<String>;
+    ) -> flux_core::Result<SpawnOutcome>;
 
     /// Like [`spawn`](Self::spawn), but additionally narrows the child's tool set to `cap_scope` (the
     /// caller's active `with_tools` allowlist, if any) — so a `task` invoked from *inside* a capability
@@ -112,7 +124,7 @@ pub trait Spawner: Send + Sync {
         task: &str,
         cancel: &tokio_util::sync::CancellationToken,
         cap_scope: Option<&[String]>,
-    ) -> flux_core::Result<String> {
+    ) -> flux_core::Result<SpawnOutcome> {
         let _ = cap_scope;
         self.spawn(role, task, cancel).await
     }

@@ -60,6 +60,17 @@ pub enum EventKind {
         usage: Option<Usage>,
     },
 
+    /// One provider call's token usage, attributed to the `model` that was **actually active** for
+    /// that call. A turn can make several calls (the loop calls `plan` once per iteration; a
+    /// sub-agent's own calls are folded in too — see `crate::projection::cost_summary`), and
+    /// [`EventKind::TurnEnded`]'s `usage` is only the turn's replace-style TOTAL — it can't tell you
+    /// which model produced which slice once a mid-turn `/model` switch changes the active planner
+    /// (`ModelChanged`). `CallUsage` is the per-call attribution record the `cost_summary` projection
+    /// rolls up by `(model, provider)`; `TurnEnded.usage` stays as the turn-total back-compat field
+    /// older logs and callers already rely on. Scoped to a turn via `NewEvent::in_turn` like
+    /// `PlanAttempted`/`TurnEnded`.
+    CallUsage { model: String, usage: Usage },
+
     /// The host admitted an egress request to a **private/internal** address under a scoped
     /// private-network grant — the auditable security event. `caller` is the plugin name (or
     /// `"web_fetch"`); `host` is the private host that was reached; `grant_source` names the grant
@@ -104,6 +115,7 @@ impl EventKind {
             EventKind::TurnStarted { .. } => "turn_started",
             EventKind::PlanAttempted { .. } => "plan_attempted",
             EventKind::TurnEnded { .. } => "turn_ended",
+            EventKind::CallUsage { .. } => "call_usage",
             EventKind::PrivateNetAdmit { .. } => "private_net_admit",
             EventKind::CrossPluginResolve { .. } => "cross_plugin_resolve",
             EventKind::EndpointDiscovered { .. } => "endpoint_discovered",

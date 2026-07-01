@@ -22,8 +22,8 @@ use flux_flow::AgentSink;
 use flux_policy::{AuthorizationPolicy, Caller, Trust};
 use flux_provider::Provider;
 use flux_runtime::{
-    ApprovalChoice, Approver, Executor, PermissionManager, Spawner, Tool, ToolContext,
-    ToolRegistry, ToolResult,
+    ApprovalChoice, Approver, Executor, PermissionManager, SpawnOutcome, Spawner, Tool,
+    ToolContext, ToolRegistry, ToolResult,
 };
 use flux_spec::{tool_input_schema, Idempotency, IntentSet, Risk, ToolSpec};
 use flux_system::System;
@@ -201,7 +201,7 @@ impl Spawner for LocalSpawner {
         role_name: &str,
         task: &str,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<String> {
+    ) -> Result<SpawnOutcome> {
         self.spawn_with_scope(role_name, task, cancel, None).await
     }
 
@@ -211,7 +211,7 @@ impl Spawner for LocalSpawner {
         task: &str,
         cancel: &tokio_util::sync::CancellationToken,
         cap_scope: Option<&[String]>,
-    ) -> Result<String> {
+    ) -> Result<SpawnOutcome> {
         self.spawn_with_scope(role_name, task, cancel, cap_scope)
             .await
     }
@@ -230,7 +230,7 @@ impl LocalSpawner {
         task: &str,
         cancel: &tokio_util::sync::CancellationToken,
         cap_scope: Option<&[String]>,
-    ) -> Result<String> {
+    ) -> Result<SpawnOutcome> {
         let role = self
             .roles
             .get(role_name)
@@ -307,6 +307,9 @@ impl LocalSpawner {
         // lands in the same log as its conversation — into the shared audit store when one is set.
         let flow = flux_flow::state::FlowStore::in_memory_with_events(events.clone())?;
         let engine = spec.into_engine(Arc::from(provider), executor, events, flow)?;
+        // Captured now (not read back off `engine` after the run) purely for clarity at the call
+        // sites below — `engine.model` never changes over a sub-agent's single turn.
+        let model = engine.model.clone();
 
         // The child runs under a child of the parent's cancel token: cancelling the parent turn
         // cancels the child. A wall-clock deadline fires that same token so the child reaches its own
@@ -343,7 +346,17 @@ impl LocalSpawner {
                     .await?;
             }
         }
-        Ok(sink.text)
+        // The child's accumulated per-turn usage (C-06 sub-agent rollup): `TaskTool` folds this into
+        // the PARENT turn's tally and records it as a `CallUsage` attributed to the child's own model,
+        // so the sub-agent's spend counts toward the parent's total without being double-attributed to
+        // the parent's model. `None` when the child billed nothing (e.g. `mock`, or no usage reported).
+        let usage = engine.loop_host.turn_usage();
+        let usage = (usage.total() > 0).then_some(usage);
+        Ok(SpawnOutcome {
+            text: sink.text,
+            model,
+            usage,
+        })
     }
 }
 
@@ -480,7 +493,8 @@ pub async fn plan_and_dispatch(
             &format!("Goal: {goal}\n\nProduce a concise, ordered plan."),
             cancel,
         )
-        .await?;
+        .await?
+        .text;
     if cancel.is_cancelled() {
         return Ok(format!("── plan ──\n{plan}\n\n(interrupted)"));
     }
@@ -490,7 +504,8 @@ pub async fn plan_and_dispatch(
             &format!("Goal: {goal}\n\nPlan:\n{plan}\n\nExecute the plan and report what you did."),
             cancel,
         )
-        .await?;
+        .await?
+        .text;
     Ok(format!("── plan ──\n{plan}\n\n── result ──\n{result}"))
 }
 
@@ -569,7 +584,8 @@ pub async fn plan_and_dispatch_waves(
             ),
             cancel,
         )
-        .await?;
+        .await?
+        .text;
     let subtasks = parse_subtasks(&plan_text)?;
     if subtasks.is_empty() {
         return Err(Error::Other("planner produced no subtasks".into()));
@@ -602,7 +618,15 @@ pub async fn plan_and_dispatch_waves(
                 st.task, deps_context
             );
             let id = st.id.clone();
-            async move { (id, spawner.spawn("worker", &prompt, cancel).await) }
+            async move {
+                (
+                    id,
+                    spawner
+                        .spawn("worker", &prompt, cancel)
+                        .await
+                        .map(|o| o.text),
+                )
+            }
         });
         for (id, res) in futures::future::join_all(futures).await {
             // One worker failing must not discard its already-completed siblings (or skip later
@@ -682,7 +706,30 @@ impl Tool for TaskTool {
             .spawn_scoped(&args.role, &args.task, &cancel, cap_scope.as_deref())
             .await
         {
-            Ok(text) => Ok(ToolResult::ok(text)),
+            Ok(outcome) => {
+                // C-06 sub-agent rollup: the child's token spend doesn't flow back through
+                // `ToolResult` (a plain string) — it rides the shared evidence log instead, the same
+                // side-channel `turn.iteration` already uses for "this turn only" facts that aren't
+                // part of a tool's own return value. The engine reads `subagent.usage` observations at
+                // turn-end to (a) fold the tokens into the PARENT turn's total and (b) emit a
+                // `CallUsage` attributed to the sub-agent's own model — so cost_summary prices the
+                // child's spend under the model that actually generated it, not the parent's.
+                if let Some(usage) = &outcome.usage {
+                    ctx.evidence
+                        .lock()
+                        .unwrap()
+                        .record(flux_evidence::Observation::new(
+                            "subagent.usage",
+                            flux_evidence::Phase::Turn,
+                            serde_json::json!({
+                                "role": args.role,
+                                "model": outcome.model,
+                                "usage": usage,
+                            }),
+                        ));
+                }
+                Ok(ToolResult::ok(outcome.text))
+            }
             Err(e) => Ok(ToolResult::error(e.to_string())),
         }
     }
@@ -717,10 +764,42 @@ mod tests {
         }
     }
 
+    /// Mock provider: a fixed text reply carrying a `Usage` chunk, so a spawned sub-agent's turn
+    /// bills tokens — the fixture C-06's rollup test needs (`MockProvider` above deliberately bills
+    /// nothing, for spawner tests that don't care about usage).
+    struct MockProviderWithUsage(Usage);
+    #[async_trait]
+    impl Provider for MockProviderWithUsage {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            let chunks = vec![
+                Chunk::TextDelta("did the subtask".into()),
+                Chunk::Block(ContentBlock::Text {
+                    text: "did the subtask".into(),
+                }),
+                Chunk::Usage(self.0.clone()),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::EndTurn),
+                },
+            ];
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
     fn temp_system() -> Arc<System> {
         let dir = std::env::temp_dir().join(format!("flux-orch-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         Arc::new(System::new(Workspace::new(&dir).unwrap()))
+    }
+
+    /// A bare-text [`SpawnOutcome`] (no usage) — the mock spawners below only script text replies.
+    fn text_outcome(text: impl Into<String>) -> SpawnOutcome {
+        SpawnOutcome {
+            text: text.into(),
+            ..Default::default()
+        }
     }
 
     #[tokio::test]
@@ -743,7 +822,7 @@ mod tests {
             .spawn("scout", "look around", &cancel)
             .await
             .unwrap();
-        assert_eq!(out, "scouted: 3 files");
+        assert_eq!(out.text, "scouted: 3 files");
         assert!(spawner.spawn("nope", "x", &cancel).await.is_err());
     }
 
@@ -830,7 +909,7 @@ mod tests {
             .spawn("scout", "scout the repo", &CancellationToken::new())
             .await
             .unwrap();
-        assert_eq!(out, "done scouting");
+        assert_eq!(out.text, "done scouting");
         assert!(
             system.read_file("PINGED.marker").await.is_ok(),
             "the plan's op executed through the loop"
@@ -884,7 +963,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(out, "done");
+        assert_eq!(out.text, "done");
         assert!(
             system.read_file("PINGED.marker").await.is_err(),
             "the block scope must narrow the role's own tools away from `ping`"
@@ -925,7 +1004,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(out, "done");
+        assert_eq!(out.text, "done");
         assert!(
             system.read_file("PINGED.marker").await.is_ok(),
             "ping is in both the role's tools and the active scope, so it must run"
@@ -1016,6 +1095,235 @@ mod tests {
             .await
             .unwrap();
         assert!(r2.is_error);
+    }
+
+    /// C-06 sub-agent rollup, at the `TaskTool` seam: a spawned sub-agent's token usage rides back as
+    /// a `subagent.usage` observation on the SHARED evidence log (the side-channel a `task` call uses
+    /// to report structured usage `ToolResult` — a plain string — can't carry). A spawner whose child
+    /// billed nothing (no usage returned) must record no observation at all, so a `mock`/free sub-agent
+    /// doesn't pollute the log with a zero entry.
+    #[tokio::test]
+    async fn task_tool_records_subagent_usage_on_the_shared_evidence_log() {
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role("---\n---\nscout prompt", "scout"));
+        let usage = Usage {
+            input_tokens: 321,
+            output_tokens: 42,
+            ..Default::default()
+        };
+        let spawner: Arc<dyn Spawner> = Arc::new(LocalSpawner::new(
+            Arc::new({
+                let usage = usage.clone();
+                move || Ok(Box::new(MockProviderWithUsage(usage.clone())) as Box<dyn Provider>)
+            }),
+            Arc::new(roles),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1024,
+        ));
+        let ctx = ToolContext::new(temp_system()).with_spawner(spawner);
+        let r = TaskTool
+            .execute(&ctx, json!({"role": "scout", "task": "recon"}))
+            .await
+            .unwrap();
+        assert!(!r.is_error);
+
+        let recorded: Vec<_> = ctx
+            .evidence
+            .lock()
+            .unwrap()
+            .by_kind("subagent.usage")
+            .cloned()
+            .collect();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "one observation for the one sub-agent call"
+        );
+        assert_eq!(recorded[0].data["model"], "mock");
+        assert_eq!(recorded[0].data["usage"]["input_tokens"], 321);
+        assert_eq!(recorded[0].data["usage"]["output_tokens"], 42);
+
+        // A sub-agent that bills nothing (MockProvider, no Usage chunk) records NO observation.
+        let mut roles2 = RoleRegistry::default();
+        roles2.insert(parse_role("---\n---\nscout prompt", "scout"));
+        let free_spawner: Arc<dyn Spawner> = Arc::new(LocalSpawner::new(
+            Arc::new(|| Ok(Box::new(MockProvider))),
+            Arc::new(roles2),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1024,
+        ));
+        let ctx2 = ToolContext::new(temp_system()).with_spawner(free_spawner);
+        TaskTool
+            .execute(&ctx2, json!({"role": "scout", "task": "recon"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx2.evidence
+                .lock()
+                .unwrap()
+                .by_kind("subagent.usage")
+                .count(),
+            0,
+            "no usage reported by the child ⇒ no observation recorded"
+        );
+    }
+
+    /// C-06 sub-agent rollup, end-to-end: a PARENT turn whose plan calls `task` to delegate to a
+    /// sub-agent must include the sub-agent's token spend in the parent turn's own `TurnEnded.usage`
+    /// total — the failing-first acceptance test named by the story
+    /// (`parent_turn_includes_subagent_usage`). The parent's own planner call bills nothing here (a
+    /// bare `emit_plan`/prose mock carries no `Chunk::Usage`), isolating the assertion to: did the
+    /// child's tokens actually reach the parent's total.
+    #[tokio::test]
+    async fn parent_turn_includes_subagent_usage() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // The child sub-agent bills real tokens.
+        let child_usage = Usage {
+            input_tokens: 1000,
+            output_tokens: 200,
+            ..Default::default()
+        };
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role("---\n---\nworker prompt", "worker"));
+        let spawner: Arc<dyn flux_runtime::Spawner> = Arc::new(LocalSpawner::new(
+            Arc::new({
+                let usage = child_usage.clone();
+                move || Ok(Box::new(MockProviderWithUsage(usage.clone())) as Box<dyn Provider>)
+            }),
+            Arc::new(roles),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1024,
+        ));
+
+        // The parent's own planner: round 0 emits a plan calling `task`; round 1 answers in prose (no
+        // usage on either call — the point is to isolate the sub-agent's contribution).
+        struct ParentMock {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for ParentMock {
+            fn name(&self) -> &str {
+                "mock"
+            }
+            async fn stream(&self, _r: Request) -> Result<ChunkStream> {
+                let n = self.calls.fetch_add(1, Ordering::Relaxed);
+                let chunks = if n == 0 {
+                    let ast = json!({ "body": [{
+                        "kind": "call", "op": "task",
+                        "args": [{ "kind": "lit", "value": { "role": "worker", "task": "do it" } }]
+                    }] });
+                    vec![
+                        Chunk::Block(ContentBlock::ToolUse {
+                            id: "p".into(),
+                            name: "emit_plan".into(),
+                            input: json!({ "ast": ast }),
+                        }),
+                        Chunk::Done {
+                            stop_reason: Some(StopReason::ToolUse),
+                        },
+                    ]
+                } else {
+                    vec![
+                        Chunk::Block(ContentBlock::Text {
+                            text: "delegated to the worker".into(),
+                        }),
+                        Chunk::Done {
+                            stop_reason: Some(StopReason::EndTurn),
+                        },
+                    ]
+                };
+                Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+            }
+        }
+
+        let system = temp_system();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(TaskTool));
+        register_agent_ops(&mut registry);
+        let executor = Executor::new(
+            registry,
+            PermissionManager::from_rules(
+                &[
+                    "task".into(),
+                    "plan".into(),
+                    "run_plan".into(),
+                    "observe".into(),
+                ],
+                &[],
+            ),
+            Arc::new(flux_runtime::AllowApprover),
+            ToolContext::new(system.clone()).with_spawner(spawner),
+        );
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let flow = flux_flow::state::FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let engine = flux_flow::engine::FlowEngine::assemble(
+            Arc::new(ParentMock {
+                calls: AtomicUsize::new(0),
+            }),
+            executor,
+            events.clone(),
+            flow,
+            "mock".into(),
+            "test".into(),
+            1024,
+            5,
+            Vec::new(),
+            0,
+            Vec::new(),
+            std::env::temp_dir().join(format!("flux-orch-parent-{}", std::process::id())),
+        )
+        .unwrap();
+
+        let sid = events.create_session("mock").unwrap();
+        struct NullSink;
+        impl AgentSink for NullSink {}
+        let mut sink = NullSink;
+        engine
+            .run_turn(&sid, "delegate this", &mut sink)
+            .await
+            .unwrap();
+
+        let turns = events.turns(&sid).unwrap();
+        assert_eq!(turns.len(), 1);
+        let usage = turns[0]
+            .usage
+            .as_ref()
+            .expect("the parent turn's usage must be Some — the sub-agent billed tokens");
+        assert_eq!(
+            usage.input_tokens, 1000,
+            "the sub-agent's input tokens reached the PARENT turn's total"
+        );
+        assert_eq!(
+            usage.output_tokens, 200,
+            "the sub-agent's output tokens reached the PARENT turn's total"
+        );
+
+        // The sub-agent's spend is ALSO individually attributed via CallUsage, to its own model —
+        // so cost_summary prices it under the model that actually generated it.
+        let raw = events.load_stream(&sid, None).unwrap();
+        let call_usages: Vec<_> = raw
+            .iter()
+            .filter_map(|e| match &e.kind {
+                flux_events::EventKind::CallUsage { model, usage } => {
+                    Some((model.clone(), usage.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            call_usages.len(),
+            1,
+            "one CallUsage for the sub-agent's call (the parent's own planner billed nothing): {call_usages:?}"
+        );
+        assert_eq!(call_usages[0].0, "mock");
+        assert_eq!(call_usages[0].1.input_tokens, 1000);
     }
 
     #[tokio::test]
@@ -1128,7 +1436,7 @@ mod tests {
             .spawn("worker", "delete things", &CancellationToken::new())
             .await
             .unwrap();
-        assert_eq!(out, "done");
+        assert_eq!(out.text, "done");
         // The destructive tool was refused → its marker was never written.
         assert!(system.read_file("EXECUTED.marker").await.is_err());
     }
@@ -1203,17 +1511,18 @@ mod tests {
                 role: &str,
                 task: &str,
                 _cancel: &CancellationToken,
-            ) -> Result<String> {
+            ) -> Result<SpawnOutcome> {
                 match role {
-                    "planner" => Ok(r#"[
+                    "planner" => Ok(text_outcome(
+                        r#"[
                         {"id":"a","task":"first","depends_on":[]},
                         {"id":"b","task":"second","depends_on":["a"]}
-                    ]"#
-                    .into()),
+                    ]"#,
+                    )),
                     "worker" => {
                         // report whether the dependency's result reached us
                         let saw_dep = task.contains("[a]");
-                        Ok(format!("worker(saw_dep={saw_dep})"))
+                        Ok(text_outcome(format!("worker(saw_dep={saw_dep})")))
                     }
                     other => Err(Error::Other(format!("unknown role {other}"))),
                 }
@@ -1245,17 +1554,18 @@ mod tests {
                 role: &str,
                 _task: &str,
                 _c: &CancellationToken,
-            ) -> Result<String> {
+            ) -> Result<SpawnOutcome> {
                 match role {
-                    "planner" => Ok(r#"[
+                    "planner" => Ok(text_outcome(
+                        r#"[
                         {"id":"a","task":"x","depends_on":[]},
                         {"id":"b","task":"y","depends_on":["a"]}
-                    ]"#
-                    .into()),
+                    ]"#,
+                    )),
                     "worker" => {
                         self.workers.fetch_add(1, Ordering::SeqCst);
                         self.cancel.cancel();
-                        Ok("did work".into())
+                        Ok(text_outcome("did work"))
                     }
                     other => Err(Error::Other(format!("unknown role {other}"))),
                 }
@@ -1296,15 +1606,16 @@ mod tests {
                 role: &str,
                 task: &str,
                 _c: &CancellationToken,
-            ) -> Result<String> {
+            ) -> Result<SpawnOutcome> {
                 match role {
-                    "planner" => Ok(r#"[
+                    "planner" => Ok(text_outcome(
+                        r#"[
                         {"id":"a","task":"ok-one","depends_on":[]},
                         {"id":"b","task":"will-fail","depends_on":[]}
-                    ]"#
-                    .into()),
+                    ]"#,
+                    )),
                     "worker" if task.contains("will-fail") => Err(Error::Other("boom".into())),
-                    "worker" => Ok("ok-one done".into()),
+                    "worker" => Ok(text_outcome("ok-one done")),
                     other => Err(Error::Other(format!("unknown role {other}"))),
                 }
             }
@@ -1521,7 +1832,7 @@ mod tests {
             .spawn("scout", "scout the repo", &CancellationToken::new())
             .await
             .unwrap();
-        assert_eq!(out, "done");
+        assert_eq!(out.text, "done");
         assert!(
             system.read_file("PINGED.marker").await.is_err(),
             "the injected deny-all approver must block the child's ping"
@@ -1728,7 +2039,7 @@ mod tests {
             .spawn("scout", "look around", &CancellationToken::new())
             .await
             .unwrap();
-        assert_eq!(out, "scouted: 3 files");
+        assert_eq!(out.text, "scouted: 3 files");
     }
 
     /// WS5: `max_depth` bounds nested delegation. With the default (1) a child is a leaf and cannot

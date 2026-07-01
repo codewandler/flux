@@ -8,6 +8,26 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Usage & cost accounting — attribution, sub-agent rollup, `cost_summary`, `flux usage`, server
+  endpoint, cache-aware surfacing (C-06).** Turns C-05's captured tokens into the full user-facing
+  surface. New `EventKind::CallUsage { model, usage }` (`flux-events`) records EVERY provider call
+  individually, stamped with the model active at call time, so a mid-turn model switch attributes
+  tokens/cost correctly (`EngineLoopHost::turn_calls`, appended by `FlowEngine` right before
+  `end_turn`); `TurnEnded.usage` stays as the turn-total back-compat field. A spawned sub-agent's
+  token spend now reaches the parent turn's total: `flux_runtime::Spawner::spawn`/`spawn_scoped`
+  return a `SpawnOutcome { text, model, usage }` (was a bare `String`); `TaskTool` records the
+  child's usage as a `subagent.usage` observation on the shared evidence log (the same
+  snapshot-then-diff side-channel `turn.iteration` already uses), and the engine folds it into the
+  parent's total AND emits a `CallUsage` attributed to the sub-agent's own model. New
+  `flux_events::cost_summary` projection (+ `EventStore::cost_summary`/`cost_summary_all`) rolls up
+  tokens + cost by model — every tier, cache-aware, reasoning priced — preferring per-call
+  `CallUsage` attribution and falling back to per-turn totals for logs written before this shipped.
+  New `flux usage` command reports per-model tokens + cost for the latest session and an
+  all-sessions total. New server routes `GET /sessions/:id/usage` + `GET /usage`; `POST
+  /sessions/:id/messages`'s usage JSON no longer drops the cache/reasoning tiers. CLI
+  `usage_annotation` and the TUI header now surface cache-write + reasoning tokens (TUI also gained
+  a running dollar-cost figure via a new `ChatState::with_cost`).
+
 - **Strict review: app journey + `flux review` CLI + CI output modes (L-13, Phase 4).** Strict review
   is now a product surface, with ONE shared `strict_review` definition consumed identically by both:
   `crates/flux-app/src/review.rs` embeds the checked-in `examples/strict_review.flux` via

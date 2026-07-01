@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use flux_core::{Message, Usage};
+use flux_core::{Message, Money, PricingTable, Usage};
 use flux_lang::ast::RunEvent;
 
 use crate::kind::{EventKind, StoredEvent};
@@ -123,6 +123,84 @@ pub fn turns(events: &[StoredEvent]) -> Vec<TurnSummary> {
         }
     }
     by_turn.into_values().collect()
+}
+
+/// One model's rolled-up token spend + cost — a row of [`cost_summary`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelCost {
+    /// The model id as it was recorded on the event (bare id or `provider/model`, whichever the
+    /// caller stamped — see [`EventKind::CallUsage`]).
+    pub model: String,
+    /// Field-wise sum across every call attributed to this model, ALL tiers included —
+    /// `reasoning_tokens` too, unlike [`Usage::total`]/[`Usage::accumulate`], since [`cost_summary`]
+    /// exists to price spend and [`flux_core::pricing::cost`] bills reasoning as its own tier.
+    pub usage: Usage,
+    /// The number of calls (or turns, for the old-log fallback) folded into `usage`.
+    pub calls: u64,
+    /// The priced cost of `usage` under `model`, when the model is known to the pricing table.
+    /// `None` for a model the table has no rates for (never a panic).
+    pub cost: Option<Money>,
+}
+
+/// Field-wise-sum one call's usage into a running total. Every tier is summed here — including
+/// `reasoning_tokens` — because this is a cost rollup, not a context-window occupancy figure: each
+/// call's reasoning tokens are a real (if usually zero-priced) cost line, and folding them keeps
+/// [`ModelCost::usage`] a faithful total across every tier `pricing::cost` can charge for. This is
+/// deliberately NOT [`Usage::accumulate`] (which replaces the input/cache side per call — correct for
+/// a live turn's context-window occupancy, wrong for summing many independent calls' spend).
+fn sum_usage(acc: &mut Usage, call: &Usage) {
+    acc.input_tokens += call.input_tokens;
+    acc.output_tokens += call.output_tokens;
+    acc.cache_creation_input_tokens += call.cache_creation_input_tokens;
+    acc.cache_read_input_tokens += call.cache_read_input_tokens;
+    acc.reasoning_tokens += call.reasoning_tokens;
+}
+
+/// Roll up token spend + cost by model, folding a stream's events. Prefers the per-call
+/// [`EventKind::CallUsage`] attribution (C-06); a stream with none recorded (an older log, written
+/// before per-call attribution existed) falls back to summing each turn's [`EventKind::TurnEnded`]
+/// total, attributed to that turn's [`EventKind::TurnStarted`] model — coarser (turn-level, not
+/// call-level), but every old log still rolls up rather than reporting nothing. The two sources are
+/// never mixed within one stream: a stream that recorded even one `CallUsage` uses ONLY those (the
+/// turn totals they came from would double-count the same spend). Rows are sorted by model id for a
+/// stable, diffable report.
+pub fn cost_summary(events: &[StoredEvent], pricing: &PricingTable) -> Vec<ModelCost> {
+    let mut per_model: BTreeMap<String, (Usage, u64)> = BTreeMap::new();
+    let mut any_call_usage = false;
+
+    for e in events {
+        if let EventKind::CallUsage { model, usage } = &e.kind {
+            any_call_usage = true;
+            let entry = per_model.entry(model.clone()).or_default();
+            sum_usage(&mut entry.0, usage);
+            entry.1 += 1;
+        }
+    }
+
+    if !any_call_usage {
+        // Fallback: attribute each turn's total to the model active when that turn STARTED (the
+        // `turns()` join point) — the best attribution an old log (no `CallUsage`) can give.
+        for t in turns(events) {
+            if let Some(usage) = &t.usage {
+                let entry = per_model.entry(t.model.clone()).or_default();
+                sum_usage(&mut entry.0, usage);
+                entry.1 += 1;
+            }
+        }
+    }
+
+    per_model
+        .into_iter()
+        .map(|(model, (usage, calls))| {
+            let cost = pricing.cost(&usage, &model);
+            ModelCost {
+                model,
+                usage,
+                calls,
+                cost,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -327,5 +405,274 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].outcome, "pending");
         assert!(turns[0].ended_at_ms.is_none());
+    }
+
+    fn usage_with(input: u64, output: u64) -> Usage {
+        Usage {
+            input_tokens: input,
+            output_tokens: output,
+            ..Default::default()
+        }
+    }
+
+    /// C-06 attribution: a turn that switches model mid-flight (`/model`) must attribute each
+    /// `CallUsage` to the model that was ACTIVE for that call, not to the turn's `TurnStarted` model
+    /// nor to whichever model is active by the time the fold finishes. Fixture: one turn started on
+    /// `model-a`, a `CallUsage` under `model-a`, then a `ModelChanged` to `model-b` mid-turn, then a
+    /// second `CallUsage` under `model-b` before the turn ends.
+    #[test]
+    fn usage_attributed_per_model_after_switch() {
+        let events = vec![
+            ev(
+                1,
+                0,
+                None,
+                EventKind::TurnStarted {
+                    user_input: "do the thing".into(),
+                    model: "model-a".into(),
+                },
+            ),
+            ev(
+                2,
+                1,
+                Some(1),
+                EventKind::CallUsage {
+                    model: "model-a".into(),
+                    usage: usage_with(100, 10),
+                },
+            ),
+            // Mid-turn model switch (the REPL `/model` command).
+            ev(
+                3,
+                2,
+                None,
+                EventKind::ModelChanged {
+                    model: "model-b".into(),
+                },
+            ),
+            ev(
+                4,
+                3,
+                Some(1),
+                EventKind::CallUsage {
+                    model: "model-b".into(),
+                    usage: usage_with(50, 5),
+                },
+            ),
+            ev(
+                5,
+                4,
+                Some(1),
+                EventKind::TurnEnded {
+                    outcome: "accepted".into(),
+                    iterations: 2,
+                    answer: "done".into(),
+                    usage: Some(usage_with(150, 15)),
+                },
+            ),
+        ];
+
+        let pricing = PricingTable::builtin();
+        let summary = cost_summary(&events, &pricing);
+        assert_eq!(summary.len(), 2, "two distinct models: {summary:?}");
+
+        let a = summary.iter().find(|m| m.model == "model-a").unwrap();
+        assert_eq!(a.usage.input_tokens, 100);
+        assert_eq!(a.usage.output_tokens, 10);
+        assert_eq!(a.calls, 1);
+
+        let b = summary.iter().find(|m| m.model == "model-b").unwrap();
+        assert_eq!(b.usage.input_tokens, 50);
+        assert_eq!(b.usage.output_tokens, 5);
+        assert_eq!(b.calls, 1);
+
+        // Neither model's slice is double-counted or merged into the other — the switch didn't
+        // smear model-a's tokens onto model-b (or vice versa) despite sharing one `TurnStarted`.
+        assert_eq!(a.usage.total() + b.usage.total(), 165);
+    }
+
+    /// `cost_summary` rolls up multiple turns, multiple models, and cache tiers, folding
+    /// `CallUsage` events by model and pricing the total via the built-in table.
+    #[test]
+    fn cost_summary_rolls_up_session() {
+        let events = vec![
+            ev(
+                1,
+                0,
+                None,
+                EventKind::TurnStarted {
+                    user_input: "first".into(),
+                    model: "claude-sonnet-4-6".into(),
+                },
+            ),
+            ev(
+                2,
+                1,
+                Some(1),
+                EventKind::CallUsage {
+                    model: "claude-sonnet-4-6".into(),
+                    usage: Usage {
+                        input_tokens: 1_000_000,
+                        output_tokens: 100_000,
+                        cache_creation_input_tokens: 200_000,
+                        cache_read_input_tokens: 500_000,
+                        reasoning_tokens: 0,
+                    },
+                },
+            ),
+            ev(
+                3,
+                2,
+                Some(1),
+                EventKind::TurnEnded {
+                    outcome: "accepted".into(),
+                    iterations: 1,
+                    answer: "done".into(),
+                    usage: Some(usage_with(1_000_000, 100_000)),
+                },
+            ),
+            // A second turn, same model — its usage must be SUMMED with the first, not replaced.
+            ev(
+                4,
+                3,
+                None,
+                EventKind::TurnStarted {
+                    user_input: "second".into(),
+                    model: "claude-sonnet-4-6".into(),
+                },
+            ),
+            ev(
+                5,
+                4,
+                Some(4),
+                EventKind::CallUsage {
+                    model: "claude-sonnet-4-6".into(),
+                    usage: Usage {
+                        input_tokens: 500_000,
+                        output_tokens: 50_000,
+                        ..Default::default()
+                    },
+                },
+            ),
+            ev(
+                6,
+                5,
+                Some(4),
+                EventKind::TurnEnded {
+                    outcome: "accepted".into(),
+                    iterations: 1,
+                    answer: "done".into(),
+                    usage: Some(usage_with(500_000, 50_000)),
+                },
+            ),
+            // A third turn on a different model entirely.
+            ev(
+                7,
+                6,
+                None,
+                EventKind::TurnStarted {
+                    user_input: "third".into(),
+                    model: "gpt-5.5".into(),
+                },
+            ),
+            ev(
+                8,
+                7,
+                Some(7),
+                EventKind::CallUsage {
+                    model: "gpt-5.5".into(),
+                    usage: usage_with(1_000_000, 1_000_000),
+                },
+            ),
+            ev(
+                9,
+                8,
+                Some(7),
+                EventKind::TurnEnded {
+                    outcome: "accepted".into(),
+                    iterations: 1,
+                    answer: "done".into(),
+                    usage: Some(usage_with(1_000_000, 1_000_000)),
+                },
+            ),
+        ];
+
+        let pricing = PricingTable::builtin();
+        let summary = cost_summary(&events, &pricing);
+        assert_eq!(summary.len(), 2, "two models rolled up: {summary:?}");
+
+        // claude-sonnet-4-6: two calls summed field-wise (1.5M input, 150K output, 200K cache
+        // write, 500K cache read) — NOT replaced (would lose the first turn's cache tiers).
+        let sonnet = summary
+            .iter()
+            .find(|m| m.model == "claude-sonnet-4-6")
+            .unwrap();
+        assert_eq!(sonnet.calls, 2);
+        assert_eq!(sonnet.usage.input_tokens, 1_500_000);
+        assert_eq!(sonnet.usage.output_tokens, 150_000);
+        assert_eq!(sonnet.usage.cache_creation_input_tokens, 200_000);
+        assert_eq!(sonnet.usage.cache_read_input_tokens, 500_000);
+        // cost = 1.5·3 + 0.15·15 + 0.2·3.75 + 0.5·0.30 = 4.5 + 2.25 + 0.75 + 0.15 = 7.65
+        let sonnet_cost = sonnet.cost.expect("claude-sonnet-4-6 is a priced model");
+        assert!(
+            (sonnet_cost.usd - 7.65).abs() < 1e-9,
+            "got {}",
+            sonnet_cost.usd
+        );
+        assert!(
+            !sonnet_cost.subscription,
+            "bare model id is not a subscription spec"
+        );
+
+        let gpt = summary.iter().find(|m| m.model == "gpt-5.5").unwrap();
+        assert_eq!(gpt.calls, 1);
+        assert_eq!(gpt.usage.input_tokens, 1_000_000);
+        assert_eq!(gpt.usage.output_tokens, 1_000_000);
+        // cost = 1·1.25 + 1·10 = 11.25
+        let gpt_cost = gpt.cost.expect("gpt-5.5 is a priced model");
+        assert!((gpt_cost.usd - 11.25).abs() < 1e-9, "got {}", gpt_cost.usd);
+    }
+
+    /// Old logs recorded before per-call attribution existed carry no `CallUsage` events at all —
+    /// only `TurnStarted.model` + `TurnEnded.usage`. `cost_summary` must still roll them up (via the
+    /// turn-level fallback), attributing each turn's total to that turn's `TurnStarted` model, rather
+    /// than silently reporting zero spend for every session ever recorded before this feature shipped.
+    #[test]
+    fn cost_summary_falls_back_to_turn_totals_for_old_logs_without_call_usage() {
+        let events = vec![
+            ev(
+                1,
+                0,
+                None,
+                EventKind::TurnStarted {
+                    user_input: "hi".into(),
+                    model: "claude-opus-4-8".into(),
+                },
+            ),
+            // No CallUsage event — an old log written before C-06.
+            ev(
+                2,
+                1,
+                Some(1),
+                EventKind::TurnEnded {
+                    outcome: "accepted".into(),
+                    iterations: 1,
+                    answer: "done".into(),
+                    usage: Some(usage_with(1_000_000, 1_000_000)),
+                },
+            ),
+        ];
+
+        let pricing = PricingTable::builtin();
+        let summary = cost_summary(&events, &pricing);
+        assert_eq!(summary.len(), 1);
+        let row = &summary[0];
+        assert_eq!(row.model, "claude-opus-4-8");
+        assert_eq!(row.usage.input_tokens, 1_000_000);
+        assert_eq!(row.usage.output_tokens, 1_000_000);
+        assert_eq!(row.calls, 1, "one turn folded via the fallback");
+        // opus: 1·5 + 1·25 = 30
+        let cost = row.cost.expect("claude-opus-4-8 is a priced model");
+        assert!((cost.usd - 30.0).abs() < 1e-9, "got {}", cost.usd);
     }
 }

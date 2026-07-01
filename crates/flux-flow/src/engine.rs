@@ -197,6 +197,12 @@ impl FlowEngine {
         // report only THIS turn's rounds. The executor (and its evidence log) is shared and persists
         // across turns, so an unscoped count grows monotonically over a long-lived served agent.
         let iter_base = self.executor.evidence().by_kind("turn.iteration").count();
+        // Same scoping trick for sub-agent usage (C-06 rollup): `task` (flux-orchestrate) records a
+        // `subagent.usage` observation per completed sub-agent call onto this SAME shared evidence
+        // log — the cross-crate side-channel `ToolResult` (a plain string) can't carry structured
+        // usage through. Snapshotting the count now (not after the turn) means only sub-agents
+        // spawned by THIS turn are folded in, never a prior turn's.
+        let subagent_base = self.executor.evidence().by_kind("subagent.usage").count();
 
         let mut outer = crate::loop_host::SharedSink::new(channel.clone());
         let flow_fut = execute_flow(
@@ -215,7 +221,9 @@ impl FlowEngine {
                 biased;
                 _ = cancel.cancelled() => {
                     while let Ok(ev) = rx.try_recv() { drain_event(ev, sink, reveal); }
-                    let usage = self.turn_usage();
+                    let subagent_calls = self.subagent_calls_since(subagent_base);
+                    self.record_call_usage_events(session_id, turn_id, &subagent_calls);
+                    let usage = self.turn_usage(&subagent_calls);
                     let _ = self.events.end_turn(session_id, turn_id, "cancelled", 0, "(turn cancelled)", usage.clone());
                     return self.finish_turn(session_id, sink, "(turn cancelled)", true, usage);
                 }
@@ -257,7 +265,9 @@ impl FlowEngine {
             .by_kind("turn.iteration")
             .count()
             .saturating_sub(iter_base) as u32;
-        let usage = self.turn_usage();
+        let subagent_calls = self.subagent_calls_since(subagent_base);
+        self.record_call_usage_events(session_id, turn_id, &subagent_calls);
+        let usage = self.turn_usage(&subagent_calls);
         let _ = self
             .events
             .end_turn(session_id, turn_id, tag, iterations, &answer, usage.clone());
@@ -520,10 +530,72 @@ impl FlowEngine {
     }
 
     /// This turn's token tally, as an `Option` for the sink: `None` when nothing was billed (e.g. an
-    /// offline `-m mock` turn) so a surface needn't render a misleading all-zero annotation.
-    fn turn_usage(&self) -> Option<Usage> {
-        let usage = self.loop_host.turn_usage();
+    /// offline `-m mock` turn) so a surface needn't render a misleading all-zero annotation. Includes
+    /// any sub-agents this turn spawned (`subagent_calls`, from [`Self::subagent_calls_since`]) — a
+    /// `task` call's tokens are real spend the parent turn incurred, so its total must reflect them
+    /// (C-06 sub-agent rollup).
+    fn turn_usage(&self, subagent_calls: &[(String, Usage)]) -> Option<Usage> {
+        let mut usage = self.loop_host.turn_usage();
+        for (_, call) in subagent_calls {
+            usage.output_tokens += call.output_tokens;
+            usage.input_tokens += call.input_tokens;
+            usage.cache_creation_input_tokens += call.cache_creation_input_tokens;
+            usage.cache_read_input_tokens += call.cache_read_input_tokens;
+            usage.reasoning_tokens += call.reasoning_tokens;
+        }
         (usage.total() > 0).then_some(usage)
+    }
+
+    /// Every `subagent.usage` observation recorded since `base` (this turn's sub-agents, per the
+    /// snapshot-then-diff scoping [`run_turn_cancellable`] already uses for `turn.iteration`), parsed
+    /// into `(model, usage)` pairs. A malformed/missing field is skipped rather than panicking — this
+    /// reads a cross-crate string-keyed contract (`flux-orchestrate`'s `TaskTool`), not a typed one.
+    fn subagent_calls_since(&self, base: usize) -> Vec<(String, Usage)> {
+        self.executor
+            .evidence()
+            .by_kind("subagent.usage")
+            .skip(base)
+            .filter_map(|o| {
+                let model = o.data.get("model")?.as_str()?.to_string();
+                let usage: Usage = serde_json::from_value(o.data.get("usage")?.clone()).ok()?;
+                Some((model, usage))
+            })
+            .collect()
+    }
+
+    /// Append one `EventKind::CallUsage` per planner call this turn made (`self.loop_host.turn_calls`)
+    /// PLUS one per sub-agent this turn spawned (`subagent_calls`), each stamped with the model that
+    /// produced it — the planner's active model at the time, or the sub-agent's own resolved model —
+    /// so a mid-turn `/model` switch AND a `task` delegation both attribute tokens/cost correctly
+    /// (C-06). Called just before `end_turn` on every termination path (cancelled or completed) so the
+    /// per-call attribution records and the turn-total `TurnEnded.usage` land together. Non-fatal like
+    /// every other telemetry write here: a DB hiccup must never fail the turn — `record_call_usage`
+    /// itself already no-ops on a failed (`-1`) `turn_id`.
+    fn record_call_usage_events(
+        &self,
+        session_id: &str,
+        turn_id: i64,
+        subagent_calls: &[(String, Usage)],
+    ) {
+        // Zero-usage calls (a `mock`/free provider, or one that genuinely reported nothing) are
+        // skipped — mirrors `TurnEnded.usage` staying `None` for a token-less turn, so a log doesn't
+        // fill with placeholder zero entries for every offline/no-cost call.
+        for (model, usage) in self.loop_host.turn_calls() {
+            if usage.total() == 0 {
+                continue;
+            }
+            let _ = self
+                .events
+                .record_call_usage(session_id, turn_id, &model, usage);
+        }
+        for (model, usage) in subagent_calls {
+            if usage.total() == 0 {
+                continue;
+            }
+            let _ = self
+                .events
+                .record_call_usage(session_id, turn_id, model, usage.clone());
+        }
     }
 
     /// Resume a flow suspended on a top-level `await`, with this turn's message as the awaited input.
@@ -886,6 +958,18 @@ mod tests {
     fn prose(text: &str) -> Vec<Chunk> {
         vec![
             Chunk::TextDelta(text.to_string()),
+            Chunk::Done {
+                stop_reason: Some(StopReason::EndTurn),
+            },
+        ]
+    }
+
+    /// Like [`prose`], but with a `Usage` chunk — so a test can assert usage rode back out AND was
+    /// attributed to the model active at the time of this call (C-06).
+    fn prose_with_usage(text: &str, usage: Usage) -> Vec<Chunk> {
+        vec![
+            Chunk::TextDelta(text.to_string()),
+            Chunk::Usage(usage),
             Chunk::Done {
                 stop_reason: Some(StopReason::EndTurn),
             },
@@ -1281,6 +1365,78 @@ mod tests {
         assert_eq!(msgs[0].role, flux_core::Role::User);
         assert_eq!(msgs[1].role, flux_core::Role::Assistant);
         assert!(msgs[1].text().contains("credit balance is too low"));
+    }
+
+    /// C-06 attribution (live path): the engine appends one `EventKind::CallUsage` per planner call,
+    /// stamped with the model that was ACTIVE for that call — so a mid-turn model switch (the REPL
+    /// `/model` command, which swaps the loop host's planner + emits `ModelChanged` before the NEXT
+    /// turn) attributes each turn's tokens to the model that actually produced them, not to whichever
+    /// model is current by the time the turn ends.
+    #[tokio::test]
+    async fn usage_attributed_per_model_after_switch() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        // `engine_with`/`engine_with_provider` always construct the engine with model "mock"
+        // (FlowEngine::assemble's hardcoded test model) — this IS the pre-switch model-a.
+        let sid = store.create_session("mock").unwrap();
+
+        // Turn 1 on the engine's initial model ("mock"): a single prose call carrying usage.
+        let responses = VecDeque::from(vec![prose_with_usage(
+            "answer one",
+            Usage {
+                input_tokens: 100,
+                output_tokens: 10,
+                ..Default::default()
+            },
+        )]);
+        let engine = engine_with(responses, store.clone());
+        let mut sink = CollectSink::default();
+        engine.run_turn(&sid, "first", &mut sink).await.unwrap();
+
+        // Switch models mid-session (mirrors the REPL `/model` command: swap the loop host's planner
+        // AND record `ModelChanged`) — a NEW provider whose usage must be attributed to `model-b`.
+        let provider_b: Arc<dyn Provider> = Arc::new(MockProvider {
+            responses: Mutex::new(VecDeque::from(vec![prose_with_usage(
+                "answer two",
+                Usage {
+                    input_tokens: 50,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+            )])),
+        });
+        engine
+            .loop_host
+            .set_model(provider_b, "model-b".to_string());
+        store.set_model(&sid, "model-b").unwrap();
+
+        engine.run_turn(&sid, "second", &mut sink).await.unwrap();
+
+        let events = store.load_stream(&sid, None).unwrap();
+        let calls: Vec<(String, Usage)> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                flux_events::EventKind::CallUsage { model, usage } => {
+                    Some((model.clone(), usage.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            2,
+            "one CallUsage per turn's planner call: {calls:?}"
+        );
+        assert_eq!(calls[0].0, "mock");
+        assert_eq!(calls[0].1.input_tokens, 100);
+        assert_eq!(calls[1].0, "model-b");
+        assert_eq!(calls[1].1.input_tokens, 50);
+
+        // Each turn's own TurnEnded.usage total stays correct too (the fields the story keeps as
+        // back-compat) — attribution didn't come at the cost of the existing turn-total field.
+        let turns = store.turns(&sid).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].usage.as_ref().unwrap().input_tokens, 100);
+        assert_eq!(turns[1].usage.as_ref().unwrap().input_tokens, 50);
     }
 
     #[test]

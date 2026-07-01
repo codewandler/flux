@@ -202,6 +202,8 @@ pub fn router(engine: Arc<FlowEngine>, token: Option<String>, card: CardInfo) ->
         .route("/sessions/:id", get(get_session))
         .route("/sessions/:id/messages", post(post_message))
         .route("/sessions/:id/stream", get(stream_message))
+        .route("/sessions/:id/usage", get(get_session_usage))
+        .route("/usage", get(get_usage_all))
         .route("/webhook", post(webhook))
         .route_layer(middleware::from_fn_with_state(
             Arc::new(token),
@@ -290,7 +292,56 @@ async fn post_message(
     Ok(Json(json!({
         "text": sink.text,
         "tool_calls": sink.tools,
-        "usage": sink.usage.map(|u| json!({ "input": u.input_tokens, "output": u.output_tokens })),
+        // Full usage (C-06): every tier, not just input/output — a caller pricing spend itself
+        // (or just wanting the true context-window occupancy) needs the cache + reasoning tiers
+        // this used to silently drop.
+        "usage": sink.usage.map(|u| usage_json(&u)),
+    })))
+}
+
+/// The full [`Usage`] as JSON — every tier, so a caller never loses cache/reasoning figures the way
+/// the old `post_message` response did (C-06).
+fn usage_json(u: &Usage) -> Value {
+    json!({
+        "input": u.input_tokens,
+        "output": u.output_tokens,
+        "cache_creation": u.cache_creation_input_tokens,
+        "cache_read": u.cache_read_input_tokens,
+        "reasoning": u.reasoning_tokens,
+    })
+}
+
+/// One [`flux_events::ModelCost`] row as JSON: tokens per tier, call count, and cost (when the model
+/// is priced) — the shape both usage endpoints below return per model.
+fn model_cost_json(row: &flux_events::ModelCost) -> Value {
+    json!({
+        "model": row.model,
+        "calls": row.calls,
+        "usage": usage_json(&row.usage),
+        "cost_usd": row.cost.map(|m| m.usd),
+        "subscription": row.cost.map(|m| m.subscription),
+    })
+}
+
+/// `GET /sessions/:id/usage` — per-model token tiers + cost for one session (C-06).
+async fn get_session_usage(
+    State(agent): State<Shared>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let pricing = flux_credentials::load_pricing_table();
+    let rows = agent.events.cost_summary(&id, &pricing).map_err(err500)?;
+    Ok(Json(json!({
+        "session_id": id,
+        "models": rows.iter().map(model_cost_json).collect::<Vec<_>>(),
+    })))
+}
+
+/// `GET /usage` — per-model token tiers + cost across every session (C-06).
+async fn get_usage_all(State(agent): State<Shared>) -> Result<Json<Value>, (StatusCode, String)> {
+    let pricing = flux_credentials::load_pricing_table();
+    let rows = agent.events.cost_summary_all(&pricing).map_err(err500)?;
+    Ok(Json(json!({
+        "models": rows.iter().map(model_cost_json).collect::<Vec<_>>(),
     })))
 }
 
@@ -471,5 +522,132 @@ mod tests {
             status(guarded_app(None), "/protected", None).await,
             StatusCode::OK
         );
+    }
+
+    /// A provider that never gets called in the usage-endpoint tests below — the fixture engine
+    /// exists only so `router()` has a real `Arc<FlowEngine>` to mount; the usage endpoints read
+    /// straight from `agent.events`, seeded directly.
+    struct UnusedProvider;
+    #[async_trait::async_trait]
+    impl flux_provider::Provider for UnusedProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(
+            &self,
+            _req: flux_provider::Request,
+        ) -> flux_core::Result<flux_provider::ChunkStream> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    /// A minimal `FlowEngine` for the usage-endpoint tests: real machinery, but no turn is ever run
+    /// through it — the events store is seeded directly with `CallUsage`/`TurnEnded` events instead,
+    /// which is all `get_session_usage`/`get_usage_all` read.
+    fn usage_test_engine() -> (Arc<FlowEngine>, Arc<flux_events::EventStore>) {
+        let dir =
+            std::env::temp_dir().join(format!("flux-server-usage-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(flux_system::System::new(
+            flux_system::Workspace::new(&dir).unwrap(),
+        ));
+        let mut registry = flux_runtime::ToolRegistry::new();
+        flux_tools::register_reflect(&mut registry);
+        flux_tools::register_evidence(&mut registry);
+        let executor = flux_runtime::Executor::new(
+            registry,
+            flux_runtime::PermissionManager::from_rules(
+                &["plan".into(), "run_plan".into(), "observe".into()],
+                &[],
+            ),
+            Arc::new(flux_runtime::AllowApprover),
+            flux_runtime::ToolContext::new(system),
+        );
+        let events = Arc::new(flux_events::EventStore::in_memory().unwrap());
+        let flow = flux_flow::state::FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let engine = FlowEngine::assemble(
+            Arc::new(UnusedProvider),
+            executor,
+            events.clone(),
+            flow,
+            "claude-sonnet-4-6".into(),
+            "test".into(),
+            1024,
+            5,
+            Vec::new(),
+            0,
+            Vec::new(),
+            dir,
+        )
+        .unwrap();
+        (Arc::new(engine), events)
+    }
+
+    async fn get_json(app: Router, path: &str) -> (StatusCode, Value) {
+        let res = app
+            .oneshot(HttpRequest::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, body)
+    }
+
+    /// C-06 server endpoint: `GET /sessions/:id/usage` returns cache tiers + cost, and `GET /usage`
+    /// rolls the same rows up across sessions — the story's named failing-first test.
+    #[tokio::test]
+    async fn usage_endpoint_returns_cache_tiers_and_cost() {
+        let (engine, events) = usage_test_engine();
+        let sid = events.create_session("claude-sonnet-4-6").unwrap();
+        let turn_id = events.begin_turn(&sid, "hi", "claude-sonnet-4-6").unwrap();
+        events
+            .record_call_usage(
+                &sid,
+                turn_id,
+                "claude-sonnet-4-6",
+                Usage {
+                    input_tokens: 1_000_000,
+                    output_tokens: 100_000,
+                    cache_creation_input_tokens: 200_000,
+                    cache_read_input_tokens: 500_000,
+                    reasoning_tokens: 0,
+                },
+            )
+            .unwrap();
+        events
+            .end_turn(&sid, turn_id, "accepted", 1, "done", None)
+            .unwrap();
+
+        let app = router(engine, None, CardInfo::flux_coding());
+        let (status, body) = get_json(app.clone(), &format!("/sessions/{sid}/usage")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["session_id"], sid);
+        let models = body["models"].as_array().unwrap();
+        assert_eq!(models.len(), 1);
+        let row = &models[0];
+        assert_eq!(row["model"], "claude-sonnet-4-6");
+        assert_eq!(row["usage"]["input"], 1_000_000);
+        assert_eq!(row["usage"]["output"], 100_000);
+        // The cache tiers `post_message`'s OLD usage JSON used to drop entirely:
+        assert_eq!(row["usage"]["cache_creation"], 200_000);
+        assert_eq!(row["usage"]["cache_read"], 500_000);
+        assert_eq!(row["usage"]["reasoning"], 0);
+        // Cost is present and positive (a known model, builtin pricing table).
+        assert!(row["cost_usd"].as_f64().unwrap() > 0.0);
+        assert_eq!(row["subscription"], false);
+
+        // The aggregate endpoint rolls up the same session.
+        let (status2, body2) = get_json(app, "/usage").await;
+        assert_eq!(status2, StatusCode::OK);
+        let models2 = body2["models"].as_array().unwrap();
+        assert_eq!(models2.len(), 1);
+        assert_eq!(models2[0]["usage"]["input"], 1_000_000);
     }
 }

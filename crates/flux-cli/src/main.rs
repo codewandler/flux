@@ -274,6 +274,8 @@ enum Commands {
         #[arg(long)]
         prune: bool,
     },
+    /// Per-model token usage + cost: the current/last session, and an all-sessions total.
+    Usage,
     /// Provider authentication (status / login).
     Auth {
         #[command(subcommand)]
@@ -847,6 +849,75 @@ fn run_sessions(prune: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `flux usage` — per-model tokens + cost for the current/last session, and an all-sessions total.
+/// Reads the unified event store's `cost_summary` projection (C-06); pricing is the builtin table
+/// overlaid by `~/.flux/pricing.toml` (same loader the live turn-end annotation uses).
+fn run_usage() -> Result<()> {
+    let store = open_event_store()?;
+    let pricing = flux_credentials::load_pricing_table();
+    run_usage_with(&store, &pricing)
+}
+
+/// The store-parameterized body of [`run_usage`] (tests pass an in-memory store so they don't touch
+/// `HOME`'s real `~/.flux/events.db`).
+fn run_usage_with(store: &EventStore, pricing: &flux_core::PricingTable) -> Result<()> {
+    let Some(session_id) = store.latest_session()? else {
+        eprintln!("no sessions yet — start one with `flux` or `flux run`");
+        return Ok(());
+    };
+
+    println!("{} {session_id}", style::bold("session:"));
+    let session_rows = store.cost_summary(&session_id, pricing)?;
+    print_usage_rows(&session_rows);
+
+    println!();
+    println!("{}", style::bold("all sessions:"));
+    let all_rows = store.cost_summary_all(pricing)?;
+    print_usage_rows(&all_rows);
+    Ok(())
+}
+
+/// Print one `cost_summary` table: model, call count, token tiers, and cost (when priced). Shared by
+/// the per-session and all-sessions sections of `flux usage`.
+fn print_usage_rows(rows: &[flux_events::ModelCost]) {
+    if rows.is_empty() {
+        eprintln!("  (no usage recorded)");
+        return;
+    }
+    let mut total_usd = 0.0_f64;
+    let mut any_priced = false;
+    for row in rows {
+        let cost = match row.cost {
+            Some(money) => {
+                any_priced = true;
+                total_usd += money.usd;
+                cost_annotation(&money)
+            }
+            None => String::new(),
+        };
+        println!(
+            "  {:<28} {:>3} call{}  ctx {} · out {}{}{}",
+            row.model,
+            row.calls,
+            if row.calls == 1 { " " } else { "s" },
+            style::fmt_tokens(row.usage.context_tokens()),
+            style::fmt_tokens(row.usage.output_tokens),
+            if row.usage.cache_read_input_tokens > 0 {
+                format!(
+                    " · cache {}",
+                    style::fmt_tokens(row.usage.cache_read_input_tokens)
+                )
+            } else {
+                String::new()
+            },
+            cost,
+        );
+    }
+    if any_priced && rows.len() > 1 {
+        println!("  {:<28} total ${:.4}", "", total_usd);
+    }
 }
 
 /// `flux loop [show|eject]` — inspect and customize the flux-lang agent loop that drives every turn.
@@ -2836,7 +2907,7 @@ async fn run_goal(
             )
             .await
         {
-            Ok(v) => v,
+            Ok(v) => v.text,
             Err(e) => {
                 eprintln!("{}", style::dim(&format!("(evaluator error: {e})")));
                 return;
@@ -3391,9 +3462,11 @@ impl AgentSink for CliSink {
 }
 
 /// The compact token annotation appended to a turn-end rule (and the prose `/goal` footer): the
-/// context-window occupancy (the final prompt size), the tokens generated, and — when prompt caching
-/// is in play — the cached tokens with the hit-rate (cached ÷ context). All four figures the user
-/// asked to see; empty when nothing was billed (e.g. an offline `-m mock` turn).
+/// context-window occupancy (the final prompt size), the tokens generated, cache tiers (read AND
+/// write — C-06 added the write side, which used to be silently dropped), and reasoning tokens when
+/// the provider reported any. Cost itself is a separate suffix ([`cost_annotation`], appended by the
+/// caller via `CliSink::cost_inline`) — this function is only the token breakdown. Empty when nothing
+/// was billed (e.g. an offline `-m mock` turn).
 fn usage_annotation(u: &Usage) -> String {
     let context = u.context_tokens();
     if context == 0 && u.output_tokens == 0 {
@@ -3409,6 +3482,18 @@ fn usage_annotation(u: &Usage) -> String {
         s.push_str(&format!(
             " · cache {} ({pct}% hit)",
             style::fmt_tokens(u.cache_read_input_tokens)
+        ));
+    }
+    if u.cache_creation_input_tokens > 0 {
+        s.push_str(&format!(
+            " · cache write {}",
+            style::fmt_tokens(u.cache_creation_input_tokens)
+        ));
+    }
+    if u.reasoning_tokens > 0 {
+        s.push_str(&format!(
+            " · reasoning {}",
+            style::fmt_tokens(u.reasoning_tokens)
         ));
     }
     s
@@ -3834,6 +3919,7 @@ async fn main() -> Result<()> {
             }
             Some(Commands::Loop { action }) => run_loop_cmd(action),
             Some(Commands::Sessions { prune }) => run_sessions(prune),
+            Some(Commands::Usage) => run_usage(),
             Some(Commands::Auth { action }) => run_auth(action).await,
             Some(Commands::Plugin { action }) => run_plugin(action).await,
             Some(Commands::Endpoint { action }) => run_endpoint(action),
@@ -4171,8 +4257,8 @@ fn addr_is_loopback(addr: &str) -> bool {
 /// in which case all tool calls are auto-approved (no modal).
 async fn run_tui(flags: AgentFlags) -> Result<()> {
     let auto_approve = flags.yes;
-    let (agent, session_id, _spec, _spawner) = build_agent(&flags).await?;
-    flux_tui::run(agent, session_id, auto_approve).await
+    let (agent, session_id, model_spec, _spawner) = build_agent(&flags).await?;
+    flux_tui::run(agent, session_id, auto_approve, Some(model_spec)).await
 }
 
 /// The credential-ref **location** column for a record — the `Ref` location string (e.g.
@@ -5240,8 +5326,9 @@ mod tests {
         build_datasources, build_invoke_input, coerce_arg_value, cost_annotation,
         credential_location, format_evidence, loop_machinery_label, new_render_suffix,
         plugin_binaries_in, plugin_status_one, render_endpoint_row, render_review_markdown,
-        resolve_plugin_operation_name, run_plugin_in, should_fail, tool_preview, truncate,
-        usage_annotation, write_generated_skill, Liveness, PluginAction, ReviewSeverity,
+        resolve_plugin_operation_name, run_plugin_in, run_usage_with, should_fail, tool_preview,
+        truncate, usage_annotation, write_generated_skill, EventStore, Liveness, PluginAction,
+        ReviewSeverity,
     };
     use serde_json::json;
 
@@ -5722,6 +5809,54 @@ mod tests {
         assert_eq!(usage_annotation(&Usage::default()), "");
     }
 
+    /// C-06 cache-aware surfacing: `usage_annotation` must show cache-WRITE tokens and reasoning
+    /// tokens too — before C-06 only cache-READ appeared, silently dropping the other tiers a
+    /// caching-heavy or reasoning-heavy turn actually spent. Combined with `cost_annotation` (the
+    /// dollar-cost suffix `CliSink::cost_inline` appends alongside this), the turn-end rule shows
+    /// every tier + cost — the story's named failing-first test.
+    #[test]
+    fn usage_annotation_includes_cache_and_cost() {
+        use flux_core::{Money, Usage};
+
+        let u = Usage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            cache_creation_input_tokens: 2_000,
+            cache_read_input_tokens: 9_000,
+            reasoning_tokens: 300,
+        };
+        let s = usage_annotation(&u);
+        assert!(s.contains("cache 9.0k"), "cache-read still shown: {s}");
+        assert!(
+            s.contains("cache write 2.0k"),
+            "cache-WRITE tokens must be surfaced too (previously dropped entirely): {s}"
+        );
+        assert!(
+            s.contains("reasoning 300"),
+            "reasoning tokens must be surfaced: {s}"
+        );
+
+        // Zero cache-write / zero reasoning ⇒ neither segment appears (no clutter on an ordinary
+        // metered turn that never wrote to cache or reasoned).
+        let plain = Usage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            cache_read_input_tokens: 9_000,
+            ..Default::default()
+        };
+        let s2 = usage_annotation(&plain);
+        assert!(!s2.contains("cache write"));
+        assert!(!s2.contains("reasoning"));
+
+        // The dollar-cost suffix (rendered alongside, via `cost_annotation`) completes the picture:
+        // the turn-end rule shows tokens (this function) AND cost (this one) together.
+        let cost = cost_annotation(&Money {
+            usd: 0.0456,
+            subscription: false,
+        });
+        assert_eq!(format!("{s}{cost}"), format!("{s} · $0.0456"));
+    }
+
     /// `cost_annotation` formats metered spend as `$X`, subscription spend (claude/codex) as the
     /// *equivalent metered cost* `~$X (sub)` (it bills against a flat sub, not the API), and a
     /// zero-cost turn as empty (C-05).
@@ -5755,6 +5890,92 @@ mod tests {
             }),
             ""
         );
+    }
+
+    /// `flux usage` reports per-model tokens + cost for the current (latest) session AND an
+    /// all-sessions total — the story's named failing-first test. Two sessions on different models,
+    /// each with a `CallUsage`-carrying turn: the latest session's report must show ONLY its own
+    /// model, while the all-sessions total rolls up both.
+    #[test]
+    fn flux_usage_reports_per_model_cost() {
+        use flux_core::Usage;
+
+        let store = EventStore::in_memory().unwrap();
+
+        let older = store.create_session("claude-opus-4-8").unwrap();
+        let t1 = store
+            .begin_turn(&older, "first", "claude-opus-4-8")
+            .unwrap();
+        store
+            .record_call_usage(
+                &older,
+                t1,
+                "claude-opus-4-8",
+                Usage {
+                    input_tokens: 1_000_000,
+                    output_tokens: 1_000_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .end_turn(&older, t1, "accepted", 1, "done", None)
+            .unwrap();
+
+        let latest = store.create_session("claude-sonnet-4-6").unwrap();
+        let t2 = store
+            .begin_turn(&latest, "second", "claude-sonnet-4-6")
+            .unwrap();
+        store
+            .record_call_usage(
+                &latest,
+                t2,
+                "claude-sonnet-4-6",
+                Usage {
+                    input_tokens: 500_000,
+                    output_tokens: 50_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .end_turn(&latest, t2, "accepted", 1, "done", None)
+            .unwrap();
+
+        assert_eq!(
+            store.latest_session().unwrap().as_deref(),
+            Some(latest.as_str()),
+            "the second session is the most recently active"
+        );
+
+        let pricing = flux_core::PricingTable::builtin();
+        // Doesn't panic and (indirectly, via the projection it wraps) reports the right rows —
+        // asserted precisely below through the projection it's built on, since `run_usage_with`
+        // itself only prints.
+        run_usage_with(&store, &pricing).unwrap();
+
+        // The precise per-model figures `run_usage_with` prints, checked directly:
+        let latest_rows = store.cost_summary(&latest, &pricing).unwrap();
+        assert_eq!(
+            latest_rows.len(),
+            1,
+            "the latest session shows only its own model"
+        );
+        assert_eq!(latest_rows[0].model, "claude-sonnet-4-6");
+        assert_eq!(latest_rows[0].usage.input_tokens, 500_000);
+
+        let all_rows = store.cost_summary_all(&pricing).unwrap();
+        assert_eq!(
+            all_rows.len(),
+            2,
+            "the all-sessions total rolls up both models"
+        );
+        let opus = all_rows
+            .iter()
+            .find(|r| r.model == "claude-opus-4-8")
+            .unwrap();
+        assert_eq!(opus.usage.input_tokens, 1_000_000);
+        assert!(opus.cost.unwrap().usd > 0.0);
     }
 
     /// A `CliSink` with an attached model spec + pricing table prices a turn's usage through the

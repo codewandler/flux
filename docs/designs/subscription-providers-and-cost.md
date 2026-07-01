@@ -52,9 +52,9 @@ and adds the missing cross-cutting piece: **full usage + cost tracking across al
 | 5 | Transport is HTTP-SSE only; codex's Rust client uses a websocket transport | `flux-provider`/`openai.rs` | **C-07** |
 | 6 | **No pricing/cost layer at all** | (none) | **C-05** |
 | 7 | OpenAI Chat + Responses codecs leave cache/reasoning token fields at 0 → cost undercounts | `openai.rs` | **C-05** |
-| 8 | Turn-level granularity only; `model` on `TurnStarted`, `usage` on `TurnEnded` — no per-call/per-model attribution | `flux-events` | **C-06** |
-| 9 | Sub-agent token spend not rolled into the parent turn | `flux-cli`/`flux-flow` | **C-06** |
-| 10 | No aggregation/reporting surface; CLI/TUI/server drop cache tiers | `flux-cli`/`flux-tui`/`flux-server` | **C-06** |
+| 8 | Turn-level granularity only; `model` on `TurnStarted`, `usage` on `TurnEnded` — no per-call/per-model attribution | `flux-events` | **C-06** ✅ |
+| 9 | Sub-agent token spend not rolled into the parent turn | `flux-cli`/`flux-flow` | **C-06** ✅ |
+| 10 | No aggregation/reporting surface; CLI/TUI/server drop cache tiers | `flux-cli`/`flux-tui`/`flux-server` | **C-06** ✅ |
 
 ## Codex transport — websocket as default (C-07)
 
@@ -81,9 +81,15 @@ HTTP. Auth headers (Bearer + `chatgpt-account-id` + beta + originator) are appli
   labelled), since the spend is against a subscription.
 - **Codec normalization** — every codec must populate the cache (and, where available, reasoning) token
   fields so cost is comparable across providers; the two OpenAI paths set them to 0 today.
-- **Accounting** — stamp the resolved model onto the usage record; roll sub-agent spend into the parent;
-  a `cost_summary` projection over the event log (per-session and aggregate); a `flux usage` command; a
-  server endpoint; cache-aware CLI/TUI/server surfacing that also shows cost.
+- **Accounting** (**shipped, C-06**) — a new per-call `EventKind::CallUsage { model, usage }` stamps the
+  model active at EACH provider call (not just per-turn), so a mid-turn `/model` switch attributes
+  correctly; a spawned sub-agent's usage rolls into the parent turn's total via a `subagent.usage`
+  observation on the shared evidence log (folded in + re-emitted as its own `CallUsage`, attributed to
+  the child's model); `flux_events::cost_summary`/`cost_summary_all` project tokens+cost by model
+  (per-session and aggregate, cache-aware, with a per-turn-total fallback for pre-C-06 logs); `flux usage`
+  reports the latest session + an all-sessions total; `GET /sessions/:id/usage` + `GET /usage` serve the
+  same rollup over HTTP; the CLI `usage_annotation` and TUI header both surface cache-write + reasoning
+  tokens (TUI also shows a running dollar cost).
 
 ## Sequencing
 

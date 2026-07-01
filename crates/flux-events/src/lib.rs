@@ -28,5 +28,7 @@ mod store;
 
 pub use context::EventContext;
 pub use kind::{EventKind, NewEvent, StoredEvent};
-pub use projection::{conversation, run_trace, turns, PlanAttempt, TurnSummary};
+pub use projection::{
+    conversation, cost_summary, run_trace, turns, ModelCost, PlanAttempt, TurnSummary,
+};
 pub use store::{EventStore, SessionInfo, SessionSummary};
