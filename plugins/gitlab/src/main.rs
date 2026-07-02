@@ -1,12 +1,14 @@
 //! `gitlab` — a flux integration plugin for the GitLab REST API (v4): projects, merge requests, issues,
 //! pipelines, CI/CD, code review, and releases. Authenticates with a personal access token via the
-//! `PRIVATE-TOKEN` header; the base URL is the `gitlab.endpoint` (defaults to gitlab.com). List ops
+//! `PRIVATE-TOKEN` header; requests address the `gitlab.endpoint` **by reference** — the host
+//! resolves the base URL (env-configured, defaulting to gitlab.com host-side) and it never crosses
+//! to the plugin (D-32). List ops
 //! contribute datasource records (`gitlab.project` / `gitlab.merge_request` / `gitlab.issue`) so the
 //! agent can search them; `gitlab.index.build` drives that contribution exhaustively over the surface.
 //!
 //! This is the reference template for the HTTP-API integration plugins: every read/list/get/search op
 //! is a `read_op` and every create/update/delete/mutate op is a `write_op`; all REST verbs go through
-//! the DRY `gl_get`/`gl_post`/`gl_put`/`gl_delete` helpers (PRIVATE-TOKEN header, `base + /api/v4 + path`,
+//! the DRY `gl_get`/`gl_post`/`gl_put`/`gl_delete` helpers (PRIVATE-TOKEN header, ref + `/api/v4 + path`,
 //! is_success check, JSON parse); `gitlab.repository.archive` stages the downloaded bytes through the
 //! host `blob` capability.
 
@@ -798,6 +800,10 @@ fn manifest_builder() -> PluginBuilder {
             env: vec!["GITLAB_URL".into(), "GITLAB_BASE_URL".into()],
             http_hosts: vec!["gitlab.com".into()],
             description: "GitLab base URL (default https://gitlab.com)".into(),
+            // Host-side default (D-32): when no env key is set the host resolves gitlab.com
+            // itself — the fallback that used to live plugin-side in `gl_base_token`.
+            default: Some("https://gitlab.com".into()),
+            ..Default::default()
         })
         .datasource(ds("gitlab.projects", "gitlab.project", "GitLab projects."))
         .datasource(ds(
@@ -1284,16 +1290,12 @@ fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
 
 // ---------------------------------------------------------------------------
 // HTTP plumbing — every REST verb funnels through `gl_request` (PRIVATE-TOKEN
-// header, base + /api/v4 + path, is_success check) so auth/encoding stay DRY.
+// header, `gitlab.endpoint` ref + /api/v4 + path, is_success check) so
+// auth/encoding stay DRY. The base URL is resolved host-side only (env or the
+// manifest's gitlab.com default) — the plugin never holds it (D-32). The
+// manifest's `personal_token` auth method is not Header-scheme, so the token
+// is still fetched via `host.secret` and sent explicitly as `PRIVATE-TOKEN`.
 // ---------------------------------------------------------------------------
-
-fn gl_base_token(host: &mut Host) -> Result<(String, String), String> {
-    let base = host
-        .endpoint("gitlab.endpoint")
-        .unwrap_or_else(|_| "https://gitlab.com".into());
-    let token = host.secret("personal_token")?;
-    Ok((base.trim_end_matches('/').to_string(), token))
-}
 
 fn gl_request(
     host: &mut Host,
@@ -1301,19 +1303,25 @@ fn gl_request(
     path: &str,
     body: Option<&Value>,
 ) -> Result<HttpResponse, String> {
-    let (base, token) = gl_base_token(host)?;
-    let url = format!("{base}/api/v4{path}");
+    let token = host.secret("personal_token")?;
     let mut headers: Vec<(&str, &str)> = vec![("PRIVATE-TOKEN", token.as_str())];
     let body_str;
     let body_ref = match body {
         Some(b) => {
             body_str = serde_json::to_string(b).map_err(|e| e.to_string())?;
             headers.push(("content-type", "application/json"));
-            Some(body_str.as_str())
+            Some(body_str.as_bytes())
         }
         None => None,
     };
-    let resp = host.http(method, &url, None, &headers, body_ref)?;
+    let resp = host.http_ref(
+        "gitlab.endpoint",
+        method,
+        &format!("/api/v4{path}"),
+        None,
+        &headers,
+        body_ref,
+    )?;
     if !resp.is_success() {
         return Err(format!(
             "gitlab {method} {path} → {} {}",
@@ -1323,7 +1331,7 @@ fn gl_request(
     Ok(resp)
 }
 
-/// GET `{base}/api/v4{path}` and return the parsed JSON.
+/// GET `/api/v4{path}` on the `gitlab.endpoint` ref and return the parsed JSON.
 fn gl_get(host: &mut Host, path: &str) -> Result<Value, String> {
     gl_request(host, "GET", path, None)?.json()
 }
@@ -1344,9 +1352,23 @@ fn gl_delete(host: &mut Host, path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// GET raw bytes (for binary downloads like the repository archive).
+/// GET raw bytes (for binary downloads like the repository archive) — byte-exact via
+/// `http_bytes_ref`, so an archive never round-trips through a UTF-8 string body.
 fn gl_get_bytes(host: &mut Host, path: &str) -> Result<Vec<u8>, String> {
-    Ok(gl_request(host, "GET", path, None)?.body.into_bytes())
+    let token = host.secret("personal_token")?;
+    let resp = host.http_bytes_ref(
+        "gitlab.endpoint",
+        "GET",
+        &format!("/api/v4{path}"),
+        None,
+        &[("PRIVATE-TOKEN", token.as_str())],
+        None,
+        true,
+    )?;
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("gitlab GET {path} → {}", resp.status));
+    }
+    Ok(resp.bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -3370,7 +3392,7 @@ mod tests {
 
     fn base() -> MockHost {
         MockHost::default()
-            .with_endpoint("gitlab.endpoint", "https://gl.example.com")
+            .with_endpoint_ref("gitlab.endpoint", "https://gl.example.com")
             .with_secret("personal_token", "tok")
     }
 
@@ -3401,7 +3423,10 @@ mod tests {
 
     #[test]
     fn project_show_encodes_the_path() {
+        // The gitlab.com fallback now lives host-side (`EndpointSpec.default`, D-32); the mock
+        // has no manifest knowledge, so pin the ref to that default and assert the composed URL.
         let mut host = MockHost::default()
+            .with_endpoint_ref("gitlab.endpoint", "https://gitlab.com")
             .with_secret("personal_token", "tok")
             .with_http(
                 "gitlab.com/api/v4/projects/group%2Fapp",
@@ -4365,7 +4390,8 @@ mod tests {
 
     #[test]
     fn repository_archive_stages_a_blob() {
-        let mut host = base().with_http("/repository/archive.tar.gz", json!("ARCHIVE-BYTES"));
+        let mut host =
+            base().with_http_bytes("/repository/archive.tar.gz", b"ARCHIVE-BYTES".to_vec());
         let out = run(
             "gitlab.repository.archive",
             json!({ "project": "group/app", "ref": "main" }),
@@ -4384,6 +4410,11 @@ mod tests {
         let m = manifest_builder().build().manifest();
         assert_eq!(m.operations.len(), 64);
         assert_eq!(m.auth[0].purpose, "personal_token");
+        assert_eq!(m.endpoints[0].name, "gitlab.endpoint");
+        assert_eq!(
+            m.endpoints[0].default.as_deref(),
+            Some("https://gitlab.com")
+        );
         assert!(m.capabilities.blob);
         assert!(m
             .datasources

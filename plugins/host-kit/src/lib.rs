@@ -2,9 +2,11 @@
 //!
 //! It wraps flux-plugin's guest protocol so a plugin is mostly "declare ops + implement each against a
 //! vendor API": a typed [`Host`] for the host-capability callbacks (secret-by-purpose, HTTP with
-//! auth-by-scheme injection, endpoint resolution, datasource-record contribution) and a [`PluginBuilder`] that collects
+//! auth-by-scheme injection, reference-based IO, datasource-record contribution) and a [`PluginBuilder`] that collects
 //! a manifest + op handlers and serves them. Plugins never read state files or hold raw tokens for the
-//! auth-injection path — the host resolves secrets and injects them.
+//! auth-injection path — the host resolves secrets and injects them. Endpoints are addressed **by
+//! reference** (D-32): the host resolves a declared endpoint's URL and performs the IO; there is no
+//! capability that hands a URL string back to the plugin.
 //!
 //! ```ignore
 //! use host_kit::*;
@@ -14,8 +16,7 @@
 //!         .auth(AuthMethod { purpose: "api_token".into(), env: vec!["ACME_TOKEN".into()], ..Default::default() })
 //!         .endpoint(EndpointSpec { name: "acme.endpoint".into(), env: vec!["ACME_URL".into()], ..Default::default() })
 //!         .operation(op("acme.ping", "Ping the API", schema), |_in, host| {
-//!             let base = host.endpoint("acme.endpoint")?;
-//!             let v = host.get_json(&format!("{base}/ping"), Some("api_token"))?;
+//!             let v = host.get_json_ref("acme.endpoint", "/ping", Some("api_token"))?;
 //!             Ok(v)
 //!         })
 //!         .serve();
@@ -30,8 +31,8 @@ use serde_json::{json, Value};
 // Re-export the protocol vocabulary so a plugin depends only on host-kit.
 pub use flux_datasource::{Declaration, EntitySchema, Link, Record, SchemaField, Source};
 pub use flux_plugin::{
-    AuthMethod, AuthScheme, EndpointSpec, GuestHost, OperationSpec, PluginCapabilities as Caps,
-    PluginHandler, PluginManifest,
+    AuthMethod, AuthScheme, ConfigSpec, EndpointSpec, GuestHost, OperationSpec,
+    PluginCapabilities as Caps, PluginHandler, PluginManifest,
 };
 pub use flux_spec::{Effect, Idempotency, Risk};
 
@@ -128,13 +129,17 @@ impl Host<'_> {
             .ok_or_else(|| "secret: host returned no value".into())
     }
 
-    /// Resolve a named endpoint base URL (config, from env).
-    pub fn endpoint(&mut self, name: &str) -> Result<String, String> {
-        let v = self.inner.host_call("endpoint", json!({ "name": name }))?;
-        v.get("url")
+    /// Read a declared **non-secret** config value by name via the gated `config` host capability
+    /// (D-32) — e.g. jira's Atlassian `cloud_id`. Deny-by-default: the host refuses undeclared
+    /// names, and refuses any declared env key that is secret-classified, so this can never return
+    /// a secret value. This replaces the config reads that abused the retired `endpoint`
+    /// URL-handback; URLs themselves stay host-side (address endpoints by reference instead).
+    pub fn config(&mut self, name: &str) -> Result<String, String> {
+        let v = self.inner.host_call("config", json!({ "name": name }))?;
+        v.get("value")
             .and_then(|x| x.as_str())
             .map(String::from)
-            .ok_or_else(|| "endpoint: host returned no url".into())
+            .ok_or_else(|| "config: host returned no value".into())
     }
 
     /// Make an HTTP request through the host. `auth_purpose` (when set) names an auth method the host
@@ -208,18 +213,27 @@ impl Host<'_> {
     /// URL. The host resolves `endpoint_ref` (a named manifest endpoint, or a discovered
     /// `@endpoint/<id>`), joins `path` onto the resolved base, and injects any credential the
     /// reference carries host-side. `auth_purpose` (when set) names a manifest auth method the host
-    /// injects per its declared scheme — same as [`http`](Self::http), but the URL stays host-only.
+    /// injects per its declared scheme; `headers` are extra request headers (e.g. a runtime session
+    /// token) — same as [`http`](Self::http), but the URL stays host-only.
     pub fn http_ref(
         &mut self,
         endpoint_ref: &str,
         method: &str,
         path: &str,
         auth_purpose: Option<&str>,
+        headers: &[(&str, &str)],
         body: Option<&[u8]>,
     ) -> Result<HttpResponse, String> {
         let mut payload = json!({ "method": method, "endpoint_ref": endpoint_ref, "path": path });
         if let Some(p) = auth_purpose {
             payload["auth_purpose"] = json!(p);
+        }
+        if !headers.is_empty() {
+            let map: serde_json::Map<String, Value> = headers
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), json!(v)))
+                .collect();
+            payload["headers"] = Value::Object(map);
         }
         if let Some(b) = body {
             payload["body_b64"] = json!(base64::engine::general_purpose::STANDARD.encode(b));
@@ -235,6 +249,54 @@ impl Host<'_> {
         })
     }
 
+    /// Make an HTTP request with a **byte-exact** body and/or response **by endpoint reference** —
+    /// the ref-based mirror of [`http_bytes`](Self::http_bytes) (D-32): binary upload/download
+    /// (attachment fetches, multipart uploads) without the plugin ever holding a URL. The host
+    /// resolves `endpoint_ref`, joins `path`, and injects `auth_purpose` per its declared scheme;
+    /// `body` (when set) is sent verbatim; `binary_response` asks for the raw response bytes
+    /// (otherwise the response body's bytes are its UTF-8 text).
+    #[allow(clippy::too_many_arguments)]
+    pub fn http_bytes_ref(
+        &mut self,
+        endpoint_ref: &str,
+        method: &str,
+        path: &str,
+        auth_purpose: Option<&str>,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+        binary_response: bool,
+    ) -> Result<HttpBytesResponse, String> {
+        let mut payload = json!({ "method": method, "endpoint_ref": endpoint_ref, "path": path });
+        if let Some(p) = auth_purpose {
+            payload["auth_purpose"] = json!(p);
+        }
+        if !headers.is_empty() {
+            let map: serde_json::Map<String, Value> = headers
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), json!(v)))
+                .collect();
+            payload["headers"] = Value::Object(map);
+        }
+        if let Some(b) = body {
+            payload["body_b64"] = json!(base64::engine::general_purpose::STANDARD.encode(b));
+        }
+        if binary_response {
+            payload["response_binary"] = json!(true);
+        }
+        let v = self.inner.host_call("http.do", payload)?;
+        let status = v.get("status").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
+        let bytes = if let Some(b64) = v.get("body_b64").and_then(|x| x.as_str()) {
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| format!("http_bytes_ref: bad body_b64: {e}"))?
+        } else if let Some(s) = v.get("body").and_then(|x| x.as_str()) {
+            s.as_bytes().to_vec()
+        } else {
+            Vec::new()
+        };
+        Ok(HttpBytesResponse { status, bytes })
+    }
+
     /// Convenience: GET an endpoint-reference path (optional auth purpose) and parse the JSON body,
     /// erroring on non-2xx. The ref-based mirror of [`get_json`](Self::get_json).
     pub fn get_json_ref(
@@ -243,7 +305,7 @@ impl Host<'_> {
         path: &str,
         auth_purpose: Option<&str>,
     ) -> Result<Value, String> {
-        let resp = self.http_ref(endpoint_ref, "GET", path, auth_purpose, None)?;
+        let resp = self.http_ref(endpoint_ref, "GET", path, auth_purpose, &[], None)?;
         if !resp.is_success() {
             return Err(format!(
                 "GET {endpoint_ref} {path} → {} {}",
@@ -264,7 +326,14 @@ impl Host<'_> {
         body: &Value,
     ) -> Result<Value, String> {
         let s = serde_json::to_string(body).map_err(|e| e.to_string())?;
-        let resp = self.http_ref(endpoint_ref, method, path, auth_purpose, Some(s.as_bytes()))?;
+        let resp = self.http_ref(
+            endpoint_ref,
+            method,
+            path,
+            auth_purpose,
+            &[("content-type", "application/json")],
+            Some(s.as_bytes()),
+        )?;
         if !resp.is_success() {
             return Err(format!(
                 "{method} {endpoint_ref} {path} → {} {}",
@@ -691,9 +760,17 @@ impl PluginBuilder {
         self
     }
 
-    /// Add a configurable endpoint (base URL from env).
+    /// Add a configurable endpoint (base URL from env, or a host-composed template), addressed by
+    /// the plugin **by reference** via the `*_ref` IO helpers.
     pub fn endpoint(mut self, ep: EndpointSpec) -> Self {
         self.manifest.endpoints.push(ep);
+        self
+    }
+
+    /// Declare a **non-secret** config value (D-32) readable via [`Host::config`]. The host refuses
+    /// undeclared names and secret-classified env keys.
+    pub fn config(mut self, spec: ConfigSpec) -> Self {
+        self.manifest.config.push(spec);
         self
     }
 
@@ -845,8 +922,8 @@ pub struct MockHost {
     pub http: Vec<(String, Value)>,
     /// `purpose -> secret value`.
     pub secrets: HashMap<String, String>,
-    /// `endpoint name -> base url`.
-    pub endpoints: HashMap<String, String>,
+    /// `config name -> value` for the gated non-secret `config` capability (D-32).
+    pub configs: HashMap<String, String>,
     /// `endpoint_ref -> base url` for ref-based IO (`http.do`/`conn.dial` with an `endpoint_ref`).
     /// Covers both named (`svc.endpoint`) and discovered (`@endpoint/<id>`) refs — the resolver the
     /// real host installs. `http_ref`/`conn_dial_ref` resolve against this map.
@@ -891,7 +968,7 @@ impl Default for MockHost {
         Self {
             http: Vec::new(),
             secrets: HashMap::new(),
-            endpoints: HashMap::new(),
+            configs: HashMap::new(),
             endpoint_refs: HashMap::new(),
             credentials: HashMap::new(),
             process: Vec::new(),
@@ -931,9 +1008,9 @@ impl MockHost {
         self.http_seq.borrow_mut().push((url_substr.into(), result));
         self
     }
-    /// A resolvable endpoint base URL.
-    pub fn with_endpoint(mut self, name: &str, url: &str) -> Self {
-        self.endpoints.insert(name.into(), url.into());
+    /// A readable non-secret config value for the gated `config` capability (D-32).
+    pub fn with_config(mut self, name: &str, value: &str) -> Self {
+        self.configs.insert(name.into(), value.into());
         self
     }
     /// A resolvable endpoint **reference** (named or discovered `@endpoint/<id>`) → base URL, for
@@ -1009,12 +1086,14 @@ impl GuestHost for MockHost {
                     .map(|v| json!({ "value": v }))
                     .ok_or_else(|| format!("mock: no secret for purpose `{p}`"))
             }
-            "endpoint" => {
+            "config" => {
+                // The gated non-secret config read (D-32). The real host additionally refuses
+                // secret-classified env keys; the mock just resolves declared names.
                 let n = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                self.endpoints
+                self.configs
                     .get(n)
-                    .map(|u| json!({ "url": u }))
-                    .ok_or_else(|| format!("mock: no endpoint `{n}`"))
+                    .map(|v| json!({ "value": v }))
+                    .ok_or_else(|| format!("mock: no config `{n}`"))
             }
             "http.do" => {
                 // Ref-based IO: resolve `endpoint_ref` to a base URL + join `path`, mirroring the
@@ -1254,13 +1333,14 @@ mod tests {
                 name: "acme.endpoint".into(),
                 env: vec!["ACME_URL".into()],
                 http_hosts: vec!["acme.example.com".into()],
-                description: String::new(),
+                ..Default::default()
             })
             .operation(
                 read_op("acme.thing", "fetch a thing", json!({"type": "object"})),
                 |_input, host| {
-                    let base = host.endpoint("acme.endpoint")?;
-                    let v = host.get_json(&format!("{base}/things/1"), Some("api_token"))?;
+                    // Ref-based IO: the endpoint is addressed by name; the host resolves the URL
+                    // and performs the call (no URL-handback, D-32).
+                    let v = host.get_json_ref("acme.endpoint", "things/1", Some("api_token"))?;
                     // contribute the fetched thing as a record
                     host.contribute(&[Record::new(
                         Source::new("acme"),
@@ -1280,7 +1360,7 @@ mod tests {
         assert_eq!(m.auth[0].purpose, "api_token");
 
         let mut host = MockHost::default()
-            .with_endpoint("acme.endpoint", "https://acme.test")
+            .with_endpoint_ref("acme.endpoint", "https://acme.test")
             .with_secret("api_token", "tok")
             .with_http("/things/1", json!({ "name": "Widget" }));
         let out = plugin
@@ -1311,7 +1391,7 @@ mod tests {
         assert_eq!(v["pong"], true);
         // An unconfigured ref is a clear error (the plugin can't reach an unknown endpoint).
         assert!(host
-            .http_ref("@endpoint/nope", "GET", "x", None, None)
+            .http_ref("@endpoint/nope", "GET", "x", None, &[], None)
             .is_err());
         // The gated `credential` capability materializes by credential_ref or endpoint_ref.
         assert_eq!(
@@ -1401,6 +1481,57 @@ mod tests {
         assert!(st.running);
         // kill is accepted
         host.process_kill(id).unwrap();
+    }
+
+    /// D-32: `http_bytes_ref` is the ref-based mirror of `http_bytes` — byte-exact upload/download
+    /// against an endpoint **reference**, the plugin never holding a URL. The mock resolves the ref
+    /// + joins the path exactly like the real host, so canned entries match by composed URL.
+    #[test]
+    fn http_bytes_ref_round_trips_binary_by_reference() {
+        let raw: Vec<u8> = vec![0, 159, 146, 150, 255];
+        let mut backend = MockHost::default()
+            .with_endpoint_ref("svc.endpoint", "https://svc.test/api")
+            .with_http_bytes("/api/download", raw.clone())
+            .with_http("/api/upload", json!({ "ok": true }));
+        let mut host = Host {
+            inner: &mut backend,
+        };
+        // binary_response=true → byte-exact download through the ref (non-UTF-8 preserved).
+        let dl = host
+            .http_bytes_ref("svc.endpoint", "GET", "download", None, &[], None, true)
+            .unwrap();
+        assert_eq!(dl.status, 200);
+        assert_eq!(dl.bytes, raw);
+        // Byte-exact upload with headers through the ref; text response bytes come back.
+        let up = host
+            .http_bytes_ref(
+                "svc.endpoint",
+                "POST",
+                "upload",
+                None,
+                &[("content-type", "multipart/form-data; boundary=x")],
+                Some(b"payload"),
+                false,
+            )
+            .unwrap();
+        assert_eq!(up.status, 200);
+        assert_eq!(up.bytes, b"{\"ok\":true}");
+        // An unconfigured ref is a clear error.
+        assert!(host
+            .http_bytes_ref("nope.endpoint", "GET", "x", None, &[], None, true)
+            .is_err());
+    }
+
+    /// D-32: the gated `config` capability reads a declared non-secret config value by name — the
+    /// replacement for the config reads that abused the retired `endpoint` URL-handback.
+    #[test]
+    fn config_reads_declared_value_and_errors_on_unknown() {
+        let mut backend = MockHost::default().with_config("cloud_id", "cloud-123");
+        let mut host = Host {
+            inner: &mut backend,
+        };
+        assert_eq!(host.config("cloud_id").unwrap(), "cloud-123");
+        assert!(host.config("nope").is_err());
     }
 
     #[test]

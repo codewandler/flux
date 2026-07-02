@@ -11,15 +11,18 @@
 //! against the configured `endpoint_ref` (see `client.go:45-56`, `do`/`getBytes`, `manifest.go:86-95`).
 //!
 //! This plugin re-ports that and keeps HTTP Basic (`email:api_token`) as a fallback (user-confirmed),
-//! selecting at request time — the plugin never builds an `Authorization` header itself:
-//!   * `cloud_id` resolvable (`ATLASSIAN_CLOUD_ID`/`CONFLUENCE_CLOUD_ID`) → Bearer (`api_token`) against
-//!     the gateway base `https://api.atlassian.com/ex/confluence/{cloud_id}`.
+//! selecting at request time — the plugin never builds an `Authorization` header itself, and never
+//! holds a URL: every request addresses a named endpoint reference the host resolves (D-32):
+//!   * `cloud_id` config resolvable (`ATLASSIAN_CLOUD_ID`/`CONFLUENCE_CLOUD_ID`) → Bearer (`api_token`)
+//!     against the `confluence.gateway` template endpoint the HOST composes as
+//!     `https://api.atlassian.com/ex/confluence/{cloud_id}`.
 //!   * else an email is configured (`CONFLUENCE_EMAIL`/`ATLASSIAN_EMAIL`) → Basic (`basic`) against the
-//!     `confluence.endpoint` site URL.
-//!   * else → Bearer (`api_token`) against the `confluence.endpoint` site URL.
+//!     `confluence.endpoint` site ref.
+//!   * else → Bearer (`api_token`) against the `confluence.endpoint` site ref.
 //!
-//! Three auth methods back this: `api_token` (Bearer secret), `basic` (Basic, email user_env + token
-//! secret), and `cloud_id` (Bearer, used only to *resolve* the cloud id at request time — never injected).
+//! Two auth methods back this: `api_token` (Bearer secret) and `basic` (Basic, email user_env + token
+//! secret). The cloud id and email are declared **non-secret config** values probed via the gated
+//! `Host::config` capability — never injected as auth.
 
 use base64::Engine as _;
 use host_kit::*;
@@ -249,16 +252,12 @@ fn manifest_builder() -> PluginBuilder {
             http_hosts: vec!["api.atlassian.com".into()],
             private_hosts: vec!["*".into()],
             blob: true,
-            // The api-token + email + cloud-id env keys must be granted secrets so the host can resolve
-            // them by purpose. The email is *also* a Basic `user_env` (config) — it is granted here only
-            // so the request-time Basic-vs-Bearer selection can probe whether it is set.
+            // Only the api-token env keys are secrets. The email + cloud-id keys are non-secret
+            // config (declared below via `.config(...)`) — the gated `config` capability REFUSES
+            // env keys that are granted secrets, so they must not be listed here.
             secrets: vec![
                 "CONFLUENCE_API_TOKEN".into(),
                 "ATLASSIAN_API_TOKEN".into(),
-                "CONFLUENCE_EMAIL".into(),
-                "ATLASSIAN_EMAIL".into(),
-                "ATLASSIAN_CLOUD_ID".into(),
-                "CONFLUENCE_CLOUD_ID".into(),
             ],
             ..Default::default()
         })
@@ -267,24 +266,28 @@ fn manifest_builder() -> PluginBuilder {
             "api_token",
             vec!["CONFLUENCE_API_TOKEN".into(), "ATLASSIAN_API_TOKEN".into()],
         ))
-        // Fallback: Basic base64(email:api_token) against the site URL.
+        // Fallback: Basic base64(email:api_token) against the site URL. The email `user_env` is
+        // config (not secret-classified), so it can double as the `email` config probe below.
         .auth(AuthMethod::basic(
             "basic",
             vec!["CONFLUENCE_EMAIL".into(), "ATLASSIAN_EMAIL".into()],
             vec!["CONFLUENCE_API_TOKEN".into(), "ATLASSIAN_API_TOKEN".into()],
         ))
-        // Atlassian Cloud id (resolved to select the gateway base; never injected as auth).
-        .auth(AuthMethod::bearer(
-            "cloud_id",
-            vec!["ATLASSIAN_CLOUD_ID".into(), "CONFLUENCE_CLOUD_ID".into()],
-        ))
-        // The Basic email, exposed as a resolvable purpose so the request-time selector can probe
-        // whether an email is configured (the Basic injection itself reads it from the `basic` method's
-        // `user_env`). Never injected as auth.
-        .auth(AuthMethod::bearer(
-            "basic_email",
-            vec!["CONFLUENCE_EMAIL".into(), "ATLASSIAN_EMAIL".into()],
-        ))
+        // Atlassian Cloud id (selects gateway mode at request time; never injected as auth).
+        .config(ConfigSpec {
+            name: "cloud_id".into(),
+            env: vec!["ATLASSIAN_CLOUD_ID".into(), "CONFLUENCE_CLOUD_ID".into()],
+            description: "Atlassian Cloud ID; when set, calls go through the Atlassian gateway"
+                .into(),
+        })
+        // The Basic email, probed at request time to select Basic vs Bearer (the Basic injection
+        // itself reads it host-side from the `basic` method's `user_env`).
+        .config(ConfigSpec {
+            name: "email".into(),
+            env: vec!["CONFLUENCE_EMAIL".into(), "ATLASSIAN_EMAIL".into()],
+            description: "Atlassian account email; when set (and no cloud_id), Basic auth is used"
+                .into(),
+        })
         .endpoint(EndpointSpec {
             name: "confluence.endpoint".into(),
             env: vec![
@@ -294,6 +297,16 @@ fn manifest_builder() -> PluginBuilder {
             ],
             http_hosts: Vec::new(),
             description: "Confluence Cloud base URL (e.g. https://site.atlassian.net)".into(),
+            ..Default::default()
+        })
+        // The Atlassian gateway base, HOST-composed from the `cloud_id` config value: the plugin
+        // addresses it by reference and the composed URL never crosses to the plugin.
+        .endpoint(EndpointSpec {
+            name: "confluence.gateway".into(),
+            template: Some("https://api.atlassian.com/ex/confluence/{cloud_id}".into()),
+            http_hosts: vec!["api.atlassian.com".into()],
+            description: "Atlassian API gateway for Confluence (composed from cloud_id)".into(),
+            ..Default::default()
         })
         .datasource(ds("confluence.pages", "confluence.page", "Confluence pages."))
         .datasource(ds("confluence.users", "confluence.user", "Confluence users."))
@@ -418,40 +431,26 @@ fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
 // Auth + base-URL selection (faithful to fluxplane's client.go `do`/NewLiveClient)
 // ---------------------------------------------------------------------------
 
-/// Where a request is routed. The cloud_id path builds a CONSTRUCTED gateway URL from a config value
-/// (not a declared endpoint), so it can only be expressed as an absolute URL; the site path is the
-/// declared manifest endpoint, addressed by its named reference so the host (not the plugin) holds the
-/// URL.
-enum Base {
-    /// A constructed absolute base URL (no trailing slash) — the Atlassian gateway. JSON IO joins
-    /// `path` onto it; byte IO (`http_bytes`) uses it directly.
-    Url(String),
-    /// A named manifest endpoint reference (`confluence.endpoint`) the host resolves to the site base.
-    Ref(&'static str),
-}
-
 /// The auth purpose + routing base for one request. fluxplane chooses the gateway base when a cloud id
 /// is resolvable and otherwise the endpoint_ref; flux additionally falls back to Basic against the site
 /// URL when an email is configured but no cloud id is.
 struct AuthCtx {
-    /// How the request is routed (constructed gateway URL vs. named site endpoint ref).
-    base: Base,
+    /// The named endpoint reference the request is routed through — `confluence.gateway` (the
+    /// host-composed Atlassian gateway template) or `confluence.endpoint` (the site base). The host
+    /// resolves the ref and joins the path; the plugin never holds a URL.
+    base: &'static str,
     /// The auth-method purpose the host injects (`api_token` Bearer or `basic`).
     purpose: &'static str,
 }
 
 /// Resolve the per-request auth + routing base, mirroring fluxplane's `NewLiveClient` + `do` selection.
 fn auth_ctx(host: &mut Host) -> Result<AuthCtx, String> {
-    // cloud_id → Atlassian gateway + Bearer (the reference's primary path). The gateway base is built
-    // from the cloud-id config value, so it stays an absolute URL (not a declared endpoint ref).
-    if let Ok(cloud) = host.secret("cloud_id") {
-        let cloud = cloud.trim();
-        if !cloud.is_empty() {
+    // cloud_id (gated non-secret config) → the host-composed Atlassian gateway ref + Bearer (the
+    // reference's primary path). The composed gateway URL stays host-side.
+    if let Ok(cloud) = host.config("cloud_id") {
+        if !cloud.trim().is_empty() {
             return Ok(AuthCtx {
-                base: Base::Url(format!(
-                    "https://api.atlassian.com/ex/confluence/{}",
-                    urlencode(cloud)
-                )),
+                base: "confluence.gateway",
                 purpose: "api_token",
             });
         }
@@ -465,16 +464,16 @@ fn auth_ctx(host: &mut Host) -> Result<AuthCtx, String> {
         "api_token"
     };
     Ok(AuthCtx {
-        base: Base::Ref("confluence.endpoint"),
+        base: "confluence.endpoint",
         purpose,
     })
 }
 
-/// Whether a Basic-auth email is configured. Probed via the `basic_email` purpose (the same email env
-/// the `basic` method uses as its `user_env`); the actual Basic injection still resolves the email from
-/// that `user_env` host-side.
+/// Whether a Basic-auth email is configured. Probed via the `email` config declaration (the same
+/// email env the `basic` method uses as its `user_env`); the actual Basic injection still resolves
+/// the email from that `user_env` host-side.
 fn email_is_set(host: &mut Host) -> bool {
-    host.secret("basic_email")
+    host.config("email")
         .ok()
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false)
@@ -520,21 +519,6 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
-}
-
-/// Resolve a [`Base`] + relative `path` into an absolute URL for the **byte-exact** HTTP path
-/// ([`Host::http_bytes`]), which the JSON ref helpers can't cover: `http_bytes` has no ref-based
-/// variant, so a byte upload/download needs a concrete URL. The gateway base is already absolute; the
-/// site path materializes its base URL via the host's endpoint resolver. This is the one residual
-/// `host.endpoint` use — confined to attachment byte IO — until host-kit grows an `http_bytes_ref`.
-fn byte_io_url(host: &mut Host, base: &Base, path: &str) -> Result<String, String> {
-    match base {
-        Base::Url(b) => Ok(format!("{b}{path}")),
-        Base::Ref(r) => {
-            let site = host.endpoint(r)?;
-            Ok(format!("{}{path}", site.trim_end_matches('/')))
-        }
-    }
 }
 
 /// Parse the Confluence `_links.next` URL and extract the `start` query parameter, which is the
@@ -638,14 +622,11 @@ fn cf_err(status: u16, body: &str) -> String {
 }
 
 /// GET `path` with the request-time auth (cloud_id→Bearer/gateway, else Basic/Bearer/site); returns
-/// the parsed JSON. Site requests address the endpoint by reference (host-resolved URL); gateway
-/// requests join the path onto the constructed gateway URL.
+/// the parsed JSON. Every request addresses its base by named endpoint reference — the host resolves
+/// the ref and joins the path.
 fn cf_get(host: &mut Host, path: &str) -> Result<Value, String> {
     let ctx = auth_ctx(host)?;
-    let resp = match ctx.base {
-        Base::Ref(r) => host.http_ref(r, "GET", path, Some(ctx.purpose), None)?,
-        Base::Url(b) => host.http("GET", &format!("{b}{path}"), Some(ctx.purpose), &[], None)?,
-    };
+    let resp = host.http_ref(ctx.base, "GET", path, Some(ctx.purpose), &[], None)?;
     if !resp.is_success() {
         return Err(cf_err(resp.status, &resp.body));
     }
@@ -656,22 +637,14 @@ fn cf_get(host: &mut Host, path: &str) -> Result<Value, String> {
 fn cf_send(host: &mut Host, method: &str, path: &str, body: &Value) -> Result<Value, String> {
     let ctx = auth_ctx(host)?;
     let body_str = serde_json::to_string(body).map_err(|e| e.to_string())?;
-    let resp = match ctx.base {
-        Base::Ref(r) => host.http_ref(
-            r,
-            method,
-            path,
-            Some(ctx.purpose),
-            Some(body_str.as_bytes()),
-        )?,
-        Base::Url(b) => host.http(
-            method,
-            &format!("{b}{path}"),
-            Some(ctx.purpose),
-            &[("Content-Type", "application/json")],
-            Some(&body_str),
-        )?,
-    };
+    let resp = host.http_ref(
+        ctx.base,
+        method,
+        path,
+        Some(ctx.purpose),
+        &[("Content-Type", "application/json")],
+        Some(body_str.as_bytes()),
+    )?;
     if !resp.is_success() {
         return Err(cf_err(resp.status, &resp.body));
     }
@@ -681,16 +654,7 @@ fn cf_send(host: &mut Host, method: &str, path: &str, body: &Value) -> Result<Va
 /// DELETE `path` (Confluence returns 204 / an empty body, so we don't parse it).
 fn cf_delete(host: &mut Host, path: &str) -> Result<(), String> {
     let ctx = auth_ctx(host)?;
-    let resp = match ctx.base {
-        Base::Ref(r) => host.http_ref(r, "DELETE", path, Some(ctx.purpose), None)?,
-        Base::Url(b) => host.http(
-            "DELETE",
-            &format!("{b}{path}"),
-            Some(ctx.purpose),
-            &[],
-            None,
-        )?,
-    };
+    let resp = host.http_ref(ctx.base, "DELETE", path, Some(ctx.purpose), &[], None)?;
     if !resp.is_success() {
         return Err(cf_err(resp.status, &resp.body));
     }
@@ -1928,8 +1892,9 @@ fn attachment_add(input: Value, host: &mut Host) -> Result<Value, String> {
     };
     let content_type = first_str(&input, &["content_type"]).unwrap_or("application/octet-stream");
 
-    // Byte-exact multipart upload via the binary HTTP path (`http_bytes` with a base64 body), so
-    // non-UTF-8 attachment bytes survive — mirroring fluxplane's multipart `UploadPageAttachment`.
+    // Byte-exact multipart upload via the ref-based binary HTTP path (`http_bytes_ref`, D-32), so
+    // non-UTF-8 attachment bytes survive — mirroring fluxplane's multipart `UploadPageAttachment` —
+    // while the base URL stays host-side (the host resolves the ref and joins the path).
     let boundary = "fluxconfluenceboundary7M2A9";
     let body = multipart_file(boundary, &filename, content_type, &data);
     let ct = format!("multipart/form-data; boundary={boundary}");
@@ -1938,14 +1903,10 @@ fn attachment_add(input: Value, host: &mut Host) -> Result<Value, String> {
         "/wiki/rest/api/content/{}/child/attachment",
         urlencode(&page_id)
     );
-    // Byte uploads need an absolute URL: `http_bytes` has no ref-based variant. The gateway base is a
-    // constructed absolute URL, so it is used directly; the site path must materialize the base URL
-    // (the host resolves the named endpoint) since byte IO cannot ride the ref path — this is the one
-    // residual `host.endpoint` use, scoped to byte attachment IO, until host-kit gains `http_bytes_ref`.
-    let url = byte_io_url(host, &ctx.base, &path)?;
-    let resp = host.http_bytes(
+    let resp = host.http_bytes_ref(
+        ctx.base,
         "POST",
-        &url,
+        &path,
         Some(ctx.purpose),
         &[
             ("Content-Type", ct.as_str()),
@@ -1968,8 +1929,8 @@ fn attachment_add(input: Value, host: &mut Host) -> Result<Value, String> {
     Ok(json!({ "ok": true, "page_id": page_id, "attachments": attachments }))
 }
 
-/// Build a single-file `multipart/form-data` body as raw bytes (sent verbatim via `http_bytes`), so
-/// binary attachment content is byte-exact.
+/// Build a single-file `multipart/form-data` body as raw bytes (sent verbatim via
+/// `http_bytes_ref`), so binary attachment content is byte-exact.
 fn multipart_file(boundary: &str, filename: &str, content_type: &str, data: &[u8]) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
@@ -2041,12 +2002,19 @@ fn attachment_get(input: Value, host: &mut Host) -> Result<Value, String> {
         }
     };
 
-    // Byte-exact download via the binary HTTP path → host blob (mirrors fluxplane's `getBytes`).
-    // Same constraint as the upload path: `http_bytes` needs an absolute URL and has no ref variant,
-    // so `byte_io_url` materializes the base (gateway directly, site via the host endpoint resolver).
+    // Byte-exact download via the ref-based binary HTTP path → host blob (mirrors fluxplane's
+    // `getBytes`): `http_bytes_ref` (D-32) rides the same named endpoint ref as the JSON ops, so
+    // the plugin never holds a URL.
     let ctx = auth_ctx(host)?;
-    let url = byte_io_url(host, &ctx.base, &dl_path)?;
-    let resp = host.http_bytes("GET", &url, Some(ctx.purpose), &[], None, true)?;
+    let resp = host.http_bytes_ref(
+        ctx.base,
+        "GET",
+        &dl_path,
+        Some(ctx.purpose),
+        &[],
+        None,
+        true,
+    )?;
     if !(200..300).contains(&resp.status) {
         return Err(format!(
             "confluence attachment download → {} {}",
@@ -2347,11 +2315,9 @@ mod tests {
     use super::*;
 
     fn host() -> MockHost {
-        // JSON IO resolves the named ref (`with_endpoint_ref`); byte-exact attachment IO has no ref
-        // variant and materializes the site base via the host endpoint resolver (`with_endpoint`).
-        MockHost::default()
-            .with_endpoint_ref("confluence.endpoint", "https://x.atlassian.net")
-            .with_endpoint("confluence.endpoint", "https://x.atlassian.net")
+        // All IO (JSON and byte-exact) rides the named endpoint ref — only the ref resolver is
+        // registered; nothing hands a URL back to the plugin.
+        MockHost::default().with_endpoint_ref("confluence.endpoint", "https://x.atlassian.net")
     }
 
     #[test]
@@ -2369,13 +2335,36 @@ mod tests {
     }
 
     #[test]
-    fn cloud_id_routes_through_the_atlassian_gateway() {
-        // With a cloud_id secret resolvable, requests go to the gateway base (Bearer), not the site URL.
+    fn cloud_id_routes_through_the_gateway_ref() {
+        // With a cloud_id config value resolvable, requests address the host-composed
+        // "confluence.gateway" endpoint ref (Bearer) — the site ref is deliberately NOT registered,
+        // so any request routed through "confluence.endpoint" would fail to resolve.
         let plugin = manifest_builder().build();
-        let mut host = host().with_secret("cloud_id", "abc-123").with_http(
-            "api.atlassian.com/ex/confluence/abc-123/wiki/rest/api/user/current",
-            json!({ "accountId": "me" }),
-        );
+        let mut host = MockHost::default()
+            .with_config("cloud_id", "abc-123")
+            .with_endpoint_ref(
+                "confluence.gateway",
+                "https://api.atlassian.com/ex/confluence/abc-123",
+            )
+            .with_http(
+                "api.atlassian.com/ex/confluence/abc-123/wiki/rest/api/user/current",
+                json!({ "accountId": "me" }),
+            );
+        let out = plugin
+            .call("confluence.test", json!({}), &mut host)
+            .unwrap();
+        assert_eq!(out["user"]["accountId"], "me");
+    }
+
+    #[test]
+    fn email_config_stays_on_the_site_ref() {
+        // An email config value (no cloud_id) selects the Basic purpose but still routes through the
+        // site ref — the gateway ref is deliberately NOT registered. (The Basic header itself is
+        // injected host-side; the mock only proves the config probe + routing.)
+        let plugin = manifest_builder().build();
+        let mut host = host()
+            .with_config("email", "me@example.com")
+            .with_http("/wiki/rest/api/user/current", json!({ "accountId": "me" }));
         let out = plugin
             .call("confluence.test", json!({}), &mut host)
             .unwrap();
@@ -2413,8 +2402,8 @@ mod tests {
 
     #[test]
     fn attachment_add_uploads_from_a_blob() {
-        // Byte-exact uploads (no ref-based HTTP variant) materialize the site base via the host
-        // endpoint resolver — same site path as the JSON ops, exercised with no cloud_id.
+        // Byte-exact uploads ride `http_bytes_ref` through the same site endpoint ref as the JSON
+        // ops (no cloud_id → site mode).
         let plugin = manifest_builder().build();
         let mut host = host().with_http(
             "/child/attachment",
@@ -2456,6 +2445,36 @@ mod tests {
     }
 
     #[test]
+    fn attachment_byte_io_routes_through_the_gateway_ref() {
+        // In cloud_id (gateway) mode the byte-exact upload rides `http_bytes_ref` through the
+        // "confluence.gateway" ref too — the site ref is deliberately NOT registered.
+        let plugin = manifest_builder().build();
+        let mut host = MockHost::default()
+            .with_config("cloud_id", "abc-123")
+            .with_endpoint_ref(
+                "confluence.gateway",
+                "https://api.atlassian.com/ex/confluence/abc-123",
+            )
+            .with_http(
+                "api.atlassian.com/ex/confluence/abc-123/wiki/rest/api/content/123/child/attachment",
+                json!({"results": [{"id": "gw1", "title": "via-gateway.txt"}]}),
+            );
+        host.blobs.borrow_mut().insert(
+            "blobgw".into(),
+            ("via-gateway.txt".into(), b"gateway-bytes".to_vec()),
+        );
+        let out = plugin
+            .call(
+                "confluence.page.attachment.add",
+                json!({ "page_id": "123", "blob_ref": "blobgw" }),
+                &mut host,
+            )
+            .unwrap();
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["attachments"][0]["id"], "gw1");
+    }
+
+    #[test]
     fn attachment_list_returns_page_attachments() {
         let plugin = manifest_builder().build();
         let mut host = host().with_http(
@@ -2475,7 +2494,7 @@ mod tests {
 
     #[test]
     fn attachment_get_downloads_into_a_blob() {
-        // Byte-exact downloads materialize the site base via the host endpoint resolver (no ref variant).
+        // Byte-exact downloads ride `http_bytes_ref` through the site endpoint ref.
         let plugin = manifest_builder().build();
         let mut host = host()
             .with_http(
@@ -3032,7 +3051,9 @@ mod tests {
     fn manifest_declares_dual_auth_ops_datasources_and_blob() {
         let m = manifest_builder().build().manifest();
         assert_eq!(m.operations.len(), 15);
-        // Primary Bearer api_token + Basic fallback + cloud_id selector.
+        // Primary Bearer api_token + Basic fallback — and nothing else: the old `cloud_id` /
+        // `basic_email` config probes are NOT auth methods (D-32 replaced them with `config`).
+        assert_eq!(m.auth.len(), 2);
         assert!(m
             .auth
             .iter()
@@ -3041,7 +3062,36 @@ mod tests {
             .auth
             .iter()
             .any(|a| a.purpose == "basic" && a.scheme == AuthScheme::Basic));
-        assert!(m.auth.iter().any(|a| a.purpose == "cloud_id"));
+        // cloud_id + email are declared non-secret config values (gated `Host::config` reads).
+        assert!(m
+            .config
+            .iter()
+            .any(|c| c.name == "cloud_id" && c.env.contains(&"ATLASSIAN_CLOUD_ID".to_string())));
+        assert!(m
+            .config
+            .iter()
+            .any(|c| c.name == "email" && c.env.contains(&"CONFLUENCE_EMAIL".to_string())));
+        // The config env keys must NOT be granted secrets — the config capability refuses
+        // secret-classified keys, so listing them would break the cloud_id/email probes.
+        for key in [
+            "ATLASSIAN_CLOUD_ID",
+            "CONFLUENCE_CLOUD_ID",
+            "CONFLUENCE_EMAIL",
+            "ATLASSIAN_EMAIL",
+        ] {
+            assert!(
+                !m.capabilities.secrets.iter().any(|s| s == key),
+                "config env key {key} must not be secret-classified"
+            );
+        }
+        // Both endpoint refs: the env-resolved site base + the host-composed gateway template.
+        assert!(m
+            .endpoints
+            .iter()
+            .any(|e| e.name == "confluence.endpoint" && e.template.is_none()));
+        assert!(m.endpoints.iter().any(|e| e.name == "confluence.gateway"
+            && e.template.as_deref()
+                == Some("https://api.atlassian.com/ex/confluence/{cloud_id}")));
         assert!(m.capabilities.http);
         assert!(m.capabilities.blob);
         assert!(m.datasources.iter().any(|d| d.entity == "confluence.page"));

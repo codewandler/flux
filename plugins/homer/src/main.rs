@@ -5,6 +5,11 @@
 //! can inject for you. The `login()` helper fetches and caches the token for one
 //! invocation; subsequent calls within the same invocation reuse it.
 //!
+//! All HTTP goes through the `homer.endpoint` reference (D-32): the host resolves
+//! the base URL (env `HOMER_URL`, defaulting host-side to `http://localhost:9080`)
+//! and joins the request path — the plugin never holds a URL, only paths and the
+//! per-invocation JWT it sends as an `authorization` header.
+//!
 //! Reference: `plugins/gitlab/src/main.rs` (HTTP plugin shape).
 //! Source of truth: `~/projects/fluxplane/fluxplane-plugins/homer/`.
 
@@ -164,6 +169,9 @@ fn manifest_builder() -> PluginBuilder {
             env: vec!["HOMER_URL".into()],
             http_hosts: vec!["localhost".into(), "127.0.0.1".into()],
             description: "Homer base URL (e.g. https://homer.example.com)".into(),
+            // Host-side zero-config default; a set HOMER_URL always wins.
+            default: Some("http://localhost:9080".into()),
+            ..Default::default()
         })
         .datasource(ds(
             "homer.messages",
@@ -248,23 +256,24 @@ fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
 
 // ─── JWT login helper ─────────────────────────────────────────────────────────
 
-/// Fetch a JWT from Homer (POST /api/v3/auth). Credentials come from the host
-/// secret store; the raw password is never stored beyond this call frame.
-fn login(host: &mut Host, base: &str) -> Result<String, String> {
+/// Fetch a JWT from Homer (POST /api/v3/auth via the `homer.endpoint` ref).
+/// Credentials come from the host secret store; the raw password is never
+/// stored beyond this call frame.
+fn login(host: &mut Host) -> Result<String, String> {
     let username = host.secret("username")?;
     let password = host.secret("password")?;
-    let auth_url = format!("{base}/api/v3/auth");
     let body_str = serde_json::to_string(&json!({
         "username": username.trim(),
         "password": password.trim(),
     }))
     .map_err(|e| e.to_string())?;
-    let resp = host.http(
+    let resp = host.http_ref(
+        "homer.endpoint",
         "POST",
-        &auth_url,
+        "/api/v3/auth",
         None,
         &[("content-type", "application/json")],
-        Some(&body_str),
+        Some(body_str.as_bytes()),
     )?;
     if !resp.is_success() {
         return Err(format!("homer login failed: {} {}", resp.status, resp.body));
@@ -288,26 +297,26 @@ fn login(host: &mut Host, base: &str) -> Result<String, String> {
 
 // ─── HTTP plumbing ────────────────────────────────────────────────────────────
 
+/// Ref-based Homer request: the host resolves `homer.endpoint` and joins `path`;
+/// the per-invocation JWT rides as an `authorization` request header.
 fn homer_request(
     host: &mut Host,
     method: &str,
-    base: &str,
     path: &str,
     token: &str,
     body: Option<&Value>,
 ) -> Result<Value, String> {
-    let url = format!("{base}{path}");
     let mut headers: Vec<(&str, &str)> = vec![("authorization", token)];
     let body_str;
     let body_ref = match body {
         Some(b) => {
             body_str = serde_json::to_string(b).map_err(|e| e.to_string())?;
             headers.push(("content-type", "application/json"));
-            Some(body_str.as_str())
+            Some(body_str.as_bytes())
         }
         None => None,
     };
-    let resp = host.http(method, &url, None, &headers, body_ref)?;
+    let resp = host.http_ref("homer.endpoint", method, path, None, &headers, body_ref)?;
     if !resp.is_success() {
         return Err(format!(
             "homer {method} {path} → {} {}",
@@ -317,18 +326,12 @@ fn homer_request(
     resp.json()
 }
 
-fn homer_get(host: &mut Host, base: &str, path: &str, token: &str) -> Result<Value, String> {
-    homer_request(host, "GET", base, path, token, None)
+fn homer_get(host: &mut Host, path: &str, token: &str) -> Result<Value, String> {
+    homer_request(host, "GET", path, token, None)
 }
 
-fn homer_post(
-    host: &mut Host,
-    base: &str,
-    path: &str,
-    token: &str,
-    body: &Value,
-) -> Result<Value, String> {
-    homer_request(host, "POST", base, path, token, Some(body))
+fn homer_post(host: &mut Host, path: &str, token: &str, body: &Value) -> Result<Value, String> {
+    homer_request(host, "POST", path, token, Some(body))
 }
 
 // ─── Homer API helpers ────────────────────────────────────────────────────────
@@ -958,20 +961,21 @@ fn calculate_mos(latency_ms: f64, jitter_ms: f64, loss_pct: f64) -> f64 {
 // ─── Op implementations ───────────────────────────────────────────────────────
 
 fn op_test(_input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = host
-        .endpoint("homer.endpoint")
-        .unwrap_or_else(|_| "http://localhost:9080".into());
-    let base = base.trim_end_matches('/').to_string();
-
     // Try the unauthenticated check endpoint first (may not exist in all deployments)
-    let check_url = format!("{base}/api/v3/agent/check");
     let reachable = host
-        .http("GET", &check_url, None, &[], None)
+        .http_ref(
+            "homer.endpoint",
+            "GET",
+            "/api/v3/agent/check",
+            None,
+            &[],
+            None,
+        )
         .map(|r| r.is_success())
         .unwrap_or(false);
 
     // Then authenticate
-    let token_result = login(host, &base);
+    let token_result = login(host);
     let authenticated = token_result.is_ok();
     let error = token_result.err().unwrap_or_default();
 
@@ -979,27 +983,24 @@ fn op_test(_input: Value, host: &mut Host) -> Result<Value, String> {
         return Err(format!("homer test failed: {error}"));
     }
 
+    // The plugin no longer holds the base URL (D-32) — report the endpoint ref name.
     Ok(json!({
         "status": "ok",
-        "url": base,
+        "endpoint": "homer.endpoint",
         "reachable": reachable || authenticated,
         "authenticated": authenticated
     }))
 }
 
 fn op_search(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = host
-        .endpoint("homer.endpoint")
-        .unwrap_or_else(|_| "http://localhost:9080".into());
-    let base = base.trim_end_matches('/').to_string();
-    let token = login(host, &base)?;
+    let token = login(host)?;
 
     let (from_ms, to_ms) = resolve_window(&input, 3_600_000); // 1h default
     let smart_input = build_search_filters(&input);
     let limit = clamp_limit(i64_opt(&input, "limit").unwrap_or(0), 200, 1000);
 
     let payload = build_search_payload(from_ms, to_ms, &smart_input, limit);
-    let result = homer_post(host, &base, "/api/v3/search/call/data", &token, &payload)?;
+    let result = homer_post(host, "/api/v3/search/call/data", &token, &payload)?;
 
     let empty_arr = Value::Array(vec![]);
     let data = result
@@ -1046,11 +1047,7 @@ fn op_search(input: Value, host: &mut Host) -> Result<Value, String> {
 }
 
 fn op_call_list(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = host
-        .endpoint("homer.endpoint")
-        .unwrap_or_else(|_| "http://localhost:9080".into());
-    let base = base.trim_end_matches('/').to_string();
-    let token = login(host, &base)?;
+    let token = login(host)?;
 
     let (from_ms, to_ms) = resolve_window(&input, 3_600_000);
     let smart_input = build_search_filters(&input);
@@ -1058,7 +1055,7 @@ fn op_call_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let number = str_opt(&input, "number").unwrap_or_default();
 
     let payload = build_search_payload(from_ms, to_ms, &smart_input, 200);
-    let result = homer_post(host, &base, "/api/v3/search/call/data", &token, &payload)?;
+    let result = homer_post(host, "/api/v3/search/call/data", &token, &payload)?;
 
     let empty_arr = Value::Array(vec![]);
     let data = result
@@ -1139,11 +1136,7 @@ fn op_call_show(input: Value, host: &mut Host) -> Result<Value, String> {
         return Err("at least one call_id is required".into());
     }
 
-    let base = host
-        .endpoint("homer.endpoint")
-        .unwrap_or_else(|_| "http://localhost:9080".into());
-    let base = base.trim_end_matches('/').to_string();
-    let token = login(host, &base)?;
+    let token = login(host)?;
 
     let (from_ms, to_ms) = resolve_window(&input, 86_400_000); // 24h default
 
@@ -1152,13 +1145,7 @@ fn op_call_show(input: Value, host: &mut Host) -> Result<Value, String> {
     let smart_input = build_smart_input(&[alts]);
 
     let search_payload = build_search_payload(from_ms, to_ms, &smart_input, 1000);
-    let search_result = homer_post(
-        host,
-        &base,
-        "/api/v3/search/call/data",
-        &token,
-        &search_payload,
-    )?;
+    let search_result = homer_post(host, "/api/v3/search/call/data", &token, &search_payload)?;
 
     let empty_arr = Value::Array(vec![]);
     let search_data = search_result
@@ -1174,7 +1161,7 @@ fn op_call_show(input: Value, host: &mut Host) -> Result<Value, String> {
     }
 
     let tx_payload = build_transaction_payload(from_ms, to_ms, search_data);
-    let tx_result = homer_post(host, &base, "/api/v3/call/transaction", &token, &tx_payload)?;
+    let tx_result = homer_post(host, "/api/v3/call/transaction", &token, &tx_payload)?;
 
     let messages = tx_result
         .pointer("/data/messages")
@@ -1220,24 +1207,14 @@ fn op_call_qos(input: Value, host: &mut Host) -> Result<Value, String> {
         return Err("at least one call_id is required".into());
     }
 
-    let base = host
-        .endpoint("homer.endpoint")
-        .unwrap_or_else(|_| "http://localhost:9080".into());
-    let base = base.trim_end_matches('/').to_string();
-    let token = login(host, &base)?;
+    let token = login(host)?;
 
     let (from_ms, to_ms) = resolve_window(&input, 86_400_000);
 
     let alts: Vec<String> = call_ids.iter().map(|id| format!("sid = '{id}'")).collect();
     let smart_input = build_smart_input(&[alts]);
     let search_payload = build_search_payload(from_ms, to_ms, &smart_input, 1000);
-    let search_result = homer_post(
-        host,
-        &base,
-        "/api/v3/search/call/data",
-        &token,
-        &search_payload,
-    )?;
+    let search_result = homer_post(host, "/api/v3/search/call/data", &token, &search_payload)?;
 
     let empty_arr = Value::Array(vec![]);
     let search_data = search_result
@@ -1253,7 +1230,7 @@ fn op_call_qos(input: Value, host: &mut Host) -> Result<Value, String> {
     }
 
     let tx_payload = build_transaction_payload(from_ms, to_ms, search_data);
-    let qos_result = homer_post(host, &base, "/api/v3/call/report/qos", &token, &tx_payload)?;
+    let qos_result = homer_post(host, "/api/v3/call/report/qos", &token, &tx_payload)?;
 
     let clock_rate = i64_opt(&input, "clock_rate").unwrap_or(8000).max(1) as f64;
     let latency_ms = i64_opt(&input, "latency_ms").unwrap_or(20).max(0) as f64;
@@ -1432,11 +1409,7 @@ fn op_call_analyze(input: Value, host: &mut Host) -> Result<Value, String> {
         return Err("provide call_id, or from_user and to_user".into());
     }
 
-    let base = host
-        .endpoint("homer.endpoint")
-        .unwrap_or_else(|_| "http://localhost:9080".into());
-    let base = base.trim_end_matches('/').to_string();
-    let token = login(host, &base)?;
+    let token = login(host)?;
     let (from_ms, to_ms) = resolve_window(&input, 6 * 3_600_000); // 6h default
 
     // Step 1: locate the seed call (by call_id, or unambiguously by from/to).
@@ -1449,13 +1422,7 @@ fn op_call_analyze(input: Value, host: &mut Host) -> Result<Value, String> {
         ];
         build_search_payload(from_ms, to_ms, &build_smart_input(&criteria), 200)
     };
-    let seed_result = homer_post(
-        host,
-        &base,
-        "/api/v3/search/call/data",
-        &token,
-        &seed_payload,
-    )?;
+    let seed_result = homer_post(host, "/api/v3/search/call/data", &token, &seed_payload)?;
     let seed_data = seed_result
         .get("data")
         .and_then(|v| v.as_array())
@@ -1505,13 +1472,7 @@ fn op_call_analyze(input: Value, host: &mut Host) -> Result<Value, String> {
         build_smart_input(&[fan_alts])
     };
     let fan_payload = build_search_payload(fan_from, fan_to, &fan_smart, limit);
-    let fan_result = homer_post(
-        host,
-        &base,
-        "/api/v3/search/call/data",
-        &token,
-        &fan_payload,
-    )?;
+    let fan_result = homer_post(host, "/api/v3/search/call/data", &token, &fan_payload)?;
     let fan_data = fan_result
         .get("data")
         .and_then(|v| v.as_array())
@@ -1523,7 +1484,7 @@ fn op_call_analyze(input: Value, host: &mut Host) -> Result<Value, String> {
     // Step 3: transaction on the merged candidates; extract the correlation header
     // (and any extra headers) from each candidate INVITE.
     let tx_payload = build_transaction_payload(fan_from, fan_to, &merged);
-    let tx_result = homer_post(host, &base, "/api/v3/call/transaction", &token, &tx_payload)?;
+    let tx_result = homer_post(host, "/api/v3/call/transaction", &token, &tx_payload)?;
     let messages = tx_result
         .pointer("/data/messages")
         .and_then(|v| v.as_array())
@@ -1702,11 +1663,7 @@ fn op_pcap_export(input: Value, host: &mut Host) -> Result<Value, String> {
         return Err("at least one call_id is required".into());
     }
 
-    let base = host
-        .endpoint("homer.endpoint")
-        .unwrap_or_else(|_| "http://localhost:9080".into());
-    let base = base.trim_end_matches('/').to_string();
-    let token = login(host, &base)?;
+    let token = login(host)?;
 
     let (from_ms, to_ms) = resolve_window(&input, 86_400_000);
 
@@ -1714,16 +1671,15 @@ fn op_pcap_export(input: Value, host: &mut Host) -> Result<Value, String> {
     let smart_input = build_smart_input(&[alts]);
     let payload = build_search_payload(from_ms, to_ms, &smart_input, 1000);
 
-    let auth_header = token.clone();
     let body_str = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
-    let url = format!("{base}/api/v3/export/call/messages/pcap");
     let bytes = {
-        let resp = host.http_bytes(
+        let resp = host.http_bytes_ref(
+            "homer.endpoint",
             "POST",
-            &url,
+            "/api/v3/export/call/messages/pcap",
             None,
             &[
-                ("authorization", auth_header.as_str()),
+                ("authorization", token.as_str()),
                 ("content-type", "application/json"),
             ],
             Some(body_str.as_bytes()),
@@ -1766,13 +1722,9 @@ fn sanitize_filename(value: &str) -> String {
 }
 
 fn op_alias_list(_input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = host
-        .endpoint("homer.endpoint")
-        .unwrap_or_else(|_| "http://localhost:9080".into());
-    let base = base.trim_end_matches('/').to_string();
-    let token = login(host, &base)?;
+    let token = login(host)?;
 
-    let result = homer_get(host, &base, "/api/v3/alias", &token)?;
+    let result = homer_get(host, "/api/v3/alias", &token)?;
 
     let empty_arr = Value::Array(vec![]);
     let data = result
@@ -1833,7 +1785,7 @@ mod tests {
 
     fn base_mock() -> MockHost {
         MockHost::default()
-            .with_endpoint("homer.endpoint", "http://homer.test")
+            .with_endpoint_ref("homer.endpoint", "http://homer.test")
             .with_secret("username", "admin")
             .with_secret("password", "secret")
             // login response
@@ -1873,6 +1825,8 @@ mod tests {
         // Note: login consumes the first /api/v3/auth match
         let result = plugin.call("homer.test", json!({}), &mut host).unwrap();
         assert_eq!(result["status"], "ok");
+        // The plugin no longer holds the URL (D-32) — it reports the endpoint ref name.
+        assert_eq!(result["endpoint"], "homer.endpoint");
         assert_eq!(result["authenticated"], true);
     }
 

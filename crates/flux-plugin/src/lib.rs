@@ -213,8 +213,10 @@ impl AuthMethod {
     }
 }
 
-/// A configurable API endpoint (base URL) the plugin resolves by name from env. A plugin asks
-/// `endpoint { "name": "gitlab.endpoint" }` and the host returns `{ "url": … }`.
+/// A configurable API endpoint (base URL) the host resolves by name — the binding a plugin
+/// addresses **by reference** on the ref-based IO paths (`http.do`/`conn.dial` with an
+/// `endpoint_ref`). Resolution is host-side only: there is no capability that hands the resolved
+/// URL string back to the plugin (the `endpoint` URL-handback was retired in D-32).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EndpointSpec {
     /// The endpoint name the plugin references.
@@ -225,6 +227,35 @@ pub struct EndpointSpec {
     /// Allowed public/fallback hosts for this endpoint. Env-resolved endpoint hosts are allowed too.
     #[serde(default)]
     pub http_hosts: Vec<String>,
+    #[serde(default)]
+    pub description: String,
+    /// A **default** base URL used when no declared env key resolves (D-32) — host-side, so a
+    /// plugin with a well-known public default (e.g. `https://gitlab.com`) works with zero config
+    /// while the URL still never crosses to the plugin. A set env key always wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// A host-side URL **template** composed from declared non-secret config values (D-32): each
+    /// `{name}` placeholder substitutes the manifest `config` entry `name`'s env-resolved value
+    /// (percent-encoded). When set, the endpoint resolves from the template and `env` is unused —
+    /// how a *dynamic* base like the Atlassian gateway
+    /// (`https://api.atlassian.com/ex/jira/{cloud_id}`) stays host-composed: the plugin addresses
+    /// it by name and the composed URL never crosses to the plugin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+}
+
+/// A declared **non-secret** configuration value the plugin may read through the gated `config`
+/// host capability (D-32) — e.g. jira's Atlassian `cloud_id`, resolved from env keys in order.
+/// Deny-by-default like every capability: only declared names resolve, and a declared env key
+/// that is secret-classified (a granted `secrets` entry or an auth method's secret env) is
+/// refused — `config` can never return a secret value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConfigSpec {
+    /// The config name the plugin references (e.g. `"cloud_id"`).
+    pub name: String,
+    /// Env-var keys holding the value, tried in order.
+    #[serde(default)]
+    pub env: Vec<String>,
     #[serde(default)]
     pub description: String,
 }
@@ -315,6 +346,10 @@ pub struct PluginManifest {
     /// Configurable API endpoints (base URLs) the host resolves from env.
     #[serde(default)]
     pub endpoints: Vec<EndpointSpec>,
+    /// Declared **non-secret** config values the plugin may read via the gated `config` host
+    /// capability (D-32). Also the substitution source for [`EndpointSpec::template`] placeholders.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config: Vec<ConfigSpec>,
     /// Products this plugin can **discover** endpoints for as a provider (D-26): e.g. the kubernetes
     /// plugin declares `["prometheus", "loki", "postgres", …]`. The fan-out broker matches a
     /// consumer's discovery query for product X against every provider whose `discovers` contains X.
@@ -572,6 +607,9 @@ pub struct SystemHostCaps {
     grants: PluginCapabilities,
     auth: Vec<AuthMethod>,
     endpoints: Vec<EndpointSpec>,
+    /// Declared non-secret config values (D-32): the `config` capability's resolution source and
+    /// the substitution source for [`EndpointSpec::template`] placeholders.
+    configs: Vec<ConfigSpec>,
     /// The caller name recorded in egress-admit audit events (the plugin's manifest name, set by
     /// [`with_manifest`](Self::with_manifest)). Defaults to `"plugin"` until a manifest is pinned.
     caller: String,
@@ -624,6 +662,7 @@ impl SystemHostCaps {
             grants: PluginCapabilities::default(),
             auth: Vec::new(),
             endpoints: Vec::new(),
+            configs: Vec::new(),
             caller: "plugin".to_string(),
             grant_source: "config:plugin".to_string(),
             audit: None,
@@ -666,6 +705,7 @@ impl SystemHostCaps {
         self.grants = m.capabilities.clone();
         self.auth = m.auth.clone();
         self.endpoints = m.endpoints.clone();
+        self.configs = m.config.clone();
         if !m.name.is_empty() {
             self.caller = m.name.clone();
             self.grant_source = format!("config:plugin/{}", m.name);
@@ -736,22 +776,95 @@ impl SystemHostCaps {
         ))
     }
 
-    /// Resolve a named endpoint base URL from its declared env keys (config, not a secret).
+    /// Resolve a named endpoint base URL — HOST-SIDE ONLY, feeding the ref-based IO paths (there
+    /// is no capability handing this URL back to the plugin, D-32). A [`template`]
+    /// (`EndpointSpec::template`) composes from declared config values; otherwise the declared env
+    /// keys are tried in order.
     fn resolve_endpoint(&self, name: &str) -> std::result::Result<String, String> {
         let ep = self
             .endpoints
             .iter()
             .find(|e| e.name == name)
             .ok_or_else(|| format!("no endpoint declared named `{name}`"))?;
+        if let Some(template) = &ep.template {
+            return self.expand_endpoint_template(template);
+        }
         for key in &ep.env {
             if let Some(v) = self.system.env(key) {
                 return Ok(v);
             }
         }
+        if let Some(default) = &ep.default {
+            return Ok(default.clone());
+        }
         Err(format!(
             "no env value for endpoint `{name}` (tried {:?})",
             ep.env
         ))
+    }
+
+    /// Resolve a declared **non-secret** config value by name (the gated `config` capability,
+    /// D-32). Deny-by-default: only names declared in the manifest's `config` resolve — and a
+    /// declared env key that is secret-classified (a granted `secrets` entry or an auth method's
+    /// secret env) is refused outright, so this path can never return a secret value.
+    fn resolve_config(&self, name: &str) -> std::result::Result<String, String> {
+        let spec = self
+            .configs
+            .iter()
+            .find(|c| c.name == name)
+            .ok_or_else(|| format!("no config declared named `{name}`"))?;
+        for key in &spec.env {
+            if self.grants.secrets.iter().any(|k| k == key)
+                || self.auth.iter().any(|a| a.env.iter().any(|k| k == key))
+            {
+                return Err(format!(
+                    "config `{name}`: env key `{key}` is secret-classified; the config capability never returns secrets"
+                ));
+            }
+        }
+        for key in &spec.env {
+            if let Some(v) = self.system.env(key) {
+                // A value that is itself a credential-bearing URL (a DSN with an embedded
+                // password) is refused: the config capability can never hand the plugin a
+                // secret, even via an operator-misconfigured env value. Move the password to
+                // its own (secret-declared) env key.
+                if url::Url::parse(&v)
+                    .map(|u| u.password().is_some_and(|p| !p.is_empty()))
+                    .unwrap_or(false)
+                {
+                    return Err(format!(
+                        "config `{name}`: the value of `{key}` embeds a credential (a URL with a \
+                         password); the config capability never returns secrets — move the \
+                         password to a secret-declared env key"
+                    ));
+                }
+                return Ok(v);
+            }
+        }
+        Err(format!(
+            "no env value for config `{name}` (tried {:?})",
+            spec.env
+        ))
+    }
+
+    /// Expand an [`EndpointSpec::template`]: each `{name}` placeholder substitutes the declared
+    /// config value `name` (percent-encoded), resolved via [`resolve_config`](Self::resolve_config)
+    /// — so a secret-classified value can never be smuggled into a composed URL.
+    fn expand_endpoint_template(&self, template: &str) -> std::result::Result<String, String> {
+        let mut out = String::with_capacity(template.len());
+        let mut rest = template;
+        while let Some(open) = rest.find('{') {
+            out.push_str(&rest[..open]);
+            let after = &rest[open + 1..];
+            let close = after
+                .find('}')
+                .ok_or_else(|| format!("endpoint template has an unclosed `{{`: `{template}`"))?;
+            let value = self.resolve_config(&after[..close])?;
+            out.push_str(&percent_encode_component(&value));
+            rest = &after[close + 1..];
+        }
+        out.push_str(rest);
+        Ok(out)
     }
 
     /// Find the manifest-declared [`FsReadScope`] matching an expanded absolute path, returning
@@ -802,6 +915,19 @@ impl SystemHostCaps {
     fn endpoint_allows_host(&self, host: &str) -> bool {
         self.endpoints.iter().any(|ep| {
             host_matches(&ep.http_hosts, host)
+                || ep
+                    .template
+                    .as_ref()
+                    .and_then(|t| self.expand_endpoint_template(t).ok())
+                    .and_then(|raw| url::Url::parse(&raw).ok())
+                    .and_then(|url| url.host_str().map(|h| h.eq_ignore_ascii_case(host)))
+                    .unwrap_or(false)
+                || ep
+                    .default
+                    .as_ref()
+                    .and_then(|raw| url::Url::parse(raw).ok())
+                    .and_then(|url| url.host_str().map(|h| h.eq_ignore_ascii_case(host)))
+                    .unwrap_or(false)
                 || ep.env.iter().any(|key| {
                     self.system
                         .env(key)
@@ -1014,9 +1140,14 @@ impl HostCapabilities for SystemHostCaps {
                     None => Err(format!("secret `{key}` not set")),
                 }
             }
-            "endpoint" => {
+            "config" => {
+                // A declared NON-secret config value (D-32) — e.g. jira's Atlassian `cloud_id`.
+                // Deny-by-default: only names declared in the manifest's `config` resolve, and a
+                // secret-classified env key is refused (see `resolve_config`). This replaces the
+                // retired `endpoint` URL-handback for the config-value reads that abused it; URLs
+                // themselves now reach the wire only through the ref-based IO paths.
                 let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                self.resolve_endpoint(name).map(|url| json!({ "url": url }))
+                self.resolve_config(name).map(|v| json!({ "value": v }))
             }
             "credential" => {
                 // The in-band-auth path for raw-socket protocols (e.g. Postgres SCRAM needs the
@@ -1506,7 +1637,8 @@ fn compose_url(base: &str, path: Option<&str>) -> std::result::Result<String, St
 }
 
 /// Build a TCP [`DialTarget`](flux_system::net::DialTarget) from a resolved endpoint URL's host+port
-/// (defaulting the port to the URL scheme's known default). For the ref-based `conn.dial` path.
+/// (defaulting the port to the URL scheme's known default, plus the SQL DSN schemes the `url` crate
+/// doesn't know: postgres 5432, mysql/mariadb 3306). For the ref-based `conn.dial` path.
 fn dial_target_from_url(raw: &str) -> std::result::Result<flux_system::net::DialTarget, String> {
     let url = url::Url::parse(raw).map_err(|e| format!("conn.dial: bad endpoint url: {e}"))?;
     let host = url
@@ -1515,8 +1647,28 @@ fn dial_target_from_url(raw: &str) -> std::result::Result<flux_system::net::Dial
         .to_string();
     let port = url
         .port_or_known_default()
+        .or(match url.scheme() {
+            "postgres" | "postgresql" => Some(5432),
+            "mysql" | "mariadb" => Some(3306),
+            _ => None,
+        })
         .ok_or("conn.dial: resolved endpoint url has no port (and scheme has no default)")?;
     Ok(flux_system::net::DialTarget::Tcp { host, port })
+}
+
+/// Percent-encode a URL path/query component: unreserved chars (`alnum` `-_.~`) pass through, all
+/// else `%XX` — for substituting config values into an [`EndpointSpec::template`].
+fn percent_encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Parse a credential reference from the `credential` capability payload: either a `Ref`-shaped
@@ -2481,7 +2633,7 @@ mod tests {
                 name: "gitlab.endpoint".into(),
                 env: vec!["FLUX_TEST_GITLAB_URL_XZ".into()],
                 http_hosts: vec!["gl.example.com".into()],
-                description: String::new(),
+                ..Default::default()
             }],
             capabilities: PluginCapabilities {
                 secrets: vec!["FLUX_TEST_API_TOKEN_XZ".into()],
@@ -2499,12 +2651,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got["value"], "s3cr3t");
-        // endpoint resolves from its declared env
-        let ep = caps
+        // endpoint resolves from its declared env — HOST-SIDE ONLY (it feeds the ref-based IO
+        // paths). The `endpoint` URL-handback capability itself is retired (D-32): a plugin can
+        // never ask the host for the resolved URL string.
+        assert_eq!(
+            caps.resolve_endpoint("gitlab.endpoint").unwrap(),
+            "https://gl.example.com"
+        );
+        let err = caps
             .handle("endpoint", &json!({"name": "gitlab.endpoint"}))
             .await
-            .unwrap();
-        assert_eq!(ep["url"], "https://gl.example.com");
+            .unwrap_err();
+        assert!(
+            err.contains("unknown host capability"),
+            "the URL-handback must be gone, not just failing: {err}"
+        );
         // an undeclared purpose is denied
         assert!(caps
             .handle("secret", &json!({"purpose": "nope"}))
@@ -2514,6 +2675,297 @@ mod tests {
         std::env::remove_var("FLUX_TEST_API_TOKEN_XZ");
         std::env::remove_var("FLUX_TEST_GITLAB_URL_XZ");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-32: the gated `config` capability reads a DECLARED non-secret config value (e.g. jira's
+    /// Atlassian `cloud_id`); undeclared names are denied; and a secret-classified env key (a
+    /// granted `secrets` entry or an auth method's secret env) is REFUSED even when declared as
+    /// config — the capability can never return a secret value.
+    #[tokio::test]
+    async fn config_capability_reads_declared_non_secret_values_only() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!("flux-config-cap-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        std::env::set_var("FLUX_TEST_CLOUD_ID_D32", "cloud-123");
+        std::env::set_var("FLUX_TEST_TOKEN_D32", "tok-s3cr3t");
+        std::env::set_var("FLUX_TEST_AUTH_ONLY_D32", "auth-s3cr3t");
+
+        let manifest = PluginManifest {
+            name: "jira".into(),
+            auth: vec![AuthMethod::bearer(
+                "api_token",
+                vec!["FLUX_TEST_AUTH_ONLY_D32".into()],
+            )],
+            config: vec![
+                ConfigSpec {
+                    name: "cloud_id".into(),
+                    env: vec!["FLUX_TEST_CLOUD_ID_D32".into()],
+                    description: String::new(),
+                },
+                // Misdeclared: the env key is a granted secret — must be refused.
+                ConfigSpec {
+                    name: "sneaky_secret".into(),
+                    env: vec!["FLUX_TEST_TOKEN_D32".into()],
+                    description: String::new(),
+                },
+                // Misdeclared: the env key backs an auth method — must be refused too.
+                ConfigSpec {
+                    name: "sneaky_auth".into(),
+                    env: vec!["FLUX_TEST_AUTH_ONLY_D32".into()],
+                    description: String::new(),
+                },
+                ConfigSpec {
+                    name: "unset".into(),
+                    env: vec!["FLUX_TEST_UNSET_D32".into()],
+                    description: String::new(),
+                },
+            ],
+            capabilities: PluginCapabilities {
+                secrets: vec!["FLUX_TEST_TOKEN_D32".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let caps = SystemHostCaps::new(sys).with_manifest(&manifest);
+
+        // Declared + non-secret → resolves.
+        let got = caps
+            .handle("config", &json!({"name": "cloud_id"}))
+            .await
+            .unwrap();
+        assert_eq!(got["value"], "cloud-123");
+        // Undeclared name → denied (deny-by-default, like every host capability).
+        assert!(caps
+            .handle("config", &json!({"name": "nope"}))
+            .await
+            .is_err());
+        // A granted-secret env key → refused; the value never crosses (not even in the error).
+        let err = caps
+            .handle("config", &json!({"name": "sneaky_secret"}))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("secret-classified"),
+            "names the refusal: {err}"
+        );
+        assert!(!err.contains("tok-s3cr3t"), "no secret in the error: {err}");
+        // An auth-method env key → refused the same way.
+        let err = caps
+            .handle("config", &json!({"name": "sneaky_auth"}))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("secret-classified"),
+            "names the refusal: {err}"
+        );
+        assert!(
+            !err.contains("auth-s3cr3t"),
+            "no secret in the error: {err}"
+        );
+        // Declared but unset env → a clear error.
+        assert!(caps
+            .handle("config", &json!({"name": "unset"}))
+            .await
+            .is_err());
+
+        std::env::remove_var("FLUX_TEST_CLOUD_ID_D32");
+        std::env::remove_var("FLUX_TEST_TOKEN_D32");
+        std::env::remove_var("FLUX_TEST_AUTH_ONLY_D32");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-32: a config value that is itself a credential-bearing URL (userinfo with a password, e.g.
+    /// a DSN `postgres://user:pass@host/db`) is refused — the config capability can never hand the
+    /// plugin an embedded secret, even through an operator-misconfigured env value.
+    #[tokio::test]
+    async fn config_capability_refuses_credential_bearing_urls() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!("flux-config-dsn-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        std::env::set_var(
+            "FLUX_TEST_DSN_WITH_PW_D32",
+            "postgres://app:sup3rs3cret@db.internal:5432/warehouse",
+        );
+        std::env::set_var(
+            "FLUX_TEST_DSN_BARE_D32",
+            "postgres://app@db.internal:5432/warehouse",
+        );
+
+        let manifest = PluginManifest {
+            name: "sql".into(),
+            config: vec![
+                ConfigSpec {
+                    name: "dsn_with_pw".into(),
+                    env: vec!["FLUX_TEST_DSN_WITH_PW_D32".into()],
+                    description: String::new(),
+                },
+                ConfigSpec {
+                    name: "dsn_bare".into(),
+                    env: vec!["FLUX_TEST_DSN_BARE_D32".into()],
+                    description: String::new(),
+                },
+            ],
+            ..Default::default()
+        };
+        let caps = SystemHostCaps::new(sys).with_manifest(&manifest);
+
+        // A bare (credential-free) DSN is plain config — allowed.
+        let got = caps
+            .handle("config", &json!({"name": "dsn_bare"}))
+            .await
+            .unwrap();
+        assert_eq!(got["value"], "postgres://app@db.internal:5432/warehouse");
+        // A password-bearing DSN is refused, and the password never crosses (not even in the error).
+        let err = caps
+            .handle("config", &json!({"name": "dsn_with_pw"}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("embeds a credential"), "{err}");
+        assert!(
+            !err.contains("sup3rs3cret"),
+            "no secret in the error: {err}"
+        );
+
+        std::env::remove_var("FLUX_TEST_DSN_WITH_PW_D32");
+        std::env::remove_var("FLUX_TEST_DSN_BARE_D32");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-32: an endpoint may declare a **default** base URL used when no env key resolves —
+    /// host-side, so a plugin with a well-known public default (gitlab.com, the Opsgenie EU API)
+    /// works with zero config while the URL still never crosses to the plugin. A set env wins;
+    /// the default's host is HTTP-allow-listed like an env-resolved one.
+    #[tokio::test]
+    async fn endpoint_default_url_resolves_when_env_unset() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!("flux-ep-default-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        std::env::remove_var("FLUX_TEST_EP_DEFAULT_URL_D32");
+
+        let manifest = PluginManifest {
+            name: "gitlab".into(),
+            endpoints: vec![EndpointSpec {
+                name: "gitlab.endpoint".into(),
+                env: vec!["FLUX_TEST_EP_DEFAULT_URL_D32".into()],
+                default: Some("https://gitlab.com".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let caps = SystemHostCaps::new(sys.clone()).with_manifest(&manifest);
+
+        // Env unset → the declared default resolves, and its host is allow-listed.
+        assert_eq!(
+            caps.resolve_endpoint("gitlab.endpoint").unwrap(),
+            "https://gitlab.com"
+        );
+        assert!(caps.endpoint_allows_host("gitlab.com"));
+        // A set env always wins over the default.
+        std::env::set_var("FLUX_TEST_EP_DEFAULT_URL_D32", "https://gl.corp.example");
+        assert_eq!(
+            caps.resolve_endpoint("gitlab.endpoint").unwrap(),
+            "https://gl.corp.example"
+        );
+        std::env::remove_var("FLUX_TEST_EP_DEFAULT_URL_D32");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-32: a **template endpoint** composes its base URL host-side from declared non-secret
+    /// config values (`{name}` placeholders, percent-encoded) — the dynamic-endpoint resolution
+    /// that replaces jira/confluence's plugin-constructed Atlassian gateway URL. Placeholders that
+    /// name an undeclared config error; secret-classified placeholders are refused (a secret can
+    /// never be smuggled into a composed URL); the composed host is HTTP-allow-listed like an
+    /// env-resolved endpoint host.
+    #[tokio::test]
+    async fn template_endpoint_composes_from_config() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!("flux-tpl-ep-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        // A value that needs percent-encoding, to prove the substitution is encoded.
+        std::env::set_var("FLUX_TEST_TPL_CLOUD_D32", "cloud/123");
+        std::env::set_var("FLUX_TEST_TPL_TOKEN_D32", "tpl-s3cr3t");
+
+        let manifest = PluginManifest {
+            name: "jira".into(),
+            auth: vec![AuthMethod::bearer(
+                "api_token",
+                vec!["FLUX_TEST_TPL_TOKEN_D32".into()],
+            )],
+            config: vec![
+                ConfigSpec {
+                    name: "cloud_id".into(),
+                    env: vec!["FLUX_TEST_TPL_CLOUD_D32".into()],
+                    description: String::new(),
+                },
+                ConfigSpec {
+                    name: "token".into(),
+                    env: vec!["FLUX_TEST_TPL_TOKEN_D32".into()],
+                    description: String::new(),
+                },
+            ],
+            endpoints: vec![
+                EndpointSpec {
+                    name: "jira.gateway".into(),
+                    template: Some("https://gw.example.com/ex/jira/{cloud_id}".into()),
+                    ..Default::default()
+                },
+                EndpointSpec {
+                    name: "jira.evil".into(),
+                    template: Some("https://gw.example.com/ex/{token}".into()),
+                    ..Default::default()
+                },
+                EndpointSpec {
+                    name: "jira.unknown".into(),
+                    template: Some("https://gw.example.com/{nope}".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let caps = SystemHostCaps::new(sys).with_manifest(&manifest);
+
+        // The template composes host-side, with the config value percent-encoded.
+        assert_eq!(
+            caps.resolve_endpoint("jira.gateway").unwrap(),
+            "https://gw.example.com/ex/jira/cloud%2F123"
+        );
+        // The composed host is allow-listed for http.do exactly like an env-resolved endpoint host
+        // (no separate http_hosts declaration needed).
+        assert!(caps.endpoint_allows_host("gw.example.com"));
+        assert!(!caps.endpoint_allows_host("evil.example.com"));
+        // A secret-classified placeholder is refused — never substituted into a URL.
+        let err = caps.resolve_endpoint("jira.evil").unwrap_err();
+        assert!(err.contains("secret-classified"), "{err}");
+        assert!(!err.contains("tpl-s3cr3t"), "no secret in the error: {err}");
+        // An undeclared placeholder errors.
+        assert!(caps.resolve_endpoint("jira.unknown").is_err());
+
+        std::env::remove_var("FLUX_TEST_TPL_CLOUD_D32");
+        std::env::remove_var("FLUX_TEST_TPL_TOKEN_D32");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-32: the ref-based `conn.dial` resolution knows the default ports of the SQL DSN schemes
+    /// (postgres/mysql have no `url`-crate known default), so `sql`'s named endpoint dials by
+    /// reference even when the operator's DSN omits the port.
+    #[test]
+    fn dial_target_from_url_defaults_sql_scheme_ports() {
+        let t = dial_target_from_url("postgres://db.internal/app").unwrap();
+        assert_eq!(conn_target_str(&t), "tcp:db.internal:5432");
+        let t = dial_target_from_url("mysql://db.internal/app").unwrap();
+        assert_eq!(conn_target_str(&t), "tcp:db.internal:3306");
+        // An explicit port always wins.
+        let t = dial_target_from_url("postgres://db.internal:6543/app").unwrap();
+        assert_eq!(conn_target_str(&t), "tcp:db.internal:6543");
+        // Known URL defaults still apply; a scheme with no default is still an error.
+        let t = dial_target_from_url("https://svc.internal/x").unwrap();
+        assert_eq!(conn_target_str(&t), "tcp:svc.internal:443");
+        assert!(dial_target_from_url("foo://svc.internal/x").is_err());
     }
 
     #[tokio::test]
@@ -3419,7 +3871,7 @@ mod tests {
                 name: "svc.endpoint".into(),
                 env: vec!["FLUX_TEST_NAMEDREF_URL".into()],
                 http_hosts: vec!["127.0.0.1".into()],
-                description: String::new(),
+                ..Default::default()
             }],
             capabilities: PluginCapabilities {
                 http: true,

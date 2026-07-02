@@ -328,6 +328,8 @@ fn manifest_builder() -> PluginBuilder {
             env: vec!["SLACK_API_URL".into()],
             http_hosts: vec!["slack.com".into()],
             description: "Slack Web API base URL (default https://slack.com/api)".into(),
+            default: Some("https://slack.com/api".into()),
+            ..Default::default()
         })
         .datasource(ds("slack.channels", "slack.channel", "Slack channels."))
         .datasource(ds("slack.users", "slack.user", "Slack workspace users."))

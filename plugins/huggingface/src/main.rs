@@ -144,12 +144,16 @@ fn manifest_builder() -> PluginBuilder {
             env: vec!["HF_HUB_URL".into()],
             http_hosts: vec!["huggingface.co".into()],
             description: "Hugging Face Hub base URL (default https://huggingface.co)".into(),
+            default: Some("https://huggingface.co".into()),
+            ..Default::default()
         })
         .endpoint(EndpointSpec {
             name: "huggingface.router".into(),
             env: vec!["HF_ROUTER_URL".into()],
             http_hosts: vec!["router.huggingface.co".into()],
             description: "Hugging Face inference router base URL (default https://router.huggingface.co)".into(),
+            default: Some("https://router.huggingface.co".into()),
+            ..Default::default()
         })
         .datasource(ds("huggingface.models", "huggingface.model", "Hugging Face Hub models."))
         .datasource(ds("huggingface.datasets", "huggingface.dataset", "Hugging Face Hub datasets."))

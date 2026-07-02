@@ -1,6 +1,8 @@
 //! `loki` — a flux integration plugin for the Grafana Loki HTTP API: readiness checks, LogQL stream
 //! queries, LogQL metric queries (rate/count over a window), recent-log lookups by app/pod/container,
-//! and label discovery. The base URL is the `loki.endpoint` (resolved from `LOKI_URL`/`LOKI_ADDR`).
+//! and label discovery. Every request goes through the host **by endpoint reference** (D-32): the
+//! plugin names `loki.endpoint` and the host resolves the base URL (from `LOKI_URL`/`LOKI_ADDR`,
+//! required — no default) and joins the relative path; the URL never crosses to the plugin.
 //!
 //! Auth is the point of this slice — Loki is **not** Bearer-authenticated. Two optional credentials are
 //! declared and injected by the host (D-12), so plain unauthenticated Lokis keep working (purpose names
@@ -144,8 +146,9 @@ fn manifest_builder() -> PluginBuilder {
         .endpoint(EndpointSpec {
             name: "loki.endpoint".into(),
             env: vec!["LOKI_URL".into(), "LOKI_ADDR".into()],
-            http_hosts: Vec::new(),
             description: "Loki base URL (e.g. https://loki.example.com)".into(),
+            // No `default` — a Loki base URL must be configured via env for the host to resolve.
+            ..Default::default()
         })
         .datasource(ds(
             "loki.log_entries",
@@ -207,17 +210,16 @@ fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
 // ---------------------------------------------------------------------------
 
 fn test(_input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = base_url(host)?;
     let (auth, tenant) = auth_bits(host);
     let mut headers: Vec<(&str, &str)> = Vec::new();
     if let Some(t) = tenant.as_deref() {
         headers.push(("X-Scope-OrgID", t));
     }
     let started = SystemTime::now();
-    let resp = host.http("GET", &format!("{base}/ready"), auth, &headers, None)?;
+    let resp = host.http_ref("loki.endpoint", "GET", "/ready", auth, &headers, None)?;
     let latency_ms = started.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0);
     let ready = resp.is_success();
-    let mut out = json!({ "url": base, "ready": ready, "latency_ms": latency_ms });
+    let mut out = json!({ "url": "loki.endpoint", "ready": ready, "latency_ms": latency_ms });
     if !ready {
         out["error"] = json!(format!("loki not ready, status {}", resp.status));
     }
@@ -229,10 +231,8 @@ fn query(input: Value, host: &mut Host) -> Result<Value, String> {
     if expr.is_empty() {
         return Err("`query` (string) required".into());
     }
-    let base = base_url(host)?;
     let result = run_query(
         host,
-        &base,
         expr,
         input.get("since").and_then(|v| v.as_str()),
         input.get("until").and_then(|v| v.as_str()),
@@ -245,10 +245,8 @@ fn query(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn recent_logs(input: Value, host: &mut Host) -> Result<Value, String> {
     let expr = build_recent_query(&input);
-    let base = base_url(host)?;
     let result = run_query(
         host,
-        &base,
         &expr,
         input.get("since").and_then(|v| v.as_str()),
         None,
@@ -264,7 +262,6 @@ fn metric(input: Value, host: &mut Host) -> Result<Value, String> {
     if expr.is_empty() {
         return Err("`query` (string) required".into());
     }
-    let base = base_url(host)?;
     let now = now_nanos();
     let end = parse_time_nanos(time_or(&input, "until", "0s"), now)?;
     let start = parse_time_nanos(time_or(&input, "since", "24h"), now)?;
@@ -290,7 +287,7 @@ fn metric(input: Value, host: &mut Host) -> Result<Value, String> {
         ("end", end.to_string()),
         ("step", step.clone()),
     ];
-    let resp = loki_get(host, &base, "/loki/api/v1/query_range", &params)?;
+    let resp = loki_get(host, "/loki/api/v1/query_range", &params)?;
     if resp.get("status").and_then(|v| v.as_str()) != Some("success") {
         return Err(format!(
             "loki metric query failed with status {}",
@@ -338,7 +335,7 @@ fn metric(input: Value, host: &mut Host) -> Result<Value, String> {
     }
     let count = series.len() as i64;
     Ok(json!({
-        "url": base,
+        "url": "loki.endpoint",
         "normalized_query": expr,
         "step": step,
         "series": series,
@@ -347,7 +344,6 @@ fn metric(input: Value, host: &mut Host) -> Result<Value, String> {
 }
 
 fn labels(input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = base_url(host)?;
     let label = input
         .get("label")
         .and_then(|v| v.as_str())
@@ -387,7 +383,7 @@ fn labels(input: Value, host: &mut Host) -> Result<Value, String> {
     {
         params.push(("end", parse_time_nanos(u, now)?.to_string()));
     }
-    let resp = loki_get(host, &base, &path, &params)?;
+    let resp = loki_get(host, &path, &params)?;
     if resp.get("status").and_then(|v| v.as_str()) != Some("success") {
         return Err(format!(
             "loki label query failed with status {}",
@@ -405,7 +401,7 @@ fn labels(input: Value, host: &mut Host) -> Result<Value, String> {
         .unwrap_or_default();
     values.sort();
     contribute_labels(host, label, &values);
-    Ok(json!({ "url": base, "label": label, "values": values }))
+    Ok(json!({ "url": "loki.endpoint", "label": label, "values": values }))
 }
 
 // ---------------------------------------------------------------------------
@@ -416,7 +412,6 @@ fn labels(input: Value, host: &mut Host) -> Result<Value, String> {
 /// as `truncated`. Shared by `query` and `recent_logs`.
 fn run_query(
     host: &mut Host,
-    base: &str,
     query: &str,
     since: Option<&str>,
     until: Option<&str>,
@@ -435,7 +430,7 @@ fn run_query(
         ("limit", limit.to_string()),
         ("direction", direction.to_string()),
     ];
-    let resp = loki_get(host, base, "/loki/api/v1/query_range", &params)?;
+    let resp = loki_get(host, "/loki/api/v1/query_range", &params)?;
     if resp.get("status").and_then(|v| v.as_str()) != Some("success") {
         return Err(format!(
             "loki query failed with status {}",
@@ -481,7 +476,7 @@ fn run_query(
     });
     let count = entries.len() as i64;
     Ok(json!({
-        "url": base,
+        "url": "loki.endpoint",
         "normalized_query": query,
         "entries": entries,
         "count": count,
@@ -782,14 +777,6 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 // HTTP + auth
 // ---------------------------------------------------------------------------
 
-/// The Loki base URL (no default — must be configured).
-fn base_url(host: &mut Host) -> Result<String, String> {
-    Ok(host
-        .endpoint("loki.endpoint")?
-        .trim_end_matches('/')
-        .to_string())
-}
-
 /// Decide the optional auth bits for a call: the Basic `basic_password` purpose (used only when a
 /// password is configured) and the resolved `X-Scope-OrgID` tenant value (`tenant_id`, when configured).
 /// Both absent → a plain unauthenticated request, matching how Loki is often deployed.
@@ -803,29 +790,27 @@ fn auth_bits(host: &mut Host) -> (Option<&'static str>, Option<String>) {
     (auth, tenant)
 }
 
-/// GET a Loki API path with query params, injecting HTTP Basic creds (via `auth_purpose`) and the
-/// `X-Scope-OrgID` tenant header when configured. Returns the parsed JSON body.
-fn loki_get(
-    host: &mut Host,
-    base: &str,
-    path: &str,
-    params: &[(&str, String)],
-) -> Result<Value, String> {
-    let mut url = format!("{base}{path}");
+/// GET a Loki API path (plus query params) through the host **by endpoint reference**, injecting
+/// HTTP Basic creds (via `auth_purpose`) and the `X-Scope-OrgID` tenant header when configured.
+/// The host resolves `loki.endpoint` and joins the relative path onto it (a leading `/` resolves
+/// against the base's root — the same shape as the old plugin-side `{base}{path}` concatenation,
+/// since the base is a bare origin). Returns the parsed JSON body.
+fn loki_get(host: &mut Host, path: &str, params: &[(&str, String)]) -> Result<Value, String> {
+    let mut full = path.to_string();
     if !params.is_empty() {
         let qs: Vec<String> = params
             .iter()
             .map(|(k, v)| format!("{k}={}", urlencode(v)))
             .collect();
-        url.push('?');
-        url.push_str(&qs.join("&"));
+        full.push('?');
+        full.push_str(&qs.join("&"));
     }
     let (auth, tenant) = auth_bits(host);
     let mut headers: Vec<(&str, &str)> = Vec::new();
     if let Some(t) = tenant.as_deref() {
         headers.push(("X-Scope-OrgID", t));
     }
-    let resp = host.http("GET", &url, auth, &headers, None)?;
+    let resp = host.http_ref("loki.endpoint", "GET", &full, auth, &headers, None)?;
     if !resp.is_success() {
         return Err(format!("loki GET {path} → {} {}", resp.status, resp.body));
     }
@@ -918,18 +903,19 @@ mod tests {
     fn test_checks_readiness() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
-            .with_endpoint("loki.endpoint", "https://loki.x")
+            .with_endpoint_ref("loki.endpoint", "https://loki.x")
             .with_http("/ready", json!("ready"));
         let out = plugin.call("loki.test", json!({}), &mut host).unwrap();
         assert_eq!(out["ready"], true);
-        assert_eq!(out["url"], "https://loki.x");
+        // The plugin never holds the resolved URL (D-32) — ops report the endpoint reference.
+        assert_eq!(out["url"], "loki.endpoint");
     }
 
     #[test]
     fn query_runs_a_stream_query_and_contributes_entries() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
-            .with_endpoint("loki.endpoint", "https://loki.x")
+            .with_endpoint_ref("loki.endpoint", "https://loki.x")
             .with_http(
                 "/loki/api/v1/query_range",
                 json!({"status": "success", "data": {"resultType": "streams", "result": [
@@ -966,7 +952,7 @@ mod tests {
     fn query_returns_an_empty_array_not_null_for_no_hits() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
-            .with_endpoint("loki.endpoint", "https://loki.x")
+            .with_endpoint_ref("loki.endpoint", "https://loki.x")
             .with_http(
                 "/loki/api/v1/query_range",
                 json!({"status": "success", "data": {"resultType": "streams", "result": []}}),
@@ -983,7 +969,7 @@ mod tests {
         // Exercises the auth_bits branches; MockHost ignores the injected auth/headers.
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
-            .with_endpoint("loki.endpoint", "https://loki.x")
+            .with_endpoint_ref("loki.endpoint", "https://loki.x")
             .with_secret("basic_password", "s3cr3t")
             .with_secret("tenant_id", "acme")
             .with_http(
@@ -1000,7 +986,7 @@ mod tests {
     fn metric_parses_a_matrix_result() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
-            .with_endpoint("loki.endpoint", "https://loki.x")
+            .with_endpoint_ref("loki.endpoint", "https://loki.x")
             .with_http(
                 "/loki/api/v1/query_range",
                 json!({"status": "success", "data": {"resultType": "matrix", "result": [
@@ -1024,7 +1010,7 @@ mod tests {
     fn metric_rejects_non_matrix_results() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
-            .with_endpoint("loki.endpoint", "https://loki.x")
+            .with_endpoint_ref("loki.endpoint", "https://loki.x")
             .with_http(
                 "/loki/api/v1/query_range",
                 json!({"status": "success", "data": {"resultType": "streams", "result": []}}),
@@ -1038,7 +1024,7 @@ mod tests {
     #[test]
     fn metric_rejects_a_bad_step() {
         let plugin = manifest_builder().build();
-        let mut host = MockHost::default().with_endpoint("loki.endpoint", "https://loki.x");
+        let mut host = MockHost::default().with_endpoint_ref("loki.endpoint", "https://loki.x");
         let err = plugin
             .call(
                 "loki.metric",
@@ -1055,7 +1041,7 @@ mod tests {
         // RFC3339 strings, not raw unix seconds.
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
-            .with_endpoint("loki.endpoint", "https://loki.x")
+            .with_endpoint_ref("loki.endpoint", "https://loki.x")
             .with_http(
                 "/loki/api/v1/query_range",
                 json!({"status": "success", "data": {"resultType": "matrix", "result": [
@@ -1081,7 +1067,7 @@ mod tests {
     fn labels_lists_and_sorts_names_and_contributes() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
-            .with_endpoint("loki.endpoint", "https://loki.x")
+            .with_endpoint_ref("loki.endpoint", "https://loki.x")
             .with_http(
                 "/loki/api/v1/labels",
                 json!({"status": "success", "data": ["namespace", "app"]}),
@@ -1097,7 +1083,7 @@ mod tests {
     fn labels_fetches_values_for_a_named_label() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
-            .with_endpoint("loki.endpoint", "https://loki.x")
+            .with_endpoint_ref("loki.endpoint", "https://loki.x")
             .with_http(
                 "/loki/api/v1/label/app/values",
                 json!({"status": "success", "data": ["web", "api"]}),
@@ -1112,7 +1098,7 @@ mod tests {
     #[test]
     fn labels_rejects_invalid_label_names() {
         let plugin = manifest_builder().build();
-        let mut host = MockHost::default().with_endpoint("loki.endpoint", "https://loki.x");
+        let mut host = MockHost::default().with_endpoint_ref("loki.endpoint", "https://loki.x");
         let err = plugin
             .call("loki.labels", json!({ "label": "bad/name" }), &mut host)
             .unwrap_err();
@@ -1123,7 +1109,7 @@ mod tests {
     fn recent_logs_builds_a_selector_and_queries() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
-            .with_endpoint("loki.endpoint", "https://loki.x")
+            .with_endpoint_ref("loki.endpoint", "https://loki.x")
             .with_http(
                 "/loki/api/v1/query_range",
                 json!({"status": "success", "data": {"resultType": "streams", "result": [

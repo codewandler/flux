@@ -1,8 +1,9 @@
 //! `opsgenie` — a flux integration plugin for the Opsgenie REST API v2: alert management, on-call
 //! visibility, and schedule listing. Authenticates with a GenieKey header (not a Bearer token, so
 //! auth is handled manually: the key is fetched via `host.secret("api_key")` and injected as
-//! `Authorization: GenieKey <key>`). The base URL is `opsgenie.endpoint` (defaults to
-//! `https://api.eu.opsgenie.com`). Alert list ops contribute datasource records (`opsgenie.alert`)
+//! `Authorization: GenieKey <key>`). All HTTP goes through the `opsgenie.endpoint` reference —
+//! the host resolves the base URL (default `https://api.eu.opsgenie.com` for the EU region); the
+//! plugin never holds it (D-32). Alert list ops contribute datasource records (`opsgenie.alert`)
 //! so the agent can search them.
 
 use host_kit::*;
@@ -111,6 +112,8 @@ fn manifest_builder() -> PluginBuilder {
             description:
                 "Opsgenie API base URL (default https://api.eu.opsgenie.com for the EU region)."
                     .into(),
+            default: Some("https://api.eu.opsgenie.com".into()),
+            ..Default::default()
         })
         .datasource(ds(
             "opsgenie.alerts",
@@ -195,16 +198,17 @@ fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
 
 // ---------------------------------------------------------------------------
 // HTTP plumbing — Opsgenie uses `Authorization: GenieKey <key>` (prefixed, not
-// bare Bearer), so we fetch the key ourselves and set the header manually.
+// bare Bearer, so no standard AuthScheme fits): we fetch the key ourselves and
+// set the header manually. Requests go through the `opsgenie.endpoint`
+// reference; the host resolves the base URL (default https://api.eu.opsgenie.com).
 // ---------------------------------------------------------------------------
 
-/// Resolve the (base_url, api_key) pair for every request.
-fn og_creds(host: &mut Host) -> Result<(String, String), String> {
-    let base = host
-        .endpoint("opsgenie.endpoint")
-        .unwrap_or_else(|_| "https://api.eu.opsgenie.com".into());
-    let key = host.secret("api_key")?;
-    Ok((base.trim_end_matches('/').to_string(), key))
+/// The manifest endpoint reference all requests go through.
+const ENDPOINT: &str = "opsgenie.endpoint";
+
+/// Resolve the GenieKey api key for every request.
+fn og_key(host: &mut Host) -> Result<String, String> {
+    host.secret("api_key")
 }
 
 /// Format a non-2xx Opsgenie response as an actionable error.
@@ -218,14 +222,14 @@ fn og_error(path: &str, status: u16, body: &str) -> String {
     }
 }
 
-/// GET `{base}{path}` with the GenieKey header; parse JSON; error on non-2xx.
+/// GET `path` on the Opsgenie endpoint with the GenieKey header; parse JSON; error on non-2xx.
 fn og_get(host: &mut Host, path: &str) -> Result<Value, String> {
-    let (base, key) = og_creds(host)?;
-    let url = format!("{base}{path}");
+    let key = og_key(host)?;
     let auth = format!("GenieKey {key}");
-    let resp = host.http(
+    let resp = host.http_ref(
+        ENDPOINT,
         "GET",
-        &url,
+        path,
         None,
         &[
             ("authorization", auth.as_str()),
@@ -239,23 +243,23 @@ fn og_get(host: &mut Host, path: &str) -> Result<Value, String> {
     resp.json()
 }
 
-/// POST a JSON body to `{base}{path}` with the GenieKey header; parse JSON; error on non-2xx.
-/// Opsgenie async write endpoints return 202 Accepted, which is still success.
+/// POST a JSON body to `path` on the Opsgenie endpoint with the GenieKey header; parse JSON;
+/// error on non-2xx. Opsgenie async write endpoints return 202 Accepted, which is still success.
 fn og_post(host: &mut Host, path: &str, body: &Value) -> Result<Value, String> {
-    let (base, key) = og_creds(host)?;
-    let url = format!("{base}{path}");
+    let key = og_key(host)?;
     let auth = format!("GenieKey {key}");
     let body_str = serde_json::to_string(body).map_err(|e| e.to_string())?;
-    let resp = host.http(
+    let resp = host.http_ref(
+        ENDPOINT,
         "POST",
-        &url,
+        path,
         None,
         &[
             ("authorization", auth.as_str()),
             ("content-type", "application/json"),
             ("accept", "application/json"),
         ],
-        Some(body_str.as_str()),
+        Some(body_str.as_bytes()),
     )?;
     if !resp.is_success() {
         return Err(og_error(path, resp.status, &resp.body));
@@ -667,7 +671,9 @@ mod tests {
     }
 
     fn mock() -> MockHost {
-        MockHost::default().with_secret("api_key", "test-genie-key")
+        MockHost::default()
+            .with_endpoint_ref("opsgenie.endpoint", "https://api.eu.opsgenie.com")
+            .with_secret("api_key", "test-genie-key")
     }
 
     // ---- opsgenie.test ----

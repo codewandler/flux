@@ -118,6 +118,7 @@ fn manifest_builder() -> PluginBuilder {
             env: vec!["ALERTMANAGER_URL".into()],
             http_hosts: Vec::new(),
             description: "Alertmanager base URL (e.g. http://alertmanager.example.com:9093)".into(),
+            ..Default::default()
         })
         .datasource(Declaration {
             name: "alertmanager.alerts".into(),
@@ -190,7 +191,7 @@ fn am_post(host: &mut Host, path: &str, body: &Value) -> Result<Value, String> {
 /// DELETE request — Alertmanager replies 200 with no body.
 fn am_delete(host: &mut Host, path: &str) -> Result<(), String> {
     let auth = am_auth(host);
-    let resp = host.http_ref("alertmanager.endpoint", "DELETE", path, auth, None)?;
+    let resp = host.http_ref("alertmanager.endpoint", "DELETE", path, auth, &[], None)?;
     if !resp.is_success() {
         return Err(format!("DELETE {path} → {} {}", resp.status, resp.body));
     }

@@ -1,8 +1,10 @@
 //! `asterisk` — a flux integration plugin for the Asterisk PBX via the Asterisk Manager Interface
 //! (AMI) over a raw TCP socket.  All IO goes through the host `conn.*` capability; secrets are read
-//! via `host.secret("username")` and `host.secret("secret")`.  The AMI host:port is taken from the
-//! `ASTERISK_AMI_HOST` / `ASTERISK_AMI_PORT` env vars (declared as an endpoint); if the endpoint
-//! cannot be resolved it falls back to `localhost:5038`.
+//! via `host.secret("username")` and `host.secret("secret")`.  The AMI host:port is a **non-secret
+//! config value**, read through the gated `config` capability (`ami_host` / `ami_port`, declared
+//! over the `ASTERISK_AMI_HOST` / `ASTERISK_AMI_PORT` env vars — it was never a URL, so it is not
+//! an endpoint); if unset it falls back to `localhost:5038`.  The dial itself stays behind the
+//! gated, SSRF-guarded `conn` capability host-side.
 //!
 //! The plugin implements 8 ops:
 //!   - asterisk.ami.ping        (read)
@@ -28,7 +30,8 @@ use std::time::{Duration, Instant};
 
 /// Shared per-call AMI connection fields. Fluxplane embeds `AMITargetInput` (endpoint_ref/url)
 /// on every op; those are an architectural split (flux resolves the AMI host from the manifest
-/// endpoint), so only the portable `timeout` field is shared. The timeout is parsed/validated
+/// `ami_host`/`ami_port` config), so only the portable `timeout` field is shared. The timeout is
+/// parsed/validated
 /// for parity but is not wire-enforced because the host `conn.*` capability does not currently
 /// expose a per-call timeout.
 #[derive(Deserialize, JsonSchema)]
@@ -186,14 +189,15 @@ fn manifest_builder() -> PluginBuilder {
             description: "Asterisk AMI secret/password".into(),
             ..Default::default()
         })
-        .endpoint(EndpointSpec {
-            name: "asterisk.ami".into(),
-            env: vec![
-                "ASTERISK_AMI_HOST".into(),
-                "ASTERISK_AMI_PORT".into(),
-            ],
-            http_hosts: Vec::new(),
-            description: "Asterisk AMI endpoint host (ASTERISK_AMI_HOST) and port (ASTERISK_AMI_PORT, default 5038)".into(),
+        .config(ConfigSpec {
+            name: "ami_host".into(),
+            env: vec!["ASTERISK_AMI_HOST".into()],
+            description: "Asterisk AMI host (optionally host:port; default localhost)".into(),
+        })
+        .config(ConfigSpec {
+            name: "ami_port".into(),
+            env: vec!["ASTERISK_AMI_PORT".into()],
+            description: "Asterisk AMI port (default 5038)".into(),
         })
         // ---- reads ----
         .operation(
@@ -469,19 +473,23 @@ fn ami_collect(
 }
 
 // ---------------------------------------------------------------------------
-// Endpoint resolution: ASTERISK_AMI_HOST + ASTERISK_AMI_PORT from the host.
+// AMI address resolution: the `ami_host` / `ami_port` non-secret config values
+// (gated `config` capability, D-32) from the host.
 // ---------------------------------------------------------------------------
 
 fn ami_address(host: &mut Host) -> Result<(String, u16), String> {
-    // Try the declared endpoint; fall back to defaults.
+    // Read the declared config values; fall back to localhost:5038.
     let ami_host = host
-        .endpoint("asterisk.ami")
+        .config("ami_host")
         .unwrap_or_else(|_| "localhost".into());
+    let default_port = host
+        .config("ami_port")
+        .ok()
+        .and_then(|p| p.trim().parse::<u16>().ok())
+        .unwrap_or(5038);
 
-    // The endpoint env contains ASTERISK_AMI_HOST; ASTERISK_AMI_PORT is a
-    // second env var.  In practice the host returns whatever ASTERISK_AMI_HOST
-    // resolves to.  We attempt to parse a "host:port" from it; if it's bare we
-    // append the default port 5038.
+    // `ami_host` may embed the port.  We attempt to parse a "host:port" from
+    // it; if it's bare we append the `ami_port` config value (default 5038).
     let (h, p) = if ami_host.contains(':') {
         // Could be "host:port" or an IPv6 "[::1]:5038"
         if let Some(last_colon) = ami_host.rfind(':') {
@@ -493,13 +501,13 @@ fn ami_address(host: &mut Host) -> Result<(String, u16), String> {
                     .to_string();
                 (host_part, port)
             } else {
-                (ami_host, 5038)
+                (ami_host, default_port)
             }
         } else {
-            (ami_host, 5038)
+            (ami_host, default_port)
         }
     } else {
-        (ami_host, 5038)
+        (ami_host, default_port)
     };
 
     Ok((h, p))

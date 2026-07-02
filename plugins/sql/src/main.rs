@@ -2,8 +2,10 @@
 //! from the fluxplane `sql` plugin. It is the hardest plugin in the pack: real async SQL driver crates
 //! own their own socket and cannot sit on flux's synchronous, host-proxied byte stream, so this plugin
 //! carries a **hand-rolled PostgreSQL wire-protocol client** that runs entirely over the host `conn.*`
-//! capability (via [`host_kit::ConnStream`]). The plugin opens no socket and reads no env itself: the
-//! host dials TCP, and credentials come back through the gated `secret` capability.
+//! capability (via [`host_kit::ConnStream`]). The plugin opens no socket, reads no env, and never
+//! holds a URL it dials: every dial goes **by endpoint reference** (`host.conn_dial_ref` — the named
+//! manifest endpoint or a discovered `@endpoint/<id>`), DSN metadata comes from the gated non-secret
+//! `config` read, and credentials come back through the gated `secret`/`credential` capabilities.
 //!
 //! ## Dialects
 //! - **PostgreSQL** — fully implemented: StartupMessage → Authentication (Ok / cleartext / MD5 /
@@ -69,11 +71,11 @@ enum Driver {
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
 struct ConnProps {
-    /// A discovered endpoint reference (from `endpoint.select`). Secret-free; preferred
-    /// for discovered endpoints.
+    /// A discovered endpoint reference (from `endpoint.select`). Secret-free; the only way to
+    /// address a discovered endpoint.
     endpoint: Option<Value>,
-    /// A discovered `@endpoint/<id>` ref, or a registered SQL endpoint name
-    /// (default `sql.endpoint`).
+    /// A registered SQL endpoint name (default `sql.endpoint`). A bare discovered
+    /// `@endpoint/<id>` id is rejected — pass the full `endpoint` object instead.
     endpoint_ref: Option<String>,
     /// Dialect override: `postgres`, `mysql`, or `sqlite`.
     driver: Option<Driver>,
@@ -165,8 +167,8 @@ fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("sql", "0.1.0")
         .capabilities(Caps {
             // Sockets only — the conn allow-list covers the two SQL ports. (SSRF-guarded host-side.)
-            // The same `conn` grant covers a dial to a *discovered* postgres endpoint: the host
-            // resolves its host:port from the ref and applies the egress guard.
+            // Every dial goes **by reference** (`host.conn_dial_ref`): the host resolves the named
+            // or discovered endpoint's host:port and applies the egress guard under this grant.
             conn: vec![
                 format!("tcp:*:{PG_DEFAULT_PORT}"),
                 format!("tcp:*:{MYSQL_DEFAULT_PORT}"),
@@ -205,6 +207,18 @@ fn manifest_builder() -> PluginBuilder {
             env: vec!["SQL_DSN".into(), "SQL_URL".into()],
             http_hosts: Vec::new(),
             description: "SQL connection DSN/URL, e.g. postgres://host:5432/db".into(),
+            ..Default::default()
+        })
+        // The DSN doubles as declared non-secret config: the plugin reads it via `host.config("dsn")`
+        // for connection *metadata* (dialect/database/username) — the host refuses secret-classified
+        // keys and credential-bearing values, so this read can never hand back a password. The dial
+        // itself still goes by reference against the `sql.endpoint` declaration above.
+        .config(ConfigSpec {
+            name: "dsn".into(),
+            env: vec!["SQL_DSN".into(), "SQL_URL".into()],
+            description: "SQL connection DSN (credential-free: put the password in SQL_PASSWORD, \
+                          not the URL)"
+                .into(),
         })
         .datasource(Declaration {
             name: "sql.query_rows".into(),
@@ -282,23 +296,32 @@ impl Dialect {
     }
 }
 
-/// A resolved connection target: where to dial and which database, plus a redacted URL for output.
+/// A resolved connection target: which database, how the host dials it (**by reference** — the
+/// plugin never dials a host:port it parsed itself), plus a redacted URL for output.
 #[derive(Debug, Clone)]
 struct SqlTarget {
     dialect: Dialect,
-    host: String,
-    port: u16,
     database: String,
     /// Username parsed from the DSN userinfo (a `host.secret("username")` overrides it when set).
     dsn_user: Option<String>,
     /// Password parsed from the DSN userinfo (a `host.secret("password")` overrides it when set).
+    /// A static/named endpoint can no longer carry one — its DSN comes from the gated `config`
+    /// read, which the host refuses for credential-bearing values — so on that path this is
+    /// effectively always `None`. Kept because [`target_from_url`] stays tolerant when parsing
+    /// inline weak-EndpointRef URLs.
     dsn_password: Option<String>,
     /// A password-redacted form of the URL, surfaced as `endpoint_url`.
     safe_url: String,
     /// When this target came from a **discovered** endpoint (an `@endpoint/<id>` ref), how the host
     /// resolves it: the plugin dials and fetches the password by reference, never holding a URL with
-    /// a password. `None` = a static/named endpoint resolved the legacy way (DSN + `secret`).
+    /// a password. `None` = a static/named manifest endpoint (DSN metadata from the gated `config`
+    /// read, dial by the named ref, credentials via `secret`).
     discovered: Option<DiscoveredSource>,
+    /// The **named** manifest endpoint a static target dials by reference via `host.conn_dial_ref`
+    /// (default `sql.endpoint`); the host resolves it (env → URL → host:port) and applies the
+    /// egress guard. `None` for a discovered target (which dials by its
+    /// [`DiscoveredSource::endpoint_ref`]) or a bare parsed URL that was never host-resolved.
+    dial_ref: Option<String>,
     /// Operation timeout parsed from the input `timeout` field. Stored for parity with the
     /// fluxplane reference, which uses it as a context deadline; flux's `conn.*` host capability
     /// does not currently expose a per-call timeout, so this is parsed/validated but not
@@ -331,18 +354,22 @@ fn normalize_dialect(value: &str) -> Option<Dialect> {
     }
 }
 
-/// Resolve the op input into a [`SqlTarget`]. Three input shapes are accepted, in priority order:
+/// Resolve the op input into a [`SqlTarget`]. Two input shapes are accepted, in priority order:
 ///
-/// 1. A full weak `EndpointRef` JSON object in `endpoint` (preferred for a discovered endpoint — the
-///    agent gets it from `endpoint.select`). It is secret-free: its `url` is a bare
-///    `postgres://user@host:port/db` (NO password), plus an optional `credential_ref` *location*. The
-///    plugin parses host:port/database/dialect/username from that bare URL and dials + fetches the
+/// 1. A full weak `EndpointRef` JSON object in `endpoint` (the discovered-endpoint path — the agent
+///    gets the object from `endpoint.select`). It is secret-free: its `url` is a bare
+///    `postgres://user@host:port/db` (NO password), plus an optional `credential_ref` *location*.
+///    The plugin parses database/dialect/username from that bare URL and dials + fetches the
 ///    password by reference.
-/// 2. An `endpoint_ref` string that is a **discovered** `@endpoint/<id>`: the host resolves it for the
-///    dial/credential references; host:port/db/user come from the host-resolved URL (host-only — the
-///    plugin learns them only as connection metadata, never a password).
-/// 3. An `endpoint_ref` string naming a **static** endpoint (or the default `sql.endpoint`): the
-///    legacy path — `host.endpoint` hands back a DSN, username/password via `secret`.
+/// 2. An `endpoint_ref` string naming a **static** manifest endpoint (or the default
+///    `sql.endpoint`): the DSN metadata (dialect/database/username/safe_url) comes from the gated
+///    non-secret `config` read (`host.config("dsn")` — the host refuses credential-bearing values,
+///    so the DSN can never embed a password), and the dial goes **by reference** through
+///    `host.conn_dial_ref(<name>)` (the host resolves env → URL → host:port).
+///
+/// A bare discovered `@endpoint/<id>` STRING in `endpoint_ref` is rejected with a clear error: it
+/// relied on the retired `endpoint` URL-handback (which the real host never covered for discovered
+/// ids) — pass the full `endpoint` object from `endpoint.select` instead.
 fn resolve_target(input: &Value, host: &mut Host) -> Result<SqlTarget, String> {
     let driver = flex_str(input, "driver");
     let db_override = flex_str(input, "database");
@@ -357,31 +384,23 @@ fn resolve_target(input: &Value, host: &mut Host) -> Result<SqlTarget, String> {
         target_from_endpoint_ref(obj, driver.as_deref(), db_override.as_deref())?
     } else {
         let endpoint_ref = flex_str(input, "endpoint_ref").unwrap_or_else(|| "sql.endpoint".into());
-
-        // (2) A discovered `@endpoint/<id>` ref id: resolve the bare URL host-side via the
-        // `endpoint` capability (no password in it), and carry the ref for the dial + credential
-        // references.
         if is_discovered_ref(&endpoint_ref) {
-            let raw_url = host.endpoint(&endpoint_ref)?;
-            let raw_url = raw_url.trim();
-            if raw_url.is_empty() {
-                return Err("discovered endpoint has no url".into());
-            }
-            let mut t = target_from_url(driver.as_deref(), raw_url, db_override.as_deref())?;
-            t.discovered = Some(DiscoveredSource {
-                endpoint_ref,
-                credential_ref: None,
-            });
-            t
-        } else {
-            // (3) A static/named endpoint: the legacy DSN-handback path.
-            let raw_url = host.endpoint(&endpoint_ref)?;
-            let raw_url = raw_url.trim();
-            if raw_url.is_empty() {
-                return Err("endpoint has no url".into());
-            }
-            target_from_url(driver.as_deref(), raw_url, db_override.as_deref())?
+            return Err(format!(
+                "discovered endpoint id {endpoint_ref:?} cannot be passed as `endpoint_ref`: the \
+                 id-only lookup is retired — pass the full `endpoint` object from \
+                 `endpoint.select` instead"
+            ));
         }
+        // (2) A static/named endpoint: DSN metadata via the gated non-secret `config` read; the
+        // dial goes by the named reference, resolved host-side.
+        let raw_dsn = host.config("dsn")?;
+        let raw_dsn = raw_dsn.trim();
+        if raw_dsn.is_empty() {
+            return Err("endpoint has no DSN configured (set SQL_DSN or SQL_URL)".into());
+        }
+        let mut t = target_from_url(driver.as_deref(), raw_dsn, db_override.as_deref())?;
+        t.dial_ref = Some(endpoint_ref);
+        t
     };
 
     target.timeout = timeout;
@@ -557,13 +576,12 @@ fn target_from_url(
 
     Ok(SqlTarget {
         dialect,
-        host: host.to_string(),
-        port,
         database,
         dsn_user,
         dsn_password,
         safe_url,
         discovered: None,
+        dial_ref: None,
         timeout: None,
     })
 }
@@ -576,8 +594,10 @@ fn target_from_url(
 /// `credential_ref` when present, else by the `endpoint_ref` itself (the host looks the record's
 /// credential up). The password is never in a URL and never returned to the model.
 ///
-/// For a **static/named** endpoint the legacy path applies: `host.secret("username"/"password")`
-/// wins over the DSN userinfo; the Postgres database defaults to the user when unset (libpq behavior).
+/// For a **static/named** endpoint, `host.secret("username"/"password")` wins over the DSN
+/// userinfo — which a config-read DSN can never carry a password in (the host refuses
+/// credential-bearing values); the Postgres database defaults to the user when unset (libpq
+/// behavior).
 fn resolve_credentials(
     target: &SqlTarget,
     host: &mut Host,
@@ -629,16 +649,15 @@ fn resolve_credentials(
     Ok((user, password, database))
 }
 
-/// Dial the target through the host: a discovered endpoint dials **by reference**
-/// (`host.conn_dial_ref` — the host resolves host:port and applies the egress guard); a static
-/// endpoint dials the parsed host:port directly. Either way the host owns the socket.
+/// Dial the target through the host — always **by reference** (`host.conn_dial_ref`): a discovered
+/// endpoint by its `@endpoint/<id>` ref, a static/named endpoint by its manifest endpoint name
+/// (default `sql.endpoint`). Either way the host resolves the address, applies the egress guard,
+/// and owns the socket; the plugin never dials a host:port it parsed itself.
 fn dial(target: &SqlTarget, host: &mut Host) -> Result<u64, String> {
-    match &target.discovered {
-        Some(disc) => host.conn_dial_ref(&disc.endpoint_ref),
-        None => host.conn_dial(ConnTarget::Tcp {
-            host: &target.host,
-            port: target.port,
-        }),
+    match (&target.discovered, &target.dial_ref) {
+        (Some(disc), _) => host.conn_dial_ref(&disc.endpoint_ref),
+        (None, Some(named)) => host.conn_dial_ref(named),
+        (None, None) => Err("sql target carries no endpoint reference to dial".into()),
     }
 }
 
@@ -2080,15 +2099,18 @@ mod tests {
         out
     }
 
-    /// A MockHost with the standard endpoint + credentials and a single canned conn stream made of
-    /// the connect frames followed by `responses` (concatenated; one chunk so `read_exact` reframes).
+    /// A MockHost with the standard static setup — the credential-free DSN as non-secret config
+    /// (metadata), the named `sql.endpoint` ref (the by-reference dial target), credentials by
+    /// purpose — and a single canned conn stream made of the connect frames followed by
+    /// `responses` (concatenated; one chunk so `read_exact` reframes).
     fn host_with(responses: Vec<Vec<u8>>) -> MockHost {
         let mut stream = connect_frames();
         for r in responses {
             stream.extend(r);
         }
         MockHost::default()
-            .with_endpoint("sql.endpoint", "postgres://app@db.test:5432/warehouse")
+            .with_config("dsn", "postgres://app@db.test:5432/warehouse")
+            .with_endpoint_ref("sql.endpoint", "postgres://app@db.test:5432/warehouse")
             .with_secret("username", "app")
             .with_secret("password", "secret")
             .with_conn_response(stream)
@@ -2115,6 +2137,10 @@ mod tests {
         }
         assert!(m.capabilities.conn.iter().any(|c| c.contains("5432")));
         assert!(m.capabilities.secrets.contains(&"SQL_PASSWORD".to_string()));
+        // D-32: the DSN is a declared non-secret config (read via `host.config("dsn")`), and the
+        // named endpoint stays declared as the by-reference dial target.
+        assert!(m.config.iter().any(|c| c.name == "dsn"));
+        assert!(m.endpoints.iter().any(|e| e.name == "sql.endpoint"));
         // All read ops are idempotent reads.
         for op in &m.operations {
             assert_eq!(op.effects, vec![Effect::Read]);
@@ -2315,9 +2341,9 @@ mod tests {
     }
 
     /// A MockHost for a DISCOVERED postgres endpoint: the conn stream replays the connect frames +
-    /// `responses` keyed by the discovered `endpoint_ref` (so `conn_dial_ref` resolves it), the URL
-    /// resolves bare (no password), and the password is materialized through the gated `credential`
-    /// capability — never via a `secret` purpose and never inside a URL.
+    /// `responses`, the bare (no-password) URL is registered under the discovered `endpoint_ref`
+    /// (so `conn_dial_ref` resolves it), and the password is materialized through the gated
+    /// `credential` capability — never via a `secret` purpose and never inside a URL.
     fn discovered_host(
         endpoint_ref: &str,
         bare_url: &str,
@@ -2329,9 +2355,7 @@ mod tests {
             stream.extend(r);
         }
         MockHost::default()
-            // The host-resolved bare URL for the discovered-id input path (no password in it).
-            .with_endpoint(endpoint_ref, bare_url)
-            // The dial-by-ref resolution target.
+            // The dial-by-ref resolution target (a bare URL — no password in it).
             .with_endpoint_ref(endpoint_ref, bare_url)
             // The password via the gated `credential` capability, keyed by endpoint_ref.
             .with_credential(endpoint_ref, password)
@@ -2392,26 +2416,27 @@ mod tests {
             "the password must never appear in the op's returned JSON: {dumped}"
         );
 
-        // (b) The discovered `@endpoint/<id>` id shape: host resolves the bare URL + the password by
-        // endpoint_ref (no inline credential_ref).
+        // (b) The bare discovered `@endpoint/<id>` id-string shape is RETIRED with the `endpoint`
+        // URL-handback it relied on (the real host never resolved discovered ids that way). Even
+        // against a fully configured host it is rejected with a clear error pointing at the object
+        // shape — before any dial or credential fetch.
         let mut host2 = discovered_host(
             "@endpoint/pg-1",
             "postgres://app@pg.monitoring.svc:5432/warehouse",
             password,
             vec![query_response(&["v"], &[vec![Some("ok")]])],
         );
-        let out2 = run(
+        let err = run(
             "sql.test",
             json!({ "endpoint_ref": "@endpoint/pg-1" }),
             &mut host2,
         )
-        .expect("sql.test against a discovered endpoint id");
-        assert_eq!(out2["status"], "ok");
-        assert_eq!(out2["database"], "warehouse");
+        .unwrap_err();
         assert!(
-            !out2.to_string().contains(password),
-            "no password in output"
+            err.contains("@endpoint/pg-1") && err.contains("endpoint.select"),
+            "the id-string shape must point the caller at the `endpoint` object: {err}"
         );
+        assert!(!err.contains(password), "no password in the error");
     }
 
     #[test]
@@ -2481,15 +2506,30 @@ mod tests {
     #[test]
     fn mysql_and_sqlite_route_to_clear_errors() {
         let mut mysql = MockHost::default()
-            .with_endpoint("sql.endpoint", "mysql://root@db.test:3306/app")
+            .with_config("dsn", "mysql://root@db.test:3306/app")
             .with_secret("username", "root")
             .with_secret("password", "");
         let err = run("sql.test", json!({}), &mut mysql).unwrap_err();
         assert!(err.contains("mysql is not yet supported"), "err = {err}");
 
-        let mut sqlite = MockHost::default().with_endpoint("sql.endpoint", "sqlite:///tmp/app.db");
+        let mut sqlite = MockHost::default().with_config("dsn", "sqlite:///tmp/app.db");
         let err = run("sql.test", json!({}), &mut sqlite).unwrap_err();
         assert!(err.contains("sqlite unsupported"), "err = {err}");
+    }
+
+    #[test]
+    fn static_endpoint_dials_by_reference() {
+        // D-32: the static/named path must dial via `host.conn_dial_ref("sql.endpoint")` — the
+        // host resolves the address; the plugin never dials a host:port it parsed from the DSN.
+        // A mock that has the DSN config but NO `with_endpoint_ref("sql.endpoint", ...)` entry
+        // must therefore fail at the dial with the mock's missing-ref error (a plugin-side
+        // `ConnTarget::Tcp` dial would have succeeded and then timed out reading frames).
+        let mut host = MockHost::default()
+            .with_config("dsn", "postgres://app@db.test:5432/warehouse")
+            .with_secret("username", "app")
+            .with_secret("password", "secret");
+        let err = run("sql.test", json!({}), &mut host).unwrap_err();
+        assert!(err.contains("no endpoint_ref"), "err = {err}");
     }
 
     // ---- unit tests for the pure helpers ----
@@ -2525,28 +2565,31 @@ mod tests {
         let t =
             target_from_url(None, "postgres://app:s3cr3t@db.test:6543/warehouse", None).unwrap();
         assert_eq!(t.dialect, Dialect::Postgres);
-        assert_eq!(t.host, "db.test");
-        assert_eq!(t.port, 6543);
         assert_eq!(t.database, "warehouse");
         assert_eq!(t.dsn_user.as_deref(), Some("app"));
         assert_eq!(t.dsn_password.as_deref(), Some("s3cr3t"));
+        // The parsed host:port surface only in the redacted URL — the target carries no dialable
+        // address (the dial goes by reference).
+        assert_eq!(t.safe_url, "postgres://app:xxxxx@db.test:6543/warehouse");
         assert!(
             !t.safe_url.contains("s3cr3t"),
             "password must be redacted: {}",
             t.safe_url
         );
-        assert!(t.safe_url.contains("xxxxx"));
 
         // Default port + percent-decoded password.
         let t = target_from_url(None, "postgresql://u:p%40ss@h/db", None).unwrap();
-        assert_eq!(t.port, PG_DEFAULT_PORT);
+        assert_eq!(
+            t.safe_url,
+            format!("postgres://u:xxxxx@h:{PG_DEFAULT_PORT}/db")
+        );
         assert_eq!(t.dsn_password.as_deref(), Some("p@ss"));
 
         // Driver override wins over scheme; sqlite is rejected at parse time.
         assert!(target_from_url(None, "sqlite:///x.db", None).is_err());
         let t = target_from_url(Some("mysql"), "mysql://root@h:3306/app", None).unwrap();
         assert_eq!(t.dialect, Dialect::MySql);
-        assert_eq!(t.port, 3306);
+        assert_eq!(t.safe_url, "mysql://root@h:3306/app");
     }
 
     #[test]
@@ -2607,7 +2650,8 @@ mod tests {
         // ErrorKind::TimedOut (not a silent hang or a clean EOF) — surfaced as "timed out".
         // Before the deadline wiring, the read would return EOF ("connection closed mid-message").
         let mut host = MockHost::default()
-            .with_endpoint("sql.endpoint", "postgres://app@db.test:5432/warehouse")
+            .with_config("dsn", "postgres://app@db.test:5432/warehouse")
+            .with_endpoint_ref("sql.endpoint", "postgres://app@db.test:5432/warehouse")
             .with_secret("username", "app")
             .with_secret("password", "secret");
         let err = run("sql.test", json!({"timeout": "1ms"}), &mut host).unwrap_err();

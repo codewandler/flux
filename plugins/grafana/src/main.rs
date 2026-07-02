@@ -255,6 +255,7 @@ fn manifest_builder() -> PluginBuilder {
             env: vec!["GRAFANA_URL".into()],
             http_hosts: Vec::new(),
             description: "Grafana base URL (e.g. https://grafana.example.com).".into(),
+            ..Default::default()
         })
         .datasource(ds(
             "grafana.dashboards",
@@ -457,7 +458,7 @@ fn gf_post(host: &mut Host, path: &str, body: &Value) -> Result<Value, String> {
 
 fn gf_delete(host: &mut Host, path: &str) -> Result<(), String> {
     let ap = auth_purpose(host);
-    let resp = host.http_ref("grafana.endpoint", "DELETE", path, ap, None)?;
+    let resp = host.http_ref("grafana.endpoint", "DELETE", path, ap, &[], None)?;
     if !resp.is_success() {
         return Err(format!("DELETE {path} → {} {}", resp.status, resp.body));
     }
@@ -1482,7 +1483,7 @@ fn op_test(_input: Value, host: &mut Host) -> Result<Value, String> {
     let mut hint = String::new();
 
     // Unauthenticated health probe
-    match host.http_ref("grafana.endpoint", "GET", "/api/health", None, None) {
+    match host.http_ref("grafana.endpoint", "GET", "/api/health", None, &[], None) {
         Ok(resp) if resp.is_success() => {
             if let Ok(v) = resp.json() {
                 database = v
@@ -1510,7 +1511,7 @@ fn op_test(_input: Value, host: &mut Host) -> Result<Value, String> {
 
     // Authenticated /api/org probe
     let ap = auth_purpose(host);
-    match host.http_ref("grafana.endpoint", "GET", "/api/org", ap, None) {
+    match host.http_ref("grafana.endpoint", "GET", "/api/org", ap, &[], None) {
         Ok(resp) if resp.is_success() => {
             if let Ok(v) = resp.json() {
                 org_name = v

@@ -25,6 +25,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **The `host.endpoint` URL-handback is gone — references-only plugin IO is now compile-enforced
+  (D-32).** No plugin op receives a URL string anymore: the `endpoint` host-capability arm in
+  `SystemHostCaps`, host-kit's `Host::endpoint`, and `MockHost`'s endpoint shim are deleted, so any
+  straggler fails to build (the epic's clean-cutover proof). The residual uses were covered first:
+  a gated non-secret **`config` capability** (declared `ConfigSpec`s only, refuses
+  secret-classified env keys *and* credential-bearing values like a password-embedding DSN);
+  **template endpoints** (`EndpointSpec.template`) that compose dynamic bases host-side from
+  declared config — the Atlassian gateway (`api.atlassian.com/ex/…/{cloud_id}`) is now a named ref
+  the plugin addresses without ever holding the URL; **`http_bytes_ref`** for attachment byte-IO by
+  reference (jira/confluence migrated, gitlab archive downloads now byte-exact); and `sql` dialing
+  by named ref (`SqlTarget` lost its `host`/`port` — the plugin *cannot* dial a parsed address;
+  the mock-only bare `@endpoint/<id>` string input was removed in favor of the full `endpoint`
+  object from `endpoint.select`). Scope grew from the story's 5–6 residual call sites to 13
+  consumer plugins, all migrated (`EndpointSpec.default` absorbed plugin-side URL fallbacks
+  behavior-preservingly; ops that surfaced a resolved URL now surface the ref name). Both
+  workspaces green; the plugins workspace builds with zero references to the old capability.
+
 - **Codex WebSocket transport — default, with transparent HTTP-SSE fallback (C-07).** The `codex`
   provider now dials `wss://chatgpt.com/backend-api/codex/responses` first, mirroring the upstream
   codex client. A new provider-level seam (`flux_provider::StreamTransport`, tried by

@@ -83,6 +83,10 @@ struct AlertsInput {}
 const MAX_SERIES_PER_RESULT: usize = 200;
 const MAX_POINTS_PER_SERIES: usize = 500;
 
+/// The manifest endpoint reference all HTTP goes through — the host resolves the base URL
+/// (from `PROMETHEUS_URL`/`PROM_URL`); the plugin never holds it (D-32).
+const ENDPOINT: &str = "prometheus.endpoint";
+
 fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("prometheus", "0.1.0")
         .capabilities(Caps {
@@ -91,10 +95,11 @@ fn manifest_builder() -> PluginBuilder {
             ..Default::default()
         })
         .endpoint(EndpointSpec {
-            name: "prometheus.endpoint".into(),
+            name: ENDPOINT.into(),
             env: vec!["PROMETHEUS_URL".into(), "PROM_URL".into()],
             http_hosts: Vec::new(),
             description: "Prometheus base URL (e.g. https://prom.example.com)".into(),
+            ..Default::default()
         })
         .datasource(ds(
             "prometheus.query_results",
@@ -136,16 +141,8 @@ fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
     }
 }
 
-fn base_url(host: &mut Host) -> Result<String, String> {
-    Ok(host
-        .endpoint("prometheus.endpoint")?
-        .trim_end_matches('/')
-        .to_string())
-}
-
 fn prom_get(host: &mut Host, path: &str) -> Result<Value, String> {
-    let base = base_url(host)?;
-    host.get_json(&format!("{base}{path}"), None)
+    host.get_json_ref(ENDPOINT, path, None)
 }
 
 fn req_str<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -258,12 +255,11 @@ fn parse_duration_secs(s: &str) -> Option<i64> {
 }
 
 fn test(_input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = base_url(host)?;
     let start = SystemTime::now();
-    let resp = host.http("GET", &format!("{base}/-/ready"), None, &[], None)?;
+    let resp = host.http_ref(ENDPOINT, "GET", "/-/ready", None, &[], None)?;
     let latency_ms = start.elapsed().map(|d| d.as_millis() as i64).unwrap_or(0);
     let ready = resp.is_success();
-    let mut out = json!({"url": base, "ready": ready, "latency_ms": latency_ms});
+    let mut out = json!({"url": ENDPOINT, "ready": ready, "latency_ms": latency_ms});
     if !ready {
         out.as_object_mut().unwrap().insert(
             "error".into(),
@@ -275,20 +271,18 @@ fn test(_input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn query(input: Value, host: &mut Host) -> Result<Value, String> {
     let q = req_query(&input)?;
-    let base = base_url(host)?;
     let mut path = format!("/api/v1/query?query={}", urlencode(q));
     if let Some(time) = opt_str(&input, "time") {
         path.push_str(&format!("&time={}", parse_time_value(time, now_unix())?));
     }
     let resp = prom_get(host, &path)?;
-    let out = typed_query_result(&base, q, &resp)?;
+    let out = typed_query_result(ENDPOINT, q, &resp)?;
     contribute_query_results(host, &out);
     Ok(out)
 }
 
 fn query_range(input: Value, host: &mut Host) -> Result<Value, String> {
     let q = req_query(&input)?;
-    let base = base_url(host)?;
     let now = now_unix();
     let end = parse_time_value(opt_str(&input, "until").unwrap_or("0s"), now)?;
     let start = parse_time_value(opt_str(&input, "since").unwrap_or("1h"), now)?;
@@ -301,7 +295,7 @@ fn query_range(input: Value, host: &mut Host) -> Result<Value, String> {
         urlencode(&step)
     );
     let resp = prom_get(host, &path)?;
-    let out = typed_query_result(&base, q, &resp)?;
+    let out = typed_query_result(ENDPOINT, q, &resp)?;
     contribute_query_results(host, &out);
     Ok(out)
 }
@@ -317,9 +311,8 @@ fn labels(input: Value, host: &mut Host) -> Result<Value, String> {
         path.push(if i == 0 { '?' } else { '&' });
         path.push_str(&format!("match[]={}", urlencode(sel)));
     }
-    let base = base_url(host)?;
     let resp = prom_get(host, &path)?;
-    let out = typed_labels_result(&base, label, &resp)?;
+    let out = typed_labels_result(ENDPOINT, label, &resp)?;
     contribute_labels(host, label, &resp);
     Ok(out)
 }
@@ -334,7 +327,6 @@ fn series(input: Value, host: &mut Host) -> Result<Value, String> {
         _ => 100,
     };
     let now = now_unix();
-    let base = base_url(host)?;
     let mut path = String::from("/api/v1/series");
     for (i, sel) in selectors.iter().enumerate() {
         path.push(if i == 0 { '?' } else { '&' });
@@ -348,7 +340,7 @@ fn series(input: Value, host: &mut Host) -> Result<Value, String> {
     }
     path.push_str(&format!("&limit={limit}"));
     let resp = prom_get(host, &path)?;
-    let out = typed_series_result(&base, limit, &resp)?;
+    let out = typed_series_result(ENDPOINT, limit, &resp)?;
     Ok(out)
 }
 
@@ -359,9 +351,8 @@ fn targets(input: Value, host: &mut Host) -> Result<Value, String> {
     } else {
         format!("/api/v1/targets?state={}", urlencode(state))
     };
-    let base = base_url(host)?;
     let resp = prom_get(host, &path)?;
-    let out = typed_targets_result(&base, state, &resp)?;
+    let out = typed_targets_result(ENDPOINT, state, &resp)?;
     contribute_targets(host, &resp);
     Ok(out)
 }
@@ -375,16 +366,14 @@ fn rules(input: Value, host: &mut Host) -> Result<Value, String> {
         "alert" | "record" => format!("/api/v1/rules?type={kind}"),
         _ => return Err("`type` must be alert or record".into()),
     };
-    let base = base_url(host)?;
     let resp = prom_get(host, &path)?;
-    let out = typed_rules_result(&base, &resp)?;
+    let out = typed_rules_result(ENDPOINT, &resp)?;
     Ok(out)
 }
 
 fn alerts(_input: Value, host: &mut Host) -> Result<Value, String> {
-    let base = base_url(host)?;
     let resp = prom_get(host, "/api/v1/alerts")?;
-    let out = typed_alerts_result(&base, &resp)?;
+    let out = typed_alerts_result(ENDPOINT, &resp)?;
     contribute_alerts(host, &resp);
     Ok(out)
 }
@@ -921,12 +910,12 @@ mod tests {
     fn test_op_pings_readiness_and_reports_latency() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
-            .with_endpoint("prometheus.endpoint", "https://p.x")
+            .with_endpoint_ref("prometheus.endpoint", "https://p.x")
             .with_http("/-/ready", json!("Prometheus Server is Ready."));
         let out = plugin
             .call("prometheus.test", json!({}), &mut host)
             .unwrap();
-        assert_eq!(out["url"], "https://p.x");
+        assert_eq!(out["url"], "prometheus.endpoint");
         assert!(out["ready"].as_bool().unwrap());
         assert!(out["latency_ms"].is_number(), "latency_ms missing: {out}");
     }
@@ -935,7 +924,7 @@ mod tests {
     fn test_reports_error_when_prometheus_not_ready() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
-            .with_endpoint("prometheus.endpoint", "https://p.x")
+            .with_endpoint_ref("prometheus.endpoint", "https://p.x")
             .with_http_status_body("/-/ready", 503, "Service Unavailable");
         let out = plugin
             .call("prometheus.test", json!({}), &mut host)
@@ -948,7 +937,7 @@ mod tests {
     fn query_hits_endpoint_and_returns_typed_samples() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
-            .with_endpoint("prometheus.endpoint", "https://p.x")
+            .with_endpoint_ref("prometheus.endpoint", "https://p.x")
             .with_http(
                 "/api/v1/query?",
                 json!({"status": "success", "data": {"resultType": "vector", "result": [
@@ -962,7 +951,7 @@ mod tests {
                 &mut host,
             )
             .unwrap();
-        assert_eq!(out["url"], "https://p.x");
+        assert_eq!(out["url"], "prometheus.endpoint");
         assert_eq!(out["result_type"], "vector");
         assert_eq!(out["count"], 1);
         assert_eq!(out["samples"][0]["value"], "1");
@@ -976,7 +965,7 @@ mod tests {
     #[test]
     fn query_rejects_an_empty_expression() {
         let plugin = manifest_builder().build();
-        let mut host = MockHost::default().with_endpoint("prometheus.endpoint", "https://p.x");
+        let mut host = MockHost::default().with_endpoint_ref("prometheus.endpoint", "https://p.x");
         let err = plugin
             .call("prometheus.query", json!({"query": "  "}), &mut host)
             .unwrap_err();
@@ -987,7 +976,7 @@ mod tests {
     fn query_range_returns_typed_series() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
-            .with_endpoint("prometheus.endpoint", "https://p.x/")
+            .with_endpoint_ref("prometheus.endpoint", "https://p.x/")
             .with_http("/api/v1/query_range", json!({"status": "success", "data": {"resultType": "matrix", "result": [
                 {"metric": {"__name__": "rps", "job": "api"}, "values": [[1609459200, "0.5"], [1609459230, "0.6"]]}
             ]}}));
@@ -1001,7 +990,7 @@ mod tests {
     fn query_range_defaults_since_until_step() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
-            .with_endpoint("prometheus.endpoint", "https://p.x")
+            .with_endpoint_ref("prometheus.endpoint", "https://p.x")
             .with_http(
                 "/api/v1/query_range",
                 json!({"status": "success", "data": {"resultType": "matrix", "result": []}}),
@@ -1059,7 +1048,7 @@ mod tests {
     fn labels_returns_typed_result_and_contributes() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
-            .with_endpoint("prometheus.endpoint", "https://p.x")
+            .with_endpoint_ref("prometheus.endpoint", "https://p.x")
             .with_http(
                 "/api/v1/label/job/values",
                 json!({"status": "success", "data": ["api", "web"]}),
@@ -1067,7 +1056,7 @@ mod tests {
         let out = plugin
             .call("prometheus.labels", json!({"label": "job"}), &mut host)
             .unwrap();
-        assert_eq!(out["url"], "https://p.x");
+        assert_eq!(out["url"], "prometheus.endpoint");
         assert_eq!(out["label"], "job");
         assert_eq!(out["values"], json!(["api", "web"]));
         let recs = host.contributed.borrow();
@@ -1080,7 +1069,7 @@ mod tests {
     fn series_requires_match_and_returns_typed_result_with_limit() {
         let plugin = manifest_builder().build();
         let mut host = MockHost::default()
-            .with_endpoint("prometheus.endpoint", "https://p.x")
+            .with_endpoint_ref("prometheus.endpoint", "https://p.x")
             .with_http(
                 "/api/v1/series",
                 json!({"status": "success", "data": [
@@ -1099,7 +1088,7 @@ mod tests {
                 &mut host,
             )
             .unwrap();
-        assert_eq!(out["url"], "https://p.x");
+        assert_eq!(out["url"], "prometheus.endpoint");
         assert_eq!(out["count"], 2);
         assert!(out["truncated"].as_bool().unwrap());
         assert_eq!(out["series"][0]["job"], "api");
@@ -1108,7 +1097,7 @@ mod tests {
     #[test]
     fn targets_returns_typed_result_with_counts_and_contributes() {
         let plugin = manifest_builder().build();
-        let mut host = MockHost::default().with_endpoint("prometheus.endpoint", "https://p.x")
+        let mut host = MockHost::default().with_endpoint_ref("prometheus.endpoint", "https://p.x")
             .with_http("/api/v1/targets", json!({"status": "success", "data": {"activeTargets": [
                 {"labels": {"job": "api", "instance": "10.0.0.1:9090"}, "health": "up", "scrapePool": "api", "scrapeUrl": "http://10.0.0.1:9090/metrics"}
             ], "droppedTargets": [
@@ -1117,7 +1106,7 @@ mod tests {
         let out = plugin
             .call("prometheus.targets", json!({}), &mut host)
             .unwrap();
-        assert_eq!(out["url"], "https://p.x");
+        assert_eq!(out["url"], "prometheus.endpoint");
         assert_eq!(out["state"], "active");
         assert_eq!(out["active_count"], 1);
         assert_eq!(out["dropped_count"], 1);
@@ -1132,7 +1121,7 @@ mod tests {
     #[test]
     fn rules_returns_typed_result_with_counts_and_rejects_bad_type() {
         let plugin = manifest_builder().build();
-        let mut host = MockHost::default().with_endpoint("prometheus.endpoint", "https://p.x")
+        let mut host = MockHost::default().with_endpoint_ref("prometheus.endpoint", "https://p.x")
             .with_http("/api/v1/rules", json!({"status": "success", "data": {"groups": [
                 {"name": "g1", "file": "rules.yml", "interval": 30, "rules": [
                     {"name": "HighErrors", "type": "alerting", "query": "rate(errors[5m]) > 0.1", "state": "firing", "duration": 300, "health": "ok", "labels": {"severity": "critical"}, "annotations": {"summary": "too many errors"}, "alerts": [{"state": "firing"}]}
@@ -1144,7 +1133,7 @@ mod tests {
         let out = plugin
             .call("prometheus.rules", json!({"type": "alert"}), &mut host)
             .unwrap();
-        assert_eq!(out["url"], "https://p.x");
+        assert_eq!(out["url"], "prometheus.endpoint");
         assert_eq!(out["group_count"], 1);
         assert_eq!(out["rule_count"], 1);
         assert_eq!(out["groups"][0]["interval"], "30s");
@@ -1159,14 +1148,14 @@ mod tests {
     #[test]
     fn alerts_returns_typed_result_with_count_and_contributes() {
         let plugin = manifest_builder().build();
-        let mut host = MockHost::default().with_endpoint("prometheus.endpoint", "https://p.x")
+        let mut host = MockHost::default().with_endpoint_ref("prometheus.endpoint", "https://p.x")
             .with_http("/api/v1/alerts", json!({"status": "success", "data": {"alerts": [
                 {"labels": {"alertname": "HighErrors", "severity": "critical"}, "state": "firing", "activeAt": "2024-01-01T00:00:00Z", "value": "1", "annotations": {"summary": "too many 5xx"}}
             ]}}));
         let out = plugin
             .call("prometheus.alerts", json!({}), &mut host)
             .unwrap();
-        assert_eq!(out["url"], "https://p.x");
+        assert_eq!(out["url"], "prometheus.endpoint");
         assert_eq!(out["count"], 1);
         assert_eq!(out["alerts"][0]["state"], "firing");
         assert_eq!(out["alerts"][0]["name"], "HighErrors");
