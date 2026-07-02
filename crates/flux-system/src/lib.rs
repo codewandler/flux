@@ -20,10 +20,18 @@ pub mod net;
 
 /// A bounded filesystem view: a primary root plus optional `@named` roots. All access is confined
 /// to these roots.
+///
+/// Two access-widening knobs (C-21): `read_roots` are additional **read-only** roots — `resolve_read`
+/// (reads/globs/greps) accepts a path under any of them, while `resolve` (writes) stays confined to the
+/// primary root (+ named); `unconfined` lifts confinement entirely for both (the `--allow-all-paths` hatch).
 #[derive(Debug, Clone)]
 pub struct Workspace {
     root: PathBuf,
     named: HashMap<String, PathBuf>,
+    /// Additional read-only roots reads may reach under; writes may not.
+    read_roots: Vec<PathBuf>,
+    /// When set, path confinement is lifted (read + write anywhere).
+    unconfined: bool,
 }
 
 impl Workspace {
@@ -36,11 +44,67 @@ impl Workspace {
         Ok(Self {
             root,
             named: HashMap::new(),
+            read_roots: Vec::new(),
+            unconfined: false,
         })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The additional read-only roots (C-21).
+    pub fn read_roots(&self) -> &[PathBuf] {
+        &self.read_roots
+    }
+
+    /// Add a **read-only** allowed root (canonicalized; must exist) — reads/globs/greps may reach under
+    /// it, writes stay confined to the primary root (C-21). Chainable.
+    pub fn add_read_root(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        let p = path
+            .as_ref()
+            .canonicalize()
+            .map_err(|e| Error::Config(format!("read root {:?}: {e}", path.as_ref())))?;
+        if !self.read_roots.contains(&p) {
+            self.read_roots.push(p);
+        }
+        Ok(())
+    }
+
+    /// Lift path confinement entirely (read + write anywhere) — the explicit `--allow-all-paths` hatch.
+    pub fn set_unconfined(&mut self, yes: bool) {
+        self.unconfined = yes;
+    }
+
+    /// Whether confinement is lifted.
+    pub fn is_unconfined(&self) -> bool {
+        self.unconfined
+    }
+
+    /// Build a workspace at `cwd` and layer access-widening from the environment (C-21): `FLUX_ADD_DIRS`
+    /// (a `:`-separated list of read-only roots) and `FLUX_ALLOW_ALL` (truthy → unconfined). This is the
+    /// channel the CLI's `--add-dir`/`--allow-all-paths` flags export through, so `app run` and other
+    /// in-process paths inherit the policy. A non-existent `FLUX_ADD_DIRS` entry is skipped (not fatal).
+    pub fn from_env(cwd: impl AsRef<Path>) -> Result<Self> {
+        let mut ws = Self::new(cwd)?;
+        if let Ok(dirs) = std::env::var("FLUX_ADD_DIRS") {
+            for d in dirs.split(':').filter(|s| !s.is_empty()) {
+                let expanded = if let Some(rest) = d.strip_prefix('~') {
+                    format!("{}{rest}", std::env::var("HOME").unwrap_or_default())
+                } else {
+                    d.to_string()
+                };
+                // Skip a missing/invalid extra root rather than failing the whole session.
+                let _ = ws.add_read_root(&expanded);
+            }
+        }
+        if std::env::var("FLUX_ALLOW_ALL")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+        {
+            ws.set_unconfined(true);
+        }
+        Ok(ws)
     }
 
     /// Register a `@name` root (canonicalized; must exist).
@@ -62,9 +126,22 @@ impl Workspace {
         self.named.contains_key(name)
     }
 
-    /// Resolve a workspace-relative (or `@name/...`) path to an absolute path guaranteed to live
-    /// inside the corresponding root. Rejects `..` escapes and symlink escapes.
+    /// Resolve a workspace-relative (or `@name/...`) path for a **write** — confined to the primary root
+    /// and any `@named` root. Rejects `..` and symlink escapes. Use [`resolve_read`](Self::resolve_read)
+    /// for reads, which additionally accepts the read-only roots (C-21).
     pub fn resolve(&self, input: &str) -> Result<PathBuf> {
+        self.resolve_in(input, false)
+    }
+
+    /// Resolve a path for a **read** — confined to the primary root, any `@named` root, **or any read-only
+    /// root** (C-21). Otherwise identical to [`resolve`](Self::resolve).
+    pub fn resolve_read(&self, input: &str) -> Result<PathBuf> {
+        self.resolve_in(input, true)
+    }
+
+    /// The shared resolver. `read_extra` widens the acceptable roots to include the read-only roots (the
+    /// read path). When `unconfined` is set, confinement is lifted entirely.
+    fn resolve_in(&self, input: &str, read_extra: bool) -> Result<PathBuf> {
         // A path containing a control byte (newline, CR, NUL, tab, …) is virtually always a
         // bug — typically an untrimmed command substitution flowing into the path, e.g.
         // `echo …` whose trailing newline becomes part of the filename. Such a file gets
@@ -104,22 +181,42 @@ impl Workspace {
         };
         let norm = normalize_lexically(&joined);
 
-        if !norm.starts_with(&base) {
-            return Err(Error::Config(format!(
-                "path {input:?} escapes the workspace root {}",
-                base.display()
-            )));
+        // The `--allow-all-paths` hatch: no root confinement, just the lexically-normalized path.
+        if self.unconfined {
+            return Ok(norm);
         }
 
+        // Find the allowed root this path lives under: the primary root, any `@named` root, and — on the
+        // read path — any read-only root (C-21).
+        let mut container: Option<&PathBuf> = None;
+        for r in std::iter::once(&self.root).chain(self.named.values()) {
+            if norm.starts_with(r) {
+                container = Some(r);
+                break;
+            }
+        }
+        if container.is_none() && read_extra {
+            for r in &self.read_roots {
+                if norm.starts_with(r) {
+                    container = Some(r);
+                    break;
+                }
+            }
+        }
+        let Some(base) = container else {
+            return Err(Error::Config(format!(
+                "path {input:?} escapes the workspace root {}",
+                self.root.display()
+            )));
+        };
+
         // Symlink guard: walk the path component-by-component, chasing every symlink found in the
-        // physically-existing prefix and rejecting any whose target escapes the root. Unlike
+        // physically-existing prefix and rejecting any whose target escapes the matched root. Unlike
         // `Path::exists()` (which follows links, so a *dangling* symlink to an outside target reads
         // as "not existing"), this uses `symlink_metadata` and so also catches symlinks whose
         // targets don't exist yet — the case a plain parent-canonicalize misses on write.
-        resolve_within_root(&base, &norm).map_err(|_| {
-            Error::Config(format!(
-                "path {input:?} resolves outside the workspace root"
-            ))
+        resolve_within_root(base, &norm).map_err(|_| {
+            Error::Config(format!("path {input:?} resolves outside the allowed roots"))
         })
     }
 
@@ -359,9 +456,9 @@ impl System {
         &self.workspace
     }
 
-    /// Read a UTF-8 file from within the workspace.
+    /// Read a UTF-8 file from within the workspace (or any read-only root, C-21).
     pub async fn read_file(&self, path: &str) -> Result<String> {
-        let p = self.workspace.resolve(path)?;
+        let p = self.workspace.resolve_read(path)?;
         let bytes = tokio::fs::read(&p).await?;
         String::from_utf8(bytes).map_err(|_| Error::Other(format!("{path}: not valid UTF-8")))
     }
@@ -379,7 +476,7 @@ impl System {
     /// Read the raw bytes of a file within the workspace (no UTF-8 decode). Used to sniff binary
     /// files (NUL bytes) and report byte sizes *before* a lossy text decode.
     pub async fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>> {
-        let p = self.workspace.resolve(path)?;
+        let p = self.workspace.resolve_read(path)?;
         Ok(tokio::fs::read(&p).await?)
     }
 
@@ -404,14 +501,14 @@ impl System {
     /// Last-modification time of a file within the workspace. Used by the read-before-write guard to
     /// detect a file that changed on disk since the model last read it.
     pub async fn file_mtime(&self, path: &str) -> Result<std::time::SystemTime> {
-        let p = self.workspace.resolve(path)?;
+        let p = self.workspace.resolve_read(path)?;
         let meta = tokio::fs::metadata(&p).await?;
         Ok(meta.modified()?)
     }
 
     /// List the entries of a directory within the workspace (names only).
     pub async fn list_dir(&self, path: &str) -> Result<Vec<String>> {
-        let p = self.workspace.resolve(path)?;
+        let p = self.workspace.resolve_read(path)?;
         let mut rd = tokio::fs::read_dir(&p).await?;
         let mut out = Vec::new();
         while let Some(entry) = rd.next_entry().await? {
@@ -427,7 +524,7 @@ impl System {
     /// This is synchronous for startup-time callers that cannot await yet, but it still resolves the
     /// directory and every child path through [`Workspace::resolve`], including symlink-escape checks.
     pub fn read_dir_text_files(&self, dir: &str, extension: &str) -> Result<Vec<(String, String)>> {
-        let root = self.workspace.resolve(dir)?;
+        let root = self.workspace.resolve_read(dir)?;
         let mut names = Vec::new();
         let rd = match std::fs::read_dir(&root) {
             Ok(rd) => rd,
@@ -456,7 +553,7 @@ impl System {
             } else {
                 format!("{base}/{name}")
             };
-            let resolved = self.workspace.resolve(&path)?;
+            let resolved = self.workspace.resolve_read(&path)?;
             let bytes = std::fs::read(&resolved)?;
             let content = String::from_utf8(bytes)
                 .map_err(|_| Error::Other(format!("{path}: not valid UTF-8")))?;
@@ -470,9 +567,17 @@ impl System {
     /// noisy `.git`/`target`/`node_modules` directories are skipped. Used by `glob`/`grep`.
     pub async fn walk_files(&self, base: &str, max: usize) -> Result<Vec<String>> {
         const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules"];
-        let root = self.workspace.resolve(base)?;
+        let root = self.workspace.resolve_read(base)?;
         let ws_root = self.workspace.root().to_path_buf();
         let mut out = Vec::new();
+        // Render a walked file: workspace-relative when under the primary root, else absolute (a read-only
+        // extra root, C-21) so a subsequent `read` resolves it via the same allowed roots.
+        let render = |p: &Path| -> String {
+            match p.strip_prefix(&ws_root) {
+                Ok(rel) => rel.to_string_lossy().into_owned(),
+                Err(_) => p.to_string_lossy().into_owned(),
+            }
+        };
         // A `base` that resolves to a single file → return just that file, so `grep`/`glob` scoped to
         // a file path search that file instead of silently finding nothing (`read_dir` on a file
         // errors, which would otherwise yield an empty walk and a misleading "no matches").
@@ -481,12 +586,15 @@ impl System {
             .map(|m| m.is_file())
             .unwrap_or(false)
         {
-            if let Ok(rel) = root.strip_prefix(&ws_root) {
-                out.push(rel.to_string_lossy().into_owned());
-            }
+            out.push(render(&root));
             return Ok(out);
         }
-        let mut stack = vec![root];
+        // Walk the base; when the base is the whole workspace root, also walk each read-only extra root so
+        // `glob`/`grep` see outside-cwd files (C-21).
+        let mut stack = vec![root.clone()];
+        if root == ws_root {
+            stack.extend(self.workspace.read_roots().iter().cloned());
+        }
         while let Some(dir) = stack.pop() {
             if out.len() >= max {
                 break;
@@ -498,7 +606,7 @@ impl System {
             while let Some(entry) = rd.next_entry().await? {
                 let ft = entry.file_type().await?;
                 if ft.is_symlink() {
-                    continue; // never follow symlinks (could escape the workspace)
+                    continue; // never follow symlinks (could escape a root)
                 }
                 let path = entry.path();
                 if ft.is_dir() {
@@ -508,11 +616,9 @@ impl System {
                     }
                     stack.push(path);
                 } else if ft.is_file() {
-                    if let Ok(rel) = path.strip_prefix(&ws_root) {
-                        out.push(rel.to_string_lossy().into_owned());
-                        if out.len() >= max {
-                            break;
-                        }
+                    out.push(render(&path));
+                    if out.len() >= max {
+                        break;
                     }
                 }
             }
@@ -828,6 +934,89 @@ mod tests {
         // max caps the count
         assert_eq!(sys.walk_files(".", 1).await.unwrap().len(), 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── C-21: read-only allowed roots + the unconfined hatch ──────────────────────────────────────
+
+    /// A read-only extra root: reads reach under it, writes do not, and outside-all is still rejected.
+    #[tokio::test]
+    async fn read_root_allows_reads_but_not_writes() {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let ws_dir = std::env::temp_dir().join(format!("flux-sys-ws-{}-{n}", std::process::id()));
+        let ext_dir = std::env::temp_dir().join(format!("flux-sys-ext-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(ext_dir.join("ref.txt"), "outside data").unwrap();
+
+        let mut ws = Workspace::new(&ws_dir).unwrap();
+        ws.add_read_root(&ext_dir).unwrap();
+        let sys = System::new(ws);
+
+        let ext_file = ext_dir.join("ref.txt");
+        let ext_file = ext_file.to_str().unwrap();
+        // Read under the read-only root works…
+        assert_eq!(sys.read_file(ext_file).await.unwrap(), "outside data");
+        // …but a write there is rejected — writes stay confined to the primary root.
+        assert!(sys.write_file(ext_file, "nope").await.is_err());
+        // A path outside ALL roots is still rejected, even for reads.
+        assert!(sys.read_file("/etc/passwd").await.is_err());
+
+        std::fs::remove_dir_all(&ws_dir).ok();
+        std::fs::remove_dir_all(&ext_dir).ok();
+    }
+
+    /// `glob`/`grep` over the whole workspace also surface read-root files, as absolute paths that a
+    /// subsequent `read` resolves.
+    #[tokio::test]
+    async fn walk_includes_read_roots_as_absolute() {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let ws_dir = std::env::temp_dir().join(format!("flux-sys-ws2-{}-{n}", std::process::id()));
+        let ext_dir =
+            std::env::temp_dir().join(format!("flux-sys-ext2-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(ext_dir.join("outside.txt"), "out").unwrap();
+
+        let mut ws = Workspace::new(&ws_dir).unwrap();
+        ws.add_read_root(&ext_dir).unwrap();
+        let sys = System::new(ws);
+        sys.write_file("inside.txt", "in").await.unwrap();
+
+        let files = sys.walk_files(".", 1000).await.unwrap();
+        assert!(
+            files.iter().any(|f| f == "inside.txt"),
+            "in-workspace file relative: {files:?}"
+        );
+        let ext_hit = files
+            .iter()
+            .find(|f| f.ends_with("outside.txt"))
+            .expect("read-root file surfaced");
+        assert!(
+            Path::new(ext_hit).is_absolute(),
+            "read-root hit is absolute: {ext_hit}"
+        );
+        // …and it reads back through the same allowed roots.
+        assert_eq!(sys.read_file(ext_hit).await.unwrap(), "out");
+
+        std::fs::remove_dir_all(&ws_dir).ok();
+        std::fs::remove_dir_all(&ext_dir).ok();
+    }
+
+    /// The `--allow-all-paths` hatch: `unconfined` lifts confinement for both read and write.
+    #[tokio::test]
+    async fn unconfined_lifts_the_sandbox() {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let ws_dir = std::env::temp_dir().join(format!("flux-sys-unc-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let mut ws = Workspace::new(&ws_dir).unwrap();
+        // Confined: an absolute outside path is rejected on both paths.
+        assert!(ws.resolve_read("/etc/passwd").is_err());
+        assert!(ws.resolve("/etc/passwd").is_err());
+        ws.set_unconfined(true);
+        // Unconfined: both resolve.
+        assert!(ws.resolve_read("/etc/passwd").is_ok());
+        assert!(ws.resolve("/etc/passwd").is_ok());
+        std::fs::remove_dir_all(&ws_dir).ok();
     }
 
     #[tokio::test]

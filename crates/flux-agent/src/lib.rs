@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use flux_core::Result;
+use flux_core::{render_knowledge_blocks, ContextBlock, Result};
 use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
 use flux_flow::state::FlowStore;
@@ -109,6 +109,9 @@ pub struct Permissions {
     pub deny: Vec<String>,
 }
 
+/// Default byte budget for injected `context` blocks (A-19); overridable per spec.
+pub const DEFAULT_CONTEXT_BUDGET: usize = 8192;
+
 /// A first-class agent definition: model, persona, skills, tool selection, permissions, and the
 /// turn settings — everything that distinguishes one agent from another. Assemble it into a running
 /// [`FlowEngine`] with [`AgentSpec::assemble`] (the simple path) or [`AgentSpec::into_engine`] (when
@@ -133,6 +136,12 @@ pub struct AgentSpec {
     pub compact_threshold_chars: usize,
     /// Workspace root, re-probed each turn for tool-surfacing signals.
     pub cwd: PathBuf,
+    /// Knowledge blocks injected inline into the system prompt as `<knowledge-base>` sections (A-19).
+    /// Empty by default; rendered after `system_prompt`, bounded by `context_budget`. This is the
+    /// "grounded knowledge" path — small KBs handed to the model directly, no retrieval round-trip.
+    pub context: Vec<ContextBlock>,
+    /// Byte budget for rendered `context` (`0` = unbounded). Over-budget blocks truncate with a marker.
+    pub context_budget: usize,
 }
 
 impl Default for AgentSpec {
@@ -148,6 +157,8 @@ impl Default for AgentSpec {
             groups: Vec::new(),
             compact_threshold_chars: 0,
             cwd: PathBuf::from("."),
+            context: Vec::new(),
+            context_budget: DEFAULT_CONTEXT_BUDGET,
         }
     }
 }
@@ -168,6 +179,32 @@ impl AgentSpec {
     pub fn with_default_skills(mut self) -> Self {
         self.skills = flux_skill::discover_merged(&flux_skill::default_skill_dirs(&self.cwd));
         self
+    }
+
+    /// Append a knowledge block injected inline into the system prompt (A-19). Chainable.
+    pub fn with_context(
+        mut self,
+        id: impl Into<String>,
+        title: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Self {
+        self.context.push(ContextBlock::new(id, title, body));
+        self
+    }
+
+    /// The system prompt actually handed to the engine: `system_prompt` followed by the rendered
+    /// `context` blocks (A-19), bounded by `context_budget`. Identical to `system_prompt` when no context
+    /// is set, so the cache-stable prefix (A-03) is untouched for context-free agents.
+    pub fn effective_system_prompt(&self) -> String {
+        if self.context.is_empty() {
+            return self.system_prompt.clone();
+        }
+        let blocks = render_knowledge_blocks(&self.context, self.context_budget);
+        if blocks.is_empty() {
+            self.system_prompt.clone()
+        } else {
+            format!("{}\n\n{}", self.system_prompt, blocks)
+        }
     }
 
     /// Build the standard agent executor for this spec (select the `tools` subset, apply
@@ -202,13 +239,14 @@ impl AgentSpec {
         events: Arc<EventStore>,
         flow: FlowStore,
     ) -> Result<FlowEngine> {
+        let system_prompt = self.effective_system_prompt();
         FlowEngine::assemble(
             provider,
             executor,
             events,
             flow,
             self.model,
-            self.system_prompt,
+            system_prompt,
             self.max_tokens,
             self.max_iterations,
             self.skills,
@@ -277,6 +315,26 @@ mod tests {
         assert_eq!(spec.system_prompt, DEFAULT_SYSTEM_PROMPT);
         assert_eq!(spec.max_iterations, 25);
         assert!(spec.tools.is_none());
+        // A-19: no injected context → the effective prompt is byte-identical (cache-stable).
+        assert_eq!(spec.effective_system_prompt(), DEFAULT_SYSTEM_PROMPT);
+        assert!(spec.context.is_empty());
+    }
+
+    /// A-19: injected context blocks render into the effective system prompt, after the persona.
+    #[test]
+    fn context_blocks_render_into_effective_prompt() {
+        let spec = AgentSpec::new("mock")
+            .with_context("hours", "Opening hours", "Mon–Fri 09:00–18:00 CET.")
+            .with_context("refund", "Refunds", "Refunds take 5–7 business days.");
+        let p = spec.effective_system_prompt();
+        assert!(p.starts_with(DEFAULT_SYSTEM_PROMPT), "persona comes first");
+        assert!(
+            p.contains("<knowledge-base id=\"hours\" title=\"Opening hours\">"),
+            "block rendered: {p}"
+        );
+        assert!(p.contains("Mon–Fri 09:00–18:00 CET."));
+        // order preserved
+        assert!(p.find("hours").unwrap() < p.find("refund").unwrap());
     }
 
     /// L-02: `with_default_skills` discovers from `flux_skill::default_skill_dirs(cwd)` — a skill

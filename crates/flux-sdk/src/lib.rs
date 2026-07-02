@@ -40,6 +40,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use flux_agent::{AgentSpec, Permissions, DEFAULT_SYSTEM_PROMPT};
+use flux_core::ContextBlock;
 use flux_core::{Result, Usage};
 use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
@@ -69,6 +70,7 @@ pub struct ClientBuilder {
     allow: Vec<String>,
     deny: Vec<String>,
     auto_approve: bool,
+    context: Vec<ContextBlock>,
 }
 
 impl Default for ClientBuilder {
@@ -82,6 +84,7 @@ impl Default for ClientBuilder {
             allow: vec!["read".to_string()],
             deny: Vec::new(),
             auto_approve: false,
+            context: Vec::new(),
         }
     }
 }
@@ -122,6 +125,17 @@ impl ClientBuilder {
         self.auto_approve = yes;
         self
     }
+    /// Inject a knowledge block into the agent's system prompt as a `<knowledge-base>` section (A-19):
+    /// grounds the agent on a small KB inline, with no retrieval round-trip. Chainable.
+    pub fn add_context(
+        mut self,
+        id: impl Into<String>,
+        title: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Self {
+        self.context.push(ContextBlock::new(id, title, body));
+        self
+    }
 
     /// Build the client with `provider` and a workspace rooted at `root`. Sessions are in-memory.
     /// The turn runs on [`FlowEngine`] (the model plans, the runtime runs the flux-lang agent loop).
@@ -157,6 +171,7 @@ impl ClientBuilder {
             max_tokens: self.max_tokens,
             max_iterations: self.max_iterations,
             cwd: root,
+            context: self.context,
             ..AgentSpec::default()
         }
         .with_default_skills();

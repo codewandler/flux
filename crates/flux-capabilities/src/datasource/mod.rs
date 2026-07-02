@@ -14,21 +14,34 @@ mod memory;
 mod ops;
 mod semantic;
 mod sqlite;
+mod vector;
 
 #[cfg(feature = "embeddings")]
 mod embeddings;
 
+#[cfg(feature = "local-embeddings")]
+mod embeddings_local;
+
 pub use host_caps::DatasourceHostCaps;
-pub use ingest::{freshness, ingest_markdown, ingest_openapi, reindex};
+pub use ingest::{
+    chunk_text, freshness, ingest_markdown, ingest_openapi, ingest_text, reindex, ChunkOptions,
+};
 pub use memory::MemoryBackend;
 pub use ops::{datasource_tools, register_datasource_ops};
 pub use semantic::SemanticIndex;
 pub use sqlite::SqliteBackend;
+pub use vector::{MemoryVectorStore, VectorAddr, VectorStore};
 
 #[cfg(feature = "embeddings")]
 pub use embeddings::OpenAiEmbedder;
 
-use flux_core::Result;
+#[cfg(feature = "local-embeddings")]
+pub use embeddings_local::FastEmbedEmbedder;
+
+#[cfg(feature = "sqlite-vec")]
+pub use vector::SqliteVecStore;
+
+use flux_core::{ContextBlock, Result};
 use flux_datasource::{
     BatchGetInput, GetInput, ListInput, Match, Record, RelationInput, SearchInput,
 };
@@ -68,4 +81,47 @@ pub trait DatasourceBackend: Send + Sync {
 pub trait Embedder: Send + Sync {
     /// Embed a batch of texts into vectors.
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+}
+
+/// Turn datasource [`Record`]s into injectable [`ContextBlock`]s (story A-19): a consumer that wants to
+/// **inject** a small KB inline into the system prompt (instead of exposing the `search` tool) maps its
+/// records through this and hands the result to [`flux_core::render_knowledge_blocks`]. `source`/`entity`
+/// ride in `meta` so they render as tag attributes.
+pub fn records_to_context_blocks(records: &[Record]) -> Vec<ContextBlock> {
+    records
+        .iter()
+        .map(|r| ContextBlock {
+            id: r.id.clone(),
+            title: r.title.clone(),
+            meta: serde_json::json!({ "source": r.source.key(), "entity": r.entity }),
+            body: r.body.clone(),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+    use flux_datasource::Source;
+
+    #[test]
+    fn records_map_to_blocks_and_render() {
+        let recs = [Record::new(
+            Source::new("local"),
+            "file.document",
+            "hours",
+            "Opening hours",
+            "Mon–Fri 09:00–18:00 CET.",
+        )];
+        let blocks = records_to_context_blocks(&recs);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].id, "hours");
+        let rendered = flux_core::render_knowledge_blocks(&blocks, 0);
+        assert!(rendered.contains("<knowledge-base id=\"hours\" title=\"Opening hours\""));
+        assert!(
+            rendered.contains("source=\"local\""),
+            "source is an attribute: {rendered}"
+        );
+        assert!(rendered.contains("Mon–Fri 09:00–18:00 CET."));
+    }
 }

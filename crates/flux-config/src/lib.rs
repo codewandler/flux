@@ -112,6 +112,25 @@ impl SkillsConfig {
     }
 }
 
+/// The `[workspace]` table — filesystem access widening (C-21).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceConfig {
+    /// Additional **read-only** roots the CLI may read/glob/grep under, beyond the cwd. A leading `~/`
+    /// expands to the home directory; relative paths resolve against the cwd. Writes stay confined to the
+    /// cwd. Mirrors the `--add-dir` flag.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub add_dirs: Vec<String>,
+    /// Lift filesystem confinement entirely (read + write anywhere) — the `--allow-all-paths` hatch.
+    #[serde(default)]
+    pub allow_all: bool,
+}
+
+impl WorkspaceConfig {
+    fn is_default(&self) -> bool {
+        self.add_dirs.is_empty() && !self.allow_all
+    }
+}
+
 /// The merged flux configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -147,6 +166,9 @@ pub struct Config {
     /// Skill-discovery settings (custom skill directories, L-02).
     #[serde(default, skip_serializing_if = "SkillsConfig::is_default")]
     pub skills: SkillsConfig,
+    /// Filesystem access widening (C-21): extra read-only roots + the unconfined hatch.
+    #[serde(default, skip_serializing_if = "WorkspaceConfig::is_default")]
+    pub workspace: WorkspaceConfig,
 }
 
 /// The default A2A session TTL (seconds) when `[server] a2a_session_ttl_secs` is absent: 1 hour.
@@ -256,6 +278,25 @@ impl Config {
             })
             .collect()
     }
+
+    /// The configured extra read-only roots as paths (C-21), with a leading `~/` expanded. Relative
+    /// paths are left relative (resolved against the cwd by the caller).
+    pub fn workspace_add_dirs(&self) -> Vec<PathBuf> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        self.workspace
+            .add_dirs
+            .iter()
+            .map(|d| match (d.strip_prefix("~/"), &home) {
+                (Some(rest), Some(h)) => h.join(rest),
+                _ => PathBuf::from(d),
+            })
+            .collect()
+    }
+
+    /// Whether the config lifts filesystem confinement entirely (C-21).
+    pub fn workspace_allow_all(&self) -> bool {
+        self.workspace.allow_all
+    }
 }
 
 fn home_config_path() -> Option<PathBuf> {
@@ -331,6 +372,11 @@ fn merge(user: Config, project: Config) -> Config {
         // order carries no meaning.
         skills: SkillsConfig {
             dirs: dedupe([project.skills.dirs, user.skills.dirs].concat()),
+        },
+        // Extra read-only roots concatenate (project first); the unconfined hatch is true if either sets it.
+        workspace: WorkspaceConfig {
+            add_dirs: dedupe([project.workspace.add_dirs, user.workspace.add_dirs].concat()),
+            allow_all: user.workspace.allow_all || project.workspace.allow_all,
         },
     }
 }
@@ -817,6 +863,41 @@ gitlab = ["gitlab.internal"]
             home.join("global-skills"),
             "~/ expands against HOME"
         );
+
+        std::fs::remove_dir_all(&project).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// C-21: `[workspace]` add_dirs merge (project first), `allow_all` OR-merges, `~/` expands.
+    #[test]
+    fn workspace_add_dirs_merge_and_allow_all() {
+        let project = temp_dir();
+        let home = temp_dir();
+        let _home = crate::HOME_LOCK.lock().unwrap();
+        std::env::set_var("HOME", &home);
+        std::fs::write(
+            home.join(".flux").join("config.toml"),
+            "[workspace]\nadd_dirs = [\"~/refs\"]\n",
+        )
+        .unwrap();
+        write_project(
+            &project,
+            "[workspace]\nadd_dirs = [\"/data/shared\"]\nallow_all = true\n",
+        );
+
+        let cfg = load(&project).unwrap();
+        assert_eq!(
+            cfg.workspace.add_dirs,
+            vec!["/data/shared", "~/refs"],
+            "project dirs first, de-duplicated"
+        );
+        assert!(
+            cfg.workspace_allow_all(),
+            "allow_all is true if either sets it"
+        );
+        let paths = cfg.workspace_add_dirs();
+        assert_eq!(paths[0], PathBuf::from("/data/shared"));
+        assert_eq!(paths[1], home.join("refs"), "~/ expands against HOME");
 
         std::fs::remove_dir_all(&project).ok();
         std::fs::remove_dir_all(&home).ok();

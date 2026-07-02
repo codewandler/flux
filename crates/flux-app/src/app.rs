@@ -296,7 +296,7 @@ impl Engine {
         // spawns always resolve paths against the identical workspace root (never two independent
         // `System`s from separate `current_dir()` calls).
         let system = Arc::new(System::new(
-            Workspace::new(std::env::current_dir().unwrap_or_else(|_| ".".into()))
+            Workspace::from_env(std::env::current_dir().unwrap_or_else(|_| ".".into()))
                 .expect("flux-app: workspace"),
         ));
         // `new_cyclic`: the `spawn` op needs a back-reference to the engine it re-enters, but the
@@ -829,6 +829,17 @@ async fn agent_spec_from_decl(
     } else {
         parts.join("\n\n")
     };
+    // Inline knowledge blocks declared in `settings.context` (A-19) — injected into the system prompt as
+    // `<knowledge-base>` sections. A non-list or malformed entry is a clean error.
+    let context: Vec<flux_core::ContextBlock> = match decl.settings.get("context") {
+        Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+            Error::Other(format!(
+                "agent `{}`: settings.context must be a list of {{id,title,body}} blocks: {e}",
+                decl.name
+            ))
+        })?,
+        None => Vec::new(),
+    };
     Ok(AgentSpec {
         model: decl
             .model
@@ -841,6 +852,7 @@ async fn agent_spec_from_decl(
             deny: Vec::new(),
         },
         cwd,
+        context,
         ..AgentSpec::default()
     })
 }
@@ -857,7 +869,7 @@ async fn build_agent_engine(
     redactor: Redactor,
 ) -> Result<FlowEngine> {
     let root = std::env::current_dir().map_err(other)?;
-    let workspace = Workspace::new(&root).map_err(other)?;
+    let workspace = Workspace::from_env(&root).map_err(other)?;
     let system = Arc::new(System::new(workspace));
     // Build the spec (which may read persona files through the guarded `system`) before moving the
     // `system` into the tool context.
@@ -1132,6 +1144,49 @@ trigger t1
             vec!["read".to_string(), "now".to_string()]
         );
         assert!(spec.permissions.deny.is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_spec_injects_inline_context_blocks() {
+        // A-19: `settings.context` blocks are injected into the effective system prompt as
+        // <knowledge-base> sections (grounded-knowledge epic).
+        let decl = AgentDecl {
+            name: "a".into(),
+            model: None,
+            tools: vec![],
+            datasources: vec![],
+            description: Some("be terse".into()),
+            settings: json!({
+                "context": [
+                    { "id": "hours", "title": "Opening hours", "body": "Mon–Fri 09:00–18:00 CET." }
+                ]
+            }),
+        };
+        let system = System::new(Workspace::new(".").unwrap());
+        let spec = agent_spec_from_decl(&decl, "m", PathBuf::from("."), &system)
+            .await
+            .unwrap();
+        assert_eq!(spec.context.len(), 1);
+        let prompt = spec.effective_system_prompt();
+        assert!(prompt.contains("be terse"), "persona kept: {prompt}");
+        assert!(
+            prompt.contains("<knowledge-base id=\"hours\" title=\"Opening hours\">"),
+            "context injected: {prompt}"
+        );
+        assert!(prompt.contains("Mon–Fri 09:00–18:00 CET."));
+
+        // A malformed context (not a list of blocks) is a clean, attributed error.
+        let bad = AgentDecl {
+            name: "b".into(),
+            settings: json!({ "context": "nope" }),
+            ..decl.clone()
+        };
+        assert!(
+            agent_spec_from_decl(&bad, "m", PathBuf::from("."), &system)
+                .await
+                .is_err(),
+            "a non-list context is an error"
+        );
     }
 
     #[tokio::test]

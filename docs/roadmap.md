@@ -143,6 +143,22 @@ both are needed for the "check db connectivity" path to be trustworthy:
   ambiguous with the newest-namespace heuristic. Provider alias resolution + broker query-parsing +
   disambiguating `latest`.
 
+### Grounded knowledge (epic)
+
+flux's datasource layer (D-07) delivers knowledge to a model **only** as retrieval **tool calls** — there
+is no way to hand a small KB to the model *inline*, and a bare agent (empty system prompt) is ungoverned
+(the incident: a customer's empty voice agent free-associated about babelforce from the base model's own
+training). This epic adds the two reusable primitives a grounded-knowledge product needs, keeping retrieval
+tool-based and unchanged: **[A-19](stories/A-19-context-block-injection.md)** — `add_context`, an
+`AgentSpec.context` rendered into the system prompt as byte-budgeted `<knowledge-base id=… title=…>` blocks
+(the greenfield inject seam); **[D-50](stories/D-50-text-file-chunking-ingester.md)** — a raw-text/file
+chunking ingester so pasted text and uploaded text files become chunked `file.document` records; and
+**[D-51](stories/D-51-local-embeddings-vector-store.md)** — per-KB, opt-in semantic search via an
+in-process fastembed CPU embedder + a generic `VectorStore` seam backed by `sqlite-vec` co-located in the
+same SQLite file (no external DB), turning on the existing `SemanticIndex`/`SqliteBackend` scaffolding.
+Epic design: [grounded-knowledge.md](designs/grounded-knowledge.md). Consumer: the babelforce ai-agents
+service (`knowledge-sources-v2` + `integrations` epics). Order: A-19 ∥ D-50 → D-51.
+
 ### Multi-pass agent loop (epic)
 
 The turn loop one-shots a plan per iteration: the plan must be right on the first try, the user

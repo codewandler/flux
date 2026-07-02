@@ -7,6 +7,7 @@
 
 mod audio;
 mod content;
+mod context;
 mod error;
 mod event;
 mod message;
@@ -15,6 +16,7 @@ mod stream;
 
 pub use audio::{AudioEncoding, AudioFormat};
 pub use content::{ContentBlock, ImageSource, Role, ToolResultContent};
+pub use context::{render_knowledge_blocks, ContextBlock};
 pub use error::{Error, Result};
 pub use event::Event;
 pub use message::Message;

@@ -62,6 +62,17 @@ struct Cli {
     /// When to colorize output: auto (a terminal, `NO_COLOR` unset), always, or never.
     #[arg(long, value_enum, default_value_t, global = true)]
     color: style::ColorChoice,
+
+    /// Grant READ access to an additional directory outside the workspace (repeatable). Reads, `glob`,
+    /// and `grep` may reach under it; writes stay confined to the current directory. Layers over
+    /// `[workspace] add_dirs` in .flux/config.toml (exported as `FLUX_ADD_DIRS` so `app run` inherits it).
+    #[arg(long = "add-dir", value_name = "DIR", global = true)]
+    add_dir: Vec<std::path::PathBuf>,
+
+    /// Lift the filesystem sandbox entirely — read AND write anywhere on disk. Dangerous; prints a
+    /// warning. Prefer `--add-dir` for read-only access to specific directories.
+    #[arg(long = "allow-all-paths", global = true)]
+    allow_all_paths: bool,
 }
 
 /// The flags for running an agent turn — flattened into each agent-path subcommand (`run`, `plan`,
@@ -1396,7 +1407,7 @@ async fn build_agent_with(
             (Box::new(native), m, canonical_spec)
         };
 
-    let mut workspace = Workspace::new(&cwd).context("workspace")?;
+    let mut workspace = Workspace::from_env(&cwd).context("workspace")?;
     if let Some(home) = std::env::var_os("HOME") {
         let global_ops = std::path::PathBuf::from(home).join(".flux").join("ops");
         std::fs::create_dir_all(&global_ops)
@@ -4292,6 +4303,54 @@ fn parse_choice(line: &str, always: ApprovalChoice) -> ApprovalChoice {
     }
 }
 
+/// Export the C-21 filesystem-access policy to `FLUX_ADD_DIRS` / `FLUX_ALLOW_ALL` from the CLI flags +
+/// `[workspace]` config, so `Workspace::from_env` (used at every production construction site) picks it
+/// up. Sources are **additive**: `--add-dir` flags, `[workspace] add_dirs`, and any pre-set `FLUX_ADD_DIRS`
+/// all contribute; `--allow-all-paths`, `[workspace] allow_all`, or `FLUX_ALLOW_ALL` each enable the hatch.
+fn apply_workspace_access_env(cli: &Cli) {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let cfg = flux_config::load(&cwd).unwrap_or_default();
+    // Absolutize each dir against the cwd so downstream canonicalization is stable regardless of cwd.
+    let abs = |p: &std::path::Path| -> String {
+        let full = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
+        };
+        full.to_string_lossy().into_owned()
+    };
+    let mut dirs: Vec<String> = Vec::new();
+    if let Ok(existing) = std::env::var("FLUX_ADD_DIRS") {
+        dirs.extend(
+            existing
+                .split(':')
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+        );
+    }
+    dirs.extend(cli.add_dir.iter().map(|p| abs(p)));
+    dirs.extend(cfg.workspace_add_dirs().iter().map(|p| abs(p)));
+    dirs.sort();
+    dirs.dedup();
+    if !dirs.is_empty() {
+        std::env::set_var("FLUX_ADD_DIRS", dirs.join(":"));
+    }
+
+    let allow_all = cli.allow_all_paths
+        || cfg.workspace_allow_all()
+        || std::env::var("FLUX_ALLOW_ALL")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+    if allow_all {
+        std::env::set_var("FLUX_ALLOW_ALL", "1");
+        eprintln!(
+            "{} filesystem sandbox disabled (--allow-all-paths): the agent can read AND write anywhere \
+             on disk",
+            style::red("warning:")
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // With the `slack` feature the dependency tree pulls rustls with BOTH crypto providers
@@ -4312,6 +4371,10 @@ async fn main() -> Result<()> {
     // subcommands (`run`/`plan`/`tui`/`serve`). With no subcommand, `flux` opens the REPL.
     let cli = Cli::parse();
     style::init(cli.color);
+    // C-21: export the filesystem-access policy (extra read-only roots + the unconfined hatch) to the
+    // environment so every workspace — including `app run` and subprocess paths — inherits it via
+    // `Workspace::from_env`.
+    apply_workspace_access_env(&cli);
 
     let run = async {
         match cli.command {
@@ -4570,7 +4633,7 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
     // journeys can drive — the D-09 registry wiring. A guarded `System` rooted at the cwd backs both.
     let cwd = std::env::current_dir()?;
     let system = Arc::new(System::new(
-        Workspace::new(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?,
+        Workspace::from_env(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?,
     ));
     // Scoped SSRF egress opt-in, off by default. Program-serving plugin hosts use per-plugin grants;
     // a missing or unreadable config keeps the safe default.
@@ -4990,7 +5053,7 @@ async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> R
             let cwd = std::env::current_dir()?;
             let cfg = flux_config::load(&cwd).unwrap_or_default();
             let system = Arc::new(System::new(
-                Workspace::new(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?,
+                Workspace::from_env(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?,
             ));
             let backend: Arc<dyn flux_capabilities::DatasourceBackend> =
                 Arc::new(flux_capabilities::MemoryBackend::new());
@@ -5206,8 +5269,9 @@ async fn plugin_status_all(dir: &std::path::Path) -> Result<Vec<PluginStatusRepo
 async fn spawn_and_load_manifest(
     d: &flux_plugin::PluginDescriptor,
 ) -> Result<flux_plugin::PluginManifest> {
-    let system =
-        System::new(Workspace::new(&std::env::current_dir()?).map_err(|e| anyhow::anyhow!("{e}"))?);
+    let system = System::new(
+        Workspace::from_env(&std::env::current_dir()?).map_err(|e| anyhow::anyhow!("{e}"))?,
+    );
     let mut host = flux_plugin::PluginHost::spawn(&system, &d.program, &d.args)
         .await
         .with_context(|| format!("spawn `{}`", d.program))?;
@@ -5621,8 +5685,9 @@ async fn load_plugin_manifests(
 ) -> Result<Vec<(String, flux_plugin::PluginManifest)>> {
     let mut plugins: Vec<(String, flux_plugin::PluginManifest)> = Vec::new();
     // Plugins launch through the one guarded spawn path, which needs a workspace-rooted System.
-    let system =
-        System::new(Workspace::new(&std::env::current_dir()?).map_err(|e| anyhow::anyhow!("{e}"))?);
+    let system = System::new(
+        Workspace::from_env(&std::env::current_dir()?).map_err(|e| anyhow::anyhow!("{e}"))?,
+    );
     for p in flux_plugin::discover(dir) {
         match flux_plugin::PluginHost::spawn(&system, &p.descriptor.program, &p.descriptor.args)
             .await
