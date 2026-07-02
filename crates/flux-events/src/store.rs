@@ -697,7 +697,10 @@ impl EventStore {
                 entry.1 += row.calls;
             }
         }
-        Ok(per_model
+        // Re-merge after the cross-stream fold (C-15): one stream may carry only the legacy bare
+        // key while another carries the canonical prefixed one — the per-stream merge can't see
+        // across streams, so without this the all-sessions report still splits one backend.
+        Ok(projection::merge_legacy_keys(per_model)
             .into_iter()
             .map(|(model, (usage, calls))| {
                 let cost = pricing.cost(&usage, &model);

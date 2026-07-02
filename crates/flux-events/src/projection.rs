@@ -332,7 +332,9 @@ pub fn cost_summary(events: &[StoredEvent], pricing: &PricingTable) -> Vec<Model
 /// - a BARE key merges into a provider-prefixed row iff exactly ONE prefixed row shares its
 ///   canonical model id — with two candidate providers the bare row stays separate (they may
 ///   bill differently; never guess).
-fn merge_legacy_keys(per_model: BTreeMap<String, (Usage, u64)>) -> BTreeMap<String, (Usage, u64)> {
+pub(crate) fn merge_legacy_keys(
+    per_model: BTreeMap<String, (Usage, u64)>,
+) -> BTreeMap<String, (Usage, u64)> {
     use flux_core::canonical_model_parts;
     // Pass 1: canonicalize each key in place (same-provider variants collapse here).
     let mut canon: BTreeMap<(Option<String>, String), (Usage, u64)> = BTreeMap::new();
