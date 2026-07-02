@@ -129,6 +129,33 @@ impl<'a> OpRegistry<'a> {
         out
     }
 
+    /// The ops a plan calls that carry a write or destructive effect — the enforcement side of
+    /// gather-plan read-only validation (A-13: a `gather: true` plan must call none of these). A
+    /// composite call counts via its OWN declared `risk`/`effects` ([`get`](Self::get) resolves it
+    /// to [`composite_signature`]), which [`analyze_composites`] validates at registration time to
+    /// already cover the composite's body transitively — so no separate expansion is needed here to
+    /// catch a write hidden a level down inside a composite. Unknown names are not reported here
+    /// (`analyze_flow`'s unknown-operation diagnostic owns those). Empty means the plan is
+    /// effect-clean.
+    pub fn mutating_ops_in(&self, body: &[Node]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for_each_node(body, &mut |node| {
+            if let Node::Call { op, .. } = node {
+                if out.contains(op) {
+                    return;
+                }
+                if let Some(sig) = self.get(op) {
+                    let mutates =
+                        sig.risk == Risk::Destructive || sig.effects.contains(&Effect::Write);
+                    if mutates {
+                        out.push(op.clone());
+                    }
+                }
+            }
+        });
+        out
+    }
+
     /// The signature of one operation, if registered. Not filtered by surfacing — resolution must
     /// succeed for any registered op a flow names.
     pub fn get(&self, name: &str) -> Option<OpSignature> {

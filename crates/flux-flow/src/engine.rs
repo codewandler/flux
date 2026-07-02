@@ -28,7 +28,7 @@ use flux_provider::{Provider, Request};
 use flux_runtime::Executor;
 
 use crate::ast::DraftAst;
-use crate::compile::{compile_turn, CompileOptions, TurnOutput};
+use crate::compile::{compile_turn, CompileOptions, Phase, TurnOutput};
 use crate::composites::DynamicComposites;
 use crate::registry::OpRegistry;
 use crate::runtime::{execute_flow, resume_flow_with_composites};
@@ -315,6 +315,8 @@ impl FlowEngine {
             max_tokens: self.max_tokens,
             ..CompileOptions::default()
         };
+        // A-13: phased compile_turn — this compile-only surface sticks to the execute/default
+        // phase for now (A-14 threads orient/gather through the real loop host).
         let (out, _usage) = compile_turn(
             &*self.provider,
             &self.model,
@@ -325,6 +327,7 @@ impl FlowEngine {
             ask,
             None,
             opts,
+            Phase::Execute,
         )
         .await?;
         Ok(out)
@@ -361,6 +364,8 @@ impl FlowEngine {
         // borrows `sink`, so scope it in a block: its drop at the block's end releases the borrow
         // before we touch `sink` again. `None` => cancelled.
         let out = {
+            // A-13: the REPL `/plan` toggle is unchanged in MVP (design Part 1) — execute/default
+            // phase; A-18 brings gather to plan mode later.
             let fut = compile_turn(
                 &*self.provider,
                 &self.model,
@@ -371,6 +376,7 @@ impl FlowEngine {
                 None,
                 Some(sink),
                 opts,
+                Phase::Execute,
             );
             tokio::pin!(fut);
             tokio::select! {
@@ -1078,6 +1084,24 @@ mod tests {
         ]
     }
 
+    /// One model turn that emits a bounded read-only `gather: true` plan (A-14) carrying `ast`.
+    fn emit_gather_plan(ast: serde_json::Value) -> Vec<Chunk> {
+        vec![
+            Chunk::Block(ContentBlock::ToolUse {
+                id: "p1".into(),
+                name: "emit_plan".into(),
+                input: json!({
+                    "ast": ast,
+                    "gather": true,
+                    "brief": { "goal": "investigate", "needs": ["context"] },
+                }),
+            }),
+            Chunk::Done {
+                stop_reason: Some(StopReason::ToolUse),
+            },
+        ]
+    }
+
     /// One model turn that answers in prose (a chat turn).
     fn prose(text: &str) -> Vec<Chunk> {
         vec![
@@ -1730,6 +1754,48 @@ mod tests {
             attempts[0].plan_text
         );
         assert_eq!(attempts.last().unwrap().outcome, "chat");
+    }
+
+    /// A-14: `PlanAttempt` is stamped with the phase that produced it, so the audit trail can tell
+    /// the orient call, the gather round(s), and the execute-phase rounds apart (C-15 wants to
+    /// report gather/revise rounds per turn from exactly this field).
+    #[tokio::test]
+    async fn plan_attempts_are_phase_stamped_across_the_multipass_loop() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let gather_ast = json!({ "body": [{
+            "kind": "bind", "name": "g",
+            "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "GATHER" }] }
+        }]});
+        let final_ast = json!({ "body": [{
+            "kind": "bind", "name": "f",
+            "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "FINAL" }] }
+        }]});
+        let responses = VecDeque::from(vec![
+            emit_gather_plan(gather_ast),
+            emit_plan(final_ast),
+            prose("done"),
+        ]);
+        let engine = engine_with(responses, store.clone());
+        let mut sink = CollectSink::default();
+        engine
+            .run_turn(&sid, "investigate then fix", &mut sink)
+            .await
+            .unwrap();
+
+        let turns = store.turns(&sid).unwrap();
+        assert_eq!(turns.len(), 1);
+        let attempts = &turns[0].plan_attempts;
+        let phases: Vec<Option<String>> = attempts.iter().map(|a| a.phase.clone()).collect();
+        assert_eq!(
+            phases,
+            vec![
+                Some("orient".to_string()),
+                Some("gather".to_string()),
+                Some("execute".to_string()),
+            ],
+            "{attempts:?}"
+        );
     }
 
     /// C-14: the `groups.active` observation carries the workspace signals that justified the

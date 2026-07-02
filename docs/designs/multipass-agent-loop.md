@@ -1,6 +1,7 @@
 # Design: multi-pass agent loop — orient → gather → plan/execute/revise, with patch-and-continue
 
-**Status:** proposed (2026-07-02) · **Pillar:** Agent (loop shape, UX) + Language (runtime ledger) ·
+**Status:** MVP implemented (2026-07-02 — A-12–A-17 + L-22 shipped, full gate green; I-03
+measurement pending) · **Pillar:** Agent (loop shape, UX) + Language (runtime ledger) ·
 **Stories:** [A-12](../stories/A-12-unsilence-planning-wait.md) ·
 [A-13](../stories/A-13-phase-aware-planner-protocol.md) ·
 [A-14](../stories/A-14-multipass-agent-loop.md) ·

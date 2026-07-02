@@ -148,6 +148,16 @@ impl flux_lang::store::DurableStore for FlowStore {
     }
 }
 
+/// The open halt latch [`FlowStore::open_halted_plan`] returns: the unresumed halt event alongside
+/// the ledger a resumed `run_plan` fast-forwards against (design `multipass-agent-loop.md` Part 2).
+#[derive(Debug, Clone)]
+pub struct OpenHalt {
+    /// The failed statement's identity, classification, and message.
+    pub halt: flux_lang::runtime::PlanHalt,
+    /// The completed-statement memory to resume against.
+    pub ledger: flux_lang::runtime::ResumeLedger,
+}
+
 /// flux-flow's own SQLite store for values, symbols, and the suspension latch. Run-event traces are
 /// forwarded to the shared [`EventStore`] rather than stored here.
 pub struct FlowStore {
@@ -338,6 +348,48 @@ impl FlowStore {
     /// Load the run-event trace for a session (projected from the unified event log).
     pub fn events(&self, session_id: &str) -> Result<Vec<RunEvent>> {
         self.events.run_trace(session_id)
+    }
+
+    /// The session's open **halt latch** (design `multipass-agent-loop.md` Part 2): the last
+    /// unresumed [`RunEvent::PlanHalted`] plus the [`flux_lang::runtime::ResumeLedger`]
+    /// `execute_flow_resumable` fast-forwards against. `None` when the session never halted, the
+    /// halt was already consumed by a later `PlanResumed`, or a crash left a `StatementCompleted`
+    /// trail with no closing `PlanHalted` (conservative — the next run starts fresh rather than
+    /// guessing at a latch that was never durably recorded).
+    ///
+    /// Folded fresh from the run-event log on every call — the `once_lookup`/`checkpoint_resume`
+    /// house pattern above, delegating the ledger half to [`flux_lang::runtime::ResumeLedger::fold`]
+    /// so the one fold algorithm isn't duplicated. No new SQLite table, so this is crash-tolerant and
+    /// cross-process by construction: any `FlowStore` opened over the same `events.db` sees the same
+    /// latch.
+    pub fn open_halted_plan(&self, session_id: &str) -> Result<Option<OpenHalt>> {
+        let events = self.events(session_id)?;
+        let Some(ledger) = flux_lang::runtime::ResumeLedger::fold(&events) else {
+            return Ok(None);
+        };
+        // The halt event itself (kind/node/stmt/op/message) — `ResumeLedger::fold` already proves
+        // `ledger.prior_plan` is the one open (unresumed) plan key, so the matching `PlanHalted` is
+        // the halt latch's own record. Reconstructed here (rather than threaded out of `fold`) to
+        // keep that fold's return type focused on the ledger it was designed for.
+        let halt = events.iter().rev().find_map(|e| match e {
+            RunEvent::PlanHalted {
+                plan,
+                node,
+                stmt,
+                op,
+                kind,
+                error,
+            } if *plan == ledger.prior_plan => Some(flux_lang::runtime::PlanHalt {
+                node: *node,
+                stmt: stmt.clone(),
+                op: op.clone(),
+                kind: *kind,
+                message: error.clone(),
+                plan: plan.clone(),
+            }),
+            _ => None,
+        });
+        Ok(halt.map(|halt| OpenHalt { halt, ledger }))
     }
 
     /// The persisted conversation for a session — the `user → assistant` message log projected from the

@@ -78,6 +78,15 @@ pub fn render_styled(ast: &DraftAst, p: &Palette) -> String {
     out
 }
 
+/// One top-level statement's one-line summary — the same head [`render_styled`] shows for each node
+/// in its tree, made available standalone (it does not recurse into children) so a host can prefix it
+/// with a ✓ (completed) / ✗ (failed) / · (not yet run) marker when rendering a halted or resumed plan
+/// (the resumable-mode feedback contract in `docs/designs/multipass-agent-loop.md` Part 2, wired by
+/// A-16/A-17). Pass [`Palette::PLAIN`] for plain text or a colored palette for a terminal surface.
+pub fn render_statement(node: &Node, p: &Palette) -> String {
+    head(node, p)
+}
+
 /// A child in the render tree: a real node, the `else` arm of a `when` (whose children are the
 /// otherwise-nodes), or a labeled group (a `parallel` branch: the `$name:` header over its body).
 enum Branch<'a> {
@@ -587,6 +596,26 @@ fn type_str(t: &TypeRef) -> String {
 mod tests {
     use super::*;
     use crate::ast::SymbolName;
+
+    #[test]
+    fn render_statement_renders_one_marker_ready_line() {
+        // Same one-line summary the tree renderer shows for this node, standalone — what a host
+        // prefixes with a ✓/✗/· marker (L-22: `docs/designs/multipass-agent-loop.md` Part 2).
+        let node = Node::Bind {
+            name: SymbolName("readme".into()),
+            value: Box::new(Node::Call {
+                op: "read".into(),
+                args: vec![Node::Lit {
+                    value: serde_json::json!("README.md"),
+                }],
+            }),
+            ty: None,
+            effect: None,
+        };
+        let line = render_statement(&node, &Palette::PLAIN);
+        assert_eq!(line, "$readme = read(\"README.md\")");
+        assert!(!line.contains('\n'), "a marker prefix needs a single line");
+    }
 
     #[test]
     fn renders_a_flow_tree() {

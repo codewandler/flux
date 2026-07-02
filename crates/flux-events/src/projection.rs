@@ -57,6 +57,9 @@ pub struct PlanAttempt {
     /// The human-auditable rendered plan graph (`render_pretty`, capped) — the durable "a turn is a
     /// readable graph" record. `None` for non-plan outcomes and pre-C-14 logs.
     pub plan_text: Option<String>,
+    /// The multi-pass loop phase (A-14) that produced this attempt — `"orient"`, `"gather"`, or
+    /// `"execute"`. `None` for pre-A-14 logs and attempts recorded outside a phase-aware call.
+    pub phase: Option<String>,
 }
 
 /// A turn's telemetry, folded from its `TurnStarted` / `PlanAttempted` / `TurnEnded`
@@ -113,6 +116,7 @@ pub fn turns(events: &[StoredEvent]) -> Vec<TurnSummary> {
                 error,
                 fingerprint,
                 plan_text,
+                phase,
             } => {
                 if let Some(t) = e.turn_id.and_then(|tid| by_turn.get_mut(&tid)) {
                     t.plan_attempts.push(PlanAttempt {
@@ -121,6 +125,7 @@ pub fn turns(events: &[StoredEvent]) -> Vec<TurnSummary> {
                         error: error.clone(),
                         fingerprint: fingerprint.clone(),
                         plan_text: plan_text.clone(),
+                        phase: phase.clone(),
                     });
                 }
             }
@@ -523,6 +528,7 @@ mod tests {
                     error: Some("boom".into()),
                     fingerprint: None,
                     plan_text: None,
+                    phase: None,
                 },
             ),
             ev(
@@ -535,6 +541,7 @@ mod tests {
                     error: None,
                     fingerprint: Some("abc123".into()),
                     plan_text: Some("$x = read(\"a\")".into()),
+                    phase: Some("execute".into()),
                 },
             ),
             ev(
@@ -564,6 +571,15 @@ mod tests {
         assert_eq!(t.plan_attempts.len(), 2);
         assert_eq!(t.plan_attempts[0].outcome, "compile_error");
         assert_eq!(t.plan_attempts[0].error.as_deref(), Some("boom"));
+        assert_eq!(
+            t.plan_attempts[0].phase, None,
+            "pre-A-14 attempts decode with no phase"
+        );
+        assert_eq!(
+            t.plan_attempts[1].phase.as_deref(),
+            Some("execute"),
+            "phase folds through"
+        );
         assert!(t.ended_at_ms.is_some());
         assert_eq!(t.usage.as_ref().map(|u| u.total()), Some(120));
     }

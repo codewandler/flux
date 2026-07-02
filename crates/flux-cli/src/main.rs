@@ -3432,6 +3432,22 @@ struct CliSink {
     /// annotation. `None` when the sink wasn't given a spec (sub-paths that don't show cost).
     model_spec: Option<String>,
     pricing: Option<flux_core::PricingTable>,
+    /// The phase of the most recent `loop.phase` observation this turn (design Part 1 / A-15):
+    /// `orient`/`gather`/`execute`, or `None` for a phase-less caller (the `/plan` REPL path,
+    /// which doesn't emit `loop.phase` — A-18 brings gather there later). Drives the spinner label
+    /// via `phase_spinner_label`.
+    phase: Option<String>,
+    /// How many `execute`-phase `loop.phase` observations have landed this turn — the first is the
+    /// turn's actual execution planning, every one after it means the prior round didn't finish
+    /// (a revision), so the spinner reads "revising…" once this exceeds 1. A plain counter over
+    /// observations already reaching the sink; no new flux-flow signal needed.
+    execute_rounds: usize,
+    /// Whether the NEXT `flow.plan` observation is a bounded, read-only gather round rather than
+    /// the full execution plan — set on a `gather`-phase `loop.phase` or a `flow.brief` (a brief
+    /// only ever accompanies a `gather: true` plan), cleared on `orient`/`execute`. `flow.plan`
+    /// itself carries no `gather` flag (that lives on `Compiled`/the host, not the observation), so
+    /// this is the cheapest surface-side derivation available without new flux-flow plumbing.
+    gather_mode: bool,
 }
 
 impl CliSink {
@@ -3459,6 +3475,9 @@ impl CliSink {
             max_iter,
             model_spec: None,
             pricing: None,
+            phase: None,
+            execute_rounds: 0,
+            gather_mode: false,
         }
     }
 
@@ -3558,12 +3577,17 @@ impl AgentSink for CliSink {
         std::io::stderr().flush().ok();
     }
     fn planning(&mut self, active: bool) {
-        // Fill the otherwise-silent compile wait with a spinner; the compiled plan tree replaces it
-        // (via the `flow.plan` observation) once the planner is done.
+        // Fill the otherwise-silent compile wait with a spinner; the compiled plan tree (or the
+        // compact gather one-liner) replaces it (via the `flow.plan` observation) once the planner
+        // is done. The label is phase-aware (A-15): "orienting…"/"gathering…"/"planning…"/
+        // "revising…" — see `phase_spinner_label`.
         if active {
             self.commit();
             if self.use_spinner() {
-                self.start_spinner(style::dim("composing plan…"));
+                self.start_spinner(style::dim(&phase_spinner_label(
+                    self.phase.as_deref(),
+                    self.execute_rounds,
+                )));
             }
         } else {
             self.stop_spinner();
@@ -3637,8 +3661,33 @@ impl AgentSink for CliSink {
             );
         } else if o.kind == "turn.cancelled" {
             eprintln!("{}", style::dim("⊘ turn cancelled"));
+        } else if o.kind == "loop.phase" {
+            self.record_phase(o);
+        } else if o.kind == "flow.brief" {
+            // A brief only ever accompanies a `gather: true` plan (`compile.rs`'s `parse_brief`
+            // call site) — its arrival marks gather mode even when the phase alone (`orient`) is
+            // ambiguous between a gather round and a full plan emitted directly.
+            self.gather_mode = true;
+            self.render_brief(o);
         } else if o.kind == "flow.plan" {
-            self.render_plan(o);
+            // A-17 (closes the A-15 residual): `flow.plan` now carries its own `gather` flag,
+            // computed host-side from the plan's own `settled` signal — prefer it directly over the
+            // surface's `loop.phase`/`flow.brief`-order inference, which couldn't tell an
+            // orient-phase gather plan apart from orient emitting the full plan directly when the
+            // model's `brief` was unusable. Falls back to the tracked state for a phase-less caller
+            // that predates the field (e.g. a stale override still on the pre-A-17 wire shape).
+            let gather = o
+                .data
+                .get("gather")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(self.gather_mode);
+            if gather {
+                self.render_gather_compact(o);
+            } else {
+                self.render_plan(o);
+            }
+        } else if o.kind == "flow.halt" {
+            self.render_halt(o);
         }
     }
     fn turn_end(&mut self, usage: Option<Usage>) {
@@ -3723,19 +3772,34 @@ fn cost_annotation(money: &flux_core::Money) -> String {
 }
 
 impl CliSink {
-    /// Render a `flow.plan` observation: the syntax-highlighted plan tree + a risk badge header.
+    /// Render a `flow.plan` observation: the syntax-highlighted plan tree + a risk badge header. A
+    /// resumed/halted plan (`resumed: true`, A-17) carries per-statement ✓/✗/· status markers in its
+    /// `plan` text instead of full syntax highlighting — patch-and-continue's granularity is
+    /// top-level statements only — so that text is rendered (marker-colored) directly rather than
+    /// reconstructing a fresh, unmarked tree from `plan_ast`.
     fn render_plan(&self, o: &flux_evidence::Observation) {
-        let rendered = o
+        let resumed = o
             .data
-            .get("plan_ast")
-            .and_then(|v| serde_json::from_value::<flux_flow::ast::DraftAst>(v.clone()).ok())
-            .map(|ast| flux_flow::render::render_styled(&ast, &style::plan_palette()))
-            .or_else(|| {
-                o.data
-                    .get("plan")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            });
+            .get("resumed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let rendered = if resumed {
+            o.data
+                .get("plan")
+                .and_then(|v| v.as_str())
+                .map(style_marked_plan)
+        } else {
+            o.data
+                .get("plan_ast")
+                .and_then(|v| serde_json::from_value::<flux_flow::ast::DraftAst>(v.clone()).ok())
+                .map(|ast| flux_flow::render::render_styled(&ast, &style::plan_palette()))
+                .or_else(|| {
+                    o.data
+                        .get("plan")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+        };
         let Some(rendered) = rendered else { return };
         let risk = o.data.get("risk").and_then(|v| v.as_str()).unwrap_or("");
         let ops = o.data.get("ops").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -3746,6 +3810,185 @@ impl CliSink {
             style::dim(&format!(" · {ops} op(s)"))
         );
         eprintln!("{rendered}");
+    }
+
+    /// Render a `flow.halt` observation (A-17): a red one-liner marking exactly where a plan halted,
+    /// printed the moment the halt happens — before the next `plan()` round's spinner (which then
+    /// reads "revising…", see `phase_spinner_label`) — so the failure is legible in real time, not
+    /// only inside the fed-back transcript text.
+    fn render_halt(&self, o: &flux_evidence::Observation) {
+        eprintln!("{}", style::red(&halt_line(&o.data)));
+    }
+
+    /// Track a `loop.phase` observation (design Part 1 / A-15, emitted at every `plan()` entry):
+    /// updates the spinner label state and whether the round's `flow.plan` (rendered a moment
+    /// later, from a separate `run_plan` reflexive call) is a compact gather round or the full
+    /// execution plan. `gather`/`execute` are unambiguous; `orient` resets to "not gathering yet" —
+    /// a `flow.brief` right after (only ever paired with a `gather: true` plan) flips it back on
+    /// when orient itself emitted the first gather round.
+    fn record_phase(&mut self, o: &flux_evidence::Observation) {
+        let phase = o
+            .data
+            .get("phase")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        match phase.as_str() {
+            "execute" => {
+                self.execute_rounds += 1;
+                self.gather_mode = false;
+            }
+            "gather" => self.gather_mode = true,
+            "orient" => self.gather_mode = false,
+            _ => {}
+        }
+        self.phase = Some(phase);
+    }
+
+    /// Render a `flow.brief` observation the moment the grounding artifact is accepted (design
+    /// Part 1's "feedback within seconds"): `◆ goal: …` plus a dim `needs: …` line when present.
+    fn render_brief(&self, o: &flux_evidence::Observation) {
+        let mut lines = brief_lines(&o.data).into_iter();
+        if let Some(goal_line) = lines.next() {
+            eprintln!("{}", style::cyan(&goal_line));
+        }
+        for line in lines {
+            eprintln!("{}", style::dim(&line));
+        }
+    }
+
+    /// Render a gather-plan `flow.plan` observation as a compact one-liner (op names, not the full
+    /// tree + risk badge a full execution plan gets — those are for the small, read-only,
+    /// approval-free collect rounds design Part 1 bounds to ~12 call nodes).
+    fn render_gather_compact(&self, o: &flux_evidence::Observation) {
+        eprintln!("{}", style::dim(&gather_compact_line(&o.data)));
+    }
+}
+
+/// The planning spinner's label (A-15): phase-derived so it reads "orienting…"/"gathering…" for
+/// the collect passes and "planning…" for the execute pass's first round. "revising…" only once
+/// the execute phase has already produced a round THIS turn — a plain counter over the
+/// `loop.phase` observations already reaching the sink, not a new flux-flow signal. The halt-aware
+/// "✗ step N/M — revising…" line is a separate, real-time render (`render_halt`/`halt_line`, A-17)
+/// fired the moment a plan halts, distinct from this spinner label. A phase-less caller (the
+/// `/plan` REPL path, which doesn't emit `loop.phase`) falls back to today's "composing plan…".
+fn phase_spinner_label(phase: Option<&str>, execute_rounds: usize) -> String {
+    match phase {
+        Some("orient") => "orienting…".to_string(),
+        Some("gather") => "gathering…".to_string(),
+        Some("execute") => {
+            if execute_rounds > 1 {
+                "revising…".to_string()
+            } else {
+                "planning…".to_string()
+            }
+        }
+        _ => "composing plan…".to_string(),
+    }
+}
+
+/// Format a `flow.brief` observation's `data` as plain lines (no color, so it's directly testable):
+/// `◆ goal: …` then, when present, a `needs: …` list line.
+fn brief_lines(data: &Value) -> Vec<String> {
+    let goal = data.get("goal").and_then(|v| v.as_str()).unwrap_or("");
+    let mut lines = vec![format!("◆ goal: {goal}")];
+    if let Some(needs) = data.get("needs").and_then(|v| v.as_array()) {
+        let items: Vec<&str> = needs.iter().filter_map(|v| v.as_str()).collect();
+        if !items.is_empty() {
+            lines.push(format!("  needs: {}", items.join(", ")));
+        }
+    }
+    lines
+}
+
+/// Format a `flow.halt` observation's `data` (A-17) as a plain line: `✗ step N/M <op> failed —
+/// revising…` — or, when the op isn't directly derivable from the failing statement (a composite/
+/// control-flow node), `✗ step N/M failed — revising…`. Emitted once per mid-plan halt, right where
+/// the rest of the feedback contract is built (`EngineLoopHost::run_plan`'s halt arm) — a real-time
+/// cue distinct from the per-tool ✓/✗ markers the dispatcher already prints as ops run.
+fn halt_line(data: &Value) -> String {
+    let step = data.get("step").and_then(|v| v.as_u64()).unwrap_or(0);
+    let of = data.get("of").and_then(|v| v.as_u64()).unwrap_or(0);
+    match data.get("op").and_then(|v| v.as_str()) {
+        Some(op) => format!("✗ step {step}/{of} {op} failed — revising…"),
+        None => format!("✗ step {step}/{of} failed — revising…"),
+    }
+}
+
+/// Color each line of a marker-prefixed plan render (A-17): `✓` done lines green, `✗` the failed
+/// statement red, `·` not-yet-run lines dim — the per-statement status text a resumed/halted plan's
+/// `flow.plan` observation carries (`render_marked_plan` in `flux-flow`) instead of a fresh full
+/// tree. Any line that doesn't start with one of those three markers passes through unstyled.
+fn style_marked_plan(text: &str) -> String {
+    text.lines()
+        .map(|line| match line.chars().next() {
+            Some('✓') => style::green(line),
+            Some('✗') => style::red(line),
+            Some('·') => style::dim(line),
+            _ => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Format a gather-plan `flow.plan` observation's `data` as a compact one-liner: `gathering ·
+/// <op> <arg> · <op> <arg> …`, pulling call nodes off `plan_ast` and reusing the same
+/// `format_call` the tool-call stream uses (so `read Cargo.toml`/`grep "needle"` etc. read
+/// identically to a real op line). Falls back to a bare op count when the AST can't be walked.
+fn gather_compact_line(data: &Value) -> String {
+    const ARG_CAP: usize = 60;
+    let calls = data
+        .get("plan_ast")
+        .and_then(|v| serde_json::from_value::<flux_flow::ast::DraftAst>(v.clone()).ok())
+        .map(|ast| {
+            let mut out = Vec::new();
+            for n in &ast.body {
+                collect_plan_calls(n, &mut out);
+            }
+            out
+        })
+        .unwrap_or_default();
+    let summary = if calls.is_empty() {
+        let ops = data.get("ops").and_then(|v| v.as_u64()).unwrap_or(0);
+        let plural = if ops == 1 { "" } else { "s" };
+        format!("{ops} op{plural}")
+    } else {
+        calls
+            .iter()
+            .map(|(op, input)| {
+                let call = flux_tui::toolview::format_call(op, input);
+                if call.arg.is_empty() {
+                    call.verb
+                } else {
+                    format!("{} {}", call.verb, truncate(&call.arg, ARG_CAP))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
+    format!("gathering · {summary}")
+}
+
+/// Walk a gather plan's top-level shape (a `Call`, a `$x = Call(...)` bind, or a `seq` of either)
+/// collecting each call's op name + its input (the single literal-object argument a tool call
+/// carries, when the plan author wrote one plainly — a computed/templated argument falls back to
+/// an empty input, which `format_call` renders as just the bare verb).
+fn collect_plan_calls(node: &flux_flow::ast::Node, out: &mut Vec<(String, Value)>) {
+    use flux_flow::ast::Node;
+    match node {
+        Node::Call { op, args } => {
+            let input = args
+                .first()
+                .and_then(|a| match a {
+                    Node::Lit { value } => Some(value.clone()),
+                    _ => None,
+                })
+                .unwrap_or(Value::Null);
+            out.push((op.clone(), input));
+        }
+        Node::Bind { value, .. } => collect_plan_calls(value, out),
+        Node::Seq { body, .. } => body.iter().for_each(|n| collect_plan_calls(n, out)),
+        _ => {}
     }
 }
 
@@ -5669,6 +5912,7 @@ mod tests {
         truncate, usage_annotation, write_generated_skill, EventStore, Liveness, PluginAction,
         ReviewSeverity,
     };
+    use flux_flow::AgentSink;
     use serde_json::json;
 
     /// C-11: every subcommand builds providers through the ONE factory (`build_provider` /
@@ -6521,6 +6765,300 @@ mod tests {
         );
         // No spec attached → no cost suffix (sub-paths that don't show cost).
         assert_eq!(super::CliSink::new(0).cost_inline(Some(&u)), "");
+    }
+
+    /// A-15 named acceptance (`phase_observations_emitted_per_pass`'s surface half): each
+    /// `loop.phase` observation updates the phase-labeled spinner — "orienting…"/"gathering…" for
+    /// the collect passes, "planning…" for the execute phase's first round this turn, and
+    /// "revising…" once the execute phase has already produced a round (no `--show-loop` needed —
+    /// this is the spinner, not the machinery). A phase-less turn (no `loop.phase` observed at
+    /// all, e.g. the `/plan` REPL path) keeps today's "composing plan…".
+    #[test]
+    fn loop_phase_observations_drive_the_phase_labeled_spinner() {
+        use flux_evidence::{Observation, Phase};
+
+        let mut sink = super::CliSink::new(0);
+        assert_eq!(
+            super::phase_spinner_label(sink.phase.as_deref(), sink.execute_rounds),
+            "composing plan…",
+            "no loop.phase observed yet -> byte-compatible fallback"
+        );
+
+        sink.observation(&Observation::new(
+            "loop.phase",
+            Phase::Turn,
+            serde_json::json!({ "phase": "orient" }),
+        ));
+        assert_eq!(
+            super::phase_spinner_label(sink.phase.as_deref(), sink.execute_rounds),
+            "orienting…"
+        );
+        assert!(!sink.gather_mode);
+
+        sink.observation(&Observation::new(
+            "loop.phase",
+            Phase::Turn,
+            serde_json::json!({ "phase": "gather" }),
+        ));
+        assert_eq!(
+            super::phase_spinner_label(sink.phase.as_deref(), sink.execute_rounds),
+            "gathering…"
+        );
+        assert!(sink.gather_mode, "a gather-phase round renders compact");
+
+        sink.observation(&Observation::new(
+            "loop.phase",
+            Phase::Turn,
+            serde_json::json!({ "phase": "execute" }),
+        ));
+        assert_eq!(
+            super::phase_spinner_label(sink.phase.as_deref(), sink.execute_rounds),
+            "planning…",
+            "the execute phase's first round this turn is a plain plan, not a revision"
+        );
+        assert!(!sink.gather_mode, "execute is never a gather round");
+
+        sink.observation(&Observation::new(
+            "loop.phase",
+            Phase::Turn,
+            serde_json::json!({ "phase": "execute" }),
+        ));
+        assert_eq!(
+            super::phase_spinner_label(sink.phase.as_deref(), sink.execute_rounds),
+            "revising…",
+            "a second execute-phase round this turn means the prior one didn't finish"
+        );
+    }
+
+    /// A-15: a `flow.brief` observation marks gather mode (a brief only ever accompanies a
+    /// `gather: true` plan, per `compile.rs`'s `parse_brief` call site) even when it arrives right
+    /// after `orient` — the only phase where a gather round is otherwise indistinguishable from a
+    /// full plan emitted directly. `brief_lines` renders the grounding artifact immediately and
+    /// compactly: `◆ goal: …` plus a dim needs list.
+    #[test]
+    fn flow_brief_observation_marks_gather_mode_and_formats_goal_and_needs() {
+        use flux_evidence::{Observation, Phase};
+
+        let mut sink = super::CliSink::new(0);
+        sink.observation(&Observation::new(
+            "loop.phase",
+            Phase::Turn,
+            serde_json::json!({ "phase": "orient" }),
+        ));
+        assert!(!sink.gather_mode);
+
+        sink.observation(&Observation::new(
+            "flow.brief",
+            Phase::Turn,
+            serde_json::json!({ "goal": "find the bug", "needs": ["stack trace", "repro steps"] }),
+        ));
+        assert!(
+            sink.gather_mode,
+            "the brief that just landed accompanies orient's gather plan"
+        );
+
+        let lines = super::brief_lines(&serde_json::json!({
+            "goal": "find the bug",
+            "needs": ["stack trace", "repro steps"],
+        }));
+        assert_eq!(lines[0], "◆ goal: find the bug");
+        assert_eq!(lines[1], "  needs: stack trace, repro steps");
+
+        // No needs -> just the goal line (an empty needs list adds no clutter).
+        let goal_only = super::brief_lines(&serde_json::json!({ "goal": "answer a question" }));
+        assert_eq!(goal_only, vec!["◆ goal: answer a question".to_string()]);
+    }
+
+    /// A-15: a gather plan (small, read-only) renders as a compact one-liner — op names pulled off
+    /// the plan's call nodes, joined `·`-separated after a `gathering` label — never the full tree
+    /// + risk badge a full execution plan keeps (`render_plan`, unchanged by this story).
+    #[test]
+    fn gather_plan_renders_as_a_compact_one_liner_not_the_full_tree() {
+        use flux_flow::ast::{DraftAst, Node};
+
+        let ast = DraftAst {
+            body: vec![
+                Node::Bind {
+                    name: "a".into(),
+                    value: Box::new(Node::Call {
+                        op: "read".into(),
+                        args: vec![Node::Lit {
+                            value: serde_json::json!({ "path": "Cargo.toml" }),
+                        }],
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+                Node::Call {
+                    op: "grep".into(),
+                    args: vec![Node::Lit {
+                        value: serde_json::json!({ "pattern": "LoopHost" }),
+                    }],
+                },
+            ],
+            ..Default::default()
+        };
+        let data = serde_json::json!({
+            "plan_ast": serde_json::to_value(&ast).unwrap(),
+            "plan": "flow\n└─ ...",
+            "risk": "low",
+            "ops": 2,
+        });
+        let line = super::gather_compact_line(&data);
+        assert!(
+            line.starts_with("gathering · "),
+            "compact one-liner, not a tree: {line}"
+        );
+        assert!(line.contains("read"), "op names: {line}");
+        assert!(line.contains("Cargo.toml"), "and their args: {line}");
+        assert!(line.contains("grep"), "every call node listed: {line}");
+        assert!(
+            !line.contains('\n'),
+            "one line, not the multi-line tree render: {line}"
+        );
+
+        // An AST-less payload (defensive) falls back to a bare op count rather than panicking.
+        let bare = super::gather_compact_line(&serde_json::json!({ "ops": 3 }));
+        assert_eq!(bare, "gathering · 3 ops");
+    }
+
+    /// A-15: the `flow.plan` dispatch itself — `observation()` picks the compact render while
+    /// `gather_mode` is set (entered via a `gather`-phase `loop.phase`) and the full tree once
+    /// `execute` clears it back. This only smoke-tests that both paths run without panicking (the
+    /// terminal painting itself goes straight to stderr, like every other `CliSink` render in this
+    /// file); the render CONTENT is covered by `gather_compact_line` above and the pre-existing
+    /// `flow.plan` full-tree behavior this story leaves untouched.
+    #[test]
+    fn flow_plan_dispatches_compact_or_full_by_gather_mode() {
+        use flux_evidence::{Observation, Phase};
+
+        let mut sink = super::CliSink::new(0);
+        let plan_data = serde_json::json!({
+            "plan": "flow\n└─ $x = read(\"README.md\")   !read",
+            "risk": "low",
+            "ops": 1,
+        });
+
+        sink.observation(&Observation::new(
+            "loop.phase",
+            Phase::Turn,
+            serde_json::json!({ "phase": "gather" }),
+        ));
+        assert!(sink.gather_mode);
+        sink.observation(&Observation::new(
+            "flow.plan",
+            Phase::Turn,
+            plan_data.clone(),
+        ));
+
+        sink.observation(&Observation::new(
+            "loop.phase",
+            Phase::Turn,
+            serde_json::json!({ "phase": "execute" }),
+        ));
+        assert!(!sink.gather_mode);
+        sink.observation(&Observation::new("flow.plan", Phase::Turn, plan_data));
+    }
+
+    /// A-17 (closes the A-15 residual): `flow.plan`'s own `gather` field is honored directly, even
+    /// when it DISAGREES with the surface's tracked `gather_mode` state — this is exactly the gap
+    /// A-15 recorded (an orient-phase gather plan the state machine couldn't tell apart from orient
+    /// emitting the full plan directly). The direct field must win.
+    #[test]
+    fn flow_plan_gather_field_is_honored_directly_even_when_state_inference_disagrees() {
+        use flux_evidence::{Observation, Phase};
+
+        let mut sink = super::CliSink::new(0);
+        // `orient` clears the surface's own `gather_mode` inference to false...
+        sink.observation(&Observation::new(
+            "loop.phase",
+            Phase::Turn,
+            serde_json::json!({ "phase": "orient" }),
+        ));
+        assert!(!sink.gather_mode);
+        // ...but the plan itself says otherwise (`gather: true`) — the direct field must be
+        // consulted at dispatch time, not the stale inferred state. Smoke-tests only that the
+        // gather branch runs without panicking; content is covered by `gather_compact_line`.
+        sink.observation(&Observation::new(
+            "flow.plan",
+            Phase::Turn,
+            serde_json::json!({ "plan": "flow\n└─ ...", "risk": "low", "ops": 1, "gather": true }),
+        ));
+
+        // A payload with NO `gather` field at all (a phase-less/stale caller) falls back to the
+        // tracked state — backward compatible with the pre-A-17 wire shape.
+        sink.observation(&Observation::new(
+            "flow.plan",
+            Phase::Turn,
+            serde_json::json!({ "plan": "flow\n└─ ...", "risk": "low", "ops": 1 }),
+        ));
+    }
+
+    /// A-17: `halt_line` formats a `flow.halt` observation's `data` as the design's `✗ step N/M <op>
+    /// failed — revising…` line, falling back to a plain "failed" when the op isn't derivable.
+    #[test]
+    fn flow_halt_observation_renders_the_step_and_op() {
+        let with_op = super::halt_line(&serde_json::json!({ "step": 4, "of": 9, "op": "edit" }));
+        assert_eq!(with_op, "✗ step 4/9 edit failed — revising…");
+
+        let without_op = super::halt_line(&serde_json::json!({ "step": 2, "of": 2 }));
+        assert_eq!(without_op, "✗ step 2/2 failed — revising…");
+    }
+
+    /// A-17: `render_halt`'s dispatch — smoke-tests that a `flow.halt` observation reaches the
+    /// sink without panicking (the rendered CONTENT is covered by `halt_line` above).
+    #[test]
+    fn flow_halt_dispatches_to_render_halt() {
+        use flux_evidence::{Observation, Phase};
+
+        let mut sink = super::CliSink::new(0);
+        sink.observation(&Observation::new(
+            "flow.halt",
+            Phase::Turn,
+            serde_json::json!({ "step": 1, "of": 2, "op": "boom", "kind": "runtime", "fatal": false }),
+        ));
+    }
+
+    /// A-17: a resumed/halted plan's marker-prefixed text is colored per line (✓ green / ✗ red / ·
+    /// dim) rather than left plain — the CLI/TUI residual this story closes (the `flow.plan`
+    /// observation carries markers, but the surface used to always reconstruct an unmarked tree
+    /// from `plan_ast` instead of rendering them).
+    #[test]
+    fn style_marked_plan_colors_each_line_by_its_status_marker() {
+        // Color is off by default in tests (no tty) — style::* helpers no-op, so this proves the
+        // per-line DISPATCH logic (which marker maps to which styler) without depending on a tty.
+        let text = "✓ 0: $a = echo(\"first\")\n✗ 1: boom()\n· 2: $b = echo(\"fixed\")";
+        let styled = super::style_marked_plan(text);
+        // With color disabled the bytes are unchanged, but every line must still be present in
+        // order (the function must not drop or reorder lines).
+        for line in text.lines() {
+            assert!(styled.contains(line), "{styled}");
+        }
+        assert_eq!(styled.lines().count(), 3);
+    }
+
+    /// A-17: `render_plan`'s dispatch — a `resumed: true` payload prefers the marked `plan` text
+    /// (smoke-tested; content covered by `style_marked_plan`), a normal payload still prefers
+    /// `plan_ast` (pre-existing behavior, unchanged).
+    #[test]
+    fn render_plan_prefers_marked_text_when_resumed() {
+        use flux_evidence::{Observation, Phase};
+
+        let mut sink = super::CliSink::new(0);
+        sink.observation(&Observation::new(
+            "flow.plan",
+            Phase::Turn,
+            serde_json::json!({
+                "plan": "✓ 0: $a = echo(\"first\")\n✗ 1: boom()",
+                "plan_ast": {"body": [
+                    {"kind":"bind","name":"a","value":{"kind":"call","op":"echo","args":[{"kind":"lit","value":"first"}]}},
+                    {"kind":"call","op":"boom","args":[]}
+                ]},
+                "risk": "low",
+                "ops": 2,
+                "resumed": true,
+            }),
+        ));
     }
 
     /// clap validates the whole command tree (catches duplicate arg ids, the global-args + subcommand

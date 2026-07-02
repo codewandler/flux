@@ -27,8 +27,13 @@ use crate::registry::{schema_params, OpRegistry};
 use crate::state::FlowStore;
 use crate::Result;
 
+/// The statement-identity hash a resumable-mode loop host needs to compute the prospective skip
+/// prefix and the denial re-emission guard BEFORE executing anything (design Part 2, wired by A-16).
+pub use flux_lang::runtime::stmt_hash16;
 /// The interpreter's public types, re-exported so `flux_flow::runtime::{…}` paths are unchanged.
-pub use flux_lang::runtime::{BindSpec, CallOutcome, FlowOutcome, Suspension};
+pub use flux_lang::runtime::{
+    BindSpec, CallOutcome, FlowOutcome, LedgerEntry, PlanHalt, ResumeLedger, Suspension,
+};
 
 // ---------------------------------------------------------------------------
 // Adapters: the engine's envelope → the interpreter's injected traits
@@ -216,6 +221,28 @@ pub async fn execute_flow_with_composites(
     let host = ExecutorHost::new_with_composites(executor, composites);
     let mut bridge = SinkBridge { inner: sink };
     flux_lang::runtime::execute_flow(store, &host, session_id, ast, &mut bridge).await
+}
+
+/// The **resumable** analog of [`execute_flow_with_composites`] — used ONLY by `run_plan`'s loop-plan
+/// execution (design Part 2, patch-and-continue). A failing TOP-LEVEL statement is reified onto
+/// `FlowOutcome::failure` instead of propagating `Err`; `ledger`, when given (folded via
+/// [`FlowStore::open_halted_plan`](crate::state::FlowStore::open_halted_plan) over the session's
+/// run-event log), fast-forwards the longest content-hash-matching completed prefix before executing
+/// from the first divergence. The authored `flux flow run` path stays on the strict
+/// [`execute_flow_with_composites`] (L-25) — this wrapper is loop-host-only.
+pub async fn execute_flow_resumable_with_composites(
+    store: &FlowStore,
+    executor: &Executor,
+    session_id: &str,
+    ast: &DraftAst,
+    composites: &[CompositeOpDecl],
+    ledger: Option<&ResumeLedger>,
+    sink: &mut dyn AgentSink,
+) -> Result<FlowOutcome> {
+    let host = ExecutorHost::new_with_composites(executor, composites);
+    let mut bridge = SinkBridge { inner: sink };
+    flux_lang::runtime::execute_flow_resumable(store, &host, session_id, ast, &mut bridge, ledger)
+        .await
 }
 
 /// Resume a flow suspended on a top-level `await` — the engine wrapper over

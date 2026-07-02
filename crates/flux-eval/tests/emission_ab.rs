@@ -24,7 +24,7 @@ use serde::Deserialize;
 
 use flux_core::pricing::PricingTable;
 use flux_core::{Message, Usage};
-use flux_flow::compile::{compile_turn_with_arm, CompileOptions, EmissionArm, TurnOutput};
+use flux_flow::compile::{compile_turn_with_arm, CompileOptions, EmissionArm, Phase, TurnOutput};
 use flux_flow::registry::OpRegistry;
 use flux_runtime::ToolRegistry;
 
@@ -143,6 +143,7 @@ async fn run_arm(
             None,
             opts,
             arm,
+            Phase::Execute,
         )
         .await;
         let ms = started.elapsed().as_millis();

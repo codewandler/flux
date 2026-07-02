@@ -85,6 +85,10 @@ struct PlanInput {
     /// working feedback / conversation seed for the planner
     #[serde(default)]
     feedback: Option<String>,
+    /// which pass of the phased turn loop is calling (A-14): "orient", "gather", or "execute";
+    /// absent/unrecognized behaves as "execute" (byte-compatible with pre-A-14 callers)
+    #[serde(default)]
+    phase: Option<String>,
 }
 
 /// Arguments for the `run_plan` op.
@@ -123,9 +127,11 @@ struct RegisterCompositeInput {
     expose: Option<bool>,
 }
 
-/// `plan(feedback?) -> Plan` — re-enter the planner (the model) to produce a plan from the working
-/// feedback/conversation. Returns a `Plan` object `{kind: "plan"|"chat"|"error", text?, ast?,
-/// complete?}` as JSON text. The model stays the planner; this op only wraps the audited compile step.
+/// `plan(feedback?, phase?) -> Plan` — re-enter the planner (the model) to produce a plan from the
+/// working feedback/conversation. Returns a `Plan` object `{kind: "plan"|"chat"|"error", text?, ast?,
+/// complete?, settled}` as JSON text. The model stays the planner; this op only wraps the audited
+/// compile step. `phase` selects the multi-pass loop's per-phase instruction segment (A-14); absent
+/// behaves as `"execute"`, so pre-A-14 callers (an ejected/overridden loop) are byte-compatible.
 struct PlanOp;
 
 #[async_trait]
@@ -134,9 +140,11 @@ impl Tool for PlanOp {
         ToolSpec {
             name: "plan".into(),
             description: "Ask the model to emit a plan from the working feedback/conversation. Returns \
-                          a Plan object {kind: \"plan\"|\"chat\"|\"error\", text?, ast?, complete?}. The \
-                          model stays the planner — this re-enters only the compile step, through the \
-                          same audited envelope as any op."
+                          a Plan object {kind: \"plan\"|\"chat\"|\"error\", text?, ast?, complete?, \
+                          settled}. `phase` (\"orient\"|\"gather\"|\"execute\", default \"execute\") \
+                          selects the multi-pass loop's current pass. The model stays the planner — \
+                          this re-enters only the compile step, through the same audited envelope as \
+                          any op."
                 .into(),
             input_schema: flux_spec::tool_input_schema::<PlanInput>(),
             output_schema: None,
@@ -164,8 +172,10 @@ impl Tool for PlanOp {
 }
 
 /// `run_plan(plan) -> Outcome` — execute an emitted plan in the CURRENT session and return its Outcome
-/// `{transcript, result, steps, suspension?}` as JSON text. The plan is re-validated and every inner op
-/// runs through the same approval+IO envelope; bounded by a host reentry-depth cap.
+/// `{transcript, result, steps, suspension?, failure}` as JSON text. `failure` is always present —
+/// `null` on a clean run, or a reified mid-plan halt object a caller can route on (design
+/// `docs/designs/multipass-agent-loop.md` Part 2, A-16/A-17). The plan is re-validated and every
+/// inner op runs through the same approval+IO envelope; bounded by a host reentry-depth cap.
 struct RunPlanOp;
 
 #[async_trait]
@@ -174,8 +184,10 @@ impl Tool for RunPlanOp {
         ToolSpec {
             name: "run_plan".into(),
             description: "Execute an emitted plan in the current session and return its Outcome \
-                          {transcript, result, steps, suspension?}. The plan is re-validated and every \
-                          op runs through the same approval+IO envelope; bounded by a reentry-depth cap."
+                          {transcript, result, steps, suspension?, failure}. `failure` is null on a \
+                          clean run, or a reified mid-plan halt to route on. The plan is re-validated \
+                          and every op runs through the same approval+IO envelope; bounded by a \
+                          reentry-depth cap."
                 .into(),
             input_schema: flux_spec::tool_input_schema::<RunPlanInput>(),
             output_schema: None,

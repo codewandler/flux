@@ -37,6 +37,11 @@ A later node reuses an earlier result by name — `$readme` to pass the whole va
 `{{readme}}` inside a string to embed it (e.g. in a sub-agent prompt); the runtime substitutes the
 stored value at execution.
 
+A trivial or already-actionable request costs exactly one (or two) model calls, same as always. A
+complex or context-hungry request first gets a bounded, read-only "gather" pass — the model looks
+around before committing to a plan, capped at a few rounds — rather than guessing the whole task in
+one shot. See [`docs/agent-loop.md`](agent-loop.md) for the phased loop that drives this.
+
 ## Two modes: normal and plan
 
 | Mode | What a turn does |

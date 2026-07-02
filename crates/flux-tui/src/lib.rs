@@ -38,6 +38,39 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 /// Streaming cursor block appended to an in-progress assistant message.
 const CURSOR: &str = "▍";
 
+/// The footer's planning-spinner label (A-15, mirrors the CLI's `phase_spinner_label`):
+/// phase-derived so it reads "orienting…"/"gathering…" for the collect passes and "planning…" for
+/// the execute pass's first round. "revising…" only once the execute phase has already produced a
+/// round THIS turn — a plain counter over the `loop.phase` observations already reaching the
+/// sink, not a new flux-flow signal. A phase-less turn (no `loop.phase` observed) falls back to
+/// today's "composing plan…".
+fn loop_phase_label(phase: Option<&str>, execute_rounds: usize) -> &'static str {
+    match phase {
+        Some("orient") => "orienting…",
+        Some("gather") => "gathering…",
+        Some("execute") => {
+            if execute_rounds > 1 {
+                "revising…"
+            } else {
+                "planning…"
+            }
+        }
+        _ => "composing plan…",
+    }
+}
+
+/// Format a `flow.halt` observation's `data` (A-17, mirrors the CLI's `halt_line`) as a plain
+/// line: `✗ step N/M <op> failed — revising…`, or `✗ step N/M failed — revising…` when the op
+/// isn't directly derivable from the failing statement (a composite/control-flow node).
+fn halt_line(data: &serde_json::Value) -> String {
+    let step = data.get("step").and_then(|v| v.as_u64()).unwrap_or(0);
+    let of = data.get("of").and_then(|v| v.as_u64()).unwrap_or(0);
+    match data.get("op").and_then(|v| v.as_str()) {
+        Some(op) => format!("✗ step {step}/{of} {op} failed — revising…"),
+        None => format!("✗ step {step}/{of} failed — revising…"),
+    }
+}
+
 /// Severity of a system notice, picking its color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Sev {
@@ -109,8 +142,14 @@ enum Entry {
     Tool(ToolEntry),
     /// An observation/notice (skill activation, destructive flag, error).
     Notice { text: String, sev: Sev },
-    /// The planner's compiled DAG (the `flow.plan` observation payload).
+    /// The planner's compiled DAG (the `flow.plan` observation payload) — a full execution plan.
     Plan(serde_json::Value),
+    /// The orient/gather grounding artifact (design Part 1's `brief: {goal, needs[]}`, A-15):
+    /// rendered the moment it's accepted, immediately and compactly.
+    Brief { goal: String, needs: Vec<String> },
+    /// A bounded, read-only gather round's compiled plan (the `flow.plan` observation payload,
+    /// A-15) — rendered as a compact one-liner rather than the full tree + risk badge `Plan` gets.
+    GatherPlan(serde_json::Value),
 }
 
 /// A tool/op call paired with its result, rendered as a card: a `→ verb arg … [badge]` header, a
@@ -251,6 +290,17 @@ pub struct ChatState {
     /// Last-rendered max scroll offset + viewport height, so the event loop can clamp paging.
     last_max_scroll: Cell<u16>,
     last_page: Cell<u16>,
+    /// The phase of the most recent `loop.phase` observation this turn (design Part 1 / A-15):
+    /// `orient`/`gather`/`execute`, or `None` for a phase-less turn. Drives the footer's spinner
+    /// label — see `loop_phase_label`.
+    plan_phase: Option<String>,
+    /// How many `execute`-phase `loop.phase` observations have landed this turn (mirrors the
+    /// CLI's `CliSink::execute_rounds`): the first is the turn's actual planning, every one after
+    /// it means the prior round didn't finish, so the footer reads "revising…" past 1.
+    execute_rounds: usize,
+    /// Whether the NEXT `Plan` entry is a bounded, read-only gather round rather than the full
+    /// execution plan (mirrors the CLI's `CliSink::gather_mode` — same derivation, same caveats).
+    gather_mode: bool,
 }
 
 /// What the agent is doing — drives the status line.
@@ -290,7 +340,29 @@ impl ChatState {
             follow: true,
             last_max_scroll: Cell::new(0),
             last_page: Cell::new(1),
+            plan_phase: None,
+            execute_rounds: 0,
+            gather_mode: false,
         }
+    }
+
+    /// Track a `loop.phase` observation (design Part 1 / A-15, mirrors the CLI's
+    /// `CliSink::record_phase`): updates the footer's spinner-label state and whether the next
+    /// `Plan` entry renders compact (gather) or full (execute). `gather`/`execute` are
+    /// unambiguous; `orient` resets to "not gathering yet" — a `Brief` right after (only ever
+    /// paired with a `gather: true` plan) flips it back on when orient itself emitted the first
+    /// gather round.
+    fn record_loop_phase(&mut self, phase: &str) {
+        match phase {
+            "execute" => {
+                self.execute_rounds += 1;
+                self.gather_mode = false;
+            }
+            "gather" => self.gather_mode = true,
+            "orient" => self.gather_mode = false,
+            _ => {}
+        }
+        self.plan_phase = Some(phase.to_string());
     }
 
     /// Attach a resolved `provider/model` spec + pricing table so the header can show a running
@@ -568,6 +640,20 @@ impl ChatState {
                     }
                 }
                 Entry::Plan(data) => out.extend(plan::render(data, t)),
+                Entry::Brief { goal, needs } => {
+                    out.push(Line::from(vec![
+                        Span::styled("◆ ", t.accent_style()),
+                        Span::styled("goal: ", t.accent_style().add_modifier(Modifier::BOLD)),
+                        Span::raw(goal.clone()),
+                    ]));
+                    if !needs.is_empty() {
+                        out.push(Line::styled(
+                            format!("  needs: {}", needs.join(", ")),
+                            t.muted_style(),
+                        ));
+                    }
+                }
+                Entry::GatherPlan(data) => out.extend(plan::render_compact(data, t)),
             }
         }
         out
@@ -700,7 +786,7 @@ impl ChatState {
                 let elapsed = self.turn_start.map(|s| s.elapsed()).unwrap_or_default();
                 let frame = SPINNER[(elapsed.as_millis() / 80) as usize % SPINNER.len()];
                 let label = if self.phase == Phase::Planning {
-                    "composing plan…"
+                    loop_phase_label(self.plan_phase.as_deref(), self.execute_rounds)
                 } else {
                     "thinking…"
                 };
@@ -943,8 +1029,16 @@ enum UiEvent {
     Thinking(String),
     /// The planner is composing (`true`) / done (`false`) — drives the status line.
     Planning(bool),
-    /// The compiled plan (`flow.plan` observation `data`).
+    /// The compiled plan (`flow.plan` observation `data`) — a full execution plan or a bounded
+    /// gather round; the event loop tells them apart from `ChatState::gather_mode` (A-15).
     Plan(serde_json::Value),
+    /// Which pass of the phased turn loop is asking (the `loop.phase` observation's `phase`, A-15).
+    Phase(String),
+    /// The orient/gather grounding artifact (the `flow.brief` observation, A-15).
+    Brief {
+        goal: String,
+        needs: Vec<String>,
+    },
     ToolCall {
         name: String,
         input: serde_json::Value,
@@ -1004,6 +1098,28 @@ impl AgentSink for ChannelSink {
     fn observation(&mut self, o: &flux_evidence::Observation) {
         if o.kind == "flow.plan" {
             let _ = self.tx.send(UiEvent::Plan(o.data.clone()));
+        } else if o.kind == "loop.phase" {
+            if let Some(phase) = o.data.get("phase").and_then(|v| v.as_str()) {
+                let _ = self.tx.send(UiEvent::Phase(phase.to_string()));
+            }
+        } else if o.kind == "flow.brief" {
+            let goal = o
+                .data
+                .get("goal")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let needs = o
+                .data
+                .get("needs")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let _ = self.tx.send(UiEvent::Brief { goal, needs });
         } else if o.kind == flux_evidence::KIND_DESTRUCTIVE {
             let _ = self.tx.send(UiEvent::Notice {
                 text: "⚠ destructive operation flagged".into(),
@@ -1016,6 +1132,14 @@ impl AgentSink for ChannelSink {
                     sev: Sev::Info,
                 });
             }
+        } else if o.kind == "flow.halt" {
+            // A-17: reuse the plain `Notice`/`Sev::Err` machinery already used for other real-time
+            // cues (destructive-op flags, skill activation) rather than a dedicated `Entry`/`UiEvent`
+            // variant — the halt line is exactly that shape: a one-off red status line.
+            let _ = self.tx.send(UiEvent::Notice {
+                text: halt_line(&o.data),
+                sev: Sev::Err,
+            });
         }
     }
 }
@@ -1150,7 +1274,30 @@ async fn event_loop(
                         state.phase = Phase::Thinking;
                     }
                 }
-                UiEvent::Plan(data) => state.push(Entry::Plan(data)),
+                UiEvent::Plan(data) => {
+                    // A-17 (closes the A-15 residual): prefer `flow.plan`'s own `gather` field,
+                    // computed host-side from the plan's own `settled` signal, over the tracked
+                    // `gather_mode` inference — which couldn't tell an orient-phase gather plan
+                    // apart from orient emitting the full plan directly when the model's `brief`
+                    // was unusable. Falls back to the tracked state for a phase-less/stale caller.
+                    let gather = data
+                        .get("gather")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(state.gather_mode);
+                    if gather {
+                        state.push(Entry::GatherPlan(data));
+                    } else {
+                        state.push(Entry::Plan(data));
+                    }
+                }
+                UiEvent::Phase(phase) => state.record_loop_phase(&phase),
+                UiEvent::Brief { goal, needs } => {
+                    // A brief only ever accompanies a `gather: true` plan (mirrors the CLI):
+                    // its arrival marks gather mode even when the phase alone (`orient`) is
+                    // ambiguous between a gather round and a full plan emitted directly.
+                    state.gather_mode = true;
+                    state.push(Entry::Brief { goal, needs });
+                }
                 UiEvent::ToolCall { name, input } => {
                     state.steps += 1;
                     state.push(Entry::Tool(ToolEntry::new(name, input)));
@@ -1665,6 +1812,107 @@ mod tests {
         assert!(screen(&terminal).contains("thinking…"));
     }
 
+    /// A-15 parity: the footer's spinner label is phase-derived, mirroring the CLI's
+    /// `CliSink`/`phase_spinner_label` — "orienting…"/"gathering…" for the collect passes,
+    /// "planning…" for the execute phase's first round, "revising…" once it has already produced
+    /// a round this turn, and today's "composing plan…" before any `loop.phase` is observed.
+    #[test]
+    fn loop_phase_observation_drives_the_phase_labeled_spinner() {
+        let mut state = ChatState::new("opus".into());
+        state.phase = Phase::Planning;
+        state.turn_start = Some(Instant::now());
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(
+            screen(&terminal).contains("composing plan…"),
+            "no loop.phase observed yet -> byte-compatible fallback"
+        );
+
+        state.record_loop_phase("orient");
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(screen(&terminal).contains("orienting…"));
+        assert!(!state.gather_mode);
+
+        state.record_loop_phase("gather");
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(screen(&terminal).contains("gathering…"));
+        assert!(state.gather_mode, "a gather-phase round renders compact");
+
+        state.record_loop_phase("execute");
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(
+            screen(&terminal).contains("planning…"),
+            "the execute phase's first round this turn is a plain plan, not a revision"
+        );
+        assert!(!state.gather_mode, "execute is never a gather round");
+
+        state.record_loop_phase("execute");
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(
+            screen(&terminal).contains("revising…"),
+            "a second execute-phase round this turn means the prior one didn't finish"
+        );
+    }
+
+    /// A-15 parity: the `ChannelSink` (the TUI's `AgentSink` wiring) forwards `loop.phase` and
+    /// `flow.brief` observations as their own `UiEvent`s, same as `flow.plan`/skill/destructive
+    /// already are.
+    #[test]
+    fn channel_sink_forwards_phase_and_brief_observations() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut sink = ChannelSink { tx };
+
+        sink.observation(&flux_evidence::Observation::new(
+            "loop.phase",
+            flux_evidence::Phase::Turn,
+            serde_json::json!({ "phase": "gather" }),
+        ));
+        match rx.try_recv().expect("a Phase event was sent") {
+            UiEvent::Phase(p) => assert_eq!(p, "gather"),
+            _ => panic!("expected UiEvent::Phase"),
+        }
+
+        sink.observation(&flux_evidence::Observation::new(
+            "flow.brief",
+            flux_evidence::Phase::Turn,
+            serde_json::json!({ "goal": "find the bug", "needs": ["stack trace"] }),
+        ));
+        match rx.try_recv().expect("a Brief event was sent") {
+            UiEvent::Brief { goal, needs } => {
+                assert_eq!(goal, "find the bug");
+                assert_eq!(needs, vec!["stack trace".to_string()]);
+            }
+            _ => panic!("expected UiEvent::Brief"),
+        }
+    }
+
+    /// A-17: the `ChannelSink` forwards a `flow.halt` observation as a `Notice`/`Sev::Err` — the
+    /// same real-time-cue machinery destructive-op flags and skill activation already use — with
+    /// `halt_line`'s `✗ step N/M <op> failed — revising…` text.
+    #[test]
+    fn channel_sink_forwards_flow_halt_as_a_notice() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut sink = ChannelSink { tx };
+
+        sink.observation(&flux_evidence::Observation::new(
+            "flow.halt",
+            flux_evidence::Phase::Turn,
+            serde_json::json!({ "step": 4, "of": 9, "op": "edit", "kind": "runtime", "fatal": false }),
+        ));
+        match rx.try_recv().expect("a Notice event was sent") {
+            UiEvent::Notice { text, sev } => {
+                assert_eq!(text, "✗ step 4/9 edit failed — revising…");
+                assert_eq!(sev, Sev::Err);
+            }
+            _ => panic!("expected UiEvent::Notice"),
+        }
+    }
+
     #[test]
     fn scroll_up_detaches_follow_and_down_reattaches() {
         let mut state = ChatState::new("opus".into());
@@ -1691,5 +1939,87 @@ mod tests {
         let content = screen(&terminal);
         assert!(content.contains("plan"));
         assert!(content.contains("read"));
+    }
+
+    /// A-15: the brief renders immediately and compactly — `◆ goal: …` plus a dim needs list —
+    /// the "feedback within seconds" artifact design Part 1 asks for.
+    #[test]
+    fn brief_entry_renders_goal_and_needs() {
+        let mut state = ChatState::new("opus".into());
+        state.push(Entry::Brief {
+            goal: "find the bug".into(),
+            needs: vec!["stack trace".into(), "repro steps".into()],
+        });
+        let mut terminal = Terminal::new(TestBackend::new(70, 14)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("goal"));
+        assert!(content.contains("find the bug"));
+        assert!(content.contains("stack trace"));
+    }
+
+    /// A-15: a gather plan (small, read-only) renders as a compact one-liner — op names, not the
+    /// full tree + risk badge a full execution `Plan` entry gets (`plan_entry_renders_tree` above,
+    /// unchanged by this story).
+    #[test]
+    fn gather_plan_entry_renders_compact_not_full_tree() {
+        let mut state = ChatState::new("opus".into());
+        state.push(Entry::GatherPlan(serde_json::json!({
+            "plan": "flow\n└─ $x = read(\"Cargo.toml\")   !read",
+            "plan_ast": {
+                "body": [{
+                    "kind": "bind",
+                    "name": "x",
+                    "value": {
+                        "kind": "call",
+                        "op": "read",
+                        "args": [{ "kind": "lit", "value": { "path": "Cargo.toml" } }],
+                    },
+                }],
+            },
+            "risk": "low",
+            "ops": 1,
+        })));
+        let mut terminal = Terminal::new(TestBackend::new(70, 10)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("gathering"));
+        assert!(content.contains("read"));
+        // `render`'s full-tree header is the bold word "plan" + the risk badge ("low") — neither
+        // appears in the compact one-liner (which never touches `plan_ast`'s tree text at all;
+        // `content.contains('└')` isn't a safe check here since the TUI's OWN box borders use the
+        // same corner glyph).
+        assert!(
+            !content.contains("plan") && !content.contains("low"),
+            "a compact one-liner must not show the full-tree header/risk badge, got: {content}"
+        );
+    }
+
+    /// A-17: a resumed/halted plan (`resumed: true`) renders its ✓/✗/· marker-prefixed `plan` text
+    /// directly — the CLI/TUI residual this story closes (the surface used to always reconstruct an
+    /// unmarked full tree from `plan_ast` instead, silently dropping the markers `flow.plan` already
+    /// carried since A-16).
+    #[test]
+    fn resumed_plan_entry_renders_marker_colored_lines_not_the_full_tree() {
+        let mut state = ChatState::new("opus".into());
+        state.push(Entry::Plan(serde_json::json!({
+            "plan": "✓ 0: $a = echo(\"first\")\n✗ 1: boom()",
+            "plan_ast": {
+                "body": [
+                    {"kind":"bind","name":"a","value":{"kind":"call","op":"echo","args":[{"kind":"lit","value":"first"}]}},
+                    {"kind":"call","op":"boom","args":[]}
+                ],
+            },
+            "risk": "low",
+            "ops": 2,
+            "resumed": true,
+        })));
+        let mut terminal = Terminal::new(TestBackend::new(70, 12)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains('✓'), "{content}");
+        assert!(content.contains('✗'), "{content}");
+        assert!(content.contains("echo"), "{content}");
+        assert!(content.contains("boom"), "{content}");
     }
 }

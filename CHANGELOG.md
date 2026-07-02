@@ -25,6 +25,30 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Multi-pass agent loop: orient → gather → execute/revise, with patch-and-continue (A-12–A-17,
+  L-22).** The turn loop (`agent-loop.flux`) is now three visible passes: the first planner call
+  *orients* (answer as chat, emit the full execution plan, or emit a small read-only gather plan
+  plus a `brief` grounding artifact rendered immediately as `◆ goal: …`), then up to three
+  compile-enforced gather rounds (effect-clean ops only — composites checked transitively — capped
+  at 12 call nodes, validated as repair feedback like hidden-ops, approval-free), then the standard
+  execute loop with unchanged guards. Trivial and simple turns make exactly as many provider calls
+  as before. The planning wait is never silent anymore: normal-mode turns stream planning state and
+  thinking deltas, and the CLI/TUI label the spinner by phase (orienting… / gathering… / planning… /
+  revising…). Mid-plan failure no longer discards the plan: `run_plan` executes in a resumable mode
+  where a failing top-level statement is *reified* — the result carries
+  `failure{node, stmt, op, kind, fatal, message, completed[]}` plus the prefix transcript and a
+  ✓/✗/·-marked plan — and every completed statement is ledgered as append-only run-events
+  (`StatementCompleted`/`PlanHalted`/`PlanResumed`, fold-derived latch, no new table). The model's
+  corrected full re-emission passes the unchanged `emit_plan` gates (C-17 intact), and the runtime
+  fast-forwards the hash-matching completed prefix with value rehydration, continuing from the
+  failure point; the loop routes revision rounds on `$ran.failure` and the surface shows
+  `✗ step N/M — revising…`. Policy: denied/confirm-denied statements are never re-dispatched
+  unchanged; assert failures demand re-planning the remainder; approval is scoped to the suffix
+  that will actually run; repeated identical halts escalate through the existing loop guard.
+  `PlanAttempt` gains a `phase` field so usage metrics can report gather/revise rounds per turn.
+  Epic design: `docs/designs/multipass-agent-loop.md`; the measured cutover verdict (I-03:
+  time-to-first-feedback, rounds, tokens, terminal-bench pass-rate vs baseline) is still open.
+
 - **flux-markdown is a real engine, and skills load progressively (L-02).** The markdown crate is
   no longer a wrapper: a two-pass own engine (goldmark-style AST — recursive block pass +
   CommonMark delimiter-stack inlines, GFM tables/strikethrough) with a shared width-aware layout

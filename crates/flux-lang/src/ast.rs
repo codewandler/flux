@@ -901,6 +901,36 @@ pub struct AwaitPlan {
 // Run-event trace
 // ---------------------------------------------------------------------------
 
+/// The kind of failure a halted top-level statement surfaced (see [`crate::runtime::PlanHalt`]),
+/// classified from the existing [`crate::error::FlowError`] variants — never a new failure mode.
+/// Lives here beside [`RunEvent`] (rather than in `runtime.rs`, which depends on this module) so the
+/// run-event log stays a pure, dependency-free data model; the classification logic itself
+/// (`FlowError` -> `FailureKind`) is an inherent `impl` in `runtime.rs`, the one place that already
+/// depends on both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    /// The host's safety envelope refused to run an op (`FlowError::Denied`, L-21).
+    Denied,
+    /// An explicit `confirm` node was denied.
+    ConfirmDenied,
+    /// An `assert` node's condition was false.
+    AssertFailed,
+    /// Any other failure — the retryable, patch-and-continue default.
+    Runtime,
+}
+
+impl FailureKind {
+    /// Mirrors [`crate::error::FlowError::is_fatal`] exactly: a deliberate refusal or a broken
+    /// invariant, never re-attempted or silently absorbed by a resume.
+    pub fn is_fatal(self) -> bool {
+        matches!(
+            self,
+            FailureKind::Denied | FailureKind::ConfirmDenied | FailureKind::AssertFailed
+        )
+    }
+}
+
 /// An immutable execution trace event. The complement to the security/audit `EvidenceLog`: this is
 /// the *replayable* record of what ran (input hashes, output refs), readable like a program trace.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -982,6 +1012,46 @@ pub enum RunEvent {
         flow_key: String,
         label: String,
         node: NodeId,
+    },
+    /// A top-level statement **completed** under the resumable execution mode
+    /// ([`crate::runtime::execute_flow_resumable`]) — the statement ledger. `stmt` is its
+    /// [`crate::runtime`]-computed `stmt_hash16` (formatting- and key-order-insensitive); `value` is
+    /// the value id it produced, if any. `skipped` is `false` the first time a statement actually
+    /// dispatched, and `true` when a later resumed run fast-forwarded past it instead (rehydrating
+    /// `value` into its bind) — so a second halt's ledger is self-contained. Append-only; a failing
+    /// statement is never ledgered here (it appears only in [`RunEvent::PlanHalted`]).
+    StatementCompleted {
+        plan: String,
+        node: NodeId,
+        stmt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<ValueId>,
+        #[serde(default)]
+        skipped: bool,
+    },
+    /// A top-level statement **failed** under the resumable execution mode and the failure was
+    /// reified instead of propagated as `Err` (see [`crate::runtime::PlanHalt`]) — the open "halt
+    /// latch" for `plan`. A later resumed run for this session folds the log for the last
+    /// `PlanHalted` with no later `PlanResumed` for the same `plan` to find the ledger to
+    /// fast-forward against (mirrors the `once`/`checkpoint` fold pattern). Composites/nested bodies
+    /// still propagate `Err` normally — this only ever fires at the top-level statement boundary.
+    PlanHalted {
+        plan: String,
+        node: NodeId,
+        stmt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        op: Option<String>,
+        kind: FailureKind,
+        error: String,
+    },
+    /// The open halt latch for `prior` was **consumed** by a resumed run of `plan` — `skipped` is how
+    /// many leading statements the ledger fast-forward matched and skipped without re-dispatch.
+    /// Append-only: "consumption" is expressed by appending this event, exactly like how
+    /// `once`/`checkpoint` state is a fold rather than a mutation.
+    PlanResumed {
+        plan: String,
+        prior: String,
+        skipped: usize,
     },
 }
 

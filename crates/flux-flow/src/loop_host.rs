@@ -33,14 +33,15 @@ use flux_core::{Error, Message, Result, Usage};
 use flux_provider::Provider;
 use flux_runtime::{CompositeRegisterRequest, CompositeRegistrar, Executor, LoopHost, ToolResult};
 
-use crate::ast::DraftAst;
+use crate::ast::{DraftAst, FailureKind, Node, NodeId};
 use crate::compile::{
-    compile_turn, parse_completion, render_completion, CompileOptions, Completion, TurnOutput,
+    compile_turn, parse_completion, render_completion, Brief, CompileOptions, Completion, Phase,
+    TurnOutput,
 };
 use crate::composites::{prepare_registration, CompositeScope, DynamicComposites};
 use crate::registry::OpRegistry;
-use crate::runtime::execute_flow_with_composites;
-use crate::state::FlowStore;
+use crate::runtime::execute_flow_resumable_with_composites;
+use crate::state::{FlowStore, OpenHalt};
 
 /// Hard cap on reflexive reentry (flow → `run_plan` → flow → …). Mirrors `flux-app`'s `MAX_SPAWN_DEPTH`:
 /// a plan that recursively runs plans is stopped here rather than blowing the stack.
@@ -108,6 +109,21 @@ fn transcript_hash(transcript: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
+/// Render the host-carried [`Brief`] as the text prepended to a planner feedback message (design
+/// Part 1 — "the brief is host-carried per-turn and prepended to feedback"). Kept short and
+/// machine-legible: the model already saw the fuller `brief` framing in the phase contract.
+fn format_brief(b: &Brief) -> String {
+    if b.needs.is_empty() {
+        format!("[brief] goal: {}", b.goal)
+    } else {
+        format!(
+            "[brief] goal: {}; still need: {}",
+            b.goal,
+            b.needs.join("; ")
+        )
+    }
+}
+
 fn deterministic_failure_key(transcript: &str) -> Option<String> {
     for line in transcript.lines() {
         if let Some((_prefix, rest)) = line.split_once("error: the argument '") {
@@ -125,6 +141,188 @@ fn deterministic_failure_key(transcript: &str) -> Option<String> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// A-16 — loop-host resume policy + structured feedback contract
+// (`docs/designs/multipass-agent-loop.md` Part 2, patch-and-continue)
+// ---------------------------------------------------------------------------
+
+/// Mirrors `flux-lang`'s `execute_flow_resumable` ledger-matching walk (its `ledger_end` scan) —
+/// duplicated here, over just the AST + ledger, because `run_plan` needs the answer BEFORE executing
+/// anything: to scope suffix-only approval (the user is never re-prompted for already-completed
+/// writes) and to mark the `flow.plan` observation's ✓-done / ·-to-run lines. A `checkpoint`/`await`
+/// node is a free pass-through; any other statement needs a matching ledger entry at that index whose
+/// [`crate::runtime::stmt_hash16`] equals the current body's node there. Deliberately ignores the
+/// separate durable `checkpoint` cursor (a session-scoped store read, not a pure function of
+/// `body`+`ledger`) — the real run may therefore skip MORE than this preview, never less, so a
+/// suffix-scoped approval never under-covers a mutating op that will actually run.
+fn prospective_skip_len(body: &[Node], ledger: &crate::runtime::ResumeLedger) -> usize {
+    let by_node: std::collections::HashMap<u32, &crate::runtime::LedgerEntry> =
+        ledger.completed.iter().map(|e| (e.node.0, e)).collect();
+    let mut i = 0usize;
+    while i < body.len() {
+        let matched = match &body[i] {
+            Node::Checkpoint { .. } | Node::Await { .. } => true,
+            node => matches!(
+                by_node.get(&(i as u32)),
+                Some(entry) if entry.stmt == crate::runtime::stmt_hash16(node)
+            ),
+        };
+        if !matched {
+            break;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Render `body`'s top-level statements one per line, each prefixed with a design Part-2 status
+/// marker: `✓` done (index `< done_before`, and not the failed one), `✗` the failed statement
+/// (`failed`, if given), `·` not yet run. Reuses flux-lang's per-statement
+/// [`crate::render::render_statement`] rather than the recursive tree — patch-and-continue's
+/// granularity is top-level statements only, matching `execute_flow_resumable`'s F14 scoping.
+fn render_marked_plan(body: &[Node], done_before: usize, failed: Option<NodeId>) -> String {
+    body.iter()
+        .enumerate()
+        .map(|(i, node)| {
+            let marker = match failed {
+                Some(f) if f.0 as usize == i => "✗",
+                _ if i < done_before => "✓",
+                _ => "·",
+            };
+            format!(
+                "{marker} {i}: {}",
+                crate::render::render_statement(node, &crate::render::Palette::PLAIN)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The wire label for a [`FailureKind`] — derived via the SAME `#[serde(rename_all = "snake_case")]`
+/// its `RunEvent`/`PlanHalt` fields serialize with, rather than a second hand-written match that could
+/// drift from it.
+fn failure_kind_label(kind: FailureKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "runtime".to_string())
+}
+
+/// Kind-specific guidance appended to a halt's feedback (design Part 2's feedback contract): the
+/// model needs different instructions depending on WHY the statement failed — a transient runtime
+/// failure invites a surgical retry, an `assert` demands re-planning the remainder, and a denial must
+/// never be silently re-emitted (the guard above already refuses that; this is the same message for
+/// when the model asks a HUMAN or changes its approach instead).
+fn halt_guidance(kind: FailureKind, node: NodeId) -> String {
+    let keep = if node.0 > 0 {
+        format!(
+            "Keep steps 0–{} byte-identical — the runtime will skip them; it re-runs any step you \
+             change. ",
+            node.0 - 1
+        )
+    } else {
+        String::new()
+    };
+    match kind {
+        FailureKind::Runtime => format!(
+            "{keep}Fix step {} and re-emit the corrected plan. If the fix would otherwise repeat an \
+             already-completed EFFECTFUL step you want to keep exactly as it ran, guard it with \
+             `once` instead of re-emitting it.",
+            node.0
+        ),
+        FailureKind::AssertFailed => format!(
+            "{keep}The plan's own invariant broke at step {} — re-plan the remainder from there with \
+             a different approach; re-emitting the same assertion unchanged will fail again.",
+            node.0
+        ),
+        FailureKind::Denied | FailureKind::ConfirmDenied => format!(
+            "Step {} was denied by policy or the user. Do not re-emit that exact step unchanged — \
+             choose a different approach, ask the user, or answer in prose to end the turn.",
+            node.0
+        ),
+    }
+}
+
+/// The ephemeral `[resume context]` message a fresh turn's first `plan()` call injects when the
+/// session has an open halt latch (design Part 2's cross-turn/cross-process bullet) — never persisted
+/// into the conversation store (see [`EngineLoopHost::plan`]), just prepended to this call's working
+/// conversation so the model knows a prior turn's plan didn't finish cleanly.
+fn resume_context_message(open: &OpenHalt) -> String {
+    format!(
+        "[resume context] A previous plan halted at step {} ({}): {}. {} statement(s) before it \
+         already completed and are still available in this session. If you re-emit a plan, keep \
+         those completed steps byte-identical so the runtime skips them — it re-runs any step you \
+         change, starting from the failed one.",
+        open.halt.node.0,
+        failure_kind_label(open.halt.kind),
+        open.halt.message,
+        open.ledger.completed.len(),
+    )
+}
+
+/// The symbol a top-level statement binds, if any — for the `completed[{node, stmt, bind, op}]`
+/// array in the machine-readable `failure` object (design Part 2's feedback contract). The ledger
+/// itself only carries `node`/`stmt`/`value`; `bind`/`op` are looked up in the executed plan's body,
+/// mirroring flux-lang's own (private) `top_level_bind` at the node kinds that matter for a legible
+/// transcript.
+fn stmt_bind_name(node: &Node) -> Option<String> {
+    match node {
+        Node::Bind { name, .. } => Some(name.to_string()),
+        Node::Memo { name, .. } => Some(name.to_string()),
+        Node::Seq { bind: Some(b), .. }
+        | Node::Pipe { bind: Some(b), .. }
+        | Node::Retry { bind: Some(b), .. }
+        | Node::Loop { bind: Some(b), .. }
+        | Node::Race { bind: Some(b), .. }
+        | Node::Fallback { bind: Some(b), .. }
+        | Node::Timeout { bind: Some(b), .. }
+        | Node::Budget { bind: Some(b), .. }
+        | Node::CapScope { bind: Some(b), .. }
+        | Node::Scope { bind: Some(b), .. }
+        | Node::Once { bind: Some(b), .. } => Some(b.to_string()),
+        Node::Each {
+            collect: Some(c), ..
+        } => Some(c.to_string()),
+        Node::Repeat {
+            collect: Some(c), ..
+        } => Some(c.to_string()),
+        _ => None,
+    }
+}
+
+/// The op a top-level statement dispatched, when directly derivable — mirrors flux-lang's own
+/// (private) `top_level_op`: `Some` for a bare `call` or a `$x = call(...)` bind, `None` for a
+/// composite/control-flow statement where no single op identifies it.
+fn stmt_op(node: &Node) -> Option<String> {
+    match node {
+        Node::Call { op, .. } => Some(op.clone()),
+        Node::Bind { value, .. } => match value.as_ref() {
+            Node::Call { op, .. } => Some(op.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The `completed[{node, stmt, bind, op}]` array in the machine-readable `failure` object (design
+/// Part 2's feedback contract) — built from `body` (the plan that actually just ran) and `ledger`
+/// (that same run's completed-statement memory, whether freshly dispatched or fast-forwarded past).
+fn completed_entries_json(body: &[Node], ledger: &crate::runtime::ResumeLedger) -> Vec<Value> {
+    ledger
+        .completed
+        .iter()
+        .map(|e| {
+            let node = body.get(e.node.0 as usize);
+            serde_json::json!({
+                "node": e.node.0,
+                "stmt": e.stmt,
+                "bind": node.and_then(stmt_bind_name),
+                "op": node.and_then(stmt_op),
+            })
+        })
+        .collect()
 }
 
 /// Per-turn loop-guard state for the retry-breaker. Reset each turn in [`EngineLoopHost::set_turn`].
@@ -195,6 +393,21 @@ pub struct EngineLoopHost {
     /// again. `None` (the default) = no ceiling. Set by the host surface (flag > env > config);
     /// NOT reset per turn — it is engine configuration, not turn state.
     token_budget: Mutex<Option<u64>>,
+    /// The orient/gather grounding artifact (design Part 1's phased loop, A-14): set the moment an
+    /// accepted `gather: true` plan carries a `brief`, and prepended to every subsequent planner
+    /// feedback message for the rest of the turn (`plan`'s `feedback` reconstruction below) so a
+    /// multi-round gather doesn't lose the thread. Reset per turn in [`set_turn`].
+    brief: Mutex<Option<Brief>>,
+    /// The phase (A-14) the most recent [`plan`](Self::plan) call was asked for — read by
+    /// [`run_plan`](Self::run_plan) so its own `PlanAttempt` records (the `"rejected"` outcome) are
+    /// phase-stamped too, not only the ones `plan` itself records. Defaults to [`Phase::Execute`],
+    /// matching a phase-less call.
+    last_phase: Mutex<Phase>,
+    /// A-16 cross-turn resume: whether THIS turn's first [`plan`](Self::plan) call has already
+    /// injected the ephemeral `[resume context]` message (design Part 2). Set on that first call and
+    /// reset per turn in [`set_turn`](Self::set_turn) — a multi-round turn (gather/execute phases)
+    /// must not repeat it every round.
+    resume_context_shown: Mutex<bool>,
 }
 
 impl EngineLoopHost {
@@ -241,6 +454,9 @@ impl EngineLoopHost {
                 pending_completion: Mutex::new(None),
                 attempt_step: AtomicU32::new(0),
                 token_budget: Mutex::new(None),
+                brief: Mutex::new(None),
+                last_phase: Mutex::new(Phase::default()),
+                resume_context_shown: Mutex::new(false),
             });
             *slot2.lock().unwrap() = Some(host.clone());
             executor.set_loop_host(host.clone());
@@ -277,6 +493,13 @@ impl EngineLoopHost {
         *self.pending_completion.lock().unwrap() = None;
         // …and the plan-attempt step counter (C-14).
         self.attempt_step.store(0, Ordering::SeqCst);
+        // …and the orient/gather brief + last-requested phase — both belonged to the prior turn
+        // (A-14).
+        *self.brief.lock().unwrap() = None;
+        *self.last_phase.lock().unwrap() = Phase::default();
+        // …and the cross-turn resume-context one-shot (A-16) — a new turn gets its own chance to
+        // see it, whether or not the prior turn's latch is still open.
+        *self.resume_context_shown.lock().unwrap() = false;
     }
 
     /// The token usage accumulated across this turn's planner calls (every `plan` re-entry). The
@@ -316,6 +539,19 @@ impl EngineLoopHost {
     /// and once the stall persists we arm a hard stop (the next `plan` ends the turn). Returns the
     /// transcript to feed back — augmented with an explicit directive when the loop is repeating.
     fn guard_transcript(&self, transcript: String) -> String {
+        self.guard_transcript_with_key(transcript, None)
+    }
+
+    /// [`Self::guard_transcript`], but with an explicit deterministic failure key rather than one
+    /// sniffed out of the transcript text — A-16's structured `halt:{op}:{stmt}:{kind}` key (built
+    /// from a reified [`flux_lang::runtime::PlanHalt`]) is far more precise than
+    /// [`deterministic_failure_key`]'s substring heuristics, so a real halt supplies its own key and
+    /// falls into the SAME stall-counting/escalation machinery rather than a parallel one.
+    fn guard_transcript_with_key(
+        &self,
+        transcript: String,
+        explicit_key: Option<String>,
+    ) -> String {
         let mut g = self.guard.lock().unwrap();
         let hash = transcript_hash(&transcript);
         let stalled = !transcript.trim().is_empty()
@@ -328,7 +564,7 @@ impl EngineLoopHost {
             g.last_transcript_hash = Some(hash);
         }
 
-        let failure_key = deterministic_failure_key(&transcript);
+        let failure_key = explicit_key.or_else(|| deterministic_failure_key(&transcript));
         if let Some(key) = failure_key {
             if g.last_failure_key.as_deref() == Some(key.as_str()) {
                 g.failure_stall += 1;
@@ -423,11 +659,33 @@ impl LoopHost for EngineLoopHost {
     /// prior `run_plan` produced without any of it being persisted. Returns a `Plan`:
     /// `{kind: "plan", ast, complete}` for an emitted graph or `{kind: "chat", text}` for a prose answer.
     async fn plan(&self, input: Value) -> Result<Value> {
+        // A-14: which pass of the phased turn loop is asking — threaded through the already-opaque
+        // JSON input (no `LoopHost` trait change). Absent/unrecognized ⇒ `Execute`, the
+        // byte-compatible contract a phase-less call (an ejected/overridden pre-A-14 loop, the
+        // one-shot `--plan`/`/plan` surfaces) must keep getting. Recorded for `run_plan`'s own
+        // audit trail (the "rejected" outcome) before anything below can return early.
+        let phase = Phase::from_wire(input.get("phase").and_then(|v| v.as_str()));
+        *self.last_phase.lock().unwrap() = phase;
+        // Observed at `plan()` entry (design Part 1) so a surface's spinner can read "orienting…" /
+        // "gathering…" / "revising…" — independent of whichever branch below produces the result.
+        {
+            let obs = flux_evidence::Observation::new(
+                "loop.phase",
+                flux_evidence::Phase::Turn,
+                serde_json::json!({ "phase": phase.as_str() }),
+            );
+            if let Ok(executor) = self.executor() {
+                executor.observe(obs.clone());
+            }
+            SharedSink(self.turn.lock().unwrap().sink.clone()).observation(&obs);
+        }
         // Retry-breaker hard stop: a prior `run_plan` flagged a stalled loop. End the turn honestly
         // as a prose answer (the flow's `case "chat"` terminates the loop) instead of re-planning.
         let force_stop = self.guard.lock().unwrap().force_stop.take();
         if let Some(msg) = force_stop {
-            return Ok(serde_json::json!({ "kind": "chat", "text": msg }));
+            // A chat result always settles the phased loop's gather pass (design Part 1): "" is
+            // reserved for an accepted `gather: true` plan.
+            return Ok(serde_json::json!({ "kind": "chat", "text": msg, "settled": "true" }));
         }
         // Token-budget ceiling (A-10), the same stall-stop pattern: when the turn's accumulated
         // planner usage has crossed the installed budget, end the turn honestly instead of paying
@@ -453,6 +711,7 @@ impl LoopHost for EngineLoopHost {
                          (or FLUX_TURN_TOKEN_BUDGET / [limits] turn_token_budget) or narrow the \
                          request to continue."
                     ),
+                    "settled": "true",
                 }));
             }
         }
@@ -461,6 +720,17 @@ impl LoopHost for EngineLoopHost {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        // Brief carry (design Part 1): once an orient/gather round's plan is accepted with a
+        // `brief`, it is host-carried per-turn and prepended to every subsequent planner feedback
+        // message — so a multi-round gather (or the execute phase that follows it) doesn't lose the
+        // thread. Read here (the state a PRIOR round's acceptance left behind); written below after
+        // this round's `compile_turn` call.
+        let brief_prefix = self.brief.lock().unwrap().as_ref().map(format_brief);
+        let feedback = match brief_prefix {
+            Some(prefix) if feedback.trim().is_empty() => prefix,
+            Some(prefix) => format!("{prefix}\n\n{feedback}"),
+            None => feedback,
+        };
         // Snapshot the per-turn session + base system + advertised set (drop the lock before the
         // model call).
         let (session_id, base_system, advertised) = {
@@ -474,6 +744,19 @@ impl LoopHost for EngineLoopHost {
         // Working conversation = persisted history + the loop-carried feedback (ephemeral). This is
         // engine.rs's `working` vector, relocated into the op so the loop itself stays in flux-lang.
         let mut conversation = self.store.conversation(&session_id).unwrap_or_default();
+        // A-16 cross-turn resume (design Part 2): the FIRST `plan()` call of a turn — not every
+        // phase round within it — injects one ephemeral `[resume context]` message when the session
+        // still has an open halt latch from a prior turn (or process). Never persisted: it is pushed
+        // onto THIS call's working conversation only, exactly like the loop-carried `feedback` below.
+        {
+            let mut shown = self.resume_context_shown.lock().unwrap();
+            if !*shown {
+                *shown = true;
+                if let Ok(Some(open)) = self.store.open_halted_plan(&session_id) {
+                    conversation.push(Message::user_text(resume_context_message(&open)));
+                }
+            }
+        }
         if !feedback.trim().is_empty() {
             conversation.push(Message::user_text(feedback));
         }
@@ -505,7 +788,9 @@ impl LoopHost for EngineLoopHost {
                     self.usage.lock().unwrap().accumulate(&call_usage);
                     let spec = flux_core::canonical_model_spec(Some(provider.name()), &model);
                     self.calls.lock().unwrap().push((spec, call_usage));
-                    return Ok(serde_json::json!({ "kind": "chat", "text": text }));
+                    return Ok(
+                        serde_json::json!({ "kind": "chat", "text": text, "settled": "true" }),
+                    );
                 }
                 Ok((_, call_usage)) => {
                     // An empty render still cost tokens; account for them, then re-plan normally.
@@ -539,6 +824,18 @@ impl LoopHost for EngineLoopHost {
         let view_ref = (!view.symbols.is_empty()).then_some(&view);
         let provider = self.provider.lock().unwrap().clone();
         let model = self.model.lock().unwrap().clone();
+        // UX (A-12): the planning call is otherwise silent in a normal turn — the REPL `/plan` path
+        // (`engine::plan_turn`) already brackets its `compile_turn` call with `sink.planning(true/false)`
+        // and forwards live thinking-token deltas; this is the one mode users actually live in, so wire
+        // the same plumbing here. `PlanningGuard`'s `Drop` fires `planning(false)` on every exit —
+        // success, a compile error, or a future early `?` — so the "composing plan…" indicator can never
+        // get stuck on.
+        let sink = self.turn.lock().unwrap().sink.clone();
+        let _planning = PlanningGuard::start(sink.clone());
+        let mut thinking_sink = SharedSink::new(sink);
+        // A-14: the phase resolved from `input` at entry threads straight into `compile_turn`,
+        // selecting that pass's instruction segment (orient's three-way contract, gather's
+        // keep-gathering-or-settle contract, or execute's byte-compatible default).
         let (out, call_usage) = match compile_turn(
             &*provider,
             &model,
@@ -547,8 +844,9 @@ impl LoopHost for EngineLoopHost {
             &ops,
             view_ref,
             None,
-            None,
+            Some(&mut thinking_sink),
             self.opts.clone(),
+            phase,
         )
         .await
         {
@@ -562,6 +860,7 @@ impl LoopHost for EngineLoopHost {
                     step: self.next_attempt_step(),
                     outcome: "compile_error".into(),
                     error: Some(msg.clone()),
+                    phase: Some(phase.as_str().to_string()),
                     ..Default::default()
                 });
                 return Err(Error::Other(msg));
@@ -590,8 +889,30 @@ impl LoopHost for EngineLoopHost {
                     outcome: "accepted".into(),
                     fingerprint: Some(fingerprint),
                     plan_text: Some(cap_plan_text(crate::render::render_pretty(&c.ast))),
+                    phase: Some(phase.as_str().to_string()),
                     ..Default::default()
                 });
+                // Design Part 1 — settled: "" only for an accepted `gather: true` plan (the phased
+                // loop's `until $settled` gate); truthy for the full execution plan, so it flows
+                // straight into the standard plan/execute/revise pass.
+                let settled = if c.gather { "" } else { "true" };
+                // `c.brief` is only ever `Some` alongside `c.gather` (see `compile.rs`'s
+                // `parse_brief` call site), so this alone gates both.
+                if let Some(brief) = &c.brief {
+                    // Host-carried per turn (reset in `set_turn`): the moment a brief is accepted
+                    // it is stored for every subsequent feedback message, and observed so a
+                    // surface can render it (A-15).
+                    *self.brief.lock().unwrap() = Some(brief.clone());
+                    let obs = flux_evidence::Observation::new(
+                        "flow.brief",
+                        flux_evidence::Phase::Turn,
+                        serde_json::json!({ "goal": brief.goal, "needs": brief.needs }),
+                    );
+                    if let Ok(executor) = self.executor() {
+                        executor.observe(obs.clone());
+                    }
+                    SharedSink(self.turn.lock().unwrap().sink.clone()).observation(&obs);
+                }
                 serde_json::json!({
                     "kind": "plan",
                     "ast": serde_json::to_value(&c.ast).unwrap_or(Value::Null),
@@ -599,15 +920,17 @@ impl LoopHost for EngineLoopHost {
                         "primer": d.primer,
                         "instructions": d.instructions,
                     })),
+                    "settled": settled,
                 })
             }
             TurnOutput::Chat(text) => {
                 self.record_plan_attempt(flux_events::PlanAttempt {
                     step: self.next_attempt_step(),
                     outcome: "chat".into(),
+                    phase: Some(phase.as_str().to_string()),
                     ..Default::default()
                 });
-                serde_json::json!({ "kind": "chat", "text": text })
+                serde_json::json!({ "kind": "chat", "text": text, "settled": "true" })
             }
         };
         Ok(plan)
@@ -615,7 +938,27 @@ impl LoopHost for EngineLoopHost {
 
     /// Re-enter the interpreter to run the plan's `ast` in the current session, streaming live. A `chat`
     /// plan has nothing to run, so its text is surfaced as the result. Bounded by [`MAX_REENTRY_DEPTH`].
+    ///
+    /// A-17: a thin normalizing wrapper over [`Self::run_plan_dispatch`] (the actual order of
+    /// operations, unchanged). Only the halt/denial-guard return paths there set a `failure` key —
+    /// this makes it ALWAYS present (`null` when this round didn't halt) before returning, because
+    /// flux-lang's dotted field-access sugar (`$ran.failure` lowers to a `jq` lookup) runtime-errors
+    /// on a genuinely MISSING key, and the loop now routes on `$ran.failure` every execute round.
+    /// `null` reads falsy via the runtime's `json_truthy`, matching the `$plan.settled` `""`/non-empty
+    /// idiom the loop already relies on — see `run_plan_failure_field_is_always_present_never_missing`.
     async fn run_plan(&self, plan: Value) -> Result<Value> {
+        let mut out = self.run_plan_dispatch(plan).await?;
+        if let Some(obj) = out.as_object_mut() {
+            obj.entry("failure").or_insert(Value::Null);
+        }
+        Ok(out)
+    }
+}
+
+impl EngineLoopHost {
+    /// The full `run_plan` order of operations (design Part 2 / A-16), wrapped by the thin
+    /// [`LoopHost::run_plan`] above so every return path is normalized there in one place.
+    async fn run_plan_dispatch(&self, plan: Value) -> Result<Value> {
         // Depth guard: increment, ensure we decrement on every exit, then check.
         let prev = self.depth.fetch_add(1, Ordering::SeqCst);
         let _guard = DepthGuard(&self.depth);
@@ -676,19 +1019,115 @@ impl LoopHost for EngineLoopHost {
         // A fresh proxy over the shared sink: the inner run streams live, interleaved under the outer op.
         let mut sink = SharedSink(sink);
 
+        // A-16: fold the session's open halt latch (design Part 2's `run_plan` order of
+        // operations, step 2). `None` = a fresh start (no prior halt, or it was already consumed by
+        // a `PlanResumed`) — every step below degrades to today's strict, non-resuming behavior.
+        let open_halt = self.store.open_halted_plan(&session_id)?;
+
+        // Step 3 — denial re-emission guard: policy/the user already said no to this EXACT
+        // statement. Never silently patched around: refuse without executing. A DIFFERENT approach
+        // (any edit that changes that one statement's content hash) flows through to the resume
+        // path below like any other correction.
+        if let Some(open) = &open_halt {
+            if matches!(
+                open.halt.kind,
+                FailureKind::Denied | FailureKind::ConfirmDenied
+            ) {
+                let reemitted = ast
+                    .body
+                    .iter()
+                    .any(|n| crate::runtime::stmt_hash16(n) == open.halt.stmt);
+                if reemitted {
+                    return Ok(serde_json::json!({
+                        "transcript": format!(
+                            "[plan halted — {}] The statement previously refused (\"{}\") is \
+                             unchanged in this plan. It was NOT re-run. Choose a different \
+                             approach, ask the user, or answer in prose to end the turn.",
+                            failure_kind_label(open.halt.kind),
+                            open.halt.message,
+                        ),
+                        "result": "",
+                        "steps": 0,
+                        "failure": {
+                            "node": open.halt.node.0,
+                            "stmt": open.halt.stmt,
+                            "op": open.halt.op,
+                            "kind": failure_kind_label(open.halt.kind),
+                            "fatal": open.halt.kind.is_fatal(),
+                            "message": open.halt.message,
+                            "plan": open.halt.plan,
+                            "completed": open.ledger.completed.iter().map(|e| serde_json::json!({
+                                "node": e.node.0,
+                                "stmt": e.stmt,
+                                "bind": Value::Null,
+                                "op": Value::Null,
+                            })).collect::<Vec<_>>(),
+                        },
+                    }));
+                }
+            }
+        }
+
+        // Step 4 — compute the prospective skip prefix IN-HOST, before executing anything: scopes
+        // suffix-only risk/approval (the user is never re-prompted to approve already-completed
+        // writes) and marks the surfaced plan tree with ✓-done / ·-to-run.
+        let skip_len = open_halt
+            .as_ref()
+            .map(|open| prospective_skip_len(&ast.body, &open.ledger))
+            .unwrap_or(0);
+
+        // Divergence-before-failure warning: the re-emitted plan changed a statement BEFORE the
+        // point the previous halt reached, so steps that would have been skipped will now RE-RUN —
+        // including their side effects. The model must be told explicitly (design Part 2).
+        let rerun_warning = open_halt.as_ref().and_then(|open| {
+            let old_index = open.halt.node.0 as usize;
+            (skip_len < old_index).then(|| {
+                format!(
+                    "[warning] steps {skip_len}–{} changed from the halted plan and will RE-RUN \
+                     (including their side effects) — only steps 0–{} matched exactly.",
+                    old_index.saturating_sub(1),
+                    skip_len.saturating_sub(1),
+                )
+            })
+        });
+
         // Surface the compiled plan BEFORE executing it — auditable, and so the user sees what is about
         // to run before any per-op approval prompt (the `flow.plan` observation the surfaces render as
-        // the plan tree). The inner ops then stream + gate live underneath.
-        let risk =
-            crate::runtime::plan_risk_with_composites(&ast, executor.registry(), &composites);
+        // the plan tree). The inner ops then stream + gate live underneath. Risk/approval are scoped to
+        // the SUFFIX that will actually run when resuming (suffix-scoped approval, step 4).
+        let risk = if skip_len > 0 {
+            let mut suffix_ast = ast.clone();
+            suffix_ast.body = ast.body[skip_len..].to_vec();
+            crate::runtime::plan_risk_with_composites(&suffix_ast, executor.registry(), &composites)
+        } else {
+            crate::runtime::plan_risk_with_composites(&ast, executor.registry(), &composites)
+        };
+        let resumed = open_halt.is_some();
+        let plan_render = if resumed {
+            render_marked_plan(&ast.body, skip_len, None)
+        } else {
+            crate::render::render_pretty(&ast)
+        };
+        // A-17 (closes the A-15 residual): the incoming `plan`'s own `settled` field (set by
+        // `plan()` from the model's `gather: true` tag, "" while still gathering) tells the surface
+        // directly whether THIS run is the bounded read-only gather pass — cheaper and more precise
+        // than the CLI/TUI's prior `loop.phase`/`flow.brief`-order inference, which couldn't tell an
+        // orient-phase gather plan apart from orient emitting the full plan directly when the model
+        // omitted a usable `brief`. `resumed` similarly hands the surface an explicit signal for
+        // when `plan` carries per-statement ✓/✗/· status markers instead of a fresh full tree.
+        let gather = plan.get("settled").and_then(|v| v.as_str()) == Some("");
+        let phase = self.last_phase.lock().unwrap().as_str().to_string();
         sink.observation(&flux_evidence::Observation::new(
             "flow.plan",
             flux_evidence::Phase::Turn,
             serde_json::json!({
-                "plan": crate::render::render_pretty(&ast),
+                "plan": plan_render,
                 "plan_ast": serde_json::to_value(&ast).unwrap_or(Value::Null),
                 "risk": risk.summary(),
                 "ops": risk.ops.len(),
+                "gather": gather,
+                "phase": phase,
+                "resumed": resumed,
             }),
         ));
 
@@ -711,6 +1150,7 @@ impl LoopHost for EngineLoopHost {
                         step: self.next_attempt_step(),
                         outcome: "rejected".into(),
                         fingerprint: Some(plan_fingerprint.clone()),
+                        phase: Some(self.last_phase.lock().unwrap().as_str().to_string()),
                         ..Default::default()
                     });
                     return Ok(serde_json::json!({
@@ -725,20 +1165,27 @@ impl LoopHost for EngineLoopHost {
             None
         };
 
-        let outcome = match execute_flow_with_composites(
+        // Step 5 — execute RESUMABLE with the ledger: a failing top-level statement is reified onto
+        // `outcome.failure` instead of propagating `Err` (composites/nested bodies keep strict `Err`
+        // propagation, unchanged — F14). Passing `ledger: Some(..)` here is what consumes the open
+        // halt latch (the runtime appends `PlanResumed` even at zero skips) — the authored
+        // `flux flow run` path never calls this resumable wrapper (L-25).
+        let ledger = open_halt.as_ref().map(|open| &open.ledger);
+        let outcome = match execute_flow_resumable_with_composites(
             self.store.as_ref(),
             executor.as_ref(),
             &session_id,
             &ast,
             &composites,
+            ledger,
             &mut sink,
         )
         .await
         {
             Ok(o) => o,
-            // A plan step failed (a bad edit, an unsupported `jq`, a denied op…). Feed the error back as
-            // the outcome transcript so the loop re-plans (model-in-the-loop self-correction), exactly as
-            // the old Rust loop did — rather than letting it abort the whole turn.
+            // An INFRASTRUCTURE failure only (store IO, …) — a statement's own failure is reified
+            // onto `outcome.failure` by the resumable runtime instead of `Err` (A-16). Feed the
+            // error back exactly as before so the loop re-plans.
             Err(e) => {
                 {
                     let mut g = self.guard.lock().unwrap();
@@ -756,6 +1203,77 @@ impl LoopHost for EngineLoopHost {
                 }));
             }
         };
+
+        // Step 6 — a reified top-level statement failure (design Part 2): the runtime already
+        // ledgered the completed prefix and appended `PlanHalted` — build the structured feedback
+        // contract instead of erroring the turn. Never arms the complete fast-path.
+        if let Some(halt) = &outcome.failure {
+            {
+                let mut g = self.guard.lock().unwrap();
+                g.last_plan_hash = Some(plan_fingerprint);
+                g.last_plan_ok = false;
+            }
+            // The FULL completed ledger for THIS run (fast-forwarded + freshly dispatched, up to the
+            // failure) — re-fold rather than reconstruct: `execute_flow_resumable_with_composites`
+            // just wrote exactly this data as `StatementCompleted` events, and folding it back is
+            // cheaper and less error-prone than rebuilding it from `outcome` + the prior ledger.
+            let completed_ledger = self
+                .store
+                .open_halted_plan(&session_id)?
+                .map(|p| p.ledger)
+                .unwrap_or_default();
+            let total = ast.body.len();
+            let step_n = halt.node.0 as usize + 1;
+            // A-17: a discrete, real-time UI cue the moment a plan halts — right where the rest of
+            // the feedback contract is built — so the surface can print `✗ step N/M <op> failed —
+            // revising…` instead of the halt being legible only inside the fed-back transcript text.
+            sink.observation(&flux_evidence::Observation::new(
+                "flow.halt",
+                flux_evidence::Phase::Turn,
+                serde_json::json!({
+                    "step": step_n,
+                    "of": total,
+                    "op": halt.op,
+                    "kind": failure_kind_label(halt.kind),
+                    "fatal": halt.kind.is_fatal(),
+                }),
+            ));
+            let marked = render_marked_plan(&ast.body, halt.node.0 as usize, Some(halt.node));
+            let guidance = halt_guidance(halt.kind, halt.node);
+            let mut transcript = format!(
+                "{}\n\n[plan halted at step {step_n} of {total}] {}\n{marked}\n{guidance}",
+                outcome.transcript, halt.message,
+            );
+            if let Some(w) = &rerun_warning {
+                transcript = format!("{w}\n\n{transcript}");
+            }
+            let transcript = self.guard_transcript_with_key(
+                transcript,
+                Some(format!(
+                    "halt:{}:{}:{}",
+                    halt.op.as_deref().unwrap_or("-"),
+                    halt.stmt,
+                    failure_kind_label(halt.kind)
+                )),
+            );
+            let transcript = cap_loop_feedback(transcript);
+            return Ok(serde_json::json!({
+                "transcript": transcript,
+                "result": outcome.result,
+                "steps": outcome.steps,
+                "failure": {
+                    "node": halt.node.0,
+                    "stmt": halt.stmt,
+                    "op": halt.op,
+                    "kind": failure_kind_label(halt.kind),
+                    "fatal": halt.kind.is_fatal(),
+                    "message": halt.message,
+                    "plan": halt.plan,
+                    "completed": completed_entries_json(&ast.body, &completed_ledger),
+                },
+            }));
+        }
+
         {
             let mut g = self.guard.lock().unwrap();
             g.last_plan_hash = Some(plan_fingerprint);
@@ -777,7 +1295,10 @@ impl LoopHost for EngineLoopHost {
         } else {
             self.guard_transcript(outcome.transcript.clone())
         };
-        let transcript = cap_loop_feedback(transcript);
+        let mut transcript = cap_loop_feedback(transcript);
+        if let Some(w) = &rerun_warning {
+            transcript = format!("{w}\n\n{transcript}");
+        }
         let mut out = serde_json::json!({
             "transcript": transcript,
             "result": outcome.result,
@@ -869,6 +1390,25 @@ struct DepthGuard<'a>(&'a AtomicU32);
 impl Drop for DepthGuard<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// RAII bracket for `plan`'s otherwise-silent compile wait (A-12): [`Self::start`] fires
+/// `sink.planning(true)` immediately, and `Drop` guarantees the matching `planning(false)` on every
+/// exit — the happy path, a compile error, or any future early `?` — so a surface's "composing plan…"
+/// indicator (or spinner) can never get stuck on. Mirrors [`DepthGuard`]'s drop-based bracketing.
+struct PlanningGuard(Arc<Mutex<dyn AgentSink>>);
+
+impl PlanningGuard {
+    fn start(sink: Arc<Mutex<dyn AgentSink>>) -> Self {
+        SharedSink(sink.clone()).planning(true);
+        Self(sink)
+    }
+}
+
+impl Drop for PlanningGuard {
+    fn drop(&mut self) {
+        SharedSink(self.0.clone()).planning(false);
     }
 }
 
@@ -1043,20 +1583,33 @@ mod tests {
         }
     }
 
-    /// A sink that records (into shared handles) the op names dispatched and text streamed — so the test
-    /// can inspect what reached the shared surface after the sink is moved behind the `Arc<Mutex<…>>`.
+    /// A sink that records (into shared handles) the op names dispatched, text streamed, planning
+    /// brackets, thinking-token deltas, and observations — so the test can inspect what reached the
+    /// shared surface after the sink is moved behind the `Arc<Mutex<…>>`.
     #[derive(Clone, Default)]
     struct Recorder {
         tools: Arc<Mutex<Vec<String>>>,
         text: Arc<Mutex<String>>,
+        planning: Arc<Mutex<Vec<bool>>>,
+        thinking: Arc<Mutex<String>>,
+        observations: Arc<Mutex<Vec<flux_evidence::Observation>>>,
     }
     struct RecSink(Recorder);
     impl AgentSink for RecSink {
         fn text_delta(&mut self, t: &str) {
             self.0.text.lock().unwrap().push_str(t);
         }
+        fn thinking_delta(&mut self, t: &str) {
+            self.0.thinking.lock().unwrap().push_str(t);
+        }
+        fn planning(&mut self, active: bool) {
+            self.0.planning.lock().unwrap().push(active);
+        }
         fn tool_call(&mut self, name: &str, _input: &Value) {
             self.0.tools.lock().unwrap().push(name.to_string());
+        }
+        fn observation(&mut self, o: &flux_evidence::Observation) {
+            self.0.observations.lock().unwrap().push(o.clone());
         }
     }
 
@@ -1082,6 +1635,33 @@ mod tests {
                 stop_reason: Some(StopReason::EndTurn),
             },
         ]
+    }
+
+    /// One model turn that emits a bounded read-only `gather: true` plan (A-14) carrying `ast` and
+    /// a `brief`.
+    fn emit_gather_plan(ast: Value, goal: &str, needs: &[&str]) -> Vec<Chunk> {
+        vec![
+            Chunk::Block(ContentBlock::ToolUse {
+                id: "p1".into(),
+                name: "emit_plan".into(),
+                input: json!({
+                    "ast": ast,
+                    "gather": true,
+                    "brief": { "goal": goal, "needs": needs },
+                }),
+            }),
+            Chunk::Done {
+                stop_reason: Some(StopReason::ToolUse),
+            },
+        ]
+    }
+
+    /// A one-node echo plan AST, `$name = echo(marker)`.
+    fn echo_ast(name: &str, marker: &str) -> Value {
+        json!({ "body": [{
+            "kind": "bind", "name": name,
+            "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": marker }] }
+        }]})
     }
 
     #[test]
@@ -1438,6 +2018,143 @@ mod tests {
         assert!(
             calls.contains(&"echo".to_string()) && calls.contains(&"run_plan".to_string()),
             "inner + outer tool calls share one evidence log: {calls:?}"
+        );
+    }
+
+    /// A-12: in a *normal* turn (not the REPL `/plan` toggle), the planning call was silent —
+    /// `sink.planning(true/false)` was only ever invoked from `engine::plan_turn`. This drives a
+    /// normal `plan()` reentry (the same op the flux-lang agent loop calls every iteration) over the
+    /// shared sink and asserts the "composing plan…" bracket now reaches it.
+    #[tokio::test]
+    async fn normal_turn_planning_state_reaches_the_sink() {
+        let rec = Recorder::default();
+        let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(rec.clone())));
+        let dir =
+            std::env::temp_dir().join(format!("flux-loop-a12-planning-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let mut reg = ToolRegistry::new();
+        flux_tools::register_reflect(&mut reg);
+        let executor = Executor::new(
+            reg,
+            PermissionManager::from_rules(&["plan".into(), "run_plan".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(system),
+        );
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider {
+            responses: Mutex::new(VecDeque::from(vec![prose("nothing to do")])),
+        });
+        let store = Arc::new(FlowStore::in_memory().unwrap());
+        let (executor, _host) = EngineLoopHost::install(
+            executor,
+            provider,
+            "mock".into(),
+            None,
+            store.clone(),
+            Arc::new(DynamicComposites::default()),
+            "sess".into(),
+            shared.clone(),
+            CompileOptions::default(),
+        );
+
+        // A normal turn's `plan()` call — no REPL `/plan` toggle involved.
+        let outer_ast: DraftAst = serde_json::from_value(json!({
+            "body": [
+                { "kind": "bind", "name": "p",
+                  "value": { "kind": "call", "op": "plan",
+                             "args": [{ "kind": "lit", "value": "" }] } },
+                { "kind": "return", "value": { "kind": "var", "name": "p" } }
+            ]
+        }))
+        .unwrap();
+
+        let mut outer = SharedSink::new(shared.clone());
+        execute_flow(
+            store.as_ref(),
+            executor.as_ref(),
+            "sess",
+            &outer_ast,
+            &mut outer,
+        )
+        .await
+        .unwrap();
+
+        let planning = rec.planning.lock().unwrap().clone();
+        assert_eq!(
+            planning,
+            vec![true, false],
+            "the normal-turn plan() call must bracket the compile wait with planning(true/false): \
+             {planning:?}"
+        );
+    }
+
+    /// A-12: thinking-token deltas the provider streams during a normal turn's planner call must reach
+    /// the sink too — before the fix, `EngineLoopHost::plan` passed `thinking_sink: None` into
+    /// `compile_turn`, so `Chunk::ThinkingDelta` chunks were silently dropped instead of forwarded.
+    #[tokio::test]
+    async fn normal_turn_streams_thinking_deltas() {
+        let rec = Recorder::default();
+        let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(rec.clone())));
+        let dir =
+            std::env::temp_dir().join(format!("flux-loop-a12-thinking-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let mut reg = ToolRegistry::new();
+        flux_tools::register_reflect(&mut reg);
+        let executor = Executor::new(
+            reg,
+            PermissionManager::from_rules(&["plan".into(), "run_plan".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(system),
+        );
+        let thinking_turn = vec![
+            Chunk::ThinkingDelta("pondering the request…".into()),
+            Chunk::TextDelta("nothing to do".into()),
+            Chunk::Done {
+                stop_reason: Some(StopReason::EndTurn),
+            },
+        ];
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider {
+            responses: Mutex::new(VecDeque::from(vec![thinking_turn])),
+        });
+        let store = Arc::new(FlowStore::in_memory().unwrap());
+        let (executor, _host) = EngineLoopHost::install(
+            executor,
+            provider,
+            "mock".into(),
+            None,
+            store.clone(),
+            Arc::new(DynamicComposites::default()),
+            "sess".into(),
+            shared.clone(),
+            CompileOptions::default(),
+        );
+
+        let outer_ast: DraftAst = serde_json::from_value(json!({
+            "body": [
+                { "kind": "bind", "name": "p",
+                  "value": { "kind": "call", "op": "plan",
+                             "args": [{ "kind": "lit", "value": "" }] } },
+                { "kind": "return", "value": { "kind": "var", "name": "p" } }
+            ]
+        }))
+        .unwrap();
+
+        let mut outer = SharedSink::new(shared.clone());
+        execute_flow(
+            store.as_ref(),
+            executor.as_ref(),
+            "sess",
+            &outer_ast,
+            &mut outer,
+        )
+        .await
+        .unwrap();
+
+        let thinking = rec.thinking.lock().unwrap().clone();
+        assert!(
+            thinking.contains("pondering the request…"),
+            "thinking-token deltas from a normal turn's plan() call must reach the sink: {thinking:?}"
         );
     }
 
@@ -2046,5 +2763,1620 @@ op project_greet(name: String) -> String
             rec.tools.lock().unwrap().contains(&"echo".to_string()),
             "the read ran"
         );
+    }
+
+    /// A-14 named acceptance: a trivial (chat) turn and a simple/actionable (full-plan) turn make
+    /// EXACTLY as many provider calls as the pre-phased loop did — Pass 1's orient call IS the
+    /// first (and, for chat, only) planner call, and Pass 2's gather loop body never runs when
+    /// orient already settled. Zero added latency for tasks that don't need it.
+    #[tokio::test]
+    async fn orient_fast_path_adds_no_provider_calls() {
+        // Scenario A: trivial request -> orient answers in prose. One provider call, full stop.
+        {
+            let rec = Recorder::default();
+            let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(rec.clone())));
+            let dir = std::env::temp_dir()
+                .join(format!("flux-loop-a14-orient-chat-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+            let mut reg = ToolRegistry::new();
+            reg.register(Arc::new(EchoTool));
+            flux_tools::register_reflect(&mut reg);
+            flux_tools::register_evidence(&mut reg);
+            let executor = Executor::new(
+                reg,
+                PermissionManager::from_rules(
+                    &[
+                        "echo".into(),
+                        "plan".into(),
+                        "run_plan".into(),
+                        "observe".into(),
+                    ],
+                    &[],
+                ),
+                Arc::new(AllowApprover),
+                ToolContext::new(system),
+            );
+            let provider = Arc::new(RecordingProvider {
+                responses: Mutex::new(VecDeque::from(vec![prose("nothing to do")])),
+                seen: Mutex::new(Vec::new()),
+                systems: Mutex::new(Vec::new()),
+            });
+            let store = Arc::new(FlowStore::in_memory().unwrap());
+            let (executor, _host) = EngineLoopHost::install(
+                executor,
+                provider.clone(),
+                "rec".into(),
+                None,
+                store.clone(),
+                Arc::new(DynamicComposites::default()),
+                "sess".into(),
+                shared.clone(),
+                CompileOptions::default(),
+            );
+            let loop_ast = crate::engine::load_agent_loop(&dir).unwrap();
+            let mut outer = SharedSink::new(shared.clone());
+            execute_flow(
+                store.as_ref(),
+                executor.as_ref(),
+                "sess",
+                &loop_ast,
+                &mut outer,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                provider.seen.lock().unwrap().len(),
+                1,
+                "trivial turn: exactly one provider call, as today"
+            );
+            assert_eq!(
+                executor.evidence().by_kind("turn.gather").count(),
+                0,
+                "the gather pass must not run when orient already settled"
+            );
+        }
+
+        // Scenario B: simple/actionable request -> orient emits the full execution plan
+        // (non-gather); the next call (execute phase) answers in prose. Two provider calls total,
+        // exactly like the pre-phased loop's plan-then-plan-again shape.
+        {
+            let rec = Recorder::default();
+            let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(rec.clone())));
+            let dir = std::env::temp_dir()
+                .join(format!("flux-loop-a14-orient-plan-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+            let mut reg = ToolRegistry::new();
+            reg.register(Arc::new(EchoTool));
+            flux_tools::register_reflect(&mut reg);
+            flux_tools::register_evidence(&mut reg);
+            let executor = Executor::new(
+                reg,
+                PermissionManager::from_rules(
+                    &[
+                        "echo".into(),
+                        "plan".into(),
+                        "run_plan".into(),
+                        "observe".into(),
+                    ],
+                    &[],
+                ),
+                Arc::new(AllowApprover),
+                ToolContext::new(system),
+            );
+            let provider = Arc::new(RecordingProvider {
+                responses: Mutex::new(VecDeque::from(vec![
+                    emit_plan(echo_ast("g", "ROUND-ECHO")),
+                    prose("done"),
+                ])),
+                seen: Mutex::new(Vec::new()),
+                systems: Mutex::new(Vec::new()),
+            });
+            let store = Arc::new(FlowStore::in_memory().unwrap());
+            let (executor, _host) = EngineLoopHost::install(
+                executor,
+                provider.clone(),
+                "rec".into(),
+                None,
+                store.clone(),
+                Arc::new(DynamicComposites::default()),
+                "sess".into(),
+                shared.clone(),
+                CompileOptions::default(),
+            );
+            let loop_ast = crate::engine::load_agent_loop(&dir).unwrap();
+            let mut outer = SharedSink::new(shared.clone());
+            execute_flow(
+                store.as_ref(),
+                executor.as_ref(),
+                "sess",
+                &loop_ast,
+                &mut outer,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                provider.seen.lock().unwrap().len(),
+                2,
+                "simple full-plan turn: exactly two provider calls, as today"
+            );
+            assert_eq!(
+                executor.evidence().by_kind("turn.gather").count(),
+                0,
+                "the gather pass must not run when orient already emitted the full plan"
+            );
+            assert_eq!(
+                rec.tools
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|t| t.as_str() == "echo")
+                    .count(),
+                1,
+                "the echo op ran exactly once"
+            );
+        }
+    }
+
+    /// A-14 named acceptance: a `gather: true` plan sets `settled: ""`, routes through the bounded
+    /// gather pass, its results bind as ordinary FlowStore symbols, and each round emits a
+    /// `turn.gather` observation (design Part 1). Also proves phase threading reaches
+    /// `compile_turn`: the `loop.phase` observations, emitted at `plan()` entry from the very
+    /// value passed into `compile_turn`, land in order orient -> gather -> execute.
+    #[tokio::test]
+    async fn gather_pass_binds_symbols_and_observes() {
+        let rec = Recorder::default();
+        let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(rec.clone())));
+        let dir = std::env::temp_dir().join(format!("flux-loop-a14-gather-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        flux_tools::register_reflect(&mut reg);
+        flux_tools::register_evidence(&mut reg);
+        let executor = Executor::new(
+            reg,
+            PermissionManager::from_rules(
+                &[
+                    "echo".into(),
+                    "plan".into(),
+                    "run_plan".into(),
+                    "observe".into(),
+                ],
+                &[],
+            ),
+            Arc::new(AllowApprover),
+            ToolContext::new(system),
+        );
+        let provider = Arc::new(RecordingProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                emit_gather_plan(
+                    echo_ast("gathered", "GATHER-ECHO"),
+                    "find the bug",
+                    &["stack trace"],
+                ),
+                emit_plan(echo_ast("final", "FINAL-ECHO")),
+                prose("done"),
+            ])),
+            seen: Mutex::new(Vec::new()),
+            systems: Mutex::new(Vec::new()),
+        });
+        let store = Arc::new(FlowStore::in_memory().unwrap());
+        let (executor, _host) = EngineLoopHost::install(
+            executor,
+            provider.clone(),
+            "rec".into(),
+            None,
+            store.clone(),
+            Arc::new(DynamicComposites::default()),
+            "sess".into(),
+            shared.clone(),
+            CompileOptions::default(),
+        );
+        let loop_ast = crate::engine::load_agent_loop(&dir).unwrap();
+        let mut outer = SharedSink::new(shared.clone());
+        execute_flow(
+            store.as_ref(),
+            executor.as_ref(),
+            "sess",
+            &loop_ast,
+            &mut outer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            provider.seen.lock().unwrap().len(),
+            3,
+            "orient(gather) + gather-phase(settle) + execute-phase(chat)"
+        );
+        assert_eq!(
+            executor.evidence().by_kind("turn.gather").count(),
+            1,
+            "exactly one gather round ran"
+        );
+        let evidence = executor.evidence();
+        let briefs: Vec<_> = evidence.by_kind("flow.brief").collect();
+        assert_eq!(briefs.len(), 1, "the brief is observed once, on acceptance");
+        assert_eq!(briefs[0].data["goal"], json!("find the bug"));
+        assert_eq!(briefs[0].data["needs"], json!(["stack trace"]));
+
+        // The gather round's result bound as an ordinary FlowStore symbol.
+        let gathered = store
+            .resolve("sess", &crate::ast::SymbolName("gathered".into()))
+            .unwrap()
+            .and_then(|id| store.get_value(&id).unwrap());
+        assert_eq!(
+            gathered,
+            Some(crate::ast::Value::String("GATHER-ECHO".into()))
+        );
+
+        let phases: Vec<String> = executor
+            .evidence()
+            .by_kind("loop.phase")
+            .filter_map(|o| {
+                o.data
+                    .get("phase")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+            .collect();
+        assert_eq!(
+            phases,
+            vec!["orient", "gather", "execute"],
+            "phase threads through compile_turn in order, one loop.phase observation per plan() call"
+        );
+    }
+
+    /// A-14 named acceptance: once an orient/gather round's plan carries a `brief`, it is
+    /// host-carried per turn and prepended to EVERY subsequent planner feedback message — not just
+    /// the immediate next round, but the execute phase that follows too.
+    #[tokio::test]
+    async fn brief_prepended_to_followup_plan_calls() {
+        let rec = Recorder::default();
+        let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(rec.clone())));
+        let dir = std::env::temp_dir().join(format!("flux-loop-a14-brief-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        flux_tools::register_reflect(&mut reg);
+        flux_tools::register_evidence(&mut reg);
+        let executor = Executor::new(
+            reg,
+            PermissionManager::from_rules(
+                &[
+                    "echo".into(),
+                    "plan".into(),
+                    "run_plan".into(),
+                    "observe".into(),
+                ],
+                &[],
+            ),
+            Arc::new(AllowApprover),
+            ToolContext::new(system),
+        );
+        let provider = Arc::new(RecordingProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                emit_gather_plan(
+                    echo_ast("gathered", "GATHER-ECHO"),
+                    "find the bug",
+                    &["stack trace"],
+                ),
+                emit_plan(echo_ast("final", "FINAL-ECHO")),
+                prose("done"),
+            ])),
+            seen: Mutex::new(Vec::new()),
+            systems: Mutex::new(Vec::new()),
+        });
+        let store = Arc::new(FlowStore::in_memory().unwrap());
+        let (executor, _host) = EngineLoopHost::install(
+            executor,
+            provider.clone(),
+            "rec".into(),
+            None,
+            store.clone(),
+            Arc::new(DynamicComposites::default()),
+            "sess".into(),
+            shared.clone(),
+            CompileOptions::default(),
+        );
+        let loop_ast = crate::engine::load_agent_loop(&dir).unwrap();
+        let mut outer = SharedSink::new(shared.clone());
+        execute_flow(
+            store.as_ref(),
+            executor.as_ref(),
+            "sess",
+            &loop_ast,
+            &mut outer,
+        )
+        .await
+        .unwrap();
+
+        let seen = provider.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 3);
+        assert!(
+            !seen[0].contains("[brief]"),
+            "orient's own call carries no brief yet: {:?}",
+            seen[0]
+        );
+        assert!(
+            seen[1].contains("[brief] goal: find the bug") && seen[1].contains("stack trace"),
+            "the gather-phase call must see the brief prepended to its feedback: {:?}",
+            seen[1]
+        );
+        assert!(
+            seen[2].contains("[brief] goal: find the bug"),
+            "the execute-phase call must STILL see the brief -- carried for the rest of the turn: {:?}",
+            seen[2]
+        );
+    }
+
+    /// A-14 named acceptance: once the gather budget (`repeat 3`) is spent while the model still
+    /// emitted a `gather: true` plan, that read-only plan is not discarded — it simply runs as the
+    /// FIRST execute-loop iteration (design Part 1's graceful degradation), and the gather rounds
+    /// stay bounded at 3 before execute-phase planning follows.
+    #[tokio::test]
+    async fn gather_budget_exhaustion_degrades_to_execute() {
+        let rec = Recorder::default();
+        let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(rec.clone())));
+        let dir = std::env::temp_dir().join(format!("flux-loop-a14-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        flux_tools::register_reflect(&mut reg);
+        flux_tools::register_evidence(&mut reg);
+        let executor = Executor::new(
+            reg,
+            PermissionManager::from_rules(
+                &[
+                    "echo".into(),
+                    "plan".into(),
+                    "run_plan".into(),
+                    "observe".into(),
+                ],
+                &[],
+            ),
+            Arc::new(AllowApprover),
+            ToolContext::new(system),
+        );
+        // Orient + all three gather rounds keep emitting `gather: true` (never settling) — the
+        // budget (repeat 3) exhausts with a leftover gather plan still on the table.
+        let provider = Arc::new(RecordingProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                emit_gather_plan(echo_ast("g1", "GATHER-1"), "goal", &["a"]),
+                emit_gather_plan(echo_ast("g2", "GATHER-2"), "goal", &["b"]),
+                emit_gather_plan(echo_ast("g3", "GATHER-3"), "goal", &["c"]),
+                emit_gather_plan(echo_ast("leftover", "LEFTOVER-GATHER"), "goal", &["d"]),
+                prose("done"),
+            ])),
+            seen: Mutex::new(Vec::new()),
+            systems: Mutex::new(Vec::new()),
+        });
+        let store = Arc::new(FlowStore::in_memory().unwrap());
+        let (executor, _host) = EngineLoopHost::install(
+            executor,
+            provider.clone(),
+            "rec".into(),
+            None,
+            store.clone(),
+            Arc::new(DynamicComposites::default()),
+            "sess".into(),
+            shared.clone(),
+            CompileOptions::default(),
+        );
+        let loop_ast = crate::engine::load_agent_loop(&dir).unwrap();
+        let mut outer = SharedSink::new(shared.clone());
+        let outcome = execute_flow(
+            store.as_ref(),
+            executor.as_ref(),
+            "sess",
+            &loop_ast,
+            &mut outer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            provider.seen.lock().unwrap().len(),
+            5,
+            "orient + 3 gather rounds (the budget) + 1 execute-phase call"
+        );
+        assert_eq!(
+            executor.evidence().by_kind("turn.gather").count(),
+            3,
+            "the gather budget bounds at 3 rounds"
+        );
+        assert_eq!(
+            executor.evidence().by_kind("turn.iteration").count(),
+            1,
+            "the leftover gather plan ran as the first EXECUTE iteration, not inside the gather pass"
+        );
+
+        for name in ["g1", "g2", "g3", "leftover"] {
+            let bound = store
+                .resolve("sess", &crate::ast::SymbolName(name.into()))
+                .unwrap();
+            assert!(bound.is_some(), "${name} should be bound -- its plan ran");
+        }
+        assert!(outcome.result.contains("done"));
+    }
+
+    /// A-14 named acceptance: a phase-less `plan(feedback: ...)` call — the exact shape a pre-A-14
+    /// ejected/overridden loop still sends — behaves as the `execute` phase, and its `PlanAttempt`
+    /// is stamped `phase: "execute"`.
+    #[tokio::test]
+    async fn phase_less_plan_call_behaves_as_execute() {
+        let rec = Recorder::default();
+        let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(rec.clone())));
+        let dir =
+            std::env::temp_dir().join(format!("flux-loop-a14-phaseless-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let mut reg = ToolRegistry::new();
+        flux_tools::register_reflect(&mut reg);
+        let executor = Executor::new(
+            reg,
+            PermissionManager::from_rules(&["plan".into(), "run_plan".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(system),
+        );
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider {
+            responses: Mutex::new(VecDeque::from(vec![prose("ok")])),
+        });
+        let store = Arc::new(FlowStore::in_memory().unwrap());
+        let events = Arc::new(flux_events::EventStore::in_memory().unwrap());
+        let sid = events.create_session("mock").unwrap();
+        let (_executor, host) = EngineLoopHost::install(
+            executor,
+            provider,
+            "mock".into(),
+            None,
+            store,
+            Arc::new(DynamicComposites::default()),
+            sid.clone(),
+            shared.clone(),
+            CompileOptions::default(),
+        );
+        let turn_id = events.begin_turn(&sid, "hi", "mock").unwrap();
+        host.set_turn(
+            sid.clone(),
+            None,
+            shared,
+            None,
+            Some((events.clone(), turn_id)),
+        );
+
+        // No "phase" key at all -- the exact shape a phase-less caller sends.
+        let out = host.plan(json!({ "feedback": "" })).await.unwrap();
+        assert_eq!(out["kind"], "chat");
+        assert_eq!(out["settled"], "true");
+
+        let turns = events.turns(&sid).unwrap();
+        let attempts = &turns[0].plan_attempts;
+        assert_eq!(
+            attempts.last().unwrap().phase.as_deref(),
+            Some("execute"),
+            "a phase-less plan() call must be recorded (and behave) as the execute phase"
+        );
+    }
+
+    /// A-14 named acceptance: an already-ejected, pre-A-14 `.flux/agent-loop.flux` override — using
+    /// the OLD phase-less `plan($feedback)` call, with no phased passes at all — still runs
+    /// correctly through the SAME host: no flag, no fallback, just the phase-less contract
+    /// behaving as `execute` end-to-end.
+    #[tokio::test]
+    async fn old_ejected_loop_text_still_runs() {
+        const OLD_LOOP: &str = "
+flow agent-loop -> string
+  $answer = fmt(\"\")
+  $feedback = fmt(\"\")
+  $done = fmt(\"\")
+  repeat 25
+    until $done
+    $plan = plan($feedback)
+    $kind = $plan.kind
+    match $kind
+      case \"chat\"
+        $answer = $plan.text
+        $done = fmt(\"true\")
+      case \"error\"
+        $answer = $plan.text
+        $done = fmt(\"true\")
+      default
+        $ran = run_plan($plan)
+        $feedback = $ran.transcript
+        do observe \"turn.iteration\", $ran
+  return $answer
+";
+        let old_ast = flux_lang::parse::parse(OLD_LOOP).expect("the old loop text still parses");
+
+        let rec = Recorder::default();
+        let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(rec.clone())));
+        let dir =
+            std::env::temp_dir().join(format!("flux-loop-a14-old-ejected-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        flux_tools::register_reflect(&mut reg);
+        flux_tools::register_evidence(&mut reg);
+        let executor = Executor::new(
+            reg,
+            PermissionManager::from_rules(
+                &[
+                    "echo".into(),
+                    "plan".into(),
+                    "run_plan".into(),
+                    "observe".into(),
+                ],
+                &[],
+            ),
+            Arc::new(AllowApprover),
+            ToolContext::new(system),
+        );
+        let provider = Arc::new(RecordingProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                emit_plan(echo_ast("g", "OLD-LOOP-ECHO")),
+                prose("done"),
+            ])),
+            seen: Mutex::new(Vec::new()),
+            systems: Mutex::new(Vec::new()),
+        });
+        let store = Arc::new(FlowStore::in_memory().unwrap());
+        let (executor, _host) = EngineLoopHost::install(
+            executor,
+            provider.clone(),
+            "rec".into(),
+            None,
+            store.clone(),
+            Arc::new(DynamicComposites::default()),
+            "sess".into(),
+            shared.clone(),
+            CompileOptions::default(),
+        );
+        let mut outer = SharedSink::new(shared.clone());
+        let outcome = execute_flow(
+            store.as_ref(),
+            executor.as_ref(),
+            "sess",
+            &old_ast,
+            &mut outer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            provider.seen.lock().unwrap().len(),
+            2,
+            "old loop: plan then plan again, exactly as before A-14"
+        );
+        assert!(outcome.result.contains("done"));
+        let g = store
+            .resolve("sess", &crate::ast::SymbolName("g".into()))
+            .unwrap()
+            .and_then(|id| store.get_value(&id).unwrap());
+        assert_eq!(g, Some(crate::ast::Value::String("OLD-LOOP-ECHO".into())));
+    }
+
+    // ---------------------------------------------------------------------------
+    // A-17 — revise wiring: the loop routes on `$ran.failure`; end-to-end patch-and-continue
+    // ---------------------------------------------------------------------------
+
+    /// A-17 named acceptance (`midplan_failure_revise_and_continue_completes_turn`): a full engine
+    /// turn where the orient pass emits a plan that fails mid-way, the loop feeds the structured
+    /// halt back (observing `turn.revision`, not `turn.iteration`), the mock provider re-emits a
+    /// corrected plan that keeps the completed statement byte-identical, the runtime fast-forwards
+    /// that completed prefix (never re-dispatching it — proven by `echo` running exactly twice, not
+    /// three times), and the turn completes with the right answer — all within one turn, well under
+    /// the loop's caps.
+    #[tokio::test]
+    async fn midplan_failure_revise_and_continue_completes_turn() {
+        let rec = Recorder::default();
+        let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(rec.clone())));
+        let dir = std::env::temp_dir().join(format!("flux-loop-a17-revise-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        reg.register(Arc::new(BoomTool));
+        flux_tools::register_reflect(&mut reg);
+        flux_tools::register_evidence(&mut reg);
+        let executor = Executor::new(
+            reg,
+            PermissionManager::from_rules(
+                &[
+                    "echo".into(),
+                    "boom".into(),
+                    "plan".into(),
+                    "run_plan".into(),
+                    "observe".into(),
+                ],
+                &[],
+            ),
+            Arc::new(AllowApprover),
+            ToolContext::new(system),
+        );
+        // Round 1 (orient): the full execution plan — statement 0 succeeds, statement 1 (`boom`)
+        // fails mid-way. Round 2 (execute, revised): statement 0 kept BYTE-IDENTICAL (fast-forward
+        // must skip it, not re-dispatch it) and statement 1 replaced with a working op. Round 3
+        // (execute): the model answers in prose, ending the turn.
+        let round1 = json!({"body":[
+            {"kind":"bind","name":"a","value":{"kind":"call","op":"echo","args":[{"kind":"lit","value":"first"}]}},
+            {"kind":"call","op":"boom","args":[]}
+        ]});
+        let round2 = json!({"body":[
+            {"kind":"bind","name":"a","value":{"kind":"call","op":"echo","args":[{"kind":"lit","value":"first"}]}},
+            {"kind":"bind","name":"b","value":{"kind":"call","op":"echo","args":[{"kind":"lit","value":"fixed"}]}}
+        ]});
+        let provider = Arc::new(MockProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                emit_plan(round1),
+                emit_plan(round2),
+                prose("done"),
+            ])),
+        });
+        let store = Arc::new(FlowStore::in_memory().unwrap());
+        let (executor, _host) = EngineLoopHost::install(
+            executor,
+            provider,
+            "mock".into(),
+            None,
+            store.clone(),
+            Arc::new(DynamicComposites::default()),
+            "sess".into(),
+            shared.clone(),
+            CompileOptions::default(),
+        );
+        let loop_ast = crate::engine::load_agent_loop(&dir).unwrap();
+        let mut outer = SharedSink::new(shared.clone());
+        let outcome = execute_flow(
+            store.as_ref(),
+            executor.as_ref(),
+            "sess",
+            &loop_ast,
+            &mut outer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome.result, "done",
+            "the turn completes with the model's answer after the revise round"
+        );
+
+        // Fast-forward proof: `echo` dispatched exactly twice — once for statement 0 (round 1) and
+        // once for the new statement `b` (round 2) — NEVER a third time for statement 0, which
+        // would mean the runtime re-ran an already-completed statement instead of skipping it.
+        let echoes = rec
+            .tools
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.as_str() == "echo")
+            .count();
+        assert_eq!(
+            echoes, 2,
+            "statement 0 must be fast-forwarded (skipped), not re-dispatched, on the revise round"
+        );
+        let booms = rec
+            .tools
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.as_str() == "boom")
+            .count();
+        assert_eq!(
+            booms, 1,
+            "boom only ever runs the one time it actually failed"
+        );
+
+        // The loop's own `do observe` calls (`turn.revision`/`turn.iteration`) go through the
+        // ordinary `observe` op, so they land in the executor's shared evidence log — the same
+        // place `turn.gather`/`turn.iteration` are already asserted elsewhere in this file (A-14).
+        // The observation trail tells the true story: a `turn.revision` round (the halt) and a
+        // `turn.iteration` round (the clean revise-and-continue run) — never the other way round.
+        let evidence = executor.evidence();
+        assert_eq!(
+            evidence.by_kind("turn.revision").count(),
+            1,
+            "exactly one round carried a failure"
+        );
+        assert_eq!(
+            evidence.by_kind("turn.iteration").count(),
+            1,
+            "exactly one round ran clean"
+        );
+        // `flow.halt` (host-side rendering plumbing, streamed to the sink like `flow.plan`) is
+        // asserted through the test sink's own recorder instead.
+        let obs = rec.observations.lock().unwrap();
+        assert_eq!(
+            obs.iter().filter(|o| o.kind == "flow.halt").count(),
+            1,
+            "the halt itself is surfaced once, in real time: {obs:?}"
+        );
+        let halt = obs.iter().find(|o| o.kind == "flow.halt").unwrap();
+        assert_eq!(halt.data["step"], 2);
+        assert_eq!(halt.data["of"], 2);
+        assert_eq!(halt.data["op"], "boom");
+    }
+
+    /// A-17 named acceptance (`loop_routes_fatal_halt_distinctly_from_retryable`): the loop's
+    /// `$ran.failure` routing is faithful for BOTH failure classes design Part 2 defines — a
+    /// retryable `runtime` halt (`boom`) and a fatal one (`assert`, `is_fatal()` per
+    /// `FailureKind`) — both still observe `turn.revision` (never silently absorbed as a plain
+    /// iteration), and the `fatal`/`kind` distinction the host already computed survives the loop's
+    /// pass-through into the observation the surface/audit trail reads.
+    #[tokio::test]
+    async fn loop_routes_fatal_halt_distinctly_from_retryable() {
+        async fn run_one_halt(
+            tag: &str,
+            failing_stmt: Value,
+            expect_kind: &str,
+            expect_fatal: bool,
+        ) {
+            let rec = Recorder::default();
+            let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(rec.clone())));
+            let dir = std::env::temp_dir()
+                .join(format!("flux-loop-a17-fatal-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+            let mut reg = ToolRegistry::new();
+            reg.register(Arc::new(EchoTool));
+            reg.register(Arc::new(BoomTool));
+            flux_tools::register_reflect(&mut reg);
+            flux_tools::register_evidence(&mut reg);
+            let executor = Executor::new(
+                reg,
+                PermissionManager::from_rules(
+                    &[
+                        "echo".into(),
+                        "boom".into(),
+                        "plan".into(),
+                        "run_plan".into(),
+                        "observe".into(),
+                    ],
+                    &[],
+                ),
+                Arc::new(AllowApprover),
+                ToolContext::new(system),
+            );
+            let round1 = json!({"body": [failing_stmt]});
+            // The corrected round never re-emits the failed statement (the denial-guard/assert
+            // guidance both say not to) — it just answers in prose, ending the turn.
+            let provider = Arc::new(MockProvider {
+                responses: Mutex::new(VecDeque::from(vec![
+                    emit_plan(round1),
+                    prose("acknowledged"),
+                ])),
+            });
+            let store = Arc::new(FlowStore::in_memory().unwrap());
+            let (executor, _host) = EngineLoopHost::install(
+                executor,
+                provider,
+                "mock".into(),
+                None,
+                store.clone(),
+                Arc::new(DynamicComposites::default()),
+                "sess".into(),
+                shared.clone(),
+                CompileOptions::default(),
+            );
+            let loop_ast = crate::engine::load_agent_loop(&dir).unwrap();
+            let mut outer = SharedSink::new(shared.clone());
+            execute_flow(
+                store.as_ref(),
+                executor.as_ref(),
+                "sess",
+                &loop_ast,
+                &mut outer,
+            )
+            .await
+            .unwrap();
+
+            // The loop's `do observe` calls land in the executor's shared evidence log (the
+            // ordinary `observe` op), not the sink — see `midplan_failure_revise_and_continue_completes_turn`.
+            let evidence = executor.evidence();
+            assert_eq!(
+                evidence.by_kind("turn.revision").count(),
+                1,
+                "[{tag}] a halt of either kind is a revision round, not a plain iteration"
+            );
+            assert_eq!(
+                evidence.by_kind("turn.iteration").count(),
+                0,
+                "[{tag}] the turn ends in prose right after the halt — no clean round in between"
+            );
+            let revisions: Vec<_> = evidence.by_kind("turn.revision").collect();
+            let revision = revisions.first().unwrap();
+            // `do observe "turn.revision", $ran` passes `$ran` through as the JSON-as-string an op
+            // result is stored as (the observed `data` is that raw string, not a nested object) — the
+            // same convention `jq`/`bind` re-parse on the way in; parse it back out the same way here.
+            let ran: Value = revision
+                .data
+                .as_str()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .expect("turn.revision carries $ran as JSON text");
+            assert_eq!(
+                ran["failure"]["kind"], expect_kind,
+                "[{tag}] the loop's pass-through must not lose the failure kind: {ran:?}"
+            );
+            assert_eq!(
+                ran["failure"]["fatal"], expect_fatal,
+                "[{tag}] the loop's pass-through must not lose the fatal/retryable distinction: {ran:?}"
+            );
+        }
+
+        // Retryable: a plain op error (`FailureKind::Runtime`, `is_fatal() == false`).
+        run_one_halt(
+            "retryable",
+            json!({"kind":"call","op":"boom","args":[]}),
+            "runtime",
+            false,
+        )
+        .await;
+
+        // Fatal: an `assert` whose condition is false (`FailureKind::AssertFailed`,
+        // `is_fatal() == true`).
+        run_one_halt(
+            "fatal",
+            json!({"kind":"assert","cond":{"kind":"lit","value":false},"message":"invariant broke"}),
+            "assert_failed",
+            true,
+        )
+        .await;
+    }
+
+    // ---------------------------------------------------------------------------
+    // A-16 — loop-host resume policy + structured feedback contract
+    // ---------------------------------------------------------------------------
+
+    /// Always fails with a plain (non-denied) error — a `FailureKind::Runtime` halt.
+    struct BoomTool;
+    #[async_trait]
+    impl Tool for BoomTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only(
+                "boom",
+                "always fails",
+                json!({"type":"object","properties":{}}),
+            )
+        }
+        async fn execute(&self, _c: &ToolContext, _p: Value) -> Result<ToolResult> {
+            Ok(ToolResult::error("boom: kaboom"))
+        }
+    }
+
+    /// A third read-only echo-like op (distinct from `echo`/`writeecho`) — used where a test needs
+    /// an op name that is unambiguously NOT the one under a denial guard.
+    struct NoteTool;
+    #[async_trait]
+    impl Tool for NoteTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only(
+                "note",
+                "note text",
+                json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
+            )
+        }
+        async fn execute(&self, _c: &ToolContext, p: Value) -> Result<ToolResult> {
+            Ok(ToolResult::ok(
+                p.get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            ))
+        }
+    }
+
+    /// A second MUTATING echo-like tool, distinct op name from `writeecho` — the suffix-scoped
+    /// approval test needs its OWN op name so a captured `PlanApprovalRequest.ops` can distinguish
+    /// "the newly-added suffix statement" from "the already-completed prefix statement".
+    struct WriteEcho2Tool;
+    #[async_trait]
+    impl Tool for WriteEcho2Tool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only(
+                "writeecho2",
+                "echo (mutating) #2",
+                json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
+            )
+        }
+        fn intents(&self, _p: &Value) -> flux_spec::IntentSet {
+            use flux_spec::{Intent, IntentBehavior, IntentCertainty, IntentRole, IntentTarget};
+            let mut s = flux_spec::IntentSet::new();
+            s.push(Intent {
+                behavior: IntentBehavior::FilesystemWrite,
+                target: IntentTarget::Path {
+                    path: "out2.txt".into(),
+                },
+                role: IntentRole::WriteTarget,
+                certainty: IntentCertainty::Certain,
+            });
+            s
+        }
+        async fn execute(&self, _c: &ToolContext, p: Value) -> Result<ToolResult> {
+            Ok(ToolResult::ok(
+                p.get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            ))
+        }
+    }
+
+    /// Records every plan-level approval request's `ops` list — used to prove suffix-scoped
+    /// approval (A-16): a resumed plan's approval preview must carry only the to-run suffix's ops.
+    struct OpsCapturingApprover {
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+    #[async_trait]
+    impl flux_runtime::Approver for OpsCapturingApprover {
+        async fn request(
+            &self,
+            _t: &str,
+            _s: &[String],
+            _i: &flux_spec::IntentSet,
+        ) -> flux_runtime::ApprovalChoice {
+            flux_runtime::ApprovalChoice::Allow
+        }
+        async fn request_plan(
+            &self,
+            plan: &flux_runtime::PlanApprovalRequest,
+        ) -> flux_runtime::ApprovalChoice {
+            self.seen.lock().unwrap().push(plan.ops.clone());
+            flux_runtime::ApprovalChoice::Allow
+        }
+    }
+
+    /// `run_plan_feeds_structured_halt_and_prefix_transcript` (A-16 acceptance): a halted `run_plan`
+    /// returns `Ok` — never `Err` — with the prefix transcript, the ✓/✗-marked plan, and a
+    /// machine-readable `failure` object the next planner round (or a flux-lang consumer) can route
+    /// on.
+    #[tokio::test]
+    async fn run_plan_feeds_structured_halt_and_prefix_transcript() {
+        let rec = Recorder::default();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        reg.register(Arc::new(BoomTool));
+        let (_ex, host) = setup_host(
+            reg,
+            PermissionManager::from_rules(&["echo".into(), "boom".into()], &[]),
+            Arc::new(AllowApprover),
+            rec,
+            "a16-halt",
+        );
+
+        let plan = json!({"kind":"plan","ast":{"body":[
+            {"kind":"bind","name":"a","value":{"kind":"call","op":"echo","args":[{"kind":"lit","value":"first"}]}},
+            {"kind":"call","op":"boom","args":[]}
+        ]}});
+        let out = host.run_plan(plan).await.unwrap();
+
+        assert_eq!(
+            out["steps"], 2,
+            "both statements were dispatched — the second one failed, it wasn't skipped: {out}"
+        );
+        let failure = &out["failure"];
+        assert!(
+            !failure.is_null(),
+            "a halt must be reified, not an Err: {out}"
+        );
+        assert_eq!(failure["node"], 1);
+        assert_eq!(failure["kind"], "runtime");
+        assert_eq!(failure["fatal"], false);
+        assert_eq!(failure["op"], "boom");
+        assert!(failure["message"].as_str().unwrap().contains("boom"));
+        let completed = failure["completed"].as_array().unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0]["node"], 0);
+        assert_eq!(completed[0]["bind"], "a");
+        assert_eq!(completed[0]["op"], "echo");
+
+        let transcript = out["transcript"].as_str().unwrap();
+        assert!(
+            transcript.contains("[plan halted at step 2 of 2]"),
+            "{transcript}"
+        );
+        assert!(transcript.contains("✓ 0:"), "{transcript}");
+        assert!(transcript.contains("✗ 1:"), "{transcript}");
+    }
+
+    /// A-17: `run_plan`'s thin normalizing wrapper always sets `failure` — `null` when this round
+    /// didn't halt, never a missing key. `flux-lang`'s dotted field-access sugar (`$ran.failure`
+    /// lowers to a `jq` lookup) runtime-errors on a genuinely MISSING key, and the loop now routes
+    /// on `$ran.failure` every execute round — so a bare-absent key would break every clean turn.
+    #[tokio::test]
+    async fn run_plan_failure_field_is_always_present_never_missing() {
+        let rec = Recorder::default();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        let (_ex, host) = setup_host(
+            reg,
+            PermissionManager::from_rules(&["echo".into()], &[]),
+            Arc::new(AllowApprover),
+            rec,
+            "a17-failure-present",
+        );
+        let plan = json!({"kind":"plan","ast":{"body":[
+            {"kind":"bind","name":"a","value":{"kind":"call","op":"echo","args":[{"kind":"lit","value":"hi"}]}}
+        ]}});
+        let out = host.run_plan(plan).await.unwrap();
+        assert_eq!(
+            out.get("failure"),
+            Some(&Value::Null),
+            "success must set failure: null, never omit the key: {out}"
+        );
+    }
+
+    /// A-17 (closes the A-15 residual + wires the ✓-marker rendering fix): `run_plan`'s `flow.plan`
+    /// observation now carries `gather`/`phase`/`resumed` directly, computed host-side — the CLI/TUI
+    /// no longer need to infer gather-mode from a `loop.phase`/`flow.brief` state machine (which
+    /// couldn't tell an orient-phase gather plan apart from orient emitting the full plan directly
+    /// when the model's `brief` was unusable — A-15's recorded residual), nor guess whether `plan`'s
+    /// text carries ✓/✗/· status markers instead of a fresh full tree.
+    #[tokio::test]
+    async fn flow_plan_observation_carries_gather_phase_and_resumed_fields() {
+        let rec = Recorder::default();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        reg.register(Arc::new(BoomTool));
+        let (_ex, host) = setup_host(
+            reg,
+            PermissionManager::from_rules(&["echo".into(), "boom".into()], &[]),
+            Arc::new(AllowApprover),
+            rec.clone(),
+            "a17-plan-fields",
+        );
+
+        // A gather-phase call (the wire `settled: ""` an accepted `gather: true` plan carries) —
+        // `gather` reads directly off the incoming plan, not the surface's own phase tracking.
+        let gather_plan = json!({
+            "kind": "plan", "settled": "",
+            "ast": {"body": [
+                {"kind":"bind","name":"a","value":{"kind":"call","op":"echo","args":[{"kind":"lit","value":"g"}]}}
+            ]},
+        });
+        host.run_plan(gather_plan).await.unwrap();
+        {
+            let obs = rec.observations.lock().unwrap();
+            let plan_obs = obs
+                .iter()
+                .find(|o| o.kind == "flow.plan")
+                .expect("flow.plan observed");
+            assert_eq!(plan_obs.data["gather"], true, "{plan_obs:?}");
+            assert_eq!(plan_obs.data["resumed"], false, "{plan_obs:?}");
+        }
+        rec.observations.lock().unwrap().clear();
+
+        // A halt, then its resume: `resumed` is false on the fresh attempt and flips true only on
+        // the corrected re-emission that actually consumes the open latch.
+        let halted = json!({"kind":"plan","ast":{"body":[
+            {"kind":"bind","name":"a","value":{"kind":"call","op":"echo","args":[{"kind":"lit","value":"keep"}]}},
+            {"kind":"call","op":"boom","args":[]}
+        ]}});
+        host.run_plan(halted).await.unwrap();
+        {
+            let obs = rec.observations.lock().unwrap();
+            let plan_obs = obs
+                .iter()
+                .find(|o| o.kind == "flow.plan")
+                .expect("flow.plan observed");
+            assert_eq!(plan_obs.data["gather"], false);
+            assert_eq!(
+                plan_obs.data["resumed"], false,
+                "the FIRST attempt is not itself a resume"
+            );
+        }
+        rec.observations.lock().unwrap().clear();
+
+        let fixed = json!({"kind":"plan","ast":{"body":[
+            {"kind":"bind","name":"a","value":{"kind":"call","op":"echo","args":[{"kind":"lit","value":"keep"}]}},
+            {"kind":"bind","name":"b","value":{"kind":"call","op":"echo","args":[{"kind":"lit","value":"fixed"}]}}
+        ]}});
+        host.run_plan(fixed).await.unwrap();
+        let obs = rec.observations.lock().unwrap();
+        let plan_obs = obs
+            .iter()
+            .find(|o| o.kind == "flow.plan")
+            .expect("flow.plan observed");
+        assert_eq!(
+            plan_obs.data["resumed"], true,
+            "the corrected re-emission IS a resume: {plan_obs:?}"
+        );
+    }
+
+    /// A-17: a mid-plan halt emits a discrete `flow.halt` observation (`{step, of, op, kind,
+    /// fatal}`) right where the rest of the feedback contract is built, so the surface can print a
+    /// real-time `✗ step N/M <op> failed — revising…` cue instead of the halt being legible only
+    /// inside the fed-back transcript text.
+    #[tokio::test]
+    async fn flow_halt_observation_fires_with_step_of_op_and_kind() {
+        let rec = Recorder::default();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        reg.register(Arc::new(BoomTool));
+        let (_ex, host) = setup_host(
+            reg,
+            PermissionManager::from_rules(&["echo".into(), "boom".into()], &[]),
+            Arc::new(AllowApprover),
+            rec.clone(),
+            "a17-flow-halt",
+        );
+        let plan = json!({"kind":"plan","ast":{"body":[
+            {"kind":"bind","name":"a","value":{"kind":"call","op":"echo","args":[{"kind":"lit","value":"first"}]}},
+            {"kind":"call","op":"boom","args":[]}
+        ]}});
+        host.run_plan(plan).await.unwrap();
+        let obs = rec.observations.lock().unwrap();
+        let halt_obs = obs
+            .iter()
+            .find(|o| o.kind == "flow.halt")
+            .expect("flow.halt observed");
+        assert_eq!(halt_obs.data["step"], 2);
+        assert_eq!(halt_obs.data["of"], 2);
+        assert_eq!(halt_obs.data["op"], "boom");
+        assert_eq!(halt_obs.data["kind"], "runtime");
+        assert_eq!(halt_obs.data["fatal"], false);
+    }
+
+    /// `second_run_plan_consumes_latch_and_skips_completed_prefix` (A-16 acceptance): a corrected
+    /// re-emission that keeps the completed statement byte-identical fast-forwards past it —
+    /// the runtime never re-dispatches it — and runs only the fixed suffix.
+    #[tokio::test]
+    async fn second_run_plan_consumes_latch_and_skips_completed_prefix() {
+        let rec = Recorder::default();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        reg.register(Arc::new(BoomTool));
+        let (_ex, host) = setup_host(
+            reg,
+            PermissionManager::from_rules(&["echo".into(), "boom".into()], &[]),
+            Arc::new(AllowApprover),
+            rec.clone(),
+            "a16-resume",
+        );
+
+        let halted = json!({"kind":"plan","ast":{"body":[
+            {"kind":"bind","name":"a","value":{"kind":"call","op":"echo","args":[{"kind":"lit","value":"keep"}]}},
+            {"kind":"call","op":"boom","args":[]}
+        ]}});
+        let first = host.run_plan(halted).await.unwrap();
+        assert!(!first["failure"].is_null());
+
+        // The corrected re-emission: statement 0 byte-identical, statement 1 fixed.
+        let fixed = json!({"kind":"plan","ast":{"body":[
+            {"kind":"bind","name":"a","value":{"kind":"call","op":"echo","args":[{"kind":"lit","value":"keep"}]}},
+            {"kind":"bind","name":"b","value":{"kind":"call","op":"echo","args":[{"kind":"lit","value":"fixed"}]}}
+        ]}});
+        let second = host.run_plan(fixed).await.unwrap();
+        assert!(
+            second.get("failure").map(|f| f.is_null()).unwrap_or(true),
+            "the corrected plan must succeed: {second}"
+        );
+        assert_eq!(
+            second["steps"], 1,
+            "only the corrected (new) statement dispatched — statement 0 was skipped: {second}"
+        );
+
+        let echoes = rec
+            .tools
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.as_str() == "echo")
+            .count();
+        assert_eq!(
+            echoes, 2,
+            "echo dispatched once for statement 0 (round 1) and once for statement 1 (round 2) — \
+             never twice for statement 0"
+        );
+    }
+
+    /// `unrelated_next_plan_consumes_latch_with_zero_skips` (A-16 acceptance): the halt latch is
+    /// one-shot — even a completely unrelated next plan (no matching prefix) consumes it.
+    #[tokio::test]
+    async fn unrelated_next_plan_consumes_latch_with_zero_skips() {
+        let rec = Recorder::default();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        reg.register(Arc::new(BoomTool));
+        let (_ex, host) = setup_host(
+            reg,
+            PermissionManager::from_rules(&["echo".into(), "boom".into()], &[]),
+            Arc::new(AllowApprover),
+            rec,
+            "a16-zero-skip",
+        );
+
+        let halted = json!({"kind":"plan","ast":{"body":[
+            {"kind":"call","op":"boom","args":[]}
+        ]}});
+        let first = host.run_plan(halted).await.unwrap();
+        assert!(!first["failure"].is_null());
+        assert!(
+            host.store.open_halted_plan("sess").unwrap().is_some(),
+            "the latch is open after the halt"
+        );
+
+        // A totally unrelated plan — no statement in common with the halted one.
+        let unrelated = json!({"kind":"plan","ast":{"body":[
+            {"kind":"bind","name":"c","value":{"kind":"call","op":"echo","args":[{"kind":"lit","value":"totally different"}]}}
+        ]}});
+        let second = host.run_plan(unrelated).await.unwrap();
+        assert!(second.get("failure").map(|f| f.is_null()).unwrap_or(true));
+        assert_eq!(
+            second["steps"], 1,
+            "the unrelated plan ran in full — nothing matched to skip"
+        );
+
+        assert!(
+            host.store.open_halted_plan("sess").unwrap().is_none(),
+            "the latch must be consumed (PlanResumed appended) even at zero skips"
+        );
+    }
+
+    /// A divergence BEFORE the previously-failed index must warn that the changed prefix will
+    /// RE-RUN (including its side effects) — the model must not assume it stays skipped.
+    #[tokio::test]
+    async fn divergence_before_failure_produces_rerun_warning() {
+        let rec = Recorder::default();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        reg.register(Arc::new(BoomTool));
+        let (_ex, host) = setup_host(
+            reg,
+            PermissionManager::from_rules(&["echo".into(), "boom".into()], &[]),
+            Arc::new(AllowApprover),
+            rec,
+            "a16-rerun-warn",
+        );
+
+        let halted = json!({"kind":"plan","ast":{"body":[
+            {"kind":"bind","name":"a","value":{"kind":"call","op":"echo","args":[{"kind":"lit","value":"A"}]}},
+            {"kind":"bind","name":"b","value":{"kind":"call","op":"echo","args":[{"kind":"lit","value":"B"}]}},
+            {"kind":"call","op":"boom","args":[]}
+        ]}});
+        let first = host.run_plan(halted).await.unwrap();
+        assert!(!first["failure"].is_null());
+
+        // Statement 0 CHANGED (diverges before the failed index 2); statement 1 unchanged;
+        // statement 2 fixed.
+        let diverged = json!({"kind":"plan","ast":{"body":[
+            {"kind":"bind","name":"a","value":{"kind":"call","op":"echo","args":[{"kind":"lit","value":"A-changed"}]}},
+            {"kind":"bind","name":"b","value":{"kind":"call","op":"echo","args":[{"kind":"lit","value":"B"}]}},
+            {"kind":"bind","name":"c","value":{"kind":"call","op":"echo","args":[{"kind":"lit","value":"fixed"}]}}
+        ]}});
+        let second = host.run_plan(diverged).await.unwrap();
+        let transcript = second["transcript"].as_str().unwrap();
+        assert!(
+            transcript.contains("will RE-RUN"),
+            "a plan that diverges before the failed index must warn: {transcript}"
+        );
+        assert_eq!(
+            second["steps"], 3,
+            "nothing matched from index 0, so all three statements ran again: {second}"
+        );
+    }
+
+    /// Suffix-scoped approval (A-16 acceptance): resuming past an already-completed mutating
+    /// statement must NOT re-prompt the user for it — the plan-level approval preview covers only
+    /// the suffix that will actually run.
+    #[tokio::test]
+    async fn suffix_scoped_approval_sees_only_the_to_run_suffix() {
+        let rec = Recorder::default();
+        let seen_ops: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let approver = Arc::new(OpsCapturingApprover {
+            seen: seen_ops.clone(),
+        });
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(WriteEchoTool));
+        reg.register(Arc::new(WriteEcho2Tool));
+        reg.register(Arc::new(BoomTool));
+        let (_ex, host) = setup_host(
+            reg,
+            PermissionManager::new(),
+            approver,
+            rec,
+            "a16-suffix-approval",
+        );
+
+        // Round 1: `writeecho` succeeds, then `boom` fails — halts at index 1.
+        let halted = json!({"kind":"plan","ast":{"body":[
+            {"kind":"call","op":"writeecho","args":[{"kind":"lit","value":"hi"}]},
+            {"kind":"call","op":"boom","args":[]}
+        ]}});
+        let first = host.run_plan(halted).await.unwrap();
+        assert!(!first["failure"].is_null());
+        seen_ops.lock().unwrap().clear(); // only round 2's approval request is under test
+
+        // Round 2: statement 0 byte-identical (will be skipped); statement 1 replaced by a NEW
+        // mutating op. The approval preview must see ONLY the suffix that will actually run.
+        let fixed = json!({"kind":"plan","ast":{"body":[
+            {"kind":"call","op":"writeecho","args":[{"kind":"lit","value":"hi"}]},
+            {"kind":"call","op":"writeecho2","args":[{"kind":"lit","value":"bye"}]}
+        ]}});
+        let second = host.run_plan(fixed).await.unwrap();
+        assert!(
+            second.get("failure").map(|f| f.is_null()).unwrap_or(true),
+            "{second}"
+        );
+
+        let calls = seen_ops.lock().unwrap();
+        assert_eq!(calls.len(), 1, "one plan-level approval prompt for round 2");
+        assert!(
+            calls[0].contains(&"writeecho2".to_string()),
+            "the to-run suffix's op must be in the approval preview: {:?}",
+            calls[0]
+        );
+        assert!(
+            !calls[0].contains(&"writeecho".to_string()),
+            "an already-completed op must NOT be re-surfaced for approval: {:?}",
+            calls[0]
+        );
+    }
+
+    /// `denied_statement_reemission_is_refused_not_redispatched` (story acceptance): a byte-identical
+    /// re-emission of a plan whose statement was denied is refused WITHOUT executing — the denied op
+    /// is attempted exactly once, ever.
+    #[tokio::test]
+    async fn denied_statement_reemission_is_refused_not_redispatched() {
+        let rec = Recorder::default();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        let (_ex, host) = setup_host(
+            reg,
+            PermissionManager::from_rules(&[], &["echo".into()]), // echo denied by permission rules
+            Arc::new(AllowApprover),
+            rec.clone(),
+            "a16-denied-guard",
+        );
+
+        let plan = json!({"kind":"plan","ast":{"body":[
+            {"kind":"call","op":"echo","args":[{"kind":"lit","value":"hi"}]}
+        ]}});
+
+        let first = host.run_plan(plan.clone()).await.unwrap();
+        assert_eq!(
+            first["steps"], 1,
+            "the denied op was ATTEMPTED once: {first}"
+        );
+        assert_eq!(first["failure"]["kind"], "denied");
+        assert_eq!(first["failure"]["fatal"], true);
+
+        let second = host.run_plan(plan).await.unwrap();
+        assert_eq!(
+            second["steps"], 0,
+            "the byte-identical denied statement must NOT be re-dispatched: {second}"
+        );
+        assert_eq!(second["failure"]["kind"], "denied");
+        let transcript = second["transcript"].as_str().unwrap();
+        assert!(transcript.contains("NOT re-run"), "{transcript}");
+
+        let echoes = rec
+            .tools
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.as_str() == "echo")
+            .count();
+        assert_eq!(echoes, 1, "echo dispatched exactly once across both rounds");
+    }
+
+    /// `policy_denied_statement_is_not_reattempted_via_resume` (design acceptance): the guard matches
+    /// by STATEMENT hash, not whole-plan fingerprint — a plan edited elsewhere that still carries the
+    /// exact denied statement is refused in full, before anything (including a brand-new, otherwise
+    /// harmless leading statement) runs.
+    #[tokio::test]
+    async fn policy_denied_statement_is_not_reattempted_via_resume() {
+        let rec = Recorder::default();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        reg.register(Arc::new(NoteTool));
+        let (_ex, host) = setup_host(
+            reg,
+            PermissionManager::from_rules(&["note".into()], &["echo".into()]),
+            Arc::new(AllowApprover),
+            rec.clone(),
+            "a16-denied-resume",
+        );
+
+        let denied_plan = json!({"kind":"plan","ast":{"body":[
+            {"kind":"call","op":"echo","args":[{"kind":"lit","value":"hi"}]}
+        ]}});
+        let first = host.run_plan(denied_plan).await.unwrap();
+        assert_eq!(first["failure"]["kind"], "denied");
+
+        // A DIFFERENT plan (a new leading statement) that still contains the EXACT SAME denied
+        // statement — proves the guard matches by statement hash, not whole-plan fingerprint.
+        let edited_plan = json!({"kind":"plan","ast":{"body":[
+            {"kind":"call","op":"note","args":[{"kind":"lit","value":"context"}]},
+            {"kind":"call","op":"echo","args":[{"kind":"lit","value":"hi"}]}
+        ]}});
+        let second = host.run_plan(edited_plan).await.unwrap();
+        assert_eq!(
+            second["steps"], 0,
+            "the whole re-emitted plan is refused — not just the one statement: {second}"
+        );
+        assert_eq!(second["failure"]["kind"], "denied");
+
+        assert!(
+            !rec.tools.lock().unwrap().contains(&"note".to_string()),
+            "the guard fires before ANY statement in the re-emitted plan runs"
+        );
+    }
+
+    /// Repeated identical halts escalate through the SAME retry-breaker thresholds as any other
+    /// stall, keyed by the structured `halt:{op}:{stmt}:{kind}` identity rather than transcript text.
+    #[tokio::test]
+    async fn guard_key_escalation_on_repeated_identical_halts() {
+        let rec = Recorder::default();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(BoomTool));
+        let (_ex, host) = setup_host(
+            reg,
+            PermissionManager::from_rules(&["boom".into()], &[]),
+            Arc::new(AllowApprover),
+            rec,
+            "a16-guard-escalate",
+        );
+        let plan = json!({"kind":"plan","ast":{"body":[
+            {"kind":"call","op":"boom","args":[]}
+        ]}});
+
+        let r1 = host.run_plan(plan.clone()).await.unwrap();
+        assert!(
+            !r1["transcript"].as_str().unwrap().contains("[loop-guard]"),
+            "first sighting is quiet: {r1}"
+        );
+
+        let r2 = host.run_plan(plan.clone()).await.unwrap();
+        let t2 = r2["transcript"].as_str().unwrap();
+        assert!(t2.contains("[loop-guard]"), "{t2}");
+        assert!(
+            t2.contains("halt:boom:"),
+            "the structured halt key must drive escalation: {t2}"
+        );
+        assert!(host.guard.lock().unwrap().force_stop.is_none());
+
+        let _r3 = host.run_plan(plan.clone()).await.unwrap();
+        assert!(host.guard.lock().unwrap().force_stop.is_none());
+
+        let r4 = host.run_plan(plan).await.unwrap();
+        assert!(r4["transcript"].as_str().unwrap().contains("STOP"), "{r4}");
+        assert!(host.guard.lock().unwrap().force_stop.is_some());
+    }
+
+    /// Cross-turn resume (A-16 acceptance): a fresh turn's FIRST `plan()` call injects one ephemeral
+    /// `[resume context]` message when the session has an open halt latch; a later round in the SAME
+    /// turn must not repeat it.
+    #[tokio::test]
+    async fn fresh_turn_resume_context_is_injected_once() {
+        let rec = Recorder::default();
+        let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(rec)));
+        let dir =
+            std::env::temp_dir().join(format!("flux-loop-a16-resumectx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(BoomTool));
+        flux_tools::register_reflect(&mut reg);
+        let executor = Executor::new(
+            reg,
+            PermissionManager::from_rules(&["boom".into(), "plan".into(), "run_plan".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(system),
+        );
+        let provider = Arc::new(RecordingProvider {
+            responses: Mutex::new(VecDeque::from(vec![prose("ok1"), prose("ok2")])),
+            seen: Mutex::new(Vec::new()),
+            systems: Mutex::new(Vec::new()),
+        });
+        let store = Arc::new(FlowStore::in_memory().unwrap());
+        let (_executor, host) = EngineLoopHost::install(
+            executor,
+            provider.clone(),
+            "rec".into(),
+            None,
+            store,
+            Arc::new(DynamicComposites::default()),
+            "sess".into(),
+            shared.clone(),
+            CompileOptions::default(),
+        );
+
+        // Halt a plan in "sess" — leaves the latch open.
+        let plan = json!({"kind":"plan","ast":{"body":[{"kind":"call","op":"boom","args":[]}]}});
+        let halted = host.run_plan(plan).await.unwrap();
+        assert!(!halted["failure"].is_null());
+
+        // A fresh turn boundary.
+        host.set_turn("sess".into(), None, shared.clone(), None, None);
+        let _ = host
+            .plan(json!({"feedback": "", "phase": "orient"}))
+            .await
+            .unwrap();
+        {
+            let seen = provider.seen.lock().unwrap();
+            assert!(
+                seen[0].contains("[resume context]"),
+                "the first plan() call of a fresh turn must inject the resume context: {}",
+                seen[0]
+            );
+        }
+
+        // The SAME turn's next round must NOT repeat it.
+        let _ = host
+            .plan(json!({"feedback": "next round", "phase": "execute"}))
+            .await
+            .unwrap();
+        let seen = provider.seen.lock().unwrap();
+        assert!(
+            !seen[1].contains("[resume context]"),
+            "must not repeat within the same turn: {}",
+            seen[1]
+        );
+    }
+
+    /// The halt latch is folded from the run-event log, not a new in-process table — a completely
+    /// FRESH `FlowStore` opened over the same `events.db` (a stand-in for a fresh process after a
+    /// crash/restart) must see the same open latch.
+    #[tokio::test]
+    async fn latch_survives_a_fresh_flowstore_over_the_same_events_db() {
+        let dir =
+            std::env::temp_dir().join(format!("flux-loop-a16-crossproc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let events_path = dir.join("events.db");
+        let flow_path = dir.join("flow.db");
+
+        // "Process one": halt a plan, then drop every handle.
+        {
+            let rec = Recorder::default();
+            let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(rec)));
+            let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+            let mut reg = ToolRegistry::new();
+            reg.register(Arc::new(BoomTool));
+            let executor = Executor::new(
+                reg,
+                PermissionManager::from_rules(&["boom".into()], &[]),
+                Arc::new(AllowApprover),
+                ToolContext::new(system),
+            );
+            let provider: Arc<dyn Provider> = Arc::new(MockProvider {
+                responses: Mutex::new(VecDeque::new()),
+            });
+            let events = Arc::new(flux_events::EventStore::open(&events_path).unwrap());
+            let store = Arc::new(FlowStore::open(&flow_path, events).unwrap());
+            let (_ex, host) = EngineLoopHost::install(
+                executor,
+                provider,
+                "mock".into(),
+                None,
+                store,
+                Arc::new(DynamicComposites::default()),
+                "sess".into(),
+                shared,
+                CompileOptions::default(),
+            );
+            let plan =
+                json!({"kind":"plan","ast":{"body":[{"kind":"call","op":"boom","args":[]}]}});
+            let out = host.run_plan(plan).await.unwrap();
+            assert!(!out["failure"].is_null());
+        }
+
+        // "Process two": a completely fresh `EventStore` + `FlowStore` over the SAME paths.
+        let events2 = Arc::new(flux_events::EventStore::open(&events_path).unwrap());
+        let store2 = FlowStore::open(&flow_path, events2).unwrap();
+        let open = store2
+            .open_halted_plan("sess")
+            .unwrap()
+            .expect("a fresh store over the same events.db must see the open halt latch");
+        assert_eq!(open.halt.op.as_deref(), Some("boom"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

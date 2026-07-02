@@ -46,7 +46,9 @@ pub enum EventKind {
     /// when it is `"compile_error"`. For an accepted plan, `fingerprint` is the SHA-256 of the plan
     /// AST's canonical JSON (the loop guard's identity) and `plan_text` is the human-auditable
     /// rendered graph (`render_pretty`, capped) — the durable "a turn is a readable graph" record
-    /// (C-14). Both `#[serde(default)]` so pre-C-14 logs decode.
+    /// (C-14). `phase` is the multi-pass loop phase that produced this attempt — `"orient"`,
+    /// `"gather"`, or `"execute"` (A-14) — `None` for pre-A-14 logs and for attempts recorded outside
+    /// a phase-aware call. All newer fields are `#[serde(default)]` so older logs decode.
     PlanAttempted {
         step: u32,
         outcome: String,
@@ -56,6 +58,8 @@ pub enum EventKind {
         fingerprint: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         plan_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase: Option<String>,
     },
     /// A turn closed with its final `outcome`, iteration count, and assistant `answer`. `usage` is
     /// the turn's accumulated token tally — `None` for turns recorded before usage capture, or when

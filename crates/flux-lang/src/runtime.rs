@@ -14,14 +14,15 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use flux_core::{Error, Usage};
 use flux_spec::IntentSet;
 
 use crate::ast::{
-    DraftAst, Node, PhysicalPlan, RunEvent, Stage, StepId, SymbolName, TypeRef, Value, ValueId,
-    Visibility,
+    DraftAst, FailureKind, Node, NodeId, PhysicalPlan, RunEvent, Stage, StepId, SymbolName,
+    TypeRef, Value, ValueId, Visibility,
 };
 use crate::host::{ApprovalChoice, OpHost, OpOutcome};
 use crate::opspec::OpCatalog;
@@ -84,6 +85,22 @@ fn flow_key(name: Option<&str>, body: &[Node]) -> String {
         Some(n) if !n.trim().is_empty() => format!("{n}#{}", &hash[..16]),
         _ => format!("h:{}", &hash[..16]),
     }
+}
+
+/// A single top-level statement's content identity for the resumable-mode ledger:
+/// `sha256(canonical JSON of the node)[..16]`. The statement is hashed through its typed [`Node`]
+/// representation (not raw source text), so the result is insensitive to the source's key order and
+/// formatting — a re-emission that reorders an object's keys or reformats whitespace still hits the
+/// same `stmt_hash16` (`serde_json` maps serialize key-sorted, and a `Node`'s own fields serialize in
+/// one fixed declared order regardless of how the original text ordered them).
+///
+/// `pub` (A-16): a loop host must compute this same identity BEFORE executing anything — to preview
+/// the prospective skip prefix (for suffix-scoped approval + ✓/·-marked plan rendering) and to check
+/// the denial re-emission guard against a halt's recorded `stmt` — so the one canonical derivation is
+/// shared rather than re-implemented at the host layer.
+pub fn stmt_hash16(node: &Node) -> String {
+    let json = serde_json::to_string(node).unwrap_or_default();
+    sha256_hex(&json)[..16].to_string()
 }
 
 /// A one-line, length-bounded summary of a value for the symbol table (never the raw bytes).
@@ -566,6 +583,170 @@ pub struct FlowOutcome {
     /// persists this (with the flow body) and calls [`resume_flow`] once a value for the awaited
     /// `source` arrives; `None` on a normal completion or `return`.
     pub suspension: Option<Suspension>,
+    /// Set when the **resumable** execution mode ([`execute_flow_resumable`]) reified a top-level
+    /// statement's failure instead of propagating it as `Err` — the model-facing halt a loop host
+    /// feeds back for patch-and-continue (`docs/designs/multipass-agent-loop.md` Part 2). Always
+    /// `None` for [`execute_flow`]/[`resume_flow`] (strict mode never sets this) and for a resumable
+    /// run that completed without failing.
+    pub failure: Option<PlanHalt>,
+}
+
+/// A top-level statement's failure, reified by [`execute_flow_resumable`] instead of propagated as
+/// `Err`. Self-contained: it carries the plan's identity (`plan`, the [`flow_key`]) alongside the
+/// failing statement's position (`node`), content identity (`stmt`, its `stmt_hash16`), the op it
+/// dispatched (when derivable), how the failure classifies, and its message — everything a loop host
+/// needs to build model-facing feedback without re-deriving anything from the flow body.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanHalt {
+    /// The top-level index of the statement that failed.
+    pub node: NodeId,
+    /// The failed statement's `stmt_hash16` (see [`stmt_hash16`]).
+    pub stmt: String,
+    /// The op the statement dispatched, when directly derivable (a bare `call` or a `$x = call(...)`
+    /// bind); `None` for a composite/control-flow statement (`when`, `saga`, …) where no single op
+    /// identifies the failure.
+    pub op: Option<String>,
+    /// How the failure classifies (mirrors [`crate::error::FlowError::is_fatal`] via
+    /// [`FailureKind::is_fatal`]).
+    pub kind: FailureKind,
+    /// The failure's human-readable message (`FlowError`'s `Display`).
+    pub message: String,
+    /// The plan's `flow_key` — the identity a later [`ResumeLedger`] is scoped to.
+    pub plan: String,
+}
+
+/// One completed top-level statement recorded for resume — the durable memory
+/// [`execute_flow_resumable`] fast-forwards against. `value` is the value id the statement produced
+/// (`None` for a statement that bound nothing), rehydrated into the statement's bind when the
+/// statement is skipped on a later resumed run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LedgerEntry {
+    /// The statement's top-level index in the plan it was recorded against.
+    pub node: NodeId,
+    /// The statement's `stmt_hash16` (see [`stmt_hash16`]).
+    pub stmt: String,
+    pub value: Option<ValueId>,
+}
+
+/// The completed-statement memory a resumable run fast-forwards against. An edited re-emission of a
+/// halted plan pairwise-compares its top-level statements' content hashes against `completed` (keyed
+/// by top-level index, not vector position — a `checkpoint`/`await` node never ledgers, so a
+/// completed run can have gaps) and skips the longest matching prefix from index 0 (see
+/// [`execute_flow_resumable`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ResumeLedger {
+    pub completed: Vec<LedgerEntry>,
+    /// The prior (halted) plan's `flow_key` this ledger was recorded against — informational only;
+    /// the fast-forward itself is driven purely by per-statement content-hash comparison, so an
+    /// edited-but-key-identical prior plan still matches statement-by-statement.
+    pub prior_plan: String,
+}
+
+impl ResumeLedger {
+    /// Fold a session's run-event log for the **open halt latch**: the last [`RunEvent::PlanHalted`]
+    /// with no later [`RunEvent::PlanResumed`] for the same plan (mirrors
+    /// [`crate::store::DurableStore::once_lookup`]'s fold pattern) — then gather that plan's
+    /// [`RunEvent::StatementCompleted`] entries into a ready-to-resume ledger. `None` means there is
+    /// nothing to resume: the session never halted, or the halt was already consumed.
+    pub fn fold(events: &[RunEvent]) -> Option<Self> {
+        let mut open: Option<&str> = None;
+        for ev in events {
+            match ev {
+                RunEvent::PlanHalted { plan, .. } => open = Some(plan.as_str()),
+                // `PlanResumed { plan, prior, .. }`: `plan` is the NEW (resuming) plan's key, `prior`
+                // is the OLD (halted) plan's key it closes — the latch check compares `open` (the
+                // open halt's OWN key) against `prior`, not `plan`. A bug here (comparing against
+                // `plan` instead) would only ever clear the latch when the resuming plan happens to
+                // be byte-identical to the one that halted (`plan == prior`) — the common
+                // patch-and-continue case (an edited or unrelated re-emission) would leave a stale
+                // latch open forever.
+                RunEvent::PlanResumed { prior, .. } if open == Some(prior.as_str()) => open = None,
+                _ => {}
+            }
+        }
+        let plan = open?.to_string();
+        let completed = events
+            .iter()
+            .filter_map(|ev| match ev {
+                RunEvent::StatementCompleted {
+                    plan: p,
+                    node,
+                    stmt,
+                    value,
+                    ..
+                } if *p == plan => Some(LedgerEntry {
+                    node: *node,
+                    stmt: stmt.clone(),
+                    value: value.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        Some(ResumeLedger {
+            completed,
+            prior_plan: plan,
+        })
+    }
+}
+
+impl FailureKind {
+    /// Classify a resumable-mode top-level failure from the existing `FlowError` variants — L-21's
+    /// `FlowError::Denied` and the `Core` wraps of `ConfirmDenied`/`AssertFailed` are the fatal set;
+    /// everything else is the retryable `Runtime` default. Never a new failure mode: this only labels
+    /// what [`FlowError::is_fatal`] already distinguishes, so a halt's `kind`/`is_fatal()` can never
+    /// drift from it.
+    fn classify(err: &FlowError) -> Self {
+        match err {
+            FlowError::Denied(_) => FailureKind::Denied,
+            FlowError::Core(Error::ConfirmDenied(_)) => FailureKind::ConfirmDenied,
+            FlowError::Core(Error::AssertFailed(_)) => FailureKind::AssertFailed,
+            _ => FailureKind::Runtime,
+        }
+    }
+}
+
+/// The symbol a top-level statement directly binds a runtime value to, if any (plus its declared type,
+/// when known) — used to rehydrate a skipped statement's recorded value back into scope on ledger
+/// fast-forward. Deliberately narrow (no recursion into nested bodies, unlike
+/// `analyze::collect_bound_symbols`): only the statement's OWN binder matters here, because a skipped
+/// statement's nested work never ran again either.
+fn top_level_bind(node: &Node) -> Option<(&SymbolName, Option<&TypeRef>)> {
+    match node {
+        Node::Bind { name, ty, .. } => Some((name, ty.as_ref())),
+        Node::Memo { name, ty, .. } => Some((name, ty.as_ref())),
+        Node::Seq { bind: Some(b), .. }
+        | Node::Pipe { bind: Some(b), .. }
+        | Node::Retry { bind: Some(b), .. }
+        | Node::Loop { bind: Some(b), .. }
+        | Node::Race { bind: Some(b), .. }
+        | Node::Fallback { bind: Some(b), .. }
+        | Node::Timeout { bind: Some(b), .. }
+        | Node::Budget { bind: Some(b), .. }
+        | Node::CapScope { bind: Some(b), .. }
+        | Node::Scope { bind: Some(b), .. }
+        | Node::Once { bind: Some(b), .. } => Some((b, None)),
+        Node::Each {
+            collect: Some(c), ..
+        } => Some((c, None)),
+        Node::Repeat {
+            collect: Some(c), ..
+        } => Some((c, None)),
+        _ => None,
+    }
+}
+
+/// The op a top-level statement dispatched, when directly derivable — [`PlanHalt::op`]. `Some` for a
+/// bare `call` or a `$x = call(...)` bind; `None` for a composite/control-flow statement (`when`,
+/// `saga`, `retry`, …), where no single op identifies the failure.
+fn top_level_op(node: &Node) -> Option<String> {
+    match node {
+        Node::Call { op, .. } => Some(op.clone()),
+        Node::Bind { value, .. } => match value.as_ref() {
+            Node::Call { op, .. } => Some(op.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// A suspended flow's resume point: the top-level `await` node it stopped at and the external input it
@@ -670,6 +851,31 @@ pub async fn execute_flow(
 ) -> Result<FlowOutcome> {
     let fk = flow_key(ast.name.as_deref(), &ast.body);
     run_top_level(store, executor, session_id, &ast.body, 0, None, &fk, sink).await
+}
+
+/// The **resumable** analog of [`execute_flow`]: a failing TOP-LEVEL statement is reified as
+/// `Ok(FlowOutcome { failure: Some(PlanHalt{..}), transcript: <prefix> })` instead of propagating
+/// `Err` — composites and nested bodies keep strict `Err` propagation and structural fatality (F14)
+/// unchanged; reification happens ONLY at this top-level statement boundary. `ledger`, when given
+/// (typically [`ResumeLedger::fold`] over the session's run-event log), fast-forwards the longest
+/// content-hash-matching completed prefix — rehydrating each skipped statement's recorded value into
+/// its bind — before executing from the first divergence. Every completed top-level statement is
+/// ledgered ([`RunEvent::StatementCompleted`]), whether freshly dispatched or fast-forwarded past.
+///
+/// `execute_flow` itself is unchanged and unaffected — this is a separate opt-in entry point (see
+/// `docs/designs/multipass-agent-loop.md` Part 2 for the full patch-and-continue semantics). The
+/// caller (a loop host) owns finding/passing `ledger` and interpreting `outcome.failure`; this
+/// function only does the mechanical fast-forward + reification.
+pub async fn execute_flow_resumable(
+    store: &dyn ValueStore,
+    executor: &dyn OpHost,
+    session_id: &str,
+    ast: &DraftAst,
+    sink: &mut dyn FlowSink,
+    ledger: Option<&ResumeLedger>,
+) -> Result<FlowOutcome> {
+    let fk = flow_key(ast.name.as_deref(), &ast.body);
+    run_top_level_resumable(store, executor, session_id, &ast.body, &fk, ledger, sink).await
 }
 
 /// Resume a flow suspended on a top-level `await` (see [`FlowOutcome::suspension`]). Binds `input` to
@@ -808,6 +1014,7 @@ async fn run_top_level(
                     node,
                     source: source.clone(),
                 }),
+                failure: None,
             });
         }
         let (blast, _bvid, step) = exec_body(
@@ -838,6 +1045,7 @@ async fn run_top_level(
                 transcript: transcript.join("\n\n"),
                 steps,
                 suspension: None,
+                failure: None,
             });
         }
         if !blast.is_empty() {
@@ -852,6 +1060,247 @@ async fn run_top_level(
         transcript: transcript.join("\n\n"),
         steps,
         suspension: None,
+        failure: None,
+    })
+}
+
+/// The resumable-mode top-level statement driver behind [`execute_flow_resumable`]. Mirrors
+/// [`run_top_level`] (checkpoint fast-forward, `await` suspend, `return` unwind) with two additions,
+/// active ONLY at this top-level statement boundary — composites and nested bodies keep strict `Err`
+/// propagation and structural fatality (F14), unchanged:
+///
+/// 1. **Ledger fast-forward.** Walk `body` from index 0: a `checkpoint`/`await` node is a free
+///    pass-through (neither ledgers, and `checkpoint` has its own separate durable cursor, handled
+///    below); any other statement must have a matching [`LedgerEntry`] (looked up by top-level index,
+///    tolerant of the gaps those pass-through nodes leave) whose `stmt` hash equals the CURRENT body's
+///    statement at that index. The walk stops at the first statement with no matching entry — the
+///    first divergence; everything from there re-runs. Each matched statement is rehydrated (its
+///    recorded value rebound to its symbol, when it has one) and re-ledgered
+///    (`StatementCompleted{skipped:true}`), and the halt latch is marked consumed (`PlanResumed`).
+///    Composes with the checkpoint cursor as the max of the two: `start = ledger_end.max(checkpoint_next)`.
+/// 2. **Reified halt.** A failing statement at or after `start` does NOT propagate `Err` — it is
+///    classified into a [`PlanHalt`], `PlanHalted` is appended, and
+///    `Ok(FlowOutcome { failure: Some(halt), transcript: <prefix> })` is returned instead.
+///
+/// Every other top-level statement that completes is ledgered (`StatementCompleted{skipped:false}`).
+#[allow(clippy::too_many_arguments)]
+async fn run_top_level_resumable(
+    store: &dyn ValueStore,
+    executor: &dyn OpHost,
+    session_id: &str,
+    body: &[Node],
+    flow_key: &str,
+    ledger: Option<&ResumeLedger>,
+    sink: &mut dyn FlowSink,
+) -> Result<FlowOutcome> {
+    let mut steps = 0usize;
+    let mut transcript: Vec<String> = Vec::new();
+    let mut last = String::new();
+
+    // Index the ledger by top-level position (NOT vector position — `checkpoint`/`await` never
+    // ledger, so a completed ledger can have gaps at those positions).
+    let by_node: HashMap<u32, &LedgerEntry> = ledger
+        .map(|l| l.completed.iter().map(|e| (e.node.0, e)).collect())
+        .unwrap_or_default();
+
+    // Walk from index 0 while the ledger keeps matching; `checkpoint`/`await` are a free pass-through
+    // (they have no ledger entry of their own — `checkpoint`'s cursor is folded in separately below).
+    // Divergence = first hash mismatch (or first statement missing a ledger entry): everything from
+    // there re-runs.
+    let mut ledger_end = 0usize;
+    if ledger.is_some() {
+        while ledger_end < body.len() {
+            match &body[ledger_end] {
+                Node::Checkpoint { .. } | Node::Await { .. } => ledger_end += 1,
+                node => match by_node.get(&(ledger_end as u32)) {
+                    Some(entry) if entry.stmt == stmt_hash16(node) => ledger_end += 1,
+                    _ => break,
+                },
+            }
+        }
+    }
+
+    // The durable checkpoint cursor (same mechanism `run_top_level` honors for a fresh run).
+    let mut checkpoint_next = 0usize;
+    if let Some(d) = store.as_durable() {
+        if let Some(cp) = d.checkpoint_resume(session_id, flow_key)? {
+            checkpoint_next = (cp.0 as usize + 1).min(body.len());
+        }
+    }
+
+    let start = ledger_end.max(checkpoint_next);
+
+    // Rehydrate the ledger-matched prefix (bounded by `ledger_end`, not `start` — a jump past
+    // `ledger_end` driven by the checkpoint cursor alone rehydrates nothing, exactly like plain
+    // `checkpoint` today) and re-ledger each skipped statement so a second halt's fast-forward never
+    // needs to walk back further than this run.
+    if let Some(l) = ledger {
+        for (idx, node) in body.iter().enumerate().take(ledger_end) {
+            let Some(entry) = by_node.get(&(idx as u32)) else {
+                continue; // a pass-through checkpoint/await position — nothing to ledger here.
+            };
+            if let Some(vid) = &entry.value {
+                if let Some(value) = store.get_value(vid)? {
+                    let text = value_text(&value);
+                    if let Some((name, ty)) = top_level_bind(node) {
+                        let ty_label = ty.map(TypeRef::label);
+                        store.bind(
+                            session_id,
+                            name,
+                            vid,
+                            ty_label.as_deref(),
+                            &summarize(&text),
+                            Visibility::Visible,
+                        )?;
+                    }
+                    if !text.is_empty() {
+                        last = text;
+                    }
+                }
+            }
+            store.append_event(
+                session_id,
+                &RunEvent::StatementCompleted {
+                    plan: flow_key.to_string(),
+                    node: NodeId(idx as u32),
+                    stmt: entry.stmt.clone(),
+                    value: entry.value.clone(),
+                    skipped: true,
+                },
+            )?;
+            transcript.push(format!(
+                "[fast-forward: statement {idx} already completed, skipped]"
+            ));
+        }
+        store.append_event(
+            session_id,
+            &RunEvent::PlanResumed {
+                plan: flow_key.to_string(),
+                prior: l.prior_plan.clone(),
+                skipped: ledger_end,
+            },
+        )?;
+    }
+
+    let mut i = start;
+    while i < body.len() {
+        if let Node::Checkpoint { label } = &body[i] {
+            // Record the durable resume cursor, then continue past it (same as `run_top_level`).
+            if let Some(d) = store.as_durable() {
+                d.checkpoint_record(session_id, flow_key, label, NodeId(i as u32))?;
+            }
+            transcript.push(format!("[checkpoint {label}]"));
+            i += 1;
+            continue;
+        }
+        if let Node::Await { source, .. } = &body[i] {
+            let node = NodeId(i as u32);
+            store.append_event(
+                session_id,
+                &RunEvent::Awaiting {
+                    run: crate::ast::RunId(format!("{session_id}:{i}")),
+                    node,
+                },
+            )?;
+            return Ok(FlowOutcome {
+                returned: None,
+                result: last,
+                transcript: transcript.join("\n\n"),
+                steps,
+                suspension: Some(Suspension {
+                    node,
+                    source: source.clone(),
+                }),
+                failure: None,
+            });
+        }
+
+        let stmt = stmt_hash16(&body[i]);
+        match exec_body(
+            store,
+            executor,
+            session_id,
+            std::slice::from_ref(&body[i]),
+            sink,
+            &mut steps,
+            &mut transcript,
+        )
+        .await
+        {
+            Ok((blast, bvid, step)) => {
+                store.append_event(
+                    session_id,
+                    &RunEvent::StatementCompleted {
+                        plan: flow_key.to_string(),
+                        node: NodeId(i as u32),
+                        stmt,
+                        value: bvid.clone(),
+                        skipped: false,
+                    },
+                )?;
+                if let Step::Return(vid) = step {
+                    if let Some(v) = &vid {
+                        store.append_event(
+                            session_id,
+                            &RunEvent::FlowReturned { value: v.clone() },
+                        )?;
+                    }
+                    let result = if vid.is_some() { blast } else { last };
+                    return Ok(FlowOutcome {
+                        returned: vid,
+                        result,
+                        transcript: transcript.join("\n\n"),
+                        steps,
+                        suspension: None,
+                        failure: None,
+                    });
+                }
+                if !blast.is_empty() {
+                    last = blast;
+                }
+            }
+            Err(e) => {
+                let kind = FailureKind::classify(&e);
+                let op = top_level_op(&body[i]);
+                let halt = PlanHalt {
+                    node: NodeId(i as u32),
+                    stmt: stmt.clone(),
+                    op: op.clone(),
+                    kind,
+                    message: e.to_string(),
+                    plan: flow_key.to_string(),
+                };
+                store.append_event(
+                    session_id,
+                    &RunEvent::PlanHalted {
+                        plan: flow_key.to_string(),
+                        node: NodeId(i as u32),
+                        stmt,
+                        op,
+                        kind,
+                        error: e.to_string(),
+                    },
+                )?;
+                return Ok(FlowOutcome {
+                    returned: None,
+                    result: last,
+                    transcript: transcript.join("\n\n"),
+                    steps,
+                    suspension: None,
+                    failure: Some(halt),
+                });
+            }
+        }
+        i += 1;
+    }
+
+    Ok(FlowOutcome {
+        returned: None,
+        result: last,
+        transcript: transcript.join("\n\n"),
+        steps,
+        suspension: None,
+        failure: None,
     })
 }
 
@@ -991,6 +1440,7 @@ pub async fn execute_plan(
         // The optimized plan path does not suspend: the optimizer never emits `Stage::Await`, and a
         // top-level `await` reaching `exec_body` errors. Cross-turn suspend goes through `execute_flow`.
         suspension: None,
+        failure: None,
     })
 }
 
@@ -2573,11 +3023,7 @@ fn eval_pure_node(
             // `.kind`/`.transcript` out of a `plan`/`run_plan` result.
             let jv = jq_parse_input(eval_arg(input, store, session_id)?);
             let result = eval_jq_path(path, &jv)?;
-            let text = match &result {
-                serde_json::Value::String(s) => s.clone(),
-                other => serde_json::to_string(other).unwrap_or_default(),
-            };
-            (format!("jq {path}"), text, None)
+            (format!("jq {path}"), lit_text(&result), None)
         }
         Node::Parse {
             value: inner,
@@ -3441,10 +3887,20 @@ fn value_text(v: &Value) -> String {
     }
 }
 
-/// Render a literal JSON value as text (a JSON string is itself; anything else is compact JSON).
+/// Render a literal JSON value as text (a JSON string is itself; `null` is the empty string —
+/// matching [`ExprVal::from_json`]'s same choice and the `""`-is-absent idiom the language already
+/// uses for an optional field, e.g. `$plan.settled` — anything else is compact JSON).
+///
+/// A-17: this null-to-`""` mapping matters beyond cosmetics. `json_truthy`'s direct-JSON arm
+/// already treats `Value::Null` as falsy, but a `jq`-extracted field is textified through here
+/// before it is ever tested — without this arm, `null` round-tripped to the literal text `"null"`,
+/// which `json_truthy`'s string rule reads as TRUTHY (only `""`/`"false"`/`"0"` are falsy text), so
+/// `$x = $obj.field` (a present-but-null field, e.g. `run_plan`'s optional `failure`) silently
+/// became an always-true condition. See `jq_of_a_present_null_field_reads_falsy`.
 fn lit_text(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
         other => serde_json::to_string(other).unwrap_or_default(),
     }
 }
@@ -5183,6 +5639,467 @@ mod tests {
         );
     }
 
+    // ---- L-22: resumable mode — reified halts + statement ledger + prefix fast-forward ----
+
+    #[tokio::test]
+    async fn halted_plan_reifies_failure_with_prefix_transcript() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![echo("a"), echo("b"), call("boom", vec![])],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+
+        let out = execute_flow_resumable(&store, &host, "s", &ast, &mut sink, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            host.marks(),
+            vec!["a", "b", "boom"],
+            "the prefix dispatched, then the failing statement dispatched too (it failed, not skipped)"
+        );
+        let halt = out
+            .failure
+            .expect("a top-level failure is reified, not returned as Err");
+        assert_eq!(halt.node, NodeId(2));
+        assert_eq!(halt.kind, FailureKind::Runtime);
+        assert!(!halt.kind.is_fatal());
+        assert!(halt.message.contains("boom"), "{}", halt.message);
+        assert!(
+            out.transcript.contains("[echo]"),
+            "the prefix's transcript survives the halt: {}",
+            out.transcript
+        );
+
+        // The ledger recorded the completed prefix; the failed statement is NOT ledgered as
+        // completed — only as the halt.
+        let events = store.events("s");
+        let completed: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                RunEvent::StatementCompleted { node, skipped, .. } => Some((*node, *skipped)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completed, vec![(NodeId(0), false), (NodeId(1), false)]);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, RunEvent::PlanHalted { node, .. } if *node == NodeId(2))));
+    }
+
+    #[test]
+    fn stmt_hash_is_canonical_across_reemission() {
+        let a: Node = serde_json::from_str(
+            r#"{"kind":"call","op":"echo","args":[{"kind":"lit","value":"hi"}]}"#,
+        )
+        .unwrap();
+        // Same statement, reordered keys + extra whitespace — must hash identically: the node is
+        // hashed through its typed `Node` representation, which serializes fields in one fixed
+        // declared order regardless of the source text's order.
+        let b: Node = serde_json::from_str(
+            r#"{
+                "args": [ { "value": "hi", "kind": "lit" } ],
+                "op": "echo",
+                "kind": "call"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(stmt_hash16(&a), stmt_hash16(&b));
+
+        // A genuinely different statement hashes differently.
+        let c: Node = serde_json::from_str(
+            r#"{"kind":"call","op":"echo","args":[{"kind":"lit","value":"bye"}]}"#,
+        )
+        .unwrap();
+        assert_ne!(stmt_hash16(&a), stmt_hash16(&c));
+    }
+
+    #[tokio::test]
+    async fn resumed_plan_skips_hash_matched_prefix_and_rehydrates_values() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+
+        let bind_a = flow_bind("a", echo("hello"));
+        let bind_b = flow_bind("b", echo("world"));
+
+        let halted_ast = DraftAst {
+            body: vec![bind_a.clone(), bind_b.clone(), call("boom", vec![])],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let halted = execute_flow_resumable(&store, &host, "s1", &halted_ast, &mut sink, None)
+            .await
+            .unwrap();
+        assert!(halted.failure.is_some());
+        assert_eq!(host.marks(), vec!["hello", "world", "boom"]);
+
+        // Build the resume ledger from the session's own event log — the real fold, not hand-rolled.
+        let ledger = ResumeLedger::fold(&store.events("s1")).expect("an open halt latch exists");
+        assert_eq!(ledger.completed.len(), 2);
+
+        // Resume under a DIFFERENT session — its symbol table has never bound $a/$b, so if the
+        // fast-forward skips statements 0/1 without rehydration, `$a`/`$b` would be unresolved and
+        // the new statement below would error. `MemStore` values are content-addressed independent
+        // of session (exactly like the production store), so the ledger's recorded `ValueId`s are
+        // still reachable — proving REHYDRATION, not incidental same-session persistence, is what
+        // makes them resolvable again.
+        assert!(
+            store
+                .resolve("s2", &SymbolName("a".into()))
+                .unwrap()
+                .is_none(),
+            "the resumed session has not bound $a yet"
+        );
+
+        // Re-emit: keep the first two statements byte-identical; replace the failing one with a
+        // statement that references BOTH rehydrated symbols — proving they were actually rebound,
+        // not just skipped over.
+        let resumed_ast = DraftAst {
+            body: vec![
+                bind_a,
+                bind_b,
+                Node::Bind {
+                    name: SymbolName("c".into()),
+                    value: Box::new(Node::Fmt {
+                        template: "{a}-{b}".into(),
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink2 = BufferSink::default();
+        let resumed =
+            execute_flow_resumable(&store, &host, "s2", &resumed_ast, &mut sink2, Some(&ledger))
+                .await
+                .unwrap();
+
+        assert!(
+            resumed.failure.is_none(),
+            "the divergent statement succeeds: {:?}",
+            resumed.failure
+        );
+        assert_eq!(
+            host.marks(),
+            vec!["hello", "world", "boom"],
+            "the matched prefix did not re-dispatch on resume"
+        );
+        let c = store
+            .resolve("s2", &SymbolName("c".into()))
+            .unwrap()
+            .expect("$c is bound");
+        let v = store.get_value(&c).unwrap().unwrap();
+        assert_eq!(
+            value_text(&v),
+            "hello-world",
+            "rehydrated $a/$b fed the new statement"
+        );
+
+        // Skipped statements re-ledger with skipped:true, so a second halt's fast-forward would
+        // have a self-contained ledger without walking back further than this run.
+        let events = store.events("s2");
+        let skips: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                RunEvent::StatementCompleted {
+                    node,
+                    skipped: true,
+                    ..
+                } => Some(*node),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(skips, vec![NodeId(0), NodeId(1)]);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, RunEvent::PlanResumed { skipped, .. } if *skipped == 2)));
+    }
+
+    /// Regression (found by A-16's loop-host tests): `ResumeLedger::fold`'s latch-closing check must
+    /// compare the open halt's key against `PlanResumed::prior` (the OLD plan it resumes), not
+    /// `PlanResumed::plan` (the NEW plan produced by resuming) — those two keys are almost always
+    /// different (an edited or unrelated re-emission), so comparing against `plan` would leave the
+    /// latch open FOREVER after any resume except a byte-identical one. A single-session, no-store
+    /// fold check (independent of the loop-host's own `open_halted_plan`, which merely delegates to
+    /// this fold) proves the fix at its source.
+    #[tokio::test]
+    async fn fold_clears_the_latch_after_a_non_identical_resume() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+
+        let halted_ast = DraftAst {
+            body: vec![call("boom", vec![])],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let halted = execute_flow_resumable(&store, &host, "s", &halted_ast, &mut sink, None)
+            .await
+            .unwrap();
+        assert!(halted.failure.is_some());
+        let ledger = ResumeLedger::fold(&store.events("s")).expect("the latch is open");
+
+        // An entirely UNRELATED plan (no statement in common) — the common "corrected re-emission"
+        // shape, since a fix almost always changes the plan's content hash.
+        let unrelated_ast = DraftAst {
+            body: vec![flow_bind("c", echo("hi"))],
+            ..Default::default()
+        };
+        let mut sink2 = BufferSink::default();
+        let resumed = execute_flow_resumable(
+            &store,
+            &host,
+            "s",
+            &unrelated_ast,
+            &mut sink2,
+            Some(&ledger),
+        )
+        .await
+        .unwrap();
+        assert!(resumed.failure.is_none());
+
+        assert!(
+            ResumeLedger::fold(&store.events("s")).is_none(),
+            "the latch must be consumed by the resume even though the new plan shares nothing with \
+             the one that halted"
+        );
+    }
+
+    #[tokio::test]
+    async fn divergent_prefix_statement_reruns() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+
+        let halted_ast = DraftAst {
+            body: vec![
+                flow_bind("a", echo("hello")),
+                flow_bind("b", echo("world")),
+                call("boom", vec![]),
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        execute_flow_resumable(&store, &host, "s", &halted_ast, &mut sink, None)
+            .await
+            .unwrap();
+        assert_eq!(host.marks(), vec!["hello", "world", "boom"]);
+
+        let ledger = ResumeLedger::fold(&store.events("s")).unwrap();
+
+        // Re-emit with the SECOND statement edited: only the first statement's hash still matches,
+        // so the fast-forward stops there — the edited statement and everything after it re-run,
+        // but the FIRST statement's side effect is not repeated.
+        let resumed_ast = DraftAst {
+            body: vec![
+                flow_bind("a", echo("hello")),
+                flow_bind("b", echo("WORLD")),
+                flow_bind("c", echo("done")),
+            ],
+            ..Default::default()
+        };
+        let mut sink2 = BufferSink::default();
+        let out =
+            execute_flow_resumable(&store, &host, "s", &resumed_ast, &mut sink2, Some(&ledger))
+                .await
+                .unwrap();
+
+        assert!(out.failure.is_none());
+        assert_eq!(
+            host.marks(),
+            vec!["hello", "world", "boom", "WORLD", "done"],
+            "statement 0 (unchanged) did not re-dispatch; statement 1 (edited) and everything \
+             after it re-ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_fast_forward_composes_with_checkpoint_cursor_as_max_of_both() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            name: Some("phased".into()),
+            body: vec![
+                flow_bind("a", echo("alpha")),           // 0
+                flow_bind("extra", echo("beta")),        // 1
+                Node::Checkpoint { label: "p1".into() }, // 2
+                flow_bind("c", echo("gamma")),           // 3
+                call("boom", vec![]),                    // 4
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        execute_flow_resumable(&store, &host, "s", &ast, &mut sink, None)
+            .await
+            .unwrap();
+        assert_eq!(host.marks(), vec!["alpha", "beta", "gamma", "boom"]);
+
+        // A ledger that only "knows about" statement 0 (as if folded from an OLDER halt, before the
+        // checkpoint was ever reached) — but the checkpoint cursor recorded during the run above is
+        // FURTHER along, so it must win (max of both): statement 1 must NOT re-dispatch even though
+        // the ledger alone would have stopped fast-forwarding right after statement 0.
+        let ledger = ResumeLedger {
+            completed: vec![LedgerEntry {
+                node: NodeId(0),
+                stmt: stmt_hash16(&ast.body[0]),
+                value: store.resolve("s", &SymbolName("a".into())).unwrap(),
+            }],
+            prior_plan: flow_key(ast.name.as_deref(), &ast.body),
+        };
+
+        let mut sink2 = BufferSink::default();
+        let out = execute_flow_resumable(&store, &host, "s", &ast, &mut sink2, Some(&ledger))
+            .await
+            .unwrap();
+
+        assert!(out.failure.is_some());
+        assert_eq!(
+            host.marks(),
+            vec!["alpha", "beta", "gamma", "boom", "gamma", "boom"],
+            "the checkpoint's cursor (past statement 2) wins over the ledger's shorter match: \
+             statement 1 does not re-dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn resumable_saga_failure_compensates_then_halts_without_ledgering_as_completed() {
+        use crate::ast::SagaStep;
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![Node::Saga {
+                steps: vec![
+                    SagaStep {
+                        body: vec![echo("s1")],
+                        undo: vec![echo("r1")],
+                    },
+                    SagaStep {
+                        body: vec![call("boom", vec![])],
+                        undo: vec![echo("r2")],
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let out = execute_flow_resumable(&store, &host, "s", &ast, &mut sink, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            host.marks(),
+            vec!["s1", "boom", "r1"],
+            "the failed step's undo does not run; the completed step's undo compensates"
+        );
+        let halt = out
+            .failure
+            .expect("the saga statement's failure is reified at the top level");
+        assert_eq!(halt.node, NodeId(0));
+
+        // The saga statement never ledgers as completed — it failed, even though it compensated.
+        let events = store.events("s");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, RunEvent::StatementCompleted { .. })),
+            "a failing saga statement is never ledgered as completed"
+        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, RunEvent::PlanHalted { node, .. } if *node == NodeId(0))));
+    }
+
+    #[tokio::test]
+    async fn resumable_once_behavior_is_unaffected() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![Node::Once {
+                label: "welcome".into(),
+                body: vec![echo("sent")],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        execute_flow_resumable(&store, &host, "s", &ast, &mut sink, None)
+            .await
+            .unwrap();
+        assert_eq!(host.marks(), vec!["sent"]);
+
+        // A second resumable run in the SAME session skips the side effect exactly like strict mode.
+        let mut sink2 = BufferSink::default();
+        execute_flow_resumable(&store, &host, "s", &ast, &mut sink2, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            host.marks(),
+            vec!["sent"],
+            "once's at-most-once guarantee holds under resumable mode too"
+        );
+    }
+
+    #[tokio::test]
+    async fn resumable_success_matches_strict_mode_result_and_transcript() {
+        let body = vec![echo("a"), echo("b")];
+
+        let host1 = CfHost::new();
+        let store1 = MemStore::new();
+        let ast1 = DraftAst {
+            body: body.clone(),
+            ..Default::default()
+        };
+        let mut sink1 = BufferSink::default();
+        let strict = execute_flow(&store1, &host1, "s", &ast1, &mut sink1)
+            .await
+            .unwrap();
+
+        let host2 = CfHost::new();
+        let store2 = MemStore::new();
+        let ast2 = DraftAst {
+            body,
+            ..Default::default()
+        };
+        let mut sink2 = BufferSink::default();
+        let resumable = execute_flow_resumable(&store2, &host2, "s", &ast2, &mut sink2, None)
+            .await
+            .unwrap();
+
+        assert_eq!(strict.result, resumable.result);
+        assert_eq!(strict.transcript, resumable.transcript);
+        assert_eq!(strict.steps, resumable.steps);
+        assert!(resumable.failure.is_none());
+        assert_eq!(host1.marks(), host2.marks());
+    }
+
+    #[test]
+    fn failure_kind_classification_matches_flow_error_is_fatal() {
+        let denied = FlowError::Denied("nope".into());
+        let confirm_denied = FlowError::Core(Error::ConfirmDenied("no".into()));
+        let assert_failed = FlowError::Core(Error::AssertFailed("bad".into()));
+        let runtime = FlowError::Runtime("boom".into());
+
+        for err in [&denied, &confirm_denied, &assert_failed, &runtime] {
+            assert_eq!(
+                FailureKind::classify(err).is_fatal(),
+                err.is_fatal(),
+                "{err}"
+            );
+        }
+        assert_eq!(FailureKind::classify(&denied), FailureKind::Denied);
+        assert_eq!(
+            FailureKind::classify(&confirm_denied),
+            FailureKind::ConfirmDenied
+        );
+        assert_eq!(
+            FailureKind::classify(&assert_failed),
+            FailureKind::AssertFailed
+        );
+        assert_eq!(FailureKind::classify(&runtime), FailureKind::Runtime);
+    }
+
     #[tokio::test]
     async fn timeout_bounds_the_wall_clock() {
         // fast body finishes inside the deadline; its dispatch is threaded into the real step count
@@ -5663,6 +6580,49 @@ mod tests {
         assert!(
             out.transcript.contains("[jq .a]"),
             "statement transcript tag unchanged: {}",
+            out.transcript
+        );
+    }
+
+    /// A-17: a field that is PRESENT but JSON `null` (e.g. `run_plan`'s optional `failure`, host-
+    /// normalized to `null` on a round that didn't halt) must read FALSY once bound through `jq` and
+    /// tested by `when`/`unless` — before `lit_text`'s null-to-`""` fix, `null` round-tripped to the
+    /// literal text `"null"`, which `json_truthy`'s string rule reads as truthy (only `""`/`"false"`/
+    /// `"0"` are falsy text), so a dotted `$obj.field` access on an absent-but-present field silently
+    /// became an always-true condition — exactly what would have broken the agent loop's `when
+    /// $failure` revise-routing (`docs/designs/multipass-agent-loop.md` Part 2).
+    #[tokio::test]
+    async fn jq_of_a_present_null_field_reads_falsy() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![
+                flow_bind("obj", flow_lit(json!({"failure": null}))),
+                flow_bind(
+                    "failure",
+                    Node::Jq {
+                        path: ".failure".into(),
+                        input: Box::new(flow_var("obj")),
+                    },
+                ),
+                Node::When {
+                    cond: Box::new(flow_var("failure")),
+                    then: vec![flow_bind("answer", flow_lit(json!("truthy")))],
+                    otherwise: vec![flow_bind("answer", flow_lit(json!("falsy")))],
+                },
+                Node::Return {
+                    value: Box::new(flow_var("answer")),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let out = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.result, "falsy",
+            "a present-but-null field must read falsy, not truthy: {}",
             out.transcript
         );
     }

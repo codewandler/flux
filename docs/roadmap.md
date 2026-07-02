@@ -165,7 +165,9 @@ win) → [A-13](stories/A-13-phase-aware-planner-protocol.md) (phase protocol) �
 [L-22](stories/L-22-reified-halts-statement-ledger.md) (runtime ledger) →
 [A-16](stories/A-16-loop-host-resume-policy.md) (resume policy) →
 [A-17](stories/A-17-revise-wiring.md) (revise wiring, tracks join) →
-[I-03](stories/I-03-multipass-cutover-measurement.md) (measured cutover gate). Later:
+[I-03](stories/I-03-multipass-cutover-measurement.md) (measured cutover gate). **Status
+2026-07-02: the MVP (A-12–A-17 + L-22) is implemented, full gate green — I-03's measured verdict
+is the remaining epic gate.** Later:
 [A-18](stories/A-18-multipass-plan-mode.md) ·
 [L-23](stories/L-23-streaming-plan-render.md) (after L-20) ·
 [L-24](stories/L-24-reified-await-ledger.md) ·

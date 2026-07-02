@@ -613,6 +613,7 @@ impl EventStore {
                 error: attempt.error,
                 fingerprint: attempt.fingerprint,
                 plan_text: attempt.plan_text,
+                phase: attempt.phase,
             })
             .in_turn(turn_id),
         )?;

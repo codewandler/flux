@@ -28,8 +28,8 @@ use flux_provider::{Provider, Request, SystemSegment, ToolDef};
 use flux_spec::tool_input_schema;
 use schemars::JsonSchema;
 
-use crate::analyze::{lower, Diagnostic};
-use crate::ast::DraftAst;
+use crate::analyze::{for_each_node, lower, Diagnostic};
+use crate::ast::{DraftAst, Node};
 use crate::registry::OpRegistry;
 use crate::state::SessionView;
 
@@ -92,6 +92,26 @@ pub struct Compiled {
     /// pre-composed summary. `None` means "keep going" → the engine loops, and the model ends the turn
     /// by answering in prose once it has seen what it needs (the standard agent loop).
     pub complete: Option<Completion>,
+    /// True when the model tagged this plan `gather: true` (design Part 1 — the phased loop): a
+    /// bounded, read-only orient/gather round rather than the execution plan. Compile-time enforced
+    /// (see [`OpRegistry::mutating_ops_in`] and [`GATHER_NODE_CAP`]) — a plan reaching here with
+    /// `gather: true` is guaranteed effect-clean and small. Always `false` for a plan compiled via
+    /// [`compile`] (the one-shot, non-phased path) or the plain-text fallback in [`compile_turn`].
+    pub gather: bool,
+    /// The orient/gather grounding artifact riding alongside a `gather: true` plan — `None` unless
+    /// `gather` is `true` and the model supplied a usable `brief` (parsed tolerantly, like
+    /// [`Completion`]).
+    pub brief: Option<Brief>,
+}
+
+/// The orient/gather grounding artifact (design Part 1's `brief: {goal, needs[]}`): what the turn is
+/// ultimately trying to accomplish, and the specific things still unknown. Host-carried per turn
+/// (A-14) and prepended to subsequent planner feedback so a multi-round gather doesn't lose the
+/// thread.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Brief {
+    pub goal: String,
+    pub needs: Vec<String>,
 }
 
 /// The model's turn-completion directive (the optional `complete` field of `emit_plan`). It carries
@@ -114,6 +134,14 @@ struct EmitPlanInput {
     /// Attach only when this plan completes the request; the runtime renders the final message after
     /// executing the plan.
     complete: Option<EmitPlanCompletionInput>,
+    /// Tag this plan as a bounded, read-only orient/gather round (only where the current phase's
+    /// instructions allow it — rejected in the execute phase). The compiler enforces effect-clean
+    /// (no write/destructive op, composites included) and a small call-node cap; pass `brief`
+    /// alongside it.
+    gather: Option<bool>,
+    /// Present alongside `gather: true`: the grounding artifact — what the turn is ultimately
+    /// trying to accomplish, and what this gather round still needs to learn.
+    brief: Option<EmitPlanBriefInput>,
 }
 
 #[derive(JsonSchema)]
@@ -127,6 +155,17 @@ struct EmitPlanCompletionInput {
 
 #[derive(JsonSchema)]
 #[allow(dead_code)]
+struct EmitPlanBriefInput {
+    /// What the turn is ultimately trying to accomplish.
+    goal: String,
+    /// The specific things still unknown that this gather round (and any that follow) is trying to
+    /// learn.
+    #[serde(default)]
+    needs: Vec<String>,
+}
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
 struct EmitPlanTextInput {
     /// The plan as native Flux-Lang source text: a `flow` header line at column 0, then one
     /// statement per line, indented 2 spaces per block level (never tabs).
@@ -134,6 +173,14 @@ struct EmitPlanTextInput {
     /// Attach only when this plan completes the request; the runtime renders the final message after
     /// executing the plan.
     complete: Option<EmitPlanCompletionInput>,
+    /// Tag this plan as a bounded, read-only orient/gather round (only where the current phase's
+    /// instructions allow it — rejected in the execute phase). The compiler enforces effect-clean
+    /// (no write/destructive op, composites included) and a small call-node cap; pass `brief`
+    /// alongside it.
+    gather: Option<bool>,
+    /// Present alongside `gather: true`: the grounding artifact — what the turn is ultimately
+    /// trying to accomplish, and what this gather round still needs to learn.
+    brief: Option<EmitPlanBriefInput>,
 }
 
 #[derive(JsonSchema)]
@@ -183,6 +230,53 @@ impl EmissionArm {
     /// Read the arm from the `FLUX_EMISSION` env switch (the planner's emission-surface selector).
     pub fn from_env() -> Result<Self> {
         Self::parse(std::env::var("FLUX_EMISSION").ok().as_deref())
+    }
+}
+
+/// Which pass of the phased turn loop is calling [`compile_turn`] (design Part 1 —
+/// `docs/designs/multipass-agent-loop.md`): selects the per-phase instruction segment appended
+/// after the shared, byte-stable segment A, and gates `gather: true` emissions. The loop text and
+/// host threading (brief carry, settled/budget bookkeeping) are story A-14's job — this type is
+/// only the protocol carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Phase {
+    /// The turn's first planner call: a three-way contract — trivial request → prose chat (as
+    /// today); simple/actionable request → the full execution plan (as today, no added latency);
+    /// complex/context-hungry request → a small, read-only plan tagged `gather: true` plus a
+    /// `brief: {goal, needs[]}`.
+    Orient,
+    /// A bounded read-only gather round: keep gathering (another `gather: true` plan) or settle
+    /// (the full execution plan, or a prose answer). Still allowed to emit `gather: true`.
+    Gather,
+    /// The standard plan/execute/revise contract — today's behavior, byte-compatible. `gather: true`
+    /// is rejected here as repair feedback: the gather budget is spent once execution starts.
+    /// Default, so a phase-less call (pre-A-14 ejected loops, the one-shot `--plan`/`/plan`
+    /// surfaces) gets exactly the pre-phase contract.
+    #[default]
+    Execute,
+}
+
+impl Phase {
+    /// The wire name for this phase (the flux-lang `plan(phase: "...")` reflexive op — A-14 —
+    /// carries exactly this string; kept here so the three names are defined once).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Phase::Orient => "orient",
+            Phase::Gather => "gather",
+            Phase::Execute => "execute",
+        }
+    }
+
+    /// Parse the `phase` argument threaded through the `plan(phase: "...")` reflexive op (A-14) —
+    /// the inverse of [`Self::as_str`]. Absent, empty, or any unrecognized value defaults to
+    /// [`Phase::Execute`] — the byte-compatible contract a phase-less call (an ejected/overridden
+    /// pre-A-14 loop) must keep getting.
+    pub fn from_wire(value: Option<&str>) -> Phase {
+        match value {
+            Some("orient") => Phase::Orient,
+            Some("gather") => Phase::Gather,
+            _ => Phase::Execute,
+        }
     }
 }
 
@@ -274,6 +368,8 @@ pub async fn compile(
                         attempts: attempt,
                         diagnostics: Vec::new(),
                         complete: None,
+                        gather: false,
+                        brief: None,
                     })
                 }
                 Err(diags) => {
@@ -283,6 +379,8 @@ pub async fn compile(
                             attempts: attempt,
                             diagnostics: diags,
                             complete: None,
+                            gather: false,
+                            brief: None,
                         });
                     }
                     last_err = join_diags(&diags);
@@ -329,6 +427,7 @@ pub async fn compile_turn(
     // reasoning in real time instead of showing a silent "composing plan\u2026" indicator.
     thinking_sink: Option<&'_ mut dyn crate::AgentSink>,
     opts: CompileOptions,
+    phase: Phase,
 ) -> Result<(TurnOutput, Usage)> {
     // The emission surface is env-selected here — the single front door — so every caller (engine,
     // loop host, CLI) picks the arm up without threading a parameter (the L-20 A/B scaffold).
@@ -344,6 +443,7 @@ pub async fn compile_turn(
         thinking_sink,
         opts,
         arm,
+        phase,
     )
     .await
 }
@@ -363,10 +463,11 @@ pub async fn compile_turn_with_arm(
     mut thinking_sink: Option<&'_ mut dyn crate::AgentSink>,
     opts: CompileOptions,
     arm: EmissionArm,
+    phase: Phase,
 ) -> Result<(TurnOutput, Usage)> {
     let steps = opts.max_steps.max(1);
     let interactive = ask.is_some();
-    let segments = assemble_system_segments(base_system, ops, view, interactive, arm);
+    let segments = assemble_system_segments(base_system, ops, view, interactive, arm, phase);
     // Pure DAG: the model's ONLY tools are `emit_plan` (+ `ask_user`). Every op — reads included — is a
     // node in the emitted graph, so a turn is always an auditable plan, never a free-form tool call.
     let tools = planner_tools(interactive, arm);
@@ -440,6 +541,11 @@ pub async fn compile_turn_with_arm(
                                 attempts: step,
                                 diagnostics: Vec::new(),
                                 complete: None,
+                                // The text fallback has no wrapping JSON object to carry `gather`/
+                                // `brief` from (it's a bare AST parsed out of prose) — same as
+                                // `complete` above, neither rides through this path.
+                                gather: false,
+                                brief: None,
                             }),
                             usage,
                         ));
@@ -500,6 +606,11 @@ pub async fn compile_turn_with_arm(
                     // present ⇒ this plan completes the request, so the engine renders the final message
                     // from the results after running. Absent ⇒ the engine loops (the model answers later).
                     let complete = parse_completion(input.get("complete"));
+                    // The orient/gather tag + grounding artifact (design Part 1), parsed the same
+                    // tolerant way regardless of arm — like `complete` above, both live on the raw
+                    // JSON `input`, not inside either arm's `ast`/`source` payload.
+                    let gather = parse_gather(input.get("gather"));
+                    let brief = gather.then(|| parse_brief(input.get("brief"))).flatten();
                     // Per-arm decode (L-20): both arms land on the SAME `DraftAst` and flow through
                     // the identical gates below — surfacing enforcement (A-04) and analyze/lower
                     // (C-17) hold regardless of which surface carried the plan.
@@ -539,6 +650,30 @@ pub async fn compile_turn_with_arm(
                                 ));
                                 continue;
                             }
+                            // Gather is enforced, not trusted (design Part 1): a `gather: true` plan
+                            // is only ever granted in the orient/gather phases, and even there must
+                            // be effect-clean and small — the SAME repair-feedback shape as the
+                            // hidden-op gate above, never a silent downgrade or a hard turn error.
+                            if gather {
+                                if phase == Phase::Execute {
+                                    last_reject = GATHER_REJECTED_IN_EXECUTE_PHASE.to_string();
+                                    results.push(ContentBlock::tool_result_text(
+                                        id,
+                                        last_reject.clone(),
+                                        true,
+                                    ));
+                                    continue;
+                                }
+                                if let Some(msg) = gather_violation(&ast, ops) {
+                                    last_reject = msg;
+                                    results.push(ContentBlock::tool_result_text(
+                                        id,
+                                        last_reject.clone(),
+                                        true,
+                                    ));
+                                    continue;
+                                }
+                            }
                             match validate_plan(&ast, ops, view) {
                                 Ok(()) => {
                                     results.push(ContentBlock::tool_result_text(
@@ -551,6 +686,8 @@ pub async fn compile_turn_with_arm(
                                         attempts: step,
                                         diagnostics: Vec::new(),
                                         complete,
+                                        gather,
+                                        brief,
                                     });
                                 }
                                 Err(diags) => {
@@ -627,6 +764,8 @@ pub async fn plan(
     opts: CompileOptions,
 ) -> Result<Compiled> {
     let conversation = [Message::user_text(instruction)];
+    // The one-shot `--plan` surface isn't phase-aware yet (design Part 1: unchanged in MVP, A-18
+    // brings gather to it later) — always the execute/default contract.
     let (out, _usage) = compile_turn(
         provider,
         model,
@@ -637,6 +776,7 @@ pub async fn plan(
         ask,
         None,
         opts,
+        Phase::Execute,
     )
     .await?;
     match out {
@@ -679,6 +819,46 @@ pub(crate) fn parse_completion(value: Option<&serde_json::Value>) -> Option<Comp
         }
         _ => None,
     }
+}
+
+/// Parse the optional `gather` field of an `emit_plan` call: a tolerant boolean read (`true`/`false`,
+/// or the strings `"true"`/`"false"`, case-insensitive). Anything else — absent, malformed, or a
+/// truthy-looking-but-not-boolean value — defaults to `false`: a gather round is an *opt-in*
+/// stricter contract, so a malformed flag must never be silently upgraded to `true` and get gated
+/// as if the model asked for it.
+pub(crate) fn parse_gather(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(s)) => s.eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+/// Parse the optional `brief` field of an `emit_plan` call into a [`Brief`] — tolerant like
+/// [`parse_completion`]: requires a non-empty `goal`; a missing/malformed `needs` defaults to empty
+/// rather than discarding the whole brief (a goal with no listed needs is still useful grounding).
+pub(crate) fn parse_brief(value: Option<&serde_json::Value>) -> Option<Brief> {
+    let goal = value
+        .and_then(|v| v.as_object())
+        .and_then(|obj| obj.get("goal"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let needs = value
+        .and_then(|v| v.as_object())
+        .and_then(|obj| obj.get("needs"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(Brief { goal, needs })
 }
 
 /// Render the turn's final user-facing message **after** the plan has run, grounded in its actual
@@ -851,6 +1031,61 @@ fn hidden_ops_rejection(hidden: &[String]) -> String {
          the catalog, then call emit_plan again.",
         hidden.join("`, `")
     )
+}
+
+// -- A-13: gather-plan enforcement (design Part 1 — "enforced, not trusted") -------------------
+
+/// Cap on call nodes in a `gather: true` plan (design Part 1 — "~12 call nodes"): keeps a gather
+/// round small enough that it can't smuggle the whole task in disguised as "just gathering". A
+/// composite call counts as ONE node — the cap bounds what the model emits in *this* plan, not a
+/// composite's own expansion (whose effects `OpRegistry::mutating_ops_in` already vouches for).
+const GATHER_NODE_CAP: usize = 12;
+
+/// The repair feedback for a `gather: true` emission arriving in the execute phase (design Part 1):
+/// the gather budget is spent by the time execute runs, so no further gather rounds are granted — a
+/// rejection, not a silent downgrade to an ordinary plan, so the model corrects and re-emits rather
+/// than the tag being quietly ignored.
+const GATHER_REJECTED_IN_EXECUTE_PHASE: &str =
+    "invalid: `gather: true` is not allowed in the execute phase — the gather budget is already \
+     spent this turn. Call emit_plan with the ordinary execution plan (no `gather` tag) instead.";
+
+/// Count every `Node::Call` in `body`, recursing into nested bodies (`each`/`repeat`/`parallel`/
+/// `when`/…) — the size measure a `gather: true` plan is capped against ([`GATHER_NODE_CAP`]).
+fn count_call_nodes(body: &[Node]) -> usize {
+    let mut n = 0usize;
+    for_each_node(body, &mut |node| {
+        if matches!(node, Node::Call { .. }) {
+            n += 1;
+        }
+    });
+    n
+}
+
+/// Validate a `gather: true` plan against its enforced contract (design Part 1 — "enforced, not
+/// trusted"): effect-clean (no write/destructive op — composites included, via the registry's own
+/// validated effect metadata, see [`OpRegistry::mutating_ops_in`]) and capped at
+/// [`GATHER_NODE_CAP`] call nodes. `None` means the plan passes; `Some(msg)` is repair feedback in
+/// the same shape as the hidden-op rejection (C-17 style) — the model corrects and re-emits rather
+/// than the plan silently running or the turn failing outright.
+fn gather_violation(ast: &DraftAst, ops: &OpRegistry) -> Option<String> {
+    let mutating = ops.mutating_ops_in(&ast.body);
+    if !mutating.is_empty() {
+        return Some(format!(
+            "invalid gather plan: operation(s) `{}` are not read-only — a `gather: true` plan may \
+             only call effect-clean operations (no write/destructive effects). Remove them, or drop \
+             `gather: true` and emit the full execution plan instead, then call emit_plan again.",
+            mutating.join("`, `")
+        ));
+    }
+    let calls = count_call_nodes(&ast.body);
+    if calls > GATHER_NODE_CAP {
+        return Some(format!(
+            "invalid gather plan: {calls} call node(s) exceeds the gather cap of {GATHER_NODE_CAP} \
+             — a `gather: true` plan must stay small. Trim it to the essentials, or drop \
+             `gather: true` and emit the full execution plan instead, then call emit_plan again."
+        ));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,10 +1273,13 @@ steps. Use ONLY operations from the catalog. Each op is shown as `name({{params}
 /// The planner's cache-first system layout (A-03), most-stable material first so provider prompt
 /// caching hits:
 ///   A (cached) — planner instructions + sorted op catalog + grammar: byte-stable per
-///       workspace/groups, the bulk of the prompt.
+///       workspace/groups AND across every [`Phase`] (A-13) — the bulk of the prompt.
+///   phase (cached) — the per-phase contract ([`phase_contract`]): a SEPARATE, byte-stable segment
+///       appended immediately after A, so every phase shares A's cache prefix (A-13/A-03) — folding
+///       phase text into segment A itself would invalidate that shared prefix on every phase change.
 ///   B (cached) — agent identity + project context + active skills (the engine's base system):
 ///       stable within a turn, drifts across turns/invocations (git status, skills) — its own
-///       breakpoint keeps a B-only change from invalidating A's segment.
+///       breakpoint keeps a B-only change from invalidating A's (or the phase segment's) cache.
 ///   C (uncached) — the per-iteration session symbols: they change every plan round, so they live
 ///       AFTER the last breakpoint where they can't invalidate anything.
 fn assemble_system_segments(
@@ -1050,11 +1288,18 @@ fn assemble_system_segments(
     view: Option<&SessionView>,
     interactive: bool,
     arm: EmissionArm,
+    phase: Phase,
 ) -> Vec<SystemSegment> {
-    let mut segments = vec![SystemSegment {
-        text: build_planner_prompt(ops, interactive, arm),
-        cache: true,
-    }];
+    let mut segments = vec![
+        SystemSegment {
+            text: build_planner_prompt(ops, interactive, arm),
+            cache: true,
+        },
+        SystemSegment {
+            text: phase_contract(phase),
+            cache: true,
+        },
+    ];
     if let Some(b) = base_system {
         if !b.trim().is_empty() {
             segments.push(SystemSegment {
@@ -1071,6 +1316,46 @@ fn assemble_system_segments(
         });
     }
     segments
+}
+
+/// The per-phase instruction segment (design Part 1, normative — `docs/designs/multipass-agent-loop.md`):
+/// appended as its OWN byte-stable cached segment directly after segment A ([`build_planner_prompt`])
+/// so every phase call shares A's cache prefix — segment A itself never varies by phase (asserted by
+/// `phase_segments_do_not_perturb_segment_a`). [`Phase::Execute`] carries the "whole task in one
+/// execution plan" guidance that used to live inside segment A (rescoped here, design Part 1) — a
+/// phase-less call defaults to `Execute`, so its overall planner prompt (A + this segment) says
+/// exactly what the single pre-phase segment used to say.
+fn phase_contract(phase: Phase) -> String {
+    match phase {
+        Phase::Orient => "\
+This is the turn's FIRST planning call (the orient pass). Choose exactly ONE of three responses:\n\
+1. Trivial request (needs no operations, or is already answered by the conversation) — answer \
+directly in prose; do not emit a plan.\n\
+2. Simple, already-actionable request (you already know enough to do it in one shot) — call \
+emit_plan with the FULL execution plan that accomplishes it, exactly as you would today. Put the \
+WHOLE task in one execution plan rather than many tiny plans.\n\
+3. Complex or context-hungry request (you need to see the repo/files/state before you can plan the \
+real work) — call emit_plan with a SMALL, read-only plan (no writes, no destructive operations, at \
+most 12 call nodes) tagged `gather: true`, plus a `brief` object: `{\"goal\": \"<what this turn is \
+ultimately trying to accomplish>\", \"needs\": [\"<the specific things you still need to learn>\", \
+...]}`. Only gather what you need to decide the real plan — you have a bounded number of these \
+rounds before you must settle on a prose answer or an execution plan.\n"
+            .to_string(),
+        Phase::Gather => "\
+This is a gather round: you already emitted a `gather: true` plan and its read-only results are in \
+the conversation above. Either keep gathering — call emit_plan again with another small, read-only \
+plan tagged `gather: true` (same constraints: no writes, no destructive operations, at most 12 call \
+nodes) if you still need more context, carrying an updated `brief`; or settle — call emit_plan with \
+the FULL execution plan now that you have enough context (put the WHOLE task in one execution plan \
+rather than many tiny plans), or answer directly in prose if nothing further needs doing. You have a \
+bounded number of gather rounds left, so settle as soon as you have what you need.\n"
+            .to_string(),
+        Phase::Execute => "\
+Put the WHOLE task in one execution plan rather than many tiny plans. Any gather budget this turn \
+had is already spent — do NOT tag a plan `gather: true` here; call emit_plan with the ordinary, \
+complete execution plan (or the next corrective step) instead.\n"
+            .to_string(),
+    }
 }
 
 /// The **static** planner block (segment A): instructions + sorted op catalog + grammar. Contains
@@ -1104,7 +1389,7 @@ SEE the results before you can answer or to keep working — you'll get the resu
 again or answer directly in prose (answering in prose ends the turn).\n\nYou have NO directly-callable tools except `emit_plan`\
 {ask_line} — you cannot run `read`/`grep`/`bash`/etc. yourself. To gather information, put `read`/`grep`/\
 `glob` as NODES in a plan and emit it; the runtime executes the plan and gives you the results, so you \
-can plan the next step. Put the WHOLE task in one plan rather than many tiny plans.\n\nIMPORTANT — \
+can plan the next step.\n\nIMPORTANT — \
 express control flow as Flux-Lang nodes, NOT inside shell commands, so the plan stays auditable: use a \
 `repeat` node for loops and a `when` node for branches — e.g. run the tests three times with \
 `repeat max 3 {{ cargo_test() }}`, never a shell `for` loop. The generic `bash` op is OFF by default \
@@ -1132,7 +1417,10 @@ fn planner_tools(interactive: bool, arm: EmissionArm) -> Vec<ToolDef> {
                       If this plan completes the request, also pass `complete` — `instructions` for your \
                       final message (the runtime writes it from the actual results and ends the turn), \
                       NOT the message itself. Omit `complete` if you must see the results before you can \
-                      answer, or to keep working; then answer in prose once done."
+                      answer, or to keep working; then answer in prose once done. When the current \
+                      phase's instructions allow it, tag `gather: true` (with a `brief: {goal, needs[]}`) \
+                      for a small, read-only round instead — see the phase instructions for when this \
+                      applies and its limits."
                 .to_string(),
             input_schema: tool_input_schema::<EmitPlanInput>(),
         },
@@ -1144,7 +1432,10 @@ fn planner_tools(interactive: bool, arm: EmissionArm) -> Vec<ToolDef> {
                       If this plan completes the request, also pass `complete` — `instructions` for your \
                       final message (the runtime writes it from the actual results and ends the turn), \
                       NOT the message itself. Omit `complete` if you must see the results before you can \
-                      answer, or to keep working; then answer in prose once done."
+                      answer, or to keep working; then answer in prose once done. When the current \
+                      phase's instructions allow it, tag `gather: true` (with a `brief: {goal, needs[]}`) \
+                      for a small, read-only round instead — see the phase instructions for when this \
+                      applies and its limits."
                 .to_string(),
             input_schema: tool_input_schema::<EmitPlanTextInput>(),
         },
@@ -1502,11 +1793,23 @@ mod tests {
 
     // -- L-20: emission-arm selector (json control vs native-text treatment) ---------------------
 
-    /// Drive one planner turn with an explicit arm (the hermetic A/B harness path).
+    /// Drive one planner turn with an explicit arm (the hermetic A/B harness path). Fixed at the
+    /// execute/default phase — these tests exercise arm behavior, not phase behavior.
     async fn turn_with_arm(
         p: &Mock,
         ops: &OpRegistry<'_>,
         arm: EmissionArm,
+        opts: CompileOptions,
+    ) -> Result<(TurnOutput, Usage)> {
+        turn_with_phase(p, ops, arm, Phase::Execute, opts).await
+    }
+
+    /// Like [`turn_with_arm`], with the phase made explicit — the A-13 test entry point.
+    async fn turn_with_phase(
+        p: &Mock,
+        ops: &OpRegistry<'_>,
+        arm: EmissionArm,
+        phase: Phase,
         opts: CompileOptions,
     ) -> Result<(TurnOutput, Usage)> {
         compile_turn_with_arm(
@@ -1520,6 +1823,7 @@ mod tests {
             None,
             opts,
             arm,
+            phase,
         )
         .await
     }
@@ -1773,8 +2077,8 @@ mod tests {
     #[test]
     fn system_segments_keep_the_static_prefix_stable_across_symbol_changes() {
         // The whole point of the layout: per-turn symbols must not perturb the cached segments.
-        // Segments A (planner) and B (base system) are byte-identical whether or not symbols exist;
-        // the symbols ride in a trailing UNCACHED segment.
+        // Segments A (planner), the phase segment, and B (base system) are byte-identical whether
+        // or not symbols exist; the symbols ride in a trailing UNCACHED segment.
         let reg = full_registry();
         let ops = OpRegistry::new(&reg);
         let view = SessionView {
@@ -1785,35 +2089,125 @@ mod tests {
                 visibility: crate::ast::Visibility::Visible,
             }],
         };
-        let without =
-            assemble_system_segments(Some("identity"), &ops, None, false, EmissionArm::Json);
+        let without = assemble_system_segments(
+            Some("identity"),
+            &ops,
+            None,
+            false,
+            EmissionArm::Json,
+            Phase::Execute,
+        );
         let with = assemble_system_segments(
             Some("identity"),
             &ops,
             Some(&view),
             false,
             EmissionArm::Json,
+            Phase::Execute,
         );
 
-        assert_eq!(without.len(), 2, "planner + base, no symbols segment");
-        assert_eq!(with.len(), 3, "planner + base + symbols");
+        assert_eq!(
+            without.len(),
+            3,
+            "planner + phase + base, no symbols segment"
+        );
+        assert_eq!(with.len(), 4, "planner + phase + base + symbols");
         assert_eq!(
             with[0].text, without[0].text,
             "segment A must be byte-stable"
         );
         assert_eq!(
             with[1].text, without[1].text,
+            "the phase segment must be byte-stable"
+        );
+        assert_eq!(
+            with[2].text, without[2].text,
             "segment B must be byte-stable"
         );
         assert!(
-            with[0].cache && with[1].cache,
+            with[0].cache && with[1].cache && with[2].cache,
             "static segments carry breakpoints"
         );
-        assert!(!with[2].cache, "the symbols segment must be uncached");
-        assert!(with[2].text.contains("$notes"));
+        assert!(!with[3].cache, "the symbols segment must be uncached");
+        assert!(with[3].text.contains("$notes"));
         assert!(
-            !with[0].text.contains("$notes") && !with[1].text.contains("$notes"),
+            !with[0].text.contains("$notes")
+                && !with[1].text.contains("$notes")
+                && !with[2].text.contains("$notes"),
             "symbols must not leak into the cached segments"
+        );
+    }
+
+    /// A-13/A-03: segment A (the shared instructions+catalog+grammar) must be byte-identical no
+    /// matter which phase is calling — only the per-phase segment (appended right after it) may
+    /// vary, so every phase shares A's cache prefix. This is the story's named acceptance test.
+    #[test]
+    fn phase_segments_do_not_perturb_segment_a() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let orient =
+            assemble_system_segments(None, &ops, None, false, EmissionArm::Json, Phase::Orient);
+        let gather =
+            assemble_system_segments(None, &ops, None, false, EmissionArm::Json, Phase::Gather);
+        let execute =
+            assemble_system_segments(None, &ops, None, false, EmissionArm::Json, Phase::Execute);
+
+        assert_eq!(
+            orient[0].text, gather[0].text,
+            "segment A: orient vs gather"
+        );
+        assert_eq!(
+            orient[0].text, execute[0].text,
+            "segment A: orient vs execute"
+        );
+        assert!(
+            orient[0].cache && gather[0].cache && execute[0].cache,
+            "segment A stays a cached breakpoint in every phase"
+        );
+
+        // The phase segment itself must differ (it carries the actual per-phase contract) and still
+        // be its own cached, byte-stable segment.
+        assert_ne!(
+            orient[1].text, execute[1].text,
+            "orient and execute phase segments differ"
+        );
+        assert_ne!(
+            gather[1].text, execute[1].text,
+            "gather and execute phase segments differ"
+        );
+        assert!(
+            orient[1].cache && gather[1].cache && execute[1].cache,
+            "the phase segment is cached too"
+        );
+
+        // The rescoped "whole task in one plan" instruction now lives in the phase segment, not
+        // segment A — it must never appear in segment A (else editing it would perturb the shared
+        // cached prefix on every phase change).
+        assert!(!orient[0].text.contains("Put the WHOLE task"));
+        assert!(!gather[0].text.contains("Put the WHOLE task"));
+        assert!(!execute[0].text.contains("Put the WHOLE task"));
+        assert!(execute[1]
+            .text
+            .contains("Put the WHOLE task in one execution plan"));
+    }
+
+    /// A-13: a phase-less call defaults to `Execute`; its overall planner prompt (segment A + the
+    /// execute phase segment) must say exactly what the single pre-phase segment used to say — just
+    /// split across two cached segments instead of one.
+    #[test]
+    fn execute_phase_is_byte_compatible_with_the_pre_phase_prompt() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let segments =
+            assemble_system_segments(None, &ops, None, false, EmissionArm::Json, Phase::Execute);
+        let combined = format!("{}{}", segments[0].text, segments[1].text);
+        assert!(combined
+            .contains("Put the WHOLE task in one execution plan rather than many tiny plans."));
+        assert!(combined.contains("You have NO directly-callable tools except `emit_plan`"));
+        assert!(
+            !segments[0].text.contains("gather: true"),
+            "segment A must stay phase-agnostic: {}",
+            segments[0].text
         );
     }
 
@@ -2030,6 +2424,310 @@ mod tests {
         assert!(OpRegistry::new(&reg).hidden_ops_in(&ast.body).is_empty());
     }
 
+    // -- A-13: gather-plan enforcement (design Part 1 — "enforced, not trusted") -------------------
+
+    fn write_composite() -> flux_lang::program::CompositeOpDecl {
+        use flux_lang::program::CompositeOpMeta;
+        flux_lang::program::CompositeOpDecl {
+            name: "wrap_write".into(),
+            body: DraftAst {
+                body: vec![Node::Call {
+                    op: "write".into(),
+                    args: vec![Node::Lit {
+                        value: json!({"path": "out.txt", "content": "x"}),
+                    }],
+                }],
+                ..Default::default()
+            },
+            meta: CompositeOpMeta {
+                // A composite's OWN declared risk/effects must already cover its body transitively
+                // (enforced by `analyze_composites` at registration) — this is what
+                // `mutating_ops_in` reads, so it catches the write without expanding the body itself.
+                effects: vec![flux_spec::Effect::Write, flux_spec::Effect::Filesystem],
+                risk: flux_spec::Risk::Medium,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mutating_ops_in_flags_write_effect_and_composite_transitively() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg).with_owned_composites(vec![write_composite()]);
+        let ast: DraftAst = serde_json::from_str(
+            r#"{"body":[
+                {"kind":"call","op":"read","args":[{"kind":"lit","value":"x"}]},
+                {"kind":"call","op":"wrap_write","args":[]}
+            ]}"#,
+        )
+        .unwrap();
+        // `read` is effect-clean; `wrap_write` (a composite) is flagged via its OWN declared
+        // effects/risk — no separate body expansion needed.
+        assert_eq!(
+            ops.mutating_ops_in(&ast.body),
+            vec!["wrap_write".to_string()]
+        );
+
+        let clean: DraftAst = serde_json::from_str(
+            r#"{"body":[{"kind":"call","op":"read","args":[{"kind":"lit","value":"x"}]}]}"#,
+        )
+        .unwrap();
+        assert!(ops.mutating_ops_in(&clean.body).is_empty());
+
+        // `git_status` et al. carry `Effect::Process` (no `Write`) at `Risk::Low` — genuinely
+        // read-only gather-phase ops must not be misclassified as mutating.
+        let git_status: DraftAst =
+            serde_json::from_str(r#"{"body":[{"kind":"call","op":"git_status","args":[]}]}"#)
+                .unwrap();
+        assert!(OpRegistry::new(&reg)
+            .mutating_ops_in(&git_status.body)
+            .is_empty());
+    }
+
+    /// The story's named failing-first test: a `gather: true` plan calling a write op is repair
+    /// feedback (C-17-style), never a hard turn error and never silently executed.
+    #[tokio::test]
+    async fn mutating_gather_plan_is_repair_feedback() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let mutating_gather = json!({
+            "ast": {"body": [{"kind":"call","op":"write","args":[{"kind":"lit","value":{"path":"out.txt","content":"x"}}]}]},
+            "gather": true,
+            "brief": {"goal": "figure out what to change", "needs": ["current file contents"]},
+        });
+        let clean_gather = json!({
+            "ast": {"body": [{"kind":"call","op":"read","args":[{"kind":"lit","value":"x"}]}]},
+            "gather": true,
+            "brief": {"goal": "figure out what to change", "needs": ["current file contents"]},
+        });
+        let p = mock(vec![
+            tool_call("emit_plan", mutating_gather),
+            tool_call("emit_plan", clean_gather),
+        ]);
+        let (out, _) = turn_with_phase(
+            &p,
+            &ops,
+            EmissionArm::Json,
+            Phase::Orient,
+            CompileOptions::default(),
+        )
+        .await
+        .expect("a mutating gather plan is repair feedback, not a hard error");
+        match out {
+            TurnOutput::Plan(c) => {
+                assert_eq!(
+                    c.attempts, 2,
+                    "the mutating gather plan must cost a repair round"
+                );
+                assert!(c.gather, "the repaired plan is still tagged gather");
+                assert_eq!(
+                    c.brief.as_ref().map(|b| b.goal.as_str()),
+                    Some("figure out what to change")
+                );
+                assert!(
+                    matches!(&c.ast.body[0], Node::Call { op, .. } if op == "read"),
+                    "the accepted plan is the effect-clean repair"
+                );
+            }
+            TurnOutput::Chat(t) => panic!("expected a gather plan, got chat: {t}"),
+        }
+    }
+
+    /// A `gather: true` plan calling a composite whose OWN declared effects/risk cover a hidden
+    /// write is rejected exactly the same way — proving the enforcement is transitive through the
+    /// registry's own composite metadata, not just literal top-level calls.
+    #[tokio::test]
+    async fn gather_plan_calling_a_mutating_composite_is_rejected_transitively() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg).with_owned_composites(vec![write_composite()]);
+        let mutating_gather = json!({
+            "ast": {"body": [{"kind":"call","op":"wrap_write","args":[]}]},
+            "gather": true,
+        });
+        let clean_gather = json!({
+            "ast": {"body": [{"kind":"call","op":"read","args":[{"kind":"lit","value":"x"}]}]},
+            "gather": true,
+        });
+        let p = mock(vec![
+            tool_call("emit_plan", mutating_gather),
+            tool_call("emit_plan", clean_gather),
+        ]);
+        let (out, _) = turn_with_phase(
+            &p,
+            &ops,
+            EmissionArm::Json,
+            Phase::Orient,
+            CompileOptions::default(),
+        )
+        .await
+        .expect("a gather plan hiding a write behind a composite is repair feedback");
+        match out {
+            TurnOutput::Plan(c) => assert_eq!(
+                c.attempts, 2,
+                "the composite-hidden write must cost a repair round"
+            ),
+            TurnOutput::Chat(t) => panic!("expected a plan, got chat: {t}"),
+        }
+    }
+
+    /// The story's named failing-first test: a `gather: true` plan over the node cap is repair
+    /// feedback.
+    #[tokio::test]
+    async fn oversize_gather_plan_is_rejected() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let many_calls: Vec<serde_json::Value> = (0..GATHER_NODE_CAP + 1)
+            .map(|i| json!({"kind":"call","op":"read","args":[{"kind":"lit","value":format!("f{i}.txt")}]}))
+            .collect();
+        let oversize = json!({ "ast": {"body": many_calls}, "gather": true });
+        let small = json!({
+            "ast": {"body": [{"kind":"call","op":"read","args":[{"kind":"lit","value":"f0.txt"}]}]},
+            "gather": true,
+        });
+        let p = mock(vec![
+            tool_call("emit_plan", oversize),
+            tool_call("emit_plan", small),
+        ]);
+        let (out, _) = turn_with_phase(
+            &p,
+            &ops,
+            EmissionArm::Json,
+            Phase::Orient,
+            CompileOptions::default(),
+        )
+        .await
+        .expect("an oversize gather plan is repair feedback, not a hard error");
+        match out {
+            TurnOutput::Plan(c) => assert_eq!(
+                c.attempts, 2,
+                "the oversize gather plan must cost a repair round"
+            ),
+            TurnOutput::Chat(t) => panic!("expected a plan, got chat: {t}"),
+        }
+    }
+
+    /// The story's named failing-first test: `gather: true` in the execute phase is rejected as
+    /// repair feedback — the gather budget is spent once execution starts.
+    #[tokio::test]
+    async fn gather_tag_rejected_in_execute_phase() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let gather_plan = json!({
+            "ast": {"body": [{"kind":"call","op":"read","args":[{"kind":"lit","value":"x"}]}]},
+            "gather": true,
+        });
+        let full_plan: serde_json::Value = serde_json::from_str(VALID_AST).unwrap();
+        let p = mock(vec![
+            tool_call("emit_plan", gather_plan),
+            tool_call("emit_plan", full_plan),
+        ]);
+        let (out, _) = turn_with_phase(
+            &p,
+            &ops,
+            EmissionArm::Json,
+            Phase::Execute,
+            CompileOptions::default(),
+        )
+        .await
+        .expect("gather:true in the execute phase is repair feedback, not a hard error");
+        match out {
+            TurnOutput::Plan(c) => {
+                assert_eq!(
+                    c.attempts, 2,
+                    "the gather-tagged plan in the execute phase must cost a repair round"
+                );
+                assert!(!c.gather, "the accepted plan is the ungathered repair");
+            }
+            TurnOutput::Chat(t) => panic!("expected a plan, got chat: {t}"),
+        }
+    }
+
+    /// Like the hidden-op gate (C-17), `gather: true` in the execute phase must never be accepted
+    /// even when the repair budget runs out.
+    #[tokio::test]
+    async fn gather_tag_in_execute_phase_is_rejected_even_on_the_final_step() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let gather_plan = json!({
+            "ast": {"body": [{"kind":"call","op":"read","args":[{"kind":"lit","value":"x"}]}]},
+            "gather": true,
+        });
+        let p = mock(vec![tool_call("emit_plan", gather_plan)]);
+        let opts = CompileOptions {
+            max_steps: 1,
+            ..Default::default()
+        };
+        let err = turn_with_phase(&p, &ops, EmissionArm::Json, Phase::Execute, opts)
+            .await
+            .expect_err(
+                "gather:true in the execute phase must never be accepted, even on the last step",
+            );
+        assert!(
+            format!("{err}").contains("gather budget"),
+            "the rejection carries the gate's reason: {err}"
+        );
+    }
+
+    /// A small, effect-clean `gather: true` plan (with a `brief`) is accepted in the orient phase —
+    /// the positive path alongside the rejection tests above.
+    #[tokio::test]
+    async fn clean_gather_plan_is_accepted_in_orient_phase() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let gather_plan = json!({
+            "ast": {"body": [{"kind":"call","op":"read","args":[{"kind":"lit","value":"x"}]}]},
+            "gather": true,
+            "brief": {"goal": "understand the repo layout", "needs": ["where the config lives"]},
+        });
+        let p = mock(vec![tool_call("emit_plan", gather_plan)]);
+        let (out, _) = turn_with_phase(
+            &p,
+            &ops,
+            EmissionArm::Json,
+            Phase::Orient,
+            CompileOptions::default(),
+        )
+        .await
+        .expect("a small, effect-clean gather plan is accepted");
+        match out {
+            TurnOutput::Plan(c) => {
+                assert_eq!(c.attempts, 1, "no repair round needed");
+                assert!(c.gather);
+                let brief = c.brief.expect("brief rides through");
+                assert_eq!(brief.goal, "understand the repo layout");
+                assert_eq!(brief.needs, vec!["where the config lives".to_string()]);
+            }
+            TurnOutput::Chat(t) => panic!("expected a plan, got chat: {t}"),
+        }
+    }
+
+    /// In the gather phase, another `gather: true` round is still allowed (the budget isn't spent
+    /// until execute).
+    #[tokio::test]
+    async fn clean_gather_plan_is_accepted_in_gather_phase() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let gather_plan = json!({
+            "ast": {"body": [{"kind":"call","op":"grep","args":[{"kind":"lit","value":"TODO"}]}]},
+            "gather": true,
+        });
+        let p = mock(vec![tool_call("emit_plan", gather_plan)]);
+        let (out, _) = turn_with_phase(
+            &p,
+            &ops,
+            EmissionArm::Json,
+            Phase::Gather,
+            CompileOptions::default(),
+        )
+        .await
+        .expect("gather:true is still allowed in the gather phase");
+        match out {
+            TurnOutput::Plan(c) => assert!(c.gather),
+            TurnOutput::Chat(t) => panic!("expected a plan, got chat: {t}"),
+        }
+    }
+
     #[tokio::test]
     async fn plan_asks_the_user() {
         let reg = full_registry();
@@ -2147,6 +2845,7 @@ mod tests {
             None,
             None,
             CompileOptions::default(),
+            Phase::Execute,
         )
         .await
         .unwrap();
@@ -2178,6 +2877,7 @@ mod tests {
             None,
             None,
             CompileOptions::default(),
+            Phase::Execute,
         )
         .await
         .unwrap();
@@ -2217,6 +2917,7 @@ mod tests {
             None,
             None,
             CompileOptions::default(),
+            Phase::Execute,
         )
         .await
         .unwrap_err();
@@ -2251,6 +2952,7 @@ mod tests {
             None,
             None,
             CompileOptions::default(),
+            Phase::Execute,
         )
         .await
         .unwrap();
@@ -2330,6 +3032,88 @@ mod tests {
         .await
         .unwrap();
         assert!(out.complete.is_none());
+    }
+
+    /// A-13: `brief` parses tolerantly alongside `gather: true`, mirroring `complete`'s leniency —
+    /// and rides through onto `Compiled.brief` only when `gather` is actually set.
+    #[tokio::test]
+    async fn emit_plan_captures_optional_brief() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let ast = serde_json::json!({
+            "body": [{ "kind": "call", "op": "read", "args": [{ "kind": "lit", "value": "x" }] }]
+        });
+
+        // Full brief: goal + needs → captured on the Compiled.
+        let p = mock(vec![tool_call(
+            "emit_plan",
+            serde_json::json!({
+                "ast": ast,
+                "gather": true,
+                "brief": { "goal": "understand the failure", "needs": ["the stack trace", "the last commit"] }
+            }),
+        )]);
+        let (out, _) = turn_with_phase(
+            &p,
+            &ops,
+            EmissionArm::Json,
+            Phase::Orient,
+            CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+        let c = match out {
+            TurnOutput::Plan(c) => c,
+            TurnOutput::Chat(t) => panic!("expected a plan, got chat: {t}"),
+        };
+        let brief = c.brief.expect("brief captured");
+        assert_eq!(brief.goal, "understand the failure");
+        assert_eq!(
+            brief.needs,
+            vec!["the stack trace".to_string(), "the last commit".to_string()]
+        );
+
+        // Goal only, no `needs` → defaults to empty (leniency, like `complete`'s bare-string form).
+        let p = mock(vec![tool_call(
+            "emit_plan",
+            serde_json::json!({ "ast": ast, "gather": true, "brief": { "goal": "just the goal" } }),
+        )]);
+        let (out, _) = turn_with_phase(
+            &p,
+            &ops,
+            EmissionArm::Json,
+            Phase::Orient,
+            CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+        let c = match out {
+            TurnOutput::Plan(c) => c,
+            TurnOutput::Chat(t) => panic!("expected a plan, got chat: {t}"),
+        };
+        assert_eq!(c.brief.unwrap().needs, Vec::<String>::new());
+
+        // `gather` absent → `brief` never rides through even if the model sent one (meaningless
+        // without a gather round).
+        let p = mock(vec![tool_call(
+            "emit_plan",
+            serde_json::json!({ "ast": ast, "brief": { "goal": "ignored" } }),
+        )]);
+        let (out, _) = turn_with_phase(
+            &p,
+            &ops,
+            EmissionArm::Json,
+            Phase::Orient,
+            CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+        let c = match out {
+            TurnOutput::Plan(c) => c,
+            TurnOutput::Chat(t) => panic!("expected a plan, got chat: {t}"),
+        };
+        assert!(!c.gather);
+        assert!(c.brief.is_none());
     }
 
     // ---- one-shot compile (with the view param) ----

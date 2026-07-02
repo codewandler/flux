@@ -153,8 +153,11 @@ pub trait LoopHost: Send + Sync {
     /// JSON. Wraps the engine's compile step.
     async fn plan(&self, input: serde_json::Value) -> flux_core::Result<serde_json::Value>;
     /// Re-enter the interpreter to run an emitted plan in the CURRENT session → an `Outcome` artifact
-    /// (`{transcript, result, steps, suspension?}`) as JSON. Bounded by a reentry-depth cap. Wraps the
-    /// engine's execute step.
+    /// (`{transcript, result, steps, suspension?, failure}`) as JSON. Bounded by a reentry-depth cap.
+    /// Wraps the engine's execute step. `failure` is always present — `null` on a clean run, or a
+    /// reified mid-plan halt object (design `docs/designs/multipass-agent-loop.md` Part 2, A-16/A-17)
+    /// a caller can route on (e.g. the agent loop's `when $ran.failure`); never a missing key, since
+    /// flux-lang's dotted field-access sugar errors on one.
     async fn run_plan(&self, plan: serde_json::Value) -> flux_core::Result<serde_json::Value>;
 }
 

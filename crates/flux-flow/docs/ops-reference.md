@@ -111,15 +111,31 @@ what let it call the model and run plans reflexively. They are how flux-lang sel
 the evidence ops let the loop emit and read its own runtime observations and grade outcomes. Every one
 still dispatches through the same `Executor` envelope — no bypass.
 
+The loop is **phased** (A-14, design [`multipass-agent-loop.md`](../../../docs/designs/multipass-agent-loop.md)):
+one **orient** `plan` call (a three-way contract — prose chat, the full execution plan, or a small
+read-only `gather: true` plan + `brief`), a bounded **gather** pass (`repeat 3`, skipped entirely when
+orient already settled), then the standard **execute** plan/run/revise pass (`repeat 25`, unchanged
+guards). `phase` (`"orient"`/`"gather"`/`"execute"`) selects the planner's per-phase instruction segment;
+`settled` on the returned `Plan` is `""` only for an accepted `gather: true` plan (gating the gather
+pass's `until $settled`), truthy otherwise. A `gather: true` plan is enforced, not trusted — effect-clean
+and capped at ~12 call nodes — and the execute phase always rejects a further `gather: true` emission
+(the budget is spent). If the gather budget exhausts before settling, the leftover gather plan simply
+runs as the execute pass's first iteration.
+
 | op | signature | description |
 |---|---|---|
-| `plan` | `[feedback]` | Ask the model to emit a plan from the working conversation → a `Plan` `{kind: "plan"\|"chat"\|"error", text?, ast?, complete?}` (JSON). `complete` is the model's completion directive (`{primer?, instructions}`) or `null`. The model stays the planner; this wraps the compile step. |
-| `run_plan` | `plan` | Execute an emitted plan in the **current** session → an `Outcome` `{transcript, result, steps, suspension?}`. Re-validated and run through the same approval+IO envelope; bounded by a reentry-depth cap. When the plan carried `complete` and ran to success, the **next** `plan` call renders the final message from the results (a toolless model call) and returns it as `{kind: "chat"}` — the complete fast-path. |
+| `plan` | `[feedback, phase]` | Ask the model to emit a plan from the working conversation → a `Plan` `{kind: "plan"\|"chat"\|"error", text?, ast?, complete?, settled}` (JSON). `phase` is `"orient"`/`"gather"`/`"execute"` — absent or unrecognized behaves as `"execute"` (byte-compatible with a phase-less/pre-A-14 caller, e.g. an ejected loop). `complete` is the model's completion directive (`{primer?, instructions}`) or `null`. The model stays the planner; this wraps the compile step. |
+| `run_plan` | `plan` | Execute an emitted plan in the **current** session → an `Outcome` `{transcript, result, steps, suspension?, failure}`. Re-validated and run through the same approval+IO envelope; bounded by a reentry-depth cap. `failure` is `null` when this round ran clean; otherwise a reified mid-plan halt (design [`multipass-agent-loop.md`](../../../docs/designs/multipass-agent-loop.md) Part 2) — `{node, stmt, op, kind, fatal, message, plan, completed[]}` — that a corrected re-emission fast-forwards the matching completed prefix of (A-16/A-17; never propagated as `Err`). When the plan carried `complete` and ran to success, the **next** `plan` call renders the final message from the results (a toolless model call) and returns it as `{kind: "chat"}` — the complete fast-path. |
 | `op.register` | `source, scope[, replace, expose]` | Register exactly one top-level Flux-Lang composite `op` for later reuse. `scope` is `turn`, `session`, `project`, or `global`; project/global writes are guarded filesystem writes, and all registered inner ops still dispatch through the normal envelope. |
-| `observe` | `kind[, data]` | Append an observation to the run's shared evidence log (the same log the runtime records `tool_call` markers into). |
+| `observe` | `kind[, data]` | Append an observation to the run's shared evidence log (the same log the runtime records `tool_call` markers into). The loop itself emits `loop.phase` (at every `plan` entry, payload `{phase}`), `flow.brief` (the moment a `brief` is accepted, payload `{goal, needs}`), `turn.gather` (each gather round's `Outcome`), `turn.iteration` (each clean execute round's `Outcome`), and `turn.revision` (an execute round whose `Outcome.failure` was set — A-17). `run_plan` itself streams (not through this log) `flow.plan` (the compiled plan tree — `resumed`/`gather`/`phase` flags let a surface render it correctly) and, on a halt, `flow.halt` (`{step, of, op, kind, fatal}`, a real-time cue distinct from the fed-back transcript text). |
 | `evidence` | `[kind]` | Read observations back as a JSON array (filtered by `kind`, or the whole log) — so a flow can branch on what has happened so far. |
 | `metrics` | | Summary counts from the evidence log: `{tool_calls, tool_errors, iterations}`. |
 | `grade` | `criterion` | Evaluate a verifiable pass/fail `Criterion` (`command`/`file_content`/`all`) against the workspace → `"true"`/`"false"`, reusing the eval harness's own grader (`flux-eval`). |
+
+The brief accepted alongside a `gather: true` plan is **host-carried for the rest of the turn**: it is
+prepended to every subsequent `plan` call's feedback message (not just the immediate next round), so a
+multi-round gather — or the execute phase that follows it — never loses the thread. It resets at the
+start of the next turn.
 
 **Visibility:** `plan`/`run_plan` are tagged to a never-surfaced `reflect` group, so the model never sees
 them in its catalog — only a pre-authored flow (the agent loop, or `flux flow run`) can call them, and only
