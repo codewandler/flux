@@ -25,6 +25,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Multi-pass cutover measurement plumbing (I-03, in progress).** The efficiency rollup now
+  reports the phased loop's rounds: `EfficiencySummary` folds `orient/gather/revise` rounds and
+  accepted plans from `PlanAttempt.phase` — gather counts every gather-phase attempt (a repair
+  round is a paid round), revise only execute-phase attempts that accepted a further plan (the
+  terminal chat round is not a revision), and plans/turn is phase-blind so pre-A-14 logs still
+  report the tiny-plan-dribble watch. `flux usage` prints `plans/turn` always and gather/revise
+  per turn only when the log carries phase data (on an older log the figures are unrecorded, not
+  zero). Alongside, two dry-run-by-default measurement harnesses land in `bench/`:
+  `run-ttff.sh` (fixed 5-prompt corpus + PTY recorder keeping raw timestamped chunks; `report.py`
+  derives spawn→first-rendered-artifact medians, spinner/banner excluded, failed-turns flagged)
+  and `run-tbench-compare.sh` (pre-cutover `b528772` vs current, same tasks/trials/model, each
+  leg's own prebuilt musl binary with `rebuild: false`). The paid comparison legs are the
+  remaining I-03 step.
+
 - **Multi-pass agent loop: orient → gather → execute/revise, with patch-and-continue (A-12–A-17,
   L-22).** The turn loop (`agent-loop.flux`) is now three visible passes: the first planner call
   *orients* (answer as chat, emit the full execution plan, or emit a small read-only gather plan

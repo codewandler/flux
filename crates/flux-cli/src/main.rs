@@ -909,19 +909,32 @@ fn run_usage_with(store: &EventStore, pricing: &flux_core::PricingTable) -> Resu
 }
 
 /// One turn-efficiency line per `flux usage` section (C-15): turns, calls/turn, iterations/turn,
-/// cache-read share, uncached-input and output per turn — the Improve pillar's tokens-per-task
-/// trend at a glance. Prints nothing when the section has no completed turns.
+/// plans/turn, cache-read share, uncached-input and output per turn — the Improve pillar's
+/// tokens-per-task trend at a glance. Logs written by the phased loop (A-14) add gather/revise
+/// rounds per turn (I-03); pre-A-14 logs omit that segment — there the figures are unrecorded,
+/// not zero. Prints nothing when the section has no completed turns.
 fn print_efficiency_line(eff: Option<&flux_events::EfficiencySummary>) {
     let Some(e) = eff else {
         return;
     };
+    let phases = if e.has_phase_rounds() {
+        format!(
+            " · gather {:.1}/turn · revise {:.1}/turn",
+            e.avg_gather_rounds_per_turn(),
+            e.avg_revise_rounds_per_turn(),
+        )
+    } else {
+        String::new()
+    };
     println!(
-        "  {} {} turn{} · {:.1} calls/turn · {:.1} iters/turn · cache-read {:.0}% · uncached-in {}/turn · out {}/turn",
+        "  {} {} turn{} · {:.1} calls/turn · {:.1} iters/turn · {:.1} plans/turn{} · cache-read {:.0}% · uncached-in {}/turn · out {}/turn",
         style::dim("efficiency:"),
         e.turns,
         if e.turns == 1 { "" } else { "s" },
         e.avg_calls_per_turn(),
         e.avg_iterations_per_turn(),
+        e.avg_plans_per_turn(),
+        phases,
         e.cache_read_share() * 100.0,
         style::fmt_tokens(e.uncached_input_per_turn() as u64),
         style::fmt_tokens(e.output_per_turn() as u64),

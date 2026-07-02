@@ -1,0 +1,5 @@
+{"id": "chat-trivial", "prompt": "What does HTTP status 418 mean? Answer in one sentence."}
+{"id": "read-one-file", "prompt": "Read notes.txt and tell me the deadline it mentions."}
+{"id": "grep-count", "prompt": "How many TODO markers are there in the src directory? List each file with its count."}
+{"id": "write-summary", "prompt": "Read the three files in src and write a one-paragraph summary of what the project does to summary.md."}
+{"id": "explore-complex", "prompt": "Explore this project and explain how its pieces fit together: what each module does, where the entry point is, and what you would refactor first."}

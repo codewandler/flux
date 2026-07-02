@@ -24,3 +24,7 @@ website/build/
 # Python (terminal-bench agent shim)
 __pycache__/
 *.pyc
+
+# I-03 measurement raw recordings (local evidence, re-derivable reports)
+bench/ttff/results/
+bench/tbench-compare/results/

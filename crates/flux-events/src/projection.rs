@@ -187,6 +187,23 @@ pub struct EfficiencySummary {
     pub uncached_input_tokens: u64,
     /// Generated tokens across those turns.
     pub output_tokens: u64,
+    /// Orient-phase planner rounds (`PlanAttempt.phase == "orient"`) — every phased turn (A-14)
+    /// opens with exactly one, so this doubles as the "does this log carry phase data at all"
+    /// signal ([`has_phase_rounds`](Self::has_phase_rounds)). 0 for pre-A-14 logs.
+    pub orient_rounds: u64,
+    /// Gather-phase planner rounds (`phase == "gather"`, every outcome) — the provider rounds the
+    /// phased loop spent collecting context, the I-03 gather-over-use watch. Counts attempts, not
+    /// accepted plans: a compile-repair round in the gather pass is still a paid round.
+    pub gather_rounds: u64,
+    /// Execute-phase attempts that accepted a FURTHER plan (`phase == "execute"` +
+    /// `outcome == "accepted"`) — the loop revised and ran again after execution, the I-03
+    /// revision-churn watch. Deliberately narrower than `gather_rounds`: the execute pass's
+    /// terminal chat/complete round is not a revision, and repair rounds already show in
+    /// calls/turn. Phase-less accepted plans (pre-A-14 / ejected loops) are not counted.
+    pub revise_rounds: u64,
+    /// Accepted plans across those turns, all phases (`outcome == "accepted"`) — the I-03
+    /// plans-per-turn tiny-plan-dribble watch. Works on pre-A-14 logs too (no phase needed).
+    pub accepted_plans: u64,
 }
 
 impl EfficiencySummary {
@@ -198,6 +215,10 @@ impl EfficiencySummary {
         self.cache_read_tokens += other.cache_read_tokens;
         self.uncached_input_tokens += other.uncached_input_tokens;
         self.output_tokens += other.output_tokens;
+        self.orient_rounds += other.orient_rounds;
+        self.gather_rounds += other.gather_rounds;
+        self.revise_rounds += other.revise_rounds;
+        self.accepted_plans += other.accepted_plans;
     }
 
     pub fn avg_calls_per_turn(&self) -> f64 {
@@ -220,6 +241,25 @@ impl EfficiencySummary {
 
     pub fn output_per_turn(&self) -> f64 {
         ratio(self.output_tokens, self.turns)
+    }
+
+    /// Whether any folded turn recorded phase-stamped plan attempts (A-14). `false` means the log
+    /// predates the phased loop — gather/revise figures are then *unrecorded*, not zero, and a
+    /// report should omit them rather than print a misleading `0.0`.
+    pub fn has_phase_rounds(&self) -> bool {
+        self.orient_rounds + self.gather_rounds + self.revise_rounds > 0
+    }
+
+    pub fn avg_gather_rounds_per_turn(&self) -> f64 {
+        ratio(self.gather_rounds, self.turns)
+    }
+
+    pub fn avg_revise_rounds_per_turn(&self) -> f64 {
+        ratio(self.revise_rounds, self.turns)
+    }
+
+    pub fn avg_plans_per_turn(&self) -> f64 {
+        ratio(self.accepted_plans, self.turns)
     }
 }
 
@@ -246,6 +286,17 @@ pub fn efficiency_summary(events: &[StoredEvent]) -> Option<EfficiencySummary> {
         s.uncached_input_tokens +=
             t.call_usage.input_tokens + t.call_usage.cache_creation_input_tokens;
         s.output_tokens += t.call_usage.output_tokens;
+        for a in &t.plan_attempts {
+            if a.outcome == "accepted" {
+                s.accepted_plans += 1;
+            }
+            match a.phase.as_deref() {
+                Some("orient") => s.orient_rounds += 1,
+                Some("gather") => s.gather_rounds += 1,
+                Some("execute") if a.outcome == "accepted" => s.revise_rounds += 1,
+                _ => {}
+            }
+        }
     }
     (s.turns > 0).then_some(s)
 }
@@ -837,6 +888,89 @@ mod tests {
         );
         assert!((e.uncached_input_per_turn() - 300.0).abs() < f64::EPSILON);
         assert!((e.output_per_turn() - 75.0).abs() < f64::EPSILON);
+    }
+
+    /// I-03: the efficiency rollup reports the phased loop's rounds — gather rounds count every
+    /// gather-phase attempt (a repair round is a paid round), revise rounds only execute-phase
+    /// attempts that accepted a further plan (the terminal chat round is not a revision), and
+    /// plans/turn counts accepted plans phase-blind so pre-A-14 logs still report it.
+    #[test]
+    fn efficiency_summary_reports_phase_rounds_and_plans_per_turn() {
+        let attempt = |phase: Option<&str>, outcome: &str| EventKind::PlanAttempted {
+            step: 0,
+            outcome: outcome.into(),
+            error: None,
+            fingerprint: None,
+            plan_text: None,
+            phase: phase.map(str::to_string),
+        };
+        let mut events = Vec::new();
+        let mut seq = 0i64;
+        let mut push = |turn_id: Option<i64>, kind: EventKind| {
+            seq += 1;
+            events.push(ev(seq, seq - 1, turn_id, kind));
+        };
+        // Turn 1 — a phased turn: orient emits a gather plan, one gather round needs a compile
+        // repair, the next settles the execution plan, one execute-phase revision, then the
+        // terminal chat round.
+        push(
+            None,
+            EventKind::TurnStarted {
+                user_input: "a".into(),
+                model: "m".into(),
+            },
+        );
+        push(Some(1), attempt(Some("orient"), "accepted"));
+        push(Some(1), attempt(Some("gather"), "compile_error"));
+        push(Some(1), attempt(Some("gather"), "accepted"));
+        push(Some(1), attempt(Some("execute"), "accepted"));
+        push(Some(1), attempt(Some("execute"), "chat"));
+        push(
+            Some(1),
+            EventKind::TurnEnded {
+                outcome: "ok".into(),
+                iterations: 3,
+                answer: "x".into(),
+                usage: None,
+            },
+        );
+        // Turn 8 — a pre-A-14 log shape: one phase-less accepted plan. Counts toward plans/turn,
+        // never toward phase rounds.
+        push(
+            None,
+            EventKind::TurnStarted {
+                user_input: "b".into(),
+                model: "m".into(),
+            },
+        );
+        push(Some(8), attempt(None, "accepted"));
+        push(
+            Some(8),
+            EventKind::TurnEnded {
+                outcome: "ok".into(),
+                iterations: 1,
+                answer: "y".into(),
+                usage: None,
+            },
+        );
+
+        let e = efficiency_summary(&events).expect("two completed turns");
+        assert_eq!(e.turns, 2);
+        assert_eq!(e.orient_rounds, 1);
+        assert_eq!(e.gather_rounds, 2, "repair + settle rounds both count");
+        assert_eq!(e.revise_rounds, 1, "terminal chat round is not a revision");
+        assert_eq!(
+            e.accepted_plans, 4,
+            "orient + gather + execute + phase-less"
+        );
+        assert!(e.has_phase_rounds());
+        assert!((e.avg_gather_rounds_per_turn() - 1.0).abs() < f64::EPSILON);
+        assert!((e.avg_revise_rounds_per_turn() - 0.5).abs() < f64::EPSILON);
+        assert!((e.avg_plans_per_turn() - 2.0).abs() < f64::EPSILON);
+
+        // A pre-A-14-only log reports no phase rounds at all — the figures are unrecorded, not 0.
+        let old_only = efficiency_summary(&events[7..]).expect("the phase-less turn");
+        assert!(!old_only.has_phase_rounds());
     }
 
     /// C-15: legacy attribution-key variants merge on the read side — a bare `gpt-5.5` folds into

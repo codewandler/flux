@@ -1,0 +1,9 @@
+Team sync notes — reporting pipeline
+
+Decisions:
+- Keep the CSV parser permissive; malformed rows are logged and skipped.
+- Reports are grouped by category, then sorted by total descending.
+- The deadline for the v0.2 report format is 2026-07-15.
+
+Open questions:
+- Should parse errors abort the run once they exceed 10%?
