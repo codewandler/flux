@@ -2,9 +2,9 @@
 id: A-11
 title: Reply-parking for `ask` — journeys suspend until the correlated reply arrives
 pillar: Agent
-status: ready
+status: done
 priority: 5
-note: `ask` today is `send` + a correlation id (the reply is never awaited — the in-code TODO at flux-app ops.rs); wire it onto the existing suspension seam so a journey parks on ask and App::deliver resumes it with the reply
+note: a top-level `$reply = ask(...)` is lowered at journey-run time into ask + `await` (source ask.reply) — the flow suspends on the EXISTING seam, the App parks it keyed by asked channel, and a correlated inbound message (channel name, or user_input for CLI channels) is CONSUMED to resume the oldest matching park via resume_flow with the reply bound; zero flux-flow/flux-lang changes, envelope invariant intact
 ---
 
 # Reply-parking for `ask` — journeys suspend until the correlated reply arrives
@@ -38,10 +38,29 @@ primitive: flow suspension + resume (`FlowStore` suspensions, `resume_suspended`
 - [ ] Gate green: `cargo test --workspace`, clippy `-D warnings`, fmt, `cargo test -p flux-codegate`.
 
 ## Progress
-- (not started — filed 2026-07-02 from the in-code TODO during the ready-queue curation.)
+- **Done (2026-07-02).** Design: an op result can't suspend a flow, so the host **lowers** every
+  top-level `$reply = ask({channel, message})` at journey-run time into the same (unbound) `ask`
+  call followed by `Node::Await { binding, source: "ask.reply" }` — the interpreter suspends
+  exactly as for a hand-written `await`, the App persists the resume point
+  (`FlowStore::save_suspension` on the run's own store) and parks it (`src/park.rs`:
+  `ParkedAsk`, keyed by the asked channel resolved from the bus's expects-reply sends).
+  - **Correlation rule (documented in park.rs):** an inbound event resumes the OLDEST pending park
+    it matches — label == asked channel name, or label == `user_input` for CLI-rendered channels
+    (the `flux app run` stdin loop). A correlated event is **consumed** (doesn't also fire
+    triggers); uncorrelated events route normally. No explicit correlation-id matching — channels
+    deliver plain messages with nowhere reliable to carry an id.
+  - Resume re-enters via `flux_flow::runtime::resume_flow(_with_composites)` over a fresh
+    full-envelope Executor — no side-channel execution; re-parks if the continuation asks again.
+  - Tests (failing-first — the suspend test failed with the old `"ask:cli"` fire-and-forget
+    result): the 3 story tests + 3 park unit tests (lowering shape, nested-ask untouched,
+    correlation matrix). Package gate + codegate green.
+- **Residuals:** park timeout/expiry (out of scope per story); parks are in-memory (matches the
+  app's in-memory store posture); NESTED asks (inside when/repeat/parallel) keep fire-and-forget —
+  `await` is top-level-only in flux-lang; a `spawn`ed child that asks returns its (empty) parked
+  result to the parent immediately; hand-written top-level `await` in a journey still has no
+  flux-app resume surface (pre-existing); the lowering drops the bind's `effect` annotation
+  (its `ty` rides as the await's `as_type`).
 
 ## Notes
-- Timeouts/expiry of a park are a sensible follow-up but NOT required here; record as residual if
-  skipped.
-- Envelope invariant: the resume path must re-enter through the normal engine/executor path — no
+- Envelope invariant: the resume path re-enters through the normal engine/executor path — no
   side-channel execution.

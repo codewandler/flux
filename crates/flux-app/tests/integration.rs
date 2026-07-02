@@ -182,6 +182,116 @@ async fn spawn_runs_a_named_journey_and_returns_its_result() {
     assert_eq!(sent[0].message, "child ran");
 }
 
+/// A journey that `ask`s the cli channel and only completes once the reply arrives: the follow-up
+/// `send` and the `return` reference the reply, so completion is observable (A-11 reply-parking).
+const INTERVIEW: &str = "\
+channel cli
+
+trigger t
+  on \"user_input\"
+  run interview
+
+journey interview
+  flow
+    $answer = ask({ \"channel\": \"cli\", \"message\": \"favourite colour?\" })
+    send({ \"channel\": \"cli\", \"message\": fmt(\"you chose: {answer}\") })
+    return $answer
+";
+
+#[tokio::test]
+async fn ask_suspends_the_journey_until_a_reply() {
+    let app = App::new(program(INTERVIEW), None, "test-model");
+
+    let runs = app
+        .deliver("user_input", json!({ "text": "start" }))
+        .await
+        .unwrap();
+
+    // The journey ran up to the ask and PARKED: the question went out (expects_reply), but the
+    // post-ask send did not run and the run carries no result yet.
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].journey, "interview");
+    assert_eq!(
+        runs[0].result, "",
+        "a parked journey has no result yet, got: {:?}",
+        runs[0].result
+    );
+    let sent = app.bus().sent();
+    assert_eq!(sent.len(), 1, "only the question was sent: {sent:?}");
+    assert_eq!(sent[0].message, "favourite colour?");
+    assert!(sent[0].expects_reply);
+}
+
+#[tokio::test]
+async fn delivered_reply_resumes_with_the_reply_text_bound() {
+    let app = App::new(program(INTERVIEW), None, "test-model");
+    app.deliver("user_input", json!({ "text": "start" }))
+        .await
+        .unwrap();
+
+    // The next message on the asked (cli) channel is the reply: it resumes the parked journey with
+    // the reply text bound as the ask's result — it does NOT start a second interview.
+    let runs = app
+        .deliver("user_input", json!({ "text": "blue" }))
+        .await
+        .unwrap();
+
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].journey, "interview");
+    assert_eq!(
+        runs[0].result, "blue",
+        "the flow's `return $answer` is the reply text"
+    );
+    let sent = app.bus().sent();
+    assert_eq!(sent.len(), 2, "question + the post-reply send: {sent:?}");
+    assert_eq!(
+        sent[1].message, "you chose: blue",
+        "the resumed body saw the bound reply"
+    );
+    // The park was consumed: only one question was ever asked.
+    assert_eq!(sent.iter().filter(|m| m.expects_reply).count(), 1);
+}
+
+#[tokio::test]
+async fn unrelated_message_does_not_resume_the_parked_journey() {
+    // Same interview journey plus an unrelated trigger/journey on another event label.
+    let src = format!(
+        "{INTERVIEW}
+trigger u
+  on \"ping\"
+  run other
+
+journey other
+  flow
+    return \"pong\"
+"
+    );
+    let app = App::new(program(&src), None, "test-model");
+    app.deliver("user_input", json!({ "text": "start" }))
+        .await
+        .unwrap();
+
+    // An event for a different label routes normally and leaves the park alone.
+    let runs = app.deliver("ping", json!({})).await.unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].journey, "other");
+    assert_eq!(runs[0].result, "pong");
+    let sent = app.bus().sent();
+    assert_eq!(
+        sent.len(),
+        1,
+        "the parked journey did not advance on the unrelated event: {sent:?}"
+    );
+
+    // The park is still pending: the next cli-channel message resumes it.
+    let runs = app
+        .deliver("user_input", json!({ "text": "green" }))
+        .await
+        .unwrap();
+    assert_eq!(runs[0].result, "green");
+    assert_eq!(app.bus().sent()[1].message, "you chose: green");
+}
+
 #[tokio::test]
 async fn registry_carries_the_orchestration_ops_and_builtins() {
     let app = App::new(program(HELLO), None, "test-model");

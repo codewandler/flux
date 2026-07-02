@@ -25,6 +25,17 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **`ask` now really waits — journey reply-parking on the suspension seam (A-11).** flux-app's
+  `ask { channel, message }` was documented as expecting a reply but behaved like `send` (the
+  reply was never awaited). A top-level `$reply = ask(...)` in a journey is now lowered at run
+  time into the same `ask` call plus an `await` (source `ask.reply`), so the flow suspends on the
+  existing seam; the App parks the run keyed by the asked channel and a correlated inbound
+  message — the channel's own name, or `user_input` for CLI-rendered channels — is consumed to
+  resume the oldest matching park with the reply text bound as the ask's result. Uncorrelated
+  messages route normally. Resume re-enters through `resume_flow` over a full-envelope executor
+  (no side-channel execution). Nested asks keep fire-and-forget (`await` is top-level-only), and
+  park timeout/expiry is a recorded follow-up.
+
 - **Pricing table verified against vendor sheets — codex costs were understated ~4× (C-20).**
   Every `builtin()` rate is now verified against the vendor's current public pricing page
   (2026-07-02, source URLs in the doc comment) instead of shipping "plausible" figures behind a

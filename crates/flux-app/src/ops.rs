@@ -67,8 +67,8 @@ fn req_str(params: &Value, key: &str) -> Option<String> {
 }
 
 /// True when `channel` should render to stdout: its declared `kind` is `cli`, or (no declaration) the
-/// conventional name `cli`.
-fn is_cli_channel(channels: &[ChannelDecl], channel: &str) -> bool {
+/// conventional name `cli`. Also used by the ask-reply correlation rule (see [`crate::park`]).
+pub(crate) fn is_cli_channel(channels: &[ChannelDecl], channel: &str) -> bool {
     match channels.iter().find(|c| c.name == channel) {
         Some(decl) => decl.kind == "cli",
         None => channel == "cli",
@@ -166,9 +166,12 @@ impl Tool for SendOp {
 // ask
 // ---------------------------------------------------------------------------
 
-/// `ask { channel, message }` — MVP: behaves like `send` (records + prints to a `cli` channel) but
-/// flags the message as expecting a reply and returns a correlation id. Full request/response
-/// correlation (parking the journey until a reply arrives) is a TODO.
+/// `ask { channel, message }` — send a question to a channel and expect a reply. The op itself only
+/// records + prints (like `send`, with the expects-reply flag set) and returns the correlation id
+/// `ask:<channel>`; the *parking* happens in the host: a **top-level** ask in a journey is lowered
+/// to this call plus an `await` (see [`crate::park`]), so the journey suspends until the correlated
+/// reply arrives and the reply text becomes the ask's bound result. A nested ask (inside
+/// `when`/`repeat`/…) cannot suspend and keeps the fire-and-forget shape (returns the id at once).
 struct AskOp {
     bus: Bus,
     channels: Arc<Vec<ChannelDecl>>,
@@ -179,8 +182,9 @@ impl Tool for AskOp {
     fn spec(&self) -> ToolSpec {
         orchestration_spec(
             "ask",
-            "Send a message to a channel and expect a reply. MVP: records + prints like `send`, \
-             returns a correlation id (reply correlation is not yet wired).",
+            "Send a question to a channel and wait for the reply. At the top level of a journey \
+             the flow suspends until the next message arrives on the asked channel; the reply \
+             text is the ask's result. Nested asks send without waiting.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -204,8 +208,9 @@ impl Tool for AskOp {
         if is_cli_channel(&self.channels, &channel) {
             println!("{message}");
         }
-        // A stable, human-readable correlation id. Reply-parking is a TODO; for now the id lets a
-        // journey thread an ask through without blocking.
+        // A stable, human-readable correlation id. A top-level ask discards it (the host's lowering
+        // binds the awaited reply instead — see `crate::park`); a nested ask threads it through
+        // without blocking.
         Ok(ToolResult::ok(format!("ask:{channel}")))
     }
 }

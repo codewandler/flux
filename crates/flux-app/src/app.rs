@@ -27,8 +27,9 @@ use flux_flow::engine::FlowEngine;
 use flux_flow::registry::analyze_composites;
 use flux_flow::state::FlowStore;
 use flux_flow::AgentSink;
-use flux_lang::ast::{SymbolName, Value as FluxValue, Visibility};
+use flux_lang::ast::{Node, SymbolName, Value as FluxValue, Visibility};
 use flux_lang::program::{AgentDecl, Program};
+use flux_lang::runtime::FlowOutcome;
 use flux_orchestrate::{SubAgents, TaskTool};
 use flux_provider::Provider;
 use flux_runtime::{
@@ -40,6 +41,7 @@ use flux_system::{System, Workspace};
 
 use crate::bus::{Bus, Event};
 use crate::ops::{self, JourneyHost};
+use crate::park::{self, ParkedAsk};
 
 /// How deep `spawn`-within-`spawn` may recurse before the engine refuses (cheap guard against a
 /// journey that spawns itself unboundedly).
@@ -268,6 +270,10 @@ pub(crate) struct Engine {
     /// store). Installed on every journey-run executor's and agent-target engine's `ToolContext`, so
     /// program-declared secrets are scrubbed from tool output/logs everywhere.
     redactor: Redactor,
+    /// Journeys parked on an `ask`, oldest first, each waiting for the correlated reply (A-11).
+    /// [`Engine::run_triggers`] checks these before routing: a correlated inbound event resumes the
+    /// oldest matching park instead of triggering journeys. See [`crate::park`] for the rule.
+    parks: Mutex<Vec<ParkedAsk>>,
 }
 
 impl Engine {
@@ -331,17 +337,26 @@ impl Engine {
                 sessions: Mutex::new(HashMap::new()),
                 system,
                 redactor,
+                parks: Mutex::new(Vec::new()),
             }
         })
     }
 
     /// Run every trigger whose `on` label equals `label`, collecting each journey run.
+    ///
+    /// A pending ask-park takes precedence: an event that correlates with a parked journey (see
+    /// [`crate::park`] for the rule) is **consumed** as that journey's reply — it resumes the park
+    /// and does not also route through triggers (otherwise the reply line would start a fresh
+    /// journey too). Uncorrelated events route normally and leave every park alone.
     async fn run_triggers(
         &self,
         label: &str,
         payload: &Value,
         sink: &mut dyn AgentSink,
     ) -> Result<Vec<JourneyRun>> {
+        if let Some(run) = self.try_resume_ask(label, payload, sink).await? {
+            return Ok(vec![run]);
+        }
         let mut runs = Vec::new();
         for trigger in self.program.triggers.iter().filter(|t| t.on == label) {
             // An `agent`-bound trigger wakes an agent turn (the model drives RAG + granted tools over
@@ -391,11 +406,13 @@ impl Engine {
         payload: &Value,
         sink: &mut dyn AgentSink,
     ) -> Result<JourneyRun> {
-        let ast = self
+        let mut ast = self
             .program
             .flow_named(name)
             .cloned()
             .ok_or_else(|| Error::Other(format!("unknown journey `{name}`")))?;
+        // Lower top-level `ask` calls onto the suspension seam (ask + await) — see `crate::park`.
+        ast.body = park::rewrite_asks(std::mem::take(&mut ast.body));
 
         // Depth guard: increment, ensure we decrement on every exit, then check.
         let prev = self.depth.fetch_add(1, Ordering::SeqCst);
@@ -406,7 +423,9 @@ impl Engine {
             )));
         }
 
-        let store = FlowStore::in_memory().map_err(other)?;
+        // `Arc`: an ask-park keeps the run's store alive (prefix symbols + the persisted
+        // suspension) until the reply arrives.
+        let store = Arc::new(FlowStore::in_memory().map_err(other)?);
         let session_id = format!("{name}#{}", self.runs.fetch_add(1, Ordering::SeqCst));
         seed_payload(&store, &session_id, payload)?;
         let executor = build_executor(
@@ -422,6 +441,9 @@ impl Engine {
         analyze_composites(&self.program.ops, &self.registry)
             .map_err(|d| Error::Other(format!("composite ops: {}", join_diags(&d))))?;
 
+        // Where the asked channel is read from if this run parks: the expects-reply sends recorded
+        // from here on belong to this segment.
+        let sent_before = self.bus.sent().len();
         let outcome = if self.program.ops.is_empty() {
             flux_flow::runtime::execute_flow(&store, &executor, &session_id, &ast, sink).await
         } else {
@@ -437,10 +459,182 @@ impl Engine {
         }
         .map_err(other)?;
 
+        if let Some(parked) = self.park_if_asked(
+            name,
+            &session_id,
+            &store,
+            &ast.body,
+            &outcome,
+            sent_before,
+            0,
+        )? {
+            return Ok(parked);
+        }
+
         Ok(JourneyRun {
             journey: name.to_string(),
             result: outcome.result,
             steps: outcome.steps,
+        })
+    }
+
+    /// Park the run when `outcome` suspended on an ask-lowered `await`: persist the resume point on
+    /// the run's own [`FlowStore`] (the same suspension latch the interactive engine uses) and queue
+    /// a [`ParkedAsk`] keyed by the asked channel. Returns the parked [`JourneyRun`] (empty result —
+    /// the question is already on the channel), or `None` on a normal completion. A suspension from
+    /// a hand-written `await` (a foreign `source`) is left untouched — flux-app has no resume
+    /// surface for those (unchanged pre-A-11 behavior: the partial result is returned).
+    #[allow(clippy::too_many_arguments)]
+    fn park_if_asked(
+        &self,
+        journey: &str,
+        session_id: &str,
+        store: &Arc<FlowStore>,
+        body: &[Node],
+        outcome: &FlowOutcome,
+        sent_before: usize,
+        prior_steps: usize,
+    ) -> Result<Option<JourneyRun>> {
+        let Some(susp) = &outcome.suspension else {
+            return Ok(None);
+        };
+        if susp.source != park::ASK_REPLY_SOURCE {
+            return Ok(None);
+        }
+        // The asked channel, from runtime truth: the lowered ask call executes immediately before
+        // its `await`, so the segment's most recent expects-reply send is necessarily this ask
+        // (a dynamically-computed channel name resolves correctly too).
+        let sent = self.bus.sent();
+        let Some(channel) = sent
+            .get(sent_before..)
+            .unwrap_or(&[])
+            .iter()
+            .rev()
+            .find(|m| m.expects_reply)
+            .map(|m| m.channel.clone())
+        else {
+            // Defensive: an ask-marked await with no recorded ask send — nothing to correlate on.
+            return Ok(None);
+        };
+        store
+            .save_suspension(session_id, body, susp.node, &susp.source)
+            .map_err(other)?;
+        let steps = prior_steps + outcome.steps;
+        self.parks.lock().expect("parks poisoned").push(ParkedAsk {
+            channel,
+            journey: journey.to_string(),
+            session_id: session_id.to_string(),
+            store: store.clone(),
+            steps,
+        });
+        Ok(Some(JourneyRun {
+            journey: journey.to_string(),
+            result: String::new(),
+            steps,
+        }))
+    }
+
+    /// If `label`/`payload` is the reply a parked ask waits for, consume it: remove the oldest
+    /// correlated park and resume that journey with the reply text. `None` means the event did not
+    /// correlate and should route through triggers as usual.
+    async fn try_resume_ask(
+        &self,
+        label: &str,
+        payload: &Value,
+        sink: &mut dyn AgentSink,
+    ) -> Result<Option<JourneyRun>> {
+        let park = {
+            let mut parks = self.parks.lock().expect("parks poisoned");
+            parks
+                .iter()
+                .position(|p| park::event_correlates(label, &self.program.channels, &p.channel))
+                .map(|i| parks.remove(i))
+        };
+        let Some(park) = park else {
+            return Ok(None);
+        };
+        let run = self.resume_parked(park, reply_text(payload), sink).await?;
+        Ok(Some(run))
+    }
+
+    /// Resume a parked journey with `reply` bound as the suspended ask's result. Re-enters through
+    /// the NORMAL engine path — `flux_flow::runtime::resume_flow*` over a fresh full-envelope
+    /// executor and the park's own store — so permission + approval rules apply to the continuation
+    /// exactly as to the original run (no side-channel execution of flow bodies). The continuation
+    /// may itself `ask` again, in which case it parks again.
+    async fn resume_parked(
+        &self,
+        park: ParkedAsk,
+        reply: String,
+        sink: &mut dyn AgentSink,
+    ) -> Result<JourneyRun> {
+        let ParkedAsk {
+            journey,
+            session_id,
+            store,
+            steps: prior_steps,
+            ..
+        } = park;
+        let Some((body, node, _source)) = store.take_suspension(&session_id).map_err(other)? else {
+            return Err(Error::Other(format!(
+                "parked ask for journey `{journey}` has no persisted suspension"
+            )));
+        };
+        let executor = build_executor(
+            self.registry.clone(),
+            self.auto_approve,
+            self.spawner.clone(),
+            self.system.clone(),
+            self.redactor.clone(),
+        )?;
+        executor.context().set_session(&session_id);
+        analyze_composites(&self.program.ops, &self.registry)
+            .map_err(|d| Error::Other(format!("composite ops: {}", join_diags(&d))))?;
+
+        let sent_before = self.bus.sent().len();
+        let input = FluxValue::String(reply);
+        let outcome = if self.program.ops.is_empty() {
+            flux_flow::runtime::resume_flow(
+                &store,
+                &executor,
+                &session_id,
+                &body,
+                node,
+                input,
+                sink,
+            )
+            .await
+        } else {
+            flux_flow::runtime::resume_flow_with_composites(
+                &store,
+                &executor,
+                &session_id,
+                &body,
+                node,
+                input,
+                &self.program.ops,
+                sink,
+            )
+            .await
+        }
+        .map_err(other)?;
+
+        if let Some(parked) = self.park_if_asked(
+            &journey,
+            &session_id,
+            &store,
+            &body,
+            &outcome,
+            sent_before,
+            prior_steps,
+        )? {
+            return Ok(parked);
+        }
+
+        Ok(JourneyRun {
+            journey,
+            result: outcome.result,
+            steps: prior_steps + outcome.steps,
         })
     }
 
@@ -743,6 +937,20 @@ fn summarize(value: &Value) -> String {
         format!("{}…", &s[..200])
     } else {
         s
+    }
+}
+
+/// The reply text an inbound event carries for a parked ask: the `text` field when present (the
+/// shape every channel delivers — the stdin loop, Slack, webhooks), a bare string payload verbatim,
+/// otherwise the payload's compact JSON.
+fn reply_text(payload: &Value) -> String {
+    match payload {
+        Value::String(s) => s.clone(),
+        v => v
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| v.to_string()),
     }
 }
 
