@@ -386,17 +386,17 @@ Drift made visible, so it stops being silent. Each maps to a story on the
   fluxplane's reference / registry / discovery / runner was dropped in D-10/D-12 (a `.dex`-style endpoint
   registry was an explicit non-goal); it is now a top-priority essentials epic. → endpoint discovery &
   brokerage ([D-25](stories/D-25-endpoint-reference-model.md)..[D-30](stories/D-30-endpoint-lifecycle-cli.md)).
-- **Two turn loops.** The CLI/TUI/server run the pure-DAG `FlowEngine`, but the SDK's
-  `flux_sdk::Client` still drives the classic `flux-agent::Agent` loop. Unify onto
-  `FlowEngine`/`FlowClient` and retire `flux-agent::Agent` (ref
-  [designs/flux-flow.md](designs/flux-flow.md) §11). → [A-01](stories/A-01-unify-flowengine.md).
+- ~~**Two turn loops.**~~ ✅ done — every surface (CLI/TUI/server/SDK) runs the pure-DAG
+  `FlowEngine`; the classic Rust loop is retired. → [A-01](stories/A-01-unify-flowengine.md).
 - ~~**Crate consolidation phases 2–4**~~ ✅ done (35 → 31). → [C-01](stories/C-01-crate-consolidation.md).
 - **crates.io publish** blocked on the `flux-core` name (needs a vanity prefix); deferred.
 - **Self-improvement headline gain** still lacks a trials ≥ 3, grader-confirmed result.
   → [I-01](stories/I-01-headline-gain.md).
-- **No cost tracking.** Per-turn token usage is captured + persisted, but there is no pricing layer and no
-  aggregation/reporting, and the OpenAI codecs drop cache tiers. → [C-05](stories/C-05-pricing-cost-model.md)
-  / [C-06](stories/C-06-usage-cost-accounting.md).
+- ~~**No cost tracking.**~~ ✅ done — per-call usage is attributed (`CallUsage`, canonical
+  provider/model keys), priced via the built-in table + `~/.flux/pricing.toml`, and reported
+  (`flux usage` incl. the per-turn efficiency line, turn-end cost annotations, a server endpoint).
+  → [C-05](stories/C-05-pricing-cost-model.md) / [C-06](stories/C-06-usage-cost-accounting.md) /
+  [C-15](stories/C-15-efficiency-metrics-and-key-normalization.md).
 - **Codex transport is HTTP-SSE only** while the upstream codex client uses a websocket transport (with HTTP
   fallback). → [C-07](stories/C-07-codex-websocket-transport.md).
 - **Subscription-provider login is import-only for codex** (claude has PKCE); full OAuth2 for codex is the

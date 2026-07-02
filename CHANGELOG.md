@@ -6,6 +6,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **Docs truth pass (C-16).** The claims are a product surface, so they now say exactly what the
+  code does: README's "re-running costs zero extra model calls" is scoped to stored-plan replay
+  (a live turn costs the *fewest* calls, matching vision.md); "symbols not re-sent" became the
+  precise "bounded digest of summaries" (A-07); the safety-model section now shows the
+  capability-scope floor as step 0 of the chain, the plan-intents disclosure re-fire (C-12), and
+  the documented `bash` `sh -c` exception to argv-only with its actual defenses (per-token
+  permission subjects, the `<shell-expansion>` sentinel subject, destructive-command escalation);
+  the evidence and sub-agent bullets reflect the durable trail (C-14) and correlated child audit
+  (A-08). roadmap.md's "Known divergences" strikes "Two turn loops" (A-01 done) and "No cost
+  tracking" (C-05/C-06/C-15 done). Every fix in this round was also live-verified against a real
+  model and events.db — a completion-carrying turn makes exactly 2 model calls ($0.0032 vs the
+  prior $0.0137 baseline), `--turn-budget 1` stops honestly, plan attempts persist with rendered
+  text + fingerprint, sub-agent streams land correlated, and `flux usage` reports the efficiency
+  line over merged keys.
+
 ### Added
 
 - **Per-turn efficiency metrics + canonical usage keys (C-15).** Tokens-per-task was queryable only

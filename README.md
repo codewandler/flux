@@ -11,10 +11,10 @@
 **The LLM is not your runtime.** Most coding agents let the model drive execution step by step — slow, expensive, and hard to audit. flux inverts that: the model compiles your request into a typed **Flux-Lang plan** (a small graph), and a deterministic Rust runtime executes it through one mandatory safety envelope. You see the plan before it runs. Every file read, shell command, and web fetch is a node in that graph, not a hidden black box.
 
 What that buys you:
-- **Auditability** — a turn is a readable graph, not a stream of opaque tool calls
+- **Auditability** — a turn is a readable graph, not a stream of opaque tool calls — and it persists: every plan lands in the session's event log with its fingerprint and rendered text
 - **Safety by construction** — a single non-bypassable chain (authorization → approval → guarded IO) covers every operation; no tool, plugin, or sub-agent can route around it
-- **Token efficiency** — tool outputs are stored as symbols, not re-sent on every turn
-- **Repeatability** — a plan is an artifact; re-running it costs zero extra model calls
+- **Token efficiency** — tool outputs are stored as symbols; the model sees a bounded digest of summaries, never the raw outputs re-sent per turn
+- **Repeatability** — a plan is an artifact; re-running a stored plan (`flux flow run`) makes no model calls at all, and a live turn costs the fewest calls that still keep the model the planner
 
 flux is one platform on that thesis, with three **co-equal pillars**:
 
@@ -158,16 +158,20 @@ The legacy `allow_private_net = true` flag is still read for compatibility, but 
 Every plan node lowers onto one non-bypassable chain before it touches the real world:
 
 ```
-pre-tool hooks → authorization policy (default-deny) → permission rules → approval gate → guarded IO
+capability-scope floor → pre-tool hooks → authorization policy (default-deny) → permission rules → approval gate → guarded IO
 ```
 
+- **Capability scope** is checked first: a `with_tools` block's allowlist narrows every dispatch inside it (and every sub-agent spawned from it) — scopes only ever narrow on descent.
 - **Policy** (pure, default-deny): grants over subjects × resources × actions, gated by trust and scopes. A sensible local default keeps the agent productive out of the box.
-- **Destructive operations are forced to approval** even under a permissive allow-rule (`rm -rf`, `git push --force`, …).
-- **Guarded IO** is the only place real filesystem/process/network access happens — workspace-confined, symlink/escape-rejecting, **argv-only** (no shell injection), SSRF-guarded fetch.
-- **Secrets** are registered with a redactor and scrubbed from all tool output and logs.
-- **Evidence** — tool calls, destructive markers, skill activations, and compaction are recorded as auditable events.
+- **Destructive operations are forced to approval** even under a permissive allow-rule (`rm -rf`, `git push --force`, …) — and plan approval sees a plan's aggregate intents, so a destructive op that was *not* visible in the approved plan re-fires the gate at dispatch.
+- **Guarded IO** is the only place real filesystem/process/network access happens — workspace-confined, symlink/escape-rejecting, **argv-only** (no shell interpretation) for the dedicated ops (incl. `proc.run`), SSRF-guarded fetch. The one exception is the opt-in `bash` op (off by default behind the `shell` group), which necessarily runs `sh -c`; it is defended in depth instead — its command is split into per-token permission subjects, unresolvable shell expansion gets a `<shell-expansion>` sentinel subject (so a permissive rule can't silently cover it), and destructive-command heuristics force approval.
+- **Secrets** — provider keys, program-declared `secret "NAME"` values, and host-materialized plugin credentials are registered with a redactor and scrubbed from all tool output and logs.
+- **Evidence** — tool calls, destructive markers, skill activations, plan attempts (with the plan's fingerprint and readable graph), and compaction are recorded as auditable events, flushed durably to the session's event log every turn.
 
-Sub-agents inherit the same policy and cannot approve destructive operations themselves.
+Sub-agents inherit the same policy and cannot approve destructive operations themselves — a
+sub-agent's *plans* are intent-checked too, so a destructive step inside an emitted plan is denied,
+not just a direct call. Their runs audit into the shared event store by default, each under its own
+stream correlated back to the spawning session.
 
 ---
 
