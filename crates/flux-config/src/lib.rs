@@ -120,6 +120,25 @@ pub struct Config {
     /// Extra authorization grants, layered onto the built-in local defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<AuthorizationPolicy>,
+    /// Resource ceilings for the agent loop (A-10). All off by default.
+    #[serde(default, skip_serializing_if = "Limits::is_default")]
+    pub limits: Limits,
+}
+
+/// Resource ceilings for the agent loop. Everything here is opt-in — absent means no ceiling.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Limits {
+    /// Per-turn token budget: once the turn's accumulated model usage (all tiers) crosses this,
+    /// the loop ends the turn honestly instead of consulting the model again. Overridden by
+    /// `FLUX_TURN_TOKEN_BUDGET` and the `--turn-budget` flag (flag > env > config).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_token_budget: Option<u64>,
+}
+
+impl Limits {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl Config {
@@ -225,6 +244,13 @@ fn merge(user: Config, project: Config) -> Config {
             (Some(u), Some(p)) => Some(AuthorizationPolicy {
                 grants: [u.grants, p.grants].concat(),
             }),
+        },
+        limits: Limits {
+            // A project ceiling overrides the user's (a scalar, not a set — nearest wins).
+            turn_token_budget: project
+                .limits
+                .turn_token_budget
+                .or(user.limits.turn_token_budget),
         },
     }
 }

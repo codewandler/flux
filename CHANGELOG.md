@@ -8,6 +8,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Opt-in per-turn token budget — the loop now has an enforced spend ceiling (A-10).** Usage was
+  accounted per call but nothing enforced a bound: a pathological turn was limited only by the
+  25-iteration cap times up-to-8 compile steps. The loop host now checks the turn's accumulated
+  planner usage at the top of every `plan()` (the same stall-stop pattern as the retry-breaker):
+  once it crosses the installed budget, the turn ends honestly with a budget-exceeded answer naming
+  the budget and the tokens used — no further model call is paid, and a `turn.budget_exceeded`
+  observation lands durably on the evidence trail. Resolution: `--turn-budget <tokens>` >
+  `FLUX_TURN_TOKEN_BUDGET` > the new `.flux/config.toml` `[limits] turn_token_budget` (project
+  overrides user). **Default OFF** — the iteration cap and stall guards already bound normal turns.
+  The ceiling counts the turn's planner/render calls; sub-agent spend still rolls up only at turn
+  end (documented limitation).
+
 - **Sub-agent audit is ON by default — child runs land correlated in the shared event store
   (A-08).** The D-05 `with_audit` seam existed but the primary paths never wired it: every `task`
   spawn fell back to a throwaway in-memory store, so a sub-agent's tool activity vanished (only its

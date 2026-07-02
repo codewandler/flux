@@ -1768,6 +1768,73 @@ mod tests {
         assert!(active.contains(&"git"), "the surfaced group: {active:?}");
     }
 
+    /// A-10: once the turn's accumulated planner usage crosses the installed token budget, the
+    /// next `plan` ends the turn honestly (no further model call) — the runaway bound is tokens,
+    /// not just the 25-iteration cap.
+    #[tokio::test]
+    async fn turn_ends_honestly_when_token_budget_exhausted() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let plan_ast = json!({
+            "body": [{
+                "kind": "bind", "name": "greeting",
+                "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "hi" }] }
+            }]
+        });
+        // The planner call reports 5000 tokens of usage — over the 100-token budget, so the second
+        // `plan` must not reach the provider at all.
+        let usage = Usage {
+            input_tokens: 4000,
+            output_tokens: 1000,
+            ..Default::default()
+        };
+        let planner_call_with_usage = vec![
+            Chunk::Block(ContentBlock::ToolUse {
+                id: "p1".into(),
+                name: "emit_plan".into(),
+                input: json!({ "ast": plan_ast }),
+            }),
+            Chunk::Usage(usage),
+            Chunk::Done {
+                stop_reason: Some(StopReason::ToolUse),
+            },
+        ];
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(CaptureProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                planner_call_with_usage,
+                prose("this response must never be consumed"),
+            ])),
+            requests: requests.clone(),
+        });
+        let engine = engine_with_provider(provider, store.clone());
+        engine.loop_host.set_token_budget(Some(100));
+        let mut sink = CollectSink::default();
+        engine.run_turn(&sid, "echo hi", &mut sink).await.unwrap();
+
+        assert_eq!(sink.tools, vec!["echo"], "the accepted plan still ran");
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "the budget stop must not pay another model call"
+        );
+        let msgs = store.conversation(&sid).unwrap();
+        let answer = msgs[1].text();
+        assert!(
+            answer.contains("token budget") && answer.contains("100"),
+            "the turn ends with the honest budget message: {answer}"
+        );
+        // The stop is auditable: a turn.budget_exceeded observation landed on the evidence trail.
+        assert!(
+            store
+                .observations(&sid)
+                .unwrap()
+                .iter()
+                .any(|o| o.kind == "turn.budget_exceeded"),
+            "budget stop recorded as evidence"
+        );
+    }
+
     #[tokio::test]
     async fn text_only_turn_answers_in_prose() {
         let store = Arc::new(EventStore::in_memory().unwrap());

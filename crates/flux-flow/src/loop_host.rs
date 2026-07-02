@@ -190,6 +190,11 @@ pub struct EngineLoopHost {
     pending_completion: Mutex<Option<Completion>>,
     /// Monotonic step counter for this turn's durable plan-attempt records (C-14). Reset per turn.
     attempt_step: AtomicU32,
+    /// Per-turn token ceiling (A-10): once the turn's accumulated planner usage crosses it, the
+    /// next `plan` ends the turn honestly (the stall-stop pattern) instead of consulting the model
+    /// again. `None` (the default) = no ceiling. Set by the host surface (flag > env > config);
+    /// NOT reset per turn — it is engine configuration, not turn state.
+    token_budget: Mutex<Option<u64>>,
 }
 
 impl EngineLoopHost {
@@ -235,6 +240,7 @@ impl EngineLoopHost {
                 calls: Mutex::new(Vec::new()),
                 pending_completion: Mutex::new(None),
                 attempt_step: AtomicU32::new(0),
+                token_budget: Mutex::new(None),
             });
             *slot2.lock().unwrap() = Some(host.clone());
             executor.set_loop_host(host.clone());
@@ -291,6 +297,12 @@ impl EngineLoopHost {
     pub fn set_model(&self, provider: Arc<dyn Provider>, model: String) {
         *self.provider.lock().unwrap() = provider;
         *self.model.lock().unwrap() = model;
+    }
+
+    /// Install (or clear) the per-turn token ceiling (A-10). Resolution order is the surface's
+    /// concern (`--turn-budget` > `FLUX_TURN_TOKEN_BUDGET` > config `[limits] turn_token_budget`).
+    pub fn set_token_budget(&self, budget: Option<u64>) {
+        *self.token_budget.lock().unwrap() = budget;
     }
 
     fn executor(&self) -> Result<Arc<Executor>> {
@@ -416,6 +428,33 @@ impl LoopHost for EngineLoopHost {
         let force_stop = self.guard.lock().unwrap().force_stop.take();
         if let Some(msg) = force_stop {
             return Ok(serde_json::json!({ "kind": "chat", "text": msg }));
+        }
+        // Token-budget ceiling (A-10), the same stall-stop pattern: when the turn's accumulated
+        // planner usage has crossed the installed budget, end the turn honestly instead of paying
+        // another model call. Checked BEFORE the completion fast-path too — the ceiling is hard.
+        let budget = *self.token_budget.lock().unwrap();
+        if let Some(budget) = budget {
+            let used = self.usage.lock().unwrap().total();
+            if used >= budget {
+                let obs = flux_evidence::Observation::new(
+                    "turn.budget_exceeded",
+                    flux_evidence::Phase::Turn,
+                    serde_json::json!({ "budget": budget, "used": used }),
+                );
+                if let Ok(executor) = self.executor() {
+                    executor.observe(obs.clone());
+                }
+                SharedSink(self.turn.lock().unwrap().sink.clone()).observation(&obs);
+                return Ok(serde_json::json!({
+                    "kind": "chat",
+                    "text": format!(
+                        "Stopping: this turn's token budget ({budget} tokens) is exhausted \
+                         ({used} used). Results so far are in the session — raise --turn-budget \
+                         (or FLUX_TURN_TOKEN_BUDGET / [limits] turn_token_budget) or narrow the \
+                         request to continue."
+                    ),
+                }));
+            }
         }
         let feedback = input
             .get("feedback")

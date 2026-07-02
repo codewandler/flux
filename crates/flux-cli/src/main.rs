@@ -102,6 +102,13 @@ struct AgentFlags {
     #[arg(long, default_value_t = 16384)]
     max_tokens: u32,
 
+    /// Per-turn token budget (all tiers, summed across the turn's model calls): once crossed, the
+    /// turn ends honestly with a budget-exceeded answer instead of consulting the model again.
+    /// Overrides `FLUX_TURN_TOKEN_BUDGET` and `[limits] turn_token_budget` in .flux/config.toml.
+    /// Off by default (no ceiling).
+    #[arg(long)]
+    turn_budget: Option<u64>,
+
     /// (Hidden) Print token usage — only wired on the `-p` raw path.
     #[arg(long, hide = true)]
     usage: bool,
@@ -1661,6 +1668,17 @@ async fn build_agent_with(
     let agent = spec
         .into_engine(Arc::from(provider), executor, events, flow)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Per-turn token ceiling (A-10), default OFF. Precedence: --turn-budget > FLUX_TURN_TOKEN_BUDGET
+    // > config [limits] turn_token_budget.
+    let turn_budget = flags
+        .turn_budget
+        .or_else(|| {
+            std::env::var("FLUX_TURN_TOKEN_BUDGET")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .or(cfg.limits.turn_token_budget);
+    agent.loop_host.set_token_budget(turn_budget);
     Ok((agent, session_id, canonical_spec, spawner))
 }
 
