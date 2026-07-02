@@ -161,6 +161,15 @@ impl AgentSpec {
         }
     }
 
+    /// Populate `skills` from the default skill directories rooted at this spec's `cwd`
+    /// ([`flux_skill::default_skill_dirs`]: project `.flux/skills` + `.claude/skills`, then the
+    /// user-global dirs; project wins name clashes). Discovery is progressive — only Level-1
+    /// metadata is read here; bodies load on activation (L-02). Set `cwd` first.
+    pub fn with_default_skills(mut self) -> Self {
+        self.skills = flux_skill::discover_merged(&flux_skill::default_skill_dirs(&self.cwd));
+        self
+    }
+
     /// Build the standard agent executor for this spec (select the `tools` subset, apply
     /// `permissions`, register the reflexive ops) and assemble the engine. The simple path for
     /// surfaces that don't need custom hooks/policy/identity (e.g. the SDK). For full control over
@@ -268,5 +277,36 @@ mod tests {
         assert_eq!(spec.system_prompt, DEFAULT_SYSTEM_PROMPT);
         assert_eq!(spec.max_iterations, 25);
         assert!(spec.tools.is_none());
+    }
+
+    /// L-02: `with_default_skills` discovers from `flux_skill::default_skill_dirs(cwd)` — a skill
+    /// under `<cwd>/.flux/skills` lands in the spec, with its body still unloaded (progressive).
+    #[test]
+    fn with_default_skills_populates_from_cwd_dirs() {
+        let dir = std::env::temp_dir().join(format!("flux-agent-skills-{}", std::process::id()));
+        let skills = dir.join(".flux").join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(
+            skills.join("agent-spec-l02.md"),
+            "---\nname: agent-spec-l02\ndescription: d\ntriggers: [zz]\n---\nBODY",
+        )
+        .unwrap();
+
+        let spec = AgentSpec {
+            cwd: dir.clone(),
+            ..AgentSpec::new("mock")
+        }
+        .with_default_skills();
+        let s = spec
+            .skills
+            .iter()
+            .find(|s| s.name == "agent-spec-l02")
+            .expect("project skill discovered");
+        assert!(
+            !s.body.is_loaded(),
+            "population is Level-1 only; the body loads on activation"
+        );
+        assert_eq!(s.body.text(), "BODY");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

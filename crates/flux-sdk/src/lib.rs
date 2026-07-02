@@ -141,7 +141,10 @@ impl ClientBuilder {
         let flow = FlowStore::in_memory()?;
 
         // The agent's definition; `assemble` selects the tool subset (all, here), applies the
-        // permissions, registers the reflexive ops, and ties the engine⇄loop-host cycle.
+        // permissions, registers the reflexive ops, and ties the engine⇄loop-host cycle. Skills
+        // come from the default skill dirs (project `.flux/skills`/`.claude/skills` + the user
+        // globals, L-02) — discovery is progressive (metadata now, bodies on activation), so this
+        // costs a frontmatter head-read per skill, not the bodies.
         let spec = AgentSpec {
             model: self.model,
             system_prompt: self
@@ -155,7 +158,8 @@ impl ClientBuilder {
             max_iterations: self.max_iterations,
             cwd: root,
             ..AgentSpec::default()
-        };
+        }
+        .with_default_skills();
         let engine = spec.assemble(
             Arc::from(provider),
             registry,
@@ -271,6 +275,71 @@ mod tests {
         assert_eq!(usage.input_tokens, 64);
         assert_eq!(usage.output_tokens, 8);
         assert_eq!(usage.cache_read_input_tokens, 16);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A mock that records every request's system prompt (segments + legacy `system`) so a test can
+    /// assert what the engine actually sent to the model.
+    struct SystemCaptureMock {
+        systems: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl Provider for SystemCaptureMock {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            let mut sys = String::new();
+            for seg in &req.system_segments {
+                sys.push_str(&seg.text);
+                sys.push('\n');
+            }
+            if let Some(s) = &req.system {
+                sys.push_str(s);
+            }
+            self.systems.lock().unwrap().push(sys);
+            Ok(Box::pin(futures::stream::iter(
+                vec![
+                    Chunk::Block(ContentBlock::Text { text: "ok".into() }),
+                    Chunk::Done {
+                        stop_reason: Some(StopReason::EndTurn),
+                    },
+                ]
+                .into_iter()
+                .map(Ok),
+            )))
+        }
+    }
+
+    /// L-02: the SDK populates skills from `flux_skill::default_skill_dirs` (previously only the
+    /// CLI did) — a project skill under `<root>/.flux/skills` whose trigger matches the turn's
+    /// input must be injected into the system prompt.
+    #[tokio::test]
+    async fn sdk_populates_skills_from_default_dirs() {
+        let dir = std::env::temp_dir().join(format!("flux-sdk-skills-{}", std::process::id()));
+        let skills = dir.join(".flux").join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(
+            skills.join("greeting.md"),
+            "---\nname: greeting\ndescription: how to greet\ntriggers: [zorblefrazz]\n---\nAlways greet with ahoy.",
+        )
+        .unwrap();
+
+        let systems = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(SystemCaptureMock {
+            systems: systems.clone(),
+        });
+        let client = Client::builder()
+            .model("mock")
+            .build(provider, &dir)
+            .unwrap();
+        client.run("please zorblefrazz me").await.unwrap();
+
+        let sys = systems.lock().unwrap().join("\n---\n");
+        assert!(
+            sys.contains("<skill name=\"greeting\">") && sys.contains("Always greet with ahoy."),
+            "the matching project skill must be injected into the system prompt; got:\n{sys}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

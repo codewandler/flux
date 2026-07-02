@@ -24,7 +24,7 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [I-01 — Statistically clean self-improvement headline gain (trials ≥ 3)](I-01-headline-gain.md) · Improve · offline half done (partial-credit scalar + durable token capture + synthetic `trials = 5` loop); the trials ≥ 5 grader-confirmed run is **staged** on a funded provider key
 
 ## Next (ready — take the top one unless the user named a story)
-- [L-02 — flux-markdown engine + progressive-disclosure skills](L-02-flux-markdown-engine.md) · Language · AST parser, body-on-demand activation — global skills currently inject whole bodies on match; progressive disclosure (name+description at startup, body on selection) is the scaling fix
+_None._
 
 ## Blocked
 _None._
@@ -116,6 +116,7 @@ _None._
 - [D-45 — Enforce sql/asterisk per-call read timeout through the host conn.read](D-45-sql-asterisk-conn-read-timeout.md) · Core · Closes the D-40/D-41 deferred item — `timeout` is now wire-enforced, not just parsed.
 - [I-02 — Reduce wasted agent-loop retries](I-02-agent-loop-retry-efficiency.md) · Improve · cargo wrappers normalize duplicate model-supplied scope flags, and the loop guard fingerprints repeated deterministic failures before replanning again
 - [L-01 — Global, multi-format skill loading](L-01-global-skills.md) · Language · multi-dir + Agent-Skills/Claude format + `flux-markdown` (see [CHANGELOG](../../CHANGELOG.md))
+- [L-02 — flux-markdown engine + progressive-disclosure skills](L-02-flux-markdown-engine.md) · Language · flux-markdown is now its OWN two-pass engine (goldmark-style AST: recursive block pass + delimiter-stack inlines; zero external parser deps — the old wrapper crates survive only as dev-dep parity oracles with exact per-line ANSI/ratatui parity pinned); skills load Level-1 (frontmatter head-scan only) and the body reads lazily exactly at injection via the SkillBody Display; [skills] dirs config key layered CLI > project > user > defaults; agent + SDK now populate via default_skill_dirs; live-verified skill activation through the real engine
 - [L-03 — Native-text module declarations (the whole app in flux-lang — `.flux` does all of it)](L-03-native-text-program-grammar.md) · Language · the whole app — `agent`/`channel`/`datasource`/`trigger`/`journey` + flows — in native flux-lang text (settings inline, secrets as `secret "ENV"` refs); JSON-program path deleted (clean cutover); `flux app run`/`flux flow run` load native text; supersedes the JSON manifest (see [design](../designs/native-text-modules.md))
 - [L-04 — Define custom ops by composing Flux-Lang](L-04-composite-ops.md) · Language · `.flux` modules can declare scoped composite ops that chain existing ops through the normal safety envelope; SDK, `flux flow run`, and `flux-app` install module composites; new argv-only `proc.run` process op is shell-group gated
 - [L-05 — Publish public Docusaurus docs](L-05-public-docusaurus-docs.md) · Language · public Docusaurus site scaffold under `website/`, with Flux-Lang text syntax/semantics docs and GitHub Pages deployment to `codewandler.github.io/flux`

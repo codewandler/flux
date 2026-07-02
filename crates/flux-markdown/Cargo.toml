@@ -3,23 +3,30 @@ name = "flux-markdown"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-description = "Frontmatter parsing/validation and (feature-gated) markdown rendering wrappers for flux"
+description = "flux's own markdown engine: frontmatter parsing plus an AST-based CommonMark-subset parser, writer, and (feature-gated) ratatui/terminal renderers"
 
 [dependencies]
 serde.workspace = true
 serde_norway.workspace = true
 
-# Rendering wrappers — off by default so the L0 frontmatter half stays lean. These wrap the
-# codewandler/markdown crates (pinned to the same rev flux-tui/flux-cli use so the workspace resolves
-# a single markdown-stream). `ratatui` is the workspace ratatui so the re-exported `Text` type-aligns.
+# Render-path extras — off by default so the L0 parser/AST half stays pure std. The parser itself
+# has NO external dependency (it is flux's own engine, L-02); these only style/measure its output.
 ratatui = { workspace = true, optional = true }
-markdown-stream = { git = "https://github.com/codewandler/markdown", rev = "35c6db54d7ab12814db738cc019592b83aab6e8a", optional = true }
-markdown-ratatui = { git = "https://github.com/codewandler/markdown", rev = "35c6db54d7ab12814db738cc019592b83aab6e8a", optional = true }
-markdown-terminal = { git = "https://github.com/codewandler/markdown", rev = "35c6db54d7ab12814db738cc019592b83aab6e8a", optional = true }
+unicode-width = { version = "0.2", optional = true }
+
+[dev-dependencies]
+# Self-dependency trick: enables both render features for this crate's own tests, so a bare
+# `cargo test -p flux-markdown` exercises the render paths without feature flags.
+flux-markdown = { path = ".", features = ["ratatui", "terminal"] }
+# The replaced wrapper crates, kept ONLY as parity oracles for tests (same rev they were pinned to
+# when they were real dependencies). Dev-only — not in the publish closure, ignored by codegate.
+markdown-stream = { git = "https://github.com/codewandler/markdown", rev = "35c6db54d7ab12814db738cc019592b83aab6e8a" }
+markdown-ratatui = { git = "https://github.com/codewandler/markdown", rev = "35c6db54d7ab12814db738cc019592b83aab6e8a" }
+markdown-terminal = { git = "https://github.com/codewandler/markdown", rev = "35c6db54d7ab12814db738cc019592b83aab6e8a" }
 
 [features]
 default = []
 # Native render to ratatui `Text` (used by flux-tui).
-ratatui = ["dep:ratatui", "dep:markdown-stream", "dep:markdown-ratatui"]
-# Live streaming render to a terminal (used by flux-cli's CliSink).
-terminal = ["dep:markdown-terminal"]
+ratatui = ["dep:ratatui", "dep:unicode-width"]
+# ANSI terminal rendering incl. the streaming `LiveRenderer` (used by flux-cli's sinks).
+terminal = ["dep:unicode-width"]

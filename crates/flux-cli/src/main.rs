@@ -132,6 +132,12 @@ struct AgentFlags {
     #[arg(long)]
     show_loop: bool,
 
+    /// Extra skill directory, layered above `[skills] dirs` from .flux/config.toml and the
+    /// well-known set (`.flux/skills`, `.claude/skills`, `~/.flux/skills`, …). Repeatable; earlier
+    /// dirs win a skill-name clash.
+    #[arg(long = "skill-dir", value_name = "DIR")]
+    skill_dirs: Vec<std::path::PathBuf>,
+
     /// Continue the most recent session instead of starting a new one.
     #[arg(short = 'c', long)]
     continue_: bool,
@@ -806,10 +812,18 @@ fn compact_threshold() -> usize {
 }
 
 /// Discover skills from the project's `.flux/skills` and `.claude/skills` plus the user/global dirs
-/// (`~/.flux/skills`, `~/.agents/skills`, `~/.claude/skills`), project winning on a name clash.
-/// Activation (triggers or a description fallback) gates which bodies are injected per turn.
-fn load_skills(cwd: &std::path::Path) -> Vec<flux_skill::Skill> {
-    flux_skill::discover_merged(&flux_skill::default_skill_dirs(cwd))
+/// (`~/.flux/skills`, `~/.agents/skills`, `~/.claude/skills`), with custom dirs layered above the
+/// well-known set: `--skill-dir` flags first, then `[skills] dirs` from the layered config (project
+/// before user) — earlier dirs win a name clash (L-02). Activation (triggers or a description
+/// fallback) gates which bodies are injected per turn; discovery reads metadata only.
+fn load_skills(
+    cwd: &std::path::Path,
+    cfg: &flux_config::Config,
+    cli_dirs: &[std::path::PathBuf],
+) -> Vec<flux_skill::Skill> {
+    let mut extra: Vec<std::path::PathBuf> = cli_dirs.to_vec();
+    extra.extend(cfg.skill_dir_paths());
+    flux_skill::discover_merged(&flux_skill::skill_dirs(cwd, &extra))
 }
 
 /// The plugin descriptor directory `~/.flux/plugins` (None if `HOME` is unset).
@@ -1676,7 +1690,7 @@ async fn build_agent_with(
     let spec = AgentSpec {
         model,
         system_prompt,
-        skills: load_skills(&cwd),
+        skills: load_skills(&cwd, &cfg, &flags.skill_dirs),
         max_tokens: flags.max_tokens,
         max_iterations: 25,
         groups,
@@ -5687,6 +5701,49 @@ mod tests {
         use flux_provider::Provider as _;
         let p = super::LazyProvider::new("anthropic/claude-sonnet-4-6".to_string());
         assert_eq!(p.name(), "anthropic");
+    }
+
+    /// L-02: skill discovery layers CLI `--skill-dir` above `[skills] dirs` from config, above the
+    /// well-known defaults — earlier layers win a name clash.
+    #[test]
+    fn load_skills_layers_cli_over_config_over_defaults() {
+        let root = std::env::temp_dir().join(format!("flux-cli-skills-{}", std::process::id()));
+        for (dir, body) in [
+            (".flux/skills", "from default"),
+            ("cfg-skills", "from config"),
+            ("cli-skills", "from cli"),
+        ] {
+            let d = root.join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("s.md"),
+                format!("---\nname: l02-cli-layering\n---\n{body}"),
+            )
+            .unwrap();
+        }
+        let cfg = flux_config::Config {
+            skills: flux_config::SkillsConfig {
+                dirs: vec!["cfg-skills".to_string()],
+            },
+            ..Default::default()
+        };
+
+        // Config layer beats the well-known default...
+        let skills = super::load_skills(&root, &cfg, &[]);
+        let s = skills
+            .iter()
+            .find(|s| s.name == "l02-cli-layering")
+            .unwrap();
+        assert_eq!(s.body, "from config");
+
+        // ...and a CLI --skill-dir beats the config layer.
+        let skills = super::load_skills(&root, &cfg, &[root.join("cli-skills")]);
+        let s = skills
+            .iter()
+            .find(|s| s.name == "l02-cli-layering")
+            .unwrap();
+        assert_eq!(s.body, "from cli");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// C-08: `flux auth login codex` drives a full PKCE flow — authorize URL with challenge+state,

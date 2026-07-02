@@ -25,6 +25,21 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **flux-markdown is a real engine, and skills load progressively (L-02).** The markdown crate is
+  no longer a wrapper: a two-pass own engine (goldmark-style AST — recursive block pass +
+  CommonMark delimiter-stack inlines, GFM tables/strikethrough) with a shared width-aware layout
+  core feeding both the terminal and ratatui renderers, whose public APIs are preserved exactly.
+  The old wrapper crates survive only as dev-dependency *parity oracles*: exact per-line
+  ANSI/ratatui output parity is pinned over a snippet suite and nine committed repo-doc fixtures,
+  plus a parse/write round-trip law. Skill activation is now standards-aligned progressive
+  disclosure: startup reads only a frontmatter head-scan (name + description), selection/capping
+  happens on metadata alone, and a skill's body is read lazily at the moment of injection —
+  unselected bodies never touch the disk. `[skills] dirs` in config (CLI > project > user >
+  defaults, with a repeatable `--skill-dir`) adds custom skill directories, and the agent/SDK now
+  populate skills from the same well-known dirs as the CLI. Documented subset: no setext
+  headings, indented code, general HTML, reference links, or footnotes; terminal code blocks lose
+  per-token syntax colors (uniform code color).
+
 - **The endpoint epic is complete — the host now terminates raw-socket auth (D-31).** The last
   place a (trusted) plugin held a secret is gone: the new `conn.authenticate` host capability
   performs the PostgreSQL v3 startup + auth handshake host-side (full RFC 5802/7677

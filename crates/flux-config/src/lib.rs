@@ -94,6 +94,24 @@ impl EndpointConfig {
     }
 }
 
+/// The `[skills]` table — skill-discovery settings (L-02).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillsConfig {
+    /// Custom skill directories, layered **above** the built-in well-known set (`.flux/skills`,
+    /// `.claude/skills`, `~/.flux/skills`, …). Unlike the permission lists, order here is semantic
+    /// — earlier dirs win skill-name clashes — so the merge puts **project** dirs before user dirs
+    /// (CLI flags layer on top of all of these; the caller resolves that). Relative paths resolve
+    /// against the workspace root; a leading `~/` expands to the home directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dirs: Vec<String>,
+}
+
+impl SkillsConfig {
+    fn is_default(&self) -> bool {
+        self.dirs.is_empty()
+    }
+}
+
 /// The merged flux configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -126,6 +144,9 @@ pub struct Config {
     /// Knobs for the HTTP/A2A server surface (`flux-server`).
     #[serde(default, skip_serializing_if = "ServerConfig::is_default")]
     pub server: ServerConfig,
+    /// Skill-discovery settings (custom skill directories, L-02).
+    #[serde(default, skip_serializing_if = "SkillsConfig::is_default")]
+    pub skills: SkillsConfig,
 }
 
 /// The default A2A session TTL (seconds) when `[server] a2a_session_ttl_secs` is absent: 1 hour.
@@ -220,6 +241,21 @@ impl Config {
             .a2a_session_ttl_secs
             .unwrap_or(DEFAULT_A2A_SESSION_TTL_SECS)
     }
+
+    /// The configured custom skill directories as paths, in precedence order, with a leading `~/`
+    /// expanded to the home directory. Relative paths are left relative — the skill-discovery
+    /// composer (`flux_skill::skill_dirs`) resolves them against the workspace root.
+    pub fn skill_dir_paths(&self) -> Vec<PathBuf> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        self.skills
+            .dirs
+            .iter()
+            .map(|d| match (d.strip_prefix("~/"), &home) {
+                (Some(rest), Some(h)) => h.join(rest),
+                _ => PathBuf::from(d),
+            })
+            .collect()
+    }
 }
 
 fn home_config_path() -> Option<PathBuf> {
@@ -289,6 +325,12 @@ fn merge(user: Config, project: Config) -> Config {
                 .server
                 .a2a_session_ttl_secs
                 .or(user.server.a2a_session_ttl_secs),
+        },
+        // Skill-dir order is name-clash precedence, so the project's dirs come FIRST (project >
+        // user) — deliberately the opposite concatenation order from the permission lists, where
+        // order carries no meaning.
+        skills: SkillsConfig {
+            dirs: dedupe([project.skills.dirs, user.skills.dirs].concat()),
         },
     }
 }
@@ -741,6 +783,40 @@ gitlab = ["gitlab.internal"]
         let cfg = load(&project).unwrap();
         assert_eq!(cfg.server.a2a_session_ttl_secs, Some(0));
         assert_eq!(cfg.a2a_session_ttl_secs(), 0, "0 = never prune");
+
+        std::fs::remove_dir_all(&project).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// L-02: `[skills] dirs` is a layered list of custom skill directories. Dir order is
+    /// name-clash precedence, so unlike the permission lists the **project's** dirs come first
+    /// (project > user), and `skill_dir_paths` expands a leading `~/`.
+    #[test]
+    fn skill_dirs_merge_project_before_user_and_expand_tilde() {
+        let project = temp_dir();
+        let home = temp_dir();
+        let _home = crate::HOME_LOCK.lock().unwrap();
+        std::env::set_var("HOME", &home);
+        std::fs::write(
+            home.join(".flux").join("config.toml"),
+            "[skills]\ndirs = [\"~/global-skills\", \"shared\"]\n",
+        )
+        .unwrap();
+        write_project(&project, "[skills]\ndirs = [\"team-skills\", \"shared\"]\n");
+
+        let cfg = load(&project).unwrap();
+        assert_eq!(
+            cfg.skills.dirs,
+            vec!["team-skills", "shared", "~/global-skills"],
+            "project dirs first (highest precedence), de-duplicated"
+        );
+        let paths = cfg.skill_dir_paths();
+        assert_eq!(paths[0], PathBuf::from("team-skills"));
+        assert_eq!(
+            paths[2],
+            home.join("global-skills"),
+            "~/ expands against HOME"
+        );
 
         std::fs::remove_dir_all(&project).ok();
         std::fs::remove_dir_all(&home).ok();
