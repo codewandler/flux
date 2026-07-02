@@ -8,6 +8,19 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Planner teaches `parallel` for independent reads; one-shot compile repairs hit the prompt cache
+  (A-09).** The grammar's canonical worked example for "read a.rs, b.rs and c.rs and summarise
+  each" emitted a serial `each` — which executes strictly in order — right after a hint saying to
+  prefer `parallel`, so every model learned the slow shape. The grammar now carries three examples
+  (sequential dependency chain, `parallel` with named branches for independent reads, and `each`
+  scoped to dynamic lists, where `parallel`'s static branches can't apply), and a test parses every
+  worked example against the real `DraftAst` schema so the prompt can never drift from the AST
+  again. The one-shot `compile()` repair loop used to re-send the entire flat prompt (instructions
+  + catalog + grammar + previous output) uncached on every attempt; it now mirrors `compile_turn`'s
+  cache-first layout — instructions+catalog+grammar as ONE byte-stable cached system segment,
+  session symbols uncached, and the repair exchange riding as ordinary messages — so attempt 2+
+  re-reads the bulk from the provider prompt cache instead of re-paying it.
+
 - **AWS Bedrock LLM provider — `flux run -m aws`, streaming, full credential chain, priced (C-09).**
   New `aws` provider (`flux_providers::bedrock`, L1) drives Bedrock-provisioned Claude through the
   same agent harness: the wire is the Anthropic Messages shape flux already speaks, wrapped in a

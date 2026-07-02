@@ -66,7 +66,7 @@ pub struct ToolDef {
 /// prompt out cache-first: byte-stable material (op catalog, grammar, identity) in cached segments,
 /// per-turn material (session symbols) in a trailing uncached one. Codecs without segment support
 /// join the texts in order (see [`Request::system_text`]).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemSegment {
     pub text: String,
     pub cache: bool,

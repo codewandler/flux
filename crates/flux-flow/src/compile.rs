@@ -128,6 +128,12 @@ pub trait AskUser: Send + Sync {
 
 /// Compile a natural-language instruction into a [`DraftAst`] in a single model call (prompt-and-parse,
 /// with a bounded repair loop). `view`, when present, lets the model reference existing session symbols.
+///
+/// Cache-segmented (A-09): the instructions + catalog + grammar are ONE cached system segment,
+/// byte-stable across repair attempts, so attempt 2+ re-reads it from the provider prompt cache
+/// instead of re-paying the full catalog. The per-session symbols are an uncached trailing segment
+/// (mirroring `compile_turn`'s A/C layout), and the instruction + each repair exchange ride as
+/// ordinary messages.
 pub async fn compile(
     provider: &dyn Provider,
     model: &str,
@@ -137,12 +143,49 @@ pub async fn compile(
     opts: CompileOptions,
 ) -> Result<Compiled> {
     let attempts = opts.max_attempts.max(1);
-    let base = build_oneshot_prompt(instruction, ops, view);
-    let mut prompt = base.clone();
+    let mut segments = vec![SystemSegment {
+        text: build_oneshot_system(ops),
+        cache: true,
+    }];
+    let symbols = symbols_block(view);
+    if !symbols.trim().is_empty() {
+        segments.push(SystemSegment {
+            text: symbols,
+            cache: false,
+        });
+    }
+    let mut messages = vec![Message::user_text(format!("Instruction: {instruction}"))];
     let mut last_err = String::new();
 
     for attempt in 1..=attempts {
-        let text = run_model(provider, model, &prompt, opts.max_tokens).await?;
+        let req = Request {
+            model: model.to_string(),
+            system: None,
+            system_segments: segments.clone(),
+            messages: messages.clone(),
+            tools: Vec::new(),
+            max_tokens: opts.max_tokens,
+            temperature: None,
+            top_p: None,
+            stop_sequences: Vec::new(),
+            thinking: false,
+            effort: None,
+            metadata: serde_json::Map::new(),
+        };
+        let mut stream = provider.stream(req).await?;
+        let mut text = String::new();
+        while let Some(chunk) = stream.next().await {
+            if let Chunk::TextDelta(t) = chunk? {
+                text.push_str(&t);
+            }
+        }
+        let repair = |messages: &mut Vec<Message>, previous: &str, error: &str| {
+            messages.push(Message::assistant_text(previous));
+            messages.push(Message::user_text(format!(
+                "Your previous output was invalid ({error}). Return a corrected AST. \
+                 Output ONLY the JSON AST in a single ```json code block."
+            )));
+        };
         match parse_draft_ast(&text) {
             Ok(ast) => match analyze_flow(&ast, ops) {
                 Ok(()) => {
@@ -163,7 +206,7 @@ pub async fn compile(
                         });
                     }
                     last_err = join_diags(&diags);
-                    prompt = repair_prompt(&base, &text, &last_err);
+                    repair(&mut messages, &text, &last_err);
                 }
             },
             Err(e) => {
@@ -173,7 +216,7 @@ pub async fn compile(
                         "compile failed after {attempt} attempt(s): {last_err}"
                     )));
                 }
-                prompt = repair_prompt(&base, &text, &last_err);
+                repair(&mut messages, &text, &last_err);
             }
         }
     }
@@ -448,28 +491,6 @@ pub async fn plan(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Model I/O
-// ---------------------------------------------------------------------------
-
-/// One single-shot text completion: stream and collect the text (mirrors `flux-agent::maybe_compact`).
-async fn run_model(
-    provider: &dyn Provider,
-    model: &str,
-    prompt: &str,
-    max_tokens: u32,
-) -> Result<String> {
-    let req = Request::new(model.to_string(), prompt.to_string()).with_max_tokens(max_tokens);
-    let mut stream = provider.stream(req).await?;
-    let mut out = String::new();
-    while let Some(chunk) = stream.next().await {
-        if let Chunk::TextDelta(t) = chunk? {
-            out.push_str(&t);
-        }
-    }
-    Ok(out)
-}
-
 /// Parse the optional `complete` field of an `emit_plan` call into a [`Completion`]. Lenient: accepts a
 /// bare string (`"summarize X"` → instructions, no primer) or an object (`{primer?, instructions}`).
 /// Anything without usable `instructions` ⇒ `None`, so the engine simply loops (the model answers in
@@ -706,16 +727,24 @@ fn symbols_block(view: Option<&SessionView>) -> String {
 fn ast_grammar() -> String {
     format!(
         "The AST is a JSON object: {{\"name\"?:string, \"params\"?:[{{\"name\":string,\"ty\":type}}], \"returns\"?:type, \"body\":[Node,...]}}. A Node is tagged by \"kind\":\n\
-{node_kinds}Prefer `each` over `repeat` for list iteration; prefer `parallel` for independent reads/calls that don't depend on each other.\n\
+{node_kinds}Independent reads/calls over a KNOWN set run CONCURRENTLY with `parallel` (each branch binds its result to its name) — `each` runs strictly in order, so keep it for steps that depend on each other, and for iterating a DYNAMIC list value (`parallel` branches are static). Prefer `each` over `repeat` for list iteration.\n\
 \nArtifact types (the `Named` types ops produce/consume — use as a `ty`/`returns` or in a `ctx`/`need`): {artifact_types}.\n\
-\nExample for \"read the readme then grep it for TODO\":\n\
+\nExample for \"read the readme then grep it for TODO\" (step 2 depends on step 1 — sequential):\n\
 {{\"body\":[\n\
   {{\"kind\":\"bind\",\"name\":\"readme\",\"value\":{{\"kind\":\"call\",\"op\":\"read\",\"args\":[{{\"kind\":\"lit\",\"value\":\"README.md\"}}]}}}},\n\
   {{\"kind\":\"bind\",\"name\":\"hits\",\"value\":{{\"kind\":\"call\",\"op\":\"grep\",\"args\":[{{\"kind\":\"lit\",\"value\":\"TODO\"}}]}}}}\n\
 ]}}\n\
-\nExample for \"read a.rs, b.rs and c.rs and summarise each\":\n\
+\nExample for \"read a.rs, b.rs and c.rs and summarise each\" (independent reads — concurrent):\n\
 {{\"body\":[\n\
-  {{\"kind\":\"each\",\"in\":{{\"kind\":\"lit\",\"value\":[\"a.rs\",\"b.rs\",\"c.rs\"]}},\"as\":\"f\",\"body\":[\n\
+  {{\"kind\":\"parallel\",\"branches\":[\n\
+    {{\"name\":\"a\",\"body\":[{{\"kind\":\"call\",\"op\":\"read\",\"args\":[{{\"kind\":\"lit\",\"value\":\"a.rs\"}}]}}]}},\n\
+    {{\"name\":\"b\",\"body\":[{{\"kind\":\"call\",\"op\":\"read\",\"args\":[{{\"kind\":\"lit\",\"value\":\"b.rs\"}}]}}]}},\n\
+    {{\"name\":\"c\",\"body\":[{{\"kind\":\"call\",\"op\":\"read\",\"args\":[{{\"kind\":\"lit\",\"value\":\"c.rs\"}}]}}]}}\n\
+  ]}}\n\
+]}}\n\
+\nExample for \"read every file in $files\" (a dynamic list from an earlier step — `each` iterates it in order):\n\
+{{\"body\":[\n\
+  {{\"kind\":\"each\",\"in\":{{\"kind\":\"var\",\"name\":\"files\"}},\"as\":\"f\",\"body\":[\n\
     {{\"kind\":\"bind\",\"name\":\"text\",\"value\":{{\"kind\":\"call\",\"op\":\"read\",\"args\":[{{\"kind\":\"var\",\"name\":\"f\"}}]}}}}\n\
   ],\"collect\":\"all\"}}\n\
 ]}}",
@@ -724,15 +753,17 @@ fn ast_grammar() -> String {
     )
 }
 
-fn build_oneshot_prompt(instruction: &str, ops: &OpRegistry, view: Option<&SessionView>) -> String {
+/// The one-shot compiler's **static** system block (segment A): instructions + sorted op catalog +
+/// grammar. Contains nothing per-session or per-attempt — symbols render as a separate uncached
+/// segment and the instruction/repair exchanges ride as messages — so this block stays byte-stable
+/// and prompt-cacheable across the repair loop (A-09).
+fn build_oneshot_system(ops: &OpRegistry) -> String {
     format!(
         "You are Flux-Lang's compiler front-end. Convert the user's instruction into a Flux-Lang flow \
 AST as JSON. Do NOT execute anything. Prefer deterministic operations; minimise model-dependent \
 steps. Use ONLY operations from the catalog. Each op is shown as `name({{params}})` — call a multi-param op with a single object argument naming each parameter (e.g. `write({{path, content}})`); a sole-required-param op accepts a bare value (e.g. `read(\"README.md\")`). [optional] params may be omitted from the object.\n\nOperation catalog:\n\
-{catalog}{symbols}\n{grammar}\n\nOutput ONLY the JSON AST in a single ```json code block.\n\n\
-Instruction: {instruction}\n",
+{catalog}\n{grammar}\n\nOutput ONLY the JSON AST in a single ```json code block.\n",
         catalog = ops_catalog(ops),
-        symbols = symbols_block(view),
         grammar = ast_grammar(),
     )
 }
@@ -837,13 +868,6 @@ fn planner_tools(interactive: bool) -> Vec<ToolDef> {
     tools
 }
 
-fn repair_prompt(base: &str, previous: &str, error: &str) -> String {
-    format!(
-        "{base}\nYour previous output was invalid ({error}). Previous output:\n{previous}\n\n\
-Return a corrected AST. Output ONLY the JSON AST in a single ```json code block.\n"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -929,6 +953,117 @@ mod tests {
 
     const VALID_AST: &str =
         r#"{"ast":{"body":[{"kind":"call","op":"read","args":[{"kind":"lit","value":"x"}]}]}}"#;
+
+    /// A-09: every worked example in the grammar must parse as a real `DraftAst` (guards the prompt
+    /// against AST drift forever), and the independent-reads example must teach `parallel` —
+    /// `each` is strictly serial, so the old `each`-based example steered every model toward
+    /// serialized reads.
+    #[test]
+    fn grammar_examples_parse_and_use_parallel_for_independent_reads() {
+        use flux_lang::ast::Node;
+        let grammar = ast_grammar();
+        let examples: Vec<(String, DraftAst)> = grammar
+            .split("Example for")
+            .skip(1)
+            .map(|chunk| {
+                let json = extract_json(chunk).expect("worked example carries a JSON AST");
+                let ast: DraftAst = serde_json::from_str(&json).unwrap_or_else(|e| {
+                    panic!("worked example must parse as a DraftAst ({e}): {json}")
+                });
+                (chunk.to_string(), ast)
+            })
+            .collect();
+        assert!(
+            examples.len() >= 3,
+            "expected the sequential, parallel and dynamic-list examples, got {}",
+            examples.len()
+        );
+        let (_, parallel_example) = examples
+            .iter()
+            .find(|(intro, _)| intro.contains("summarise each"))
+            .expect("the independent-reads example");
+        assert!(
+            parallel_example
+                .body
+                .iter()
+                .any(|n| matches!(n, Node::Parallel { .. })),
+            "independent reads must be taught as a `parallel` node, not a serial `each`"
+        );
+    }
+
+    /// A-09: the one-shot repair loop must re-send the instructions+catalog+grammar as a byte-stable
+    /// CACHED system segment (attempt 2 hits the provider prompt cache), with the repair exchange
+    /// riding as messages — not as a re-inflated, uncached flat prompt.
+    #[tokio::test]
+    async fn oneshot_repair_reuses_a_byte_stable_cached_segment() {
+        struct Capture {
+            responses: Mutex<VecDeque<Vec<Chunk>>>,
+            requests: Mutex<Vec<Request>>,
+        }
+        #[async_trait]
+        impl Provider for Capture {
+            fn name(&self) -> &str {
+                "mock"
+            }
+            async fn stream(&self, req: Request) -> Result<ChunkStream> {
+                self.requests.lock().unwrap().push(req);
+                let chunks = self
+                    .responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_default();
+                Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+            }
+        }
+        let text = |t: &str| {
+            vec![
+                Chunk::TextDelta(t.to_string()),
+                Chunk::Done {
+                    stop_reason: Some(flux_core::StopReason::EndTurn),
+                },
+            ]
+        };
+        let provider = Capture {
+            responses: Mutex::new(
+                vec![
+                    text("not a json object at all"),
+                    text("```json\n{\"body\":[{\"kind\":\"call\",\"op\":\"read\",\"args\":[{\"kind\":\"lit\",\"value\":\"x\"}]}]}\n```"),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            requests: Mutex::new(Vec::new()),
+        };
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let compiled = compile(
+            &provider,
+            "m",
+            "read x",
+            &ops,
+            None,
+            CompileOptions::default(),
+        )
+        .await
+        .expect("second attempt repairs");
+        assert_eq!(compiled.attempts, 2);
+
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        // Segment A is cached and byte-identical across attempts — that is what makes the repair
+        // round a cache HIT instead of a full re-pay of the catalog+grammar.
+        assert!(!requests[0].system_segments.is_empty(), "segmented request");
+        assert!(requests[0].system_segments[0].cache, "segment A is cached");
+        assert_eq!(
+            requests[0].system_segments, requests[1].system_segments,
+            "system segments must be byte-stable across repair attempts"
+        );
+        // The repair context rides as messages: instruction, then previous output + repair note.
+        assert_eq!(requests[0].messages.len(), 1);
+        assert_eq!(requests[1].messages.len(), 3);
+        assert!(requests[1].messages[2].text().contains("invalid"));
+    }
 
     #[test]
     fn planner_advertises_only_emit_plan_and_ask_user() {
