@@ -808,7 +808,13 @@ impl Tool for ChangeImplementTool {
             let prompt = format!(
                 "Implement exactly this task and nothing else, then report what you changed:\n{desc}"
             );
-            match spawner.spawn("worker", &prompt, &cancel).await {
+            match spawner
+                .spawn(
+                    flux_runtime::SpawnRequest::new("worker", prompt.clone()),
+                    &cancel,
+                )
+                .await
+            {
                 Ok(outcome) => {
                     results.push(json!({ "task": desc, "ok": true, "result": outcome.text }))
                 }

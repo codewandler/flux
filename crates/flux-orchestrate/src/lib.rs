@@ -22,8 +22,8 @@ use flux_flow::AgentSink;
 use flux_policy::{AuthorizationPolicy, Caller, Trust};
 use flux_provider::Provider;
 use flux_runtime::{
-    ApprovalChoice, Approver, Executor, PermissionManager, SpawnOutcome, Spawner, Tool,
-    ToolContext, ToolRegistry, ToolResult,
+    ApprovalChoice, Approver, Executor, PermissionManager, SpawnOutcome, SpawnRequest, Spawner,
+    Tool, ToolContext, ToolRegistry, ToolResult,
 };
 use flux_spec::{tool_input_schema, Idempotency, IntentSet, Risk, ToolSpec};
 use flux_system::System;
@@ -211,41 +211,19 @@ impl LocalSpawner {
 
 #[async_trait]
 impl Spawner for LocalSpawner {
+    /// Run one sub-agent. `request.cap_scope` (the caller's active `with_tools` allowlist, if any)
+    /// is intersected into the role's own `tools` so a `task` invoked from inside a capability
+    /// scope can never hand the child a broader tool set than the block that spawned it
+    /// (capabilities only ever narrow on descent: role ∩ block scope). `request.parent_session`
+    /// is recorded as the child session's `correlation_id` (A-08).
     async fn spawn(
         &self,
-        role_name: &str,
-        task: &str,
+        request: SpawnRequest,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<SpawnOutcome> {
-        self.spawn_with_scope(role_name, task, cancel, None).await
-    }
-
-    async fn spawn_scoped(
-        &self,
-        role_name: &str,
-        task: &str,
-        cancel: &tokio_util::sync::CancellationToken,
-        cap_scope: Option<&[String]>,
-    ) -> Result<SpawnOutcome> {
-        self.spawn_with_scope(role_name, task, cancel, cap_scope)
-            .await
-    }
-}
-
-impl LocalSpawner {
-    /// Shared implementation behind [`Spawner::spawn`]/[`Spawner::spawn_scoped`]. `cap_scope` is the
-    /// caller's active `with_tools` allowlist, if any — intersected into the role's own `tools` so a
-    /// `task` invoked from inside a capability scope can never hand the child a broader tool set than
-    /// the block that spawned it (capabilities only ever narrow on descent: role ∩ block scope). `None`
-    /// (the `spawn` path, or `spawn_scoped` with no active scope) leaves the role's `tools` as the sole
-    /// bound, exactly as before this method existed.
-    async fn spawn_with_scope(
-        &self,
-        role_name: &str,
-        task: &str,
-        cancel: &tokio_util::sync::CancellationToken,
-        cap_scope: Option<&[String]>,
-    ) -> Result<SpawnOutcome> {
+        let role_name = request.role.as_str();
+        let task = request.task.as_str();
+        let cap_scope = request.cap_scope.as_deref();
         let role = self
             .roles
             .get(role_name)
@@ -312,12 +290,20 @@ impl LocalSpawner {
         spec.max_iterations = self.limits.max_iterations;
 
         // Child runs persist into the shared (tenant) store when auditing; otherwise a throwaway
-        // in-memory store keeps the sub-agent ephemeral (the historical default).
+        // in-memory store keeps the sub-agent ephemeral (the documented mode for storeless hosts).
         let events = match &self.audit {
             Some(store) => store.clone(),
             None => Arc::new(EventStore::in_memory()?),
         };
-        let session_id = events.create_session(&spec.model)?;
+        // The child stream carries its identity + provenance (A-08, on the D-02 context envelope):
+        // `agent_id` names the role, `correlation_id` points back at the parent session — so a
+        // shared audit store answers "what did the sub-agents of turn X do" with one indexed read.
+        let child_ctx = flux_events::EventContext {
+            agent_id: Some(format!("subagent:{role_name}")),
+            correlation_id: request.parent_session.clone(),
+            ..Default::default()
+        };
+        let session_id = events.create_session_with_context(&spec.model, &child_ctx)?;
         // Share the event store with the flow store so the child's run trace (its inner tool calls)
         // lands in the same log as its conversation — into the shared audit store when one is set.
         let flow = flux_flow::state::FlowStore::in_memory_with_events(events.clone())?;
@@ -371,6 +357,8 @@ impl LocalSpawner {
             text: sink.text,
             model,
             usage,
+            session_id,
+            tool_calls: sink.tool_calls,
         })
     }
 }
@@ -486,10 +474,15 @@ impl SubAgents {
 #[derive(Default)]
 struct TextCollector {
     text: String,
+    /// How many tool calls the child streamed — the cheap trace count `subagent.trace` reports.
+    tool_calls: usize,
 }
 impl AgentSink for TextCollector {
     fn text_delta(&mut self, t: &str) {
         self.text.push_str(t);
+    }
+    fn tool_call(&mut self, _name: &str, _input: &serde_json::Value) {
+        self.tool_calls += 1;
     }
     fn turn_end(&mut self, _u: Option<Usage>) {}
 }
@@ -504,8 +497,10 @@ pub async fn plan_and_dispatch(
 ) -> Result<String> {
     let plan = spawner
         .spawn(
-            "planner",
-            &format!("Goal: {goal}\n\nProduce a concise, ordered plan."),
+            SpawnRequest::new(
+                "planner",
+                format!("Goal: {goal}\n\nProduce a concise, ordered plan."),
+            ),
             cancel,
         )
         .await?
@@ -515,8 +510,12 @@ pub async fn plan_and_dispatch(
     }
     let result = spawner
         .spawn(
-            "worker",
-            &format!("Goal: {goal}\n\nPlan:\n{plan}\n\nExecute the plan and report what you did."),
+            SpawnRequest::new(
+                "worker",
+                format!(
+                    "Goal: {goal}\n\nPlan:\n{plan}\n\nExecute the plan and report what you did."
+                ),
+            ),
             cancel,
         )
         .await?
@@ -591,11 +590,13 @@ pub async fn plan_and_dispatch_waves(
 ) -> Result<String> {
     let plan_text = spawner
         .spawn(
-            "planner",
-            &format!(
-                "Goal: {goal}\n\nBreak this into subtasks. Respond with ONLY a JSON array of \
-                 objects with fields `id` (string), `task` (string), and `depends_on` (array of \
-                 ids). No prose, no code fences."
+            SpawnRequest::new(
+                "planner",
+                format!(
+                    "Goal: {goal}\n\nBreak this into subtasks. Respond with ONLY a JSON array of \
+                     objects with fields `id` (string), `task` (string), and `depends_on` (array of \
+                     ids). No prose, no code fences."
+                ),
             ),
             cancel,
         )
@@ -637,7 +638,7 @@ pub async fn plan_and_dispatch_waves(
                 (
                     id,
                     spawner
-                        .spawn("worker", &prompt, cancel)
+                        .spawn(SpawnRequest::new("worker", prompt.clone()), cancel)
                         .await
                         .map(|o| o.text),
                 )
@@ -715,12 +716,16 @@ impl Tool for TaskTool {
         // The active `with_tools` block scope (if any) narrows the child's tool set too — capabilities
         // only ever narrow on descent, and a sub-agent invocation is a descent step like any other.
         // `active_cap_scope` reads the SAME shared stack `Executor::dispatch` checks, so this call site
-        // sees exactly the scope this `task` call itself is subject to.
-        let cap_scope = ctx.active_cap_scope();
-        match spawner
-            .spawn_scoped(&args.role, &args.task, &cancel, cap_scope.as_deref())
-            .await
-        {
+        // sees exactly the scope this `task` call itself is subject to. `parent_session` (installed on
+        // the context per turn by the engine) rides along so the child's audit stream correlates back
+        // to THIS turn (A-08).
+        let request = SpawnRequest {
+            role: args.role.clone(),
+            task: args.task.clone(),
+            cap_scope: ctx.active_cap_scope(),
+            parent_session: ctx.session_id(),
+        };
+        match spawner.spawn(request, &cancel).await {
             Ok(outcome) => {
                 // C-06 sub-agent rollup: the child's token spend doesn't flow back through
                 // `ToolResult` (a plain string) — it rides the shared evidence log instead, the same
@@ -743,6 +748,23 @@ impl Tool for TaskTool {
                             }),
                         ));
                 }
+                // One compact trace marker on the PARENT's evidence trail (A-08): the child's
+                // session id + how many tool calls it made. The full child trail already lives
+                // durably under its own correlated stream (C-14 flush inside the child's engine) —
+                // this is the pointer, never a wholesale copy (no double-persist).
+                ctx.evidence
+                    .lock()
+                    .unwrap()
+                    .record(flux_evidence::Observation::new(
+                        "subagent.trace",
+                        flux_evidence::Phase::Turn,
+                        serde_json::json!({
+                            "role": args.role,
+                            "session": outcome.session_id,
+                            "tool_calls": outcome.tool_calls,
+                            "model": outcome.model,
+                        }),
+                    ));
                 Ok(ToolResult::ok(outcome.text))
             }
             Err(e) => Ok(ToolResult::error(e.to_string())),
@@ -834,11 +856,14 @@ mod tests {
         );
         let cancel = CancellationToken::new();
         let out = spawner
-            .spawn("scout", "look around", &cancel)
+            .spawn(SpawnRequest::new("scout", "look around"), &cancel)
             .await
             .unwrap();
         assert_eq!(out.text, "scouted: 3 files");
-        assert!(spawner.spawn("nope", "x", &cancel).await.is_err());
+        assert!(spawner
+            .spawn(SpawnRequest::new("nope", "x"), &cancel)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -921,7 +946,10 @@ mod tests {
             1024,
         );
         let out = spawner
-            .spawn("scout", "scout the repo", &CancellationToken::new())
+            .spawn(
+                SpawnRequest::new("scout", "scout the repo"),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert_eq!(out.text, "done scouting");
@@ -970,11 +998,12 @@ mod tests {
         // it — so the child's registry must not contain `ping` and the marker must never be written.
         let scope = vec!["read_only_other".to_string()];
         let out = spawner
-            .spawn_scoped(
-                "scout",
-                "scout the repo",
+            .spawn(
+                SpawnRequest {
+                    cap_scope: Some(scope),
+                    ..SpawnRequest::new("scout", "scout the repo")
+                },
                 &CancellationToken::new(),
-                Some(&scope),
             )
             .await
             .unwrap();
@@ -1011,11 +1040,12 @@ mod tests {
         );
         let scope = vec!["ping".to_string()];
         let out = spawner
-            .spawn_scoped(
-                "scout",
-                "scout the repo",
+            .spawn(
+                SpawnRequest {
+                    cap_scope: Some(scope),
+                    ..SpawnRequest::new("scout", "scout the repo")
+                },
                 &CancellationToken::new(),
-                Some(&scope),
             )
             .await
             .unwrap();
@@ -1448,7 +1478,10 @@ mod tests {
         .with_authorization(flux_policy::default_local_grants(), caller, trust);
 
         let out = spawner
-            .spawn("worker", "delete things", &CancellationToken::new())
+            .spawn(
+                SpawnRequest::new("worker", "delete things"),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert_eq!(out.text, "done");
@@ -1572,7 +1605,10 @@ mod tests {
         .with_authorization(flux_policy::default_local_grants(), caller, trust);
 
         let out = spawner
-            .spawn("worker", "delete things", &CancellationToken::new())
+            .spawn(
+                SpawnRequest::new("worker", "delete things"),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert_eq!(out.text, "done");
@@ -1650,10 +1686,10 @@ mod tests {
         impl Spawner for ScriptedSpawner {
             async fn spawn(
                 &self,
-                role: &str,
-                task: &str,
+                request: SpawnRequest,
                 _cancel: &CancellationToken,
             ) -> Result<SpawnOutcome> {
+                let (role, task) = (request.role.as_str(), request.task.as_str());
                 match role {
                     "planner" => Ok(text_outcome(
                         r#"[
@@ -1693,11 +1729,10 @@ mod tests {
         impl Spawner for CancelSpawner {
             async fn spawn(
                 &self,
-                role: &str,
-                _task: &str,
+                request: SpawnRequest,
                 _c: &CancellationToken,
             ) -> Result<SpawnOutcome> {
-                match role {
+                match request.role.as_str() {
                     "planner" => Ok(text_outcome(
                         r#"[
                         {"id":"a","task":"x","depends_on":[]},
@@ -1745,10 +1780,10 @@ mod tests {
         impl Spawner for FlakySpawner {
             async fn spawn(
                 &self,
-                role: &str,
-                task: &str,
+                request: SpawnRequest,
                 _c: &CancellationToken,
             ) -> Result<SpawnOutcome> {
+                let (role, task) = (request.role.as_str(), request.task.as_str());
                 match role {
                     "planner" => Ok(text_outcome(
                         r#"[
@@ -1840,7 +1875,10 @@ mod tests {
         // The 5s guard fails the test (rather than hanging CI) if the deadline doesn't fire.
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            spawner.spawn("sloth", "spin forever", &CancellationToken::new()),
+            spawner.spawn(
+                SpawnRequest::new("sloth", "spin forever"),
+                &CancellationToken::new(),
+            ),
         )
         .await
         .expect("spawn should return by its wall-clock deadline, not hang");
@@ -1971,7 +2009,10 @@ mod tests {
         .with_approver(Arc::new(DenyAll));
 
         let out = spawner
-            .spawn("scout", "scout the repo", &CancellationToken::new())
+            .spawn(
+                SpawnRequest::new("scout", "scout the repo"),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert_eq!(out.text, "done");
@@ -2062,7 +2103,10 @@ mod tests {
             1024,
         );
         spawner
-            .spawn("prober", "try to escape", &CancellationToken::new())
+            .spawn(
+                SpawnRequest::new("prober", "try to escape"),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
         let marker = system.read_file("PROBE.marker").await.unwrap();
@@ -2101,7 +2145,10 @@ mod tests {
         .with_audit(store.clone());
 
         spawner
-            .spawn("scout", "scout the repo", &CancellationToken::new())
+            .spawn(
+                SpawnRequest::new("scout", "scout the repo"),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
 
@@ -2138,7 +2185,10 @@ mod tests {
 
         // No `with_audit` → the child uses a throwaway store; the shared one stays empty.
         scout_spawner()
-            .spawn("scout", "recon", &CancellationToken::new())
+            .spawn(
+                SpawnRequest::new("scout", "recon"),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert!(
@@ -2149,12 +2199,64 @@ mod tests {
         // `with_audit(store)` → the same store now receives the child's session.
         scout_spawner()
             .with_audit(store.clone())
-            .spawn("scout", "recon", &CancellationToken::new())
+            .spawn(
+                SpawnRequest::new("scout", "recon"),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert!(
             store.latest_session().unwrap().is_some(),
             "with_audit must route the child's session into the shared store"
+        );
+    }
+
+    /// A-08: an audited child's stream is CORRELATED — its session context names the role
+    /// (`agent_id = subagent:<role>`) and points back at the parent session (`correlation_id`), so
+    /// the shared store answers "what did the sub-agents of turn X do" with one indexed read.
+    #[tokio::test]
+    async fn sub_agent_run_lands_in_shared_audit_store_with_correlation() {
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role("---\n---\nscout prompt", "scout"));
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let parent = store.create_session("mock").unwrap();
+
+        let spawner = LocalSpawner::new(
+            Arc::new(|| Ok(Box::new(MockProvider))),
+            Arc::new(roles),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1024,
+        )
+        .with_audit(store.clone());
+        let outcome = spawner
+            .spawn(
+                SpawnRequest {
+                    parent_session: Some(parent.clone()),
+                    ..SpawnRequest::new("scout", "recon")
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(outcome.session_id, parent, "the child gets its own stream");
+        let info = store.info(&outcome.session_id).unwrap();
+        assert_eq!(
+            info.context.agent_id.as_deref(),
+            Some("subagent:scout"),
+            "the child stream names its role"
+        );
+        assert_eq!(
+            info.context.correlation_id.as_deref(),
+            Some(parent.as_str()),
+            "the child stream correlates back to the parent session"
+        );
+        // And the child's activity is durably there — its conversation landed in the shared store.
+        assert!(
+            !store.conversation(&outcome.session_id).unwrap().is_empty(),
+            "the child's turn persisted under its own correlated stream"
         );
     }
 
@@ -2178,7 +2280,10 @@ mod tests {
             1024,
         );
         let out = spawner
-            .spawn("scout", "look around", &CancellationToken::new())
+            .spawn(
+                SpawnRequest::new("scout", "look around"),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert_eq!(out.text, "scouted: 3 files");
@@ -2278,7 +2383,10 @@ mod tests {
         // Default depth (1): the delegator is a leaf — its `task` call finds no tool, so no grandchild.
         let sys1 = unique_system("depth-leaf");
         build(sys1.clone(), 1)
-            .spawn("delegator", "go", &CancellationToken::new())
+            .spawn(
+                SpawnRequest::new("delegator", "go"),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert!(
@@ -2289,7 +2397,10 @@ mod tests {
         // max_depth=2: the delegator may spawn the inner leaf, which runs `ping` and leaves its marker.
         let sys2 = unique_system("depth-nested");
         build(sys2.clone(), 2)
-            .spawn("delegator", "go", &CancellationToken::new())
+            .spawn(
+                SpawnRequest::new("delegator", "go"),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert!(

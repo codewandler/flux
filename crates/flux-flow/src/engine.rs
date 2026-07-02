@@ -205,8 +205,10 @@ impl FlowEngine {
             Some((self.events.clone(), turn_id)),
         );
         // Thread this turn's cancellation into the tool context so a spawning tool (`task`) can hand a
-        // child token to its sub-agent — cancelling the parent turn then cancels the child.
+        // child token to its sub-agent — cancelling the parent turn then cancels the child. The session
+        // id rides along so `task` can correlate the child's audit stream to THIS turn (A-08).
         self.executor.context().set_cancel(cancel.clone());
+        self.executor.context().set_session(session_id);
 
         // Per-turn iteration count: snapshot the cumulative `turn.iteration` evidence now so we can
         // report only THIS turn's rounds. The executor (and its evidence log) is shared and persists
@@ -384,6 +386,29 @@ impl FlowEngine {
         let usage = (usage.total() > 0).then_some(usage);
 
         match out {
+            // C-17 (F2) backstop: a diagnostics-carrying plan must never be handed back for `/run`.
+            // `compile_turn` no longer produces one (it repairs or rejects the turn), but this is a
+            // safety gate, so the executing surface enforces the `Compiled` contract ("surfaced
+            // rather than executed") itself instead of trusting the compiler's invariant.
+            TurnOutput::Plan(compiled) if !compiled.diagnostics.is_empty() => {
+                let text = format!(
+                    "The proposed plan was rejected — it references operations this workspace \
+                     does not know: {}. Nothing will run; refine the request and try again.",
+                    compiled
+                        .diagnostics
+                        .iter()
+                        .map(|d| d.message.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                );
+                sink.text_delta(&text);
+                self.events.record_message(
+                    session_id,
+                    &Message::assistant(vec![ContentBlock::Text { text }]),
+                )?;
+                sink.turn_end(usage);
+                Ok(None)
+            }
             TurnOutput::Plan(compiled) => {
                 let rendered = crate::render::render_pretty(&compiled.ast);
                 sink.observation(&self.plan_observation(session_id, &compiled.ast));
@@ -1358,6 +1383,45 @@ mod tests {
         .unwrap();
 
         assert!(out.is_none(), "a cancelled compose yields no plan to run");
+    }
+
+    /// C-17 (F2): a plan that never passes analysis (every attempt references an unknown op) must
+    /// NOT be handed back to the plan-mode caller for `/run` — the diagnostics are surfaced (as the
+    /// turn's text or its error) and nothing executable escapes. Before C-17, the final repair step
+    /// "accepted with diagnostics" and `plan_turn` returned the AST blind.
+    #[tokio::test]
+    async fn plan_turn_rejects_a_diagnostics_plan_instead_of_handing_it_to_run() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let bad_ast = json!({
+            "body": [{ "kind": "call", "op": "nope.op", "args": [] }]
+        });
+        // Every repair round re-emits the same unknown-op plan, exhausting the planner's budget.
+        let responses: VecDeque<Vec<Chunk>> = (0..8).map(|_| emit_plan(bad_ast.clone())).collect();
+        let engine = engine_with(responses, store.clone());
+        let mut sink = CollectSink::default();
+        let res = engine
+            .plan_turn(
+                &sid,
+                "run the impossible op",
+                &mut sink,
+                &CancellationToken::new(),
+            )
+            .await;
+        match res {
+            Ok(Some(_)) => {
+                panic!("a plan that never passed analysis must not be handed back for /run")
+            }
+            Ok(None) => assert!(
+                sink.text.contains("unknown operation"),
+                "the diagnostics are surfaced: {}",
+                sink.text
+            ),
+            Err(e) => assert!(
+                e.to_string().contains("unknown operation"),
+                "the rejection carries the diagnostic text: {e}"
+            ),
+        }
     }
 
     /// Reified await (post-cutover; see the design's turn-boundary section): a top-level `await` inside a

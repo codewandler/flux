@@ -311,9 +311,10 @@ impl Engine {
             // Sub-agents (L-13): register `task` and build the spawner over the shared `system` — the
             // same `SubAgents::into_spawner` construction path the CLI's `build_agent` and the SDK's
             // `FlowClient::with_sub_agents` use, so a journey delegates through the identical envelope.
+            // Children audit into the app's own event store by default (A-08), correlated per spawn.
             let spawner = sub_agents.map(|sa| {
                 registry.register(Arc::new(TaskTool));
-                sa.into_spawner(system.clone())
+                sa.with_audit(events.clone()).into_spawner(system.clone())
             });
             Engine {
                 program,
@@ -415,6 +416,9 @@ impl Engine {
             self.system.clone(),
             self.redactor.clone(),
         )?;
+        // The journey's session id on the context, so a `task` call inside the journey correlates
+        // its child's audit stream back to this run (A-08).
+        executor.context().set_session(&session_id);
         analyze_composites(&self.program.ops, &self.registry)
             .map_err(|d| Error::Other(format!("composite ops: {}", join_diags(&d))))?;
 

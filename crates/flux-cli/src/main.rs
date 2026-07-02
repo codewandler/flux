@@ -1370,6 +1370,11 @@ async fn build_agent_with(
     let (caller, trust) =
         flux_auth::IdentityProvider::resolve(&flux_auth::LocalIdentity::current());
 
+    // The unified event store, opened BEFORE the sub-agent spawner (A-08: child runs audit into
+    // this same store by default) and before plugins (the egress-audit hook appends
+    // `PrivateNetAdmit` events to this stream).
+    let events = Arc::new(open_event_store()?);
+
     // Sub-agent spawner (multi-agent orchestration): the `task` tool delegates to roles, each run
     // as an isolated sub-agent — bounded by the same authorization policy (no blanket allow).
     let roles = load_roles(&cwd);
@@ -1381,10 +1386,12 @@ async fn build_agent_with(
     };
     // One construction path for sub-agents (shared with the SDK's `FlowClient::with_sub_agents`):
     // `SubAgents::into_spawner` builds the spawner; we register `TaskTool` into the top-level registry
-    // below. Sub-agents inherit the same authorization floor as the top-level agent.
+    // below. Sub-agents inherit the same authorization floor as the top-level agent, and audit into
+    // the shared event store by default (A-08) — each child gets its own correlated session stream.
     let spawner: Arc<dyn flux_runtime::Spawner> =
         SubAgents::new(roles, child_base, factory, model.clone(), flags.max_tokens)
             .with_authorization(policy.clone(), caller.clone(), trust.clone())
+            .with_audit(events.clone())
             .into_spawner(system.clone());
 
     // Tools + permissions: from config (deny/allow rules); if no allow rules are configured,
@@ -1436,9 +1443,7 @@ async fn build_agent_with(
     let backend = build_doc_index(&system).await;
     flux_capabilities::register_datasource_ops(&mut registry, backend);
 
-    // The unified event store + this run's session, opened before plugins so the egress-audit hook
-    // (which appends `PrivateNetAdmit` events to this stream) can be wired into each plugin's caps.
-    let events = Arc::new(open_event_store()?);
+    // This run's session on the store opened above.
     let session_id = if flags.continue_ || flags.resume {
         events
             .latest_session()
@@ -3037,10 +3042,12 @@ async fn run_goal(
         }
         let verdict = match spawner
             .spawn(
-                "evaluator",
-                &format!(
-                    "Goal: {goal}\n\nLatest result:\n{}\n\nReply `SATISFIED` or `CONTINUE: <next>`.",
-                    sink.text
+                flux_runtime::SpawnRequest::new(
+                    "evaluator",
+                    format!(
+                        "Goal: {goal}\n\nLatest result:\n{}\n\nReply `SATISFIED` or `CONTINUE: <next>`.",
+                        sink.text
+                    ),
                 ),
                 &cancel,
             )

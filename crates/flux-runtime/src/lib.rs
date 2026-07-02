@@ -88,12 +88,43 @@ impl ToolResult {
 /// (C-06). `model` is the role's resolved model (whatever `AgentSpec::into_engine` ran it as —
 /// the role's own override, or the spawner's default); `usage` is the child's accumulated per-turn
 /// tally from [`crate::LoopHost`]'s equivalent on the engine side, `None` when the child billed
-/// nothing (e.g. a `mock` sub-agent, or a role whose provider reported no usage).
+/// nothing (e.g. a `mock` sub-agent, or a role whose provider reported no usage). `session_id` is
+/// the child's own session in whatever store the spawner ran it against — under a shared audit
+/// store (A-08) that's the durable, correlated child stream; `tool_calls` is a cheap trace count
+/// for the parent's `subagent.trace` observation.
 #[derive(Debug, Clone, Default)]
 pub struct SpawnOutcome {
     pub text: String,
     pub model: String,
     pub usage: Option<flux_core::Usage>,
+    pub session_id: String,
+    pub tool_calls: usize,
+}
+
+/// One sub-agent spawn, fully described. `cap_scope` is the caller's active `with_tools`
+/// allowlist, if any — the spawner intersects it into the role's own `tools`, so a `task` invoked
+/// from inside a capability scope can never hand the child a broader tool set than the block that
+/// spawned it (capabilities only narrow on descent). `parent_session`, when known, is recorded as
+/// the child session's `correlation_id` so a shared audit store correlates child streams to the
+/// turn that spawned them (A-08).
+#[derive(Debug, Clone, Default)]
+pub struct SpawnRequest {
+    pub role: String,
+    pub task: String,
+    pub cap_scope: Option<Vec<String>>,
+    pub parent_session: Option<String>,
+}
+
+impl SpawnRequest {
+    /// A bare request: no capability scope, no parent correlation.
+    pub fn new(role: impl Into<String>, task: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            task: task.into(),
+            cap_scope: None,
+            parent_session: None,
+        }
+    }
 }
 
 /// Runs a sub-agent (by role name) and returns its outcome. Implemented by `flux-orchestrate`
@@ -104,30 +135,9 @@ pub struct SpawnOutcome {
 pub trait Spawner: Send + Sync {
     async fn spawn(
         &self,
-        role: &str,
-        task: &str,
+        request: SpawnRequest,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> flux_core::Result<SpawnOutcome>;
-
-    /// Like [`spawn`](Self::spawn), but additionally narrows the child's tool set to `cap_scope` (the
-    /// caller's active `with_tools` allowlist, if any) — so a `task` invoked from *inside* a capability
-    /// scope can't hand the sub-agent a broader tool set than the block that spawned it, even when the
-    /// role itself declares more. `None` means no scope is active (the default, unrestricted `spawn`
-    /// behaviour). The default implementation ignores `cap_scope` and delegates to [`spawn`](Self::spawn)
-    /// — a `Spawner` that doesn't override this simply doesn't narrow by block scope (still bounded by
-    /// the role's own `tools` and, once inside the child, by the child's own [`Executor::dispatch`]).
-    /// The `task` tool (`flux-orchestrate`) is the one caller with a live [`ToolContext`] to read
-    /// `cap_scope` from, so it calls this instead of `spawn` directly.
-    async fn spawn_scoped(
-        &self,
-        role: &str,
-        task: &str,
-        cancel: &tokio_util::sync::CancellationToken,
-        cap_scope: Option<&[String]>,
-    ) -> flux_core::Result<SpawnOutcome> {
-        let _ = cap_scope;
-        self.spawn(role, task, cancel).await
-    }
 }
 
 /// The reflexive capability: re-enter the planner and the interpreter from *within* a flow. Defined
@@ -204,6 +214,10 @@ pub struct ToolContext {
     /// that fan out concurrently (e.g. a server) must use one engine per concurrent turn; the SDK's
     /// `FlowClient` is already safe (a fresh `ToolContext` per `execute`).
     cancel: Arc<Mutex<Option<tokio_util::sync::CancellationToken>>>,
+    /// The current turn's session id, installed per turn by the engine (same interior-mutable,
+    /// one-active-turn-per-engine lifecycle as `cancel`). A spawning tool (`task`) reads it to
+    /// correlate the child's audit stream to the parent turn (A-08).
+    session: Arc<Mutex<Option<String>>>,
     /// The **capability-scope stack**: each entry is the effective tool-name allowlist of one active
     /// `with_tools` block, narrow-only (an entry is always the intersection of its own declared set
     /// with the one below it — see [`Executor::push_cap_scope`]). Empty stack = no scope active = every
@@ -225,6 +239,7 @@ impl ToolContext {
             read_times: Arc::new(Mutex::new(HashMap::new())),
             evidence: Arc::new(Mutex::new(EvidenceLog::new())),
             cancel: Arc::new(Mutex::new(None)),
+            session: Arc::new(Mutex::new(None)),
             cap_scopes: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -246,6 +261,18 @@ impl ToolContext {
     /// The turn's cancellation token, if a cancellable driver installed one.
     pub fn cancel_token(&self) -> Option<tokio_util::sync::CancellationToken> {
         self.cancel.lock().unwrap().clone()
+    }
+
+    /// Install the turn's session id (the engine calls this per turn, like [`set_cancel`]
+    /// (Self::set_cancel)). A spawning tool (`task`) reads it back to correlate the child's audit
+    /// stream to the parent turn (A-08). Same one-active-turn-per-engine lifecycle as `cancel`.
+    pub fn set_session(&self, session_id: impl Into<String>) {
+        *self.session.lock().unwrap() = Some(session_id.into());
+    }
+
+    /// The current turn's session id, if a driver installed one.
+    pub fn session_id(&self) -> Option<String> {
+        self.session.lock().unwrap().clone()
     }
 
     /// Record that `path` was read at `mtime` (called by `read`/`read_many`).

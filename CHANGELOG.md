@@ -8,6 +8,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Sub-agent audit is ON by default — child runs land correlated in the shared event store
+  (A-08).** The D-05 `with_audit` seam existed but the primary paths never wired it: every `task`
+  spawn fell back to a throwaway in-memory store, so a sub-agent's tool activity vanished (only its
+  token usage bubbled up). The CLI now opens the session event store BEFORE building the spawner
+  and audits children into it by default; flux-app's journey spawner does the same with the app's
+  own store. Each child gets its OWN session stream, correlated on the D-02 context envelope —
+  `agent_id: "subagent:<role>"`, `correlation_id: <parent session>` — so the store answers "what
+  did the sub-agents of turn X do" with one indexed read; the parent session id reaches the spawner
+  via the new `ToolContext::set_session/session_id` (installed per turn beside `set_cancel`, and
+  per journey run in flux-app). The `Spawner` trait collapsed to a single
+  `spawn(SpawnRequest { role, task, cap_scope, parent_session }, cancel)` (breaking, clean
+  cutover), and `SpawnOutcome` now reports the child's `session_id` + `tool_calls`, which feed a
+  new compact `subagent.trace` observation on the parent's evidence trail (a pointer — the full
+  child trail already flushes durably under its own correlated stream via C-14, never a copy).
+  Spawners built without an audit store keep the ephemeral in-memory behavior — the documented
+  mode for storeless hosts (SDK consumers, tests), not a fallback.
+
 - **The evidence trail is durable — observations, plan attempts, and signal provenance land in
   `events.db` (C-14).** The audit story used to be two unrelated systems: the in-memory
   `EvidenceLog` that `/evidence` reads (lost on exit) and the durable event store — and the
