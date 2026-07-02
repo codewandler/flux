@@ -2,11 +2,11 @@
 id: C-07
 title: Codex WebSocket transport (default, HTTP fallback)
 pillar: Core
-status: backlog
+status: done
 epic: subscription-providers-and-cost
 theme: subscription-providers-cost
 design: docs/designs/subscription-providers-and-cost.md
-note: WS primary with transparent HTTP-SSE fallback (needs C-03)
+note: WS is now the default codex transport — a provider-level StreamTransport seam tried before HTTP, tungstenite handshake carrying the shared codex headers, frames re-enveloped through the SAME Responses codec (chunk-identity by construction), transparent connect-time fallback to HTTP-SSE (incl. 1008 policy close); all hermetic, live smoke remains the WS-contract check
 ---
 
 # Codex WebSocket transport (default, HTTP fallback)
@@ -17,20 +17,40 @@ Make the websocket transport (`wss://chatgpt.com/backend-api/codex/responses`) t
 codex Rust client (which uses `tokio_tungstenite` and itself keeps HTTP as fallback because WS is unstable).
 
 ## Acceptance
-- [ ] **transport seam.** A transport abstraction lets the codex provider speak WS while other providers keep
+- [x] **transport seam.** A transport abstraction lets the codex provider speak WS while other providers keep
       the reqwest HTTP+SSE path unchanged. Failing-first test `codex_uses_ws_transport_by_default`.
-- [ ] **WS frames → same chunks.** Response-event frames map through the existing `map_responses_stream`
+- [x] **WS frames → same chunks.** Response-event frames map through the existing `map_responses_stream`
       producing the identical `Chunk` sequence as the SSE path. Failing-first test
       `ws_frames_map_to_same_chunks_as_sse` over paired SSE/WS fixtures.
-- [ ] **auth on the handshake.** Bearer + `chatgpt-account-id` + `OpenAI-Beta` + `originator` are set on the
+- [x] **auth on the handshake.** Bearer + `chatgpt-account-id` + `OpenAI-Beta` + `originator` are set on the
       tungstenite handshake (Credential::apply is reqwest-bound — follow the realtime-provider precedent).
       Test `ws_handshake_carries_auth_headers`.
-- [ ] **transparent fallback.** A WS handshake/policy failure (e.g. 1008) falls back to HTTP-SSE and the turn
+- [x] **transparent fallback.** A WS handshake/policy failure (e.g. 1008) falls back to HTTP-SSE and the turn
       still completes. Failing-first test `ws_failure_falls_back_to_http`.
-- [ ] Gate green: `cargo build/test`, `clippy -D warnings`, `fmt`, `cargo test -p flux-codegate`.
+- [x] Gate green: `cargo build/test`, `clippy -D warnings`, `fmt`, `cargo test -p flux-codegate`.
 
 ## Progress
-- (not started)
+- **Done (2026-07-02).** Implemented as a provider-level seam plus a codex-private transport:
+  - **Seam (axis c, beside `WireCodec`/`Credential`):** `flux_provider::StreamTransport` —
+    `connect(&body) -> Result<ByteStream>` returning the response bytes **in the envelope the codec's
+    `map_stream` already expects**. `NativeProvider::with_transport(...)` tries it first; any
+    connect-time `Err` logs a warning and falls through to the byte-for-byte unchanged reqwest
+    HTTP+SSE loop (incl. the C-04 401→refresh path). Providers without a transport are untouched.
+  - **Codex WS:** `CodexWsTransport` in `codex.rs`; `codex::oauth()` (signature unchanged) derives
+    `wss://chatgpt.com/backend-api/codex/responses` from `CODEX_ENDPOINT`. Handshake headers set on
+    the tungstenite client request (realtime precedent) from a shared `codex_headers()` that also
+    feeds `OpenAiCred.extra` — HTTP and WS can't drift. The transport waits for the **first data
+    frame** before committing (a post-upgrade 1008 policy close still falls back), then re-envelopes
+    frames as SSE `data:` bytes into the existing `map_responses_stream` — chunk-identity by
+    construction.
+  - **Tests (failing-first, all hermetic tungstenite/TcpListener stubs):** the 4 story tests plus
+    `ws_connection_refused_falls_back_to_http`, `ws_url_derived_from_codex_endpoint`, and seam-level
+    `transport_is_tried_before_http` / `transport_failure_falls_back_to_http`.
+  - `tokio-tungstenite` promoted from `realtime`-optional to unconditional in flux-providers.
+- **Caveats:** the stubs encode the assumed upstream contract (body = one text frame, one JSON event
+  per text frame, clean close ends the turn) — the live smoke script remains the WS-contract check;
+  fallback triggers on connect-time failures only (mid-stream errors surface, matching HTTP
+  semantics); the WS path delegates 401 recovery to the HTTP fallback, which owns it (C-04).
 
 ## Notes
 - Epic + design: [subscription-providers-and-cost.md](../designs/subscription-providers-and-cost.md).

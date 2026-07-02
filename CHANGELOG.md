@@ -25,6 +25,19 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Codex WebSocket transport — default, with transparent HTTP-SSE fallback (C-07).** The `codex`
+  provider now dials `wss://chatgpt.com/backend-api/codex/responses` first, mirroring the upstream
+  codex client. A new provider-level seam (`flux_provider::StreamTransport`, tried by
+  `NativeProvider` before the reqwest path) keeps every other provider byte-for-byte on HTTP+SSE.
+  The tungstenite handshake carries the codex auth headers (Bearer, `chatgpt-account-id`,
+  `OpenAI-Beta`, `originator`) from the one `codex_headers()` source that also feeds the HTTP
+  credential, so the two paths cannot drift; response frames are re-enveloped as SSE bytes into
+  the existing Responses codec, making the chunk stream identical by construction. Any
+  connect-time failure — refused connection, handshake rejection, or a policy close (1008) before
+  the first data frame — falls back transparently to HTTP-SSE, which also owns 401 recovery
+  (C-04). All hermetic (paired SSE/WS fixtures, stub servers); the live smoke script remains the
+  WS-contract verification.
+
 - **flux-lang v1 hardening (epic: C-17, L-15..L-19).** A full review of the language pillar
   (27 findings, `docs/designs/flux-lang-v1-hardening.md`) fixed in one pass:
   - *Compile-path plan gates (C-17).* The plain-text plan fallback now runs the same

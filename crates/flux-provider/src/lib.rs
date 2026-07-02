@@ -221,6 +221,21 @@ pub trait Credential: Send + Sync {
     }
 }
 
+/// Axis (c): an **alternative streaming transport** (e.g. the codex WebSocket) tried *before*
+/// the generic HTTP+SSE path. `connect` performs its own handshake/auth (the [`Credential`] is
+/// reqwest-bound), sends the codec-built body, and returns the response byte stream **in the
+/// same envelope the codec's [`WireCodec::map_stream`] expects** (SSE `data:` lines for the
+/// JSON-event codecs). Any `Err` — handshake failure, policy close before data, refused
+/// connection — makes [`NativeProvider`] fall back transparently to HTTP; providers without a
+/// transport keep the reqwest path untouched.
+#[async_trait]
+pub trait StreamTransport: Send + Sync {
+    /// Open the transport, send `body`, and return the response byte stream. Must fail (rather
+    /// than hang or return an empty stream) on any connect-time problem so the HTTP fallback
+    /// can take over before the turn is committed to this transport.
+    async fn connect(&self, body: &serde_json::Value) -> Result<ByteStream>;
+}
+
 /// A source of OAuth access tokens that refreshes on demand. Implemented by
 /// `flux-credentials`; consumed by OAuth [`Credential`]s in the provider crates.
 #[async_trait]
@@ -264,6 +279,7 @@ pub struct NativeProvider {
     codec: Arc<dyn WireCodec>,
     cred: Arc<dyn Credential>,
     max_retries: u32,
+    transport: Option<Arc<dyn StreamTransport>>,
 }
 
 impl NativeProvider {
@@ -278,12 +294,20 @@ impl NativeProvider {
             codec,
             cred,
             max_retries: DEFAULT_MAX_RETRIES,
+            transport: None,
         }
     }
 
     /// Override the retry budget for transient connection failures (default [`DEFAULT_MAX_RETRIES`]).
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
+        self
+    }
+
+    /// Attach an alternative [`StreamTransport`] (axis c) tried before the HTTP path. A
+    /// connect-time failure falls back transparently to HTTP — see [`StreamTransport`].
+    pub fn with_transport(mut self, transport: Arc<dyn StreamTransport>) -> Self {
+        self.transport = Some(transport);
         self
     }
 }
@@ -319,6 +343,18 @@ impl Provider for NativeProvider {
         let span =
             tracing::info_span!("provider.stream", provider = %self.name, model = %req.model);
         let _enter = span.enter();
+
+        // C-07: an alternative transport (e.g. the codex WebSocket) is tried first. Any
+        // connect-time failure — handshake rejection, policy close before data, refused
+        // connection — falls back transparently to the generic HTTP+SSE path below.
+        if let Some(transport) = &self.transport {
+            match transport.connect(&body).await {
+                Ok(bytes) => return Ok(self.codec.map_stream(bytes)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "stream transport failed; falling back to HTTP");
+                }
+            }
+        }
 
         // Retry only the connection attempt (POST + status). The token is (re)applied each attempt
         // so an OAuth refresh can recover a 401/expired credential on the next try.
@@ -509,6 +545,72 @@ mod tests {
         };
         assert_eq!(status, 503);
         assert_eq!(count.load(Ordering::SeqCst), 2, "initial attempt + 1 retry");
+        handle.abort();
+    }
+
+    // --- alternative stream transport (C-07 seam) --------------------------------------------
+
+    /// A fake transport that counts connects and either yields an empty stream or fails.
+    struct FakeTransport {
+        connects: Arc<AtomicUsize>,
+        fail: bool,
+    }
+    #[async_trait]
+    impl StreamTransport for FakeTransport {
+        async fn connect(&self, _body: &serde_json::Value) -> Result<ByteStream> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(Error::Http("ws handshake refused".to_string()));
+            }
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_is_tried_before_http() {
+        let (url, handle, http_hits) = flaky_server(0).await;
+        let connects = Arc::new(AtomicUsize::new(0));
+        let provider = NativeProvider::new(
+            "test",
+            Arc::new(NullCodec),
+            Arc::new(NullCred { endpoint: url }),
+        )
+        .with_transport(Arc::new(FakeTransport {
+            connects: connects.clone(),
+            fail: false,
+        }));
+        let res = provider.stream(Request::new("m", "hi")).await;
+        assert!(res.is_ok());
+        assert_eq!(connects.load(Ordering::SeqCst), 1, "transport dialed first");
+        assert_eq!(
+            http_hits.load(Ordering::SeqCst),
+            0,
+            "HTTP path must stay cold when the transport succeeds"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn transport_failure_falls_back_to_http() {
+        let (url, handle, http_hits) = flaky_server(0).await;
+        let connects = Arc::new(AtomicUsize::new(0));
+        let provider = NativeProvider::new(
+            "test",
+            Arc::new(NullCodec),
+            Arc::new(NullCred { endpoint: url }),
+        )
+        .with_transport(Arc::new(FakeTransport {
+            connects: connects.clone(),
+            fail: true,
+        }));
+        let res = provider.stream(Request::new("m", "hi")).await;
+        assert!(res.is_ok(), "the turn must complete over the HTTP fallback");
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            http_hits.load(Ordering::SeqCst),
+            1,
+            "a failing transport must fall back to exactly one HTTP attempt"
+        );
         handle.abort();
     }
 
