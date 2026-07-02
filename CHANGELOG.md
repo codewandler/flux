@@ -8,6 +8,17 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **The session-symbols digest is bounded (A-07).** The symbols block — the uncached trailing
+  system segment re-sent on every planner call — rendered one line per visible/pinned session
+  symbol with no cap, so a long session's per-call context grew without eviction (conversation
+  compaction never touched it). The renderer now caps it at 64 lines with a 10k-char backstop:
+  pinned symbols always rank ahead of visible ones, the store's newest-updated-first order is kept
+  within each tier, an oversized summary is dropped-and-continued (L-08 precedent) instead of
+  evicting everything after it, and a trailing marker counts the omissions — omitted symbols stay
+  fully referencable by `$name`; only the digest is capped, `FlowStore::view` (symbol resolution,
+  context budgeting) stays complete. `FLUX_SYMBOLS_CAP` overrides the line cap (`0` disables).
+  Both the loop planner's segment C and the one-shot compiler go through the same bounded renderer.
+
 - **Planner teaches `parallel` for independent reads; one-shot compile repairs hit the prompt cache
   (A-09).** The grammar's canonical worked example for "read a.rs, b.rs and c.rs and summarise
   each" emitted a serial `each` — which executes strictly in order — right after a hint saying to

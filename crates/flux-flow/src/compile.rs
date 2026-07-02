@@ -702,24 +702,72 @@ fn ops_catalog(ops: &OpRegistry) -> String {
     s
 }
 
+/// Default line cap for the rendered symbols block (segment C). The block is uncached and re-sent
+/// on EVERY planner call, so it must stay bounded even in a long session (A-07) — the cap applies
+/// only to this rendering; `FlowStore::view` itself stays uncapped (it also serves symbol
+/// resolution and context budgeting).
+const SYMBOLS_LINE_CAP: usize = 64;
+/// Hard character backstop for the rendered symbols block (a few huge summaries can blow the
+/// budget long before the line cap).
+const SYMBOLS_CHAR_CAP: usize = 10_000;
+
 fn symbols_block(view: Option<&SessionView>) -> String {
-    match view {
-        Some(v) if !v.symbols.is_empty() => {
-            let mut s = String::from(
-                "\nExisting session symbols (reference these instead of re-fetching):\n",
-            );
-            for sym in &v.symbols {
-                let ty = sym
-                    .ty
-                    .as_deref()
-                    .map(|t| format!(": {t}"))
-                    .unwrap_or_default();
-                s.push_str(&format!("- ${}{} = {}\n", sym.name.0, ty, sym.summary));
-            }
-            s
+    let cap = std::env::var("FLUX_SYMBOLS_CAP")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok());
+    symbols_block_bounded(view, cap)
+}
+
+/// Render the symbols block bounded to `cap` lines (`None` → the default cap; `Some(0)` →
+/// unbounded, the `FLUX_SYMBOLS_CAP=0` escape hatch). Pinned symbols always rank ahead of visible
+/// ones, and the store's newest-updated-first order is preserved within each tier, so the freshest
+/// working set survives. An overflowing line is dropped-and-continued (L-08 precedent) — one
+/// oversized summary must not evict everything after it. Omitted symbols stay referencable (the
+/// cap is on the *digest*, not the store), which the trailing marker states.
+fn symbols_block_bounded(view: Option<&SessionView>, cap: Option<usize>) -> String {
+    let v = match view {
+        Some(v) if !v.symbols.is_empty() => v,
+        _ => return String::new(),
+    };
+    let (line_cap, char_cap) = match cap {
+        Some(0) => (usize::MAX, usize::MAX),
+        Some(n) => (n, SYMBOLS_CHAR_CAP),
+        None => (SYMBOLS_LINE_CAP, SYMBOLS_CHAR_CAP),
+    };
+    let pinned = v
+        .symbols
+        .iter()
+        .filter(|s| s.visibility == flux_lang::ast::Visibility::Pinned);
+    let visible = v
+        .symbols
+        .iter()
+        .filter(|s| s.visibility != flux_lang::ast::Visibility::Pinned);
+    let mut s =
+        String::from("\nExisting session symbols (reference these instead of re-fetching):\n");
+    let mut kept = 0usize;
+    let mut omitted = 0usize;
+    let mut chars = 0usize;
+    for sym in pinned.chain(visible) {
+        let ty = sym
+            .ty
+            .as_deref()
+            .map(|t| format!(": {t}"))
+            .unwrap_or_default();
+        let line = format!("- ${}{} = {}\n", sym.name.0, ty, sym.summary);
+        if kept >= line_cap || chars.saturating_add(line.len()) > char_cap {
+            omitted += 1;
+            continue;
         }
-        _ => String::new(),
+        chars += line.len();
+        kept += 1;
+        s.push_str(&line);
     }
+    if omitted > 0 {
+        s.push_str(&format!(
+            "… {omitted} older symbol(s) omitted (still referencable as $name)\n"
+        ));
+    }
+    s
 }
 
 /// The planner grammar: top-level AST shape + node kinds auto-generated from `Node` in `ast.rs`
@@ -953,6 +1001,90 @@ mod tests {
 
     const VALID_AST: &str =
         r#"{"ast":{"body":[{"kind":"call","op":"read","args":[{"kind":"lit","value":"x"}]}]}}"#;
+
+    fn sym(name: &str, summary: &str, vis: flux_lang::ast::Visibility) -> crate::state::SymbolView {
+        crate::state::SymbolView {
+            name: flux_lang::ast::SymbolName(name.to_string()),
+            ty: None,
+            summary: summary.to_string(),
+            visibility: vis,
+        }
+    }
+
+    /// A-07: the rendered symbols digest is bounded — pinned symbols always survive, the newest
+    /// visible ones fill the rest, and the marker names how many were omitted (they stay
+    /// referencable; only the digest is capped).
+    #[test]
+    fn symbols_block_caps_lines_and_keeps_pinned_newest_first() {
+        use flux_lang::ast::Visibility;
+        // View order is newest-updated first. Put the pinned symbol LAST (oldest) — it must still
+        // survive the cap ahead of newer visible symbols.
+        let mut symbols: Vec<crate::state::SymbolView> = (0..10)
+            .map(|i| sym(&format!("s{i}"), "v", Visibility::Visible))
+            .collect();
+        symbols.push(sym("keystone", "pinned", Visibility::Pinned));
+        let view = SessionView { symbols };
+
+        let block = symbols_block_bounded(Some(&view), Some(4));
+        assert!(
+            block.contains("$keystone"),
+            "pinned survives the cap: {block}"
+        );
+        assert!(block.contains("$s0"), "newest visible survives: {block}");
+        assert!(!block.contains("$s9"), "oldest visible is dropped: {block}");
+        assert!(
+            block.find("$keystone").unwrap() < block.find("$s0").unwrap(),
+            "pinned ranks ahead of visible: {block}"
+        );
+        assert!(
+            block.contains("7 older symbol(s) omitted"),
+            "marker counts the omissions: {block}"
+        );
+        assert!(block.contains("still referencable"), "{block}");
+    }
+
+    /// A-07: `FLUX_SYMBOLS_CAP=0` disables the bound entirely.
+    #[test]
+    fn symbols_block_cap_zero_disables() {
+        use flux_lang::ast::Visibility;
+        let symbols: Vec<crate::state::SymbolView> = (0..SYMBOLS_LINE_CAP + 10)
+            .map(|i| sym(&format!("s{i}"), "v", Visibility::Visible))
+            .collect();
+        let view = SessionView { symbols };
+        let block = symbols_block_bounded(Some(&view), Some(0));
+        assert!(
+            !block.contains("omitted"),
+            "cap 0 renders everything: {block}"
+        );
+        assert!(block.contains(&format!("$s{}", SYMBOLS_LINE_CAP + 9)));
+    }
+
+    /// A-07: one oversized summary is dropped-and-continued (L-08 precedent) — it must not evict
+    /// the symbols after it.
+    #[test]
+    fn symbols_block_char_backstop_drops_oversized_and_continues() {
+        use flux_lang::ast::Visibility;
+        let huge = "x".repeat(SYMBOLS_CHAR_CAP + 1);
+        let view = SessionView {
+            symbols: vec![
+                sym("small_before", "v", Visibility::Visible),
+                sym("huge", &huge, Visibility::Visible),
+                sym("small_after", "v", Visibility::Visible),
+            ],
+        };
+        let block = symbols_block_bounded(Some(&view), None);
+        assert!(block.contains("$small_before"));
+        assert!(
+            !block.contains(&huge),
+            "oversized summary dropped: len {}",
+            block.len()
+        );
+        assert!(
+            block.contains("$small_after"),
+            "drop-and-continue: the symbol after the oversized one survives: {block}"
+        );
+        assert!(block.contains("1 older symbol(s) omitted"));
+    }
 
     /// A-09: every worked example in the grammar must parse as a real `DraftAst` (guards the prompt
     /// against AST drift forever), and the independent-reads example must teach `parallel` —
