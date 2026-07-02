@@ -3,30 +3,36 @@
 //! The native-text grammar lowers `secret "NAME"` to the reserved marker `{"$secret":"NAME"}` — never
 //! inline plaintext (see `flux_lang::parse`). The host resolves those markers to real values at load,
 //! once, from the environment. A missing variable is a clean startup error that names the variable but
-//! never any value; resolved secrets live only in memory and are never logged.
+//! never any value; resolved secrets live only in memory and are never logged. Every resolved value is
+//! registered with the caller's [`Redactor`] at the moment of resolution, so a program-declared secret
+//! is scrubbed from tool output and logs exactly like a provider API key — provided the host hands the
+//! SAME redactor (clones share the value store) to the executors it builds.
 
 use flux_core::{Error, Result};
 use flux_lang::program::{as_secret_ref, Program};
+use flux_secret::Redactor;
 use serde_json::Value;
 
 /// Resolve every `secret "NAME"` marker in `program`'s declaration settings to the value of the
-/// environment variable `NAME`. Walks the agent / channel / datasource settings bags. A missing
-/// variable errors, naming the variable (never its value); on success the program carries no markers.
-pub fn resolve_secrets(program: &mut Program) -> Result<()> {
+/// environment variable `NAME`, registering each resolved value with `redactor`. Walks the agent /
+/// channel / datasource settings bags. A missing variable errors, naming the variable (never its
+/// value); on success the program carries no markers and the redactor scrubs every resolved value.
+pub fn resolve_secrets(program: &mut Program, redactor: &Redactor) -> Result<()> {
     for a in &mut program.agents {
-        resolve_in(&mut a.settings)?;
+        resolve_in(&mut a.settings, redactor)?;
     }
     for c in &mut program.channels {
-        resolve_in(&mut c.settings)?;
+        resolve_in(&mut c.settings, redactor)?;
     }
     for d in &mut program.datasources {
-        resolve_in(&mut d.settings)?;
+        resolve_in(&mut d.settings, redactor)?;
     }
     Ok(())
 }
 
-/// Recursively replace each `{"$secret":"NAME"}` marker with the env value of `NAME`, in place.
-fn resolve_in(value: &mut Value) -> Result<()> {
+/// Recursively replace each `{"$secret":"NAME"}` marker with the env value of `NAME`, in place,
+/// seeding `redactor` with the resolved value.
+fn resolve_in(value: &mut Value, redactor: &Redactor) -> Result<()> {
     if let Some(name) = as_secret_ref(value) {
         let name = name.to_string(); // end the borrow of `value` before mutating it
         let resolved = std::env::var(&name).map_err(|_| {
@@ -34,18 +40,19 @@ fn resolve_in(value: &mut Value) -> Result<()> {
                 "secret env var `{name}` is not set (referenced via `secret \"{name}\"`)"
             ))
         })?;
+        redactor.add_secret(resolved.clone());
         *value = Value::String(resolved);
         return Ok(());
     }
     match value {
         Value::Object(map) => {
             for v in map.values_mut() {
-                resolve_in(v)?;
+                resolve_in(v, redactor)?;
             }
         }
         Value::Array(items) => {
             for v in items {
-                resolve_in(v)?;
+                resolve_in(v, redactor)?;
             }
         }
         _ => {}
@@ -70,8 +77,28 @@ mod tests {
             }],
             ..Default::default()
         };
-        resolve_secrets(&mut program).unwrap();
+        resolve_secrets(&mut program, &Redactor::new()).unwrap();
         assert_eq!(program.channels[0].settings["bot_token"], json!("s3cr3t"));
+    }
+
+    #[test]
+    fn resolved_secret_is_registered_with_the_redactor() {
+        std::env::set_var("FLUX_TEST_REDACT_TOKEN", "xoxb-redact-me-1234");
+        let mut program = Program {
+            channels: vec![ChannelDecl {
+                name: "slack".into(),
+                kind: "slack".into(),
+                settings: json!({ "bot_token": { "$secret": "FLUX_TEST_REDACT_TOKEN" } }),
+            }],
+            ..Default::default()
+        };
+        let redactor = Redactor::new();
+        resolve_secrets(&mut program, &redactor).unwrap();
+        let scrubbed = redactor.redact("leak: xoxb-redact-me-1234 done");
+        assert!(
+            !scrubbed.contains("xoxb-redact-me-1234"),
+            "the resolved value must be scrubbed: {scrubbed}"
+        );
     }
 
     #[test]
@@ -85,7 +112,9 @@ mod tests {
             }],
             ..Default::default()
         };
-        let err = resolve_secrets(&mut program).unwrap_err().to_string();
+        let err = resolve_secrets(&mut program, &Redactor::new())
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("FLUX_TEST_DEFINITELY_UNSET_VAR"),
             "names the var: {err}"
@@ -97,7 +126,7 @@ mod tests {
         std::env::set_var("FLUX_TEST_NESTED_SECRET", "deep");
         let mut settings =
             json!({ "auth": { "headers": { "x-key": { "$secret": "FLUX_TEST_NESTED_SECRET" } } } });
-        resolve_in(&mut settings).unwrap();
+        resolve_in(&mut settings, &Redactor::new()).unwrap();
         assert_eq!(settings["auth"]["headers"]["x-key"], json!("deep"));
     }
 }

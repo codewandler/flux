@@ -1039,6 +1039,20 @@ impl flux_plugin::EgressAudit for EventStoreEgressAudit {
     }
 }
 
+/// Seed `redactor` from the credential-bearing env vars: the provider keys
+/// (`flux_credentials::provider_env_keys()` — the single source, covering the API-key providers and
+/// the AWS secret material the Bedrock chain materializes into env) plus flux's own `FLUX_SECRET`.
+/// Credential-shaped tokens are also caught by the redactor's heuristics; this makes the known ones
+/// exact. The redactor shares its value store across clones, so seeding any clone seeds them all.
+fn seed_provider_env_secrets(redactor: &flux_secret::Redactor) {
+    let secret_refs: Vec<flux_secret::Ref> = flux_credentials::provider_env_keys()
+        .iter()
+        .chain(["FLUX_SECRET"].iter())
+        .map(|k| flux_secret::Ref::env(*k))
+        .collect();
+    flux_runtime::SecretResolver::new().seed_redactor(&mut redactor.clone(), &secret_refs);
+}
+
 /// L6 binding of the L4 [`flux_plugin::SecretSink`] seam: registers a credential the host materialized
 /// on the `credential` capability path with the executor's [`Redactor`](flux_secret::Redactor), so it
 /// is scrubbed from any model-visible output. The redactor shares its value store across clones, so a
@@ -1440,16 +1454,7 @@ async fn build_agent_with(
     // host-materialized credentials with the SAME redactor the executor later redacts with — the
     // redactor shares its value store across clones, so a credential resolved mid-run is scrubbed.
     let redactor = flux_secret::Redactor::new();
-    let secret_refs: Vec<flux_secret::Ref> = [
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "OPENROUTER_API_KEY",
-        "FLUX_SECRET",
-    ]
-    .iter()
-    .map(|k| flux_secret::Ref::env(*k))
-    .collect();
-    flux_runtime::SecretResolver::new().seed_redactor(&mut redactor.clone(), &secret_refs);
+    seed_provider_env_secrets(&redactor);
 
     // Discover subprocess plugins (~/.flux/plugins/*.toml) and project their operations as tools.
     // Each plugin's host capabilities are the guarded System (same boundary as built-in tools).
@@ -4207,8 +4212,12 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
         }
     };
     // Resolve `secret "ENV_NAME"` references in declaration settings from the environment (plaintext is
-    // never inline) before any of those settings reach a channel/datasource/agent.
-    flux_app::resolve_secrets(&mut program).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // never inline) before any of those settings reach a channel/datasource/agent. Every resolved value
+    // seeds the ONE redactor the app's journey + agent-target executors redact with (C-13), alongside
+    // the known provider credential env vars.
+    let redactor = flux_secret::Redactor::new();
+    seed_provider_env_secrets(&redactor);
+    flux_app::resolve_secrets(&mut program, &redactor).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // `--serve <addr>` injects a synthetic `a2a` channel bound to the program's sole agent, so the
     // serving path is identical to a declared `channel … { kind = "a2a" }`. An ambiguous (multi-agent)
@@ -4362,6 +4371,7 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
         auto_approve,
         extra_tools,
         sub_agents,
+        redactor,
     ));
     let channels = flux_channels::build_channels(&channel_decls)?;
     // Serve stdin when an interactive `cli` channel is declared, or when the program declares no

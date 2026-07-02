@@ -35,6 +35,7 @@ use flux_runtime::{
     AllowApprover, Approver, DenyApprover, Executor, PermissionManager, Spawner, Tool, ToolContext,
     ToolRegistry,
 };
+use flux_secret::Redactor;
 use flux_system::{System, Workspace};
 
 use crate::bus::{Bus, Event};
@@ -99,7 +100,15 @@ impl App {
         auto_approve: bool,
         extra_tools: Vec<Arc<dyn Tool>>,
     ) -> Self {
-        Self::with_sub_agents(program, provider, model, auto_approve, extra_tools, None)
+        Self::with_sub_agents(
+            program,
+            provider,
+            model,
+            auto_approve,
+            extra_tools,
+            None,
+            Redactor::new(),
+        )
     }
 
     /// Like [`with_tools`](Self::with_tools) but also wires a sub-agent [`SubAgents`] bundle: the
@@ -108,6 +117,10 @@ impl App {
     /// `strict_review`'s bounded reviewer fan-out — flux L-13) can delegate to a named role exactly as
     /// the CLI's `build_agent`/the SDK's `FlowClient::with_sub_agents` do — the same construction path
     /// (`SubAgents::into_spawner`), not a re-implementation.
+    ///
+    /// `redactor` is the host's shared secret redactor — pass the SAME one `resolve_secrets` seeded
+    /// (clones share the value store), so program-declared secrets are scrubbed from every journey's
+    /// and agent-target's tool output.
     pub fn with_sub_agents(
         program: Program,
         provider: Option<Arc<dyn Provider>>,
@@ -115,6 +128,7 @@ impl App {
         auto_approve: bool,
         extra_tools: Vec<Arc<dyn Tool>>,
         sub_agents: Option<SubAgents>,
+        redactor: Redactor,
     ) -> Self {
         App {
             engine: Engine::new(
@@ -124,6 +138,7 @@ impl App {
                 auto_approve,
                 extra_tools,
                 sub_agents,
+                redactor,
             ),
         }
     }
@@ -249,6 +264,10 @@ pub(crate) struct Engine {
     /// built once here rather than a fresh instance per journey run, so a journey and the sub-agents
     /// it spawns always resolve paths against the identical workspace root.
     system: Arc<System>,
+    /// The host's shared secret redactor — the one `resolve_secrets` seeded (clones share the value
+    /// store). Installed on every journey-run executor's and agent-target engine's `ToolContext`, so
+    /// program-declared secrets are scrubbed from tool output/logs everywhere.
+    redactor: Redactor,
 }
 
 impl Engine {
@@ -259,6 +278,7 @@ impl Engine {
         auto_approve: bool,
         extra_tools: Vec<Arc<dyn Tool>>,
         sub_agents: Option<SubAgents>,
+        redactor: Redactor,
     ) -> Arc<Self> {
         let bus = Bus::new();
         let channels = Arc::new(program.channels.clone());
@@ -309,6 +329,7 @@ impl Engine {
                 agents: Mutex::new(HashMap::new()),
                 sessions: Mutex::new(HashMap::new()),
                 system,
+                redactor,
             }
         })
     }
@@ -392,6 +413,7 @@ impl Engine {
             self.auto_approve,
             self.spawner.clone(),
             self.system.clone(),
+            self.redactor.clone(),
         )?;
         analyze_composites(&self.program.ops, &self.registry)
             .map_err(|d| Error::Other(format!("composite ops: {}", join_diags(&d))))?;
@@ -444,6 +466,7 @@ impl Engine {
                 self.registry.clone(),
                 self.events.clone(),
                 &self.default_model,
+                self.redactor.clone(),
             )
             .await?,
         );
@@ -534,8 +557,9 @@ fn build_executor(
     auto_approve: bool,
     spawner: Option<Arc<dyn Spawner>>,
     system: Arc<System>,
+    redactor: Redactor,
 ) -> Result<Executor> {
-    let mut ctx = ToolContext::new(system);
+    let mut ctx = ToolContext::new(system).with_redactor(redactor);
     if let Some(spawner) = spawner {
         ctx = ctx.with_spawner(spawner);
     }
@@ -627,6 +651,7 @@ async fn build_agent_engine(
     registry: ToolRegistry,
     events: Arc<EventStore>,
     default_model: &str,
+    redactor: Redactor,
 ) -> Result<FlowEngine> {
     let root = std::env::current_dir().map_err(other)?;
     let workspace = Workspace::new(&root).map_err(other)?;
@@ -634,7 +659,7 @@ async fn build_agent_engine(
     // Build the spec (which may read persona files through the guarded `system`) before moving the
     // `system` into the tool context.
     let spec = agent_spec_from_decl(decl, default_model, root, &system).await?;
-    let ctx = ToolContext::new(system);
+    let ctx = ToolContext::new(system).with_redactor(redactor);
     let approver: Arc<dyn Approver> = Arc::new(DenyApprover);
     // The agent loop's planner reads the turn's conversation via the FlowStore (`store.conversation()`),
     // which delegates to the FlowStore's *internal* event log. Back it with the SAME `events` store the
@@ -826,6 +851,42 @@ trigger t1
             reply: reply.to_string(),
         });
         App::with_options(program(src), Some(provider), "mock", false)
+    }
+
+    /// The C-13 wiring: the redactor `resolve_secrets` seeded is the SAME one every journey-run
+    /// executor redacts with — a tool result leaking a resolved secret comes back scrubbed.
+    #[tokio::test]
+    async fn journey_executor_scrubs_resolved_secrets_from_tool_output() {
+        // A fixture named `search` (inside build_executor's pre-allowed safe set) that leaks a secret.
+        struct LeakyTool;
+        #[async_trait]
+        impl Tool for LeakyTool {
+            fn spec(&self) -> flux_spec::ToolSpec {
+                flux_spec::ToolSpec::read_only("search", "leaks", json!({"type": "object"}))
+            }
+            async fn execute(
+                &self,
+                _ctx: &ToolContext,
+                _params: Value,
+            ) -> Result<flux_runtime::ToolResult> {
+                Ok(flux_runtime::ToolResult::ok(
+                    "found: xoxb-app-secret-987".to_string(),
+                ))
+            }
+        }
+        let redactor = Redactor::new();
+        redactor.add_secret("xoxb-app-secret-987"); // what resolve_secrets does at load
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(LeakyTool));
+        let system = Arc::new(System::new(Workspace::new(".").unwrap()));
+        let executor = build_executor(registry, false, None, system, redactor).unwrap();
+        let r = executor.dispatch("search", json!({})).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            !r.content.contains("xoxb-app-secret-987"),
+            "the resolved secret must be scrubbed from tool output: {}",
+            r.content
+        );
     }
 
     #[tokio::test]

@@ -19,6 +19,7 @@ flux-provider.workspace = true
 flux-evidence.workspace = true
 flux-system.workspace = true
 flux-cognition.workspace = true
+flux-secret.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-std", "io-util"] }
 futures.workspace = true
 async-trait.workspace = true

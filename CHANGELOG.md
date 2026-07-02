@@ -340,6 +340,19 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Program-declared secrets now seed the redactor at resolution (C-13).** `flux_app::resolve_secrets`
+  resolved `secret "NAME"` markers to plaintext without ever registering the values, so a Slack bot
+  token (or any declared secret) leaking into tool output passed unredacted unless it happened to
+  match a credential-shape heuristic — despite README's "secrets are scrubbed from all tool output
+  and logs". `resolve_secrets(program, &redactor)` now `add_secret`s every resolved value at the
+  moment of resolution, and `App::with_sub_agents` threads that ONE redactor into both executor-build
+  paths (journey runs and agent-target engines) via `ToolContext::with_redactor` — redactor clones
+  share the value store, so the CLI, the app host, and the plugin secret sink all scrub with the same
+  set. Provider env-key seeding is unified behind the new `flux_credentials::provider_env_keys()`
+  (replacing the CLI's hardcoded 4-key list), which also covers `AWS_SECRET_ACCESS_KEY`/
+  `AWS_SESSION_TOKEN` — the Bedrock credential chain materializes those into the process env, so an
+  `env` dump in tool output is scrubbed now too. The `flux app run` path previously seeded nothing.
+
 - **Plan approval sees the plan's real intents — the sub-agent destructive bypass is closed (C-12).**
   `Approver::request_plan` used to forward an **empty** `IntentSet`, and an approved plan scope
   suppressed every per-op gate — so a sub-agent's destructive op, arriving via its only tool

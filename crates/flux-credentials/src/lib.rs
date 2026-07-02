@@ -668,6 +668,21 @@ pub struct ProviderAuth {
     pub source: String,
 }
 
+/// The environment variables whose values are provider credentials — the single source hosts use
+/// to seed a `flux_secret::Redactor`, so a leaked `env`/`printenv`/debug dump in tool output is
+/// scrubbed. Covers the API-key providers plus the AWS secret material the Bedrock credential
+/// chain materializes into the process environment (the access-key *id* is an identifier, not a
+/// secret, and appears legitimately in ARNs and logs — deliberately not listed).
+pub fn provider_env_keys() -> &'static [&'static str] {
+    &[
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+    ]
+}
+
 /// Report what credentials are available for each provider, in resolution-chain order.
 pub fn auth_status() -> Vec<ProviderAuth> {
     let env_status = |provider: &'static str, var: &str| {
@@ -724,6 +739,10 @@ pub fn auth_status() -> Vec<ProviderAuth> {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that repoint `HOME` — the process env is shared across the parallel
+    /// test threads, so two concurrent `set_var("HOME", …)` tests race and flake.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn jwt_expiry_decodes_exp() {
         // header.{"exp":2000000000}.sig  (exp = 2033-05-18)
@@ -762,6 +781,7 @@ mod tests {
         )
         .unwrap();
 
+        let _home = HOME_LOCK.lock().unwrap();
         std::env::set_var("HOME", &home);
         let tok = import_codex().expect("import_codex should read the fixture auth.json");
         std::fs::remove_dir_all(&home).ok();
@@ -893,6 +913,9 @@ input = 1.0
     }
 
     #[tokio::test]
+    // HOME must stay repointed across the `refresh().await` calls (save_stored reads it there), and
+    // #[tokio::test] runs on a current-thread runtime, so holding the std guard across await is safe.
+    #[allow(clippy::await_holding_lock)]
     async fn force_refresh_ignores_expiry_buffer_and_coalesces() {
         // Redirect HOME so the best-effort `save_stored` writes to a throwaway dir, never the real
         // credential store. (set_var("HOME", ..) is the established test pattern in this workspace.)
@@ -902,6 +925,7 @@ input = 1.0
             std::thread::current().id()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
+        let _home = HOME_LOCK.lock().unwrap();
         std::env::set_var("HOME", &tmp);
 
         let calls = Arc::new(AtomicUsize::new(0));

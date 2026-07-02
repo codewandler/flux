@@ -148,6 +148,7 @@ async fn run_via_journey() -> Value {
         true,
         Vec::new(),
         Some(sub_agents()),
+        flux_secret::Redactor::new(),
     );
     let runs = app
         .deliver("review", json!({ "files": seed_files() }))
