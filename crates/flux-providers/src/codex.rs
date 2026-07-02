@@ -113,9 +113,10 @@ fn http_native(tokens: Arc<dyn TokenSource>, endpoint: &str) -> NativeProvider {
 /// The codex WebSocket transport — the **primary** path for the `codex` provider, mirroring the
 /// upstream codex Rust client. It opens `wss://…/codex/responses` with the auth/gating headers on
 /// the tungstenite handshake (the reqwest-bound [`OpenAiCred`] cannot serve a WS — same precedent
-/// as the realtime provider), sends the Responses body as one text frame, and yields the
-/// response-event frames re-enveloped as SSE bytes so the **existing** Responses codec
-/// (`map_responses_stream`) parses them — guaranteeing WS and HTTP produce identical chunks.
+/// as the realtime provider), sends the Responses body inline in a `response.create` event frame
+/// (the live contract), and yields the response-event frames re-enveloped as SSE bytes so the
+/// **existing** Responses codec (`map_responses_stream`) parses them — guaranteeing WS and HTTP
+/// produce identical chunks. The WS-only `codex.rate_limits` preamble is skipped pre-commit.
 ///
 /// Upstream WS is experimental/unstable (1008 policy closes, proxy trouble), so every
 /// connect-time failure surfaces as `Err` and [`NativeProvider`] falls back transparently to
@@ -126,6 +127,21 @@ struct CodexWsTransport {
     /// Bearer + `chatgpt-account-id` for the handshake. The WS path never refreshes on auth
     /// failure itself — a rejected handshake falls back to HTTP, which owns the 401→refresh path.
     tokens: Arc<dyn TokenSource>,
+}
+
+/// Whether a WS event payload semantically ends the response. The live backend resets the socket
+/// after the terminal event instead of performing a close handshake (observed 2026-07-02), so the
+/// transport stops reading here — a reset *before* the terminal event still surfaces as a stream
+/// error (real truncation).
+fn is_terminal_event(payload: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|v| {
+            v["type"]
+                .as_str()
+                .map(|t| matches!(t, "response.completed" | "response.failed"))
+        })
+        .unwrap_or(false)
 }
 
 /// Re-envelope one WS frame payload as an SSE `data:` event so the SSE-based codec parses it.
@@ -181,16 +197,44 @@ impl StreamTransport for CodexWsTransport {
         let (mut ws, _resp) = tokio_tungstenite::connect_async(request)
             .await
             .map_err(|e| Error::Http(format!("ws connect: {e}")))?;
-        ws.send(Message::Text(body.to_string()))
+        // Live contract (verified 2026-07-02): the first websocket event must be a
+        // `response.create` message with the Responses body fields inline — a bare body is
+        // rejected ("Expected a 'response.create' message as the first websocket event"), and
+        // nesting the body under a `response` key loses the model.
+        let mut create = body.clone();
+        if let Some(obj) = create.as_object_mut() {
+            obj.insert(
+                "type".to_string(),
+                serde_json::Value::String("response.create".to_string()),
+            );
+        }
+        ws.send(Message::Text(create.to_string()))
             .await
             .map_err(|e| Error::Http(format!("ws send: {e}")))?;
 
-        // Policy failures (the upstream 1008 close) arrive AFTER a successful upgrade — wait for
-        // the first data frame before committing to the WS path, so such closes still trigger the
-        // HTTP fallback instead of yielding an empty turn.
+        // Policy failures arrive AFTER a successful upgrade — as a 1008 close OR as an `error`
+        // EVENT before any response event (both observed live). Wait for the first substantive
+        // frame before committing to the WS path, so either shape still triggers the HTTP
+        // fallback instead of a dead turn. The `codex.rate_limits` preamble arrives before the
+        // request is validated and must not commit (the codec would ignore it anyway).
         let first = loop {
             match ws.next().await {
-                Some(Ok(Message::Text(t))) => break t,
+                Some(Ok(Message::Text(t))) => {
+                    let kind = serde_json::from_str::<serde_json::Value>(&t)
+                        .ok()
+                        .and_then(|v| v["type"].as_str().map(str::to_string))
+                        .unwrap_or_default();
+                    match kind.as_str() {
+                        "codex.rate_limits" => continue,
+                        "error" => {
+                            return Err(Error::Http(format!(
+                                "ws error before data: {}",
+                                &t[..t.len().min(300)]
+                            )));
+                        }
+                        _ => break t,
+                    }
+                }
                 Some(Ok(Message::Close(frame))) => {
                     let detail = frame
                         .map(|f| format!("{} {}", f.code, f.reason))
@@ -204,12 +248,18 @@ impl StreamTransport for CodexWsTransport {
         };
 
         // From here on the turn is committed to WS: mid-stream failures surface as stream errors
-        // (matching the HTTP path, which also never retries mid-stream).
+        // (matching the HTTP path, which also never retries mid-stream). Reading stops at the
+        // terminal event — see `is_terminal_event`.
         let stream = try_stream! {
+            let mut done = is_terminal_event(&first);
             yield sse_frame(&first);
-            while let Some(msg) = ws.next().await {
+            while !done {
+                let Some(msg) = ws.next().await else { break };
                 match msg {
-                    Ok(Message::Text(t)) => yield sse_frame(&t),
+                    Ok(Message::Text(t)) => {
+                        done = is_terminal_event(&t);
+                        yield sse_frame(&t);
+                    }
                     Ok(Message::Close(_)) => break,
                     Ok(_) => continue,
                     Err(e) => Err(Error::Provider(format!("ws stream: {e}")))?,
@@ -306,11 +356,27 @@ mod tests {
             .collect()
     }
 
-    type HeaderLog = Arc<Mutex<HashMap<String, String>>>;
+    /// The live protocol's WS-only preamble event: `codex.rate_limits` arrives immediately after
+    /// the upgrade, *before* the request is validated (observed live 2026-07-02). The transport
+    /// must not treat it as the committing data frame.
+    fn rate_limits_preamble() -> String {
+        r#"{"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":1.0}}}"#.to_string()
+    }
 
-    /// A local WS stub: accepts connections, records each handshake's headers, reads the client's
+    /// Live WS frame sequence: the preamble followed by the shared fixture events.
+    fn live_ws_frames() -> Vec<String> {
+        let mut frames = vec![rate_limits_preamble()];
+        frames.extend(fixture_events());
+        frames
+    }
+
+    type HeaderLog = Arc<Mutex<HashMap<String, String>>>;
+    /// The last request frame the stub read from the client (the WS request message).
+    type RequestLog = Arc<Mutex<Option<String>>>;
+
+    /// A local WS stub: accepts connections, records each handshake's headers and the client's
     /// request frame, streams `frames` as text messages, then closes cleanly. Returns
-    /// (ws url, accept-loop handle, connection counter, recorded handshake headers).
+    /// (ws url, accept-loop handle, connection counter, handshake headers, request frame).
     async fn ws_stub_server(
         frames: Vec<String>,
     ) -> (
@@ -318,12 +384,14 @@ mod tests {
         tokio::task::JoinHandle<()>,
         Arc<AtomicUsize>,
         HeaderLog,
+        RequestLog,
     ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
         let headers: HeaderLog = Arc::new(Mutex::new(HashMap::new()));
-        let (hits2, headers2) = (hits.clone(), headers.clone());
+        let request: RequestLog = Arc::new(Mutex::new(None));
+        let (hits2, headers2, request2) = (hits.clone(), headers.clone(), request.clone());
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((sock, _)) = listener.accept().await else {
@@ -341,7 +409,10 @@ mod tests {
                 let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(sock, cb).await else {
                     continue;
                 };
-                let _ = ws.next().await; // the client's Responses request body frame
+                // The client's request message (live contract: a `response.create` event).
+                if let Some(Ok(WsMessage::Text(t))) = ws.next().await {
+                    *request2.lock().unwrap() = Some(t);
+                }
                 for f in &frames {
                     if ws.send(WsMessage::Text(f.clone())).await.is_err() {
                         break;
@@ -352,7 +423,38 @@ mod tests {
                 while let Some(Ok(_)) = ws.next().await {}
             }
         });
-        (format!("ws://{addr}"), handle, hits, headers)
+        (format!("ws://{addr}"), handle, hits, headers, request)
+    }
+
+    /// A WS stub that sends `frames` and then DROPS the socket without a close handshake — the
+    /// live backend's observed end-of-turn behavior (a reset after the terminal event instead of
+    /// a clean close). Returns (ws url, handle, connection counter).
+    async fn ws_reset_after_frames_server(
+        frames: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                hits2.fetch_add(1, Ordering::SeqCst);
+                let Ok(mut ws) = tokio_tungstenite::accept_async(sock).await else {
+                    continue;
+                };
+                let _ = ws.next().await; // request frame
+                for f in &frames {
+                    if ws.send(WsMessage::Text(f.clone())).await.is_err() {
+                        break;
+                    }
+                }
+                drop(ws); // no close handshake — the socket just goes away
+            }
+        });
+        (format!("ws://{addr}"), handle, hits)
     }
 
     /// A WS stub that accepts the handshake, reads the request frame, then closes with a 1008
@@ -426,7 +528,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_uses_ws_transport_by_default() {
-        let (ws_url, ws_handle, ws_hits, _) = ws_stub_server(fixture_events()).await;
+        let (ws_url, ws_handle, ws_hits, _, _) = ws_stub_server(live_ws_frames()).await;
         // An HTTP stub that must stay cold: WS is the primary transport.
         let (http_url, http_handle, http_hits) = sse_server(fixture_sse()).await;
 
@@ -455,8 +557,9 @@ mod tests {
 
     #[tokio::test]
     async fn ws_frames_map_to_same_chunks_as_sse() {
-        // WS side: the fixture events as individual frames.
-        let (ws_url, ws_handle, _, _) = ws_stub_server(fixture_events()).await;
+        // WS side: the live frame sequence (preamble + fixture events) — the SSE side never sees
+        // the preamble, so equality also proves the preamble is transparent.
+        let (ws_url, ws_handle, _, _, _) = ws_stub_server(live_ws_frames()).await;
         // A dead HTTP endpoint proves the WS side never falls back mid-test.
         let ws_provider = oauth_at(Arc::new(StubTokens), "http://127.0.0.1:1/", &ws_url);
         let ws_chunks = collect_chunks(&ws_provider).await;
@@ -482,7 +585,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_handshake_carries_auth_headers() {
-        let (ws_url, ws_handle, _, headers) = ws_stub_server(fixture_events()).await;
+        let (ws_url, ws_handle, _, headers, _) = ws_stub_server(live_ws_frames()).await;
         let provider = oauth_at(Arc::new(StubTokens), "http://127.0.0.1:1/", &ws_url);
         let _ = collect_chunks(&provider).await;
 
@@ -534,6 +637,89 @@ mod tests {
             Some(&Chunk::Done {
                 stop_reason: Some(StopReason::ToolUse)
             })
+        );
+        ws_handle.abort();
+        http_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn ws_request_is_a_response_create_envelope() {
+        // Live contract (verified 2026-07-02): the first websocket event must be a
+        // `response.create` message with the Responses body fields INLINE (a bare body is
+        // rejected with "Expected a 'response.create' message as the first websocket event";
+        // nesting the body under `response` loses the model).
+        let (ws_url, ws_handle, _, _, request) = ws_stub_server(live_ws_frames()).await;
+        let provider = oauth_at(Arc::new(StubTokens), "http://127.0.0.1:1/", &ws_url);
+        let _ = collect_chunks(&provider).await;
+
+        let sent = request
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the stub must have received a request frame");
+        let v: serde_json::Value = serde_json::from_str(&sent).expect("request frame is JSON");
+        assert_eq!(
+            v["type"].as_str(),
+            Some("response.create"),
+            "the request must be enveloped as a response.create event"
+        );
+        assert_eq!(
+            v["model"].as_str(),
+            Some("gpt-5.5"),
+            "the Responses body fields must ride inline in the event"
+        );
+        assert!(
+            v["input"].is_array(),
+            "the Responses input must ride inline in the event"
+        );
+        ws_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn ws_reset_after_terminal_event_ends_the_turn_cleanly() {
+        // Live behavior (observed 2026-07-02): after `response.completed` the backend resets the
+        // socket instead of performing a close handshake. That must end the turn cleanly — a
+        // reset BEFORE the terminal event still surfaces as a stream error (real truncation).
+        let (ws_url, ws_handle, _) = ws_reset_after_frames_server(live_ws_frames()).await;
+        let provider = oauth_at(Arc::new(StubTokens), "http://127.0.0.1:1/", &ws_url);
+        let chunks = collect_chunks(&provider).await;
+
+        assert!(
+            chunks.contains(&Chunk::TextDelta("Hi".to_string())),
+            "the turn must stream the fixture text"
+        );
+        assert_eq!(
+            chunks.last(),
+            Some(&Chunk::Done {
+                stop_reason: Some(StopReason::ToolUse)
+            }),
+            "the turn must end cleanly despite the reset"
+        );
+        ws_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn ws_error_event_before_data_falls_back_to_http() {
+        // The live backend rejects a bad request with an `error` EVENT (a data frame), not a
+        // close — observed live 2026-07-02. Committing to WS on it would kill the turn; it must
+        // fall back like any other connect-time failure.
+        let error_event = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"nope"}}"#;
+        let (ws_url, ws_handle, ws_hits, _, _) =
+            ws_stub_server(vec![error_event.to_string()]).await;
+        let (http_url, http_handle, http_hits) = sse_server(fixture_sse()).await;
+
+        let provider = oauth_at(Arc::new(StubTokens), &http_url, &ws_url);
+        let chunks = collect_chunks(&provider).await;
+
+        assert_eq!(ws_hits.load(Ordering::SeqCst), 1, "WS must be attempted");
+        assert_eq!(
+            http_hits.load(Ordering::SeqCst),
+            1,
+            "an error event before data must fall back to HTTP-SSE"
+        );
+        assert!(
+            chunks.contains(&Chunk::TextDelta("Hi".to_string())),
+            "the turn must still complete over HTTP"
         );
         ws_handle.abort();
         http_handle.abort();

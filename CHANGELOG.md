@@ -50,10 +50,17 @@ All notable changes to this project are documented in this file. The format is b
   `OpenAI-Beta`, `originator`) from the one `codex_headers()` source that also feeds the HTTP
   credential, so the two paths cannot drift; response frames are re-enveloped as SSE bytes into
   the existing Responses codec, making the chunk stream identical by construction. Any
-  connect-time failure — refused connection, handshake rejection, or a policy close (1008) before
-  the first data frame — falls back transparently to HTTP-SSE, which also owns 401 recovery
-  (C-04). All hermetic (paired SSE/WS fixtures, stub servers); the live smoke script remains the
-  WS-contract verification.
+  connect-time failure — refused connection, handshake rejection, a policy close (1008), or an
+  `error` event before the first response event — falls back transparently to HTTP-SSE, which
+  also owns 401 recovery (C-04). The wire contract was **live-verified the same day and
+  corrected**: the backend requires the request as an inline `response.create` event (a bare body
+  is rejected with an error *event*, which the first implementation would have committed to,
+  silently killing the WS leg) and prefixes responses with a WS-only `codex.rate_limits`
+  preamble, and it resets the socket after the terminal event instead of a close handshake; the
+  transport now sends the envelope, skips the preamble pre-commit, treats an error-type first
+  frame as fallback, stops reading at the terminal event (a reset before it still surfaces as
+  real truncation), and the hermetic stubs pin the observed live contract — a live
+  `flux run -m codex` turn completes green over the WS path end-to-end.
 
 - **flux-lang v1 hardening (epic: C-17, L-15..L-19).** A full review of the language pillar
   (27 findings, `docs/designs/flux-lang-v1-hardening.md`) fixed in one pass:

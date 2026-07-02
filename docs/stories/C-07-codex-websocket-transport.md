@@ -47,10 +47,30 @@ codex Rust client (which uses `tokio_tungstenite` and itself keeps HTTP as fallb
     `ws_connection_refused_falls_back_to_http`, `ws_url_derived_from_codex_endpoint`, and seam-level
     `transport_is_tried_before_http` / `transport_failure_falls_back_to_http`.
   - `tokio-tungstenite` promoted from `realtime`-optional to unconditional in flux-providers.
-- **Caveats:** the stubs encode the assumed upstream contract (body = one text frame, one JSON event
-  per text frame, clean close ends the turn) — the live smoke script remains the WS-contract check;
-  fallback triggers on connect-time failures only (mid-stream errors surface, matching HTTP
-  semantics); the WS path delegates 401 recovery to the HTTP fallback, which owns it (C-04).
+- **Live contract verification (same day) — the assumed contract was WRONG and is now fixed.**
+  A raw-socket probe against the real backend (`wss://chatgpt.com/backend-api/codex/responses`,
+  real handshake headers) found: (1) the upgrade is accepted (101), but (2) a bare Responses body
+  is rejected with an `error` EVENT — "Expected a 'response.create' message as the first
+  websocket event" — as a *data frame*, which the original first-frame gate would have committed
+  to, killing every live WS turn (invisible: the pre-C-07 binary had produced the earlier green
+  live turn over HTTP); (3) the correct shape is the body fields INLINE in a
+  `{"type":"response.create", …}` event (nesting under `response` loses the model); (4) responses
+  are the same Responses events the SSE path parses, preceded by a WS-only `codex.rate_limits`
+  preamble. The probe completed a full live turn over WS with the corrected envelope
+  (`response.created` → `output_text.delta "ok"` → `response.completed`). Fixes: the transport
+  sends the `response.create` envelope, skips the preamble pre-commit, and treats an error-type
+  first frame as a connect-time failure (→ HTTP fallback); stubs/tests pin the live contract
+  (`ws_request_is_a_response_create_envelope`, `ws_error_event_before_data_falls_back_to_http`,
+  preamble in `live_ws_frames()` with SSE-equality proving its transparency). A second live CLI
+  turn then surfaced quirk (5): after the terminal event the backend RESETS the socket instead of
+  a close handshake, which surfaced as a bogus "ws stream: Connection reset without closing
+  handshake" error after all data had arrived — the transport now stops reading at the terminal
+  event (`response.completed`/`response.failed`; `is_terminal_event`), while a reset *before* it
+  still surfaces as real truncation (`ws_reset_after_terminal_event_ends_the_turn_cleanly` pins
+  it). A live `flux run -m codex` turn completes green over the WS path end-to-end.
+- **Caveats:** fallback triggers on connect-time failures only (mid-stream errors surface,
+  matching HTTP semantics); the WS path delegates 401 recovery to the HTTP fallback, which owns
+  it (C-04).
 
 ## Notes
 - Epic + design: [subscription-providers-and-cost.md](../designs/subscription-providers-and-cost.md).
