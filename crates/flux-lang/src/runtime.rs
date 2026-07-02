@@ -43,12 +43,28 @@ pub struct CallOutcome {
     /// The stored value id, or `None` if the op errored (nothing is bound on error).
     pub value_id: Option<ValueId>,
     pub is_error: bool,
+    /// True when the failure was the host envelope **refusing to run** the op (see
+    /// [`OpOutcome::denied`]) — surfaced as the fatal [`FlowError::Denied`] instead of the
+    /// retryable runtime wrap, so `retry`/`loop`/composites never re-attempt a denial (L-21).
+    pub denied: bool,
     /// The canonical value: bound to the symbol, spliced into `{{interpolation}}`, used for control
     /// flow (`when`/`return`). Deterministic execution works with this.
     pub content: String,
     /// The model-facing rendering (line-numbered read, diff, …). Equals `content` when the op set no
     /// distinct view. Surfaced to the sink/observation, never bound or interpolated.
     pub view: String,
+}
+
+/// The error a failed call surfaces as: a **denial** (the host envelope refused the op — see
+/// [`CallOutcome::denied`]) keeps its structural identity as the fatal [`FlowError::Denied`] so the
+/// reliability wrappers (`retry`, `loop`, the composite boundary) never re-attempt it; every other
+/// failure is the transient [`FlowError::Runtime`] wrap, labelled with its call site.
+fn call_failure(label: &str, outcome: &CallOutcome) -> FlowError {
+    if outcome.denied {
+        FlowError::Denied(outcome.content.clone())
+    } else {
+        FlowError::Runtime(format!("{label} failed: {}", outcome.content))
+    }
 }
 
 fn sha256_hex(s: &str) -> String {
@@ -342,6 +358,7 @@ pub async fn execute_call(
         return Ok(CallOutcome {
             value_id: None,
             is_error: true,
+            denied: result.denied,
             content: result.content,
             view,
         });
@@ -370,6 +387,7 @@ pub async fn execute_call(
     Ok(CallOutcome {
         value_id: Some(value_id),
         is_error: false,
+        denied: false,
         content: result.content,
         view,
     })
@@ -418,6 +436,7 @@ async fn execute_composite_call(
             return Ok(CallOutcome {
                 value_id: None,
                 is_error: true,
+                denied: false,
                 content: error.clone(),
                 view: error,
             });
@@ -437,15 +456,16 @@ async fn execute_composite_call(
                 },
             )?;
             if e.is_fatal() {
-                // Fatality survives the composite boundary: a denied `confirm` or failed `assert`
-                // inside a composite op keeps its structural identity instead of being stringified
-                // into a retryable in-band error, so an enclosing `retry` will not re-attempt it
-                // (F14). The StepFailed audit record above is still written.
+                // Fatality survives the composite boundary: a denied `confirm`/op or a failed
+                // `assert` inside a composite op keeps its structural identity instead of being
+                // stringified into a retryable in-band error, so an enclosing `retry` will not
+                // re-attempt it (F14). The StepFailed audit record above is still written.
                 return Err(e);
             }
             return Ok(CallOutcome {
                 value_id: None,
                 is_error: true,
+                denied: false,
                 content: error.clone(),
                 view: error,
             });
@@ -463,6 +483,7 @@ async fn execute_composite_call(
         return Ok(CallOutcome {
             value_id: None,
             is_error: true,
+            denied: false,
             content: error.clone(),
             view: error,
         });
@@ -517,6 +538,7 @@ async fn execute_composite_call(
     Ok(CallOutcome {
         value_id: Some(value_id),
         is_error: false,
+        denied: false,
         content,
         view,
     })
@@ -1059,10 +1081,7 @@ fn exec_body<'a>(
                         run_call(store, executor, session_id, op, args, Some(bind), sink).await?;
                     *steps += 1;
                     if outcome.is_error {
-                        return Err(crate::FlowError::Runtime(format!(
-                            "step `{op}` failed: {}",
-                            outcome.content
-                        )));
+                        return Err(call_failure(&format!("step `{op}`"), &outcome));
                     }
                     // The model reasons over intermediate results → feed the model-facing VIEW
                     // (line-numbered read, diff, …). Control flow (`when`/`return`) stays canonical.
@@ -1079,10 +1098,7 @@ fn exec_body<'a>(
                         run_call(store, executor, session_id, op, args, None, sink).await?;
                     *steps += 1;
                     if outcome.is_error {
-                        return Err(crate::FlowError::Runtime(format!(
-                            "step `{op}` failed: {}",
-                            outcome.content
-                        )));
+                        return Err(call_failure(&format!("step `{op}`"), &outcome));
                     }
                     // The model reasons over intermediate results → feed the model-facing VIEW
                     // (line-numbered read, diff, …). Control flow (`when`/`return`) stays canonical.
@@ -1331,10 +1347,7 @@ fn exec_body<'a>(
                         .await?;
                         *steps += 1;
                         if outcome.is_error {
-                            return Err(FlowError::Runtime(format!(
-                                "pipe step `{op}` failed: {}",
-                                outcome.content
-                            )));
+                            return Err(call_failure(&format!("pipe step `{op}`"), &outcome));
                         }
                         // Transcript views are trimmed to the host's output budget, like every
                         // other transcript push (F20a); the canonical value is untouched.
@@ -1404,10 +1417,7 @@ fn exec_body<'a>(
                         run_call(store, executor, session_id, op, args, Some(bspec), sink).await?;
                     *steps += 1;
                     if outcome.is_error {
-                        return Err(FlowError::Runtime(format!(
-                            "step `{op}` failed: {}",
-                            outcome.content
-                        )));
+                        return Err(call_failure(&format!("step `{op}`"), &outcome));
                     }
                     // Transcript views are trimmed to the host's output budget, like every other
                     // transcript push (F20a); the canonical value is untouched.
@@ -1999,10 +2009,10 @@ fn exec_body<'a>(
                                 run_call(store, executor, session_id, op, args, None, sink).await?;
                             *steps += 1;
                             if outcome.is_error {
-                                return Err(FlowError::Runtime(format!(
-                                    "`route` selector `{op}` failed: {}",
-                                    outcome.content
-                                )));
+                                return Err(call_failure(
+                                    &format!("`route` selector `{op}`"),
+                                    &outcome,
+                                ));
                             }
                             outcome.content.trim().to_string()
                         }
@@ -2445,6 +2455,13 @@ async fn eval_cond(
             let outcome = run_call(store, executor, session_id, op, args, None, sink).await?;
             *steps += 1;
             if outcome.is_error {
+                // A denial is a deliberate refusal, not a falsy answer: reading it as `false`
+                // would silently absorb it — and a `repeat`/`loop` `until` guard would re-dispatch
+                // (re-prompt) the denied op every iteration (L-21). Any other failed condition op
+                // stays falsy (the op ran and errored — "not confirmed").
+                if outcome.denied {
+                    return Err(FlowError::Denied(outcome.content));
+                }
                 return Ok(false);
             }
             Ok(json_truthy(&serde_json::Value::String(outcome.content)))
@@ -2510,6 +2527,7 @@ async fn run_call(
             content: outcome.view.clone(),
             view: None,
             is_error: outcome.is_error,
+            denied: outcome.denied,
         },
     );
     Ok(outcome)
@@ -2883,10 +2901,7 @@ async fn eval_return(
             let outcome = run_call(store, executor, session_id, op, args, None, sink).await?;
             *steps += 1;
             if outcome.is_error {
-                return Err(FlowError::Runtime(format!(
-                    "return step `{op}` failed: {}",
-                    outcome.content
-                )));
+                return Err(call_failure(&format!("return step `{op}`"), &outcome));
             }
             Ok((outcome.content, outcome.value_id))
         }
@@ -5686,6 +5701,114 @@ mod tests {
             "the denied confirm was asked exactly once — not retried"
         );
         assert!(host.marks().is_empty(), "the confirmed body never ran");
+    }
+
+    /// L-21: a host whose envelope **denies** every dispatch (the policy / permission-rule /
+    /// approval class, marked via [`OpOutcome::denial`]) — the op never runs. Distinct from `boom`
+    /// (an op that runs and fails, which stays retryable).
+    struct DenyEnvelopeHost {
+        cat: CfCat,
+        dispatches: AtomicUsize,
+    }
+    impl DenyEnvelopeHost {
+        fn new() -> Self {
+            Self {
+                cat: CfCat,
+                dispatches: AtomicUsize::new(0),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl OpHost for DenyEnvelopeHost {
+        async fn dispatch(&self, op: &str, _input: serde_json::Value) -> OpOutcome {
+            self.dispatches.fetch_add(1, Ordering::SeqCst);
+            OpOutcome::denial(format!("`{op}` denied by policy (fs.read on File)"))
+        }
+        fn catalog(&self) -> &dyn OpCatalog {
+            &self.cat
+        }
+        async fn request_approval(&self, _l: &str, _i: &flux_spec::IntentSet) -> ApprovalChoice {
+            ApprovalChoice::Allow
+        }
+        fn trim_output(&self, view: String, _op: &str) -> String {
+            view
+        }
+    }
+
+    /// L-21: a *policy-denied op* is fatal exactly like the denied `confirm` above — the denial is
+    /// typed (`FlowError::Denied`, host-marked via `OpOutcome::denied`), survives the `loop` wrap,
+    /// and `retry` propagates it without a second attempt. Before, the denial was an in-band error
+    /// string and the whole nest re-attempted it.
+    #[tokio::test]
+    async fn policy_denied_op_is_not_retried_inside_loop() {
+        let host = DenyEnvelopeHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![Node::Retry {
+                max: 3,
+                backoff: None,
+                delay_ms: Some(0),
+                body: vec![Node::Loop {
+                    for_ms: 10_000,
+                    every_ms: 0,
+                    until: None,
+                    body: vec![flow_bind("x", echo("never"))],
+                    bind: None,
+                }],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let err = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap_err();
+        assert!(
+            err.is_fatal(),
+            "a denial is fatal through loop+retry: {err}"
+        );
+        assert!(
+            err.to_string().contains("denied by policy"),
+            "the denial message survives: {err}"
+        );
+        assert_eq!(
+            host.dispatches.load(Ordering::SeqCst),
+            1,
+            "the denied op was dispatched exactly once — never re-attempted"
+        );
+    }
+
+    /// L-21: a denial in **condition position** propagates as the fatal error instead of reading as
+    /// `false` — otherwise a `repeat until denied()` guard re-dispatches (re-prompts) the denied op
+    /// every iteration, and a `when denied()` silently absorbs the refusal.
+    #[tokio::test]
+    async fn denied_op_in_condition_position_propagates_not_false() {
+        let host = DenyEnvelopeHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![Node::Repeat {
+                max: 5,
+                until: Some(Box::new(call("echo", vec![flow_lit(json!("done?"))]))),
+                body: vec![Node::Bind {
+                    name: SymbolName("i".into()),
+                    value: Box::new(flow_lit(json!(1))),
+                    ty: None,
+                    effect: None,
+                }],
+                collect: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let err = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap_err();
+        assert!(err.is_fatal(), "a denied guard is fatal: {err}");
+        assert_eq!(
+            host.dispatches.load(Ordering::SeqCst),
+            1,
+            "the denied guard was not re-evaluated across iterations"
+        );
     }
 
     /// F14: fatality survives the composite-op boundary — a denied `confirm` inside a composite is

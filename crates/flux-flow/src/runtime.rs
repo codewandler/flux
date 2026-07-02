@@ -66,11 +66,24 @@ impl<'a> ExecutorHost<'a> {
     }
 }
 
+/// Whether a failed dispatch is the envelope's own **denial** — the executor refusing to run the op
+/// (capability scope, policy floor, permission rules, or the user declining approval) — rather than
+/// an op that ran and failed. `Executor::dispatch` (flux-runtime) reports every one of its deny
+/// paths as `ToolResult::error` with the one canonical, op-anchored message shape
+/// `` `{op}` denied by {authority}`` — that exact prefix is the boundary's marker (never a
+/// substring match on arbitrary tool prose; the live-executor test below pins the contract against
+/// drift). The interpreter turns a denied outcome into the fatal `FlowError::Denied`, so
+/// `retry`/`loop`/composites never re-attempt a deliberate refusal (L-21).
+fn is_envelope_denial(op: &str, content: &str) -> bool {
+    content.starts_with(&format!("`{op}` denied by "))
+}
+
 #[async_trait]
 impl OpHost for ExecutorHost<'_> {
     async fn dispatch(&self, op: &str, input: serde_json::Value) -> OpOutcome {
         let r = self.executor.dispatch(op, input).await;
         OpOutcome {
+            denied: r.is_error && is_envelope_denial(op, &r.content),
             content: r.content,
             view: r.view,
             is_error: r.is_error,
@@ -222,12 +235,17 @@ pub async fn resume_flow(
     flux_lang::runtime::resume_flow(store, &host, session_id, body, at, input, &mut bridge).await
 }
 
-/// Resume a flow with composite ops installed in the operation catalog.
+/// Resume a flow with composite ops installed in the operation catalog. `name` is the flow's
+/// declared name as persisted with the suspension (see `FlowStore::save_suspension`), threaded into
+/// [`flux_lang::runtime::resume_flow_named`] so a **named** flow's resumed run records its
+/// checkpoints under the same `flow_key` (name + body hash) the original run used — run and resume
+/// agree on keys (L-21; the flux-lang derivation shipped with F17, this is the engine wiring).
 #[allow(clippy::too_many_arguments)]
 pub async fn resume_flow_with_composites(
     store: &FlowStore,
     executor: &Executor,
     session_id: &str,
+    name: Option<&str>,
     body: &[flux_lang::ast::Node],
     at: flux_lang::ast::NodeId,
     input: flux_lang::ast::Value,
@@ -236,7 +254,17 @@ pub async fn resume_flow_with_composites(
 ) -> Result<FlowOutcome> {
     let host = ExecutorHost::new_with_composites(executor, composites);
     let mut bridge = SinkBridge { inner: sink };
-    flux_lang::runtime::resume_flow(store, &host, session_id, body, at, input, &mut bridge).await
+    flux_lang::runtime::resume_flow_named(
+        store,
+        &host,
+        session_id,
+        name,
+        body,
+        at,
+        input,
+        &mut bridge,
+    )
+    .await
 }
 
 /// Execute an optimizer [`flux_lang::ast::PhysicalPlan`] over a flow's top-level `body` — the engine
@@ -1280,6 +1308,139 @@ mod tests {
             .unwrap()
             .and_then(|id| store.get_value(&id).unwrap());
         assert_eq!(x, Some(Value::String("hi".into())));
+    }
+
+    /// L-21: a **named** flow resumed through the engine path must record its checkpoints under the
+    /// SAME `flow_key` (name + body hash) the original run used. Run → suspend at `await` → persist
+    /// (name included) → take → resume named: the checkpoint reached *after* the await must
+    /// fast-forward a subsequent fresh run of the same named flow past the await entirely. Before
+    /// the fix the resume derived its key hash-only, so the fresh run only saw the pre-await
+    /// checkpoint and re-suspended at the await.
+    #[tokio::test]
+    async fn named_flow_resume_uses_the_same_checkpoint_key_as_the_run() {
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        let ast = DraftAst {
+            name: Some("wf".into()),
+            body: vec![
+                flow_bind("a", "echo", vec![flow_lit(json!("one"))]),
+                Node::Checkpoint { label: "p1".into() },
+                Node::Await {
+                    binding: Some(SymbolName("x".into())),
+                    source: "user_input".into(),
+                    as_type: None,
+                },
+                flow_bind("b", "echo", vec![flow_lit(json!("two"))]),
+                Node::Checkpoint { label: "p2".into() },
+                Node::Return {
+                    value: Box::new(flow_var("b")),
+                },
+            ],
+            ..Default::default()
+        };
+
+        // Run: checkpoint `p1` is recorded under the NAMED key; the flow suspends at the await.
+        let mut sink = CollectSink::default();
+        let out = execute_flow(&store, &ex, "sess", &ast, &mut sink)
+            .await
+            .unwrap();
+        let susp = out
+            .suspension
+            .expect("the named flow suspends at the await");
+
+        // Persist + take across the turn boundary, exactly as the engine does.
+        store
+            .save_suspension(
+                "sess",
+                ast.name.as_deref(),
+                &ast.body,
+                susp.node,
+                &susp.source,
+            )
+            .unwrap();
+        let (flow_name, body, node, _source) = store
+            .take_suspension("sess")
+            .unwrap()
+            .expect("a suspension");
+        assert_eq!(flow_name.as_deref(), Some("wf"));
+
+        // Resume named: runs the post-await suffix and records checkpoint `p2`.
+        let mut sink2 = CollectSink::default();
+        let resumed = resume_flow_with_composites(
+            &store,
+            &ex,
+            "sess",
+            flow_name.as_deref(),
+            &body,
+            node,
+            Value::String("go".into()),
+            &[],
+            &mut sink2,
+        )
+        .await
+        .unwrap();
+        assert!(resumed.suspension.is_none(), "the resume completes");
+
+        // A fresh run of the SAME named flow fast-forwards past `p2` — proof the resume recorded it
+        // under the run's own key. With mismatched keys it would only see `p1` and re-suspend.
+        let mut sink3 = CollectSink::default();
+        let rerun = execute_flow(&store, &ex, "sess", &ast, &mut sink3)
+            .await
+            .unwrap();
+        assert!(
+            rerun.suspension.is_none(),
+            "run and resume agree on the checkpoint key — the fresh run must not re-suspend at the await"
+        );
+        assert!(
+            sink3.calls.is_empty(),
+            "everything before the last checkpoint is fast-forwarded, nothing re-dispatches: {:?}",
+            sink3.calls
+        );
+        assert_eq!(rerun.result, "two", "the flow completes from the suffix");
+    }
+
+    /// L-21: an op the REAL executor's envelope denies (a permission-rule deny here — the same
+    /// canonical `` `{op}` denied by … `` shape policy/capability-scope/user denials use) is
+    /// classified `denied` at the flux-lang boundary and surfaces as the fatal `FlowError::Denied`:
+    /// `retry` must not re-attempt it. This also pins the executor's denial message contract that
+    /// `is_envelope_denial` matches on.
+    #[tokio::test]
+    async fn policy_denied_op_is_not_retried_inside_loop() {
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(false); // `echo` denied by permission rules
+        let ast = DraftAst {
+            body: vec![Node::Retry {
+                max: 3,
+                backoff: None,
+                delay_ms: Some(0),
+                body: vec![Node::Loop {
+                    for_ms: 10_000,
+                    every_ms: 0,
+                    until: None,
+                    body: vec![flow_bind("x", "echo", vec![flow_lit(json!("hi"))])],
+                    bind: None,
+                }],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let err = execute_flow(&store, &ex, "sess", &ast, &mut sink)
+            .await
+            .unwrap_err();
+        assert!(
+            err.is_fatal(),
+            "an envelope denial is fatal through loop+retry: {err}"
+        );
+        assert!(
+            err.to_string().contains("denied by permission rules"),
+            "the executor's denial message survives: {err}"
+        );
+        assert_eq!(
+            sink.calls,
+            vec!["echo"],
+            "the denied op was attempted exactly once — never retried"
+        );
     }
 
     #[test]

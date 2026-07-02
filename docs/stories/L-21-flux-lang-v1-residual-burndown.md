@@ -2,11 +2,11 @@
 id: L-21
 title: flux-lang v1 hardening — residual burn-down (resume key, denial fatality, analyzer gaps)
 pillar: Language
-status: ready
+status: done
 priority: 4
 epic: flux-lang-v1-hardening
 design: docs/designs/flux-lang-v1-hardening.md
-note: the four residuals the epic recorded at close — named-flow resume still checkpoints hash-only through the engine, policy denial is retryable because it's an in-band string, three eval_arg positions still accept calls, and type_check_body diagnostics lack node paths
+note: all four closed — suspensions persist flow_name (guarded migration) so named-flow resume checkpoints name+hash like the run; FlowError::Denied is fatal (host-marked via OpOutcome.denied, executor's canonical op-anchored denial shape pinned by test; hook denials stay retryable by design); each/jq/parse eval_arg positions reject calls; type diagnostics carry node paths
 ---
 
 # flux-lang v1 hardening — residual burn-down
@@ -36,7 +36,32 @@ Close the four residuals `docs/designs/flux-lang-v1-hardening.md` recorded at th
 - [ ] Gate green: `cargo test --workspace`, clippy `-D warnings`, fmt, `cargo test -p flux-codegate`.
 
 ## Progress
-- (not started — filed 2026-07-02 from the epic design's Residuals section.)
+- **Done (2026-07-02).** All four residuals closed with failing-first tests:
+  - **Named-flow resume key:** the suspensions table persists a nullable `flow_name` (guarded
+    `ALTER TABLE` migration for pre-existing stores); `save_suspension`/`take_suspension` carry
+    it, `resume_flow_with_composites` gained `name: Option<&str>`, and the engine's
+    `resume_suspended` threads the persisted name into `resume_flow_named` (re-saving on
+    re-suspension). Test proves a resumed named flow fast-forwards past the post-await checkpoint
+    with zero re-dispatches (empirically failed with `None` swapped in).
+  - **Denial fatality:** new `FlowError::Denied` (fatal). The host marks denials structurally —
+    `OpOutcome.denied` set only by the host; the flux-flow `ExecutorHost` classifies via the
+    executor's ONE canonical op-anchored denial shape (`` `{op}` denied by {authority} ``, all
+    four deny paths), pinned by a live-executor contract test — no substring matching on
+    arbitrary prose. A denied op inside `loop`/`retry` dispatches exactly once; `eval_cond`
+    propagates denial instead of reading `false` (a denied `until` guard no longer re-prompts
+    per iteration); `try/catch` still catches denials (L-17 semantics unchanged). **Hook denials
+    stay retryable by design** (arbitrary reason text, possibly transient).
+  - **Analyzer eval_arg positions:** `each` source / `jq` input / `parse` value now reject `call`
+    nodes (mirroring the runtime's accepted set lit/var/obj/list), with node paths and a
+    no-false-positive sibling test.
+  - **Type-diagnostic paths:** `type_check_body`/`check_call_types` thread the same path
+    accumulator as the structural pass (`body[1].then[0]`, `args[i]`, `branches[i]`, …).
+- **Cross-agent fallout (fixed by the orchestrator in this commit):** A-11's reply-parking landed
+  mid-flight calling the old `save_suspension`/`resume_flow_with_composites` arities —
+  flux-app's park now passes `None`/the persisted name (journeys execute their flow unnamed, so
+  run and resume agree on the hash-only key).
+- **Residual:** if flux-runtime ever grows a structured `denied` flag on `ToolResult`, replace
+  `is_envelope_denial` with it (strictly better marker; noted in code).
 
 ## Notes
 - `{{sym}}` definedness inside `Fmt` templates stays **out of scope** — the epic explicitly

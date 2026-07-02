@@ -351,10 +351,10 @@ pub fn lower(
         .iter()
         .map(|p| (p.name.0.clone(), p.ty.clone()))
         .collect();
-    let mut diags = Vec::new();
-    type_check_body(&ast.body, ops, &mut scope, &mut diags);
-    if !diags.is_empty() {
-        return Err(diags);
+    let mut d = Diags::default();
+    type_check_body(&ast.body, "body", ops, &mut scope, &mut d);
+    if !d.items.is_empty() {
+        return Err(d.items);
     }
     Ok(HirFlow {
         name: ast.name.clone(),
@@ -416,7 +416,7 @@ fn check_call_types(
     args: &[Node],
     ops: &dyn OpCatalog,
     scope: &HashMap<String, TypeRef>,
-    diags: &mut Vec<Diagnostic>,
+    d: &mut Diags,
 ) {
     let Some(sig) = ops.lookup(op) else {
         return;
@@ -428,21 +428,21 @@ fn check_call_types(
     if let [Node::Lit { value }] = args {
         if let Some(obj) = value.as_object() {
             for req in sig.required_params.iter().filter(|r| !obj.contains_key(*r)) {
-                diags.push(Diagnostic::new(format!(
+                d.add(format!(
                     "op `{op}` is missing required parameter `{req}` — add the key to the \
                      argument object"
-                )));
+                ));
             }
             if let Some(props_types) = Some(&sig.param_types).filter(|m| !m.is_empty()) {
                 for (name, val) in obj {
                     if let Some(ptype) = props_types.get(name) {
                         let atype = lit_type(val);
                         if types_conflict(&atype, ptype) {
-                            diags.push(Diagnostic::new(format!(
+                            d.add(format!(
                                 "op `{op}` parameter `{name}` expects {}, got {}",
                                 ptype.label(),
                                 atype.label()
-                            )));
+                            ));
                         }
                     }
                 }
@@ -459,10 +459,10 @@ fn check_call_types(
             .iter()
             .filter(|r| !fields.contains_key(*r))
         {
-            diags.push(Diagnostic::new(format!(
+            d.add(format!(
                 "op `{op}` is missing required parameter `{req}` — add the key to the \
                  argument object"
-            )));
+            ));
         }
         return;
     }
@@ -488,11 +488,11 @@ fn check_call_types(
                     if let Some(ptype) = sig.param_types.get(&pname) {
                         let atype = infer_type(&args[0], scope);
                         if types_conflict(&atype, ptype) {
-                            diags.push(Diagnostic::new(format!(
+                            d.add(format!(
                                 "op `{op}` parameter `{pname}` expects {}, got {}",
                                 ptype.label(),
                                 atype.label()
-                            )));
+                            ));
                         }
                     }
                 }
@@ -500,28 +500,33 @@ fn check_call_types(
             _ => {} // multi-bare: rejected upstream; nothing to type-check here.
         }
     }
-    for a in args {
+    for (i, a) in args.iter().enumerate() {
         if let Node::Call {
             op: inner,
             args: iargs,
         } = a
         {
-            check_call_types(inner, iargs, ops, scope, diags);
+            d.with(format!("args[{i}]"), |d| {
+                check_call_types(inner, iargs, ops, scope, d)
+            });
         }
     }
 }
 
 /// Ordered type-check walk: track each symbol's type (a `bind`/`memo`'s `ty` annotation, else `Any`)
 /// and check every `call`'s args. Control bodies are checked with a cloned scope (a branch-local bind
-/// doesn't leak out — conservative).
+/// doesn't leak out — conservative). Threads the same `label[i]` node path [`analyze_flow`]'s
+/// structural walk renders, so a type diagnostic carries the locator a repairing model can act on
+/// (L-21; previously these diagnostics were path-less while the structural ones weren't).
 fn type_check_body(
     body: &[Node],
+    label: &str,
     ops: &dyn OpCatalog,
     scope: &mut HashMap<String, TypeRef>,
-    diags: &mut Vec<Diagnostic>,
+    d: &mut Diags,
 ) {
-    for node in body {
-        match node {
+    for (i, node) in body.iter().enumerate() {
+        d.with(format!("{label}[{i}]"), |d| match node {
             Node::Bind {
                 name, value, ty, ..
             }
@@ -529,34 +534,36 @@ fn type_check_body(
                 name, value, ty, ..
             } => {
                 if let Node::Call { op, args } = value.as_ref() {
-                    check_call_types(op, args, ops, scope, diags);
+                    d.with("value", |d| check_call_types(op, args, ops, scope, d));
                 }
                 scope.insert(name.0.clone(), ty.clone().unwrap_or(TypeRef::Any));
             }
-            Node::Call { op, args } => check_call_types(op, args, ops, scope, diags),
+            Node::Call { op, args } => check_call_types(op, args, ops, scope, d),
             Node::Return { value } => {
                 if let Node::Call { op, args } = value.as_ref() {
-                    check_call_types(op, args, ops, scope, diags);
+                    d.with("value", |d| check_call_types(op, args, ops, scope, d));
                 }
             }
             Node::Pipe { steps, .. } => {
-                for s in steps {
+                for (j, s) in steps.iter().enumerate() {
                     if let Node::Call { op, args } = s {
-                        check_call_types(op, args, ops, scope, diags);
+                        d.with(format!("steps[{j}]"), |d| {
+                            check_call_types(op, args, ops, scope, d)
+                        });
                     }
                 }
             }
             Node::When {
                 then, otherwise, ..
             } => {
-                type_check_body(then, ops, &mut scope.clone(), diags);
-                type_check_body(otherwise, ops, &mut scope.clone(), diags);
+                type_check_body(then, "then", ops, &mut scope.clone(), d);
+                type_check_body(otherwise, "otherwise", ops, &mut scope.clone(), d);
             }
-            Node::Unless { body, .. } => type_check_body(body, ops, &mut scope.clone(), diags),
+            Node::Unless { body, .. } => type_check_body(body, "body", ops, &mut scope.clone(), d),
             Node::Each { item, body, .. } => {
                 let mut s = scope.clone();
                 s.insert(item.0.clone(), TypeRef::Any);
-                type_check_body(body, ops, &mut s, diags);
+                type_check_body(body, "body", ops, &mut s, d);
             }
             Node::Repeat { body, .. }
             | Node::Seq { body, .. }
@@ -564,42 +571,52 @@ fn type_check_body(
             | Node::Confirm { body, .. }
             | Node::Loop { body, .. }
             | Node::Throttle { body, .. }
-            | Node::Debounce { body, .. } => type_check_body(body, ops, &mut scope.clone(), diags),
+            | Node::Debounce { body, .. } => {
+                type_check_body(body, "body", ops, &mut scope.clone(), d)
+            }
             Node::Try { body, handler, .. } => {
-                type_check_body(body, ops, &mut scope.clone(), diags);
-                type_check_body(handler, ops, &mut scope.clone(), diags);
+                type_check_body(body, "body", ops, &mut scope.clone(), d);
+                type_check_body(handler, "handler", ops, &mut scope.clone(), d);
             }
             Node::Parallel { branches } | Node::Race { branches, .. } => {
-                for b in branches {
-                    type_check_body(&b.body, ops, &mut scope.clone(), diags);
+                for (j, b) in branches.iter().enumerate() {
+                    d.with(format!("branches[{j}]"), |d| {
+                        type_check_body(&b.body, "body", ops, &mut scope.clone(), d)
+                    });
                 }
             }
             Node::Timeout { body, .. } | Node::Budget { body, .. } => {
-                type_check_body(body, ops, &mut scope.clone(), diags)
+                type_check_body(body, "body", ops, &mut scope.clone(), d)
             }
             Node::Scope { body, finally, .. } => {
-                type_check_body(body, ops, &mut scope.clone(), diags);
-                type_check_body(finally, ops, &mut scope.clone(), diags);
+                type_check_body(body, "body", ops, &mut scope.clone(), d);
+                type_check_body(finally, "finally", ops, &mut scope.clone(), d);
             }
             Node::Saga { steps } => {
-                for step in steps {
-                    type_check_body(&step.body, ops, &mut scope.clone(), diags);
-                    type_check_body(&step.undo, ops, &mut scope.clone(), diags);
+                for (j, step) in steps.iter().enumerate() {
+                    d.with(format!("steps[{j}]"), |d| {
+                        type_check_body(&step.body, "body", ops, &mut scope.clone(), d);
+                        type_check_body(&step.undo, "undo", ops, &mut scope.clone(), d);
+                    });
                 }
             }
-            Node::Once { body, .. } => type_check_body(body, ops, &mut scope.clone(), diags),
+            Node::Once { body, .. } => type_check_body(body, "body", ops, &mut scope.clone(), d),
             Node::Fallback { branches, .. } => {
-                for b in branches {
-                    type_check_body(&b.body, ops, &mut scope.clone(), diags);
+                for (j, b) in branches.iter().enumerate() {
+                    d.with(format!("branches[{j}]"), |d| {
+                        type_check_body(&b.body, "body", ops, &mut scope.clone(), d)
+                    });
                 }
             }
             Node::Match { cases, default, .. } => {
                 // The subject is a literal/bound symbol (enforced by `check_node`), so there's no call
                 // to type-check here — only the case + default bodies.
-                for c in cases {
-                    type_check_body(&c.body, ops, &mut scope.clone(), diags);
+                for (j, c) in cases.iter().enumerate() {
+                    d.with(format!("cases[{j}]"), |d| {
+                        type_check_body(&c.body, "body", ops, &mut scope.clone(), d)
+                    });
                 }
-                type_check_body(default, ops, &mut scope.clone(), diags);
+                type_check_body(default, "default", ops, &mut scope.clone(), d);
             }
             Node::Route {
                 selector,
@@ -607,15 +624,17 @@ fn type_check_body(
                 default,
             } => {
                 if let Node::Call { op, args } = selector.as_ref() {
-                    check_call_types(op, args, ops, scope, diags);
+                    d.with("selector", |d| check_call_types(op, args, ops, scope, d));
                 }
-                for c in cases {
-                    type_check_body(&c.body, ops, &mut scope.clone(), diags);
+                for (j, c) in cases.iter().enumerate() {
+                    d.with(format!("cases[{j}]"), |d| {
+                        type_check_body(&c.body, "body", ops, &mut scope.clone(), d)
+                    });
                 }
-                type_check_body(default, ops, &mut scope.clone(), diags);
+                type_check_body(default, "default", ops, &mut scope.clone(), d);
             }
             _ => {}
-        }
+        });
     }
 }
 
@@ -920,6 +939,24 @@ fn check_cond_kind(cond: &Node, what: &str, d: &mut Diags) {
     }
 }
 
+/// Reject a node kind the runtime cannot resolve in an `eval_arg` position. Coupled to the
+/// runtime's `eval_arg` accepted set (runtime.rs, `fn eval_arg`): an `each` source, `jq` input, or
+/// `parse` value resolves WITHOUT dispatch and takes only `lit`, `var`, and the pure `obj`/`list`
+/// templates — anything else (notably a `call`) is a runtime error, so reject it at analysis first
+/// (L-21; the same F7 rule call arguments already get).
+fn check_eval_arg_position(node: &Node, what: &str, d: &mut Diags) {
+    if !matches!(
+        node,
+        Node::Lit { .. } | Node::Var { .. } | Node::Obj { .. } | Node::List { .. }
+    ) {
+        d.add(format!(
+            "`{}` is not a valid {what} — the runtime accepts only `lit`, `var` ($symbol), and \
+             `obj`/`list` templates here; bind it to a symbol first (`$x = …`), then use `$x`",
+            node_kind_label(node)
+        ));
+    }
+}
+
 /// Walk a child statement body, extending the node path with `label[i]` per statement.
 fn check_body(
     body: &[Node],
@@ -1076,7 +1113,10 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, bound: &HashSet<String>, d: &mut
                      put the per-item op(s) in `body`",
                 );
             }
-            d.with("in", |d| check_node(source, ops, bound, d));
+            d.with("in", |d| {
+                check_eval_arg_position(source, "`each` source", d);
+                check_node(source, ops, bound, d)
+            });
             check_body(body, "body", ops, bound, d);
         }
         Node::Assert { cond, .. } => {
@@ -1235,7 +1275,10 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, bound: &HashSet<String>, d: &mut
             }
         }
         Node::Fmt { .. } => {}
-        Node::Jq { input, .. } => d.with("input", |d| check_node(input, ops, bound, d)),
+        Node::Jq { input, .. } => d.with("input", |d| {
+            check_eval_arg_position(input, "`jq` input", d);
+            check_node(input, ops, bound, d)
+        }),
         Node::Parse { value, as_type } => {
             const VALID: &[&str] = &["f64", "i64", "bool", "json", "string"];
             if !VALID.contains(&as_type.as_str()) {
@@ -1243,7 +1286,10 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, bound: &HashSet<String>, d: &mut
                     "`parse` as_type must be one of f64/i64/bool/json/string, got `{as_type}`"
                 ));
             }
-            d.with("value", |d| check_node(value, ops, bound, d));
+            d.with("value", |d| {
+                check_eval_arg_position(value, "`parse` value", d);
+                check_node(value, ops, bound, d)
+            });
         }
         Node::Ctx { name, budget, .. } => {
             check_decl_name(name, "`ctx`", d);
@@ -2022,6 +2068,45 @@ mod tests {
         let _ = TypeRef::Number;
     }
 
+    /// L-21: `type_check_body` diagnostics carry the same JSON-pointer node paths the structural
+    /// pass renders (`body[1].then[0]`), so a repairing model can locate the mistyped call — they
+    /// were previously path-less while `analyze_flow`'s carried paths (L-16/F11).
+    #[test]
+    fn type_diagnostics_carry_node_paths() {
+        use crate::ast::Node;
+        let ast = DraftAst {
+            body: vec![
+                Node::Call {
+                    op: "dbl".into(),
+                    args: vec![Node::Lit {
+                        value: serde_json::json!(1),
+                    }],
+                },
+                Node::When {
+                    cond: Box::new(Node::Lit {
+                        value: serde_json::json!(true),
+                    }),
+                    then: vec![Node::Call {
+                        op: "dbl".into(),
+                        args: vec![Node::Lit {
+                            value: serde_json::json!("hello"),
+                        }],
+                    }],
+                    otherwise: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+        let err = lower(&ast, &TypeCat, &HashSet::new()).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("expects Number")
+                    && d.message.contains("body[1].then[0]")),
+            "expected the type diagnostic to carry its node path, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn known_op_passes_and_unknown_op_fails() {
         let ops = catalog();
@@ -2559,6 +2644,177 @@ mod tests {
                     && d.message.contains("bind it to a symbol first")),
             "expected an invalid-argument-position diagnostic, got: {:?}",
             err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    // ---- L-21: the remaining `eval_arg` positions (each source / jq input / parse value) ----
+
+    /// A `call` as an `each` source is a diagnostic — the runtime resolves the source through
+    /// `eval_arg` (no dispatch), so it would fail at runtime with "unsupported call argument".
+    #[test]
+    fn call_in_each_source_is_a_diagnostic() {
+        let ops = catalog();
+        let ast = DraftAst {
+            body: vec![Node::Each {
+                source: Box::new(Node::Call {
+                    op: "read".into(),
+                    args: vec![Node::Lit {
+                        value: serde_json::json!("f"),
+                    }],
+                }),
+                item: "x".into(),
+                body: vec![Node::Call {
+                    op: "read".into(),
+                    args: vec![Node::Var { name: "x".into() }],
+                }],
+                collect: None,
+                flat: false,
+            }],
+            ..Default::default()
+        };
+        let err = analyze_flow(&ast, &ops, &HashSet::new()).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("not a valid `each` source")
+                    && d.message.contains("bind it to a symbol first")
+                    && d.message.contains("body[0].in")),
+            "expected an invalid each-source diagnostic with its node path, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A `call` as a `jq` input is a diagnostic (same `eval_arg` rule).
+    #[test]
+    fn call_in_jq_input_is_a_diagnostic() {
+        let ops = catalog();
+        let ast = DraftAst {
+            body: vec![Node::Bind {
+                name: "k".into(),
+                value: Box::new(Node::Jq {
+                    path: ".kind".into(),
+                    input: Box::new(Node::Call {
+                        op: "read".into(),
+                        args: vec![Node::Lit {
+                            value: serde_json::json!("f"),
+                        }],
+                    }),
+                }),
+                ty: None,
+                effect: None,
+            }],
+            ..Default::default()
+        };
+        let err = analyze_flow(&ast, &ops, &HashSet::new()).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("not a valid `jq` input")),
+            "expected an invalid jq-input diagnostic, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A `call` as a `parse` value is a diagnostic (same `eval_arg` rule).
+    #[test]
+    fn call_in_parse_value_is_a_diagnostic() {
+        let ops = catalog();
+        let ast = DraftAst {
+            body: vec![Node::Bind {
+                name: "n".into(),
+                value: Box::new(Node::Parse {
+                    value: Box::new(Node::Call {
+                        op: "read".into(),
+                        args: vec![Node::Lit {
+                            value: serde_json::json!("f"),
+                        }],
+                    }),
+                    as_type: "i64".into(),
+                }),
+                ty: None,
+                effect: None,
+            }],
+            ..Default::default()
+        };
+        let err = analyze_flow(&ast, &ops, &HashSet::new()).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("not a valid `parse` value")),
+            "expected an invalid parse-value diagnostic, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// No false positives: the node kinds the runtime's `eval_arg` DOES accept in those positions —
+    /// `var`, `lit`, and the pure `obj`/`list` templates — analyze clean.
+    #[test]
+    fn valid_non_call_expressions_in_eval_arg_positions_pass() {
+        let ops = catalog();
+        let bind_lit = |name: &str, v: serde_json::Value| Node::Bind {
+            name: name.into(),
+            value: Box::new(Node::Lit { value: v }),
+            ty: None,
+            effect: None,
+        };
+        let ast = DraftAst {
+            body: vec![
+                bind_lit("items", serde_json::json!(["a", "b"])),
+                bind_lit("raw", serde_json::json!({"kind": "chat"})),
+                // each over a bound symbol and over a list template
+                Node::Each {
+                    source: Box::new(Node::Var {
+                        name: "items".into(),
+                    }),
+                    item: "x".into(),
+                    body: vec![Node::Call {
+                        op: "read".into(),
+                        args: vec![Node::Var { name: "x".into() }],
+                    }],
+                    collect: None,
+                    flat: false,
+                },
+                Node::Each {
+                    source: Box::new(Node::List {
+                        items: vec![Node::Var {
+                            name: "items".into(),
+                        }],
+                    }),
+                    item: "y".into(),
+                    body: vec![Node::Call {
+                        op: "read".into(),
+                        args: vec![Node::Var { name: "y".into() }],
+                    }],
+                    collect: None,
+                    flat: false,
+                },
+                // jq over a var, parse over a lit
+                Node::Bind {
+                    name: "k".into(),
+                    value: Box::new(Node::Jq {
+                        path: ".kind".into(),
+                        input: Box::new(Node::Var { name: "raw".into() }),
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+                Node::Bind {
+                    name: "n".into(),
+                    value: Box::new(Node::Parse {
+                        value: Box::new(Node::Lit {
+                            value: serde_json::json!("42"),
+                        }),
+                        as_type: "i64".into(),
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(
+            analyze_flow(&ast, &ops, &HashSet::new()).is_ok(),
+            "valid eval_arg-position expressions must not be flagged: {:?}",
+            analyze_flow(&ast, &ops, &HashSet::new())
+                .err()
+                .map(|ds| ds.iter().map(|d| d.message.clone()).collect::<Vec<_>>())
         );
     }
 

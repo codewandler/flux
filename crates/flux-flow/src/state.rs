@@ -199,6 +199,7 @@ impl FlowStore {
              );
              CREATE TABLE IF NOT EXISTS suspensions (
                  session_id TEXT PRIMARY KEY,
+                 flow_name  TEXT,
                  body       TEXT NOT NULL,
                  node       INTEGER NOT NULL,
                  source     TEXT NOT NULL,
@@ -213,6 +214,11 @@ impl FlowStore {
              );",
         )
         .map_err(map_sql)?;
+        // Migration (L-21): pre-existing stores created the `suspensions` table without the
+        // `flow_name` column (a named flow's resume then derived its checkpoint key hash-only).
+        // `ALTER TABLE ADD COLUMN` errors when the column already exists — that error is the
+        // "already migrated" signal, so it is deliberately ignored.
+        let _ = conn.execute("ALTER TABLE suspensions ADD COLUMN flow_name TEXT", []);
         Ok(Self {
             conn: Mutex::new(conn),
             events,
@@ -377,12 +383,16 @@ impl FlowStore {
         Ok(out)
     }
 
-    /// Persist a flow suspended on a top-level `await`: its body, the suspended node index, and the
-    /// awaited input `source`. One pending suspension per session — a new one replaces any prior.
-    /// Resumed (and cleared) by [`take_suspension`] when the awaited input arrives next turn.
+    /// Persist a flow suspended on a top-level `await`: the flow's declared name (if any), its body,
+    /// the suspended node index, and the awaited input `source`. One pending suspension per session —
+    /// a new one replaces any prior. Resumed (and cleared) by [`take_suspension`] when the awaited
+    /// input arrives next turn. The name is part of the resume point on purpose: a *named* flow's
+    /// checkpoint `flow_key` is name + body hash, so the resume must carry the name to record/read
+    /// checkpoints under the same key the original run used (L-21).
     pub fn save_suspension(
         &self,
         session_id: &str,
+        flow_name: Option<&str>,
         body: &[Node],
         node: NodeId,
         source: &str,
@@ -390,31 +400,37 @@ impl FlowStore {
         let body_json = serde_json::to_string(body)?;
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO suspensions (session_id, body, node, source, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![session_id, body_json, node.0, source, now_ms()],
+            "INSERT OR REPLACE INTO suspensions (session_id, flow_name, body, node, source, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![session_id, flow_name, body_json, node.0, source, now_ms()],
         )
         .map_err(map_sql)?;
         Ok(())
     }
 
     /// Take (load **and** remove) a session's pending suspension, if any — a one-shot resume point.
-    /// Returns the persisted flow body, the suspended `await` node, and the awaited source.
-    pub fn take_suspension(&self, session_id: &str) -> Result<Option<(Vec<Node>, NodeId, String)>> {
+    /// Returns the persisted flow name (if the suspended flow was named), body, the suspended
+    /// `await` node, and the awaited source.
+    #[allow(clippy::type_complexity)]
+    pub fn take_suspension(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(Option<String>, Vec<Node>, NodeId, String)>> {
         let conn = self.conn.lock().unwrap();
         let row = conn.query_row(
-            "SELECT body, node, source FROM suspensions WHERE session_id = ?1",
+            "SELECT flow_name, body, node, source FROM suspensions WHERE session_id = ?1",
             [session_id],
             |r| {
                 Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
                 ))
             },
         );
         match row {
-            Ok((body_json, node, source)) => {
+            Ok((flow_name, body_json, node, source)) => {
                 // One-shot: clear the row regardless. A body that no longer deserializes (e.g. AST
                 // schema drift across an upgrade) is discarded and reported as "no suspension" so the
                 // turn recovers with a fresh compile rather than hard-erroring on every future turn.
@@ -424,7 +440,7 @@ impl FlowStore {
                 )
                 .map_err(map_sql)?;
                 match serde_json::from_str::<Vec<Node>>(&body_json) {
-                    Ok(body) => Ok(Some((body, NodeId(node as u32), source))),
+                    Ok(body) => Ok(Some((flow_name, body, NodeId(node as u32), source))),
                     Err(_) => Ok(None),
                 }
             }
@@ -499,16 +515,24 @@ mod tests {
             "none initially"
         );
 
-        s.save_suspension("sess", &body, NodeId(3), "user_input")
+        s.save_suspension("sess", None, &body, NodeId(3), "user_input")
             .unwrap();
-        // A second save replaces the first (one pending suspension per session).
-        s.save_suspension("sess", &body, NodeId(5), "other")
+        // A second save replaces the first (one pending suspension per session) — and the flow's
+        // declared name round-trips with the resume point (L-21: the resume needs it to derive the
+        // same checkpoint `flow_key` the run used).
+        s.save_suspension("sess", Some("wf"), &body, NodeId(5), "other")
             .unwrap();
 
-        let (got_body, node, source) = s.take_suspension("sess").unwrap().expect("a suspension");
+        let (flow_name, got_body, node, source) =
+            s.take_suspension("sess").unwrap().expect("a suspension");
         assert_eq!(node, NodeId(5), "latest save wins");
         assert_eq!(source, "other");
         assert_eq!(got_body, body);
+        assert_eq!(
+            flow_name.as_deref(),
+            Some("wf"),
+            "the flow name is part of the resume point"
+        );
         // Taking is one-shot — it's cleared.
         assert!(s.take_suspension("sess").unwrap().is_none(), "consumed");
     }

@@ -20,6 +20,13 @@ pub struct OpOutcome {
     /// `content`. Surfaced to the sink, never bound or interpolated.
     pub view: Option<String>,
     pub is_error: bool,
+    /// True when the host's safety envelope **refused to run** the op (a policy / permission-rule /
+    /// capability-scope / user-approval denial) rather than the op running and failing. The
+    /// interpreter surfaces a denied outcome as the fatal
+    /// [`FlowError::Denied`](crate::error::FlowError) so `retry`/`loop`/composite wrappers never
+    /// re-attempt it (L-21). Only the host can set this — it is the layer that shaped the denial —
+    /// so the interpreter never guesses from message prose.
+    pub denied: bool,
 }
 
 impl OpOutcome {
@@ -29,6 +36,7 @@ impl OpOutcome {
             content: content.into(),
             view: None,
             is_error: false,
+            denied: false,
         }
     }
 
@@ -38,6 +46,19 @@ impl OpOutcome {
             content: content.into(),
             view: None,
             is_error: true,
+            denied: false,
+        }
+    }
+
+    /// A **denial** outcome: the envelope refused to run the op (the message is the content).
+    /// Distinct from [`error`](Self::error) — a denial is fatal to the enclosing flow's reliability
+    /// wrappers ([`denied`](Self::denied)).
+    pub fn denial(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            view: None,
+            is_error: true,
+            denied: true,
         }
     }
 

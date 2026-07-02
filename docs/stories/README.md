@@ -32,10 +32,6 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 _flux's plugins each talk to a single, statically-configured service. The fluxplane pack they were_
 - [D-31 — Host-terminated raw-socket auth (no credential to the plugin)](D-31-host-terminated-rawsocket-auth.md) · Core · the last open story of the endpoint epic (D-25..D-30, D-32 done) — host speaks the Postgres startup/SCRAM handshake and hands sql a post-auth connection; big and protocol-specific, sequenced last and run alone (touches the same sql/flux-plugin files D-32 reworked)
 
-### flux-lang v1 hardening — close the review findings, ship an honest v1
-_A full review of flux-lang (2026-07-02: three scoped deep-dives — runtime, analyzer/optimizer,_
-- [L-21 — flux-lang v1 hardening — residual burn-down (resume key, denial fatality, analyzer gaps)](L-21-flux-lang-v1-residual-burndown.md) · Language · the four residuals the epic recorded at close — named-flow resume still checkpoints hash-only through the engine, policy denial is retryable because it's an in-band string, three eval_arg positions still accept calls, and type_check_body diagnostics lack node paths
-
 ### Plugin Platform Hardening
 - [D-21 — Plugin distribution for non-source users (scoping)](D-21-plugin-distribution.md) · Core · scoping/epic-seed: how a non-repo user obtains the pack (bundled binaries / fetch-on-install / marketplace); produces a design + the follow-on stories, no code
 
@@ -141,6 +137,7 @@ _None._
 - [L-17 — Runtime semantics hardening — fatality, eval-path unification, concurrency audit, real throttle/debounce](L-17-runtime-semantics-hardening.md) · Language · statement-position jq diverges from bind-position; a denied confirm inside loop/composite IS retried; parallel/race drop completed-branch audit; checkpoint run/resume keys disagree; throttle counts entries not dispatches; debounce is a sleep stub
 - [L-18 — Round-trip totality + parse-error line numbers](L-18-roundtrip-totality-parser-locators.md) · Language · parse(format(ast))==ast is claimed "for every DraftAst" but empirically false — Var{"a.b"} in expression position silently reparses as jq; space names fail loudly; no property test; parse errors carry no line numbers
 - [L-19 — flux-lang spec/docs truth pass + render/skill drift guards](L-19-flux-lang-docs-truth-pass.md) · Language · syntax.md documents """ strings, named-arg comma calls, multi-line call args and watch/block that the parser cannot parse; reference.md promises race/throttle/debounce semantics the runtime doesn't deliver; emission-ab.md says "not built" for a shipped arm; render hides obj/list template args from plan approval
+- [L-21 — flux-lang v1 hardening — residual burn-down (resume key, denial fatality, analyzer gaps)](L-21-flux-lang-v1-residual-burndown.md) · Language · all four closed — suspensions persist flow_name (guarded migration) so named-flow resume checkpoints name+hash like the run; FlowError::Denied is fatal (host-marked via OpOutcome.denied, executor's canonical op-anchored denial shape pinned by test; hook denials stay retryable by design); each/jq/parse eval_arg positions reject calls; type diagnostics carry node paths
 
 _See [CHANGELOG.md](../../CHANGELOG.md) for the full released history._
 <!-- END track:board -->

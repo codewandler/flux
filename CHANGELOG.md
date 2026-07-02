@@ -25,6 +25,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **flux-lang v1 residual burn-down (L-21).** The four residuals the hardening epic recorded at
+  close are gone: (1) suspensions persist the flow name (guarded migration), so a *named* flow
+  resumed through the engine derives the same name+hash checkpoint key as its run — edited flows
+  no longer fast-forward wrongly on the resume path either; (2) a policy/permission/scope/user
+  denial is now structurally marked (`OpOutcome.denied` set by the host, the executor's canonical
+  op-anchored denial shape pinned by a contract test) and surfaces as the fatal
+  `FlowError::Denied` — a denied op inside `loop`/`retry` dispatches exactly once, and a denied
+  condition op propagates instead of reading `false` (hook denials deliberately stay retryable);
+  (3) `each` source / `jq` input / `parse` value reject `call` nodes at analysis time like the
+  runtime does at eval time; (4) type-checker diagnostics carry the same JSON-pointer node paths
+  as structural ones.
+
 - **A2A task sessions now expire — TTL-scoped retention (C-18).** Every A2A request minted a
   session that lived in `events.db` forever. A2A sessions are now created tagged (D-02 envelope:
   `agent_id "a2a"`, the request's `contextId` as `correlation_id`) and a lazy sweep at each mint

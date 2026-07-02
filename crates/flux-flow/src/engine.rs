@@ -165,9 +165,9 @@ impl FlowEngine {
     ) -> Result<()> {
         // If a flow is suspended on a top-level `await`, THIS turn's message is the awaited input:
         // resume the persisted flow instead of compiling a fresh plan. (`take_suspension` clears it.)
-        if let Some((body, node, _source)) = self.flow.take_suspension(session_id)? {
+        if let Some((flow_name, body, node, _source)) = self.flow.take_suspension(session_id)? {
             return self
-                .resume_suspended(session_id, user_input, body, node, sink)
+                .resume_suspended(session_id, user_input, flow_name, body, node, sink)
                 .await;
         }
 
@@ -680,6 +680,7 @@ impl FlowEngine {
         &self,
         session_id: &str,
         user_input: &str,
+        flow_name: Option<String>,
         body: Vec<flux_lang::ast::Node>,
         node: flux_lang::ast::NodeId,
         sink: &mut dyn AgentSink,
@@ -690,10 +691,13 @@ impl FlowEngine {
         self.composites
             .ensure_session_loaded(&self.flow, session_id)?;
         let composites = self.composites.active_for_session(session_id);
+        // The persisted flow name rides along so a NAMED flow's resumed run derives the same
+        // checkpoint `flow_key` (name + body hash) its original run recorded under (L-21).
         let outcome = match resume_flow_with_composites(
             &self.flow,
             &self.executor,
             session_id,
+            flow_name.as_deref(),
             &body,
             node,
             input,
@@ -710,10 +714,16 @@ impl FlowEngine {
             }
         };
 
-        // Suspended again on a later `await`: persist the new resume point and wait for more input.
+        // Suspended again on a later `await`: persist the new resume point (name included) and wait
+        // for more input.
         if let Some(susp) = &outcome.suspension {
-            self.flow
-                .save_suspension(session_id, &body, susp.node, &susp.source)?;
+            self.flow.save_suspension(
+                session_id,
+                flow_name.as_deref(),
+                &body,
+                susp.node,
+                &susp.source,
+            )?;
             let hint = "(awaiting your input — reply to continue the flow)";
             sink.text_delta(hint);
             return self.finish_turn(session_id, -1, sink, hint, false, None);

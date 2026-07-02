@@ -517,7 +517,9 @@ impl Engine {
             return Ok(None);
         };
         store
-            .save_suspension(session_id, body, susp.node, &susp.source)
+            // Journeys execute their flow unnamed (see `run_journey`), so the park persists no
+            // flow name — run and resume must derive the same (hash-only) checkpoint key.
+            .save_suspension(session_id, None, body, susp.node, &susp.source)
             .map_err(other)?;
         let steps = prior_steps + outcome.steps;
         self.parks.lock().expect("parks poisoned").push(ParkedAsk {
@@ -575,7 +577,9 @@ impl Engine {
             steps: prior_steps,
             ..
         } = park;
-        let Some((body, node, _source)) = store.take_suspension(&session_id).map_err(other)? else {
+        let Some((flow_name, body, node, _source)) =
+            store.take_suspension(&session_id).map_err(other)?
+        else {
             return Err(Error::Other(format!(
                 "parked ask for journey `{journey}` has no persisted suspension"
             )));
@@ -609,6 +613,7 @@ impl Engine {
                 &store,
                 &executor,
                 &session_id,
+                flow_name.as_deref(),
                 &body,
                 node,
                 input,
