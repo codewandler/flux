@@ -1230,6 +1230,7 @@ dependencies = [
  "async-trait",
  "axum",
  "flux-a2a",
+ "flux-config",
  "flux-core",
  "flux-credentials",
  "flux-events",

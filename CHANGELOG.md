@@ -25,6 +25,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **A2A task sessions now expire — TTL-scoped retention (C-18).** Every A2A request minted a
+  session that lived in `events.db` forever. A2A sessions are now created tagged (D-02 envelope:
+  `agent_id "a2a"`, the request's `contextId` as `correlation_id`) and a lazy sweep at each mint
+  deletes whole expired A2A streams — age measured from last activity, TTL from
+  `[server] a2a_session_ttl_secs` (default 3600, `0` = never prune, project-over-user merge).
+  Deletion is stream-scoped (`EventStore::prune_inactive`, one txn) — append-only holds *within*
+  a stream; retention is a stream-level decision, same as the existing `prune_empty`. CLI/TUI and
+  other untagged sessions are never touched, and the sweep covers both the standalone server and
+  the flux-channels `a2a` mount with no caller changes.
+
 - **`ask` now really waits — journey reply-parking on the suspension seam (A-11).** flux-app's
   `ask { channel, message }` was documented as expecting a reply but behaved like `send` (the
   reply was never awaited). A top-level `$reply = ask(...)` in a journey is now lowered at run

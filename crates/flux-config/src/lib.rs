@@ -123,6 +123,28 @@ pub struct Config {
     /// Resource ceilings for the agent loop (A-10). All off by default.
     #[serde(default, skip_serializing_if = "Limits::is_default")]
     pub limits: Limits,
+    /// Knobs for the HTTP/A2A server surface (`flux-server`).
+    #[serde(default, skip_serializing_if = "ServerConfig::is_default")]
+    pub server: ServerConfig,
+}
+
+/// The default A2A session TTL (seconds) when `[server] a2a_session_ttl_secs` is absent: 1 hour.
+pub const DEFAULT_A2A_SESSION_TTL_SECS: u64 = 3600;
+
+/// The `[server]` table — settings for the HTTP/A2A surface.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ServerConfig {
+    /// TTL in seconds for sessions minted by the A2A surface (C-18). Absent means the default
+    /// [`DEFAULT_A2A_SESSION_TTL_SECS`] (1h); `0` means never prune. Age is measured from a
+    /// session's last activity, not its creation — see [`Config::a2a_session_ttl_secs`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a2a_session_ttl_secs: Option<u64>,
+}
+
+impl ServerConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Resource ceilings for the agent loop. Everything here is opt-in — absent means no ceiling.
@@ -190,6 +212,14 @@ impl Config {
             .iter()
             .any(|g| g == &format!("{consumer}:{provider}") || g == &format!("{consumer}:*"))
     }
+
+    /// The effective A2A session TTL in seconds: `[server] a2a_session_ttl_secs`, defaulting to
+    /// [`DEFAULT_A2A_SESSION_TTL_SECS`] (1h). `0` disables pruning entirely (C-18).
+    pub fn a2a_session_ttl_secs(&self) -> u64 {
+        self.server
+            .a2a_session_ttl_secs
+            .unwrap_or(DEFAULT_A2A_SESSION_TTL_SECS)
+    }
 }
 
 fn home_config_path() -> Option<PathBuf> {
@@ -251,6 +281,14 @@ fn merge(user: Config, project: Config) -> Config {
                 .limits
                 .turn_token_budget
                 .or(user.limits.turn_token_budget),
+        },
+        server: ServerConfig {
+            // Same scalar rule: a project TTL (including an explicit 0 = "never prune")
+            // overrides the user's.
+            a2a_session_ttl_secs: project
+                .server
+                .a2a_session_ttl_secs
+                .or(user.server.a2a_session_ttl_secs),
         },
     }
 }
@@ -672,6 +710,37 @@ gitlab = ["gitlab.internal"]
         assert!(cfg
             .endpoint_private_hosts("prometheus", "metrics.endpoint")
             .is_empty());
+
+        std::fs::remove_dir_all(&project).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn a2a_session_ttl_defaults_and_merges_project_over_user() {
+        // Absent everywhere → the built-in 1h default.
+        assert_eq!(Config::default().a2a_session_ttl_secs(), 3600);
+        assert_eq!(DEFAULT_A2A_SESSION_TTL_SECS, 3600);
+
+        let project = temp_dir();
+        let home = temp_dir();
+        let _home = crate::HOME_LOCK.lock().unwrap();
+        std::env::set_var("HOME", &home);
+        std::fs::write(
+            home.join(".flux").join("config.toml"),
+            "[server]\na2a_session_ttl_secs = 120\n",
+        )
+        .unwrap();
+
+        // User-only: the user value beats the default.
+        let cfg = load(&project).unwrap();
+        assert_eq!(cfg.a2a_session_ttl_secs(), 120);
+
+        // Project sets the disable value 0: it overrides the user's 120 (an explicit 0 is a
+        // real setting, not "absent" — `Some(0)` must survive the merge).
+        write_project(&project, "[server]\na2a_session_ttl_secs = 0\n");
+        let cfg = load(&project).unwrap();
+        assert_eq!(cfg.server.a2a_session_ttl_secs, Some(0));
+        assert_eq!(cfg.a2a_session_ttl_secs(), 0, "0 = never prune");
 
         std::fs::remove_dir_all(&project).ok();
         std::fs::remove_dir_all(&home).ok();

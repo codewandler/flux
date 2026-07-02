@@ -385,6 +385,51 @@ impl EventStore {
         Ok(empty.len())
     }
 
+    /// Delete sessions tagged with `agent_id` whose last activity (`updated_at`) is strictly
+    /// older than `cutoff_ms`, along with their whole event streams. Returns the number of
+    /// sessions removed. This is the TTL retention primitive for machine-minted surface sessions
+    /// (C-18: the A2A surface tags each task session `agent_id = "a2a"` and sweeps by tag + age).
+    ///
+    /// Design notes:
+    /// - **Real `DELETE`, not a tombstone.** The store is append-only *within* a stream — no event
+    ///   is ever rewritten — but removing a *whole expired stream* is a retention decision, not a
+    ///   history rewrite (the same reasoning as [`prune_empty`](Self::prune_empty)). A tombstone
+    ///   would keep the rows forever and force every all-streams projection (`cost_summary_all`,
+    ///   `efficiency_all`, `list`) to learn a skip rule; deleting the stream keeps them consistent
+    ///   by construction — they enumerate `streams`, so a removed session simply contributes
+    ///   nothing — and actually reclaims the space a TTL exists to bound. The trade-off: a pruned
+    ///   session's token spend leaves the aggregate rollups, so a deployment that must retain
+    ///   spend indefinitely should disable pruning (TTL 0) or snapshot its usage upstream first.
+    /// - **Tag-scoped.** Only streams whose registry `agent_id` equals `agent_id` are eligible;
+    ///   an untagged (CLI/TUI) session is untouchable here regardless of age.
+    /// - **Age = last activity.** `updated_at` advances on every append, so a recently-active
+    ///   stream survives even when it was created long before the cutoff.
+    pub fn prune_inactive(&self, agent_id: &str, cutoff_ms: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction().map_err(map_sql)?;
+        let expired: Vec<i64> = {
+            let mut stmt = tx
+                .prepare("SELECT n FROM streams WHERE agent_id = ?1 AND updated_at < ?2")
+                .map_err(map_sql)?;
+            let rows = stmt
+                .query_map(rusqlite::params![agent_id, cutoff_ms], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .map_err(map_sql)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(map_sql)?
+        };
+        for n in &expired {
+            let stream = format!("s_{n}");
+            tx.execute("DELETE FROM events WHERE stream = ?1", [&stream])
+                .map_err(map_sql)?;
+            tx.execute("DELETE FROM streams WHERE n = ?1", [n])
+                .map_err(map_sql)?;
+        }
+        tx.commit().map_err(map_sql)?;
+        Ok(expired.len())
+    }
+
     // --- append -------------------------------------------------------------
 
     /// Append one event, assigning its `stream_seq` / `global_seq` / `ts` and updating the
@@ -1154,6 +1199,89 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, a);
         assert_eq!(store.latest_session().unwrap(), Some(a));
+    }
+
+    #[test]
+    fn prune_inactive_deletes_only_expired_streams_with_the_tag() {
+        let store = EventStore::in_memory().unwrap();
+        let a2a = EventContext {
+            agent_id: Some("a2a".into()),
+            ..Default::default()
+        };
+
+        // An a2a-tagged session with recorded spend — will expire.
+        let old = store.create_session_with_context("m", &a2a).unwrap();
+        let t = store.begin_turn(&old, "hi", "claude-sonnet-4-6").unwrap();
+        store
+            .record_call_usage(
+                &old,
+                t,
+                "claude-sonnet-4-6",
+                Usage {
+                    input_tokens: 7,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .end_turn(&old, t, "accepted", 1, "done", None)
+            .unwrap();
+        // An untagged (CLI) session just as old — never eligible, whatever its age.
+        let cli = store.create_session("m").unwrap();
+        let tc = store.begin_turn(&cli, "hi", "other-model").unwrap();
+        store
+            .record_call_usage(
+                &cli,
+                tc,
+                "other-model",
+                Usage {
+                    input_tokens: 3,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .end_turn(&cli, tc, "accepted", 1, "done", None)
+            .unwrap();
+        // A session tagged by a DIFFERENT agent — not eligible for the "a2a" sweep.
+        let other = store
+            .create_session_with_context(
+                "m",
+                &EventContext {
+                    agent_id: Some("subagent:scout".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let cutoff = now_ms(); // everything above is now strictly older than this
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        // A fresh a2a session minted after the cutoff — tagged, but not expired.
+        let fresh = store.create_session_with_context("m", &a2a).unwrap();
+
+        assert_eq!(store.prune_inactive("a2a", cutoff).unwrap(), 1);
+        assert!(store.info(&old).is_err(), "expired a2a stream is gone");
+        assert!(
+            store.load_stream(&old, None).unwrap().is_empty(),
+            "its whole event stream is gone too (no partial streams)"
+        );
+        assert!(store.info(&cli).is_ok(), "untagged session survives");
+        assert!(store.info(&other).is_ok(), "other agent's tag survives");
+        assert!(store.info(&fresh).is_ok(), "recent a2a session survives");
+        assert_eq!(store.all_streams().unwrap().len(), 3);
+
+        // The all-streams projections stay consistent after the delete: they enumerate
+        // `streams`, so the pruned session simply no longer contributes.
+        let pricing = flux_core::PricingTable::builtin();
+        let costs = store.cost_summary_all(&pricing).unwrap();
+        assert_eq!(costs.len(), 1, "only the surviving session's model remains");
+        assert_eq!(costs[0].usage.input_tokens, 3);
+        let eff = store.efficiency_all().unwrap().expect("cli's turn remains");
+        assert_eq!(eff.turns, 1, "the pruned session's turn no longer folds in");
+
+        // A second sweep at the same cutoff is a no-op (idempotent).
+        assert_eq!(store.prune_inactive("a2a", cutoff).unwrap(), 0);
     }
 
     #[test]

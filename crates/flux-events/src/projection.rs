@@ -1007,9 +1007,9 @@ mod tests {
         assert_eq!(gpt.calls, 1);
         assert_eq!(gpt.usage.input_tokens, 1_000_000);
         assert_eq!(gpt.usage.output_tokens, 1_000_000);
-        // cost = 1·1.25 + 1·10 = 11.25
+        // cost = 1·5 + 1·30 = 35 (builtin gpt-5.5 rates, corrected in C-20)
         let gpt_cost = gpt.cost.expect("gpt-5.5 is a priced model");
-        assert!((gpt_cost.usd - 11.25).abs() < 1e-9, "got {}", gpt_cost.usd);
+        assert!((gpt_cost.usd - 35.0).abs() < 1e-9, "got {}", gpt_cost.usd);
     }
 
     /// Old logs recorded before per-call attribution existed carry no `CallUsage` events at all —

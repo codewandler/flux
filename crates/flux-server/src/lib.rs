@@ -37,6 +37,11 @@ use flux_flow::AgentSink;
 type Shared = Arc<FlowEngine>;
 pub(crate) type TurnGate = Arc<tokio::sync::Mutex<()>>;
 
+/// The A2A session TTL in seconds (C-18): A2A-minted sessions whose last activity is older than
+/// this are swept lazily before the next A2A session is created. `0` disables pruning.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct A2aTtl(pub(crate) u64);
+
 /// Discovery metadata for the served agent — what the A2A agent card advertises. The `/a2a` URL is
 /// not stored here; it is derived per-request from the `Host`/`X-Forwarded-Proto` headers.
 #[derive(Clone)]
@@ -88,6 +93,7 @@ pub struct ServerState {
     engine: Arc<FlowEngine>,
     card: Arc<CardInfo>,
     turn_gate: TurnGate,
+    a2a_ttl: A2aTtl,
 }
 
 impl FromRef<ServerState> for Arc<FlowEngine> {
@@ -105,6 +111,12 @@ impl FromRef<ServerState> for Arc<CardInfo> {
 impl FromRef<ServerState> for TurnGate {
     fn from_ref(s: &ServerState) -> Self {
         s.turn_gate.clone()
+    }
+}
+
+impl FromRef<ServerState> for A2aTtl {
+    fn from_ref(s: &ServerState) -> Self {
+        s.a2a_ttl
     }
 }
 
@@ -183,10 +195,40 @@ pub async fn shutdown_signal() {
 /// Public so the `a2a` channel ([`flux_channels`]) can mount it onto a program agent's engine with its
 /// own graceful-shutdown serve.
 pub fn router(engine: Arc<FlowEngine>, token: Option<String>, card: CardInfo) -> Router {
+    router_with_ttl(engine, token, card, a2a_ttl_from_config())
+}
+
+/// Resolve the A2A session TTL from the layered flux config (`[server] a2a_session_ttl_secs`,
+/// project over user, default 1h, `0` = never prune). Resolved here — at router build — so every
+/// mount of the router (the standalone server and the `a2a` channel) gets the same retention
+/// behavior without each caller plumbing the knob. A malformed config file falls back to the
+/// default with a warning rather than failing the surface (the CLI already fails loudly on it).
+fn a2a_ttl_from_config() -> A2aTtl {
+    let ttl = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| match flux_config::load(&cwd) {
+            Ok(cfg) => Some(cfg.a2a_session_ttl_secs()),
+            Err(e) => {
+                eprintln!("(ignoring malformed flux config for the A2A session TTL: {e})");
+                None
+            }
+        })
+        .unwrap_or(flux_config::DEFAULT_A2A_SESSION_TTL_SECS);
+    A2aTtl(ttl)
+}
+
+/// [`router`] with an explicit A2A session TTL (tests inject one; production resolves from config).
+fn router_with_ttl(
+    engine: Arc<FlowEngine>,
+    token: Option<String>,
+    card: CardInfo,
+    a2a_ttl: A2aTtl,
+) -> Router {
     let state = ServerState {
         engine,
         card: Arc::new(card),
         turn_gate: Arc::new(tokio::sync::Mutex::new(())),
+        a2a_ttl,
     };
     // Auth-exempt routes — registered outside the middleware layer so path-string comparison
     // cannot be bypassed by percent-encoding or double-slash tricks.
@@ -541,10 +583,39 @@ mod tests {
         }
     }
 
+    /// A provider that answers every call with a one-word prose turn — the agent loop exits on
+    /// prose, so a handler-driven test turn completes fast and deterministically.
+    struct ProseProvider;
+    #[async_trait::async_trait]
+    impl flux_provider::Provider for ProseProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(
+            &self,
+            _req: flux_provider::Request,
+        ) -> flux_core::Result<flux_provider::ChunkStream> {
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(flux_core::Chunk::TextDelta("ok".into())),
+                Ok(flux_core::Chunk::Done {
+                    stop_reason: Some(flux_core::StopReason::EndTurn),
+                }),
+            ])))
+        }
+    }
+
     /// A minimal `FlowEngine` for the usage-endpoint tests: real machinery, but no turn is ever run
     /// through it — the events store is seeded directly with `CallUsage`/`TurnEnded` events instead,
     /// which is all `get_session_usage`/`get_usage_all` read.
     fn usage_test_engine() -> (Arc<FlowEngine>, Arc<flux_events::EventStore>) {
+        test_engine(Arc::new(UnusedProvider))
+    }
+
+    /// A `FlowEngine` over `provider` with a fresh in-memory event store (shared out for seeding
+    /// and assertions).
+    fn test_engine(
+        provider: Arc<dyn flux_provider::Provider>,
+    ) -> (Arc<FlowEngine>, Arc<flux_events::EventStore>) {
         let dir =
             std::env::temp_dir().join(format!("flux-server-usage-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -566,7 +637,7 @@ mod tests {
         let events = Arc::new(flux_events::EventStore::in_memory().unwrap());
         let flow = flux_flow::state::FlowStore::in_memory_with_events(events.clone()).unwrap();
         let engine = FlowEngine::assemble(
-            Arc::new(UnusedProvider),
+            provider,
             executor,
             events.clone(),
             flow,
@@ -649,5 +720,148 @@ mod tests {
         let models2 = body2["models"].as_array().unwrap();
         assert_eq!(models2.len(), 1);
         assert_eq!(models2[0]["usage"]["input"], 1_000_000);
+    }
+
+    async fn post_json(app: Router, path: &str, body: Value) -> (StatusCode, Value) {
+        let res = app
+            .oneshot(
+                HttpRequest::post(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, body)
+    }
+
+    /// An a2a-tagged D-02 context envelope, as `create_a2a_session` stamps it.
+    fn a2a_ctx() -> flux_events::EventContext {
+        flux_events::EventContext {
+            agent_id: Some(a2a::A2A_AGENT_ID.into()),
+            ..Default::default()
+        }
+    }
+
+    /// C-18: sessions minted by the A2A surface are tagged `agent_id = "a2a"` at creation (with
+    /// the request's `contextId` as correlation id), and only THOSE are eligible for TTL pruning
+    /// — an untagged CLI/TUI session older than the cutoff survives every sweep.
+    #[tokio::test]
+    async fn a2a_ttl_prunes_only_expired_a2a_sessions() {
+        let (engine, events) = test_engine(Arc::new(ProseProvider));
+        // An untagged (CLI-style) session that predates everything — must never be pruned.
+        let cli = events.create_session("m").unwrap();
+
+        // Mint the A2A session through the REAL handler (message/send), proving creation-time
+        // tagging on the production path.
+        let app = router_with_ttl(engine, None, CardInfo::flux_coding(), A2aTtl(60));
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "message/send",
+            "params": { "message": {
+                "contextId": "ctx-42",
+                "parts": [{ "kind": "text", "text": "hi" }],
+            } }
+        });
+        let (status, _res) = post_json(app, "/a2a", body).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let tagged: Vec<_> = events
+            .list(10)
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.context.agent_id.as_deref() == Some(a2a::A2A_AGENT_ID))
+            .collect();
+        assert_eq!(
+            tagged.len(),
+            1,
+            "the A2A handler tags its session at creation"
+        );
+        assert_eq!(
+            tagged[0].context.correlation_id.as_deref(),
+            Some("ctx-42"),
+            "the request contextId rides the D-02 envelope as the correlation id"
+        );
+        let a2a_id = tagged[0].id.clone();
+
+        // One TTL (plus ε) after the a2a session's last activity: it has expired; the CLI
+        // session is even older, but untagged — never eligible.
+        let now = events.info(&a2a_id).unwrap().updated_at_ms + 60_000 + 1;
+        assert_eq!(a2a::prune_expired_a2a_sessions_at(&events, 60, now), 1);
+        assert!(
+            events.info(&a2a_id).is_err(),
+            "expired a2a session is pruned"
+        );
+        assert!(
+            events.info(&cli).is_ok(),
+            "a CLI/TUI session is never pruned, whatever its age"
+        );
+    }
+
+    /// C-18: age is measured from LAST ACTIVITY, not creation — an a2a session created long
+    /// before the cutoff but active after it survives the sweep.
+    #[tokio::test]
+    async fn recently_active_a2a_session_survives_pruning() {
+        let events = flux_events::EventStore::in_memory().unwrap();
+        let stale = events.create_session_with_context("m", &a2a_ctx()).unwrap();
+        let active = events.create_session_with_context("m", &a2a_ctx()).unwrap();
+        let active_created = events.info(&active).unwrap().created_at_ms;
+
+        // Both sessions age past the cutoff below… but `active` sees a message afterwards.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        events
+            .record_message(&active, &flux_core::Message::user_text("still here"))
+            .unwrap();
+
+        // Cutoff strictly after both creations, strictly before the touch: prune as of
+        // `cutoff + 1s TTL`.
+        let cutoff = events
+            .info(&stale)
+            .unwrap()
+            .updated_at_ms
+            .max(active_created)
+            + 1;
+        assert!(
+            events.info(&active).unwrap().updated_at_ms > cutoff,
+            "sanity: the touch moved last-activity past the cutoff"
+        );
+        assert_eq!(
+            a2a::prune_expired_a2a_sessions_at(&events, 1, cutoff + 1_000),
+            1
+        );
+        assert!(
+            events.info(&stale).is_err(),
+            "the inactive session is pruned"
+        );
+        assert!(
+            events.info(&active).is_ok(),
+            "created before the cutoff but active after it → survives (age = last activity)"
+        );
+        assert!(
+            active_created < cutoff,
+            "sanity: survival is due to activity, not creation time"
+        );
+    }
+
+    /// C-18: `a2a_session_ttl_secs = 0` disables pruning — even an ancient a2a session survives.
+    #[test]
+    fn a2a_ttl_zero_disables_pruning() {
+        let events = flux_events::EventStore::in_memory().unwrap();
+        let old = events.create_session_with_context("m", &a2a_ctx()).unwrap();
+        // "Ten years later", with pruning disabled, nothing is swept.
+        let far_future = events.info(&old).unwrap().updated_at_ms + 315_360_000_000;
+        assert_eq!(
+            a2a::prune_expired_a2a_sessions_at(&events, 0, far_future),
+            0
+        );
+        assert!(events.info(&old).is_ok(), "ttl 0 means never prune");
     }
 }
