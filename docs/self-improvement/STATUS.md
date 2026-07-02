@@ -120,6 +120,18 @@ loop misbehaving — each was the machinery working and exposing a bug, which wa
    the grader as authoritative (`2f49d68`) and by `cargo fmt` (`ba0859e`); and the process rule below
    was adopted.
 4. **Run 4 — the kept gain.** Described above.
+5. **2026-07-02 — synthetic calibration + tbench-over-OpenRouter smoke (no loop run).** The I-01
+   staged calibration ran `flux eval synthetic --trials 5` twice: **the synthetic suite is stable but
+   saturated** — Sonnet 4.6 *and* Haiku 4.5 (via OpenRouter) both score 1000/1000 with mean_iters 1.0.
+   Zero headroom: it is a **regression floor, not a gain vehicle**; the headline gain must come from
+   terminal-bench. The tbench plumbing was then smoke-proven end-to-end over OpenRouter (key forwards
+   into the container, model plumbs through `eval_run` → `tb --model`, musl binary builds): 1 task ×
+   1 trial ran for real. Result 0/1 (`parse_error`) — and instructive: the agent **functionally solved**
+   `fibonacci-server` (server up, every curl check correct) yet burned the 30-plan-iteration cap stuck
+   on one step (480s, $0.58, never credited). That failure shape motivated the
+   **multi-pass agent loop epic** (`docs/designs/multipass-agent-loop.md`). The full improve-loop run
+   was postponed (user call, 2026-07-02); known CLI gap: `flux eval terminal-bench` can't pass
+   `flux_binary` (workaround: an `eval_run` flow via `flux flow run`).
 
 A separate **correct revert** is worth calling out as a soundness check: a candidate built a
 *working-looking* fibonacci server that still reverted, because the grader's hidden
@@ -203,9 +215,11 @@ was valid and the revert was correct — the loop did not reward a plausible-but
    branch.
 2. ~~**Fix the tag scalar** to be partial-credit-aware~~ — ✅ done (`score.rs`,
    `round(mean_check_pass_rate*1000)`).
-3. **One trials ≥ 5 run on the synthetic suite** for a clean, defensible headline gain — the loop
-   (`bench/run-synthetic-loop.sh` → `examples/improve-synthetic.flux`) is wired and gate-green; first
-   calibrate the baseline (`flux eval synthetic --trials 5 …`, twice) to confirm it's stable and has
-   headroom, then drive rounds until a strict kept gain.
+3. ~~**One trials ≥ 5 run on the synthetic suite** for a clean headline gain~~ — **calibrated out
+   (2026-07-02, journey entry 5):** the suite is stable but saturated (two models at 1000/1000,
+   mean_iters 1.0) — zero headroom; it stays as the regression floor. The headline gain must come
+   from **terminal-bench** (plumbing smoke-proven over OpenRouter same day; full loop run postponed
+   by user). When resumed: fix the `flux eval terminal-bench` `flux_binary` CLI gap, then
+   `bench/run-tbench-loop.sh` with trials ≥ 3 on tasks with a stable baseline.
 4. Optionally, a tracked pre-commit hook to mechanically block un-`fmt`'d commits (enforces the process
    rule above).

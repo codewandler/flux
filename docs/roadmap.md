@@ -143,6 +143,34 @@ both are needed for the "check db connectivity" path to be trustworthy:
   ambiguous with the newest-namespace heuristic. Provider alias resolution + broker query-parsing +
   disambiguating `latest`.
 
+### Multi-pass agent loop (epic)
+
+The turn loop one-shots a plan per iteration: the plan must be right on the first try, the user
+stares at a silent wait while it composes, and a mid-plan failure **discards the whole plan** for a
+from-scratch re-plan (a terminal-bench smoke functionally solved its task yet burned the
+30-iteration cap stuck on one step; `s_251` above is the same shape). This epic restructures the
+turn into visible passes — **orient** (the first planner call may answer, emit the full plan, or
+emit a small read-only gather plan + a `brief` grounding artifact) → **bounded gather** (compile-
+enforced read-only, capped) → **execute/revise** — and gives the runtime a memory of what already
+ran: a failing statement is *reified* (structured halt + prefix transcript) into an append-only
+**statement ledger**, so the model's corrected re-emission fast-forwards the hash-matching
+completed prefix and **continues from the failure point**. The loop stays a flux-lang program
+(no Rust loop returns); every re-emission re-passes the C-17 gates; denied statements are never
+re-dispatched unchanged. Epic design:
+[multipass-agent-loop.md](designs/multipass-agent-loop.md). Built in this order:
+[A-12](stories/A-12-unsilence-planning-wait.md) (un-silence the planning wait — independent quick
+win) → [A-13](stories/A-13-phase-aware-planner-protocol.md) (phase protocol) →
+[A-14](stories/A-14-multipass-agent-loop.md) (the phased loop) →
+[A-15](stories/A-15-phase-aware-surface.md) (surface) ∥
+[L-22](stories/L-22-reified-halts-statement-ledger.md) (runtime ledger) →
+[A-16](stories/A-16-loop-host-resume-policy.md) (resume policy) →
+[A-17](stories/A-17-revise-wiring.md) (revise wiring, tracks join) →
+[I-03](stories/I-03-multipass-cutover-measurement.md) (measured cutover gate). Later:
+[A-18](stories/A-18-multipass-plan-mode.md) ·
+[L-23](stories/L-23-streaming-plan-render.md) (after L-20) ·
+[L-24](stories/L-24-reified-await-ledger.md) ·
+[L-25](stories/L-25-flow-run-resumable-mode.md).
+
 ### Downstream enablement
 
 A ranked track that exists to **unblock and de-risk downstream products** that consume flux by **path
