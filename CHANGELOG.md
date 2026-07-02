@@ -25,6 +25,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Plugin-pack distribution is scoped and decided (D-21).** How a non-source user gets the ~20
+  integration plugins: **fetch-on-install from a signed, first-party pack channel** — pack
+  releases as their own `plugins-v*` GitHub release series (one prebuilt archive per plugin per
+  target + a minisign-signed `plugins-index.json`), with `flux plugin install <name>[@version]`
+  verifying the index signature against a pubkey embedded in flux and the artifact sha256 before
+  anything becomes executable, into a versioned store that gives the existing `pin`/`rollback`
+  real teeth (spawn-time hash re-verification). Bundling into the core release was rejected on
+  coupling (not size); no marketplace service — the index is the marketplace seed. Design:
+  `docs/designs/plugin-distribution.md`; implementation slices filed as D-46 → D-47 → {D-48,
+  D-49}. Found along the way: Windows `--dir` install is broken today (`plugin_binaries_in` skips
+  `.exe`) — fix scheduled in D-47.
+
 - **The planner-emission A/B has an answer: strict JSON stays (L-20).** The open question from
   the emission design doc is now measured, not guessed: a `FLUX_EMISSION=json|text` selector (json
   default byte-identical to the shipped surface; both arms behind the same hidden-op +
