@@ -17,6 +17,10 @@
 //! of re-fetching, and the emitted AST may reference *any* registered op (it is the *plan*, not executed
 //! here). This is the seat of "the LLM plans": the model proposes structure; the runtime owns execution.
 
+// The compile path is a safety gate — keep it free of `unsafe` (C-17/F4 replaced the one raw-pointer
+// sink reborrow with a plain safe reborrow).
+#![deny(unsafe_code)]
+
 use futures::StreamExt;
 
 use flux_core::{Chunk, ContentBlock, Error, Message, Result, StopReason, Usage};
@@ -54,7 +58,10 @@ impl Default for CompileOptions {
 
 /// The result of a compile: the AST the model produced, how many attempts/steps it took, and any
 /// analyzer diagnostics. Non-empty `diagnostics` means the AST parsed but references unknown ops — it
-/// is surfaced (compile-only shows it) rather than executed.
+/// is surfaced (compile-only shows it) rather than executed. Only the one-shot [`compile`] returns a
+/// diagnostics-carrying value (its surface prints them and refuses to run); [`compile_turn`] — whose
+/// plans callers execute — never does: a plan that fails analysis is repair feedback, and exhausting
+/// the step budget rejects the turn with the diagnostic text (C-17/F2).
 #[derive(Debug, Clone)]
 pub struct Compiled {
     pub ast: DraftAst,
@@ -265,6 +272,10 @@ pub async fn compile_turn(
     // Token usage for this whole planner consultation: summed across the repair/tool-result steps
     // below (each is a separate provider call), with the input/cache side reflecting the final step.
     let mut usage = Usage::default();
+    // The most recent rejection fed back to the model (hidden ops, analyzer diagnostics, duplicate
+    // emit_plan). When the step budget runs out, the turn is rejected WITH this text (C-17/F2) —
+    // never "accepted with diagnostics" for a caller to execute blind.
+    let mut last_reject = String::new();
     for step in 1..=steps {
         let req = Request {
             model: model.to_string(),
@@ -281,12 +292,11 @@ pub async fn compile_turn(
             metadata: serde_json::Map::new(),
         };
 
-        // SAFETY: we reborrow through a raw pointer to break the loop-iteration
-        // lifetime cycle. `stream_blocks` is `await`ed to completion before the next
-        // iteration touches `thinking_sink`, so there is no actual aliasing.
-        let ts: Option<&mut dyn crate::AgentSink> = thinking_sink
-            .as_mut()
-            .map(|s| unsafe { &mut *(*s as *mut dyn crate::AgentSink) });
+        // Per-iteration reborrow of the sink (C-17/F4): `as_deref_mut` borrows `thinking_sink` only
+        // for this statement — the `stream_blocks` future is awaited to completion and dropped
+        // before the next iteration reborrows, so no `unsafe` is needed. (`stream_blocks` keeps its
+        // reference and trait-object lifetimes independent for exactly this reborrow.)
+        let ts = thinking_sink.as_deref_mut();
         let (mut blocks, acc_text, stop_reason, call_usage) =
             stream_blocks(provider, req, ts).await?;
         usage.accumulate(&call_usage);
@@ -309,15 +319,28 @@ pub async fn compile_turn(
             // model would intentionally emit outside `emit_plan`, so require at least one node.
             if let Ok(ast) = parse_draft_ast(&assistant.text()) {
                 if !ast.body.is_empty() && analyze_flow(&ast, ops).is_ok() {
-                    return Ok((
-                        TurnOutput::Plan(Compiled {
-                            ast,
-                            attempts: step,
-                            diagnostics: Vec::new(),
-                            complete: None,
-                        }),
-                        usage,
-                    ));
+                    // Surfacing enforcement (A-04) applies to the text fallback too (C-17/F1): a
+                    // prose-emitted plan is still a model-emitted plan, so a registered-but-hidden
+                    // op (e.g. `bash` with the `shell` group off) is rejected here exactly like the
+                    // `emit_plan` branch rejects it — repair feedback, and never an accepted plan,
+                    // not even on the last step. Without this gate, emitting the plan as plain text
+                    // instead of a tool call bypassed the check entirely.
+                    let hidden = ops.hidden_ops_in(&ast.body);
+                    if hidden.is_empty() {
+                        return Ok((
+                            TurnOutput::Plan(Compiled {
+                                ast,
+                                attempts: step,
+                                diagnostics: Vec::new(),
+                                complete: None,
+                            }),
+                            usage,
+                        ));
+                    }
+                    // No tool_use id to answer here — the rejection rides as a plain user message.
+                    last_reject = hidden_ops_rejection(&hidden);
+                    messages.push(Message::user_text(last_reject.clone()));
+                    continue;
                 }
             }
             // A `max_tokens` cutoff drops the in-flight `emit_plan` block — the provider never sends its
@@ -346,10 +369,25 @@ pub async fn compile_turn(
         }
 
         // Answer every tool_use (keeps the local history valid); capture an accepted plan if any.
+        // A message carrying MORE than one `emit_plan` is rejected outright (C-17/F3): a turn takes
+        // exactly one plan, and silently letting the last call win would execute a plan the model
+        // may not have meant as final.
+        let emit_plan_calls = tool_uses
+            .iter()
+            .filter(|(_, name, _)| name == "emit_plan")
+            .count();
         let mut results = Vec::new();
         let mut done: Option<Compiled> = None;
         for (id, name, input) in tool_uses {
             match name.as_str() {
+                "emit_plan" if emit_plan_calls > 1 => {
+                    last_reject = format!(
+                        "invalid: you called emit_plan {emit_plan_calls} times in one message — a \
+                         turn takes exactly ONE plan. Merge the steps into a single plan and call \
+                         emit_plan once."
+                    );
+                    results.push(ContentBlock::tool_result_text(id, last_reject.clone(), true));
+                }
                 "emit_plan" => {
                     // The model's optional completion directive (captured before `input` is moved):
                     // present ⇒ this plan completes the request, so the engine renders the final message
@@ -365,16 +403,10 @@ pub async fn compile_turn(
                             // must never execute because the model ran out of repair budget.
                             let hidden = ops.hidden_ops_in(&ast.body);
                             if !hidden.is_empty() {
+                                last_reject = hidden_ops_rejection(&hidden);
                                 results.push(ContentBlock::tool_result_text(
                                     id,
-                                    format!(
-                                        "invalid plan: operation(s) `{}` exist but are not enabled \
-                                         in this workspace (their tool group is not active — e.g. \
-                                         `bash` requires `enable_shell = true` in .flux/config.toml \
-                                         or FLUX_ENABLE_BASH=1). Re-plan using only operations from \
-                                         the catalog, then call emit_plan again.",
-                                        hidden.join("`, `")
-                                    ),
+                                    last_reject.clone(),
                                     true,
                                 ));
                                 continue;
@@ -394,26 +426,19 @@ pub async fn compile_turn(
                                     });
                                 }
                                 Err(diags) => {
+                                    // Always repair feedback — never "accepted with diagnostics"
+                                    // (C-17/F2): every `compile_turn` caller executes the plan it
+                                    // gets back, so a diagnostics-carrying plan must not escape,
+                                    // not even on the last step. If the budget runs out, the turn
+                                    // is rejected with this text (below).
                                     let msg = join_diags(&diags);
-                                    if step == steps {
-                                        results.push(ContentBlock::tool_result_text(
-                                            id,
-                                            format!("accepted with diagnostics: {msg}"),
-                                            false,
-                                        ));
-                                        done = Some(Compiled {
-                                            ast,
-                                            attempts: step,
-                                            diagnostics: diags,
-                                            complete,
-                                        });
-                                    } else {
-                                        results.push(ContentBlock::tool_result_text(
+                                    last_reject =
+                                        format!("invalid plan: {msg}. Fix it and call emit_plan again.");
+                                    results.push(ContentBlock::tool_result_text(
                                         id,
-                                        format!("invalid plan: {msg}. Fix it and call emit_plan again."),
+                                        last_reject.clone(),
                                         true,
                                     ));
-                                    }
                                 }
                             }
                         }
@@ -451,9 +476,16 @@ pub async fn compile_turn(
             return Ok((TurnOutput::Plan(c), usage));
         }
     }
-    Err(Error::Other(format!(
-        "planner did not produce a plan within {steps} steps"
-    )))
+    // Reject the turn with the last rejection's text (C-17/F2): the diagnostics are surfaced to the
+    // caller as the turn's error instead of riding out on an "accepted" plan.
+    Err(Error::Other(if last_reject.is_empty() {
+        format!("planner did not produce a plan within {steps} steps")
+    } else {
+        format!(
+            "planner did not produce a valid plan within {steps} step(s) — \
+             the last plan was rejected: {last_reject}"
+        )
+    }))
 }
 
 /// Compile a single natural-language instruction into a [`DraftAst`] (the one-shot `--plan` surface).
@@ -579,10 +611,15 @@ pub async fn render_completion(
 ///
 /// `on_thinking` receives each incremental thinking-token delta as it arrives; pass `None` when the
 /// caller doesn't need live thinking output (e.g. the one-shot `compile` path).
-async fn stream_blocks(
+///
+/// The sink's reference lifetime and trait-object bound are deliberately independent (`+ 'b`):
+/// `&mut` is invariant, so unifying them (the `&mut dyn AgentSink` default) would force a caller's
+/// per-iteration reborrow to last as long as the original sink borrow — the lifetime cycle the old
+/// `unsafe` raw-pointer reborrow in [`compile_turn`] existed to break (C-17/F4).
+async fn stream_blocks<'a, 'b>(
     provider: &dyn Provider,
     req: Request,
-    mut on_thinking: Option<&mut dyn crate::AgentSink>,
+    mut on_thinking: Option<&'a mut (dyn crate::AgentSink + 'b)>,
 ) -> Result<(Vec<ContentBlock>, String, Option<StopReason>, Usage)> {
     let mut stream = provider.stream(req).await?;
     let mut blocks = Vec::new();
@@ -677,6 +714,19 @@ fn join_diags(diags: &[Diagnostic]) -> String {
         .map(|d| d.message.clone())
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// The repair feedback for a plan calling registered-but-hidden ops (A-04). Shared by the
+/// `emit_plan` branch and the plain-text plan fallback (C-17/F1), so both paths gate identically.
+fn hidden_ops_rejection(hidden: &[String]) -> String {
+    format!(
+        "invalid plan: operation(s) `{}` exist but are not enabled \
+         in this workspace (their tool group is not active — e.g. \
+         `bash` requires `enable_shell = true` in .flux/config.toml \
+         or FLUX_ENABLE_BASH=1). Re-plan using only operations from \
+         the catalog, then call emit_plan again.",
+        hidden.join("`, `")
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1385,6 +1435,133 @@ mod tests {
         assert!(
             res.is_err(),
             "a hidden-op plan must never be accepted, even on the last step"
+        );
+    }
+
+    /// C-17 (F1): the SAME gate applies when the model emits the plan as plain text instead of
+    /// calling `emit_plan` — a gated op must never reach dispatch through the text fallback either.
+    /// Mirrors `hidden_op_plan_is_rejected_and_repaired` above.
+    #[tokio::test]
+    async fn hidden_op_text_fallback_plan_is_rejected_and_repaired() {
+        let reg = full_registry();
+        let ops = ops_without_bash(&reg);
+        // A prose-JSON plan (no tool call) naming the hidden op — parses, analyzes clean (bash IS
+        // registered), and before C-17 sailed straight through as an executable TurnOutput::Plan.
+        let text_plan = "```json\n{\"body\":[{\"kind\":\"call\",\"op\":\"bash\",\"args\":[{\"kind\":\"lit\",\"value\":\"rm x\"}]}]}\n```";
+        let p = mock(vec![
+            text_chunk(text_plan),
+            tool_call("emit_plan", serde_json::from_str(VALID_AST).unwrap()),
+        ]);
+        let out = plan(
+            &p,
+            "mock",
+            "delete x",
+            &ops,
+            None,
+            None,
+            CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.attempts, 2, "the text plan must cost a repair round");
+        assert!(
+            matches!(&out.ast.body[0], crate::ast::Node::Call { op, .. } if op == "read"),
+            "the accepted plan is the repaired one, not the hidden-op text plan"
+        );
+    }
+
+    /// C-17 (F1): like the tool-call path, the text fallback rejects a hidden op even when the step
+    /// budget is exhausted — and the turn's rejection names why.
+    #[tokio::test]
+    async fn hidden_op_text_fallback_is_rejected_even_on_the_final_step() {
+        let reg = full_registry();
+        let ops = ops_without_bash(&reg);
+        let text_plan = "```json\n{\"body\":[{\"kind\":\"call\",\"op\":\"bash\",\"args\":[{\"kind\":\"lit\",\"value\":\"rm x\"}]}]}\n```";
+        let p = mock(vec![text_chunk(text_plan)]);
+        let opts = CompileOptions {
+            max_steps: 1,
+            ..Default::default()
+        };
+        let err = plan(&p, "mock", "delete x", &ops, None, None, opts)
+            .await
+            .expect_err("a hidden-op text plan must never be accepted, even on the last step");
+        assert!(
+            format!("{err}").contains("not enabled"),
+            "the rejection carries the gate's reason: {err}"
+        );
+    }
+
+    /// C-17 (F2): `compile_turn` must NEVER return an accepted plan carrying diagnostics — every
+    /// turn caller executes what it gets back, and the `Compiled` contract says diagnostics are
+    /// surfaced rather than executed. Exhausting the repair budget on an unknown-op plan rejects
+    /// the turn with the diagnostic text instead of "accepting with diagnostics".
+    #[tokio::test]
+    async fn unknown_op_plan_is_never_accepted_with_diagnostics() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let invalid = r#"{"ast":{"body":[{"kind":"call","op":"nope.op","args":[]}]}}"#;
+        let p = mock(vec![
+            tool_call("emit_plan", serde_json::from_str(invalid).unwrap()),
+            tool_call("emit_plan", serde_json::from_str(invalid).unwrap()),
+        ]);
+        let opts = CompileOptions {
+            max_steps: 2,
+            ..Default::default()
+        };
+        let err = plan(&p, "mock", "do it", &ops, None, None, opts)
+            .await
+            .expect_err("an unknown-op plan must not be accepted when the budget runs out");
+        assert!(
+            format!("{err}").contains("unknown operation"),
+            "the rejection carries the diagnostic text: {err}"
+        );
+    }
+
+    /// C-17 (F3): two `emit_plan` calls in one assistant message are rejected with repair feedback
+    /// — never silently last-wins. The model recovers by emitting ONE plan on the next round.
+    #[tokio::test]
+    async fn duplicate_emit_plan_calls_are_rejected_not_last_wins() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let plan_a = json!({"ast": {"body": [{"kind":"call","op":"glob","args":[{"kind":"lit","value":"a"}]}]}});
+        let plan_b = json!({"ast": {"body": [{"kind":"call","op":"grep","args":[{"kind":"lit","value":"b"}]}]}});
+        let double = vec![
+            Chunk::Block(ContentBlock::ToolUse {
+                id: "ep_1".into(),
+                name: "emit_plan".into(),
+                input: plan_a,
+            }),
+            Chunk::Block(ContentBlock::ToolUse {
+                id: "ep_2".into(),
+                name: "emit_plan".into(),
+                input: plan_b,
+            }),
+            Chunk::Done {
+                stop_reason: Some(flux_core::StopReason::ToolUse),
+            },
+        ];
+        let p = mock(vec![
+            double,
+            tool_call("emit_plan", serde_json::from_str(VALID_AST).unwrap()),
+        ]);
+        let out = plan(
+            &p,
+            "mock",
+            "do it",
+            &ops,
+            None,
+            None,
+            CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.attempts, 2,
+            "the duplicate message must cost a repair round"
+        );
+        assert!(
+            matches!(&out.ast.body[0], crate::ast::Node::Call { op, .. } if op == "read"),
+            "the accepted plan is the single re-emitted one — neither duplicate wins"
         );
     }
 
