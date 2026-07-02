@@ -193,10 +193,29 @@ fn children(node: &Node) -> Vec<Branch<'_>> {
             v
         }
         Node::Once { body, .. } => body.iter().map(Branch::Node).collect(),
-        Node::Verify { .. } => Vec::new(),
-        Node::Peek { .. } => Vec::new(),
-        Node::Expr { .. } | Node::Fmt { .. } | Node::Jq { .. } => Vec::new(),
-        _ => Vec::new(),
+        // Leaf / inline-rendered kinds: no tree children — everything they carry is rendered in
+        // full by `head`/`expr`. Exhaustive on purpose (no `_` wildcard): a future node kind fails
+        // compilation here instead of silently rendering as a headless leaf.
+        Node::Bind { .. }
+        | Node::Call { .. }
+        | Node::Assert { .. }
+        | Node::Memo { .. }
+        | Node::Await { .. }
+        | Node::Return { .. }
+        | Node::Var { .. }
+        | Node::Lit { .. }
+        | Node::Thing { .. }
+        | Node::Verify { .. }
+        | Node::Peek { .. }
+        | Node::Expr { .. }
+        | Node::Fmt { .. }
+        | Node::Jq { .. }
+        | Node::Parse { .. }
+        | Node::Ctx { .. }
+        | Node::CtxAppend { .. }
+        | Node::Checkpoint { .. }
+        | Node::Obj { .. }
+        | Node::List { .. } => Vec::new(),
     }
 }
 
@@ -366,7 +385,12 @@ fn head(node: &Node, p: &Palette) -> String {
         Node::Var { name } => sym(p, &name.0),
         Node::Lit { value } => lit(value, p),
         Node::Thing { thing } => thing_str(thing, p),
-        Node::Parse { .. } => paint(p.keyword, "parse"),
+        Node::Parse { value, as_type } => format!(
+            "{} {} {} {as_type}",
+            paint(p.keyword, "parse"),
+            expr(value, p),
+            paint(p.keyword, "as")
+        ),
         Node::Ctx { name, budget, .. } => match budget {
             Some(b) => format!("{} {} budget {b}", paint(p.keyword, "ctx"), sym(p, &name.0)),
             None => format!("{} {}", paint(p.keyword, "ctx"), sym(p, &name.0)),
@@ -407,8 +431,9 @@ fn head(node: &Node, p: &Palette) -> String {
             None => format!("{} {label:?}", paint(p.keyword, "once")),
         },
         Node::Checkpoint { label } => format!("{} {label:?}", paint(p.keyword, "checkpoint")),
-        Node::Obj { fields } => format!("{} ({} fields)", paint(p.keyword, "obj"), fields.len()),
-        Node::List { items } => format!("{} ({} items)", paint(p.keyword, "list"), items.len()),
+        // Value templates render their contents inline — the plan is the artifact you approve,
+        // so `{k: $v}` must show what it assembles, not a `(N fields)` count.
+        Node::Obj { .. } | Node::List { .. } => expr(node, p),
     }
 }
 
@@ -424,8 +449,42 @@ fn expr(node: &Node, p: &Palette) -> String {
         Node::Thing { thing } => thing_str(thing, p),
         Node::Bind { name, .. } => sym(p, &name.0),
         Node::Return { value } => format!("{} {}", paint(p.keyword, "return"), expr(value, p)),
-        Node::Obj { .. } => "{…}".to_string(),
-        Node::List { .. } => "[…]".to_string(),
+        // Value templates and the pure leaf nodes render inline in full — as call arguments and
+        // bind values they ARE the reviewed plan's arguments, so nothing may hide behind `…`.
+        Node::Obj { fields } => {
+            let fs: Vec<String> = fields
+                .iter()
+                .map(|(k, v)| format!("{k}: {}", expr(v, p)))
+                .collect();
+            format!("{{{}}}", fs.join(", "))
+        }
+        Node::List { items } => {
+            let is: Vec<String> = items.iter().map(|x| expr(x, p)).collect();
+            format!("[{}]", is.join(", "))
+        }
+        Node::Jq { path, input } => format!(
+            "{}({}, {})",
+            paint(p.op, "jq"),
+            paint(p.string, &format!("\"{path}\"")),
+            expr(input, p)
+        ),
+        Node::Fmt { template } => format!(
+            "{}({})",
+            paint(p.op, "fmt"),
+            paint(p.string, &format!("\"{template}\""))
+        ),
+        Node::Expr { formula, vars } => {
+            let mut s = format!(
+                "{}({}",
+                paint(p.op, "expr"),
+                paint(p.string, &format!("\"{formula}\""))
+            );
+            for (k, v) in vars {
+                s.push_str(&format!(", {k}: {}", expr(v, p)));
+            }
+            s.push(')');
+            s
+        }
         Node::When { .. }
         | Node::Repeat { .. }
         | Node::Each { .. }
@@ -445,9 +504,6 @@ fn expr(node: &Node, p: &Palette) -> String {
         | Node::Unless { .. }
         | Node::Verify { .. }
         | Node::Peek { .. }
-        | Node::Expr { .. }
-        | Node::Fmt { .. }
-        | Node::Jq { .. }
         | Node::Parse { .. }
         | Node::Ctx { .. }
         | Node::CtxAppend { .. }
@@ -647,6 +703,66 @@ mod tests {
         // `parallel` shows each branch as a labeled `$name:` group with its body underneath.
         assert!(s.contains("parallel"));
         assert!(s.contains("$left:"), "got: {s}");
+    }
+
+    #[test]
+    fn obj_and_list_template_contents_are_visible() {
+        // F26: the plan-approval tree must show what a value template assembles — a `{…}` / `(N
+        // fields)` placeholder hides exactly the arguments the reviewer is approving.
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert(
+            "ok".to_string(),
+            Box::new(Node::Lit {
+                value: serde_json::json!(true),
+            }),
+        );
+        fields.insert(
+            "n".to_string(),
+            Box::new(Node::Var {
+                name: SymbolName("count".into()),
+            }),
+        );
+        fields.insert(
+            "intent".to_string(),
+            Box::new(Node::Jq {
+                path: ".intent".into(),
+                input: Box::new(Node::Var {
+                    name: SymbolName("extract".into()),
+                }),
+            }),
+        );
+        let ast = DraftAst {
+            body: vec![
+                Node::Bind {
+                    name: SymbolName("r".into()),
+                    value: Box::new(Node::Obj { fields }),
+                    ty: None,
+                    effect: None,
+                },
+                Node::Return {
+                    value: Box::new(Node::List {
+                        items: vec![
+                            Node::Var {
+                                name: SymbolName("a".into()),
+                            },
+                            Node::Lit {
+                                value: serde_json::json!(3),
+                            },
+                        ],
+                    }),
+                },
+            ],
+            ..Default::default()
+        };
+        let s = render_pretty(&ast);
+        // Obj fields (BTreeMap order) render inline, including the jq leaf's path and input.
+        assert!(
+            s.contains("$r = {intent: jq(\".intent\", $extract), n: $count, ok: true}"),
+            "got: {s}"
+        );
+        // List items render inline in order.
+        assert!(s.contains("return [$a, 3]"), "got: {s}");
+        assert!(!s.contains('…'), "no hidden template placeholders: {s}");
     }
 
     #[test]

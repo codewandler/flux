@@ -28,10 +28,29 @@ use flux_provider::{Provider, Request, SystemSegment, ToolDef};
 use flux_spec::tool_input_schema;
 use schemars::JsonSchema;
 
-use crate::analyze::{analyze_flow, Diagnostic};
+use crate::analyze::{lower, Diagnostic};
 use crate::ast::DraftAst;
 use crate::registry::OpRegistry;
 use crate::state::SessionView;
+
+/// The session-symbol set the analyzer's definedness pass checks `$var` references against
+/// (L-15): the names in the current [`SessionView`], i.e. exactly the symbols the model was shown.
+fn view_symbols(view: Option<&SessionView>) -> std::collections::HashSet<String> {
+    view.map(|v| v.symbols.iter().map(|s| s.name.0.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// Validate a model-emitted plan on the production path: full structural analysis **plus** the
+/// typed lowering pass (L-16/F9 — `lower` is the gate, not just `analyze_flow`), definedness
+/// checked against the session's bound symbols. The `HirFlow` is discarded here; execution
+/// re-derives what it needs.
+fn validate_plan(
+    ast: &DraftAst,
+    ops: &OpRegistry<'_>,
+    view: Option<&SessionView>,
+) -> std::result::Result<(), Vec<Diagnostic>> {
+    lower(ast, ops, &view_symbols(view)).map(|_| ())
+}
 
 /// Options for [`compile`] / [`plan`].
 #[derive(Debug, Clone)]
@@ -194,7 +213,7 @@ pub async fn compile(
             )));
         };
         match parse_draft_ast(&text) {
-            Ok(ast) => match analyze_flow(&ast, ops) {
+            Ok(ast) => match validate_plan(&ast, ops, view) {
                 Ok(()) => {
                     return Ok(Compiled {
                         ast,
@@ -318,7 +337,7 @@ pub async fn compile_turn(
             // answer as a no-op `Plan` instead of `Chat`. A genuinely empty plan achieves nothing a
             // model would intentionally emit outside `emit_plan`, so require at least one node.
             if let Ok(ast) = parse_draft_ast(&assistant.text()) {
-                if !ast.body.is_empty() && analyze_flow(&ast, ops).is_ok() {
+                if !ast.body.is_empty() && validate_plan(&ast, ops, view).is_ok() {
                     // Surfacing enforcement (A-04) applies to the text fallback too (C-17/F1): a
                     // prose-emitted plan is still a model-emitted plan, so a registered-but-hidden
                     // op (e.g. `bash` with the `shell` group off) is rejected here exactly like the
@@ -411,7 +430,7 @@ pub async fn compile_turn(
                                 ));
                                 continue;
                             }
-                            match analyze_flow(&ast, ops) {
+                            match validate_plan(&ast, ops, view) {
                                 Ok(()) => {
                                     results.push(ContentBlock::tool_result_text(
                                         id,

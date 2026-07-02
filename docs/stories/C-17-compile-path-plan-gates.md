@@ -2,8 +2,7 @@
 id: C-17
 title: Compile-path plan gates — close the text-fallback hidden-op bypass
 pillar: Core
-status: ready
-priority: 1
+status: done
 epic: flux-lang-v1-hardening
 design: docs/designs/flux-lang-v1-hardening.md
 note: a plan emitted as prose JSON (not emit_plan) skips hidden_ops_in entirely — a registered-but-unsurfaced op (e.g. bash with the shell group off) executes; verified on the current tree incl. uncommitted WIP
@@ -18,13 +17,13 @@ Every path that turns model output into an executable plan applies the same gate
 (engine.rs:380-390, F2), and duplicate `emit_plan` calls silently last-win (F3).
 
 ## Acceptance
-- [ ] **Failing-first:** a text-fallback plan calling a registered-but-hidden op is NOT returned as
+- [x] **Failing-first:** a text-fallback plan calling a registered-but-hidden op is NOT returned as
       `TurnOutput::Plan` (mirrors the existing tool-call-path test at compile.rs:1284-1302).
-- [ ] Engine turn loop surfaces `Compiled.diagnostics` and repairs instead of executing a plan
+- [x] Engine turn loop surfaces `Compiled.diagnostics` and repairs instead of executing a plan
       accepted with unknown-op diagnostics (test).
-- [ ] Two `emit_plan` calls in one assistant message → clean rejection, not last-wins (test).
-- [ ] The `unsafe` sink reborrow (compile.rs:284-291) replaced with a safe per-iteration reborrow.
-- [ ] Uncommitted compile.rs WIP preserved; full gate green.
+- [x] Two `emit_plan` calls in one assistant message → clean rejection, not last-wins (test).
+- [x] The `unsafe` sink reborrow (compile.rs:284-291) replaced with a safe per-iteration reborrow.
+- [x] Uncommitted compile.rs WIP preserved; full gate green.
 
 ## Progress
 - [x] **F1** — the plain-text plan fallback in `compile_turn` now runs the same `hidden_ops_in`

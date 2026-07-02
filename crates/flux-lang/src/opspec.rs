@@ -23,8 +23,8 @@ pub struct Param {
     #[serde(rename = "type")]
     pub ty: TypeRef,
     /// When true, the param is omitted from the schema's `required` array (it still appears in
-    /// `properties`). Parameter order is non-load-bearing — calls name their args via a single object.
-    /// unordered.
+    /// `properties`). Parameter order is non-load-bearing — calls name their args via a single
+    /// object — so `optional` only controls `required` membership.
     #[serde(default)]
     pub optional: bool,
 }
@@ -72,10 +72,10 @@ impl OpSpec {
 
     /// Project the named, typed [`inputs`](Self::inputs) onto a JSON Schema object: every param
     /// becomes a `properties` entry (its [`TypeRef`] via [`type_ref_to_schema`]), and every
-    /// non-`optional` param is listed in `required` **in declared order** — the array preserves order,
-    /// so [`schema_params`] reads it back to recover the op's required-parameter *set*. Parameter order
-    /// is non-load-bearing — calls name their args via a single object (see `map_args_to_input`).
-    /// carry no order guarantee (JSON object keys are unordered), matching hand-written op schemas.
+    /// non-`optional` param is listed in the `required` array. [`schema_params`] reads the schema
+    /// back to recover the required/optional parameter **sets** — membership is load-bearing, order
+    /// is not: calls name their args via a single object (see `map_args_to_input`), and the declared
+    /// order the `required` array happens to preserve is used only for stable display.
     pub fn input_schema(&self) -> serde_json::Value {
         let mut properties = serde_json::Map::new();
         let mut required: Vec<serde_json::Value> = Vec::new();
@@ -170,10 +170,12 @@ pub struct OpSignature {
     pub effects: Vec<Effect>,
     pub risk: Risk,
     pub idempotency: Idempotency,
-    /// Required input parameters, in declared order (positional call args bind to these first).
+    /// Required input parameters — a membership set (declared order kept only for stable display).
+    /// Calls bind arguments by NAME via a single object argument; the analyzer rejects two or more
+    /// positional args (the deprecated positional form), so nothing binds "to these first."
     #[serde(default)]
     pub required_params: Vec<String>,
-    /// Optional input parameters (bound after the required ones).
+    /// Optional input parameters (may be omitted from the call's named-object argument).
     #[serde(default)]
     pub optional_params: Vec<String>,
     /// The declared type of each named param (parsed from the op's input schema), for the analyzer's
@@ -306,8 +308,8 @@ mod tests {
         // Only the non-optional param is required.
         assert_eq!(schema["required"], json!(["query"]));
 
-        // Round-trip: the lowered schema reads back to the declared params. Required order is
-        // load-bearing (positional binding); `query` is required, `limit` optional.
+        // Round-trip: the lowered schema reads back to the declared params — `query` required,
+        // `limit` optional. Membership is what matters; calls bind args by name.
         let (required, optional) = schema_params(schema);
         assert_eq!(required, vec!["query"]);
         assert_eq!(optional, vec!["limit"]);
@@ -319,8 +321,9 @@ mod tests {
 
     #[test]
     fn required_param_order_is_preserved_through_lowering() {
-        // Required params bind positionally, so their order must survive the round-trip exactly
-        // (the `required` array preserves order even though object keys are unordered).
+        // The `required` array preserves declaration order through lowering (stable display in the
+        // planner catalog). Binding itself is by name — the canonical call form is a single
+        // named-map object; the analyzer rejects the 2+-positional form.
         let spec = OpSpec {
             name: "edit".into(),
             description: "edit a file".into(),

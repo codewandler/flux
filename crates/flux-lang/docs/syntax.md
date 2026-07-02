@@ -8,16 +8,22 @@ the relationship to the JSON wire format, and the toolchain.
 
 ## Implementation status (read first)
 
-The text syntax **is built**: `flux_lang::parse::parse(&str) -> Result<DraftAst>` (one flow) and
-`flux_lang::format::format(&DraftAst) -> String`, with `parse(format(ast)) == ast` for **every**
-`DraftAst`. But `format`/`parse` give a **native** surface to a *subset* of node kinds and fall back to a
-single-line `@json <compact-json>` escape for the rest — so the round-trip always holds while the
-hand-written grammar stays small.
+The text syntax **is built**: `flux_lang::parse::parse(&str) -> Result<DraftAst>` (one flow),
+`flux_lang::parse::parse_program(&str) -> Result<Module>` (a whole `.flux` **module**: multiple
+`flow`s plus `agent`/`channel`/`datasource`/`trigger`/`journey`/`op` declarations), and
+`flux_lang::format::format(&DraftAst) -> String`, with `parse(format(ast)) == ast` — native
+spellings for the supported subset, a single-line `@json <compact-json>` escape for everything
+else, and non-identifier names falling back to `@json` (L-18); property-tested
+(`tests/roundtrip_property.rs`). The round-trip holds while the hand-written grammar stays small.
+
+Body sections below marked **aspirational** describe *target* syntax the parser does **not**
+accept today; everything unmarked is implemented.
 
 - **Native text** (markers `=` bind · `do <op> <args>` effectful call · `+=` `ctx_append`): `bind`,
   `call` (bare `do …` or inline `op(…)`), `var` (`$x`), `lit` (JSON), `return`, `when`/`else`, `unless`,
-  `each`, `repeat`, `seq`, the context-pack nodes **`ctx`** / **`ctx_append`**, and (added P6) the Tier-1
-  control-flow blocks **`match`**, **`route`**, **`fallback`**, **`loop`**, **`timeout`**, **`budget`**,
+  `each`, `repeat`, `seq`, the context-pack nodes **`ctx`** / **`ctx_append`**, `@effect(tag)` bind
+  annotations, and (added P6) the Tier-1 control-flow blocks **`match`**, **`route`**, **`fallback`**,
+  **`loop`**, **`timeout`**, **`budget`**, the capability scope **`with_tools`**,
   the inline **`fmt("…")`** node, and **`$var.path`** field-access sugar (lowers to a `jq` node); and
   (added P8) the value-template constructors **`obj`** (`{ k: expr }`) / **`list`** (`[ expr ]`) plus the
   **`assert`**, **`retry`**, and **`parallel`** blocks. Flow header carries optional
@@ -25,11 +31,19 @@ hand-written grammar stays small.
   AST/round-trip). The actual P6/P8 spellings are documented in
   [§ Native control-flow forms (P6)](#native-control-flow-forms-p6) below.
 - **`@json` escape** (everything else, today): `race`, `try`, `confirm`, `throttle`, `debounce`,
-  `verify`, `pipe`, `memo`, `await`, `peek`, `thing`, `expr`, `parse`, and any `jq` whose input is not a
-  plain `$var` or whose path uses an array index (`.items[0]`) — those still round-trip through `@json`.
-- **Aspirational** (described below as the *target* language, **not** yet parsed): multiple flows per
-  file, file-scope `type`/union declarations, and the `block`/`watch` spellings (the implemented nodes
-  are `seq` and `loop`). The AST type is **`DraftAst`** (this doc historically said `FlowAst`, which does
+  `verify`, `pipe`, `memo`, `await`, `peek`, `thing`, `expr`, `parse`, `scope`, `saga`, `once`,
+  `checkpoint`, and any `jq` whose input is not a plain `$var` or whose path uses an array index
+  (`.items[0]`) — those round-trip through `@json`. Beware: writing `expr(…)`, `peek(…)`, or
+  `jq(…)` call-style in text parses as an ordinary **op call** named `expr`/`peek`/`jq`, *not* the
+  pure node — only `fmt(…)` is special-cased, and the native `jq` spelling is the `$var.path` sugar.
+- **Aspirational** (described below as the *target* language, **not** yet parsed): triple-quoted
+  `"""` multi-line strings; comma-form named arguments in call argument lists
+  (`grep("ERROR", glob: "*.log")` — the shipped form is a single object argument,
+  see [§ Named arguments](#named-arguments)); comma-kwarg flow-control headers
+  (`retry 3, backoff: exponential`); multi-line literals inside call arguments (the parser is
+  strictly line-based); `@kind(…)` thing references; a `memo` keyword; `verify … in …`; file-scope
+  `type`/union declarations; and the `block`/`watch` spellings (the implemented keywords are `seq`
+  and `loop`). The AST type is **`DraftAst`** (this doc historically said `FlowAst`, which does
   not exist).
 
 ---
@@ -54,10 +68,12 @@ read-only output for inspection, not a format you write.
 
 ## File structure
 
-A `.flux` file is a sequence of one or more named flow definitions. The `flow` header
+A `.flux` file is a sequence of one or more named flow definitions (plus, at the module level,
+optional `agent`/`channel`/`datasource`/`trigger`/`journey`/`op` declarations). The `flow` header
 is **always required** — even for single-flow files. This keeps the format unambiguous
 for parsers and formatters, and means any `.flux` snippet is valid in a multi-flow file
-without modification.
+without modification. `parse` reads a single flow; `parse_program` reads a whole module
+(a file with several `flow`s is a module).
 
 ```flux
 # single-flow file
@@ -67,18 +83,19 @@ flow check-readme
 ```
 
 ```flux
-# multi-flow file
+# multi-flow file (a module — parsed by parse_program)
 flow fetch-and-grep
   $content = read("README.md")
-  $hits    = grep("TODO", glob: "*.rs")
+  $hits    = grep({pattern: "TODO", glob: "*.rs"})
   return $hits
 
 flow summarise(text: String) -> String
-  $summary = task("summariser", "Summarise:\n{text}")
+  $summary = task({role: "summariser", task: "Summarise:\n{text}"})
   return $summary
 ```
 
-Flows are separated by one or more blank lines. Comments between flows are allowed.
+Each flow starts with a `flow` header at column 0; blank lines and comments between flows are
+allowed (blank lines are not required separators).
 
 ### Composite op declarations
 
@@ -129,9 +146,9 @@ flow poll-until-done(url: String, timeout_ms: Number) -> Bool
 
 ## Indentation
 
-Indentation is **2 spaces** per level. The formatter always writes 2 spaces; the parser
-accepts 2 or 4 spaces consistently within a file. Tabs are rejected. There are no
-braces and no semicolons.
+Indentation is **2 spaces** per level by convention. The formatter always writes 2 spaces; the
+parser requires consistent indentation within each block (every statement of a block at the same
+column). Tabs are rejected. There are no braces and no semicolons.
 
 A block ends when the next non-blank line returns to the parent indentation level.
 This is the only block-termination rule — there are no `end` keywords.
@@ -159,7 +176,8 @@ else
   bash("a false")             # else of outer when
 ```
 
-The same rule applies to `catch` relative to `try`.
+The same rule would apply to `catch` relative to `try` — but note `try`/`catch` has **no native
+text spelling today** (a `try` node is written via the `@json` escape).
 
 ---
 
@@ -194,8 +212,7 @@ Line comments start with `#` and run to end of line. Block comments are not supp
 $x = read("a.txt")   # inline comment
 ```
 
-`#` has no special meaning inside string literals (single- or triple-quoted).
-A `#` comment is not permitted on the opening `"""` line of a multi-line string.
+`#` has no special meaning inside double-quoted string literals.
 
 ---
 
@@ -204,7 +221,7 @@ A `#` comment is not permitted on the opening `"""` line of a multi-line string.
 | Kind | Syntax | Example |
 |---|---|---|
 | String | double-quoted | `"hello"` |
-| Multi-line string | triple-quoted | `"""..."""` |
+| Multi-line string | *(aspirational)* triple-quoted | `"""..."""` — **not parsed today**; use `\n` escapes in a `"…"` string |
 | Number | bare numeric | `42`, `3.14` |
 | Bool | bare keyword | `true`, `false` |
 | Null | bare keyword | `null` |
@@ -234,11 +251,14 @@ $example = "use {{key: value}} syntax"   # outputs: use {key: value} syntax
 The JSON wire format uses the same `{sym}` / `{{` / `}}` convention inside string
 values — there is no difference between the text and wire formats for interpolation.
 
-### Multi-line strings
+### Multi-line strings *(aspirational — not implemented)*
 
-Triple-quoted strings strip the common leading indent from all non-empty lines:
+The parser has **no** triple-quote handling: a `"""` token is a parse error. Long text today is a
+single-line double-quoted string with `\n` escapes (or an `@json` node). The *target* syntax, kept
+here for the eventual design, is a triple-quoted string that strips the common leading indent:
 
 ```flux
+# ASPIRATIONAL — does not parse today
 $prompt = """
   Analyse this diff and suggest improvements.
   Focus on correctness, not style.
@@ -248,24 +268,26 @@ $prompt = """
 """
 ```
 
-The `"""` opening token must be the last non-whitespace on its line. `#` inside a
-triple-quoted string is literal text, not a comment.
-
 ### Inline object literals
 
-Multi-line object literals are allowed inside call arguments:
+Object (and array) literals are valid inside call arguments — **on one line**. The parser is
+strictly line-based: a statement is a single line, so a multi-line literal inside a call is a parse
+error.
 
 ```flux
-$result = eval_run({
-  adapter:       "terminal-bench",
-  tasks:         ["chess-best-move"],
-  trials:        1,
-  agent_timeout: 180
-})
+$result = eval_run({adapter: "terminal-bench", tasks: ["chess-best-move"], trials: 1, agent_timeout: 180})
 ```
 
-The closing `)` may appear on its own line. Contents are indented 2 spaces deeper
-than the call.
+*(Aspirational)* the multi-line spelling — contents indented 2 spaces deeper, closing `)` on its
+own line — is **not implemented**:
+
+```flux
+# ASPIRATIONAL — does not parse today
+$result = eval_run({
+  adapter: "terminal-bench",
+  trials:  1
+})
+```
 
 ---
 
@@ -281,40 +303,44 @@ git_commit("chore: bump version")
 ### Bind (result stored)
 
 ```flux
-$hits    = grep("TODO", glob: "*.rs")
+$hits    = grep({pattern: "TODO", glob: "*.rs"})
 $content = read("README.md")
 ```
 
 ### Named arguments
 
-All named arguments — for op calls **and** for flow-control node parameters — use
-`key: value` syntax. There is exactly one convention.
-
-Positional arguments come first; named arguments follow:
-
-```flux
-$hits = grep("ERROR", glob: "*.log", max_results: 50)
-$page = read("large.txt", limit: 100, offset: 200)
-```
-
-Flow-control nodes use the same `key: value` form:
+Named arguments are passed as **a single object argument** whose keys name the op's parameters
+(story L-09). This is the one convention for multi-parameter calls; a sole-required-param op
+accepts a bare value as sugar.
 
 ```flux
-retry 3, backoff: exponential, delay: 500
-watch for: 10000, every: 1000
-race timeout: 5000 -> $result
+$hits = grep({pattern: "ERROR", glob: "*.log", max_results: 50})
+$page = read({path: "large.txt", limit: 100, offset: 200})
+$src  = read("README.md")            # sole-required-param sugar
 ```
 
-### Memo (cross-turn cache)
+Two or more bare positional arguments is the deprecated positional form — the analyzer rejects it.
 
-A `memo` bind is computed once per session. On subsequent turns the cached value is
-reused without re-executing the op:
+*(Aspirational — not implemented)* a comma-separated `key: value` form appended after positional
+args (`grep("ERROR", glob: "*.log")`) does **not** parse; nor do comma-kwarg flow-control headers
+(`retry 3, backoff: exponential` / `race timeout: 5000`). The implemented flow-control headers use
+**space-keyword** tokens in fixed order (see [§ Native control-flow forms
+(P6)](#native-control-flow-forms-p6)):
 
 ```flux
-memo $schema = read("schema.sql")
+retry 3 backoff exponential delay 500 -> $out
+loop for 10000 every 1000
 ```
 
-The `memo` keyword is the only form — there is no `@memo` annotation alternative.
+### Memo (cross-turn cache) — *no text keyword; `@json` only*
+
+A `memo` node binds once per session: on subsequent turns the cached value is reused without
+re-executing the op. There is **no `memo` keyword in the text syntax** (`memo $x = …` does not
+parse, and there is no `@memo` annotation either) — a memo node is written via the `@json` escape:
+
+```flux
+@json {"kind": "memo", "name": "schema", "value": {"kind": "call", "op": "read", "args": [{"kind": "lit", "value": "schema.sql"}]}}
+```
 
 ---
 
@@ -380,7 +406,7 @@ repeat 5
 ```
 
 With an early-exit condition. `until` is written on its own line as the **first**
-statement of the body; it is evaluated before each iteration:
+statement of the body; it is a stop-when-true guard evaluated **after** each iteration:
 
 ```flux
 repeat 10
@@ -412,25 +438,20 @@ each $dir in $dirs -> flat $all_files
   glob("*.rs", path: $dir)
 ```
 
-### watch
+### watch *(aspirational spelling — the implemented keyword is `loop`)*
 
-Time-bounded iteration. `loop` is a keyword in Rust and many shells; `watch` is the
-Flux-Lang equivalent. `for` (milliseconds) is required.
-
-```flux
-watch for: 10000, every: 1000
-  $done = bash("check-ready.sh")
-```
-
-With early exit and result capture:
+Time-bounded iteration is implemented as the **`loop`** block (see [§ loop / timeout /
+budget](#loop--timeout--budget)); the `watch` spelling and its comma-kwarg header
+(`watch for: 10000, every: 1000`) never landed and do **not** parse. The real spelling:
 
 ```flux
-watch for: 30000, every: 2000, until: $done -> $last
+loop for 30000 every 2000 -> $last
+  until $done
   $done = bash("health-check.sh")
 ```
 
-Argument order: `for`, `every`, `until` (all named), then `-> $name` (optional result
-capture after the argument list). `for` is the only required argument.
+`until` is the optional first body line (a stop-when-true guard evaluated after each iteration);
+`-> $name` optionally captures the last iteration's result.
 
 ---
 
@@ -553,38 +574,36 @@ parallel
 
 ## Sequencing and piping
 
-### block
+### seq
 
-A sequential block that optionally binds its final result. (`seq` was the earlier
-name; `block` reads more naturally and avoids confusion with the Unix `seq` command.)
+A sequential block that optionally binds its final result. The implemented keyword is **`seq`**
+(the proposed `block` rename never landed and does not parse):
 
 ```flux
-block -> $result
+seq -> $result
   bash("echo one")
   $two = bash("echo two")
 ```
 
-A `block` with no result binding is valid:
+A `seq` with no result binding is valid:
 
 ```flux
-block
+seq
   git_stage(["."])
   git_commit("chore: update")
 ```
 
-### pipe
+### pipe — *no native text spelling; `@json` only*
 
 Each step's output is passed as the first argument of the next step. The final
-step's output is the pipe's result. Named result (`-> $name`) is optional.
+step's output is the pipe's result. A `pipe` node has **no native text form** — it is written via
+the `@json` escape:
 
 ```flux
-pipe -> $hits
-  read("log.txt")
-  grep("ERROR")
+@json {"kind": "pipe", "bind": "hits", "steps": [{"kind": "call", "op": "read", "args": [{"kind": "lit", "value": "log.txt"}]}, {"kind": "call", "op": "grep", "args": [{"kind": "lit", "value": "ERROR"}]}]}
 ```
 
-A `pipe` with a single step is valid (equivalent to a bare call). A `pipe` with zero
-steps is a parse error.
+A `pipe` with a single step is valid (equivalent to a bare call).
 
 ---
 
@@ -612,50 +631,53 @@ A symbol bound *inside* a branch body (other than its implicit result) is not
 visible outside that branch. A `parallel` with one branch is valid (degenerates to a
 sequential bind); a `parallel` with zero branches round-trips as an empty block.
 
-### race
+### race — *no native text spelling; `@json` only*
 
-Run branches concurrently; return as soon as the first succeeds. `timeout`
-(milliseconds) is required. If no branch completes within the timeout, the node errors.
+Run branches concurrently; the first branch to complete **successfully** wins. `timeout_ms` is
+required. If every branch fails, the node errors with a joined branch error (distinct from a
+timeout); if the deadline expires first, it errors with a timeout. Losing branches' dispatched
+steps stay counted and traced. A `race` node has **no native text form** (the `$fast:` label
+syntax shown in earlier drafts does not parse) — it is written via the `@json` escape:
 
 ```flux
-race timeout: 5000 -> $result
-  $fast:
-    bash("fast-path.sh")
-  $slow:
-    bash("slow-path.sh")
+@json {"kind": "race", "timeout_ms": 5000, "bind": "result", "branches": [{"name": "fast", "body": [{"kind": "call", "op": "bash", "args": [{"kind": "lit", "value": "fast-path.sh"}]}]}, {"name": "slow", "body": [{"kind": "call", "op": "bash", "args": [{"kind": "lit", "value": "slow-path.sh"}]}]}]}
 ```
-
-Branch syntax is identical to `parallel`. `-> $result` binds the winning value.
 
 ---
 
 ## Error handling
 
-### try / catch
+### try / catch — *no native text spelling; `@json` only*
+
+A `try` node has **no native text form** today; write it via the `@json` escape. The *target*
+block spelling (not yet parsed):
 
 ```flux
+# ASPIRATIONAL — does not parse today; use @json
 try
   bash("might-fail.sh")
 catch $err
   bash("echo fallback: {err}")
 ```
 
-- `catch $name` binds the error message string to `$name`
-- `catch` is optional; a bare `try` with no `catch` suppresses errors silently
+- `catch` (JSON field) binds the error message string to the named symbol
+- `catch`/`handler` are optional; a `try` with no handler suppresses errors silently
 - If the handler also errors, that error propagates
 
 ### retry
 
-Retry the body on failure up to `max` times.
+Retry the body on failure up to `max` times. The header uses **space-keyword** tokens in fixed
+order (the comma-kwarg form `retry 3, backoff: exponential, delay: 500` is aspirational and does
+not parse):
 
 ```flux
-retry 3, backoff: exponential, delay: 500 -> $out
+retry 3 backoff exponential delay 500 -> $out
   bash("flaky.sh")
 ```
 
 - `max` (positional, required) — maximum attempts including the first
-- `backoff: none | linear | exponential` — default `none`
-- `delay: <ms>` — base delay in milliseconds, default `0`
+- `backoff none | linear | exponential` — default `none`
+- `delay <ms>` — base delay in milliseconds, default `0`
 - `-> $name` — binds the last expression of the body on success
 - Fatal errors (policy denial, unknown op) are never retried
 - A denied `confirm` inside a `retry` body is **not** retried
@@ -676,44 +698,44 @@ retry 3
 
 ## Human-in-the-loop
 
-### confirm
+### confirm — *no native text spelling; `@json` only*
 
-Explicit approval gate. The `--yes` flag and the TUI modal satisfy it automatically.
+Explicit approval gate. The `--yes` flag and the TUI modal satisfy it automatically. A `confirm`
+node has **no native text form** (the comma-kwarg spelling `confirm "…", risk: high` does not
+parse) — write it via the `@json` escape:
 
 ```flux
-confirm "Delete all temp files?", risk: high
-  bash("rm -rf tmp/")
+@json {"kind": "confirm", "message": "Delete all temp files?", "risk": "high", "body": [{"kind": "call", "op": "bash", "args": [{"kind": "lit", "value": "rm -rf tmp/"}]}]}
 ```
 
-- `message` (positional string, required)
-- `risk: low | medium | high | critical` — default `medium`
+- `message` (required)
+- `risk`: `low | medium | high | critical` — default `medium`
 - Body runs only on approval; denial causes the node to error
-- A `confirm` with **no body** is valid — a pure gate with no conditional action:
-
-```flux
-confirm "Proceed with production deploy?", risk: critical
-```
+- A `confirm` with **no body** is valid — a pure gate with no conditional action
 
 ---
 
 ## Rate limiting and debouncing
 
-### throttle
+Both nodes are **`@json`-only** in text (no native spelling; the comma-kwarg headers shown in
+earlier drafts do not parse). See [`reference.md`](reference.md) for full semantics.
 
-At most `max` executions per sliding `window` (milliseconds):
+### throttle — *`@json` only*
+
+At most `max` **op dispatches** inside the body per sliding `window_ms`; the bucket is tracked in
+the session store, atomically, keyed by the required `name`:
 
 ```flux
-throttle max: 5, window: 60000
-  web_fetch($url)
+@json {"kind": "throttle", "name": "fetches", "max": 5, "window_ms": 60000, "body": [{"kind": "call", "op": "web_fetch", "args": [{"kind": "var", "name": "url"}]}]}
 ```
 
-### debounce
+### debounce — *`@json` only*
 
-The body fires only after `wait` milliseconds have elapsed with no new invocation:
+Keyed cross-turn coalescing: each arrival records a last-trigger timestamp for `name` in the
+session store; the body runs only once `wait_ms` has elapsed since that key's last trigger:
 
 ```flux
-debounce wait: 300
-  bash("rebuild.sh")
+@json {"kind": "debounce", "name": "rebuild", "wait_ms": 300, "body": [{"kind": "call", "op": "bash", "args": [{"kind": "lit", "value": "rebuild.sh"}]}]}
 ```
 
 ---
@@ -730,33 +752,43 @@ assert $hits, "grep returned no results"
 assert $gate
 ```
 
-### verify
+### verify — *no native text spelling; `@json` only*
 
-Run a command and assert its output contains a pattern. Syntax:
-`verify <pattern> in <cmd-expr>`:
+Run a command and assert its output contains a pattern (substring match). The
+`verify <pattern> in <cmd-expr>` spelling is **aspirational** and does not parse — write the node
+via the `@json` escape:
 
 ```flux
-verify "test result: ok" in bash("cargo test")
-verify "healthy" in bash("./health.sh"), message: "health check failed"
+@json {"kind": "verify", "cmd": {"kind": "call", "op": "bash", "args": [{"kind": "lit", "value": "cargo test"}]}, "expect": {"kind": "lit", "value": "test result: ok"}, "message": "tests failed"}
 ```
 
-The pattern is a substring match. `message: "..."` overrides the default error text.
+The optional `message` overrides the default error text.
 
 ---
 
 ## Pure (no-IO) expressions
 
-### expr — arithmetic
+### expr — arithmetic — *no native text spelling; `@json` only*
+
+The call-style spelling below is **aspirational**: in text, `expr(…)` parses as an ordinary op
+call named `expr` (and the `name: $sym` argument form doesn't parse at all). Write the pure `expr`
+node via the `@json` escape:
 
 ```flux
+@json {"kind": "bind", "name": "total", "value": {"kind": "expr", "formula": "price * qty", "vars": {"price": {"kind": "var", "name": "price"}, "qty": {"kind": "var", "name": "qty"}}}}
+```
+
+```flux
+# ASPIRATIONAL — does not parse today
 $total  = expr("price * qty", price: $price, qty: $qty)
 $scaled = expr("round(base * 1.2, 2)", base: $base)
 ```
 
 Standard precedence: `*` and `/` before `+` and `-`; parentheses for grouping.
 Nesting is allowed: `round(max($a, $b) * 1.1, 2)`. All variable names used in
-the formula must be declared as `name: $sym` named arguments — undeclared identifiers
-are a parse error.
+the formula must be declared in `vars` — undeclared identifiers error. The formula language also
+supports comparison, boolean, and string functions — see [`reference.md`](reference.md#expr) for
+the full whitelist.
 
 | Token | Meaning |
 |---|---|
@@ -778,9 +810,16 @@ string literals, but explicit about being pure.
 
 ### jq — JSON path extraction
 
+The native text spelling of the pure `jq` node is the **`$var.path` sugar** (below). The
+call-style `jq(".path", $raw)` parses as an ordinary op call named `jq`, **not** the pure node —
+bracket paths and non-symbol inputs are written via `@json`:
+
 ```flux
-$price = jq(".bitcoin.usd", $raw)
-$first = jq(".results[0].value", $response)
+$price = $raw.bitcoin.usd     # native sugar for the jq node
+```
+
+```flux
+@json {"kind": "bind", "name": "first", "value": {"kind": "jq", "path": ".results[0].value", "input": {"kind": "var", "name": "response"}}}
 ```
 
 Path syntax: a leading `.` followed by dot-separated field names with optional `[n]`
@@ -828,33 +867,39 @@ bash("continue working")
 
 ---
 
-## peek
+## peek — *no native text spelling; `@json` only*
 
 `peek` reads the current in-session value of a named symbol without IO. Returns the
-stored value, or `null` if the symbol is not yet bound. Useful for resumable flows.
+stored value, or an empty result if the symbol is not yet bound. Useful for resumable flows.
 
-`peek` takes the symbol name as a **string** argument:
+In text, `peek(…)` would parse as an ordinary op call named `peek` — the pure node is written via
+the `@json` escape, with the symbol **name** as a string:
 
 ```flux
-$prev = peek("last_result")   # correct: looks up the symbol named "last_result"
-$prev = peek($last_result)    # wrong: reads the value stored in $last_result
+@json {"kind": "bind", "name": "prev", "value": {"kind": "peek", "name": "last_result"}}
 ```
 
 ---
 
-## External references (things)
+## External references (things) — *`@kind(…)` spelling aspirational; `@json` only*
 
-External objects use `@kind(key: value)` syntax:
+A `thing` node references an external object. The `@kind(key: value)` spelling is **aspirational**
+— in text, `@` introduces only `@json` (anywhere) or `@effect(...)` (before a bind) today. Write a
+thing via the `@json` escape:
 
 ```flux
+@json {"kind": "bind", "name": "ticket", "value": {"kind": "thing", "thing": {"kind": "ticket", "selector": {"id": "FLUX-42"}}}}
+```
+
+```flux
+# ASPIRATIONAL — does not parse today
 $author = @person(name: "timo")
 $ticket = @ticket(id: "FLUX-42")
 $config = @file(path: "config.yaml")
 $secret = @secret(key: "ANTHROPIC_API_KEY")
 ```
 
-`@` introduces either a thing-reference or an effect annotation (`@effect(...)`). It
-is never an operator, so there is no ambiguity.
+`@` is never an operator, so there is no ambiguity.
 
 Built-in kinds: `context`, `file`, `person`, `ticket`, `email`, `repo`, `dataset`,
 `calendar_event`, `url`, `secret`. Custom kinds: `@jira_issue(id: "PROJ-1")`.
@@ -864,16 +909,17 @@ Selector keys: `id`, `name`, `path`, `query`, `key`.
 
 ## Async / cross-turn
 
-### await
+### await — *no native text spelling; `@json` only*
 
-Suspend until an external event arrives:
+Suspend until an external event arrives. In text, `await(…)` would parse as an op call — the node
+is written via the `@json` escape:
 
 ```flux
-$push   = await("github.push")
-$result = await("human.reply")
+@json {"kind": "await", "source": "github.push", "binding": "push"}
 ```
 
-The event source is a string label. The optional `as` type is coerced leniently onto the received value.
+The event source is a string label. The optional `as_type` is coerced leniently onto the received
+value.
 
 **Implemented (P6a):** a **top-level** `await` suspends the flow for cross-turn resume — the interpreter
 records the suspend point (`FlowOutcome.suspension` + a `RunEvent::Awaiting` trace), and the engine
@@ -883,9 +929,14 @@ rejects it nested inside `when`/`repeat`/`each`/… ), and the optimized `execut
 
 ---
 
-## Schema declarations
+## Schema declarations *(aspirational — not implemented)*
 
-Flux-Lang has a lightweight, structural type system. Types are declared at file
+**None of this section parses today**: file-scope `type` record/union declarations are a design
+target, not shipped syntax (`parse_program` accepts only `agent`/`channel`/`datasource`/`trigger`/
+`journey`/`op`/`flow` at file scope). Named types can still be *referenced* in flow headers
+(`-> RouteResult`); their definitions come from the registered prelude, not from `.flux` text.
+
+Flux-Lang has a lightweight, structural type system. Types would be declared at file
 scope alongside `flow` definitions — same indentation level, separated by blank
 lines. They are used to constrain op call arguments, flow parameters and return
 values, and model calls (e.g. `intent_extract`).
@@ -981,18 +1032,20 @@ they are documentation and are preserved in the AST.
 | `each` over an empty list | `$collect` bound to `[]`; body never runs |
 | `each` with no `-> $collect` | results discarded; body still runs |
 | `parallel` with one branch | valid; degenerates to sequential bind |
-| `parallel` with zero branches | parse error |
-| `pipe` with one step | valid; equivalent to a bare call |
-| `pipe` with zero steps | parse error |
-| `confirm` with no body | valid; pure approval gate |
+| `parallel` with zero branches | **parses**; round-trips as an empty block (emptiness is an analyzer concern, not a parse error) |
+| `pipe` with one step | valid; equivalent to a bare call (`pipe` is `@json`-only in text) |
+| `confirm` with no body | valid; pure approval gate (`confirm` is `@json`-only in text) |
 | `retry` wrapping `confirm` | denial is fatal — not retried |
-| Flow with empty body | parse error |
-| `watch` `until` | evaluated at start of each iteration, before the body |
-| `repeat` `until` | `until` must be the first line of the body |
+| Flow with empty body | **parses** to an empty-body flow (emptiness checks are the analyzer's job) |
+| `loop` `until` | stop-when-true guard, evaluated **after** each iteration |
+| `repeat` `until` | `until` must be the first line of the body; evaluated after each iteration |
 
 ---
 
 ## Complete examples
+
+Both examples use the shipped spellings only: single-line calls, the single-object named-argument
+form, and `branch $name` parallel arms.
 
 ### eval-smoke.flux
 
@@ -1001,7 +1054,7 @@ flow eval-smoke
   $baseline   = eval_run("mock")
   $sessions   = eval_sessions($baseline)
   $mined      = painpoints_collect($sessions)
-  $candidates = improvements_aggregate($mined, [])
+  $candidates = improvements_aggregate({mined: $mined, reviewed: []})
   return $candidates
 ```
 
@@ -1009,39 +1062,28 @@ flow eval-smoke
 
 ```flux
 flow improve -> EvalReport
-  $baseline = eval_run({
-    adapter:  "local",
-    dir:      "suites",
-    flux_bin: "target/debug/flux",
-    trials:   3
-  })
+  $baseline = eval_run({adapter: "local", dir: "suites", flux_bin: "target/debug/flux", trials: 3})
   $sessions = eval_sessions($baseline)
   $digest   = sessions_digest($sessions)
 
   parallel
-    $mined:
-      painpoints_collect($sessions)
-    $reviewed:
-      task("reviewer", """
-        Review these flux eval sessions for failure modes.
-        Sessions:
-        {digest}
+    branch $mined
+      $mined = painpoints_collect($sessions)
+    branch $reviewed
+      $reviewed = task({role: "reviewer", task: "Review these flux eval sessions for failure modes.\nSessions:\n{digest}\n\nReturn ONLY a JSON array of findings."})
 
-        Return ONLY a JSON array of findings.
-      """)
-
-  $candidates = improvements_aggregate($mined, $reviewed)
+  $candidates = improvements_aggregate({mined: $mined, reviewed: $reviewed})
 
   repeat 3
     until $done
-    $tasks    = task("planner", "Turn these candidates into AT MOST 2 tasks:\n{candidates}")
+    $tasks    = task({role: "planner", task: "Turn these candidates into AT MOST 2 tasks:\n{candidates}"})
     $snapshot = git_snapshot()
-    change_implement($tasks, 2)
+    change_implement({tasks: $tasks, limit: 2})
     $gate     = gate_check()
 
     when $gate
       $candidate = eval_run({adapter: "local", dir: "suites", trials: 3})
-      when score_compare($baseline, $candidate)
+      when score_compare({baseline: $baseline, candidate: $candidate})
         git_stage(["."])
         git_commit("improve: adopt candidate")
         $baseline = eval_adopt($candidate)
@@ -1067,7 +1109,9 @@ flow improve -> EvalReport
   brace-free indentation blocks; emits `@json` for nodes without a native form. Separate from `render.rs`
   (a lossy one-way terminal display tree).
 
-Round-trip invariant (**holds today**): `parse(&format(&ast)) == ast` for every `DraftAst`.
+Round-trip invariant: `parse(&format(&ast)) == ast` — native spellings for the supported subset,
+`@json` for everything else, and non-identifier names fall back to `@json` (L-18);
+property-tested (`tests/roundtrip_property.rs`).
 
 `flux run <app.flux>` runs a multi-agent program through the `flux-app` host (see
 [`../../../docs/designs/flux-lang-evolution.md`](../../../docs/designs/flux-lang-evolution.md) §6); a
@@ -1083,8 +1127,8 @@ Round-trip invariant (**holds today**): `parse(&format(&ast)) == ast` for every 
 | Where it lives | `examples/`, user repos | `.flux/flows/`, session storage |
 | Round-trips | via `parse` + `format` | via `serde_json` |
 | Comments | yes (`#`) | no |
-| Multi-line strings | yes (`"""..."""`) | escaped `\n` in JSON string |
-| Named args | yes (`key: val`) | positional array only |
+| Multi-line strings | no (`"""` aspirational) — escaped `\n` in a `"…"` string | escaped `\n` in JSON string |
+| Named args | single object argument (`op({k: v})`) | same — one object argument names the params |
 | Type annotations | yes (params/returns) | yes (same `TypeRef` serde) |
 | String interpolation | `{sym}`, escape `{{` `}}` | same `{sym}` inside JSON strings |
 

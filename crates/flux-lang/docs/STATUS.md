@@ -9,7 +9,7 @@ update it in the same commit as the behaviour it describes.
 [`docs/designs/flux-lang-evolution.md`](../../../docs/designs/flux-lang-evolution.md)).
 
 > Note: the implementation has intentionally grown **beyond** the PRD's "deliberately small" v1 node set
-> (PRD §4/§8 list ~7 constructs; `ast.rs` ships **36**). That is a superset, not a regression.
+> (PRD §4/§8 list ~7 constructs; `ast.rs` ships **43**). That is a superset, not a regression.
 
 ## Evolution build status (P0–P6 + flux-app)
 
@@ -33,7 +33,7 @@ The forward design ([`flux-lang-evolution.md`](../../../docs/designs/flux-lang-e
 | **P7** | Tier-2 control-flow (`scope`/`saga`/`once`/`checkpoint`) + `DurableStore` seam (`FlowStore` event-log folds) + dead-step + **CSE** optimizer passes (`Stage::Alias`) | ✅ |
 | **P8a** | bind-grammar ergonomics: `bind` now accepts a `var` (`$b = $a` alias) or `lit` (`$x = 5`/`[1,2,3]`/`{…}`) directly (runtime-only; parser/analyzer already produced these) | ✅ |
 | **P8b** | **value-template construction** — pure `obj`/`list` nodes so a record/list assembles from variables (`return { ok: true, n: $count, intent: $x.intent }`); leaves restricted to pure value nodes | ✅ |
-| — | `ask` reply-correlation (flux-app MVP); `checkpoint`∘`await` composition; `once` crash-exactly-once; native `{k:expr}`/`[expr]` text spelling + a strict-JSON-vs-native-text emission A/B | ⬜ (optional) |
+| — | `ask` reply-correlation (flux-app MVP); `checkpoint`∘`await` composition; `once` crash-exactly-once; the **measured** strict-JSON-vs-native-text emission A/B (native `{k:expr}`/`[expr]` spellings shipped in P8; the strict `emit_plan` schema arm shipped in flux-flow — only the comparison run remains) | ⬜ (optional) |
 
 Each landed phase shipped behind the full dev loop (build/test/clippy/fmt/codegate) and an adversarial
 review pass (findings fixed before commit).
@@ -42,10 +42,10 @@ review pass (findings fixed before commit).
 
 | PRD § | Requirement | Status | Evidence / note |
 |---|---|---|---|
-| 8, 10.1 | Draft AST + core node kinds (`flow`/bind/call/thing/branch/repeat/await/return/effect) | ✅ | `src/ast.rs` — 42 `Node` kinds |
-| 8 | Constructs beyond v1 (`each`/`parallel`/`race`/`try`/`retry`/`confirm`/`loop`/`throttle`/…) | ✅ | `src/ast.rs`, `src/runtime.rs` |
+| 8, 10.1 | Draft AST + core node kinds (`flow`/bind/call/thing/branch/repeat/await/return/effect) | ✅ | `src/ast.rs` — 43 `Node` kinds |
+| 8 | Constructs beyond v1 (`each`/`parallel`/`race`/`try`/`retry`/`confirm`/`loop`/`throttle`/…) | ✅ | `src/ast.rs`, `src/runtime.rs`. Reliability-tier semantics hardened per the v1-hardening epic (L-17): `race` = concurrent first-success (all-failed → joined error, losers' dispatches counted); `throttle` = op dispatches per sliding window, atomic bucket keyed by `name`; `debounce` = keyed cross-turn coalescing via per-`name` last-trigger in the session store |
 | 8 | `await` pause/resume | ✅ (P6a) | cross-turn suspend/resume: a top-level `await` suspends (`FlowOutcome.suspension`, `RunEvent::Awaiting`); the engine persists it (`suspensions` table) and resumes next turn via `resume_flow` — the prefix is not re-run. Top-level-only in v1 (analyzer-enforced) |
-| 1, 8 | Compact **text parser** (text → AST) | ✅ | `src/parse.rs` + `src/format.rs`; `parse(format(ast)) == ast` (native subset + `@json` fallback; round-trip + real-example tests) |
+| 1, 8 | Compact **text parser** (text → AST) | ✅ | `src/parse.rs` + `src/format.rs`; `parse(format(ast)) == ast` — native spellings for the supported subset, `@json` for everything else, and non-identifier names fall back to `@json` (L-18); property-tested (`tests/roundtrip_property.rs`) |
 | 8, 16 | Pretty-printer / renderer (AST → readable) | ✅ | `src/render.rs` is intentionally one-way (lossy display tree); the round-trippable text surface is `format`/`parse` (row above) |
 | 20.1 | AST serializable + versioned (JSON wire) | ✅ | serde on `ast.rs`; `examples/*.flux` are JSON |
 

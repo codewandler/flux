@@ -23,8 +23,11 @@ fn cognition_research_example_text_round_trips() {
     );
 }
 
-/// The P6b control-flow primitives round-trip through the `@json` escape (no native grammar yet), so
-/// `parse(format(ast)) == ast` still holds for a flow that uses every one of them.
+/// The P6b control-flow primitives (`match`/`route`/`fallback`/`timeout`/`budget`) have had a
+/// native grammar since P8 — they round-trip through their own text forms (no `@json` escape), so
+/// `parse(format(ast)) == ast` holds for a flow that uses every one of them. Statement-position
+/// `@json` escape coverage lives in `json_fallback_round_trips_statement_and_inline` (parse.rs)
+/// and the `roundtrip_property` suite.
 #[test]
 fn p6b_control_flow_nodes_round_trip() {
     use flux_lang::ast::{DraftAst, FallbackBranch, MatchCase, Node, RouteCase, SymbolName};
@@ -75,6 +78,10 @@ fn p6b_control_flow_nodes_round_trip() {
     };
 
     let text = flux_lang::format::format(&ast);
+    assert!(
+        !text.contains("@json"),
+        "P6b nodes are native since P8 — no @json expected\n--- text ---\n{text}"
+    );
     let back = flux_lang::parse::parse(&text)
         .unwrap_or_else(|e| panic!("parse the formatted text: {e}\n--- text ---\n{text}"));
     assert_eq!(

@@ -12,7 +12,7 @@ use std::collections::HashSet;
 
 use async_trait::async_trait;
 
-use flux_lang::analyze::{analyze_flow, for_each_node, Diagnostic};
+use flux_lang::analyze::{for_each_node, lower, Diagnostic};
 use flux_runtime::ToolRegistry;
 use flux_spec::{Effect, Risk};
 
@@ -194,7 +194,11 @@ pub fn analyze_composites(
                 op.name
             )));
         }
-        analyze_flow(&op.body, &catalog).unwrap_or_else(|mut e| diags.append(&mut e));
+        // Composites validate through the same typed gate as model plans (L-16/F9): full
+        // structural analysis + lowering. Params seed the definedness scope; no session set.
+        lower(&op.body, &catalog, &std::collections::HashSet::new())
+            .map(|_| ())
+            .unwrap_or_else(|mut e| diags.append(&mut e));
         if body_contains_await(&op.body.body) {
             diags.push(Diagnostic::new(format!(
                 "composite op `{}` cannot contain `await` in v1",

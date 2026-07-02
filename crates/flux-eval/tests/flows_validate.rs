@@ -25,7 +25,7 @@ fn example_flows_validate_against_the_registry() {
         let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         let ast: flux_flow::ast::DraftAst =
             serde_json::from_str(&src).unwrap_or_else(|e| panic!("parse {path} as DraftAst: {e}"));
-        flux_flow::analyze::analyze_flow(&ast, &ops).unwrap_or_else(|diags| {
+        flux_flow::analyze::analyze_flow(&ast, &ops, &Default::default()).unwrap_or_else(|diags| {
             panic!("{path} references unknown ops / is invalid: {diags:?}")
         });
     }

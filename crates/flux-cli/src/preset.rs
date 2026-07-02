@@ -637,7 +637,8 @@ mod tests {
 
         // analyze must accept it (every op resolves), then execute over an in-memory store.
         let oreg = flux_flow::registry::OpRegistry::new(exec.registry());
-        flux_flow::analyze::analyze_flow(&ast, &oreg).expect("read flow analyzes");
+        flux_flow::analyze::analyze_flow(&ast, &oreg, &Default::default())
+            .expect("read flow analyzes");
 
         let store = flux_flow::state::FlowStore::in_memory().unwrap();
         let mut sink = NullSink;

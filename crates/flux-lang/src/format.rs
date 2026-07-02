@@ -1,6 +1,7 @@
 //! `format` — the **canonical compact text projection** of a [`DraftAst`], and the round-trip partner
 //! of [`crate::parse`]. Where [`crate::render`] is a one-way box-drawing *display* tree, this module
-//! emits a re-parseable surface: `parse(&format(&ast)) == ast` for every `DraftAst`.
+//! emits a re-parseable surface: `parse(&format(&ast)) == ast` for every `DraftAst` whose header
+//! names are spellable (see "The flow-header exception" below — node bodies are covered totally).
 //!
 //! # Markers (design §5)
 //! - `$x = <expr>` — a **bind** (`=`).
@@ -19,11 +20,34 @@
 //! reads back via serde. This keeps the round-trip total for **every** `DraftAst` while keeping the
 //! hand-written surface small. The `@json` JSON is exactly the wire format, so it never loses data.
 //!
+//! # Name guards (round-trip totality)
+//! Every *declared* name position — bind/memo targets, `each` items and collectors, `repeat`
+//! collectors, every `-> $bind` arrow target, `ctx` names and include/exclude symbols, `ctx_append`
+//! symbols, `parallel` branch names, and `$var` references (statement and expression position) — is
+//! spelled natively only when the name is a plain identifier ([`SymbolName::is_identifier`]).
+//! Op names are spelled natively only when [`is_valid_op_name`] holds (and, inline, when the op is
+//! not literally `fmt`, whose paren form would reparse as the [`Node::Fmt`] node). A `Bind`'s type
+//! annotation is spelled only when its label reparses to the same [`TypeRef`] (a `Named("Bool")`
+//! would silently come back as the builtin). Any violation makes the **whole node** fall back to
+//! `@json`, mirroring the `retry`-backoff and degenerate-`each` guards, so
+//! `parse(&format(&ast)) == ast` stays total for node bodies.
+//!
+//! # The flow-header exception
+//! The header (`flow <name>(<params>) -> <type>`) has **no** `@json` escape: an unspellable flow
+//! name, parameter name, or header type cannot fall back to anything without changing the AST, and
+//! [`crate::parse`] has no whole-flow escape line. `format` emits header names verbatim; an
+//! unspellable one produces a **loud** parse error on the way back (never silent corruption). The
+//! analyzer rejects such names ([`crate::ast::is_valid_decl_name`]), so they cannot reach a
+//! formatted artifact through the normal pipeline; the round-trip property test excludes header
+//! names for exactly this documented reason.
+//!
 //! # Note on `goal`
 //! `DraftAst` has no `goal` field, so `format` never emits a `goal` line. The parser *tolerates and
 //! ignores* one for forward-compatibility with hand-written headers; it is not part of the round-trip.
 
-use crate::ast::{DraftAst, FlowEffect, Node, SymbolName};
+use crate::ast::{
+    is_valid_decl_name, is_valid_op_name, DraftAst, FlowEffect, Node, SymbolName, TypeRef,
+};
 use crate::program::CompositeOpDecl;
 use flux_spec::{Effect, Idempotency, Risk};
 
@@ -193,12 +217,14 @@ fn fmt_string_list(items: &[String]) -> String {
 }
 
 /// Render a node *inline* (as a bind value, call argument, condition, or return value). Only `var`,
-/// `lit` and `call` have a native inline form; everything else falls back to `@json`.
+/// `lit` and `call` have a native inline form; everything else falls back to `@json`. Unspellable
+/// names (a non-identifier `$var`, an invalid op name, an op literally named `fmt` whose paren form
+/// would reparse as the `Fmt` node) also fall back to `@json`.
 fn fmt_expr(node: &Node) -> String {
     match node {
-        Node::Var { name } => format!("${}", name.0),
+        Node::Var { name } if name.is_identifier() => format!("${}", name.0),
         Node::Lit { value } => compact(value),
-        Node::Call { op, args } => {
+        Node::Call { op, args } if is_valid_op_name(op) && op != "fmt" => {
             let a: Vec<String> = args.iter().map(fmt_expr).collect();
             format!("{}({})", op, a.join(", "))
         }
@@ -210,10 +236,12 @@ fn fmt_expr(node: &Node) -> String {
             )
         }
         // Field-access sugar: a `jq` over a plain `$var` with a simple dotted path renders as
-        // `$var.path` (parse re-derives the same `Jq`). Bracket paths or non-`Var` inputs can't be
-        // spelled this way, so they fall through to `@json` — keeping the round-trip total.
+        // `$var.path` (parse re-derives the same `Jq`). Bracket paths, non-`Var` inputs, or a
+        // non-identifier input symbol can't be spelled this way, so they fall through to `@json` —
+        // keeping the round-trip total.
         Node::Jq { path, input }
-            if is_field_path(path) && matches!(input.as_ref(), Node::Var { .. }) =>
+            if is_field_path(path)
+                && matches!(input.as_ref(), Node::Var { name } if name.is_identifier()) =>
         {
             match input.as_ref() {
                 Node::Var { name } => format!("${}{}", name.0, path),
@@ -257,6 +285,36 @@ fn is_word_token(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Whether an optional declared symbol is spellable (absent counts as spellable) — the guard for
+/// every optional `-> $bind` / `collect` slot.
+fn opt_ident(sym: &Option<SymbolName>) -> bool {
+    sym.as_ref().is_none_or(SymbolName::is_identifier)
+}
+
+/// Whether every symbol in a `$a, $b` list is spellable.
+fn all_idents(syms: &[SymbolName]) -> bool {
+    syms.iter().all(SymbolName::is_identifier)
+}
+
+/// Whether a type annotation can be spelled in the text surface and re-read as the *same*
+/// [`TypeRef`]. A `Named` label that collides with a builtin (`Any`/`Bool`/`Number`/`String`) or
+/// leaves the decl-name charset (spaces, `=`, `<`, `#`, …) would reparse as something else — the
+/// node carrying it falls back to `@json` instead.
+fn is_spellable_type(ty: &TypeRef) -> bool {
+    match ty {
+        TypeRef::Any | TypeRef::Bool | TypeRef::Number | TypeRef::String => true,
+        TypeRef::List(inner) => is_spellable_type(inner),
+        TypeRef::Named(n) => {
+            is_valid_decl_name(n) && !matches!(n.as_str(), "Any" | "Bool" | "Number" | "String")
+        }
+    }
+}
+
+/// Whether an optional type annotation is spellable (absent counts as spellable).
+fn opt_spellable_type(ty: &Option<TypeRef>) -> bool {
+    ty.as_ref().is_none_or(is_spellable_type)
 }
 
 /// Whether an object-template key is identifier-safe (emit as a bareword); otherwise it is JSON-quoted.
@@ -311,7 +369,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
             value,
             ty,
             effect,
-        } => {
+        } if name.is_identifier() && opt_spellable_type(ty) => {
             if let Some(e) = effect {
                 out.push_str(&ind);
                 out.push_str("@effect(");
@@ -329,7 +387,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
             out.push_str(&fmt_expr(value));
             out.push('\n');
         }
-        Node::CtxAppend { ctx, add } => {
+        Node::CtxAppend { ctx, add } if ctx.is_identifier() && all_idents(add) => {
             out.push_str(&ind);
             out.push('$');
             out.push_str(&ctx.0);
@@ -340,8 +398,9 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
             }
             out.push('\n');
         }
-        // A bare `call` statement (result discarded) uses the `do` marker.
-        Node::Call { op, args } => {
+        // A bare `call` statement (result discarded) uses the `do` marker. (`do fmt …` is fine —
+        // only the *inline* paren form collides with the `Fmt` node.)
+        Node::Call { op, args } if is_valid_op_name(op) => {
             out.push_str(&ind);
             out.push_str("do ");
             out.push_str(op);
@@ -358,7 +417,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
             out.push_str(&fmt_expr(value));
             out.push('\n');
         }
-        Node::Var { name } => {
+        Node::Var { name } if name.is_identifier() => {
             out.push_str(&ind);
             out.push('$');
             out.push_str(&name.0);
@@ -398,10 +457,11 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
             body,
             collect,
             flat,
-        } if !(*flat && collect.is_none()) => {
+        } if !(*flat && collect.is_none()) && item.is_identifier() && opt_ident(collect) => {
             // The native `each … -> flat $c` surface can only spell `flat` next to a `collect` target.
             // A `flat: true, collect: None` node (degenerate, but a valid AST shape) has no native form,
             // so this guard lets it fall through to the `@json` escape below — preserving round-trip.
+            // Unspellable item/collect names fall through the same way (the F21 name guards).
             out.push_str(&ind);
             out.push_str("each $");
             out.push_str(&item.0);
@@ -423,7 +483,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
             until,
             body,
             collect,
-        } => {
+        } if opt_ident(collect) => {
             out.push_str(&ind);
             out.push_str("repeat ");
             out.push_str(&max.to_string());
@@ -440,7 +500,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
             }
             fmt_body(body, level + 1, indent, out);
         }
-        Node::Seq { body, bind } => {
+        Node::Seq { body, bind } if opt_ident(bind) => {
             out.push_str(&ind);
             out.push_str("seq");
             if let Some(b) = bind {
@@ -456,7 +516,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
             include,
             exclude,
             budget,
-        } => {
+        } if name.is_identifier() && all_idents(include) && all_idents(exclude) => {
             out.push_str(&ind);
             out.push_str("ctx $");
             out.push_str(&name.0);
@@ -533,7 +593,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
                 fmt_body(default, level + 2, indent, out);
             }
         }
-        Node::Fallback { branches, bind } => {
+        Node::Fallback { branches, bind } if opt_ident(bind) => {
             out.push_str(&ind);
             out.push_str("fallback");
             if let Some(b) = bind {
@@ -554,7 +614,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
             until,
             body,
             bind,
-        } => {
+        } if opt_ident(bind) => {
             out.push_str(&ind);
             out.push_str("loop for ");
             out.push_str(&for_ms.to_string());
@@ -573,7 +633,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
             }
             fmt_body(body, level + 1, indent, out);
         }
-        Node::Timeout { ms, body, bind } => {
+        Node::Timeout { ms, body, bind } if opt_ident(bind) => {
             out.push_str(&ind);
             out.push_str("timeout ");
             out.push_str(&ms.to_string());
@@ -584,7 +644,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
             out.push('\n');
             fmt_body(body, level + 1, indent, out);
         }
-        Node::Budget { limit, body, bind } => {
+        Node::Budget { limit, body, bind } if opt_ident(bind) => {
             out.push_str(&ind);
             out.push_str("budget ");
             out.push_str(&limit.to_string());
@@ -595,7 +655,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
             out.push('\n');
             fmt_body(body, level + 1, indent, out);
         }
-        Node::CapScope { tools, body, bind } => {
+        Node::CapScope { tools, body, bind } if opt_ident(bind) => {
             out.push_str(&ind);
             out.push_str("with_tools ");
             out.push_str(&fmt_string_list(tools));
@@ -608,7 +668,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
         }
         // `parallel` + indented `branch $name` arms. Native only when every branch name is an
         // identifier (so the `$name` reader recovers it exactly); otherwise fall through to `@json`.
-        Node::Parallel { branches } if branches.iter().all(|b| is_ident_key(&b.name.0)) => {
+        Node::Parallel { branches } if branches.iter().all(|b| b.name.is_identifier()) => {
             out.push_str(&ind);
             out.push_str("parallel\n");
             for br in branches {
@@ -620,14 +680,15 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
             }
         }
         // `retry <max> [backoff <ident>] [delay <ms>] [-> $bind]` + body. Native only when `backoff`
-        // is a single bare word (the field is free-form `String`); otherwise fall through to `@json`.
+        // is a single bare word (the field is free-form `String`) and the bind is spellable;
+        // otherwise fall through to `@json`.
         Node::Retry {
             max,
             backoff,
             delay_ms,
             body,
             bind,
-        } if backoff.as_deref().is_none_or(is_word_token) => {
+        } if backoff.as_deref().is_none_or(is_word_token) && opt_ident(bind) => {
             out.push_str(&ind);
             out.push_str("retry ");
             out.push_str(&max.to_string());

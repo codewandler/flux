@@ -39,6 +39,43 @@ macro_rules! string_id {
 string_id! {
     /// A session symbol name (the `$draft` in source is stored without the `$`).
     SymbolName,
+}
+
+impl SymbolName {
+    /// Whether this symbol name is a plain identifier — non-empty, ASCII alphanumeric or `_` only.
+    /// This is the text surface's spellable-name contract: the formatter emits `$name` natively only
+    /// for identifiers (anything else falls back to `@json`), and the analyzer rejects non-identifier
+    /// names outright. A `.` in particular is never valid in a *declared* name: in expression
+    /// position `$a.b` is field-access sugar for `jq(".b", $a)`, so a dotted symbol name would
+    /// silently change meaning through a format→parse cycle.
+    pub fn is_identifier(&self) -> bool {
+        !self.0.is_empty()
+            && self
+                .0
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+}
+
+/// Whether `name` is a spellable operation name: starts with an ASCII letter or `_`, then ASCII
+/// alphanumerics, `_`, `.` (op namespacing, e.g. `email.send`), or `-`. Mirrors what the text
+/// parser's call grammar accepts; the formatter must not emit a bare `do <op>`/`op(…)` outside it.
+pub fn is_valid_op_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+}
+
+/// Whether `name` is a spellable declaration name (flow names, params, composite-op names):
+/// non-empty ASCII alphanumerics, `_`, or `-` — the text parser's `is_name_char` set.
+pub fn is_valid_decl_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+string_id! {
     /// The identity of a stored immutable value.
     ValueId,
     /// The identity of a resolved external thing.

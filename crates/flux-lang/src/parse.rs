@@ -1,8 +1,18 @@
 //! `parse` — read canonical Flux-Lang **text** back into a [`DraftAst`]. The round-trip partner of
 //! [`crate::format`]: `parse(&format(&ast)) == ast` for every `DraftAst` (the supported subset natively,
-//! everything else via the `@json` escape). Hand-written, indentation-sensitive recursive descent.
+//! everything else via the `@json` escape; the flow *header* is the one documented exception — see
+//! [`crate::format`]'s "flow-header exception"). Hand-written, indentation-sensitive recursive descent.
 //!
-//! It is **total**: malformed input returns [`FlowError::Parse`], never a panic.
+//! It is **total**: malformed input returns [`FlowError::Parse`], never a panic. Errors carry a
+//! `line N:` prefix (1-based source line, counting comment/blank lines) wherever a line is in scope,
+//! so the model repair loop can point at the offending statement.
+//!
+//! # Declared vs. referenced names
+//! A *declared* symbol (a bind target, `each` item, `-> $bind` arrow target, `ctx` name, sym-list
+//! entry, `parallel` branch name) is a plain identifier: ASCII alphanumerics and `_` only. `.` is
+//! deliberately **not** a declared-name character — in expression position `$a.b` is field-access
+//! sugar for `jq(".b", $a)`, so a dotted *declared* name would silently change meaning through a
+//! format→parse cycle (`$a.b = 1` is a parse error, not a bind named `a.b`).
 //!
 //! # Surface (see [`crate::format`] for the full grammar)
 //! - Header: `flow [<name>][(<param>, …)][ -> <type>]`, body indented 2 (or any consistent step).
@@ -34,9 +44,12 @@ pub fn parse(src: &str) -> Result<DraftAst> {
         return Err(perr("empty input: expected a `flow` header"));
     }
     if lines[0].indent != 0 {
-        return Err(perr("the `flow` header must start at column 0"));
+        return Err(perr_at(
+            lines[0].number,
+            "the `flow` header must start at column 0",
+        ));
     }
-    let (name, params, returns) = parse_header(&lines[0].text)?;
+    let (name, params, returns) = parse_header(&lines[0].text).map_err(|e| err_at(&lines[0], e))?;
 
     // The body is every indented line. Top-level (column-0) lines after the header may only be a
     // tolerated-and-ignored `goal "…"` directive (there is no AST slot for it).
@@ -46,7 +59,10 @@ pub fn parse(src: &str) -> Result<DraftAst> {
             if is_goal_line(&l.text) {
                 continue;
             }
-            return Err(perr(&format!("unexpected top-level line: `{}`", l.text)));
+            return Err(perr_at(
+                l.number,
+                &format!("unexpected top-level line: `{}`", l.text),
+            ));
         }
         body_lines.push(l.clone());
     }
@@ -62,6 +78,22 @@ pub fn parse(src: &str) -> Result<DraftAst> {
 
 fn perr(msg: &str) -> FlowError {
     FlowError::Parse(msg.to_string())
+}
+
+/// A parse error located at a 1-based source line.
+fn perr_at(line: usize, msg: &str) -> FlowError {
+    FlowError::Parse(format!("line {line}: {msg}"))
+}
+
+/// Attach `line`'s source position to a parse error — once. An error already carrying a `line N:`
+/// prefix from a deeper (more precise) frame is left untouched, so the innermost statement wins.
+fn err_at(line: &Line, e: FlowError) -> FlowError {
+    match e {
+        FlowError::Parse(msg) if !msg.starts_with("line ") => {
+            FlowError::Parse(format!("line {}: {msg}", line.number))
+        }
+        other => other,
+    }
 }
 
 fn is_goal_line(t: &str) -> bool {
@@ -97,44 +129,59 @@ pub fn parse_program(src: &str) -> Result<Module> {
     while i < lines.len() {
         let line = &lines[i];
         if line.indent != 0 {
-            return Err(perr(&format!(
-                "a declaration must start at column 0: `{}`",
-                line.text
-            )));
+            return Err(perr_at(
+                line.number,
+                &format!("a declaration must start at column 0: `{}`", line.text),
+            ));
         }
         let header = line.text.as_str();
         let region = child_region(&lines[i..], 0);
         let consumed = 1 + region.len();
 
         if let Some(rest) = kw(header, "agent") {
-            program.agents.push(parse_agent_decl(rest, region)?);
+            program
+                .agents
+                .push(parse_agent_decl(rest, region).map_err(|e| err_at(line, e))?);
             saw_module_decl = true;
         } else if let Some(rest) = kw(header, "channel") {
-            program.channels.push(parse_channel_decl(rest, region)?);
+            program
+                .channels
+                .push(parse_channel_decl(rest, region).map_err(|e| err_at(line, e))?);
             saw_module_decl = true;
         } else if let Some(rest) = kw(header, "datasource") {
             program
                 .datasources
-                .push(parse_datasource_decl(rest, region)?);
+                .push(parse_datasource_decl(rest, region).map_err(|e| err_at(line, e))?);
             saw_module_decl = true;
         } else if let Some(rest) = kw(header, "trigger") {
-            program.triggers.push(parse_trigger_decl(rest, region)?);
+            program
+                .triggers
+                .push(parse_trigger_decl(rest, region).map_err(|e| err_at(line, e))?);
             saw_module_decl = true;
         } else if let Some(rest) = kw(header, "journey") {
-            program.journeys.push(parse_journey_decl(rest, region)?);
+            program
+                .journeys
+                .push(parse_journey_decl(rest, region).map_err(|e| err_at(line, e))?);
             saw_module_decl = true;
         } else if let Some(rest) = kw(header, "op") {
-            program.ops.push(parse_composite_op_decl(rest, region)?);
+            program
+                .ops
+                .push(parse_composite_op_decl(rest, region).map_err(|e| err_at(line, e))?);
             saw_module_decl = true;
         } else if is_flow_header(header) {
-            program.flows.push(parse_flow_decl(header, region)?);
+            program
+                .flows
+                .push(parse_flow_decl(header, region).map_err(|e| err_at(line, e))?);
         } else if is_goal_line(header) {
             // tolerated and ignored, mirroring `parse`
         } else {
-            return Err(perr(&format!(
-                "unknown top-level declaration: `{header}` (expected agent / channel / datasource / \
-                 trigger / journey / op / flow)"
-            )));
+            return Err(perr_at(
+                line.number,
+                &format!(
+                    "unknown top-level declaration: `{header}` (expected agent / channel / \
+                     datasource / trigger / journey / op / flow)"
+                ),
+            ));
         }
         i += consumed;
     }
@@ -207,16 +254,17 @@ fn parse_composite_op_decl(name_str: &str, region: &[Line]) -> Result<CompositeO
     while body_start < region.len() {
         let line = &region[body_start];
         if line.indent != block_indent {
-            return Err(perr(&format!(
-                "unexpected indentation in op `{name}`: `{}`",
-                line.text
-            )));
+            return Err(perr_at(
+                line.number,
+                &format!("unexpected indentation in op `{name}`: `{}`", line.text),
+            ));
         }
         let (key, rest) = take_while(&line.text, is_name_char);
         if !is_composite_meta_key(key) {
             break;
         }
-        parse_composite_meta_line(&mut meta, key, rest.trim_start())?;
+        parse_composite_meta_line(&mut meta, key, rest.trim_start())
+            .map_err(|e| err_at(line, e))?;
         body_start += 1;
     }
 
@@ -284,17 +332,17 @@ fn attr_lines(region: &[Line]) -> Result<Vec<(String, &str)>> {
     let indent = region[0].indent;
     for l in region {
         if l.indent != indent {
-            return Err(perr(&format!(
-                "unexpected indentation in declaration body: `{}`",
-                l.text
-            )));
+            return Err(perr_at(
+                l.number,
+                &format!("unexpected indentation in declaration body: `{}`", l.text),
+            ));
         }
         let (key, rest) = take_while(&l.text, is_name_char);
         if key.is_empty() {
-            return Err(perr(&format!(
-                "expected a `key value` attribute, got: `{}`",
-                l.text
-            )));
+            return Err(perr_at(
+                l.number,
+                &format!("expected a `key value` attribute, got: `{}`", l.text),
+            ));
         }
         out.push((key.to_string(), rest.trim_start()));
     }
@@ -401,25 +449,31 @@ fn parse_journey_decl(name_str: &str, region: &[Line]) -> Result<JourneyDecl> {
     while j < region.len() {
         let line = &region[j];
         if line.indent != block_indent {
-            return Err(perr(&format!(
-                "unexpected indentation in journey `{name}`: `{}`",
-                line.text
-            )));
+            return Err(perr_at(
+                line.number,
+                &format!(
+                    "unexpected indentation in journey `{name}`: `{}`",
+                    line.text
+                ),
+            ));
         }
         let t = line.text.as_str();
         if let Some(rest) = kw(t, "agent") {
-            agent = Some(string_value(rest, "agent")?);
+            agent = Some(string_value(rest, "agent").map_err(|e| err_at(line, e))?);
             j += 1;
         } else if is_flow_header(t) {
             let body = child_region(&region[j..], block_indent);
-            let mut ast = parse_flow_decl(t, body)?;
+            let mut ast = parse_flow_decl(t, body).map_err(|e| err_at(line, e))?;
             if ast.name.is_none() {
                 ast.name = Some(name.clone());
             }
             flow = Some(ast);
             j += 1 + body.len();
         } else {
-            return Err(perr(&format!("unexpected line in journey `{name}`: `{t}`")));
+            return Err(perr_at(
+                line.number,
+                &format!("unexpected line in journey `{name}`: `{t}`"),
+            ));
         }
     }
     let flow = flow.ok_or_else(|| perr(&format!("journey `{name}` needs a `flow` body")))?;
@@ -637,17 +691,21 @@ fn parse_setting_record(s: &str) -> Result<(serde_json::Value, &str)> {
 struct Line {
     indent: usize,
     text: String,
+    /// The 1-based source line this logical line came from (comment/blank lines still count), so
+    /// parse errors can point back into the exact text the model emitted.
+    number: usize,
 }
 
 fn preprocess(src: &str) -> Result<Vec<Line>> {
     let mut out = Vec::new();
-    for raw in src.lines() {
+    for (idx, raw) in src.lines().enumerate() {
+        let number = idx + 1;
         let code = strip_comment(raw);
         let mut indent = 0usize;
         for c in code.chars() {
             match c {
                 ' ' => indent += 1,
-                '\t' => return Err(perr("tabs are not allowed for indentation")),
+                '\t' => return Err(perr_at(number, "tabs are not allowed for indentation")),
                 _ => break,
             }
         }
@@ -658,6 +716,7 @@ fn preprocess(src: &str) -> Result<Vec<Line>> {
         out.push(Line {
             indent,
             text: text.to_string(),
+            number,
         });
     }
     Ok(out)
@@ -694,6 +753,16 @@ fn is_name_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-'
 }
 
+/// A *declared*-symbol character (bind targets, `each` items, `-> $bind`, sym lists, `ctx` names,
+/// `parallel` branch names): ASCII alphanumeric or `_` — the parser-side mirror of
+/// [`SymbolName::is_identifier`]. Deliberately excludes `.` (see the module docs: dotted names are
+/// field-access sugar in expression position, never declarable).
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// A *referenced*-symbol character in expression position: identifier chars plus `.`, so `$a.b` is
+/// read as one token and then split into the symbol + jq field path by [`parse_expr`].
 fn is_var_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '.'
 }
@@ -825,12 +894,13 @@ fn parse_stmts(lines: &[Line], parent_indent: usize) -> Result<(Vec<Node>, usize
             break;
         }
         if lines[i].indent != block_indent {
-            return Err(perr(&format!(
-                "unexpected indentation at: `{}`",
-                lines[i].text
-            )));
+            return Err(perr_at(
+                lines[i].number,
+                &format!("unexpected indentation at: `{}`", lines[i].text),
+            ));
         }
-        let (node, used) = parse_stmt(&lines[i..], block_indent)?;
+        let (node, used) =
+            parse_stmt(&lines[i..], block_indent).map_err(|e| err_at(&lines[i], e))?;
         nodes.push(node);
         i += used;
     }
@@ -882,7 +952,7 @@ fn parse_stmt(lines: &[Line], indent: usize) -> Result<(Node, usize)> {
         if lines.len() < 2 || lines[1].indent != indent {
             return Err(perr("`@effect` must directly precede a bind"));
         }
-        let (inner, used) = parse_stmt(&lines[1..], indent)?;
+        let (inner, used) = parse_stmt(&lines[1..], indent).map_err(|e| err_at(&lines[1], e))?;
         return Ok((set_effect(inner, eff)?, 1 + used));
     }
 
@@ -902,7 +972,7 @@ fn parse_stmt(lines: &[Line], indent: usize) -> Result<(Node, usize)> {
     }
     if kw(t, "until").is_some() {
         return Err(perr(
-            "`until` is only valid as the first line of a `repeat` body",
+            "`until` is only valid as the first line of a `repeat`/`loop` body",
         ));
     }
 
@@ -1018,7 +1088,7 @@ fn parse_each(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)
     let item_part = rest
         .strip_prefix('$')
         .ok_or_else(|| perr("`each` expects `$item`"))?;
-    let (item, r) = take_while(item_part, is_var_char);
+    let (item, r) = take_while(item_part, is_ident_char);
     if item.is_empty() {
         return Err(perr("`each` has an empty item symbol"));
     }
@@ -1036,7 +1106,7 @@ fn parse_each(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)
             .trim_start()
             .strip_prefix('$')
             .ok_or_else(|| perr("`each` expects `$collect` after `->`"))?;
-        let (nm, tail) = take_while(nm, is_var_char);
+        let (nm, tail) = take_while(nm, is_ident_char);
         if nm.is_empty() || !tail.trim().is_empty() {
             return Err(perr("malformed `$collect` in `each`"));
         }
@@ -1082,16 +1152,7 @@ fn parse_repeat(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usiz
     };
 
     let region = child_region(lines, indent);
-    let (until, body_region) = match region.first() {
-        Some(first) => match kw(&first.text, "until") {
-            Some(u) => {
-                let uexpr = parse_full_expr(u, "until condition")?;
-                (Some(Box::new(uexpr)), &region[1..])
-            }
-            None => (None, region),
-        },
-        None => (None, region),
-    };
+    let (until, body_region) = split_until(region)?;
     let (body, _) = parse_stmts(body_region, indent)?;
     Ok((
         Node::Repeat {
@@ -1131,7 +1192,7 @@ fn split_until(region: &[Line]) -> Result<(Option<Box<Node>>, &[Line])> {
     match region.first() {
         Some(first) => match kw(&first.text, "until") {
             Some(u) => {
-                let uexpr = parse_full_expr(u, "until condition")?;
+                let uexpr = parse_full_expr(u, "until condition").map_err(|e| err_at(first, e))?;
                 Ok((Some(Box::new(uexpr)), &region[1..]))
             }
             None => Ok((None, region)),
@@ -1154,10 +1215,13 @@ fn parse_arms(region: &[Line], arm_kw: &str) -> Result<(Vec<(String, Vec<Node>)>
     let mut i = 0;
     while i < region.len() {
         if region[i].indent != arm_indent {
-            return Err(perr(&format!(
-                "unexpected indentation in `{arm_kw}` arms: `{}`",
-                region[i].text
-            )));
+            return Err(perr_at(
+                region[i].number,
+                &format!(
+                    "unexpected indentation in `{arm_kw}` arms: `{}`",
+                    region[i].text
+                ),
+            ));
         }
         let t = region[i].text.as_str();
         let body_region = child_region(&region[i..], arm_indent);
@@ -1167,9 +1231,10 @@ fn parse_arms(region: &[Line], arm_kw: &str) -> Result<(Vec<(String, Vec<Node>)>
         } else if let Some(hdr) = kw(t, arm_kw) {
             arms.push((hdr.to_string(), body));
         } else {
-            return Err(perr(&format!(
-                "expected `{arm_kw}` or `default`, got: `{t}`"
-            )));
+            return Err(perr_at(
+                region[i].number,
+                &format!("expected `{arm_kw}` or `default`, got: `{t}`"),
+            ));
         }
         i += 1 + body_region.len();
     }
@@ -1254,7 +1319,7 @@ fn parse_parallel(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, us
             .trim()
             .strip_prefix('$')
             .ok_or_else(|| perr(&format!("`parallel` branch needs a `$name`, got: `{hdr}`")))?;
-        let (nm, tail) = take_while(name, is_var_char);
+        let (nm, tail) = take_while(name, is_ident_char);
         if nm.is_empty() || !tail.trim().is_empty() {
             return Err(perr(&format!("invalid `parallel` branch name: `{hdr}`")));
         }
@@ -1377,7 +1442,7 @@ fn parse_ctx(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)>
     let nm = rest
         .strip_prefix('$')
         .ok_or_else(|| perr("`ctx` expects `$name`"))?;
-    let (name, tail) = take_while(nm, is_var_char);
+    let (name, tail) = take_while(nm, is_ident_char);
     if name.is_empty() {
         return Err(perr("`ctx` has an empty name"));
     }
@@ -1394,24 +1459,28 @@ fn parse_ctx(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)>
     let mut budget = None;
     for l in region {
         let lt = l.text.as_str();
-        if let Some(r) = kw(lt, "purpose") {
-            let (v, tail) = take_json(r.trim_start())?;
-            if !tail.trim().is_empty() {
-                return Err(perr("trailing text after `purpose`"));
+        let attr: Result<()> = (|| {
+            if let Some(r) = kw(lt, "purpose") {
+                let (v, tail) = take_json(r.trim_start())?;
+                if !tail.trim().is_empty() {
+                    return Err(perr("trailing text after `purpose`"));
+                }
+                match v {
+                    serde_json::Value::String(s) => purpose = Some(s),
+                    _ => return Err(perr("`purpose` must be a string")),
+                }
+            } else if let Some(r) = kw(lt, "budget") {
+                budget = Some(r.trim().parse().map_err(|_| perr("invalid `budget`"))?);
+            } else if let Some(r) = kw(lt, "include") {
+                include = parse_sym_list(r)?;
+            } else if let Some(r) = kw(lt, "exclude") {
+                exclude = parse_sym_list(r)?;
+            } else {
+                return Err(perr(&format!("unknown `ctx` attribute: `{lt}`")));
             }
-            match v {
-                serde_json::Value::String(s) => purpose = Some(s),
-                _ => return Err(perr("`purpose` must be a string")),
-            }
-        } else if let Some(r) = kw(lt, "budget") {
-            budget = Some(r.trim().parse().map_err(|_| perr("invalid `budget`"))?);
-        } else if let Some(r) = kw(lt, "include") {
-            include = parse_sym_list(r)?;
-        } else if let Some(r) = kw(lt, "exclude") {
-            exclude = parse_sym_list(r)?;
-        } else {
-            return Err(perr(&format!("unknown `ctx` attribute: `{lt}`")));
-        }
+            Ok(())
+        })();
+        attr.map_err(|e| err_at(l, e))?;
     }
 
     Ok((
@@ -1474,10 +1543,18 @@ fn parse_assert(rest: &str) -> Result<(Node, usize)> {
 }
 
 /// A `$name`-led statement: a bare var, a ctx_append (`+=`), or a bind (`=` / `: T =`).
+/// The name is a *declared*-symbol identifier — `$a.b = 1` is a parse error (in expression
+/// position `$a.b` is field access on `$a`; a declared name can never contain `.`).
 fn parse_dollar(t: &str) -> Result<(Node, usize)> {
-    let (name, rest) = take_while(&t[1..], is_var_char);
+    let (name, rest) = take_while(&t[1..], is_ident_char);
     if name.is_empty() {
         return Err(perr("empty symbol after `$`"));
+    }
+    if rest.starts_with('.') {
+        return Err(perr(&format!(
+            "`${name}{rest}`: a declared name cannot contain `.` — `$x.y` is field access on \
+             `$x`, valid only in expression position"
+        )));
     }
     let rest = rest.trim_start();
     if rest.is_empty() {
@@ -1820,7 +1897,7 @@ fn parse_arrow_sym(after_arrow: &str, ctx: &str) -> Result<SymbolName> {
     let nm = a
         .strip_prefix('$')
         .ok_or_else(|| perr(&format!("`{ctx}` expects `$name` after `->`")))?;
-    let (nm, tail) = take_while(nm, is_var_char);
+    let (nm, tail) = take_while(nm, is_ident_char);
     if nm.is_empty() || !tail.trim().is_empty() {
         return Err(perr(&format!("malformed `$name` after `->` in `{ctx}`")));
     }
@@ -1839,7 +1916,7 @@ fn parse_sym_list(s: &str) -> Result<Vec<SymbolName>> {
         let name = part
             .strip_prefix('$')
             .ok_or_else(|| perr(&format!("expected `$symbol`, got: `{part}`")))?;
-        if name.is_empty() || !name.chars().all(is_var_char) {
+        if name.is_empty() || !name.chars().all(is_ident_char) {
             return Err(perr(&format!("invalid symbol: `{part}`")));
         }
         out.push(name.into());
@@ -2578,24 +2655,26 @@ mod tests {
 
     #[test]
     fn json_fallback_round_trips_statement_and_inline() {
-        assert_round_trips(&DraftAst {
+        let ast = DraftAst {
             body: vec![
-                // Unsupported node as a statement -> @json line.
-                Node::Assert {
-                    cond: Box::new(var("hits")),
-                    message: Some("no results".into()),
+                // Unsupported nodes as statements -> @json lines.
+                Node::Once {
+                    label: "charge-once".into(),
+                    body: vec![call("charge", vec![])],
+                    bind: None,
                 },
-                Node::Parallel {
-                    branches: vec![Branch {
-                        name: "left".into(),
-                        body: vec![call("read", vec![lit(serde_json::json!("l"))])],
-                    }],
+                Node::Thing {
+                    thing: ThingRef {
+                        kind: ThingKind::Person,
+                        selector: Selector::Name("john".into()),
+                    },
                 },
-                // Unsupported node inline (as a bind value) -> @json escape.
+                // `jq(".bitcoin.usd", $raw)` inline is *native* field-access sugar; a bracket path
+                // is not, so it uses the inline @json escape.
                 Node::Bind {
                     name: "price".into(),
                     value: Box::new(Node::Jq {
-                        path: ".bitcoin.usd".into(),
+                        path: ".prices[0]".into(),
                         input: Box::new(var("raw")),
                     }),
                     ty: None,
@@ -2618,7 +2697,312 @@ mod tests {
                 },
             ],
             ..Default::default()
-        });
+        };
+        let text = format(&ast);
+        // Statement-position `@json` lines are really present (explicit escape coverage).
+        assert!(
+            text.lines()
+                .filter(|l| l.trim_start().starts_with("@json "))
+                .count()
+                >= 2,
+            "expected statement-position @json lines: {text}"
+        );
+        assert_round_trips(&ast);
+    }
+
+    // ----- F21: name guards — the round-trip is total for unspellable names -----
+
+    /// Confirmed counterexample 1 (F8/F21): `Var{name:"a.b"}` in expression position used to format
+    /// as `$a.b`, which reparses as `Jq{".b", $a}` — a *different program*, silently.
+    #[test]
+    fn dotted_var_name_round_trips_via_json_fallback() {
+        let expr_pos = DraftAst {
+            body: vec![bind("x", var("a.b"))],
+            ..Default::default()
+        };
+        let text = format(&expr_pos);
+        assert!(text.contains("@json"), "expression position: {text}");
+        assert_round_trips(&expr_pos);
+
+        // Statement position: the parser no longer admits `.` in declared names, so the formatter
+        // must fall back here too (it used to round-trip only by charset luck).
+        let stmt_pos = DraftAst {
+            body: vec![var("a.b")],
+            ..Default::default()
+        };
+        let text = format(&stmt_pos);
+        assert!(text.contains("@json"), "statement position: {text}");
+        assert_round_trips(&stmt_pos);
+    }
+
+    /// Confirmed counterexample 2 (F21): symbol/op names with spaces used to produce *unparseable*
+    /// text (loud failure). They now fall back to `@json` and round-trip exactly.
+    #[test]
+    fn space_names_round_trip_via_json_fallback() {
+        let ast = DraftAst {
+            body: vec![
+                bind("a b", lit(serde_json::json!(1))),
+                call("git status", vec![lit(serde_json::json!("."))]),
+                var("a b"),
+                bind("y", call("git status", vec![])), // inline op position
+            ],
+            ..Default::default()
+        };
+        assert_round_trips(&ast);
+    }
+
+    /// Every declared-name position falls back to `@json` when the name is unspellable — one node
+    /// per position, each with a name the surface cannot spell.
+    #[test]
+    fn every_name_position_guards_unspellable_names() {
+        let bad: SymbolName = "a b".into();
+        let some_bad = || Some(SymbolName::from("a b"));
+        let nodes: Vec<(&str, Node)> = vec![
+            (
+                "bind name",
+                Node::Bind {
+                    name: bad.clone(),
+                    value: Box::new(lit(serde_json::json!(1))),
+                    ty: None,
+                    effect: None,
+                },
+            ),
+            (
+                "bind ty (builtin-colliding Named)",
+                Node::Bind {
+                    name: "x".into(),
+                    value: Box::new(lit(serde_json::json!(1))),
+                    ty: Some(TypeRef::Named("Bool".into())),
+                    effect: None,
+                },
+            ),
+            (
+                "memo name",
+                Node::Memo {
+                    name: bad.clone(),
+                    value: Box::new(lit(serde_json::json!(1))),
+                    ty: None,
+                    effect: None,
+                },
+            ),
+            (
+                "each item",
+                Node::Each {
+                    source: Box::new(var("xs")),
+                    item: bad.clone(),
+                    body: vec![],
+                    collect: None,
+                    flat: false,
+                },
+            ),
+            (
+                "each collect",
+                Node::Each {
+                    source: Box::new(var("xs")),
+                    item: "x".into(),
+                    body: vec![],
+                    collect: some_bad(),
+                    flat: false,
+                },
+            ),
+            (
+                "repeat collect",
+                Node::Repeat {
+                    max: 2,
+                    until: None,
+                    body: vec![],
+                    collect: some_bad(),
+                },
+            ),
+            (
+                "seq bind",
+                Node::Seq {
+                    body: vec![],
+                    bind: some_bad(),
+                },
+            ),
+            (
+                "ctx name",
+                Node::Ctx {
+                    name: bad.clone(),
+                    purpose: None,
+                    include: vec![],
+                    exclude: vec![],
+                    budget: None,
+                },
+            ),
+            (
+                "ctx include sym",
+                Node::Ctx {
+                    name: "p".into(),
+                    purpose: None,
+                    include: vec![bad.clone()],
+                    exclude: vec![],
+                    budget: None,
+                },
+            ),
+            (
+                "ctx exclude sym",
+                Node::Ctx {
+                    name: "p".into(),
+                    purpose: None,
+                    include: vec![],
+                    exclude: vec![bad.clone()],
+                    budget: None,
+                },
+            ),
+            (
+                "ctx_append ctx",
+                Node::CtxAppend {
+                    ctx: bad.clone(),
+                    add: vec![],
+                },
+            ),
+            (
+                "ctx_append sym",
+                Node::CtxAppend {
+                    ctx: "p".into(),
+                    add: vec![bad.clone()],
+                },
+            ),
+            (
+                "fallback bind",
+                Node::Fallback {
+                    branches: vec![],
+                    bind: some_bad(),
+                },
+            ),
+            (
+                "loop bind",
+                Node::Loop {
+                    for_ms: 1,
+                    every_ms: 1,
+                    until: None,
+                    body: vec![],
+                    bind: some_bad(),
+                },
+            ),
+            (
+                "timeout bind",
+                Node::Timeout {
+                    ms: 1,
+                    body: vec![],
+                    bind: some_bad(),
+                },
+            ),
+            (
+                "budget bind",
+                Node::Budget {
+                    limit: 1,
+                    body: vec![],
+                    bind: some_bad(),
+                },
+            ),
+            (
+                "with_tools bind",
+                Node::CapScope {
+                    tools: vec![],
+                    body: vec![],
+                    bind: some_bad(),
+                },
+            ),
+            (
+                "retry bind",
+                Node::Retry {
+                    max: 1,
+                    backoff: None,
+                    delay_ms: None,
+                    body: vec![],
+                    bind: some_bad(),
+                },
+            ),
+            (
+                "parallel branch name",
+                Node::Parallel {
+                    branches: vec![Branch {
+                        name: bad.clone(),
+                        body: vec![],
+                    }],
+                },
+            ),
+            ("call op (statement)", call("not an op", vec![])),
+            ("call op (inline)", bind("x", call("not an op", vec![]))),
+            (
+                "call op literally `fmt` (inline collides with the Fmt node)",
+                bind("x", call("fmt", vec![lit(serde_json::json!("hi"))])),
+            ),
+            ("jq input var name", bind("x", jq(".kind", var("a b")))),
+            ("var (statement)", var("a b")),
+            ("var (expression)", bind("x", var("a b"))),
+        ];
+        for (what, node) in nodes {
+            let ast = DraftAst {
+                body: vec![node],
+                ..Default::default()
+            };
+            let text = format(&ast);
+            assert!(text.contains("@json"), "{what} must @json-fallback: {text}");
+            assert_round_trips(&ast);
+        }
+    }
+
+    // ----- F8 text side: `.` is no longer a declared-name character -----
+
+    #[test]
+    fn dotted_declared_names_are_parse_errors() {
+        for bad in [
+            "flow x\n  $a.b = 1",
+            "flow x\n  $a.b: Number = 1",
+            "flow x\n  $pack.x += $a",
+            "flow x\n  each $it.x in $xs",
+            "flow x\n  seq -> $out.y",
+            "flow x\n  repeat 2 -> $c.d",
+            "flow x\n  ctx $p.q",
+            "flow x\n  ctx $p\n    include $a.b",
+            "flow x\n  parallel\n    branch $l.r\n      do go",
+        ] {
+            assert!(parse(bad).is_err(), "expected Err for: {bad:?}");
+        }
+        // Expression position is untouched: `$plan.kind` stays jq field-access sugar.
+        let ast = parse("flow x\n  $k = $plan.kind\n").unwrap();
+        assert_eq!(ast.body, vec![bind("k", jq(".kind", var("plan")))]);
+        // …and a bare `$a` statement still parses as a var reference.
+        let ast = parse("flow x\n  $a\n").unwrap();
+        assert_eq!(ast.body, vec![var("a")]);
+    }
+
+    /// The documented flow-header exception: the header has no `@json` escape, so an unspellable
+    /// flow name cannot round-trip — but it must fail **loudly** (a parse error), never silently
+    /// reparse as a different program. The analyzer rejects such names before they ever format.
+    #[test]
+    fn unspellable_flow_header_name_is_a_loud_parse_error() {
+        let ast = DraftAst {
+            name: Some("a b".into()),
+            ..Default::default()
+        };
+        let text = format(&ast);
+        assert!(
+            parse(&text).is_err(),
+            "space flow name must fail loudly, got Ok for: {text}"
+        );
+    }
+
+    // ----- F22: parse errors carry 1-based source line numbers -----
+
+    #[test]
+    fn parse_errors_carry_line_numbers() {
+        // Comment and blank lines still count toward the source line number.
+        let err = parse("flow x\n\n  # a comment\n  $a =").unwrap_err();
+        assert!(err.to_string().contains("line 4:"), "{err}");
+        // The innermost statement line wins, not the enclosing block header.
+        let err = parse("flow x\n  when $ok\n    do\n").unwrap_err();
+        assert!(err.to_string().contains("line 3:"), "{err}");
+        // Header errors point at the header line.
+        let err = parse("not a flow").unwrap_err();
+        assert!(err.to_string().contains("line 1:"), "{err}");
+        // Module declarations locate their lines too.
+        let err = parse_program("agent a\n  model \"m\"\n\nwidget w\n").unwrap_err();
+        assert!(err.to_string().contains("line 4:"), "{err}");
     }
 
     // ----- Hand-written text fixtures: pin the surface (not just self-consistency) -----
@@ -2732,22 +3116,28 @@ flow pack-it
 
     #[test]
     fn malformed_input_returns_parse_error() {
-        for bad in [
-            "",
-            "not a flow",
-            "flow x\n\telse",            // tab indentation
-            "flow x\n  $ = 1",           // empty symbol
-            "flow x\n  $a = ",           // missing expression
-            "flow x\n  do",              // do without op
-            "flow x\n  each $f $xs",     // each without `in`
-            "flow x\n  repeat\n",        // repeat without count
-            "flow x\n  when",            // when without condition
-            "flow x\n  $a = read(\"x\"", // unbalanced parens
-            "flow x\n  else",            // dangling else
-            "flow x\n  @json {oops}",    // invalid json
+        // Inputs with a located line: the error must carry a `line N:` prefix (F22).
+        for (bad, line) in [
+            ("not a flow", 1),
+            ("flow x\n\telse", 2),            // tab indentation
+            ("flow x\n  $ = 1", 2),           // empty symbol
+            ("flow x\n  $a = ", 2),           // missing expression
+            ("flow x\n  do", 2),              // do without op
+            ("flow x\n  each $f $xs", 2),     // each without `in`
+            ("flow x\n  repeat\n", 2),        // repeat without count
+            ("flow x\n  when", 2),            // when without condition
+            ("flow x\n  $a = read(\"x\"", 2), // unbalanced parens
+            ("flow x\n  else", 2),            // dangling else
+            ("flow x\n  @json {oops}", 2),    // invalid json
         ] {
-            assert!(parse(bad).is_err(), "expected Err for: {bad:?}");
+            let err = parse(bad).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("line {line}:")),
+                "expected `line {line}:` for {bad:?}, got: {err}"
+            );
         }
+        // Empty input has no line to point at.
+        assert!(parse("").is_err());
     }
 
     /// `take_json` consumes exactly one value and reports the remainder (the inline-args case).

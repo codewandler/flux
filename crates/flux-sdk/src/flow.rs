@@ -314,11 +314,14 @@ impl FlowClient {
     }
 
     /// Analyze an AST against the assembled registry's op catalog. `Ok(())` means every referenced op
-    /// resolves; `Err` carries the [`Diagnostic`]s (e.g. unknown ops).
+    /// resolves and every `$var` is defined; `Err` carries the [`Diagnostic`]s (e.g. unknown ops,
+    /// unbound symbols). A symbol supplied at run time via [`execute_with`](Self::execute_with)
+    /// seeding must be declared as a flow param (`flow(name: Type)`) to analyze clean — params count
+    /// as bound; undeclared seed-only names are reported unbound (L-15).
     pub fn analyze(&self, ast: &DraftAst) -> std::result::Result<(), Vec<Diagnostic>> {
         analyze_composites(&self.composites, &self.registry)?;
         let ops = OpRegistry::new(&self.registry).with_composites(&self.composites);
-        analyze_flow(ast, &ops)
+        analyze_flow(ast, &ops, &std::collections::HashSet::new())
     }
 
     /// Execute a compiled [`DraftAst`] through the real safety envelope (`Executor::dispatch` under
@@ -395,7 +398,7 @@ impl FlowClient {
         ast: &DraftAst,
     ) -> std::result::Result<flux_flow::ast::PhysicalPlan, Vec<Diagnostic>> {
         let ops = OpRegistry::new(&self.registry).with_composites(&self.composites);
-        let hir = flux_flow::analyze::lower(ast, &ops)?;
+        let hir = flux_flow::analyze::lower(ast, &ops, &std::collections::HashSet::new())?;
         Ok(flux_flow::optimize::optimize(&hir, &ops))
     }
 
@@ -896,7 +899,9 @@ mod tests {
             .model("mock")
             .build(mock.clone(), temp_root("parse"))
             .unwrap();
-        let ast = client.parse("flow\n  return $greeting").unwrap();
+        let ast = client
+            .parse("flow(greeting: String)\n  return $greeting")
+            .unwrap();
         client.analyze(&ast).expect("a parsed flow analyzes clean");
         assert_eq!(
             mock.replies.lock().unwrap().len(),

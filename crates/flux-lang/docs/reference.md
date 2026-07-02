@@ -454,8 +454,10 @@ cache.
 ### `parallel`
 
 Concurrent fan-out: run independent branches concurrently; bind each branch's final
-result to its `name`. Each branch writes to a buffering sink; after the join, events
-are replayed into the real sink in branch order (no interleaving).
+result to its `name`. Each branch writes to a buffering sink; after the join, results
+and events are merged in **declaration order** (no interleaving). When a branch fails,
+the completed branches' buffered output and steps are still merged — a deterministic
+prefix — before the error propagates.
 
 ```json
 {"kind": "parallel", "branches": [
@@ -473,16 +475,17 @@ are replayed into the real sink in branch order (no interleaving).
 | `branches` | Branch[] | yes | each `{name, body}` — name must be unique |
 
 Constraints: branch names must be distinct (the analyzer rejects duplicates). `return`
-inside a branch is rejected. Every op in every branch still goes through
-`Executor::dispatch`.
+inside a branch is rejected. Two branches binding the **same symbol** (including inner
+binds) is an analyzer error — cross-branch binds would race. Every op in every branch
+still goes through `Executor::dispatch`.
 
 ---
 
 ### `race`
 
-First-wins fallback: try branches in order, return as soon as one succeeds. If no
-branch succeeds before `timeout_ms` elapses the node errors. `bind` names the symbol
-that receives the winning branch's result.
+First-success concurrency: run branches **concurrently**; the first branch to complete
+**successfully** wins and its result becomes the node's result. `timeout_ms` is the
+wall-clock deadline; `bind` names the symbol that receives the winning branch's result.
 
 ```json
 {"kind": "race", "timeout_ms": 5000, "bind": "result", "branches": [
@@ -493,17 +496,19 @@ that receives the winning branch's result.
 ]}
 ```
 
-**Semantics:** branches are tried sequentially (in order); the first one that completes
-without error wins. A failing branch is skipped (its error is swallowed) and the next
-branch is tried — as long as the deadline has not passed. Branch names must be
-distinct.
+**Semantics:** all branches start together; the first *success* wins (a branch that
+fails does not win, but it does not abort the race either). If **every** branch fails,
+the node errors with a joined branch error — reported distinctly from a timeout. If the
+deadline expires before any branch succeeds, the node errors with a timeout. Losing
+branches' already-dispatched steps stay in the step count and transcript (audit parity
+with the event log; an enclosing `budget` counts them). Branch names must be distinct.
 
 **Fields**
 
 | field | type | required | description |
 |---|---|---|---|
 | `timeout_ms` | u64 | yes | wall-clock deadline in milliseconds |
-| `branches` | Branch[] | yes | `{name, body}` tried in order |
+| `branches` | Branch[] | yes | `{name, body}` run concurrently |
 | `bind` | string | no | symbol to bind to the winning branch's result |
 
 ---
@@ -634,12 +639,14 @@ use `retry` inside the body for that).
 
 ### `throttle`
 
-Rate-limit body execution: at most `max` dispatches per `window_ms` sliding window.
-The token bucket is tracked in the session store; if the limit is exceeded the node
-errors rather than blocking, so the plan stays responsive.
+Rate-limit the **op dispatches** inside the body: at most `max` dispatches per
+`window_ms` sliding window (budget-style counting — what is limited is calls through
+`Executor::dispatch`, not body statements or node entries). The bucket is tracked in
+the session store with an **atomic** update keyed by `name`; if the limit is exceeded
+the node errors rather than blocking, so the plan stays responsive.
 
 ```json
-{"kind": "throttle", "max": 5, "window_ms": 60000,
+{"kind": "throttle", "name": "fetches", "max": 5, "window_ms": 60000,
  "body": [
    {"kind": "call", "op": "web_fetch", "args": [{"kind": "var", "name": "url"}]}
  ]}
@@ -650,7 +657,7 @@ errors rather than blocking, so the plan stays responsive.
 | field | type | required | description |
 |---|---|---|---|
 | `name` | string | yes | unique bucket key; state is tracked per `name` and survives across turns |
-| `max` | u32 | yes | maximum calls in the window |
+| `max` | u32 | yes | maximum op dispatches in the window |
 | `window_ms` | u64 | yes | sliding window size in milliseconds |
 | `body` | Node[] | no | the rate-limited body |
 
@@ -661,12 +668,15 @@ never share a bucket; reusing a `name` deliberately shares one bucket across nod
 
 ### `debounce`
 
-Coalesce rapid re-invocations: wait `wait_ms` after the node is reached before running
-body. In a `loop` or watch context this means the body only executes once things have
-settled. In a single sequential flow it acts as a fixed delay before the body.
+Keyed **cross-turn coalescing**: each time the node is reached, the trigger timestamp
+for its `name` is recorded in the session store; the body runs only once `wait_ms` has
+elapsed since that key's last trigger. Rapid re-arrivals within the window keep
+re-arming the key, so a burst of triggers coalesces into a single body run after
+things have settled. Because the last-trigger timestamp lives in the session store,
+the settling window spans turns, not just one plan execution.
 
 ```json
-{"kind": "debounce", "wait_ms": 300,
+{"kind": "debounce", "name": "rebuild", "wait_ms": 300,
  "body": [
    {"kind": "call", "op": "bash", "args": [{"kind": "lit", "value": "rebuild.sh"}]}
  ]}
@@ -676,9 +686,9 @@ settled. In a single sequential flow it acts as a fixed delay before the body.
 
 | field | type | required | description |
 |---|---|---|---|
-| `name` | string | yes | stable key so debounce state survives across turns |
-| `wait_ms` | u64 | yes | settling delay in milliseconds |
-| `body` | Node[] | no | body that runs after the delay |
+| `name` | string | yes | stable key: the last-trigger timestamp is tracked per `(session, name)` and survives across turns |
+| `wait_ms` | u64 | yes | settling window in milliseconds since the key's last trigger |
+| `body` | Node[] | no | body that runs once the key has been quiet for `wait_ms` |
 
 ---
 
@@ -799,8 +809,11 @@ If the selector label matches no case and `default` is empty, the route errors.
 ### `fallback`
 
 Ordered "first useful success wins" selector. Run branches in declared order. The first branch that
-finishes successfully with a non-empty result wins; if branches succeed only with empty results, the
-first empty success is kept as a last resort. If every branch errors, the last error propagates.
+finishes successfully with a non-empty result wins. A branch error **or an empty result** falls
+through to the next branch — so a *side-effecting* branch that returns empty still falls through and
+the next branch also runs (attempts stream live, as in `try`/`retry`). If branches succeed only with
+empty results, the first empty success is kept as a last resort. If every branch errors, the last
+error propagates.
 
 ```json
 {"kind": "fallback", "bind": "answer", "branches": [
@@ -1288,9 +1301,11 @@ gates on a shell exit-code wrapper or a boolean tool output work as expected.
 - **`throttle` errors instead of blocking** — if the rate limit is exceeded the node
   returns an error; the plan remains responsive and the caller can wrap with `try` or
   `retry`.
-- **`debounce` in a single sequential flow is a fixed delay**, not a true event-driven
-  debounce. Combine with `loop` to get settling semantics.
-- **`race` picks the first *succeeding* branch** within its deadline and drops the losing branch
-  futures. Use `parallel` if you want all branches to complete.
+- **`debounce` coalesces per `name` across turns** — reaching the node records the key's
+  last-trigger timestamp in the session store; the body runs only after `wait_ms` of quiet
+  for that key.
+- **`race` runs branches concurrently and picks the first *success*** within its deadline;
+  all-branches-failed is a joined branch error (distinct from a timeout), and losing branches'
+  dispatched steps remain counted and traced. Use `parallel` if you want all branches to complete.
 - **`await` and `checkpoint` are top-level only** — they need stable resume cursors.
 - **`obj`/`list` are pure templates** — they cannot contain `call` or control-flow leaves.

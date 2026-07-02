@@ -25,6 +25,43 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **flux-lang v1 hardening (epic: C-17, L-15..L-19).** A full review of the language pillar
+  (27 findings, `docs/designs/flux-lang-v1-hardening.md`) fixed in one pass:
+  - *Compile-path plan gates (C-17).* The plain-text plan fallback now runs the same
+    `hidden_ops_in` gate as `emit_plan` (a prose-JSON plan can no longer execute a
+    registered-but-unsurfaced op); plans are never "accepted with diagnostics" (always repair
+    feedback, with a `plan_turn` backstop); duplicate `emit_plan` calls in one message are
+    rejected; the planner loop's `unsafe` sink reborrow is gone (`#![deny(unsafe_code)]`).
+  - *Analyzer contract (L-15, L-16).* `analyze_flow`/`lower` now take the session-symbol set and
+    enforce symbol definedness (unbound `$var` is a diagnostic, order-insensitive — zero false
+    positives), required-param presence on named input maps, expression-position legality
+    mirroring the runtime's `eval_arg`/`eval_cond`, declared-name validity (dotted/spaced names
+    rejected — the silent round-trip corruption class), `repeat` bounds sanity, `parallel`
+    cross-branch bind disjointness, and JSON-pointer node paths (`body[3].then[1]`) on every
+    diagnostic. **`lower` (typed gate) now runs on the production path** — engine compile,
+    composite registration, and the CLI flow gate — not just the SDK opt-in.
+  - *Runtime semantics (L-17).* One shared `eval_pure_node` path for pure nodes in bind and
+    statement position (fixes statement-`jq` divergence); structural error fatality
+    (`FlowError::is_fatal()`) surviving `loop`/composite wrapping so a denied `confirm` is never
+    retried; `parallel` merges completed branches' audit in declaration order even when a sibling
+    fails; `race` distinguishes all-failed (joined error) from timeout and keeps losers' dispatch
+    audit; one checkpoint `flow_key` (name + body hash) for run and resume — edited flows never
+    fast-forward wrongly; `throttle` counts real op dispatches atomically; `debounce` is real
+    keyed cross-turn coalescing; `StepId` includes the op name; `each` restores shadowed outer
+    bindings; `pipe`/`memo` transcript views respect the output cap.
+  - *Round-trip totality (L-18).* `parse(format(ast)) == ast` now holds for every `DraftAst`:
+    the formatter falls back to `@json` for unspellable names in every position (op/symbol/
+    branch/collect/bind/type), pinned by a seeded 1000-iteration property test over all 43 node
+    kinds; parse errors carry `line N:` locators; the parser rejects dotted declared names
+    (`$a.b = …`) with a field-access hint.
+  - *Docs truth pass (L-19).* syntax.md/reference.md/STATUS.md/emission-ab.md now describe only
+    what is implemented (multi-line strings, comma-form named args, `watch`/`block`, `memo`
+    keyword et al. explicitly marked aspirational or `@json`-only; race/throttle/debounce match
+    the new runtime); the plan-approval render shows `obj`/`list` template contents and
+    `children()` is exhaustive; skill examples carry a parse-as-`DraftAst` drift test.
+  - Design policy adopted: **node-catalog freeze** — no new `Node` kinds until definedness
+    analysis and diagnostic locators had shipped (both landed with this epic).
+
 - **Per-turn efficiency metrics + canonical usage keys (C-15).** Tokens-per-task was queryable only
   from raw `CallUsage` rows. `TurnSummary` now folds each turn's provider-call count and per-call
   usage sum, and the new `efficiency_summary()` projection (surfaced as one line per `flux usage`

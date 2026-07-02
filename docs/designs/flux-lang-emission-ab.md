@@ -1,11 +1,17 @@
 # Design: planner emission surface — strict JSON schema vs native text (an accuracy A/B)
 
+> **Status update (2026-07-02, L-19):** arm 1 — the strict derived `DraftAst` schema on `emit_plan` —
+> has since **shipped**: `planner_tools()` now advertises `tool_input_schema::<EmitPlanInput>()`
+> (`crates/flux-flow/src/compile.rs`), whose `ast` field is the schemars-derived `DraftAst` schema.
+> The loose `{"type":"object"}` described below no longer exists. What remains unbuilt is the
+> **measured A/B** against the native-text arm (the selector, corpus run, and comparison table).
+
 ## Why
 
-The planner emits its execution plan (a `DraftAst`) through the `emit_plan` tool. Today it advertises
-that plan as **deeply-nested JSON against a loose schema**: `planner_tools()` declares
-`"ast": { "type": "object" }` (`crates/flux-flow/src/compile.rs`, ~line 731) — the model gets **no
-structural guidance**, and every step is a 5–10 line nested object (`{"kind":"bind","value":{"kind":
+The planner emits its execution plan (a `DraftAst`) through the `emit_plan` tool. At the time this
+was written it advertised that plan as **deeply-nested JSON against a loose schema**:
+`planner_tools()` declared `"ast": { "type": "object" }` — the model got **no structural guidance**,
+and every step is a 5–10 line nested object (`{"kind":"bind","value":{"kind":
 "call","op":…,"args":[{"kind":"lit",…}]}}`).
 
 There is also a **native text surface** (`flux_lang::parse`/`format`) that is ~3–4× more compact for
@@ -117,5 +123,11 @@ regardless**, so even a "native loses" outcome leaves a shippable win.
 
 ## Status
 
-**Not built.** Prerequisite (native-text spellings) shipped (`8052796`). This doc is the spec; an
-impl plan belongs in `.flux/plans/` when the work starts.
+**Arm 1 shipped; the A/B itself not built.** The strict-schema `json` arm landed on the production
+path: `emit_plan` is advertised via `tool_input_schema::<EmitPlanInput>()`
+(`crates/flux-flow/src/compile.rs`), so the model sees the real derived `DraftAst` schema — the
+"net improvement regardless" called out under *Decision & cutover* is banked. Prerequisite for the
+`text` arm (native-text spellings) also shipped (`8052796`). Still unbuilt: the `plan_surface`
+selector, the `text` arm's prompt/grammar wiring, and the measured corpus run — the empirical
+comparison has not happened, so no cutover decision exists. This doc remains the spec for that
+remaining work; an impl plan belongs in `.flux/plans/` when it starts.

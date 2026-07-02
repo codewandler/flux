@@ -4,11 +4,15 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{DraftAst, FlowEffect, HirFlow, Node, TypeRef};
+use crate::ast::{
+    is_valid_decl_name, is_valid_op_name, DraftAst, FlowEffect, HirFlow, Node, SymbolName, TypeRef,
+};
 use crate::opspec::OpCatalog;
 
 /// A single analyzer diagnostic, suitable for UI display or feeding back into the compile/repair
-/// loop.
+/// loop. The JSON-pointer-style node path (`body[3].then[1]`) is rendered into `message` — the
+/// struct's shape is kept message-only so downstream crates (flux-flow/flux-sdk/flux-cli) keep
+/// compiling unchanged (L-16/F11).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
     pub message: String,
@@ -22,6 +26,50 @@ impl Diagnostic {
     }
 }
 
+/// Diagnostic accumulator that threads the current node path (`body[3].then[1]`) through the
+/// structural walk and renders it into every message it emits — the locator a repairing model can
+/// act on (L-16/F11). Internal only; the public surface stays `Vec<Diagnostic>`.
+#[derive(Default)]
+struct Diags {
+    items: Vec<Diagnostic>,
+    path: Vec<String>,
+}
+
+impl Diags {
+    /// Record a diagnostic at the current node path.
+    fn add(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        let rendered = if self.path.is_empty() {
+            message
+        } else {
+            format!("{message} (at `{}`)", self.path.join("."))
+        };
+        self.items.push(Diagnostic::new(rendered));
+    }
+
+    /// Run `f` with `seg` pushed onto the node path (popped afterwards, even on early return).
+    fn with<R>(&mut self, seg: impl Into<String>, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.path.push(seg.into());
+        let out = f(self);
+        self.path.pop();
+        out
+    }
+}
+
+/// Sanity ceiling for `repeat` `max` (F10): a bound above this is virtually always a model
+/// emitting an effectively-unbounded loop, not a real plan — reject it so the repair loop asks
+/// for a plausible bound (or an `each` over real data).
+const MAX_REPEAT_BOUND: u32 = 100_000;
+
+/// The serde `kind` tag of a node, for diagnostics — read off the tagged serialization so it can
+/// never drift from the wire format (and needs no 43-arm match to keep in sync).
+fn node_kind_label(node: &Node) -> String {
+    serde_json::to_value(node)
+        .ok()
+        .and_then(|v| v.get("kind").and_then(|k| k.as_str().map(str::to_owned)))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
 /// Validate that `op` names a registered operation (the M1 single-call grammar). Returns the
 /// collected diagnostics on failure.
 pub fn analyze_call(op: &str, ops: &dyn OpCatalog) -> Result<(), Vec<Diagnostic>> {
@@ -32,20 +80,47 @@ pub fn analyze_call(op: &str, ops: &dyn OpCatalog) -> Result<(), Vec<Diagnostic>
     }
 }
 
-/// Validate every operation referenced anywhere in a flow against the catalog (the M2 whole-flow
-/// check; richer type/effect checking comes later). Returns aggregated diagnostics on failure.
-pub fn analyze_flow(ast: &DraftAst, ops: &dyn OpCatalog) -> Result<(), Vec<Diagnostic>> {
-    let mut diags = Vec::new();
-    for node in &ast.body {
-        check_node(node, ops, &mut diags);
+/// Validate a whole flow against the catalog and the structural contract the runtime actually
+/// enforces: op resolution and arity, symbol definedness (every `$var` names a flow param, a
+/// symbol bound by *some* binder form anywhere in the flow, or a `session_symbols` entry —
+/// order-insensitive on purpose, so there are zero false positives and the typo class is caught,
+/// L-15/F5), declared-name validity (F8), expression-position legality mirroring the runtime's
+/// `eval_arg`/`eval_cond` (F7), loop bounds (F10), and `parallel` bind disjointness (F15).
+/// Diagnostics render a JSON-pointer-style node path (`body[3].then[1]`) into their message.
+///
+/// `session_symbols` is the set of symbols already bound in the executing session (SessionView
+/// names, SDK-seeded params, …); composites and presets pass an empty set.
+pub fn analyze_flow(
+    ast: &DraftAst,
+    ops: &dyn OpCatalog,
+    session_symbols: &HashSet<String>,
+) -> Result<(), Vec<Diagnostic>> {
+    let mut d = Diags::default();
+    if let Some(name) = &ast.name {
+        if !is_valid_decl_name(name) {
+            d.add(format!(
+                "invalid flow name `{name}` — flow names contain only ASCII letters, digits, \
+                 `_`, or `-`"
+            ));
+        }
     }
-    check_await_position(&ast.body, &mut diags);
-    check_checkpoint_position(&ast.body, &mut diags);
-    check_cap_scopes(&ast.body, None, &mut diags);
-    if diags.is_empty() {
+    for p in &ast.params {
+        check_decl_name(&p.name, "a flow param", &mut d);
+    }
+    // The definedness set: params + session symbols + every binder form anywhere in the body.
+    let mut bound: HashSet<String> = session_symbols.clone();
+    bound.extend(ast.params.iter().map(|p| p.name.0.clone()));
+    collect_bound_symbols(&ast.body, &mut bound);
+    for (i, node) in ast.body.iter().enumerate() {
+        d.with(format!("body[{i}]"), |d| check_node(node, ops, &bound, d));
+    }
+    check_await_position(&ast.body, &mut d);
+    check_checkpoint_position(&ast.body, &mut d);
+    check_cap_scopes(&ast.body, None, &mut d);
+    if d.items.is_empty() {
         Ok(())
     } else {
-        Err(diags)
+        Err(d.items)
     }
 }
 
@@ -57,15 +132,10 @@ pub fn analyze_flow(ast: &DraftAst, ops: &dyn OpCatalog) -> Result<(), Vec<Diagn
 /// same narrow-only rule the runtime's `push_cap_scope` enforces — so a nested scope is checked against
 /// the *effective*, already-narrowed set, never the outer scope's original one. Non-literal call sites
 /// don't exist in this grammar (`op` is always a literal `String`), so every `call` site is checkable.
-fn check_cap_scopes(body: &[Node], active: Option<&[String]>, diags: &mut Vec<Diagnostic>) {
+fn check_cap_scopes(body: &[Node], active: Option<&[String]>, d: &mut Diags) {
     for node in body {
         match node {
-            Node::Call { op, .. } => check_call_in_scope(op, active, diags),
-            Node::Bind { value, .. } | Node::Memo { value, .. } => {
-                if let Node::Call { op, .. } = value.as_ref() {
-                    check_call_in_scope(op, active, diags);
-                }
-            }
+            Node::Call { op, .. } => check_call_in_scope(op, active, d),
             Node::CapScope {
                 tools, body: inner, ..
             } => {
@@ -77,48 +147,66 @@ fn check_cap_scopes(body: &[Node], active: Option<&[String]>, diags: &mut Vec<Di
                         .collect(),
                     None => tools.clone(),
                 };
-                check_cap_scopes(inner, Some(&narrowed), diags);
+                check_cap_scopes(inner, Some(&narrowed), d);
                 continue;
             }
             _ => {}
         }
-        // Recurse into every OTHER nested body under the same active scope — a `when`/`each`/`repeat`/
-        // `try`/… inside a `with_tools` block is still inside it. `CapScope` already recursed above
-        // with its own narrowed set and `continue`d, so it never reaches here.
+        // Recurse into every OTHER dispatch-capable child position under the same active scope — a
+        // `when`/`each`/`repeat`/`try`/… inside a `with_tools` block is still inside it, and so are
+        // a `bind`'s call value, a `when`'s call condition, a `pipe`'s steps, a `route` selector, …
+        // `CapScope` already recursed above with its own narrowed set and `continue`d, so it never
+        // reaches here.
         for nested in nested_bodies(node) {
-            check_cap_scopes(nested, active, diags);
+            check_cap_scopes(nested, active, d);
         }
     }
 }
 
 /// Flag `op` if a capability scope is active and `op` is not in its allowlist.
-fn check_call_in_scope(op: &str, active: Option<&[String]>, diags: &mut Vec<Diagnostic>) {
+fn check_call_in_scope(op: &str, active: Option<&[String]>, d: &mut Diags) {
     let Some(allowed) = active else { return };
     if !allowed.iter().any(|t| t == op) {
-        diags.push(Diagnostic::new(format!(
+        d.add(format!(
             "op `{op}` is outside the enclosing `with_tools` scope ({})",
             if allowed.is_empty() {
                 "which allows no tools".to_string()
             } else {
                 format!("which allows only [{}]", allowed.join(", "))
             }
-        )));
+        ));
     }
 }
 
-/// The direct child statement-bodies of `node` (one level, not recursive) that can themselves contain
-/// `call`/`with_tools` sites — used by [`check_cap_scopes`] to recurse while threading an explicit
-/// (possibly narrowed) active allowlist, which the generic [`for_each_node`] callback can't carry.
+/// The direct dispatch-capable child positions of `node` (one level, not recursive) — every place
+/// a `call`/`with_tools` site can occur: statement bodies, plus the single-node positions the
+/// runtime executes via dispatch-capable evaluators (`bind`/`memo`/`return` values, `when`/
+/// `unless`/`assert` conditions and `repeat`/`loop` `until` guards — `eval_cond` dispatches a
+/// `call` condition — `pipe` steps, a `route` selector, `verify` cmd/expect, a `scope` acquire).
+/// Used by [`check_cap_scopes`] to recurse while threading an explicit (possibly narrowed) active
+/// allowlist, which the generic [`for_each_node`] callback can't carry.
+///
+/// Exhaustive on purpose (no `_ =>`, F12): a new node kind must state its child positions here.
 fn nested_bodies(node: &Node) -> Vec<&[Node]> {
+    use std::slice::from_ref;
     match node {
         Node::When {
-            then, otherwise, ..
-        } => vec![then, otherwise],
-        Node::Unless { body, .. }
-        | Node::Each { body, .. }
-        | Node::Repeat { body, .. }
-        | Node::Loop { body, .. }
-        | Node::Seq { body, .. }
+            cond,
+            then,
+            otherwise,
+        } => vec![from_ref(cond.as_ref()), then, otherwise],
+        Node::Unless { cond, body } => vec![from_ref(cond.as_ref()), body],
+        Node::Repeat { until, body, .. } | Node::Loop { until, body, .. } => {
+            let mut v: Vec<&[Node]> = Vec::with_capacity(2);
+            if let Some(u) = until {
+                v.push(from_ref(u.as_ref()));
+            }
+            v.push(body);
+            v
+        }
+        // An `each` source resolves through `eval_arg` (no dispatch), so only the body counts.
+        Node::Each { body, .. } => vec![body],
+        Node::Seq { body, .. }
         | Node::Retry { body, .. }
         | Node::Confirm { body, .. }
         | Node::Throttle { body, .. }
@@ -130,23 +218,69 @@ fn nested_bodies(node: &Node) -> Vec<&[Node]> {
         Node::Parallel { branches } | Node::Race { branches, .. } => {
             branches.iter().map(|b| b.body.as_slice()).collect()
         }
-        Node::Scope { body, finally, .. } => vec![body, finally],
+        Node::Scope {
+            acquire,
+            body,
+            finally,
+            ..
+        } => {
+            let mut v: Vec<&[Node]> = Vec::with_capacity(3);
+            if let Some(acq) = acquire {
+                v.push(from_ref(acq.as_ref()));
+            }
+            v.push(body);
+            v.push(finally);
+            v
+        }
         Node::Saga { steps } => steps
             .iter()
             .flat_map(|s| [s.body.as_slice(), s.undo.as_slice()])
             .collect(),
+        // A `match` subject / case value must be a literal or bound symbol (enforced by
+        // `check_node`), so only the bodies can dispatch.
         Node::Match { cases, default, .. } => cases
             .iter()
             .map(|c| c.body.as_slice())
             .chain(std::iter::once(default.as_slice()))
             .collect(),
-        Node::Route { cases, default, .. } => cases
-            .iter()
-            .map(|c| c.body.as_slice())
+        Node::Route {
+            selector,
+            cases,
+            default,
+        } => std::iter::once(from_ref(selector.as_ref()))
+            .chain(cases.iter().map(|c| c.body.as_slice()))
             .chain(std::iter::once(default.as_slice()))
             .collect(),
         Node::Fallback { branches, .. } => branches.iter().map(|b| b.body.as_slice()).collect(),
-        _ => Vec::new(),
+        Node::Bind { value, .. } | Node::Memo { value, .. } | Node::Return { value } => {
+            vec![from_ref(value.as_ref())]
+        }
+        Node::Assert { cond, .. } => vec![from_ref(cond.as_ref())],
+        Node::Pipe { steps, .. } => vec![steps.as_slice()],
+        Node::Verify { cmd, expect, .. } => {
+            vec![from_ref(cmd.as_ref()), from_ref(expect.as_ref())]
+        }
+        // `with_tools` is descended by `check_cap_scopes` itself — it must narrow the active
+        // allowlist on the way down, which this label-free helper cannot express.
+        Node::CapScope { .. } => Vec::new(),
+        // Leaf / pure-expression nodes: no dispatch-capable child positions. Call args, template
+        // leaves, `expr` vars, and `jq`/`parse` inputs are argument positions — the analyzer
+        // rejects call/control nodes there, so there is nothing for the cap-scope pass to see.
+        Node::Call { .. }
+        | Node::Await { .. }
+        | Node::Peek { .. }
+        | Node::Var { .. }
+        | Node::Lit { .. }
+        | Node::Thing { .. }
+        | Node::Expr { .. }
+        | Node::Fmt { .. }
+        | Node::Jq { .. }
+        | Node::Parse { .. }
+        | Node::Ctx { .. }
+        | Node::CtxAppend { .. }
+        | Node::Checkpoint { .. }
+        | Node::Obj { .. }
+        | Node::List { .. } => Vec::new(),
     }
 }
 
@@ -154,8 +288,8 @@ fn nested_bodies(node: &Node) -> Vec<&[Node]> {
 /// resume (the interpreter records the top-level index and continues from the next statement on resume).
 /// Nesting one inside a `when`/`repeat`/`each`/`parallel`/… body has no well-defined resume point in v1,
 /// so it is rejected here (a clear analysis error rather than a runtime failure deep in `exec_body`).
-fn check_await_position(body: &[Node], diags: &mut Vec<Diagnostic>) {
-    for node in body {
+fn check_await_position(body: &[Node], d: &mut Diags) {
+    for (i, node) in body.iter().enumerate() {
         // A top-level `await` is fine; flag any `await` hiding inside a non-`await` statement's subtree.
         if matches!(node, Node::Await { .. }) {
             continue;
@@ -167,9 +301,11 @@ fn check_await_position(body: &[Node], diags: &mut Vec<Diagnostic>) {
             }
         });
         if nested {
-            diags.push(Diagnostic::new(
-                "`await` must be a top-level flow statement — it suspends the whole flow and cannot be nested (v1)",
-            ));
+            d.with(format!("body[{i}]"), |d| {
+                d.add(
+                    "`await` must be a top-level flow statement — it suspends the whole flow and cannot be nested (v1)",
+                )
+            });
         }
     }
 }
@@ -177,8 +313,8 @@ fn check_await_position(body: &[Node], diags: &mut Vec<Diagnostic>) {
 /// `checkpoint` may only appear as a **top-level** flow statement: it is a durable resume cursor keyed
 /// on a top-level index, so a `checkpoint` nested inside a `when`/`repeat`/`scope`/… body has no stable
 /// resume point. Rejected here (mirrors [`check_await_position`]).
-fn check_checkpoint_position(body: &[Node], diags: &mut Vec<Diagnostic>) {
-    for node in body {
+fn check_checkpoint_position(body: &[Node], d: &mut Diags) {
+    for (i, node) in body.iter().enumerate() {
         if matches!(node, Node::Checkpoint { .. }) {
             continue;
         }
@@ -189,19 +325,25 @@ fn check_checkpoint_position(body: &[Node], diags: &mut Vec<Diagnostic>) {
             }
         });
         if nested {
-            diags.push(Diagnostic::new(
-                "`checkpoint` must be a top-level flow statement — it is a durable resume cursor and cannot be nested (v1)",
-            ));
+            d.with(format!("body[{i}]"), |d| {
+                d.add(
+                    "`checkpoint` must be a top-level flow statement — it is a durable resume cursor and cannot be nested (v1)",
+                )
+            });
         }
     }
 }
 
 /// Lower a `DraftAst` to a typed [`HirFlow`]: run the whole-flow analysis (op resolution, grammar,
-/// bounded loops, call arity) and gather the flow's semantic effect set. Full type inference over
-/// expressions is a later milestone; today the HIR carries the validated body plus the gathered
-/// effects an authorizer/optimizer reasons over.
-pub fn lower(ast: &DraftAst, ops: &dyn OpCatalog) -> Result<HirFlow, Vec<Diagnostic>> {
-    analyze_flow(ast, ops)?;
+/// bounded loops, call arity, symbol definedness against `session_symbols`) and gather the flow's
+/// semantic effect set. Full type inference over expressions is a later milestone; today the HIR
+/// carries the validated body plus the gathered effects an authorizer/optimizer reasons over.
+pub fn lower(
+    ast: &DraftAst,
+    ops: &dyn OpCatalog,
+    session_symbols: &HashSet<String>,
+) -> Result<HirFlow, Vec<Diagnostic>> {
+    analyze_flow(ast, ops, session_symbols)?;
     // Type-check call arguments against the ops' declared param types, tracking symbol types from
     // `param` decls + `bind` annotations. Lenient: only hard scalar/list mismatches are rejected.
     let mut scope: HashMap<String, TypeRef> = ast
@@ -279,11 +421,18 @@ fn check_call_types(
     let Some(sig) = ops.lookup(op) else {
         return;
     };
-    // A lone object literal is the named input map. Check each field's type against the declared
-    // param types; extra/missing fields are not type errors (the runtime/op decides) but we flag
-    // hard scalar mismatches on the fields that are present and declared.
+    // A lone object literal is the named input map. Every `required_params` key must be present —
+    // keys are static even when values are dynamic (L-15/F6) — and each present, declared field's
+    // type is checked; extra fields are not errors (the runtime/op decides) but we flag hard
+    // scalar mismatches.
     if let [Node::Lit { value }] = args {
         if let Some(obj) = value.as_object() {
+            for req in sig.required_params.iter().filter(|r| !obj.contains_key(*r)) {
+                diags.push(Diagnostic::new(format!(
+                    "op `{op}` is missing required parameter `{req}` — add the key to the \
+                     argument object"
+                )));
+            }
             if let Some(props_types) = Some(&sig.param_types).filter(|m| !m.is_empty()) {
                 for (name, val) in obj {
                     if let Some(ptype) = props_types.get(name) {
@@ -300,6 +449,22 @@ fn check_call_types(
             }
             return;
         }
+    }
+    // A lone `obj` **template** is the named input map exactly like a lone `lit` object (the
+    // runtime resolves its fields first) — its KEYS are static, so required-key presence is
+    // checkable even though its values are dynamic.
+    if let [Node::Obj { fields }] = args {
+        for req in sig
+            .required_params
+            .iter()
+            .filter(|r| !fields.contains_key(*r))
+        {
+            diags.push(Diagnostic::new(format!(
+                "op `{op}` is missing required parameter `{req}` — add the key to the \
+                 argument object"
+            )));
+        }
+        return;
     }
     let n_params = sig.required_params.len() + sig.optional_params.len();
     // Arity (multi-bare rejection, single-bare-vs-multi) is handled in `check_node` (the structural
@@ -635,12 +800,153 @@ pub fn for_each_node(body: &[Node], f: &mut impl FnMut(&Node)) {
     }
 }
 
-/// Recursively validate the operations in a node and its children.
-fn check_node(node: &Node, ops: &dyn OpCatalog, diags: &mut Vec<Diagnostic>) {
+/// Every symbol name `body` can bind at runtime, in ANY binder form, added to `out`. Deliberately
+/// order-insensitive (L-15/F5): the definedness check wants **zero false positives** — it catches
+/// the typo / never-bound class, while use-before-bind stays a precise runtime error. Binder
+/// forms mirror the runtime's `bind`/`bind_existing` sites. Exhaustive on purpose (no `_ =>`,
+/// F12): a new node kind must state here whether it binds.
+fn collect_bound_symbols(body: &[Node], out: &mut HashSet<String>) {
+    for_each_node(body, &mut |node| match node {
+        Node::Bind { name, .. } | Node::Memo { name, .. } | Node::Ctx { name, .. } => {
+            out.insert(name.0.clone());
+        }
+        Node::Each { item, collect, .. } => {
+            out.insert(item.0.clone());
+            if let Some(c) = collect {
+                out.insert(c.0.clone());
+            }
+        }
+        Node::Repeat { collect, .. } => {
+            if let Some(c) = collect {
+                out.insert(c.0.clone());
+            }
+        }
+        // `race` branch names are NOT bound at runtime (only the winner's `bind` is) — they are
+        // deliberately absent from this list.
+        Node::Pipe { bind, .. }
+        | Node::Seq { bind, .. }
+        | Node::Retry { bind, .. }
+        | Node::Loop { bind, .. }
+        | Node::Race { bind, .. }
+        | Node::Fallback { bind, .. }
+        | Node::Timeout { bind, .. }
+        | Node::Budget { bind, .. }
+        | Node::CapScope { bind, .. }
+        | Node::Scope { bind, .. }
+        | Node::Once { bind, .. } => {
+            if let Some(b) = bind {
+                out.insert(b.0.clone());
+            }
+        }
+        Node::Try { catch, .. } => {
+            if let Some(c) = catch {
+                out.insert(c.0.clone());
+            }
+        }
+        Node::Await { binding, .. } => {
+            if let Some(b) = binding {
+                out.insert(b.0.clone());
+            }
+        }
+        Node::Parallel { branches } => {
+            for b in branches {
+                out.insert(b.name.0.clone());
+            }
+        }
+        // Non-binding kinds. (`ctx_append` rebinds an existing pack — it creates nothing.)
+        Node::Call { .. }
+        | Node::When { .. }
+        | Node::Assert { .. }
+        | Node::Confirm { .. }
+        | Node::Throttle { .. }
+        | Node::Debounce { .. }
+        | Node::Unless { .. }
+        | Node::Verify { .. }
+        | Node::Return { .. }
+        | Node::Peek { .. }
+        | Node::Var { .. }
+        | Node::Lit { .. }
+        | Node::Thing { .. }
+        | Node::Expr { .. }
+        | Node::Fmt { .. }
+        | Node::Jq { .. }
+        | Node::Parse { .. }
+        | Node::CtxAppend { .. }
+        | Node::Match { .. }
+        | Node::Route { .. }
+        | Node::Saga { .. }
+        | Node::Checkpoint { .. }
+        | Node::Obj { .. }
+        | Node::List { .. } => {}
+    });
+}
+
+/// Reject a *declared* symbol name that is not a plain identifier (F8): a dotted name like `a.b`
+/// silently reparses as field-access `jq(".b", $a)` through the text round-trip, so it must never
+/// be declarable.
+fn check_decl_name(name: &SymbolName, what: &str, d: &mut Diags) {
+    if !name.is_identifier() {
+        d.add(format!(
+            "invalid symbol name `${}` declared by {what} — symbol names must be plain \
+             identifiers (ASCII letters, digits, `_`); a dotted or spaced name silently changes \
+             meaning through the text round-trip",
+            name.0
+        ));
+    }
+}
+
+/// [`check_decl_name`] for the many optional `bind`-style declarations.
+fn check_opt_decl_name(name: &Option<SymbolName>, what: &str, d: &mut Diags) {
+    if let Some(n) = name {
+        check_decl_name(n, what, d);
+    }
+}
+
+/// Reject a condition node kind the runtime cannot evaluate. Coupled to the runtime's `eval_cond`
+/// accepted set (runtime.rs, `fn eval_cond`): a `when`/`unless` condition, `repeat`/`loop`
+/// `until` guard, or `assert` condition is evaluated only as `call`, `lit`, `var`, or `expr` —
+/// every other kind is a runtime error, so reject it at analysis (F7).
+fn check_cond_kind(cond: &Node, what: &str, d: &mut Diags) {
+    if !matches!(
+        cond,
+        Node::Call { .. } | Node::Lit { .. } | Node::Var { .. } | Node::Expr { .. }
+    ) {
+        d.add(format!(
+            "`{}` is not a valid {what} condition — the runtime evaluates only `call`, `lit`, \
+             `var` ($symbol), or `expr` conditions; bind the value to a symbol first, then test \
+             `$name`",
+            node_kind_label(cond)
+        ));
+    }
+}
+
+/// Walk a child statement body, extending the node path with `label[i]` per statement.
+fn check_body(
+    body: &[Node],
+    label: &str,
+    ops: &dyn OpCatalog,
+    bound: &HashSet<String>,
+    d: &mut Diags,
+) {
+    for (i, n) in body.iter().enumerate() {
+        d.with(format!("{label}[{i}]"), |d| check_node(n, ops, bound, d));
+    }
+}
+
+/// Recursively validate a node and its children: op resolution and arity, expression-position
+/// legality, declared-name validity, symbol definedness against `bound` (the whole-flow binder
+/// set plus params and session symbols), and per-kind structural guard-rails.
+fn check_node(node: &Node, ops: &dyn OpCatalog, bound: &HashSet<String>, d: &mut Diags) {
     match node {
         Node::Call { op, args } => {
+            if !is_valid_op_name(op) {
+                d.add(format!(
+                    "invalid operation name `{op}` — op names start with an ASCII letter or `_` \
+                     and contain only letters, digits, `_`, `.`, `-`"
+                ));
+            }
             match ops.lookup(op) {
-                None => diags.push(Diagnostic::new(format!("unknown operation: `{op}`"))),
+                None => d.add(format!("unknown operation: `{op}`")),
                 Some(sig) => {
                     // Named-args semantics: a lone object is the whole input (exempt); a single bare
                     // value binds to the sole param; two+ bare values is the deprecated positional
@@ -654,7 +960,7 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, diags: &mut Vec<Diagnostic>) {
                         || matches!(args.as_slice(), [Node::Obj { .. }]);
                     let max = sig.required_params.len() + sig.optional_params.len();
                     if !lone_object && max > 0 && args.len() >= 2 {
-                        diags.push(Diagnostic::new(format!(
+                        d.add(format!(
                             "op `{op}`: pass a single object argument naming its parameters \
                              (e.g. `{{\"{}\": …}}`) instead of {n} positional arguments",
                             sig.required_params
@@ -663,204 +969,286 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, diags: &mut Vec<Diagnostic>) {
                                 .cloned()
                                 .unwrap_or_default(),
                             n = args.len()
-                        )));
+                        ));
                     }
                     // A single bare value against a multi-param op is ambiguous without names —
                     // BUT a single required param (plus optionals) is the common ergonomic sugar
                     // (`read("x")`, `grep("TODO")`), so allow it.
                     let single_required = sig.required_params.len() == 1;
                     if !lone_object && max > 1 && args.len() == 1 && !single_required {
-                        diags.push(Diagnostic::new(format!(
+                        d.add(format!(
                             "op `{op}` takes {max} parameters; pass a single object argument naming \
                              each (e.g. `{{…}}`) instead of one bare value"
-                        )));
+                        ));
                     }
                     // Too few: a call with NO args can never bind a required param (zero args cannot
                     // be the lone whole-input object). Surface it at compile time so the planner
                     // re-plans, instead of failing at runtime mid-execution after side effects.
                     if args.is_empty() && !sig.required_params.is_empty() {
-                        diags.push(Diagnostic::new(format!(
+                        d.add(format!(
                             "op `{op}` requires argument(s) {} but none were supplied",
                             sig.required_params
                                 .iter()
                                 .map(|p| format!("`{p}`"))
                                 .collect::<Vec<_>>()
                                 .join(", ")
-                        )));
+                        ));
                     }
                 }
             }
-            for a in args {
-                check_node(a, ops, diags);
+            // Coupled to the runtime's `eval_arg` accepted set (runtime.rs, `fn eval_arg`):
+            // argument positions resolve WITHOUT dispatch and take only `lit`, `var`, and the
+            // pure `obj`/`list` templates — anything else is a runtime error, so reject it here
+            // first (F7).
+            for (i, a) in args.iter().enumerate() {
+                d.with(format!("args[{i}]"), |d| {
+                    if !matches!(
+                        a,
+                        Node::Lit { .. } | Node::Var { .. } | Node::Obj { .. } | Node::List { .. }
+                    ) {
+                        d.add(format!(
+                            "`{}` is not a valid call argument — the runtime accepts only `lit`, \
+                             `var` ($symbol), and `obj`/`list` templates in argument position; \
+                             bind it to a symbol first (`$x = …`), then pass `$x`",
+                            node_kind_label(a)
+                        ));
+                    }
+                    check_node(a, ops, bound, d);
+                });
             }
         }
-        Node::Bind { value, .. } => check_node(value, ops, diags),
+        Node::Bind { name, value, .. } | Node::Memo { name, value, .. } => {
+            check_decl_name(name, "`bind`/`memo`", d);
+            d.with("value", |d| check_node(value, ops, bound, d));
+        }
         Node::When {
             cond,
             then,
             otherwise,
         } => {
-            check_node(cond, ops, diags);
-            for n in then.iter().chain(otherwise) {
-                check_node(n, ops, diags);
-            }
+            check_cond_kind(cond, "`when`", d);
+            d.with("cond", |d| check_node(cond, ops, bound, d));
+            check_body(then, "then", ops, bound, d);
+            check_body(otherwise, "otherwise", ops, bound, d);
         }
-        Node::Repeat { until, body, .. } => {
+        Node::Repeat {
+            max,
+            until,
+            body,
+            collect,
+        } => {
+            if *max == 0 {
+                d.add(
+                    "`repeat` requires a non-zero `max` (a `max: 0` loop can never run its body)",
+                );
+            }
+            if *max > MAX_REPEAT_BOUND {
+                d.add(format!(
+                    "`repeat` `max` {max} exceeds the analyzer bound ({MAX_REPEAT_BOUND}) — \
+                     plans must be plausibly bounded; lower the bound or restructure with `each`"
+                ));
+            }
+            if body.is_empty() {
+                d.add(
+                    "`repeat` has an empty body — nothing runs and nothing is bound per \
+                     iteration; put the op(s) in `body`",
+                );
+            }
+            check_opt_decl_name(collect, "`repeat` `collect`", d);
             if let Some(u) = until {
-                check_node(u, ops, diags);
+                check_cond_kind(u, "`repeat` `until`", d);
+                d.with("until", |d| check_node(u, ops, bound, d));
             }
-            for n in body {
-                check_node(n, ops, diags);
+            check_body(body, "body", ops, bound, d);
+        }
+        Node::Each {
+            source,
+            item,
+            body,
+            collect,
+            ..
+        } => {
+            check_decl_name(item, "`each` `as`", d);
+            check_opt_decl_name(collect, "`each` `collect`", d);
+            if body.is_empty() {
+                d.add(
+                    "`each` has an empty body — nothing runs and nothing is bound per item; \
+                     put the per-item op(s) in `body`",
+                );
+            }
+            d.with("in", |d| check_node(source, ops, bound, d));
+            check_body(body, "body", ops, bound, d);
+        }
+        Node::Assert { cond, .. } => {
+            check_cond_kind(cond, "`assert`", d);
+            d.with("cond", |d| check_node(cond, ops, bound, d));
+        }
+        Node::Pipe { steps, bind } => {
+            check_opt_decl_name(bind, "`pipe` `bind`", d);
+            for (i, s) in steps.iter().enumerate() {
+                d.with(format!("steps[{i}]"), |d| {
+                    if !matches!(s, Node::Call { .. }) {
+                        d.add("`pipe` steps must be `call` nodes");
+                    }
+                    check_node(s, ops, bound, d);
+                });
             }
         }
-        Node::Each { source, body, .. } => {
-            check_node(source, ops, diags);
-            for n in body {
-                check_node(n, ops, diags);
-            }
+        Node::Seq { body, bind } => {
+            check_opt_decl_name(bind, "`seq` `bind`", d);
+            check_body(body, "body", ops, bound, d);
         }
-        Node::Assert { cond, .. } => check_node(cond, ops, diags),
-        Node::Pipe { steps, .. } => {
-            for s in steps {
-                if !matches!(s, Node::Call { .. }) {
-                    diags.push(Diagnostic::new("`pipe` steps must be `call` nodes"));
-                }
-                check_node(s, ops, diags);
-            }
-        }
-        Node::Seq { body, .. } => {
-            for n in body {
-                check_node(n, ops, diags);
-            }
-        }
-        Node::Memo { value, .. } => check_node(value, ops, diags),
         Node::Parallel { branches } => {
             let mut seen: HashSet<&str> = HashSet::new();
-            for b in branches {
-                if !seen.insert(b.name.0.as_str()) {
-                    diags.push(Diagnostic::new(format!(
-                        "duplicate `parallel` branch name `${}`",
-                        b.name.0
-                    )));
-                }
-                if body_contains_return(&b.body) {
-                    diags.push(Diagnostic::new(
-                        "`return` is not allowed inside a `parallel` branch",
-                    ));
-                }
-                if b.body.is_empty() {
-                    diags.push(Diagnostic::new(format!(
-                        "`parallel` branch `${0}` has an empty body — put the op(s) that \
-                         produce its value in `body`, e.g. \
-                         {{\"name\":\"{0}\",\"body\":[{{\"kind\":\"call\",...}}]}}",
-                        b.name.0
-                    )));
-                }
-                for n in &b.body {
-                    check_node(n, ops, diags);
-                }
+            // F15 (analyzer half): branches run concurrently against ONE shared symbol store, so
+            // two branches binding the same symbol — via their branch names or ANY binder form
+            // inside their bodies — race nondeterministically. Require bind-disjointness.
+            let mut bound_by: HashMap<String, &str> = HashMap::new();
+            for (i, b) in branches.iter().enumerate() {
+                d.with(format!("branches[{i}]"), |d| {
+                    check_decl_name(&b.name, "a `parallel` branch", d);
+                    if !seen.insert(b.name.0.as_str()) {
+                        d.add(format!("duplicate `parallel` branch name `${}`", b.name.0));
+                    }
+                    if body_contains_return(&b.body) {
+                        d.add("`return` is not allowed inside a `parallel` branch");
+                    }
+                    if b.body.is_empty() {
+                        d.add(format!(
+                            "`parallel` branch `${0}` has an empty body — put the op(s) that \
+                             produce its value in `body`, e.g. \
+                             {{\"name\":\"{0}\",\"body\":[{{\"kind\":\"call\",...}}]}}",
+                            b.name.0
+                        ));
+                    }
+                    let mut binds: HashSet<String> = HashSet::new();
+                    binds.insert(b.name.0.clone());
+                    collect_bound_symbols(&b.body, &mut binds);
+                    let mut binds: Vec<String> = binds.into_iter().collect();
+                    binds.sort();
+                    for sym in binds {
+                        match bound_by.entry(sym) {
+                            std::collections::hash_map::Entry::Occupied(e) => {
+                                // Same-name branches are already the `duplicate` diagnostic above.
+                                if *e.get() != b.name.0.as_str() {
+                                    d.add(format!(
+                                        "`parallel` branches `${}` and `${}` both bind `${}` — \
+                                         concurrent branches must bind disjoint symbols",
+                                        e.get(),
+                                        b.name.0,
+                                        e.key()
+                                    ));
+                                }
+                            }
+                            std::collections::hash_map::Entry::Vacant(v) => {
+                                v.insert(b.name.0.as_str());
+                            }
+                        }
+                    }
+                    check_body(&b.body, "body", ops, bound, d);
+                });
             }
         }
-        Node::Return { value } => check_node(value, ops, diags),
-        Node::Retry { body, .. } => {
-            for n in body {
-                check_node(n, ops, diags);
-            }
+        Node::Return { value } => d.with("value", |d| check_node(value, ops, bound, d)),
+        Node::Retry { body, bind, .. } => {
+            check_opt_decl_name(bind, "`retry` `bind`", d);
+            check_body(body, "body", ops, bound, d);
         }
-        Node::Try { body, handler, .. } => {
-            for n in body.iter().chain(handler) {
-                check_node(n, ops, diags);
-            }
+        Node::Try {
+            body,
+            catch,
+            handler,
+        } => {
+            check_opt_decl_name(catch, "`try` `catch`", d);
+            check_body(body, "body", ops, bound, d);
+            check_body(handler, "handler", ops, bound, d);
         }
         Node::Confirm { body, .. } => {
-            for n in body {
-                check_node(n, ops, diags);
-            }
+            check_body(body, "body", ops, bound, d);
         }
-        Node::Race { branches, .. } => {
+        Node::Race { branches, bind, .. } => {
+            check_opt_decl_name(bind, "`race` `bind`", d);
             let mut seen: HashSet<&str> = HashSet::new();
-            for b in branches {
-                if !seen.insert(b.name.0.as_str()) {
-                    diags.push(Diagnostic::new(format!(
-                        "duplicate `race` branch name `${}`",
-                        b.name.0
-                    )));
-                }
-                for n in &b.body {
-                    check_node(n, ops, diags);
-                }
+            for (i, b) in branches.iter().enumerate() {
+                d.with(format!("branches[{i}]"), |d| {
+                    check_decl_name(&b.name, "a `race` branch", d);
+                    if !seen.insert(b.name.0.as_str()) {
+                        d.add(format!("duplicate `race` branch name `${}`", b.name.0));
+                    }
+                    if b.body.is_empty() {
+                        d.add(format!(
+                            "`race` branch `${}` has an empty body — an empty branch can never \
+                             produce a value; put the op(s) in `body`",
+                            b.name.0
+                        ));
+                    }
+                    check_body(&b.body, "body", ops, bound, d);
+                });
             }
         }
         Node::Throttle {
             max, name, body, ..
         } => {
             if *max == 0 {
-                diags.push(Diagnostic::new("`throttle` requires a non-zero `max`"));
+                d.add("`throttle` requires a non-zero `max`");
             }
             if name.is_empty() {
-                diags.push(Diagnostic::new("`throttle` requires a non-empty `name`"));
+                d.add("`throttle` requires a non-empty `name`");
             }
-            for n in body {
-                check_node(n, ops, diags);
-            }
+            check_body(body, "body", ops, bound, d);
         }
         Node::Debounce { name, body, .. } => {
             if name.is_empty() {
-                diags.push(Diagnostic::new("`debounce` requires a non-empty `name`"));
+                d.add("`debounce` requires a non-empty `name`");
             }
-            for n in body {
-                check_node(n, ops, diags);
-            }
+            check_body(body, "body", ops, bound, d);
         }
         Node::Loop {
             until,
             body,
             for_ms,
+            bind,
             ..
         } => {
             if *for_ms == 0 {
-                diags.push(Diagnostic::new(
-                    "`loop` requires a non-zero `for_ms` (unbounded loops are rejected)",
-                ));
+                d.add("`loop` requires a non-zero `for_ms` (unbounded loops are rejected)");
             }
+            check_opt_decl_name(bind, "`loop` `bind`", d);
             if let Some(u) = until {
-                check_node(u, ops, diags);
+                check_cond_kind(u, "`loop` `until`", d);
+                d.with("until", |d| check_node(u, ops, bound, d));
             }
-            for n in body {
-                check_node(n, ops, diags);
-            }
+            check_body(body, "body", ops, bound, d);
         }
         Node::Unless { cond, body } => {
-            check_node(cond, ops, diags);
-            for n in body {
-                check_node(n, ops, diags);
-            }
+            check_cond_kind(cond, "`unless`", d);
+            d.with("cond", |d| check_node(cond, ops, bound, d));
+            check_body(body, "body", ops, bound, d);
         }
         Node::Verify { cmd, expect, .. } => {
-            check_node(cmd, ops, diags);
-            check_node(expect, ops, diags);
+            d.with("cmd", |d| check_node(cmd, ops, bound, d));
+            d.with("expect", |d| check_node(expect, ops, bound, d));
         }
         Node::Expr { vars, .. } => {
-            for v in vars.values() {
-                check_node(v, ops, diags);
+            for (k, v) in vars {
+                d.with(format!("vars.{k}"), |d| check_node(v, ops, bound, d));
             }
         }
         Node::Fmt { .. } => {}
-        Node::Jq { input, .. } => check_node(input, ops, diags),
+        Node::Jq { input, .. } => d.with("input", |d| check_node(input, ops, bound, d)),
         Node::Parse { value, as_type } => {
             const VALID: &[&str] = &["f64", "i64", "bool", "json", "string"];
             if !VALID.contains(&as_type.as_str()) {
-                diags.push(Diagnostic::new(format!(
+                d.add(format!(
                     "`parse` as_type must be one of f64/i64/bool/json/string, got `{as_type}`"
-                )));
-            }
-            check_node(value, ops, diags);
-        }
-        Node::Ctx { budget, .. } => {
-            if matches!(budget, Some(0)) {
-                diags.push(Diagnostic::new(
-                    "`ctx` budget must be non-zero (a 0-char budget drops every member)",
                 ));
+            }
+            d.with("value", |d| check_node(value, ops, bound, d));
+        }
+        Node::Ctx { name, budget, .. } => {
+            check_decl_name(name, "`ctx`", d);
+            if matches!(budget, Some(0)) {
+                d.add("`ctx` budget must be non-zero (a 0-char budget drops every member)");
             }
         }
         Node::Match {
@@ -872,91 +1260,80 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, diags: &mut Vec<Diagnostic>) {
             // interpreter can resolve without dispatch — a literal or a bound symbol. To branch on an
             // op's result, bind it first (`$s = call(); match $s {…}`) or use `route`.
             if !matches!(subject.as_ref(), Node::Lit { .. } | Node::Var { .. }) {
-                diags.push(Diagnostic::new(
+                d.add(
                     "`match` subject must be a literal or a bound symbol (`$x`); bind a call result first, or use `route` to branch on an op",
-                ));
+                );
             }
-            check_node(subject, ops, diags);
+            d.with("subject", |d| check_node(subject, ops, bound, d));
             if cases.is_empty() {
-                diags.push(Diagnostic::new("`match` requires at least one case"));
+                d.add("`match` requires at least one case");
             }
-            for c in cases {
-                if !matches!(c.value, Node::Lit { .. } | Node::Var { .. }) {
-                    diags.push(Diagnostic::new(
-                        "`match` case values must be literals or bound symbols",
-                    ));
-                }
-                check_node(&c.value, ops, diags);
-                for n in &c.body {
-                    check_node(n, ops, diags);
-                }
+            for (i, c) in cases.iter().enumerate() {
+                d.with(format!("cases[{i}]"), |d| {
+                    if !matches!(c.value, Node::Lit { .. } | Node::Var { .. }) {
+                        d.add("`match` case values must be literals or bound symbols");
+                    }
+                    d.with("value", |d| check_node(&c.value, ops, bound, d));
+                    check_body(&c.body, "body", ops, bound, d);
+                });
             }
-            for n in default {
-                check_node(n, ops, diags);
-            }
+            check_body(default, "default", ops, bound, d);
         }
         Node::Route {
             selector,
             cases,
             default,
         } => {
-            check_node(selector, ops, diags);
+            d.with("selector", |d| check_node(selector, ops, bound, d));
             if cases.is_empty() {
-                diags.push(Diagnostic::new("`route` requires at least one case"));
+                d.add("`route` requires at least one case");
             }
             let mut seen: HashSet<&str> = HashSet::new();
-            for c in cases {
-                if c.label.is_empty() {
-                    diags.push(Diagnostic::new("`route` case labels must be non-empty"));
-                }
-                if !seen.insert(c.label.as_str()) {
-                    diags.push(Diagnostic::new(format!(
-                        "duplicate `route` case label `{}`",
-                        c.label
-                    )));
-                }
-                for n in &c.body {
-                    check_node(n, ops, diags);
-                }
+            for (i, c) in cases.iter().enumerate() {
+                d.with(format!("cases[{i}]"), |d| {
+                    if c.label.is_empty() {
+                        d.add("`route` case labels must be non-empty");
+                    }
+                    if !seen.insert(c.label.as_str()) {
+                        d.add(format!("duplicate `route` case label `{}`", c.label));
+                    }
+                    check_body(&c.body, "body", ops, bound, d);
+                });
             }
-            for n in default {
-                check_node(n, ops, diags);
-            }
+            check_body(default, "default", ops, bound, d);
         }
-        Node::Fallback { branches, .. } => {
+        Node::Fallback { branches, bind } => {
+            check_opt_decl_name(bind, "`fallback` `bind`", d);
             if branches.is_empty() {
-                diags.push(Diagnostic::new("`fallback` requires at least one branch"));
+                d.add("`fallback` requires at least one branch");
             }
-            for b in branches {
-                for n in &b.body {
-                    check_node(n, ops, diags);
-                }
+            for (i, b) in branches.iter().enumerate() {
+                d.with(format!("branches[{i}]"), |d| {
+                    check_body(&b.body, "body", ops, bound, d)
+                });
             }
         }
-        Node::Timeout { ms, body, .. } => {
+        Node::Timeout { ms, body, bind } => {
             if *ms == 0 {
-                diags.push(Diagnostic::new("`timeout` requires a non-zero `ms`"));
+                d.add("`timeout` requires a non-zero `ms`");
             }
-            for n in body {
-                check_node(n, ops, diags);
-            }
+            check_opt_decl_name(bind, "`timeout` `bind`", d);
+            check_body(body, "body", ops, bound, d);
         }
-        Node::Budget { limit, body, .. } => {
+        Node::Budget { limit, body, bind } => {
             if *limit == 0 {
-                diags.push(Diagnostic::new("`budget` requires a non-zero `limit`"));
+                d.add("`budget` requires a non-zero `limit`");
             }
-            for n in body {
-                check_node(n, ops, diags);
-            }
+            check_opt_decl_name(bind, "`budget` `bind`", d);
+            check_body(body, "body", ops, bound, d);
         }
-        Node::CapScope { body, .. } => {
+        Node::CapScope { body, bind, .. } => {
             // Op-name/type validation is unconditional (same as every other block); the *scope*-aware
             // "this literal op is outside the allowlist" diagnostic is a separate pass
             // (`check_cap_scopes`) run once over the whole flow, since it must thread the narrowing
             // allowlist through nested scopes — information `check_node`'s signature doesn't carry.
-            for n in body {
-                check_node(n, ops, diags);
-            }
+            check_opt_decl_name(bind, "`with_tools` `bind`", d);
+            check_body(body, "body", ops, bound, d);
         }
         Node::Scope {
             acquire,
@@ -964,69 +1341,81 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, diags: &mut Vec<Diagnostic>) {
             body,
             finally,
         } => {
+            check_opt_decl_name(bind, "`scope` `bind`", d);
             // `bind` names the *acquired resource*, so it only makes sense with an `acquire`.
             if bind.is_some() && acquire.is_none() {
-                diags.push(Diagnostic::new(
-                    "`scope` binds the acquired resource — `-> $name` requires an `acquire`",
-                ));
+                d.add("`scope` binds the acquired resource — `-> $name` requires an `acquire`");
             }
             if let Some(acq) = acquire {
-                check_node(acq, ops, diags);
+                d.with("acquire", |d| check_node(acq, ops, bound, d));
             }
-            for n in body {
-                check_node(n, ops, diags);
-            }
-            for n in finally {
-                check_node(n, ops, diags);
-            }
+            check_body(body, "body", ops, bound, d);
+            check_body(finally, "finally", ops, bound, d);
         }
         Node::Saga { steps } => {
             if steps.is_empty() {
-                diags.push(Diagnostic::new("`saga` requires at least one step"));
+                d.add("`saga` requires at least one step");
             }
-            for step in steps {
-                for n in &step.body {
-                    check_node(n, ops, diags);
-                }
-                for n in &step.undo {
-                    check_node(n, ops, diags);
-                }
+            for (i, step) in steps.iter().enumerate() {
+                d.with(format!("steps[{i}]"), |d| {
+                    check_body(&step.body, "body", ops, bound, d);
+                    check_body(&step.undo, "undo", ops, bound, d);
+                });
             }
         }
-        Node::Once { label, body, .. } => {
+        Node::Once { label, body, bind } => {
             // The label is the durable idempotency key, so it must be a fixed, auditable string.
             if label.trim().is_empty() {
-                diags.push(Diagnostic::new(
-                    "`once` requires a non-empty label (its durable idempotency key)",
-                ));
+                d.add("`once` requires a non-empty label (its durable idempotency key)");
             }
-            for n in body {
-                check_node(n, ops, diags);
-            }
+            check_opt_decl_name(bind, "`once` `bind`", d);
+            check_body(body, "body", ops, bound, d);
         }
         Node::Checkpoint { label } => {
             if label.trim().is_empty() {
-                diags.push(Diagnostic::new(
-                    "`checkpoint` requires a non-empty label (its durable resume key)",
-                ));
+                d.add("`checkpoint` requires a non-empty label (its durable resume key)");
             }
         }
         Node::Obj { fields } => {
-            for v in fields.values() {
-                check_template_leaf(v, ops, diags);
+            for (k, v) in fields {
+                d.with(format!("fields.{k}"), |d| {
+                    check_template_leaf(v, ops, bound, d)
+                });
             }
         }
         Node::List { items } => {
-            for it in items {
-                check_template_leaf(it, ops, diags);
+            for (i, it) in items.iter().enumerate() {
+                d.with(format!("items[{i}]"), |d| {
+                    check_template_leaf(it, ops, bound, d)
+                });
             }
         }
-        Node::Await { .. }
-        | Node::Peek { .. }
-        | Node::Var { .. }
-        | Node::Lit { .. }
-        | Node::Thing { .. }
-        | Node::CtxAppend { .. } => {}
+        Node::Await { binding, .. } => {
+            check_opt_decl_name(binding, "`await` `binding`", d);
+        }
+        Node::Var { name } => {
+            // Reference-side of F8: a dotted/spaced `var` name can never be satisfied (no binder
+            // may declare one) and silently reparses as field access through the text round-trip.
+            if !name.is_identifier() {
+                d.add(format!(
+                    "invalid symbol reference `${}` — symbol names must be plain identifiers \
+                     (ASCII letters, digits, `_`); for field access bind the base symbol and use \
+                     `jq`",
+                    name.0
+                ));
+            } else if !bound.contains(&name.0) {
+                // L-15/F5: definedness. `bound` already contains every binder form anywhere in
+                // the flow (order-insensitive), the flow params, and the session's symbols — so
+                // this can only be a typo or a reference to a value that nothing produces.
+                d.add(format!(
+                    "unbound symbol `${}` — it is not a flow param, is never bound by any \
+                     statement in this flow, and is not a session symbol; bind it first or fix \
+                     the name",
+                    name.0
+                ));
+            }
+        }
+        Node::Peek { .. } | Node::Lit { .. } | Node::Thing { .. } | Node::CtxAppend { .. } => {}
     }
 }
 
@@ -1034,7 +1423,7 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, diags: &mut Vec<Diagnostic>) {
 /// value node** (`var`/`lit`/`jq`/`expr`/`fmt`/`obj`/`list`). A `call` or control-flow leaf would
 /// smuggle side effects into a notionally-pure template, so it is rejected — bind it to a symbol
 /// first, then reference `$name`. Recurses so nested templates are checked too.
-fn check_template_leaf(node: &Node, ops: &dyn OpCatalog, diags: &mut Vec<Diagnostic>) {
+fn check_template_leaf(node: &Node, ops: &dyn OpCatalog, bound: &HashSet<String>, d: &mut Diags) {
     if !matches!(
         node,
         Node::Var { .. }
@@ -1045,14 +1434,14 @@ fn check_template_leaf(node: &Node, ops: &dyn OpCatalog, diags: &mut Vec<Diagnos
             | Node::Obj { .. }
             | Node::List { .. }
     ) {
-        diags.push(Diagnostic::new(
+        d.add(
             "a value template (`obj`/`list`) may only contain pure value leaves \
              (`var`/`lit`/`jq`/`expr`/`fmt`/`obj`/`list`); bind a call or control-flow result to a \
              symbol first, then reference it as `$name`",
-        ));
+        );
     }
     // Recurse regardless, so a nested issue (e.g. an unknown op inside the offending call) also surfaces.
-    check_node(node, ops, diags);
+    check_node(node, ops, bound, d);
 }
 
 /// Whether any statement in `body` is (or reaches, through nested control flow) a `return`. Used to
@@ -1062,25 +1451,31 @@ fn body_contains_return(body: &[Node]) -> bool {
     body.iter().any(node_contains_return)
 }
 
+/// Exhaustive on purpose (no `_ =>`, F12): a new node kind must state here whether executing it
+/// can reach a `return` statement.
 fn node_contains_return(node: &Node) -> bool {
     match node {
         Node::Return { .. } => true,
         Node::When {
             then, otherwise, ..
         } => body_contains_return(then) || body_contains_return(otherwise),
-        Node::Repeat { body, .. } => body_contains_return(body),
-        Node::Each { body, .. } => body_contains_return(body),
-        Node::Seq { body, .. } => body_contains_return(body),
-        Node::Retry { body, .. } => body_contains_return(body),
+        Node::Repeat { body, .. }
+        | Node::Each { body, .. }
+        | Node::Seq { body, .. }
+        | Node::Retry { body, .. }
+        | Node::Confirm { body, .. }
+        | Node::Loop { body, .. }
+        | Node::Throttle { body, .. }
+        | Node::Debounce { body, .. }
+        | Node::Unless { body, .. }
+        | Node::Timeout { body, .. }
+        | Node::Budget { body, .. }
+        | Node::CapScope { body, .. }
+        | Node::Once { body, .. } => body_contains_return(body),
         Node::Try { body, handler, .. } => {
             body_contains_return(body) || body_contains_return(handler)
         }
-        Node::Confirm { body, .. } => body_contains_return(body),
-        Node::Loop { body, .. } => body_contains_return(body),
         Node::Race { branches, .. } => branches.iter().any(|b| body_contains_return(&b.body)),
-        Node::Throttle { body, .. } => body_contains_return(body),
-        Node::Debounce { body, .. } => body_contains_return(body),
-        Node::Unless { body, .. } => body_contains_return(body),
         Node::Match { cases, default, .. } => {
             cases.iter().any(|c| body_contains_return(&c.body)) || body_contains_return(default)
         }
@@ -1088,16 +1483,38 @@ fn node_contains_return(node: &Node) -> bool {
             cases.iter().any(|c| body_contains_return(&c.body)) || body_contains_return(default)
         }
         Node::Fallback { branches, .. } => branches.iter().any(|b| body_contains_return(&b.body)),
-        Node::Timeout { body, .. } | Node::Budget { body, .. } => body_contains_return(body),
         Node::Scope { body, finally, .. } => {
             body_contains_return(body) || body_contains_return(finally)
         }
         Node::Saga { steps } => steps
             .iter()
             .any(|s| body_contains_return(&s.body) || body_contains_return(&s.undo)),
-        Node::Once { body, .. } => body_contains_return(body),
-        Node::Expr { .. } | Node::Fmt { .. } | Node::Jq { .. } => false,
-        _ => false,
+        // A nested `parallel`'s own branches are validated separately (its own `return` rule),
+        // so their returns intentionally don't count here.
+        Node::Parallel { .. } => false,
+        // Expression / leaf positions cannot execute a `return` statement: bind/memo values are
+        // expressions (a statement value is a runtime error), `pipe` steps must be calls, and the
+        // rest carry no statement bodies at all.
+        Node::Call { .. }
+        | Node::Bind { .. }
+        | Node::Memo { .. }
+        | Node::Assert { .. }
+        | Node::Pipe { .. }
+        | Node::Await { .. }
+        | Node::Verify { .. }
+        | Node::Peek { .. }
+        | Node::Var { .. }
+        | Node::Lit { .. }
+        | Node::Thing { .. }
+        | Node::Expr { .. }
+        | Node::Fmt { .. }
+        | Node::Jq { .. }
+        | Node::Parse { .. }
+        | Node::Ctx { .. }
+        | Node::CtxAppend { .. }
+        | Node::Checkpoint { .. }
+        | Node::Obj { .. }
+        | Node::List { .. } => false,
     }
 }
 
@@ -1188,7 +1605,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let hir: HirFlow = lower(&ast, &ops).unwrap();
+        let hir: HirFlow = lower(&ast, &ops, &HashSet::new()).unwrap();
         // Read (from `read`) + WriteFile (from `write`) + Model (declared) — deduped.
         assert!(hir.effects.contains(&FlowEffect::Read));
         assert!(hir.effects.contains(&FlowEffect::WriteFile));
@@ -1211,7 +1628,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let err = lower(&positional, &ops).unwrap_err();
+        let err = lower(&positional, &ops, &HashSet::new()).unwrap_err();
         assert!(
             err.iter()
                 .any(|d| d.message.contains("single object argument")),
@@ -1229,7 +1646,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let err = lower(&bare, &ops).unwrap_err();
+        let err = lower(&bare, &ops, &HashSet::new()).unwrap_err();
         assert!(
             err.iter()
                 .any(|d| d.message.contains("single object argument naming each")),
@@ -1252,7 +1669,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let err = lower(&empty, &ops).unwrap_err();
+        let err = lower(&empty, &ops, &HashSet::new()).unwrap_err();
         assert!(
             err.iter()
                 .any(|d| d.message.contains("requires argument(s)") && d.message.contains("`path`")),
@@ -1305,7 +1722,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let hir = lower(&ast, &ops);
+        let hir = lower(&ast, &ops, &HashSet::new());
         assert!(
             hir.is_ok(),
             "a lone obj-template arg with a dynamic field must analyze cleanly, got: {:?}",
@@ -1323,7 +1740,7 @@ mod tests {
             value: serde_json::json!(v),
         };
         let has = |ast: &DraftAst, needle: &str| {
-            lower(ast, &ops)
+            lower(ast, &ops, &HashSet::new())
                 .err()
                 .is_some_and(|ds| ds.iter().any(|d| d.message.contains(needle)))
         };
@@ -1444,7 +1861,7 @@ mod tests {
             }],
             bind: None,
         });
-        let r = lower(&ok, &ops);
+        let r = lower(&ok, &ops, &HashSet::new());
         assert!(
             r.is_ok(),
             "well-formed fallback should analyze clean: {:?}",
@@ -1475,7 +1892,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let err = analyze_flow(&nested, &ops).unwrap_err();
+        let err = analyze_flow(&nested, &ops, &HashSet::new()).unwrap_err();
         assert!(
             err.iter().any(|d| d
                 .message
@@ -1488,7 +1905,7 @@ mod tests {
             body: vec![await_node()],
             ..Default::default()
         };
-        assert!(analyze_flow(&top, &ops).is_ok());
+        assert!(analyze_flow(&top, &ops, &HashSet::new()).is_ok());
     }
 
     #[test]
@@ -1506,7 +1923,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let err = analyze_flow(&nested, &ops).unwrap_err();
+        let err = analyze_flow(&nested, &ops, &HashSet::new()).unwrap_err();
         assert!(
             err.iter().any(|d| d
                 .message
@@ -1519,13 +1936,13 @@ mod tests {
             body: vec![cp()],
             ..Default::default()
         };
-        assert!(analyze_flow(&top, &ops).is_ok());
+        assert!(analyze_flow(&top, &ops, &HashSet::new()).is_ok());
 
         let empty = DraftAst {
             body: vec![Node::Checkpoint { label: "".into() }],
             ..Default::default()
         };
-        assert!(analyze_flow(&empty, &ops).is_err());
+        assert!(analyze_flow(&empty, &ops, &HashSet::new()).is_err());
     }
 
     /// A catalog with a typed op `dbl(n: Number)` for the argument type-checker.
@@ -1562,7 +1979,7 @@ mod tests {
         let bad = call_dbl(Node::Lit {
             value: serde_json::json!("hello"),
         });
-        let err = lower(&bad, &TypeCat).unwrap_err();
+        let err = lower(&bad, &TypeCat, &HashSet::new()).unwrap_err();
         assert!(
             err.iter().any(|d| d.message.contains("expects Number")),
             "expected a Number-mismatch diagnostic, got {err:?}"
@@ -1572,7 +1989,7 @@ mod tests {
         let good = call_dbl(Node::Lit {
             value: serde_json::json!(5),
         });
-        assert!(lower(&good, &TypeCat).is_ok());
+        assert!(lower(&good, &TypeCat, &HashSet::new()).is_ok());
 
         // A var of unknown (Any) type passes leniently — no false positive.
         let lenient = DraftAst {
@@ -1596,7 +2013,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            lower(&lenient, &TypeCat).is_ok(),
+            lower(&lenient, &TypeCat, &HashSet::new()).is_ok(),
             "an Any-typed var argument must pass leniently"
         );
 
@@ -1628,7 +2045,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(analyze_flow(&good, &ops).is_ok());
+        assert!(analyze_flow(&good, &ops, &HashSet::new()).is_ok());
 
         let bad = DraftAst {
             body: vec![Node::Return {
@@ -1639,7 +2056,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(analyze_flow(&bad, &ops).is_err());
+        assert!(analyze_flow(&bad, &ops, &HashSet::new()).is_err());
     }
 
     #[test]
@@ -1674,7 +2091,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let diags = analyze_flow(&bad, &ops).unwrap_err();
+        let diags = analyze_flow(&bad, &ops, &HashSet::new()).unwrap_err();
         assert_eq!(diags.len(), 2, "both nested unknown ops are reported");
     }
 
@@ -1692,7 +2109,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let diags = analyze_flow(&bad, &ops).unwrap_err();
+        let diags = analyze_flow(&bad, &ops, &HashSet::new()).unwrap_err();
         assert!(diags.iter().any(|d| d.message.contains("pipe")));
     }
 
@@ -1716,13 +2133,14 @@ mod tests {
             }],
             ..Default::default()
         };
-        let diags = analyze_flow(&bad_ast, &ops).unwrap_err();
+        let diags = analyze_flow(&bad_ast, &ops, &HashSet::new()).unwrap_err();
         assert!(
             diags.iter().any(|d| d.message.contains("value template")),
             "expected a template-leaf diagnostic, got: {diags:?}"
         );
 
-        // The pure version (field-access + literal + nested list) analyzes clean.
+        // The pure version (field-access + literal + nested list) analyzes clean. `$x` is bound
+        // first — the L-15 definedness check rejects a reference nothing binds.
         let good: Node = serde_json::from_value(serde_json::json!({
             "kind": "obj",
             "fields": {
@@ -1733,15 +2151,25 @@ mod tests {
         }))
         .unwrap();
         let good_ast = DraftAst {
-            body: vec![Node::Bind {
-                name: "r".into(),
-                value: Box::new(good),
-                ty: None,
-                effect: None,
-            }],
+            body: vec![
+                Node::Bind {
+                    name: "x".into(),
+                    value: Box::new(Node::Lit {
+                        value: serde_json::json!({"intent": "demo"}),
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+                Node::Bind {
+                    name: "r".into(),
+                    value: Box::new(good),
+                    ty: None,
+                    effect: None,
+                },
+            ],
             ..Default::default()
         };
-        assert!(analyze_flow(&good_ast, &ops).is_ok());
+        assert!(analyze_flow(&good_ast, &ops, &HashSet::new()).is_ok());
     }
 
     #[test]
@@ -1770,7 +2198,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let diags = analyze_flow(&bad, &ops).unwrap_err();
+        let diags = analyze_flow(&bad, &ops, &HashSet::new()).unwrap_err();
         assert!(
             diags.iter().any(|d| d.message.contains("return")),
             "a return nested inside unless inside a parallel branch must be rejected"
@@ -1804,7 +2232,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let diags = analyze_flow(&bad, &ops).unwrap_err();
+        let diags = analyze_flow(&bad, &ops, &HashSet::new()).unwrap_err();
         assert!(
             diags.iter().any(|d| d.message.contains("return")),
             "a return inside a parallel branch is rejected"
@@ -1831,7 +2259,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let diags = analyze_flow(&bad, &ops).unwrap_err();
+        let diags = analyze_flow(&bad, &ops, &HashSet::new()).unwrap_err();
         assert!(
             diags.iter().any(|d| d.message.contains("empty body")),
             "an empty parallel branch body is rejected"
@@ -1857,7 +2285,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let diags = analyze_flow(&bad, &ops).unwrap_err();
+        let diags = analyze_flow(&bad, &ops, &HashSet::new()).unwrap_err();
         assert!(
             diags
                 .iter()
@@ -1882,7 +2310,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(analyze_flow(&good, &ops).is_ok());
+        assert!(analyze_flow(&good, &ops, &HashSet::new()).is_ok());
     }
 
     /// Nesting narrows: an inner `with_tools` cannot re-grant a tool the outer scope removed, and the
@@ -1906,7 +2334,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let diags = analyze_flow(&bad, &ops).unwrap_err();
+        let diags = analyze_flow(&bad, &ops, &HashSet::new()).unwrap_err();
         assert!(
             diags.iter().any(|d| d.message.contains("`grep`")),
             "inner scope must not re-grant what the outer removed: {:?}",
@@ -1936,6 +2364,507 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert!(analyze_flow(&good, &ops).is_ok());
+        assert!(analyze_flow(&good, &ops, &HashSet::new()).is_ok());
+    }
+
+    // ---- L-15: symbol definedness (F5) ----
+
+    /// A `$var` no binder form anywhere in the flow (and no param / session symbol) can satisfy is
+    /// a diagnostic naming the symbol — the typo class caught at analysis instead of runtime.
+    /// Order-insensitivity is part of the contract: a use BEFORE its bind is NOT flagged (zero
+    /// false positives; use-before-bind stays a precise runtime error).
+    #[test]
+    fn unbound_var_reference_is_a_diagnostic() {
+        let ops = catalog();
+        let ast = DraftAst {
+            body: vec![
+                Node::Bind {
+                    name: "real".into(),
+                    value: Box::new(Node::Lit {
+                        value: serde_json::json!("v"),
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+                Node::Call {
+                    op: "grep".into(),
+                    args: vec![Node::Var {
+                        name: "typo".into(),
+                    }],
+                },
+            ],
+            ..Default::default()
+        };
+        let err = analyze_flow(&ast, &ops, &HashSet::new()).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("unbound symbol `$typo`")),
+            "expected an unbound-symbol diagnostic naming $typo, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        assert!(
+            !err.iter().any(|d| d.message.contains("$real")),
+            "the bound symbol must not be flagged"
+        );
+
+        // Order-insensitive: a reference BEFORE its bind is fine, and a flow param satisfies too.
+        let late = DraftAst {
+            params: vec![crate::ast::Param {
+                name: "arg".into(),
+                ty: TypeRef::Any,
+            }],
+            body: vec![
+                Node::Call {
+                    op: "grep".into(),
+                    args: vec![
+                        Node::Var {
+                            name: "late".into(),
+                        },
+                        Node::Var { name: "arg".into() },
+                    ],
+                },
+                Node::Bind {
+                    name: "late".into(),
+                    value: Box::new(Node::Lit {
+                        value: serde_json::json!("x"),
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(
+            analyze_flow(&late, &ops, &HashSet::new()).is_ok(),
+            "use-before-bind and params must not be false positives"
+        );
+    }
+
+    /// A `$var` satisfied only by the executing session's symbol set analyzes clean through the
+    /// session-aware entry point — and is (correctly) unbound through the empty-set delegate.
+    #[test]
+    fn session_symbols_satisfy_var_references() {
+        let ops = catalog();
+        let ast = DraftAst {
+            body: vec![Node::Call {
+                op: "grep".into(),
+                args: vec![Node::Var {
+                    name: "seeded".into(),
+                }],
+            }],
+            ..Default::default()
+        };
+        let err = analyze_flow(&ast, &ops, &HashSet::new()).unwrap_err();
+        assert!(err
+            .iter()
+            .any(|d| d.message.contains("unbound symbol `$seeded`")));
+        let seeded: HashSet<String> = ["seeded".to_string()].into_iter().collect();
+        assert!(
+            analyze_flow(&ast, &ops, &seeded).is_ok(),
+            "a session-seeded symbol satisfies the reference"
+        );
+    }
+
+    // ---- L-15: required-param presence (F6) ----
+
+    /// An object-literal (or lone `obj`-template) call whose static keys miss a `required_params`
+    /// entry is a diagnostic; a call with all required keys present passes. Keys are static even
+    /// when values are dynamic — the check needs no jsonschema.
+    #[test]
+    fn object_call_missing_required_param_is_a_diagnostic() {
+        let ops = TypedCatalog;
+        let call = |args: Vec<Node>| DraftAst {
+            body: vec![Node::Call {
+                op: "write".into(),
+                args,
+            }],
+            ..Default::default()
+        };
+
+        // `write` requires `path` + `content`; the lit object names only `path`.
+        let err = lower(
+            &call(vec![Node::Lit {
+                value: serde_json::json!({"path": "p"}),
+            }]),
+            &ops,
+            &HashSet::new(),
+        )
+        .unwrap_err();
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("missing required parameter")
+                    && d.message.contains("`content`")),
+            "expected a missing-required-parameter diagnostic for `content`, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        // Same rule for a lone `obj` template — its keys are static even with dynamic values.
+        let err = lower(
+            &call(vec![Node::Obj {
+                fields: [(
+                    "content".to_string(),
+                    Box::new(Node::Lit {
+                        value: serde_json::json!("c"),
+                    }),
+                )]
+                .into_iter()
+                .collect(),
+            }]),
+            &ops,
+            &HashSet::new(),
+        )
+        .unwrap_err();
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("missing required parameter")
+                    && d.message.contains("`path`")),
+            "expected a missing-required-parameter diagnostic for `path`, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        // All required keys present → clean.
+        assert!(lower(
+            &call(vec![Node::Lit {
+                value: serde_json::json!({"path": "p", "content": "c"}),
+            }]),
+            &ops,
+            &HashSet::new(),
+        )
+        .is_ok());
+    }
+
+    // ---- L-16: expression positions the runtime rejects (F7) ----
+
+    /// A `call` in argument position is a diagnostic with a bind-it-first hint — the runtime's
+    /// `eval_arg` resolves arguments without dispatch and accepts only `lit`/`var`/`obj`/`list`.
+    #[test]
+    fn call_in_argument_position_is_a_diagnostic() {
+        let ops = catalog();
+        let ast = DraftAst {
+            body: vec![Node::Call {
+                op: "write".into(),
+                args: vec![Node::Call {
+                    op: "read".into(),
+                    args: vec![Node::Lit {
+                        value: serde_json::json!("f"),
+                    }],
+                }],
+            }],
+            ..Default::default()
+        };
+        let err = analyze_flow(&ast, &ops, &HashSet::new()).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("not a valid call argument")
+                    && d.message.contains("bind it to a symbol first")),
+            "expected an invalid-argument-position diagnostic, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A condition kind the runtime's `eval_cond` rejects (anything but `call`/`lit`/`var`/`expr`)
+    /// is a diagnostic; an `expr` condition passes.
+    #[test]
+    fn invalid_condition_kind_is_a_diagnostic() {
+        let ops = catalog();
+        let then_read = || {
+            vec![Node::Call {
+                op: "read".into(),
+                args: vec![],
+            }]
+        };
+        let bad = DraftAst {
+            body: vec![Node::When {
+                cond: Box::new(Node::Fmt {
+                    template: "{x}".into(),
+                }),
+                then: then_read(),
+                otherwise: vec![],
+            }],
+            ..Default::default()
+        };
+        let err = analyze_flow(&bad, &ops, &HashSet::new()).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("not a valid `when` condition")),
+            "expected an invalid-condition diagnostic, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        let good = DraftAst {
+            body: vec![Node::When {
+                cond: Box::new(Node::Expr {
+                    formula: "1 == 1".into(),
+                    vars: Default::default(),
+                }),
+                then: then_read(),
+                otherwise: vec![],
+            }],
+            ..Default::default()
+        };
+        assert!(analyze_flow(&good, &ops, &HashSet::new()).is_ok());
+    }
+
+    // ---- L-16: declared-name validity (F8) ----
+
+    /// The confirmed round-trip corruption case: a bind or var named `a.b` (which reparses as
+    /// field-access `jq(".b", $a)` through the text surface) is rejected outright.
+    #[test]
+    fn non_identifier_symbol_names_are_rejected() {
+        let ops = catalog();
+        let bad_bind = DraftAst {
+            body: vec![Node::Bind {
+                name: "a.b".into(),
+                value: Box::new(Node::Lit {
+                    value: serde_json::json!(1),
+                }),
+                ty: None,
+                effect: None,
+            }],
+            ..Default::default()
+        };
+        let err = analyze_flow(&bad_bind, &ops, &HashSet::new()).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("invalid symbol name `$a.b`")),
+            "a dotted declared name is rejected, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        let bad_var = DraftAst {
+            body: vec![Node::Call {
+                op: "grep".into(),
+                args: vec![Node::Var { name: "a.b".into() }],
+            }],
+            ..Default::default()
+        };
+        let err = analyze_flow(&bad_var, &ops, &HashSet::new()).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("invalid symbol reference `$a.b`")),
+            "a dotted var reference is rejected, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        // Whitespace is just as invalid.
+        let bad_space = DraftAst {
+            body: vec![Node::Bind {
+                name: "a b".into(),
+                value: Box::new(Node::Lit {
+                    value: serde_json::json!(1),
+                }),
+                ty: None,
+                effect: None,
+            }],
+            ..Default::default()
+        };
+        assert!(analyze_flow(&bad_space, &ops, &HashSet::new()).is_err());
+    }
+
+    // ---- L-16: loop bounds + empty bodies (F10) ----
+
+    #[test]
+    fn repeat_each_race_bounds_and_empty_bodies_are_validated() {
+        let ops = catalog();
+        let read = || Node::Call {
+            op: "read".into(),
+            args: vec![],
+        };
+        let wrap = |n: Node| DraftAst {
+            body: vec![n],
+            ..Default::default()
+        };
+        let has = |ast: &DraftAst, needle: &str| {
+            analyze_flow(ast, &ops, &HashSet::new())
+                .err()
+                .is_some_and(|ds| ds.iter().any(|d| d.message.contains(needle)))
+        };
+
+        // `repeat` max: 0 can never run.
+        assert!(has(
+            &wrap(Node::Repeat {
+                max: 0,
+                until: None,
+                body: vec![read()],
+                collect: None,
+            }),
+            "`repeat` requires a non-zero `max`"
+        ));
+        // An absurd max is effectively unbounded.
+        assert!(has(
+            &wrap(Node::Repeat {
+                max: 100_001,
+                until: None,
+                body: vec![read()],
+                collect: None,
+            }),
+            "exceeds the analyzer bound"
+        ));
+        // Empty bodies run nothing and bind nothing (mirrors the empty-`parallel`-branch rule).
+        assert!(has(
+            &wrap(Node::Repeat {
+                max: 2,
+                until: None,
+                body: vec![],
+                collect: None,
+            }),
+            "`repeat` has an empty body"
+        ));
+        assert!(has(
+            &wrap(Node::Each {
+                source: Box::new(Node::Lit {
+                    value: serde_json::json!([1]),
+                }),
+                item: "x".into(),
+                body: vec![],
+                collect: None,
+                flat: false,
+            }),
+            "`each` has an empty body"
+        ));
+        assert!(has(
+            &wrap(Node::Race {
+                timeout_ms: 100,
+                branches: vec![crate::ast::Branch {
+                    name: "b".into(),
+                    body: vec![],
+                }],
+                bind: None,
+            }),
+            "`race` branch `$b` has an empty body"
+        ));
+
+        // The well-formed version analyzes clean.
+        assert!(analyze_flow(
+            &wrap(Node::Repeat {
+                max: 3,
+                until: None,
+                body: vec![read()],
+                collect: None,
+            }),
+            &ops,
+            &HashSet::new()
+        )
+        .is_ok());
+    }
+
+    // ---- L-16: `parallel` cross-branch bind disjointness (F15 analyzer half) ----
+
+    #[test]
+    fn parallel_cross_branch_binds_are_rejected() {
+        use crate::ast::Branch;
+        let ops = catalog();
+        let bind_x = |v: i64| Node::Bind {
+            name: "x".into(),
+            value: Box::new(Node::Lit {
+                value: serde_json::json!(v),
+            }),
+            ty: None,
+            effect: None,
+        };
+        // Two branches each bind `$x` via INNER binds (not their branch names) — a store race.
+        let bad = DraftAst {
+            body: vec![Node::Parallel {
+                branches: vec![
+                    Branch {
+                        name: "a".into(),
+                        body: vec![bind_x(1)],
+                    },
+                    Branch {
+                        name: "b".into(),
+                        body: vec![bind_x(2)],
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+        let err = analyze_flow(&bad, &ops, &HashSet::new()).unwrap_err();
+        assert!(
+            err.iter().any(|d| d.message.contains("both bind `$x`")),
+            "expected a cross-branch bind diagnostic, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        // A branch name colliding with another branch's inner bind is the same race.
+        let name_vs_inner = DraftAst {
+            body: vec![Node::Parallel {
+                branches: vec![
+                    Branch {
+                        name: "a".into(),
+                        body: vec![bind_x(1)],
+                    },
+                    Branch {
+                        name: "x".into(),
+                        body: vec![Node::Call {
+                            op: "read".into(),
+                            args: vec![],
+                        }],
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+        assert!(analyze_flow(&name_vs_inner, &ops, &HashSet::new())
+            .unwrap_err()
+            .iter()
+            .any(|d| d.message.contains("both bind `$x`")));
+
+        // Disjoint binds analyze clean.
+        let good = DraftAst {
+            body: vec![Node::Parallel {
+                branches: vec![
+                    Branch {
+                        name: "a".into(),
+                        body: vec![bind_x(1)],
+                    },
+                    Branch {
+                        name: "b".into(),
+                        body: vec![Node::Bind {
+                            name: "y".into(),
+                            value: Box::new(Node::Lit {
+                                value: serde_json::json!(2),
+                            }),
+                            ty: None,
+                            effect: None,
+                        }],
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+        assert!(analyze_flow(&good, &ops, &HashSet::new()).is_ok());
+    }
+
+    // ---- L-16: diagnostics carry node-path locators (F11) ----
+
+    #[test]
+    fn diagnostics_carry_node_paths() {
+        let ops = catalog();
+        let ast = DraftAst {
+            body: vec![
+                Node::Call {
+                    op: "read".into(),
+                    args: vec![],
+                },
+                Node::When {
+                    cond: Box::new(Node::Lit {
+                        value: serde_json::json!(true),
+                    }),
+                    then: vec![Node::Call {
+                        op: "nope.op".into(),
+                        args: vec![],
+                    }],
+                    otherwise: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+        let err = analyze_flow(&ast, &ops, &HashSet::new()).unwrap_err();
+        assert!(
+            err.iter().any(|d| d.message.contains("unknown operation")
+                && d.message.contains("body[1].then[0]")),
+            "expected the diagnostic to carry its node path, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 }

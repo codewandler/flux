@@ -2029,7 +2029,14 @@ pub(crate) async fn run_draft_ast_with_composites(
     }
     let oreg = flux_flow::registry::OpRegistry::new(engine.executor.registry())
         .with_composites(&active_composites);
-    if let Err(diags) = flux_flow::analyze::analyze_flow(ast, &oreg) {
+    // Typed gate (L-16/F9): full structural analysis + lowering, with the session's already-bound
+    // symbols satisfying definedness (a resumed session may legitimately reference prior turns).
+    let session_symbols: std::collections::HashSet<String> = engine
+        .flow
+        .view(&session_id)
+        .map(|v| v.symbols.into_iter().map(|s| s.name.0).collect())
+        .unwrap_or_default();
+    if let Err(diags) = flux_flow::analyze::lower(ast, &oreg, &session_symbols) {
         print_diagnostics(&diags);
         bail!("flow validation failed — see diagnostics above");
     }

@@ -57,16 +57,16 @@ fn sha256_hex(s: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
-/// The durable identity of a flow for `checkpoint` scoping: its declared name if any, else a stable
-/// content hash of its top-level body. Scopes a flow's durable resume state to the same logical flow
-/// across re-runs without colliding with a different flow in the same session.
+/// The durable identity of a flow for `checkpoint` scoping: the declared name (when present) **plus**
+/// a stable content hash of its top-level body. The hash means an *edited* flow never fast-forwards
+/// past changed statements; the name scopes two identical bodies apart. This is the ONE derivation
+/// shared by [`execute_flow`] and [`resume_flow_named`], so a flow's run and resume agree on its
+/// checkpoint keys (F17 — previously run keyed by name only and resume by hash only).
 fn flow_key(name: Option<&str>, body: &[Node]) -> String {
+    let hash = sha256_hex(&serde_json::to_string(body).unwrap_or_default());
     match name {
-        Some(n) if !n.trim().is_empty() => n.to_string(),
-        _ => format!(
-            "h:{}",
-            &sha256_hex(&serde_json::to_string(body).unwrap_or_default())[..16]
-        ),
+        Some(n) if !n.trim().is_empty() => format!("{n}#{}", &hash[..16]),
+        _ => format!("h:{}", &hash[..16]),
     }
 }
 
@@ -313,7 +313,9 @@ pub async fn execute_call(
     bind: Option<BindSpec<'_>>,
 ) -> Result<CallOutcome> {
     let input_hash = sha256_hex(&serde_json::to_string(&input).unwrap_or_default());
-    let step = StepId(format!("step_{}", &input_hash[..16]));
+    // The step id carries the op name, not just the input hash — two different ops over identical
+    // input must not share an id in the audit trail (F20c).
+    let step = StepId(format!("step_{op}_{}", &input_hash[..16]));
 
     store.append_event(
         session_id,
@@ -383,7 +385,7 @@ async fn execute_composite_call(
     sink: &mut dyn FlowSink,
 ) -> Result<CallOutcome> {
     let input_hash = sha256_hex(&serde_json::to_string(&input).unwrap_or_default());
-    let step = StepId(format!("step_{}", &input_hash[..16]));
+    let step = StepId(format!("step_{}_{}", composite.name, &input_hash[..16]));
     store.append_event(
         session_id,
         &RunEvent::StepStarted {
@@ -434,6 +436,13 @@ async fn execute_composite_call(
                     error: error.clone(),
                 },
             )?;
+            if e.is_fatal() {
+                // Fatality survives the composite boundary: a denied `confirm` or failed `assert`
+                // inside a composite op keeps its structural identity instead of being stringified
+                // into a retryable in-band error, so an enclosing `retry` will not re-attempt it
+                // (F14). The StepFailed audit record above is still written.
+                return Err(e);
+            }
             return Ok(CallOutcome {
                 value_id: None,
                 is_error: true,
@@ -654,7 +663,26 @@ pub async fn resume_flow(
     input: Value,
     sink: &mut dyn FlowSink,
 ) -> Result<FlowOutcome> {
-    let fk = flow_key(None, body);
+    resume_flow_named(store, executor, session_id, None, body, at, input, sink).await
+}
+
+/// [`resume_flow`] with the flow's declared name, so a *named* flow's resumed run records its
+/// checkpoints under the same `flow_key` (name + body hash) that [`execute_flow`] uses — run and
+/// resume agree on keys (F17). A caller that did not persist the name passes `None` (equivalent to
+/// [`resume_flow`]); the key then falls back to the body hash alone, which still never matches an
+/// edited body.
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_flow_named(
+    store: &dyn ValueStore,
+    executor: &dyn OpHost,
+    session_id: &str,
+    name: Option<&str>,
+    body: &[Node],
+    at: crate::ast::NodeId,
+    input: Value,
+    sink: &mut dyn FlowSink,
+) -> Result<FlowOutcome> {
+    let fk = flow_key(name, body);
     run_top_level(
         store,
         executor,
@@ -965,189 +993,56 @@ fn exec_body<'a>(
                 Node::Bind {
                     name, value, ty, ..
                 } => {
-                    // Pure nodes (expr/fmt/jq) may appear as a bind value without going through
-                    // execute_call — they are side-effect-free and need no dispatch envelope.
-                    match value.as_ref() {
-                        Node::Expr { formula, vars } => {
-                            let resolved = resolve_expr_vars(vars, store, session_id)?;
-                            let text = eval_expr_value(formula, &resolved)?.as_text();
-                            let vid = store.put_value(session_id, &Value::String(text.clone()))?;
-                            let ty_label = ty.as_ref().map(TypeRef::label);
-                            store.bind(
-                                session_id,
-                                name,
-                                &vid,
-                                ty_label.as_deref(),
-                                &summarize(&text),
-                                Visibility::Visible,
-                            )?;
-                            transcript.push(format!("[${} = expr {formula}]\n{text}", name.0));
-                            last = text;
-                            last_value = Some(vid);
-                            continue;
-                        }
-                        Node::Fmt { template } => {
-                            let text = interpolate_str(template, store, session_id);
-                            let vid = store.put_value(session_id, &Value::String(text.clone()))?;
-                            let ty_label = ty.as_ref().map(TypeRef::label);
-                            store.bind(
-                                session_id,
-                                name,
-                                &vid,
-                                ty_label.as_deref(),
-                                &summarize(&text),
-                                Visibility::Visible,
-                            )?;
-                            transcript.push(format!("[${} = fmt]\n{text}", name.0));
-                            last = text;
-                            last_value = Some(vid);
-                            continue;
-                        }
-                        Node::Jq { path, input } => {
-                            // Op results are stored as JSON *strings* (the canonical `content`), so a
-                            // string input that is really JSON is parsed first — this is what lets a flow
-                            // pull `.kind`/`.transcript` out of a `plan`/`run_plan` result.
-                            let jv = jq_parse_input(eval_arg(input, store, session_id)?);
-                            let result = eval_jq_path(path, &jv)?;
-                            let text = match &result {
-                                serde_json::Value::String(s) => s.clone(),
-                                other => serde_json::to_string(other).unwrap_or_default(),
-                            };
-                            let vid = store.put_value(session_id, &Value::String(text.clone()))?;
-                            let ty_label = ty.as_ref().map(TypeRef::label);
-                            store.bind(
-                                session_id,
-                                name,
-                                &vid,
-                                ty_label.as_deref(),
-                                &summarize(&text),
-                                Visibility::Visible,
-                            )?;
-                            transcript.push(format!("[${} = jq {path}]\n{text}", name.0));
-                            last = text;
-                            last_value = Some(vid);
-                            continue;
-                        }
-                        Node::Parse {
-                            value: inner,
-                            as_type,
-                        } => {
-                            let jv = eval_arg(inner, store, session_id)?;
-                            let text = coerce_parse(&jv, as_type)?;
-                            let vid = store.put_value(session_id, &Value::String(text.clone()))?;
-                            let ty_label = ty.as_ref().map(TypeRef::label);
-                            store.bind(
-                                session_id,
-                                name,
-                                &vid,
-                                ty_label.as_deref(),
-                                &summarize(&text),
-                                Visibility::Visible,
-                            )?;
-                            transcript.push(format!("[${} = parse {as_type}]\n{text}", name.0));
-                            last = text;
-                            last_value = Some(vid);
-                            continue;
-                        }
-                        Node::Thing { thing } => {
-                            // Resolve the external reference to an exact identity through the host's
-                            // resolver (the deterministic default handles self-identifying selectors),
-                            // record it in the run trace, and bind the resolved `Thing` value.
-                            let resolved = executor
-                                .resolve_thing(thing)
-                                .await
-                                .map_err(crate::FlowError::Runtime)?;
-                            store.append_event(
-                                session_id,
-                                &RunEvent::ThingResolved {
-                                    thing: thing.clone(),
-                                    resolved: resolved.clone(),
-                                },
-                            )?;
-                            let display = resolved.display.clone();
-                            let vid = store.put_value(session_id, &Value::Thing(resolved))?;
-                            let ty_label = ty.as_ref().map(TypeRef::label);
-                            store.bind(
-                                session_id,
-                                name,
-                                &vid,
-                                ty_label.as_deref(),
-                                &summarize(&display),
-                                Visibility::Visible,
-                            )?;
-                            transcript.push(format!("[${} = thing]\n{display}", name.0));
-                            last = display;
-                            last_value = Some(vid);
-                            continue;
-                        }
-                        Node::Var { name: src } => {
-                            // Alias a symbol: `$b = $a` rebinds `name` to `$a`'s current value. Pure —
-                            // values are immutable, so sharing the same ValueId is sound (this is the
-                            // body-level twin of the optimizer's `Stage::Alias`). No dispatch, no IO.
-                            let vid = store.resolve(session_id, src)?.ok_or_else(|| {
-                                crate::FlowError::Runtime(format!("unbound symbol ${}", src.0))
-                            })?;
-                            let text = store
-                                .get_value(&vid)?
-                                .map(|v| value_text(&v))
-                                .unwrap_or_default();
-                            let ty_label = ty.as_ref().map(TypeRef::label);
-                            store.bind(
-                                session_id,
-                                name,
-                                &vid,
-                                ty_label.as_deref(),
-                                &summarize(&text),
-                                Visibility::Visible,
-                            )?;
-                            transcript.push(format!("[${} = ${}]\n{text}", name.0, src.0));
-                            last = text;
-                            last_value = Some(vid);
-                            continue;
-                        }
-                        Node::Lit { value } => {
-                            // Bind a literal directly: `$x = 5`, `"hi"`, `[1,2,3]`, `{"a":1}`. Stored as
-                            // the canonical JSON-as-string `Value::String` (same shape op results take),
-                            // with `{{sym}}` interpolation honored to match `eval_arg`. Pure, no IO.
-                            let jv = interpolate(value, store, session_id);
-                            let text = lit_text(&jv);
-                            let vid = store.put_value(session_id, &Value::String(text.clone()))?;
-                            let ty_label = ty.as_ref().map(TypeRef::label);
-                            store.bind(
-                                session_id,
-                                name,
-                                &vid,
-                                ty_label.as_deref(),
-                                &summarize(&text),
-                                Visibility::Visible,
-                            )?;
-                            transcript.push(format!("[${} = lit]\n{text}", name.0));
-                            last = text;
-                            last_value = Some(vid);
-                            continue;
-                        }
-                        Node::Obj { .. } | Node::List { .. } => {
-                            // Record/list constructor: `$r = { k: $v, … }` / `$xs = [ $a, $b ]`. Pure —
-                            // assembles a JSON value from its sub-expressions (the analyzer guarantees
-                            // every leaf is a pure value node). Stored as canonical JSON-as-string.
-                            let jv = eval_template(value, store, session_id)?;
-                            let text = lit_text(&jv);
-                            let vid = store.put_value(session_id, &Value::String(text.clone()))?;
-                            let ty_label = ty.as_ref().map(TypeRef::label);
-                            store.bind(
-                                session_id,
-                                name,
-                                &vid,
-                                ty_label.as_deref(),
-                                &summarize(&text),
-                                Visibility::Visible,
-                            )?;
-                            transcript.push(format!("[${} = template]\n{text}", name.0));
-                            last = text;
-                            last_value = Some(vid);
-                            continue;
-                        }
-                        _ => {}
+                    // Pure value nodes (expr/fmt/jq/parse/var/lit/obj/list) evaluate through the ONE
+                    // shared helper — the same path statement position uses, so bind and statement
+                    // semantics can never diverge again (F13). They are side-effect-free and need no
+                    // dispatch envelope.
+                    if let Some(pe) = eval_pure_node(value.as_ref(), store, session_id)? {
+                        let ty_label = ty.as_ref().map(TypeRef::label);
+                        store.bind(
+                            session_id,
+                            name,
+                            &pe.vid,
+                            ty_label.as_deref(),
+                            &summarize(&pe.text),
+                            Visibility::Visible,
+                        )?;
+                        transcript.push(format!("[${} = {}]\n{}", name.0, pe.tag, pe.text));
+                        last = pe.text;
+                        last_value = Some(pe.vid);
+                        continue;
+                    }
+                    if let Node::Thing { thing } = value.as_ref() {
+                        // Resolve the external reference to an exact identity through the host's
+                        // resolver (the deterministic default handles self-identifying selectors),
+                        // record it in the run trace, and bind the resolved `Thing` value. Not part
+                        // of the pure-node helper: resolution is async and host-mediated.
+                        let resolved = executor
+                            .resolve_thing(thing)
+                            .await
+                            .map_err(crate::FlowError::Runtime)?;
+                        store.append_event(
+                            session_id,
+                            &RunEvent::ThingResolved {
+                                thing: thing.clone(),
+                                resolved: resolved.clone(),
+                            },
+                        )?;
+                        let display = resolved.display.clone();
+                        let vid = store.put_value(session_id, &Value::Thing(resolved))?;
+                        let ty_label = ty.as_ref().map(TypeRef::label);
+                        store.bind(
+                            session_id,
+                            name,
+                            &vid,
+                            ty_label.as_deref(),
+                            &summarize(&display),
+                            Visibility::Visible,
+                        )?;
+                        transcript.push(format!("[${} = thing]\n{display}", name.0));
+                        last = display;
+                        last_value = Some(vid);
+                        continue;
                     }
                     let Node::Call { op, args } = value.as_ref() else {
                         return Err(crate::FlowError::Runtime(
@@ -1244,8 +1139,9 @@ fn exec_body<'a>(
                     .await?;
                     if !blast.is_empty() {
                         last = blast;
-                        last_value = bvid;
                     }
+                    // The branch's value is the node's value even when its text renders empty (F20b).
+                    last_value = bvid;
                     if let Step::Return(v) = step {
                         return Ok((last, v.clone(), Step::Return(v)));
                     }
@@ -1316,6 +1212,12 @@ fn exec_body<'a>(
                             "`each` source must evaluate to a list".to_string(),
                         ));
                     };
+                    // The item symbol is loop-scoped: save any outer binding of the same name so the
+                    // loop variable doesn't clobber it past the loop (F20d). Restored on normal
+                    // completion; with no prior binding the last item stays bound (the store has no
+                    // unbind).
+                    let saved_item_vid = store.resolve(session_id, item)?;
+                    let saved_item_meta = store.binding(session_id, item)?;
                     let mut collected: Vec<ValueId> = Vec::new();
                     for elem in &elems {
                         let vid = store.put_value(session_id, &Value::from_json(elem))?;
@@ -1339,6 +1241,21 @@ fn exec_body<'a>(
                         }
                         if let Step::Return(v) = step {
                             return Ok((last, v.clone(), Step::Return(v)));
+                        }
+                    }
+                    // Restore the outer binding the loop variable shadowed (F20d), with its original
+                    // metadata; done before `collect` binds so an explicit collect symbol wins.
+                    if let Some(prev_vid) = &saved_item_vid {
+                        match &saved_item_meta {
+                            Some(m) => store.bind(
+                                session_id,
+                                item,
+                                prev_vid,
+                                m.ty.as_deref(),
+                                &m.summary,
+                                m.visibility,
+                            )?,
+                            None => bind_existing(store, session_id, item, prev_vid)?,
                         }
                     }
                     if let Some(cname) = collect {
@@ -1419,7 +1336,10 @@ fn exec_body<'a>(
                                 outcome.content
                             )));
                         }
-                        transcript.push(format!("[pipe {op}]\n{}", outcome.view));
+                        // Transcript views are trimmed to the host's output budget, like every
+                        // other transcript push (F20a); the canonical value is untouched.
+                        let view = executor.trim_output(outcome.view.clone(), op);
+                        transcript.push(format!("[pipe {op}]\n{view}"));
                         last = outcome.view;
                         prev = outcome.value_id;
                     }
@@ -1489,39 +1409,60 @@ fn exec_body<'a>(
                             outcome.content
                         )));
                     }
-                    transcript.push(format!("[${} = memo {op}]\n{}", name.0, outcome.view));
+                    // Transcript views are trimmed to the host's output budget, like every other
+                    // transcript push (F20a); the canonical value is untouched.
+                    let view = executor.trim_output(outcome.view.clone(), op);
+                    transcript.push(format!("[${} = memo {op}]\n{view}", name.0));
                     last = outcome.view;
                     last_value = outcome.value_id;
                 }
                 Node::Parallel { branches } => {
                     // Run each branch concurrently, each writing to its own buffering sink; after the
-                    // join, replay the buffers into the real sink in branch order so concurrent output
-                    // doesn't interleave. Every op still dispatches through the same envelope.
+                    // join, merge the buffers/steps/transcripts into the real sink in DECLARATION
+                    // order so concurrent output doesn't interleave. Every branch runs to completion
+                    // (`join_all`, not `try_join_all`): a sibling's failure must not drop a completed
+                    // branch's buffered output, dispatched-step count, or binding — the audit is
+                    // merged first, then the first (declaration-order) error propagates (F15). Every
+                    // op still dispatches through the same envelope.
                     let futs = branches.iter().map(|b| async move {
                         let mut buf = BufferSink::default();
                         let mut s = 0usize;
                         let mut tr: Vec<String> = Vec::new();
-                        let (text, lv, step) = exec_body(
+                        let res = exec_body(
                             store, executor, session_id, &b.body, &mut buf, &mut s, &mut tr,
                         )
-                        .await?;
-                        Ok::<_, FlowError>((b, buf, s, tr, text, lv, step))
+                        .await;
+                        (b, buf, s, tr, res)
                     });
-                    let results = futures::future::try_join_all(futs).await?;
-                    for (b, buf, s, tr, text, lv, step) in results {
-                        if let Step::Return(_) = step {
-                            return Err(FlowError::Runtime(
-                                "`return` is not allowed inside a `parallel` branch".to_string(),
-                            ));
-                        }
+                    let results = futures::future::join_all(futs).await;
+                    let mut first_err: Option<FlowError> = None;
+                    for (b, buf, s, tr, res) in results {
                         buf.replay(&mut *sink);
                         *steps += s;
                         transcript.extend(tr);
-                        if let Some(vid) = lv {
-                            bind_existing(store, session_id, &b.name, &vid)?;
-                            last = text;
-                            last_value = Some(vid);
+                        match res {
+                            Ok((text, lv, step)) => {
+                                if let Step::Return(_) = step {
+                                    return Err(FlowError::Runtime(
+                                        "`return` is not allowed inside a `parallel` branch"
+                                            .to_string(),
+                                    ));
+                                }
+                                if let Some(vid) = lv {
+                                    bind_existing(store, session_id, &b.name, &vid)?;
+                                    last = text;
+                                    last_value = Some(vid);
+                                }
+                            }
+                            Err(e) => {
+                                if first_err.is_none() {
+                                    first_err = Some(e);
+                                }
+                            }
                         }
+                    }
+                    if let Some(e) = first_err {
+                        return Err(e);
                     }
                 }
                 Node::Retry {
@@ -1570,12 +1511,11 @@ fn exec_body<'a>(
                                 break;
                             }
                             Err(e) => {
-                                // Fatal errors must not be retried — propagate immediately.
-                                if matches!(
-                                    e,
-                                    FlowError::Core(Error::AssertFailed(_))
-                                        | FlowError::Core(Error::ConfirmDenied(_))
-                                ) {
+                                // Fatal errors (denied confirm, failed assert) must not be retried —
+                                // propagate immediately. Checked structurally: the wrap points
+                                // (`loop`, composite ops) preserve fatal identity, so this sees
+                                // through nesting (F14).
+                                if e.is_fatal() {
                                     return Err(e);
                                 }
                                 last_err = e.to_string();
@@ -1709,6 +1649,12 @@ fn exec_body<'a>(
                                 }
                             }
                             Err(e) => {
+                                // A fatal error keeps its structural identity so an enclosing
+                                // `retry` still sees it (F14); only transient failures get the
+                                // `loop` wrap.
+                                if e.is_fatal() {
+                                    return Err(e);
+                                }
                                 return Err(FlowError::Runtime(format!("`loop` body failed: {e}")));
                             }
                         }
@@ -1733,8 +1679,13 @@ fn exec_body<'a>(
                     branches,
                     bind,
                 } => {
-                    // True first-wins concurrency: spawn each branch, drive with tokio::select!,
-                    // cancel losers. Same BufferSink pattern as Node::Parallel.
+                    // True first-wins concurrency with an honest audit (F16): branches run
+                    // concurrently; the first *success* wins and the losers are cancelled — but
+                    // every branch's dispatched-step count and transcript survive (each branch's
+                    // state lives OUTSIDE its future, so a cancelled loser's already-dispatched
+                    // work stays counted; an enclosing `budget` sees it — audit parity with the
+                    // event log). All-branches-failed is a joined branch error, distinct from a
+                    // timeout.
                     // A zero deadline can accommodate no work: `tokio::time::timeout` polls the
                     // inner future before the (already-elapsed) timer, so an immediately-ready
                     // branch would otherwise win a 0ms race. Short-circuit so the deadline holds.
@@ -1743,47 +1694,67 @@ fn exec_body<'a>(
                             "`race` timed out after {timeout_ms}ms with no successful branch"
                         )));
                     }
-                    let remaining = std::time::Duration::from_millis(*timeout_ms);
-                    let race_result: Option<(String, Option<ValueId>, Step)> =
+                    use futures::StreamExt;
+                    let mut states: Vec<(BufferSink, usize, Vec<String>)> = branches
+                        .iter()
+                        .map(|_| (BufferSink::default(), 0usize, Vec::new()))
+                        .collect();
+                    let mut errs: Vec<String> = Vec::new();
+                    // `winner` is `Option<(branch index, (text, last value, step))>`.
+                    let winner = {
+                        let mut pending: futures::stream::FuturesUnordered<_> = branches
+                            .iter()
+                            .zip(states.iter_mut())
+                            .enumerate()
+                            .map(|(idx, (b, (buf, s, tr)))| async move {
+                                (
+                                    idx,
+                                    exec_body(store, executor, session_id, &b.body, buf, s, tr)
+                                        .await,
+                                )
+                            })
+                            .collect();
+                        let remaining = std::time::Duration::from_millis(*timeout_ms);
                         tokio::time::timeout(remaining, async {
-                            // We can't use macro select! over a dynamic list, so we poll branches
-                            // as ordered futures but with a shared deadline enforced by the outer
-                            // timeout — meaning we truly give each branch a chance concurrently
-                            // by joining them and taking the first Ok.
-                            let futs: Vec<_> = branches
-                                .iter()
-                                .map(|b| {
-                                    let body = &b.body;
-                                    Box::pin(async move {
-                                        let mut buf = BufferSink::default();
-                                        let mut s = 0usize;
-                                        let mut tr: Vec<String> = Vec::new();
-                                        exec_body(
-                                            store, executor, session_id, body, &mut buf, &mut s,
-                                            &mut tr,
-                                        )
-                                        .await
-                                        .map(|(text, lv, step)| (text, lv, step, buf, s, tr))
-                                    })
-                                })
-                                .collect();
-                            // Race: futures::future::select_ok returns first success
-                            futures::future::select_ok(futs).await.ok()
+                            while let Some((idx, res)) = pending.next().await {
+                                match res {
+                                    Ok(v) => return Some((idx, v)),
+                                    Err(e) => errs.push(format!("`{}`: {e}", branches[idx].name.0)),
+                                }
+                            }
+                            None
                         })
                         .await
                         .ok()
                         .flatten()
-                        .map(|((text, lv, step, buf, s, tr), _rest)| {
+                        // `pending` (and with it every loser future) is dropped here — the losers
+                        // are cancelled, but their buffered state persists in `states`.
+                    };
+                    // Merge every branch's audit in declaration order: steps and transcript from ALL
+                    // branches (a loser's dispatched work happened); sink output only from the
+                    // winner (a cancelled loser's buffer may end mid-op).
+                    let winner_idx = winner.as_ref().map(|(idx, _)| *idx);
+                    for (idx, (buf, s, tr)) in states.into_iter().enumerate() {
+                        *steps += s;
+                        transcript.extend(tr);
+                        if Some(idx) == winner_idx {
                             buf.replay(&mut *sink);
-                            *steps += s;
-                            transcript.extend(tr);
-                            (text, lv, step)
-                        });
-                    let (blast, bvid, step) = race_result.ok_or_else(|| {
-                        FlowError::Runtime(format!(
+                        }
+                    }
+                    let Some((_, (blast, bvid, step))) = winner else {
+                        // No branch succeeded: distinguish "every branch errored" (all failures
+                        // arrived before the deadline) from an actual timeout.
+                        if !branches.is_empty() && errs.len() == branches.len() {
+                            return Err(FlowError::Runtime(format!(
+                                "`race` failed: all {} branch(es) errored: {}",
+                                branches.len(),
+                                errs.join("; ")
+                            )));
+                        }
+                        return Err(FlowError::Runtime(format!(
                             "`race` timed out after {timeout_ms}ms with no successful branch"
-                        ))
-                    })?;
+                        )));
+                    };
                     if !blast.is_empty() {
                         last = blast;
                     }
@@ -1801,57 +1772,95 @@ fn exec_body<'a>(
                     window_ms,
                     body: tbody,
                 } => {
-                    // Token-bucket: track call timestamps in the session store keyed by `name`.
-                    // Keying on `name` means the bucket persists correctly across turns and
-                    // different throttle nodes with different names never share a bucket.
+                    // Sliding-window rate limit on **op dispatches** (budget-style counting, F18):
+                    // before each body statement the keyed bucket must have room; after it, the
+                    // statement's actual dispatches (the `steps` delta — the same counter `budget`
+                    // uses) are recorded as timestamps. The bucket lives in the session store keyed
+                    // by `name` (persists across turns; different names never share), and every
+                    // load-evict-store cycle runs atomically under a process-wide lock so
+                    // concurrent branches can't interleave a read-modify-write. Like `budget`, a
+                    // single statement may still overshoot within itself — documented v1.
                     let bucket_key = SymbolName(format!("__throttle_bucket_{tname}"));
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    let window_start = now_ms.saturating_sub(*window_ms);
-                    // Load existing timestamps.
-                    let mut times: Vec<u64> =
-                        if let Some(vid) = store.resolve(session_id, &bucket_key).ok().flatten() {
-                            if let Some(Value::String(s)) = store.get_value(&vid).ok().flatten() {
-                                serde_json::from_str::<Vec<u64>>(&s).unwrap_or_default()
-                            } else {
-                                vec![]
-                            }
-                        } else {
-                            vec![]
-                        };
-                    // Evict expired entries.
-                    times.retain(|&t| t >= window_start);
-                    if times.len() >= *max as usize {
-                        return Err(FlowError::Runtime(format!(
-                            "`throttle` limit of {max} per {window_ms}ms exceeded"
-                        )));
+                    let mut tvid: Option<ValueId> = None;
+                    for stmt in tbody {
+                        let now_ms = now_millis();
+                        let window_start = now_ms.saturating_sub(*window_ms);
+                        let in_window = throttle_bucket_rmw(
+                            store,
+                            session_id,
+                            &bucket_key,
+                            window_start,
+                            0,
+                            0,
+                        )?;
+                        if in_window >= *max as usize {
+                            return Err(FlowError::Runtime(format!(
+                                "`throttle` limit of {max} per {window_ms}ms exceeded"
+                            )));
+                        }
+                        let start = *steps;
+                        let (blast, svid, step) = exec_body(
+                            store,
+                            executor,
+                            session_id,
+                            std::slice::from_ref(stmt),
+                            &mut *sink,
+                            &mut *steps,
+                            &mut *transcript,
+                        )
+                        .await?;
+                        let dispatched = (*steps).saturating_sub(start);
+                        if dispatched > 0 {
+                            let now_ms = now_millis();
+                            let window_start = now_ms.saturating_sub(*window_ms);
+                            throttle_bucket_rmw(
+                                store,
+                                session_id,
+                                &bucket_key,
+                                window_start,
+                                now_ms,
+                                dispatched,
+                            )?;
+                        }
+                        if !blast.is_empty() {
+                            last = blast;
+                        }
+                        if let Some(v) = svid {
+                            tvid = Some(v);
+                        }
+                        if let Step::Return(v) = step {
+                            return Ok((last, v.clone(), Step::Return(v)));
+                        }
                     }
-                    times.push(now_ms);
-                    let times_json = serde_json::to_string(&times).unwrap_or_default();
-                    let vid = store.put_value(session_id, &Value::String(times_json))?;
-                    store.bind(session_id, &bucket_key, &vid, None, "", Visibility::Hidden)?;
-                    let (blast, bvid, step) =
-                        exec_body(store, executor, session_id, tbody, sink, steps, transcript)
-                            .await?;
-                    if !blast.is_empty() {
-                        last = blast;
-                    }
-                    last_value = bvid;
-                    if let Step::Return(v) = step {
-                        return Ok((last, v.clone(), Step::Return(v)));
-                    }
+                    last_value = tvid;
                 }
                 Node::Debounce {
-                    name: _dname,
+                    name: dname,
                     wait_ms,
                     body: dbody,
                 } => {
-                    // Debounce: sleep for wait_ms then run body once.
-                    // `name` is a stable key (used for future cross-turn debounce state);
-                    // currently the settling delay is implemented as a fixed sleep.
-                    tokio::time::sleep(std::time::Duration::from_millis(*wait_ms)).await;
+                    // Keyed cross-turn coalescing (F19): each execution of this node is a *trigger*.
+                    // A trigger records a unique token (embedding its timestamp) under the
+                    // per-`name` key in the session store, waits `wait_ms`, then runs the body only
+                    // if no NEWER trigger arrived meanwhile (its token is still current). A
+                    // re-trigger within the window therefore resets it: the older trigger sees the
+                    // newer token and coalesces (skips), and the newest trigger alone runs the body
+                    // once the key has been quiet for `wait_ms`. State persists across turns via the
+                    // session store — the same seam the throttle bucket uses; no new IO.
+                    let debounce_key = SymbolName(format!("__debounce_last_{dname}"));
+                    let token = debounce_record_trigger(store, session_id, &debounce_key)?;
+                    if *wait_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(*wait_ms)).await;
+                    }
+                    if debounce_current_token(store, session_id, &debounce_key)?.as_deref()
+                        != Some(token.as_str())
+                    {
+                        // A newer trigger superseded this one within the window — coalesce.
+                        transcript.push(format!(
+                            "[debounce {dname} coalesced — re-triggered within {wait_ms}ms]"
+                        ));
+                        continue;
+                    }
                     let (blast, bvid, step) =
                         exec_body(store, executor, session_id, dbody, sink, steps, transcript)
                             .await?;
@@ -1881,8 +1890,9 @@ fn exec_body<'a>(
                         .await?;
                         if !blast.is_empty() {
                             last = blast;
-                            last_value = bvid;
                         }
+                        // The body's value is the node's value even when its text is empty (F20b).
+                        last_value = bvid;
                         if let Step::Return(v) = step {
                             return Ok((last, v.clone(), Step::Return(v)));
                         }
@@ -1924,47 +1934,15 @@ fn exec_body<'a>(
                     transcript.push(format!("[peek ${}]\n{text}", name.0));
                     last = text;
                 }
-                Node::Expr { formula, vars } => {
-                    // Pure computation — no IO, no approval gate.
-                    let resolved = resolve_expr_vars(vars, store, session_id)?;
-                    let text = eval_expr_value(formula, &resolved)?.as_text();
-                    let vid = store.put_value(session_id, &Value::String(text.clone()))?;
-                    transcript.push(format!("[expr {formula}]\n{text}"));
-                    last = text;
-                    last_value = Some(vid);
-                }
-                Node::Fmt { template } => {
-                    // Pure string interpolation — substitutes {sym} from session symbols.
-                    let text = interpolate_str(template, store, session_id);
-                    let vid = store.put_value(session_id, &Value::String(text.clone()))?;
-                    transcript.push(format!("[fmt]\n{text}"));
-                    last = text;
-                    last_value = Some(vid);
-                }
-                Node::Jq { path, input } => {
-                    // Pure JSON path extraction — no IO.
-                    let jv = eval_arg(input, store, session_id)?;
-                    let result = eval_jq_path(path, &jv)?;
-                    let text = match &result {
-                        serde_json::Value::String(s) => s.clone(),
-                        other => serde_json::to_string(other).unwrap_or_default(),
-                    };
-                    let vid = store.put_value(session_id, &Value::String(text.clone()))?;
-                    transcript.push(format!("[jq {path}]\n{text}"));
-                    last = text;
-                    last_value = Some(vid);
-                }
-                Node::Parse {
-                    value: inner,
-                    as_type,
-                } => {
-                    // Pure type coercion — no IO.
-                    let jv = eval_arg(inner, store, session_id)?;
-                    let text = coerce_parse(&jv, as_type)?;
-                    let vid = store.put_value(session_id, &Value::String(text.clone()))?;
-                    transcript.push(format!("[parse {as_type}]\n{text}"));
-                    last = text;
-                    last_value = Some(vid);
+                Node::Expr { .. } | Node::Fmt { .. } | Node::Jq { .. } | Node::Parse { .. } => {
+                    // Pure computation — no IO, no approval gate. Evaluated through the SAME shared
+                    // helper as bind position (F13: statement-position `jq` used to skip the
+                    // string-stored-JSON re-parse the bind arm did, so the two diverged).
+                    let pe = eval_pure_node(node, store, session_id)?
+                        .expect("expr/fmt/jq/parse are pure value nodes");
+                    transcript.push(format!("[{}]\n{}", pe.tag, pe.text));
+                    last = pe.text;
+                    last_value = Some(pe.vid);
                 }
                 Node::Match {
                     subject,
@@ -2001,8 +1979,9 @@ fn exec_body<'a>(
                     .await?;
                     if !blast.is_empty() {
                         last = blast;
-                        last_value = bvid;
                     }
+                    // The case's value is the node's value even when its text renders empty (F20b).
+                    last_value = bvid;
                     if let Step::Return(v) = step {
                         return Ok((last, v.clone(), Step::Return(v)));
                     }
@@ -2057,8 +2036,9 @@ fn exec_body<'a>(
                     .await?;
                     if !blast.is_empty() {
                         last = blast;
-                        last_value = bvid;
                     }
+                    // The case's value is the node's value even when its text renders empty (F20b).
+                    last_value = bvid;
                     if let Step::Return(v) = step {
                         return Ok((last, v.clone(), Step::Return(v)));
                     }
@@ -2533,6 +2513,97 @@ async fn run_call(
         },
     );
     Ok(outcome)
+}
+
+/// A pure value node evaluated to its canonical text, stored value, and transcript tag.
+struct PureEval {
+    /// The transcript tag describing the node (e.g. `expr a + b`, `jq .k`, `fmt`, `lit`).
+    tag: String,
+    /// The canonical text of the produced value.
+    text: String,
+    /// The stored value id — a fresh immutable value, or the aliased source's id for `var`.
+    vid: ValueId,
+}
+
+/// Evaluate a **pure value node** — `expr` / `fmt` / `jq` / `parse` / `var` / `lit` / `obj` /
+/// `list` — to its canonical text and stored value. This is the ONE eval path shared by bind
+/// position (`$x = jq(...)`) and statement position (bare `jq(...)`), so the two can never diverge
+/// again (F13: the statement-position `jq` arm skipped the string-stored-JSON re-parse the bind arm
+/// did, so `jq` over an op result errored as a statement but worked as a bind).
+///
+/// Returns `Ok(None)` for any non-pure node so callers fall through to their own handling. No op
+/// dispatch, no approval gate — `thing` (host resolver, async) and `call` are NOT handled here.
+fn eval_pure_node(
+    node: &Node,
+    store: &dyn ValueStore,
+    session_id: &str,
+) -> Result<Option<PureEval>> {
+    let (tag, text, existing_vid) = match node {
+        Node::Expr { formula, vars } => {
+            let resolved = resolve_expr_vars(vars, store, session_id)?;
+            let text = eval_expr_value(formula, &resolved)?.as_text();
+            (format!("expr {formula}"), text, None)
+        }
+        Node::Fmt { template } => (
+            "fmt".to_string(),
+            interpolate_str(template, store, session_id),
+            None,
+        ),
+        Node::Jq { path, input } => {
+            // Op results are stored as JSON *strings* (the canonical `content`), so a string input
+            // that is really JSON is parsed first — this is what lets a flow pull
+            // `.kind`/`.transcript` out of a `plan`/`run_plan` result.
+            let jv = jq_parse_input(eval_arg(input, store, session_id)?);
+            let result = eval_jq_path(path, &jv)?;
+            let text = match &result {
+                serde_json::Value::String(s) => s.clone(),
+                other => serde_json::to_string(other).unwrap_or_default(),
+            };
+            (format!("jq {path}"), text, None)
+        }
+        Node::Parse {
+            value: inner,
+            as_type,
+        } => {
+            let jv = eval_arg(inner, store, session_id)?;
+            (
+                format!("parse {as_type}"),
+                coerce_parse(&jv, as_type)?,
+                None,
+            )
+        }
+        Node::Var { name: src } => {
+            // Alias a symbol: `$b = $a` shares `$a`'s current ValueId. Pure — values are immutable,
+            // so sharing the id is sound (the body-level twin of the optimizer's `Stage::Alias`).
+            let vid = store
+                .resolve(session_id, src)?
+                .ok_or_else(|| FlowError::Runtime(format!("unbound symbol ${}", src.0)))?;
+            let text = store
+                .get_value(&vid)?
+                .map(|v| value_text(&v))
+                .unwrap_or_default();
+            (format!("${}", src.0), text, Some(vid))
+        }
+        Node::Lit { value } => {
+            // A literal: `5`, `"hi"`, `[1,2,3]`, `{"a":1}`. Stored as the canonical
+            // JSON-as-string `Value::String` (same shape op results take), with `{{sym}}`
+            // interpolation honored to match `eval_arg`.
+            let jv = interpolate(value, store, session_id);
+            ("lit".to_string(), lit_text(&jv), None)
+        }
+        Node::Obj { .. } | Node::List { .. } => {
+            // Record/list constructor — assembles a JSON value from its sub-expressions (the
+            // analyzer guarantees every leaf is a pure value node). Canonical JSON-as-string.
+            let jv = eval_template(node, store, session_id)?;
+            ("template".to_string(), lit_text(&jv), None)
+        }
+        _ => return Ok(None),
+    };
+    let vid = match existing_vid {
+        Some(v) => v,
+        None => store.put_value(session_id, &Value::String(text.clone()))?,
+    };
+    Ok(Some(PureEval { tag, text, vid }))
 }
 
 /// Evaluate a call-argument expression to a concrete JSON value. `Lit` yields its raw JSON, with
@@ -3361,6 +3432,81 @@ fn lit_text(v: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         other => serde_json::to_string(other).unwrap_or_default(),
     }
+}
+
+/// Wall-clock milliseconds since the Unix epoch (0 if the clock is before it).
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// One **atomic** read-modify-write on a throttle bucket (F18): under a process-wide lock, load the
+/// keyed timestamp list from the session store, evict entries older than `window_start`, append
+/// `add` copies of `now_ms` (the statement's dispatch count; `add == 0` is a pure read), store the
+/// result back, and return the number of in-window entries as of the load. Atomicity is
+/// process-local — the store seam offers no compare-and-swap, and one interpreter's concurrent
+/// branches are the scope the language owns.
+fn throttle_bucket_rmw(
+    store: &dyn ValueStore,
+    session_id: &str,
+    key: &SymbolName,
+    window_start: u64,
+    now_ms: u64,
+    add: usize,
+) -> Result<usize> {
+    static BUCKET_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = BUCKET_LOCK.lock().unwrap();
+    let mut times: Vec<u64> = match store.resolve(session_id, key)? {
+        Some(vid) => match store.get_value(&vid)? {
+            Some(Value::String(s)) => serde_json::from_str::<Vec<u64>>(&s).unwrap_or_default(),
+            _ => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    times.retain(|&t| t >= window_start);
+    let in_window = times.len();
+    if add > 0 {
+        for _ in 0..add {
+            times.push(now_ms);
+        }
+        let times_json = serde_json::to_string(&times).unwrap_or_default();
+        let vid = store.put_value(session_id, &Value::String(times_json))?;
+        store.bind(session_id, key, &vid, None, "", Visibility::Hidden)?;
+    }
+    Ok(in_window)
+}
+
+/// Record a `debounce` trigger (F19): bind a process-unique token (timestamp + sequence) under the
+/// per-name key in the session store and return it. A later
+/// [`debounce_current_token`] comparison tells the trigger whether it is still the newest.
+fn debounce_record_trigger(
+    store: &dyn ValueStore,
+    session_id: &str,
+    key: &SymbolName,
+) -> Result<String> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let token = format!(
+        "{}:{}",
+        now_millis(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let vid = store.put_value(session_id, &Value::String(token.clone()))?;
+    store.bind(session_id, key, &vid, None, "", Visibility::Hidden)?;
+    Ok(token)
+}
+
+/// The most recent `debounce` trigger token for `key`, if any.
+fn debounce_current_token(
+    store: &dyn ValueStore,
+    session_id: &str,
+    key: &SymbolName,
+) -> Result<Option<String>> {
+    Ok(match store.resolve(session_id, key)? {
+        Some(vid) => store.get_value(&vid)?.map(|v| value_text(&v)),
+        None => None,
+    })
 }
 
 /// The visibility keep-priority: pinned context is retained over plain/hidden when a pack is budgeted.
@@ -4297,26 +4443,38 @@ mod tests {
             match name {
                 "pick" => mk(&["label"]),
                 "echo" => mk(&["v"]),
-                "boom" | "slow" => mk(&[]),
+                "boom" | "slow" | "nap" | "flaky" => mk(&[]),
                 _ => None,
             }
         }
     }
 
     /// A host that records the (op, first-arg) of each dispatch so a test can assert *which* branch
-    /// ran. `pick` echoes its `label` (a `route` selector), `echo` echoes its `v`, `boom` errors, and
-    /// `slow` sleeps before succeeding (to exercise `timeout`).
+    /// ran. `pick` echoes its `label` (a `route` selector), `echo` echoes its `v`, `boom` errors,
+    /// `slow` sleeps 150ms before succeeding (to exercise `timeout`/`race`), and `nap` sleeps 400ms
+    /// (a `race` loser that outlives the winner). Approval is configurable so `confirm` fatality can
+    /// be exercised (`denying()`), with the request count recorded.
     struct CfHost {
         cat: CfCat,
         log: Mutex<Vec<String>>,
         calls: AtomicUsize,
+        approve: bool,
+        approvals: AtomicUsize,
     }
     impl CfHost {
         fn new() -> Self {
+            Self::with_approval(true)
+        }
+        fn denying() -> Self {
+            Self::with_approval(false)
+        }
+        fn with_approval(approve: bool) -> Self {
             CfHost {
                 cat: CfCat,
                 log: Mutex::new(Vec::new()),
                 calls: AtomicUsize::new(0),
+                approve,
+                approvals: AtomicUsize::new(0),
             }
         }
         fn marks(&self) -> Vec<String> {
@@ -4345,6 +4503,10 @@ mod tests {
                     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                     ("slow".to_string(), OpOutcome::ok("slow done"))
                 }
+                "nap" => {
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    ("nap".to_string(), OpOutcome::ok("nap done"))
+                }
                 other => (other.to_string(), OpOutcome::ok(other.to_string())),
             };
             self.log.lock().unwrap().push(mark);
@@ -4358,7 +4520,12 @@ mod tests {
             _label: &str,
             _intents: &flux_spec::IntentSet,
         ) -> ApprovalChoice {
-            ApprovalChoice::Allow
+            self.approvals.fetch_add(1, Ordering::SeqCst);
+            if self.approve {
+                ApprovalChoice::Allow
+            } else {
+                ApprovalChoice::Deny
+            }
         }
         fn trim_output(&self, view: String, _op: &str) -> String {
             view
@@ -5449,5 +5616,773 @@ mod tests {
         assert!(!ExprVal::Str("false".into()).truthy());
         assert!(!ExprVal::Str("0".into()).truthy());
         assert!(!ExprVal::Str("  ".into()).truthy());
+    }
+
+    // ---- L-17: runtime semantics hardening (F13–F20) ----
+
+    /// F13: op results/literals are stored as JSON *strings*; the bind arm re-parsed them before
+    /// `jq` but the statement arm did not, so `$y = jq(".a", $x)` worked while the same `jq` as a
+    /// bare statement errored. One shared pure-node eval path now serves both positions.
+    #[tokio::test]
+    async fn statement_position_jq_parses_string_stored_json_like_bind_position() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![
+                flow_bind("x", flow_lit(json!({"a": 1}))),
+                Node::Jq {
+                    path: ".a".into(),
+                    input: Box::new(flow_var("x")),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let out = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.result, "1",
+            "statement-position jq parses the string-stored JSON"
+        );
+        assert!(
+            out.transcript.contains("[jq .a]"),
+            "statement transcript tag unchanged: {}",
+            out.transcript
+        );
+    }
+
+    /// F14: a denied `confirm` nested in `loop` nested in `retry` is fatal — the `loop` wrap
+    /// preserves its structural identity and `retry` propagates it without another attempt.
+    #[tokio::test]
+    async fn denied_confirm_inside_loop_inside_retry_is_not_retried() {
+        let host = CfHost::denying();
+        let body = vec![Node::Retry {
+            max: 3,
+            backoff: None,
+            delay_ms: Some(0),
+            body: vec![Node::Loop {
+                for_ms: 10_000,
+                every_ms: 0,
+                until: None,
+                body: vec![Node::Confirm {
+                    message: "wipe it".into(),
+                    risk: Some("high".into()),
+                    body: vec![echo("never")],
+                }],
+                bind: None,
+            }],
+            bind: None,
+        }];
+        let err = run(&host, body).await.unwrap_err();
+        assert!(err.to_string().contains("confirm denied"), "got: {err}");
+        assert!(
+            err.is_fatal(),
+            "fatal identity survives loop+retry wrapping"
+        );
+        assert_eq!(
+            host.approvals.load(Ordering::SeqCst),
+            1,
+            "the denied confirm was asked exactly once — not retried"
+        );
+        assert!(host.marks().is_empty(), "the confirmed body never ran");
+    }
+
+    /// F14: fatality survives the composite-op boundary — a denied `confirm` inside a composite is
+    /// NOT stringified into a retryable in-band error.
+    #[tokio::test]
+    async fn denied_confirm_inside_composite_op_is_not_retried() {
+        struct CompositeCat(CompositeOpDecl);
+        impl OpCatalog for CompositeCat {
+            fn lookup(&self, name: &str) -> Option<OpSignature> {
+                if name == self.0.name {
+                    Some(sig(name, &[], &[]))
+                } else {
+                    CfCat.lookup(name)
+                }
+            }
+            fn composite(&self, name: &str) -> Option<CompositeOpDecl> {
+                (name == self.0.name).then(|| self.0.clone())
+            }
+        }
+        struct CompositeDenyHost {
+            cat: CompositeCat,
+            approvals: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl OpHost for CompositeDenyHost {
+            async fn dispatch(&self, _op: &str, _input: serde_json::Value) -> OpOutcome {
+                OpOutcome::ok("ok")
+            }
+            fn catalog(&self) -> &dyn OpCatalog {
+                &self.cat
+            }
+            async fn request_approval(
+                &self,
+                _label: &str,
+                _intents: &flux_spec::IntentSet,
+            ) -> ApprovalChoice {
+                self.approvals.fetch_add(1, Ordering::SeqCst);
+                ApprovalChoice::Deny
+            }
+            fn trim_output(&self, view: String, _op: &str) -> String {
+                view
+            }
+        }
+
+        let decl = CompositeOpDecl {
+            name: "danger_op".into(),
+            params: vec![],
+            returns: None,
+            meta: Default::default(),
+            body: DraftAst {
+                body: vec![Node::Confirm {
+                    message: "danger".into(),
+                    risk: None,
+                    body: vec![echo("never")],
+                }],
+                ..Default::default()
+            },
+        };
+        let host = CompositeDenyHost {
+            cat: CompositeCat(decl),
+            approvals: AtomicUsize::new(0),
+        };
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![Node::Retry {
+                max: 3,
+                backoff: None,
+                delay_ms: Some(0),
+                body: vec![call("danger_op", vec![])],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let err = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("confirm denied"), "got: {err}");
+        assert_eq!(
+            host.approvals.load(Ordering::SeqCst),
+            1,
+            "not re-attempted through the composite boundary"
+        );
+        // The composite boundary still records the failure in the audit trail.
+        assert!(store
+            .events("s")
+            .iter()
+            .any(|e| matches!(e, RunEvent::StepFailed { .. })));
+    }
+
+    /// F14: a failed `assert` inside `loop` inside `retry` aborts on the first attempt.
+    #[tokio::test]
+    async fn failed_assert_inside_loop_is_not_retried() {
+        let host = CfHost::new();
+        let body = vec![Node::Retry {
+            max: 3,
+            backoff: None,
+            delay_ms: Some(0),
+            body: vec![
+                echo("attempt"),
+                Node::Loop {
+                    for_ms: 10_000,
+                    every_ms: 0,
+                    until: None,
+                    body: vec![Node::Assert {
+                        cond: Box::new(flow_lit(json!(false))),
+                        message: Some("invariant broke".into()),
+                    }],
+                    bind: None,
+                },
+            ],
+            bind: None,
+        }];
+        let err = run(&host, body).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("assertion failed: invariant broke"),
+            "got: {err}"
+        );
+        assert_eq!(
+            host.marks(),
+            vec!["attempt"],
+            "exactly one attempt — a failed assert is not retried"
+        );
+    }
+
+    /// `retry` re-attempts transient failures (with backoff) and binds the succeeding attempt.
+    #[tokio::test]
+    async fn retry_retries_transient_failures_then_succeeds() {
+        struct FlakyHost {
+            cat: CfCat,
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl OpHost for FlakyHost {
+            async fn dispatch(&self, _op: &str, _input: serde_json::Value) -> OpOutcome {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    OpOutcome::error("transient")
+                } else {
+                    OpOutcome::ok("recovered")
+                }
+            }
+            fn catalog(&self) -> &dyn OpCatalog {
+                &self.cat
+            }
+            async fn request_approval(
+                &self,
+                _l: &str,
+                _i: &flux_spec::IntentSet,
+            ) -> ApprovalChoice {
+                ApprovalChoice::Allow
+            }
+            fn trim_output(&self, view: String, _op: &str) -> String {
+                view
+            }
+        }
+        let host = FlakyHost {
+            cat: CfCat,
+            calls: AtomicUsize::new(0),
+        };
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![Node::Retry {
+                max: 3,
+                backoff: Some("exponential".into()),
+                delay_ms: Some(0),
+                body: vec![flow_bind("r", call("flaky", vec![]))],
+                bind: Some(SymbolName("out".into())),
+            }],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let out = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            host.calls.load(Ordering::SeqCst),
+            3,
+            "two transient failures then a success"
+        );
+        assert_eq!(out.result, "recovered");
+        assert!(
+            store
+                .resolve("s", &SymbolName("out".into()))
+                .unwrap()
+                .is_some(),
+            "the retry bound the succeeding attempt's value"
+        );
+    }
+
+    /// `retry` exhausts its attempts on persistent failure and reports the last error.
+    #[tokio::test]
+    async fn retry_exhausts_attempts_and_reports_the_last_error() {
+        let host = CfHost::new();
+        let body = vec![Node::Retry {
+            max: 2,
+            backoff: None,
+            delay_ms: Some(0),
+            body: vec![call("boom", vec![])],
+            bind: None,
+        }];
+        let err = run(&host, body).await.unwrap_err();
+        assert!(
+            err.to_string().contains("`retry` exhausted 2 attempt(s)"),
+            "got: {err}"
+        );
+        assert_eq!(host.marks(), vec!["boom", "boom"]);
+    }
+
+    /// F15: when a `parallel` branch fails, the completed branches' buffered sink output, dispatched
+    /// steps, transcript, and bindings are merged (declaration order) before the error propagates.
+    #[tokio::test]
+    async fn parallel_sibling_failure_preserves_completed_branch_audit() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let par = Node::Parallel {
+            branches: vec![
+                crate::ast::Branch {
+                    name: SymbolName("a".into()),
+                    body: vec![echo("okA")],
+                },
+                crate::ast::Branch {
+                    name: SymbolName("b".into()),
+                    body: vec![call("boom", vec![])],
+                },
+            ],
+        };
+        // Wrapped in `try` so the flow completes and the merged audit is observable on the outcome.
+        let ast = DraftAst {
+            body: vec![Node::Try {
+                body: vec![par],
+                catch: Some(SymbolName("e".into())),
+                handler: vec![],
+            }],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let out = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.steps, 2,
+            "both branches' dispatches counted (completed + failed)"
+        );
+        assert!(
+            out.transcript.contains("okA"),
+            "completed branch's transcript survives the sibling failure: {}",
+            out.transcript
+        );
+        assert!(
+            sink.events
+                .iter()
+                .any(|ev| matches!(ev, SinkEvent::ToolResult(n, _) if n == "echo")),
+            "completed branch's buffered sink output was replayed"
+        );
+        assert!(
+            store
+                .resolve("s", &SymbolName("a".into()))
+                .unwrap()
+                .is_some(),
+            "completed branch's binding happened before the error propagated"
+        );
+        let evid = store
+            .resolve("s", &SymbolName("e".into()))
+            .unwrap()
+            .unwrap();
+        assert!(
+            value_text(&store.get_value(&evid).unwrap().unwrap()).contains("boom"),
+            "the branch error itself propagated"
+        );
+    }
+
+    /// F16: all branches failing before the deadline is a joined branch error naming each branch's
+    /// failure — distinct from the timeout message.
+    #[tokio::test]
+    async fn race_all_branches_failed_is_a_joined_error_distinct_from_timeout() {
+        let host = CfHost::new();
+        let body = vec![Node::Race {
+            timeout_ms: 5_000,
+            bind: None,
+            branches: vec![
+                crate::ast::Branch {
+                    name: SymbolName("a".into()),
+                    body: vec![call("boom", vec![])],
+                },
+                crate::ast::Branch {
+                    name: SymbolName("b".into()),
+                    body: vec![call("boom", vec![])],
+                },
+            ],
+        }];
+        let err = run(&host, body).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("all 2 branch(es) errored"), "got: {msg}");
+        assert!(
+            msg.contains("`a`") && msg.contains("`b`") && msg.contains("boom"),
+            "names the branch errors: {msg}"
+        );
+        assert!(
+            !msg.contains("timed out"),
+            "an all-fail is not reported as a timeout: {msg}"
+        );
+    }
+
+    /// F16: a losing branch's dispatched steps stay in the returned step count and transcript, so
+    /// an enclosing `budget` counts the work that actually happened.
+    #[tokio::test]
+    async fn race_losing_branch_dispatches_stay_counted() {
+        let host = CfHost::new();
+        // Loser: dispatches `echo l1` (completes), then naps past the winner's finish (cancelled
+        // mid-nap). Winner: `slow` succeeds at ~150ms.
+        let body = vec![Node::Race {
+            timeout_ms: 10_000,
+            bind: Some(SymbolName("winner".into())),
+            branches: vec![
+                crate::ast::Branch {
+                    name: SymbolName("loser".into()),
+                    body: vec![echo("l1"), call("nap", vec![])],
+                },
+                crate::ast::Branch {
+                    name: SymbolName("fast".into()),
+                    body: vec![flow_bind("w", call("slow", vec![]))],
+                },
+            ],
+        }];
+        let out = run(&host, body).await.unwrap();
+        assert_eq!(out.result, "slow done", "the successful branch won");
+        assert_eq!(
+            out.steps, 2,
+            "the loser's completed dispatch is counted alongside the winner's"
+        );
+        assert!(
+            out.transcript.contains("l1"),
+            "the loser's dispatched step stays in the transcript: {}",
+            out.transcript
+        );
+    }
+
+    /// F17: the flow key includes the body hash, so an EDITED body (same declared name) does not
+    /// fast-forward past a stale checkpoint.
+    #[tokio::test]
+    async fn edited_flow_body_does_not_fast_forward_past_stale_checkpoint() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let v1 = DraftAst {
+            name: Some("phased".into()),
+            body: vec![
+                echo("step1"),
+                Node::Checkpoint { label: "p1".into() },
+                echo("step2"),
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        execute_flow(&store, &host, "s", &v1, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(host.marks(), vec!["step1", "step2"]);
+
+        // Same declared name, edited body: no fast-forward — the changed prefix re-runs.
+        let v2 = DraftAst {
+            name: Some("phased".into()),
+            body: vec![
+                echo("stepX"),
+                Node::Checkpoint { label: "p1".into() },
+                echo("step2"),
+            ],
+            ..Default::default()
+        };
+        execute_flow(&store, &host, "s", &v2, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            host.marks(),
+            vec!["step1", "step2", "stepX", "step2"],
+            "the edited body's prefix re-runs instead of fast-forwarding"
+        );
+    }
+
+    /// F17: a named flow's run and resume derive the SAME flow key, so a checkpoint recorded during
+    /// a resumed run fast-forwards a later fresh run.
+    #[tokio::test]
+    async fn named_flow_run_and_resume_agree_on_checkpoint_keys() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let body = vec![
+            echo("a"),
+            await_node(Some("reply"), "user_input", None),
+            Node::Checkpoint { label: "c1".into() },
+            echo("b"),
+        ];
+        let ast = DraftAst {
+            name: Some("named".into()),
+            body: body.clone(),
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let susp = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap()
+            .suspension
+            .unwrap();
+
+        // Resume WITH the declared name: the post-await checkpoint records under the named key.
+        let mut sink2 = BufferSink::default();
+        resume_flow_named(
+            &store,
+            &host,
+            "s",
+            Some("named"),
+            &body,
+            susp.node,
+            Value::String("hi".into()),
+            &mut sink2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(host.marks(), vec!["a", "b"]);
+
+        // A fresh run of the same named flow sees the resumed run's checkpoint: it fast-forwards
+        // past the whole prefix (including the await) instead of suspending again.
+        let mut sink3 = BufferSink::default();
+        let out3 = execute_flow(&store, &host, "s", &ast, &mut sink3)
+            .await
+            .unwrap();
+        assert!(
+            out3.suspension.is_none(),
+            "run and resume agree on the flow key — no re-suspend"
+        );
+        assert_eq!(
+            host.marks(),
+            vec!["a", "b", "b"],
+            "fast-forwarded past the checkpointed prefix"
+        );
+    }
+
+    /// F18: `throttle` counts actual op DISPATCHES per sliding window (budget-style), not
+    /// throttle-node entries, and the keyed bucket persists across runs in the same session.
+    #[tokio::test]
+    async fn throttle_counts_op_dispatches_within_the_window() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![Node::Throttle {
+                name: "t1".into(),
+                max: 2,
+                window_ms: 60_000,
+                body: vec![echo("one"), echo("two"), echo("three")],
+            }],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let err = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("`throttle` limit of 2"),
+            "got: {err}"
+        );
+        assert_eq!(
+            host.marks(),
+            vec!["one", "two"],
+            "the over-limit dispatch never ran"
+        );
+
+        // Cross-run persistence: a fresh run of a same-named throttle in the same session is
+        // still saturated.
+        let ast2 = DraftAst {
+            body: vec![Node::Throttle {
+                name: "t1".into(),
+                max: 2,
+                window_ms: 60_000,
+                body: vec![echo("four")],
+            }],
+            ..Default::default()
+        };
+        let mut sink2 = BufferSink::default();
+        let err2 = execute_flow(&store, &host, "s", &ast2, &mut sink2)
+            .await
+            .unwrap_err();
+        assert!(err2.to_string().contains("throttle"), "got: {err2}");
+        assert_eq!(
+            host.marks(),
+            vec!["one", "two"],
+            "no further dispatch admitted in the window"
+        );
+    }
+
+    /// F19: two rapid triggers of the same debounce key coalesce — only the newest runs the body,
+    /// once the key has been quiet for `wait_ms`. State lives in the session store (cross-turn).
+    #[tokio::test]
+    async fn debounce_coalesces_a_retrigger_within_the_window() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let mk = || DraftAst {
+            body: vec![Node::Debounce {
+                name: "d1".into(),
+                wait_ms: 250,
+                body: vec![echo("ran")],
+            }],
+            ..Default::default()
+        };
+        let (ast1, ast2) = (mk(), mk());
+        let mut sink1 = BufferSink::default();
+        let mut sink2 = BufferSink::default();
+        let (out1, out2) =
+            tokio::join!(execute_flow(&store, &host, "s", &ast1, &mut sink1), async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                execute_flow(&store, &host, "s", &ast2, &mut sink2).await
+            });
+        let (out1, out2) = (out1.unwrap(), out2.unwrap());
+        assert_eq!(
+            host.marks(),
+            vec!["ran"],
+            "the body ran exactly once for two rapid triggers"
+        );
+        assert!(
+            out1.transcript.contains("coalesced"),
+            "the superseded trigger reports the coalesce: {}",
+            out1.transcript
+        );
+        assert!(
+            out2.transcript.contains("[echo]"),
+            "the newest trigger ran the body: {}",
+            out2.transcript
+        );
+    }
+
+    /// F20a: `pipe` and `memo` transcript pushes go through `executor.trim_output` like every other
+    /// transcript path; the canonical bound value stays untouched.
+    #[tokio::test]
+    async fn pipe_and_memo_transcript_views_are_trimmed_to_the_output_budget() {
+        struct TrimHost(CfCat);
+        #[async_trait::async_trait]
+        impl OpHost for TrimHost {
+            async fn dispatch(&self, _op: &str, input: serde_json::Value) -> OpOutcome {
+                OpOutcome::ok(
+                    input
+                        .get("v")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                )
+            }
+            fn catalog(&self) -> &dyn OpCatalog {
+                &self.0
+            }
+            async fn request_approval(
+                &self,
+                _l: &str,
+                _i: &flux_spec::IntentSet,
+            ) -> ApprovalChoice {
+                ApprovalChoice::Allow
+            }
+            fn trim_output(&self, view: String, _op: &str) -> String {
+                if view.len() > 8 {
+                    format!("{}…[trim]", &view[..8])
+                } else {
+                    view
+                }
+            }
+        }
+        let host = TrimHost(CfCat);
+        let store = MemStore::new();
+        let long = "abcdefghijklmnopqrstuvwxyz";
+        let ast = DraftAst {
+            body: vec![
+                Node::Pipe {
+                    steps: vec![echo(long)],
+                    bind: None,
+                },
+                Node::Memo {
+                    name: SymbolName("m".into()),
+                    value: Box::new(echo(long)),
+                    ty: None,
+                    effect: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let out = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert!(
+            out.transcript.matches("…[trim]").count() >= 2,
+            "both pipe and memo transcript views are trimmed: {}",
+            out.transcript
+        );
+        assert!(
+            !out.transcript.contains(long),
+            "the oversized view does not reach the transcript"
+        );
+        // The canonical value is untouched — the memo bound the full content.
+        let m = store
+            .resolve("s", &SymbolName("m".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(value_text(&store.get_value(&m).unwrap().unwrap()), long);
+    }
+
+    /// F20b: a `when` branch that binds an EMPTY string still surfaces its value id as the node's
+    /// last value, so an enclosing `seq … bind` binds it instead of nothing.
+    #[tokio::test]
+    async fn branch_value_propagates_even_when_its_text_is_empty() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![Node::Seq {
+                body: vec![Node::When {
+                    cond: Box::new(flow_lit(json!(true))),
+                    then: vec![flow_bind("e", flow_lit(json!("")))],
+                    otherwise: vec![],
+                }],
+                bind: Some(SymbolName("out".into())),
+            }],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        let out_vid = store.resolve("s", &SymbolName("out".into())).unwrap();
+        assert!(
+            out_vid.is_some(),
+            "the empty-text branch value still propagates to the seq bind"
+        );
+        assert_eq!(
+            value_text(&store.get_value(&out_vid.unwrap()).unwrap().unwrap()),
+            ""
+        );
+    }
+
+    /// F20c: step ids carry the op name, not just the input hash — two different ops over identical
+    /// input must not share an id in the audit trail.
+    #[tokio::test]
+    async fn step_ids_include_the_op_name() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![echo("x")],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        let step = store
+            .events("s")
+            .into_iter()
+            .find_map(|e| match e {
+                RunEvent::StepStarted { step, .. } => Some(step),
+                _ => None,
+            })
+            .expect("a StepStarted event");
+        assert!(
+            step.0.contains("echo"),
+            "the step id names the op: {}",
+            step.0
+        );
+    }
+
+    /// F20d: the `each` item symbol is loop-scoped — an outer binding of the same name is restored
+    /// after the loop instead of being clobbered by the last item.
+    #[tokio::test]
+    async fn each_item_binding_restores_the_outer_symbol_after_the_loop() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![
+                flow_bind("item", flow_lit(json!("outer"))),
+                Node::Each {
+                    source: Box::new(flow_lit(json!(["x", "y"]))),
+                    item: SymbolName("item".into()),
+                    body: vec![echo("{{item}}")],
+                    collect: None,
+                    flat: false,
+                },
+                Node::Return {
+                    value: Box::new(flow_var("item")),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let out = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            host.marks(),
+            vec!["x", "y"],
+            "the loop variable was bound per iteration"
+        );
+        assert_eq!(
+            out.result, "outer",
+            "the outer binding is restored past the loop"
+        );
     }
 }

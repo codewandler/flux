@@ -67,6 +67,26 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 
 ## Next
 
+### flux-lang v1 hardening (epic)
+
+A full review of the language pillar (2026-07-02: three scoped deep-dives plus first-hand
+parser/spec reading and empirical round-trip probes) confirmed the architecture but surfaced 27
+findings concentrated where a model-authored language hurts: a hidden-op bypass on the compile
+path's plain-text plan fallback, an analyzer that under-delivers its documented contract (no
+symbol definedness, accepts expression positions the runtime rejects, type checker unwired),
+duplicated runtime eval paths that already diverged (`jq`), retry fatality defeated by error
+re-wrapping, a **confirmed silent round-trip corruption** (`Var{"a.b"}` → `jq`), and spec/docs
+describing behavior that doesn't exist. Done means: every finding fixed with a failing-first test
+or honestly re-documented, `throttle`/`debounce` implemented fully, `lower()` type checking on
+the production path, and a **node-catalog freeze** until definedness + diagnostic locators ship.
+Epic design: [flux-lang-v1-hardening.md](designs/flux-lang-v1-hardening.md). Stories:
+[C-17](stories/C-17-compile-path-plan-gates.md) (compile-path gates, P0) →
+[L-15](stories/L-15-analyzer-unbound-vars-required-params.md) +
+[L-16](stories/L-16-analyzer-contract-completion.md) (analyzer contract) ·
+[L-17](stories/L-17-runtime-semantics-hardening.md) (runtime semantics) ·
+[L-18](stories/L-18-roundtrip-totality-parser-locators.md) (round-trip totality) ·
+[L-19](stories/L-19-flux-lang-docs-truth-pass.md) (spec truth pass).
+
 ### Endpoint discovery & brokerage (epic) — **new top priority**
 
 flux's plugins each talk to a single, statically-configured service; the fluxplane pack they were modelled on

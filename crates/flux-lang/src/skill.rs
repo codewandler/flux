@@ -171,6 +171,30 @@ of these schemas; ops declare their inputs/outputs in these terms.
 mod tests {
     use super::*;
 
+    /// F27: every hand-written JSON example in the skill body must stay a valid [`DraftAst`] —
+    /// the same drift guard the engine prompt's grammar examples already have
+    /// (flux-flow `compile.rs::grammar_examples_parse_and_use_parallel_for_independent_reads`).
+    #[test]
+    fn body_examples_parse_as_draft_asts() {
+        use crate::ast::DraftAst;
+        let mut checked = 0usize;
+        for chunk in BODY.split("```json").skip(1) {
+            let json = chunk
+                .split("```")
+                .next()
+                .expect("fenced example closes")
+                .trim();
+            let ast: DraftAst = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("skill example must parse as a DraftAst ({e}): {json}"));
+            assert!(!ast.body.is_empty(), "example body is non-empty: {json}");
+            checked += 1;
+        }
+        assert!(
+            checked >= 8,
+            "expected the 8 worked body examples, got {checked}"
+        );
+    }
+
     #[test]
     fn skill_embeds_the_generated_node_kinds() {
         let skill = render();
