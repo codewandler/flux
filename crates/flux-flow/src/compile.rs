@@ -494,8 +494,9 @@ pub async fn plan(
 /// Parse the optional `complete` field of an `emit_plan` call into a [`Completion`]. Lenient: accepts a
 /// bare string (`"summarize X"` → instructions, no primer) or an object (`{primer?, instructions}`).
 /// Anything without usable `instructions` ⇒ `None`, so the engine simply loops (the model answers in
-/// prose later) rather than completing on a malformed signal.
-fn parse_completion(value: Option<&serde_json::Value>) -> Option<Completion> {
+/// prose later) rather than completing on a malformed signal. `pub(crate)`: the loop host re-parses
+/// the directive off the plan *value* it received (the same shape `plan` serialized it into).
+pub(crate) fn parse_completion(value: Option<&serde_json::Value>) -> Option<Completion> {
     let value = value?;
     let nonempty = |s: &str| {
         let t = s.trim();
@@ -525,17 +526,19 @@ fn parse_completion(value: Option<&serde_json::Value>) -> Option<Completion> {
 }
 
 /// Render the turn's final user-facing message **after** the plan has run, grounded in its actual
-/// results. The engine calls this when a plan carried a [`Completion`]: `conversation` is the working
-/// log (already extended with the user's request and the fed-back `[results]`), so the model writes the
-/// summary from what really happened — never a pre-composed promise. No tools are offered, so this call
-/// cannot recurse into planning; it just produces prose.
+/// results. The loop host calls this when a completion-carrying plan ran to success (A-06):
+/// `conversation` is the working log (already extended with the user's request and the fed-back
+/// `[results]`), so the model writes the summary from what really happened — never a pre-composed
+/// promise. No tools and no op catalog are offered, so this call cannot recurse into planning; it
+/// just produces prose. Returns the rendered text plus the call's token usage so the turn totals
+/// stay honest.
 pub async fn render_completion(
     provider: &dyn Provider,
     model: &str,
     conversation: &[Message],
     directive: &Completion,
     max_tokens: u32,
-) -> Result<String> {
+) -> Result<(String, Usage)> {
     let primer = directive
         .primer
         .as_deref()
@@ -562,11 +565,11 @@ pub async fn render_completion(
         effort: None,
         metadata: serde_json::Map::new(),
     };
-    let (mut blocks, acc_text, _stop, _usage) = stream_blocks(provider, req, None).await?;
+    let (mut blocks, acc_text, _stop, usage) = stream_blocks(provider, req, None).await?;
     if blocks.is_empty() && !acc_text.trim().is_empty() {
         blocks.push(ContentBlock::Text { text: acc_text });
     }
-    Ok(Message::assistant(blocks).text())
+    Ok((Message::assistant(blocks).text(), usage))
 }
 
 /// Stream a turn, collecting content blocks (tool_use, text), the accumulated text delta, and the

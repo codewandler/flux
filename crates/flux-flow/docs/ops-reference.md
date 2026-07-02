@@ -113,8 +113,8 @@ still dispatches through the same `Executor` envelope — no bypass.
 
 | op | signature | description |
 |---|---|---|
-| `plan` | `[feedback]` | Ask the model to emit a plan from the working conversation → a `Plan` `{kind: "plan"\|"chat"\|"error", text?, ast?, complete?}` (JSON). The model stays the planner; this wraps the compile step. |
-| `run_plan` | `plan` | Execute an emitted plan in the **current** session → an `Outcome` `{transcript, result, steps, suspension?}`. Re-validated and run through the same approval+IO envelope; bounded by a reentry-depth cap. |
+| `plan` | `[feedback]` | Ask the model to emit a plan from the working conversation → a `Plan` `{kind: "plan"\|"chat"\|"error", text?, ast?, complete?}` (JSON). `complete` is the model's completion directive (`{primer?, instructions}`) or `null`. The model stays the planner; this wraps the compile step. |
+| `run_plan` | `plan` | Execute an emitted plan in the **current** session → an `Outcome` `{transcript, result, steps, suspension?}`. Re-validated and run through the same approval+IO envelope; bounded by a reentry-depth cap. When the plan carried `complete` and ran to success, the **next** `plan` call renders the final message from the results (a toolless model call) and returns it as `{kind: "chat"}` — the complete fast-path. |
 | `op.register` | `source, scope[, replace, expose]` | Register exactly one top-level Flux-Lang composite `op` for later reuse. `scope` is `turn`, `session`, `project`, or `global`; project/global writes are guarded filesystem writes, and all registered inner ops still dispatch through the normal envelope. |
 | `observe` | `kind[, data]` | Append an observation to the run's shared evidence log (the same log the runtime records `tool_call` markers into). |
 | `evidence` | `[kind]` | Read observations back as a JSON array (filtered by `kind`, or the whole log) — so a flow can branch on what has happened so far. |

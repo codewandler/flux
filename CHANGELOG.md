@@ -8,6 +8,22 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **The `complete` fast-path is wired — a finishing turn no longer pays a full second planner round
+  (A-06).** The planner prompt has always instructed models to attach a `complete` directive
+  (instructions for the final message) to a plan that finishes the request, and `render_completion`
+  (a grounded, toolless, catalog-less render) was fully implemented — but nothing ever called it:
+  the loop host surfaced `complete` as a bare boolean the shipped loop never read, so every working
+  turn ended with planner round 2 (full catalog + conversation + uncached symbols) just to produce
+  closing prose. Now `run_plan` arms the directive after a plan runs to success (a rejection,
+  execute error, suspension, or identical-plan skip never arms it — the model keeps seeing feedback
+  and re-plans), and the next `plan()` renders the final message from the actual results in one
+  cheap toolless call, ending the turn through the loop's existing `case "chat"` — no change to the
+  loop contract, so ejected/custom loops keep working. The render call's tokens land in the turn
+  totals and per-call attribution; a render failure emits a `completion.render_error` observation
+  and falls back to a normal planner round rather than aborting a turn whose work already
+  succeeded. The plan value's `complete` field is now the directive object (or `null`) instead of a
+  boolean.
+
 - **The session-symbols digest is bounded (A-07).** The symbols block — the uncached trailing
   system segment re-sent on every planner call — rendered one line per visible/pinned session
   symbol with no cap, so a long session's per-call context grew without eviction (conversation

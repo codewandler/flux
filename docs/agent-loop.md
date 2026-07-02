@@ -54,7 +54,7 @@ iteration streams as it happens:
 
 ```
 → [1/25] plan       ask the model
-  ✓ {"kind":"plan","ast":{…},"complete":false}
+  ✓ {"kind":"plan","ast":{…},"complete":null}
 → [2/25] run plan   execute the emitted graph
     … the inner ops (read/edit/cargo_test) stream and gate here …
 → [4/25] observe    turn.iteration

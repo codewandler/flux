@@ -34,7 +34,9 @@ use flux_provider::Provider;
 use flux_runtime::{CompositeRegisterRequest, CompositeRegistrar, Executor, LoopHost, ToolResult};
 
 use crate::ast::DraftAst;
-use crate::compile::{compile_turn, CompileOptions, TurnOutput};
+use crate::compile::{
+    compile_turn, parse_completion, render_completion, CompileOptions, Completion, TurnOutput,
+};
 use crate::composites::{prepare_registration, CompositeScope, DynamicComposites};
 use crate::registry::OpRegistry;
 use crate::runtime::execute_flow_with_composites;
@@ -176,6 +178,12 @@ pub struct EngineLoopHost {
     /// a mid-turn `/model` switch changes the active planner. Reset per turn in [`set_turn`]; read by
     /// the engine at turn-end to emit one `EventKind::CallUsage` per call (C-06 attribution).
     calls: Mutex<Vec<(String, Usage)>>,
+    /// The complete fast-path (A-06): armed by [`run_plan`](Self::run_plan) when a plan carrying a
+    /// `complete` directive ran to success (non-suspended). The NEXT [`plan`](Self::plan) call
+    /// renders the final message via [`render_completion`] — a toolless, catalog-less call — instead
+    /// of a full planner round, and the turn ends through the flow's existing `case "chat"`. Never
+    /// armed on rejection, error, suspension, or the identical-plan skip. Reset per turn.
+    pending_completion: Mutex<Option<Completion>>,
 }
 
 impl EngineLoopHost {
@@ -218,6 +226,7 @@ impl EngineLoopHost {
                 guard: Mutex::new(LoopGuard::default()),
                 usage: Mutex::new(Usage::default()),
                 calls: Mutex::new(Vec::new()),
+                pending_completion: Mutex::new(None),
             });
             *slot2.lock().unwrap() = Some(host.clone());
             executor.set_loop_host(host.clone());
@@ -248,6 +257,8 @@ impl EngineLoopHost {
         // …and the per-turn token tally, so usage reflects only this turn's planner calls.
         *self.usage.lock().unwrap() = Usage::default();
         self.calls.lock().unwrap().clear();
+        // …and any un-rendered completion directive — it belonged to the prior turn's plan.
+        *self.pending_completion.lock().unwrap() = None;
     }
 
     /// The token usage accumulated across this turn's planner calls (every `plan` re-entry). The
@@ -392,6 +403,46 @@ impl LoopHost for EngineLoopHost {
             conversation.push(Message::user_text(""));
         }
 
+        // The complete fast-path (A-06): the previous `run_plan` ran a completion-carrying plan to
+        // success, so the model already said how to close the turn. Render the final message from
+        // the working conversation (the fed-back results included) with a toolless, catalog-less
+        // call — no second full planner round — and end the turn via the flow's `case "chat"`.
+        // A render failure falls through to a normal planner round: a summary hiccup must never
+        // abort a turn whose work already succeeded.
+        let pending = self.pending_completion.lock().unwrap().take();
+        if let Some(directive) = pending {
+            let provider = self.provider.lock().unwrap().clone();
+            let model = self.model.lock().unwrap().clone();
+            match render_completion(
+                &*provider,
+                &model,
+                &conversation,
+                &directive,
+                self.opts.max_tokens,
+            )
+            .await
+            {
+                Ok((text, call_usage)) if !text.trim().is_empty() => {
+                    self.usage.lock().unwrap().accumulate(&call_usage);
+                    self.calls.lock().unwrap().push((model, call_usage));
+                    return Ok(serde_json::json!({ "kind": "chat", "text": text }));
+                }
+                Ok((_, call_usage)) => {
+                    // An empty render still cost tokens; account for them, then re-plan normally.
+                    self.usage.lock().unwrap().accumulate(&call_usage);
+                    self.calls.lock().unwrap().push((model, call_usage));
+                }
+                Err(e) => {
+                    let sink = self.turn.lock().unwrap().sink.clone();
+                    SharedSink(sink).observation(&flux_evidence::Observation::new(
+                        "completion.render_error",
+                        flux_evidence::Phase::Turn,
+                        serde_json::json!({ "error": e.to_string() }),
+                    ));
+                }
+            }
+        }
+
         let executor = self.executor()?;
         self.composites
             .ensure_session_loaded(&self.store, &session_id)?;
@@ -430,10 +481,15 @@ impl LoopHost for EngineLoopHost {
         self.calls.lock().unwrap().push((model.clone(), call_usage));
 
         let plan = match out {
+            // `complete` carries the model's full directive (object) or null — `run_plan` re-parses
+            // it off this value to arm the fast-path after a successful run (A-06).
             TurnOutput::Plan(c) => serde_json::json!({
                 "kind": "plan",
                 "ast": serde_json::to_value(&c.ast).unwrap_or(Value::Null),
-                "complete": c.complete.is_some(),
+                "complete": c.complete.as_ref().map(|d| serde_json::json!({
+                    "primer": d.primer,
+                    "instructions": d.instructions,
+                })),
             }),
             TurnOutput::Chat(text) => serde_json::json!({ "kind": "chat", "text": text }),
         };
@@ -467,6 +523,10 @@ impl LoopHost for EngineLoopHost {
             .ok_or_else(|| Error::Other("run_plan: the plan has no `ast` to run".into()))?;
         let ast: DraftAst = serde_json::from_value(ast_val)
             .map_err(|e| Error::Other(format!("run_plan: invalid plan ast: {e}")))?;
+        // The plan's completion directive (A-06), if any. Armed only at the success point below —
+        // every early return (identical-skip, rejection, error) and a suspension must NOT arm it,
+        // or the turn would close on a summary of work that didn't happen.
+        let completion = parse_completion(plan.get("complete"));
 
         // Silent-success guard (A-05): a byte-identical plan re-emitted right after a SUCCESSFUL
         // run means the model couldn't read the success (e.g. an empty-output command) — don't
@@ -578,6 +638,13 @@ impl LoopHost for EngineLoopHost {
             g.last_plan_hash = Some(plan_fingerprint);
             // A suspension is not a completed success — a repeat after resume is legitimate.
             g.last_plan_ok = outcome.suspension.is_none();
+        }
+        // Success, not suspended: arm the complete fast-path — the NEXT `plan` renders the final
+        // message from these results instead of paying a full planner round (A-06).
+        if outcome.suspension.is_none() {
+            if let Some(directive) = completion {
+                *self.pending_completion.lock().unwrap() = Some(directive);
+            }
         }
 
         // A suspension means the turn is awaiting input — real progress, not a stall — so skip the

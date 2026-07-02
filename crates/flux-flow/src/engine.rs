@@ -1010,6 +1010,48 @@ mod tests {
         ]
     }
 
+    /// Replays canned responses AND records every `Request` — so a test can distinguish a full
+    /// planner round (tools + op catalog) from the toolless completion render (A-06). The plain
+    /// [`MockProvider`] cannot: both consume the next queued response identically.
+    struct CaptureProvider {
+        responses: Mutex<VecDeque<Vec<Chunk>>>,
+        requests: Arc<Mutex<Vec<Request>>>,
+    }
+
+    #[async_trait]
+    impl Provider for CaptureProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            self.requests.lock().unwrap().push(req);
+            let chunks = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default();
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    /// An op that always fails at execution (but passes compile-time analysis) — drives the
+    /// plan-error feedback path.
+    struct BoomTool;
+    #[async_trait]
+    impl Tool for BoomTool {
+        fn spec(&self) -> flux_spec::ToolSpec {
+            flux_spec::ToolSpec::read_only("boom", "always fails", json!({"type": "object"}))
+        }
+        async fn execute(
+            &self,
+            _c: &ToolContext,
+            _params: serde_json::Value,
+        ) -> Result<ToolResult> {
+            Ok(ToolResult::error("boom: deliberate failure"))
+        }
+    }
+
     /// A provider whose every `stream()` fails — simulates a provider/API failure (e.g. credit
     /// exhausted) so the engine's error-surfacing path is exercised.
     struct FailProvider {
@@ -1059,6 +1101,7 @@ mod tests {
         let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(EchoTool));
+        registry.register(Arc::new(BoomTool));
         // The flux-lang agent loop calls these — register them so a turn can run.
         flux_tools::register_reflect(&mut registry);
         flux_tools::register_evidence(&mut registry);
@@ -1067,6 +1110,7 @@ mod tests {
             PermissionManager::from_rules(
                 &[
                     "echo".into(),
+                    "boom".into(),
                     "plan".into(),
                     "run_plan".into(),
                     "observe".into(),
@@ -1346,6 +1390,143 @@ mod tests {
             !msgs[1].text().contains("summarize what the plan did"),
             "the directive instructions must not leak into the final message"
         );
+    }
+
+    /// A-06 discriminating test: with a `complete` directive, the turn makes EXACTLY two model
+    /// calls — the planner round and the toolless, catalog-less completion render. The older
+    /// `plan_with_complete_renders_grounded_summary` cannot distinguish the render from an ordinary
+    /// second planner round (the mock consumes the next queued response either way); this one
+    /// inspects the actual requests.
+    #[tokio::test]
+    async fn completion_directive_skips_the_second_planner_round() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let plan_ast = json!({
+            "body": [{
+                "kind": "bind", "name": "greeting",
+                "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "hi" }] }
+            }]
+        });
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(CaptureProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                emit_plan_complete(plan_ast, Some("summarize what the plan did")),
+                prose("Ran echo and it returned hi."),
+            ])),
+            requests: requests.clone(),
+        });
+        let engine = engine_with_provider(provider, store.clone());
+        let mut sink = CollectSink::default();
+        engine.run_turn(&sid, "echo hi", &mut sink).await.unwrap();
+
+        assert_eq!(sink.tools, vec!["echo"], "the plan executed");
+        let reqs = requests.lock().unwrap();
+        assert_eq!(
+            reqs.len(),
+            2,
+            "exactly two model calls: planner + completion render"
+        );
+        assert!(
+            reqs[0].tools.iter().any(|t| t.name == "emit_plan"),
+            "call 1 is the planner"
+        );
+        assert!(
+            reqs[1].tools.is_empty(),
+            "call 2 offers NO tools — it cannot recurse into planning"
+        );
+        let sys2 = format!(
+            "{}{}",
+            reqs[1].system.as_deref().unwrap_or_default(),
+            reqs[1]
+                .system_segments
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<String>()
+        );
+        assert!(
+            !sys2.contains("Operation catalog"),
+            "call 2 carries no op catalog"
+        );
+        assert!(
+            sys2.contains("The plan has run"),
+            "call 2 is the grounded render: {sys2}"
+        );
+        let msgs = store.conversation(&sid).unwrap();
+        assert!(
+            msgs[1].text().contains("Ran echo and it returned hi."),
+            "the persisted answer is the rendered summary"
+        );
+    }
+
+    /// A-06: a failed plan run must NOT consume the completion directive — the loop re-plans
+    /// normally (call 2 is a full planner round with tools, not a render).
+    #[tokio::test]
+    async fn failed_plan_run_does_not_consume_completion() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let failing_plan = json!({
+            "body": [{ "kind": "call", "op": "boom", "args": [] }]
+        });
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(CaptureProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                emit_plan_complete(failing_plan, Some("summarize the fix")),
+                prose("The operation failed, so nothing was changed."),
+            ])),
+            requests: requests.clone(),
+        });
+        let engine = engine_with_provider(provider, store.clone());
+        let mut sink = CollectSink::default();
+        engine.run_turn(&sid, "do it", &mut sink).await.unwrap();
+
+        let reqs = requests.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert!(
+            reqs[1].tools.iter().any(|t| t.name == "emit_plan"),
+            "after a FAILED run, call 2 is a planner round (tools offered) — never the render"
+        );
+        let msgs = store.conversation(&sid).unwrap();
+        assert!(msgs[1].text().contains("nothing was changed"));
+    }
+
+    /// A-06: the identical-plan skip (A-05 silent-success guard) must NOT render the completion —
+    /// the skipped plan did not run, so its directive dies with it and the loop re-plans.
+    #[tokio::test]
+    async fn identical_plan_skip_does_not_render_completion() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let plan_ast = json!({
+            "body": [{
+                "kind": "bind", "name": "greeting",
+                "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "hi" }] }
+            }]
+        });
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(CaptureProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                // Round 1: the plan runs successfully (no directive).
+                emit_plan(plan_ast.clone()),
+                // Round 2: the model re-emits the IDENTICAL plan, now with a directive — the
+                // silent-success guard skips the re-run, so the directive must not arm.
+                emit_plan_complete(plan_ast, Some("summarize")),
+                // Round 3: a normal planner round ends the turn in prose.
+                prose("done after skip"),
+            ])),
+            requests: requests.clone(),
+        });
+        let engine = engine_with_provider(provider, store.clone());
+        let mut sink = CollectSink::default();
+        engine.run_turn(&sid, "echo hi", &mut sink).await.unwrap();
+
+        assert_eq!(sink.tools, vec!["echo"], "the plan ran exactly once");
+        let reqs = requests.lock().unwrap();
+        assert_eq!(reqs.len(), 3);
+        assert!(
+            reqs[2].tools.iter().any(|t| t.name == "emit_plan"),
+            "after the skip, call 3 is a planner round — the unexecuted plan's directive must not render"
+        );
+        let msgs = store.conversation(&sid).unwrap();
+        assert!(msgs[1].text().contains("done after skip"));
     }
 
     #[tokio::test]
