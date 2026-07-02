@@ -25,6 +25,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Pricing table verified against vendor sheets — codex costs were understated ~4× (C-20).**
+  Every `builtin()` rate is now verified against the vendor's current public pricing page
+  (2026-07-02, source URLs in the doc comment) instead of shipping "plausible" figures behind a
+  `TODO verify` hedge. Headline fix: `gpt-5.5` had shipped sharing gpt-5's launch rates
+  ($1.25/$10) but actually bills **$5/$30** (cache write $5, read $0.50) — the exact row the live
+  `codex` provider resolves to, so all codex cost reporting to date was ~4× low. The llama
+  OpenRouter row was also adjusted, unverifiable rows (`gpt-5-codex`, routed llama) are marked
+  ESTIMATED inline, known unmodelled premiums are documented (Bedrock cross-region ~10%, OpenAI
+  long-context 2×/1.5×, Anthropic 1h cache-write tier), and a pin test locks the headline rates.
+
 - **The `host.endpoint` URL-handback is gone — references-only plugin IO is now compile-enforced
   (D-32).** No plugin op receives a URL string anymore: the `endpoint` host-capability arm in
   `SystemHostCaps`, host-kit's `Host::endpoint`, and `MockHost`'s endpoint shim are deleted, so any

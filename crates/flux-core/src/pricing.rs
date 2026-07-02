@@ -175,11 +175,31 @@ pub fn canonical_model_parts(spec: &str) -> (Option<&str>, &str) {
 impl PricingTable {
     /// The built-in curated rate table. Prices are USD per 1M tokens.
     ///
-    /// `// TODO verify rates` — these are plausible public list prices captured for the mechanism's
-    /// sake; confirm against each vendor's current pricing page before relying on the exact figures.
-    /// Cache-write ≈ 1.25× input and cache-read ≈ 0.1× input follow the standard Anthropic ephemeral
-    /// (5-minute) cache economics; OpenAI has no cache-write tier (cached input is just discounted),
-    /// so `cache_write` mirrors `input` and `cache_read` ≈ 0.1× input there.
+    /// Verified against the vendors' public pricing pages on **2026-07-02**:
+    /// - Anthropic: <https://platform.claude.com/docs/en/about-claude/pricing>
+    /// - OpenAI: <https://developers.openai.com/api/docs/pricing> (base `gpt-5` is off the main
+    ///   sheet but still served at its published rate, confirmed on the per-model page
+    ///   <https://developers.openai.com/api/docs/models/gpt-5>)
+    /// - AWS Bedrock: <https://aws.amazon.com/bedrock/pricing/> — Anthropic models bill at the
+    ///   direct Anthropic list rates
+    /// - OpenRouter: <https://openrouter.ai/anthropic/claude-sonnet-4.6> and
+    ///   <https://openrouter.ai/meta-llama/llama-3.3-70b-instruct>
+    ///
+    /// Cache tiers per vendor: Anthropic bills ephemeral (5-minute) cache writes at 1.25× input
+    /// and cache reads at 0.1× input — both confirmed on the sheet; the 1-hour cache-write tier
+    /// (2× input) is NOT modelled because flux never requests it. OpenAI has no cache-write tier —
+    /// cached input is simply discounted (0.1× input on the current sheet) — so `cache_write`
+    /// mirrors `input` there.
+    ///
+    /// Known, deliberate approximations (the vendor sheet disagrees at the margin):
+    /// - Bedrock regional/multi-region cross-region profiles (`us.`/`eu.`/`apac.`) carry a ~10%
+    ///   premium over `global.` endpoints on 4.5+ models; this table prices every routing prefix
+    ///   at the base (global) rate.
+    /// - OpenAI's gpt-5.5 long-context premium (input beyond 272K tokens bills 2× input /
+    ///   1.5× output) is not modelled.
+    /// - Rows with no current public sheet are marked **estimated** inline (`gpt-5-codex`,
+    ///   delisted); the OpenRouter llama row is the listed price as of the verification date but
+    ///   floats across serving providers.
     pub fn builtin() -> Self {
         let mut rates = BTreeMap::new();
 
@@ -243,9 +263,20 @@ impl PricingTable {
             reasoning: 0.0,
         };
         rates.insert("gpt-5".to_string(), gpt5);
-        rates.insert("gpt-5.5".to_string(), gpt5);
+        rates.insert(
+            "gpt-5.5".to_string(),
+            Rates {
+                input: 5.0,
+                output: 30.0,
+                cache_write: 5.0,
+                cache_read: 0.50,
+                reasoning: 0.0,
+            },
+        );
         // Legacy alias: the `codex` provider resolves `*-codex` → `gpt-5.5` before cost, but keep the
         // key so a raw `codex/gpt-5-codex` spec still prices (defence-in-depth, never the live path).
+        // ESTIMATED: delisted from OpenAI's current sheet; kept at its last published list price
+        // (which matched gpt-5), the rate historical events with the raw legacy id actually ran at.
         rates.insert("gpt-5-codex".to_string(), gpt5);
 
         // --- OpenRouter passthrough models (keyed by the OpenRouter model id, slash and all) -------
@@ -259,13 +290,16 @@ impl PricingTable {
                 reasoning: 0.0,
             },
         );
+        // ESTIMATED: multi-provider routed — the OpenRouter listed price as of 2026-07-02; the
+        // effective rate floats with the serving provider. No caching tiers published (cache
+        // tiers mirror input so cached tokens never under-bill).
         rates.insert(
             "meta-llama/llama-3.3-70b-instruct".to_string(),
             Rates {
-                input: 0.12,
-                output: 0.30,
-                cache_write: 0.12,
-                cache_read: 0.12,
+                input: 0.10,
+                output: 0.32,
+                cache_write: 0.10,
+                cache_read: 0.10,
                 reasoning: 0.0,
             },
         );
@@ -414,6 +448,52 @@ mod tests {
         // An unknown provider (mock/ad-hoc) leaves the id bare — hermetic tests untouched.
         assert_eq!(canonical_model_spec(Some("mock"), "mock"), "mock");
         assert_eq!(canonical_model_spec(None, "gpt-5.5"), "gpt-5.5");
+    }
+
+    /// C-20: pin the headline rows to the vendor-verified rates so accidental edits are caught.
+    /// Values verified against the vendor pricing pages on 2026-07-02 (source URLs in the
+    /// [`PricingTable::builtin`] doc comment). Failing-first: `gpt-5.5` shipped at gpt-5's launch
+    /// rates (1.25 / 10.0 / cached 0.125) — OpenAI's current sheet prices it at 5.0 / 30.0 with
+    /// 0.50 cached input — and the OpenRouter llama row shipped as 0.12 / 0.30 vs the listed
+    /// 0.10 / 0.32; this test failed on both until the table was corrected.
+    #[test]
+    fn builtin_pins_vendor_verified_headline_rates() {
+        let t = PricingTable::builtin();
+        let pin = |model: &str, input: f64, output: f64, cache_write: f64, cache_read: f64| {
+            let r = t
+                .rates_for(model)
+                .unwrap_or_else(|| panic!("{model} must be in the builtin table"));
+            assert_eq!(
+                (r.input, r.output, r.cache_write, r.cache_read),
+                (input, output, cache_write, cache_read),
+                "{model}: (input, output, cache_write, cache_read)"
+            );
+            assert_eq!(
+                r.reasoning, 0.0,
+                "{model}: reasoning is a surcharge tier, 0.0 in every built-in row"
+            );
+        };
+
+        // Anthropic (5-minute ephemeral cache: write = 1.25x input, read = 0.1x input).
+        pin("claude-opus-4-8", 5.0, 25.0, 6.25, 0.50);
+        pin("claude-opus-4-7", 5.0, 25.0, 6.25, 0.50);
+        pin("claude-sonnet-4-6", 3.0, 15.0, 3.75, 0.30);
+        pin("claude-haiku-4-5", 1.0, 5.0, 1.25, 0.10);
+
+        // OpenAI (no cache-write tier: cache_write == input; cached input = 0.1x input).
+        pin("gpt-5", 1.25, 10.0, 1.25, 0.125);
+        pin("gpt-5.5", 5.0, 30.0, 5.0, 0.50);
+
+        // AWS Bedrock bills Anthropic models at the direct Anthropic list rates (global endpoint).
+        assert_eq!(
+            t.rates_for("anthropic.claude-sonnet-4-6"),
+            t.rates_for("claude-sonnet-4-6"),
+            "Bedrock Sonnet must match the direct Anthropic rates"
+        );
+
+        // OpenRouter passthrough + the listed llama price as of 2026-07-02 (floats across routes).
+        pin("anthropic/claude-sonnet-4.6", 3.0, 15.0, 3.75, 0.30);
+        pin("meta-llama/llama-3.3-70b-instruct", 0.10, 0.32, 0.10, 0.10);
     }
 
     #[test]
