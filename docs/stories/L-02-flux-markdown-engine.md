@@ -2,8 +2,9 @@
 id: L-02
 title: flux-markdown engine + progressive-disclosure skills
 pillar: Language
-status: backlog
-note: AST parser, body-on-demand activation
+status: ready
+priority: 7
+note: AST parser, body-on-demand activation — global skills currently inject whole bodies on match; progressive disclosure (name+description at startup, body on selection) is the scaling fix
 ---
 
 # flux-markdown engine + progressive-disclosure skills

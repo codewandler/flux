@@ -2,11 +2,12 @@
 id: C-08
 title: Full OAuth2 login — codex PKCE (+ claude parity)
 pillar: Core
-status: backlog
+status: ready
+priority: 6
 epic: subscription-providers-and-cost
 theme: subscription-providers-cost
 design: docs/designs/subscription-providers-and-cost.md
-note: the explicit later stage; import + refresh cover the near term
+note: the last open story of the subscription epic (C-03..C-07 done) — flux-native codex PKCE login to parity with claude; import + refresh remain the default path
 ---
 
 # Full OAuth2 login — codex PKCE (+ claude parity)

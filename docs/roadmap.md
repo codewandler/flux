@@ -417,8 +417,8 @@ Drift made visible, so it stops being silent. Each maps to a story on the
   (`flux usage` incl. the per-turn efficiency line, turn-end cost annotations, a server endpoint).
   → [C-05](stories/C-05-pricing-cost-model.md) / [C-06](stories/C-06-usage-cost-accounting.md) /
   [C-15](stories/C-15-efficiency-metrics-and-key-normalization.md).
-- **Codex transport is HTTP-SSE only** while the upstream codex client uses a websocket transport (with HTTP
-  fallback). → [C-07](stories/C-07-codex-websocket-transport.md).
+- ~~**Codex transport is HTTP-SSE only**~~ ✅ done — WS is the default codex transport (live-verified
+  wire contract) with transparent HTTP-SSE fallback. → [C-07](stories/C-07-codex-websocket-transport.md).
 - **Subscription-provider login is import-only for codex** (claude has PKCE); full OAuth2 for codex is the
   deferred later stage. → [C-08](stories/C-08-full-oauth2-login.md).
 

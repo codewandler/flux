@@ -2,9 +2,11 @@
 id: D-31
 title: Host-terminated raw-socket auth (no credential to the plugin)
 pillar: Core
-status: backlog
+status: ready
+priority: 10
 epic: endpoint-discovery
 design: docs/designs/endpoint-discovery.md
+note: the last open story of the endpoint epic (D-25..D-30, D-32 done) — host speaks the Postgres startup/SCRAM handshake and hands sql a post-auth connection; big and protocol-specific, sequenced last and run alone (touches the same sql/flux-plugin files D-32 reworked)
 ---
 
 # Host-terminated raw-socket auth (no credential to the plugin)

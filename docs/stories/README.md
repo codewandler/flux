@@ -24,24 +24,33 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [I-01 — Statistically clean self-improvement headline gain (trials ≥ 3)](I-01-headline-gain.md) · Improve · offline half done (partial-credit scalar + durable token capture + synthetic `trials = 5` loop); the trials ≥ 5 grader-confirmed run is **staged** on a funded provider key
 
 ## Next (ready — take the top one unless the user named a story)
-_None._
-
-## Blocked
-_None._
-
-## Backlog
-- [L-02 — flux-markdown engine + progressive-disclosure skills](L-02-flux-markdown-engine.md) · Language · AST parser, body-on-demand activation
+- [C-18 — A2A task sessions are never pruned — TTL-based cleanup](C-18-a2a-session-ttl.md) · Core · every `tasks/send` creates a session that lives forever in events.db — add TTL-scoped pruning for A2A-created sessions (the in-code TODO at flux-server a2a.rs)
+- [C-19 — Subscription-provider legs in the live smoke gate (claude + codex WS)](C-19-subscription-live-smoke.md) · Core · C-07 proved hermetic stubs cannot catch live wire-contract drift (three contract quirks found only by probing) — smoke-live.sh gains opt-in claude/codex legs so the WS contract regressing shows up before a release
+- [C-20 — Verify the built-in pricing table against current vendor price sheets](C-20-pricing-rate-verification.md) · Core · the builtin() table ships "plausible public list prices" with an explicit TODO-verify hedge — since C-05/C-06/C-15 the numbers feed real cost reporting, so verify each rate, fix drift, stamp a verified-on date
+- [A-11 — Reply-parking for `ask` — journeys suspend until the correlated reply arrives](A-11-journey-reply-parking.md) · Agent · `ask` today is `send` + a correlation id (the reply is never awaited — the in-code TODO at flux-app ops.rs); wire it onto the existing suspension seam so a journey parks on ask and App::deliver resumes it with the reply
+- [L-02 — flux-markdown engine + progressive-disclosure skills](L-02-flux-markdown-engine.md) · Language · AST parser, body-on-demand activation — global skills currently inject whole bodies on match; progressive disclosure (name+description at startup, body on selection) is the scaling fix
+- [L-20 — Planner emission A/B — measure strict-JSON vs native-text on a fixed corpus](L-20-emission-ab-measured.md) · Language · arm 1 (derived DraftAst schema on emit_plan) shipped with L-19; what remains is the actual experiment — an emission-arm selector, a fixed task corpus, and the measured comparison (acceptance rate, repair rounds, tokens) recorded back into the design doc
 
 ### endpoint discovery & brokerage (references-only plugin IO)
 _flux's plugins each talk to a single, statically-configured service. The fluxplane pack they were_
-- [D-31 — Host-terminated raw-socket auth (no credential to the plugin)](D-31-host-terminated-rawsocket-auth.md) · Core
+- [D-31 — Host-terminated raw-socket auth (no credential to the plugin)](D-31-host-terminated-rawsocket-auth.md) · Core · the last open story of the endpoint epic (D-25..D-30, D-32 done) — host speaks the Postgres startup/SCRAM handshake and hands sql a post-auth connection; big and protocol-specific, sequenced last and run alone (touches the same sql/flux-plugin files D-32 reworked)
+
+### flux-lang v1 hardening — close the review findings, ship an honest v1
+_A full review of flux-lang (2026-07-02: three scoped deep-dives — runtime, analyzer/optimizer,_
+- [L-21 — flux-lang v1 hardening — residual burn-down (resume key, denial fatality, analyzer gaps)](L-21-flux-lang-v1-residual-burndown.md) · Language · the four residuals the epic recorded at close — named-flow resume still checkpoints hash-only through the engine, policy denial is retryable because it's an in-band string, three eval_arg positions still accept calls, and type_check_body diagnostics lack node paths
 
 ### Plugin Platform Hardening
 - [D-21 — Plugin distribution for non-source users (scoping)](D-21-plugin-distribution.md) · Core · scoping/epic-seed: how a non-repo user obtains the pack (bundled binaries / fetch-on-install / marketplace); produces a design + the follow-on stories, no code
 
 ### subscription providers (claude-code + codex) & cross-provider usage/cost
 _flux can already drive the two **subscription / passthrough** model backends — `claude` (Claude_
-- [C-08 — Full OAuth2 login — codex PKCE (+ claude parity)](C-08-full-oauth2-login.md) · Core · the explicit later stage; import + refresh cover the near term
+- [C-08 — Full OAuth2 login — codex PKCE (+ claude parity)](C-08-full-oauth2-login.md) · Core · the last open story of the subscription epic (C-03..C-07 done) — flux-native codex PKCE login to parity with claude; import + refresh remain the default path
+
+## Blocked
+_None._
+
+## Backlog
+_None._
 
 ## Done
 - [A-01 — Unify SDK onto FlowEngine, retire the classic Agent loop](A-01-unify-flowengine.md) · Agent · one loop everywhere; `flux-agent` repurposed as the `AgentSpec` home (see [CHANGELOG](../../CHANGELOG.md))
