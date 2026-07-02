@@ -75,6 +75,11 @@ pub struct TurnSummary {
     pub ended_at_ms: Option<i64>,
     /// The turn's accumulated token usage, when recorded (`None` for older logs / no provider usage).
     pub usage: Option<Usage>,
+    /// How many provider calls the turn made (its `CallUsage` events) — 0 for pre-C-06 logs (C-15).
+    pub calls: u64,
+    /// Field-wise sum of this turn's per-call usage records, all tiers — the attribution-grade
+    /// per-turn total (`usage` above stays the turn's replace-style back-compat total) (C-15).
+    pub call_usage: Usage,
 }
 
 /// Fold turn telemetry, keyed (and ordered) by `turn_id` = the `TurnStarted`'s `global_seq`.
@@ -97,6 +102,8 @@ pub fn turns(events: &[StoredEvent]) -> Vec<TurnSummary> {
                         started_at_ms: e.ts_ms,
                         ended_at_ms: None,
                         usage: None,
+                        calls: 0,
+                        call_usage: Usage::default(),
                     },
                 );
             }
@@ -131,6 +138,12 @@ pub fn turns(events: &[StoredEvent]) -> Vec<TurnSummary> {
                     t.usage = usage.clone();
                 }
             }
+            EventKind::CallUsage { usage, .. } => {
+                if let Some(t) = e.turn_id.and_then(|tid| by_turn.get_mut(&tid)) {
+                    t.calls += 1;
+                    sum_usage(&mut t.call_usage, usage);
+                }
+            }
             _ => {}
         }
     }
@@ -149,6 +162,87 @@ pub fn observations(events: &[StoredEvent]) -> Vec<flux_evidence::Observation> {
             _ => None,
         })
         .collect()
+}
+
+/// Turn-efficiency counters folded from a stream's turn telemetry (C-15) — the Improve pillar's
+/// measurability rollup: how many model calls and loop iterations a turn takes, and how much of
+/// the prompt side is served from cache. Raw sums, so summaries from many streams merge by
+/// addition; the `avg_*`/share accessors derive the report figures.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EfficiencySummary {
+    /// Completed turns folded in (turns that never ended are skipped — their counters would skew).
+    pub turns: u64,
+    /// Provider calls across those turns (`CallUsage` events).
+    pub calls: u64,
+    /// Loop iterations across those turns (`TurnEnded.iterations`).
+    pub iterations: u64,
+    /// Prompt tokens served from cache across those turns.
+    pub cache_read_tokens: u64,
+    /// Prompt tokens NOT served from cache (fresh input + cache writes).
+    pub uncached_input_tokens: u64,
+    /// Generated tokens across those turns.
+    pub output_tokens: u64,
+}
+
+impl EfficiencySummary {
+    /// Fold another summary in (raw sums — used to aggregate across streams).
+    pub fn merge(&mut self, other: &Self) {
+        self.turns += other.turns;
+        self.calls += other.calls;
+        self.iterations += other.iterations;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.uncached_input_tokens += other.uncached_input_tokens;
+        self.output_tokens += other.output_tokens;
+    }
+
+    pub fn avg_calls_per_turn(&self) -> f64 {
+        ratio(self.calls, self.turns)
+    }
+
+    pub fn avg_iterations_per_turn(&self) -> f64 {
+        ratio(self.iterations, self.turns)
+    }
+
+    /// Share of the prompt side served from cache: `cache_read / (cache_read + uncached_input)`.
+    pub fn cache_read_share(&self) -> f64 {
+        let prompt = self.cache_read_tokens + self.uncached_input_tokens;
+        ratio(self.cache_read_tokens, prompt)
+    }
+
+    pub fn uncached_input_per_turn(&self) -> f64 {
+        ratio(self.uncached_input_tokens, self.turns)
+    }
+
+    pub fn output_per_turn(&self) -> f64 {
+        ratio(self.output_tokens, self.turns)
+    }
+}
+
+fn ratio(num: u64, den: u64) -> f64 {
+    if den == 0 {
+        0.0
+    } else {
+        num as f64 / den as f64
+    }
+}
+
+/// Fold a stream's completed turns into an [`EfficiencySummary`] (C-15). `None` when the stream
+/// has no completed turn — a section with nothing to report renders nothing.
+pub fn efficiency_summary(events: &[StoredEvent]) -> Option<EfficiencySummary> {
+    let mut s = EfficiencySummary::default();
+    for t in turns(events) {
+        if t.ended_at_ms.is_none() {
+            continue;
+        }
+        s.turns += 1;
+        s.calls += t.calls;
+        s.iterations += u64::from(t.iterations);
+        s.cache_read_tokens += t.call_usage.cache_read_input_tokens;
+        s.uncached_input_tokens +=
+            t.call_usage.input_tokens + t.call_usage.cache_creation_input_tokens;
+        s.output_tokens += t.call_usage.output_tokens;
+    }
+    (s.turns > 0).then_some(s)
 }
 
 /// One model's rolled-up token spend + cost — a row of [`cost_summary`].
@@ -215,7 +309,7 @@ pub fn cost_summary(events: &[StoredEvent], pricing: &PricingTable) -> Vec<Model
         }
     }
 
-    per_model
+    merge_legacy_keys(per_model)
         .into_iter()
         .map(|(model, (usage, calls))| {
             let cost = pricing.cost(&usage, &model);
@@ -225,6 +319,58 @@ pub fn cost_summary(events: &[StoredEvent], pricing: &PricingTable) -> Vec<Model
                 calls,
                 cost,
             }
+        })
+        .collect()
+}
+
+/// Fold legacy attribution-key variants into their canonical siblings (C-15). New events are
+/// stamped canonically at write time (`canonical_model_spec`); older logs carry variants of the
+/// same backend (`gpt-5.5` vs `openai/gpt-5.5`; region-prefixed Bedrock ids). The log is
+/// append-only and never rewritten — this read-side merge is the migration:
+/// - rows with the SAME provider whose model ids canonicalize identically merge (e.g.
+///   `aws/us.anthropic.…` + `aws/eu.anthropic.…` → `aws/anthropic.…`);
+/// - a BARE key merges into a provider-prefixed row iff exactly ONE prefixed row shares its
+///   canonical model id — with two candidate providers the bare row stays separate (they may
+///   bill differently; never guess).
+fn merge_legacy_keys(per_model: BTreeMap<String, (Usage, u64)>) -> BTreeMap<String, (Usage, u64)> {
+    use flux_core::canonical_model_parts;
+    // Pass 1: canonicalize each key in place (same-provider variants collapse here).
+    let mut canon: BTreeMap<(Option<String>, String), (Usage, u64)> = BTreeMap::new();
+    for (key, (usage, calls)) in per_model {
+        let (provider, model) = canonical_model_parts(&key);
+        let entry = canon
+            .entry((provider.map(str::to_string), model.to_string()))
+            .or_default();
+        sum_usage(&mut entry.0, &usage);
+        entry.1 += calls;
+    }
+    // Pass 2: fold each bare row into its sole prefixed sibling, when unambiguous.
+    let bare_keys: Vec<String> = canon
+        .keys()
+        .filter(|(p, _)| p.is_none())
+        .map(|(_, m)| m.clone())
+        .collect();
+    for model in bare_keys {
+        let providers: Vec<String> = canon
+            .keys()
+            .filter(|(p, m)| p.is_some() && *m == model)
+            .filter_map(|(p, _)| p.clone())
+            .collect();
+        if let [sole] = providers.as_slice() {
+            let (usage, calls) = canon.remove(&(None, model.clone())).expect("bare row");
+            let entry = canon.entry((Some(sole.clone()), model)).or_default();
+            sum_usage(&mut entry.0, &usage);
+            entry.1 += calls;
+        }
+    }
+    canon
+        .into_iter()
+        .map(|((provider, model), v)| {
+            let key = match provider {
+                Some(p) => format!("{p}/{model}"),
+                None => model,
+            };
+            (key, v)
         })
         .collect()
 }
@@ -519,6 +665,207 @@ mod tests {
         // Neither model's slice is double-counted or merged into the other — the switch didn't
         // smear model-a's tokens onto model-b (or vice versa) despite sharing one `TurnStarted`.
         assert_eq!(a.usage.total() + b.usage.total(), 165);
+    }
+
+    /// C-15: the turns fold counts each turn's provider calls and sums their per-call usage —
+    /// the per-turn attribution `TurnEnded.usage` (a replace-style total) can't give.
+    #[test]
+    fn turns_fold_per_turn_call_counts_and_cache_usage() {
+        let cached = Usage {
+            input_tokens: 100,
+            output_tokens: 10,
+            cache_read_input_tokens: 900,
+            cache_creation_input_tokens: 50,
+            ..Default::default()
+        };
+        let events = vec![
+            ev(
+                1,
+                0,
+                None,
+                EventKind::TurnStarted {
+                    user_input: "go".into(),
+                    model: "m".into(),
+                },
+            ),
+            ev(
+                2,
+                1,
+                Some(1),
+                EventKind::CallUsage {
+                    model: "m".into(),
+                    usage: cached.clone(),
+                },
+            ),
+            ev(
+                3,
+                2,
+                Some(1),
+                EventKind::CallUsage {
+                    model: "m".into(),
+                    usage: cached.clone(),
+                },
+            ),
+            ev(
+                4,
+                3,
+                Some(1),
+                EventKind::TurnEnded {
+                    outcome: "ok".into(),
+                    iterations: 2,
+                    answer: "done".into(),
+                    usage: Some(usage_with(150, 15)),
+                },
+            ),
+        ];
+        let ts = turns(&events);
+        assert_eq!(ts.len(), 1);
+        assert_eq!(ts[0].calls, 2, "both provider calls counted");
+        assert_eq!(ts[0].call_usage.input_tokens, 200);
+        assert_eq!(ts[0].call_usage.cache_read_input_tokens, 1800);
+        assert_eq!(ts[0].call_usage.cache_creation_input_tokens, 100);
+        assert_eq!(ts[0].call_usage.output_tokens, 20);
+    }
+
+    /// C-15: the efficiency rollup reports calls/turn and the cache-read share of the prompt side.
+    #[test]
+    fn efficiency_summary_reports_calls_per_turn_and_cache_read_share() {
+        let cached = Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_input_tokens: 300,
+            cache_creation_input_tokens: 100,
+            ..Default::default()
+        };
+        let mut events = Vec::new();
+        // Two completed turns: 2 calls and 1 call respectively; plus one PENDING turn that must
+        // not skew the averages.
+        let mut seq = 0i64;
+        let mut push = |turn_id: Option<i64>, kind: EventKind| {
+            seq += 1;
+            events.push(ev(seq, seq - 1, turn_id, kind));
+        };
+        push(
+            None,
+            EventKind::TurnStarted {
+                user_input: "a".into(),
+                model: "m".into(),
+            },
+        ); // turn 1
+        push(
+            Some(1),
+            EventKind::CallUsage {
+                model: "m".into(),
+                usage: cached.clone(),
+            },
+        );
+        push(
+            Some(1),
+            EventKind::CallUsage {
+                model: "m".into(),
+                usage: cached.clone(),
+            },
+        );
+        push(
+            Some(1),
+            EventKind::TurnEnded {
+                outcome: "ok".into(),
+                iterations: 3,
+                answer: "x".into(),
+                usage: None,
+            },
+        );
+        push(
+            None,
+            EventKind::TurnStarted {
+                user_input: "b".into(),
+                model: "m".into(),
+            },
+        ); // turn 5
+        push(
+            Some(5),
+            EventKind::CallUsage {
+                model: "m".into(),
+                usage: cached.clone(),
+            },
+        );
+        push(
+            Some(5),
+            EventKind::TurnEnded {
+                outcome: "ok".into(),
+                iterations: 1,
+                answer: "y".into(),
+                usage: None,
+            },
+        );
+        push(
+            None,
+            EventKind::TurnStarted {
+                user_input: "never ends".into(),
+                model: "m".into(),
+            },
+        );
+
+        let e = efficiency_summary(&events).expect("two completed turns");
+        assert_eq!(e.turns, 2, "the pending turn is excluded");
+        assert_eq!(e.calls, 3);
+        assert!((e.avg_calls_per_turn() - 1.5).abs() < f64::EPSILON);
+        assert!((e.avg_iterations_per_turn() - 2.0).abs() < f64::EPSILON);
+        // Per call: 300 cached vs 200 uncached (100 input + 100 cache write) → 60% cache-read.
+        assert!(
+            (e.cache_read_share() - 0.6).abs() < 1e-9,
+            "{}",
+            e.cache_read_share()
+        );
+        assert!((e.uncached_input_per_turn() - 300.0).abs() < f64::EPSILON);
+        assert!((e.output_per_turn() - 75.0).abs() < f64::EPSILON);
+    }
+
+    /// C-15: legacy attribution-key variants merge on the read side — a bare `gpt-5.5` folds into
+    /// its sole prefixed sibling `openai/gpt-5.5`, and two regional Bedrock stamps under one
+    /// provider collapse to the region-less id. An AMBIGUOUS bare key (two candidate providers)
+    /// stays separate — providers bill differently, never guess.
+    #[test]
+    fn cost_summary_merges_bare_and_prefixed_model_keys() {
+        let call = |seq: i64, model: &str| {
+            ev(
+                seq,
+                seq - 1,
+                Some(1),
+                EventKind::CallUsage {
+                    model: model.into(),
+                    usage: usage_with(100, 10),
+                },
+            )
+        };
+        let pricing = PricingTable::builtin();
+
+        // Bare + prefixed variant of one backend → ONE row under the canonical key.
+        let events = vec![call(1, "gpt-5.5"), call(2, "openai/gpt-5.5")];
+        let rows = cost_summary(&events, &pricing);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].model, "openai/gpt-5.5");
+        assert_eq!(rows[0].calls, 2);
+        assert_eq!(rows[0].usage.input_tokens, 200);
+
+        // Two regional Bedrock stamps under one provider → the region-less canonical id.
+        let events = vec![
+            call(1, "aws/us.anthropic.claude-sonnet-4-6"),
+            call(2, "aws/eu.anthropic.claude-sonnet-4-6"),
+        ];
+        let rows = cost_summary(&events, &pricing);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].model, "aws/anthropic.claude-sonnet-4-6");
+        assert_eq!(rows[0].calls, 2);
+
+        // Ambiguous: the bare id has TWO prefixed siblings — it must stay its own row.
+        let events = vec![
+            call(1, "claude-sonnet-4-6"),
+            call(2, "anthropic/claude-sonnet-4-6"),
+            call(3, "claude/claude-sonnet-4-6"),
+        ];
+        let rows = cost_summary(&events, &pricing);
+        assert_eq!(rows.len(), 3, "ambiguous bare key never merges: {rows:?}");
     }
 
     /// `cost_summary` rolls up multiple turns, multiple models, and cache tiers, folding

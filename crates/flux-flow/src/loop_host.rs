@@ -503,13 +503,15 @@ impl LoopHost for EngineLoopHost {
             {
                 Ok((text, call_usage)) if !text.trim().is_empty() => {
                     self.usage.lock().unwrap().accumulate(&call_usage);
-                    self.calls.lock().unwrap().push((model, call_usage));
+                    let spec = flux_core::canonical_model_spec(Some(provider.name()), &model);
+                    self.calls.lock().unwrap().push((spec, call_usage));
                     return Ok(serde_json::json!({ "kind": "chat", "text": text }));
                 }
                 Ok((_, call_usage)) => {
                     // An empty render still cost tokens; account for them, then re-plan normally.
                     self.usage.lock().unwrap().accumulate(&call_usage);
-                    self.calls.lock().unwrap().push((model, call_usage));
+                    let spec = flux_core::canonical_model_spec(Some(provider.name()), &model);
+                    self.calls.lock().unwrap().push((spec, call_usage));
                 }
                 Err(e) => {
                     let sink = self.turn.lock().unwrap().sink.clone();
@@ -570,7 +572,10 @@ impl LoopHost for EngineLoopHost {
         // switch attributes tokens/cost to the right model (C-06 attribution) rather than being lost in
         // the turn's single replace-style total.
         self.usage.lock().unwrap().accumulate(&call_usage);
-        self.calls.lock().unwrap().push((model.clone(), call_usage));
+        // Stamped with the CANONICAL provider/model spec (C-15) so `cost_summary` never splits one
+        // backend's spend across key variants.
+        let spec = flux_core::canonical_model_spec(Some(provider.name()), &model);
+        self.calls.lock().unwrap().push((spec, call_usage));
 
         let plan = match out {
             // `complete` carries the model's full directive (object) or null — `run_plan` re-parses

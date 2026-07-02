@@ -230,6 +230,9 @@ impl Spawner for LocalSpawner {
             .ok_or_else(|| Error::Other(format!("unknown role: {role_name}")))?;
 
         let provider = (self.provider_factory)()?;
+        // Captured before the provider moves into the child engine: the canonical-spec stamp on
+        // the child's usage attribution needs the provider name (C-15).
+        let provider_name = provider.name().to_string();
 
         // Scoped toolset; sub-agents run autonomously under the policy-bounded headless approver
         // (auto-approve scoped, policy-permitted calls; refuse destructive ones — unless an approver
@@ -309,8 +312,9 @@ impl Spawner for LocalSpawner {
         let flow = flux_flow::state::FlowStore::in_memory_with_events(events.clone())?;
         let engine = spec.into_engine(Arc::from(provider), executor, events, flow)?;
         // Captured now (not read back off `engine` after the run) purely for clarity at the call
-        // sites below — `engine.model` never changes over a sub-agent's single turn.
-        let model = engine.model.clone();
+        // sites below — `engine.model` never changes over a sub-agent's single turn. Canonical
+        // provider/model spec (C-15): this string keys the parent's `CallUsage` attribution.
+        let model = flux_core::canonical_model_spec(Some(&provider_name), &engine.model);
 
         // The child runs under a child of the parent's cancel token: cancelling the parent turn
         // cancels the child. A wall-clock deadline fires that same token so the child reaches its own

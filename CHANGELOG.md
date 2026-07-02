@@ -8,6 +8,21 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Per-turn efficiency metrics + canonical usage keys (C-15).** Tokens-per-task was queryable only
+  from raw `CallUsage` rows. `TurnSummary` now folds each turn's provider-call count and per-call
+  usage sum, and the new `efficiency_summary()` projection (surfaced as one line per `flux usage`
+  section) reports turns, calls/turn, iterations/turn, the cache-read share of the prompt side, and
+  uncached-input/output per turn — the Improve pillar's efficiency trend at a glance. Usage
+  attribution keys are now stamped **canonically at write time** via the new
+  `flux_core::pricing::canonical_model_spec` (`provider/model`, aliases resolved, Bedrock regional
+  routing prefixes stripped) at all three write sites — the loop host's planner and completion-render
+  calls, the engine's `begin_turn`, and sub-agent spawns. **Migration caveat:** the append-only log
+  is never rewritten, so older events keep their inconsistent keys (`gpt-5.5` vs `openai/gpt-5.5`,
+  `aws/us.anthropic.…`); `cost_summary` now merges those legacy variants on the read side —
+  same-provider canonical duplicates always collapse, and a bare key folds into a prefixed sibling
+  only when exactly one candidate provider exists (an ambiguous bare key stays its own row rather
+  than guessing between providers that bill differently).
+
 - **Opt-in per-turn token budget — the loop now has an enforced spend ceiling (A-10).** Usage was
   accounted per call but nothing enforced a bound: a pathological turn was limited only by the
   25-iteration cap times up-to-8 compile steps. The loop host now checks the turn's accumulated

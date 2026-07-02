@@ -884,12 +884,34 @@ fn run_usage_with(store: &EventStore, pricing: &flux_core::PricingTable) -> Resu
     println!("{} {session_id}", style::bold("session:"));
     let session_rows = store.cost_summary(&session_id, pricing)?;
     print_usage_rows(&session_rows);
+    print_efficiency_line(store.efficiency(&session_id)?.as_ref());
 
     println!();
     println!("{}", style::bold("all sessions:"));
     let all_rows = store.cost_summary_all(pricing)?;
     print_usage_rows(&all_rows);
+    print_efficiency_line(store.efficiency_all()?.as_ref());
     Ok(())
+}
+
+/// One turn-efficiency line per `flux usage` section (C-15): turns, calls/turn, iterations/turn,
+/// cache-read share, uncached-input and output per turn — the Improve pillar's tokens-per-task
+/// trend at a glance. Prints nothing when the section has no completed turns.
+fn print_efficiency_line(eff: Option<&flux_events::EfficiencySummary>) {
+    let Some(e) = eff else {
+        return;
+    };
+    println!(
+        "  {} {} turn{} · {:.1} calls/turn · {:.1} iters/turn · cache-read {:.0}% · uncached-in {}/turn · out {}/turn",
+        style::dim("efficiency:"),
+        e.turns,
+        if e.turns == 1 { "" } else { "s" },
+        e.avg_calls_per_turn(),
+        e.avg_iterations_per_turn(),
+        e.cache_read_share() * 100.0,
+        style::fmt_tokens(e.uncached_input_per_turn() as u64),
+        style::fmt_tokens(e.output_per_turn() as u64),
+    );
 }
 
 /// Print one `cost_summary` table: model, call count, token tiers, and cost (when priced). Shared by

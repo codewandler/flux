@@ -146,6 +146,32 @@ pub fn is_subscription(spec: &str) -> bool {
     matches!(split_provider(spec).0, Some("claude") | Some("codex"))
 }
 
+/// The canonical attribution key for usage records: `provider/model`, with flux's short aliases
+/// resolved and Bedrock's regional routing prefix stripped — stamped at **write** time on
+/// `CallUsage`/`TurnStarted` events so `cost_summary`/`flux usage` never splits one backend's
+/// spend across key variants (`gpt-5.5` vs `openai/gpt-5.5`, `us.anthropic.…` vs `anthropic.…`)
+/// (C-15). A spec that already carries a known provider keeps it; a bare model id is prefixed
+/// with `provider` when that names a known provider (a `mock`/unknown provider leaves the id
+/// bare, so hermetic tests and ad-hoc providers are untouched).
+pub fn canonical_model_spec(provider: Option<&str>, model: &str) -> String {
+    let (spec_provider, bare) = split_provider(model);
+    let bare = resolve_alias(bare);
+    let bare = strip_bedrock_region_prefix(bare).unwrap_or(bare);
+    match spec_provider.or_else(|| provider.filter(|p| known_provider(p))) {
+        Some(p) => format!("{p}/{bare}"),
+        None => bare.to_string(),
+    }
+}
+
+/// The `(provider?, canonical model id)` pair behind [`canonical_model_spec`] — the read-side
+/// merge key `cost_summary` uses to fold legacy key variants written before write-time stamping.
+pub fn canonical_model_parts(spec: &str) -> (Option<&str>, &str) {
+    let (provider, bare) = split_provider(spec);
+    let bare = resolve_alias(bare);
+    let bare = strip_bedrock_region_prefix(bare).unwrap_or(bare);
+    (provider, bare)
+}
+
 impl PricingTable {
     /// The built-in curated rate table. Prices are USD per 1M tokens.
     ///
@@ -360,6 +386,34 @@ mod tests {
         // `anthropic/claude-sonnet-4-6` resolves to the same rates via prefix-strip.
         let m2 = builtin.cost(&u, "anthropic/claude-sonnet-4-6").unwrap();
         assert!((m2.usd - 18.0).abs() < 1e-9, "got {}", m2.usd);
+    }
+
+    /// C-15: the write-time attribution key — bare ids get the provider prefix, existing specs
+    /// are preserved, aliases resolve, Bedrock regional prefixes strip, unknown providers stay bare.
+    #[test]
+    fn canonical_model_spec_prefixes_bare_ids_and_preserves_specs() {
+        assert_eq!(
+            canonical_model_spec(Some("openai"), "gpt-5.5"),
+            "openai/gpt-5.5"
+        );
+        // An already-prefixed spec keeps ITS provider, even when another is offered.
+        assert_eq!(
+            canonical_model_spec(Some("anthropic"), "openai/gpt-5.5"),
+            "openai/gpt-5.5"
+        );
+        // Alias resolution + prefixing.
+        assert_eq!(
+            canonical_model_spec(Some("anthropic"), "sonnet"),
+            "anthropic/claude-sonnet-4-6"
+        );
+        // Bedrock regional routing prefix strips to the region-less id.
+        assert_eq!(
+            canonical_model_spec(Some("aws"), "us.anthropic.claude-sonnet-4-6"),
+            "aws/anthropic.claude-sonnet-4-6"
+        );
+        // An unknown provider (mock/ad-hoc) leaves the id bare — hermetic tests untouched.
+        assert_eq!(canonical_model_spec(Some("mock"), "mock"), "mock");
+        assert_eq!(canonical_model_spec(None, "gpt-5.5"), "gpt-5.5");
     }
 
     #[test]

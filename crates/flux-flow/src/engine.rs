@@ -176,7 +176,13 @@ impl FlowEngine {
         // Non-fatal: a DB hiccup must never prevent a turn from running.
         let turn_id = self
             .events
-            .begin_turn(session_id, user_input, &self.model)
+            .begin_turn(
+                session_id,
+                user_input,
+                // Canonical attribution key (C-15) — the old-log cost fallback rolls turns up by
+                // this stamp, so it must match the per-call `CallUsage` keys.
+                &flux_core::canonical_model_spec(Some(self.provider.name()), &self.model),
+            )
             .unwrap_or(-1);
 
         // Agent identity + project context + any skills whose triggers match this turn — prepended to

@@ -711,6 +711,27 @@ impl EventStore {
             .collect())
     }
 
+    /// Turn-efficiency rollup for one stream — see [`projection::efficiency_summary`] (C-15).
+    pub fn efficiency(&self, stream: &str) -> Result<Option<projection::EfficiencySummary>> {
+        Ok(projection::efficiency_summary(
+            &self.load_stream(stream, None)?,
+        ))
+    }
+
+    /// Turn-efficiency rollup across every session — per-stream summaries merged by raw sums.
+    pub fn efficiency_all(&self) -> Result<Option<projection::EfficiencySummary>> {
+        let mut acc: Option<projection::EfficiencySummary> = None;
+        for stream in self.all_streams()? {
+            if let Some(s) = self.efficiency(&stream)? {
+                match &mut acc {
+                    Some(a) => a.merge(&s),
+                    None => acc = Some(s),
+                }
+            }
+        }
+        Ok(acc)
+    }
+
     /// Every session id (`s_<n>`), oldest first — the unfiltered enumeration primitive
     /// [`cost_summary_all`](Self::cost_summary_all) folds over. Unlike [`list`](Self::list) (which
     /// truncates to a limit and orders by recency for display), this returns everything.

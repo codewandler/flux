@@ -18,5 +18,8 @@ pub use content::{ContentBlock, ImageSource, Role, ToolResultContent};
 pub use error::{Error, Result};
 pub use event::Event;
 pub use message::Message;
-pub use pricing::{is_subscription, Money, PricingTable, RateOverride, Rates};
+pub use pricing::{
+    canonical_model_parts, canonical_model_spec, is_subscription, Money, PricingTable,
+    RateOverride, Rates,
+};
 pub use stream::{Chunk, StopReason, Usage};
