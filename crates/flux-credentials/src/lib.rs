@@ -4,7 +4,7 @@
 //! Provides OAuth token sources for the subscription providers (`claude`, `codex`): a refreshing
 //! [`TokenSource`] backed by a 0600 token store, with import from the official CLIs'
 //! credential files (`~/.claude/.credentials.json`, `~/.codex/auth.json`) as the primary
-//! acquisition path and PKCE login (`flux auth login claude`) as the alternative.
+//! acquisition path and PKCE login (`flux auth login claude|codex`) as the alternative.
 //!
 //! Constants and flows mirror the user's Go implementations (`coder/internal/oauth`,
 //! `llm/provider/codex/auth.go`).
@@ -27,9 +27,25 @@ const ANTHROPIC_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token"
 const ANTHROPIC_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
 const ANTHROPIC_SCOPE: &str = "org:create_api_key user:profile user:inference";
 
-// --- Codex OAuth constants (← llm/provider/codex/auth.go) ------------------
+// --- Codex OAuth constants (← llm/provider/codex/auth.go; authorize/redirect verified against
+// the upstream codex CLI, openai/codex `codex-rs/login/src/server.rs`: DEFAULT_ISSUER
+// "https://auth.openai.com", DEFAULT_PORT 1455, redirect "http://localhost:{port}/auth/callback",
+// form-encoded `authorization_code` exchange against "{issuer}/oauth/token") -------------------
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+/// Codex token endpoint. Public so the CLI login flow can name the production endpoint explicitly
+/// where its hermetic test substitutes a stub (see [`codex_exchange_and_store_at`]).
+pub const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const CODEX_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
+/// The local callback the codex client is registered for: the upstream CLI binds
+/// `localhost:1455` and receives the redirect at `/auth/callback` — flux's login mirrors it.
+/// Public so `flux auth login codex` derives its callback listener from the same source of truth.
+pub const CODEX_REDIRECT_PORT: u16 = 1455;
+/// Path component of [`CODEX_REDIRECT_URI`] (see [`CODEX_REDIRECT_PORT`]).
+pub const CODEX_REDIRECT_PATH: &str = "/auth/callback";
+const CODEX_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
+/// The core OIDC scope set. Upstream additionally requests `api.connectors.read` /
+/// `api.connectors.invoke`; flux doesn't use connectors, so it asks for the least it needs.
+const CODEX_SCOPE: &str = "openid profile email offline_access";
 
 const REFRESH_BUFFER_MS: i64 = 5 * 60 * 1000;
 
@@ -317,10 +333,12 @@ pub fn import_codex() -> Option<OAuthToken> {
 // ---------------------------------------------------------------------------
 
 /// The result of a refresh: a new access token + (possibly rotated) refresh token + expiry.
+/// `id_token` is only present on codex responses; its claims carry the ChatGPT account id.
 struct Refreshed {
     access: String,
     refresh: Option<String>,
     expires_at_ms: Option<i64>,
+    id_token: Option<String>,
 }
 
 #[async_trait]
@@ -336,6 +354,9 @@ struct TokenResp {
     refresh_token: Option<String>,
     #[serde(default)]
     expires_in: Option<i64>,
+    /// OIDC id token (codex responses); the ChatGPT account id lives in its claims.
+    #[serde(default)]
+    id_token: Option<String>,
     #[serde(default)]
     error: Option<String>,
     #[serde(default)]
@@ -363,6 +384,7 @@ impl TokenResp {
             access: self.access_token,
             refresh: self.refresh_token,
             expires_at_ms,
+            id_token: self.id_token,
         })
     }
 }
@@ -535,7 +557,7 @@ pub fn claude_token_source() -> Result<Arc<dyn TokenSource>> {
 pub fn codex_token_source() -> Result<Arc<dyn TokenSource>> {
     let token = load_stored("codex").or_else(import_codex).ok_or_else(|| {
         Error::Auth(
-            "no Codex subscription credentials — log into the Codex CLI (`~/.codex/auth.json`)"
+            "no Codex subscription credentials — log into the Codex CLI, or run `flux auth login codex`"
                 .to_string(),
         )
     })?;
@@ -579,32 +601,21 @@ pub fn generate_state() -> String {
     b64().encode(buf)
 }
 
-/// Build the Anthropic authorization URL the user visits to approve flux.
-pub fn anthropic_authorize_url(pkce: &Pkce, state: &str) -> String {
-    let q = [
-        ("code", "true"),
-        ("client_id", ANTHROPIC_CLIENT_ID),
-        ("response_type", "code"),
-        ("redirect_uri", ANTHROPIC_REDIRECT_URI),
-        ("scope", ANTHROPIC_SCOPE),
-        ("code_challenge", &pkce.challenge),
-        ("code_challenge_method", "S256"),
-        ("state", state),
-    ];
+/// `base?k=v&…` with percent-encoded values.
+fn build_url(base: &str, q: &[(&str, &str)]) -> String {
     let qs = q
         .iter()
         .map(|(k, v)| format!("{k}={}", urlencode(v)))
         .collect::<Vec<_>>()
         .join("&");
-    format!("{ANTHROPIC_AUTHORIZE_URL}?{qs}")
+    format!("{base}?{qs}")
 }
 
-/// Exchange an authorization code (the user pastes the callback value) for tokens and persist
-/// them under the `claude` provider.
-pub async fn anthropic_exchange_and_store(code: &str, state: &str, verifier: &str) -> Result<()> {
-    // The callback value is pasted as `code#state`. When a state is present it MUST match the one
-    // we generated for this login — otherwise the user may have pasted an attacker-supplied code
-    // (OAuth login-CSRF / account injection). PKCE is the primary defense; this is the binding.
+/// Split a callback value of the shape `code[#state]` and enforce the CSRF state binding: when a
+/// state is present it MUST match the one we generated for this login — otherwise the code may be
+/// attacker-supplied (OAuth login-CSRF / account injection). PKCE is the primary defense; this is
+/// the binding. Returns the bare code. Runs **before** any network I/O in the exchange paths.
+fn bind_callback_state<'a>(code: &'a str, state: &str) -> Result<&'a str> {
     let (code, callback_state) = match code.split_once('#') {
         Some((c, s)) => (c.trim(), Some(s.trim())),
         None => (code.trim(), None),
@@ -618,6 +629,31 @@ pub async fn anthropic_exchange_and_store(code: &str, state: &str, verifier: &st
             ));
         }
     }
+    Ok(code)
+}
+
+/// Build the Anthropic authorization URL the user visits to approve flux.
+pub fn anthropic_authorize_url(pkce: &Pkce, state: &str) -> String {
+    build_url(
+        ANTHROPIC_AUTHORIZE_URL,
+        &[
+            ("code", "true"),
+            ("client_id", ANTHROPIC_CLIENT_ID),
+            ("response_type", "code"),
+            ("redirect_uri", ANTHROPIC_REDIRECT_URI),
+            ("scope", ANTHROPIC_SCOPE),
+            ("code_challenge", &pkce.challenge),
+            ("code_challenge_method", "S256"),
+            ("state", state),
+        ],
+    )
+}
+
+/// Exchange an authorization code (the user pastes the callback value) for tokens and persist
+/// them under the `claude` provider.
+pub async fn anthropic_exchange_and_store(code: &str, state: &str, verifier: &str) -> Result<()> {
+    // The callback value is pasted as `code#state`; enforce the CSRF binding before any network.
+    let code = bind_callback_state(code, state)?;
     let resp = reqwest::Client::new()
         .post(ANTHROPIC_TOKEN_URL)
         .json(&serde_json::json!({
@@ -639,6 +675,82 @@ pub async fn anthropic_exchange_and_store(code: &str, state: &str, verifier: &st
             refresh: refreshed.refresh,
             expires_at_ms: refreshed.expires_at_ms,
             account_id: None,
+        },
+    )
+}
+
+/// Build the Codex (ChatGPT subscription) authorization URL the user visits to approve flux.
+///
+/// Mirrors the upstream codex CLI's `build_authorize_url` (openai/codex,
+/// `codex-rs/login/src/server.rs`): same client id, the registered `localhost:1455` redirect,
+/// S256 PKCE, and the `id_token_add_organizations` / `codex_cli_simplified_flow` switches the CLI
+/// sets (the former puts the org/account claims in the id token, where flux reads the ChatGPT
+/// account id from). Scope is the core OIDC subset (see [`CODEX_SCOPE`]).
+pub fn codex_authorize_url(pkce: &Pkce, state: &str) -> String {
+    build_url(
+        CODEX_AUTHORIZE_URL,
+        &[
+            ("response_type", "code"),
+            ("client_id", CODEX_CLIENT_ID),
+            ("redirect_uri", CODEX_REDIRECT_URI),
+            ("scope", CODEX_SCOPE),
+            ("code_challenge", &pkce.challenge),
+            ("code_challenge_method", "S256"),
+            ("id_token_add_organizations", "true"),
+            ("codex_cli_simplified_flow", "true"),
+            ("state", state),
+        ],
+    )
+}
+
+/// Exchange a codex authorization code for tokens and persist them under the `codex` provider —
+/// the same store slot the `~/.codex/auth.json` import path fills, so everything downstream
+/// (`codex_token_source`, refresh) is shared.
+///
+/// `code` is the callback value, optionally suffixed `#state` (the login harness forwards the
+/// callback's `code#state`); a present state MUST match the `state` generated for this login —
+/// the same CSRF binding as the claude flow, enforced before any network I/O. The exchange itself
+/// mirrors the upstream codex CLI: a form-encoded `authorization_code` grant with the PKCE
+/// verifier, whose response carries an `id_token` with the ChatGPT account id in its claims.
+pub async fn codex_exchange_and_store(code: &str, state: &str, verifier: &str) -> Result<()> {
+    codex_exchange_and_store_at(CODEX_TOKEN_URL, code, state, verifier).await
+}
+
+/// [`codex_exchange_and_store`] against an explicit token endpoint — the seam hermetic login
+/// tests use to point the exchange at a loopback stub instead of auth.openai.com.
+pub async fn codex_exchange_and_store_at(
+    token_url: &str,
+    code: &str,
+    state: &str,
+    verifier: &str,
+) -> Result<()> {
+    let code = bind_callback_state(code, state)?;
+    let resp = reqwest::Client::new()
+        .post(token_url)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", CODEX_REDIRECT_URI),
+            ("client_id", CODEX_CLIENT_ID),
+            ("code_verifier", verifier),
+        ])
+        .send()
+        .await
+        .map_err(|e| Error::Http(e.to_string()))?;
+    let refreshed = parse_token_resp(resp).await?;
+    // The ChatGPT backend rejects requests without `chatgpt-account-id`; pull it from the
+    // id token's claims, exactly as the import path does.
+    let account_id = refreshed
+        .id_token
+        .as_deref()
+        .and_then(account_id_from_id_token);
+    save_stored(
+        "codex",
+        &OAuthToken {
+            access: refreshed.access,
+            refresh: refreshed.refresh,
+            expires_at_ms: refreshed.expires_at_ms,
+            account_id,
         },
     )
 }
@@ -817,6 +929,7 @@ mod tests {
             access_token: "tok".into(),
             refresh_token: Some("r".into()),
             expires_in: Some(3600),
+            id_token: None,
             error: None,
             error_description: None,
         }
@@ -835,6 +948,126 @@ mod tests {
                 .await;
         assert!(r.is_err());
         assert!(r.unwrap_err().to_string().contains("state mismatch"));
+    }
+
+    #[test]
+    fn codex_authorize_url_has_pkce_and_state() {
+        let p = Pkce {
+            verifier: "v".into(),
+            challenge: "chal".into(),
+        };
+        let url = codex_authorize_url(&p, "st8");
+        assert!(url.starts_with("https://auth.openai.com/oauth/authorize?"));
+        assert!(url.contains("code_challenge=chal"));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("state=st8"));
+        assert!(url.contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"));
+        // The redirect the codex CLI client is registered for: the localhost:1455 callback.
+        assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"));
+        assert!(url.contains("scope=openid%20profile%20email%20offline_access"));
+        assert!(url.contains("response_type=code"));
+    }
+
+    #[tokio::test]
+    async fn codex_oauth_rejects_state_mismatch_before_any_network() {
+        // A callback `code#state` whose state doesn't match the one we generated must abort the
+        // login (CSRF / wrong-session guard) — same binding as claude. The mismatch returns before
+        // any HTTP call: the real token endpoint is unreachable from this test, so anything but the
+        // pre-network state check would surface as a connection error, not this message.
+        let r = codex_exchange_and_store("attackercode#attackerstate", "my-real-state", "verifier")
+            .await;
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("state mismatch"));
+    }
+
+    /// Read one HTTP request off `sock` (headers + `Content-Length` body) and answer with a JSON
+    /// token response — a stub token endpoint for the exchange tests.
+    async fn serve_one_token_response(listener: tokio::net::TcpListener, body: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut req = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = sock.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            req.extend_from_slice(&tmp[..n]);
+            let text = String::from_utf8_lossy(&req);
+            if let Some(head_end) = text.find("\r\n\r\n") {
+                let content_length = text
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if req.len() >= head_end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        sock.write_all(resp.as_bytes()).await.unwrap();
+        String::from_utf8_lossy(&req).into_owned()
+    }
+
+    #[tokio::test]
+    // HOME must stay repointed across the exchange (save_stored writes ~/.flux); current-thread
+    // test runtime, so holding the std guard across await is safe (same pattern as the C-04 test).
+    #[allow(clippy::await_holding_lock)]
+    async fn codex_exchange_persists_under_codex_with_account_id() {
+        // Hermetic: a loopback stub stands in for auth.openai.com and HOME is a throwaway dir.
+        let tmp = std::env::temp_dir().join(format!(
+            "flux-cred-c08-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _home = HOME_LOCK.lock().unwrap();
+        std::env::set_var("HOME", &tmp);
+
+        // Token response whose id_token nests the ChatGPT account id, like real codex tokens.
+        let claims = br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_c08"}}"#;
+        let id_token = format!("h.{}.s", b64().encode(claims));
+        let body = serde_json::json!({
+            "access_token": "at_c08",
+            "refresh_token": "rt_c08",
+            "id_token": id_token,
+            "expires_in": 3600,
+        })
+        .to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_one_token_response(listener, body));
+
+        codex_exchange_and_store_at(
+            &format!("http://{addr}/oauth/token"),
+            "authcode#st8",
+            "st8",
+            "verifier-xyz",
+        )
+        .await
+        .unwrap();
+
+        // The exchange was a form-encoded PKCE authorization_code grant (upstream codex shape)...
+        let req = server.await.unwrap();
+        assert!(req.contains("grant_type=authorization_code"));
+        assert!(req.contains("code=authcode"));
+        assert!(req.contains("code_verifier=verifier-xyz"));
+        assert!(req.contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"));
+
+        // ...and the token landed under the `codex` provider — the same store import uses.
+        let stored = load_stored("codex").expect("token stored under `codex`");
+        std::fs::remove_dir_all(&tmp).ok();
+        assert_eq!(stored.access, "at_c08");
+        assert_eq!(stored.refresh.as_deref(), Some("rt_c08"));
+        assert_eq!(stored.account_id.as_deref(), Some("acct_c08"));
+        assert!(stored.expires_at_ms.unwrap() > now_ms());
     }
 
     #[test]
@@ -885,6 +1118,7 @@ input = 1.0
             access_token: String::new(),
             refresh_token: None,
             expires_in: None,
+            id_token: None,
             error: Some("invalid_grant".into()),
             error_description: Some("bad".into()),
         }
@@ -908,6 +1142,7 @@ input = 1.0
                 access: format!("fresh-{n}"),
                 refresh: Some("rotated".into()),
                 expires_at_ms: Some(now_ms() + 3_600_000),
+                id_token: None,
             })
         }
     }

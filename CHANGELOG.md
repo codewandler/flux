@@ -25,6 +25,17 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **`flux auth login codex` — flux-native PKCE login, claude parity (C-08).** The last open story
+  of the subscription epic: codex authentication no longer requires logging into the Codex CLI
+  first. The flow uses upstream-verified constants (`auth.openai.com/oauth/authorize`, the
+  registered `localhost:1455/auth/callback` redirect, `id_token_add_organizations=true` so the
+  ChatGPT account id rides the id_token claims) with a deliberately narrower scope than upstream
+  (connectors scopes dropped — least privilege, documented). CSRF state-binding is factored into
+  one helper shared with the claude flow and checked before any network I/O; the exchange
+  persists under the `codex` provider exactly like the import path, which remains the default.
+  All hermetic (stub token endpoint, injected callback); a manual live login smoke is the
+  recorded residual.
+
 - **flux-lang v1 residual burn-down (L-21).** The four residuals the hardening epic recorded at
   close are gone: (1) suspensions persist the flow name (guarded migration), so a *named* flow
   resumed through the engine derives the same name+hash checkpoint key as its run — edited flows

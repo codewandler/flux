@@ -388,7 +388,7 @@ enum LoopAction {
 enum AuthAction {
     /// Show which providers are configured (the default).
     Status,
-    /// Log in to a provider (currently `claude`).
+    /// Log in to a provider (`claude` or `codex`).
     Login {
         /// Provider to log in to.
         provider: String,
@@ -5476,10 +5476,8 @@ async fn run_auth(action: Option<AuthAction>) -> Result<()> {
         }
         AuthAction::Login { provider } => match provider.as_str() {
             "claude" => login_claude().await,
-            "codex" => bail!(
-                "codex login: sign in with the Codex CLI — flux imports `~/.codex/auth.json` automatically"
-            ),
-            other => bail!("`flux auth login` expects `claude` (got `{other}`)"),
+            "codex" => login_codex().await,
+            other => bail!("`flux auth login` expects `claude` or `codex` (got `{other}`)"),
         },
     }
 }
@@ -5501,6 +5499,136 @@ async fn login_claude() -> Result<()> {
         .context("exchange authorization code")?;
     println!("\u{2713} stored Claude subscription credentials in ~/.flux/credentials.toml");
     Ok(())
+}
+
+/// Interactive Codex (ChatGPT subscription) PKCE login. Unlike claude's paste-the-code flow, the
+/// codex client's registered redirect is `http://localhost:1455/auth/callback` (the upstream codex
+/// CLI's pattern), so flux listens there and the code arrives without pasting.
+async fn login_codex() -> Result<()> {
+    codex_login_flow(flux_credentials::CODEX_TOKEN_URL, |url, _state| async move {
+        println!(
+            "Open this URL and approve access — flux is listening on localhost:{} for the redirect:\n\n{url}\n",
+            flux_credentials::CODEX_REDIRECT_PORT
+        );
+        wait_for_codex_callback().await
+    })
+    .await?;
+    println!("\u{2713} stored Codex subscription credentials in ~/.flux/credentials.toml");
+    Ok(())
+}
+
+/// Drive the codex PKCE login: generate the PKCE pair + CSRF state, hand the authorize URL (and
+/// the state, for test injection) to `callback`, then exchange the returned `code#state` against
+/// `token_url` and persist under the `codex` provider. The interactive path passes the real token
+/// endpoint + the localhost:1455 listener; the hermetic test passes a loopback stub + a canned
+/// callback (no browser, no network).
+async fn codex_login_flow<F, Fut>(token_url: &str, callback: F) -> Result<()>
+where
+    F: FnOnce(String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    let pkce = flux_credentials::generate_pkce();
+    let state = flux_credentials::generate_state();
+    let url = flux_credentials::codex_authorize_url(&pkce, &state);
+    let code = callback(url, state.clone()).await?;
+    flux_credentials::codex_exchange_and_store_at(token_url, &code, &state, &pkce.verifier)
+        .await
+        .context("exchange authorization code")
+}
+
+/// Bind the codex client's registered redirect address (`localhost:1455`) and wait for the OAuth
+/// redirect, answering the browser with a small confirmation page. Non-callback requests (e.g.
+/// `/favicon.ico`) get a 404 and the wait continues. Returns the callback as `code#state` — the
+/// shape `codex_exchange_and_store` binds against the login's CSRF state.
+async fn wait_for_codex_callback() -> Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener =
+        tokio::net::TcpListener::bind(("127.0.0.1", flux_credentials::CODEX_REDIRECT_PORT))
+            .await
+            .with_context(|| {
+                format!(
+            "bind localhost:{} for the OAuth callback (is another login or the codex CLI running?)",
+            flux_credentials::CODEX_REDIRECT_PORT
+        )
+            })?;
+    loop {
+        let (mut sock, _) = listener.accept().await.context("accept OAuth callback")?;
+        // The callback is a small GET; one read is enough for the request line we parse.
+        let mut buf = vec![0u8; 8192];
+        let n = sock.read(&mut buf).await.unwrap_or(0);
+        let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+        // "GET <target> HTTP/1.1" — take the target.
+        let target = req.split_whitespace().nth(1).unwrap_or("");
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        if path != flux_credentials::CODEX_REDIRECT_PATH {
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            continue;
+        }
+        let result = parse_codex_callback(query);
+        let page = match &result {
+            Ok(_) => "Login complete — you can return to the terminal.",
+            Err(_) => "Login failed — see the terminal for details.",
+        };
+        let body = format!("<!doctype html><html><body><p>{page}</p></body></html>");
+        let _ = sock
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await;
+        let (code, state) = result?;
+        return Ok(format!("{code}#{state}"));
+    }
+}
+
+/// Extract `code`/`state` (or the provider's `error`) from the OAuth callback query string.
+fn parse_codex_callback(query: &str) -> Result<(String, String)> {
+    let (mut code, mut state, mut error) = (None, None, None);
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        let v = percent_decode(v);
+        match k {
+            "code" => code = Some(v),
+            "state" => state = Some(v),
+            "error" => error = Some(v),
+            _ => {}
+        }
+    }
+    if let Some(e) = error {
+        bail!("authorization failed: {e}");
+    }
+    match (code, state) {
+        (Some(c), Some(s)) if !c.is_empty() => Ok((c, s)),
+        _ => bail!("OAuth callback did not include an authorization code and state"),
+    }
+}
+
+/// Minimal percent-decoding for OAuth callback query values (`+` is left as-is — codes and states
+/// are URL-safe base64, never space-bearing).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Run a one-shot prompt turn.
@@ -5559,6 +5687,98 @@ mod tests {
         use flux_provider::Provider as _;
         let p = super::LazyProvider::new("anthropic/claude-sonnet-4-6".to_string());
         assert_eq!(p.name(), "anthropic");
+    }
+
+    /// C-08: `flux auth login codex` drives a full PKCE flow — authorize URL with challenge+state,
+    /// callback code exchanged (form-encoded `authorization_code` grant with the verifier), token
+    /// persisted under the `codex` provider. Hermetic: a loopback stub stands in for
+    /// auth.openai.com's token endpoint and the callback is injected (no browser, no port 1455).
+    /// Serialized implicitly: the only flux-cli test that repoints HOME (the store is ~/.flux).
+    #[tokio::test]
+    async fn auth_login_codex_runs_pkce_flow() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let home = std::env::temp_dir().join(format!("flux-login-codex-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("HOME", &home);
+
+        // Stub token endpoint: answers one POST with a token response, captures the request.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&tmp[..n]);
+                let text = String::from_utf8_lossy(&req);
+                if let Some(head_end) = text.find("\r\n\r\n") {
+                    let len = text
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if req.len() >= head_end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let body =
+                r#"{"access_token":"at_cli_c08","refresh_token":"rt_cli_c08","expires_in":3600}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&req).into_owned()
+        });
+
+        // Injected callback: assert the authorize URL carries PKCE + this login's state, then
+        // return the `code#state` shape the real localhost:1455 listener produces.
+        super::codex_login_flow(
+            &format!("http://{addr}/oauth/token"),
+            |url, state| async move {
+                assert!(url.starts_with("https://auth.openai.com/oauth/authorize?"));
+                assert!(url.contains("code_challenge="));
+                assert!(url.contains("code_challenge_method=S256"));
+                assert!(url.contains(&format!("state={state}")));
+                Ok(format!("cli-test-code#{state}"))
+            },
+        )
+        .await
+        .expect("login flow completes against the stub endpoint");
+
+        // The exchange was a PKCE authorization_code grant…
+        let req = server.await.unwrap();
+        assert!(req.contains("grant_type=authorization_code"));
+        assert!(req.contains("code=cli-test-code"));
+        assert!(req.contains("code_verifier="));
+
+        // …and the token landed under the `codex` provider, in the same store import fills.
+        let store = std::fs::read_to_string(home.join(".flux").join("credentials.toml")).unwrap();
+        std::fs::remove_dir_all(&home).ok();
+        assert!(store.contains("[codex]"), "stored under `codex`: {store}");
+        assert!(store.contains("at_cli_c08"));
+    }
+
+    /// C-08: the OAuth callback parser — happy path, provider error, and junk.
+    #[test]
+    fn parse_codex_callback_extracts_code_and_state() {
+        let (code, state) =
+            super::parse_codex_callback("code=abc%2F123&state=st8&scope=openid").unwrap();
+        assert_eq!(code, "abc/123");
+        assert_eq!(state, "st8");
+        let err = super::parse_codex_callback("error=access_denied&state=st8").unwrap_err();
+        assert!(err.to_string().contains("access_denied"));
+        assert!(super::parse_codex_callback("foo=bar").is_err());
     }
 
     /// `build_datasources` walks a `markdown` datasource's directory and ingests its docs into a shared

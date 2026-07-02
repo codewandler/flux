@@ -35,10 +35,6 @@ _flux's plugins each talk to a single, statically-configured service. The fluxpl
 ### Plugin Platform Hardening
 - [D-21 — Plugin distribution for non-source users (scoping)](D-21-plugin-distribution.md) · Core · scoping/epic-seed: how a non-repo user obtains the pack (bundled binaries / fetch-on-install / marketplace); produces a design + the follow-on stories, no code
 
-### subscription providers (claude-code + codex) & cross-provider usage/cost
-_flux can already drive the two **subscription / passthrough** model backends — `claude` (Claude_
-- [C-08 — Full OAuth2 login — codex PKCE (+ claude parity)](C-08-full-oauth2-login.md) · Core · the last open story of the subscription epic (C-03..C-07 done) — flux-native codex PKCE login to parity with claude; import + refresh remain the default path
-
 ## Blocked
 _None._
 
@@ -64,6 +60,7 @@ _None._
 - [C-05 — Cross-provider pricing & cost model](C-05-pricing-cost-model.md) · Core · per-model per-tier rates + `cost(&Usage, model)`; built-in table + `~/.flux/pricing.toml` override; normalize codecs' cache fields
 - [C-06 — Usage & cost accounting — attribution, aggregation, reporting](C-06-usage-cost-accounting.md) · Core · model attribution + sub-agent rollup + a `cost_summary` projection + `flux usage` + a server endpoint + cache-aware surfacing (needs C-05)
 - [C-07 — Codex WebSocket transport (default, HTTP fallback)](C-07-codex-websocket-transport.md) · Core · WS is now the default codex transport — a provider-level StreamTransport seam tried before HTTP, tungstenite handshake carrying the shared codex headers, frames re-enveloped through the SAME Responses codec (chunk-identity by construction), transparent connect-time fallback to HTTP-SSE (incl. 1008 policy close); all hermetic, live smoke remains the WS-contract check
+- [C-08 — Full OAuth2 login — codex PKCE (+ claude parity)](C-08-full-oauth2-login.md) · Core · flux auth login codex now runs a real PKCE flow — upstream-verified constants (auth.openai.com/oauth/authorize, localhost:1455/auth/callback, id_token_add_organizations for the account id), CSRF state-binding shared with claude and checked BEFORE any network IO, least-privilege scope (connectors scopes deliberately dropped), account_id from id_token claims like the import path; import stays the default
 - [C-09 — AWS Bedrock LLM provider](C-09-aws-bedrock-provider.md) · Core · fully functional e2e — streaming `invoke-with-response-stream` (AWS event-stream deframer → shared SSE mapper, non-streaming path deleted), hand-rolled L1 credential chain (env → SSO w/ OIDC refresh → IRSA → EKS Pod Identity, no `aws` CLI), SigV4, region-aware model resolution, region-less pricing; live-verified streaming + tool-use + haiku `global.` profile with cost suffixes
 - [C-10 — Structured op outputs — list-producing ops return arrays, not joined strings](C-10-structured-op-outputs.md) · Core · FIXED — glob binds a JSON-array value (readable joined view preserved); `each` sources and `merge` elements re-parse JSON-array strings (the store's JSON-as-string form); array values summarize by shape (`list (N): …`); the originally-failing glob→merge plan replays green
 - [C-11 — Uniform provider construction across subcommands (lazy for deterministic flows; aws chain everywhere)](C-11-uniform-provider-wiring.md) · Core · FIXED — build_provider owns the aws chain (sync-callable ensure_aws_chain), so review/-m aws, /model, sub-agent factory all work; flow run + preset --run use a LazyProvider that constructs on the first model call; live-verified: credential-less replay (28ms) + flux review -m aws (full Bedrock report)
