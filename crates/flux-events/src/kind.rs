@@ -42,12 +42,20 @@ pub enum EventKind {
     /// turn's [`EventKind::PlanAttempted`] / [`EventKind::TurnEnded`] events.
     TurnStarted { user_input: String, model: String },
     /// One planning attempt within a turn. `outcome` is one of `"accepted"`, `"chat"`,
-    /// `"compile_error"`; `error` carries the diagnostic when it is `"compile_error"`.
+    /// `"compile_error"`, `"rejected"` (the user declined the plan); `error` carries the diagnostic
+    /// when it is `"compile_error"`. For an accepted plan, `fingerprint` is the SHA-256 of the plan
+    /// AST's canonical JSON (the loop guard's identity) and `plan_text` is the human-auditable
+    /// rendered graph (`render_pretty`, capped) — the durable "a turn is a readable graph" record
+    /// (C-14). Both `#[serde(default)]` so pre-C-14 logs decode.
     PlanAttempted {
         step: u32,
         outcome: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fingerprint: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_text: Option<String>,
     },
     /// A turn closed with its final `outcome`, iteration count, and assistant `answer`. `usage` is
     /// the turn's accumulated token tally — `None` for turns recorded before usage capture, or when
@@ -100,6 +108,14 @@ pub enum EventKind {
         provider: String,
         count: usize,
     },
+
+    /// One evidence observation (`tool_call` markers, `turn.iteration`, `groups.active`,
+    /// `skill.activated`, flow-emitted `observe(…)`, …), persisted from the in-memory
+    /// `EvidenceLog` by the engine's per-turn watermark flush (C-14). This is what makes the
+    /// `/evidence` trail durable — the in-memory log stays the live read model; the event log is
+    /// the offline one (`projection::observations`). The inner type is reused verbatim from
+    /// `flux-evidence` (L0), never re-defined.
+    Observation(flux_evidence::Observation),
 }
 
 impl EventKind {
@@ -119,6 +135,7 @@ impl EventKind {
             EventKind::PrivateNetAdmit { .. } => "private_net_admit",
             EventKind::CrossPluginResolve { .. } => "cross_plugin_resolve",
             EventKind::EndpointDiscovered { .. } => "endpoint_discovered",
+            EventKind::Observation(_) => "observation",
         }
     }
 }

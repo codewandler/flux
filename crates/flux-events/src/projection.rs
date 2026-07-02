@@ -43,12 +43,20 @@ pub fn run_trace(events: &[StoredEvent]) -> Vec<RunEvent> {
         .collect()
 }
 
-/// One planning attempt within a turn (the old `plan_attempts` row).
-#[derive(Debug, Clone, PartialEq)]
+/// One planning attempt within a turn (the old `plan_attempts` row). Also the WRITE shape
+/// [`EventStore::record_plan_attempt`](crate::EventStore::record_plan_attempt) takes — one struct,
+/// no field drift between what is recorded and what the fold reads back.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PlanAttempt {
     pub step: u32,
     pub outcome: String,
     pub error: Option<String>,
+    /// SHA-256 of the accepted plan AST's canonical JSON (the loop guard's identity) — `None` for
+    /// non-plan outcomes and pre-C-14 logs.
+    pub fingerprint: Option<String>,
+    /// The human-auditable rendered plan graph (`render_pretty`, capped) — the durable "a turn is a
+    /// readable graph" record. `None` for non-plan outcomes and pre-C-14 logs.
+    pub plan_text: Option<String>,
 }
 
 /// A turn's telemetry, folded from its `TurnStarted` / `PlanAttempted` / `TurnEnded`
@@ -96,12 +104,16 @@ pub fn turns(events: &[StoredEvent]) -> Vec<TurnSummary> {
                 step,
                 outcome,
                 error,
+                fingerprint,
+                plan_text,
             } => {
                 if let Some(t) = e.turn_id.and_then(|tid| by_turn.get_mut(&tid)) {
                     t.plan_attempts.push(PlanAttempt {
                         step: *step,
                         outcome: outcome.clone(),
                         error: error.clone(),
+                        fingerprint: fingerprint.clone(),
+                        plan_text: plan_text.clone(),
                     });
                 }
             }
@@ -123,6 +135,20 @@ pub fn turns(events: &[StoredEvent]) -> Vec<TurnSummary> {
         }
     }
     by_turn.into_values().collect()
+}
+
+/// The durable evidence trail: every persisted observation, in stream order (C-14). This is the
+/// offline/programmatic read of what `/evidence` shows live from the in-memory log — plan the
+/// `tool_call` markers, `turn.iteration` rounds, `groups.active` (+ signals), skill activations,
+/// and flow-emitted `observe(…)` records land here via the engine's per-turn watermark flush.
+pub fn observations(events: &[StoredEvent]) -> Vec<flux_evidence::Observation> {
+    events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::Observation(o) => Some(o.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// One model's rolled-up token spend + cost — a row of [`cost_summary`].
@@ -347,6 +373,8 @@ mod tests {
                     step: 0,
                     outcome: "compile_error".into(),
                     error: Some("boom".into()),
+                    fingerprint: None,
+                    plan_text: None,
                 },
             ),
             ev(
@@ -357,6 +385,8 @@ mod tests {
                     step: 1,
                     outcome: "accepted".into(),
                     error: None,
+                    fingerprint: Some("abc123".into()),
+                    plan_text: Some("$x = read(\"a\")".into()),
                 },
             ),
             ev(

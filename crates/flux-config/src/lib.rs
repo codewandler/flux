@@ -376,6 +376,11 @@ pub fn merge_groups(
     out
 }
 
+/// Serializes the tests that repoint `HOME` — the process env is shared across parallel test
+/// threads, so two concurrent `set_var("HOME", …)` tests race and flake.
+#[cfg(test)]
+static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod groups_tests {
     use super::*;
@@ -399,6 +404,7 @@ surface_when = [{ kind = "project.signal", signal = "custom" }]
         )
         .unwrap();
         // HOME points elsewhere so only the project file is read.
+        let _home = crate::HOME_LOCK.lock().unwrap();
         std::env::set_var("HOME", dir.join("nohome"));
         let cfg = load_groups(&dir);
         assert!(cfg
@@ -566,6 +572,7 @@ actions = ["workspace.read"]
     fn scoped_private_net_grants_parse_and_merge() {
         let project = temp_dir();
         let home = temp_dir();
+        let _home = crate::HOME_LOCK.lock().unwrap();
         std::env::set_var("HOME", &home);
         std::fs::write(
             home.join(".flux").join("config.toml"),
@@ -611,6 +618,7 @@ gitlab = true
     fn per_endpoint_grant_merges_with_plugin_level() {
         let project = temp_dir();
         let home = temp_dir();
+        let _home = crate::HOME_LOCK.lock().unwrap();
         std::env::set_var("HOME", &home);
         write_project(
             &project,

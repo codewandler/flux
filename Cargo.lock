@@ -1008,6 +1008,7 @@ name = "flux-events"
 version = "0.2.7"
 dependencies = [
  "flux-core",
+ "flux-evidence",
  "flux-lang",
  "rusqlite",
  "serde",

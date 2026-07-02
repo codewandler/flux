@@ -2019,6 +2019,7 @@ pub(crate) async fn run_draft_ast_with_composites(
         Some(engine.system_prompt.clone()),
         shared.clone(),
         None,
+        None,
     );
 
     let mut sink = flux_flow::loop_host::SharedSink::new(shared.clone());

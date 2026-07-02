@@ -68,6 +68,11 @@ pub struct FlowEngine {
     pub groups: Vec<flux_evidence::ToolGroup>,
     /// Workspace root, re-probed each turn for the surfacing signals above.
     pub cwd: std::path::PathBuf,
+    /// How many in-memory evidence observations have been flushed to the event store so far — the
+    /// per-turn watermark [`flush_observations`](Self::flush_observations) advances (C-14). The
+    /// executor's log is append-only and shared across this engine's turns, so a plain high-water
+    /// mark attributes each tail to the turn that just ended.
+    evidence_flushed: std::sync::atomic::AtomicUsize,
 }
 
 impl FlowEngine {
@@ -132,6 +137,7 @@ impl FlowEngine {
             compact_threshold_chars,
             groups,
             cwd,
+            evidence_flushed: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -196,6 +202,7 @@ impl FlowEngine {
             Some(base_system),
             channel.clone(),
             Some(advertised),
+            Some((self.events.clone(), turn_id)),
         );
         // Thread this turn's cancellation into the tool context so a spawning tool (`task`) can hand a
         // child token to its sub-agent — cancelling the parent turn then cancels the child.
@@ -233,7 +240,7 @@ impl FlowEngine {
                     self.record_call_usage_events(session_id, turn_id, &subagent_calls);
                     let usage = self.turn_usage(&subagent_calls);
                     let _ = self.events.end_turn(session_id, turn_id, "cancelled", 0, "(turn cancelled)", usage.clone());
-                    return self.finish_turn(session_id, sink, "(turn cancelled)", true, usage);
+                    return self.finish_turn(session_id, turn_id, sink, "(turn cancelled)", true, usage);
                 }
                 maybe = rx.recv() => {
                     if let Some(ev) = maybe { drain_event(ev, sink, reveal); }
@@ -279,7 +286,7 @@ impl FlowEngine {
         let _ = self
             .events
             .end_turn(session_id, turn_id, tag, iterations, &answer, usage.clone());
-        self.finish_turn(session_id, sink, &answer, false, usage)
+        self.finish_turn(session_id, turn_id, sink, &answer, false, usage)
     }
 
     /// Compile a single instruction into a [`TurnOutput`] using this engine's full catalog + current
@@ -437,9 +444,9 @@ impl FlowEngine {
         let composites = session_id
             .map(|sid| self.composites.active_for_session(sid))
             .unwrap_or_default();
-        let (advertised, active) = surfaced_op_names(reg, &self.groups, &self.cwd);
-        if let (Some(sink), Some(active)) = (sink, active.as_ref()) {
-            self.record_active_groups(active, sink);
+        let (advertised, surfaced) = surfaced_op_names(reg, &self.groups, &self.cwd);
+        if let (Some(sink), Some(surfaced)) = (sink, surfaced.as_ref()) {
+            self.record_active_groups(surfaced, sink);
         }
         OpRegistry::new(reg)
             .with_owned_composites(composites)
@@ -452,27 +459,26 @@ impl FlowEngine {
     /// advertised every turn and the opt-in `shell` group gated nothing. Records the `groups.active`
     /// observation when gating is on.
     fn surfaced_for_turn(&self, sink: &mut dyn AgentSink) -> std::collections::HashSet<String> {
-        let (advertised, active) =
+        let (advertised, surfaced) =
             surfaced_op_names(self.executor.registry(), &self.groups, &self.cwd);
-        if let Some(active) = active.as_ref() {
-            self.record_active_groups(active, sink);
+        if let Some(surfaced) = surfaced.as_ref() {
+            self.record_active_groups(surfaced, sink);
         }
         advertised
     }
 
-    /// Record (audit + surface) which evidence-gated groups are active this turn, so the user can see
-    /// what the workspace surfaced. Mirrors the skill-activation observation pattern.
-    fn record_active_groups(
-        &self,
-        active: &std::collections::HashSet<String>,
-        sink: &mut dyn AgentSink,
-    ) {
-        let mut names: Vec<&str> = active.iter().map(String::as_str).collect();
+    /// Record (audit + surface) which evidence-gated groups are active this turn — and which
+    /// workspace signals justified them (C-14 provenance) — so the user can see what the workspace
+    /// surfaced and why. Mirrors the skill-activation observation pattern.
+    fn record_active_groups(&self, surfaced: &SurfacedGroups, sink: &mut dyn AgentSink) {
+        let mut names: Vec<&str> = surfaced.active.iter().map(String::as_str).collect();
         names.sort_unstable();
+        let mut signals: Vec<&str> = surfaced.signals.iter().map(String::as_str).collect();
+        signals.sort_unstable();
         let obs = flux_evidence::Observation::new(
             "groups.active",
             flux_evidence::Phase::Turn,
-            serde_json::json!({ "groups": names }),
+            serde_json::json!({ "groups": names, "signals": signals }),
         );
         self.executor.observe(obs.clone());
         sink.observation(&obs);
@@ -505,9 +511,12 @@ impl FlowEngine {
     /// Persist the single assistant message for this turn (keeping the `user → assistant` session
     /// shape) and end the turn. `cancelled` records the audit observation. `usage` is this turn's
     /// token tally (the planner calls summed), surfaced to the sink for the turn-end annotation.
+    /// Both termination paths (completion + cancel) come through here, which is what makes the
+    /// evidence flush below turn-complete.
     fn finish_turn(
         &self,
         session_id: &str,
+        turn_id: i64,
         sink: &mut dyn AgentSink,
         answer: &str,
         cancelled: bool,
@@ -522,6 +531,11 @@ impl FlowEngine {
             self.executor.observe(obs.clone());
             sink.observation(&obs);
         }
+        // Durable evidence (C-14): flush everything the in-memory log gained since the last flush
+        // to the event store, batched per turn (a crash mid-turn loses at most that turn's batch —
+        // turn-granular audit is the goal, not crash forensics). The first flush starts at
+        // watermark 0, so startup observations land too.
+        self.flush_observations(session_id, turn_id);
         self.composites.clear_turn(session_id);
         self.events.record_message(
             session_id,
@@ -531,6 +545,24 @@ impl FlowEngine {
         )?;
         sink.turn_end(usage);
         Ok(())
+    }
+
+    /// Persist the in-memory evidence log's tail (`[watermark..]`) as `EventKind::Observation`
+    /// events on the session stream, then advance the watermark. Non-fatal — audit writes never
+    /// fail a turn. The in-memory log stays the live `/evidence` read model; this is its durable
+    /// mirror (`projection::observations`).
+    fn flush_observations(&self, session_id: &str, turn_id: i64) {
+        let log = self.executor.evidence();
+        let all = log.all();
+        let start = self
+            .evidence_flushed
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .min(all.len());
+        for obs in &all[start..] {
+            let _ = self.events.record_observation(session_id, turn_id, obs);
+        }
+        self.evidence_flushed
+            .store(all.len(), std::sync::atomic::Ordering::SeqCst);
     }
 
     /// This turn's token tally, as an `Option` for the sink: `None` when nothing was billed (e.g. an
@@ -643,7 +675,7 @@ impl FlowEngine {
             Err(e) => {
                 let msg = format!("The resumed flow failed — {e}");
                 sink.text_delta(&msg);
-                return self.finish_turn(session_id, sink, &msg, true, None);
+                return self.finish_turn(session_id, -1, sink, &msg, true, None);
             }
         };
 
@@ -653,7 +685,7 @@ impl FlowEngine {
                 .save_suspension(session_id, &body, susp.node, &susp.source)?;
             let hint = "(awaiting your input — reply to continue the flow)";
             sink.text_delta(hint);
-            return self.finish_turn(session_id, sink, hint, false, None);
+            return self.finish_turn(session_id, -1, sink, hint, false, None);
         }
 
         // Completed: the flow's own output is the answer (a model-grounded summary is a later refinement).
@@ -663,7 +695,7 @@ impl FlowEngine {
             format!("Resumed and completed ({} step(s)).", outcome.steps)
         };
         sink.text_delta(&answer);
-        self.finish_turn(session_id, sink, &answer, false, None)
+        self.finish_turn(session_id, -1, sink, &answer, false, None)
     }
 
     /// If the session has grown past `compact_threshold_chars`, summarize everything but the most
@@ -782,10 +814,7 @@ pub(crate) fn surfaced_op_names(
     reg: &flux_runtime::ToolRegistry,
     groups: &[flux_evidence::ToolGroup],
     cwd: &std::path::Path,
-) -> (
-    std::collections::HashSet<String>,
-    Option<std::collections::HashSet<String>>,
-) {
+) -> (std::collections::HashSet<String>, Option<SurfacedGroups>) {
     if groups.is_empty() {
         let advertised = reg
             .specs()
@@ -798,7 +827,27 @@ pub(crate) fn surfaced_op_names(
     let signals = flux_runtime::detect_signals(cwd);
     let active = flux_evidence::resolve_active_groups(groups, &signals);
     let advertised = flux_runtime::advertised_op_names(&reg.specs(), groups, &active);
-    (advertised, Some(active))
+    // Keep the signal NAMES alongside the resolved groups — the `groups.active` observation
+    // records both, so the audit trail says not just which groups surfaced but WHY (C-14).
+    let signal_names = signals
+        .iter()
+        .filter_map(|o| o.data.get("signal").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect();
+    (
+        advertised,
+        Some(SurfacedGroups {
+            active,
+            signals: signal_names,
+        }),
+    )
+}
+
+/// The resolved evidence-gated groups for a turn plus the workspace signals that justified them —
+/// the signal→group provenance the `groups.active` observation records (C-14).
+pub(crate) struct SurfacedGroups {
+    pub active: std::collections::HashSet<String>,
+    pub signals: Vec<String>,
 }
 
 /// The compiled-in default agent loop, as readable Flux-Lang text. This is the loop every turn runs
@@ -1092,6 +1141,14 @@ mod tests {
     }
 
     fn engine_with_provider(provider: Box<dyn Provider>, events: Arc<EventStore>) -> FlowEngine {
+        engine_with_groups(provider, events, Vec::new())
+    }
+
+    fn engine_with_groups(
+        provider: Box<dyn Provider>,
+        events: Arc<EventStore>,
+        groups: Vec<flux_evidence::ToolGroup>,
+    ) -> FlowEngine {
         let dir = std::env::temp_dir().join(format!(
             "flux-flow-engine-{}-{}",
             std::process::id(),
@@ -1132,7 +1189,7 @@ mod tests {
             5,
             Vec::new(),
             0,
-            Vec::new(),
+            groups,
             dir,
         )
         .unwrap()
@@ -1527,6 +1584,124 @@ mod tests {
         );
         let msgs = store.conversation(&sid).unwrap();
         assert!(msgs[1].text().contains("done after skip"));
+    }
+
+    /// C-14: the in-memory evidence trail is flushed to the durable event store at turn end — the
+    /// `tool_call` markers and `turn.iteration` rounds survive process exit.
+    #[tokio::test]
+    async fn turn_evidence_persists_to_event_store() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let plan_ast = json!({
+            "body": [{
+                "kind": "bind", "name": "greeting",
+                "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "hi" }] }
+            }]
+        });
+        let responses = VecDeque::from(vec![emit_plan(plan_ast), prose("done")]);
+        let engine = engine_with(responses, store.clone());
+        let mut sink = CollectSink::default();
+        engine.run_turn(&sid, "echo hi", &mut sink).await.unwrap();
+
+        let obs = store.observations(&sid).unwrap();
+        assert!(
+            obs.iter().any(|o| o.kind == "tool_call"),
+            "the dispatcher's tool_call markers persist: {:?}",
+            obs.iter().map(|o| &o.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            obs.iter().any(|o| o.kind == "turn.iteration"),
+            "the loop's turn.iteration observations persist"
+        );
+    }
+
+    /// C-14: every planning attempt lands durably — the accepted plan with its AST fingerprint and
+    /// the human-readable rendered graph, and the closing chat round.
+    #[tokio::test]
+    async fn plan_attempts_recorded_with_fingerprint_and_text() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let plan_ast = json!({
+            "body": [{
+                "kind": "bind", "name": "greeting",
+                "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "hi" }] }
+            }]
+        });
+        let responses = VecDeque::from(vec![emit_plan(plan_ast), prose("done")]);
+        let engine = engine_with(responses, store.clone());
+        let mut sink = CollectSink::default();
+        engine.run_turn(&sid, "echo hi", &mut sink).await.unwrap();
+
+        let turns = store.turns(&sid).unwrap();
+        assert_eq!(turns.len(), 1);
+        let attempts = &turns[0].plan_attempts;
+        assert!(attempts.len() >= 2, "accepted + chat: {attempts:?}");
+        assert_eq!(attempts[0].outcome, "accepted");
+        assert!(
+            attempts[0].fingerprint.is_some(),
+            "the accepted plan carries its AST fingerprint"
+        );
+        assert!(
+            attempts[0]
+                .plan_text
+                .as_deref()
+                .is_some_and(|t| t.contains("echo")),
+            "the accepted plan carries its readable graph: {:?}",
+            attempts[0].plan_text
+        );
+        assert_eq!(attempts.last().unwrap().outcome, "chat");
+    }
+
+    /// C-14: the `groups.active` observation carries the workspace signals that justified the
+    /// surfaced groups — durable signal→group provenance.
+    #[tokio::test]
+    async fn groups_active_observation_carries_signals() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let groups = vec![flux_evidence::ToolGroup {
+            name: "git".into(),
+            description: String::new(),
+            tools: vec!["echo".into()],
+            surface_when: vec![flux_evidence::SignalMatch {
+                kind: flux_evidence::KIND_SIGNAL.to_string(),
+                signal: Some("git_repo".into()),
+            }],
+        }];
+        let responses = VecDeque::from(vec![prose("hi")]);
+        let engine = engine_with_groups(
+            Box::new(MockProvider {
+                responses: Mutex::new(responses),
+            }),
+            store.clone(),
+            groups,
+        );
+        // Make the workspace a git repo so detect_signals emits `git_repo`.
+        std::fs::create_dir_all(engine.cwd.join(".git")).unwrap();
+        let mut sink = CollectSink::default();
+        engine.run_turn(&sid, "hello", &mut sink).await.unwrap();
+
+        let obs = store.observations(&sid).unwrap();
+        let groups_active = obs
+            .iter()
+            .find(|o| o.kind == "groups.active")
+            .expect("groups.active recorded");
+        let signals: Vec<&str> = groups_active.data["signals"]
+            .as_array()
+            .expect("signals array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            signals.contains(&"git_repo"),
+            "the observation names the justifying signal: {signals:?}"
+        );
+        let active: Vec<&str> = groups_active.data["groups"]
+            .as_array()
+            .expect("groups array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(active.contains(&"git"), "the surfaced group: {active:?}");
     }
 
     #[tokio::test]

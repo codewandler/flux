@@ -80,8 +80,11 @@ per-iteration markers, and any observation a flow emits. In the REPL:
 ```
 
 This is the same shared log the `observe`/`evidence`/grading ops read, which is what makes the loop
-*evidence-based*: it can branch on its own runtime observations. (The log is per-session and held in
-memory; it is not yet persisted across runs.)
+*evidence-based*: it can branch on its own runtime observations. The trail is also **durable**: at
+the end of every turn the engine flushes the log's new entries to the session's event store
+(`events.db`) as `observation` events, and each planning attempt is recorded with the accepted
+plan's fingerprint and its readable rendered graph — so a session's evidence survives process exit
+and can be read offline (`flux_events::projection::observations`).
 
 ## Read & customize the loop — `flux loop`
 

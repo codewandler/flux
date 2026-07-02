@@ -8,6 +8,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **The evidence trail is durable — observations, plan attempts, and signal provenance land in
+  `events.db` (C-14).** The audit story used to be two unrelated systems: the in-memory
+  `EvidenceLog` that `/evidence` reads (lost on exit) and the durable event store — and the
+  compiled plan graph reached NEITHER (`flow.plan` went to the display sink only;
+  `record_plan_attempt` had zero production callers). Now: (1) a new
+  `EventKind::Observation(flux_evidence::Observation)` and a per-turn watermark flush in the
+  engine persist every observation (`tool_call` markers, `turn.iteration`, `groups.active`,
+  `skill.activated`, flow-emitted `observe(…)`) to the session stream at both turn-termination
+  paths — batched per turn, so a crash mid-turn loses at most that turn's batch; (2) the loop host
+  records every planning attempt durably — `accepted` with the plan's AST fingerprint and its
+  human-readable rendered graph (capped 8k; "a turn is a readable graph", persisted), `chat`,
+  `compile_error` (with the planner error), and `rejected` (user declined) — via the struct-shaped
+  `record_plan_attempt`, with `#[serde(default)]` fields so old logs decode; (3) the `groups.active`
+  observation now carries the workspace **signals** that justified the surfaced groups, closing the
+  signal→group provenance gap. `/evidence` keeps reading the live in-memory log; the new
+  `flux_events::projection::observations()` (and `EventStore::observations`) serves offline reads.
+
 - **The `complete` fast-path is wired — a finishing turn no longer pays a full second planner round
   (A-06).** The planner prompt has always instructed models to attach a `complete` directive
   (instructions for the final message) to a plan that finishes the request, and `render_completion`

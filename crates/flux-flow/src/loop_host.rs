@@ -58,6 +58,10 @@ struct TurnCtx {
     /// restricted to these names and a model-emitted plan naming a hidden op is rejected at
     /// compile; `None` ⇒ unrestricted (tests / hosts that opt out of gating).
     advertised: Option<std::collections::HashSet<String>>,
+    /// Where this turn's plan attempts are durably recorded (C-14): the engine's event store plus
+    /// the turn id `begin_turn` minted. `None` for hosts without a store (tests, the pre-authored
+    /// `flow run` path); a negative turn id is skipped inside `record_plan_attempt`.
+    audit: Option<(Arc<flux_events::EventStore>, i64)>,
 }
 
 /// Retry-breaker thresholds. Without a guard the agent loop can replay a byte-identical failing (or
@@ -184,6 +188,8 @@ pub struct EngineLoopHost {
     /// of a full planner round, and the turn ends through the flow's existing `case "chat"`. Never
     /// armed on rejection, error, suspension, or the identical-plan skip. Reset per turn.
     pending_completion: Mutex<Option<Completion>>,
+    /// Monotonic step counter for this turn's durable plan-attempt records (C-14). Reset per turn.
+    attempt_step: AtomicU32,
 }
 
 impl EngineLoopHost {
@@ -222,11 +228,13 @@ impl EngineLoopHost {
                     base_system,
                     sink,
                     advertised: None,
+                    audit: None,
                 }),
                 guard: Mutex::new(LoopGuard::default()),
                 usage: Mutex::new(Usage::default()),
                 calls: Mutex::new(Vec::new()),
                 pending_completion: Mutex::new(None),
+                attempt_step: AtomicU32::new(0),
             });
             *slot2.lock().unwrap() = Some(host.clone());
             executor.set_loop_host(host.clone());
@@ -245,12 +253,14 @@ impl EngineLoopHost {
         base_system: Option<String>,
         sink: Arc<Mutex<dyn AgentSink>>,
         advertised: Option<std::collections::HashSet<String>>,
+        audit: Option<(Arc<flux_events::EventStore>, i64)>,
     ) {
         *self.turn.lock().unwrap() = TurnCtx {
             session_id,
             base_system,
             sink,
             advertised,
+            audit,
         };
         // Fresh turn → reset the retry-breaker so a prior turn's stall never bleeds in.
         *self.guard.lock().unwrap() = LoopGuard::default();
@@ -259,6 +269,8 @@ impl EngineLoopHost {
         self.calls.lock().unwrap().clear();
         // …and any un-rendered completion directive — it belonged to the prior turn's plan.
         *self.pending_completion.lock().unwrap() = None;
+        // …and the plan-attempt step counter (C-14).
+        self.attempt_step.store(0, Ordering::SeqCst);
     }
 
     /// The token usage accumulated across this turn's planner calls (every `plan` re-entry). The
@@ -360,6 +372,34 @@ impl EngineLoopHost {
         }
         transcript
     }
+
+    /// Durably record one planning attempt (C-14): `accepted` (with the AST fingerprint + rendered
+    /// plan text), `chat`, `compile_error`, or `rejected`. Non-fatal, no-op when the turn has no
+    /// audit target (tests, the pre-authored `flow run` path).
+    fn record_plan_attempt(&self, attempt: flux_events::PlanAttempt) {
+        let audit = self.turn.lock().unwrap().audit.clone();
+        if let Some((events, turn_id)) = audit {
+            let session_id = self.turn.lock().unwrap().session_id.clone();
+            let _ = events.record_plan_attempt(&session_id, turn_id, attempt);
+        }
+    }
+
+    /// The next 1-based step number for this turn's plan-attempt records.
+    fn next_attempt_step(&self) -> u32 {
+        self.attempt_step.fetch_add(1, Ordering::SeqCst) + 1
+    }
+}
+
+/// Cap for the durable rendered-plan text on an accepted attempt — the auditable graph, not a
+/// transcript dump (C-14).
+const PLAN_TEXT_CAP: usize = 8_000;
+
+fn cap_plan_text(text: String) -> String {
+    if text.chars().count() <= PLAN_TEXT_CAP {
+        return text;
+    }
+    let kept: String = text.chars().take(PLAN_TEXT_CAP).collect();
+    format!("{kept}\n[plan text truncated]")
 }
 
 #[async_trait]
@@ -458,7 +498,7 @@ impl LoopHost for EngineLoopHost {
         let view_ref = (!view.symbols.is_empty()).then_some(&view);
         let provider = self.provider.lock().unwrap().clone();
         let model = self.model.lock().unwrap().clone();
-        let (out, call_usage) = compile_turn(
+        let (out, call_usage) = match compile_turn(
             &*provider,
             &model,
             &conversation,
@@ -470,9 +510,22 @@ impl LoopHost for EngineLoopHost {
             self.opts.clone(),
         )
         .await
-        // Surface a provider failure (credit/auth/rate-limit/transport) as a readable sentence — the
-        // error flows out through the op envelope and becomes the turn's answer, never raw JSON.
-        .map_err(|e| Error::Other(crate::engine::planner_error(&e)))?;
+        {
+            Ok(v) => v,
+            // Surface a provider failure (credit/auth/rate-limit/transport) as a readable sentence —
+            // the error flows out through the op envelope and becomes the turn's answer, never raw
+            // JSON. Recorded durably as a failed attempt first (C-14).
+            Err(e) => {
+                let msg = crate::engine::planner_error(&e);
+                self.record_plan_attempt(flux_events::PlanAttempt {
+                    step: self.next_attempt_step(),
+                    outcome: "compile_error".into(),
+                    error: Some(msg.clone()),
+                    ..Default::default()
+                });
+                return Err(Error::Other(msg));
+            }
+        };
         // Fold this planner call's tokens into the per-turn tally the engine reports at turn-end, AND
         // record it individually (with the model that was ACTIVE for this call) so a mid-turn `/model`
         // switch attributes tokens/cost to the right model (C-06 attribution) rather than being lost in
@@ -483,15 +536,35 @@ impl LoopHost for EngineLoopHost {
         let plan = match out {
             // `complete` carries the model's full directive (object) or null — `run_plan` re-parses
             // it off this value to arm the fast-path after a successful run (A-06).
-            TurnOutput::Plan(c) => serde_json::json!({
-                "kind": "plan",
-                "ast": serde_json::to_value(&c.ast).unwrap_or(Value::Null),
-                "complete": c.complete.as_ref().map(|d| serde_json::json!({
-                    "primer": d.primer,
-                    "instructions": d.instructions,
-                })),
-            }),
-            TurnOutput::Chat(text) => serde_json::json!({ "kind": "chat", "text": text }),
+            TurnOutput::Plan(c) => {
+                // Durable audit (C-14): the accepted plan's identity (fingerprint) + its readable
+                // graph — "a turn is a readable graph", persisted.
+                let fingerprint =
+                    transcript_hash(&serde_json::to_string(&c.ast).unwrap_or_default());
+                self.record_plan_attempt(flux_events::PlanAttempt {
+                    step: self.next_attempt_step(),
+                    outcome: "accepted".into(),
+                    fingerprint: Some(fingerprint),
+                    plan_text: Some(cap_plan_text(crate::render::render_pretty(&c.ast))),
+                    ..Default::default()
+                });
+                serde_json::json!({
+                    "kind": "plan",
+                    "ast": serde_json::to_value(&c.ast).unwrap_or(Value::Null),
+                    "complete": c.complete.as_ref().map(|d| serde_json::json!({
+                        "primer": d.primer,
+                        "instructions": d.instructions,
+                    })),
+                })
+            }
+            TurnOutput::Chat(text) => {
+                self.record_plan_attempt(flux_events::PlanAttempt {
+                    step: self.next_attempt_step(),
+                    outcome: "chat".into(),
+                    ..Default::default()
+                });
+                serde_json::json!({ "kind": "chat", "text": text })
+            }
         };
         Ok(plan)
     }
@@ -590,6 +663,12 @@ impl LoopHost for EngineLoopHost {
             match executor.approve_plan(&risk.approval_request()).await {
                 Some(scope) => Some(scope),
                 None => {
+                    self.record_plan_attempt(flux_events::PlanAttempt {
+                        step: self.next_attempt_step(),
+                        outcome: "rejected".into(),
+                        fingerprint: Some(plan_fingerprint.clone()),
+                        ..Default::default()
+                    });
                     return Ok(serde_json::json!({
                         "transcript": "[plan rejected by user] The user declined to run this plan. \
                                        Do not propose another — acknowledge briefly and stop.",
@@ -1043,7 +1122,7 @@ mod tests {
             let names = OpRegistry::new(ex.registry()).op_names();
             names.into_iter().filter(|n| n != "bash").collect()
         };
-        host.set_turn("sess".into(), None, shared, Some(advertised));
+        host.set_turn("sess".into(), None, shared, Some(advertised), None);
 
         let out = host.plan(json!({ "feedback": "" })).await.unwrap();
         assert_eq!(out["kind"], "chat");

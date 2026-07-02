@@ -8,6 +8,7 @@ description = "flux unified append-only event store: one ordered log projected i
 [dependencies]
 flux-core.workspace = true
 flux-lang.workspace = true
+flux-evidence.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rusqlite.workspace = true

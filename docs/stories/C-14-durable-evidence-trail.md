@@ -2,9 +2,9 @@
 id: C-14
 title: Durable evidence trail — persist observations, record plan attempts, carry signal provenance
 pillar: Core
-status: ready
+status: done
 priority: 6
-note: the plan graph reaches NO audit trail (flow.plan is sink-only; record_plan_attempt has zero production callers) and /evidence is an in-memory Vec lost on exit — while vision.md claims evidence is "recorded as auditable events" on event-sourced sessions
+note: observations flush durably to events.db at every turn end (watermark batch), every planning attempt is recorded with the accepted plan's fingerprint + readable rendered graph, and groups.active now carries the justifying workspace signals — projection::observations serves offline reads
 ---
 
 # Durable evidence trail
@@ -21,30 +21,41 @@ goes to the display sink only (`loop_host.rs:507`), and `EventStore::record_plan
 only active group names are recorded, never the signals that justified them (`engine.rs:472,798`).
 
 ## Acceptance
-- [ ] **Failing-first:** `turn_evidence_persists_to_event_store` (flux-flow) — a mock turn against
+- [x] **Failing-first:** `turn_evidence_persists_to_event_store` (flux-flow) — a mock turn against
       an in-memory store leaves `observation`-kind events (incl. `tool_call`) on the session stream.
-- [ ] New `EventKind::Observation(flux_evidence::Observation)` (flux-events gains the
+- [x] New `EventKind::Observation(flux_evidence::Observation)` (flux-events gains the
       flux-evidence dep — L2→L0, codegate-clean); `EventStore::record_observation` non-fatal.
       Emission = watermark flush in `FlowEngine` at BOTH turn-termination paths (cancel +
       completion); batched per turn (crash-loss documented — turn-granular audit is the goal, not
       crash forensics). First flush from watermark 0 also captures startup observations.
-- [ ] **Failing-first:** `plan_attempts_recorded_with_fingerprint_and_text` — the loop host records
+- [x] **Failing-first:** `plan_attempts_recorded_with_fingerprint_and_text` — the loop host records
       `PlanAttempted` for: accepted (with AST fingerprint = the existing `transcript_hash`, plus
       `render_pretty` plan text capped at 8k — the human-auditable graph, round-trippable via
       `parse`), chat, compile_error, and user-rejected. `PlanAttempted` gains
       `#[serde(default)] fingerprint/plan_text` (old logs decode); `record_plan_attempt` takes a
       `PlanAttempt` struct.
-- [ ] **Failing-first:** `groups_active_observation_carries_signals` — the per-turn `groups.active`
+- [x] **Failing-first:** `groups_active_observation_carries_signals` — the per-turn `groups.active`
       observation carries the detected signal names alongside the resolved groups (one cheap record
       per turn; `detect_signals` already runs exactly once per turn).
-- [ ] `/evidence` keeps reading the in-memory log (identical content for the live session); new
+- [x] `/evidence` keeps reading the in-memory log (identical content for the live session); new
       `flux_events::projection::observations()` serves offline/programmatic reads. No duplication
       of `TurnStarted`/`TurnEnded`/`CallUsage`.
-- [ ] `docs/agent-loop.md:85` persistence note updated to the new reality.
-- [ ] Full gate green; CHANGELOG entry.
+- [x] `docs/agent-loop.md:85` persistence note updated to the new reality.
+- [x] Full gate green; CHANGELOG entry.
 
 ## Progress
 - Filed 2026-07-02 from the harness claims review (P6 of the round).
+- Done 2026-07-02. `EventKind::Observation` + `record_observation`/`observations()` on the store,
+  `projection::observations` fold; `FlowEngine.evidence_flushed` watermark flushed in `finish_turn`
+  (both cancel + completion route through it; the suspended-resume path flushes unscoped with
+  turn_id −1). Loop host records every attempt via the new struct-shaped `record_plan_attempt`:
+  accepted (fingerprint = the loop guard's `transcript_hash` of the AST JSON + `render_pretty` text
+  capped 8k), chat, compile_error (planner/provider failure, message recorded), rejected (user
+  declined, fingerprint kept); per-turn `attempt_step` counter; audit target = `(EventStore,
+  turn_id)` handed through `set_turn` (None on the pre-authored `flow run` path).
+  `surfaced_op_names` now returns `SurfacedGroups { active, signals }` and `groups.active` carries
+  both. Drive-by: HOME_LOCK for flux-config's env-mutating tests (same pre-existing flake class as
+  flux-credentials').
 
 ## Notes
 - Layering: flux-evidence stays pure L0 (never sees flux-events); the engine (L3) is the tee point.

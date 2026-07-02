@@ -549,14 +549,13 @@ impl EventStore {
     }
 
     /// Record one planning attempt within `turn_id`. A negative `turn_id` (failed
-    /// `begin_turn`) is silently skipped.
+    /// `begin_turn`) is silently skipped. Takes the same [`projection::PlanAttempt`] shape the
+    /// `turns()` fold reads back, so the write and read models can't drift (C-14).
     pub fn record_plan_attempt(
         &self,
         stream: &str,
         turn_id: i64,
-        step: u32,
-        outcome: &str,
-        error: Option<&str>,
+        attempt: projection::PlanAttempt,
     ) -> Result<()> {
         if turn_id < 0 {
             return Ok(());
@@ -564,13 +563,37 @@ impl EventStore {
         self.append(
             stream,
             NewEvent::new(EventKind::PlanAttempted {
-                step,
-                outcome: outcome.to_string(),
-                error: error.map(|s| s.to_string()),
+                step: attempt.step,
+                outcome: attempt.outcome,
+                error: attempt.error,
+                fingerprint: attempt.fingerprint,
+                plan_text: attempt.plan_text,
             })
             .in_turn(turn_id),
         )?;
         Ok(())
+    }
+
+    /// Persist one evidence observation (C-14). Scoped to `turn_id` when non-negative; recorded
+    /// unscoped otherwise (a failed `begin_turn` must not lose the trail). Callers treat this as
+    /// non-fatal (`let _ = …`) — audit writes never break a turn.
+    pub fn record_observation(
+        &self,
+        stream: &str,
+        turn_id: i64,
+        obs: &flux_evidence::Observation,
+    ) -> Result<()> {
+        let mut ev = NewEvent::new(EventKind::Observation(obs.clone()));
+        if turn_id >= 0 {
+            ev = ev.in_turn(turn_id);
+        }
+        self.append(stream, ev)?;
+        Ok(())
+    }
+
+    /// The durable evidence trail for `stream` — see [`projection::observations`].
+    pub fn observations(&self, stream: &str) -> Result<Vec<flux_evidence::Observation>> {
+        Ok(projection::observations(&self.load_stream(stream, None)?))
     }
 
     /// Record one provider call's usage, attributed to the `model` that was active for that call —
@@ -1149,10 +1172,27 @@ mod tests {
 
         let turn = store.begin_turn(&id, "do it", "m").unwrap();
         store
-            .record_plan_attempt(&id, turn, 0, "compile_error", Some("boom"))
+            .record_plan_attempt(
+                &id,
+                turn,
+                projection::PlanAttempt {
+                    step: 0,
+                    outcome: "compile_error".into(),
+                    error: Some("boom".into()),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         store
-            .record_plan_attempt(&id, turn, 1, "accepted", None)
+            .record_plan_attempt(
+                &id,
+                turn,
+                projection::PlanAttempt {
+                    step: 1,
+                    outcome: "accepted".into(),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         store
             .record_run_event(
