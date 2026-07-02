@@ -127,9 +127,63 @@ struct EmitPlanCompletionInput {
 
 #[derive(JsonSchema)]
 #[allow(dead_code)]
+struct EmitPlanTextInput {
+    /// The plan as native Flux-Lang source text: a `flow` header line at column 0, then one
+    /// statement per line, indented 2 spaces per block level (never tabs).
+    source: String,
+    /// Attach only when this plan completes the request; the runtime renders the final message after
+    /// executing the plan.
+    complete: Option<EmitPlanCompletionInput>,
+}
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
 struct AskUserInput {
     /// The single clarifying question to ask the user.
     question: String,
+}
+
+/// Which surface `emit_plan` speaks — the **L-20 emission A/B scaffold**, selected per turn via the
+/// `FLUX_EMISSION` env switch (see `docs/designs/flux-lang-emission-ab.md`).
+///
+/// - [`EmissionArm::Json`] (the default): the shipped strict derived [`DraftAst`] JSON schema.
+///   With `FLUX_EMISSION` unset this is byte-identical to the pre-selector surface — prompt,
+///   tools, and parse path all unchanged.
+/// - [`EmissionArm::Text`]: the plan rides as native Flux-Lang **text** in a single `source`
+///   string, taught via the native grammar (worked examples rendered by [`flux_lang::format`], so
+///   they are parseable by construction) and parsed with [`flux_lang::parse`]. The decoded
+///   [`DraftAst`] then flows through **exactly** the same gates as the JSON arm — surfacing
+///   enforcement (A-04) and the analyze/lower validation (C-17) are arm-independent.
+///
+/// This is a temporary measurement scaffold: once the A/B is decided, the losing arm and this
+/// selector are deleted (the project's no-fallbacks stance).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EmissionArm {
+    /// Strict derived `DraftAst` JSON schema on `emit_plan` (`ast` param) — the control arm.
+    #[default]
+    Json,
+    /// Native Flux-Lang text on `emit_plan` (`source` param) — the treatment arm.
+    Text,
+}
+
+impl EmissionArm {
+    /// Parse a selector value: unset/empty/`json` → [`Self::Json`], `text` → [`Self::Text`].
+    /// Anything else is an error — a typo must not silently pick an arm mid-experiment.
+    pub fn parse(value: Option<&str>) -> Result<Self> {
+        match value.map(str::trim) {
+            None | Some("") => Ok(Self::Json),
+            Some(v) if v.eq_ignore_ascii_case("json") => Ok(Self::Json),
+            Some(v) if v.eq_ignore_ascii_case("text") => Ok(Self::Text),
+            Some(v) => Err(Error::Other(format!(
+                "invalid FLUX_EMISSION value `{v}` — use `json` or `text`"
+            ))),
+        }
+    }
+
+    /// Read the arm from the `FLUX_EMISSION` env switch (the planner's emission-surface selector).
+    pub fn from_env() -> Result<Self> {
+        Self::parse(std::env::var("FLUX_EMISSION").ok().as_deref())
+    }
 }
 
 /// What the planner produced for a turn: an executable plan, or a plain-prose answer (a chat turn —
@@ -273,15 +327,49 @@ pub async fn compile_turn(
     // Optional sink for live thinking-token streaming during the planning call. When present,
     // each ThinkingDelta chunk is forwarded via sink.thinking_delta so the surface can display
     // reasoning in real time instead of showing a silent "composing plan\u2026" indicator.
+    thinking_sink: Option<&'_ mut dyn crate::AgentSink>,
+    opts: CompileOptions,
+) -> Result<(TurnOutput, Usage)> {
+    // The emission surface is env-selected here — the single front door — so every caller (engine,
+    // loop host, CLI) picks the arm up without threading a parameter (the L-20 A/B scaffold).
+    let arm = EmissionArm::from_env()?;
+    compile_turn_with_arm(
+        provider,
+        model,
+        conversation,
+        base_system,
+        ops,
+        view,
+        ask,
+        thinking_sink,
+        opts,
+        arm,
+    )
+    .await
+}
+
+/// [`compile_turn`] with the emission arm made explicit (the L-20 A/B harness entry point — a
+/// measurement runner drives both arms in one process without racing on the `FLUX_EMISSION` env).
+/// Production callers use [`compile_turn`], which reads the arm from the environment.
+#[allow(clippy::too_many_arguments)]
+pub async fn compile_turn_with_arm(
+    provider: &dyn Provider,
+    model: &str,
+    conversation: &[Message],
+    base_system: Option<&str>,
+    ops: &OpRegistry<'_>,
+    view: Option<&SessionView>,
+    ask: Option<&dyn AskUser>,
     mut thinking_sink: Option<&'_ mut dyn crate::AgentSink>,
     opts: CompileOptions,
+    arm: EmissionArm,
 ) -> Result<(TurnOutput, Usage)> {
     let steps = opts.max_steps.max(1);
     let interactive = ask.is_some();
-    let segments = assemble_system_segments(base_system, ops, view, interactive);
+    let segments = assemble_system_segments(base_system, ops, view, interactive, arm);
     // Pure DAG: the model's ONLY tools are `emit_plan` (+ `ask_user`). Every op — reads included — is a
     // node in the emitted graph, so a turn is always an auditable plan, never a free-form tool call.
-    let tools = planner_tools(interactive);
+    let tools = planner_tools(interactive, arm);
     let mut messages = conversation.to_vec();
     // Forward thinking-token deltas to the sink while we're in the planning phase, so both surfaces
     // (CLI: dims them on stderr; TUI: streams them into a dedicated Thinking entry) can show reasoning
@@ -412,8 +500,29 @@ pub async fn compile_turn(
                     // present ⇒ this plan completes the request, so the engine renders the final message
                     // from the results after running. Absent ⇒ the engine loops (the model answers later).
                     let complete = parse_completion(input.get("complete"));
-                    let ast_val = input.get("ast").cloned().unwrap_or(input);
-                    match serde_json::from_value::<DraftAst>(ast_val) {
+                    // Per-arm decode (L-20): both arms land on the SAME `DraftAst` and flow through
+                    // the identical gates below — surfacing enforcement (A-04) and analyze/lower
+                    // (C-17) hold regardless of which surface carried the plan.
+                    let decoded: std::result::Result<DraftAst, String> = match arm {
+                        EmissionArm::Json => {
+                            let ast_val = input.get("ast").cloned().unwrap_or(input);
+                            serde_json::from_value::<DraftAst>(ast_val)
+                                .map_err(|e| format!("emit_plan: invalid AST JSON: {e}"))
+                        }
+                        EmissionArm::Text => match input.get("source").and_then(|v| v.as_str()) {
+                            Some(src) => flux_lang::parse::parse(src).map_err(|e| {
+                                format!(
+                                    "emit_plan: invalid Flux-Lang source ({e}). Fix the source \
+                                     text — a `flow` header at column 0, statements indented 2 \
+                                     spaces per level, no tabs — and call emit_plan again."
+                                )
+                            }),
+                            None => Err("emit_plan: missing `source` — pass the plan as native \
+                                         Flux-Lang text in the `source` string parameter."
+                                .to_string()),
+                        },
+                    };
+                    match decoded {
                         Ok(ast) => {
                             // Surfacing enforcement (A-04): a model-emitted plan may only call ops
                             // advertised this turn. A registered-but-hidden op (e.g. `bash` with the
@@ -461,11 +570,7 @@ pub async fn compile_turn(
                                 }
                             }
                         }
-                        Err(e) => results.push(ContentBlock::tool_result_text(
-                            id,
-                            format!("emit_plan: invalid AST JSON: {e}"),
-                            true,
-                        )),
+                        Err(msg) => results.push(ContentBlock::tool_result_text(id, msg, true)),
                     }
                 }
                 "ask_user" => {
@@ -873,6 +978,48 @@ fn ast_grammar() -> String {
     )
 }
 
+/// The `text`-arm grammar (L-20): teaches the SAME plan language through the **native text**
+/// surface. Node semantics still come from the schema-derived catalog (the SSOT), and the worked
+/// examples are [`ast_grammar`]'s own examples re-rendered through [`flux_lang::format::format`] —
+/// so both arms teach byte-equivalent plans, and every text example is parseable by construction
+/// (the format/parse round-trip invariant). The `expect`s run over a compile-time-constant string
+/// and are guarded by `text_grammar_examples_parse_and_match_the_json_arm`.
+fn text_grammar() -> String {
+    let mut examples = String::new();
+    for chunk in ast_grammar().split("\nExample for ").skip(1) {
+        let intro = chunk.lines().next().unwrap_or_default();
+        let json = extract_json(chunk).expect("grammar example carries a JSON AST");
+        let ast: DraftAst =
+            serde_json::from_str(&json).expect("grammar example parses as a DraftAst");
+        examples.push_str(&format!(
+            "\nExample for {intro}\n{}",
+            flux_lang::format::format(&ast)
+        ));
+    }
+    format!(
+        "A plan is native Flux-Lang TEXT: a `flow` header at column 0 (optionally `flow name(param: Type, ...) -> Type`), then one statement per line, indented 2 spaces per block level (never tabs).\n\
+Statements:\n\
+- `$x = <expr>` — bind a result to `$x` (optional type annotation: `$x: String = <expr>`).\n\
+- `do <op> <arg>, ...` — call an op and discard its result.\n\
+- `when <cond>` / `else` and `unless <cond>` — branch (bodies indented one level).\n\
+- `each $item in <expr> [-> $collected]` — iterate a list value IN ORDER (`-> $c` collects the per-item results).\n\
+- `repeat <max> [-> $collected]` — bounded loop; an optional FIRST body line `until <cond>` exits early.\n\
+- `parallel` with indented `branch $name` arms — run independent branches CONCURRENTLY; each branch binds its result to its `$name`.\n\
+- `retry <max> [backoff <word>] [delay <ms>] [-> $bind]` — re-run the body on failure.\n\
+- `assert <cond>[, \"message\"]` — fail the plan when the condition is falsy.\n\
+- `return <expr>` — the flow's result.\n\
+- `@json {{\"kind\":...}}` — single-line compact-JSON escape for any node with no text spelling.\n\
+Expressions: `$var` (a bound symbol), `$var.field.path` (field access), JSON literals (`\"s\"`, `3`, `[\"a\"]`, `{{\"k\":\"v\"}}`), `op(<arg>, ...)` (inline call), `fmt(\"...{{var}}...\")` (string interpolation), and value templates with dynamic leaves: `{{ key: <expr>, ... }}` / `[ <expr>, ... ]`.\n\
+Call a multi-param op with ONE object argument naming each parameter — `write({{\"path\":\"out.txt\",\"content\":\"hi\"}})`, or `write({{ path: \"out.txt\", content: $body }})` when a value is dynamic.\n\
+\nNode semantics (each maps to a statement/expression above; anything else spells as `@json`):\n\
+{node_kinds}Independent reads/calls over a KNOWN set run CONCURRENTLY with `parallel` (each branch binds its result to its name) — `each` runs strictly in order, so keep it for steps that depend on each other, and for iterating a DYNAMIC list value (`parallel` branches are static). Prefer `each` over `repeat` for list iteration.\n\
+\nArtifact types (the `Named` types ops produce/consume — use as a param/return type): {artifact_types}.\n\
+{examples}",
+        node_kinds = crate::schema::node_kind_catalog(),
+        artifact_types = crate::prelude::PRELUDE_TYPES.join(", "),
+    )
+}
+
 /// The one-shot compiler's **static** system block (segment A): instructions + sorted op catalog +
 /// grammar. Contains nothing per-session or per-attempt — symbols render as a separate uncached
 /// segment and the instruction/repair exchanges ride as messages — so this block stays byte-stable
@@ -902,9 +1049,10 @@ fn assemble_system_segments(
     ops: &OpRegistry,
     view: Option<&SessionView>,
     interactive: bool,
+    arm: EmissionArm,
 ) -> Vec<SystemSegment> {
     let mut segments = vec![SystemSegment {
-        text: build_planner_prompt(ops, interactive),
+        text: build_planner_prompt(ops, interactive, arm),
         cache: true,
     }];
     if let Some(b) = base_system {
@@ -928,15 +1076,23 @@ fn assemble_system_segments(
 /// The **static** planner block (segment A): instructions + sorted op catalog + grammar. Contains
 /// nothing per-turn — the session symbols render separately (an uncached trailing segment in
 /// `compile_turn`) so this block stays byte-stable and prompt-cacheable across calls (A-03).
-fn build_planner_prompt(ops: &OpRegistry, interactive: bool) -> String {
+///
+/// The `arm` selects the emission surface (L-20): `Json` interpolates to the exact pre-selector
+/// prompt (byte-identical — the A/B control); `Text` swaps the plan-shape wording and teaches the
+/// native-text grammar instead.
+fn build_planner_prompt(ops: &OpRegistry, interactive: bool, arm: EmissionArm) -> String {
     let ask_line = if interactive {
         " and `ask_user` (ask ONE clarifying question only if the request is genuinely ambiguous)"
     } else {
         ""
     };
+    let (plan_form, ast_word, grammar) = match arm {
+        EmissionArm::Json => ("a Flux-Lang flow AST", "AST", ast_grammar()),
+        EmissionArm::Text => ("native Flux-Lang source text", "plan", text_grammar()),
+    };
     format!(
         "You are Flux-Lang's planning agent. For the user's request, either call `emit_plan` with ONE \
-execution plan (a Flux-Lang flow AST) that accomplishes it, or — if the request needs no operations or is \
+execution plan ({plan_form}) that accomplishes it, or — if the request needs no operations or is \
 ALREADY satisfied by results shown earlier in the conversation — answer directly in prose (do NOT emit a \
 plan, and do NOT repeat work already done).\n\nWhen a plan COMPLETES the request, attach `complete` to \
 `emit_plan` — NOT the finished message, but `instructions` for it (e.g. \"summarize what changed and \
@@ -953,30 +1109,45 @@ express control flow as Flux-Lang nodes, NOT inside shell commands, so the plan 
 `repeat` node for loops and a `when` node for branches — e.g. run the tests three times with \
 `repeat max 3 {{ cargo_test() }}`, never a shell `for` loop. The generic `bash` op is OFF by default \
 — prefer the dedicated ops; when `bash` IS enabled, keep each call to ONE discrete command (no \
-`for`/`while`/`if`/`&&`/`;` chains).\n\nWhen the user asks to create, add, define, or register an operation, first check whether it can be expressed as a Flux-Lang composite op using existing operations. If yes, use `op.register` instead of editing Rust; default to `session` scope unless the user explicitly asks for project/global persistence. Only add a native Rust tool when the operation needs a new host capability, new IO primitive, or permanent built-in behavior.\n\nWhen your plan edits code, fold the build/test into the SAME plan and wrap the fix in a `retry` so a compile error is repaired automatically rather than handed back to the user; before an `edit`, make sure its `old_string` actually occurs in the file (a no-op edit silently spins the loop). Decide ordinary implementation choices (a flag's default, a helper name) yourself — only stop to ask on genuinely destructive or ambiguous decisions.\n\nThe AST may use ANY operation from the catalog; prefer deterministic ops and reference \
+`for`/`while`/`if`/`&&`/`;` chains).\n\nWhen the user asks to create, add, define, or register an operation, first check whether it can be expressed as a Flux-Lang composite op using existing operations. If yes, use `op.register` instead of editing Rust; default to `session` scope unless the user explicitly asks for project/global persistence. Only add a native Rust tool when the operation needs a new host capability, new IO primitive, or permanent built-in behavior.\n\nWhen your plan edits code, fold the build/test into the SAME plan and wrap the fix in a `retry` so a compile error is repaired automatically rather than handed back to the user; before an `edit`, make sure its `old_string` actually occurs in the file (a no-op edit silently spins the loop). Decide ordinary implementation choices (a flag's default, a helper name) yourself — only stop to ask on genuinely destructive or ambiguous decisions.\n\nThe {ast_word} may use ANY operation from the catalog; prefer deterministic ops and reference \
 existing session symbols instead of re-fetching. To embed a stored symbol's value INSIDE a string \
 argument (e.g. a `task` prompt or a message), write `{{symbol_name}}` — the runtime substitutes the \
 value at execution; to pass a symbol's value as a whole argument, use it directly as a `var` node. Each \
-op is shown as `name({{params}})` — call a multi-param op with a single object argument naming each parameter (e.g. `write({{path, content}})`); a sole-required-param op accepts a bare value (e.g. `read(\"README.md\")`). [optional] params may be omitted from the object.\n\nOperation catalog (for the AST):\n{catalog}\n{grammar}\n",
+op is shown as `name({{params}})` — call a multi-param op with a single object argument naming each parameter (e.g. `write({{path, content}})`); a sole-required-param op accepts a bare value (e.g. `read(\"README.md\")`). [optional] params may be omitted from the object.\n\nOperation catalog (for the {ast_word}):\n{catalog}\n{grammar}\n",
         catalog = ops_catalog(ops),
-        grammar = ast_grammar(),
     )
 }
 
 /// The only tools the planner can call: the synthetic `emit_plan` (and `ask_user` when interactive).
 /// There are NO directly-callable ops — every operation (reads included) is a node in the emitted AST,
-/// so a turn is always an auditable plan (pure DAG).
-fn planner_tools(interactive: bool) -> Vec<ToolDef> {
+/// so a turn is always an auditable plan (pure DAG). The `arm` picks `emit_plan`'s surface (L-20):
+/// the strict derived `DraftAst` schema on `ast` (json, the unchanged default) or a native
+/// Flux-Lang `source` string (text).
+fn planner_tools(interactive: bool, arm: EmissionArm) -> Vec<ToolDef> {
     let mut tools: Vec<ToolDef> = Vec::new();
-    tools.push(ToolDef {
-        name: "emit_plan".to_string(),
-        description: "Emit the Flux-Lang flow AST to run (your only way to act). Pass the AST as `ast`. \
+    tools.push(match arm {
+        EmissionArm::Json => ToolDef {
+            name: "emit_plan".to_string(),
+            description: "Emit the Flux-Lang flow AST to run (your only way to act). Pass the AST as `ast`. \
                       If this plan completes the request, also pass `complete` — `instructions` for your \
                       final message (the runtime writes it from the actual results and ends the turn), \
                       NOT the message itself. Omit `complete` if you must see the results before you can \
                       answer, or to keep working; then answer in prose once done."
-            .to_string(),
-        input_schema: tool_input_schema::<EmitPlanInput>(),
+                .to_string(),
+            input_schema: tool_input_schema::<EmitPlanInput>(),
+        },
+        EmissionArm::Text => ToolDef {
+            name: "emit_plan".to_string(),
+            description: "Emit the Flux-Lang plan to run (your only way to act). Pass the plan as `source` — \
+                      native Flux-Lang TEXT per the grammar: a `flow` header line at column 0, then \
+                      statements indented 2 spaces per block level (never tabs). \
+                      If this plan completes the request, also pass `complete` — `instructions` for your \
+                      final message (the runtime writes it from the actual results and ends the turn), \
+                      NOT the message itself. Omit `complete` if you must see the results before you can \
+                      answer, or to keep working; then answer in prose once done."
+                .to_string(),
+            input_schema: tool_input_schema::<EmitPlanTextInput>(),
+        },
     });
     if interactive {
         tools.push(ToolDef {
@@ -1272,15 +1443,21 @@ mod tests {
     #[test]
     fn planner_advertises_only_emit_plan_and_ask_user() {
         // Pure DAG: the model has NO directly-callable ops — only `emit_plan` (+ `ask_user`).
-        let names: Vec<String> = planner_tools(false).into_iter().map(|t| t.name).collect();
+        let names: Vec<String> = planner_tools(false, EmissionArm::Json)
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
         assert_eq!(names, vec!["emit_plan"]);
-        let interactive: Vec<String> = planner_tools(true).into_iter().map(|t| t.name).collect();
+        let interactive: Vec<String> = planner_tools(true, EmissionArm::Json)
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
         assert_eq!(interactive, vec!["emit_plan", "ask_user"]);
     }
 
     #[test]
     fn planner_emit_plan_schema_is_the_real_ast_schema() {
-        let tools = planner_tools(false);
+        let tools = planner_tools(false, EmissionArm::Json);
         let emit = tools
             .iter()
             .find(|t| t.name == "emit_plan")
@@ -1311,7 +1488,7 @@ mod tests {
 
     #[test]
     fn planner_ask_user_schema_is_derived() {
-        let tools = planner_tools(true);
+        let tools = planner_tools(true, EmissionArm::Json);
         let ask = tools
             .iter()
             .find(|t| t.name == "ask_user")
@@ -1321,6 +1498,249 @@ mod tests {
         assert_eq!(ask.input_schema["properties"]["question"]["type"], "string");
         assert!(ask.input_schema.get("$schema").is_none());
         assert!(ask.input_schema.get("title").is_none());
+    }
+
+    // -- L-20: emission-arm selector (json control vs native-text treatment) ---------------------
+
+    /// Drive one planner turn with an explicit arm (the hermetic A/B harness path).
+    async fn turn_with_arm(
+        p: &Mock,
+        ops: &OpRegistry<'_>,
+        arm: EmissionArm,
+        opts: CompileOptions,
+    ) -> Result<(TurnOutput, Usage)> {
+        compile_turn_with_arm(
+            p,
+            "mock",
+            &[Message::user_text("do it")],
+            None,
+            ops,
+            None,
+            None,
+            None,
+            opts,
+            arm,
+        )
+        .await
+    }
+
+    #[test]
+    fn emission_arm_defaults_to_json_and_rejects_junk() {
+        // The selector contract: unset/empty/`json` → Json (the shipped behavior), `text` → Text,
+        // anything else is a hard error (no silent fallback mid-experiment).
+        assert_eq!(EmissionArm::parse(None).unwrap(), EmissionArm::Json);
+        assert_eq!(EmissionArm::parse(Some("")).unwrap(), EmissionArm::Json);
+        assert_eq!(EmissionArm::parse(Some("json")).unwrap(), EmissionArm::Json);
+        assert_eq!(EmissionArm::parse(Some("JSON")).unwrap(), EmissionArm::Json);
+        assert_eq!(EmissionArm::parse(Some("text")).unwrap(), EmissionArm::Text);
+        assert_eq!(
+            EmissionArm::parse(Some(" Text ")).unwrap(),
+            EmissionArm::Text
+        );
+        assert!(EmissionArm::parse(Some("yaml")).is_err());
+        // With FLUX_EMISSION unset (the normal test env), the env read lands on the default arm.
+        if std::env::var("FLUX_EMISSION").is_err() {
+            assert_eq!(EmissionArm::from_env().unwrap(), EmissionArm::Json);
+        }
+    }
+
+    #[test]
+    fn json_arm_surface_is_byte_identical_when_unset() {
+        // The default (env unset) arm must reproduce the pre-selector surface exactly: the strict
+        // `ast` schema on emit_plan and the JSON grammar in the prompt — no trace of the text arm.
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let default_arm = EmissionArm::default();
+        assert_eq!(default_arm, EmissionArm::Json);
+        let prompt = build_planner_prompt(&ops, false, EmissionArm::Json);
+        assert_eq!(
+            prompt,
+            build_planner_prompt(&ops, false, default_arm),
+            "default arm builds the json prompt"
+        );
+        assert!(
+            prompt.contains("(a Flux-Lang flow AST)") && prompt.contains("\"kind\":\"bind\""),
+            "json prompt keeps the original wording and JSON worked examples"
+        );
+        assert!(
+            !prompt.contains("native Flux-Lang source text") && !prompt.contains("`flow` header"),
+            "no text-arm material leaks into the json prompt"
+        );
+        let tools = planner_tools(false, EmissionArm::Json);
+        assert_eq!(tools[0].input_schema["required"], json!(["ast"]));
+    }
+
+    #[test]
+    fn text_arm_advertises_a_source_string() {
+        let tools = planner_tools(false, EmissionArm::Text);
+        let emit = tools
+            .iter()
+            .find(|t| t.name == "emit_plan")
+            .expect("emit_plan");
+        assert_eq!(emit.input_schema["required"], json!(["source"]));
+        assert_eq!(emit.input_schema["properties"]["source"]["type"], "string");
+        assert!(emit.description.contains("native Flux-Lang TEXT"));
+        // The prompt teaches the native grammar, not the JSON one.
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let prompt = build_planner_prompt(&ops, false, EmissionArm::Text);
+        assert!(prompt.contains("native Flux-Lang source text"));
+        assert!(prompt.contains("`flow` header at column 0"));
+        assert!(
+            !prompt.contains("{\"kind\":\"bind\""),
+            "the JSON worked examples must not ride along in the text arm"
+        );
+    }
+
+    /// The text grammar's worked examples are the JSON grammar's examples re-rendered through
+    /// `format` — assert they appear, round-trip through `parse` to the SAME `DraftAst`s, and thus
+    /// can never drift from the json arm (in-sync-by-construction, L-20).
+    #[test]
+    fn text_grammar_examples_parse_and_match_the_json_arm() {
+        let text = text_grammar();
+        let mut checked = 0usize;
+        for chunk in ast_grammar().split("\nExample for ").skip(1) {
+            let json = extract_json(chunk).expect("json example");
+            let ast: DraftAst = serde_json::from_str(&json).expect("json example parses");
+            let native = flux_lang::format::format(&ast);
+            assert!(
+                text.contains(&native),
+                "text grammar carries the formatted twin of the json example: {native}"
+            );
+            assert_eq!(
+                flux_lang::parse::parse(&native).expect("text example parses"),
+                ast,
+                "round-trip: the text example is the same plan as the json example"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 3,
+            "expected the three worked examples, got {checked}"
+        );
+    }
+
+    /// L-20 acceptance: both arms produce a runnable plan for the same fixture task via a scripted
+    /// provider — and the plans are identical `DraftAst`s (the arm changes the wire, not the plan).
+    #[tokio::test]
+    async fn both_arms_produce_the_same_runnable_plan_for_a_fixture_task() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+
+        let p = mock(vec![tool_call(
+            "emit_plan",
+            serde_json::from_str(VALID_AST).unwrap(),
+        )]);
+        let (json_out, _) = turn_with_arm(&p, &ops, EmissionArm::Json, CompileOptions::default())
+            .await
+            .expect("json arm plans");
+
+        let p = mock(vec![tool_call(
+            "emit_plan",
+            json!({"source": "flow\n  do read \"x\""}),
+        )]);
+        let (text_out, _) = turn_with_arm(&p, &ops, EmissionArm::Text, CompileOptions::default())
+            .await
+            .expect("text arm plans");
+
+        match (json_out, text_out) {
+            (TurnOutput::Plan(j), TurnOutput::Plan(t)) => {
+                assert_eq!(j.ast, t.ast, "both surfaces carry the same plan");
+                assert_eq!(j.attempts, 1);
+                assert_eq!(t.attempts, 1);
+            }
+            other => panic!("both arms must produce a plan, got {other:?}"),
+        }
+    }
+
+    /// A malformed `source` is repair feedback (the same loop as bad JSON): the model fixes the
+    /// text and the corrected plan is accepted on the next step.
+    #[tokio::test]
+    async fn text_arm_parse_failure_is_repaired() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let p = mock(vec![
+            // Missing the `flow` header — flux_lang::parse rejects it.
+            tool_call("emit_plan", json!({"source": "do read \"x\""})),
+            tool_call("emit_plan", json!({"source": "flow\n  do read \"x\""})),
+        ]);
+        let (out, _) = turn_with_arm(&p, &ops, EmissionArm::Text, CompileOptions::default())
+            .await
+            .unwrap();
+        match out {
+            TurnOutput::Plan(c) => {
+                assert_eq!(c.attempts, 2, "the bad source must cost a repair round");
+                assert!(
+                    matches!(&c.ast.body[0], crate::ast::Node::Call { op, .. } if op == "read")
+                );
+            }
+            TurnOutput::Chat(t) => panic!("expected a plan, got chat: {t}"),
+        }
+    }
+
+    /// A text-arm `emit_plan` that ignores the surface and passes `ast` instead of `source` gets
+    /// steering feedback, then recovers.
+    #[tokio::test]
+    async fn text_arm_missing_source_is_repaired() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let p = mock(vec![
+            tool_call("emit_plan", serde_json::from_str(VALID_AST).unwrap()),
+            tool_call("emit_plan", json!({"source": "flow\n  do read \"x\""})),
+        ]);
+        let (out, _) = turn_with_arm(&p, &ops, EmissionArm::Text, CompileOptions::default())
+            .await
+            .unwrap();
+        match out {
+            TurnOutput::Plan(c) => assert_eq!(c.attempts, 2),
+            TurnOutput::Chat(t) => panic!("expected a plan, got chat: {t}"),
+        }
+    }
+
+    /// The C-17/A-04 gates hold in the text arm: a registered-but-hidden op (`bash`, shell group
+    /// off) arriving as native text is rejected — even on the final step (no gate skipping).
+    #[tokio::test]
+    async fn text_arm_hidden_op_is_rejected_even_on_the_final_step() {
+        let reg = full_registry();
+        let ops = ops_without_bash(&reg);
+        let p = mock(vec![tool_call(
+            "emit_plan",
+            json!({"source": "flow\n  do bash \"rm x\""}),
+        )]);
+        let opts = CompileOptions {
+            max_steps: 1,
+            ..Default::default()
+        };
+        let err = turn_with_arm(&p, &ops, EmissionArm::Text, opts)
+            .await
+            .expect_err("a hidden-op text plan must never be accepted");
+        assert!(
+            format!("{err}").contains("not enabled"),
+            "the rejection carries the gate's reason: {err}"
+        );
+    }
+
+    /// The analyze/lower gate holds in the text arm: an unknown op in native text is repair
+    /// feedback, never an accepted plan (C-17/F2 parity with the json arm).
+    #[tokio::test]
+    async fn text_arm_unknown_op_is_never_accepted() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let p = mock(vec![
+            tool_call("emit_plan", json!({"source": "flow\n  do nope.op"})),
+            tool_call("emit_plan", json!({"source": "flow\n  do nope.op"})),
+        ]);
+        let opts = CompileOptions {
+            max_steps: 2,
+            ..Default::default()
+        };
+        let err = turn_with_arm(&p, &ops, EmissionArm::Text, opts)
+            .await
+            .expect_err("an unknown-op plan must not be accepted when the budget runs out");
+        assert!(
+            format!("{err}").contains("unknown operation"),
+            "the rejection carries the diagnostic text: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1365,8 +1785,15 @@ mod tests {
                 visibility: crate::ast::Visibility::Visible,
             }],
         };
-        let without = assemble_system_segments(Some("identity"), &ops, None, false);
-        let with = assemble_system_segments(Some("identity"), &ops, Some(&view), false);
+        let without =
+            assemble_system_segments(Some("identity"), &ops, None, false, EmissionArm::Json);
+        let with = assemble_system_segments(
+            Some("identity"),
+            &ops,
+            Some(&view),
+            false,
+            EmissionArm::Json,
+        );
 
         assert_eq!(without.len(), 2, "planner + base, no symbols segment");
         assert_eq!(with.len(), 3, "planner + base + symbols");

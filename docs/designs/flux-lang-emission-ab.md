@@ -1,5 +1,8 @@
 # Design: planner emission surface — strict JSON schema vs native text (an accuracy A/B)
 
+> **Status update (2026-07-02, L-20): the A/B has been RUN — decision: keep `json`.** See
+> *Measured results & decision* at the bottom of this doc.
+>
 > **Status update (2026-07-02, L-19):** arm 1 — the strict derived `DraftAst` schema on `emit_plan` —
 > has since **shipped**: `planner_tools()` now advertises `tool_input_schema::<EmitPlanInput>()`
 > (`crates/flux-flow/src/compile.rs`), whose `ast` field is the schemars-derived `DraftAst` schema.
@@ -123,11 +126,60 @@ regardless**, so even a "native loses" outcome leaves a shippable win.
 
 ## Status
 
-**Arm 1 shipped; the A/B itself not built.** The strict-schema `json` arm landed on the production
-path: `emit_plan` is advertised via `tool_input_schema::<EmitPlanInput>()`
-(`crates/flux-flow/src/compile.rs`), so the model sees the real derived `DraftAst` schema — the
-"net improvement regardless" called out under *Decision & cutover* is banked. Prerequisite for the
-`text` arm (native-text spellings) also shipped (`8052796`). Still unbuilt: the `plan_surface`
-selector, the `text` arm's prompt/grammar wiring, and the measured corpus run — the empirical
-comparison has not happened, so no cutover decision exists. This doc remains the spec for that
-remaining work; an impl plan belongs in `.flux/plans/` when it starts.
+**Both arms built and measured (L-20); decision below.** The strict-schema `json` arm had landed
+with L-19; L-20 added the selector (`FLUX_EMISSION=json|text`, default `json`, byte-identical
+surface when unset), the `text` arm (`emit_plan` takes a `source` string; native grammar block with
+worked examples derived from the JSON grammar's own examples via `flux_lang::format::format`, so
+the two arms teach byte-equivalent plans; parsed with `flux_lang::parse` and gated by the SAME
+hidden-op + analyze/lower checks), a fixed 15-task corpus
+(`crates/flux-eval/assets/emission-ab/tasks.json`), and the env-gated live runner
+(`crates/flux-eval/tests/emission_ab.rs`; `FLUX_EMISSION_AB=1 … -- --ignored --nocapture`). The
+selector was named `plan_surface` in this doc's sketch; it shipped as the `FLUX_EMISSION` env
+switch read in `compile_turn` — the single front door — so engine/loop-host/CLI all inherit it.
+
+## Measured results & decision (2026-07-02, L-20)
+
+One run per arm over the 15-task corpus, same conversation/options per task, serially, against
+`openrouter-anthropic/anthropic/claude-sonnet-4.6` (OpenRouter Anthropic-Messages wire; no prompt
+caching was returned — `cache_read`/`cache_write` = 0 in both arms, so every call paid fresh
+input). Full builtin op catalog (37 ops), no session view, `max_steps = 4` (≤3 repair rounds),
+default temperature. Metrics straight from the planner's `Usage` + `Compiled::attempts`.
+
+| metric | json (strict `ast` schema) | text (native `source`) |
+|---|---|---|
+| plans accepted | 15/15 | 15/15 |
+| **first-emission acceptance** | **14/15 (93%)** | **9/15 (60%)** |
+| repair rounds (total) | 1 | 10 |
+| accepted within one retry | 15/15 | 13/15 |
+| prompt size (base, tokens/call) | ~18.0k | ~9.6k (−47%) |
+| final-call input tok (total / per task) | 270,919 / 18,061 | 146,084 / 9,739 |
+| billed input est. incl. repair calls¹ | ~289k | ~242–247k |
+| output tok (total / per task) | 5,028 / 335 | 4,114 / 274 |
+| wall time (total / per task) | 87.2s / 5.8s | 96.0s / 6.4s |
+| est. cost @ $3/M in + $15/M out | ~$0.94 | ~$0.79–0.80 |
+
+¹ `Usage::accumulate` keeps only the final call's prompt occupancy per turn; each repair round adds
+one earlier billed call, estimated here between the arm's base prompt (lower bound) and the final
+prompt (upper bound). The undercount is identical in kind across arms; it penalizes the arm with
+more repairs (text).
+
+Per-construct repair hotspots — text arm: `when-branch` ×3 and `jq-extract` ×3 (both accepted only
+on the 4th attempt), `retry-tests`/`repeat-append`/`write-then-read`/`grep-assert` ×1 each. Json
+arm: `jq-extract` ×1 (the one task that also cost json a repair — jq/parse semantics, not the
+surface). The text failures cluster on multi-clause statements (`when`/`else` bodies, `retry`
+headers) and the parser's strictness (indentation, statement-position rules) — exactly the risk
+this doc predicted for an in-prompt-taught DSL.
+
+**Decision: keep `json`.** The pre-registered tie-break said: cut to `text` only if it clearly wins
+on **both** validity-within-one-retry **and** token cost. It wins token cost (~15% cheaper overall
+— the −47% prompt and −18% output more than absorb 10× the repair rounds) but **loses validity**
+(60% vs 93% first-emission; 13/15 vs 15/15 within one retry) and wall time (+10%). Emission
+validity is the planner's core reliability property — every repair round is user-visible latency
+and a chance to exhaust the step budget — so `json` stays the production surface and the default.
+
+Cutover note (the no-fallbacks stance): the `FLUX_EMISSION` selector + text arm are a measurement
+scaffold, not a product feature. Follow-up after this table is reviewed: either delete the text arm
+and selector outright, or first re-measure with the construct-level fixes the hotspots suggest
+(e.g. a `when`/`retry` worked example in the text grammar) if the ~15% cost edge is judged worth
+chasing. The semantic (terminal-bench pass-rate) leg was not run — both arms produce the same
+`DraftAst`s once accepted, and the syntactic gap was decisive under the pre-registered rule.

@@ -25,6 +25,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **The planner-emission A/B has an answer: strict JSON stays (L-20).** The open question from
+  the emission design doc is now measured, not guessed: a `FLUX_EMISSION=json|text` selector (json
+  default byte-identical to the shipped surface; both arms behind the same hidden-op +
+  analyze/lower gates), a 15-task committed corpus, and one live run per arm on OpenRouter Sonnet.
+  Strict-schema JSON wins where it matters — 93% vs 60% first-emission acceptance, 15/15 vs 13/15
+  accepted within one retry — while native text wins base-prompt size (−47%) and cost (~15%) but
+  loses wall time. Decision recorded in `docs/designs/flux-lang-emission-ab.md` with the full
+  table; the text arm stays behind the flag for future re-measurement.
+
 - **Live smoke gate covers the subscription providers — and WS regressions fail loudly (C-19).**
   `scripts/smoke-live.sh` gains a `claude` and a `codex` leg (one tiny turn each, SKIP when the
   credential is absent). The codex leg runs under the new `FLUX_TRANSPORT_DEBUG=1` switch: the

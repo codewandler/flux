@@ -26,3 +26,7 @@ regex.workspace = true
 # For the fixture test that validates examples/*.flux against the live op registry.
 flux-tools.workspace = true
 flux-orchestrate.workspace = true
+# For the env-gated L-20 emission A/B runner (tests/emission_ab.rs): it drives the planner's two
+# emission arms against a live OpenRouter model.
+flux-provider.workspace = true
+flux-providers.workspace = true

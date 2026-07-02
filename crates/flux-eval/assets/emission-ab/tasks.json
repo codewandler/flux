@@ -1,0 +1,77 @@
+[
+  {
+    "id": "seq-read-grep",
+    "prompt": "Read the file README.md, then search it for the string TODO with a grep.",
+    "exercises": ["bind", "call", "sequential"]
+  },
+  {
+    "id": "parallel-reads",
+    "prompt": "Read the three files src/a.rs, src/b.rs and src/c.rs concurrently so they can be compared afterwards.",
+    "exercises": ["parallel"]
+  },
+  {
+    "id": "glob-each-read",
+    "prompt": "Find all markdown files matching docs/*.md, then read every file that was found, collecting the contents.",
+    "exercises": ["bind", "each", "collect"]
+  },
+  {
+    "id": "retry-tests",
+    "prompt": "Run the cargo test suite, retrying up to 3 times if it fails.",
+    "exercises": ["retry"]
+  },
+  {
+    "id": "obj-template",
+    "prompt": "Read Cargo.toml and return an object with two fields: manifest (the file content that was read) and checked (the literal true).",
+    "exercises": ["bind", "obj", "return"]
+  },
+  {
+    "id": "list-template",
+    "prompt": "Get the git status and the git diff, then return a list containing exactly those two results in order.",
+    "exercises": ["bind", "list", "return"]
+  },
+  {
+    "id": "when-branch",
+    "prompt": "Search the src directory for the pattern unsafe. If any matches were found, write them to a file named unsafe-report.txt; otherwise do nothing.",
+    "exercises": ["bind", "when", "write"]
+  },
+  {
+    "id": "repeat-append",
+    "prompt": "Append the line tick to the file log.txt exactly 3 times, one append per iteration of a bounded loop.",
+    "exercises": ["repeat"]
+  },
+  {
+    "id": "fmt-version",
+    "prompt": "Read the file VERSION and return the message 'current version: <contents>' with the file contents interpolated into the string.",
+    "exercises": ["bind", "fmt", "return"]
+  },
+  {
+    "id": "jq-extract",
+    "prompt": "Read package.json, parse the content as JSON, and return just the version field.",
+    "exercises": ["bind", "parse", "jq", "return"]
+  },
+  {
+    "id": "parallel-combine",
+    "prompt": "Concurrently get the git status and read CHANGELOG.md, then return an object combining both results under the fields status and changelog.",
+    "exercises": ["parallel", "obj", "return"]
+  },
+  {
+    "id": "each-static-collect",
+    "prompt": "For each of the paths docs/a.md, docs/b.md and docs/c.md in order, read the file; collect all the contents into one list.",
+    "exercises": ["each", "collect"]
+  },
+  {
+    "id": "write-then-read",
+    "prompt": "Write the text hello to a file named hello.txt, then read hello.txt back to confirm the content.",
+    "exercises": ["write", "bind", "sequential"]
+  },
+  {
+    "id": "grep-assert",
+    "prompt": "Search Cargo.toml for the pattern [package] and assert that at least one match was found, with the failure message 'missing package section'.",
+    "exercises": ["bind", "assert"]
+  },
+  {
+    "id": "edit-then-check",
+    "prompt": "In src/main.rs replace the string foo with bar, then run cargo check to verify the crate still compiles.",
+    "exercises": ["edit", "call", "sequential"]
+  }
+]

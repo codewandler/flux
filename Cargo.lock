@@ -990,6 +990,8 @@ dependencies = [
  "flux-evidence",
  "flux-flow",
  "flux-orchestrate",
+ "flux-provider",
+ "flux-providers",
  "flux-runtime",
  "flux-spec",
  "flux-system",
