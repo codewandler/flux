@@ -11,6 +11,12 @@
 # small real turns. Override the model with FLUX_SMOKE_MODEL (default: anthropic/opus) and the
 # binary with FLUX_BIN.
 #
+# Subscription legs (C-19): steps 7/8 exercise the `claude` and `codex` subscription providers with
+# one tiny turn each — skipped (never failed) when the credential is absent. The codex leg asserts
+# the turn ran over the WebSocket transport: with FLUX_TRANSPORT_DEBUG=1 the provider prints a
+# stable stderr marker when it silently falls back to HTTP, and the leg FAILS on that marker —
+# the upstream WS contract is experimental, and only a live probe catches it drifting (C-07).
+#
 # The cancel-then-continue check (Ctrl-C mid-turn, then resume) is INHERENTLY MANUAL — Ctrl-C is only
 # wired into the interactive REPL, not one-shot mode — so it's printed as a manual step at the end.
 
@@ -43,7 +49,7 @@ if printf '%s' "$out" | grep -q "SMOKE_OK"; then ok "streamed a response"; else 
 
 # 2. Agentic edit: a real tool_use → tool_result round-trip through the safety envelope.
 WS="$(mktemp -d)"
-trap 'kill "${A2A_PID:-}" 2>/dev/null; rm -rf "$WS" "${A2A_WS:-}" "${QWS:-}" "${A2A_LOG:-}"' EXIT
+trap 'kill "${A2A_PID:-}" 2>/dev/null; rm -rf "$WS" "${A2A_WS:-}" "${QWS:-}" "${A2A_LOG:-}" "${CODEX_ERR:-}"' EXIT
 step "2. agentic edit (real tool round-trip, scratch workspace)"
 ( cd "$WS" && "$FLUX" --agent --yes -m "$MODEL" -p \
   'Create a file named hello.txt whose entire contents are exactly: SMOKE_EDIT' ) >/dev/null 2>&1
@@ -157,6 +163,45 @@ else
     bad "$OLLAMA_MODEL did not write tool.txt — tool calling NOT working (returned prose / unsupported)"
     printf '    last model output:\n'
     tail -n 20 "$QWS/out.log" 2>/dev/null | sed 's/^/    /'
+  fi
+fi
+
+# 7. Claude subscription leg: one tiny turn through the OAuth (claude.ai subscription) credential.
+#    Skipped, never failed, when no claude credential resolves — the leg is opt-in by being logged
+#    in (`flux auth login claude`, or an importable Claude Code credentials file).
+CLAUDE_MODEL="${FLUX_SMOKE_CLAUDE_MODEL:-claude/sonnet}"
+step "7. claude subscription — $CLAUDE_MODEL (one tiny turn)"
+if ! "$FLUX" auth status 2>/dev/null | grep -q '^✓ claude '; then
+  skip "no claude credential — run: flux auth login claude"
+else
+  out="$("$FLUX" run --yes -m "$CLAUDE_MODEL" 'Reply with exactly this token and nothing else: CLAUDE_SUB_OK' 2>/dev/null)"
+  if printf '%s' "$out" | grep -q "CLAUDE_SUB_OK"; then
+    ok "claude subscription turn completed"
+  else
+    bad "claude turn failed (got: ${out:-<empty>}) — check the subscription credential"
+  fi
+fi
+
+# 8. Codex subscription leg + WS-contract assertion. The codex provider dials the WebSocket
+#    transport first and falls back to HTTP-SSE transparently on connect failure (C-07) — so a
+#    quietly-passing turn could hide a broken WS leg. FLUX_TRANSPORT_DEBUG=1 makes the provider
+#    print a stable stderr marker on that fallback (C-19); this leg FAILS on the marker:
+#    completing the turn is not enough, it must complete over WS.
+CODEX_MODEL="${FLUX_SMOKE_CODEX_MODEL:-codex}"
+step "8. codex subscription — $CODEX_MODEL (one tiny turn, must run over WS)"
+if ! "$FLUX" auth status 2>/dev/null | grep -q '^✓ codex '; then
+  skip "no codex credential — run: flux auth login codex"
+else
+  CODEX_ERR="$(mktemp)"
+  out="$(FLUX_TRANSPORT_DEBUG=1 "$FLUX" run --yes -m "$CODEX_MODEL" 'Reply with exactly this token and nothing else: CODEX_WS_OK' 2>"$CODEX_ERR")"
+  if grep -q 'flux: stream transport fell back to HTTP' "$CODEX_ERR"; then
+    reason="$(grep -m1 'flux: stream transport fell back to HTTP' "$CODEX_ERR" | sed 's/^.*fell back to HTTP: //')"
+    bad "codex WS leg BROKEN — turn completed via the HTTP fallback (${reason:-unknown error})"
+  elif printf '%s' "$out" | grep -q "CODEX_WS_OK"; then
+    ok "codex turn completed over the WebSocket transport"
+  else
+    bad "codex turn failed (got: ${out:-<empty>}) — check the subscription credential"
+    tail -n 5 "$CODEX_ERR" 2>/dev/null | sed 's/^/    /'
   fi
 fi
 

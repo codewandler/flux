@@ -280,7 +280,14 @@ pub struct NativeProvider {
     cred: Arc<dyn Credential>,
     max_retries: u32,
     transport: Option<Arc<dyn StreamTransport>>,
+    /// Test-only observation seam for the C-19 fallback note (production writes stderr).
+    #[cfg(test)]
+    fallback_note_sink: Option<FallbackNoteSink>,
 }
+
+/// Test-only sink for the C-19 fallback note — see `NativeProvider::with_fallback_note_sink`.
+#[cfg(test)]
+type FallbackNoteSink = Arc<dyn Fn(&str) + Send + Sync>;
 
 impl NativeProvider {
     pub fn new(
@@ -295,6 +302,8 @@ impl NativeProvider {
             cred,
             max_retries: DEFAULT_MAX_RETRIES,
             transport: None,
+            #[cfg(test)]
+            fallback_note_sink: None,
         }
     }
 
@@ -310,6 +319,33 @@ impl NativeProvider {
         self.transport = Some(transport);
         self
     }
+
+    /// Route the C-19 fallback note into `sink` instead of stderr so a test can assert on it.
+    #[cfg(test)]
+    fn with_fallback_note_sink(mut self, sink: FallbackNoteSink) -> Self {
+        self.fallback_note_sink = Some(sink);
+        self
+    }
+
+    /// Emit a C-19 transport-fallback note: stderr in production, the test sink when installed.
+    fn emit_fallback_note(&self, note: &str) {
+        #[cfg(test)]
+        if let Some(sink) = &self.fallback_note_sink {
+            sink(note);
+            return;
+        }
+        eprintln!("{note}");
+    }
+}
+
+/// C-19: format the env-gated marker for the transport→HTTP fallback — `Some` only when
+/// `FLUX_TRANSPORT_DEBUG=1`. The fallback otherwise logs only via `tracing::warn!`, which is
+/// invisible from the CLI (no subscriber installed), so a broken WS leg would silently complete
+/// over HTTP with no observable signal. The prefix is stable — the live smoke gate
+/// (`scripts/smoke-live.sh`) greps stderr for it to tell "over WS" apart from "via HTTP fallback".
+fn transport_fallback_note(err: &Error) -> Option<String> {
+    let on = std::env::var("FLUX_TRANSPORT_DEBUG").is_ok_and(|v| v == "1");
+    on.then(|| format!("flux: stream transport fell back to HTTP: {err}"))
 }
 
 #[async_trait]
@@ -352,6 +388,13 @@ impl Provider for NativeProvider {
                 Ok(bytes) => return Ok(self.codec.map_stream(bytes)),
                 Err(e) => {
                     tracing::warn!(error = %e, "stream transport failed; falling back to HTTP");
+                    // C-19: the warning above is invisible from the CLI (no tracing subscriber
+                    // is installed), so a broken WS leg would silently complete over HTTP. With
+                    // FLUX_TRANSPORT_DEBUG=1 the fallback also emits a stable stderr marker the
+                    // live smoke gate greps to tell "over WS" apart from "via HTTP fallback".
+                    if let Some(note) = transport_fallback_note(&e) {
+                        self.emit_fallback_note(&note);
+                    }
                 }
             }
         }
@@ -612,6 +655,63 @@ mod tests {
             "a failing transport must fall back to exactly one HTTP attempt"
         );
         handle.abort();
+    }
+
+    /// Run one turn through a failing transport (→ HTTP fallback) with the fallback note routed
+    /// into `notes` instead of stderr. Helper for the C-19 marker test below.
+    async fn stream_with_note_sink(
+        url: String,
+        notes: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Result<ChunkStream> {
+        let provider = NativeProvider::new(
+            "test",
+            Arc::new(NullCodec),
+            Arc::new(NullCred { endpoint: url }),
+        )
+        .with_transport(Arc::new(FakeTransport {
+            connects: Arc::new(AtomicUsize::new(0)),
+            fail: true,
+        }))
+        .with_fallback_note_sink(Arc::new(move |n: &str| {
+            notes.lock().unwrap().push(n.to_string())
+        }));
+        provider.stream(Request::new("m", "hi")).await
+    }
+
+    /// C-19: with `FLUX_TRANSPORT_DEBUG=1` the transport→HTTP fallback emits a stable stderr
+    /// marker (observed here via the test sink); with the variable unset the fallback stays
+    /// silent. Both states live in ONE test so the env-var flip cannot race a sibling test.
+    #[tokio::test]
+    async fn fallback_note_is_emitted_only_when_env_gated() {
+        let notes: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Gated ON → exactly one note, with the stable grep-able prefix.
+        std::env::set_var("FLUX_TRANSPORT_DEBUG", "1");
+        let (url, handle, _hits) = flaky_server(0).await;
+        let res = stream_with_note_sink(url, notes.clone()).await;
+        std::env::remove_var("FLUX_TRANSPORT_DEBUG");
+        assert!(res.is_ok(), "the turn still completes over HTTP");
+        handle.abort();
+        {
+            let got = notes.lock().unwrap();
+            assert_eq!(got.len(), 1, "one note per fallback when gated on");
+            assert!(
+                got[0].starts_with("flux: stream transport fell back to HTTP:"),
+                "stable marker prefix (smoke-live.sh greps it), got: {}",
+                got[0]
+            );
+        }
+
+        // Gated OFF (unset) → the fallback is silent.
+        notes.lock().unwrap().clear();
+        let (url, handle, _hits) = flaky_server(0).await;
+        let res = stream_with_note_sink(url, notes.clone()).await;
+        assert!(res.is_ok());
+        handle.abort();
+        assert!(
+            notes.lock().unwrap().is_empty(),
+            "no note when FLUX_TRANSPORT_DEBUG is unset"
+        );
     }
 
     // --- 401 force-refresh-then-retry (C-04) ------------------------------------------------

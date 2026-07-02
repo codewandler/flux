@@ -55,7 +55,11 @@ slipped through). With a real key (e.g. `anthropic/opus`), exercise:
 - (semi-manual) a Ctrl-C mid-turn in the REPL, then a follow-up turn in the same session.
 
 This is scripted as `scripts/smoke-live.sh` (model overridable via `FLUX_SMOKE_MODEL`) — run it
-before every release.
+before every release. It also carries **subscription-provider legs** (C-19): one tiny `claude` and
+one tiny `codex` turn, each SKIPped when the credential is absent — and the codex leg runs under
+`FLUX_TRANSPORT_DEBUG=1` so a WebSocket-contract regression **fails loudly** instead of hiding
+behind the transparent HTTP fallback (the C-07 lesson: live wire-contract drift is invisible to
+hermetic stubs *and* to a fallback that works).
 
 A second, **integration-plugin** smoke (`scripts/smoke-plugins.sh`) exercises the D-08 plugin pack against
 real vendor APIs: for each integration whose credential is in the environment it builds the plugin,

@@ -25,6 +25,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Live smoke gate covers the subscription providers — and WS regressions fail loudly (C-19).**
+  `scripts/smoke-live.sh` gains a `claude` and a `codex` leg (one tiny turn each, SKIP when the
+  credential is absent). The codex leg runs under the new `FLUX_TRANSPORT_DEBUG=1` switch: the
+  transport→HTTP fallback in `NativeProvider::stream` now emits a stable, env-gated stderr marker,
+  and the smoke greps for it — so the next codex wire-contract drift fails the gate with the
+  fallback reason instead of silently completing over HTTP (the C-07 lesson). Both legs validated
+  live (codex confirmed over the WebSocket). Known issue recorded in the story: the script's older
+  steps 1–5 still use the pre-subcommand CLI forms and need modernizing.
+
 - **`flux auth login codex` — flux-native PKCE login, claude parity (C-08).** The last open story
   of the subscription epic: codex authentication no longer requires logging into the Codex CLI
   first. The flow uses upstream-verified constants (`auth.openai.com/oauth/authorize`, the
