@@ -2,11 +2,11 @@
 id: C-04
 title: Claude provider verify + force-refresh-on-401
 pillar: Core
-status: backlog
+status: done
 epic: subscription-providers-and-cost
 theme: subscription-providers-cost
 design: docs/designs/subscription-providers-and-cost.md
-note: refresh today is expiry-time-only; add a 401→refresh→retry path (shared by both subscription providers)
+note: 401 now triggers exactly one force-refresh + one retry (second 401 surfaces, 5xx keeps backoff), RefreshingToken force-path coalesces concurrent bursts, claude request shape verified hermetically — landed in c2cd360; frontmatter was stale until 2026-07-02
 ---
 
 # Claude provider verify + force-refresh-on-401

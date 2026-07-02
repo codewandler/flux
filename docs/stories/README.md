@@ -42,7 +42,6 @@ _flux's plugins each talk to a single, statically-configured service. The fluxpl
 
 ### subscription providers (claude-code + codex) & cross-provider usage/cost
 _flux can already drive the two **subscription / passthrough** model backends — `claude` (Claude_
-- [C-04 — Claude provider verify + force-refresh-on-401](C-04-claude-401-refresh.md) · Core · refresh today is expiry-time-only; add a 401→refresh→retry path (shared by both subscription providers)
 - [C-07 — Codex WebSocket transport (default, HTTP fallback)](C-07-codex-websocket-transport.md) · Core · WS primary with transparent HTTP-SSE fallback (needs C-03)
 - [C-08 — Full OAuth2 login — codex PKCE (+ claude parity)](C-08-full-oauth2-login.md) · Core · the explicit later stage; import + refresh cover the near term
 
@@ -60,6 +59,7 @@ _flux can already drive the two **subscription / passthrough** model backends �
 - [C-01 — Crate consolidation, phases 2–4](C-01-crate-consolidation.md) · Core · hooks→plugin, browser+datasource→capabilities, context→runtime; removed dead integrations (35 → 31 crates)
 - [C-02 — Integration-stack hardening — embeddings backend, plugin install/call + CI, live smoke](C-02-integration-stack-hardening.md) · Core · `flux plugin call`/`install` + a `plugins/` CI job (`a8092dc`); feature-gated embeddings/semantic backend — `OpenAiEmbedder` + a `SemanticIndex` hybrid-rerank decorator, default build unchanged (`f912c24`); a live env-gated `scripts/smoke-plugins.sh` (`5fda8be`)
 - [C-03 — Codex provider hardening — account-id, usage tiers, reasoning continuity](C-03-codex-provider-hardening.md) · Core · `account_id` from the `id_token` JWT, cache+reasoning token capture, reasoning continuity under `store:false`
+- [C-04 — Claude provider verify + force-refresh-on-401](C-04-claude-401-refresh.md) · Core · 401 now triggers exactly one force-refresh + one retry (second 401 surfaces, 5xx keeps backoff), RefreshingToken force-path coalesces concurrent bursts, claude request shape verified hermetically — landed in c2cd360; frontmatter was stale until 2026-07-02
 - [C-05 — Cross-provider pricing & cost model](C-05-pricing-cost-model.md) · Core · per-model per-tier rates + `cost(&Usage, model)`; built-in table + `~/.flux/pricing.toml` override; normalize codecs' cache fields
 - [C-06 — Usage & cost accounting — attribution, aggregation, reporting](C-06-usage-cost-accounting.md) · Core · model attribution + sub-agent rollup + a `cost_summary` projection + `flux usage` + a server endpoint + cache-aware surfacing (needs C-05)
 - [C-09 — AWS Bedrock LLM provider](C-09-aws-bedrock-provider.md) · Core · fully functional e2e — streaming `invoke-with-response-stream` (AWS event-stream deframer → shared SSE mapper, non-streaming path deleted), hand-rolled L1 credential chain (env → SSO w/ OIDC refresh → IRSA → EKS Pod Identity, no `aws` CLI), SigV4, region-aware model resolution, region-less pricing; live-verified streaming + tool-use + haiku `global.` profile with cost suffixes

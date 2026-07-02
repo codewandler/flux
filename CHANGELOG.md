@@ -454,6 +454,16 @@ All notable changes to this project are documented in this file. The format is b
   alias table — the CLI keeps only the bare-`codex` shorthand policy. (The cache + reasoning token
   capture in the Responses codec was already present and is now live-verified: `cache 5.1k (15% hit)`.)
 
+- **Claude/codex force-refresh-on-401 (C-04).** OAuth-backed subscription providers refreshed
+  tokens on expiry time only — a stale or wrong expiry re-sent the same dead token and failed the
+  turn. `NativeProvider::stream` now reacts to a 401 on an OAuth credential by forcing exactly one
+  token refresh (`Credential::token_source()` / `TokenSource::refresh()` seams) and retrying once;
+  a second 401 surfaces the error, and 5xx/429 keep the ordinary backoff without spending the
+  refresh grant. `RefreshingToken`'s forced path ignores the expiry buffer, persists the freshened
+  token, and coalesces a concurrent burst of 401s into one refresh. Landed with C-03/C-05 in
+  `c2cd360`; this entry and the story's `done` status were back-filled after a tracking audit
+  found the frontmatter stale.
+
 - **Live per-turn cost in the CLI annotation + codex pricing fix (C-05).** The cross-provider cost
   model (`flux_core::pricing`: per-model per-tier rates, `cost(&Usage, model)`, `~/.flux/pricing.toml`
   overlay, subscription labelling) was shipped but never *wired* — `cost()` was dead code and the CLI
