@@ -2935,7 +2935,13 @@ async fn run_pending_plan(
     ast: &flux_flow::ast::DraftAst,
     cancel: &tokio_util::sync::CancellationToken,
 ) {
-    let _scope = agent.executor.enter_approved_scope();
+    // The human reviewed the rendered plan (tree + risk badge) in `/plan` mode, so the disclosure
+    // follows what that preview showed: a destructive op the user saw doesn't re-prompt per-op,
+    // while a destructive command assembled at runtime (invisible to the preview) still does.
+    let composites = agent.composites.active_for_session(session_id);
+    let risk =
+        flux_flow::runtime::plan_risk_with_composites(ast, agent.executor.registry(), &composites);
+    let _scope = agent.executor.enter_approved_scope(risk.destructive);
     let mut sink = CliSink::new(0);
     // Race execution against `cancel`: `execute_flow` has no cancellation of its own, so Ctrl-C is
     // honored by dropping the in-flight flow future (which aborts the current op's IO). The future
@@ -3859,12 +3865,11 @@ impl Approver for StdinApprover {
 
     /// The whole-plan confirm. The plan tree + risk were already rendered (the `flow.plan` observation),
     /// so this is one line. `always` here trusts every plan for the rest of the session.
-    async fn request_plan(&self, summary: &str, ops: usize) -> ApprovalChoice {
+    async fn request_plan(&self, plan: &flux_runtime::PlanApprovalRequest) -> ApprovalChoice {
         let prompt = format!(
-            "\n{} this plan? ({} op(s) · {})  [y]es / [a]lways / [N]o: ",
+            "\n{} this plan? ({})  [y]es / [a]lways / [N]o: ",
             style::yellow("run"),
-            ops,
-            summary,
+            plan.subject(),
         );
         read_choice(prompt, ApprovalChoice::AllowAlways("*plans*".to_string())).await
     }

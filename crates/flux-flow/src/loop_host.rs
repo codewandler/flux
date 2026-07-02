@@ -527,7 +527,7 @@ impl LoopHost for EngineLoopHost {
             // prompt can print ahead of the tree, and the tree can render under raw mode (no `\n`→`\r\n`),
             // staircasing it. Yielding here parks us so the drain runs in cooked mode first.
             tokio::task::yield_now().await;
-            match executor.approve_plan(&risk.summary(), risk.ops.len()).await {
+            match executor.approve_plan(&risk.approval_request()).await {
                 Some(scope) => Some(scope),
                 None => {
                     return Ok(serde_json::json!({
@@ -1692,7 +1692,10 @@ op project_greet(name: String) -> String
             self.op_calls.fetch_add(1, Ordering::SeqCst);
             flux_runtime::ApprovalChoice::Deny
         }
-        async fn request_plan(&self, _summary: &str, _ops: usize) -> flux_runtime::ApprovalChoice {
+        async fn request_plan(
+            &self,
+            _plan: &flux_runtime::PlanApprovalRequest,
+        ) -> flux_runtime::ApprovalChoice {
             self.plan_calls.fetch_add(1, Ordering::SeqCst);
             if self.allow {
                 flux_runtime::ApprovalChoice::Allow

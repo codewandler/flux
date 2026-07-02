@@ -599,6 +599,34 @@ pub enum ApprovalChoice {
     Deny,
 }
 
+/// What a whole-plan approval decides on: the plan's statically-visible behavior, aggregated from
+/// every op call the risk preview walked. `intents` carries the SAME pre-execution risk signal the
+/// per-op gate sees (so a headless approver like the sub-agent one can apply its per-op policy to
+/// the plan as a unit); `destructive` additionally covers spec-level `Risk::Destructive` ops whose
+/// concrete intents aren't statically visible (e.g. composite ops declaring destructive risk).
+#[derive(Debug, Clone, Default)]
+pub struct PlanApprovalRequest {
+    /// One-line human risk summary (shown at the approval prompt).
+    pub summary: String,
+    /// The distinct op names the plan calls, in first-seen order.
+    pub ops: Vec<String>,
+    /// True when the plan contains a destructive-shaped op (by intent heuristic or declared risk).
+    pub destructive: bool,
+    /// True when any op writes / executes / connects out.
+    pub mutating: bool,
+    /// Aggregate statically-visible intents across the plan's op calls. Only literal args are known
+    /// at approval time — a command assembled from `$symbols` at runtime is NOT in here, which is
+    /// why an *undisclosed* destructive op re-fires the per-op gate inside an approved scope.
+    pub intents: IntentSet,
+}
+
+impl PlanApprovalRequest {
+    /// The prompt subject line (`N op(s) · summary`).
+    pub fn subject(&self) -> String {
+        format!("{} op(s) · {}", self.ops.len(), self.summary)
+    }
+}
+
 /// How the runtime asks for human approval when a call isn't covered by a rule.
 #[async_trait]
 pub trait Approver: Send + Sync {
@@ -608,10 +636,10 @@ pub trait Approver: Send + Sync {
     /// Approve a whole compiled plan as one unit (the "approve the graph, not each node" path). The
     /// plan itself has already been rendered for the user (the `flow.plan` observation); this is just
     /// the single confirm. `AllowAlways` here means "trust every plan for the rest of the session".
-    /// The default delegates to [`request`](Self::request) so existing approvers keep working.
-    async fn request_plan(&self, summary: &str, ops: usize) -> ApprovalChoice {
-        let subject = format!("{ops} op(s) · {summary}");
-        self.request("run plan", &[subject], &IntentSet::default())
+    /// The default delegates to [`request`](Self::request) with the plan's REAL aggregate intents —
+    /// so a single-method approver applies its per-op policy (e.g. deny-destructive) to the plan too.
+    async fn request_plan(&self, plan: &PlanApprovalRequest) -> ApprovalChoice {
+        self.request("run plan", &[plan.subject()], &plan.intents)
             .await
     }
 }
@@ -626,7 +654,10 @@ impl Approver for DenyApprover {
     }
 }
 
-/// A headless approver that allows everything (e.g. `flux run --yes`). Use with care.
+/// A headless approver that allows everything (e.g. `flux run --yes`, the served daemon). Use with
+/// care — it approves destructive plans and ops alike (the human opted in at the surface). Never
+/// install it for sub-agents: `SubAgentApprover` (flux-orchestrate) is the sub-agent default and
+/// denies destructive work outright.
 pub struct AllowApprover;
 
 #[async_trait]
@@ -740,18 +771,35 @@ pub struct Executor {
     /// plan the user already approved as a whole, so the per-op approval gate is skipped (deny rules
     /// still win). A depth (not a bool) so a plan that runs a nested plan stays approved throughout.
     plan_scope: AtomicU32,
+    /// Depth of approved-plan scopes whose approval DISCLOSED a destructive op (the plan's risk
+    /// preview carried `destructive: true`, so whoever approved it saw the badge). While `0`, a
+    /// destructive-intent op re-fires the per-op approval gate even inside an approved scope — the
+    /// closed loophole is a destructive command assembled from `$symbols` at runtime, invisible to
+    /// the static plan risk that the approval was based on.
+    destructive_scope: AtomicU32,
     /// Set when the user answered `always` at a plan prompt: every subsequent plan this session runs
-    /// without asking.
+    /// without asking. Deliberately does NOT disclose destructiveness: a statically-visible
+    /// destructive plan still discloses per plan via its scope guard, and a runtime-assembled
+    /// destructive op still asks — "trust all plans" is not "never ask about `rm -rf` again".
     trust_all: AtomicBool,
 }
 
 /// Holds an approved-plan scope open. While alive, [`Executor::dispatch`] skips the per-op approval
 /// prompt; `Drop` closes the scope (decrementing the depth so re-planning asks again next round).
-pub struct PlanScopeGuard<'a>(&'a AtomicU32);
+/// When the plan's approval disclosed a destructive op, the guard also holds the destructive
+/// disclosure open (see [`Executor::enter_approved_scope`]).
+pub struct PlanScopeGuard<'a> {
+    plan: &'a AtomicU32,
+    /// `Some` iff this guard opened a destructive disclosure (paired decrement on drop).
+    destructive: Option<&'a AtomicU32>,
+}
 
 impl Drop for PlanScopeGuard<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.plan.fetch_sub(1, Ordering::SeqCst);
+        if let Some(d) = self.destructive {
+            d.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -794,6 +842,7 @@ impl Executor {
             caller: default_local_caller(),
             trust: default_local_trust(),
             plan_scope: AtomicU32::new(0),
+            destructive_scope: AtomicU32::new(0),
             trust_all: AtomicBool::new(false),
         }
     }
@@ -806,26 +855,37 @@ impl Executor {
 
     /// Open a pre-approved scope for the duration of the returned guard — used when the act of running
     /// *is* the approval (the REPL `/run`, where the human already reviewed the plan). Inner ops dispatch
-    /// without prompting; the guard closes the scope on drop.
-    pub fn enter_approved_scope(&self) -> PlanScopeGuard<'_> {
+    /// without prompting; the guard closes the scope on drop. `destructive_disclosed` says whether the
+    /// reviewed plan's risk preview showed a destructive op: pass the preview's `destructive` flag so a
+    /// destructive op the human saw doesn't re-prompt, while one assembled at runtime still does.
+    pub fn enter_approved_scope(&self, destructive_disclosed: bool) -> PlanScopeGuard<'_> {
         self.plan_scope.fetch_add(1, Ordering::SeqCst);
-        PlanScopeGuard(&self.plan_scope)
+        let destructive = destructive_disclosed.then(|| {
+            self.destructive_scope.fetch_add(1, Ordering::SeqCst);
+            &self.destructive_scope
+        });
+        PlanScopeGuard {
+            plan: &self.plan_scope,
+            destructive,
+        }
     }
 
     /// Approve a whole plan once, then keep it pre-approved while the returned guard is held. If already
     /// inside an approved scope (a nested `run_plan`) or the user trusts all plans, returns a guard
-    /// without prompting. `None` means the user rejected the plan. `summary`/`ops` come from the plan's
-    /// risk preview — the plan tree itself was already rendered (the `flow.plan` observation).
-    pub async fn approve_plan(&self, summary: &str, ops: usize) -> Option<PlanScopeGuard<'_>> {
+    /// without prompting. `None` means the approver rejected the plan. The request comes from the plan's
+    /// risk preview — the plan tree itself was already rendered (the `flow.plan` observation). The
+    /// scope's destructive disclosure follows the request's `destructive` flag on every arm: whoever
+    /// approved (or pre-trusted) the plan did so against a preview that carried that badge.
+    pub async fn approve_plan(&self, plan: &PlanApprovalRequest) -> Option<PlanScopeGuard<'_>> {
         if self.in_approved_scope() {
-            return Some(self.enter_approved_scope());
+            return Some(self.enter_approved_scope(plan.destructive));
         }
         let approver = self.approver.lock().unwrap().clone();
-        match approver.request_plan(summary, ops).await {
-            ApprovalChoice::Allow => Some(self.enter_approved_scope()),
+        match approver.request_plan(plan).await {
+            ApprovalChoice::Allow => Some(self.enter_approved_scope(plan.destructive)),
             ApprovalChoice::AllowAlways(_) => {
                 self.trust_all.store(true, Ordering::SeqCst);
-                Some(self.enter_approved_scope())
+                Some(self.enter_approved_scope(plan.destructive))
             }
             ApprovalChoice::Deny => None,
         }
@@ -1055,9 +1115,17 @@ impl Executor {
             || spec.risk == Risk::Destructive
             || policy_requires_approval
             || unscoped_write;
-        //    Inside an approved-plan scope the prompt is skipped entirely — the user approved the plan as
-        //    a whole (its risk badge disclosed every op). Hard denies (steps 1-2 above) still apply.
-        if !self.in_approved_scope() && (force_approval || perm != PermDecision::Allow) {
+        //    Inside an approved-plan scope the prompt is skipped — the user approved the plan as a
+        //    whole — EXCEPT for a destructive op the plan's approval never disclosed (the risk preview
+        //    only sees literal args, so a destructive command assembled from `$symbols` at runtime is
+        //    invisible to it). Such an undisclosed destructive op re-fires the gate: the interactive
+        //    approver prompts, `--yes` allows, the sub-agent approver denies. This deliberately also
+        //    holds under `trust_all` ("always"). Hard denies (steps 1-2 above) always apply.
+        let undisclosed_destructive =
+            intents.is_destructive() && self.destructive_scope.load(Ordering::SeqCst) == 0;
+        if (!self.in_approved_scope() || undisclosed_destructive)
+            && (force_approval || perm != PermDecision::Allow)
+        {
             let approver = self.approver.lock().unwrap().clone();
             match approver.request(name, &subjects, &intents).await {
                 ApprovalChoice::Allow => {}
@@ -1143,6 +1211,41 @@ mod tests {
         async fn request(&self, _t: &str, _s: &[String], _i: &IntentSet) -> ApprovalChoice {
             self.asked.store(true, Ordering::Relaxed);
             (self.choice)()
+        }
+    }
+
+    /// Builds a plan-approval request the way the flow layer does from its risk preview.
+    fn plan_request(summary: &str, ops: usize) -> PlanApprovalRequest {
+        PlanApprovalRequest {
+            summary: summary.into(),
+            ops: (0..ops).map(|i| format!("op{i}")).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// A tool with a destructive-shaped process intent (the per-op gate's force-approval trigger),
+    /// used to prove the disclosed/undisclosed destructive-scope semantics.
+    struct RmTool;
+    #[async_trait]
+    impl Tool for RmTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only("rm", "rm", json!({"type": "object"}))
+                .with_effects(vec![Effect::Process])
+        }
+        fn intents(&self, _p: &Value) -> IntentSet {
+            let mut s = IntentSet::new();
+            s.push(flux_spec::Intent {
+                behavior: flux_spec::IntentBehavior::CommandExecution,
+                target: flux_spec::IntentTarget::Process {
+                    command: "rm -rf scratch".into(),
+                },
+                role: flux_spec::IntentRole::ProcessCommand,
+                certainty: flux_spec::IntentCertainty::Certain,
+            });
+            s
+        }
+        async fn execute(&self, _ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
+            Ok(ToolResult::ok("removed"))
         }
     }
 
@@ -1255,7 +1358,7 @@ mod tests {
         // Inside an approved-plan scope: no prompt, the op runs.
         approver.asked.store(false, Ordering::Relaxed);
         let r = {
-            let _scope = ex.enter_approved_scope();
+            let _scope = ex.enter_approved_scope(false);
             ex.dispatch("echo", json!({"text": "hi"})).await
         };
         assert!(
@@ -1282,7 +1385,7 @@ mod tests {
     async fn approved_scope_still_respects_deny_rules() {
         let perms = PermissionManager::from_rules(&[], &["echo".into()]);
         let ex = Executor::new(registry(), perms, Arc::new(AllowApprover), test_ctx());
-        let _scope = ex.enter_approved_scope();
+        let _scope = ex.enter_approved_scope(false);
         let r = ex.dispatch("echo", json!({"text": "hi"})).await;
         assert!(
             r.is_error,
@@ -1467,7 +1570,7 @@ mod tests {
         );
         assert!(!ex.in_approved_scope());
         {
-            let scope = ex.approve_plan("medium · mutating", 2).await;
+            let scope = ex.approve_plan(&plan_request("medium · mutating", 2)).await;
             assert!(scope.is_some(), "Allow/AllowAlways opens a scope");
             assert!(ex.in_approved_scope());
         }
@@ -1477,7 +1580,7 @@ mod tests {
             "`always` trusts every plan for the rest of the session"
         );
         approver.asked.store(false, Ordering::Relaxed);
-        let _ = ex.approve_plan("low", 1).await;
+        let _ = ex.approve_plan(&plan_request("low", 1)).await;
         assert!(
             !approver.asked.load(Ordering::Relaxed),
             "a trusted session does not prompt again"
@@ -1497,10 +1600,72 @@ mod tests {
             test_ctx(),
         );
         assert!(
-            ex.approve_plan("medium", 1).await.is_none(),
+            ex.approve_plan(&plan_request("medium", 1)).await.is_none(),
             "Deny → no scope"
         );
         assert!(!ex.in_approved_scope());
+    }
+
+    #[tokio::test]
+    async fn undisclosed_destructive_op_refires_approval_inside_approved_scope() {
+        // The plan was approved WITHOUT a destructive badge (the risk preview only sees literal
+        // args), so a destructive-intent op assembled at runtime must re-fire the per-op gate even
+        // inside the approved scope — and a denying approver must block it.
+        let approver = Arc::new(RecordingApprover {
+            asked: AtomicBool::new(false),
+            choice: || ApprovalChoice::Deny,
+        });
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(RmTool));
+        let ex = Executor::new(reg, PermissionManager::new(), approver.clone(), test_ctx());
+
+        let _scope = ex.enter_approved_scope(false); // approval never disclosed a destructive op
+        let r = ex.dispatch("rm", json!({})).await;
+        assert!(
+            approver.asked.load(Ordering::Relaxed),
+            "an undisclosed destructive op must re-fire the approval gate inside the scope"
+        );
+        assert!(r.is_error, "the denying approver blocks it: {}", r.content);
+        assert!(r.content.contains("denied by user"));
+    }
+
+    #[tokio::test]
+    async fn disclosed_destructive_plan_runs_without_per_op_reprompt() {
+        // The plan approval DID disclose the destructive op (request.destructive == true), so the
+        // per-op gate stays skipped inside the scope — no interactive double-prompt.
+        let approver = Arc::new(RecordingApprover {
+            asked: AtomicBool::new(false),
+            choice: || ApprovalChoice::Allow,
+        });
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(RmTool));
+        let ex = Executor::new(reg, PermissionManager::new(), approver.clone(), test_ctx());
+
+        let request = PlanApprovalRequest {
+            destructive: true,
+            ..plan_request("destructive · contains a destructive operation", 1)
+        };
+        let scope = ex.approve_plan(&request).await;
+        assert!(scope.is_some(), "the approver allowed the disclosed plan");
+        approver.asked.store(false, Ordering::Relaxed);
+        let r = ex.dispatch("rm", json!({})).await;
+        assert!(
+            !r.is_error,
+            "the disclosed destructive op runs: {}",
+            r.content
+        );
+        assert!(
+            !approver.asked.load(Ordering::Relaxed),
+            "no per-op re-prompt when the plan approval disclosed the destructive op"
+        );
+        drop(scope);
+
+        // Once the scope closes, the disclosure closes with it: the same op prompts again.
+        let _ = ex.dispatch("rm", json!({})).await;
+        assert!(
+            approver.asked.load(Ordering::Relaxed),
+            "scope closed → the destructive op prompts again"
+        );
     }
 
     #[tokio::test]

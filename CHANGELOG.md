@@ -340,6 +340,25 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Plan approval sees the plan's real intents — the sub-agent destructive bypass is closed (C-12).**
+  `Approver::request_plan` used to forward an **empty** `IntentSet`, and an approved plan scope
+  suppressed every per-op gate — so a sub-agent's destructive op, arriving via its only tool
+  (`emit_plan` → `run_plan` → `approve_plan`), sailed past `SubAgentApprover`'s destructive-deny
+  blind, breaking README's "sub-agents cannot approve destructive operations". `request_plan` now
+  takes a `PlanApprovalRequest { summary, ops, destructive, mutating, intents }` (breaking trait
+  change, clean cutover) built by `PlanRisk::approval_request()`; `plan_risk` folds each call node's
+  `tool.intents(...)` into the aggregate. `SubAgentApprover` denies any plan that is destructive or
+  carries a destructive intent — proven on the real emit_plan path by a new orchestrate test. The
+  dynamic-arg hole is closed too: a `destructive_scope` disclosure bit rides beside the approved-plan
+  scope, and a destructive op that was **not** statically visible at plan-approval time re-fires the
+  approval gate even inside an approved scope (interactive approvers prompt, `--yes` allows,
+  sub-agents deny) — **this deliberately also holds under "always"/trust_all**, a behavior change:
+  previously a trusted session never re-prompted; now a plan that smuggles a destructive op through
+  dynamic args gets one more explicit prompt. Disclosed destructive plans run without any per-op
+  re-prompt (regression-tested), and the REPL's `/run` computes the reviewed AST's risk so its
+  approval discloses correctly. `AllowApprover` keeps allowing destructive plans at top level (human
+  opt-in via `--yes`/server); its docs now state it must never be installed for sub-agents.
+
 - **Plugin descriptor names are sanitized against path traversal (D-35).** `flux plugin
   uninstall` (and `add` / `pin` / `rollback` / `status`) fed the user-typed plugin name straight into
   `Path::join` for `<dir>/<name>.toml`, and `remove_descriptor` handed the result to

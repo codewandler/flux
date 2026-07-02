@@ -288,9 +288,26 @@ pub struct PlanRisk {
     pub mutating: bool,
     /// The distinct op names the plan calls, in first-seen order.
     pub ops: Vec<String>,
+    /// Aggregate statically-visible intents across the plan's op calls — the same pre-execution
+    /// signal the per-op gate sees, so a plan-level approver (notably the sub-agent one) can apply
+    /// its per-op policy to the plan as a unit. Only literal args contribute; a `$symbol` arg is
+    /// invisible here, which is why dispatch re-fires the gate for an undisclosed destructive op.
+    pub intents: flux_spec::IntentSet,
 }
 
 impl PlanRisk {
+    /// The request handed to plan approval ([`Executor::approve_plan`](flux_runtime::Executor)) —
+    /// the whole-plan prompt decides on exactly this preview.
+    pub fn approval_request(&self) -> flux_runtime::PlanApprovalRequest {
+        flux_runtime::PlanApprovalRequest {
+            summary: self.summary(),
+            ops: self.ops.clone(),
+            destructive: self.destructive,
+            mutating: self.mutating,
+            intents: self.intents.clone(),
+        }
+    }
+
     /// A one-line human summary (for the approval prompt).
     pub fn summary(&self) -> String {
         let base = match self.max_risk {
@@ -337,6 +354,7 @@ pub fn plan_risk(ast: &DraftAst, registry: &ToolRegistry) -> PlanRisk {
         if intents.is_mutating() {
             risk.mutating = true;
         }
+        risk.intents.intents.extend(intents.intents);
     });
     risk
 }
@@ -374,6 +392,7 @@ fn accumulate_risk(
             if intents.is_mutating() {
                 risk.mutating = true;
             }
+            risk.intents.intents.extend(intents.intents);
             return;
         }
         let Some(composite) = composites.iter().find(|c| c.name == op) else {

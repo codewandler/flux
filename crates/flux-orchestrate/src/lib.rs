@@ -56,6 +56,21 @@ impl Approver for SubAgentApprover {
             ApprovalChoice::Allow
         }
     }
+
+    /// The plan-level face of the same policy — a sub-agent's real work arrives as an `emit_plan`
+    /// graph approved as one unit, so the destructive deny must fire HERE, not only per-op (an
+    /// approved plan's ops skip the per-op gate). Denies on the plan's aggregate intents AND on the
+    /// declared-destructive flag, which also covers spec-level `Risk::Destructive` ops (e.g.
+    /// composites) whose concrete intents aren't statically visible. A destructive command assembled
+    /// at runtime from `$symbols` is caught by the dispatcher's undisclosed-destructive re-fire,
+    /// which routes back to `request` above — denied there too.
+    async fn request_plan(&self, plan: &flux_runtime::PlanApprovalRequest) -> ApprovalChoice {
+        if plan.destructive || plan.intents.is_destructive() {
+            ApprovalChoice::Deny
+        } else {
+            ApprovalChoice::Allow
+        }
+    }
 }
 
 /// Produces a fresh provider per sub-agent (sub-agents can't share one `Box<dyn Provider>`).
@@ -1439,6 +1454,133 @@ mod tests {
         assert_eq!(out.text, "done");
         // The destructive tool was refused → its marker was never written.
         assert!(system.read_file("EXECUTED.marker").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn sub_agent_denies_destructive_plan_from_emit_plan() {
+        use flux_policy::{Caller, CallerKind, Principal, Trust, TrustKind, TrustLevel};
+        use flux_runtime::{Tool, ToolContext};
+        use flux_spec::{
+            Effect, Intent, IntentBehavior, IntentCertainty, IntentRole, IntentSet, IntentTarget,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // The REAL sub-agent path: the child's only tool is `emit_plan`, its work runs as a plan
+        // approved as one unit — so the destructive backstop must fire at PLAN approval (an approved
+        // plan's inner ops skip the per-op gate). Before C-12, request_plan forwarded an empty
+        // IntentSet and this destructive plan executed; the direct-ToolUse sibling test above never
+        // exercises this path (the pure-DAG planner nudges bare tool calls away).
+        struct FakeDestructive;
+        #[async_trait]
+        impl Tool for FakeDestructive {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec::read_only("danger", "d", json!({"type": "object"}))
+                    .with_effects(vec![Effect::Process])
+            }
+            fn intents(&self, _p: &Value) -> IntentSet {
+                let mut s = IntentSet::new();
+                s.push(Intent {
+                    behavior: IntentBehavior::CommandExecution,
+                    target: IntentTarget::Process {
+                        command: "rm -rf x".into(),
+                    },
+                    role: IntentRole::ProcessCommand,
+                    certainty: IntentCertainty::Certain,
+                });
+                s
+            }
+            async fn execute(&self, ctx: &ToolContext, _p: Value) -> Result<ToolResult> {
+                ctx.system.write_file("EXECUTED.marker", "1").await?;
+                Ok(ToolResult::ok("ran"))
+            }
+        }
+
+        // Mock provider: turn 1 emits a PLAN that calls `danger`; turn 2 answers in prose.
+        struct DestructivePlanMock {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for DestructivePlanMock {
+            fn name(&self) -> &str {
+                "mock"
+            }
+            async fn stream(&self, _r: Request) -> Result<ChunkStream> {
+                let n = self.calls.fetch_add(1, Ordering::Relaxed);
+                let chunks = if n == 0 {
+                    vec![
+                        Chunk::Block(ContentBlock::ToolUse {
+                            id: "p".into(),
+                            name: "emit_plan".into(),
+                            input: json!({
+                                "ast": { "body": [{
+                                    "kind": "bind", "name": "out",
+                                    "value": { "kind": "call", "op": "danger", "args": [] }
+                                }]}
+                            }),
+                        }),
+                        Chunk::Done {
+                            stop_reason: Some(StopReason::ToolUse),
+                        },
+                    ]
+                } else {
+                    vec![
+                        Chunk::TextDelta("done".into()),
+                        Chunk::Block(ContentBlock::Text {
+                            text: "done".into(),
+                        }),
+                        Chunk::Done {
+                            stop_reason: Some(StopReason::EndTurn),
+                        },
+                    ]
+                };
+                Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+            }
+        }
+
+        let system = temp_system();
+        let mut base = ToolRegistry::new();
+        base.register(Arc::new(FakeDestructive));
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role("---\n---\nworker", "worker"));
+
+        let caller = Caller {
+            principal: Principal {
+                id: "t".into(),
+                name: "t".into(),
+                kind: CallerKind::User,
+            },
+            groups: Vec::new(),
+            source: "test".into(),
+        };
+        let trust = Trust {
+            kind: TrustKind::Invocation,
+            level: TrustLevel::Privileged,
+            scopes: Vec::new(),
+        };
+        let spawner = LocalSpawner::new(
+            Arc::new(|| {
+                Ok(Box::new(DestructivePlanMock {
+                    calls: AtomicUsize::new(0),
+                }))
+            }),
+            Arc::new(roles),
+            base,
+            system.clone(),
+            "mock",
+            1024,
+        )
+        .with_authorization(flux_policy::default_local_grants(), caller, trust);
+
+        let out = spawner
+            .spawn("worker", "delete things", &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(out.text, "done");
+        // The destructive PLAN was denied at plan approval → the op never executed.
+        assert!(
+            system.read_file("EXECUTED.marker").await.is_err(),
+            "an emit_plan-carried destructive op must not execute under SubAgentApprover"
+        );
     }
 
     #[test]

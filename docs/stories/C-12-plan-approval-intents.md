@@ -2,9 +2,9 @@
 id: C-12
 title: Thread plan intents into plan approval — close the sub-agent destructive bypass
 pillar: Core
-status: ready
+status: done
 priority: 1
-note: request_plan forwards an EMPTY IntentSet and the approved scope skips every per-op gate — a sub-agent's emit_plan-carried destructive op sails past SubAgentApprover's deny; README's "sub-agents cannot approve destructive operations" is currently false
+note: plan approval now sees the plan's real aggregate IntentSet — SubAgentApprover denies destructive plans on the emit_plan path, and an undisclosed destructive op re-fires the approval gate even inside an approved scope
 ---
 
 # Thread plan intents into plan approval — close the sub-agent destructive bypass
@@ -23,28 +23,37 @@ fixture — a path the pure-DAG compiler steers away from. This breaks README:17
 cannot approve destructive operations themselves."
 
 ## Acceptance
-- [ ] **Failing-first:** `sub_agent_denies_destructive_plan_from_emit_plan` (flux-orchestrate) — a
+- [x] **Failing-first:** `sub_agent_denies_destructive_plan_from_emit_plan` (flux-orchestrate) — a
       mock provider emits `emit_plan` whose AST calls the existing `FakeDestructive` tool; the
       destructive op must NOT execute (fails today: it runs).
-- [ ] `request_plan` takes a `PlanApprovalRequest { summary, ops: Vec<String>, destructive,
+- [x] `request_plan` takes a `PlanApprovalRequest { summary, ops: Vec<String>, destructive,
       mutating, intents: IntentSet }` (breaking trait change, clean cutover — all in-tree
       implementors updated); the default impl forwards the REAL aggregate intents.
-- [ ] `PlanRisk` (flux-flow `runtime.rs:281`) accumulates per-call-node `tool.intents(...)` into an
+- [x] `PlanRisk` (flux-flow `runtime.rs:281`) accumulates per-call-node `tool.intents(...)` into an
       aggregate `intents: IntentSet`; `PlanRisk::approval_request()` builds the request.
-- [ ] `SubAgentApprover` explicitly denies when `plan.destructive || plan.intents.is_destructive()`.
-- [ ] **Dynamic-arg hole closed:** a `destructive_scope` disclosure bit rides beside `plan_scope`;
+- [x] `SubAgentApprover` explicitly denies when `plan.destructive || plan.intents.is_destructive()`.
+- [x] **Dynamic-arg hole closed:** a `destructive_scope` disclosure bit rides beside `plan_scope`;
       a destructive op that was NOT disclosed at plan-approval time re-fires the approval gate even
       inside an approved scope (interactive prompts; `--yes` allows; sub-agents deny). Failing-first:
       `undisclosed_destructive_op_refires_approval_inside_approved_scope` (flux-runtime). REPL `/run`
       computes `plan_risk_with_composites` on the reviewed AST and passes disclosure.
-- [ ] Regression: `disclosed_destructive_plan_runs_without_per_op_reprompt` — no interactive
+- [x] Regression: `disclosed_destructive_plan_runs_without_per_op_reprompt` — no interactive
       double-prompt when the destructive op WAS visible in the approved plan.
-- [ ] `AllowApprover` (`--yes`, server) keeps allowing destructive plans at top level (human
+- [x] `AllowApprover` (`--yes`, server) keeps allowing destructive plans at top level (human
       opt-in); doc-comment states it must never be installed for sub-agents.
-- [ ] Full gate green; CHANGELOG entry (note the trust_all/undisclosed-destructive behavior change).
+- [x] Full gate green; CHANGELOG entry (note the trust_all/undisclosed-destructive behavior change).
 
 ## Progress
 - Filed 2026-07-02 from the harness claims review (P1 of the round).
+- Done 2026-07-02. `PlanApprovalRequest` carries summary/ops/destructive/mutating + the aggregate
+  `IntentSet` folded by `plan_risk`/`accumulate_risk`; `PlanRisk::approval_request()` builds it.
+  `SubAgentApprover::request_plan` denies `destructive || intents.is_destructive()` — proven on the
+  real emit_plan path by the new orchestrate test (marker file never written). `destructive_scope`
+  disclosure bit added beside `plan_scope` (`PlanScopeGuard` pairs the decrement): an undisclosed
+  destructive op re-fires the approval gate inside an approved scope; disclosed ones don't re-prompt.
+  This deliberately also holds under trust_all ("always"). REPL `/run` computes
+  `plan_risk_with_composites` on the reviewed AST and enters the scope with disclosure. 3 new tests;
+  full gate green.
 
 ## Notes
 - Design decisions in `~/.claude/plans/wiggly-tumbling-salamander.md` §C-12.
