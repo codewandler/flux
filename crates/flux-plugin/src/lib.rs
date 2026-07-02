@@ -25,6 +25,10 @@ use flux_system::net::PrivateNetAllow;
 pub mod hooks;
 pub use hooks::JsHookEngine;
 
+/// Host-terminated raw-socket authentication (D-31): the host speaks the PostgreSQL startup + SCRAM
+/// handshake so the trusted plugin is handed a *post-auth* connection and never receives the password.
+mod pg;
+
 pub const PROTOCOL: &str = "flux.plugin.v1";
 
 /// Whether a frame is a request (host→plugin) or a response (plugin→host).
@@ -776,6 +780,30 @@ impl SystemHostCaps {
         ))
     }
 
+    /// Resolve a credential for a **host-terminated handshake** (D-31) by declared auth-method
+    /// purpose — the static/named path of `conn.authenticate`. Reads the auth method's declared env
+    /// keys directly host-side, the same way [`resolve_user`](Self::resolve_user) /
+    /// [`resolve_endpoint`](Self::resolve_endpoint) read declared env. Deliberately NOT gated by the
+    /// plugin-facing `secrets` grant: the plugin can no longer read this key via the `secret`
+    /// capability (its grant is removed), but the host resolves it for the declared handshake and
+    /// never returns the value to the plugin.
+    fn resolve_handshake_secret(&self, purpose: &str) -> std::result::Result<String, String> {
+        let method = self
+            .auth
+            .iter()
+            .find(|a| a.purpose == purpose)
+            .ok_or_else(|| format!("no auth method declared for handshake purpose `{purpose}`"))?;
+        for key in &method.env {
+            if let Some(v) = self.system.env(key) {
+                return Ok(v);
+            }
+        }
+        Err(format!(
+            "no env value for handshake purpose `{purpose}` (tried {:?})",
+            method.env
+        ))
+    }
+
     /// Resolve a named endpoint base URL — HOST-SIDE ONLY, feeding the ref-based IO paths (there
     /// is no capability handing this URL back to the plugin, D-32). A [`template`]
     /// (`EndpointSpec::template`) composes from declared config values; otherwise the declared env
@@ -1184,6 +1212,111 @@ impl HostCapabilities for SystemHostCaps {
                     sink.register_secret(&material.value);
                 }
                 Ok(json!({ "value": material.value }))
+            }
+            "conn.authenticate" => {
+                // Host-terminated raw-socket auth (D-31): the host speaks the protocol's startup +
+                // in-band auth handshake on an already-dialed `conn_id`, so the trusted plugin is
+                // handed a POST-AUTH connection and NEVER receives the password. This closes the last
+                // gap in the references-only invariant — the one place a plugin still held a secret
+                // value. The credential is resolved host-side (the SAME resolution path as the gated
+                // `credential` capability — cross-plugin grant + audit unchanged; only WHO SPEAKS THE
+                // HANDSHAKE moves to the host), used on the wire, and never serialized back.
+                let conn_id = payload
+                    .get("conn_id")
+                    .and_then(|v| v.as_u64())
+                    .ok_or("conn.authenticate: `conn_id` (u64) required")?;
+                let protocol = payload
+                    .get("protocol")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("postgres");
+                let user = payload
+                    .get("user")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let database = payload
+                    .get("database")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let application_name = payload
+                    .get("application_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("flux-plugin")
+                    .to_string();
+                let timeout = payload
+                    .get("timeout_ms")
+                    .and_then(|v| v.as_u64())
+                    .map(std::time::Duration::from_millis);
+
+                // Resolve the credential host-side. Three sources, mirroring the `credential`
+                // capability plus the static/env path: an explicit `credential_ref`, an endpoint's
+                // attached `credential_ref` (both via the broker, cross-plugin gated), or a declared
+                // manifest auth method (`auth_purpose`, the static/named env path). The value never
+                // leaves the host.
+                let password = if let Some(cr) = payload.get("credential_ref") {
+                    let reference = parse_credential_ref(cr)?;
+                    let resolver = self.resolver.as_ref().ok_or(
+                        "conn.authenticate: credential_ref requires a reference resolver (none installed)",
+                    )?;
+                    resolver
+                        .resolve_credential_for(&self.consumer, &reference)
+                        .await?
+                        .value
+                } else if let Some(endpoint_ref) =
+                    payload.get("endpoint_ref").and_then(|v| v.as_str())
+                {
+                    let resolver = self.resolver.as_ref().ok_or(
+                        "conn.authenticate: endpoint_ref requires a reference resolver (none installed)",
+                    )?;
+                    let reference = resolver.credential_ref_for_endpoint(endpoint_ref).await?;
+                    resolver
+                        .resolve_credential_for(&self.consumer, &reference)
+                        .await?
+                        .value
+                } else if let Some(purpose) = payload.get("auth_purpose").and_then(|v| v.as_str()) {
+                    // Static/named endpoint: resolve the credential from the declared auth method's
+                    // env HOST-SIDE. Not gated by the plugin-facing `secrets` grant (same as
+                    // `resolve_user`/`resolve_endpoint` reading declared env) — the whole point is
+                    // that the plugin can NOT read this key via the `secret` capability, but the host
+                    // may resolve it for the declared handshake.
+                    self.resolve_handshake_secret(purpose)?
+                } else {
+                    return Err(
+                        "conn.authenticate: one of `credential_ref`/`endpoint_ref`/`auth_purpose` required"
+                            .into(),
+                    );
+                };
+                // Register the resolved value with the redactor so it is scrubbed from any captured
+                // output even though it never reaches the plugin.
+                if let Some(sink) = &self.secret_sink {
+                    sink.register_secret(&password);
+                }
+
+                let params = pg::HandshakeParams {
+                    user,
+                    database,
+                    application_name,
+                };
+                let mut guard = self.conns.lock().await;
+                let stream = guard
+                    .get_mut(&conn_id)
+                    .ok_or_else(|| format!("conn.authenticate: no open connection {conn_id}"))?;
+                let result =
+                    pg::terminate_handshake(protocol, stream, &params, &password, timeout).await?;
+                drop(guard);
+                // The response carries ONLY negotiated non-secret parameters — never the password.
+                let mut out = json!({
+                    "parameters": result.parameters,
+                    "server_version": result.server_version(),
+                });
+                if let Some(pid) = result.backend_pid {
+                    out["backend_pid"] = json!(pid);
+                }
+                if let Some(key) = result.backend_key {
+                    out["backend_key"] = json!(key);
+                }
+                Ok(out)
             }
             "fs.read" => {
                 // Path-scoped HOST-file read (C-09a). For the `aws-bedrock` plugin to read
@@ -4033,6 +4166,379 @@ mod tests {
             .pinned
             .is_none());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ===========================================================================
+    // D-31: host-terminated PostgreSQL auth handshake (the `pg` module) against a scripted
+    // PG-server stub over a real loopback TcpListener. Hermetic — no external postgres.
+    // ===========================================================================
+
+    /// Build a tagged backend message: 1 byte tag + int32 length (incl. itself) + body.
+    fn pg_frame(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut m = vec![tag];
+        m.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        m.extend_from_slice(body);
+        m
+    }
+
+    /// Read one tagged frontend message from the client on the server side.
+    async fn pg_read_tagged(sock: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+        let mut hdr = [0u8; 5];
+        sock.read_exact(&mut hdr).await.unwrap();
+        let len = i32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
+        let mut body = vec![0u8; len - 4];
+        sock.read_exact(&mut body).await.unwrap();
+        (hdr[0], body)
+    }
+
+    /// Read the untagged StartupMessage (int32 length, then length-4 body).
+    async fn pg_read_startup(sock: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut lenbuf = [0u8; 4];
+        sock.read_exact(&mut lenbuf).await.unwrap();
+        let len = i32::from_be_bytes(lenbuf) as usize;
+        let mut body = vec![0u8; len - 4];
+        sock.read_exact(&mut body).await.unwrap();
+    }
+
+    /// The trailing startup frames a successful auth is followed by: server_version + ReadyForQuery.
+    fn pg_ready_frames() -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut ps = b"server_version\0".to_vec();
+        ps.extend_from_slice(b"16.2\0");
+        out.extend(pg_frame(b'S', &ps));
+        out.extend(pg_frame(b'K', &{
+            let mut k = 4321i32.to_be_bytes().to_vec();
+            k.extend_from_slice(&8765i32.to_be_bytes());
+            k
+        }));
+        out.extend(pg_frame(b'Z', b"I"));
+        out
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum ScramMode {
+        Ok,
+        WrongPassword,
+        BadServerSig,
+    }
+
+    /// A scripted PostgreSQL server speaking SCRAM-SHA-256 (no channel binding). Reuses the host's own
+    /// crypto for the server-side keys so the success path produces a correct server signature the
+    /// client must accept, and `BadServerSig` a wrong one the client must REJECT (the MITM guard).
+    async fn spawn_scram_server(password: &'static str, mode: ScramMode) -> u16 {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            pg_read_startup(&mut sock).await;
+
+            // AuthenticationSASL: mechanism list "SCRAM-SHA-256" (NUL-separated, extra trailing NUL).
+            let mut sasl = 10i32.to_be_bytes().to_vec();
+            sasl.extend_from_slice(b"SCRAM-SHA-256\0\0");
+            sock.write_all(&pg_frame(b'R', &sasl)).await.unwrap();
+
+            // SASLInitialResponse: mechanism CString + int32 len + client-first ("n,,n=,r=<nonce>").
+            let (_tag, body) = pg_read_tagged(&mut sock).await;
+            let nul = body.iter().position(|&b| b == 0).unwrap();
+            let client_first = String::from_utf8_lossy(&body[nul + 5..]).into_owned();
+            let client_first_bare = client_first.trim_start_matches("n,,").to_string();
+            let client_nonce = client_first_bare.split("r=").nth(1).unwrap().to_string();
+
+            let server_nonce = "3rfcNHYJY1ZVvWVs7jserverpart";
+            let combined = format!("{client_nonce}{server_nonce}");
+            let salt = [
+                7u8, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67,
+            ];
+            let salt_b64 = crate::pg::base64_encode(&salt);
+            let iterations = 4096u32;
+            let server_first = format!("r={combined},s={salt_b64},i={iterations}");
+            let mut cont = 11i32.to_be_bytes().to_vec();
+            cont.extend_from_slice(server_first.as_bytes());
+            sock.write_all(&pg_frame(b'R', &cont)).await.unwrap();
+
+            // SASLResponse: client-final "c=biws,r=<combined>,p=<proof>".
+            let (_tag, body) = pg_read_tagged(&mut sock).await;
+            let client_final = String::from_utf8_lossy(&body).into_owned();
+            let client_final_no_proof = client_final.split(",p=").next().unwrap().to_string();
+
+            if mode == ScramMode::WrongPassword {
+                // Auth failure after the client-final — an ErrorResponse (like a real server).
+                let mut err = Vec::new();
+                err.extend_from_slice(b"SFATAL\0");
+                err.extend_from_slice(b"C28P01\0");
+                err.extend_from_slice(b"Mpassword authentication failed\0");
+                err.push(0);
+                sock.write_all(&pg_frame(b'E', &err)).await.unwrap();
+                let _ = sock.shutdown().await;
+                return;
+            }
+
+            let auth_message =
+                format!("{client_first_bare},{server_first},{client_final_no_proof}");
+            let salted = crate::pg::pbkdf2_hmac_sha256(password.as_bytes(), &salt, iterations);
+            let server_key = crate::pg::hmac_sha256(&salted, b"Server Key");
+            let mut server_sig = crate::pg::hmac_sha256(&server_key, auth_message.as_bytes());
+            if mode == ScramMode::BadServerSig {
+                server_sig[0] ^= 0xff; // corrupt it: the client must reject.
+            }
+            let server_final = format!("v={}", crate::pg::base64_encode(&server_sig));
+            let mut fin = 12i32.to_be_bytes().to_vec();
+            fin.extend_from_slice(server_final.as_bytes());
+            sock.write_all(&pg_frame(b'R', &fin)).await.unwrap();
+
+            // AuthenticationOk + startup params + ReadyForQuery.
+            sock.write_all(&pg_frame(b'R', &0i32.to_be_bytes()))
+                .await
+                .unwrap();
+            sock.write_all(&pg_ready_frames()).await.unwrap();
+            let _ = sock.flush().await;
+            // Keep the socket briefly so the client's reads complete.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+        port
+    }
+
+    async fn dial_loopback(port: u16) -> flux_system::net::DialStream {
+        flux_system::net::dial(
+            &flux_system::net::DialTarget::Tcp {
+                host: "127.0.0.1".into(),
+                port,
+            },
+            true,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn pg_params() -> pg::HandshakeParams {
+        pg::HandshakeParams {
+            user: "app".into(),
+            database: "warehouse".into(),
+            application_name: "flux-test".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pg_scram_handshake_succeeds_and_captures_parameters() {
+        let port = spawn_scram_server("pencil", ScramMode::Ok).await;
+        let mut stream = dial_loopback(port).await;
+        let result = pg::authenticate(
+            &mut stream,
+            &pg_params(),
+            "pencil",
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .await
+        .expect("SCRAM handshake should succeed");
+        assert_eq!(result.server_version(), Some("16.2"));
+        assert_eq!(result.backend_pid, Some(4321));
+        assert_eq!(result.backend_key, Some(8765));
+    }
+
+    #[tokio::test]
+    async fn pg_scram_rejects_wrong_password() {
+        // The server rejects the proof with an ErrorResponse; the terminator surfaces it as an error.
+        let port = spawn_scram_server("pencil", ScramMode::WrongPassword).await;
+        let mut stream = dial_loopback(port).await;
+        let err = pg::authenticate(
+            &mut stream,
+            &pg_params(),
+            "wrong-password",
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("28P01") || err.to_lowercase().contains("password"),
+            "wrong-password must be surfaced as an auth error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pg_scram_rejects_bad_server_signature() {
+        // MITM guard: even with the right password, a bad server-final `v=` must be rejected.
+        let port = spawn_scram_server("pencil", ScramMode::BadServerSig).await;
+        let mut stream = dial_loopback(port).await;
+        let err = pg::authenticate(
+            &mut stream,
+            &pg_params(),
+            "pencil",
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("server signature verification failed"),
+            "a corrupt server signature must be rejected: {err}"
+        );
+    }
+
+    /// A scripted server speaking the legacy MD5 auth method.
+    async fn spawn_md5_server() -> u16 {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            pg_read_startup(&mut sock).await;
+            // AuthenticationMD5Password: int32(5) + 4-byte salt.
+            let mut md5 = 5i32.to_be_bytes().to_vec();
+            md5.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+            sock.write_all(&pg_frame(b'R', &md5)).await.unwrap();
+            // PasswordMessage ('p') with the md5 token — accept whatever the client sends.
+            let (_tag, _body) = pg_read_tagged(&mut sock).await;
+            sock.write_all(&pg_frame(b'R', &0i32.to_be_bytes()))
+                .await
+                .unwrap();
+            sock.write_all(&pg_ready_frames()).await.unwrap();
+            let _ = sock.flush().await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn pg_md5_handshake_succeeds() {
+        let port = spawn_md5_server().await;
+        let mut stream = dial_loopback(port).await;
+        let result = pg::authenticate(
+            &mut stream,
+            &pg_params(),
+            "hunter2",
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .await
+        .expect("MD5 handshake should succeed");
+        assert_eq!(result.server_version(), Some("16.2"));
+    }
+
+    /// The SCRAM-SHA-256 client derivation matches the RFC 7677 §3 well-known vector (user "user",
+    /// password "pencil") — moved here from the `sql` plugin when the handshake became host-terminated.
+    #[test]
+    fn pg_scram_derivation_matches_rfc7677_vector() {
+        let password = "pencil";
+        let salt = crate::pg::base64_decode("W22ZaJ0SNY7soEsUEjb6gQ==").unwrap();
+        let salted = crate::pg::pbkdf2_hmac_sha256(password.as_bytes(), &salt, 4096);
+        let client_key = crate::pg::hmac_sha256(&salted, b"Client Key");
+        let stored_key = crate::pg::sha256(&client_key);
+
+        let client_first_bare = "n=user,r=rOprNGfwEbeRWgbNEkqO";
+        let server_first =
+            "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+        let client_final_no_proof = "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
+        let auth_message = format!("{client_first_bare},{server_first},{client_final_no_proof}");
+        let client_signature = crate::pg::hmac_sha256(&stored_key, auth_message.as_bytes());
+        let proof: Vec<u8> = client_key
+            .iter()
+            .zip(client_signature.iter())
+            .map(|(a, b)| a ^ b)
+            .collect();
+        assert_eq!(
+            crate::pg::base64_encode(&proof),
+            "dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
+        );
+        let server_key = crate::pg::hmac_sha256(&salted, b"Server Key");
+        let server_sig = crate::pg::hmac_sha256(&server_key, auth_message.as_bytes());
+        assert_eq!(
+            crate::pg::base64_encode(&server_sig),
+            "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="
+        );
+    }
+
+    #[test]
+    fn pg_md5_digest_matches_known_vectors() {
+        assert_eq!(crate::pg::md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(
+            crate::pg::md5_hex(b"abc"),
+            "900150983cd24fb0d6963f7d28e17f72"
+        );
+    }
+
+    /// The `conn.authenticate` host capability end to end: dial a scripted SCRAM server through the
+    /// host's own `conn.dial`, then `conn.authenticate` by `auth_purpose` — the credential is resolved
+    /// HOST-SIDE from the declared auth method's env (registered with the redactor) and NEVER appears
+    /// in the response frame handed back to the plugin.
+    #[tokio::test]
+    async fn conn_authenticate_terminates_handshake_without_returning_the_password() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!("flux-connauth-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+
+        let password = "pg-scram-env-password";
+        std::env::set_var("FLUX_TEST_PG_PW_D31", password);
+        let port = spawn_scram_server("pg-scram-env-password", ScramMode::Ok).await;
+
+        let redactor = flux_secret::Redactor::new();
+        let sink = Arc::new(RedactorSink {
+            redactor: redactor.clone(),
+        });
+        // The plugin declares a "password" auth method (env-backed) but does NOT grant that env as a
+        // readable `secret` — exactly the D-31 sql manifest shape. `conn` is granted for loopback.
+        let manifest = PluginManifest {
+            name: "sql".into(),
+            auth: vec![AuthMethod {
+                purpose: "password".into(),
+                env: vec!["FLUX_TEST_PG_PW_D31".into()],
+                ..Default::default()
+            }],
+            capabilities: PluginCapabilities {
+                conn: vec!["tcp:127.0.0.1:*".into()],
+                private_hosts: vec!["127.0.0.1".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let caps = SystemHostCaps::new(sys)
+            .with_manifest(&manifest)
+            .with_private_net_grants(vec!["127.0.0.1".into()])
+            .with_secret_sink(sink.clone());
+
+        // Dial through the host, then host-terminate the handshake by declared purpose.
+        let dialed = caps
+            .handle(
+                "conn.dial",
+                &json!({"kind": "tcp", "host": "127.0.0.1", "port": port}),
+            )
+            .await
+            .unwrap();
+        let conn_id = dialed["conn_id"].as_u64().unwrap();
+        let result = caps
+            .handle(
+                "conn.authenticate",
+                &json!({
+                    "conn_id": conn_id,
+                    "protocol": "postgres",
+                    "user": "app",
+                    "database": "warehouse",
+                    "auth_purpose": "password",
+                    "timeout_ms": 5000,
+                }),
+            )
+            .await
+            .expect("host-terminated auth should succeed");
+
+        assert_eq!(result["server_version"], "16.2");
+        // The password is NOWHERE in the frame the plugin receives.
+        let frame = result.to_string();
+        assert!(
+            !frame.contains(password),
+            "conn.authenticate must never return the password to the plugin: {frame}"
+        );
+        // It WAS registered with the redactor (scrubbed from any captured output).
+        assert_eq!(
+            redactor.redact(&format!("used {password} to connect")),
+            "used [redacted] to connect"
+        );
+
+        caps.handle("conn.close", &json!({"conn_id": conn_id}))
+            .await
+            .ok();
+        std::env::remove_var("FLUX_TEST_PG_PW_D31");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

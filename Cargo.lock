@@ -1116,6 +1116,8 @@ dependencies = [
  "flux-secret",
  "flux-spec",
  "flux-system",
+ "hmac",
+ "rand 0.8.6",
  "reqwest",
  "rquickjs",
  "serde",

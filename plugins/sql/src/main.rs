@@ -4,26 +4,34 @@
 //! carries a **hand-rolled PostgreSQL wire-protocol client** that runs entirely over the host `conn.*`
 //! capability (via [`host_kit::ConnStream`]). The plugin opens no socket, reads no env, and never
 //! holds a URL it dials: every dial goes **by endpoint reference** (`host.conn_dial_ref` — the named
-//! manifest endpoint or a discovered `@endpoint/<id>`), DSN metadata comes from the gated non-secret
-//! `config` read, and credentials come back through the gated `secret`/`credential` capabilities.
+//! manifest endpoint or a discovered `@endpoint/<id>`), and DSN metadata comes from the gated
+//! non-secret `config` read.
+//!
+//! ## Host-terminated auth (D-31)
+//! The plugin **never receives the password**. The host speaks the PostgreSQL startup + SCRAM-SHA-256
+//! /MD5 handshake itself (`host.conn_authenticate`) using a credential it resolves host-side, and
+//! hands the plugin a *post-auth* connection at the first `ReadyForQuery`. The plugin then drives the
+//! Simple Query protocol over that same `conn_id`. It has no `credential` grant and no password in any
+//! `secrets` grant — it holds only a credential *location* (a declared auth purpose for the static
+//! endpoint, or the discovered endpoint's `credential_ref`/`endpoint_ref`), never a value.
 //!
 //! ## Dialects
-//! - **PostgreSQL** — fully implemented: StartupMessage → Authentication (Ok / cleartext / MD5 /
-//!   SASL SCRAM-SHA-256) → the Simple Query protocol. All six read ops run parameter-free, whitelisted
-//!   introspection SQL over Simple Query and shape the rows into the same JSON the fluxplane reference
-//!   returns.
+//! - **PostgreSQL** — fully implemented: the host terminates StartupMessage → Authentication (Ok /
+//!   cleartext / MD5 / SASL SCRAM-SHA-256); the plugin drives the Simple Query protocol. All six read
+//!   ops run parameter-free, whitelisted introspection SQL over Simple Query and shape the rows into
+//!   the same JSON the fluxplane reference returns.
 //! - **MySQL** — *not yet supported*. Routed to a clear error; a minimal handshake-v10 + query client
 //!   is the residual (see the module note on [`open_target`]).
 //! - **SQLite** — *unsupported by design*. SQLite is a local file and flux plugins have no filesystem
 //!   capability (`conn.*` is sockets only); a host file capability would be required.
 //!
 //! ## Honesty note on interop confidence
-//! The PostgreSQL client is exercised by `MockHost` tests that replay **hand-crafted** server frames.
-//! Those prove the *frame parser and message assembly* are correct against bytes the test author wrote;
-//! they are **not** a live-interop test against a real `postgres` server. The protocol is implemented to
-//! the spec (length-prefixed messages, the documented Authentication subtypes, RowDescription/DataRow/
-//! CommandComplete/ErrorResponse/ReadyForQuery), and SCRAM is covered by a dedicated unit test against
-//! the RFC 5802 / RFC 7677 client-key derivation, but first contact with a real server is unverified.
+//! The plugin's Simple Query client is exercised by `MockHost` tests that replay **hand-crafted**
+//! server frames. Those prove the *frame parser and message assembly* are correct against bytes the
+//! test author wrote; they are **not** a live-interop test against a real `postgres` server. The
+//! host-terminated auth handshake (StartupMessage + the documented Authentication subtypes + SCRAM
+//! including the server-signature check) lives in `flux-plugin`'s `pg` module and is covered there by
+//! hermetic tests against a scripted PG-server stub; first contact with a real server is unverified.
 
 use host_kit::*;
 use schemars::JsonSchema;
@@ -31,11 +39,6 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::io::{Read, Write};
 use std::time::Duration;
-
-use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256};
-
-type HmacSha256 = Hmac<Sha256>;
 
 // ===========================================================================
 // Manifest
@@ -174,32 +177,24 @@ fn manifest_builder() -> PluginBuilder {
                 format!("tcp:*:{MYSQL_DEFAULT_PORT}"),
             ],
             private_hosts: vec!["*".into()],
-            secrets: vec![
-                "SQL_USERNAME".into(),
-                "SQL_PASSWORD".into(),
-                "MYSQL_USERNAME".into(),
-                "MYSQL_PASSWORD".into(),
-            ],
-            // Consume discovered endpoints' credentials: the gated `credential` capability lets sql
-            // materialize the password (e.g. a kubernetes `credential_ref`) for the SCRAM handshake.
-            // Deny-by-default + cross-plugin grant/audit still apply host-side; the value is redacted
-            // and never returned to the model.
-            credential: true,
+            // D-31: the plugin holds NO credential. It has no `secrets` grant (the password is never
+            // read via `host.secret`) and no `credential` grant (the password is never materialized
+            // into the plugin). The host terminates the auth handshake itself (`host.conn_authenticate`)
+            // and hands back a post-auth connection — closing the last references-only gap.
             ..Default::default()
         })
-        // Credentials resolved by purpose. The handshake needs the *raw* values (it builds its own
-        // SCRAM/MD5 proof on the wire), so it fetches them via `host.secret` rather than the HTTP
-        // auth-injection path — there is no HTTP here.
-        .auth(AuthMethod {
-            purpose: "username".into(),
-            env: vec!["SQL_USERNAME".into(), "MYSQL_USERNAME".into()],
-            description: "SQL username".into(),
-            ..Default::default()
-        })
+        // The credential *location* the host resolves for the auth handshake it terminates on the
+        // plugin's behalf (`host.conn_authenticate`). Declared here as an auth method so the host
+        // knows which env keys back the "password" purpose for the static/named endpoint path; the
+        // plugin never reads these — they are NOT in the `secrets` grant, so the `secret` capability
+        // would refuse them. The discovered-endpoint path resolves the password from the endpoint's
+        // own `credential_ref` instead.
         .auth(AuthMethod {
             purpose: "password".into(),
             env: vec!["SQL_PASSWORD".into(), "MYSQL_PASSWORD".into()],
-            description: "SQL password".into(),
+            description: "SQL password (host-resolved for the terminated auth handshake; never read \
+                          by the plugin)"
+                .into(),
             ..Default::default()
         })
         .endpoint(EndpointSpec {
@@ -302,20 +297,15 @@ impl Dialect {
 struct SqlTarget {
     dialect: Dialect,
     database: String,
-    /// Username parsed from the DSN userinfo (a `host.secret("username")` overrides it when set).
+    /// Username parsed from the DSN userinfo (non-secret connection metadata used for the startup
+    /// message; the discovered path takes it from the bare ref URL, the static path from the DSN).
     dsn_user: Option<String>,
-    /// Password parsed from the DSN userinfo (a `host.secret("password")` overrides it when set).
-    /// A static/named endpoint can no longer carry one — its DSN comes from the gated `config`
-    /// read, which the host refuses for credential-bearing values — so on that path this is
-    /// effectively always `None`. Kept because [`target_from_url`] stays tolerant when parsing
-    /// inline weak-EndpointRef URLs.
-    dsn_password: Option<String>,
     /// A password-redacted form of the URL, surfaced as `endpoint_url`.
     safe_url: String,
     /// When this target came from a **discovered** endpoint (an `@endpoint/<id>` ref), how the host
-    /// resolves it: the plugin dials and fetches the password by reference, never holding a URL with
-    /// a password. `None` = a static/named manifest endpoint (DSN metadata from the gated `config`
-    /// read, dial by the named ref, credentials via `secret`).
+    /// resolves it: the plugin dials by reference and the host terminates the auth handshake, never
+    /// holding a URL with a password. `None` = a static/named manifest endpoint (DSN metadata from
+    /// the gated `config` read, dial by the named ref, host-terminated auth by declared purpose).
     discovered: Option<DiscoveredSource>,
     /// The **named** manifest endpoint a static target dials by reference via `host.conn_dial_ref`
     /// (default `sql.endpoint`); the host resolves it (env → URL → host:port) and applies the
@@ -330,16 +320,16 @@ struct SqlTarget {
 }
 
 /// The host-resolved references a discovered-endpoint [`SqlTarget`] carries. The plugin passes these
-/// references back to the host for the privileged operations (dial, materialize the password); it
-/// never holds the URL-with-password itself.
+/// references back to the host for the privileged operations (dial by ref, host-terminated auth); it
+/// never holds the URL-with-password nor the credential value itself.
 #[derive(Debug, Clone)]
 struct DiscoveredSource {
     /// The `@endpoint/<id>` reference — dialed via `host.conn_dial_ref` (the host applies the egress
-    /// guard) and used to materialize the password via `host.credential_for_endpoint` when no
-    /// explicit `credential_ref` is present.
+    /// guard) and, when no explicit `credential_ref` is present, passed to `host.conn_authenticate`
+    /// so the host materializes the endpoint record's credential for the terminated handshake.
     endpoint_ref: String,
     /// The endpoint's `credential_ref` string (a *location*, never a value), when the weak
-    /// `EndpointRef` carried one. Materialized via the gated `credential` capability for SCRAM.
+    /// `EndpointRef` carried one. Passed to `host.conn_authenticate`, which resolves it host-side.
     credential_ref: Option<String>,
 }
 
@@ -508,15 +498,19 @@ fn target_from_url(
         Some((u, h)) => (Some(u), h),
         None => (None, rest),
     };
-    let (dsn_user, dsn_password) = match userinfo {
+    // The username is non-secret connection metadata. A password may still appear in an inline
+    // weak-EndpointRef URL; it is only used LOCALLY to redact `safe_url` and is never stored on the
+    // target or sent to the host — the host resolves the credential itself for the terminated
+    // handshake (D-31). The static config-read DSN can never carry one (config refuses those).
+    let (dsn_user, dsn_password_present) = match userinfo {
         Some(u) => match u.split_once(':') {
             Some((user, pass)) => (
                 opt_nonempty(pct_decode(user)),
-                opt_nonempty(pct_decode(pass)),
+                opt_nonempty(pct_decode(pass)).is_some(),
             ),
-            None => (opt_nonempty(pct_decode(u)), None),
+            None => (opt_nonempty(pct_decode(u)), false),
         },
-        None => (None, None),
+        None => (None, false),
     };
 
     let (hostport, path) = match hostpath.split_once('/') {
@@ -561,7 +555,7 @@ fn target_from_url(
     let mut safe_url = format!("{}://", dialect.label());
     if !safe_user.is_empty() {
         safe_url.push_str(&safe_user);
-        if dsn_password.is_some() {
+        if dsn_password_present {
             safe_url.push_str(":xxxxx");
         }
         safe_url.push('@');
@@ -578,7 +572,6 @@ fn target_from_url(
         dialect,
         database,
         dsn_user,
-        dsn_password,
         safe_url,
         discovered: None,
         dial_ref: None,
@@ -586,67 +579,57 @@ fn target_from_url(
     })
 }
 
-/// Resolve the effective `(user, password, database)` for the handshake.
-///
-/// For a **discovered** endpoint the connection metadata (username, host, port, database) comes from
-/// the weak ref's bare URL — those are non-secret. The PASSWORD is materialized through the gated
-/// `credential` host capability (host-side, audited, redacted): by the endpoint's explicit
-/// `credential_ref` when present, else by the `endpoint_ref` itself (the host looks the record's
-/// credential up). The password is never in a URL and never returned to the model.
-///
-/// For a **static/named** endpoint, `host.secret("username"/"password")` wins over the DSN
-/// userinfo — which a config-read DSN can never carry a password in (the host refuses
-/// credential-bearing values); the Postgres database defaults to the user when unset (libpq
-/// behavior).
-fn resolve_credentials(
-    target: &SqlTarget,
-    host: &mut Host,
-) -> Result<(String, String, String), String> {
-    if let Some(disc) = &target.discovered {
-        // Username/database are non-secret connection metadata parsed from the bare ref URL.
-        let user = target
-            .dsn_user
-            .clone()
-            .unwrap_or_else(|| match target.dialect {
-                Dialect::Postgres => "postgres".into(),
-                Dialect::MySql => "root".into(),
-                Dialect::Sqlite => String::new(),
-            });
-        // Password via the gated `credential` capability — by explicit ref, else by endpoint ref.
-        let password = match &disc.credential_ref {
-            Some(cref) => host.credential(cref)?,
-            None => host.credential_for_endpoint(&disc.endpoint_ref)?,
-        };
-        let database = if target.database.trim().is_empty() {
-            user.clone()
-        } else {
-            target.database.clone()
-        };
-        return Ok((user, password, database));
-    }
+/// Where the host finds the connection credential for the auth handshake it terminates on the
+/// plugin's behalf (D-31). Every variant is a *location*, never a value — the plugin holds no secret.
+enum CredSource {
+    /// Static/named endpoint: the declared "password" auth method (the host resolves its env).
+    AuthPurpose(&'static str),
+    /// Discovered endpoint with an explicit `credential_ref` (a `scheme/...` location).
+    CredentialRef(String),
+    /// Discovered endpoint: the host materializes the endpoint record's attached credential.
+    EndpointRef(String),
+}
 
-    let user = host
-        .secret("username")
-        .ok()
+impl CredSource {
+    fn as_pg(&self) -> PgCredential<'_> {
+        match self {
+            CredSource::AuthPurpose(p) => PgCredential::AuthPurpose(p),
+            CredSource::CredentialRef(r) => PgCredential::CredentialRef(r),
+            CredSource::EndpointRef(r) => PgCredential::EndpointRef(r),
+        }
+    }
+}
+
+/// Resolve the effective `(user, database, credential-location)` for the handshake — **pure**, no
+/// secret ever touches the plugin (D-31). Username + database are non-secret connection metadata
+/// (from a discovered ref's bare URL, or the config-read DSN, which can never carry a password); the
+/// Postgres database defaults to the user when unset (libpq behavior). The credential is only ever a
+/// *location* the host resolves when it terminates the handshake:
+///   - **discovered** endpoint → the ref's explicit `credential_ref`, else the `endpoint_ref` itself;
+///   - **static/named** endpoint → the declared "password" auth method (host-side env).
+fn resolve_connection(target: &SqlTarget) -> (String, String, CredSource) {
+    let user = target
+        .dsn_user
+        .clone()
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| target.dsn_user.clone())
         .unwrap_or_else(|| match target.dialect {
             Dialect::Postgres => "postgres".into(),
             Dialect::MySql => "root".into(),
             Dialect::Sqlite => String::new(),
         });
-    let password = host
-        .secret("password")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| target.dsn_password.clone())
-        .unwrap_or_default();
     let database = if target.database.trim().is_empty() {
         user.clone()
     } else {
         target.database.clone()
     };
-    Ok((user, password, database))
+    let cred = match &target.discovered {
+        Some(disc) => match &disc.credential_ref {
+            Some(cref) => CredSource::CredentialRef(cref.clone()),
+            None => CredSource::EndpointRef(disc.endpoint_ref.clone()),
+        },
+        None => CredSource::AuthPurpose("password"),
+    };
+    (user, database, cred)
 }
 
 /// Dial the target through the host — always **by reference** (`host.conn_dial_ref`): a discovered
@@ -951,11 +934,19 @@ fn read_only_query(query: &str) -> bool {
 fn op_test(input: Value, host: &mut Host) -> Result<Value, String> {
     let target = resolve_target(&input, host)?;
     require_postgres(&target)?;
-    let (user, password, database) = resolve_credentials(&target, host)?;
+    let (user, database, cred) = resolve_connection(&target);
 
     let cid = dial(&target, host)?;
     let result = (|| -> Result<Value, String> {
-        let mut pg = PgClient::connect(host, cid, &user, &password, &database, target.timeout)?;
+        let mut pg = PgClient::connect(
+            host,
+            cid,
+            target.dialect.label(),
+            &user,
+            &database,
+            cred.as_pg(),
+            target.timeout,
+        )?;
         let res = pg.simple_query("SELECT 1")?;
         let _ = res; // connectivity only; the value is unused
         Ok(json!({
@@ -978,11 +969,19 @@ fn op_query(input: Value, host: &mut Host) -> Result<Value, String> {
     let max_rows = clamp(flex_i64(&input, "max_rows").unwrap_or(0), 100, 1000) as usize;
     let target = resolve_target(&input, host)?;
     require_postgres(&target)?;
-    let (user, password, database) = resolve_credentials(&target, host)?;
+    let (user, database, cred) = resolve_connection(&target);
 
     let cid = dial(&target, host)?;
     let shaped = (|| -> Result<Value, String> {
-        let mut pg = PgClient::connect(host, cid, &user, &password, &database, target.timeout)?;
+        let mut pg = PgClient::connect(
+            host,
+            cid,
+            target.dialect.label(),
+            &user,
+            &database,
+            cred.as_pg(),
+            target.timeout,
+        )?;
         let result = pg.simple_query(&query)?;
         let (rows, truncated) = bounded_rows(&result, max_rows);
         Ok(json!({
@@ -1006,11 +1005,19 @@ fn op_query(input: Value, host: &mut Host) -> Result<Value, String> {
 fn op_database_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let target = resolve_target(&input, host)?;
     require_postgres(&target)?;
-    let (user, password, database) = resolve_credentials(&target, host)?;
+    let (user, database, cred) = resolve_connection(&target);
 
     let cid = dial(&target, host)?;
     let result = (|| -> Result<Value, String> {
-        let mut pg = PgClient::connect(host, cid, &user, &password, &database, target.timeout)?;
+        let mut pg = PgClient::connect(
+            host,
+            cid,
+            target.dialect.label(),
+            &user,
+            &database,
+            cred.as_pg(),
+            target.timeout,
+        )?;
         let mut databases: Vec<Value> = Vec::new();
         // Databases.
         let db_res = pg.simple_query(
@@ -1057,14 +1064,22 @@ fn op_database_list(input: Value, host: &mut Host) -> Result<Value, String> {
 fn op_table_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let target = resolve_target(&input, host)?;
     require_postgres(&target)?;
-    let (user, password, database) = resolve_credentials(&target, host)?;
+    let (user, database, cred) = resolve_connection(&target);
     let schema = flex_str(&input, "schema").unwrap_or_default();
     let include_views = flex_bool(&input, "include_views");
     let max_results = clamp(flex_i64(&input, "max_results").unwrap_or(0), 200, 1000) as usize;
 
     let cid = dial(&target, host)?;
     let result = (|| -> Result<Value, String> {
-        let mut pg = PgClient::connect(host, cid, &user, &password, &database, target.timeout)?;
+        let mut pg = PgClient::connect(
+            host,
+            cid,
+            target.dialect.label(),
+            &user,
+            &database,
+            cred.as_pg(),
+            target.timeout,
+        )?;
         let relkinds = if include_views {
             "('r','p','v','m')"
         } else {
@@ -1121,13 +1136,21 @@ fn op_table_list(input: Value, host: &mut Host) -> Result<Value, String> {
 fn op_table_show(input: Value, host: &mut Host) -> Result<Value, String> {
     let target = resolve_target(&input, host)?;
     require_postgres(&target)?;
-    let (user, password, database) = resolve_credentials(&target, host)?;
+    let (user, database, cred) = resolve_connection(&target);
     let table = flex_str(&input, "table").ok_or("`table` (string) required")?;
     let schema = flex_str(&input, "schema").unwrap_or_default();
 
     let cid = dial(&target, host)?;
     let result = (|| -> Result<Value, String> {
-        let mut pg = PgClient::connect(host, cid, &user, &password, &database, target.timeout)?;
+        let mut pg = PgClient::connect(
+            host,
+            cid,
+            target.dialect.label(),
+            &user,
+            &database,
+            cred.as_pg(),
+            target.timeout,
+        )?;
 
         // Columns.
         let col_sql = format!(
@@ -1228,13 +1251,21 @@ fn op_table_show(input: Value, host: &mut Host) -> Result<Value, String> {
 fn op_index_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let target = resolve_target(&input, host)?;
     require_postgres(&target)?;
-    let (user, password, database) = resolve_credentials(&target, host)?;
+    let (user, database, cred) = resolve_connection(&target);
     let schema = flex_str(&input, "schema").unwrap_or_default();
     let table = flex_str(&input, "table").unwrap_or_default();
 
     let cid = dial(&target, host)?;
     let result = (|| -> Result<Value, String> {
-        let mut pg = PgClient::connect(host, cid, &user, &password, &database, target.timeout)?;
+        let mut pg = PgClient::connect(
+            host,
+            cid,
+            target.dialect.label(),
+            &user,
+            &database,
+            cred.as_pg(),
+            target.timeout,
+        )?;
         let sql = format!(
             "SELECT n.nspname AS table_schema, t.relname AS table_name, i.relname AS index_name, \
              ix.indisunique, ix.indisprimary, am.amname, pg_get_indexdef(ix.indexrelid) AS definition \
@@ -1458,210 +1489,51 @@ struct QueryResult {
     rows: Vec<Vec<Option<String>>>,
 }
 
-/// A minimal blocking PostgreSQL frontend speaking the v3 protocol over a host [`ConnStream`].
-/// Implements StartupMessage, the Authentication subtypes (Ok / cleartext / MD5 / SASL SCRAM-SHA-256),
-/// and the Simple Query ('Q') protocol. Extended query / COPY / binary formats are out of scope — the
-/// introspection queries are all text-format Simple Query.
+/// A minimal blocking PostgreSQL frontend over a host [`ConnStream`]. The startup + authentication
+/// handshake is **host-terminated** (`host.conn_authenticate`, D-31) — the plugin never speaks it and
+/// never holds the password; this client drives only the post-auth Simple Query ('Q') protocol.
+/// Extended query / COPY / binary formats are out of scope — the introspection queries are all
+/// text-format Simple Query.
 struct PgClient<'h, 'a> {
     stream: ConnStream<'h, 'a>,
     server_version: Option<String>,
 }
 
 impl<'h, 'a> PgClient<'h, 'a> {
-    /// Open a connection: send the startup packet, complete authentication, and drain to the first
-    /// `ReadyForQuery`. `database` defaults to `user` upstream when the DSN names none.
+    /// Open a connection by asking the host to **terminate the auth handshake** on the already-dialed
+    /// `conn_id`: the host speaks StartupMessage + SCRAM/MD5 itself using a credential it resolves
+    /// host-side, and returns the negotiated parameters (`server_version`) plus a socket left at the
+    /// first `ReadyForQuery`. The plugin never receives the password. `database` defaults to `user`
+    /// upstream when the DSN names none (resolved by [`resolve_connection`]).
     fn connect(
         host: &'h mut Host<'a>,
         conn_id: u64,
+        protocol: &str,
         user: &str,
-        password: &str,
         database: &str,
+        credential: PgCredential<'_>,
         timeout: Option<std::time::Duration>,
     ) -> Result<PgClient<'h, 'a>, String> {
+        // D-45: forward the per-call `timeout` (ms) as a read deadline — to the host handshake and to
+        // the plugin's own Simple Query reads. The PostgreSQL wire protocol is request/response, so a
+        // deadline on every read bounds the whole exchange; on elapsed the host returns
+        // ErrorKind::TimedOut (the connection stays open — closed by the outer handler's conn_close).
+        let timeout_ms = timeout.map(|d| d.as_millis().min(u64::MAX as u128) as u64);
+        let handshake = host.conn_authenticate(
+            conn_id,
+            protocol,
+            user,
+            database,
+            Some("flux-plugin-sql"),
+            credential,
+            timeout_ms,
+        )?;
         let mut client = PgClient {
             stream: ConnStream::new(host, conn_id),
-            server_version: None,
+            server_version: handshake.server_version,
         };
-        // D-45: forward the per-call `timeout` to the host's `conn.read` as a read deadline.
-        // The PostgreSQL wire protocol is request/response, so a deadline on every read bounds
-        // the whole handshake + query exchange; on elapsed the host returns ErrorKind::TimedOut
-        // (the connection stays open — closed by the outer handler's conn_close).
         client.stream.set_read_deadline(timeout);
-        client.startup(user, database)?;
-        client.authenticate(user, password)?;
-        client.drain_to_ready()?;
         Ok(client)
-    }
-
-    /// Send the StartupMessage: int32 length, int32 protocol 196608 (3.0), then NUL-terminated
-    /// `key\0value\0` pairs, ended by a final NUL.
-    fn startup(&mut self, user: &str, database: &str) -> Result<(), String> {
-        let mut params: Vec<u8> = Vec::new();
-        params.extend_from_slice(&196608i32.to_be_bytes());
-        for (k, v) in [
-            ("user", user),
-            ("database", database),
-            ("application_name", "flux-plugin-sql"),
-            ("client_encoding", "UTF8"),
-        ] {
-            params.extend_from_slice(k.as_bytes());
-            params.push(0);
-            params.extend_from_slice(v.as_bytes());
-            params.push(0);
-        }
-        params.push(0);
-        let mut msg = Vec::with_capacity(params.len() + 4);
-        msg.extend_from_slice(&((params.len() + 4) as i32).to_be_bytes());
-        msg.extend_from_slice(&params);
-        self.write_all(&msg)
-    }
-
-    /// Drive authentication until `AuthenticationOk`. Handles cleartext, MD5, and SCRAM-SHA-256.
-    fn authenticate(&mut self, user: &str, password: &str) -> Result<(), String> {
-        loop {
-            let (tag, body) = self.read_message()?;
-            match tag {
-                b'R' => {
-                    let code = be_i32(&body, 0)?;
-                    match code {
-                        0 => return Ok(()), // AuthenticationOk
-                        3 => {
-                            // Cleartext password.
-                            self.send_password_message(password.as_bytes())?;
-                        }
-                        5 => {
-                            // MD5: salt is the 4 bytes after the code.
-                            let salt = body.get(4..8).ok_or("pg: short MD5 salt")?;
-                            let token = md5_password(user, password, salt);
-                            self.send_password_message(token.as_bytes())?;
-                        }
-                        10 => {
-                            // SASL: NUL-separated mechanism list. Require SCRAM-SHA-256.
-                            let mechs = parse_cstring_list(&body[4..]);
-                            if !mechs.iter().any(|m| m == "SCRAM-SHA-256") {
-                                return Err(format!(
-                                    "pg: server offered SASL mechanisms {mechs:?}; only SCRAM-SHA-256 is supported"
-                                ));
-                            }
-                            self.scram_authenticate(password)?;
-                        }
-                        2 => return Err("pg: KerberosV5 auth unsupported".into()),
-                        6 => return Err("pg: SCM credential auth unsupported".into()),
-                        7 | 8 => return Err("pg: GSSAPI/SSPI auth unsupported".into()),
-                        9 => return Err("pg: SSPI auth unsupported".into()),
-                        other => return Err(format!("pg: unsupported auth request {other}")),
-                    }
-                }
-                b'E' => return Err(format!("pg: {}", parse_error(&body))),
-                other => {
-                    return Err(format!(
-                        "pg: unexpected message {:?} during authentication",
-                        other as char
-                    ))
-                }
-            }
-        }
-    }
-
-    /// Run the full SCRAM-SHA-256 SASL exchange (RFC 5802 / RFC 7677) after the server offered it.
-    fn scram_authenticate(&mut self, password: &str) -> Result<(), String> {
-        let client_nonce = gen_nonce();
-        let client_first_bare = format!("n=,r={client_nonce}");
-        let client_first = format!("n,,{client_first_bare}");
-
-        // SASLInitialResponse ('p'): mechanism CString + int32 length + the initial response bytes.
-        let mut init: Vec<u8> = Vec::new();
-        init.extend_from_slice(b"SCRAM-SHA-256");
-        init.push(0);
-        init.extend_from_slice(&(client_first.len() as i32).to_be_bytes());
-        init.extend_from_slice(client_first.as_bytes());
-        self.send_message(b'p', &init)?;
-
-        // AuthenticationSASLContinue (R, code 11): the server-first message.
-        let (tag, body) = self.read_message()?;
-        let server_first = self.expect_sasl(tag, &body, 11, "SASLContinue")?;
-        let attrs = parse_scram_attrs(&server_first);
-        let combined_nonce = attrs
-            .get("r")
-            .cloned()
-            .ok_or("pg scram: server-first missing nonce")?;
-        if !combined_nonce.starts_with(&client_nonce) {
-            return Err("pg scram: server nonce does not extend the client nonce".into());
-        }
-        let salt_b64 = attrs
-            .get("s")
-            .ok_or("pg scram: server-first missing salt")?;
-        let iterations: u32 = attrs
-            .get("i")
-            .and_then(|i| i.parse().ok())
-            .ok_or("pg scram: server-first missing/invalid iteration count")?;
-        let salt = base64_decode(salt_b64)?;
-
-        // SaltedPassword = PBKDF2-HMAC-SHA256(password, salt, i).
-        let salted = pbkdf2_hmac_sha256(password.as_bytes(), &salt, iterations);
-        let client_key = hmac_sha256(&salted, b"Client Key");
-        let stored_key = sha256(&client_key);
-        let channel_binding = base64_encode(b"n,,"); // GS2 header, no channel binding.
-        let client_final_no_proof = format!("c={channel_binding},r={combined_nonce}");
-        let auth_message = format!("{client_first_bare},{server_first},{client_final_no_proof}");
-        let client_signature = hmac_sha256(&stored_key, auth_message.as_bytes());
-        let proof: Vec<u8> = client_key
-            .iter()
-            .zip(client_signature.iter())
-            .map(|(a, b)| a ^ b)
-            .collect();
-        let client_final = format!("{client_final_no_proof},p={}", base64_encode(&proof));
-
-        // SASLResponse ('p'): the client-final message.
-        self.send_message(b'p', client_final.as_bytes())?;
-
-        // AuthenticationSASLFinal (R, code 12): verify the server signature.
-        let (tag, body) = self.read_message()?;
-        let server_final = self.expect_sasl(tag, &body, 12, "SASLFinal")?;
-        let final_attrs = parse_scram_attrs(&server_final);
-        let server_sig_b64 = final_attrs
-            .get("v")
-            .ok_or("pg scram: server-final missing verifier")?;
-        let server_key = hmac_sha256(&salted, b"Server Key");
-        let expected_sig = hmac_sha256(&server_key, auth_message.as_bytes());
-        if base64_decode(server_sig_b64)? != expected_sig {
-            return Err("pg scram: server signature verification failed".into());
-        }
-        // The following AuthenticationOk is consumed by the authenticate() loop.
-        Ok(())
-    }
-
-    /// Expect a SASL Authentication message (`R`) with the given sub-code, returning its UTF-8 payload.
-    fn expect_sasl(
-        &self,
-        tag: u8,
-        body: &[u8],
-        want_code: i32,
-        what: &str,
-    ) -> Result<String, String> {
-        if tag == b'E' {
-            return Err(format!("pg: {}", parse_error(body)));
-        }
-        if tag != b'R' {
-            return Err(format!(
-                "pg scram: expected Authentication ({what}), got {:?}",
-                tag as char
-            ));
-        }
-        let code = be_i32(body, 0)?;
-        if code != want_code {
-            return Err(format!(
-                "pg scram: expected auth code {want_code} ({what}), got {code}"
-            ));
-        }
-        Ok(String::from_utf8_lossy(&body[4..]).into_owned())
-    }
-
-    /// Send a PasswordMessage ('p') with a NUL-terminated payload (cleartext/MD5 path).
-    fn send_password_message(&mut self, payload: &[u8]) -> Result<(), String> {
-        let mut body = payload.to_vec();
-        body.push(0);
-        self.send_message(b'p', &body)
     }
 
     /// Run a Simple Query ('Q'): send the NUL-terminated SQL, then parse frames until ReadyForQuery.
@@ -1691,27 +1563,6 @@ impl<'h, 'a> PgClient<'h, 'a> {
             return Err(format!("pg: {err}"));
         }
         Ok(QueryResult { columns, rows })
-    }
-
-    /// Drain messages until the first ReadyForQuery, capturing `server_version` from ParameterStatus.
-    fn drain_to_ready(&mut self) -> Result<(), String> {
-        loop {
-            let (tag, body) = self.read_message()?;
-            match tag {
-                b'Z' => return Ok(()), // ReadyForQuery
-                b'S' => {
-                    // ParameterStatus: name\0value\0.
-                    let parts = parse_cstring_list(&body);
-                    if parts.len() >= 2 && parts[0] == "server_version" {
-                        self.server_version = Some(parts[1].clone());
-                    }
-                }
-                b'E' => return Err(format!("pg: {}", parse_error(&body))),
-                b'K' => {} // BackendKeyData — ignored (no cancel support).
-                b'N' => {} // NoticeResponse — ignored.
-                _ => {}    // Other startup messages — ignored.
-            }
-        }
     }
 
     // --- framing ---
@@ -1852,176 +1703,14 @@ fn parse_error(body: &[u8]) -> String {
     }
 }
 
-/// Split a buffer of NUL-terminated C strings into a list (a trailing empty terminator is dropped).
-fn parse_cstring_list(buf: &[u8]) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    for (i, &b) in buf.iter().enumerate() {
-        if b == 0 {
-            if i > start {
-                out.push(String::from_utf8_lossy(&buf[start..i]).into_owned());
-            }
-            start = i + 1;
-        }
-    }
-    out
-}
-
-/// Parse `key=value,key=value` SCRAM attributes (values may contain `=`).
-fn parse_scram_attrs(s: &str) -> std::collections::HashMap<String, String> {
-    s.split(',')
-        .filter_map(|part| part.split_once('='))
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
-}
-
 // ===========================================================================
-// Crypto primitives (SCRAM / MD5)
-// ===========================================================================
-
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
-}
-
-fn sha256(data: &[u8]) -> Vec<u8> {
-    let mut h = Sha256::new();
-    h.update(data);
-    h.finalize().to_vec()
-}
-
-/// PBKDF2-HMAC-SHA256 with a single 32-byte output block (SCRAM uses dkLen = hashLen, so block 1 only).
-fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
-    // U1 = HMAC(password, salt || INT(1)); Ui = HMAC(password, Ui-1); result = U1 ^ U2 ^ … ^ Uc.
-    let mut salted = salt.to_vec();
-    salted.extend_from_slice(&1u32.to_be_bytes());
-    let mut u = hmac_sha256(password, &salted);
-    let mut result = u.clone();
-    for _ in 1..iterations {
-        u = hmac_sha256(password, &u);
-        for (r, x) in result.iter_mut().zip(u.iter()) {
-            *r ^= *x;
-        }
-    }
-    result
-}
-
-/// `md5` PostgreSQL password token: `"md5" + md5_hex(md5_hex(password+user) + salt)`.
-fn md5_password(user: &str, password: &str, salt: &[u8]) -> String {
-    let inner = md5_hex(format!("{password}{user}").as_bytes());
-    let mut outer_input = inner.into_bytes();
-    outer_input.extend_from_slice(salt);
-    format!("md5{}", md5_hex(&outer_input))
-}
-
-/// A small, self-contained MD5 (RFC 1321) — used only for the legacy MD5 auth token. Postgres MD5 is
-/// not a security boundary (the server picks it), so a vendored MD5 here avoids another dependency.
-fn md5_hex(input: &[u8]) -> String {
-    let digest = md5_digest(input);
-    let mut s = String::with_capacity(32);
-    for b in digest {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
-
-fn md5_digest(input: &[u8]) -> [u8; 16] {
-    const S: [u32; 64] = [
-        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
-        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
-        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
-    ];
-    const K: [u32; 64] = [
-        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
-        0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193,
-        0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d,
-        0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
-        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122,
-        0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa,
-        0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244,
-        0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
-        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb,
-        0xeb86d391,
-    ];
-    let mut a0: u32 = 0x67452301;
-    let mut b0: u32 = 0xefcdab89;
-    let mut c0: u32 = 0x98badcfe;
-    let mut d0: u32 = 0x10325476;
-
-    let mut msg = input.to_vec();
-    let bit_len = (input.len() as u64).wrapping_mul(8);
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bit_len.to_le_bytes());
-
-    for chunk in msg.chunks_exact(64) {
-        let mut m = [0u32; 16];
-        for (i, word) in m.iter_mut().enumerate() {
-            *word = u32::from_le_bytes([
-                chunk[i * 4],
-                chunk[i * 4 + 1],
-                chunk[i * 4 + 2],
-                chunk[i * 4 + 3],
-            ]);
-        }
-        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
-        for i in 0..64 {
-            let (f, g) = match i {
-                0..=15 => ((b & c) | (!b & d), i),
-                16..=31 => ((d & b) | (!d & c), (5 * i + 1) % 16),
-                32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
-                _ => (c ^ (b | !d), (7 * i) % 16),
-            };
-            let f = f.wrapping_add(a).wrapping_add(K[i]).wrapping_add(m[g]);
-            a = d;
-            d = c;
-            c = b;
-            b = b.wrapping_add(f.rotate_left(S[i]));
-        }
-        a0 = a0.wrapping_add(a);
-        b0 = b0.wrapping_add(b);
-        c0 = c0.wrapping_add(c);
-        d0 = d0.wrapping_add(d);
-    }
-    let mut out = [0u8; 16];
-    out[0..4].copy_from_slice(&a0.to_le_bytes());
-    out[4..8].copy_from_slice(&b0.to_le_bytes());
-    out[8..12].copy_from_slice(&c0.to_le_bytes());
-    out[12..16].copy_from_slice(&d0.to_le_bytes());
-    out
-}
-
-/// A 24-char alphanumeric client nonce (SCRAM forbids `,` and `=`; alphanumerics are always safe).
-fn gen_nonce() -> String {
-    use rand::Rng;
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut rng = rand::thread_rng();
-    (0..24)
-        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
-        .collect()
-}
-
-fn base64_encode(data: &[u8]) -> String {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD.encode(data)
-}
-
-fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD
-        .decode(s.trim())
-        .map_err(|e| format!("pg scram: bad base64: {e}"))
-}
-
-// ===========================================================================
-// Tests — one MockHost test per op (hand-crafted server frames) + a SCRAM unit test.
+// Tests — one MockHost test per op (hand-crafted server frames) + the host-terminated-auth contract.
 //
-// HONESTY: these replay author-written PostgreSQL frames. They prove the frame parser, message
-// assembly, and JSON shaping — NOT live interop with a real server. AuthenticationOk is used for the
-// connect handshake to keep the canned bytes small; SCRAM is covered separately by its own unit test.
+// HONESTY: these replay author-written PostgreSQL frames over the POST-AUTH Simple Query protocol.
+// They prove the frame parser, message assembly, and JSON shaping — NOT live interop with a real
+// server. The auth handshake is host-terminated (D-31): the mock `conn.authenticate` returns the
+// negotiated `server_version` without the plugin ever seeing a password; the wire-level SCRAM
+// correctness (including the server-signature check) is covered by `flux-plugin`'s `pg` tests.
 // ===========================================================================
 
 #[cfg(test)]
@@ -2035,17 +1724,6 @@ mod tests {
         m.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
         m.extend_from_slice(body);
         m
-    }
-
-    /// AuthenticationOk + a server_version ParameterStatus + ReadyForQuery('I' = idle).
-    fn connect_frames() -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend(msg(b'R', &0i32.to_be_bytes())); // AuthenticationOk
-        let mut ps = b"server_version\0".to_vec();
-        ps.extend_from_slice(b"16.2\0");
-        out.extend(msg(b'S', &ps));
-        out.extend(msg(b'Z', b"I"));
-        out
     }
 
     fn row_description(cols: &[&str]) -> Vec<u8> {
@@ -2100,19 +1778,18 @@ mod tests {
     }
 
     /// A MockHost with the standard static setup — the credential-free DSN as non-secret config
-    /// (metadata), the named `sql.endpoint` ref (the by-reference dial target), credentials by
-    /// purpose — and a single canned conn stream made of the connect frames followed by
-    /// `responses` (concatenated; one chunk so `read_exact` reframes).
+    /// (metadata) and the named `sql.endpoint` ref (the by-reference dial target). The auth handshake
+    /// is host-terminated (D-31: the mock `conn.authenticate` returns `server_version` — the plugin
+    /// never reads a secret), so the canned conn stream carries only the POST-AUTH query `responses`
+    /// (concatenated into one chunk so the plugin's `read_exact` reframes).
     fn host_with(responses: Vec<Vec<u8>>) -> MockHost {
-        let mut stream = connect_frames();
+        let mut stream = Vec::new();
         for r in responses {
             stream.extend(r);
         }
         MockHost::default()
             .with_config("dsn", "postgres://app@db.test:5432/warehouse")
             .with_endpoint_ref("sql.endpoint", "postgres://app@db.test:5432/warehouse")
-            .with_secret("username", "app")
-            .with_secret("password", "secret")
             .with_conn_response(stream)
     }
 
@@ -2136,7 +1813,20 @@ mod tests {
             assert!(names.contains(&want), "missing op {want}");
         }
         assert!(m.capabilities.conn.iter().any(|c| c.contains("5432")));
-        assert!(m.capabilities.secrets.contains(&"SQL_PASSWORD".to_string()));
+        // D-31: the plugin holds NO credential — no `credential` grant and no password in `secrets`
+        // (the host terminates the auth handshake and never hands the plugin a secret value).
+        assert!(
+            !m.capabilities.credential,
+            "sql must not hold the `credential` grant (host-terminated auth)"
+        );
+        assert!(
+            m.capabilities.secrets.is_empty(),
+            "sql must not grant any `secrets` (the password is host-resolved): {:?}",
+            m.capabilities.secrets
+        );
+        // The "password" auth method stays DECLARED so the host knows which env backs it — but that
+        // env is not in the `secrets` grant, so the `secret` capability would refuse it to the plugin.
+        assert!(m.auth.iter().any(|a| a.purpose == "password"));
         // D-32: the DSN is a declared non-secret config (read via `host.config("dsn")`), and the
         // named endpoint stays declared as the by-reference dial target.
         assert!(m.config.iter().any(|c| c.name == "dsn"));
@@ -2340,24 +2030,25 @@ mod tests {
         assert_eq!(out["indexes"][1]["columns"], json!(["name"]));
     }
 
-    /// A MockHost for a DISCOVERED postgres endpoint: the conn stream replays the connect frames +
-    /// `responses`, the bare (no-password) URL is registered under the discovered `endpoint_ref`
-    /// (so `conn_dial_ref` resolves it), and the password is materialized through the gated
-    /// `credential` capability — never via a `secret` purpose and never inside a URL.
+    /// A MockHost for a DISCOVERED postgres endpoint: the conn stream carries the POST-AUTH query
+    /// `responses`, the bare (no-password) URL is registered under the discovered `endpoint_ref` (so
+    /// `conn_dial_ref` resolves it), and the password is registered so the HOST can resolve it for the
+    /// terminated handshake (`conn.authenticate`) — never via a `secret` purpose, never inside a URL,
+    /// and never handed to the plugin.
     fn discovered_host(
         endpoint_ref: &str,
         bare_url: &str,
         password: &str,
         responses: Vec<Vec<u8>>,
     ) -> MockHost {
-        let mut stream = connect_frames();
+        let mut stream = Vec::new();
         for r in responses {
             stream.extend(r);
         }
         MockHost::default()
             // The dial-by-ref resolution target (a bare URL — no password in it).
             .with_endpoint_ref(endpoint_ref, bare_url)
-            // The password via the gated `credential` capability, keyed by endpoint_ref.
+            // The password the host resolves for the terminated handshake, keyed by endpoint_ref.
             .with_credential(endpoint_ref, password)
             .with_conn_response(stream)
     }
@@ -2369,8 +2060,9 @@ mod tests {
         let password = "k8s-scram-password";
 
         // (a) The PREFERRED shape: the full weak EndpointRef object passed inline, with a kubernetes
-        // `credential_ref` (a location). The bare `url` carries NO password; the password is fetched
-        // through the gated `credential` capability against the `credential_ref`.
+        // `credential_ref` (a location). The bare `url` carries NO password; the HOST resolves the
+        // password against the `credential_ref` when it terminates the handshake — the plugin never
+        // sees it.
         let endpoint = json!({
             "id": "@endpoint/pg-1",
             "url": "postgres://app@pg.monitoring.svc:5432/warehouse",
@@ -2387,14 +2079,10 @@ mod tests {
                 "postgres://app@pg.monitoring.svc:5432/warehouse",
             )
             .with_credential("kubernetes/monitoring/pg-creds/password", password)
-            .with_conn_response({
-                let mut s = connect_frames();
-                s.extend(query_response(
-                    &["id", "name"],
-                    &[vec![Some("1"), Some("ada")]],
-                ));
-                s
-            });
+            .with_conn_response(query_response(
+                &["id", "name"],
+                &[vec![Some("1"), Some("ada")]],
+            ));
         let out = run(
             "sql.query",
             json!({ "endpoint": endpoint, "query": "select id, name from users" }),
@@ -2415,6 +2103,30 @@ mod tests {
             !dumped.contains(password),
             "the password must never appear in the op's returned JSON: {dumped}"
         );
+
+        // D-31 CONTRACT: on the PG path the plugin NEVER materializes the credential itself — it made
+        // no `credential`/`secret` call, and no host call it made carried the password. The password
+        // reaches the wire only inside the host-terminated `conn.authenticate`, which the plugin
+        // invoked with a credential *location* (the `credential_ref`), not a value.
+        let calls = host.calls.borrow();
+        assert!(
+            calls
+                .iter()
+                .all(|(cmd, _)| cmd != "credential" && cmd != "secret"),
+            "the plugin must not call `credential`/`secret` on the host-terminated PG path: {:?}",
+            calls.iter().map(|(c, _)| c).collect::<Vec<_>>()
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|(_, payload)| !payload.to_string().contains(password)),
+            "no host-call payload the plugin sent may carry the password"
+        );
+        // It DID drive the flow by reference: dial-by-ref + a host-terminated conn.authenticate.
+        assert!(calls.iter().any(|(cmd, _)| cmd == "conn.dial"));
+        assert!(calls.iter().any(|(cmd, p)| cmd == "conn.authenticate"
+            && p.get("credential_ref").is_some()
+            && p.get("user").and_then(|u| u.as_str()) == Some("app")));
 
         // (b) The bare discovered `@endpoint/<id>` id-string shape is RETIRED with the `endpoint`
         // URL-handback it relied on (the real host never resolved discovered ids that way). Even
@@ -2458,11 +2170,7 @@ mod tests {
         let mut host_a = MockHost::default()
             .with_endpoint_ref("@endpoint/pg-a", "postgres://ua@a.svc:5432/dba")
             .with_credential("kubernetes/ns/pg-a/password", "pw-a")
-            .with_conn_response({
-                let mut s = connect_frames();
-                s.extend(query_response(&["db"], &[vec![Some("a")]]));
-                s
-            });
+            .with_conn_response(query_response(&["db"], &[vec![Some("a")]]));
         let out_a = run(
             "sql.test",
             json!({ "endpoint": ep("@endpoint/pg-a", "postgres://ua@a.svc:5432/dba") }),
@@ -2475,11 +2183,7 @@ mod tests {
         let mut host_b = MockHost::default()
             .with_endpoint_ref("@endpoint/pg-b", "postgres://ub@b.svc:5432/dbb")
             .with_credential("kubernetes/ns/pg-b/password", "pw-b")
-            .with_conn_response({
-                let mut s = connect_frames();
-                s.extend(query_response(&["db"], &[vec![Some("b")]]));
-                s
-            });
+            .with_conn_response(query_response(&["db"], &[vec![Some("b")]]));
         let out_b = run(
             "sql.test",
             json!({ "endpoint": ep("@endpoint/pg-b", "postgres://ub@b.svc:5432/dbb") }),
@@ -2505,10 +2209,7 @@ mod tests {
 
     #[test]
     fn mysql_and_sqlite_route_to_clear_errors() {
-        let mut mysql = MockHost::default()
-            .with_config("dsn", "mysql://root@db.test:3306/app")
-            .with_secret("username", "root")
-            .with_secret("password", "");
+        let mut mysql = MockHost::default().with_config("dsn", "mysql://root@db.test:3306/app");
         let err = run("sql.test", json!({}), &mut mysql).unwrap_err();
         assert!(err.contains("mysql is not yet supported"), "err = {err}");
 
@@ -2524,12 +2225,32 @@ mod tests {
         // A mock that has the DSN config but NO `with_endpoint_ref("sql.endpoint", ...)` entry
         // must therefore fail at the dial with the mock's missing-ref error (a plugin-side
         // `ConnTarget::Tcp` dial would have succeeded and then timed out reading frames).
-        let mut host = MockHost::default()
-            .with_config("dsn", "postgres://app@db.test:5432/warehouse")
-            .with_secret("username", "app")
-            .with_secret("password", "secret");
+        let mut host =
+            MockHost::default().with_config("dsn", "postgres://app@db.test:5432/warehouse");
         let err = run("sql.test", json!({}), &mut host).unwrap_err();
         assert!(err.contains("no endpoint_ref"), "err = {err}");
+    }
+
+    #[test]
+    fn static_endpoint_host_terminates_auth_by_purpose() {
+        // D-31: on the static/named path the plugin authenticates by REFERENCE — it passes the
+        // declared "password" auth purpose to the host-terminated `conn.authenticate`, never reading
+        // a secret itself. It makes no `credential`/`secret` call, and no host call carries a value.
+        let mut host = host_with(vec![query_response(&["?column?"], &[vec![Some("1")]])]);
+        let out = run("sql.test", json!({}), &mut host).expect("sql.test");
+        assert_eq!(out["status"], "ok");
+        let calls = host.calls.borrow();
+        assert!(
+            calls
+                .iter()
+                .all(|(cmd, _)| cmd != "credential" && cmd != "secret"),
+            "the static PG path must not call `credential`/`secret`: {:?}",
+            calls.iter().map(|(c, _)| c).collect::<Vec<_>>()
+        );
+        // It authenticated by the declared purpose (a location), not a value.
+        assert!(calls.iter().any(|(cmd, p)| cmd == "conn.authenticate"
+            && p.get("auth_purpose").and_then(|v| v.as_str()) == Some("password")
+            && p.get("user").and_then(|v| v.as_str()) == Some("app")));
     }
 
     // ---- unit tests for the pure helpers ----
@@ -2567,9 +2288,8 @@ mod tests {
         assert_eq!(t.dialect, Dialect::Postgres);
         assert_eq!(t.database, "warehouse");
         assert_eq!(t.dsn_user.as_deref(), Some("app"));
-        assert_eq!(t.dsn_password.as_deref(), Some("s3cr3t"));
-        // The parsed host:port surface only in the redacted URL — the target carries no dialable
-        // address (the dial goes by reference).
+        // An inline password (from a weak-ref URL) is redacted into `safe_url` and never stored on
+        // the target or sent to the host — the host resolves the credential itself (D-31).
         assert_eq!(t.safe_url, "postgres://app:xxxxx@db.test:6543/warehouse");
         assert!(
             !t.safe_url.contains("s3cr3t"),
@@ -2577,13 +2297,13 @@ mod tests {
             t.safe_url
         );
 
-        // Default port + percent-decoded password.
+        // Default port + percent-decoded password (redacted).
         let t = target_from_url(None, "postgresql://u:p%40ss@h/db", None).unwrap();
         assert_eq!(
             t.safe_url,
             format!("postgres://u:xxxxx@h:{PG_DEFAULT_PORT}/db")
         );
-        assert_eq!(t.dsn_password.as_deref(), Some("p@ss"));
+        assert!(!t.safe_url.contains("p@ss"), "password must be redacted");
 
         // Driver override wins over scheme; sqlite is rejected at parse time.
         assert!(target_from_url(None, "sqlite:///x.db", None).is_err());
@@ -2592,48 +2312,9 @@ mod tests {
         assert_eq!(t.safe_url, "mysql://root@h:3306/app");
     }
 
-    #[test]
-    fn scram_client_derivation_matches_rfc7677_vector() {
-        // RFC 7677 §3 SCRAM-SHA-256 example: user "user", password "pencil".
-        // SaltedPassword/ClientKey/ClientProof are well-known for these inputs.
-        let password = "pencil";
-        let salt = base64_decode("W22ZaJ0SNY7soEsUEjb6gQ==").unwrap();
-        let iterations = 4096u32;
-        let salted = pbkdf2_hmac_sha256(password.as_bytes(), &salt, iterations);
-        let client_key = hmac_sha256(&salted, b"Client Key");
-        let stored_key = sha256(&client_key);
-
-        let client_first_bare = "n=user,r=rOprNGfwEbeRWgbNEkqO";
-        let server_first =
-            "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
-        let client_final_no_proof = "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
-        let auth_message = format!("{client_first_bare},{server_first},{client_final_no_proof}");
-        let client_signature = hmac_sha256(&stored_key, auth_message.as_bytes());
-        let proof: Vec<u8> = client_key
-            .iter()
-            .zip(client_signature.iter())
-            .map(|(a, b)| a ^ b)
-            .collect();
-        // The expected ClientProof from RFC 7677 §3.
-        assert_eq!(
-            base64_encode(&proof),
-            "dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
-        );
-
-        // And the server-signature check our client performs round-trips.
-        let server_key = hmac_sha256(&salted, b"Server Key");
-        let server_sig = hmac_sha256(&server_key, auth_message.as_bytes());
-        assert_eq!(
-            base64_encode(&server_sig),
-            "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="
-        );
-    }
-
-    #[test]
-    fn md5_digest_matches_known_vectors() {
-        assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
-        assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
-    }
+    // NOTE (D-31): the SCRAM-SHA-256 RFC 7677 derivation + server-signature check and the MD5
+    // vectors now live in `flux-plugin`'s `pg` module (the host terminates the auth handshake), and
+    // are covered there by hermetic tests against a scripted PG-server stub.
 
     #[test]
     fn timeout_is_parsed_and_invalid_timeout_fails_fast() {
@@ -2645,15 +2326,13 @@ mod tests {
 
     #[test]
     fn timeout_is_enforced_on_read_when_no_server_data() {
-        // Failing-first for D-45: a valid `timeout` forwards a per-read deadline to the host's
-        // `conn.read`. With no server frames queued, the handshake's first read returns
-        // ErrorKind::TimedOut (not a silent hang or a clean EOF) — surfaced as "timed out".
-        // Before the deadline wiring, the read would return EOF ("connection closed mid-message").
+        // D-45: a valid `timeout` forwards a per-read deadline to the host's `conn.read`. The auth
+        // handshake is host-terminated (the mock `conn.authenticate` returns immediately), so with no
+        // POST-AUTH query frames queued the first Simple Query read returns ErrorKind::TimedOut (not a
+        // silent hang or a clean EOF) — surfaced as "timed out".
         let mut host = MockHost::default()
             .with_config("dsn", "postgres://app@db.test:5432/warehouse")
-            .with_endpoint_ref("sql.endpoint", "postgres://app@db.test:5432/warehouse")
-            .with_secret("username", "app")
-            .with_secret("password", "secret");
+            .with_endpoint_ref("sql.endpoint", "postgres://app@db.test:5432/warehouse");
         let err = run("sql.test", json!({"timeout": "1ms"}), &mut host).unwrap_err();
         assert!(err.contains("timed out"), "err = {err}");
     }

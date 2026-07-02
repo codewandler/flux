@@ -13,10 +13,6 @@ host-kit.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true
-base64.workspace = true
-# SCRAM-SHA-256 auth (the modern PostgreSQL default): HMAC-SHA256 + SHA-256 + a
-# random client nonce. PBKDF2 is a short HMAC loop we implement here rather than
-# pulling the `pbkdf2` crate.
-hmac = "0.12"
-sha2 = "0.10"
-rand = "0.8"
+# D-31: the plugin no longer speaks the auth handshake (the host terminates it via
+# `host.conn_authenticate`), so the SCRAM/MD5 crypto deps (hmac/sha2/rand) and base64 are gone —
+# the plugin drives only the post-auth Simple Query protocol.

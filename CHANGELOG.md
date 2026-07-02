@@ -25,6 +25,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **The endpoint epic is complete — the host now terminates raw-socket auth (D-31).** The last
+  place a (trusted) plugin held a secret is gone: the new `conn.authenticate` host capability
+  performs the PostgreSQL v3 startup + auth handshake host-side (full RFC 5802/7677
+  SCRAM-SHA-256 including server-signature verification, plus MD5/cleartext) over an
+  already-dialed connection, resolving the credential by reference (broker path — cross-plugin
+  gate + audit unchanged — or declared auth purpose) and handing `sql` a *post-auth* connection
+  with only `server_version`/parameters/backend-key. The `sql` plugin's own
+  startup/SCRAM/MD5/crypto code is deleted and its manifest grants **no `credential` and no
+  `secrets`**; MockHost call-log tests prove no password ever crosses a plugin frame. The
+  references-only invariant now holds absolutely, not "except for in-band-auth raw sockets";
+  mysql/AMI termination are seamed follow-ons behind the same capability.
+
 - **Plugin-pack distribution is scoped and decided (D-21).** How a non-source user gets the ~20
   integration plugins: **fetch-on-install from a signed, first-party pack channel** — pack
   releases as their own `plugins-v*` GitHub release series (one prebuilt archive per plugin per

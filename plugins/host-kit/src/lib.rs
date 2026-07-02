@@ -537,6 +537,63 @@ impl Host<'_> {
             .ok_or_else(|| "credential: host returned no value".into())
     }
 
+    /// **Host-terminate** the in-band-auth handshake of a raw-socket protocol on an already-dialed
+    /// connection (D-31). The host speaks the protocol's startup + authentication (e.g. PostgreSQL
+    /// StartupMessage + SCRAM-SHA-256/MD5) using a credential it resolves **host-side**, and hands
+    /// back a POST-AUTH connection: the plugin keeps driving the same `conn_id` (Simple Query, etc.)
+    /// but **never receives the password**. This is the stricter successor to [`credential`](Self::credential)
+    /// for host-terminated protocols — the plugin holds no secret value at all.
+    ///
+    /// `credential` names WHERE the host finds the secret (a declared auth method, an explicit
+    /// credential reference, or a discovered endpoint's attached credential) — never the value.
+    /// Returns the negotiated non-secret connection parameters (notably `server_version`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn conn_authenticate(
+        &mut self,
+        conn_id: u64,
+        protocol: &str,
+        user: &str,
+        database: &str,
+        application_name: Option<&str>,
+        credential: PgCredential,
+        timeout_ms: Option<u64>,
+    ) -> Result<HandshakeInfo, String> {
+        let mut payload = json!({
+            "conn_id": conn_id,
+            "protocol": protocol,
+            "user": user,
+            "database": database,
+        });
+        if let Some(app) = application_name {
+            payload["application_name"] = json!(app);
+        }
+        if let Some(ms) = timeout_ms {
+            payload["timeout_ms"] = json!(ms);
+        }
+        match credential {
+            PgCredential::AuthPurpose(p) => payload["auth_purpose"] = json!(p),
+            PgCredential::CredentialRef(r) => payload["credential_ref"] = json!(r),
+            PgCredential::EndpointRef(r) => payload["endpoint_ref"] = json!(r),
+        }
+        let v = self.inner.host_call("conn.authenticate", payload)?;
+        let parameters = v
+            .get("parameters")
+            .and_then(|p| p.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(HandshakeInfo {
+            server_version: v
+                .get("server_version")
+                .and_then(|x| x.as_str())
+                .map(String::from),
+            parameters,
+        })
+    }
+
     /// Write bytes to an open connection; returns the number written.
     pub fn conn_write(&mut self, conn_id: u64, data: &[u8]) -> Result<usize, String> {
         let b64 = base64::engine::general_purpose::STANDARD.encode(data);
@@ -640,6 +697,29 @@ pub enum ConnTarget<'a> {
     Tcp { host: &'a str, port: u16 },
     /// A local Unix-domain socket path.
     Unix { path: &'a str },
+}
+
+/// Where the host finds the credential for a host-terminated handshake ([`Host::conn_authenticate`],
+/// D-31). Every variant is a *location*, never a value — the plugin never holds the secret.
+pub enum PgCredential<'a> {
+    /// A declared manifest auth method (the static/named-endpoint path — env-backed). The host
+    /// resolves the auth method's env host-side; the plugin's `secret` grant no longer covers it.
+    AuthPurpose(&'a str),
+    /// An explicit credential reference string (`scheme/...`), resolved through the host broker
+    /// (cross-plugin grant + audit apply) — the discovered-endpoint path with an explicit ref.
+    CredentialRef(&'a str),
+    /// A discovered endpoint reference (`@endpoint/<id>`); the host materializes the credential the
+    /// endpoint record carries (cross-plugin grant + audit apply).
+    EndpointRef(&'a str),
+}
+
+/// The negotiated, non-secret connection parameters from a host-terminated handshake
+/// ([`Host::conn_authenticate`]). Carries no credential.
+pub struct HandshakeInfo {
+    /// The server version reported via `ParameterStatus`, when present.
+    pub server_version: Option<String>,
+    /// All `ParameterStatus` values the server sent during startup.
+    pub parameters: HashMap<String, String>,
 }
 
 /// Metadata for a stored blob (from [`Host::blob_info`]).
@@ -961,6 +1041,13 @@ pub struct MockHost {
     pub conn_script: std::cell::RefCell<std::collections::VecDeque<Vec<u8>>>,
     /// An in-memory `blob.*` store: `blob_ref -> (name, bytes)`.
     pub blobs: std::cell::RefCell<HashMap<String, (String, Vec<u8>)>>,
+    /// The `server_version` a host-terminated `conn.authenticate` reports back (D-31). Default
+    /// `"16.2"`; override with [`with_pg_server_version`](MockHost::with_pg_server_version).
+    pub pg_server_version: String,
+    /// A log of every `host_call` the plugin made: `(command, payload)`, in call order. Lets a test
+    /// assert what the plugin did and did NOT ask the host to do — e.g. that a host-terminated PG
+    /// path never calls `credential`/`secret` and never puts a password on the wire (D-31).
+    pub calls: std::cell::RefCell<Vec<(String, Value)>>,
 }
 
 impl Default for MockHost {
@@ -983,6 +1070,8 @@ impl Default for MockHost {
             conn_buf: std::cell::RefCell::new(Vec::new()),
             conn_script: std::cell::RefCell::new(std::collections::VecDeque::new()),
             blobs: std::cell::RefCell::new(HashMap::new()),
+            pg_server_version: "16.2".to_string(),
+            calls: std::cell::RefCell::new(Vec::new()),
         }
     }
 }
@@ -1057,6 +1146,11 @@ impl MockHost {
         self.conn_script.get_mut().push_back(bytes.into());
         self
     }
+    /// The `server_version` a host-terminated `conn.authenticate` reports back (D-31).
+    pub fn with_pg_server_version(mut self, version: &str) -> Self {
+        self.pg_server_version = version.into();
+        self
+    }
 }
 
 /// Join a base URL and a relative `path` with exactly one separating slash — a small stand-in for
@@ -1075,6 +1169,10 @@ fn join_url(base: &str, path: &str) -> String {
 
 impl GuestHost for MockHost {
     fn host_call(&mut self, command: &str, payload: Value) -> Result<Value, String> {
+        // Log every call so a test can assert what the plugin did / did not ask of the host (D-31).
+        self.calls
+            .borrow_mut()
+            .push((command.to_string(), payload.clone()));
         match command {
             "secret" => {
                 let p = payload
@@ -1230,6 +1328,33 @@ impl GuestHost for MockHost {
                     }
                 }
                 Ok(json!({ "conn_id": 1 }))
+            }
+            "conn.authenticate" => {
+                // Host-terminated handshake (D-31): the HOST would speak the wire auth here. The mock
+                // does not run the wire protocol; it only proves the guest-side contract — the plugin
+                // passes a credential *location* (never a value) and gets back the negotiated
+                // parameters. A discovered credential ref/endpoint ref must still be resolvable
+                // host-side (looked up but NOT returned to the plugin); the static `auth_purpose`
+                // path resolves from host env, so nothing plugin-visible is needed.
+                if let Some(cr) = payload.get("credential_ref").and_then(|v| v.as_str()) {
+                    if !self.credentials.contains_key(cr) {
+                        return Err(format!("mock: no credential for `{cr}`"));
+                    }
+                } else if let Some(er) = payload.get("endpoint_ref").and_then(|v| v.as_str()) {
+                    if !self.credentials.contains_key(er) {
+                        return Err(format!("mock: no credential for endpoint `{er}`"));
+                    }
+                } else if payload
+                    .get("auth_purpose")
+                    .and_then(|v| v.as_str())
+                    .is_none()
+                {
+                    return Err("mock: conn.authenticate requires a credential location".into());
+                }
+                Ok(json!({
+                    "server_version": self.pg_server_version,
+                    "parameters": { "server_version": self.pg_server_version },
+                }))
             }
             "conn.write" => {
                 let b64 = payload

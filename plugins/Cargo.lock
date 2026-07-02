@@ -248,6 +248,8 @@ dependencies = [
  "flux-secret",
  "flux-spec",
  "flux-system",
+ "hmac",
+ "rand 0.8.6",
  "reqwest",
  "rquickjs",
  "serde",
@@ -1409,14 +1411,10 @@ dependencies = [
 name = "sql"
 version = "0.1.0"
 dependencies = [
- "base64",
- "hmac",
  "host-kit",
- "rand 0.8.6",
  "schemars",
  "serde",
  "serde_json",
- "sha2",
 ]
 
 [[package]]
