@@ -1,0 +1,206 @@
+# Plugin pack release channel (D-46, docs/designs/plugin-distribution.md).
+#
+# Hand-written on purpose — cargo-dist is NOT extended to the plugins workspace (dist models one
+# app per package; 17 lockstep packages would collide with the core release series). Deliberately
+# `workflow_dispatch`, NOT a tag push: the dist-generated release.yml triggers on the tag glob
+# '**[0-9]+.[0-9]+.[0-9]+*', which any semver-ish plugins tag would also match and red-X dist's
+# plan job. This workflow creates the `plugins-v<version>` tag + release itself via GITHUB_TOKEN
+# (workflow-created refs don't re-trigger workflows, so no recursion). Do NOT hand-push a
+# `plugins-v*` tag.
+#
+# Secrets: MINISIGN_SECRET_KEY — the contents of a PASSWORDLESS minisign secret key
+# (`minisign -G -W`); its public half is embedded in the flux binary (D-47). Required to publish;
+# a dry run without it skips signing with a notice.
+
+name: release-plugins
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Pack version to release (must equal plugins/ workspace.package.version)"
+        required: true
+        type: string
+      publish:
+        description: "Create the plugins-v<version> tag + GitHub release (false = dry run: artifacts only)"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-plugins
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-13
+            target: x86_64-apple-darwin
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The requested version must be the plugins workspace's lockstep version — the index, the
+      # archive names, and the manifests all report it; a mismatch here would ship lies.
+      - name: Verify version input matches the plugins workspace
+        shell: bash
+        run: |
+          ws_version="$(grep -A5 '^\[workspace\.package\]' plugins/Cargo.toml | grep -m1 '^version' | sed 's/.*"\(.*\)".*/\1/')"
+          if [ "${ws_version}" != "${{ inputs.version }}" ]; then
+            echo "::error::input version '${{ inputs.version }}' != plugins workspace.package.version '${ws_version}' — bump plugins/Cargo.toml first"
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo (plugins)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: plugins
+
+      - name: Build the pack (release)
+        working-directory: plugins
+        run: cargo build --release --workspace
+
+      # One archive per plugin per target, containing just the binary:
+      # flux-plugin-<name>-<version>-<target>.tar.xz (.zip on windows, binary keeps its .exe).
+      - name: Package per-plugin archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          target="${{ matrix.target }}"
+          mkdir -p out
+          shopt -s nullglob
+          count=0
+          if [[ "${target}" == *windows* ]]; then
+            for bin in plugins/target/release/flux-plugin-*.exe; do
+              name="$(basename "${bin}" .exe)"           # flux-plugin-<name>
+              # cd into the binary dir so the zip holds the bare .exe, not the path hierarchy
+              (cd "$(dirname "${bin}")" && 7z a -bso0 "${GITHUB_WORKSPACE}/out/${name}-${version}-${target}.zip" "${name}.exe")
+              count=$((count + 1))
+            done
+          else
+            for bin in plugins/target/release/flux-plugin-*; do
+              [ -f "${bin}" ] && [ -x "${bin}" ] || continue
+              case "${bin}" in *.d) continue ;; esac
+              name="$(basename "${bin}")"                # flux-plugin-<name>
+              archive="out/${name}-${version}-${target}.tar.xz"
+              tar -cJf "${archive}" -C "$(dirname "${bin}")" "${name}"
+              count=$((count + 1))
+            done
+          fi
+          echo "packaged ${count} plugin archives for ${target}"
+          [ "${count}" -gt 0 ] || { echo "::error::no flux-plugin-* binaries found"; exit 1; }
+          ls -l out/
+
+      - name: Upload leg artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pack-${{ matrix.target }}
+          path: out/*
+          if-no-files-found: error
+
+  assemble:
+    name: assemble · index · sign${{ inputs.publish && ' · release' || ' (dry run)' }}
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo (plugins)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: plugins
+
+      - name: Collect all leg artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pack-*
+          path: dist
+          merge-multiple: true
+
+      # The index is generated by the unit-tested pack-index tool (plugins/pack-index), never by
+      # inline YAML. --expect-* is the sanity gate: asset count = plugins × targets, and every
+      # index entry names a file that exists in dist/ (the index is built FROM dist/, so an entry
+      # that names a missing asset cannot occur; a missing build leg fails the count).
+      - name: Generate plugins-index.json (sanity-gated)
+        working-directory: plugins
+        run: |
+          expected_plugins="$(grep -rl '^name = "flux-plugin-' ./*/Cargo.toml | wc -l)"
+          echo "expecting ${expected_plugins} plugins x 5 targets"
+          cargo run --release -p pack-index -- \
+            --version "${{ inputs.version }}" \
+            --dir ../dist \
+            --out ../dist/plugins-index.json \
+            --released-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --expect-plugins "${expected_plugins}" \
+            --expect-targets 5
+          cat ../dist/plugins-index.json
+
+      # One minisign signature covers every artifact transitively via the per-artifact sha256
+      # entries (the terraform sign-the-aggregate pattern). Publishing without the key is refused;
+      # a dry run without it proceeds unsigned with a loud notice.
+      - name: Sign the index (minisign)
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if [ -z "${MINISIGN_SECRET_KEY}" ]; then
+            if [ "${{ inputs.publish }}" = "true" ]; then
+              echo "::error::MINISIGN_SECRET_KEY secret is not set — cannot publish an unsigned pack"
+              exit 1
+            fi
+            echo "::notice::MINISIGN_SECRET_KEY not set — dry run proceeds UNSIGNED"
+            exit 0
+          fi
+          sudo apt-get update -q && sudo apt-get install -y -q minisign
+          umask 077
+          printf '%s\n' "${MINISIGN_SECRET_KEY}" > "${RUNNER_TEMP}/minisign.key"
+          minisign -S -s "${RUNNER_TEMP}/minisign.key" \
+            -m dist/plugins-index.json -x dist/plugins-index.json.minisig \
+            -t "flux plugin pack v${{ inputs.version }}"
+          rm -f "${RUNNER_TEMP}/minisign.key"
+          minisign -V >/dev/null 2>&1 || true
+          test -s dist/plugins-index.json.minisig
+
+      # Dry run: everything the release would carry, as a workflow artifact — no tag, no release.
+      - name: Upload dry-run bundle
+        if: ${{ !inputs.publish }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugins-release-${{ inputs.version }}-dry-run
+          path: dist/*
+          if-no-files-found: error
+
+      # --latest=false keeps releases/latest/download/flux-cli-installer.sh resolving to a CORE
+      # release; gh creates the plugins-v tag itself at the workflow's commit.
+      - name: Create the plugins-v release
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          test -s dist/plugins-index.json.minisig || { echo "::error::unsigned index"; exit 1; }
+          gh release create "plugins-v${{ inputs.version }}" dist/* \
+            --latest=false \
+            --target "${GITHUB_SHA}" \
+            --title "flux plugin pack v${{ inputs.version }}" \
+            --notes "Prebuilt \`flux-plugin-*\` binaries for the five core targets, plus the minisign-signed \`plugins-index.json\`. Install with \`flux plugin install <name>\` (D-47). This release series is consumed by the flux CLI — it is not the flux core release."

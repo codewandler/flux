@@ -25,6 +25,8 @@ members = [
     "sql",
     "docker",
     "asterisk",
+    # release tooling (D-46) — NOT a plugin: generates the signed pack-release index
+    "pack-index",
 ]
 
 [workspace.package]

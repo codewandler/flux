@@ -2,8 +2,7 @@
 id: D-47
 title: Remote `flux plugin install <name>[@version]` — verified fetch into a versioned store
 pillar: Core
-status: ready
-priority: 8
+status: in-progress
 epic: plugin-platform-hardening
 design: docs/designs/plugin-distribution.md
 note: "the demand side: resolve the `plugins-v` release → verify minisign-signed index (embedded pubkey, no skip flag) → sha256-check → unpack to `~/.flux/plugins/bin/<name>/<version>/` → descriptor records version+sha256+source; local scan moves behind `install --dir`"
@@ -50,7 +49,10 @@ cutover).
       Root gate green (build/test/clippy/fmt + flux-codegate layering).
 
 ## Progress
-- (not started)
+- 2026-07-03 — Picked up (in-progress), running in parallel with the D-46 session (release
+  pipeline, `plugins/pack-index/`). Schema contract verified against BOTH the design doc and
+  D-46's WIP generator: matches, except the generator emits no `description` field — the D-47
+  parser treats it as optional (serde-default) so either form reads.
 
 ## Notes
 - Depends on [D-46](D-46-plugin-pack-release-pipeline.md) — the fixture index/archives must encode

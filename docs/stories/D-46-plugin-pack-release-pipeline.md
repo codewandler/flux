@@ -2,8 +2,7 @@
 id: D-46
 title: Plugin pack release pipeline — per-plugin artifacts + signed index
 pillar: Core
-status: ready
-priority: 7
+status: in-progress
 epic: plugin-platform-hardening
 design: docs/designs/plugin-distribution.md
 note: "workflow_dispatch `release-plugins.yml`: build the pack on 5 native runners, package per-plugin archives, emit a minisign-signed `plugins-index.json`, create the `plugins-v<ver>` release (`--latest=false`); core dist release untouched"
@@ -18,34 +17,51 @@ carrying one prebuilt archive per plugin per target plus a signed machine-readab
 without pulling the excluded `plugins/` workspace into the core cargo-dist release or the root gate.
 
 ## Acceptance
-- [ ] A new `.github/workflows/release-plugins.yml` triggered by **`workflow_dispatch`** (inputs:
+- [x] A new `.github/workflows/release-plugins.yml` triggered by **`workflow_dispatch`** (inputs:
       `version`, `publish: bool`) — *not* a tag push (the dist-generated `release.yml` tag glob
       `'**[0-9]+.[0-9]+.[0-9]+*'` would match any semver-ish plugins tag and red-X dist's plan job).
       The workflow itself creates the `plugins-v<version>` tag + release via `GITHUB_TOKEN`.
-- [ ] Build matrix on **native runners** (no cross-compilation): `ubuntu-latest`,
+- [x] Build matrix on **native runners** (no cross-compilation): `ubuntu-latest`,
       `ubuntu-24.04-arm`, `macos-13`, `macos-latest`, `windows-latest` → the five core targets. Each
       leg runs `cargo build --release --workspace` in `plugins/` and packages
       `flux-plugin-<name>-<version>-<target>.tar.xz` (`.zip` on windows, binary =
       `flux-plugin-<name>.exe`), one archive per plugin.
-- [ ] Index generation is a **unit-tested tool**, not inline YAML: a small `pack-index` bin crate in
+- [x] Index generation is a **unit-tested tool**, not inline YAML: a small `pack-index` bin crate in
       the plugins workspace emits `plugins-index.json` per the design's `schema: 1` (pack_version,
       `protocol` = `flux.plugin.v1`, per-plugin per-target `asset`/`sha256`/`size`; asset values are
       **bare file names, never URLs**). Failing-first test `gen_index_matches_schema_and_hashes`
       (fixture: two plugins × two targets; asserts schema shape, hash correctness, and that a
       URL-shaped asset name is rejected).
-- [ ] The assemble job signs the index (**minisign**, secret key from an Actions secret) and uploads
+- [x] The assemble job signs the index (**minisign**, secret key from an Actions secret) and uploads
       `plugins-index.json` + `plugins-index.json.minisig`; a sanity gate fails the run unless asset
       count = plugins × targets and every index entry names an uploaded asset.
-- [ ] The release is created with **`--latest=false`** — the core installer URL
+- [x] The release is created with **`--latest=false`** — the core installer URL
       `releases/latest/download/flux-cli-installer.sh` keeps resolving to a core release.
-- [ ] `publish: false` is a dry run: artifacts + index produced and uploaded as workflow artifacts,
+- [x] `publish: false` is a dry run: artifacts + index produced and uploaded as workflow artifacts,
       no tag, no release.
-- [ ] Core plumbing untouched: `release.yml`, `dist-workspace.toml`, root `Cargo.toml`, and the
+- [x] Core plumbing untouched: `release.yml`, `dist-workspace.toml`, root `Cargo.toml`, and the
       existing `ci.yml` jobs are unmodified; the pack stays excluded from the root gate.
 - [ ] One real (or dry-run) workflow execution attached to the story Progress as evidence.
 
 ## Progress
-- (not started)
+- 2026-07-03 in-progress. Implemented both halves: (1) `plugins/pack-index` — a workspace-member
+  bin crate (deliberately not `flux-plugin-*`-named, so the packaging glob never archives it) that
+  scans packaged archives and emits `plugins-index.json` (`schema: 1`, deterministic BTreeMap
+  ordering, `--released-at` required so the tool reads no clock); enforces bare-asset-names
+  (URL/path shapes rejected) and carries the sanity gate (`--expect-plugins/--expect-targets`).
+  Tests `gen_index_matches_schema_and_hashes` (bite-verified: neutering the URL check fails it),
+  `expectation_gate_catches_missing_leg`, `asset_parsing_is_strict`. (2)
+  `.github/workflows/release-plugins.yml` — `workflow_dispatch(version, publish)`, version input
+  checked against `workspace.package.version`, 5 native-runner matrix, per-plugin `tar.xz`/`zip`
+  (bare binary at archive root — 7z is cd'd into the bin dir), assemble job runs pack-index +
+  minisign signing (publish without `MINISIGN_SECRET_KEY` refused; unsigned dry run allowed with a
+  notice), `gh release create plugins-v<ver> --latest=false`; dry run uploads the bundle as a
+  workflow artifact instead. Local end-to-end evidence: release-built all 17 plugins, ran the
+  workflow's packaging loop verbatim (17 archives; `tar -tf` shows the bare binary), then
+  `pack-index --expect-plugins 17 --expect-targets 1` — index correct, spot sha256 matches
+  `sha256sum` (`e28eb338…`). Plugins gate green (fmt/clippy/build/test, 21 test binaries). Core
+  plumbing untouched. Remaining: the workflow-dispatch execution (needs the workflow pushed to
+  GitHub; dry run needs no secret).
 
 ## Notes
 - Design: [plugin-distribution](../designs/plugin-distribution.md) — see "Build & release plumbing"

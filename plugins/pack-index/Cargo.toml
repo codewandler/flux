@@ -1,0 +1,17 @@
+[package]
+name = "pack-index"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+# Release tooling for the plugin pack channel (D-46), not a plugin binary: the bin name
+# deliberately does NOT match the `flux-plugin-*` packaging glob, so it is never archived
+# or installed. It generates `plugins-index.json` for a `plugins-v<version>` release.
+[[bin]]
+name = "pack-index"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
