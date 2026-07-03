@@ -22,7 +22,7 @@ without pulling the excluded `plugins/` workspace into the core cargo-dist relea
       `'**[0-9]+.[0-9]+.[0-9]+*'` would match any semver-ish plugins tag and red-X dist's plan job).
       The workflow itself creates the `plugins-v<version>` tag + release via `GITHUB_TOKEN`.
 - [x] Build matrix on **native runners** (no cross-compilation): `ubuntu-latest`,
-      `ubuntu-24.04-arm`, `macos-13`, `macos-latest`, `windows-latest` → the five core targets. Each
+      `ubuntu-24.04-arm`, `macos-15-intel`, `macos-latest`, `windows-latest` → the five core targets. Each
       leg runs `cargo build --release --workspace` in `plugins/` and packages
       `flux-plugin-<name>-<version>-<target>.tar.xz` (`.zip` on windows, binary =
       `flux-plugin-<name>.exe`), one archive per plugin.

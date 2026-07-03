@@ -195,7 +195,7 @@ version-unified announcements colliding with core — wrong tool):
   created refs don't re-trigger workflows, so no recursion; a hand-pushed `plugins-v*` tag would
   red-X the dist plan job — documented as "don't do that").
 - **Matrix on native runners** — no cross-compilation: `ubuntu-latest` (x86_64-linux),
-  `ubuntu-24.04-arm` (aarch64-linux), `macos-13` (x86_64-darwin), `macos-latest` (aarch64-darwin),
+  `ubuntu-24.04-arm` (aarch64-linux), `macos-15-intel` (x86_64-darwin), `macos-latest` (aarch64-darwin),
   `windows-latest` (x86_64-windows). Each leg: `cargo build --release --workspace` inside `plugins/`,
   package per-plugin archives + per-artifact sha256, upload as workflow artifacts.
 - **Assemble job**: collects all legs, generates `plugins-index.json` (versions read from the
