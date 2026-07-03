@@ -3,7 +3,7 @@ id: D-12
 title: Plugin protocol parity extensions (auth / conn / blob)
 pillar: Core
 status: done
-design: docs/designs/plugin-protocol-parity.md
+design: docs/designs/integration-plugins.md
 note: "additive host caps for the missing fluxplane plugins — non-Bearer auth injection (A: Basic/header/query by purpose) + raw `conn.*` dialer (B) + `blob.*` store (C); clean extension of `flux.plugin.v1`, unblocks D-14..D-17 (commit `a21bc47`)"
 ---
 
@@ -43,8 +43,8 @@ plugins untouched. This is the prerequisite that gates D-15/D-16/D-17 and lets D
   cross-invocation persistent blob dir + `flux plugin blob put` CLI; long-lived `process.start/stop/list`.
 
 ## Notes
-- Design: [plugin-protocol-parity.md](../designs/plugin-protocol-parity.md). Epic:
-  [fluxplane-plugins-parity.md](../designs/fluxplane-plugins-parity.md).
+- Design: [plugin-protocol-parity.md](../designs/integration-plugins.md). Epic:
+  [fluxplane-plugins-parity.md](../designs/integration-plugins.md).
 - Touch points: `crates/flux-plugin/src/lib.rs` (`AuthMethod`, `PluginCapabilities`, `SystemHostCaps::handle`),
   `plugins/host-kit/src/lib.rs` (`Host`), `crates/flux-system/src/net.rs` (new `dial`).
 - Reuse: `resolve_purpose`/`resolve_endpoint`, `guard_http_url`/`flux_system::net::guard_url`,

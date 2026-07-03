@@ -3,7 +3,7 @@ id: D-16
 title: Datastore & infra plugin pack (sql, docker, aws)
 pillar: Agent
 status: done
-design: docs/designs/fluxplane-plugins-parity.md
+design: docs/designs/integration-plugins.md
 note: added native `sql` (6 PostgreSQL read/introspection ops over `ConnStream`, MySQL/SQLite explicit residuals), `docker` (33 core Docker Engine REST ops over Unix socket), and `aws` (11 read-only ops via host-managed `aws` CLI); full `plugins/` gate green
 ---
 
@@ -36,4 +36,4 @@ HTTP — the heaviest ports, gated by D-12's ConnDialer (and blob where files mo
 ## Notes
 - Op shapes from `~/projects/fluxplane/fluxplane-plugins/{sql,docker,aws}/manifest.go`; fluxplane reaches these
   via its ConnDialer — flux's D-12 `Host::conn_dial` is the equivalent.
-  Epic: [fluxplane-plugins-parity.md](../designs/fluxplane-plugins-parity.md).
+  Epic: [fluxplane-plugins-parity.md](../designs/integration-plugins.md).

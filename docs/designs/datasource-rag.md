@@ -1,7 +1,8 @@
 # Design: knowledge datasource — a real RAG layer
 
-**Status:** proposed (story [D-07](../stories/D-07-knowledge-datasource-rag.md)) · **Layers:** L0 (new
-`flux-datasource` schema crate) + L5 (`flux-capabilities` `datasource` module) · **Owner:** Timo
+**Status:** ✅ shipped (story [D-07](../stories/D-07-knowledge-datasource-rag.md) done) · **Layers:** L0 (new
+`flux-datasource` schema crate) + L5 (`flux-capabilities` `datasource` module) · **Owner:** Timo ·
+**Related:** [grounded-knowledge.md](grounded-knowledge.md) (the KB-injection + embeddable layer built on this)
 
 ## Why
 
@@ -16,7 +17,7 @@ contribute records into the same schema.
 
 ### 1. Record schema — a new **L0 `flux-datasource` crate**
 The record/declaration/lookup types live in a **pure, no-IO L0 crate `flux-datasource`**, so **both**
-`flux-plugin` (L4 — plugins emit records, via [D-10](process-plugin-protocol.md)) **and**
+`flux-plugin` (L4 — plugins emit records, via [D-10](integration-plugins.md)) **and**
 `flux-capabilities` (L5 — the index) share one contract without a layering violation. `EntitySchema` is
 declared **explicitly**; a `flux-datasource-derive` `#[derive(EntitySchema)]` is an **optional** convenience
 (flux has no proc-macro precedent — explicit values are the baseline). Shapes ported (not copied) from

@@ -1,6 +1,6 @@
 # Design: grounded knowledge — KB-injection into the system prompt + multi-shape, embeddable datasources
 
-**Status:** proposed (2026-07-02) · **Pillar:** Agent (prompt assembly) + Core (datasource layer) ·
+**Status:** ✅ shipped (A-19 · D-50 · D-51 done) · **Pillar:** Agent (prompt assembly) + Core (datasource layer) · **Builds on:** [datasource-rag.md](datasource-rag.md) ·
 **Stories:** [A-19](../stories/A-19-context-block-injection.md) ·
 [D-50](../stories/D-50-text-file-chunking-ingester.md) ·
 [D-51](../stories/D-51-local-embeddings-vector-store.md)

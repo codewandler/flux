@@ -3,7 +3,7 @@ id: D-17
 title: Telephony plugin pack (asterisk, homer)
 pillar: Agent
 status: done
-design: docs/designs/fluxplane-plugins-parity.md
+design: docs/designs/integration-plugins.md
 note: added native `asterisk` (8 AMI ops over guarded `conn.*`) and `homer` (8 HTTP/JWT ops, including SIP search/call/QoS/PCAP export); full `plugins/` gate green
 ---
 
@@ -30,4 +30,4 @@ a direction flux otherwise has no coverage for.
 ## Notes
 - Op shapes from `~/projects/fluxplane/fluxplane-plugins/{asterisk,homer}/manifest.go`. Serves downstream
   voice surfaces (see the realtime-voice track). Epic:
-  [fluxplane-plugins-parity.md](../designs/fluxplane-plugins-parity.md).
+  [fluxplane-plugins-parity.md](../designs/integration-plugins.md).

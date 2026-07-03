@@ -3,7 +3,7 @@
 **Status:** shipped; generalized by [generated-flux-skills.md](generated-flux-skills.md) ·
 **Pillar:** Core · **Layer:** L6 (`flux-cli`) + L0 (`flux-markdown` writer) ·
 **Owner:** Timo · **Story:** [D-13](../stories/D-13-plugin-skill-command.md) ·
-**Epic:** [fluxplane-plugins-parity.md](fluxplane-plugins-parity.md)
+**Epic:** [fluxplane-plugins-parity.md](integration-plugins.md)
 
 ## Why
 

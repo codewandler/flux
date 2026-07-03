@@ -13,7 +13,7 @@
 //! be swapped without touching L1. The shipped resolvers: [`EnvStaticResolver`] (reads
 //! `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN`/`AWS_REGION`) and
 //! [`AwsChainResolver`] (the full env → SSO → IRSA → EKS Pod Identity chain, below). See
-//! `docs/designs/aws-bedrock-provider.md`.
+//! `docs/designs/subscription-providers-and-cost.md` (consolidated providers & cost design).
 //!
 //! Layering: L1, no flux deps above L0/L1. Crypto (`sha2`/`hmac`) is pure; the credential reads
 //! env (the established L1 pattern — `anthropic_from_env` reads `ANTHROPIC_API_KEY`).

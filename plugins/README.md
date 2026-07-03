@@ -68,7 +68,7 @@ spec helpers, and a `MockHost` for hermetic unit tests. See `gitlab/src/main.rs`
 
 The **Surface** column is indicative; each plugin now carries its fluxplane counterpart's full op set
 (D-14 through D-17). Run `flux plugin skill` for the live per-plugin op reference, or see the
-[parity matrix](../docs/designs/fluxplane-plugins-parity.md).
+[parity matrix](../docs/designs/integration-plugins.md).
 
 ## Installing + invoking plugins
 

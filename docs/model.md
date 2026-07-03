@@ -22,16 +22,16 @@ flux run -m sonnet  "explain the auth flow"
 flux run -m haiku   "summarise README.md"
 
 # Fully qualified form
-flux run -m anthropic/claude-opus-4-5      "write tests for the parser"
-flux run -m anthropic/claude-sonnet-4-5    "review this PR"
-flux run -m anthropic/claude-haiku-4-5     "quick lint pass"
+flux run -m anthropic/claude-opus-4-8      "write tests for the parser"
+flux run -m anthropic/claude-sonnet-4-6    "review this PR"
+flux run -m anthropic/claude-haiku-4-5-20251001     "quick lint pass"
 ```
 
 ### Config file
 
 ```toml
 # .flux/config.toml  (or ~/.flux/config.toml for a user-wide default)
-model = "anthropic/claude-sonnet-4-5"
+model = "anthropic/claude-sonnet-4-6"
 ```
 
 ### Notes
@@ -120,7 +120,7 @@ OpenRouter gives you access to hundreds of models from different providers behin
 
 ```bash
 # General form: flux run -m openrouter/<provider>/<model-slug>
-flux run -m openrouter/anthropic/claude-sonnet-4-5  "review this PR"
+flux run -m openrouter/anthropic/claude-sonnet-4-6  "review this PR"
 flux run -m openrouter/google/gemini-2.5-pro         "explain the safety model"
 flux run -m openrouter/meta-llama/llama-3.3-70b-instruct  "summarise docs"
 ```
@@ -128,7 +128,7 @@ flux run -m openrouter/meta-llama/llama-3.3-70b-instruct  "summarise docs"
 ### Config file
 
 ```toml
-model = "openrouter/anthropic/claude-sonnet-4-5"
+model = "openrouter/anthropic/claude-sonnet-4-6"
 ```
 
 ### `openrouter-anthropic` — native tool calling (recommended for agentic use)
@@ -281,10 +281,10 @@ model = "ollama/qwen2.5-coder:7b"
 
 | Use case | Recommended | Rationale |
 |---|---|---|
-| Daily coding, file edits | `anthropic/claude-sonnet-4-5` | Fast, strong at code, supports caching |
-| Long planning / reasoning | `anthropic/claude-opus-4-5` | Highest capability; use `--think` |
-| Quick summarise / lint | `anthropic/claude-haiku-4-5` | Cheapest, low latency |
-| Multi-provider fallback | `openrouter/anthropic/claude-sonnet-4-5` | Same model, OpenRouter routing |
+| Daily coding, file edits | `anthropic/claude-sonnet-4-6` | Fast, strong at code, supports caching |
+| Long planning / reasoning | `anthropic/claude-opus-4-8` | Highest capability; use `--think` |
+| Quick summarise / lint | `anthropic/claude-haiku-4-5-20251001` | Cheapest, low latency |
+| Multi-provider fallback | `openrouter/anthropic/claude-sonnet-4-6` | Same model, OpenRouter routing |
 | GLM / Zhipu AI work | `openrouter/z-ai/glm-5.2` | Latest GLM reasoning model |
 | Local / offline coding | `ollama/qwen2.5-coder:7b` | Runs on your machine, no key; needs a tool-capable model |
 | AWS / Bedrock (compliance) | `aws/sonnet` | Claude via AWS Bedrock; SSO/IRSA, no `aws` CLI; metered |

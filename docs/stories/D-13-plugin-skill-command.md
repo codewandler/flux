@@ -38,7 +38,7 @@ sync with what is installed, with no hand-maintained catalog.
 
 ## Notes
 - Design: [plugin-skill-generation.md](../designs/plugin-skill-generation.md). Epic:
-  [fluxplane-plugins-parity.md](../designs/fluxplane-plugins-parity.md).
+  [fluxplane-plugins-parity.md](../designs/integration-plugins.md).
 - Touch points: `crates/flux-markdown/src/frontmatter.rs` (+ `lib.rs`), `crates/flux-cli/src/main.rs`
   (`PluginAction`, `run_plugin`).
 - Reuse: the `discover`/`PluginHost::spawn`/`manifest` path from the `Call`/`Install` arms;

@@ -1,6 +1,6 @@
 # Design: endpoint discovery & brokerage (references-only plugin IO)
 
-**Status:** proposed (epic) · **Pillar:** Core (platform) · **Layer:** L0 schema + L4 (`flux-plugin`)
+**Status:** ✅ shipped (epic complete — D-25–D-32 done) · **Pillar:** Core (platform) · **Layer:** L0 schema + L4 (`flux-plugin`)
 broker, invoked from L6 surfaces · **Owner:** Timo · **Stories:**
 [D-25](../stories/D-25-endpoint-reference-model.md) ·
 [D-26](../stories/D-26-endpoint-discovery-broker.md) ·
@@ -14,8 +14,8 @@ broker, invoked from L6 surfaces · **Owner:** Timo · **Stories:**
 
 flux's plugins each talk to a single, statically-configured service. The fluxplane pack they were
 modelled on (`~/projects/fluxplane/fluxplane-endpoint`) had a richer essentials feature flux
-**deliberately deferred** in [D-10](process-plugin-protocol.md) and
-[the parity epic](fluxplane-plugins-parity.md) (both list *"a `.dex`-style endpoint registry"* as a
+**deliberately deferred** in [D-10](integration-plugins.md) and
+[the parity epic](integration-plugins.md) (both list *"a `.dex`-style endpoint registry"* as a
 non-goal): **cross-plugin endpoint discovery**. The kubernetes plugin discovers "endpoints" — each
 kubeconfig context is one cluster endpoint, and once connected it discovers *other* services in the
 cluster: crossplane/RDS manifests → endpoints for the `sql` plugin; a monitoring namespace →

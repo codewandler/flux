@@ -1,9 +1,12 @@
 # Design: flux-flow (Flux-Lang)
 
-**Status:** Draft design · **Layers:** `flux-lang` (L0 language core) + `flux-flow` (L3 engine) · **Owner:** Timo Friedl
+**Status:** ✅ shipped (the engine design landed — story [A-01](../stories/A-01-unify-flowengine.md) done: one `FlowEngine`, the loop is itself Flux-Lang, the free-form loop deleted) · **Layers:** `flux-lang` (L0 language core) + `flux-flow` (L3 engine) · **Owner:** Timo Friedl
 
-Canonical design reference for **Flux-Lang**, delivered as two crates: the pure `flux-lang` language
-core and the `flux-flow` engine that compiles and runs it.
+Canonical **engine** design reference for **Flux-Lang**, delivered as two crates: the pure `flux-lang`
+language core and the `flux-flow` engine that compiles and runs it. The forward-looking *language /
+cognition / SDK* companion is [flux-lang-evolution.md](flux-lang-evolution.md); the compact live
+semantics are in [../language.md](../language.md) and the crate-level reference under
+[../../crates/flux-lang/docs/](../../crates/flux-lang/docs/).
 [architecture.md](../architecture.md) is the existing system design; [vision.md](../vision.md) is the
 *why*. The implementation plan is a local working doc under `.flux/` (gitignored, not committed):
 `.flux/plans/flux-flow-implementation.md`.

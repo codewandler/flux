@@ -4,7 +4,7 @@ title: Agentic channel target — wake an AgentSpec (not just a journey) on an e
 pillar: Agent
 status: done
 theme: downstream-managed-services
-design: docs/designs/agentic-channel-target.md
+design: docs/designs/event-trigger-channels.md
 note: "`trigger.agent` wakes an `AgentSpec` turn (per-thread session memory + declared grants, `0d8ac58`) + the registry wiring (`App::with_tools` loads datasource + plugin tools on the `flux app run` path, `e4710ad`)"
 ---
 

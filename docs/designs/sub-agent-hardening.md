@@ -1,6 +1,6 @@
 # Design: harden the sub-agent primitive for multi-tenant production
 
-**Status:** proposed (story [D-05](../stories/D-05-sub-agent-hardening.md)) · **Layer:** L3
+**Status:** ✅ shipped (story [D-05](../stories/D-05-sub-agent-hardening.md) done) · **Layer:** L3
 (`flux-orchestrate`) + L2 seam (`flux-runtime`), surfaced at L6 (`flux-sdk`, `flux-cli`) · **Owner:** Timo
 
 ## Why

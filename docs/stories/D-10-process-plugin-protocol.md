@@ -4,7 +4,7 @@ title: Process-plugin protocol redesign — a clean, unified plugin wire protoco
 pillar: Core
 status: done
 theme: downstream-managed-services
-design: docs/designs/process-plugin-protocol.md
+design: docs/designs/integration-plugins.md
 note: enriched the plugin manifest (auth-by-purpose, datasource declarations, endpoints) + host capabilities (HTTP method/headers/body + bearer injection, secret-by-purpose, endpoint, datasource-record contribution) over the existing unified frame; `DatasourceHostCaps` L5 bridge (commits `f389bc7`/`7db537a`)
 ---
 
@@ -65,7 +65,7 @@ plugin-binding SDK beyond the raw `PluginHandler`.
 
 ## Notes
 - This is the redesign the user flagged: fluxplane's protocol "evolved over time" and carries legacy we
-  should not copy. The design doc ([process-plugin-protocol.md](../designs/process-plugin-protocol.md))
+  should not copy. The design doc ([process-plugin-protocol.md](../designs/integration-plugins.md))
   records the specific cruft to drop and the target frame. The detailed wire spec is finalized in the
   design step at the top of implementation (plan Phase 2).
 - Reuse: `flux-plugin`'s existing `PluginHost`/`serve` transport scaffolding + `SystemHostCaps` (extend,

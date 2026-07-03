@@ -52,4 +52,4 @@ the authoring guide requested under the fluxplane-plugins parity epic (prereq fo
   the plugin-level end-to-end guard so nobody reverts `PluginHost::spawn` to a raw `Command`.
 - Sibling safety story: [D-20](D-20-scoped-private-net-egress.md) scopes *network* egress; this scopes
   *process/env*. Prereq for the parity epic's remaining packs
-  ([fluxplane-plugins-parity](../designs/fluxplane-plugins-parity.md), D-15/16/17).
+  ([fluxplane-plugins-parity](../designs/integration-plugins.md), D-15/16/17).

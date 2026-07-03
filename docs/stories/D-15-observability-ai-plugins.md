@@ -3,7 +3,7 @@ id: D-15
 title: Observability & AI plugin pack (alertmanager, grafana, opsgenie, huggingface)
 pillar: Agent
 status: done
-design: docs/designs/fluxplane-plugins-parity.md
+design: docs/designs/integration-plugins.md
 note: added native `alertmanager` (5 ops), `grafana` (20), `opsgenie` (8), and `huggingface` (9), with datasource contributions and env-gated smoke coverage; full `plugins/` gate green
 ---
 
@@ -30,4 +30,4 @@ plain HTTP plugins on `host-kit` — they need only D-12's non-Bearer auth injec
 
 ## Notes
 - Op shapes from `~/projects/fluxplane/fluxplane-plugins/{alertmanager,grafana,opsgenie,huggingface}/manifest.go`.
-  Epic: [fluxplane-plugins-parity.md](../designs/fluxplane-plugins-parity.md).
+  Epic: [fluxplane-plugins-parity.md](../designs/integration-plugins.md).

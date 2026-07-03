@@ -4,7 +4,7 @@ title: AWS Bedrock LLM provider
 pillar: Core
 status: done
 epic: aws-bedrock-provider
-design: docs/designs/aws-bedrock-provider.md
+design: docs/designs/subscription-providers-and-cost.md
 note: fully functional e2e — streaming `invoke-with-response-stream` (AWS event-stream deframer → shared SSE mapper, non-streaming path deleted), hand-rolled L1 credential chain (env → SSO w/ OIDC refresh → IRSA → EKS Pod Identity, no `aws` CLI), SigV4, region-aware model resolution, region-less pricing; live-verified streaming + tool-use + haiku `global.` profile with cost suffixes
 ---
 
@@ -140,7 +140,7 @@ a new-protocol story.
 
 ## Notes
 - Design + full scoping, the two forks, and the smallest-first breakdown (C-09a/b/c) live in
-  [docs/designs/aws-bedrock-provider.md](../designs/aws-bedrock-provider.md).
+  [docs/designs/subscription-providers-and-cost.md](../designs/subscription-providers-and-cost.md).
 - Wire reuse: `crates/flux-providers/src/messages` (body builder + SSE mapper) is unchanged; the
   Bedrock codec injects `anthropic_version` into the body and emits no version header.
 - The real work splits cleanly across layers: **SigV4 + the Messages codec + a

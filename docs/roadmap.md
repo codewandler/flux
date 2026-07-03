@@ -285,7 +285,7 @@ with secrets as `secret "ENV"` references, replacing the JSON manifest
    secret-by-purpose injection, process/env/blob/conn) over **one clean unified frame** — informed by
    fluxplane's evolved protocol but dropping its cruft (dual modes, three command families, per-call grant
    negotiation). Clean cutover of `flux.plugin.v1`. Blocks D-08. Design:
-   [process-plugin-protocol.md](designs/process-plugin-protocol.md).
+   [process-plugin-protocol.md](designs/integration-plugins.md).
 9. **[D-08](stories/D-08-integration-plugin-pack.md) — Integration plugin pack** · *Slack assistant (epic) ·
    ready (rank 3).* Native flux plugins (capability-gated, over the D-10 protocol) for the DevOps surface —
    Slack ops, websearch, GitLab, Jira, Confluence, Kubernetes, Loki, Prometheus — in an **in-repo
@@ -298,7 +298,7 @@ with secrets as `secret "ENV"` references, replacing the JSON manifest
     shipped journey route, with per-conversation thread memory + declared op grants — builds the
     `EngineTarget` the D-04 design deferred, via a new `Deliverer` (the Slack adapter is unchanged). Also
     wires the `flux app run` path to **load plugins + register datasource tools** (today CLI-only). Design:
-    [agentic-channel-target.md](designs/agentic-channel-target.md).
+    [agentic-channel-target.md](designs/event-trigger-channels.md).
 
 ### fluxplane-plugins parity (epic)
 
@@ -308,14 +308,14 @@ k8s 5/24). This epic drives **full native parity**: every *portable* fluxplane p
 flux plugin at full op coverage, plus a generated plugin skill so the catalog is self-documenting. Builtin/
 provider-covered plugins (clock/system/sleep/git/openai/ollama/duckduckgo/tavily) and fluxplane's
 aggregator/generator surfaces (vision/websearch-aggregator/openapi) are explicit non-goals. Epic design:
-[fluxplane-plugins-parity.md](designs/fluxplane-plugins-parity.md). Built in this order:
+[fluxplane-plugins-parity.md](designs/integration-plugins.md). Built in this order:
 
 - **[D-12](stories/D-12-plugin-protocol-parity.md) — Plugin protocol parity extensions** · *core, leads.*
   Three additive host capabilities the missing plugins need: non-Bearer auth injection (Basic/header/query by
   purpose — Slice A), a guarded raw `conn.*` socket dialer (Slice B), and a `blob.*` store (Slice C). Clean
   extension of `flux.plugin.v1`; the dialer lives in flux-system. Gates D-15/D-16/D-17 and lets D-14 delete
   jira/confluence's hand-rolled base64. Design:
-  [plugin-protocol-parity.md](designs/plugin-protocol-parity.md).
+  [plugin-protocol-parity.md](designs/integration-plugins.md).
 - **[D-13](stories/D-13-plugin-skill-command.md) — Generated plugin skill (`flux plugin skill`)** · *core.*
   Renders the installed plugin manifests into a Claude-format `flux-plugin` SKILL.md + `references/` (the
   flux analogue of fluxplane's `fluxplane-plugin skill`); adds a frontmatter writer to flux-markdown.
@@ -375,7 +375,7 @@ makes codex's **websocket** the default transport (HTTP fallback), and adds the 
   regional profile prices identically, metered). The C-09a protocol knobs (`internal` op flag,
   path-scoped `fs.read`) landed for other plugins' benefit. Live-verified e2e on the dev account
   (SSO, eu-central-1) incl. tool-use turns and cost suffixes.
-  Design + implementation status in [aws-bedrock-provider.md](designs/aws-bedrock-provider.md).
+  Design + implementation status in [aws-bedrock-provider.md](designs/subscription-providers-and-cost.md).
 
 ### Strict review flows & journeys (epic)
 
