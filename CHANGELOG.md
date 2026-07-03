@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.2.13] - 2026-07-03
+
 ### Fixed
 
 - **A-28 — window-sliding reads no longer defeat the resource stall guard.** The A-20 `ReadTracker`
