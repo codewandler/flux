@@ -68,6 +68,16 @@ pub struct FlowEngine {
     pub groups: Vec<flux_evidence::ToolGroup>,
     /// Workspace root, re-probed each turn for the surfacing signals above.
     pub cwd: std::path::PathBuf,
+    /// Monotonic union of every group that has surfaced on this ENGINE. `resolve_active_groups` is
+    /// stateless (it reflects only the current turn's signals), so a marker file appearing then
+    /// disappearing would rewrite segment A's op catalog and miss the provider prompt cache on the
+    /// whole `tools+A+phase+B` prefix (A-03). Accumulating here makes the advertised catalog grow
+    /// monotonically — once a group surfaces it stays — so the cached prefix only ever stabilizes.
+    /// Scope note: an engine shared across sessions (the a2a server) accumulates across them; that
+    /// widens advertisement only (never grants), and the signals derive from the same host/cwd anyway.
+    /// The approval/policy envelope still gates every op. Unused when `groups` is empty (gating off ⇒
+    /// all ops advertised, already stable).
+    sticky_groups: std::sync::Mutex<std::collections::HashSet<String>>,
     /// How many in-memory evidence observations have been flushed to the event store so far — the
     /// per-turn watermark [`flush_observations`](Self::flush_observations) advances (C-14). The
     /// executor's log is append-only and shared across this engine's turns, so a plain high-water
@@ -137,6 +147,7 @@ impl FlowEngine {
             compact_threshold_chars,
             groups,
             cwd,
+            sticky_groups: std::sync::Mutex::new(std::collections::HashSet::new()),
             evidence_flushed: std::sync::atomic::AtomicUsize::new(0),
         })
     }
@@ -481,7 +492,8 @@ impl FlowEngine {
         let composites = session_id
             .map(|sid| self.composites.active_for_session(sid))
             .unwrap_or_default();
-        let (advertised, surfaced) = surfaced_op_names(reg, &self.groups, &self.cwd);
+        let (advertised, surfaced) =
+            surfaced_op_names(reg, &self.groups, &self.cwd, &self.sticky_groups);
         if let (Some(sink), Some(surfaced)) = (sink, surfaced.as_ref()) {
             self.record_active_groups(surfaced, sink);
         }
@@ -496,8 +508,12 @@ impl FlowEngine {
     /// advertised every turn and the opt-in `shell` group gated nothing. Records the `groups.active`
     /// observation when gating is on.
     fn surfaced_for_turn(&self, sink: &mut dyn AgentSink) -> std::collections::HashSet<String> {
-        let (advertised, surfaced) =
-            surfaced_op_names(self.executor.registry(), &self.groups, &self.cwd);
+        let (advertised, surfaced) = surfaced_op_names(
+            self.executor.registry(),
+            &self.groups,
+            &self.cwd,
+            &self.sticky_groups,
+        );
         if let Some(surfaced) = surfaced.as_ref() {
             self.record_active_groups(surfaced, sink);
         }
@@ -992,6 +1008,7 @@ pub(crate) fn surfaced_op_names(
     reg: &flux_runtime::ToolRegistry,
     groups: &[flux_evidence::ToolGroup],
     cwd: &std::path::Path,
+    sticky: &std::sync::Mutex<std::collections::HashSet<String>>,
 ) -> (std::collections::HashSet<String>, Option<SurfacedGroups>) {
     if groups.is_empty() {
         let advertised = reg
@@ -1004,7 +1021,17 @@ pub(crate) fn surfaced_op_names(
     }
     let signals = flux_runtime::detect_signals(cwd);
     let active = flux_evidence::resolve_active_groups(groups, &signals);
-    let advertised = flux_runtime::advertised_op_names(&reg.specs(), groups, &active);
+    // Monotonic surfacing (A-03 cache stability): fold this turn's active groups into the session's
+    // sticky union and advertise from the ACCUMULATED set. `resolve_active_groups` is stateless, so a
+    // marker file appearing then disappearing would otherwise rewrite segment A's op catalog and miss
+    // the cached `tools+A+phase+B` prefix; accumulating means the catalog only ever grows and the
+    // prefix restabilizes. Advertising is not granting — the approval/policy envelope still gates ops.
+    let accumulated = {
+        let mut s = sticky.lock().unwrap();
+        s.extend(active);
+        s.clone()
+    };
+    let advertised = flux_runtime::advertised_op_names(&reg.specs(), groups, &accumulated);
     // Keep the signal NAMES alongside the resolved groups — the `groups.active` observation
     // records both, so the audit trail says not just which groups surfaced but WHY (C-14).
     let signal_names = signals
@@ -1015,7 +1042,9 @@ pub(crate) fn surfaced_op_names(
     (
         advertised,
         Some(SurfacedGroups {
-            active,
+            // The CUMULATIVE set, so the `groups.active` audit matches what's actually advertised
+            // this turn; `signals` above still reflects what fired THIS turn (the provenance).
+            active: accumulated,
             signals: signal_names,
         }),
     )
@@ -2196,6 +2225,75 @@ mod tests {
             .filter_map(|v| v.as_str())
             .collect();
         assert!(active.contains(&"git"), "the surfaced group: {active:?}");
+    }
+
+    /// The loop host's conversation cache is bounded: `set_turn` evicts every other session's entry,
+    /// so a shared engine serving many sessions (the a2a server mints one per request) holds at most
+    /// the active session's conversation instead of leaking one per session ever seen. Same-session
+    /// turns keep their cache (the whole point of the incremental fold).
+    #[test]
+    fn conversation_cache_evicts_other_sessions_on_set_turn() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let a = store.create_session("mock").unwrap();
+        let b = store.create_session("mock").unwrap();
+        store.record_message(&a, &Message::user_text("ha")).unwrap();
+        store.record_message(&b, &Message::user_text("hb")).unwrap();
+        let engine = engine_with(VecDeque::new(), store.clone());
+        let host = &engine.loop_host;
+        assert_eq!(host.load_persisted_conversation(&a).len(), 1);
+        assert_eq!(host.load_persisted_conversation(&b).len(), 1);
+        assert_eq!(host.cached_conversation_sessions().len(), 2);
+
+        let sink: Arc<std::sync::Mutex<dyn AgentSink>> = Arc::new(std::sync::Mutex::new(NullSink));
+        host.set_turn(b.clone(), None, sink, None, None);
+        assert_eq!(
+            host.cached_conversation_sessions(),
+            vec![b.clone()],
+            "only the active session's conversation stays cached"
+        );
+        // The surviving entry still serves the right history (and keeps folding incrementally).
+        assert_eq!(host.load_persisted_conversation(&b).len(), 1);
+    }
+
+    /// Monotonic surfacing: once a group surfaces it stays advertised for the session, even after its
+    /// workspace marker disappears — so segment A's op catalog is a stable provider-cache prefix
+    /// (A-03) instead of flapping with `resolve_active_groups`'s stateless, per-turn result.
+    #[test]
+    fn surfacing_is_monotonic_across_a_marker_flip() {
+        let dir = std::env::temp_dir().join(format!("flux-sticky-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir.join(".git")); // clean slate from any prior run
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        let groups = vec![flux_evidence::ToolGroup {
+            name: "git".into(),
+            description: String::new(),
+            tools: vec!["echo".into()],
+            surface_when: vec![flux_evidence::SignalMatch {
+                kind: flux_evidence::KIND_SIGNAL.to_string(),
+                signal: Some("git_repo".into()),
+            }],
+        }];
+        let sticky = std::sync::Mutex::new(std::collections::HashSet::new());
+
+        // Turn A — no `.git`: the git group is inactive, so `echo` is gated (not advertised).
+        let (a, _) = surfaced_op_names(&registry, &groups, &dir, &sticky);
+        assert!(!a.contains("echo"), "echo gated before the marker appears: {a:?}");
+
+        // Turn B — `.git` present: the group surfaces, `echo` is advertised.
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let (b, _) = surfaced_op_names(&registry, &groups, &dir, &sticky);
+        assert!(b.contains("echo"), "echo advertised once the marker is present: {b:?}");
+
+        // Turn C — `.git` removed: stateless resolution would drop `echo`, but the sticky union keeps
+        // the group surfaced, so the advertised catalog never shrinks.
+        std::fs::remove_dir_all(dir.join(".git")).unwrap();
+        let (c, _) = surfaced_op_names(&registry, &groups, &dir, &sticky);
+        assert!(
+            c.contains("echo"),
+            "sticky surfacing keeps echo after the marker disappears: {c:?}"
+        );
+        assert!(b.is_subset(&c), "the advertised catalog never shrinks: {b:?} !⊆ {c:?}");
     }
 
     /// A-10: once the turn's accumulated planner usage crosses the installed token budget, the

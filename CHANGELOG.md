@@ -6,6 +6,44 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **Efficiency + LLM prompt-cache hardening across the per-turn hot path.** A review of the agent loop
+  surfaced several redundant-work and cache-invalidation issues; all fixed:
+  - *Incremental conversation cache.* The reflexive `plan` op reloaded and re-decoded the entire
+    session event log on every planner round (orient/gather/execute + repairs) — an effective O(N²)
+    per session. The loop host now maintains the conversation incrementally, fetching only the
+    message/compacted events appended since the last round (new `FlowStore::conversation_delta` /
+    `EventStore::conversation_delta`, kind-filtered so the bulky plan/run/usage payloads are no longer
+    decoded and discarded), and folding them in (a `Compacted` resets the fold). The cache is bounded:
+    switching sessions evicts the previous session's entry, so a shared engine (a2a server) holds at
+    most the active conversation.
+  - *Monotonic (sticky) group surfacing.* Evidence-gated op surfacing was recomputed statelessly each
+    turn, so a workspace marker appearing/disappearing rewrote the cached op catalog and missed the
+    provider prompt cache on the whole `tools + system` prefix. Surfacing now accumulates within a
+    session — once a group surfaces it stays advertised — keeping the cached prefix stable. Behavior
+    note: advertising is not granting; the approval/policy envelope still gates every op. Only affects
+    workspaces that opt into gating via `.flux/groups.toml` (the default advertises all ops, already
+    stable).
+  - *Schema memoization.* The op catalog re-derived every registered tool's JSON schema via
+    `schema_for!` (~40 per turn) and each op resolution rebuilt a signature, plus the node-kind catalog
+    and both plan grammars were rebuilt on every planner call — all compile-time constants. Now
+    memoized: `tool_input_schema` caches per `TypeId` (a bare `static` in a generic fn is shared across
+    monomorphizations, so it must be type-keyed), and `ast_schema` / `node_kind_catalog` / `ast_grammar`
+    / `text_grammar` via `OnceLock`. `tool_input_schema` / host-kit `op_input_schema` (+ the `*_typed`
+    spec helpers) gain a `T: 'static` bound — satisfied by every real input struct.
+  - *Event-append statements* now use `prepare_cached` (many appends per turn).
+  - *`grep`* bounds its per-file line-scan (`GREP_FILE_BYTE_CAP`) so one huge matched file can't
+    dominate a search; *windowed `read`* streams only the requested line window instead of
+    materializing every line of the file first, and applies the byte cap to the windowed path too.
+  - *`detect_signals`* probes workspace markers in a single upward walk instead of one full cwd→root
+    walk per marker.
+
+  Deferred for a follow-up (noted, not done): the compaction size-probe still serializes to measure
+  (a cheaper estimate would shift trigger semantics, and it's once-per-turn, not the O(N²) path), and
+  the per-repair-step `Request` re-clone (a clean fix would widen the `Provider` trait for a cold
+  path).
+
 ## [0.2.10] - 2026-07-03
 
 ### Changed

@@ -399,6 +399,17 @@ impl FlowStore {
         self.events.conversation(session_id)
     }
 
+    /// Incremental conversation replay: the message/compacted events with `stream_seq > after_seq`,
+    /// so a caller maintaining a cached conversation can fetch only what was appended since instead of
+    /// re-reading the whole log every planner round. See [`EventStore::conversation_delta`].
+    pub fn conversation_delta(
+        &self,
+        session_id: &str,
+        after_seq: i64,
+    ) -> Result<Vec<flux_events::StoredEvent>> {
+        self.events.conversation_delta(session_id, after_seq)
+    }
+
     /// Persist a session-scoped composite op definition as normalized Flux-Lang source.
     pub fn save_session_composite(&self, session_id: &str, name: &str, source: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();

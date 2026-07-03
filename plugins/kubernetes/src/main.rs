@@ -478,7 +478,7 @@ fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
 
 /// A typed operation spec with explicit effects/risk/idempotency (for the high-impact ops where
 /// the generic [`read_op_typed`]/[`write_op_typed`] presets are not accurate enough).
-fn op_spec_typed<T: JsonSchema>(
+fn op_spec_typed<T: JsonSchema + 'static>(
     name: &str,
     description: &str,
     effects: Vec<Effect>,

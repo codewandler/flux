@@ -77,18 +77,18 @@ fn read_context(conn: &Connection, stream: &str) -> Result<EventContext> {
         return Ok(EventContext::default());
     };
     let ctx = conn
-        .query_row(
+        .prepare_cached(
             "SELECT account, agent_id, agent_version, correlation_id FROM streams WHERE n = ?1",
-            [n],
-            |r| {
-                Ok(EventContext {
-                    account: r.get(0)?,
-                    agent_id: r.get(1)?,
-                    agent_version: r.get(2)?,
-                    correlation_id: r.get(3)?,
-                })
-            },
         )
+        .map_err(map_sql)?
+        .query_row([n], |r| {
+            Ok(EventContext {
+                account: r.get(0)?,
+                agent_id: r.get(1)?,
+                agent_version: r.get(2)?,
+                correlation_id: r.get(3)?,
+            })
+        })
         .optional()
         .map_err(map_sql)?;
     Ok(ctx.unwrap_or_default())
@@ -471,11 +471,9 @@ impl EventStore {
         // All events in a stream share its run context; read it once and stamp the stored event.
         let ctx = read_context(&tx, stream)?;
         let next_seq: i64 = tx
-            .query_row(
-                "SELECT COALESCE(MAX(stream_seq), -1) + 1 FROM events WHERE stream = ?1",
-                [stream],
-                |r| r.get(0),
-            )
+            .prepare_cached("SELECT COALESCE(MAX(stream_seq), -1) + 1 FROM events WHERE stream = ?1")
+            .map_err(map_sql)?
+            .query_row([stream], |r| r.get(0))
             .map_err(map_sql)?;
         let stored = insert_event(&tx, stream, &ev, next_seq, &ctx)?;
         // Maintain the session registry — but only for real `s_<n>` sessions. The log itself accepts
@@ -488,27 +486,26 @@ impl EventStore {
                 }
                 _ => None,
             };
-            tx.execute(
+            tx.prepare_cached(
                 "UPDATE streams SET updated_at = ?1, last_seq = ?2, model = COALESCE(?3, model) \
                  WHERE n = ?4",
-                rusqlite::params![stored.ts_ms, next_seq, model_opt, n],
             )
+            .map_err(map_sql)?
+            .execute(rusqlite::params![stored.ts_ms, next_seq, model_opt, n])
             .map_err(map_sql)?;
             // Keep msg_count equal to the live conversation length (so `list` matches a replay).
             match &ev.kind {
                 EventKind::Message(_) => {
-                    tx.execute(
-                        "UPDATE streams SET msg_count = msg_count + 1 WHERE n = ?1",
-                        [n],
-                    )
-                    .map_err(map_sql)?;
+                    tx.prepare_cached("UPDATE streams SET msg_count = msg_count + 1 WHERE n = ?1")
+                        .map_err(map_sql)?
+                        .execute([n])
+                        .map_err(map_sql)?;
                 }
                 EventKind::Compacted { messages } => {
-                    tx.execute(
-                        "UPDATE streams SET msg_count = ?1 WHERE n = ?2",
-                        rusqlite::params![messages.len() as i64, n],
-                    )
-                    .map_err(map_sql)?;
+                    tx.prepare_cached("UPDATE streams SET msg_count = ?1 WHERE n = ?2")
+                        .map_err(map_sql)?
+                        .execute(rusqlite::params![messages.len() as i64, n])
+                        .map_err(map_sql)?;
                 }
                 _ => {}
             }
@@ -554,6 +551,27 @@ impl EventStore {
             )
             .map_err(map_sql)?;
         let raw = collect_raw(&mut stmt, rusqlite::params![stream, kind])?;
+        decode_all(stream, &ctx, raw)
+    }
+
+    /// The message-affecting events (`message`/`compacted`) of a stream with `stream_seq > after_seq`,
+    /// in order — the incremental input for maintaining a cached conversation without re-reading and
+    /// re-decoding the whole event log every planner round. `after_seq = -1` yields the full history.
+    /// The kind filter is served by `idx_events_stream_kind`, so this skips the bulky plan/run/usage
+    /// payloads the conversation projection would otherwise decode and discard.
+    pub fn conversation_delta(&self, stream: &str, after_seq: i64) -> Result<Vec<StoredEvent>> {
+        let conn = self.conn.lock().unwrap();
+        let ctx = read_context(&conn, stream)?;
+        // `prepare_cached` — this is the one query that runs on EVERY planner round (the point of
+        // the incremental cache is that it usually returns nothing), so don't re-compile it each time.
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT global_seq, stream_seq, id, schema_version, ts, payload, turn_id \
+                 FROM events WHERE stream = ?1 AND stream_seq > ?2 AND kind IN ('message', 'compacted') \
+                 ORDER BY stream_seq",
+            )
+            .map_err(map_sql)?;
+        let raw = collect_raw(&mut stmt, rusqlite::params![stream, after_seq])?;
         decode_all(stream, &ctx, raw)
     }
 
@@ -920,20 +938,21 @@ fn insert_event(
     let ts = now_ms();
     let kind_tag = ev.kind.kind_tag();
     let payload = serde_json::to_string(&ev.kind)?;
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO events (stream, stream_seq, id, kind, schema_version, ts, payload, turn_id) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        rusqlite::params![
-            stream,
-            stream_seq,
-            id,
-            kind_tag,
-            ev.schema_version,
-            ts,
-            payload,
-            ev.turn_id
-        ],
     )
+    .map_err(map_sql)?
+    .execute(rusqlite::params![
+        stream,
+        stream_seq,
+        id,
+        kind_tag,
+        ev.schema_version,
+        ts,
+        payload,
+        ev.turn_id
+    ])
     .map_err(map_sql)?;
     let global_seq = conn.last_insert_rowid();
     Ok(StoredEvent {
@@ -1041,6 +1060,60 @@ mod tests {
         let after = store.info(&id).unwrap().updated_at_ms;
         assert!(after >= before);
         assert_eq!(store.info(&id).unwrap().model, "opus");
+    }
+
+    /// The incremental `conversation_delta` fold (as the loop host maintains it) must equal a fresh
+    /// full `conversation()` replay at every step — after plain appends AND across a compaction
+    /// (which resets the fold). This is the correctness contract behind the loop host's cached
+    /// conversation replacing the per-round full re-read.
+    #[test]
+    fn conversation_delta_folds_incrementally_like_a_full_replay() {
+        let store = EventStore::in_memory().unwrap();
+        let sid = store.create_session("m").unwrap();
+        let mut msgs: Vec<Message> = Vec::new();
+        let mut cursor = -1i64;
+        let fold = |store: &EventStore, msgs: &mut Vec<Message>, cursor: &mut i64| {
+            for e in store.conversation_delta(&sid, *cursor).unwrap() {
+                match &e.kind {
+                    EventKind::Message(m) => msgs.push(m.clone()),
+                    EventKind::Compacted { messages } => {
+                        msgs.clear();
+                        msgs.extend(messages.iter().cloned());
+                    }
+                    _ => {}
+                }
+                *cursor = (*cursor).max(e.stream_seq);
+            }
+        };
+
+        store.record_message(&sid, &Message::user_text("u1")).unwrap();
+        store
+            .record_message(&sid, &Message::assistant_text("a1"))
+            .unwrap();
+        fold(&store, &mut msgs, &mut cursor);
+        assert_eq!(msgs, store.conversation(&sid).unwrap(), "after first appends");
+
+        // A second batch is picked up incrementally (only the new events are read).
+        store.record_message(&sid, &Message::user_text("u2")).unwrap();
+        store
+            .record_message(&sid, &Message::assistant_text("a2"))
+            .unwrap();
+        fold(&store, &mut msgs, &mut cursor);
+        assert_eq!(msgs, store.conversation(&sid).unwrap(), "after second appends");
+        assert_eq!(msgs.len(), 4);
+
+        // A compaction in the delta resets the fold to the snapshot.
+        let snapshot = vec![Message::user_text("[summary]"), Message::assistant_text("a2")];
+        store.record_compaction(&sid, &snapshot).unwrap();
+        fold(&store, &mut msgs, &mut cursor);
+        assert_eq!(msgs, store.conversation(&sid).unwrap(), "after compaction");
+        assert_eq!(msgs, snapshot);
+
+        // A message after the compaction appends onto the snapshot, not the pre-compaction history.
+        store.record_message(&sid, &Message::user_text("u3")).unwrap();
+        fold(&store, &mut msgs, &mut cursor);
+        assert_eq!(msgs, store.conversation(&sid).unwrap(), "after post-compaction append");
+        assert_eq!(msgs.len(), 3);
     }
 
     #[test]

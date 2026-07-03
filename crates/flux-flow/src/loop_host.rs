@@ -408,6 +408,16 @@ pub struct EngineLoopHost {
     /// reset per turn in [`set_turn`](Self::set_turn) — a multi-round turn (gather/execute phases)
     /// must not repeat it every round.
     resume_context_shown: Mutex<bool>,
+    /// Cached persisted conversation per session, `(messages, cursor)` where `cursor` is the highest
+    /// `stream_seq` folded in. `plan` runs several rounds per turn and many turns per session, and the
+    /// message log only grows, so re-reading + re-decoding the whole log every round is O(N²) over a
+    /// session. Instead we fetch only the message/compacted events appended since `cursor`
+    /// ([`FlowStore::conversation_delta`]) and fold them in (a `Compacted` resets the vector, matching
+    /// `projection::conversation`). NOT reset per turn — it survives across turns of one session and is
+    /// consistent by construction because the event log is append-only. Bounded: [`set_turn`]
+    /// (Self::set_turn) evicts every OTHER session's entry, so a shared engine serving many sessions
+    /// (the a2a server) holds at most the active session's conversation, not one per session ever seen.
+    conversation_cache: Mutex<std::collections::HashMap<String, (Vec<Message>, i64)>>,
 }
 
 impl EngineLoopHost {
@@ -457,6 +467,7 @@ impl EngineLoopHost {
                 brief: Mutex::new(None),
                 last_phase: Mutex::new(Phase::default()),
                 resume_context_shown: Mutex::new(false),
+                conversation_cache: Mutex::new(std::collections::HashMap::new()),
             });
             *slot2.lock().unwrap() = Some(host.clone());
             executor.set_loop_host(host.clone());
@@ -477,6 +488,15 @@ impl EngineLoopHost {
         advertised: Option<std::collections::HashSet<String>>,
         audit: Option<(Arc<flux_events::EventStore>, i64)>,
     ) {
+        // Bound the conversation cache: keep only THIS session's entry. One engine can serve many
+        // sessions over its lifetime (the a2a server mints a session per request on a shared engine),
+        // and each cached entry holds a full conversation — without eviction that's an unbounded
+        // leak. Same-session turns (REPL, eval loops, multi-round turns) keep their cache; switching
+        // sessions costs one full reload, exactly the pre-cache status quo.
+        self.conversation_cache
+            .lock()
+            .unwrap()
+            .retain(|k, _| *k == session_id);
         *self.turn.lock().unwrap() = TurnCtx {
             session_id,
             base_system,
@@ -757,7 +777,10 @@ impl LoopHost for EngineLoopHost {
         };
         // Working conversation = persisted history + the loop-carried feedback (ephemeral). This is
         // engine.rs's `working` vector, relocated into the op so the loop itself stays in flux-lang.
-        let mut conversation = self.store.conversation(&session_id).unwrap_or_default();
+        // The persisted history is served from an incremental per-session cache (see
+        // [`load_persisted_conversation`]) so a multi-round turn / long session doesn't re-read the
+        // whole event log every planner round.
+        let mut conversation = self.load_persisted_conversation(&session_id);
         // A-16 cross-turn resume (design Part 2): the FIRST `plan()` call of a turn — not every
         // phase round within it — injects one ephemeral `[resume context]` message when the session
         // still has an open halt latch from a prior turn (or process). Never persisted: it is pushed
@@ -970,6 +993,54 @@ impl LoopHost for EngineLoopHost {
 }
 
 impl EngineLoopHost {
+    /// The persisted `user → assistant` conversation for `session_id`, maintained incrementally: the
+    /// first call loads the full history, later calls fetch only the message/compacted events appended
+    /// since (turn-boundary messages + compaction) and fold them into the cached vector — replacing the
+    /// per-round full re-read + re-decode of the whole event log (a per-session O(N²)). A `Compacted`
+    /// event in the delta resets the vector, matching `projection::conversation`. Consistent by
+    /// construction: the event log is append-only, so already-folded events never change. On a read
+    /// error it falls back to an uncached full load so a turn never silently loses context.
+    pub(crate) fn load_persisted_conversation(&self, session_id: &str) -> Vec<Message> {
+        let mut cache = self.conversation_cache.lock().unwrap();
+        let (msgs, cursor) = cache
+            .entry(session_id.to_string())
+            .or_insert_with(|| (Vec::new(), -1));
+        match self.store.conversation_delta(session_id, *cursor) {
+            Ok(delta) => {
+                for e in &delta {
+                    match &e.kind {
+                        flux_events::EventKind::Message(m) => msgs.push(m.clone()),
+                        flux_events::EventKind::Compacted { messages } => {
+                            msgs.clear();
+                            msgs.extend(messages.iter().cloned());
+                        }
+                        // The delta is kind-filtered to message/compacted; nothing else reaches here.
+                        _ => {}
+                    }
+                    *cursor = (*cursor).max(e.stream_seq);
+                }
+                msgs.clone()
+            }
+            Err(_) => self.store.conversation(session_id).unwrap_or_default(),
+        }
+    }
+
+    /// The sessions currently held by the conversation cache, sorted — test seam for the
+    /// [`set_turn`](Self::set_turn) eviction that keeps a shared engine from leaking one cached
+    /// conversation per session ever seen.
+    #[cfg(test)]
+    pub(crate) fn cached_conversation_sessions(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .conversation_cache
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+
     /// The full `run_plan` order of operations (design Part 2 / A-16), wrapped by the thin
     /// [`LoopHost::run_plan`] above so every return path is normalized there in one place.
     async fn run_plan_dispatch(&self, plan: Value) -> Result<Value> {

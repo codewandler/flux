@@ -1195,8 +1195,14 @@ fn symbols_omission_marker(omitted: usize) -> String {
 }
 
 /// The planner grammar: top-level AST shape + node kinds auto-generated from `Node` in `ast.rs`
-/// via the derived JSON schema (`crate::schema`) -- never edit by hand.
+/// via the derived JSON schema (`crate::schema`) -- never edit by hand. Memoized (see
+/// [`build_ast_grammar`]) — it's a compile-time constant rebuilt on every planner call otherwise.
 fn ast_grammar() -> String {
+    static CELL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CELL.get_or_init(build_ast_grammar).clone()
+}
+
+fn build_ast_grammar() -> String {
     format!(
         "The AST is a JSON object: {{\"name\"?:string, \"params\"?:[{{\"name\":string,\"ty\":type}}], \"returns\"?:type, \"body\":[Node,...]}}. A Node is tagged by \"kind\":\n\
 {node_kinds}Independent reads/calls over a KNOWN set run CONCURRENTLY with `parallel` (each branch binds its result to its name) — `each` runs strictly in order, so keep it for steps that depend on each other, and for iterating a DYNAMIC list value (`parallel` branches are static). Prefer `each` over `repeat` for list iteration.\n\
@@ -1230,8 +1236,14 @@ fn ast_grammar() -> String {
 /// examples are [`ast_grammar`]'s own examples re-rendered through [`flux_lang::format::format`] —
 /// so both arms teach byte-equivalent plans, and every text example is parseable by construction
 /// (the format/parse round-trip invariant). The `expect`s run over a compile-time-constant string
-/// and are guarded by `text_grammar_examples_parse_and_match_the_json_arm`.
+/// and are guarded by `text_grammar_examples_parse_and_match_the_json_arm`. Memoized (see
+/// [`build_text_grammar`]) — otherwise every planner call re-parses and re-formats each example.
 fn text_grammar() -> String {
+    static CELL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CELL.get_or_init(build_text_grammar).clone()
+}
+
+fn build_text_grammar() -> String {
     let mut examples = String::new();
     for chunk in ast_grammar().split("\nExample for ").skip(1) {
         let intro = chunk.lines().next().unwrap_or_default();
@@ -1940,6 +1952,18 @@ mod tests {
 
     /// The text grammar's worked examples are the JSON grammar's examples re-rendered through
     /// `format` — assert they appear, round-trip through `parse` to the SAME `DraftAst`s, and thus
+    /// Memoization guard: the cached `ast_grammar`/`text_grammar` return exactly what a fresh
+    /// (uncached) build produces, and successive calls are byte-stable. A caching bug that returned
+    /// stale/empty content would break the cache-stable planner prefix (A-03) silently otherwise.
+    #[test]
+    fn memoized_grammars_match_the_fresh_build() {
+        assert_eq!(ast_grammar(), build_ast_grammar());
+        assert_eq!(text_grammar(), build_text_grammar());
+        assert_eq!(ast_grammar(), ast_grammar());
+        assert_eq!(text_grammar(), text_grammar());
+        assert!(!ast_grammar().is_empty());
+    }
+
     /// can never drift from the json arm (in-sync-by-construction, L-20).
     #[test]
     fn text_grammar_examples_parse_and_match_the_json_arm() {

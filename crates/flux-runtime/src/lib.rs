@@ -526,30 +526,39 @@ pub fn detect_signals(cwd: &std::path::Path) -> Vec<Observation> {
             json!({ "signal": sig }),
         ));
     };
-    if find_up(cwd, |p| p.join(".git").exists()) {
-        push("git_repo");
+    // Marker signals via a SINGLE upward walk (cwd→root): at each ancestor level, test every
+    // not-yet-found marker — a marker in any parent still counts (running from a subdir, or a git
+    // worktree where `.git` is a file) — instead of re-walking the whole ancestor chain once per
+    // marker. Push order is preserved (callers sort anyway, but keep it stable).
+    type Marker = (&'static str, fn(&std::path::Path) -> bool);
+    let markers: [Marker; 7] = [
+        ("git_repo", |p| p.join(".git").exists()),
+        ("go", |p| p.join("go.mod").exists()),
+        ("rust", |p| p.join("Cargo.toml").exists()),
+        ("node", |p| p.join("package.json").exists()),
+        ("python", |p| {
+            p.join("pyproject.toml").exists() || p.join("requirements.txt").exists()
+        }),
+        ("make", |p| p.join("Makefile").exists() || p.join("makefile").exists()),
+        ("eval", |p| p.join(".flux").join("evals").is_dir()),
+    ];
+    let mut found = [false; 7];
+    let mut dir = Some(cwd);
+    while let Some(d) = dir {
+        for (i, (_, pred)) in markers.iter().enumerate() {
+            if !found[i] {
+                found[i] = pred(d);
+            }
+        }
+        if found.iter().all(|&f| f) {
+            break;
+        }
+        dir = d.parent();
     }
-    if find_up(cwd, |p| p.join("go.mod").exists()) {
-        push("go");
-    }
-    if find_up(cwd, |p| p.join("Cargo.toml").exists()) {
-        push("rust");
-    }
-    if find_up(cwd, |p| p.join("package.json").exists()) {
-        push("node");
-    }
-    if find_up(cwd, |p| {
-        p.join("pyproject.toml").exists() || p.join("requirements.txt").exists()
-    }) {
-        push("python");
-    }
-    if find_up(cwd, |p| {
-        p.join("Makefile").exists() || p.join("makefile").exists()
-    }) {
-        push("make");
-    }
-    if find_up(cwd, |p| p.join(".flux").join("evals").is_dir()) {
-        push("eval");
+    for (i, (sig, _)) in markers.iter().enumerate() {
+        if found[i] {
+            push(sig);
+        }
     }
     // `shell` is an explicit opt-in, not a filesystem marker: it surfaces the off-by-default `shell`
     // group (the generic `bash` op). The CLI sets `FLUX_ENABLE_BASH` from config `enable_shell`, the
@@ -574,20 +583,6 @@ fn kubeconfig_present() -> bool {
     std::env::var_os("HOME")
         .map(|h| std::path::PathBuf::from(h).join(".kube").join("config"))
         .is_some_and(|p| p.exists())
-}
-
-/// Walk up from `start` to the filesystem root, returning true at the first ancestor satisfying
-/// `pred` — so a marker in any parent (e.g. running from a repo subdirectory or a git worktree,
-/// where `.git` is a *file*) is still found, matching how the rest of the system detects a repo.
-fn find_up(start: &std::path::Path, pred: impl Fn(&std::path::Path) -> bool) -> bool {
-    let mut dir = Some(start);
-    while let Some(d) = dir {
-        if pred(d) {
-            return true;
-        }
-        dir = d.parent();
-    }
-    false
 }
 
 /// Cap an oversized tool result for the model transcript: within `cap` chars it is returned

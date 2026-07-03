@@ -36,6 +36,9 @@ const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 const WALK_FILE_CAP: usize = 10_000;
 const DEFAULT_GLOB_LIMIT: usize = 1000;
 const DEFAULT_GREP_LIMIT: usize = 200;
+/// Per-file scan cap for `grep`: at most this many bytes of any single file are line-scanned, so one
+/// giant matched file (a generated bundle, a data dump) can't dominate a search.
+const GREP_FILE_BYTE_CAP: usize = 2 * 1024 * 1024;
 /// An unbounded `read` (no explicit offset/limit) over these caps returns guidance instead of dumping.
 const READ_LINE_CAP: usize = 2000;
 const READ_BYTE_CAP: usize = 256 * 1024;
@@ -545,17 +548,35 @@ impl Tool for ReadTool {
             return Ok(ToolResult::ok_view(content, view));
         }
 
-        // Explicit window: honor it (the model chose the range). `saturating_add` — attacker-supplied
-        // offset/limit can otherwise overflow usize and panic.
-        let lines: Vec<&str> = content.lines().collect();
-        let end = match limit {
-            Some(l) => offset.saturating_add(l).min(lines.len()),
-            None => lines.len(),
-        };
-        let start = offset.min(lines.len());
-        let slice = lines[start..end].join("\n");
+        // Explicit window: honor it (the model chose the range). Stream the lines and take only the
+        // requested window instead of collecting EVERY line of the file into a `Vec<&str>` first — a
+        // ranged read of a huge file must not allocate a slice-per-line for the whole thing. Bound
+        // the assembled window by `READ_BYTE_CAP` too: the unbounded branch above already caps, but
+        // the windowed branch didn't, so a range spanning enormous lines could blow the budget.
+        let take = limit.unwrap_or(usize::MAX);
+        let mut slice = String::new();
+        let mut byte_capped = false;
+        for line in content.lines().skip(offset).take(take) {
+            // +1 for the rejoining '\n' (matches the old `join("\n")`), except before the first line.
+            let extra = line.len() + usize::from(!slice.is_empty());
+            if slice.len().saturating_add(extra) > READ_BYTE_CAP {
+                byte_capped = true;
+                break;
+            }
+            if !slice.is_empty() {
+                slice.push('\n');
+            }
+            slice.push_str(line);
+        }
         note_read(ctx, path).await;
-        let view = number_lines(&slice, start + 1);
+        // `saturating_add` — an attacker-supplied `offset` near usize::MAX must not overflow; a huge
+        // offset yields an empty window anyway, so the numbering base is immaterial there.
+        let mut view = number_lines(&slice, offset.saturating_add(1));
+        if byte_capped {
+            view.push_str(&format!(
+                "\n…[read window truncated at {READ_BYTE_CAP} bytes — narrow offset/limit for the rest]"
+            ));
+        }
         Ok(ToolResult::ok_view(slice, view))
     }
 }
@@ -1388,7 +1409,15 @@ impl Tool for GrepTool {
             let Ok(content) = ctx.system.read_file(&f).await else {
                 continue;
             };
+            // Per-file scan guard: bound the line-scan at GREP_FILE_BYTE_CAP so one huge matched file
+            // (a generated bundle, a data dump) can't dominate the search. The overall `max`-hits cap
+            // already bounds output; this bounds the work per file. Best-effort, like the skip above.
+            let mut scanned = 0usize;
             for (i, line) in content.lines().enumerate() {
+                scanned += line.len() + 1;
+                if scanned > GREP_FILE_BYTE_CAP {
+                    break;
+                }
                 if is_match(line) {
                     let shown: String = if line.chars().count() > 200 {
                         let head: String = line.chars().take(200).collect();
@@ -2593,6 +2622,54 @@ mod tests {
             .unwrap();
         assert_eq!(g.content.trim(), r#"["a.rs"]"#);
         assert_eq!(g.view.as_deref(), Some("a.rs"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn windowed_read_streams_the_exact_window_and_honors_the_byte_cap() {
+        let (dir, c) = ctx();
+        // 500 numbered lines; read a small window out of the middle.
+        let content: String = (0..500).map(|i| format!("line{i}\n")).collect();
+        WriteTool
+            .execute(&c, json!({"path": "big.txt", "content": content}))
+            .await
+            .unwrap();
+        let r = ReadTool
+            .execute(&c, json!({"path": "big.txt", "offset": 100, "limit": 5}))
+            .await
+            .unwrap();
+        assert!(!r.is_error);
+        // Canonical value is the raw slice: exactly the window, '\n'-joined, no trailing newline —
+        // byte-identical to the old `lines[start..end].join("\n")`.
+        assert_eq!(
+            r.content, "line100\nline101\nline102\nline103\nline104",
+            "exact window, no extra lines materialized"
+        );
+        assert!(
+            r.view.as_deref().unwrap().contains("101"),
+            "view numbered from offset+1: {:?}",
+            r.view
+        );
+
+        // Byte cap: a window of very long lines is truncated with guidance rather than unbounded.
+        let wide: String = (0..10).map(|_| format!("{}\n", "x".repeat(40 * 1024))).collect(); // ~400 KiB
+        WriteTool
+            .execute(&c, json!({"path": "wide.txt", "content": wide}))
+            .await
+            .unwrap();
+        let capped = ReadTool
+            .execute(&c, json!({"path": "wide.txt", "offset": 0, "limit": 10}))
+            .await
+            .unwrap();
+        assert!(
+            capped.content.len() <= READ_BYTE_CAP,
+            "windowed canonical bounded by the byte cap: {} bytes",
+            capped.content.len()
+        );
+        assert!(
+            capped.view.as_deref().unwrap().contains("truncated"),
+            "cap guidance present in the view"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

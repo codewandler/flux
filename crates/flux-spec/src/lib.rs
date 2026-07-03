@@ -13,7 +13,23 @@ use serde::{Deserialize, Serialize};
 /// Tool schemas are an API contract with models/providers, so keep them derived from Rust input
 /// structs rather than hand-maintained JSON. The returned value intentionally omits the root
 /// meta-schema/title noise while preserving definitions and doc-comment descriptions.
-pub fn tool_input_schema<T: schemars::JsonSchema>() -> serde_json::Value {
+pub fn tool_input_schema<T: schemars::JsonSchema + 'static>() -> serde_json::Value {
+    // A tool's input schema is a compile-time constant for its `T`, but `schema_for!` is a
+    // non-trivial reflective build (a recursive type like the plan AST expands to dozens of
+    // subschemas). Memoize it so the reflection runs once per type instead of on every call — this
+    // matters on the planner hot path, where the op catalog re-derives every tool's spec and each op
+    // resolution rebuilds a signature. NOTE: a `static` inside a generic fn is SHARED across all
+    // monomorphizations (not one-per-`T`), so the cache must be keyed by `TypeId::of::<T>()` — a bare
+    // `OnceLock<Value>` here would return the first-built type's schema for every tool.
+    use std::any::TypeId;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<TypeId, serde_json::Value>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = TypeId::of::<T>();
+    if let Some(v) = cache.lock().unwrap().get(&key) {
+        return v.clone();
+    }
     let mut schema =
         serde_json::to_value(schemars::schema_for!(T)).expect("tool input schema serializes");
     if let Some(obj) = schema.as_object_mut() {
@@ -23,6 +39,7 @@ pub fn tool_input_schema<T: schemars::JsonSchema>() -> serde_json::Value {
         // redundant top-level description, so drop it. Field descriptions (under `properties`) stay.
         obj.remove("description");
     }
+    cache.lock().unwrap().insert(key, schema.clone());
     schema
 }
 
@@ -115,7 +132,7 @@ impl ToolSpec {
     }
 
     /// A read-only spec whose input schema is derived from the Rust input type.
-    pub fn read_only_typed<T: schemars::JsonSchema>(
+    pub fn read_only_typed<T: schemars::JsonSchema + 'static>(
         name: impl Into<String>,
         description: impl Into<String>,
     ) -> Self {

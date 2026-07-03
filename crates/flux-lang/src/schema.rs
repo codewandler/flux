@@ -8,30 +8,44 @@
 
 use crate::ast::{DraftAst, Node};
 
-/// The full JSON Schema of the Draft AST, as a `serde_json::Value`.
+/// The full JSON Schema of the Draft AST, as a `serde_json::Value`. Memoized — the schema is a
+/// compile-time constant, and `schema_for!` over the recursive AST is a non-trivial reflective build
+/// that would otherwise re-run on every planner call.
 pub fn ast_schema() -> serde_json::Value {
-    serde_json::to_value(schemars::schema_for!(DraftAst)).expect("DraftAst schema serializes")
+    static CELL: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        serde_json::to_value(schemars::schema_for!(DraftAst)).expect("DraftAst schema serializes")
+    })
+    .clone()
 }
 
 /// A markdown `| kind | description |` table of every [`Node`] variant, generated from the derived
 /// schema's per-variant doc-comments. Replaces the former build-time `NODE_KIND_CATALOG` (the same
 /// content, now derived from the type rather than parsed out of `ast.rs` by `syn`).
 pub fn node_kind_catalog() -> String {
-    let schema = serde_json::to_value(schemars::schema_for!(Node)).expect("Node schema serializes");
-    let mut out = String::from("| kind | description |\n|---|---|\n");
-    if let Some(variants) = schema.get("oneOf").and_then(|v| v.as_array()) {
-        for v in variants {
-            let kind = variant_kind(v).unwrap_or_default();
-            // Doc-comments arrive multi-line; collapse to one row the way the old build script did.
-            let desc = v
-                .get("description")
-                .and_then(|d| d.as_str())
-                .unwrap_or_default()
-                .replace('\n', " ");
-            out.push_str(&format!("| `{kind}` | {desc} |\n"));
+    // Memoized: the table is a compile-time constant, but building it runs `schema_for!(Node)` (a
+    // full reflective build of the 40+-variant AST enum) plus a per-variant walk. It feeds the
+    // planner prompt on every turn, so cache the finished string and hand back a clone.
+    static CELL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(Node)).expect("Node schema serializes");
+        let mut out = String::from("| kind | description |\n|---|---|\n");
+        if let Some(variants) = schema.get("oneOf").and_then(|v| v.as_array()) {
+            for v in variants {
+                let kind = variant_kind(v).unwrap_or_default();
+                // Doc-comments arrive multi-line; collapse to one row the way the old build script did.
+                let desc = v
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or_default()
+                    .replace('\n', " ");
+                out.push_str(&format!("| `{kind}` | {desc} |\n"));
+            }
         }
-    }
-    out
+        out
+    })
+    .clone()
 }
 
 /// Extract the internally-tagged `kind` constant from a variant subschema, tolerating both the

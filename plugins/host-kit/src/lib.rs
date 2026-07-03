@@ -50,7 +50,7 @@ pub use schemars;
 /// model sees and the fields the handler reads cannot drift (D-36).
 ///
 /// Prefer the [`read_op_typed`] / [`write_op_typed`] helpers, which call this for you.
-pub fn op_input_schema<T: schemars::JsonSchema>() -> Value {
+pub fn op_input_schema<T: schemars::JsonSchema + 'static>() -> Value {
     flux_spec::tool_input_schema::<T>()
 }
 
@@ -955,14 +955,14 @@ pub fn write_op(name: &str, description: &str, input_schema: Value) -> Operation
 /// Add `#[schemars(allow_unknown_fields)]` when the handler ignores unknown keys (the common
 /// case for flex-extractors) so the derived schema doesn't forbid extras the runtime accepts.
 /// Effects/risk/idempotency match [`read_op`] (Read, Low, Idempotent).
-pub fn read_op_typed<T: schemars::JsonSchema>(name: &str, description: &str) -> OperationSpec {
+pub fn read_op_typed<T: schemars::JsonSchema + 'static>(name: &str, description: &str) -> OperationSpec {
     read_op(name, description, op_input_schema::<T>())
 }
 
 /// A **typed** write/mutating op: `input_schema` derived from `T` via `schemars`
 /// ([`op_input_schema`]). Effects/risk/idempotency match [`write_op`] (Write+Network,
 /// Medium, NonIdempotent). See [`read_op_typed`] for the `T` contract.
-pub fn write_op_typed<T: schemars::JsonSchema>(name: &str, description: &str) -> OperationSpec {
+pub fn write_op_typed<T: schemars::JsonSchema + 'static>(name: &str, description: &str) -> OperationSpec {
     write_op(name, description, op_input_schema::<T>())
 }
 
@@ -987,7 +987,7 @@ pub fn internal_op(name: &str, description: &str, input_schema: Value) -> Operat
 
 /// A **typed** host-only op: `input_schema` derived from `T` via `schemars` ([`op_input_schema`]).
 /// See [`internal_op`] for the host-only contract.
-pub fn internal_op_typed<T: schemars::JsonSchema>(name: &str, description: &str) -> OperationSpec {
+pub fn internal_op_typed<T: schemars::JsonSchema + 'static>(name: &str, description: &str) -> OperationSpec {
     internal_op(name, description, op_input_schema::<T>())
 }
 
