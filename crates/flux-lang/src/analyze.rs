@@ -1266,12 +1266,26 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, bound: &HashSet<String>, d: &mut
             check_body(body, "body", ops, bound, d);
         }
         Node::Verify { cmd, expect, .. } => {
+            // `cmd` dispatches (typically a `bash` call); `expect` is an `eval_arg` position
+            // (runtime.rs `fn exec_body`, `Node::Verify` arm) — lit/var/obj/list only, no dispatch
+            // — so reject a non-`eval_arg` `expect` up front (L-27).
             d.with("cmd", |d| check_node(cmd, ops, bound, d));
-            d.with("expect", |d| check_node(expect, ops, bound, d));
+            d.with("expect", |d| {
+                check_eval_arg_position(expect, "`verify` `expect`", d);
+                check_node(expect, ops, bound, d)
+            });
         }
-        Node::Expr { vars, .. } => {
+        Node::Expr { formula, vars } => {
             for (k, v) in vars {
                 d.with(format!("vars.{k}"), |d| check_node(v, ops, bound, d));
+            }
+            // The runtime tokenizes/evaluates `formula` against `vars` (runtime.rs `eval_expr_value`);
+            // `vars` is an explicit, unambiguous scope, so an ident absent from it or a malformed
+            // formula is a plan the runtime rejects — reject it here first with zero false positives
+            // (L-27). Reuses the runtime tokenizer/parser so the two agree exactly.
+            let keys: std::collections::BTreeSet<&str> = vars.keys().map(String::as_str).collect();
+            for msg in crate::runtime::validate_expr_formula(formula, &keys) {
+                d.add(msg);
             }
         }
         Node::Fmt { .. } => {}
@@ -1330,7 +1344,15 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, bound: &HashSet<String>, d: &mut
             cases,
             default,
         } => {
-            d.with("selector", |d| check_node(selector, ops, bound, d));
+            d.with("selector", |d| {
+                // The runtime dispatches a `call` selector (the `!model` op) but resolves any other
+                // kind via `eval_arg` (runtime.rs `fn exec_body`, `Node::Route` arm) — lit/var/obj/
+                // list only — so reject a non-`call`, non-`eval_arg` selector up front (L-27).
+                if !matches!(selector.as_ref(), Node::Call { .. }) {
+                    check_eval_arg_position(selector, "`route` selector", d);
+                }
+                check_node(selector, ops, bound, d)
+            });
             if cases.is_empty() {
                 d.add("`route` requires at least one case");
             }
@@ -2812,6 +2834,250 @@ mod tests {
         assert!(
             analyze_flow(&ast, &ops, &HashSet::new()).is_ok(),
             "valid eval_arg-position expressions must not be flagged: {:?}",
+            analyze_flow(&ast, &ops, &HashSet::new())
+                .err()
+                .map(|ds| ds.iter().map(|d| d.message.clone()).collect::<Vec<_>>())
+        );
+    }
+
+    /// L-27: a non-`call` `route` selector is resolved via `eval_arg` (lit/var/obj/list only) at
+    /// runtime, so a `jq`/`fmt`/… selector must be rejected up front with a bind-it-first hint
+    /// (mirrors the L-21 each/jq/parse guards).
+    #[test]
+    fn non_call_route_selector_is_a_diagnostic() {
+        let ops = catalog();
+        let ast = DraftAst {
+            body: vec![
+                Node::Bind {
+                    name: "raw".into(),
+                    value: Box::new(Node::Lit {
+                        value: serde_json::json!({"intent": "refund"}),
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+                Node::Route {
+                    // `jq` is not a `call`, so the runtime would `eval_arg` it and error.
+                    selector: Box::new(Node::Jq {
+                        path: ".intent".into(),
+                        input: Box::new(Node::Var { name: "raw".into() }),
+                    }),
+                    cases: vec![crate::ast::RouteCase {
+                        label: "refund".into(),
+                        body: vec![Node::Call {
+                            op: "read".into(),
+                            args: vec![],
+                        }],
+                    }],
+                    default: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+        let err = analyze_flow(&ast, &ops, &HashSet::new()).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("not a valid `route` selector")
+                    && d.message.contains("bind it to a symbol first")),
+            "expected an invalid route-selector diagnostic with a bind-it-first hint, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// L-27: a `call` `route` selector (the primary `!model` form) is NOT flagged — the runtime
+    /// dispatches it. No false positive.
+    #[test]
+    fn call_route_selector_passes() {
+        let ops = catalog();
+        let ast = DraftAst {
+            body: vec![Node::Route {
+                selector: Box::new(Node::Call {
+                    op: "read".into(),
+                    args: vec![],
+                }),
+                cases: vec![crate::ast::RouteCase {
+                    label: "a".into(),
+                    body: vec![Node::Call {
+                        op: "read".into(),
+                        args: vec![],
+                    }],
+                }],
+                default: vec![],
+            }],
+            ..Default::default()
+        };
+        assert!(
+            analyze_flow(&ast, &ops, &HashSet::new()).is_ok(),
+            "a call route selector must not be flagged: {:?}",
+            analyze_flow(&ast, &ops, &HashSet::new())
+                .err()
+                .map(|ds| ds.iter().map(|d| d.message.clone()).collect::<Vec<_>>())
+        );
+    }
+
+    /// L-27: `verify`'s `expect` is resolved via `eval_arg` (lit/var/obj/list), no dispatch — a
+    /// `fmt` (or any other non-eval_arg kind) must be rejected with a bind-it-first hint.
+    #[test]
+    fn non_eval_arg_verify_expect_is_a_diagnostic() {
+        let ops = catalog();
+        let ast = DraftAst {
+            body: vec![Node::Verify {
+                // `cmd` may be a `call` (it dispatches) — only `expect` is the eval_arg position.
+                cmd: Box::new(Node::Call {
+                    op: "read".into(),
+                    args: vec![],
+                }),
+                expect: Box::new(Node::Fmt {
+                    template: "{x}".into(),
+                }),
+                message: None,
+            }],
+            ..Default::default()
+        };
+        let err = analyze_flow(&ast, &ops, &HashSet::new()).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("not a valid `verify` `expect`")
+                    && d.message.contains("bind it to a symbol first")),
+            "expected an invalid verify-expect diagnostic with a bind-it-first hint, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// L-27: an `expr` `formula` ident absent from its own `vars` map is a diagnostic — the runtime
+    /// evaluates the formula against `vars`, an explicit scope, so this is checkable with no false
+    /// positives.
+    #[test]
+    fn expr_formula_ident_absent_from_vars_is_a_diagnostic() {
+        let ops = catalog();
+        let ast = DraftAst {
+            body: vec![
+                Node::Bind {
+                    name: "n".into(),
+                    value: Box::new(Node::Lit {
+                        value: serde_json::json!(5),
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+                Node::Bind {
+                    name: "ok".into(),
+                    value: Box::new(Node::Expr {
+                        // `count` is declared; `threshold` is NOT in `vars`.
+                        formula: "count > threshold".into(),
+                        vars: [(
+                            "count".to_string(),
+                            Box::new(Node::Var { name: "n".into() }),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let err = analyze_flow(&ast, &ops, &HashSet::new()).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("threshold") && d.message.contains("vars")),
+            "expected a missing-vars-ident diagnostic naming `threshold`, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// L-27: a structurally malformed `expr` `formula` (a trailing operator) produces a parse
+    /// diagnostic even when every referenced ident is declared.
+    #[test]
+    fn malformed_expr_formula_is_a_parse_diagnostic() {
+        let ops = catalog();
+        let ast = DraftAst {
+            body: vec![
+                Node::Bind {
+                    name: "n".into(),
+                    value: Box::new(Node::Lit {
+                        value: serde_json::json!(5),
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+                Node::Bind {
+                    name: "ok".into(),
+                    value: Box::new(Node::Expr {
+                        formula: "count >".into(),
+                        vars: [(
+                            "count".to_string(),
+                            Box::new(Node::Var { name: "n".into() }),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let err = analyze_flow(&ast, &ops, &HashSet::new()).unwrap_err();
+        assert!(
+            err.iter().any(|d| d.message.contains("malformed")),
+            "expected a malformed-formula parse diagnostic, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// L-27: no false positives — a valid `expr` whose formula uses built-in functions, boolean and
+    /// string literals, and only declared variables analyzes clean.
+    #[test]
+    fn valid_expr_formula_passes() {
+        let ops = catalog();
+        let ast = DraftAst {
+            body: vec![
+                Node::Bind {
+                    name: "n".into(),
+                    value: Box::new(Node::Lit {
+                        value: serde_json::json!(5),
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+                Node::Bind {
+                    name: "s".into(),
+                    value: Box::new(Node::Lit {
+                        value: serde_json::json!("ok"),
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+                Node::Bind {
+                    name: "ok".into(),
+                    value: Box::new(Node::Expr {
+                        // round(…)/&&/'ok'/true are built-ins/literals, not variables; count/status
+                        // are both declared in `vars`.
+                        formula: "round(count * 2, 1) > 0 && status == 'ok' && true".into(),
+                        vars: [
+                            (
+                                "count".to_string(),
+                                Box::new(Node::Var { name: "n".into() }),
+                            ),
+                            (
+                                "status".to_string(),
+                                Box::new(Node::Var { name: "s".into() }),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(
+            analyze_flow(&ast, &ops, &HashSet::new()).is_ok(),
+            "a valid expr formula must not be flagged: {:?}",
             analyze_flow(&ast, &ops, &HashSet::new())
                 .err()
                 .map(|ds| ds.iter().map(|d| d.message.clone()).collect::<Vec<_>>())

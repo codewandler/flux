@@ -624,9 +624,23 @@ impl EngineLoopHost {
     /// Durably record one planning attempt (C-14): `accepted` (with the AST fingerprint + rendered
     /// plan text), `chat`, `compile_error`, or `rejected`. Non-fatal, no-op when the turn has no
     /// audit target (tests, the pre-authored `flow run` path).
-    fn record_plan_attempt(&self, attempt: flux_events::PlanAttempt) {
+    ///
+    /// C-22: the rendered `plan_text` (and any error string) is scrubbed through the SAME
+    /// [`Redactor`](flux_secret::Redactor) the executor uses on tool results (seeded per C-13)
+    /// before it reaches the store — a `bash("curl -H 'Authorization: Bearer …'")` arg in the
+    /// accepted plan graph would otherwise persist in the clear on the `PlanAttempted` event.
+    fn record_plan_attempt(&self, mut attempt: flux_events::PlanAttempt) {
         let audit = self.turn.lock().unwrap().audit.clone();
         if let Some((events, turn_id)) = audit {
+            if let Ok(executor) = self.executor() {
+                let redactor = &executor.context().redactor;
+                if let Some(text) = attempt.plan_text.take() {
+                    attempt.plan_text = Some(redactor.redact(&text));
+                }
+                if let Some(err) = attempt.error.take() {
+                    attempt.error = Some(redactor.redact(&err));
+                }
+            }
             let session_id = self.turn.lock().unwrap().session_id.clone();
             let _ = events.record_plan_attempt(&session_id, turn_id, attempt);
         }

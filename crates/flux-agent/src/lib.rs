@@ -112,6 +112,14 @@ pub struct Permissions {
 /// Default byte budget for injected `context` blocks (A-19); overridable per spec.
 pub const DEFAULT_CONTEXT_BUDGET: usize = 8192;
 
+/// Default session size (serialized chars) past which a long-lived agent summarizes older turns
+/// (A-22). Non-zero so served / agentic / SDK agents — which bind a conversation to one persistent
+/// session and re-send the growing transcript every turn — compact by default instead of growing
+/// unbounded until the provider's context window errors. Matches the CLI's `FLUX_COMPACT_CHARS`
+/// default so behaviour is consistent across surfaces; override per-agent via
+/// [`AgentSpec::with_compaction`] (or, on the served path, the `AgentDecl` settings / env).
+pub const DEFAULT_COMPACT_THRESHOLD_CHARS: usize = 48_000;
+
 /// A first-class agent definition: model, persona, skills, tool selection, permissions, and the
 /// turn settings — everything that distinguishes one agent from another. Assemble it into a running
 /// [`FlowEngine`] with [`AgentSpec::assemble`] (the simple path) or [`AgentSpec::into_engine`] (when
@@ -155,7 +163,7 @@ impl Default for AgentSpec {
             max_tokens: 4096,
             max_iterations: 25,
             groups: Vec::new(),
-            compact_threshold_chars: 0,
+            compact_threshold_chars: DEFAULT_COMPACT_THRESHOLD_CHARS,
             cwd: PathBuf::from("."),
             context: Vec::new(),
             context_budget: DEFAULT_CONTEXT_BUDGET,
@@ -178,6 +186,15 @@ impl AgentSpec {
     /// metadata is read here; bodies load on activation (L-02). Set `cwd` first.
     pub fn with_default_skills(mut self) -> Self {
         self.skills = flux_skill::discover_merged(&flux_skill::default_skill_dirs(&self.cwd));
+        self
+    }
+
+    /// Set the compaction threshold (serialized chars) — the size past which older turns are
+    /// summarized before the next request (A-22). `0` disables compaction (a one-shot / short-turn
+    /// agent that must never compact). Chainable; this is the per-agent override that wins over the
+    /// non-zero [`DEFAULT_COMPACT_THRESHOLD_CHARS`].
+    pub fn with_compaction(mut self, threshold_chars: usize) -> Self {
+        self.compact_threshold_chars = threshold_chars;
         self
     }
 
@@ -305,6 +322,38 @@ mod tests {
             DEFAULT_SYSTEM_PROMPT
                 .contains("never write files and exit silently when the server never started"),
             "bash bullet must forbid writing files and exiting silently when the server never started"
+        );
+    }
+
+    /// A-22: non-CLI (served / agentic / SDK) agents get a sane NON-ZERO compaction threshold by
+    /// default — a long-lived persistent-session agent bounds its conversation instead of growing
+    /// until the provider context window blows. A per-agent `with_compaction` override tunes it or
+    /// disables it entirely.
+    #[test]
+    fn served_agents_get_a_nonzero_compaction_default() {
+        let spec = AgentSpec::new("mock");
+        assert!(
+            spec.compact_threshold_chars > 0,
+            "served/SDK agents must compact by default (was {})",
+            spec.compact_threshold_chars
+        );
+        assert_eq!(
+            spec.compact_threshold_chars,
+            DEFAULT_COMPACT_THRESHOLD_CHARS
+        );
+        // Per-agent override: tune it…
+        assert_eq!(
+            AgentSpec::new("mock")
+                .with_compaction(12_345)
+                .compact_threshold_chars,
+            12_345
+        );
+        // …or disable it entirely (never compact).
+        assert_eq!(
+            AgentSpec::new("mock")
+                .with_compaction(0)
+                .compact_threshold_chars,
+            0
         );
     }
 

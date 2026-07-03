@@ -173,22 +173,45 @@ fn is_side_effecting(node: &Node, ops: &dyn OpCatalog) -> bool {
     }
 }
 
-/// Collect the symbols read anywhere in `nodes` — explicit `Var` names AND the `{name}`/`{{name}}`
-/// interpolation tokens inside `lit` string args (a `lit` string is interpolated from bound symbols
-/// at `eval_arg` time, so it reads them). Over-approximating is sound: extra reads only *suppress*
-/// batching, never wrongly permit it.
+/// Collect the symbols read anywhere in `nodes` — the explicit `Var` names, the `{name}`/`{{name}}`
+/// interpolation tokens inside `lit`/`fmt` strings, and the members a `ctx`/`ctx_append` pack pulls
+/// in — recursing through EVERY nested sub-expression, including the `obj`/`list`/`expr` templates a
+/// named-arg call carries (the canonical `grep({path:$dir})` form). Routed through the analyzer's
+/// exhaustive [`for_each_node`] visitor (as [`collect_reads_deep`] is) so a new node kind can never
+/// silently hide a read site — the earlier hand-rolled match dropped `obj`/`list`/`fmt`/`expr` under
+/// a `_ => {}`, making a reader invisible to the batch/CSE hazard check (L-26). This drives both
+/// `Batch::independent` (parallelization) and `cse_aliases` (invalidation); over-approximating is
+/// sound — extra reads only *suppress* batching/aliasing, never wrongly permit them.
 fn collect_var_reads(nodes: &[Node], acc: &mut BTreeSet<String>) {
-    for n in nodes {
-        match n {
-            Node::Var { name } => {
-                acc.insert(name.0.clone());
-            }
-            Node::Lit { value } => collect_interp_reads(value, acc),
-            Node::Call { args, .. } => collect_var_reads(args, acc),
-            Node::Jq { input, .. } => collect_var_reads(std::slice::from_ref(input), acc),
-            Node::Parse { value, .. } => collect_var_reads(std::slice::from_ref(value), acc),
-            _ => {}
+    crate::analyze::for_each_node(nodes, &mut |n| collect_leaf_read(n, acc));
+}
+
+/// Record the symbol at a single leaf read site the exhaustive [`for_each_node`] visitor reaches — a
+/// `var`/`peek` reference, the `{name}` tokens in a `lit` string or `fmt` template, and the members
+/// a `ctx`/`ctx_append` pack names. The shared leaf logic of [`collect_var_reads`] (call-arg reads)
+/// and [`collect_reads_deep`] (whole-flow liveness); every other node's reads are reached as the
+/// nested leaves the visitor descends into.
+fn collect_leaf_read(n: &Node, acc: &mut BTreeSet<String>) {
+    match n {
+        Node::Var { name } | Node::Peek { name } => {
+            acc.insert(name.0.clone());
         }
+        Node::Lit { value } => collect_interp_reads(value, acc),
+        Node::Fmt { template } => collect_interp_reads_str(template, acc),
+        Node::Ctx {
+            include, exclude, ..
+        } => {
+            for s in include.iter().chain(exclude.iter()) {
+                acc.insert(s.0.clone());
+            }
+        }
+        Node::CtxAppend { ctx, add } => {
+            acc.insert(ctx.0.clone());
+            for s in add {
+                acc.insert(s.0.clone());
+            }
+        }
+        _ => {}
     }
 }
 
@@ -232,28 +255,7 @@ fn collect_interp_reads_str(s: &str, acc: &mut BTreeSet<String>) {
 /// members a `ctx`/`ctx_append` pack pulls in. Powers dead-step elimination: a read-only bind whose
 /// symbol is absent here is provably unused.
 fn collect_reads_deep(body: &[Node], acc: &mut BTreeSet<String>) {
-    crate::analyze::for_each_node(body, &mut |n| match n {
-        Node::Var { name } | Node::Peek { name } => {
-            acc.insert(name.0.clone());
-        }
-        Node::Lit { value } => collect_interp_reads(value, acc),
-        Node::Fmt { template } => collect_interp_reads_str(template, acc),
-        Node::Ctx {
-            include, exclude, ..
-        } => {
-            for s in include.iter().chain(exclude.iter()) {
-                acc.insert(s.0.clone());
-            }
-        }
-        Node::CtxAppend { ctx, add } => {
-            acc.insert(ctx.0.clone());
-            for s in add {
-                acc.insert(s.0.clone());
-            }
-        }
-        // Every other node's reads are reached as nested `var`/`lit`/… nodes the visitor descends into.
-        _ => {}
-    });
+    crate::analyze::for_each_node(body, &mut |n| collect_leaf_read(n, acc));
 }
 
 /// Whether `node` is a read-only `bind`-of-`call` whose bound symbol is read nowhere in the flow — a
@@ -613,5 +615,124 @@ mod tests {
             !has_alias(&stages),
             "distinct args are not CSE'd: {stages:?}"
         );
+    }
+
+    /// Build a single-object call arg `{ k: v, … }` from `(key, node)` pairs — the canonical
+    /// named-arg form (L-09), the shape the old hand-rolled collector was blind to.
+    fn obj(fields: Vec<(&str, Node)>) -> Node {
+        Node::Obj {
+            fields: fields
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), Box::new(v)))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn batch_split_sees_object_arg_reads() {
+        // $dir = read "x"; $hits = read({pattern:"TODO", path:$dir}) — the reader's `$dir` lives
+        // inside a named-arg OBJECT. The optimizer must see that read (RAW hazard on `$dir`) and
+        // NOT place both binds in one `Stage::Parallel`, or `$hits` would resolve `$dir` unbound.
+        let stages = plan(vec![
+            bind("dir", "read", vec![lit("x")]),
+            bind(
+                "hits",
+                "read",
+                vec![obj(vec![("pattern", lit("TODO")), ("path", var("dir"))])],
+            ),
+        ]);
+        assert_eq!(
+            stages,
+            vec![Stage::Sequential(NodeId(0)), Stage::Sequential(NodeId(1))],
+            "an object-arg read of $dir must split the batch, not parallelize with its writer: {stages:?}"
+        );
+    }
+
+    #[test]
+    fn cse_invalidated_by_object_arg_rebind() {
+        // $dir = read "c"; $a = read({path:$dir}); $dir = read "c2" (rebinds dir);
+        // $b = read({path:$dir}); $r consumes both. $a and $b are textually identical calls, but
+        // the intervening rebind means $b reads a DIFFERENT $dir — the object-arg read must
+        // invalidate the cache so $b is NOT aliased to $a's stale value.
+        let stages = plan(vec![
+            bind("dir", "read", vec![lit("c")]),
+            bind("a", "read", vec![obj(vec![("path", var("dir"))])]),
+            bind("dir", "read", vec![lit("c2")]),
+            bind("b", "read", vec![obj(vec![("path", var("dir"))])]),
+            bind("r", "read", vec![lit("{{a}}{{b}}")]),
+        ]);
+        assert!(
+            !has_alias(&stages),
+            "an intervening rebind of a symbol read inside an object arg must block CSE: {stages:?}"
+        );
+    }
+
+    #[test]
+    fn collect_var_reads_sees_every_var_in_nested_args() {
+        // Read-set soundness invariant: EVERY `Var` name reachable anywhere in a call's args —
+        // however deeply nested through obj/list/jq/expr/parse/fmt/call — is collected. A
+        // deterministic property check over pseudo-randomly generated nested arg trees: build a
+        // tree seeded with a known set of `$xN` reads at random depths, then assert the collector
+        // returns a superset of them. If any descent arm is dropped, a planted name goes missing.
+        //
+        // Simple reproducible LCG — no external rand crate in this lib's dev-deps.
+        let mut seed: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Build a node that embeds `planted` (a var read) somewhere, wrapping it in a random pure
+        // container up to `depth` levels deep. Returns the wrapped node.
+        fn wrap(planted: Node, depth: u32, next: &mut impl FnMut() -> u64) -> Node {
+            if depth == 0 {
+                return planted;
+            }
+            let inner = wrap(planted, depth - 1, next);
+            match next() % 6 {
+                0 => Node::Obj {
+                    fields: [("f".to_string(), Box::new(inner))].into_iter().collect(),
+                },
+                1 => Node::List { items: vec![inner] },
+                2 => Node::Jq {
+                    path: ".p".into(),
+                    input: Box::new(inner),
+                },
+                3 => Node::Parse {
+                    value: Box::new(inner),
+                    as_type: "json".into(),
+                },
+                4 => Node::Expr {
+                    formula: "k + 1".into(),
+                    vars: [("k".to_string(), Box::new(inner))].into_iter().collect(),
+                },
+                _ => Node::Call {
+                    op: "read".into(),
+                    args: vec![inner],
+                },
+            }
+        }
+
+        for trial in 0..200 {
+            let names: Vec<String> = (0..(1 + next() % 5))
+                .map(|i| format!("x{trial}_{i}"))
+                .collect();
+            let args: Vec<Node> = names
+                .iter()
+                .map(|n| {
+                    let depth = (next() % 5) as u32;
+                    wrap(var(n), depth, &mut next)
+                })
+                .collect();
+            let mut reads = BTreeSet::new();
+            collect_var_reads(&args, &mut reads);
+            for n in &names {
+                assert!(
+                    reads.contains(n),
+                    "planted read `${n}` was dropped from the collected set {reads:?} (args: {args:?})"
+                );
+            }
+        }
     }
 }

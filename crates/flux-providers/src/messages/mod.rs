@@ -112,6 +112,11 @@ pub fn build_messages_body(req: &Request, q: &MessagesQuirks) -> Result<Value> {
 /// shorter prompts (or providers without caching) stay a plain string.
 const CACHE_MIN_CHARS: usize = 4096;
 
+/// Anthropic accepts at most **4** `cache_control` breakpoints per request; a 5th → HTTP 400. The
+/// subscription-claude planner layout already stamps exactly 4 cache:true segments (transport prefix
+/// + planner-A + phase + base-B), so any future cache:true segment would tip it over (A-23).
+const MAX_CACHE_BREAKPOINTS: usize = 4;
+
 fn system_field(s: &str, caching: bool) -> Value {
     if caching && s.len() >= CACHE_MIN_CHARS {
         json!([{ "type": "text", "text": s, "cache_control": { "type": "ephemeral" } }])
@@ -131,11 +136,13 @@ fn segmented_system_field(
     caching: bool,
 ) -> Value {
     if caching {
+        let keep = cache_breakpoints(segments);
         let mut blocks: Vec<Value> = segments
             .iter()
-            .map(|seg| {
+            .enumerate()
+            .map(|(i, seg)| {
                 let mut b = json!({ "type": "text", "text": seg.text });
-                if seg.cache {
+                if keep.contains(&i) {
                     b["cache_control"] = json!({ "type": "ephemeral" });
                 }
                 b
@@ -152,6 +159,38 @@ fn segmented_system_field(
         }
         json!(parts.join("\n\n"))
     }
+}
+
+/// Which segment indices should actually carry a `cache_control` breakpoint. Every cache:true
+/// segment is stamped while the total stays within Anthropic's [`MAX_CACHE_BREAKPOINTS`] ceiling; if
+/// more segments than that ask to be cached, only the `MAX` **largest** are stamped and the smaller
+/// ones drop their breakpoint (A-23). Keeping the biggest cache:true segments preserves the stable
+/// planner prefix (the bulk of the prompt) — so the cache hit isn't regressed — while a dropped
+/// small segment's bytes still ride inside a later segment's cached prefix. This makes the ≤4
+/// invariant hold no matter how many cache:true segments a future layout adds.
+fn cache_breakpoints(segments: &[flux_provider::SystemSegment]) -> Vec<usize> {
+    let cached: Vec<usize> = segments
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.cache)
+        .map(|(i, _)| i)
+        .collect();
+    if cached.len() <= MAX_CACHE_BREAKPOINTS {
+        return cached;
+    }
+    // Too many breakpoints: keep the largest `MAX` cache:true segments. Ties break toward the earlier
+    // segment, keeping the choice stable and prefix-friendly.
+    let mut by_size = cached;
+    by_size.sort_by(|&a, &b| {
+        segments[b]
+            .text
+            .len()
+            .cmp(&segments[a].text.len())
+            .then(a.cmp(&b))
+    });
+    by_size.truncate(MAX_CACHE_BREAKPOINTS);
+    by_size.sort_unstable();
+    by_size
 }
 
 fn role_str(role: Role) -> &'static str {
@@ -510,6 +549,77 @@ mod tests {
             sys[2].get("cache_control").is_none(),
             "the dynamic tail must not carry a breakpoint"
         );
+    }
+
+    /// Recursively count `cache_control` keys anywhere in the request body (system + tools +
+    /// messages) — Anthropic's 4-breakpoint ceiling is across the whole request.
+    fn count_cache_control(v: &Value) -> usize {
+        match v {
+            Value::Object(m) => {
+                (m.contains_key("cache_control") as usize)
+                    + m.values().map(count_cache_control).sum::<usize>()
+            }
+            Value::Array(a) => a.iter().map(count_cache_control).sum(),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn assembled_request_caps_cache_breakpoints_at_four() {
+        use flux_provider::SystemSegment;
+        // Mirror the subscription-claude planner layout (transport prefix + planner-A + phase +
+        // base-B, all cache:true) and then add a FIFTH cache:true segment — the case that today tips
+        // the request past Anthropic's 4-breakpoint ceiling into a 400.
+        let big = |name: &str| SystemSegment {
+            text: format!("{name} {}", "x".repeat(CACHE_MIN_CHARS)),
+            cache: true,
+        };
+        let mut req = Request::new("claude-opus-4-8", "hi");
+        req.system_segments = vec![
+            big("transport-prefix"),
+            big("planner-A-catalog-and-grammar-the-large-stable-prefix"),
+            big("phase-contract"),
+            big("base-B-identity"),
+            big("future-extra-cache-segment"),
+            SystemSegment {
+                text: "per-turn session symbols".into(),
+                cache: false,
+            },
+        ];
+        let body = build_messages_body(&req, &anthropic_quirks()).unwrap();
+        assert!(
+            count_cache_control(&body) <= MAX_CACHE_BREAKPOINTS,
+            "Anthropic allows at most {MAX_CACHE_BREAKPOINTS} cache_control breakpoints; got {}: {body}",
+            count_cache_control(&body)
+        );
+        // The cache hit isn't regressed: the large stable prefix still carries a breakpoint.
+        let sys = body["system"].as_array().unwrap();
+        let stable_prefix = sys
+            .iter()
+            .find(|b| {
+                b["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("planner-A-catalog"))
+            })
+            .expect("the stable prefix segment is present");
+        assert!(
+            stable_prefix.get("cache_control").is_some(),
+            "the largest stable-prefix segment must keep its breakpoint: {body}"
+        );
+    }
+
+    #[test]
+    fn four_cache_segments_are_all_kept() {
+        use flux_provider::SystemSegment;
+        // Exactly the current subscription layout (4 cache:true): none dropped, no regression.
+        let seg = |name: &str| SystemSegment {
+            text: name.to_string(),
+            cache: true,
+        };
+        let mut req = Request::new("claude-opus-4-8", "hi");
+        req.system_segments = vec![seg("a"), seg("b"), seg("c"), seg("d")];
+        let body = build_messages_body(&req, &anthropic_quirks()).unwrap();
+        assert_eq!(count_cache_control(&body), 4, "{body}");
     }
 
     #[test]

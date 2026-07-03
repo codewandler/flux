@@ -21,6 +21,17 @@ fn map_sql<E: std::fmt::Display>(e: E) -> Error {
     Error::Other(format!("event store: {e}"))
 }
 
+/// Begin a write transaction that takes the WAL write lock up front (`BEGIN IMMEDIATE`) (C-25). A
+/// deferred transaction (rusqlite's default `unchecked_transaction`) takes a read lock first and only
+/// tries to promote to the write lock at its first write — and SQLite refuses to run the busy handler
+/// on that read→write upgrade (it could deadlock), returning `SQLITE_BUSY` immediately. So a
+/// cross-process contender would still abort despite the `busy_timeout` set in [`EventStore::open`].
+/// Acquiring the write lock at `BEGIN` instead lets the busy handler wait the other writer out.
+fn begin_write(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
+    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(map_sql)
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -164,6 +175,19 @@ impl EventStore {
         let conn = Connection::open(path).map_err(map_sql)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(map_sql)?;
+        // C-25: coordinate cross-process writers on the shared `~/.flux/events.db`. WAL permits a
+        // single writer at a time; without a busy handler a second process (a `flux app run --serve`
+        // daemon + a CLI turn on the same file) gets `SQLITE_BUSY` immediately and the write is lost
+        // — `record_message` `?`-propagates and aborts the turn. A ~5s busy_timeout makes a contended
+        // writer WAIT for the lock instead of failing; the in-process `Mutex` still serializes one
+        // process's own writers, so this only ever matters across processes.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(map_sql)?;
+        // NORMAL is the recommended durability level under WAL: durable against application crashes
+        // (only a power loss can drop the last few committed transactions) while avoiding an fsync
+        // per commit — so single-process throughput does not regress.
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(map_sql)?;
         Self::init(conn)
     }
 
@@ -225,7 +249,7 @@ impl EventStore {
     pub fn create_session_with_context(&self, model: &str, ctx: &EventContext) -> Result<String> {
         let ts = now_ms();
         let conn = self.conn.lock().unwrap();
-        let tx = conn.unchecked_transaction().map_err(map_sql)?;
+        let tx = begin_write(&conn)?;
         tx.execute(
             "INSERT INTO streams \
              (model, created_at, updated_at, last_seq, msg_count, \
@@ -363,7 +387,7 @@ impl EventStore {
     /// worth preserving, so real deletion is append-only-safe.
     pub fn prune_empty(&self) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
-        let tx = conn.unchecked_transaction().map_err(map_sql)?;
+        let tx = begin_write(&conn)?;
         let empty: Vec<i64> = {
             let mut stmt = tx
                 .prepare("SELECT n FROM streams WHERE msg_count = 0")
@@ -406,7 +430,7 @@ impl EventStore {
     ///   stream survives even when it was created long before the cutoff.
     pub fn prune_inactive(&self, agent_id: &str, cutoff_ms: i64) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
-        let tx = conn.unchecked_transaction().map_err(map_sql)?;
+        let tx = begin_write(&conn)?;
         let expired: Vec<i64> = {
             let mut stmt = tx
                 .prepare("SELECT n FROM streams WHERE agent_id = ?1 AND updated_at < ?2")
@@ -443,7 +467,7 @@ impl EventStore {
                 return Ok(existing);
             }
         }
-        let tx = conn.unchecked_transaction().map_err(map_sql)?;
+        let tx = begin_write(&conn)?;
         // All events in a stream share its run context; read it once and stamp the stored event.
         let ctx = read_context(&tx, stream)?;
         let next_seq: i64 = tx
@@ -729,7 +753,7 @@ impl EventStore {
         &self,
         pricing: &flux_core::PricingTable,
     ) -> Result<Vec<projection::ModelCost>> {
-        let streams = self.all_streams()?;
+        let streams = self.aggregate_streams()?;
         let mut per_model: std::collections::BTreeMap<String, (flux_core::Usage, u64)> =
             std::collections::BTreeMap::new();
         for stream in &streams {
@@ -770,7 +794,7 @@ impl EventStore {
     /// Turn-efficiency rollup across every session — per-stream summaries merged by raw sums.
     pub fn efficiency_all(&self) -> Result<Option<projection::EfficiencySummary>> {
         let mut acc: Option<projection::EfficiencySummary> = None;
-        for stream in self.all_streams()? {
+        for stream in self.aggregate_streams()? {
             if let Some(s) = self.efficiency(&stream)? {
                 match &mut acc {
                     Some(a) => a.merge(&s),
@@ -781,9 +805,46 @@ impl EventStore {
         Ok(acc)
     }
 
-    /// Every session id (`s_<n>`), oldest first — the unfiltered enumeration primitive
-    /// [`cost_summary_all`](Self::cost_summary_all) folds over. Unlike [`list`](Self::list) (which
-    /// truncates to a limit and orders by recency for display), this returns everything.
+    /// The session ids the all-sessions rollups ([`cost_summary_all`](Self::cost_summary_all),
+    /// [`efficiency_all`](Self::efficiency_all)) fold over — every stream EXCEPT a correlated
+    /// sub-agent child (C-23). A `task` sub-agent runs a full turn on its own child stream in the
+    /// shared audit store, tagged with `correlation_id = <parent session>` (A-08); the parent turn
+    /// *also* records that child's total as a synthetic `CallUsage` on the parent stream (the C-06
+    /// rollup). Folding the child stream too would count the same spend twice, so the parent-side
+    /// rollup is chosen as the single authoritative source and the correlated child is dropped from
+    /// the aggregate. A stream whose `correlation_id` points OUTSIDE the current set (an orphaned or
+    /// pruned parent) is kept — better to count it once than lose it. Per-stream reads
+    /// ([`cost_summary`](Self::cost_summary) / [`efficiency`](Self::efficiency)) are unaffected: a
+    /// child's own session still reports its full spend.
+    fn aggregate_streams(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT n, correlation_id FROM streams ORDER BY n")
+            .map_err(map_sql)?;
+        let rows: Vec<(i64, Option<String>)> = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+            })
+            .map_err(map_sql)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_sql)?;
+        let ids: std::collections::HashSet<String> =
+            rows.iter().map(|(n, _)| format!("s_{n}")).collect();
+        Ok(rows
+            .into_iter()
+            .filter(|(_, corr)| match corr {
+                // Correlated child of a stream we are already folding → its spend is on the parent.
+                Some(parent) => !ids.contains(parent),
+                None => true,
+            })
+            .map(|(n, _)| format!("s_{n}"))
+            .collect())
+    }
+
+    /// Every session id (`s_<n>`), oldest first — the unfiltered enumeration primitive. Unlike
+    /// [`list`](Self::list) (which truncates to a limit and orders by recency for display), this
+    /// returns everything. (The all-sessions rollups fold over [`aggregate_streams`](Self::aggregate_streams)
+    /// instead, which excludes correlated sub-agent children to avoid double-counting — C-23.)
     pub fn all_streams(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
@@ -1516,6 +1577,162 @@ mod tests {
         let store = EventStore::open(&path).unwrap();
         assert_eq!(store.info(&id).unwrap().context, ctx);
         assert_eq!(store.list_for_account("tenant-7", 10).unwrap()[0].id, id);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// C-23: the `flux usage` all-sessions rollups must not double-count sub-agent spend. A sub-agent
+    /// runs a full turn on its OWN correlated child stream in the shared audit store (A-08) AND its
+    /// total is rolled up as a synthetic `CallUsage` on the parent turn (C-06). `cost_summary_all` /
+    /// `efficiency_all` fold every stream, so unless correlated child streams are excluded the child's
+    /// N tokens land twice. The parent-side rollup is the single authoritative source; the child
+    /// stream's own per-session reporting stays intact.
+    #[test]
+    fn cost_summary_all_does_not_double_count_correlated_children() {
+        let store = EventStore::in_memory().unwrap();
+
+        // Parent turn: records the child's total as a synthetic `CallUsage` (the C-06 rollup).
+        let parent = store.create_session("claude-sonnet-4-6").unwrap();
+        let tp = store
+            .begin_turn(&parent, "delegate", "claude-sonnet-4-6")
+            .unwrap();
+        store
+            .record_call_usage(
+                &parent,
+                tp,
+                "child-model",
+                Usage {
+                    input_tokens: 1_000_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .end_turn(&parent, tp, "accepted", 1, "done", None)
+            .unwrap();
+
+        // The child runs its own turn on a correlated child stream in the SAME store (A-08).
+        let child = store
+            .create_session_with_context(
+                "child-model",
+                &EventContext {
+                    agent_id: Some("subagent:scout".into()),
+                    correlation_id: Some(parent.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let tc = store.begin_turn(&child, "scout", "child-model").unwrap();
+        store
+            .record_call_usage(
+                &child,
+                tc,
+                "child-model",
+                Usage {
+                    input_tokens: 1_000_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .end_turn(&child, tc, "accepted", 1, "done", None)
+            .unwrap();
+
+        let pricing = flux_core::PricingTable::builtin();
+
+        // All-sessions cost: the child's 1M tokens counted ONCE (the parent-side rollup), not 2M,
+        // and the synthetic parent-side call is the single call, not two.
+        let all = store.cost_summary_all(&pricing).unwrap();
+        let child_row = all
+            .iter()
+            .find(|m| m.model == "child-model")
+            .expect("child-model row present");
+        assert_eq!(
+            child_row.usage.input_tokens, 1_000_000,
+            "child spend counted once, not doubled: {all:?}"
+        );
+        assert_eq!(
+            child_row.calls, 1,
+            "the synthetic parent-side call is the single authoritative source: {all:?}"
+        );
+
+        // Per-session (single-stream) reporting is UNCHANGED: the child's own stream still reports
+        // its full spend, and the parent's still includes the rolled-up child total.
+        let child_solo = store.cost_summary(&child, &pricing).unwrap();
+        assert_eq!(
+            child_solo
+                .iter()
+                .find(|m| m.model == "child-model")
+                .unwrap()
+                .usage
+                .input_tokens,
+            1_000_000
+        );
+        let parent_solo = store.cost_summary(&parent, &pricing).unwrap();
+        assert_eq!(
+            parent_solo
+                .iter()
+                .find(|m| m.model == "child-model")
+                .unwrap()
+                .usage
+                .input_tokens,
+            1_000_000
+        );
+
+        // Efficiency all-sessions: the correlated child turn does not fold in twice either — the
+        // parent turn is the top-level unit and the sub-agent's work rolls into it.
+        let eff = store.efficiency_all().unwrap().expect("completed turns");
+        assert_eq!(
+            eff.turns, 1,
+            "only the parent turn counts at top level; the sub-agent turn rolls into it"
+        );
+        assert_eq!(
+            eff.calls, 1,
+            "the single synthetic call, not the child's duplicate"
+        );
+    }
+
+    /// C-25: two `EventStore` handles on the same file (a `serve` daemon + a CLI turn on the shared
+    /// `~/.flux/events.db`) must not lose a write to `SQLITE_BUSY`. WAL permits one writer at a time;
+    /// here a raw connection holds the write lock, released after a short delay. With `busy_timeout`
+    /// set the contended writer WAITS for the lock and succeeds; without it the write returns
+    /// `SQLITE_BUSY` immediately and aborts.
+    #[test]
+    fn concurrent_writers_wait_on_busy_timeout_instead_of_erroring() {
+        use std::time::Duration;
+        let path = std::env::temp_dir().join(format!(
+            "flux-events-c25-busy-{}-{:?}.db",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        // Set up a session via one handle.
+        let s1 = EventStore::open(&path).unwrap();
+        let sid = s1.create_session("m").unwrap();
+
+        // A second handle on the SAME file (a separate connection = a separate process's writer).
+        let s2 = EventStore::open(&path).unwrap();
+
+        // Hold the single WAL write lock on a raw connection: BEGIN IMMEDIATE acquires it now.
+        let blocker = rusqlite::Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        // Release the lock after a short delay, from another thread.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            blocker.execute_batch("COMMIT").unwrap();
+        });
+
+        // With busy_timeout set this append waits ~300ms for the lock and succeeds; without it the
+        // write returns SQLITE_BUSY at once → Err.
+        let res = s2.record_message(&sid, &Message::user_text("under contention"));
+        releaser.join().unwrap();
+
+        assert!(
+            res.is_ok(),
+            "a contended writer must wait on busy_timeout, not error: {res:?}"
+        );
+        assert_eq!(s2.conversation(&sid).unwrap().len(), 1, "the write landed");
         let _ = std::fs::remove_file(&path);
     }
 }

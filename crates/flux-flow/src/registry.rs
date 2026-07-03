@@ -129,12 +129,20 @@ impl<'a> OpRegistry<'a> {
         out
     }
 
-    /// The ops a plan calls that carry a write or destructive effect — the enforcement side of
-    /// gather-plan read-only validation (A-13: a `gather: true` plan must call none of these). A
-    /// composite call counts via its OWN declared `risk`/`effects` ([`get`](Self::get) resolves it
-    /// to [`composite_signature`]), which [`analyze_composites`] validates at registration time to
-    /// already cover the composite's body transitively — so no separate expansion is needed here to
-    /// catch a write hidden a level down inside a composite. Unknown names are not reported here
+    /// The ops a plan calls that escape the read-only gather sandbox — the enforcement side of
+    /// gather-plan validation (A-13: a `gather: true` plan must call none of these). An op is
+    /// gather-safe when its effects stay within a *read-only orientation*: `Read` and `Filesystem`
+    /// (a filesystem **read**, e.g. `grep`/`glob` carry `[Read, Filesystem]`), plus a bare `Process`
+    /// read-command like `git_status` (`Effect::Process` at `Risk::Low` — a deliberate A-13
+    /// classification, pinned by `mutating_ops_in_flags_write_effect_and_composite_transitively`).
+    /// Anything that escapes that sandbox is mutating and is reported here: a `Write`, `Network`
+    /// (`http`/`run_plan`), `Browser`, or `LocalSystem` effect (arbitrary local execution — `cargo`/
+    /// `bash` carry `[Process, LocalSystem]`), plus any `Destructive`-risk op. Before L-29 this only
+    /// caught `Write`/`Destructive`, so an advertised `[Network]` or `[Process, LocalSystem]` op
+    /// slipped through a "read-only orientation" round undetected. A composite call counts via its
+    /// OWN declared `effects` ([`get`](Self::get) resolves it to [`composite_signature`]), which
+    /// [`analyze_composites`] validates at registration to already cover the composite's body
+    /// transitively — so no separate body expansion is needed here. Unknown names are not reported
     /// (`analyze_flow`'s unknown-operation diagnostic owns those). Empty means the plan is
     /// effect-clean.
     pub fn mutating_ops_in(&self, body: &[Node]) -> Vec<String> {
@@ -145,9 +153,15 @@ impl<'a> OpRegistry<'a> {
                     return;
                 }
                 if let Some(sig) = self.get(op) {
-                    let mutates =
-                        sig.risk == Risk::Destructive || sig.effects.contains(&Effect::Write);
-                    if mutates {
+                    // Effects that escape a read-only orientation. `Read`/`Filesystem` (filesystem
+                    // reads) and bare `Process` (fixed read-commands) stay gather-safe.
+                    let escapes = sig.effects.iter().any(|e| {
+                        matches!(
+                            e,
+                            Effect::Write | Effect::Network | Effect::Browser | Effect::LocalSystem
+                        )
+                    });
+                    if escapes || sig.risk == Risk::Destructive {
                         out.push(op.clone());
                     }
                 }

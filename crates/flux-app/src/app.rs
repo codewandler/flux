@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
-use flux_agent::{AgentSpec, Permissions};
+use flux_agent::{AgentSpec, Permissions, DEFAULT_COMPACT_THRESHOLD_CHARS};
 use flux_core::{Error, Result};
 use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
@@ -788,6 +788,25 @@ fn build_executor(
 /// `settings.system_prompt_files` paths — read through the guarded, workspace-confined `system` so a
 /// declarative bot can keep a long persona in `bot/PERSONA.md` instead of inlining it (flux D-11). A
 /// non-string entry or an unreadable path is a clean error. `model` falls back to the host default.
+/// Resolve a served/agentic agent's compaction threshold (A-22). A `run_agent` target binds its
+/// conversation to ONE persistent session (`session_for`), so without a working threshold it
+/// re-sends the whole growing transcript every turn — linear cost, then a hard provider
+/// context-window error. Precedence: per-agent (`settings.compact_threshold_chars`) > env
+/// (`FLUX_COMPACT_CHARS`, the same knob the CLI honours) > the sane non-zero
+/// [`DEFAULT_COMPACT_THRESHOLD_CHARS`]. A per-agent `0` disables compaction explicitly.
+fn compact_threshold_for_decl(decl: &AgentDecl) -> usize {
+    decl.settings
+        .get("compact_threshold_chars")
+        .and_then(serde_json::Value::as_u64)
+        .map(|n| n as usize)
+        .or_else(|| {
+            std::env::var("FLUX_COMPACT_CHARS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(DEFAULT_COMPACT_THRESHOLD_CHARS)
+}
+
 async fn agent_spec_from_decl(
     decl: &AgentDecl,
     default_model: &str,
@@ -853,6 +872,7 @@ async fn agent_spec_from_decl(
         },
         cwd,
         context,
+        compact_threshold_chars: compact_threshold_for_decl(decl),
         ..AgentSpec::default()
     })
 }
@@ -1144,6 +1164,54 @@ trigger t1
             vec!["read".to_string(), "now".to_string()]
         );
         assert!(spec.permissions.deny.is_empty());
+    }
+
+    /// A-22: a served/agentic agent target gets a NON-ZERO compaction threshold by default (so its
+    /// persistent-session conversation is bounded), and `settings.compact_threshold_chars` overrides
+    /// it per-agent — including an explicit `0` to disable compaction. Before the fix every non-CLI
+    /// construction used `AgentSpec::default()`'s `0`, so `maybe_compact` was a no-op and the
+    /// transcript grew until the provider context window blew.
+    #[tokio::test]
+    async fn agent_spec_has_nonzero_compaction_default_and_per_agent_override() {
+        let system = System::new(Workspace::new(".").unwrap());
+        let base = AgentDecl {
+            name: "a".into(),
+            model: None,
+            tools: vec![],
+            datasources: vec![],
+            description: Some("be terse".into()),
+            settings: Value::Null,
+        };
+
+        // No per-agent setting → a sane non-zero default (the served agent compacts).
+        let spec = agent_spec_from_decl(&base, "m", PathBuf::from("."), &system)
+            .await
+            .unwrap();
+        assert!(
+            spec.compact_threshold_chars > 0,
+            "a served agent must compact by default, got {}",
+            spec.compact_threshold_chars
+        );
+
+        // Per-agent override wins.
+        let tuned = AgentDecl {
+            settings: json!({ "compact_threshold_chars": 9999 }),
+            ..base.clone()
+        };
+        let spec = agent_spec_from_decl(&tuned, "m", PathBuf::from("."), &system)
+            .await
+            .unwrap();
+        assert_eq!(spec.compact_threshold_chars, 9999);
+
+        // …including disabling compaction explicitly.
+        let disabled = AgentDecl {
+            settings: json!({ "compact_threshold_chars": 0 }),
+            ..base.clone()
+        };
+        let spec = agent_spec_from_decl(&disabled, "m", PathBuf::from("."), &system)
+            .await
+            .unwrap();
+        assert_eq!(spec.compact_threshold_chars, 0);
     }
 
     #[tokio::test]

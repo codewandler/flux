@@ -1119,9 +1119,11 @@ fn ops_catalog(ops: &OpRegistry) -> String {
 /// only to this rendering; `FlowStore::view` itself stays uncapped (it also serves symbol
 /// resolution and context budgeting).
 const SYMBOLS_LINE_CAP: usize = 64;
-/// Hard character backstop for the rendered symbols block (a few huge summaries can blow the
-/// budget long before the line cap).
-const SYMBOLS_CHAR_CAP: usize = 10_000;
+/// Hard **byte** backstop for the rendered symbols block, header + marker included (a few huge
+/// summaries can blow the budget long before the line cap). This is a byte budget — it is measured
+/// against `line.len()` / `block.len()`, not `chars().count()` — so the name and the bound agree
+/// (A-24; the old "10k chars" claim was untrue for multibyte summaries).
+const SYMBOLS_BYTE_CAP: usize = 10_000;
 
 fn symbols_block(view: Option<&SessionView>) -> String {
     let cap = std::env::var("FLUX_SYMBOLS_CAP")
@@ -1141,10 +1143,10 @@ fn symbols_block_bounded(view: Option<&SessionView>, cap: Option<usize>) -> Stri
         Some(v) if !v.symbols.is_empty() => v,
         _ => return String::new(),
     };
-    let (line_cap, char_cap) = match cap {
+    let (line_cap, byte_cap) = match cap {
         Some(0) => (usize::MAX, usize::MAX),
-        Some(n) => (n, SYMBOLS_CHAR_CAP),
-        None => (SYMBOLS_LINE_CAP, SYMBOLS_CHAR_CAP),
+        Some(n) => (n, SYMBOLS_BYTE_CAP),
+        None => (SYMBOLS_LINE_CAP, SYMBOLS_BYTE_CAP),
     };
     let pinned = v
         .symbols
@@ -1156,9 +1158,14 @@ fn symbols_block_bounded(view: Option<&SessionView>, cap: Option<usize>) -> Stri
         .filter(|s| s.visibility != flux_lang::ast::Visibility::Pinned);
     let mut s =
         String::from("\nExisting session symbols (reference these instead of re-fetching):\n");
+    // Count the header AND reserve the worst-case omission marker up front so the finished block
+    // (header + kept lines + marker) can't exceed `byte_cap` — both were omitted from the old tally,
+    // which ran ~110 B over (A-24). Worst case: every symbol omitted, so reserve the marker for the
+    // full count.
+    let marker_reserve = symbols_omission_marker(v.symbols.len()).len();
+    let mut used = s.len().saturating_add(marker_reserve);
     let mut kept = 0usize;
     let mut omitted = 0usize;
-    let mut chars = 0usize;
     for sym in pinned.chain(visible) {
         let ty = sym
             .ty
@@ -1166,20 +1173,25 @@ fn symbols_block_bounded(view: Option<&SessionView>, cap: Option<usize>) -> Stri
             .map(|t| format!(": {t}"))
             .unwrap_or_default();
         let line = format!("- ${}{} = {}\n", sym.name.0, ty, sym.summary);
-        if kept >= line_cap || chars.saturating_add(line.len()) > char_cap {
+        if kept >= line_cap || used.saturating_add(line.len()) > byte_cap {
             omitted += 1;
             continue;
         }
-        chars += line.len();
+        used += line.len();
         kept += 1;
         s.push_str(&line);
     }
     if omitted > 0 {
-        s.push_str(&format!(
-            "… {omitted} older symbol(s) omitted (still referencable as $name)\n"
-        ));
+        s.push_str(&symbols_omission_marker(omitted));
     }
     s
+}
+
+/// The trailing marker naming how many session symbols were dropped from the digest (they stay
+/// referencable as `$name`). Factored out so [`symbols_block_bounded`] can reserve its length up
+/// front and keep `block.len() <= SYMBOLS_BYTE_CAP` (A-24).
+fn symbols_omission_marker(omitted: usize) -> String {
+    format!("… {omitted} older symbol(s) omitted (still referencable as $name)\n")
 }
 
 /// The planner grammar: top-level AST shape + node kinds auto-generated from `Node` in `ast.rs`
@@ -1598,7 +1610,7 @@ mod tests {
     #[test]
     fn symbols_block_char_backstop_drops_oversized_and_continues() {
         use flux_lang::ast::Visibility;
-        let huge = "x".repeat(SYMBOLS_CHAR_CAP + 1);
+        let huge = "x".repeat(SYMBOLS_BYTE_CAP + 1);
         let view = SessionView {
             symbols: vec![
                 sym("small_before", "v", Visibility::Visible),
@@ -1618,6 +1630,36 @@ mod tests {
             "drop-and-continue: the symbol after the oversized one survives: {block}"
         );
         assert!(block.contains("1 older symbol(s) omitted"));
+    }
+
+    /// A-24: the rendered symbols digest — header + kept lines + omission marker — never exceeds the
+    /// byte cap (the header and marker were previously left out of the tally, running ~110 B over).
+    #[test]
+    fn symbols_block_stays_within_cap() {
+        use flux_lang::ast::Visibility;
+        // Many small symbols so the BYTE cap (not the line cap) is what bites: raise the line cap
+        // well out of the way and pile on enough bytes to overflow SYMBOLS_BYTE_CAP several times.
+        let symbols: Vec<crate::state::SymbolView> = (0..4000)
+            .map(|i| {
+                sym(
+                    &format!("symbol_{i}"),
+                    "a summary that adds up over time",
+                    Visibility::Visible,
+                )
+            })
+            .collect();
+        let view = SessionView { symbols };
+        let block = symbols_block_bounded(Some(&view), Some(1_000_000));
+        assert!(
+            block.len() <= SYMBOLS_BYTE_CAP,
+            "symbols block must stay within its byte cap: len {} > cap {SYMBOLS_BYTE_CAP}",
+            block.len()
+        );
+        // We deliberately overflowed, so the clip is still visible.
+        assert!(
+            block.contains("older symbol(s) omitted"),
+            "a visible clip marker is present: {block}"
+        );
     }
 
     /// A-09: every worked example in the grammar must parse as a real `DraftAst` (guards the prompt

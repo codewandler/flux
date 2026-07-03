@@ -71,6 +71,34 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 
 ## Next
 
+### Library hardening (epic) — **shipped 2026-07-03 (13/13, full gate green)**
+
+Three adversarial subsystem audits (2026-07-03, one Opus reader each over the context-assembly,
+evidence/event-store, and flux-lang/flow paths) surfaced 15 code-confirmed residual defects **inside
+already-shipped stories** — every one carrying `file:line` evidence and a concrete failure scenario. The
+headline three are 🔴 silent/security: an optimizer read-collector that drops `Obj`/`List` call args and so
+parallelizes a reader with its writer / reuses a stale CSE value on the canonical named-arg form
+([L-26](stories/L-26-optimizer-nested-arg-reads.md)); a `<knowledge-base>` body emitted verbatim so a
+retrieved/poisoned RAG record can close the containment tag and inject top-level system content
+([A-21](stories/A-21-knowledge-base-body-escape.md)); and the durable evidence trail persisted **unredacted**
+so a `Bearer` token in a plan/bash arg lands in the clear in `events.db`
+([C-22](stories/C-22-redact-durable-evidence-trail.md)). Then 🟠 enforcement/durability — the gather phase's
+effect gate only blocks `Write`/`Destructive` not `Network`/`Process`
+([L-29](stories/L-29-gather-effect-gate.md)), `events.db` has no `busy_timeout` so a serve-daemon + CLI
+collide on `SQLITE_BUSY` ([C-25](stories/C-25-events-db-busy-timeout.md)), and the observation watermark
+advances past failed writes ([C-24](stories/C-24-observation-flush-failure-watermark.md)); plus 🟡 accounting/
+hygiene — sub-agent spend double-counted in the all-sessions rollups
+([C-23](stories/C-23-subagent-usage-double-count.md)), served/agentic agents that never compact
+([A-22](stories/A-22-served-agents-compaction.md)), the 4-breakpoint prompt-cache ceiling with no guard
+([A-23](stories/A-23-cache-breakpoint-cap.md)), await/resume continuations with no turn telemetry
+([C-26](stories/C-26-resume-turn-telemetry.md)), a ledger fast-forward that silently drops an
+un-rehydratable binding ([L-28](stories/L-28-ledger-rehydration-guard.md)), analyzer positions the runtime
+rejects ([L-27](stories/L-27-analyzer-contract-completion-r2.md)), and context byte-budgets that overshoot
+their cap ([A-24](stories/A-24-context-byte-budget-overshoot.md)). Scoped to the **library core** — crate
+release and the plugin platform (D-46..D-49) are explicitly out. Each ships with the failing-first test named
+in its Acceptance; order: correctness/security → enforcement/durability → hygiene. Epic design:
+[library-hardening.md](designs/library-hardening.md).
+
 ### flux-lang v1 hardening (epic)
 
 A full review of the language pillar (2026-07-02: three scoped deep-dives plus first-hand

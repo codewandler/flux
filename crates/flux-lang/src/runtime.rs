@@ -705,15 +705,17 @@ impl FailureKind {
     }
 }
 
-/// The symbol a top-level statement directly binds a runtime value to, if any (plus its declared type,
-/// when known) — used to rehydrate a skipped statement's recorded value back into scope on ledger
-/// fast-forward. Deliberately narrow (no recursion into nested bodies, unlike
-/// `analyze::collect_bound_symbols`): only the statement's OWN binder matters here, because a skipped
-/// statement's nested work never ran again either.
-fn top_level_bind(node: &Node) -> Option<(&SymbolName, Option<&TypeRef>)> {
+/// The symbols a top-level statement directly binds runtime values to (plus each declared type, when
+/// known) — used to rehydrate a skipped statement's recorded value back into scope on ledger
+/// fast-forward, and to recognise (in the fast-forward guard) that a statement HAS a binding to lose.
+/// Deliberately narrow (no recursion into nested bodies, unlike `analyze::collect_bound_symbols`):
+/// only the statement's OWN binder(s) matter here, because a skipped statement's nested work never
+/// ran again either. Returns a `Vec` because a `parallel` binds one symbol per branch (L-28); every
+/// other kind binds at most one.
+fn top_level_bind(node: &Node) -> Vec<(&SymbolName, Option<&TypeRef>)> {
     match node {
-        Node::Bind { name, ty, .. } => Some((name, ty.as_ref())),
-        Node::Memo { name, ty, .. } => Some((name, ty.as_ref())),
+        Node::Bind { name, ty, .. } => vec![(name, ty.as_ref())],
+        Node::Memo { name, ty, .. } => vec![(name, ty.as_ref())],
         Node::Seq { bind: Some(b), .. }
         | Node::Pipe { bind: Some(b), .. }
         | Node::Retry { bind: Some(b), .. }
@@ -724,14 +726,17 @@ fn top_level_bind(node: &Node) -> Option<(&SymbolName, Option<&TypeRef>)> {
         | Node::Budget { bind: Some(b), .. }
         | Node::CapScope { bind: Some(b), .. }
         | Node::Scope { bind: Some(b), .. }
-        | Node::Once { bind: Some(b), .. } => Some((b, None)),
+        | Node::Once { bind: Some(b), .. } => vec![(b, None)],
         Node::Each {
             collect: Some(c), ..
-        } => Some((c, None)),
+        } => vec![(c, None)],
         Node::Repeat {
             collect: Some(c), ..
-        } => Some((c, None)),
-        _ => None,
+        } => vec![(c, None)],
+        // A `parallel` binds each branch's result to the branch name; every branch is a top-level
+        // binder for rehydration/guard purposes (L-28).
+        Node::Parallel { branches } => branches.iter().map(|b| (&b.name, None)).collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -1139,23 +1144,52 @@ async fn run_top_level_resumable(
             let Some(entry) = by_node.get(&(idx as u32)) else {
                 continue; // a pass-through checkpoint/await position — nothing to ledger here.
             };
+            let binds = top_level_bind(node);
             if let Some(vid) = &entry.value {
-                if let Some(value) = store.get_value(vid)? {
-                    let text = value_text(&value);
-                    if let Some((name, ty)) = top_level_bind(node) {
-                        let ty_label = ty.map(TypeRef::label);
-                        store.bind(
-                            session_id,
-                            name,
-                            vid,
-                            ty_label.as_deref(),
-                            &summarize(&text),
-                            Visibility::Visible,
-                        )?;
+                match store.get_value(vid)? {
+                    Some(value) => {
+                        let text = value_text(&value);
+                        // Rebind the statement's OWN binder to the recorded value. A single-binder
+                        // statement (`$x = …`, a `seq`/`retry`/… `bind`, an `each`/`repeat`
+                        // `collect`) rebinds that symbol. A `parallel` records ONE value (its last
+                        // branch's) yet binds several symbols, and each branch's binding is already
+                        // durable in the store — so the single recorded value never overwrites them;
+                        // its arm exists so the guard below still recognises it as a binder.
+                        if let [(name, ty)] = binds.as_slice() {
+                            let ty_label = ty.map(TypeRef::label);
+                            store.bind(
+                                session_id,
+                                name,
+                                vid,
+                                ty_label.as_deref(),
+                                &summarize(&text),
+                                Visibility::Visible,
+                            )?;
+                        }
+                        if !text.is_empty() {
+                            last = text;
+                        }
                     }
-                    if !text.is_empty() {
-                        last = text;
+                    // The statement bound symbol(s) but its recorded value is gone from the value
+                    // store — fast-forwarding past it would silently drop the binding and a later
+                    // statement would die on "unbound symbol". Fail the resume LOUDLY instead (L-28).
+                    // Unreachable on the in-session path (the value store is INSERT-only, never
+                    // evicted); reachable only under a cross-store / fresh-store resume (L-25).
+                    None if !binds.is_empty() => {
+                        return Err(FlowError::Runtime(format!(
+                            "cannot resume: statement {idx} bound {} but its recorded value `{}` is \
+                             missing from the value store — the ledger and value store are out of sync",
+                            binds
+                                .iter()
+                                .map(|(n, _)| format!("${}", n.0))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            vid.0,
+                        )));
                     }
+                    // A statement that produced a value but bound no symbol (a bare `call` whose
+                    // result only fed `last`): nothing to rehydrate, nothing lost — carry on.
+                    None => {}
                 }
             }
             store.append_event(
@@ -3445,6 +3479,57 @@ fn eval_expr_value(
     }
 }
 
+/// Statically validate an `expr` `formula` against its declared `var_keys` — the analyzer-side twin
+/// of [`eval_expr_value`], reusing the SAME tokenizer/parser so the analyzer accepts exactly what
+/// the runtime will (L-27). Returns one message per problem: a variable-position identifier absent
+/// from `vars` (the runtime would fail to resolve it), a call to an unknown built-in function, or a
+/// structurally malformed formula the parser rejects. `vars` is an explicit, unambiguous scope, so
+/// this has zero false positives — `true`/`false` literals and the built-in function names are not
+/// treated as variables.
+pub(crate) fn validate_expr_formula(
+    formula: &str,
+    var_keys: &std::collections::BTreeSet<&str>,
+) -> Vec<String> {
+    let toks: Vec<Tok> = tokenize_expr(formula).into_iter().collect();
+    let mut diags = Vec::new();
+    // A complete dummy binding for every variable-position ident, so the structural parse below
+    // fails only on a genuinely malformed formula — never merely on an unbound name (which gets its
+    // own, more actionable diagnostic here).
+    let mut dummy: std::collections::BTreeMap<String, ExprVal> = std::collections::BTreeMap::new();
+    for (i, tok) in toks.iter().enumerate() {
+        let Tok::Ident(name) = tok else { continue };
+        // An ident immediately followed by `(` is a function call, not a variable read.
+        if matches!(toks.get(i + 1), Some(Tok::Op(s)) if s == "(") {
+            if !is_known_expr_fn(name) {
+                diags.push(format!(
+                    "`expr` formula calls unknown function `{name}(…)` — the built-ins are \
+                     round/abs/min/max/len/lower/upper/trim/replace/repeat/reverse/contains/concat"
+                ));
+            }
+            continue;
+        }
+        // `true`/`false` are boolean literals, not variables.
+        if name == "true" || name == "false" {
+            continue;
+        }
+        dummy.insert(name.clone(), ExprVal::Num(1.0));
+        if !var_keys.contains(name.as_str()) {
+            diags.push(format!(
+                "`expr` formula references `{name}` which is not declared in `vars` — add it to \
+                 the `vars` map (e.g. `{{\"{name}\": $symbol}}`) so the runtime can resolve it"
+            ));
+        }
+    }
+    // Only run the structural check when nothing more specific already fired: a genuinely malformed
+    // formula (e.g. a trailing operator or unbalanced parens) has no named cause above.
+    if diags.is_empty() && eval_expr_value(formula, &dummy).is_err() {
+        diags.push(format!(
+            "`expr` formula is malformed and cannot be parsed: `{formula}`"
+        ));
+    }
+    diags
+}
+
 /// A lexical token of an `expr` formula.
 #[derive(Clone, Debug, PartialEq)]
 enum Tok {
@@ -3775,6 +3860,27 @@ fn expr_call_fn(name: &str, args: &[ExprVal]) -> Option<ExprVal> {
         "concat" => Some(ExprVal::Str(args.iter().map(|a| a.as_text()).collect())),
         _ => None,
     }
+}
+
+/// Whether `name` is a built-in `expr` function (the set [`expr_call_fn`] dispatches). Used by
+/// [`validate_expr_formula`] to tell a function call from an undeclared variable reference.
+fn is_known_expr_fn(name: &str) -> bool {
+    matches!(
+        name,
+        "round"
+            | "abs"
+            | "min"
+            | "max"
+            | "len"
+            | "lower"
+            | "upper"
+            | "trim"
+            | "reverse"
+            | "contains"
+            | "replace"
+            | "repeat"
+            | "concat"
+    )
 }
 
 /// Format a float cleanly: integer results drop the decimal, fractional keep up to 2 places.
@@ -5817,6 +5923,138 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, RunEvent::PlanResumed { skipped, .. } if *skipped == 2)));
+    }
+
+    /// L-28: a resumed run whose ledgered value can't be looked up in the (fresh / cross-store) value
+    /// store must fail LOUDLY naming the lost statement, not silently skip the rebind and later die on
+    /// an "unbound symbol". Simulates L-25's cross-store resume by resuming against a *fresh* store
+    /// that never held the recorded values.
+    #[tokio::test]
+    async fn resume_with_missing_ledger_value_is_a_hard_error() {
+        let host = CfHost::new();
+        let store1 = MemStore::new();
+
+        let bind_a = flow_bind("a", echo("hello"));
+        let bind_b = flow_bind("b", echo("world"));
+        let halted_ast = DraftAst {
+            body: vec![bind_a.clone(), bind_b.clone(), call("boom", vec![])],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let halted = execute_flow_resumable(&store1, &host, "s1", &halted_ast, &mut sink, None)
+            .await
+            .unwrap();
+        assert!(halted.failure.is_some());
+
+        let ledger = ResumeLedger::fold(&store1.events("s1")).expect("an open halt latch exists");
+        assert_eq!(ledger.completed.len(), 2);
+
+        // Resume against a FRESH store that never stored the ledgered values — `get_value` returns
+        // `None` for $a/$b, so the fast-forward cannot rehydrate them.
+        let fresh = MemStore::new();
+        let resumed_ast = DraftAst {
+            body: vec![
+                bind_a,
+                bind_b,
+                Node::Bind {
+                    name: SymbolName("c".into()),
+                    value: Box::new(Node::Fmt {
+                        template: "{a}-{b}".into(),
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink2 = BufferSink::default();
+        let err =
+            execute_flow_resumable(&fresh, &host, "s2", &resumed_ast, &mut sink2, Some(&ledger))
+                .await
+                .expect_err("a missing rehydration value must be a hard resume error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("statement 0") && msg.contains("$a"),
+            "the hard resume error must name the lost statement and its symbol, got: {msg}"
+        );
+    }
+
+    /// L-28: `top_level_bind` gains a `parallel` arm — a `parallel` statement directly binds ALL its
+    /// branch names, so the fast-forward guard sees it as a binder (and a future cross-store resume
+    /// can rehydrate its branches) instead of treating it as a no-op.
+    #[test]
+    fn top_level_bind_covers_parallel_branches() {
+        let node = Node::Parallel {
+            branches: vec![
+                crate::ast::Branch {
+                    name: "left".into(),
+                    body: vec![echo("l")],
+                },
+                crate::ast::Branch {
+                    name: "right".into(),
+                    body: vec![echo("r")],
+                },
+            ],
+        };
+        let binds: Vec<String> = top_level_bind(&node)
+            .into_iter()
+            .map(|(n, _)| n.0.clone())
+            .collect();
+        assert_eq!(binds, vec!["left".to_string(), "right".to_string()]);
+    }
+
+    /// L-28: the parallel arm feeds the missing-value guard — a fast-forwarded `parallel` whose
+    /// recorded value is absent from the resumed store is a hard error (not a silent skip that drops
+    /// every branch binding).
+    #[tokio::test]
+    async fn resume_with_missing_parallel_value_is_a_hard_error() {
+        let host = CfHost::new();
+        let store1 = MemStore::new();
+
+        let par = Node::Parallel {
+            branches: vec![
+                crate::ast::Branch {
+                    name: "left".into(),
+                    body: vec![echo("l")],
+                },
+                crate::ast::Branch {
+                    name: "right".into(),
+                    body: vec![echo("r")],
+                },
+            ],
+        };
+        let halted_ast = DraftAst {
+            body: vec![par.clone(), call("boom", vec![])],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let halted = execute_flow_resumable(&store1, &host, "s1", &halted_ast, &mut sink, None)
+            .await
+            .unwrap();
+        assert!(halted.failure.is_some());
+
+        let ledger = ResumeLedger::fold(&store1.events("s1")).expect("an open halt latch exists");
+        assert_eq!(
+            ledger.completed.len(),
+            1,
+            "the parallel completed before boom"
+        );
+
+        let fresh = MemStore::new();
+        let resumed_ast = DraftAst {
+            body: vec![par, call("boom", vec![])],
+            ..Default::default()
+        };
+        let mut sink2 = BufferSink::default();
+        let err =
+            execute_flow_resumable(&fresh, &host, "s2", &resumed_ast, &mut sink2, Some(&ledger))
+                .await
+                .expect_err("a missing parallel rehydration value must be a hard resume error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("statement 0") && (msg.contains("$left") || msg.contains("$right")),
+            "the hard resume error must name the lost parallel statement and a branch symbol, got: {msg}"
+        );
     }
 
     /// Regression (found by A-16's loop-host tests): `ResumeLedger::fold`'s latch-closing check must

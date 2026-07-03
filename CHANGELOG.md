@@ -6,6 +6,49 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **Library hardening (epic).** Three adversarial subsystem audits (context, evidence,
+  flux-lang/flow) surfaced 15 code-confirmed residual defects inside already-shipped stories; all
+  are fixed with the failing-first test named in each story, full gate green (1218 tests).
+  - *flux-lang / flow.* **L-26** — the CSE/batch optimizer's `collect_var_reads` dropped `Obj`/
+    `List`/`Fmt`/`Expr` under a `_ => {}`, so a `$var` read inside a named-argument object was
+    invisible to the batch/CSE hazard check (a reader could parallelize with its writer; CSE could
+    reuse a stale value) — now routed through the exhaustive `for_each_node`, with a property test.
+    **L-27** — the `route` selector, `verify` `expect`, and `expr` formula were analyzer positions
+    the runtime rejected but the analyzer accepted; now diagnosed at analysis time (bind-it-first
+    hint / formula validated against its own `vars`). **L-29** — the gather-phase effect gate only
+    blocked `Write`/`Destructive`, letting an advertised `Network`/`Process+LocalSystem` op (http,
+    `run_plan`, cargo, bash) execute in a "read-only orientation" round; it now flags any
+    `Write`/`Network`/`Browser`/`LocalSystem` effect or `Destructive` risk while keeping
+    `Read`/`Filesystem`/bare-`Process` (`git_status`) gather-safe. **L-28** — a resumable-mode
+    ledger fast-forward silently dropped a binding when a ledgered value couldn't be rehydrated;
+    now a hard resume error naming the lost statement, plus a `parallel` arm in `top_level_bind`.
+  - *Context management.* **A-21** — `<knowledge-base>` block bodies were emitted verbatim, so
+    untrusted RAG/datasource text containing `</knowledge-base>` could close the containment tag and
+    inject top-level system content; the body is now neutralized (case-insensitive,
+    whitespace-tolerant) in both render paths, before truncation. **A-22** — served/agentic/SDK
+    agents built with `AgentSpec::default()` never compacted (`compact_threshold_chars = 0`), so a
+    persistent-session channel target grew unbounded; a non-zero default + `with_compaction` +
+    per-agent/env/default precedence now bounds it (CLI and one-shot `flux run` unchanged). **A-23**
+    — the Anthropic 4-`cache_control` ceiling was unguarded (subscription-claude sat at exactly 4);
+    `segmented_system_field` now caps breakpoints at 4, keeping the largest (stable prefix
+    preserved). **A-24** — `render_knowledge_blocks` and `symbols_block_bounded` overshot their byte
+    budgets (marker/header uncounted); both now reserve it and pin `len <= cap`
+    (`SYMBOLS_CHAR_CAP`→`SYMBOLS_BYTE_CAP`, honest doc).
+  - *Evidence.* **C-22** — the durable evidence trail (tool-call observations + rendered plan text)
+    was persisted to `events.db` unredacted; both are now scrubbed through the executor's `Redactor`
+    before persistence, so a secret in a plan/bash arg no longer lands in the clear. **C-23** —
+    sub-agent spend was double-counted in the all-sessions cost/efficiency rollups (parent synthetic
+    `CallUsage` + child's own stream); correlated child streams are now excluded from the
+    all-streams folds (per-session reporting unchanged). **C-24** — `flush_observations` advanced
+    the watermark past failed writes (silent permanent loss); it now advances only past successful
+    writes and retries the rest. **C-25** — the shared `events.db` set no `busy_timeout`, so a
+    serve-daemon + CLI collided on `SQLITE_BUSY`; `open` now sets `busy_timeout`/`synchronous=NORMAL`
+    and writes use `BEGIN IMMEDIATE`. **C-26** — await/resume (reply-parking) continuations recorded
+    no turn telemetry (`turn_id = -1`); they now run inside a real `begin_turn`/`end_turn` with
+    sub-agent `CallUsage`.
+
 ### Changed
 
 - **Docs truth pass (C-16).** The claims are a product surface, so they now say exactly what the

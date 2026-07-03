@@ -588,18 +588,32 @@ impl FlowEngine {
     /// events on the session stream, then advance the watermark. Non-fatal — audit writes never
     /// fail a turn. The in-memory log stays the live `/evidence` read model; this is its durable
     /// mirror (`projection::observations`).
+    ///
+    /// C-22: the tail is scrubbed through the SAME [`Redactor`](flux_secret::Redactor) the executor
+    /// uses on tool results (seeded from `resolve_secrets` per C-13) BEFORE it reaches the store —
+    /// the `tool_call` observation carries raw per-token permission subjects (a `Bearer`/secret in a
+    /// `bash` arg), built and pushed before dispatch redacts the model-facing result. Redacting once
+    /// here, at the single flush seam, covers every observation kind without touching the live
+    /// in-memory log (which is process-local and already gated behind `/evidence`).
     fn flush_observations(&self, session_id: &str, turn_id: i64) {
+        let redactor = &self.executor.context().redactor;
         let log = self.executor.evidence();
         let all = log.all();
         let start = self
             .evidence_flushed
             .load(std::sync::atomic::Ordering::SeqCst)
             .min(all.len());
-        for obs in &all[start..] {
-            let _ = self.events.record_observation(session_id, turn_id, obs);
-        }
+        // C-24: advance the watermark only past observations whose write returned `Ok` — a transient
+        // `record_observation` failure (WAL `BUSY`, disk-full) leaves the unwritten tail behind the
+        // watermark to be retried next flush, instead of being lost forever behind an
+        // unconditionally-advanced mark.
+        let written = flush_tail(&all[start..], |obs| {
+            let redacted = redact_observation(redactor, obs);
+            self.events
+                .record_observation(session_id, turn_id, &redacted)
+        });
         self.evidence_flushed
-            .store(all.len(), std::sync::atomic::Ordering::SeqCst);
+            .store(start + written, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// This turn's token tally, as an `Option` for the sink: `None` when nothing was billed (e.g. an
@@ -693,6 +707,25 @@ impl FlowEngine {
     ) -> Result<()> {
         self.events
             .record_message(session_id, &Message::user_text(user_input))?;
+        // C-26: a resumed continuation is a first-class turn. Open it here so its observations are
+        // turn-scoped and it emits a `TurnSummary`/`CallUsage`, instead of flushing unscoped under a
+        // hardcoded `turn_id = -1`. A NEW turn id (not a continuation of the suspended one) — the
+        // suspended turn already closed when it parked; this reply is a distinct unit of work.
+        let turn_id = self
+            .events
+            .begin_turn(
+                session_id,
+                user_input,
+                &flux_core::canonical_model_spec(Some(self.provider.name()), &self.model),
+            )
+            .unwrap_or(-1);
+        // Sub-agent spend during the resume (a `task` op in the resumed body) rides the shared
+        // evidence log as `subagent.usage` observations, exactly as in `run_turn` — snapshot the
+        // count so only THIS resume's sub-agents fold in. The resume bypasses the planner/loop host,
+        // so there are no planner `CallUsage` rows to gather here (and the loop host's per-turn
+        // tallies belong to a prior turn — never read them on this path).
+        let subagent_base = self.executor.evidence().by_kind("subagent.usage").count();
+
         let input = flux_lang::ast::Value::String(user_input.to_string());
         self.composites
             .ensure_session_loaded(&self.flow, session_id)?;
@@ -716,7 +749,11 @@ impl FlowEngine {
             Err(e) => {
                 let msg = format!("The resumed flow failed — {e}");
                 sink.text_delta(&msg);
-                return self.finish_turn(session_id, -1, sink, &msg, true, None);
+                let usage = self.record_resume_usage(session_id, turn_id, subagent_base);
+                let _ = self
+                    .events
+                    .end_turn(session_id, turn_id, "error", 0, &msg, usage.clone());
+                return self.finish_turn(session_id, turn_id, sink, &msg, true, usage);
             }
         };
 
@@ -732,7 +769,16 @@ impl FlowEngine {
             )?;
             let hint = "(awaiting your input — reply to continue the flow)";
             sink.text_delta(hint);
-            return self.finish_turn(session_id, -1, sink, hint, false, None);
+            let usage = self.record_resume_usage(session_id, turn_id, subagent_base);
+            let _ = self.events.end_turn(
+                session_id,
+                turn_id,
+                "suspended",
+                outcome.steps as u32,
+                hint,
+                usage.clone(),
+            );
+            return self.finish_turn(session_id, turn_id, sink, hint, false, usage);
         }
 
         // Completed: the flow's own output is the answer (a model-grounded summary is a later refinement).
@@ -742,7 +788,43 @@ impl FlowEngine {
             format!("Resumed and completed ({} step(s)).", outcome.steps)
         };
         sink.text_delta(&answer);
-        self.finish_turn(session_id, -1, sink, &answer, false, None)
+        let usage = self.record_resume_usage(session_id, turn_id, subagent_base);
+        let _ = self.events.end_turn(
+            session_id,
+            turn_id,
+            "resumed",
+            outcome.steps as u32,
+            &answer,
+            usage.clone(),
+        );
+        self.finish_turn(session_id, turn_id, sink, &answer, false, usage)
+    }
+
+    /// Record this resumed turn's sub-agent spend and return the turn total (C-26). A resume bypasses
+    /// the planner, so the only spend is from `task` ops in the resumed body — folded from the
+    /// `subagent.usage` observations recorded since `base`, one `CallUsage` per sub-agent (attributed
+    /// to the child's model). `None` when nothing billed, mirroring [`Self::turn_usage`].
+    fn record_resume_usage(
+        &self,
+        session_id: &str,
+        turn_id: i64,
+        subagent_base: usize,
+    ) -> Option<Usage> {
+        let subagent_calls = self.subagent_calls_since(subagent_base);
+        let mut total = Usage::default();
+        for (model, call) in &subagent_calls {
+            if call.total() > 0 {
+                let _ = self
+                    .events
+                    .record_call_usage(session_id, turn_id, model, call.clone());
+            }
+            total.output_tokens += call.output_tokens;
+            total.input_tokens += call.input_tokens;
+            total.cache_creation_input_tokens += call.cache_creation_input_tokens;
+            total.cache_read_input_tokens += call.cache_read_input_tokens;
+            total.reasoning_tokens += call.reasoning_tokens;
+        }
+        (total.total() > 0).then_some(total)
     }
 
     /// If the session has grown past `compact_threshold_chars`, summarize everything but the most
@@ -831,6 +913,55 @@ impl FlowEngine {
         self.executor.observe(obs.clone());
         sink.observation(&obs);
         Ok(())
+    }
+}
+
+/// Persist a `tail` of observations via `record`, returning how many were durably written (C-24).
+/// The caller advances the flush watermark by exactly this count, so a failed write leaves its
+/// observation (and everything after it) behind the watermark for the next flush to retry.
+fn flush_tail(
+    tail: &[flux_evidence::Observation],
+    mut record: impl FnMut(&flux_evidence::Observation) -> Result<()>,
+) -> usize {
+    let mut written = 0;
+    for obs in tail {
+        // Stop at the FIRST failed write: everything from here stays behind the watermark and is
+        // retried next flush. Advancing past a failed write is exactly the lost-observation bug.
+        if record(obs).is_err() {
+            break;
+        }
+        written += 1;
+    }
+    written
+}
+
+/// Return a redacted copy of `obs` — its `data` scrubbed of any registered/credential-shaped
+/// secret (C-22). Only the JSON's string leaves are rewritten; keys and structure are preserved so
+/// the persisted observation still folds through `projection::observations` unchanged in shape.
+pub(crate) fn redact_observation(
+    redactor: &flux_secret::Redactor,
+    obs: &flux_evidence::Observation,
+) -> flux_evidence::Observation {
+    let mut out = obs.clone();
+    redact_json_strings(redactor, &mut out.data);
+    out
+}
+
+/// Recursively rewrite every string leaf of `value` through the redactor (in place).
+fn redact_json_strings(redactor: &flux_secret::Redactor, value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => *s = redactor.redact(s),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_json_strings(redactor, item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() {
+                redact_json_strings(redactor, v);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1716,6 +1847,223 @@ mod tests {
         assert!(
             obs.iter().any(|o| o.kind == "turn.iteration"),
             "the loop's turn.iteration observations persist"
+        );
+    }
+
+    /// C-22: the durable evidence trail is redacted with the SAME redactor the executor uses. A
+    /// seeded secret carried in a persisted `tool_call` observation (the raw per-token permission
+    /// subject the dispatcher builds BEFORE the model-facing result is redacted) OR in the accepted
+    /// plan's rendered `plan_text` lands `[redacted]` in the event store — not in the clear.
+    #[tokio::test]
+    async fn redacts_secrets_in_durable_observations_and_plan_text() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        const SECRET: &str = "supersecretbearervalue12345";
+
+        // Round 1: a plan whose arg carries the secret (so the accepted plan's `plan_text` renders
+        // it). Round 2: prose ends the turn.
+        let plan_ast = json!({
+            "body": [{
+                "kind": "bind", "name": "greeting",
+                "value": { "kind": "call", "op": "echo",
+                           "args": [{ "kind": "lit", "value": SECRET }] }
+            }]
+        });
+        let responses = VecDeque::from(vec![emit_plan(plan_ast), prose("done")]);
+        let engine = engine_with(responses, store.clone());
+
+        // Seed the executor's redactor exactly as C-13 seeds it from `resolve_secrets`, and stage a
+        // raw `tool_call` observation carrying the secret in a permission subject.
+        engine.executor.context().redactor.add_secret(SECRET);
+        engine.executor.observe(flux_evidence::Observation::new(
+            "tool_call",
+            flux_evidence::Phase::Turn,
+            json!({ "tool": "bash",
+                    "subjects": [format!("curl -H 'Authorization: Bearer {SECRET}'")] }),
+        ));
+
+        let mut sink = CollectSink::default();
+        engine.run_turn(&sid, "run it", &mut sink).await.unwrap();
+
+        // No persisted observation carries the secret in the clear.
+        for o in store.observations(&sid).unwrap() {
+            let data = serde_json::to_string(&o.data).unwrap();
+            assert!(
+                !data.contains(SECRET),
+                "observation `{}` leaked the secret to events.db: {data}",
+                o.kind
+            );
+        }
+        // The accepted plan's durable rendered graph is recorded AND redacted.
+        let plan_texts: Vec<String> = store
+            .turns(&sid)
+            .unwrap()
+            .into_iter()
+            .flat_map(|t| t.plan_attempts)
+            .filter_map(|a| a.plan_text)
+            .collect();
+        assert!(
+            plan_texts.iter().any(|t| t.contains("greeting")),
+            "the accepted plan's plan_text was recorded: {plan_texts:?}"
+        );
+        assert!(
+            plan_texts.iter().all(|t| !t.contains(SECRET)),
+            "plan_text leaked the secret to events.db: {plan_texts:?}"
+        );
+    }
+
+    /// C-24: `flush_tail` advances the watermark only past durable (Ok) writes. A store that fails
+    /// one `record_observation` stops the flush at that index; the dropped observations are retried on
+    /// the next flush once the store recovers, rather than being lost forever behind an
+    /// unconditionally-advanced watermark.
+    #[test]
+    fn flush_tail_stops_at_first_failed_write_and_retries_next_flush() {
+        let obs =
+            |k: &str| flux_evidence::Observation::new(k, flux_evidence::Phase::Turn, json!({}));
+        let all = [obs("a"), obs("b"), obs("c"), obs("d")];
+
+        // A store that fails the write of observation "c" once, then recovers.
+        let fail_on = std::cell::Cell::new(Some("c"));
+        let recorded = std::cell::RefCell::new(Vec::<String>::new());
+        let mut record = |o: &flux_evidence::Observation| -> Result<()> {
+            if fail_on.get() == Some(o.kind.as_str()) {
+                return Err(flux_core::Error::Other("transient store failure".into()));
+            }
+            recorded.borrow_mut().push(o.kind.clone());
+            Ok(())
+        };
+
+        // First flush: a, b written; the flush STOPS at the failed c — the watermark advances by 2.
+        let n1 = flush_tail(&all[0..], &mut record);
+        assert_eq!(
+            n1, 2,
+            "watermark advanced only past the two successful writes"
+        );
+        assert_eq!(*recorded.borrow(), vec!["a", "b"]);
+
+        // The store recovers; the next flush resumes AT the watermark and writes c, d — nothing lost.
+        fail_on.set(None);
+        let n2 = flush_tail(&all[n1..], &mut record);
+        assert_eq!(n2, 2);
+        assert_eq!(
+            *recorded.borrow(),
+            vec!["a", "b", "c", "d"],
+            "the dropped observation was retried, not lost"
+        );
+    }
+
+    /// A-22: an engine with a NON-ZERO compaction threshold, driven past it, actually compacts —
+    /// the persisted conversation shrinks (older turns collapse into one summary message) instead of
+    /// growing unbounded. This is the behaviour the served/SDK non-zero default now unlocks; with the
+    /// old `compact_threshold_chars = 0` default `maybe_compact` returned early and the transcript
+    /// grew until the provider context window blew.
+    #[tokio::test]
+    async fn agent_past_threshold_compacts_the_conversation() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        // The only model call `maybe_compact` makes is the summary render.
+        let responses = VecDeque::from(vec![prose("SUMMARY: the earlier turns.")]);
+        let mut engine = engine_with(responses, store.clone());
+        engine.compact_threshold_chars = 50; // tiny, so a handful of messages exceed it
+
+        // Seed a persistent-session conversation that exceeds the threshold.
+        for i in 0..6 {
+            store
+                .record_message(
+                    &sid,
+                    &Message::user_text(format!("message number {i} with some length")),
+                )
+                .unwrap();
+        }
+        let before = store.conversation(&sid).unwrap().len();
+        assert_eq!(before, 6);
+
+        let mut sink = CollectSink::default();
+        engine
+            .maybe_compact(&sid, &mut sink, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let after = store.conversation(&sid).unwrap().len();
+        assert!(
+            after < before,
+            "compaction bounded the conversation: {before} -> {after}"
+        );
+    }
+
+    /// C-26: a resumed (reply-parked) continuation is a first-class turn. Before the fix
+    /// `resume_suspended` finished with a hardcoded `turn_id = -1`, so no `TurnStarted`/`TurnEnded`
+    /// was emitted (no `TurnSummary`) and its observations flushed unscoped. Now it wraps its work in
+    /// a real `begin_turn`/`end_turn`, so the continuation produces a `TurnSummary` and its
+    /// observations are retrievable scoped to that turn.
+    #[tokio::test]
+    async fn resumed_flow_produces_turn_telemetry() {
+        use flux_lang::ast::{Node, NodeId};
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        // A resume bypasses the planner, so no provider round is queued.
+        let engine = engine_with(VecDeque::new(), store.clone());
+
+        // A parked flow: awaiting the user's reply, then it echoes and returns.
+        let body = vec![
+            Node::Await {
+                binding: Some(SymbolName("reply".into())),
+                source: "user_input".into(),
+                as_type: None,
+            },
+            Node::Bind {
+                name: SymbolName("b".into()),
+                value: Box::new(Node::Call {
+                    op: "echo".into(),
+                    args: vec![Node::Lit {
+                        value: json!("resumed work"),
+                    }],
+                }),
+                ty: None,
+                effect: None,
+            },
+            Node::Return {
+                value: Box::new(Node::Var {
+                    name: SymbolName("b".into()),
+                }),
+            },
+        ];
+        engine
+            .flow
+            .save_suspension(&sid, None, &body, NodeId(0), "user_input")
+            .unwrap();
+
+        // This turn's message is the awaited input → the engine resumes the parked flow.
+        let mut sink = CollectSink::default();
+        engine
+            .run_turn(&sid, "here is my reply", &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(sink.tools, vec!["echo"], "the resumed suffix ran");
+
+        // The resume produced a real TurnSummary (today: none — turn_id was -1).
+        let turns = store.turns(&sid).unwrap();
+        assert_eq!(
+            turns.len(),
+            1,
+            "the resumed continuation is a first-class turn"
+        );
+        let t = &turns[0];
+        assert!(t.turn_id >= 0, "the turn has a real id, not -1");
+        assert!(
+            t.ended_at_ms.is_some(),
+            "the turn closed via begin_turn + end_turn"
+        );
+
+        // Its observations are retrievable scoped to that turn (the echo `tool_call` ran on resume).
+        let turn_events = store.load_turn(&sid, t.turn_id).unwrap();
+        let scoped_obs = turn_events
+            .iter()
+            .filter(|e| e.kind.kind_tag() == "observation")
+            .count();
+        assert!(
+            scoped_obs > 0,
+            "resume observations are turn-scoped, not unscoped under -1"
         );
     }
 
