@@ -25,6 +25,7 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [I-03 — Measure the multi-pass cutover — time-to-first-feedback, rounds, tokens, tbench pass-rate](I-03-multipass-cutover-measurement.md) · Improve · the epic's acceptance gate — judged on evidence, not vibes; runs after the MVP stories land; baseline = pre-cutover main
 
 ## Next (ready — take the top one unless the user named a story)
+- [L-37 — Multi-perspective example — parallel 3-lens scout fan-out, merged and synthesized to a cited Answer](L-37-multi-perspective-example.md) · Language · every capability already ships (parallel branch binds, task→.flux/agents roles, merge/synth/observe, prelude Answer) — the work is authoring the example in the REAL indentation grammar (the sketched brace/call()/let/@param syntax is not the language) + 3 scout role files + a strict_review.rs-style hermetic test
 
 ### multi-pass agent loop — orient → gather → plan/execute/revise, with patch-and-continue
 _A flux turn today one-shots a plan per loop iteration. Two costs:_
