@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-07-03
+
 ### Changed
 
 - **Efficiency + LLM prompt-cache hardening across the per-turn hot path.** A review of the agent loop
