@@ -346,14 +346,15 @@ parse, and there is no `@memo` annotation either) — a memo node is written via
 
 ## Effect annotations
 
-An optional `@effect(name)` annotation precedes the statement it annotates:
+An optional `@effect(name)` annotation precedes the **bind** it annotates (a bare call cannot
+carry one — the parser rejects `@effect` on anything but a bind):
 
 ```flux
 @effect(send_external)
 $report = generate_pdf($data)
 
 @effect(delete)
-bash("rm -rf tmp/")
+$gone = bash("rm -rf tmp/")
 ```
 
 Valid effects: `pure`, `read`, `model`, `network`, `write_file`, `write_db`,
@@ -435,7 +436,7 @@ Flattened collect — each iteration yields a list; they are concatenated:
 
 ```flux
 each $dir in $dirs -> flat $all_files
-  glob("*.rs", path: $dir)
+  glob({pattern: "*.rs", path: $dir})
 ```
 
 ### watch *(aspirational spelling — the implemented keyword is `loop`)*
