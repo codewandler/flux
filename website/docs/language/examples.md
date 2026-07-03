@@ -44,25 +44,8 @@ flow answer(query: String)
   return $answer
 ```
 
-## App module sketch
+## A whole app in one file
 
-```flux
-agent assistant
-  model "claude-sonnet"
-  tools [read, search]
-  datasources [docs]
-
-datasource docs
-  kind "markdown"
-  path "./docs"
-
-trigger on-message
-  on "user_input"
-  run answer
-  agent assistant
-
-journey answer
-  flow
-    $hits = search($text)
-    return $hits
-```
+A `.flux` file can declare more than a single flow — `agent`, `channel`, `datasource`, `trigger`, and
+`journey` modules describe a complete multi-agent program. See
+[Multi-agent programs](../agent/programs.md) for a runnable example and the `flux app run` runtime.

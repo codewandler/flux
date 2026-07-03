@@ -8,7 +8,14 @@ const sidebars = {
     {
       type: 'category',
       label: 'Agent',
-      items: ['agent/cli', 'agent/providers'],
+      items: [
+        'agent/cli',
+        'agent/agent-loop',
+        'agent/providers',
+        'agent/safety',
+        'agent/a2a',
+        'agent/programs',
+      ],
     },
     {
       type: 'category',

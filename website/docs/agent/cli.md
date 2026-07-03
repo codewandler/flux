@@ -17,7 +17,39 @@ flux app run path/to/app.flux
 
 During a turn, the model has no directly callable tools. It emits a plan, and each operation in that
 plan is dispatched by the runtime. Approval prompts appear when policy, risk, or permission rules
-require human confirmation.
+require human confirmation — see [Safety & approvals](./safety.md).
+
+## Subcommands
+
+| Command | What it does |
+|---|---|
+| `flux run "…"` | plan + run a turn (`--yes` auto-approves; `-c` continues the last session) |
+| `flux plan "…"` | show the plan without running it (`-o json\|yaml` prints and exits) |
+| `flux` | interactive REPL |
+| `flux tui` | ratatui chat UI with an in-UI approval modal |
+| `flux a2a <URL>` | drive a remote [A2A](./a2a.md) agent |
+| `flux app run <prog.flux>` | run a [multi-agent program](./programs.md); `--serve <addr>` exposes HTTP/A2A |
+| `flux flow run <file>` | execute a stored Flux-Lang flow |
+| `flux loop show \| eject` | inspect or scaffold the [agent loop](./agent-loop.md) |
+| `flux auth status \| login` | manage [provider credentials](./providers.md) |
+| `flux sessions` / `flux usage` | list recent sessions / show token + cost accounting |
+| `flux plugin …` / `flux preset …` | manage subprocess plugins / prebuilt flows |
+
+## Two modes
+
+**normal** (default) plans then runs the plan, gating risky steps as they come. **plan** mode shows the
+plan and waits — review or refine it, then approve to run. Toggle plan mode in the REPL with `/plan`,
+or one-shot with `flux plan "…"`.
+
+## REPL slash commands
+
+| Command | Effect |
+|---|---|
+| `/plan` · `/run` | toggle plan mode · run the plan you just reviewed |
+| `/model <spec>` | switch model mid-session (e.g. `/model opus`) |
+| `/tools` · `/evidence` | list available operations · show the turn's evidence trail |
+| `/sessions` · `/resume <id>` · `/clear` | session management |
+| `/help` | the full command list |
 
 ## Agent loop visibility
 

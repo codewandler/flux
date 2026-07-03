@@ -5,22 +5,64 @@ title: Getting started
 
 # Getting started
 
-flux is currently developed from source. The CLI is the reference application.
+flux ships as a single `flux` binary. The fastest way to try it needs no API key at all.
 
-## Build
+## Install
 
-```bash
-cargo build --workspace
-```
-
-## Run a local agent turn
+**Prebuilt binary** — installs `flux` into `~/.cargo/bin` (Linux, macOS, Windows; x86_64 + aarch64):
 
 ```bash
-cargo run -p flux-cli -- run "read the README and summarize the project"
+# Linux / macOS
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/codewandler/flux/releases/latest/download/flux-cli-installer.sh | sh
 ```
 
-The exact provider and model setup depends on your local configuration. flux also includes a mock
-provider path used by tests and offline development.
+```powershell
+# Windows (PowerShell)
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/codewandler/flux/releases/latest/download/flux-cli-installer.ps1 | iex"
+```
+
+**From source** — requires Rust 1.85+ (`rustup update stable`):
+
+```bash
+cargo install --git https://github.com/codewandler/flux flux-cli
+```
+
+Prebuilt binaries, installers, and checksums are attached to every
+[tagged release](https://github.com/codewandler/flux/releases/latest).
+
+## Try it with no API key
+
+`-m mock` runs an offline provider through the full pipeline — a zero-config way to see how a turn
+plans and executes:
+
+```bash
+flux run --yes -m mock "summarise this repo"
+```
+
+## Run a real agent turn
+
+Point flux at a provider (see [Providers and models](./agent/providers.md) for the full matrix and
+`flux auth login`), then:
+
+```bash
+# Plan + run. Risky steps prompt for approval; --yes auto-approves.
+flux run "add a test for the parser"
+
+# Preview the plan before anything runs
+flux plan "summarize README.md into SUMMARY.txt"
+
+# Interactive REPL (session auto-saved); /help for slash commands
+flux
+
+# ratatui chat UI with live streaming + an in-UI approval modal
+flux tui
+
+# Which providers/credentials are configured
+flux auth status
+```
+
+Every operation crosses the same [safety envelope](./agent/safety.md): reads are pre-allowed, writes
+and commands prompt for approval, and destructive steps always re-confirm.
 
 ## Run a stored Flux-Lang flow
 
@@ -32,12 +74,14 @@ flow hello(name: String) -> String
   return $message
 ```
 
-The important distinction is that input values are data. They do not grant capabilities. Any operation
-that touches files, processes, network, models, or plugins still crosses the runtime safety envelope.
+Input values are data — they do not grant capabilities. Any operation that touches files, processes,
+network, models, or plugins still crosses the runtime safety envelope. See the
+[Flux-Lang overview](./language/overview.md) to go deeper, or
+[Multi-agent programs](./agent/programs.md) to run a whole app from one `.flux` file.
 
 ## Contributor setup
 
-The full repository gate is:
+Building from a checkout, the full repository gate is:
 
 ```bash
 cargo build --workspace

@@ -20,7 +20,8 @@ decides what is allowed and performs the work.
 
 ## The three pillars
 
-- **Agent**: the local coding agent, CLI/TUI, SDK, and server surfaces.
+- **Agent**: the local coding agent — CLI/TUI, an embeddable Rust SDK, an HTTP/[A2A](./agent/a2a.md)
+  server, and [multi-agent programs](./agent/programs.md).
 - **Flux-Lang**: the plan language and reference interpreter.
 - **Improvement loop**: the eval and self-improvement harness used to improve flux itself.
 
@@ -36,5 +37,7 @@ when contributing to flux, but they are intentionally more detailed and more vol
 ## Start here
 
 - New to flux: read [Getting started](./getting-started.md).
+- How a turn works: read [Concepts](./concepts.md) and [The agent loop](./agent/agent-loop.md).
+- What flux is allowed to do: read [Safety & approvals](./agent/safety.md).
 - Interested in the language: read [Flux-Lang overview](./language/overview.md).
 - Embedding flux: read [FlowClient](./sdk/flow-client.md).
