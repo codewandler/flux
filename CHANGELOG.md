@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.2.14] - 2026-07-03
+
 ### Added
 
 - **Verified remote plugin install (D-47 — the demand side of plugin distribution).**
