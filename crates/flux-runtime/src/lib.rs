@@ -539,7 +539,9 @@ pub fn detect_signals(cwd: &std::path::Path) -> Vec<Observation> {
         ("python", |p| {
             p.join("pyproject.toml").exists() || p.join("requirements.txt").exists()
         }),
-        ("make", |p| p.join("Makefile").exists() || p.join("makefile").exists()),
+        ("make", |p| {
+            p.join("Makefile").exists() || p.join("makefile").exists()
+        }),
         ("eval", |p| p.join(".flux").join("evals").is_dir()),
     ];
     let mut found = [false; 7];

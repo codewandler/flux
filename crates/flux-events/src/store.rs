@@ -471,7 +471,9 @@ impl EventStore {
         // All events in a stream share its run context; read it once and stamp the stored event.
         let ctx = read_context(&tx, stream)?;
         let next_seq: i64 = tx
-            .prepare_cached("SELECT COALESCE(MAX(stream_seq), -1) + 1 FROM events WHERE stream = ?1")
+            .prepare_cached(
+                "SELECT COALESCE(MAX(stream_seq), -1) + 1 FROM events WHERE stream = ?1",
+            )
             .map_err(map_sql)?
             .query_row([stream], |r| r.get(0))
             .map_err(map_sql)?;
@@ -1086,33 +1088,54 @@ mod tests {
             }
         };
 
-        store.record_message(&sid, &Message::user_text("u1")).unwrap();
+        store
+            .record_message(&sid, &Message::user_text("u1"))
+            .unwrap();
         store
             .record_message(&sid, &Message::assistant_text("a1"))
             .unwrap();
         fold(&store, &mut msgs, &mut cursor);
-        assert_eq!(msgs, store.conversation(&sid).unwrap(), "after first appends");
+        assert_eq!(
+            msgs,
+            store.conversation(&sid).unwrap(),
+            "after first appends"
+        );
 
         // A second batch is picked up incrementally (only the new events are read).
-        store.record_message(&sid, &Message::user_text("u2")).unwrap();
+        store
+            .record_message(&sid, &Message::user_text("u2"))
+            .unwrap();
         store
             .record_message(&sid, &Message::assistant_text("a2"))
             .unwrap();
         fold(&store, &mut msgs, &mut cursor);
-        assert_eq!(msgs, store.conversation(&sid).unwrap(), "after second appends");
+        assert_eq!(
+            msgs,
+            store.conversation(&sid).unwrap(),
+            "after second appends"
+        );
         assert_eq!(msgs.len(), 4);
 
         // A compaction in the delta resets the fold to the snapshot.
-        let snapshot = vec![Message::user_text("[summary]"), Message::assistant_text("a2")];
+        let snapshot = vec![
+            Message::user_text("[summary]"),
+            Message::assistant_text("a2"),
+        ];
         store.record_compaction(&sid, &snapshot).unwrap();
         fold(&store, &mut msgs, &mut cursor);
         assert_eq!(msgs, store.conversation(&sid).unwrap(), "after compaction");
         assert_eq!(msgs, snapshot);
 
         // A message after the compaction appends onto the snapshot, not the pre-compaction history.
-        store.record_message(&sid, &Message::user_text("u3")).unwrap();
+        store
+            .record_message(&sid, &Message::user_text("u3"))
+            .unwrap();
         fold(&store, &mut msgs, &mut cursor);
-        assert_eq!(msgs, store.conversation(&sid).unwrap(), "after post-compaction append");
+        assert_eq!(
+            msgs,
+            store.conversation(&sid).unwrap(),
+            "after post-compaction append"
+        );
         assert_eq!(msgs.len(), 3);
     }
 

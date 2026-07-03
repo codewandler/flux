@@ -2652,7 +2652,9 @@ mod tests {
         );
 
         // Byte cap: a window of very long lines is truncated with guidance rather than unbounded.
-        let wide: String = (0..10).map(|_| format!("{}\n", "x".repeat(40 * 1024))).collect(); // ~400 KiB
+        let wide: String = (0..10)
+            .map(|_| format!("{}\n", "x".repeat(40 * 1024)))
+            .collect(); // ~400 KiB
         WriteTool
             .execute(&c, json!({"path": "wide.txt", "content": wide}))
             .await

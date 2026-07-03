@@ -2278,12 +2278,18 @@ mod tests {
 
         // Turn A — no `.git`: the git group is inactive, so `echo` is gated (not advertised).
         let (a, _) = surfaced_op_names(&registry, &groups, &dir, &sticky);
-        assert!(!a.contains("echo"), "echo gated before the marker appears: {a:?}");
+        assert!(
+            !a.contains("echo"),
+            "echo gated before the marker appears: {a:?}"
+        );
 
         // Turn B — `.git` present: the group surfaces, `echo` is advertised.
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let (b, _) = surfaced_op_names(&registry, &groups, &dir, &sticky);
-        assert!(b.contains("echo"), "echo advertised once the marker is present: {b:?}");
+        assert!(
+            b.contains("echo"),
+            "echo advertised once the marker is present: {b:?}"
+        );
 
         // Turn C — `.git` removed: stateless resolution would drop `echo`, but the sticky union keeps
         // the group surfaced, so the advertised catalog never shrinks.
@@ -2293,7 +2299,10 @@ mod tests {
             c.contains("echo"),
             "sticky surfacing keeps echo after the marker disappears: {c:?}"
         );
-        assert!(b.is_subset(&c), "the advertised catalog never shrinks: {b:?} !⊆ {c:?}");
+        assert!(
+            b.is_subset(&c),
+            "the advertised catalog never shrinks: {b:?} !⊆ {c:?}"
+        );
     }
 
     /// A-10: once the turn's accumulated planner usage crosses the installed token budget, the
