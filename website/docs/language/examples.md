@@ -1,51 +1,176 @@
 ---
 title: Examples
+description: A cookbook of complete, runnable Flux-Lang flows — from a two-line summarizer to a self-improvement loop.
 ---
 
-# Flux-Lang examples
+# Examples
+
+Complete flows you can copy into a `.flux` file and run with `flux flow run` (see
+[Tooling](./tooling.md)). Every example uses current, native text syntax.
 
 ## Read and summarize
+
+One read, one budgeted context pack, one model call:
 
 ```flux
 flow summarize-readme
   $src = read("README.md")
   ctx $brief
-    purpose "summarize README"
+    purpose "summarize the project README"
     budget 6000
     include $src
-  $summary = ai.reason("Summarize the project", ctx: $brief)
+  $summary = ai.reason({ask: "Summarize the project in five bullets.", ctx: $brief})
   return $summary
+```
+
+## Fetch, extract, format
+
+Pure field access and formatting — no shell, no approval pauses:
+
+```flux
+flow latest-release
+  $raw = web_fetch("https://api.github.com/repos/codewandler/flux/releases/latest")
+  $tag = $raw.tag_name
+  $msg = fmt("latest flux release: {tag}")
+  return { tag: $tag, message: $msg }
 ```
 
 ## Bounded routing
 
+A selector picks among declared branches; the case set is fixed before anything runs:
+
 ```flux
-flow handle-ticket(ticket: String)
-  $label = classify($ticket)
-  route $label
+flow route-ticket(ticket: String)
+  route classify($ticket)
     case "bug"
-      return "send to engineering"
+      $queue = "engineering"
     case "billing"
-      return "send to billing"
+      $queue = "finance"
     default
-      return "send to support"
+      $queue = "support"
+  $msg = fmt("routed to {queue}")
+  return $msg
 ```
 
-## Resilient fallback
+## Resilient fetch
+
+Cache first, then the network with backoff — the first branch that succeeds with a non-empty
+result wins:
 
 ```flux
-flow answer(query: String)
-  fallback -> $answer
+flow cached-page(url: String)
+  fallback -> $page
     branch
-      $answer = cache_get($query)
+      $page = read("cache/page.html")
     branch
-      $docs = search($query)
-      $answer = ai.reason("Answer from docs", ctx: $docs)
-  return $answer
+      retry 3 backoff exponential delay 500 -> $page
+        web_fetch($url)
+  assert $page, "no cached copy and the fetch failed"
+  return $page
 ```
 
-## A whole app in one file
+## Fan out, then reason once
 
-A `.flux` file can declare more than a single flow — `agent`, `channel`, `datasource`, `trigger`, and
-`journey` modules describe a complete multi-agent program. See
-[Multi-agent programs](../agent/programs.md) for a runnable example and the `flux app run` runtime.
+Independent reads run concurrently; one model call sees a budgeted pack of all three results:
+
+```flux
+flow repo-survey
+  parallel
+    branch $readme
+      $readme = read("README.md")
+    branch $todos
+      $todos = grep({pattern: "TODO", glob: "*.rs", max_results: 100})
+    branch $status
+      $status = git_status()
+
+  ctx $pack
+    purpose "assess repository state"
+    budget 8000
+    include $readme, $todos, $status
+
+  $assessment = ai.reason({ask: "What needs attention first?", ctx: $pack})
+  return { assessment: $assessment, todos: $todos }
+```
+
+## Poll until done
+
+A time-bounded loop with an early-exit guard — `path_exists` returns `"true"`/`"false"`, which
+plugs straight into truthiness:
+
+```flux
+flow wait-for-artifact
+  loop for 60000 every 2000 -> $found
+    until $found
+    $found = path_exists("target/release/flux")
+  assert $found, "artifact did not appear within 60s"
+  return "artifact ready"
+```
+
+## Walk directories
+
+`-> flat` concatenates per-iteration lists into one:
+
+```flux
+flow rust-files(dirs: List<String>)
+  each $dir in $dirs -> flat $files
+    glob({pattern: "*.rs", path: $dir})
+  each $f in $files -> $stats
+    file_stat($f)
+  return { files: $files, stats: $stats }
+```
+
+## A real program: the improvement loop
+
+An abridged version of the flow flux uses to improve itself — eval, mine pain points in
+parallel, implement candidates, keep what measures better, revert what does not:
+
+```flux
+flow improve -> EvalReport
+  $baseline = eval_run({adapter: "local", dir: "suites", trials: 3})
+  $sessions = eval_sessions($baseline)
+  $digest   = sessions_digest($sessions)
+
+  parallel
+    branch $mined
+      $mined = painpoints_collect($sessions)
+    branch $reviewed
+      $reviewed = task({role: "reviewer", task: "Review these eval sessions for failure modes.\nSessions:\n{digest}\n\nReturn ONLY a JSON array of findings."})
+
+  $candidates = improvements_aggregate({mined: $mined, reviewed: $reviewed})
+
+  repeat 3
+    until $done
+    $tasks    = task({role: "planner", task: "Turn these candidates into AT MOST 2 tasks:\n{candidates}"})
+    $snapshot = git_snapshot()
+    change_implement({tasks: $tasks, limit: 2})
+    $gate     = gate_check()
+
+    when $gate
+      $candidate = eval_run({adapter: "local", dir: "suites", trials: 3})
+      when score_compare({baseline: $baseline, candidate: $candidate})
+        git_stage(["."])
+        git_commit("improve: adopt candidate")
+        $baseline = eval_adopt($candidate)
+      else
+        git_revert($snapshot)
+    else
+      git_revert($snapshot)
+
+    $done       = candidates_empty($candidates)
+    $candidates = candidates_advance($candidates)
+
+  return $baseline
+```
+
+Everything here is ordinary language surface: `parallel` fan-out, a bounded `repeat` with an
+`until` guard, nested `when`/`else`, and every op — including the sub-agent `task` calls —
+crossing the safety envelope.
+
+## Going further
+
+- The repository ships runnable examples in
+  [`examples/`](https://github.com/codewandler/flux/tree/main/examples), including the real
+  improvement loops.
+- A single `.flux` file can also declare agents, channels, and journeys — a whole application.
+  See [Multi-agent programs](../agent/programs.md) and
+  [Modules, composite ops & programs](./modules-and-programs.md).

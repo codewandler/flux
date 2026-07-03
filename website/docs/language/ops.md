@@ -1,0 +1,122 @@
+---
+title: Operations
+description: The registered operations a Flux-Lang call can target — core tools, toolchains, git, cognition ops, and app orchestration ops.
+---
+
+# Operations
+
+Operations are what a `call` node targets — and they are provided by the **host runtime**, not
+the language. The engine advertises a catalog built from its live tool registry;
+[plugins](../plugins/authoring.md) project additional operations into the same catalog. The
+language only knows the op's name and arguments; the host validates the call and dispatches it
+through the [safety envelope](../agent/safety.md).
+
+The catalog is also **evidence-gated**: tool groups surface when the workspace shows their
+signal (the `cargo_*` ops appear in Rust workspaces, `go_*` alongside Go modules), and the
+generic `bash` op is opt-in — plans are steered toward dedicated, accurately-gated ops.
+
+Arguments below are named; pass them as a single object (`read({path: "…", limit: 100})`), or
+bare for a sole required parameter (`read("README.md")`). Optional arguments are in
+`[brackets]`. Ops marked **approval** may pause for user approval depending on the active
+policy.
+
+## Files, search, and web
+
+| op | arguments | risk | description |
+|---|---|---|---|
+| `read` | `path[, limit, offset]` | low | Read a file (line-numbered), a list of files, or a glob pattern |
+| `read_many` | `paths` | low | Read several files at once, sections headed per path |
+| `grep` | `pattern[, glob, literal, max_results, path]` | low | Regex search; `literal: true` for plain substrings |
+| `glob` | `pattern[, path]` | low | List files matching a glob pattern |
+| `file_stat` | `path` | low | Size, line count, mtime |
+| `path_exists` | `path` | low | `"true"`/`"false"` — branch on file presence with `when`/`unless` |
+| `write` | `path, content` | medium, approval | Create or overwrite a file |
+| `edit` | `path, old_string, new_string[, replace_all]` | medium, approval | Replace a string in a file (exact-match first, then progressively looser anchoring) |
+| `patch` | `path, edits` | medium, approval | Several line-anchored edits in one call |
+| `append` | `path, content` | low, approval | Append to a file, creating it if absent |
+| `search` | `query[, limit]` | low | Search the indexed datasource |
+| `web_fetch` | `url` | low | Fetch an HTTP(S) URL |
+| `web_search` | `query[, max_results]` | low | Web search (requires a search API key) |
+| `sqlite_query` | `db, sql[, params]` | low | Read-only SQLite query |
+| `now` / `cwd` / `sys_info` | | low | Clock, workspace root, host metadata — no shell needed |
+
+## Processes and toolchains
+
+| op | arguments | risk | description |
+|---|---|---|---|
+| `bash` | `command[, timeout_secs]` | high, approval | Run a shell command — **opt-in**, off by default |
+| `proc.run` | `program[, args, timeout_secs]` | high, approval | One argv-only process, no shell, cleared env |
+| `task` | `role, task` | medium, approval | Delegate to a sub-agent role |
+| `cargo_check` / `cargo_build` / `cargo_test` / `cargo_clippy` / `cargo_fmt` | `[package, args, …]` | medium, approval | The Rust toolchain (Rust workspaces) |
+| `go_build` / `go_test` / `go_vet` | `[package, args]` | medium, approval | The Go toolchain (Go workspaces) |
+| `python_run` / `pytest` | `[script, module, path, args]` | medium, approval | Python scripts and tests |
+| `npm` / `node_run` | `args` / `script[, args]` | medium, approval | Node tooling |
+| `make` | `[target, args]` | medium, approval | Run make (surfaces on a Makefile) |
+
+## Git
+
+| op | arguments | risk | description |
+|---|---|---|---|
+| `git_status` | | low | Working tree status |
+| `git_diff` | `[path, staged]` | low | Unstaged (or staged) diff |
+| `git_log` | `[limit]` | low | Recent commits |
+| `git_stage` / `git_unstage` | `paths` | medium / low | Stage or unstage files |
+| `git_commit` | `message[, body]` | medium | Create a commit |
+| `git_push` | `[branch, remote]` | medium | Push to a remote |
+| `git_checkout` | `branch[, create]` | medium | Switch or create a branch |
+
+## Cognition ops
+
+The cognition pack splits into **pure** data-shaping ops — deterministic, no IO, never pause
+for approval — and **model-backed** ops that make one structured model call each. The
+model-backed ops carry a network effect and are advertised only when the host registers a
+provider for them.
+
+Pure:
+
+| op | arguments | description |
+|---|---|---|
+| `need` | `ask, require[, done_when]` | Build a `Need` artifact — an explicit statement of missing info |
+| `gaps` | `claims, need` | Report a `Need`'s still-unmet required fields |
+| `compare` | `a, b` | `{added, removed, common}` over two arrays |
+| `dedupe` | `items[, by]` | Remove duplicates, first-seen order |
+| `sort` | `items[, by, order]` | Stable sort by a field, `asc`/`desc` |
+| `top` | `items, n` | First `n` items |
+| `merge` | `lists` | Concatenate an array of arrays |
+| `filter` | `items[, by, equals]` | Keep items where a field is truthy or equals a value |
+| `len` / `first` / `last` | `items` | Count, first item, last item |
+| `cite` | `claims` | A markdown citation list, one line per claim |
+
+Model-backed:
+
+| op | arguments | description |
+|---|---|---|
+| `ai.extract` | `from[, ask, schema]` | Extract typed items (e.g. `Claim`s) from free text |
+| `ai.rank` | `items[, by]` | Reorder items by a natural-language criterion |
+| `ai.judge` | `claim[, evidence]` | Adjudicate a claim into a `Verdict` |
+| `ai.reason` | `ask[, ctx]` | Free-form reasoning over a [context pack](./context-packs.md) |
+| `synth` | `claims[, format, cite]` | Synthesize a cited `Answer` from claims |
+| `ai.rewrite` | `text[, style]` | Rewrite text in a requested style |
+
+These produce and consume the [prelude artifact types](./types-and-effects.md) — `Claim`,
+`Evidence`, `Verdict`, `Answer`, and friends — so multi-step reasoning pipelines stay typed.
+
+## App orchestration ops
+
+Registered **only** by the `flux app run` host for [multi-agent programs](../agent/programs.md)
+— journeys use them to drive the event bus and channels:
+
+| op | arguments | description |
+|---|---|---|
+| `emit` | `event[, payload]` | Publish an event to the bus (fires matching triggers) |
+| `send` | `channel, message` | Send a message to a named channel |
+| `ask` | `channel, message` | Send and return a correlation id |
+| `spawn` | `run[, input]` | Run a named journey to completion and return its result |
+
+## The loop itself
+
+flux's own agent turn loop is a Flux-Lang flow, driven by reflexive planning and evidence ops
+that are never advertised to the model — see [The agent loop](../agent/agent-loop.md).
+
+Whatever the op, the rule is the same: **every** call crosses authorization, approval, and
+guarded IO. There is no trusted shortcut for any operation on this page.

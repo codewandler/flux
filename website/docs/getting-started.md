@@ -69,15 +69,21 @@ and commands prompt for approval, and destructive steps always re-confirm.
 Flux-Lang text can be parsed and executed without asking a model to compile a new plan:
 
 ```flux
-flow hello(name: String) -> String
-  $message = fmt("hello {name}")
+flow hello -> String
+  $when = now()
+  $message = fmt("hello — the time is {when}")
   return $message
 ```
 
-Input values are data — they do not grant capabilities. Any operation that touches files, processes,
-network, models, or plugins still crosses the runtime safety envelope. See the
-[Flux-Lang overview](./language/overview.md) to go deeper, or
-[Multi-agent programs](./agent/programs.md) to run a whole app from one `.flux` file.
+```bash
+flux flow run hello.flux
+```
+
+A flow that never reaches a model op runs without any API credentials. Input values are data —
+they do not grant capabilities. Any operation that touches files, processes, network, models, or
+plugins still crosses the runtime safety envelope. Take the
+[ten-minute language tour](./language/tour.md) to go deeper, or run a whole app from one `.flux`
+file with [multi-agent programs](./agent/programs.md).
 
 ## Contributor setup
 

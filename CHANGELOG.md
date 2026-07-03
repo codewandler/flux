@@ -6,6 +6,24 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **Website: complete makeover of the Flux-Lang docs.** The language section grows from 5 stub pages
+  (~280 lines) to a 16-page language documentation set (~2,400 lines) sourced from the authoritative
+  in-repo references (`crates/flux-lang/docs/{syntax,reference}.md`,
+  `crates/flux-flow/docs/ops-reference.md`): an example-first overview + ten-minute tour, an
+  eight-page guide (flows & syntax, control flow, pure data, context packs, concurrency, reliability,
+  durability, execution model, modules/composite ops/programs), a four-page reference (full node
+  catalog with JSON shapes + field tables, types & effects incl. the prelude artifacts, the registered
+  ops catalog, tooling), and a rewritten examples cookbook. Every one of the 86 `flux` code snippets
+  on the site is validated against the real parser (`fluxlang compile`); the docs strictly separate
+  native text spellings from `@json`-only nodes and drop all aspirational syntax. Site chrome:
+  a custom Prism grammar highlights `flux` code blocks, the landing page gains a hero flow +
+  dark-mode support, the sidebar gets Guide/Reference sub-categories, and `flux flow run` is now shown
+  in getting-started. The old `text-syntax`/`execution-semantics`/`ast-reference` pages are replaced.
+  Fixed en route: an `@effect` example (inherited from syntax.md) that annotated a bare call, which
+  the parser rejects — `@effect` only annotates binds.
+
 ## [0.2.9] - 2026-07-03
 
 ### Fixed

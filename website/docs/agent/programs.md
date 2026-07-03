@@ -51,7 +51,7 @@ journey answer
 ```
 
 That is the entire application. The `flow` body is regular Flux-Lang — see the
-[language overview](../language/overview.md) and [text syntax](../language/text-syntax.md).
+[language overview](../language/overview.md) and [flows & syntax](../language/flows-and-syntax.md).
 
 ## Secrets are references, never plaintext
 
@@ -95,6 +95,6 @@ See [Agent-to-agent (A2A)](./a2a.md) for reaching a running program from other a
 ## Where to go next
 
 - [Concepts](../concepts.md) — the plan-not-transcript model and the one safety envelope every operation runs through.
-- [Language overview](../language/overview.md) and [text syntax](../language/text-syntax.md) — the Flux-Lang you write journey bodies in.
+- [Language overview](../language/overview.md) and [flows & syntax](../language/flows-and-syntax.md) — the Flux-Lang you write journey bodies in.
 - [Agent-to-agent (A2A)](./a2a.md) — reaching programs over the network.
 - Runnable examples live in the [flux repository](https://github.com/codewandler/flux).
