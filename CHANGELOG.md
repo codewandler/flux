@@ -6,6 +6,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-07-03
+
+### Documentation
+
+- **Docs consolidation + public docs site refresh.** Reviewed and consolidated `docs/`: merged three
+  genuinely-redundant design clusters into their story-linked survivor (plugin ×4 →
+  `integration-plugins.md`, channel ×2 → `event-trigger-channels.md`, provider ×2 →
+  `subscription-providers-and-cost.md`; `docs/designs/` 31 → 26), repointed the affected story
+  `design:` links + roadmap/cross-design links (0 broken links), truth-passed stale "Status: proposed"
+  lines on already-shipped designs, and corrected stale Anthropic model ids in `docs/model.md` to the
+  real aliases (`opus`→`claude-opus-4-8`, `sonnet`→`claude-sonnet-4-6`, `haiku`→`claude-haiku-4-5-20251001`).
+  Refreshed and expanded the public Docusaurus site (`website/`, deployed to
+  `codewandler.github.io/flux`): new pages for the multi-pass agent loop, agent-to-agent (A2A),
+  multi-agent `.flux` programs, and the safety & approval model, plus install-first getting-started,
+  a full provider matrix, a concrete config schema, and CLI subcommand/slash-command tables. Site
+  build green (`onBrokenLinks: throw`).
+
 ### Fixed
 
 - **Library hardening (epic).** Three adversarial subsystem audits (context, evidence,
