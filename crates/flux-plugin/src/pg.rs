@@ -25,6 +25,14 @@ use flux_system::net::DialStream;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Upper bound on the server-supplied SCRAM `i=` iteration count (RFC 5802 §3), enforced *before* any
+/// PBKDF2 work. RFC-typical deployments sit in the 4096–100,000 range (Postgres itself defaults to
+/// 4096); this ceiling is an order of magnitude above the highest sane value anyone would legitimately
+/// configure, yet stops a hostile/MITM'd endpoint from driving `pbkdf2_hmac_sha256`'s `for _ in
+/// 1..iterations` loop for `i=2000000000`-style counts, which pegs a CPU core for minutes. The
+/// handshake's socket-read `timeout` never covers this — it's pure computation, not I/O.
+pub(crate) const MAX_SCRAM_ITERATIONS: u32 = 1_000_000;
+
 /// Connection parameters the host puts in the StartupMessage. All non-secret metadata the plugin
 /// already holds (from a discovered endpoint's bare URL or the config DSN) — never the credential.
 pub(crate) struct HandshakeParams {
@@ -180,6 +188,12 @@ impl Handshake<'_> {
             .get("i")
             .and_then(|i| i.parse().ok())
             .ok_or("pg scram: server-first missing/invalid iteration count")?;
+        if iterations > MAX_SCRAM_ITERATIONS {
+            return Err(format!(
+                "pg scram: server-first iteration count {iterations} exceeds the maximum of \
+                 {MAX_SCRAM_ITERATIONS} (refusing to run a hostile/absurd PBKDF2 iteration count)"
+            ));
+        }
         let salt = base64_decode(salt_b64)?;
 
         // SaltedPassword = PBKDF2-HMAC-SHA256(password, salt, i).

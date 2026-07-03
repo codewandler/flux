@@ -102,6 +102,13 @@ pub trait OpHost: Send + Sync {
         default_resolve_thing(thing)
     }
 
+    /// Notify the host that a call's result was just bound to a session symbol — `op` and `input`
+    /// identify the dispatch exactly as [`dispatch`](Self::dispatch) saw it (resolved named input),
+    /// `symbol` is the bound name. Purely informational (fires after the bind, cannot fail or veto);
+    /// hosts use it to keep dispatch-keyed bookkeeping legible in symbol terms — e.g. flux-flow's
+    /// redundant-read cache citing "already read as `$X`" (A-20). Default: no-op.
+    fn call_bound(&self, _op: &str, _input: &serde_json::Value, _symbol: &str) {}
+
     /// Open a capability scope for the duration of a `with_tools` block, narrowing subsequent
     /// [`dispatch`](Self::dispatch) calls to `tools` (intersected with any scope already open — the
     /// real runtime implementation enforces narrow-only nesting). The interpreter's `CapScope` node

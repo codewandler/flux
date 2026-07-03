@@ -71,6 +71,22 @@ struct TurnCtx {
 const STALL_ESCALATE: u32 = 2; // 2nd identical round → inject a stronger "stop repeating" directive
 const STALL_STOP: u32 = 4; // 4th identical round → end the turn honestly instead of looping
 
+/// Resource-aware convergence thresholds (A-20). Distinct from the transcript thresholds above:
+/// a renamed-symbol re-read round LOOKS different (new bind names → new transcript bytes) while
+/// gathering nothing new, so it is counted by resources, not bytes — and it converges faster,
+/// because by construction the model already holds every piece of evidence it keeps re-fetching.
+const RESOURCE_STALL_ESCALATE: u32 = 2; // 2nd no-new-evidence round → "answer now" directive
+const RESOURCE_STALL_STOP: u32 = 3; // 3rd no-new-evidence round → end the turn honestly
+
+/// The identical-plan skip's informational transcript (A-05/A-27): a byte-identical plan re-emitted
+/// right after a SUCCESSFUL run is not re-run — this is what tells the model so. Routed through
+/// [`EngineLoopHost::guard_transcript`] like every other `run_plan` return path, so a model that
+/// keeps re-emitting it hits the SAME transcript-stall escalation/force-stop as any other stuck loop.
+const IDENTICAL_PLAN_SKIP_MESSAGE: &str =
+    "[loop-guard] This EXACT plan already ran SUCCESSFULLY in the previous round — it was NOT \
+     re-run. An empty result there means the operation succeeded with no output. Use those \
+     results, or answer in prose to finish the turn.";
+
 /// Default max chars of `run_plan` transcript handed back into the next planner round. Per-tool output
 /// trimming happens earlier, but the loop feedback is the concatenated plan transcript and can still
 /// become large enough to crowd out useful context.
@@ -347,6 +363,10 @@ struct LoopGuard {
     /// re-execution and says so instead of re-running a possibly destructive op.
     last_plan_hash: Option<String>,
     last_plan_ok: bool,
+    /// Consecutive clean read-only rounds that bound NO new resource (A-20): every read repeated a
+    /// resource already in the turn's [`ReadTracker`] ledger — however the symbols were renamed or
+    /// the statements reordered, which is exactly the variation the transcript hash can't see.
+    resource_stall: u32,
 }
 
 /// The engine-side reflexive host. Holds the stable machinery the two ops need that a `ToolContext`
@@ -418,6 +438,11 @@ pub struct EngineLoopHost {
     /// (Self::set_turn) evicts every OTHER session's entry, so a shared engine serving many sessions
     /// (the a2a server) holds at most the active session's conversation, not one per session ever seen.
     conversation_cache: Mutex<std::collections::HashMap<String, (Vec<Message>, i64)>>,
+    /// The turn's read-resource ledger (A-20): every inner dispatch is classified/tracked here
+    /// (threaded into `execute_flow_resumable_with_composites`), exact-repeat filesystem reads are
+    /// served from it with a reuse note, and [`guard_resources`](Self::guard_resources) reads each
+    /// round's fresh/redundant summary off it. Reset per turn in [`set_turn`](Self::set_turn).
+    reads: Arc<crate::runtime::ReadTracker>,
 }
 
 impl EngineLoopHost {
@@ -468,6 +493,7 @@ impl EngineLoopHost {
                 last_phase: Mutex::new(Phase::default()),
                 resume_context_shown: Mutex::new(false),
                 conversation_cache: Mutex::new(std::collections::HashMap::new()),
+                reads: Arc::new(crate::runtime::ReadTracker::default()),
             });
             *slot2.lock().unwrap() = Some(host.clone());
             executor.set_loop_host(host.clone());
@@ -520,6 +546,9 @@ impl EngineLoopHost {
         // …and the cross-turn resume-context one-shot (A-16) — a new turn gets its own chance to
         // see it, whether or not the prior turn's latch is still open.
         *self.resume_context_shown.lock().unwrap() = false;
+        // …and the read-resource ledger (A-20) — evidence gathered by a prior turn must not make
+        // this turn's first reads look redundant (and its cache may be stale across turns).
+        self.reads.reset();
     }
 
     /// The token usage accumulated across this turn's planner calls (every `plan` re-entry). The
@@ -533,6 +562,21 @@ impl EngineLoopHost {
     /// per-model attribution `turn_usage`'s single replace-style total can't express (C-06).
     pub fn turn_calls(&self) -> Vec<(String, Usage)> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// Cumulative BILLED tokens across every planner call this turn (A-26): each call's OWN
+    /// `Usage::total()`, summed. Deliberately NOT `turn_usage().total()` — that accumulator is
+    /// replace-style on input/cache (right for reporting context-window occupancy, see
+    /// [`Usage::accumulate`]), so a runaway multi-call loop that re-pays roughly the same input
+    /// every round barely advances past one call's tokens there and a token-budget ceiling checked
+    /// against it would never trip on exactly the runaway cost it exists to bound.
+    fn cumulative_billed_tokens(&self) -> u64 {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, usage)| usage.total())
+            .sum()
     }
 
     /// Swap the planner (provider + model) — the REPL `/model` command, applied to the shared host so
@@ -641,6 +685,51 @@ impl EngineLoopHost {
         transcript
     }
 
+    /// Resource-aware convergence guard (A-20), applied to a clean round's transcript AFTER
+    /// [`guard_transcript`](Self::guard_transcript): a round of pure reads that were ALL already in
+    /// the turn's [`ReadTracker`] ledger bound no new evidence — no matter how the symbols were
+    /// renamed or the statements reordered, the superficial variation that defeats the byte-exact
+    /// transcript hash (the s_346 runaway). Consecutive such rounds escalate at
+    /// [`RESOURCE_STALL_ESCALATE`] and arm the honest stop at [`RESOURCE_STALL_STOP`]. A round with
+    /// any effectful dispatch, any genuinely new read, or no reads at all resets the counter —
+    /// legitimate incremental gathering and read→fix iteration are never punished.
+    fn guard_resources(&self, transcript: String) -> String {
+        let round = self.reads.round();
+        let mut g = self.guard.lock().unwrap();
+        if round.effectful || round.reads == 0 || round.fresh > 0 {
+            g.resource_stall = 0;
+            return transcript;
+        }
+        g.resource_stall += 1;
+        let stalled = g.resource_stall;
+        let gathered = round.seen_total;
+        if stalled >= RESOURCE_STALL_STOP {
+            if g.force_stop.is_none() {
+                g.force_stop = Some(format!(
+                    "Stopping: the last {stalled} rounds only re-read evidence already gathered \
+                     this turn ({gathered} distinct read(s), all bound to session symbols) without \
+                     producing an answer. Ask a narrower question, or tell me what specifically is \
+                     still missing."
+                ));
+            }
+            return format!(
+                "[loop-guard] STOP — {stalled} consecutive rounds re-read only already-gathered \
+                 resources; the turn will now end.\n{transcript}"
+            );
+        }
+        if stalled >= RESOURCE_STALL_ESCALATE {
+            return format!(
+                "[loop-guard] No NEW evidence in {stalled} consecutive rounds — every read \
+                 repeated one of the {gathered} resources already gathered this turn (re-binding \
+                 them under new symbol names changes nothing). STOP reading. Answer the request \
+                 now from the session symbols, or state in prose exactly what you cannot \
+                 determine.\n{transcript}"
+            );
+        }
+        // First redundant round: the per-read reuse notes in the transcript are the nudge.
+        transcript
+    }
+
     /// Durably record one planning attempt (C-14): `accepted` (with the AST fingerprint + rendered
     /// plan text), `chat`, `compile_error`, or `rejected`. Non-fatal, no-op when the turn has no
     /// audit target (tests, the pre-authored `flow run` path).
@@ -726,7 +815,7 @@ impl LoopHost for EngineLoopHost {
         // another model call. Checked BEFORE the completion fast-path too — the ceiling is hard.
         let budget = *self.token_budget.lock().unwrap();
         if let Some(budget) = budget {
-            let used = self.usage.lock().unwrap().total();
+            let used = self.cumulative_billed_tokens();
             if used >= budget {
                 let obs = flux_evidence::Observation::new(
                     "turn.budget_exceeded",
@@ -1079,18 +1168,22 @@ impl EngineLoopHost {
         // insists, this same informational transcript repeats and the transcript-stall guard
         // escalates/stops the turn.
         let plan_fingerprint = transcript_hash(&serde_json::to_string(&ast).unwrap_or_default());
-        {
+        let identical_completed_skip = {
             let g = self.guard.lock().unwrap();
-            if g.last_plan_ok && g.last_plan_hash.as_deref() == Some(plan_fingerprint.as_str()) {
-                return Ok(serde_json::json!({
-                    "transcript": "[loop-guard] This EXACT plan already ran SUCCESSFULLY in the \
-                                   previous round — it was NOT re-run. An empty result there means \
-                                   the operation succeeded with no output. Use those results, or \
-                                   answer in prose to finish the turn.",
-                    "result": "",
-                    "steps": 0,
-                }));
-            }
+            g.last_plan_ok && g.last_plan_hash.as_deref() == Some(plan_fingerprint.as_str())
+        };
+        if identical_completed_skip {
+            // A-27: route this skip's transcript through the SAME stall-guard machinery as every
+            // other return path (the plan-error path below, the halt path, the success path) —
+            // otherwise a model that keeps re-emitting this byte-identical already-succeeded plan
+            // never advances the transcript-stall counter and `force_stop` never arms, spinning the
+            // full repeat budget instead of ending after `STALL_STOP` rounds.
+            let transcript = self.guard_transcript(IDENTICAL_PLAN_SKIP_MESSAGE.to_string());
+            return Ok(serde_json::json!({
+                "transcript": transcript,
+                "result": "",
+                "steps": 0,
+            }));
         }
 
         let (session_id, sink) = {
@@ -1256,6 +1349,9 @@ impl EngineLoopHost {
         // halt latch (the runtime appends `PlanResumed` even at zero skips) — the authored
         // `flux flow run` path never calls this resumable wrapper (L-25).
         let ledger = open_halt.as_ref().map(|open| &open.ledger);
+        // A-20: open a fresh round on the turn's read-resource ledger — the inner dispatches fill
+        // it, and the clean-success path below folds its summary into the convergence guard.
+        self.reads.begin_round();
         let outcome = match execute_flow_resumable_with_composites(
             self.store.as_ref(),
             executor.as_ref(),
@@ -1263,6 +1359,7 @@ impl EngineLoopHost {
             &ast,
             &composites,
             ledger,
+            Some(self.reads.clone()),
             &mut sink,
         )
         .await
@@ -1378,7 +1475,9 @@ impl EngineLoopHost {
         let transcript = if outcome.suspension.is_some() {
             outcome.transcript.clone()
         } else {
-            self.guard_transcript(outcome.transcript.clone())
+            // Byte-exact stall first (identical transcripts), then the resource-aware guard
+            // (renamed/reshuffled re-reads the byte hash can't see — A-20).
+            self.guard_resources(self.guard_transcript(outcome.transcript.clone()))
         };
         let mut transcript = cap_loop_feedback(transcript);
         if let Some(w) = &rerun_warning {
@@ -1722,6 +1821,18 @@ mod tests {
         ]
     }
 
+    /// [`prose`], but reporting `usage` for the call — for exercising the token-budget ceiling
+    /// (A-26) without needing a full plan/execute round-trip.
+    fn prose_with_usage(text: &str, usage: Usage) -> Vec<Chunk> {
+        vec![
+            Chunk::TextDelta(text.to_string()),
+            Chunk::Usage(usage),
+            Chunk::Done {
+                stop_reason: Some(StopReason::EndTurn),
+            },
+        ]
+    }
+
     /// One model turn that emits a bounded read-only `gather: true` plan (A-14) carrying `ast` and
     /// a `brief`.
     fn emit_gather_plan(ast: Value, goal: &str, needs: &[&str]) -> Vec<Chunk> {
@@ -1757,6 +1868,127 @@ mod tests {
             cap_loop_feedback_with_cap("abcdef".to_string(), 0),
             "abcdef"
         );
+    }
+
+    /// Build a host wired to `provider` (a fresh in-memory session, no tools needed) — for
+    /// exercising `plan()`'s token-budget ceiling across several planner-only rounds without a
+    /// full plan/execute round-trip.
+    // NB: returns the `Arc<Executor>` too — the host only holds a `Weak` back-reference to it
+    // (see `EngineLoopHost::executor`), so the caller must keep this alive for the host to work.
+    fn budget_test_host(provider: Arc<dyn Provider>) -> (Arc<Executor>, Arc<EngineLoopHost>) {
+        let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(Recorder::default())));
+        let dir = std::env::temp_dir().join(format!("flux-loop-a26-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let mut reg = ToolRegistry::new();
+        flux_tools::register_reflect(&mut reg);
+        let executor = Executor::new(
+            reg,
+            PermissionManager::from_rules(&["plan".into(), "run_plan".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(system),
+        );
+        let store = Arc::new(FlowStore::in_memory().unwrap());
+        EngineLoopHost::install(
+            executor,
+            provider,
+            "mock".into(),
+            None,
+            store,
+            Arc::new(DynamicComposites::default()),
+            "sess".into(),
+            shared,
+            CompileOptions::default(),
+        )
+    }
+
+    /// A-26: the per-turn token budget must bound CUMULATIVE billed tokens across every planner
+    /// call this turn, not `turn_usage()`'s replace-style total (which replaces input/cache each
+    /// call and only sums outputs — the right shape for reporting context-window occupancy, wrong
+    /// for a spend ceiling). A runaway loop that re-pays ~equal input every round barely advances
+    /// past one call's tokens under the old total, so the ceiling never trips. Two rounds are
+    /// queued, each billing 110 tokens (100 in + 10 out); a budget of 200 sits BETWEEN one round's
+    /// tokens and two rounds' cumulative tokens, so the THIRD `plan()` call must stop before ever
+    /// reaching the provider — a third canned response is queued that must never be consumed.
+    #[tokio::test]
+    async fn token_budget_trips_on_cumulative_billed_tokens_across_calls() {
+        let round_usage = || Usage {
+            input_tokens: 100,
+            output_tokens: 10,
+            ..Default::default()
+        };
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                prose_with_usage("keep going 1", round_usage()),
+                prose_with_usage("keep going 2", round_usage()),
+                prose_with_usage("this call must never happen", round_usage()),
+            ])),
+        });
+        let (_executor, host) = budget_test_host(provider);
+        host.set_token_budget(Some(200));
+
+        let r1 = host.plan(json!({ "feedback": "" })).await.unwrap();
+        assert_eq!(r1["kind"], "chat");
+        assert_eq!(r1["text"], "keep going 1");
+
+        let r2 = host.plan(json!({ "feedback": "" })).await.unwrap();
+        assert_eq!(r2["kind"], "chat");
+        assert_eq!(r2["text"], "keep going 2");
+
+        // Cumulative billed tokens (110 + 110 = 220) now exceed the 200 budget: the turn must end
+        // honestly WITHOUT a third provider call.
+        let r3 = host.plan(json!({ "feedback": "" })).await.unwrap();
+        assert_eq!(
+            host.turn_calls().len(),
+            2,
+            "the budget stop must not pay a third model call"
+        );
+        assert_eq!(r3["kind"], "chat");
+        let text = r3["text"].as_str().unwrap();
+        assert!(text.contains("token budget"), "{text}");
+        assert!(
+            !text.contains("must never happen"),
+            "the third canned response must not be consumed: {text}"
+        );
+    }
+
+    /// A-26 (no regression): an unset budget never checks usage at all, and a single call that
+    /// stays under an installed budget proceeds exactly as before.
+    #[tokio::test]
+    async fn token_budget_unset_or_single_call_under_it_is_unaffected() {
+        // Unset budget: even a call that would blow any reasonable ceiling is untouched.
+        let big_usage = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 1,
+            ..Default::default()
+        };
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider {
+            responses: Mutex::new(VecDeque::from(vec![prose_with_usage(
+                "unset budget",
+                big_usage,
+            )])),
+        });
+        let (_executor, host) = budget_test_host(provider);
+        let r = host.plan(json!({ "feedback": "" })).await.unwrap();
+        assert_eq!(r["text"], "unset budget");
+
+        // A single call comfortably under an installed budget: proceeds normally, no stop text.
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider {
+            responses: Mutex::new(VecDeque::from(vec![prose_with_usage(
+                "under budget",
+                Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+            )])),
+        });
+        let (_executor, host) = budget_test_host(provider);
+        host.set_token_budget(Some(200));
+        let r = host.plan(json!({ "feedback": "" })).await.unwrap();
+        assert_eq!(r["kind"], "chat");
+        assert_eq!(r["text"], "under budget");
+        assert_eq!(host.turn_calls().len(), 1);
     }
 
     /// Build a minimal host (no canned plans needed) for exercising the retry-breaker directly.
@@ -1914,6 +2146,101 @@ mod tests {
             .filter(|t| t.as_str() == "echo")
             .count();
         assert_eq!(echoes, 1, "echo dispatched exactly once across both rounds");
+    }
+
+    /// A-27: the identical-plan skip (the previous test) must route its transcript through the
+    /// SAME stall-guard machinery as every other `run_plan` return path. Before the fix the skip
+    /// returned its transcript directly, bypassing `guard_transcript` — so a model that keeps
+    /// re-emitting the byte-identical already-succeeded plan never advanced the transcript-stall
+    /// counter and `force_stop` never armed, spinning the full repeat budget (up to 25 planner
+    /// rounds) instead of ending after `STALL_STOP`. A single (non-repeated) skip must still return
+    /// its informational transcript untouched, with no premature stop.
+    #[tokio::test]
+    async fn identical_plan_skip_escalates_and_force_stops_on_repeats() {
+        let rec = Recorder::default();
+        let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(rec.clone())));
+        let dir = std::env::temp_dir().join(format!("flux-loop-a27-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        flux_tools::register_reflect(&mut reg);
+        let executor = Executor::new(
+            reg,
+            PermissionManager::from_rules(&["plan".into(), "run_plan".into(), "echo".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(system),
+        );
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider {
+            responses: Mutex::new(VecDeque::new()),
+        });
+        let store = Arc::new(FlowStore::in_memory().unwrap());
+        let (_executor, host) = EngineLoopHost::install(
+            executor,
+            provider,
+            "mock".into(),
+            None,
+            store,
+            Arc::new(DynamicComposites::default()),
+            "sess".into(),
+            shared,
+            CompileOptions::default(),
+        );
+        // An echo of "" — a silent success (empty view), exactly like the previous test.
+        let plan = json!({
+            "kind": "plan",
+            "ast": { "body": [
+                { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "" }] }
+            ]}
+        });
+        let first = host.run_plan(plan.clone()).await.unwrap();
+        assert_eq!(first["steps"], 1, "the first round actually runs the plan");
+
+        // Round 2 — the FIRST identical-plan skip: informational only, byte-identical to the raw
+        // message (no stall-escalation wrapper prepended yet — this IS what "no premature stop"
+        // means, since the base message itself always carries a `[loop-guard]` prefix).
+        let second = host.run_plan(plan.clone()).await.unwrap();
+        let second_transcript = second["transcript"].as_str().unwrap().to_string();
+        assert_eq!(
+            second_transcript, IDENTICAL_PLAN_SKIP_MESSAGE,
+            "a single skip must return its informational transcript untouched"
+        );
+        assert!(
+            host.guard.lock().unwrap().force_stop.is_none(),
+            "a single skip must not stop the turn"
+        );
+
+        // The model keeps re-emitting the identical already-succeeded plan. Round 2 (above) was
+        // stall count 1; every further repeat must escalate the SAME transcript-stall counter (the
+        // machinery every other `run_plan` return path already uses) — `force_stop` stays unarmed
+        // until the count reaches STALL_STOP, then arms exactly there.
+        let mut last_transcript = second_transcript;
+        let mut stall = 1u32;
+        while stall < STALL_STOP {
+            let out = host.run_plan(plan.clone()).await.unwrap();
+            last_transcript = out["transcript"].as_str().unwrap().to_string();
+            stall += 1;
+            assert_eq!(
+                host.guard.lock().unwrap().force_stop.is_some(),
+                stall >= STALL_STOP,
+                "stall={stall} (STALL_STOP={STALL_STOP}): {last_transcript}"
+            );
+        }
+        assert!(
+            last_transcript.contains("STOP"),
+            "stall={STALL_STOP} must force-stop the turn: {last_transcript}"
+        );
+
+        // The op itself only ever ran once — every skip (and the escalations) correctly avoided
+        // re-executing the (potentially non-idempotent) plan.
+        let echoes = rec
+            .tools
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.as_str() == "echo")
+            .count();
+        assert_eq!(echoes, 1, "echo dispatched exactly once across every round");
     }
 
     /// Fix 2: an identical `run_plan` transcript repeating means the loop is not progressing. The
@@ -4463,5 +4790,389 @@ flow agent-loop -> string
         assert_eq!(open.halt.op.as_deref(), Some("boom"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // A-20 — resource-aware convergence guard + redundant-read short-circuit.
+    // The s_346 runaway: 22 read-only rounds re-reading the same 6 files under
+    // renamed symbols; the byte-exact transcript hash never stalled.
+    // -----------------------------------------------------------------------
+
+    /// A cacheable filesystem-read stand-in, classified exactly like the real `read`
+    /// (effects `[Read]`, access `[Filesystem]`) but hermetic: serves from a shared map and
+    /// counts every REAL dispatch, so a test can assert the short-circuit performed no second IO.
+    struct CountingReadTool {
+        calls: Arc<AtomicUsize>,
+        files: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    }
+
+    #[async_trait]
+    impl Tool for CountingReadTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only(
+                "cread",
+                "read a mapped file (dispatch-counting)",
+                json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+            )
+            .with_access(vec![flux_spec::AccessKind::Filesystem])
+        }
+        async fn execute(&self, _c: &ToolContext, p: Value) -> Result<ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let path = p.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            match self.files.lock().unwrap().get(path) {
+                Some(content) => Ok(ToolResult::ok(content.clone())),
+                None => Ok(ToolResult::error(format!("no such file: {path}"))),
+            }
+        }
+    }
+
+    /// Companion writer over the same map (effects `[Write, Filesystem]`) — a mutating dispatch
+    /// that must invalidate the read cache, or a later `cread` would reuse stale content.
+    struct MapWriteTool {
+        files: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    }
+
+    #[async_trait]
+    impl Tool for MapWriteTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only(
+                "cwrite",
+                "write a mapped file",
+                json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
+            )
+            .with_effects(vec![flux_spec::Effect::Write, flux_spec::Effect::Filesystem])
+            .with_access(vec![flux_spec::AccessKind::Filesystem])
+        }
+        async fn execute(&self, _c: &ToolContext, p: Value) -> Result<ToolResult> {
+            let path = p.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let content = p.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            self.files
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), content.to_string());
+            Ok(ToolResult::ok(""))
+        }
+    }
+
+    fn a20_files(pairs: &[(&str, &str)]) -> Arc<Mutex<std::collections::HashMap<String, String>>> {
+        Arc::new(Mutex::new(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        ))
+    }
+
+    /// A plan AST that binds `$name = cread(path)` per pair — the renamed-symbol re-read shape.
+    fn cread_plan(binds: &[(&str, &str)]) -> Value {
+        let body: Vec<Value> = binds
+            .iter()
+            .map(|(name, path)| {
+                json!({"kind":"bind","name":name,
+                       "value":{"kind":"call","op":"cread","args":[{"kind":"lit","value":path}]}})
+            })
+            .collect();
+        json!({"kind":"plan","ast":{"body":body}})
+    }
+
+    /// Returns the executor too — the host holds only a `Weak` back-reference, so dropping the
+    /// `Arc<Executor>` would kill every dispatch with "the executor is no longer alive".
+    fn a20_host(
+        calls: &Arc<AtomicUsize>,
+        files: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+        tag: &str,
+    ) -> (Arc<Executor>, Arc<EngineLoopHost>) {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(CountingReadTool {
+            calls: calls.clone(),
+            files: files.clone(),
+        }));
+        reg.register(Arc::new(MapWriteTool {
+            files: files.clone(),
+        }));
+        flux_tools::register_reflect(&mut reg);
+        setup_host(
+            reg,
+            PermissionManager::from_rules(
+                &[
+                    "cread".into(),
+                    "cwrite".into(),
+                    "plan".into(),
+                    "run_plan".into(),
+                ],
+                &[],
+            ),
+            Arc::new(AllowApprover),
+            Recorder::default(),
+            tag,
+        )
+    }
+
+    /// A-20 acceptance 1 + 3: consecutive read-only rounds whose reads are a subset of the
+    /// already-seen resources — under NEW symbol names each round — must escalate the stall
+    /// feedback and then force the honest `chat` termination. Before the fix the guard hashed
+    /// byte-exact transcripts, so renamed re-reads never tripped it.
+    #[tokio::test]
+    async fn renamed_symbol_rereads_escalate_then_force_stop() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let files = a20_files(&[("f1", "alpha"), ("f2", "beta")]);
+        let (_ex, host) = a20_host(&calls, &files, "a20-resource-guard");
+
+        // Round 1: two fresh reads — progress.
+        let r1 = host
+            .run_plan(cread_plan(&[("a", "f1"), ("b", "f2")]))
+            .await
+            .unwrap();
+        let t1 = r1["transcript"].as_str().unwrap();
+        assert!(t1.contains("alpha") && t1.contains("beta"), "{t1}");
+
+        // Round 2: the same two resources under new symbol names — no new evidence (stall 1).
+        let r2 = host
+            .run_plan(cread_plan(&[("a2", "f1"), ("b2", "f2")]))
+            .await
+            .unwrap();
+        let t2 = r2["transcript"].as_str().unwrap();
+        assert!(
+            !t2.contains("No NEW evidence"),
+            "the first redundant round must not yet escalate: {t2}"
+        );
+
+        // Round 3: a strict subset, renamed again (stall 2) → the feedback must escalate.
+        let r3 = host.run_plan(cread_plan(&[("a3", "f1")])).await.unwrap();
+        let t3 = r3["transcript"].as_str().unwrap();
+        assert!(
+            t3.contains("No NEW evidence"),
+            "two consecutive no-new-evidence rounds must escalate the feedback: {t3}"
+        );
+
+        // Round 4: still nothing new (stall 3) → the guard arms the honest stop.
+        let r4 = host.run_plan(cread_plan(&[("b3", "f2")])).await.unwrap();
+        let t4 = r4["transcript"].as_str().unwrap();
+        assert!(
+            t4.contains("STOP —"),
+            "the third no-new-evidence round must announce the stop: {t4}"
+        );
+
+        // The next `plan` must end the turn as a chat instead of consulting the model again.
+        let out = host.plan(json!({ "feedback": t4 })).await.unwrap();
+        assert_eq!(out["kind"], "chat", "{out}");
+        assert!(
+            out["text"].as_str().unwrap().starts_with("Stopping:"),
+            "{out}"
+        );
+    }
+
+    /// A-20 acceptance 2: a `cread(path)` whose exact call already ran this turn performs NO
+    /// second dispatch — the cached value is re-bound under the new name and the feedback says so.
+    #[tokio::test]
+    async fn redundant_read_short_circuits_io_with_reuse_note() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let files = a20_files(&[("f1", "alpha")]);
+        let (_ex, host) = a20_host(&calls, &files, "a20-read-cache");
+
+        host.run_plan(cread_plan(&[("data", "f1")])).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Same read, new symbol name, plus a return that proves the value still binds.
+        let plan = json!({"kind":"plan","ast":{"body":[
+            {"kind":"bind","name":"data_full",
+             "value":{"kind":"call","op":"cread","args":[{"kind":"lit","value":"f1"}]}},
+            {"kind":"return","value":{"kind":"var","name":"data_full"}}
+        ]}});
+        let r2 = host.run_plan(plan).await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the re-read must not dispatch a second IO: {r2}"
+        );
+        let t2 = r2["transcript"].as_str().unwrap();
+        assert!(
+            t2.contains("already read as $data") && t2.contains("reusing"),
+            "the feedback must say the read was served from the session: {t2}"
+        );
+        assert_eq!(
+            r2["result"].as_str().unwrap(),
+            "alpha",
+            "the cached value must still bind correctly: {r2}"
+        );
+    }
+
+    /// A-20 acceptance 3 (reset side): a round that binds a genuinely NEW resource resets the
+    /// no-new-evidence counter — legitimate incremental gathering is never punished.
+    #[tokio::test]
+    async fn fresh_read_resets_resource_stall() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let files = a20_files(&[("f1", "alpha"), ("f2", "beta")]);
+        let (_ex, host) = a20_host(&calls, &files, "a20-stall-reset");
+
+        host.run_plan(cread_plan(&[("x1", "f1")])).await.unwrap();
+        host.run_plan(cread_plan(&[("x2", "f1")])).await.unwrap(); // stall 1
+                                                                   // A new resource beside a re-read → progress, counter resets.
+        let r3 = host
+            .run_plan(cread_plan(&[("x3", "f1"), ("y1", "f2")]))
+            .await
+            .unwrap();
+        assert!(
+            !r3["transcript"]
+                .as_str()
+                .unwrap()
+                .contains("No NEW evidence"),
+            "a round with a fresh read must not escalate: {r3}"
+        );
+        host.run_plan(cread_plan(&[("y2", "f2")])).await.unwrap(); // stall 1 again
+        let r5 = host.run_plan(cread_plan(&[("x4", "f1")])).await.unwrap(); // stall 2
+        let t5 = r5["transcript"].as_str().unwrap();
+        assert!(
+            t5.contains("No NEW evidence"),
+            "after the reset the counter must climb again: {t5}"
+        );
+        assert!(
+            !t5.contains("STOP —"),
+            "stall 2 escalates but must not stop yet: {t5}"
+        );
+    }
+
+    /// Correctness guard for the short-circuit: a mutating dispatch invalidates the read cache —
+    /// a later identical read re-fetches and sees the NEW content, never a stale reuse.
+    #[tokio::test]
+    async fn mutating_op_invalidates_read_cache() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let files = a20_files(&[("f1", "alpha")]);
+        let (_ex, host) = a20_host(&calls, &files, "a20-invalidate");
+
+        host.run_plan(cread_plan(&[("a", "f1")])).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Write f1, then re-read it in the same plan: the read MUST re-dispatch and see "gamma".
+        let plan = json!({"kind":"plan","ast":{"body":[
+            {"kind":"call","op":"cwrite","args":[
+                {"kind":"lit","value":"f1"},{"kind":"lit","value":"gamma"}]},
+            {"kind":"bind","name":"b",
+             "value":{"kind":"call","op":"cread","args":[{"kind":"lit","value":"f1"}]}},
+            {"kind":"return","value":{"kind":"var","name":"b"}}
+        ]}});
+        let r2 = host.run_plan(plan).await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the post-write read must not be served from the cache: {r2}"
+        );
+        assert_eq!(r2["result"].as_str().unwrap(), "gamma", "{r2}");
+
+        // The refilled cache serves the NEW content without a third dispatch.
+        let plan3 = json!({"kind":"plan","ast":{"body":[
+            {"kind":"bind","name":"c",
+             "value":{"kind":"call","op":"cread","args":[{"kind":"lit","value":"f1"}]}},
+            {"kind":"return","value":{"kind":"var","name":"c"}}
+        ]}});
+        let r3 = host.run_plan(plan3).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "{r3}");
+        assert_eq!(r3["result"].as_str().unwrap(), "gamma", "{r3}");
+    }
+
+    /// A-20 acceptance 4 — the s_346 regression fixture: a planner that re-reads the same files
+    /// under fresh symbol names every round, forever. The full built-in agent loop must converge
+    /// to an honest stop within ~6 planner rounds instead of spinning to the 25-round cap, and
+    /// every re-read must be served from the cache (3 files → exactly 3 real dispatches).
+    #[tokio::test]
+    async fn s346_renamed_reread_turn_is_forced_to_converge() {
+        let rec_sink = Recorder::default();
+        let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(rec_sink.clone())));
+
+        let dir = std::env::temp_dir().join(format!("flux-loop-s346-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let files = a20_files(&[
+            ("knowledge-api.ts", "export const api = 1;"),
+            ("main.rs", "fn main() {}"),
+            ("lib.rs", "pub fn lib() {}"),
+        ]);
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(CountingReadTool {
+            calls: calls.clone(),
+            files: files.clone(),
+        }));
+        flux_tools::register_reflect(&mut reg);
+        flux_tools::register_evidence(&mut reg);
+        let executor = Executor::new(
+            reg,
+            PermissionManager::from_rules(
+                &[
+                    "cread".into(),
+                    "plan".into(),
+                    "run_plan".into(),
+                    "observe".into(),
+                ],
+                &[],
+            ),
+            Arc::new(AllowApprover),
+            ToolContext::new(system),
+        );
+
+        // The s_346 shape: every planner round re-reads the same 3 files under fresh names
+        // ($main_rs → $main_rs_v2 → $main_rs_v3 → …), never answering. A closing prose response
+        // marks "the model finally gave up" — with the guard in place it is never reached.
+        let ast = |suffix: &str| {
+            json!({"body": [
+                {"kind":"bind","name":format!("api_ts{suffix}"),
+                 "value":{"kind":"call","op":"cread","args":[{"kind":"lit","value":"knowledge-api.ts"}]}},
+                {"kind":"bind","name":format!("main_rs{suffix}"),
+                 "value":{"kind":"call","op":"cread","args":[{"kind":"lit","value":"main.rs"}]}},
+                {"kind":"bind","name":format!("lib_rs{suffix}"),
+                 "value":{"kind":"call","op":"cread","args":[{"kind":"lit","value":"lib.rs"}]}}
+            ]})
+        };
+        let mut responses = VecDeque::new();
+        responses.push_back(emit_plan(ast("")));
+        for i in 2..=13 {
+            responses.push_back(emit_plan(ast(&format!("_v{i}"))));
+        }
+        responses.push_back(prose("gave up"));
+        let provider = Arc::new(RecordingProvider {
+            responses: Mutex::new(responses),
+            seen: Mutex::new(Vec::new()),
+            systems: Mutex::new(Vec::new()),
+        });
+        let store = Arc::new(FlowStore::in_memory().unwrap());
+        let (executor, _host) = EngineLoopHost::install(
+            executor,
+            provider.clone(),
+            "mock".into(),
+            None,
+            store.clone(),
+            Arc::new(DynamicComposites::default()),
+            "sess".into(),
+            shared.clone(),
+            CompileOptions::default(),
+        );
+
+        let loop_ast = crate::engine::load_agent_loop(&dir).unwrap();
+        let mut outer = SharedSink::new(shared);
+        let out = execute_flow(
+            store.as_ref(),
+            executor.as_ref(),
+            "sess",
+            &loop_ast,
+            &mut outer,
+        )
+        .await
+        .unwrap();
+
+        let planner_rounds = provider.systems.lock().unwrap().len();
+        assert!(
+            planner_rounds <= 6,
+            "a renamed-re-read turn must converge in ≤6 planner rounds, took {planner_rounds}"
+        );
+        assert!(
+            out.result.contains("Stopping"),
+            "the turn must end with the honest stop, got: {}",
+            out.result
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "3 distinct files → exactly 3 real reads; every re-read served from the cache"
+        );
     }
 }

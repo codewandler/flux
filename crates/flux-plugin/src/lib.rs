@@ -4223,6 +4223,9 @@ mod tests {
         Ok,
         WrongPassword,
         BadServerSig,
+        /// Server-first reports an iteration count one above `pg::MAX_SCRAM_ITERATIONS` — must be
+        /// rejected before any PBKDF2 work (D-52), not silently computed.
+        HugeIterations,
     }
 
     /// A scripted PostgreSQL server speaking SCRAM-SHA-256 (no channel binding). Reuses the host's own
@@ -4254,11 +4257,22 @@ mod tests {
                 7u8, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67,
             ];
             let salt_b64 = crate::pg::base64_encode(&salt);
-            let iterations = 4096u32;
+            let iterations: u32 = if mode == ScramMode::HugeIterations {
+                crate::pg::MAX_SCRAM_ITERATIONS + 1
+            } else {
+                4096
+            };
             let server_first = format!("r={combined},s={salt_b64},i={iterations}");
             let mut cont = 11i32.to_be_bytes().to_vec();
             cont.extend_from_slice(server_first.as_bytes());
             sock.write_all(&pg_frame(b'R', &cont)).await.unwrap();
+
+            if mode == ScramMode::HugeIterations {
+                // The client must reject an over-ceiling iteration count right here, before PBKDF2,
+                // and never send a client-final — nothing more for the scripted server to do.
+                let _ = sock.shutdown().await;
+                return;
+            }
 
             // SASLResponse: client-final "c=biws,r=<combined>,p=<proof>".
             let (_tag, body) = pg_read_tagged(&mut sock).await;
@@ -4374,6 +4388,30 @@ mod tests {
         assert!(
             err.contains("server signature verification failed"),
             "a corrupt server signature must be rejected: {err}"
+        );
+    }
+
+    /// D-52: a server-first `i=` one above `MAX_SCRAM_ITERATIONS` must be rejected before any PBKDF2
+    /// work, not silently accepted and computed. `MAX+1` (not `u32::MAX`) keeps this test fast (it's
+    /// still well within a legitimate-looking magnitude) while proving the ceiling is enforced —
+    /// pre-fix this assertion fails because the handshake actually SUCCEEDS (both sides derive the
+    /// same keys at that iteration count), not because it hangs.
+    #[tokio::test]
+    async fn pg_scram_rejects_iteration_count_above_ceiling() {
+        let port = spawn_scram_server("pencil", ScramMode::HugeIterations).await;
+        let mut stream = dial_loopback(port).await;
+        let err = pg::authenticate(
+            &mut stream,
+            &pg_params(),
+            "pencil",
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("exceeds the maximum")
+                && err.contains(&pg::MAX_SCRAM_ITERATIONS.to_string()),
+            "an over-ceiling iteration count must be rejected before PBKDF2: {err}"
         );
     }
 

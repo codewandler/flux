@@ -99,6 +99,38 @@ release and the plugin platform (D-46..D-49) are explicitly out. Each ships with
 in its Acceptance; order: correctness/security → enforcement/durability → hygiene. Epic design:
 [library-hardening.md](designs/library-hardening.md).
 
+### Review hardening (epic) — 0.2.11 diff-review residuals
+
+An xhigh workflow-backed code review of the 0.2.11 diff (2026-07-03, 192 changed files: six finder angles
+→ 38 candidates → an independent verifier per (file, line) → 15 reported) surfaced a batch of residual
+defects **inside already-shipped stories**. Before filing, every finding was **grounded against flux's
+stated invariants** by an independent Opus reader — and that grounding is the point of the epic: the raw
+review ranked four "enforcement-boundary bypasses" as the gravest defects, and only one survived as
+security. The one that did is 🔴 [C-27](stories/C-27-nested-destructive-refire.md) — the C-12
+undisclosed-destructive re-fire gate keys on a bare shared depth counter, so a nested `run_plan` approved
+`destructive:false` rides an outer plan's disclosure and a runtime-assembled `rm -rf` dispatches with no
+prompt (a genuine approval-gate bypass, reachable via reflexive `run_plan`). The rest of the raw "gravest
+four" were **corrected**: the composite hidden-op "bypass" is a legibility gap, not a security one — the
+envelope holds and the gather gate is honored transitively ([L-30](stories/L-30-composite-surfacing-transitive.md),
+🟡); the `parallel` cap-scope corruption is a real but **latent** soundness gap (`with_tools` is unused in
+any shipped flow — [L-31](stories/L-31-cap-scope-parallel-position.md), 🟡); the nested-delegation cap-scope
+escape is real but **opt-in only** (default `max_depth = 1` keeps every child a leaf —
+[A-25](stories/A-25-nested-delegation-cap-scope.md), 🟠); and one candidate — the SQL_USERNAME
+"regression" — was **withdrawn** entirely (a username is non-secret DSN metadata; plugins read no env; the
+D-31 redesign was correct). The other confirmed 🔴/🟠 items are grounded correctness/robustness bugs against
+documented contracts: `is_envelope_denial` misclassifying real tool failures as fatal denials
+([L-32](stories/L-32-envelope-denial-classification.md)); the codex WS transport defeating its guaranteed
+HTTP fallback three ways ([C-28](stories/C-28-codex-ws-fallback-hardening.md)); a markdown writer emitting
+an early-closing fence ([L-33](stories/L-33-markdown-writer-fence-length.md)); the host-terminated SCRAM
+handshake trusting an unbounded server iteration count ([D-52](stories/D-52-scram-iteration-bound.md)); the
+A-10 turn budget measuring last-call occupancy instead of cumulative billed tokens
+([A-26](stories/A-26-turn-budget-cumulative.md)); the A-05 identical-plan skip bypassing the stall guard
+([A-27](stories/A-27-identical-plan-skip-stall-guard.md)); a queued a2a session pruned mid-flight into
+orphaned, un-prunable events ([C-29](stories/C-29-a2a-queued-session-retention.md)); and a markdown list
+swallowing a spaced thematic break ([L-34](stories/L-34-markdown-parser-thematic-break.md)). Each ships
+with the failing-first test named in its Acceptance; order: security/correctness → robustness → hygiene.
+Epic design: [review-hardening.md](designs/review-hardening.md).
+
 ### flux-lang v1 hardening (epic)
 
 A full review of the language pillar (2026-07-02: three scoped deep-dives plus first-hand

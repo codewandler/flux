@@ -1307,5 +1307,9 @@ gates on a shell exit-code wrapper or a boolean tool output work as expected.
 - **`race` runs branches concurrently and picks the first *success*** within its deadline;
   all-branches-failed is a joined branch error (distinct from a timeout), and losing branches'
   dispatched steps remain counted and traced. Use `parallel` if you want all branches to complete.
+- **`with_tools`/`cap_scope` cannot appear inside a `parallel`/`race` branch** — its cap-scope
+  stack is shared, mutable state across the one executor concurrent branches run against, so
+  nesting it there doesn't compose safely. Rejected by the analyzer; a sequential `with_tools`
+  outside any concurrent branch is unaffected.
 - **`await` and `checkpoint` are top-level only** — they need stable resume cursors.
 - **`obj`/`list` are pure templates** — they cannot contain `call` or control-flow leaves.

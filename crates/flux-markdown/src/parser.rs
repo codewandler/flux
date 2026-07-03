@@ -328,8 +328,10 @@ fn parse_list(lines: &[&str], i: &mut usize, first: Marker, opts: &ParseOptions)
             blocks: parse_blocks(&content_refs, opts),
         });
 
-        // Another item of the same list?
-        if *i >= lines.len() {
+        // Another item of the same list? A thematic break takes precedence over a list marker
+        // here too (mirrors `parse_blocks`' block-start precedence), so a spaced break like
+        // `- - -` terminates the list instead of nesting as an empty item.
+        if *i >= lines.len() || is_thematic_break(lines[*i]) {
             break;
         }
         match list_marker(lines[*i]) {
@@ -581,6 +583,26 @@ mod tests {
         assert!(l.ordered);
         assert_eq!(l.start, 1);
         assert_eq!(l.marker, '.');
+    }
+
+    /// A spaced thematic break after a list item terminates the list instead of being consumed as
+    /// a nested empty list item — mirroring `parse_blocks`' precedence of `is_thematic_break` over
+    /// `list_marker` at block start (L-34).
+    #[test]
+    fn spaced_thematic_break_terminates_list() {
+        let doc = parse("- a\n- - -\n");
+        assert_eq!(doc.blocks.len(), 2, "{doc:?}");
+        let Block::List(l) = &doc.blocks[0] else {
+            panic!("{doc:?}")
+        };
+        assert_eq!(l.items.len(), 1);
+        assert_eq!(
+            l.items[0].blocks,
+            vec![Block::Paragraph {
+                content: vec![text("a")]
+            }]
+        );
+        assert_eq!(doc.blocks[1], Block::ThematicBreak);
     }
 
     #[test]

@@ -399,6 +399,9 @@ pub async fn execute_call(
             &summarize_bound_result(op, &summary_input, &result.content),
             b.visibility,
         )?;
+        // Post-bind host notification (A-20): lets dispatch-keyed host bookkeeping (e.g. the
+        // redundant-read cache) name the symbol this exact call's result lives under.
+        executor.call_bound(op, &summary_input, &b.name.0);
     }
 
     Ok(CallOutcome {

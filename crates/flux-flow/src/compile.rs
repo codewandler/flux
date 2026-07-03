@@ -2490,6 +2490,79 @@ mod tests {
         assert!(OpRegistry::new(&reg).hidden_ops_in(&ast.body).is_empty());
     }
 
+    /// L-30: a turn/session-scoped composite (`op.register`) that wraps a hidden op. Its own
+    /// declared `effects`/`risk` cover the body correctly (so `analyze_composites` accepts
+    /// registration — that check runs against the FULL registry, not this turn's advertised set),
+    /// but the composite's body calls `bash`, which is hidden this turn.
+    fn bash_composite() -> flux_lang::program::CompositeOpDecl {
+        use flux_lang::program::CompositeOpMeta;
+        flux_lang::program::CompositeOpDecl {
+            name: "wrap_bash".into(),
+            body: DraftAst {
+                body: vec![Node::Call {
+                    op: "bash".into(),
+                    args: vec![Node::Lit {
+                        value: json!("rm x"),
+                    }],
+                }],
+                ..Default::default()
+            },
+            meta: CompositeOpMeta {
+                effects: vec![flux_spec::Effect::Process, flux_spec::Effect::LocalSystem],
+                risk: flux_spec::Risk::High,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn hidden_ops_in_expands_composite_bodies_transitively() {
+        let reg = full_registry();
+        let ops = ops_without_bash(&reg).with_owned_composites(vec![bash_composite()]);
+        let ast: DraftAst =
+            serde_json::from_str(r#"{"body":[{"kind":"call","op":"wrap_bash","args":[]}]}"#)
+                .unwrap();
+        // The composite call itself is never reported (composites aren't gated by advertisement),
+        // but the hidden `bash` op inside its body IS surfaced — a turn-scoped composite can't
+        // launder a hidden op past the gate by wrapping it.
+        assert_eq!(ops.hidden_ops_in(&ast.body), vec!["bash".to_string()]);
+    }
+
+    /// The story's named failing-first test (L-30): mirrors `hidden_op_plan_is_rejected_and_repaired`
+    /// above, but the hidden op is reached through a registered composite rather than named directly.
+    /// Before the fix, `compile_turn` accepted this plan outright — `hidden_ops_in` exempted every
+    /// composite call without ever looking at its body.
+    #[tokio::test]
+    async fn hidden_op_behind_a_composite_is_rejected_and_repaired() {
+        let reg = full_registry();
+        let ops = ops_without_bash(&reg).with_owned_composites(vec![bash_composite()]);
+        let wrap_bash_ast = r#"{"ast":{"body":[{"kind":"call","op":"wrap_bash","args":[]}]}}"#;
+        let p = mock(vec![
+            tool_call("emit_plan", serde_json::from_str(wrap_bash_ast).unwrap()),
+            tool_call("emit_plan", serde_json::from_str(VALID_AST).unwrap()),
+        ]);
+        let out = plan(
+            &p,
+            "mock",
+            "delete x",
+            &ops,
+            None,
+            None,
+            CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.attempts, 2,
+            "the composite-wrapped bash plan must cost a repair round"
+        );
+        assert!(
+            matches!(&out.ast.body[0], crate::ast::Node::Call { op, .. } if op == "read"),
+            "the accepted plan is the repaired one, not the composite hiding bash"
+        );
+    }
+
     // -- A-13: gather-plan enforcement (design Part 1 — "enforced, not trusted") -------------------
 
     fn write_composite() -> flux_lang::program::CompositeOpDecl {

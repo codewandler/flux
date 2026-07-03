@@ -6,6 +6,82 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **Review hardening — the 0.2.11 diff-review residuals.** An xhigh workflow-backed review of the
+  0.2.11 diff produced 15 findings; each was grounded against flux's invariants before filing
+  (design: `docs/designs/review-hardening.md` — the grounding outcomes, incl. one withdrawal and
+  three downgrades, are the point of that doc). All 12 filed stories fixed, each with a
+  failing-first test:
+  - *C-27 — nested destructive re-fire (security).* `destructive_scope` is now a per-scope
+    disclosure stack and the undisclosed-destructive gate keys on the **innermost** approved scope's
+    own flag — a nested `run_plan` approved `destructive:false` no longer rides an outer plan's
+    destructive disclosure, so a runtime-assembled destructive op inside the nested plan re-fires
+    per-op approval instead of dispatching silently.
+  - *L-32 — structural denial classification.* Envelope denials are flagged structurally at the
+    executor's own deny sites (new `DispatchOutcome::denied`: cap-scope, policy floor,
+    permission-rule deny, approval deny) instead of prefix-matching tool output — an op that ran and
+    merely relayed `` `op` denied by … `` text is a repairable failure again, while genuine envelope
+    denials stay fatal and hook denials stay retryable.
+  - *C-28 — codex WS fail-fast contract.* Three fallback-defeating defects fixed: oversized pre-data
+    error payloads are truncated on a char boundary (was a panic on multibyte text), the first-frame
+    wait has a bounded connect timeout (default 30s) so a blackholing proxy fails over to HTTP-SSE,
+    and a Close before the terminal event surfaces as a stream error instead of a silently truncated
+    turn. (`tokio` becomes a hard dep of `flux-providers`.)
+  - *L-33 — tilde-fence sizing.* The markdown writer sizes a tilde fence from the literal's tilde
+    runs (was: backtick runs), restoring the `parse(to_markdown(parse(src))) == parse(src)`
+    round-trip for code blocks whose info string forces a tilde fence.
+  - *D-52 — SCRAM iteration bound.* The host-terminated PG handshake rejects a server-supplied
+    `i=` above `MAX_SCRAM_ITERATIONS` (1,000,000) before any PBKDF2 work — a hostile/MITM'd endpoint
+    can no longer peg a CPU core for minutes.
+  - *A-26 — cumulative turn budget.* The per-turn token budget gates on cumulative billed tokens
+    summed across the turn's calls (was: the replace-style last-call snapshot) — a runaway
+    multi-call loop now trips the ceiling it exists to enforce.
+  - *A-27 — identical-plan skip stall guard.* The skip transcript routes through `guard_transcript`,
+    so a model re-emitting a byte-identical already-succeeded plan force-stops after the stall
+    threshold instead of spinning the full 25-round repeat budget.
+  - *A-25 — transitive delegation cap-scope.* Under opt-in `with_max_depth ≥ 2`, the depth-next
+    spawner is built over the ancestor-narrowed registry subset and `task` must survive the
+    role∩cap-scope intersection to delegate further — an ancestor `with_tools` ceiling now holds N
+    hops down. Behavior note: a delegating role must now declare `task` in its tool set.
+  - *L-30 — transitive surfacing enforcement.* `hidden_ops_in` expands composite bodies
+    (cycle-guarded), so a turn-registered composite naming a non-advertised op is rejected by
+    `compile_turn` like a direct hidden-op call. Legibility-gate completeness; the approval envelope
+    always held.
+  - *C-29 — queued a2a session retention.* Sessions are minted **inside** the single-turn gate
+    (both `send` and `subscribe`), so a request queued behind a long turn can no longer age past the
+    TTL and be swept mid-flight — no more orphaned event rows or spend missing from usage rollups.
+  - *L-31 — cap-scope in concurrent position.* The analyzer statically rejects
+    `with_tools`/`CapScope` inside a `parallel`/`race` branch (`check_cap_scope_position`, mirroring
+    the await/checkpoint positional guards) — the shared cap-scope stack doesn't compose with
+    concurrent branches.
+  - *L-34 — spaced thematic break after a list.* `parse_list` terminates the list when the next line
+    is a thematic break (`- - -`), matching block-start precedence, instead of consuming it as a
+    nested empty list.
+- **A-20 — the agent loop converges on read-heavy analysis turns (the `s_346` runaway).** The
+  loop's stall guard hashed byte-exact `run_plan` transcripts, so re-reading the same files under
+  renamed symbols / reordered statements never tripped it — `s_346` burned 22 read-only rounds and
+  51.8k output tokens re-reading 6 files ~10× each with no answer. Fixed with a per-turn,
+  dispatch-time read-resource ledger (`ReadTracker`, threaded into the loop's `run_plan` execution
+  only — pre-authored `flow run`/journeys are untouched):
+  - *Resource-aware convergence guard.* Reads are keyed on `op + resolved args` — symbol-name- and
+    statement-order-insensitive by construction (the dispatch input is post-var-resolution). A
+    clean round of pure reads that were ALL already gathered this turn is a no-new-evidence stall:
+    the feedback escalates at 2 consecutive stalled rounds ("answer now") and the turn force-stops
+    honestly at 3. Any effectful dispatch, any genuinely new read, or a read-free round resets the
+    counter — incremental gathering and read→fix iteration are never punished.
+  - *Redundant-read short-circuit.* An exact-repeat filesystem read (`read`/`glob`/`grep`/
+    `read_many`/`sqlite_query` — classified from effect + access metadata, never an op-name list)
+    is served from the turn's cache with a legible note (`already read as $X — reusing`) instead of
+    re-fetching, so ignoring the session symbols is costless and the fed-back transcript stays
+    small. Live session state (`evidence`/`metrics`) is stall-tracked but never cache-served; ANY
+    local-state-mutating dispatch invalidates the cache (a post-write re-read is real IO again,
+    pinned by test); hits are never served while a `with_tools` cap scope is open.
+  - The `s_346` shape is pinned as a regression fixture: the full built-in agent loop, driven by a
+    scripted planner that re-reads the same 3 files under fresh symbol names forever, converges in
+    ≤ 6 planner rounds with an honest stop and exactly 3 real read dispatches (previously it spun
+    toward the 25-round cap).
+
 ## [0.2.11] - 2026-07-03
 
 ### Changed

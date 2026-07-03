@@ -36,6 +36,227 @@ pub use flux_lang::runtime::{
 };
 
 // ---------------------------------------------------------------------------
+// A-20 — the turn's read-resource ledger: dispatch-time tracking + reuse cache
+// ---------------------------------------------------------------------------
+
+/// How one dispatch interacts with the turn's read-resource ledger (A-20).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReadClass {
+    /// A pure, filesystem-scoped read (`read`/`glob`/`grep`/`read_many`/`sqlite_query`): counted
+    /// against the no-new-evidence guard AND cache-served on an exact repeat — local state only
+    /// changes through [`Invalidating`](Self::Invalidating) dispatches, which clear the cache.
+    CacheableRead,
+    /// A read of LIVE session state (`evidence`/`metrics` — effects `[Read]` but no filesystem
+    /// access): counted against the guard, but NEVER cache-served — the underlying state grows as
+    /// the turn proceeds, so an identical call can legitimately return more.
+    TrackedRead,
+    /// Cannot touch local state (network reads, pure ops, the reflexive ops' empty effect sets):
+    /// invisible to the ledger.
+    Neutral,
+    /// May mutate local state (write/process/browser/local-system effects, destructive risk, or an
+    /// op the registry doesn't know): clears the cache — every resource is fresh evidence again.
+    Invalidating,
+}
+
+fn classify_spec(spec: &flux_spec::ToolSpec) -> ReadClass {
+    use flux_spec::{AccessKind, Effect};
+    let mutates_local = spec.effects.iter().any(|e| {
+        matches!(
+            e,
+            Effect::Write | Effect::Process | Effect::Browser | Effect::LocalSystem
+        )
+    });
+    if mutates_local || spec.risk == Risk::Destructive {
+        return ReadClass::Invalidating;
+    }
+    let read_scoped = spec.effects.contains(&Effect::Read)
+        && spec
+            .effects
+            .iter()
+            .all(|e| matches!(e, Effect::Read | Effect::Filesystem));
+    if !read_scoped {
+        // Network reads (remote state changes on its own), pure/empty-effect ops (`run_plan`,
+        // cognition ops) — legitimate to repeat, never local-state hazards.
+        return ReadClass::Neutral;
+    }
+    let fs_access_only = !spec.access.is_empty()
+        && spec
+            .access
+            .iter()
+            .all(|a| matches!(a, AccessKind::Filesystem));
+    if fs_access_only {
+        ReadClass::CacheableRead
+    } else {
+        ReadClass::TrackedRead
+    }
+}
+
+/// Canonical identity of one read dispatch: `op` + the RESOLVED input's canonical JSON.
+/// `serde_json` maps serialize key-sorted (BTreeMap storage) and the input is post-var-resolution,
+/// so renamed symbols and reordered statements produce the SAME key — the property the transcript
+/// hash lacked (A-20's root cause).
+fn resource_key(op: &str, input: &serde_json::Value) -> String {
+    format!(
+        "{op}\u{1}{}",
+        serde_json::to_string(input).unwrap_or_default()
+    )
+}
+
+struct ReadEntry {
+    /// The dispatch's canonical content — `Some` only for [`ReadClass::CacheableRead`] fills, and
+    /// what a repeat is served from.
+    content: Option<String>,
+    /// The first session symbol this exact call's result was bound to (via
+    /// [`OpHost::call_bound`]) — cited by the reuse note so the model knows what to reference.
+    symbol: Option<String>,
+}
+
+#[derive(Default)]
+struct ReadTrackerInner {
+    entries: std::collections::HashMap<String, ReadEntry>,
+    /// Memoized [`ReadClass`] per op name — specs are static per registry.
+    class_by_op: std::collections::HashMap<String, ReadClass>,
+    /// Bumped on every invalidation; a fill records content only if the generation it dispatched
+    /// under is still current (a parallel-branch write must not resurrect pre-write content).
+    generation: u64,
+    round_reads: u32,
+    round_fresh: u32,
+    round_effectful: bool,
+}
+
+/// The per-turn read-resource ledger (A-20). Owned by the loop host (reset each turn), threaded
+/// into the inner plan execution, and consulted by `run_plan` after each round: a round of pure
+/// reads that were ALL already seen this turn — however the symbols were renamed — bound no new
+/// evidence, and the convergence guard escalates on consecutive such rounds.
+#[derive(Default)]
+pub struct ReadTracker {
+    inner: std::sync::Mutex<ReadTrackerInner>,
+}
+
+/// One `run_plan` round's read/effect summary, read by the loop host's convergence guard.
+pub struct RoundReads {
+    /// Read dispatches this round (cache hits included).
+    pub reads: u32,
+    /// Reads whose resource was NOT already in the turn's ledger — new evidence.
+    pub fresh: u32,
+    /// Whether any local-state-mutating op dispatched this round.
+    pub effectful: bool,
+    /// Distinct resources read so far this turn.
+    pub seen_total: usize,
+}
+
+impl ReadTracker {
+    /// Forget everything — a new turn starts with an empty ledger.
+    pub fn reset(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        *inner = ReadTrackerInner::default();
+    }
+
+    /// Start a `run_plan` round: zero the per-round counters (the ledger itself persists).
+    pub fn begin_round(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.round_reads = 0;
+        inner.round_fresh = 0;
+        inner.round_effectful = false;
+    }
+
+    /// The finished round's summary.
+    pub fn round(&self) -> RoundReads {
+        let inner = self.inner.lock().unwrap();
+        RoundReads {
+            reads: inner.round_reads,
+            fresh: inner.round_fresh,
+            effectful: inner.round_effectful,
+            seen_total: inner.entries.len(),
+        }
+    }
+
+    fn classify(&self, op: &str, registry: &ToolRegistry) -> ReadClass {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(class) = inner.class_by_op.get(op) {
+            return *class;
+        }
+        let class = registry
+            .get(op)
+            .map(|tool| classify_spec(&tool.spec()))
+            .unwrap_or(ReadClass::Invalidating);
+        inner.class_by_op.insert(op.to_string(), class);
+        class
+    }
+
+    /// A local-state-mutating dispatch: drop the cache (files may have changed — re-reading them
+    /// is genuinely new evidence now) and mark the round effectful.
+    fn invalidate(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.entries.clear();
+        inner.generation += 1;
+        inner.round_effectful = true;
+    }
+
+    fn generation(&self) -> u64 {
+        self.inner.lock().unwrap().generation
+    }
+
+    /// Serve a cacheable repeat: the cached content + the symbol it lives under, counting the
+    /// round's read as redundant. `None` on a miss (or an entry tracked without content).
+    fn serve(&self, key: &str) -> Option<(String, Option<String>)> {
+        let mut inner = self.inner.lock().unwrap();
+        let entry = inner.entries.get(key)?;
+        let hit = entry
+            .content
+            .as_ref()
+            .map(|c| (c.clone(), entry.symbol.clone()))?;
+        inner.round_reads += 1;
+        Some(hit)
+    }
+
+    /// Record a dispatched read: counts it for the round (fresh when its resource was unseen) and,
+    /// for cacheable reads whose `generation` is still current, retains the content for reuse.
+    fn record(&self, key: String, content: Option<String>, generation: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.round_reads += 1;
+        let content = (inner.generation == generation)
+            .then_some(content)
+            .flatten();
+        let fresh = !inner.entries.contains_key(&key);
+        if fresh {
+            inner.round_fresh += 1;
+            inner.entries.insert(
+                key,
+                ReadEntry {
+                    content,
+                    symbol: None,
+                },
+            );
+        } else if content.is_some() {
+            if let Some(entry) = inner.entries.get_mut(&key) {
+                entry.content = content;
+            }
+        }
+    }
+
+    /// Remember the FIRST symbol a tracked read's result was bound to — cited in the reuse note.
+    fn record_symbol(&self, key: &str, symbol: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(entry) = inner.entries.get_mut(key) {
+            entry.symbol.get_or_insert_with(|| symbol.to_string());
+        }
+    }
+}
+
+/// The model-facing view a cache-served read returns — legible ("the feedback says so",
+/// story acceptance) and steering: reference the existing symbol instead of re-reading.
+fn reuse_note(op: &str, symbol: Option<&str>) -> String {
+    match symbol {
+        Some(s) => format!(
+            "already read as ${s} this turn — reusing the cached result (reference ${s} instead \
+             of re-reading)."
+        ),
+        None => format!("this exact `{op}` already ran this turn — reusing the cached result."),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Adapters: the engine's envelope → the interpreter's injected traits
 // ---------------------------------------------------------------------------
 
@@ -51,6 +272,9 @@ struct ExecutorHost<'a> {
     /// executor's own stack discipline. `Executor::dispatch` is the actual enforcement point; dropping
     /// a guard here only pops the shared stack it also reads.
     cap_scope_guards: std::sync::Mutex<Vec<flux_runtime::CapScopeGuard<'a>>>,
+    /// The loop host's per-turn read-resource ledger (A-20) — `Some` only on the `run_plan`
+    /// execution path; every other flow path (pre-authored `flow run`, journeys) runs untracked.
+    reads: Option<Arc<ReadTracker>>,
 }
 
 impl<'a> ExecutorHost<'a> {
@@ -59,6 +283,7 @@ impl<'a> ExecutorHost<'a> {
             catalog: OpRegistry::new(executor.registry()),
             executor,
             cap_scope_guards: std::sync::Mutex::new(Vec::new()),
+            reads: None,
         }
     }
 
@@ -67,36 +292,85 @@ impl<'a> ExecutorHost<'a> {
             catalog: OpRegistry::new(executor.registry()).with_composites(composites),
             executor,
             cap_scope_guards: std::sync::Mutex::new(Vec::new()),
+            reads: None,
         }
     }
-}
-
-/// Whether a failed dispatch is the envelope's own **denial** — the executor refusing to run the op
-/// (capability scope, policy floor, permission rules, or the user declining approval) — rather than
-/// an op that ran and failed. `Executor::dispatch` (flux-runtime) reports every one of its deny
-/// paths as `ToolResult::error` with the one canonical, op-anchored message shape
-/// `` `{op}` denied by {authority}`` — that exact prefix is the boundary's marker (never a
-/// substring match on arbitrary tool prose; the live-executor test below pins the contract against
-/// drift). The interpreter turns a denied outcome into the fatal `FlowError::Denied`, so
-/// `retry`/`loop`/composites never re-attempt a deliberate refusal (L-21).
-fn is_envelope_denial(op: &str, content: &str) -> bool {
-    content.starts_with(&format!("`{op}` denied by "))
 }
 
 #[async_trait]
 impl OpHost for ExecutorHost<'_> {
     async fn dispatch(&self, op: &str, input: serde_json::Value) -> OpOutcome {
-        let r = self.executor.dispatch(op, input).await;
-        OpOutcome {
-            denied: r.is_error && is_envelope_denial(op, &r.content),
-            content: r.content,
-            view: r.view,
-            is_error: r.is_error,
+        // A-20: fold this dispatch into the turn's read-resource ledger. A local-state-mutating op
+        // clears the reuse cache; a read is keyed on `op + resolved args` — and a CACHEABLE read
+        // whose exact call already ran this turn is served from the cache with a legible note
+        // instead of re-fetching. Hits are never served while a `with_tools` narrowing is open
+        // (`Executor::dispatch` stays the enforcement point), and only ever replay content the
+        // envelope already authorized and returned this same turn — no new bypass surface.
+        let tracked = self.reads.as_ref().and_then(|tracker| {
+            match tracker.classify(op, self.executor.registry()) {
+                ReadClass::Invalidating => {
+                    tracker.invalidate();
+                    None
+                }
+                ReadClass::Neutral => None,
+                class @ (ReadClass::CacheableRead | ReadClass::TrackedRead) => {
+                    Some((tracker, class, resource_key(op, &input)))
+                }
+            }
+        });
+        if let Some((tracker, ReadClass::CacheableRead, key)) = &tracked {
+            if self.cap_scope_guards.lock().unwrap().is_empty() {
+                if let Some((content, symbol)) = tracker.serve(key) {
+                    let view = reuse_note(op, symbol.as_deref());
+                    return OpOutcome {
+                        denied: false,
+                        content,
+                        view: Some(view),
+                        is_error: false,
+                    };
+                }
+            }
         }
+        let generation = tracked.as_ref().map(|(tracker, ..)| tracker.generation());
+        // L-32: `denied` is read straight off the envelope's own structural flag
+        // (`DispatchOutcome::denied`, set at the exact call site inside `Executor::dispatch_outcome`
+        // that refuses the call) rather than inferred here by prefix-matching `content` against the
+        // envelope's refusal wording. The interpreter turns a denied outcome into the fatal
+        // `FlowError::Denied`, so `retry`/`loop`/composites never re-attempt a deliberate refusal
+        // (L-21) — but an op that merely *ran* and relayed foreign text shaped like that wording
+        // (e.g. a wrapped CLI's own "denied by" stderr) must NOT be misclassified as one.
+        let outcome = self.executor.dispatch_outcome(op, input).await;
+        let out = OpOutcome {
+            denied: outcome.denied,
+            content: outcome.result.content,
+            view: outcome.result.view,
+            is_error: outcome.result.is_error,
+        };
+        if let Some((tracker, class, key)) = tracked {
+            if !out.is_error {
+                let content = (class == ReadClass::CacheableRead).then(|| out.content.clone());
+                tracker.record(key, content, generation.unwrap_or_default());
+            }
+        }
+        out
     }
 
     fn catalog(&self) -> &dyn OpCatalog {
         &self.catalog
+    }
+
+    fn call_bound(&self, op: &str, input: &serde_json::Value, symbol: &str) {
+        // A-20: name the symbol this exact call's result lives under, so a later cache-served
+        // repeat can say "already read as $X — reusing". Only tracked reads have ledger entries;
+        // everything else is a cheap no-op lookup.
+        if let Some(tracker) = &self.reads {
+            if matches!(
+                tracker.classify(op, self.executor.registry()),
+                ReadClass::CacheableRead | ReadClass::TrackedRead
+            ) {
+                tracker.record_symbol(&resource_key(op, input), symbol);
+            }
+        }
     }
 
     async fn request_approval(
@@ -230,6 +504,7 @@ pub async fn execute_flow_with_composites(
 /// run-event log), fast-forwards the longest content-hash-matching completed prefix before executing
 /// from the first divergence. The authored `flux flow run` path stays on the strict
 /// [`execute_flow_with_composites`] (L-25) — this wrapper is loop-host-only.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_flow_resumable_with_composites(
     store: &FlowStore,
     executor: &Executor,
@@ -237,9 +512,13 @@ pub async fn execute_flow_resumable_with_composites(
     ast: &DraftAst,
     composites: &[CompositeOpDecl],
     ledger: Option<&ResumeLedger>,
+    reads: Option<Arc<ReadTracker>>,
     sink: &mut dyn AgentSink,
 ) -> Result<FlowOutcome> {
-    let host = ExecutorHost::new_with_composites(executor, composites);
+    let mut host = ExecutorHost::new_with_composites(executor, composites);
+    // A-20: the loop host's per-turn read-resource ledger rides along so every inner dispatch is
+    // classified/tracked (and an exact-repeat cacheable read is served with a reuse note).
+    host.reads = reads;
     let mut bridge = SinkBridge { inner: sink };
     flux_lang::runtime::execute_flow_resumable(store, &host, session_id, ast, &mut bridge, ledger)
         .await
@@ -1429,8 +1708,9 @@ mod tests {
     /// L-21: an op the REAL executor's envelope denies (a permission-rule deny here — the same
     /// canonical `` `{op}` denied by … `` shape policy/capability-scope/user denials use) is
     /// classified `denied` at the flux-lang boundary and surfaces as the fatal `FlowError::Denied`:
-    /// `retry` must not re-attempt it. This also pins the executor's denial message contract that
-    /// `is_envelope_denial` matches on.
+    /// `retry` must not re-attempt it. This also pins the executor's structural denial contract
+    /// (`DispatchOutcome::denied`, set by `Executor::dispatch_outcome` at the exact deny call site —
+    /// L-32) that `ExecutorHost::dispatch` reads to fill `OpOutcome::denied`.
     #[tokio::test]
     async fn policy_denied_op_is_not_retried_inside_loop() {
         let store = FlowStore::in_memory().unwrap();
@@ -1467,6 +1747,73 @@ mod tests {
             sink.calls,
             vec!["echo"],
             "the denied op was attempted exactly once — never retried"
+        );
+    }
+
+    /// L-32: an op that the envelope actually RAN — and which failed on its own, merely relaying
+    /// foreign text shaped exactly like the envelope's own canonical denial wording (`` `bash`
+    /// denied by `` — here a nested CLI's stderr) — must NOT be misclassified as an envelope denial.
+    /// It is an ordinary repairable failure: `retry` must keep re-attempting it (unlike the genuine
+    /// denial pinned by `policy_denied_op_is_not_retried_inside_loop`, which runs exactly once).
+    /// Before the fix this was classified purely by a `content.starts_with(...)` prefix match, so
+    /// `bash` surfacing that exact text as its own stderr killed the whole turn with a fatal,
+    /// never-retried `FlowError::Denied`.
+    #[tokio::test]
+    async fn op_relaying_denial_shaped_text_is_repairable_not_fatal() {
+        let store = FlowStore::in_memory().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "flux-flow-rt-l32-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut reg = ToolRegistry::new();
+        flux_tools::register_builtins(&mut reg);
+        let ex = Executor::new(
+            reg,
+            PermissionManager::from_rules(&["bash".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap()))),
+        );
+        let ast = DraftAst {
+            body: vec![Node::Retry {
+                max: 3,
+                backoff: None,
+                delay_ms: Some(0),
+                body: vec![Node::Loop {
+                    for_ms: 10_000,
+                    every_ms: 0,
+                    until: None,
+                    body: vec![flow_bind(
+                        "x",
+                        "bash",
+                        vec![flow_lit(json!(
+                            "echo '`bash` denied by nested-cli-policy' >&2; exit 1"
+                        ))],
+                    )],
+                    bind: None,
+                }],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let err = execute_flow(&store, &ex, "sess", &ast, &mut sink)
+            .await
+            .unwrap_err();
+        assert!(
+            !err.is_fatal(),
+            "an op that ran and merely relayed denial-shaped text is repairable, not fatal: {err}"
+        );
+        assert!(
+            err.to_string().contains("denied by nested-cli-policy"),
+            "the op's own failure content survives: {err}"
+        );
+        assert_eq!(
+            sink.calls,
+            vec!["bash", "bash", "bash"],
+            "a repairable (non-fatal) failure is retried up to `max`, unlike a genuine denial: {:?}",
+            sink.calls
         );
     }
 

@@ -110,23 +110,49 @@ impl<'a> OpRegistry<'a> {
     /// that *names* a hidden op (the planner prompt itself mentions `bash`), so the compiler rejects
     /// plans calling these. Empty when the registry is unrestricted (`advertised: None` — the
     /// pre-authored `flow run` / composite paths) or when every named op is surfaced. Unknown names
-    /// are not reported here — `analyze_flow`'s unknown-operation diagnostic owns those. Composites
-    /// are never hidden: they are user/agent-registered compositions of already-gated ops.
+    /// are not reported here — `analyze_flow`'s unknown-operation diagnostic owns those.
+    ///
+    /// A composite **call** is never itself reported — composites are user/agent-registered
+    /// compositions resolved by name, not part of the advertised-name set — but its **body** is
+    /// walked transitively (L-30). Without that, a turn/session-scoped composite installed via
+    /// `op.register` could launder a hidden op past this gate: `analyze_composites` validates a
+    /// composite's body against the FULL tool registry at registration time (registry.rs's own
+    /// scratch catalog, `advertised: None`), not the turn's advertised set, so registering a
+    /// composite whose body calls `bash` succeeds even when `bash` is hidden this turn. This
+    /// mirrors the gather gate's transitivity through composite bodies (A-13/L-29) — there via a
+    /// composite's own declared effects, here via body expansion, because "advertised" is a
+    /// turn-local fact a composite's static metadata can't capture at registration time.
     pub fn hidden_ops_in(&self, body: &[Node]) -> Vec<String> {
         if self.advertised.is_none() {
             return Vec::new();
         }
         let mut out: Vec<String> = Vec::new();
+        let mut visiting: Vec<String> = Vec::new();
+        self.collect_hidden_ops(body, &mut visiting, &mut out);
+        out
+    }
+
+    /// Depth-first helper behind [`hidden_ops_in`](Self::hidden_ops_in). `visiting` guards against a
+    /// composite cycle looping forever if one ever slips past `analyze_composites`'s own cycle check
+    /// (defense in depth — real cycles are already rejected at registration).
+    fn collect_hidden_ops(&self, body: &[Node], visiting: &mut Vec<String>, out: &mut Vec<String>) {
         for_each_node(body, &mut |node| {
-            if let Node::Call { op, .. } = node {
-                let registered = self.tools.get(op).is_some();
-                let composite = self.composites.iter().any(|c| c.name == *op);
-                if registered && !composite && !self.is_advertised(op) && !out.contains(op) {
-                    out.push(op.clone());
+            let Node::Call { op, .. } = node else {
+                return;
+            };
+            if let Some(composite) = self.composites.iter().find(|c| c.name == *op) {
+                if !visiting.contains(&composite.name) {
+                    visiting.push(composite.name.clone());
+                    self.collect_hidden_ops(&composite.body.body, visiting, out);
+                    visiting.pop();
                 }
+                return;
+            }
+            let registered = self.tools.get(op).is_some();
+            if registered && !self.is_advertised(op) && !out.contains(op) {
+                out.push(op.clone());
             }
         });
-        out
     }
 
     /// The ops a plan calls that escape the read-only gather sandbox — the enforcement side of

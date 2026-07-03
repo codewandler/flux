@@ -277,6 +277,13 @@ executes from the first divergence.
    ask the user. Revisit with policy-surface work.
 8. **Spirals are bounded, not abolished** — the execute loop can still read repeatedly; the
    stall/token/25-cap guards remain the backstop, as today.
+   *Update (2026-07-03, [A-20](../stories/A-20-stall-guard-resource-aware.md)):* the backstop is
+   now resource-aware. The byte-exact transcript stall was defeated in practice by renamed-symbol
+   re-reads (the `s_346` runaway: 22 read-only rounds, no answer); a per-turn `ReadTracker` at the
+   dispatch seam now keys every read on `op + resolved args` (rename/reorder-insensitive by
+   construction), escalates after 2 consecutive no-new-evidence rounds and force-stops honestly at
+   3, and serves exact-repeat filesystem reads from a write-invalidated cache with an
+   `already read as $X — reusing` note.
 
 **Residuals (recorded up front):** `patch_plan` token optimization; orphaned-ledger crash recovery
 (recovering `StatementCompleted` trails with no `PlanHalted`); High-risk-rerun confirm escalation;

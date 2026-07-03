@@ -16,6 +16,7 @@
 //! reaches it as `flux_providers::codex::resolve_model` instead of each carrying its own table.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -85,9 +86,21 @@ pub fn oauth(tokens: Arc<dyn TokenSource>) -> NativeProvider {
 /// local stub servers. Production goes through [`oauth`] (live ChatGPT backend, `wss://` derived
 /// from [`CODEX_ENDPOINT`]).
 fn oauth_at(tokens: Arc<dyn TokenSource>, endpoint: &str, ws_url: &str) -> NativeProvider {
+    oauth_at_timeout(tokens, endpoint, ws_url, DEFAULT_FIRST_FRAME_TIMEOUT)
+}
+
+/// [`oauth_at`] with an explicit first-frame connect timeout (C-28), so tests can keep it short
+/// instead of waiting out [`DEFAULT_FIRST_FRAME_TIMEOUT`].
+fn oauth_at_timeout(
+    tokens: Arc<dyn TokenSource>,
+    endpoint: &str,
+    ws_url: &str,
+    first_frame_timeout: Duration,
+) -> NativeProvider {
     http_native(tokens.clone(), endpoint).with_transport(Arc::new(CodexWsTransport {
         url: ws_url.to_string(),
         tokens,
+        first_frame_timeout,
     }))
 }
 
@@ -127,7 +140,16 @@ struct CodexWsTransport {
     /// Bearer + `chatgpt-account-id` for the handshake. The WS path never refreshes on auth
     /// failure itself — a rejected handshake falls back to HTTP, which owns the 401→refresh path.
     tokens: Arc<dyn TokenSource>,
+    /// Bound on the first-frame wait in [`CodexWsTransport::connect`] (C-28): a proxy that
+    /// accepts the upgrade and then blackholes the socket must not pend the turn forever —
+    /// exceeding this returns `Err` so the HTTP fallback engages.
+    first_frame_timeout: Duration,
 }
+
+/// Production default for [`CodexWsTransport::first_frame_timeout`] — generous enough to cover a
+/// slow-starting reasoning turn's time-to-first-token, but bounded so a wedged proxy can't hang
+/// the whole turn indefinitely. Tests override it via [`oauth_at_timeout`] to stay fast.
+const DEFAULT_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Whether a WS event payload semantically ends the response. The live backend resets the socket
 /// after the terminal event instead of performing a close handshake (observed 2026-07-02), so the
@@ -142,6 +164,23 @@ fn is_terminal_event(payload: &str) -> bool {
                 .map(|t| matches!(t, "response.completed" | "response.failed"))
         })
         .unwrap_or(false)
+}
+
+/// The largest char-boundary prefix of `s` no longer than `max` bytes. A raw byte-range slice
+/// (`&s[..max]`) panics when `max` lands mid-codepoint, which a >300-byte untrusted WS payload
+/// with a multibyte char straddling the offset can trigger (C-28) — the same char-boundary-safe
+/// truncation idiom used elsewhere in the codebase for untrusted bytes (e.g.
+/// `flux_core::context::truncate_str`, `flux_plugin`'s `truncate_on_char_boundary`), reproduced
+/// here rather than shared publicly since neither crate is a dependency of `flux-providers`.
+fn truncate_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Re-envelope one WS frame payload as an SSE `data:` event so the SSE-based codec parses it.
@@ -217,39 +256,51 @@ impl StreamTransport for CodexWsTransport {
         // frame before committing to the WS path, so either shape still triggers the HTTP
         // fallback instead of a dead turn. The `codex.rate_limits` preamble arrives before the
         // request is validated and must not commit (the codec would ignore it anyway).
-        let first = loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(t))) => {
-                    let kind = serde_json::from_str::<serde_json::Value>(&t)
-                        .ok()
-                        .and_then(|v| v["type"].as_str().map(str::to_string))
-                        .unwrap_or_default();
-                    match kind.as_str() {
-                        "codex.rate_limits" => continue,
-                        "error" => {
-                            return Err(Error::Http(format!(
-                                "ws error before data: {}",
-                                &t[..t.len().min(300)]
-                            )));
+        //
+        // Bounded by `first_frame_timeout` (C-28): a proxy that accepts the upgrade and then
+        // blackholes the socket must not pend this `await` forever — that would hang the whole
+        // turn instead of letting the HTTP fallback take over.
+        let wait_for_first = async {
+            Ok::<String, Error>(loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(t))) => {
+                        let kind = serde_json::from_str::<serde_json::Value>(&t)
+                            .ok()
+                            .and_then(|v| v["type"].as_str().map(str::to_string))
+                            .unwrap_or_default();
+                        match kind.as_str() {
+                            "codex.rate_limits" => continue,
+                            "error" => {
+                                return Err(Error::Http(format!(
+                                    "ws error before data: {}",
+                                    truncate_char_boundary(&t, 300)
+                                )));
+                            }
+                            _ => break t,
                         }
-                        _ => break t,
                     }
+                    Some(Ok(Message::Close(frame))) => {
+                        let detail = frame
+                            .map(|f| format!("{} {}", f.code, f.reason))
+                            .unwrap_or_else(|| "no close frame".to_string());
+                        return Err(Error::Http(format!("ws closed before data: {detail}")));
+                    }
+                    Some(Ok(_)) => continue, // ping/pong/binary — keep waiting for data
+                    Some(Err(e)) => return Err(Error::Http(format!("ws: {e}"))),
+                    None => return Err(Error::Http("ws closed before data".to_string())),
                 }
-                Some(Ok(Message::Close(frame))) => {
-                    let detail = frame
-                        .map(|f| format!("{} {}", f.code, f.reason))
-                        .unwrap_or_else(|| "no close frame".to_string());
-                    return Err(Error::Http(format!("ws closed before data: {detail}")));
-                }
-                Some(Ok(_)) => continue, // ping/pong/binary — keep waiting for data
-                Some(Err(e)) => return Err(Error::Http(format!("ws: {e}"))),
-                None => return Err(Error::Http("ws closed before data".to_string())),
-            }
+            })
         };
+        let first = tokio::time::timeout(self.first_frame_timeout, wait_for_first)
+            .await
+            .map_err(|_| Error::Http("ws: timed out waiting for the first frame".to_string()))??;
 
         // From here on the turn is committed to WS: mid-stream failures surface as stream errors
         // (matching the HTTP path, which also never retries mid-stream). Reading stops at the
-        // terminal event — see `is_terminal_event`.
+        // terminal event — see `is_terminal_event`. A `Close` frame received *before* the
+        // terminal event is real truncation (a policy-close or reset mid-turn), not a clean
+        // end-of-turn, so it surfaces as a stream error too (C-28) rather than silently ending the
+        // turn on whatever partial text arrived.
         let stream = try_stream! {
             let mut done = is_terminal_event(&first);
             yield sse_frame(&first);
@@ -260,7 +311,14 @@ impl StreamTransport for CodexWsTransport {
                         done = is_terminal_event(&t);
                         yield sse_frame(&t);
                     }
-                    Ok(Message::Close(_)) => break,
+                    Ok(Message::Close(frame)) => {
+                        let detail = frame
+                            .map(|f| format!("{} {}", f.code, f.reason))
+                            .unwrap_or_else(|| "no close frame".to_string());
+                        Err(Error::Provider(format!(
+                            "ws closed before terminal event: {detail}"
+                        )))?
+                    }
                     Ok(_) => continue,
                     Err(e) => Err(Error::Provider(format!("ws stream: {e}")))?,
                 }
@@ -482,6 +540,69 @@ mod tests {
                     .close(Some(CloseFrame {
                         code: CloseCode::Policy,
                         reason: "policy violation".into(),
+                    }))
+                    .await;
+                while let Some(Ok(_)) = ws.next().await {}
+            }
+        });
+        (format!("ws://{addr}"), handle, hits)
+    }
+
+    /// A WS stub that accepts the handshake, reads the request frame, then sends nothing and
+    /// closes nothing — a proxy that accepts the upgrade and then blackholes the socket (C-28).
+    /// The connection is held open (via `std::future::pending`) until the caller aborts the
+    /// returned task. Returns (ws url, handle, connection counter).
+    async fn ws_blackhole_server() -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                hits2.fetch_add(1, Ordering::SeqCst);
+                let Ok(mut ws) = tokio_tungstenite::accept_async(sock).await else {
+                    continue;
+                };
+                let _ = ws.next().await; // request frame
+                                         // Blackhole: never send a frame, never close. Held alive until aborted.
+                std::future::pending::<()>().await;
+            }
+        });
+        (format!("ws://{addr}"), handle, hits)
+    }
+
+    /// A WS stub that sends `frames` (none of which is a terminal event) and then performs a
+    /// **clean WS close** — a policy-close or reset arriving mid-turn, before the terminal event
+    /// (C-28). Returns (ws url, handle, connection counter).
+    async fn ws_close_before_terminal_server(
+        frames: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                hits2.fetch_add(1, Ordering::SeqCst);
+                let Ok(mut ws) = tokio_tungstenite::accept_async(sock).await else {
+                    continue;
+                };
+                let _ = ws.next().await; // request frame
+                for f in &frames {
+                    if ws.send(WsMessage::Text(f.clone())).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = ws
+                    .close(Some(CloseFrame {
+                        code: CloseCode::Normal,
+                        reason: "done".into(),
                     }))
                     .await;
                 while let Some(Ok(_)) = ws.next().await {}
@@ -746,5 +867,118 @@ mod tests {
         );
         assert!(chunks.contains(&Chunk::TextDelta("Hi".to_string())));
         http_handle.abort();
+    }
+
+    // --- C-28: hardening the fail-fast contract (panic / hang / silent truncation)
+
+    #[tokio::test]
+    async fn ws_error_event_over_300_bytes_with_multibyte_char_does_not_panic() {
+        // The pre-data `error` event truncation used to slice `&t[..t.len().min(300)]` — a raw
+        // byte range that panics when byte 300 isn't a char boundary. Build a >300-byte error
+        // event with a multibyte char straddling exactly that offset to reproduce it: 299 bytes
+        // of ASCII, then a 3-byte UTF-8 char occupying bytes 299/300/301, so byte 300 sits mid-
+        // codepoint.
+        let prefix =
+            r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":""#;
+        let pad = 299usize
+            .checked_sub(prefix.len())
+            .expect("fixture prefix must be shorter than the 299-byte pad target");
+        let mut payload = String::new();
+        payload.push_str(prefix);
+        payload.push_str(&"a".repeat(pad));
+        payload.push('€'); // 3-byte UTF-8 char starting at byte 299, straddling byte 300
+        payload.push_str(&"a".repeat(50));
+        payload.push_str(r#""}}"#);
+        assert!(
+            payload.len() > 300,
+            "fixture must exceed the 300-byte truncation window"
+        );
+        assert!(
+            !payload.is_char_boundary(300),
+            "fixture must straddle byte 300 with a multibyte char to reproduce the panic"
+        );
+        serde_json::from_str::<serde_json::Value>(&payload).expect("fixture must be valid JSON");
+
+        let (ws_url, ws_handle, ws_hits, _, _) = ws_stub_server(vec![payload]).await;
+        let (http_url, http_handle, http_hits) = sse_server(fixture_sse()).await;
+
+        let provider = oauth_at(Arc::new(StubTokens), &http_url, &ws_url);
+        let chunks = collect_chunks(&provider).await;
+
+        assert_eq!(ws_hits.load(Ordering::SeqCst), 1, "WS must be attempted");
+        assert_eq!(
+            http_hits.load(Ordering::SeqCst),
+            1,
+            "a >300-byte error event must fall back to HTTP-SSE instead of panicking"
+        );
+        assert!(
+            chunks.contains(&Chunk::TextDelta("Hi".to_string())),
+            "the turn must still complete over HTTP"
+        );
+        ws_handle.abort();
+        http_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn ws_first_frame_timeout_falls_back_to_http() {
+        // A proxy that accepts the WS upgrade and then blackholes the socket (never sends a frame,
+        // never closes) must not pend the turn forever — connect() needs a bounded first-frame
+        // timeout so the HTTP fallback engages instead.
+        let (ws_url, ws_handle, ws_hits) = ws_blackhole_server().await;
+        let (http_url, http_handle, http_hits) = sse_server(fixture_sse()).await;
+
+        let provider = oauth_at_timeout(
+            Arc::new(StubTokens),
+            &http_url,
+            &ws_url,
+            Duration::from_millis(200),
+        );
+
+        // Guard with a generous outer timeout: pre-fix this pends forever, so without the guard a
+        // still-broken transport would hang the test suite instead of failing this test.
+        let chunks = tokio::time::timeout(Duration::from_secs(10), collect_chunks(&provider))
+            .await
+            .expect("connect must time out and fall back rather than hang the turn indefinitely");
+
+        assert_eq!(ws_hits.load(Ordering::SeqCst), 1, "WS must be attempted");
+        assert_eq!(
+            http_hits.load(Ordering::SeqCst),
+            1,
+            "a blackholed WS connect must time out and fall back to HTTP-SSE"
+        );
+        assert!(
+            chunks.contains(&Chunk::TextDelta("Hi".to_string())),
+            "the turn must still complete over HTTP"
+        );
+        ws_handle.abort();
+        http_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn ws_close_before_terminal_event_surfaces_as_stream_error() {
+        // A Close received before the terminal event is real truncation (a policy-close or reset
+        // mid-turn) and must surface as a stream error, not a clean end-of-turn that silently
+        // ships whatever partial text arrived.
+        let non_terminal = fixture_events()[0].clone(); // "response.output_text.delta"
+        let (ws_url, ws_handle, _) = ws_close_before_terminal_server(vec![non_terminal]).await;
+        let provider = oauth_at(Arc::new(StubTokens), "http://127.0.0.1:1/", &ws_url);
+
+        let mut stream = provider
+            .stream(Request::new("gpt-5.5", "hi"))
+            .await
+            .expect("stream should open — the first frame is a normal data frame");
+        let mut saw_error = false;
+        while let Some(c) = stream.next().await {
+            if c.is_err() {
+                saw_error = true;
+                break;
+            }
+        }
+        assert!(
+            saw_error,
+            "a Close before the terminal event must surface as a stream error, not a clean \
+             end-of-turn"
+        );
+        ws_handle.abort();
     }
 }

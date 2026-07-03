@@ -183,20 +183,26 @@ impl LocalSpawner {
         self
     }
 
-    /// Allow bounded nested delegation: a sub-agent at `depth < max_depth` keeps the `task` tool and a
-    /// depth-incremented spawner. Default `1` (children are leaves). `> 1` is an opt-in escape hatch —
-    /// the recursion bound is `max_depth`, never unbounded.
+    /// Allow bounded nested delegation: a sub-agent at `depth < max_depth` whose own `effective_tools`
+    /// include `task` keeps the `task` tool and a depth-incremented spawner built over its own narrowed
+    /// registry (never the unrestricted base). Default `1` (children are leaves). `> 1` is an opt-in
+    /// escape hatch — the recursion bound is `max_depth`, never unbounded.
     pub fn with_max_depth(mut self, max_depth: usize) -> Self {
         self.max_depth = max_depth.max(1);
         self
     }
 
-    /// A clone of this spawner at a deeper delegation level (shares all Arc-held state).
-    fn at_depth(&self, depth: usize) -> LocalSpawner {
+    /// A clone of this spawner at a deeper delegation level (shares all Arc-held state), rebased on
+    /// `base_registry` — the caller's own narrowed registry (base ∩ its `effective_tools`), never the
+    /// unrestricted original. This is what makes a `with_tools` ceiling transitive across nested
+    /// delegation: a grandchild role's `tools` allowlist is intersected against a pool that has already
+    /// had everything the ancestor's ceiling excluded removed, so no descendant's own role declaration
+    /// can resurrect a tool an ancestor narrowed away, no matter how many hops down.
+    fn at_depth(&self, depth: usize, base_registry: ToolRegistry) -> LocalSpawner {
         LocalSpawner {
             provider_factory: self.provider_factory.clone(),
             roles: self.roles.clone(),
-            base_registry: self.base_registry.clone(),
+            base_registry,
             system: self.system.clone(),
             default_model: self.default_model.clone(),
             limits: self.limits.clone(),
@@ -261,18 +267,31 @@ impl Spawner for LocalSpawner {
         // Recursion bound: a child at the leaf depth must never spawn further sub-agents, so `task` is
         // stripped from its registry AND no spawner is installed in its context (the two guards that
         // make a sub-agent a leaf). Below the bound, the child keeps `task` and a depth-incremented
-        // spawner. With the default `max_depth = 1`, every child is a leaf — today's behaviour exactly.
+        // spawner — but ONLY when `task` itself survived the role ∩ cap_scope narrowing above
+        // (`effective_tools`); a `with_tools` block that excluded `task` must make this child a leaf
+        // too, exactly as it would for any other excluded tool. With the default `max_depth = 1`, every
+        // child is a leaf — today's behaviour exactly.
         let child_depth = self.depth + 1;
-        let child_can_delegate = child_depth < self.max_depth;
+        let child_has_task = effective_tools
+            .as_deref()
+            .is_none_or(|tools| tools.iter().any(|t| t == "task"));
+        let child_can_delegate = child_depth < self.max_depth && child_has_task;
         let mut ctx = ToolContext::new(self.system.clone());
         if child_can_delegate {
             // Bounded nested delegation: the child keeps both halves of the delegation capability —
-            // the `task` tool in its registry AND a depth-incremented spawner in its context.
+            // the `task` tool in its registry AND a depth-incremented spawner in its context. The
+            // depth-next spawner is rebased on THIS child's own narrowed registry (base ∩
+            // `effective_tools`), never the unrestricted `base_registry` — so a `with_tools` ceiling is
+            // transitive across nested delegation: a grandchild role's `tools` allowlist can only ever
+            // draw from a pool this ancestor has already narrowed, no matter how many hops down
+            // (capabilities only ever narrow on descent, see `push_cap_scope`'s doc).
             registry.register(Arc::new(TaskTool));
-            ctx = ctx.with_spawner(Arc::new(self.at_depth(child_depth)));
+            let child_base = self.base_registry.subset(effective_tools.as_deref());
+            ctx = ctx.with_spawner(Arc::new(self.at_depth(child_depth, child_base)));
         } else {
-            // Leaf: never spawn further sub-agents. Both guards apply — `task` is stripped from the
-            // registry and no spawner is installed in the context.
+            // Leaf (depth bound hit, or this hop's own scope excludes `task`): never spawn further
+            // sub-agents. Both guards apply — `task` is stripped from the registry and no spawner is
+            // installed in the context.
             registry.remove("task");
         }
         let approver: Arc<dyn Approver> = self
@@ -2294,7 +2313,10 @@ mod tests {
     }
 
     /// WS5: `max_depth` bounds nested delegation. With the default (1) a child is a leaf and cannot
-    /// delegate; with `max_depth = 2` it can — the grandchild runs and leaves its marker.
+    /// delegate; with `max_depth = 2` it can — the grandchild runs and leaves its marker. A-25: an
+    /// ancestor's active `with_tools` ceiling must carry down through that nested delegation too — a
+    /// grandchild two hops away must not be able to resurrect a tool the ceiling excluded, even though
+    /// the grandchild's own role declares it.
     #[tokio::test]
     async fn max_depth_bounds_nested_delegation() {
         /// The grandchild op: writes a marker iff a second-level sub-agent actually ran.
@@ -2361,8 +2383,12 @@ mod tests {
             let mut base = ToolRegistry::new();
             base.register(Arc::new(GrandPing));
             let mut roles = RoleRegistry::default();
+            // Declares `task` among its own tools (A-25): `task` is gated on `task ∈ effective_tools`
+            // like any other tool, so a role must actually declare it to delegate at all — this lets
+            // scenario 3 below hand it an active `with_tools` scope that includes `task` but excludes
+            // `ping`, isolating "the ceiling carries down" from "this role can't delegate at all".
             roles.insert(parse_role(
-                "---\ntools: [ping]\n---\nYou DELEGATE to a sub-agent.",
+                "---\ntools: [task, ping]\n---\nYou DELEGATE to a sub-agent.",
                 "delegator",
             ));
             roles.insert(parse_role(
@@ -2410,6 +2436,30 @@ mod tests {
         assert!(
             sys2.read_file("GRANDCHILD.marker").await.is_ok(),
             "max_depth=2 must allow one level of nested delegation"
+        );
+
+        // max_depth=2, but the *caller's* active `with_tools` scope excludes `ping` (keeping `task` and
+        // `read`): the delegator can still delegate (`task` is in scope), but the excluded `ping` must
+        // not resurface at the grandchild two hops down even though the grandchild's own role (`inner`,
+        // `tools: [ping]`) would otherwise grant it. Before the fix the child got a fresh, empty
+        // cap-scope stack and the nested spawner re-subset the full base registry, so this ceiling was
+        // dropped and the grandchild ran `ping` anyway.
+        let sys3 = unique_system("depth-nested-scoped");
+        build(sys3.clone(), 2)
+            .spawn(
+                SpawnRequest {
+                    role: "delegator".into(),
+                    task: "go".into(),
+                    cap_scope: Some(vec!["task".into(), "read".into()]),
+                    parent_session: None,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            sys3.read_file("GRANDCHILD.marker").await.is_err(),
+            "an active with_tools scope excluding `ping` must carry down to the grandchild two hops away"
         );
     }
 }

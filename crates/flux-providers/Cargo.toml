@@ -27,16 +27,14 @@ chrono.workspace = true
 base64.workspace = true
 
 # WebSocket transport — always on: the `codex` provider speaks WS as its primary transport
-# (C-07); the realtime (voice-to-voice) provider reuses it behind the `realtime` feature.
+# (C-07), including the bounded first-frame connect timeout (C-28, needs `tokio::time`); the
+# realtime (voice-to-voice) provider reuses the WS transport behind the `realtime` feature.
 tokio-tungstenite.workspace = true
+tokio.workspace = true
 
 # Realtime (voice-to-voice) provider extras, off by default so the HTTP family stays lean.
-tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 
 [features]
 # The OpenAI Realtime (full-duplex, voice-to-voice) provider.
-realtime = ["dep:tokio", "dep:tokio-util"]
-
-[dev-dependencies]
-tokio.workspace = true
+realtime = ["dep:tokio-util"]

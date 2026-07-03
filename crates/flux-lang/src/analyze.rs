@@ -116,6 +116,7 @@ pub fn analyze_flow(
     }
     check_await_position(&ast.body, &mut d);
     check_checkpoint_position(&ast.body, &mut d);
+    check_cap_scope_position(&ast.body, &mut d);
     check_cap_scopes(&ast.body, None, &mut d);
     if d.items.is_empty() {
         Ok(())
@@ -332,6 +333,51 @@ fn check_checkpoint_position(body: &[Node], d: &mut Diags) {
             });
         }
     }
+}
+
+/// `parallel`/`race` branches run concurrently against the interpreter's ONE shared executor
+/// (`futures::future::join_all`), so `with_tools`/`CapScope`'s cap-scope stack is shared, mutable
+/// state across every branch. A scope opened in one branch can be intersected away or popped by a
+/// sibling branch mid-await: either the effective allowlist is emptied (a spurious `Denied`, fails
+/// safe but nondeterministic) or a sibling finishing first pops the wrong guard (LIFO across
+/// branches), leaving a wider allowlist active than the branch itself declared (an authorization
+/// escape, capped at the outer scope). `with_tools` composes soundly only when the cap-scope stack
+/// is used single-threaded, so a `CapScope` nested inside a `parallel`/`race` branch is rejected
+/// here (mirrors [`check_await_position`]/[`check_checkpoint_position`]); a sequential `with_tools`
+/// outside any concurrent branch is unaffected.
+fn check_cap_scope_position(body: &[Node], d: &mut Diags) {
+    for (i, node) in body.iter().enumerate() {
+        let mut nested = false;
+        for_each_node(std::slice::from_ref(node), &mut |n| {
+            let branches = match n {
+                Node::Parallel { branches } => branches,
+                Node::Race { branches, .. } => branches,
+                _ => return,
+            };
+            if branches.iter().any(|b| branch_contains_cap_scope(&b.body)) {
+                nested = true;
+            }
+        });
+        if nested {
+            d.with(format!("body[{i}]"), |d| {
+                d.add(
+                    "`with_tools` cannot be nested inside a `parallel`/`race` branch — its capability scope is shared, mutable state across concurrently running branches and does not compose safely (v1)",
+                )
+            });
+        }
+    }
+}
+
+/// True if `body`'s subtree contains a `CapScope` anywhere — used by [`check_cap_scope_position`]
+/// to scan a `parallel`/`race` branch for a nested `with_tools`.
+fn branch_contains_cap_scope(body: &[Node]) -> bool {
+    let mut found = false;
+    for_each_node(body, &mut |n| {
+        if matches!(n, Node::CapScope { .. }) {
+            found = true;
+        }
+    });
+    found
 }
 
 /// Lower a `DraftAst` to a typed [`HirFlow`]: run the whole-flow analysis (op resolution, grammar,
@@ -2469,6 +2515,100 @@ mod tests {
                     args: vec![],
                 },
             ],
+            ..Default::default()
+        };
+        assert!(analyze_flow(&good, &ops, &HashSet::new()).is_ok());
+    }
+
+    // ---- L-31: `with_tools`/`CapScope` rejected inside a `parallel`/`race` branch ----
+
+    /// `parallel` branches run concurrently against ONE shared executor whose cap-scope stack is
+    /// shared, mutable state — a `with_tools` opened inside a branch does not compose with a
+    /// sibling branch running concurrently against the same stack. Rejected statically.
+    #[test]
+    fn cap_scope_inside_parallel_branch_is_rejected() {
+        use crate::ast::Branch;
+        let ops = catalog();
+        let bad = DraftAst {
+            body: vec![Node::Parallel {
+                branches: vec![Branch {
+                    name: "a".into(),
+                    body: vec![Node::CapScope {
+                        tools: vec!["read".into()],
+                        body: vec![Node::Call {
+                            op: "read".into(),
+                            args: vec![],
+                        }],
+                        bind: None,
+                    }],
+                }],
+            }],
+            ..Default::default()
+        };
+        let err = analyze_flow(&bad, &ops, &HashSet::new()).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("`with_tools`")
+                    && d.message.contains("`parallel`/`race`")),
+            "expected a cap-scope-in-parallel diagnostic, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// Same hazard, `race` branches: first-wins concurrency runs every branch against the same
+    /// shared executor until one succeeds, so a `with_tools` inside a branch is equally unsound.
+    #[test]
+    fn cap_scope_inside_race_branch_is_rejected() {
+        use crate::ast::Branch;
+        let ops = catalog();
+        let bad = DraftAst {
+            body: vec![Node::Race {
+                timeout_ms: 100,
+                branches: vec![Branch {
+                    name: "a".into(),
+                    body: vec![Node::CapScope {
+                        tools: vec!["read".into()],
+                        body: vec![Node::Call {
+                            op: "read".into(),
+                            args: vec![],
+                        }],
+                        bind: None,
+                    }],
+                }],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        let err = analyze_flow(&bad, &ops, &HashSet::new()).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("`with_tools`")
+                    && d.message.contains("`parallel`/`race`")),
+            "expected a cap-scope-in-race diagnostic, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A sequential `with_tools` — nested inside `when`, a non-concurrent control construct — is
+    /// unaffected by this guard and still analyzes clean.
+    #[test]
+    fn sequential_with_tools_outside_parallel_is_unaffected() {
+        let ops = catalog();
+        let good = DraftAst {
+            body: vec![Node::When {
+                cond: Box::new(Node::Lit {
+                    value: serde_json::json!(true),
+                }),
+                then: vec![Node::CapScope {
+                    tools: vec!["read".into()],
+                    body: vec![Node::Call {
+                        op: "read".into(),
+                        args: vec![],
+                    }],
+                    bind: None,
+                }],
+                otherwise: vec![],
+            }],
             ..Default::default()
         };
         assert!(analyze_flow(&good, &ops, &HashSet::new()).is_ok());

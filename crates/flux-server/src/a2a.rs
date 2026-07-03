@@ -19,6 +19,13 @@
 //! context envelope, and each mint first sweeps A2A-tagged sessions whose last activity is older
 //! than the configured TTL (`[server] a2a_session_ttl_secs`, default 1h, `0` = never) — see
 //! [`create_a2a_session`]. Only A2A-tagged sessions are ever eligible.
+//!
+//! Minting happens *after* the single-turn `turn_gate` is acquired, never before (C-29): a
+//! session minted while still queued behind another in-flight turn would sit with a frozen
+//! `updated_at` until its own `run_turn` starts, so a concurrent request's mint-time sweep could
+//! prune it out from under the queue — no error results (there is no FK from `events` back to
+//! `streams`), but its already-tagged registry row is gone, so every future append to its stream
+//! becomes an orphaned, unenumerable event row and its spend drops out of the usage rollups.
 
 use std::convert::Infallible;
 
@@ -51,6 +58,12 @@ pub(crate) const A2A_AGENT_ID: &str = "a2a";
 /// Mint the session for one A2A task: sweep expired A2A sessions first (the lazy TTL pass), then
 /// create the new session tagged `agent_id = "a2a"` with the request's `contextId` (if any) as
 /// the correlation id.
+///
+/// Callers MUST hold the `turn_gate` before calling this (C-29): minting ahead of the gate would
+/// let a session sit queued — alive but idle, its `updated_at` frozen at mint — where a *different*
+/// concurrent request's mint-time sweep (this same lazy pass) could prune it before it ever gets
+/// its turn. Minting inside the gate closes that window: a session's lifetime never has a
+/// queued-but-unswept-safe gap, because mint and run happen back to back under one gate hold.
 ///
 /// The sweep runs lazily per request rather than on a background timer in `serve_on`, because:
 /// (a) it then covers *every* mount of [`crate::router`] — the standalone server and the `a2a`
@@ -230,13 +243,14 @@ async fn send(
         None => return rpc_err(id, -32602, "No text found in message parts"),
     };
     let requested_context = server::extract_context_id(&params);
+    // Acquire the gate BEFORE minting (C-29) — see `create_a2a_session`'s doc for why.
+    let _turn = turn_gate.lock().await;
     let session_id = match create_a2a_session(&engine, ttl, requested_context.as_deref()) {
         Ok(s) => s,
         Err(e) => return rpc_err(id, -32603, format!("Session error: {e}")),
     };
     let context_id = requested_context.unwrap_or_else(|| session_id.clone());
     let mut sink = Collect::default();
-    let _turn = turn_gate.lock().await;
     match engine.run_turn(&session_id, &input, &mut sink).await {
         Ok(()) => {
             let status = TaskStatus::new(
@@ -267,10 +281,6 @@ async fn subscribe(
     let input =
         server::extract_text(&params).ok_or_else(|| "No text in message parts".to_string())?;
     let requested_context = server::extract_context_id(&params);
-    let session_id = create_a2a_session(&engine, ttl, requested_context.as_deref())
-        .map_err(|e| e.to_string())?;
-    let context_id = requested_context.unwrap_or_else(|| session_id.clone());
-    let task_id = session_id.clone();
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     // `drop_guard` cancels `cancel` when the SSE stream is dropped (client disconnect), which
@@ -281,6 +291,32 @@ async fn subscribe(
 
     let engine_clone = engine.clone();
     tokio::spawn(async move {
+        // Acquire the gate BEFORE minting (C-29) — see `create_a2a_session`'s doc for why. This
+        // also delays the session id (and so `task_id`/`context_id`) until it's this task's turn,
+        // which is why the mint and the initial "working" frame both live inside the gate below
+        // rather than before `tokio::spawn`.
+        let _turn = turn_gate.lock().await;
+        let session_id =
+            match create_a2a_session(&engine_clone, ttl, requested_context.as_deref()) {
+                Ok(s) => s,
+                Err(e) => {
+                    // The SSE response is already established by the time minting can fail here, so
+                    // report it as a JSON-RPC error frame inside the stream (mirroring `rpc_err`)
+                    // rather than a pre-SSE HTTP error.
+                    let _ = tx.send(Event::default().data(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32603, "message": format!("Session error: {e}") },
+                    })
+                    .to_string(),
+                ));
+                    return;
+                }
+            };
+        let context_id = requested_context.unwrap_or_else(|| session_id.clone());
+        let task_id = session_id.clone();
+
         // Initial "working" update so the caller knows the task started.
         let _ = tx.send(status_frame(
             &id,
@@ -297,7 +333,6 @@ async fn subscribe(
             context_id: context_id.clone(),
             cancel: cancel_task.clone(),
         };
-        let _turn = turn_gate.lock().await;
         let result = engine_clone
             .run_turn_cancellable(&session_id, &input, &mut sink, &cancel_task)
             .await;
@@ -366,3 +401,141 @@ impl AgentSink for StreamSink {
 
 // The text/contextId extraction, the agent card, the RFC-3339 timestamp, and the status-update
 // shaping now live in `flux_a2a::server` (shared with other A2A surfaces) and are unit-tested there.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flux_flow::engine::FlowEngine;
+
+    /// A provider that answers every call with a one-word prose turn — the agent loop exits on
+    /// prose, so a handler-driven test turn completes fast and deterministically. (Mirrors
+    /// `crate::tests::ProseProvider`; duplicated locally so this module stays self-contained.)
+    struct ProseProvider;
+    #[async_trait::async_trait]
+    impl flux_provider::Provider for ProseProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(
+            &self,
+            _req: flux_provider::Request,
+        ) -> flux_core::Result<flux_provider::ChunkStream> {
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(flux_core::Chunk::TextDelta("ok".into())),
+                Ok(flux_core::Chunk::Done {
+                    stop_reason: Some(flux_core::StopReason::EndTurn),
+                }),
+            ])))
+        }
+    }
+
+    /// A minimal `FlowEngine` for the test below: real machinery, but the only turn ever run is a
+    /// one-word prose completion (`ProseProvider`), so it finishes fast and deterministically.
+    fn test_engine() -> (Shared, Arc<flux_events::EventStore>) {
+        let dir =
+            std::env::temp_dir().join(format!("flux-server-a2a-c29-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(flux_system::System::new(
+            flux_system::Workspace::new(&dir).unwrap(),
+        ));
+        let mut registry = flux_runtime::ToolRegistry::new();
+        flux_tools::register_reflect(&mut registry);
+        flux_tools::register_evidence(&mut registry);
+        let executor = flux_runtime::Executor::new(
+            registry,
+            flux_runtime::PermissionManager::from_rules(
+                &["plan".into(), "run_plan".into(), "observe".into()],
+                &[],
+            ),
+            Arc::new(flux_runtime::AllowApprover),
+            flux_runtime::ToolContext::new(system),
+        );
+        let events = Arc::new(flux_events::EventStore::in_memory().unwrap());
+        let flow = flux_flow::state::FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let engine = FlowEngine::assemble(
+            Arc::new(ProseProvider),
+            executor,
+            events.clone(),
+            flow,
+            "claude-sonnet-4-6".into(),
+            "test".into(),
+            1024,
+            5,
+            Vec::new(),
+            0,
+            Vec::new(),
+            dir,
+        )
+        .unwrap();
+        (Arc::new(engine), events)
+    }
+
+    /// A minimal `message/send` params payload with the given text.
+    fn send_params(text: &str) -> Value {
+        json!({ "message": { "parts": [{ "kind": "text", "text": text }] } })
+    }
+
+    /// C-29 failing-first test: `send`/`subscribe` used to mint a session (running the lazy TTL
+    /// sweep) *before* acquiring the single-turn `turn_gate`, and a session's `updated_at` is
+    /// frozen at mint until its own `run_turn` first records something. So a session minted just
+    /// ahead of a long turn already holding the gate could sit queued long enough to look expired
+    /// to a *different*, concurrent request's mint-time sweep — which prunes it out from under the
+    /// queue. The request whose turn it was still runs to completion (there is no FK from `events`
+    /// back to `streams`, so nothing errors), but the session's registry row is gone: every future
+    /// append becomes an orphaned event row, and its spend drops out of the usage rollups.
+    ///
+    /// This drives the real `send` handler for the queued request (so it mints exactly where the
+    /// production code does — pre-fix: before the gate; post-fix: after it) against the real
+    /// `create_a2a_session` mint path with a real wall-clock TTL crossed by a real sleep, and
+    /// asserts the queued session survives a concurrent request's mint-time sweep.
+    #[tokio::test]
+    async fn queued_session_survives_concurrent_sweep_while_gate_held() {
+        let (engine, events) = test_engine();
+        let ttl = A2aTtl(1); // 1s — small enough to cross for real within the test.
+        let turn_gate: TurnGate = Arc::new(tokio::sync::Mutex::new(()));
+
+        // Simulate a long turn already in flight: something else holds the single-turn gate.
+        let held = turn_gate.clone().lock_owned().await;
+
+        // Fire request X through the real `send` handler. It must queue behind the held gate
+        // before its turn can run.
+        let engine_x = engine.clone();
+        let gate_x = turn_gate.clone();
+        let x_task = tokio::spawn(async move {
+            send(
+                engine_x,
+                gate_x,
+                ttl,
+                Some(json!(1)),
+                Some(send_params("hi")),
+            )
+            .await
+        });
+        // Give X's task a chance to actually reach (and block on) the gate before time moves past
+        // the TTL below.
+        tokio::task::yield_now().await;
+
+        // Advance the store clock past the TTL for real.
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+        // Request Y arrives while X is still queued: its mint runs the lazy TTL sweep — the exact
+        // moment the bug prunes a queued session out from under the queue.
+        let _session_y = create_a2a_session(&engine, ttl, None).unwrap();
+
+        // Release the gate: X's queued turn can finally run.
+        drop(held);
+        let response = x_task.await.expect("X's task must not panic").0;
+        let session_x = response["result"]["id"]
+            .as_str()
+            .expect("send returns a Task with an `id`")
+            .to_string();
+
+        // X must still be a live, correctly-tagged session — not orphaned by Y's concurrent sweep.
+        // (Do NOT assert the request failed — it does not; the bug is silent data loss, not an
+        // error.)
+        let info = events.info(&session_x).expect(
+            "a session queued behind the turn gate must survive a concurrent request's sweep",
+        );
+        assert_eq!(info.context.agent_id.as_deref(), Some(A2A_AGENT_ID));
+    }
+}

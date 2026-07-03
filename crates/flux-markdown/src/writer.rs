@@ -30,15 +30,17 @@ fn block(b: &Block) -> String {
             )
         }
         Block::CodeBlock { info, literal } => {
-            // Fence with one more char than the longest interior run (min 3); switch to ~ when the
-            // info string itself carries a backtick.
+            // Fence with one more char than the longest interior run of the FENCE CHARACTER (min
+            // 3); switch to ~ when the info string itself carries a backtick, and size from the
+            // literal's tilde runs in that case (not its backtick runs) so a `~~~` run in the body
+            // can't close a shorter emitted fence early.
+            let ch = if info.contains('`') { '~' } else { '`' };
             let longest = literal
-                .split(|c: char| c != '`')
+                .split(|c: char| c != ch)
                 .map(str::len)
                 .max()
                 .unwrap_or(0);
-            let ch = if info.contains('`') { "~" } else { "`" };
-            let fence = ch.repeat((longest + 1).max(3));
+            let fence = ch.to_string().repeat((longest + 1).max(3));
             if literal.is_empty() {
                 format!("{fence}{info}\n{fence}")
             } else {
@@ -318,6 +320,18 @@ mod tests {
         };
         let written = to_markdown(&doc);
         assert_eq!(parse(&written), doc, "written: {written:?}");
+    }
+
+    /// A tilde fence (forced by a backtick in the info string) must be sized from the literal's
+    /// longest *tilde* run, not its longest backtick run — otherwise a body containing a `~~~` run
+    /// closes the emitted fence early and the block splits on re-parse (L-33).
+    #[test]
+    fn tilde_fence_sized_from_tilde_run_not_backtick_run() {
+        let src = "~~~~a`b\n~~~\n~~~~\n";
+        let a = parse(src);
+        let written = to_markdown(&a);
+        let b = parse(&written);
+        assert_eq!(a, b, "round-trip drift for {src:?} via {written:?}");
     }
 
     /// Adjacent emphasis nodes alternate delimiters so they don't merge on re-parse.

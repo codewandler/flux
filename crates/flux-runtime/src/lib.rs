@@ -798,12 +798,17 @@ pub struct Executor {
     /// plan the user already approved as a whole, so the per-op approval gate is skipped (deny rules
     /// still win). A depth (not a bool) so a plan that runs a nested plan stays approved throughout.
     plan_scope: AtomicU32,
-    /// Depth of approved-plan scopes whose approval DISCLOSED a destructive op (the plan's risk
-    /// preview carried `destructive: true`, so whoever approved it saw the badge). While `0`, a
+    /// Stack of approved-plan scopes' destructive-disclosure flags, one frame per currently-open
+    /// scope in nesting order (pushed by [`Executor::enter_approved_scope`], popped when its guard
+    /// drops). A frame is `true` iff that scope's own approval DISCLOSED a destructive op (the
+    /// plan's risk preview carried `destructive: true`, so whoever approved it saw the badge). The
+    /// undisclosed-destructive gate keys on the INNERMOST (top-of-stack) frame only — a bare shared
+    /// depth counter would let a nested plan approved `destructive:false` inherit an outer scope's
+    /// disclosure (C-27). While the innermost frame is `false` (or the stack is empty), a
     /// destructive-intent op re-fires the per-op approval gate even inside an approved scope — the
     /// closed loophole is a destructive command assembled from `$symbols` at runtime, invisible to
     /// the static plan risk that the approval was based on.
-    destructive_scope: AtomicU32,
+    destructive_scope: Mutex<Vec<bool>>,
     /// Set when the user answered `always` at a plan prompt: every subsequent plan this session runs
     /// without asking. Deliberately does NOT disclose destructiveness: a statically-visible
     /// destructive plan still discloses per plan via its scope guard, and a runtime-assembled
@@ -817,16 +822,15 @@ pub struct Executor {
 /// disclosure open (see [`Executor::enter_approved_scope`]).
 pub struct PlanScopeGuard<'a> {
     plan: &'a AtomicU32,
-    /// `Some` iff this guard opened a destructive disclosure (paired decrement on drop).
-    destructive: Option<&'a AtomicU32>,
+    /// The disclosure stack this guard pushed its own frame onto; popped on drop so the innermost
+    /// frame always reflects the currently-active scope, never a closed one.
+    destructive: &'a Mutex<Vec<bool>>,
 }
 
 impl Drop for PlanScopeGuard<'_> {
     fn drop(&mut self) {
         self.plan.fetch_sub(1, Ordering::SeqCst);
-        if let Some(d) = self.destructive {
-            d.fetch_sub(1, Ordering::SeqCst);
-        }
+        self.destructive.lock().unwrap().pop();
     }
 }
 
@@ -839,6 +843,27 @@ impl Drop for PlanScopeGuard<'_> {
 pub struct CapScopeGuard<'a> {
     cap_scopes: &'a Mutex<Vec<Vec<String>>>,
     evidence: &'a Mutex<EvidenceLog>,
+}
+
+/// The full outcome of [`Executor::dispatch_outcome`]: the ordinary [`ToolResult`] every caller
+/// already gets from [`Executor::dispatch`], plus a **structural** flag for whether the envelope
+/// itself refused to run the op.
+///
+/// L-32: before this existed, a denial was inferred downstream by prefix-matching `content` against
+/// the envelope's own refusal wording (`` `{op}` denied by `` ) — so an op that *ran* and merely
+/// relayed foreign text shaped like that wording (e.g. a wrapped CLI surfacing its own "denied by"
+/// stderr) was misclassified as a deliberate authorization refusal and escalated to a fatal,
+/// never-retried error. `denied` is set at the exact call site inside [`Executor::dispatch_outcome`]
+/// that refuses the call, so classification never has to guess from prose again.
+pub struct DispatchOutcome {
+    pub result: ToolResult,
+    /// `true` iff the envelope itself refused to run the op: a capability-scope miss, the
+    /// authorization policy floor, a permission-rule deny, or the approver declining. A pre-tool
+    /// hook's `Deny` is deliberately excluded — hook denials are meant to stay retryable/repairable
+    /// rather than a terminal authorization refusal, exactly as before this flag existed (hook
+    /// denials never matched the old prefix heuristic either, since their wording is `` `{op}`
+    /// blocked by hook `` , not `` `{op}` denied by `` ).
+    pub denied: bool,
 }
 
 impl Drop for CapScopeGuard<'_> {
@@ -869,7 +894,7 @@ impl Executor {
             caller: default_local_caller(),
             trust: default_local_trust(),
             plan_scope: AtomicU32::new(0),
-            destructive_scope: AtomicU32::new(0),
+            destructive_scope: Mutex::new(Vec::new()),
             trust_all: AtomicBool::new(false),
         }
     }
@@ -887,13 +912,15 @@ impl Executor {
     /// destructive op the human saw doesn't re-prompt, while one assembled at runtime still does.
     pub fn enter_approved_scope(&self, destructive_disclosed: bool) -> PlanScopeGuard<'_> {
         self.plan_scope.fetch_add(1, Ordering::SeqCst);
-        let destructive = destructive_disclosed.then(|| {
-            self.destructive_scope.fetch_add(1, Ordering::SeqCst);
-            &self.destructive_scope
-        });
+        // Always push a frame — even `false` — so the stack's depth tracks `plan_scope` exactly and
+        // the innermost frame always reflects THIS scope's own disclosure, never an ancestor's.
+        self.destructive_scope
+            .lock()
+            .unwrap()
+            .push(destructive_disclosed);
         PlanScopeGuard {
             plan: &self.plan_scope,
-            destructive,
+            destructive: &self.destructive_scope,
         }
     }
 
@@ -1040,8 +1067,17 @@ impl Executor {
 
     /// Run a tool call through the full safety envelope.
     pub async fn dispatch(&self, name: &str, params: Value) -> ToolResult {
+        self.dispatch_outcome(name, params).await.result
+    }
+
+    /// Like [`dispatch`](Self::dispatch), but also reports — structurally, not by inference —
+    /// whether the envelope itself denied the call. See [`DispatchOutcome`].
+    pub async fn dispatch_outcome(&self, name: &str, params: Value) -> DispatchOutcome {
         let Some(tool) = self.registry.get(name) else {
-            return ToolResult::error(format!("unknown tool: {name}"));
+            return DispatchOutcome {
+                result: ToolResult::error(format!("unknown tool: {name}")),
+                denied: false,
+            };
         };
 
         // 0. Capability-scope floor — checked FIRST, before pre-tool hooks or the policy/permission
@@ -1059,9 +1095,12 @@ impl Executor {
                     Phase::Turn,
                     json!({ "tool": name, "scope": scope }),
                 ));
-                return ToolResult::error(format!(
-                    "`{name}` denied by capability scope (not in the active with_tools allowlist)"
-                ));
+                return DispatchOutcome {
+                    result: ToolResult::error(format!(
+                        "`{name}` denied by capability scope (not in the active with_tools allowlist)"
+                    )),
+                    denied: true,
+                };
             }
         }
 
@@ -1072,7 +1111,12 @@ impl Executor {
                 HookOutcome::Continue => {}
                 HookOutcome::Modify(p) => params = p,
                 HookOutcome::Deny(reason) => {
-                    return ToolResult::error(format!("`{name}` blocked by hook: {reason}"));
+                    // Not an authorization refusal — hooks are meant to stay retryable/repairable
+                    // (see `DispatchOutcome::denied`'s doc comment).
+                    return DispatchOutcome {
+                        result: ToolResult::error(format!("`{name}` blocked by hook: {reason}")),
+                        denied: false,
+                    };
                 }
             }
         }
@@ -1096,10 +1140,13 @@ impl Executor {
                 };
                 match evaluate(policy, &req).decision {
                     Decision::Deny => {
-                        return ToolResult::error(format!(
-                            "`{name}` denied by policy ({} on {:?})",
-                            action.0, resource.kind
-                        ));
+                        return DispatchOutcome {
+                            result: ToolResult::error(format!(
+                                "`{name}` denied by policy ({} on {:?})",
+                                action.0, resource.kind
+                            )),
+                            denied: true,
+                        };
                     }
                     Decision::ApprovalRequired => policy_requires_approval = true,
                     Decision::Allow => {}
@@ -1110,7 +1157,10 @@ impl Executor {
         // 2. Permission rules (coder-style): deny wins; otherwise allow/ask for tool + subjects.
         let perm = self.perms.lock().unwrap().check(name, &subjects);
         if perm == PermDecision::Deny {
-            return ToolResult::error(format!("`{name}` denied by permission rules"));
+            return DispatchOutcome {
+                result: ToolResult::error(format!("`{name}` denied by permission rules")),
+                denied: true,
+            };
         }
 
         // 3. Evidence + reactions: record this call (and a destructive marker when matched), then
@@ -1143,13 +1193,22 @@ impl Executor {
             || policy_requires_approval
             || unscoped_write;
         //    Inside an approved-plan scope the prompt is skipped — the user approved the plan as a
-        //    whole — EXCEPT for a destructive op the plan's approval never disclosed (the risk preview
-        //    only sees literal args, so a destructive command assembled from `$symbols` at runtime is
-        //    invisible to it). Such an undisclosed destructive op re-fires the gate: the interactive
-        //    approver prompts, `--yes` allows, the sub-agent approver denies. This deliberately also
-        //    holds under `trust_all` ("always"). Hard denies (steps 1-2 above) always apply.
-        let undisclosed_destructive =
-            intents.is_destructive() && self.destructive_scope.load(Ordering::SeqCst) == 0;
+        //    whole — EXCEPT for a destructive op the CURRENT (innermost) scope's approval never
+        //    disclosed (the risk preview only sees literal args, so a destructive command assembled
+        //    from `$symbols` at runtime is invisible to it). Such an undisclosed destructive op
+        //    re-fires the gate: the interactive approver prompts, `--yes` allows, the sub-agent
+        //    approver denies. This deliberately also holds under `trust_all` ("always"). Hard denies
+        //    (steps 1-2 above) always apply. C-27: keyed on the innermost scope's own disclosure flag
+        //    (top of `destructive_scope`), not a shared depth counter — a nested plan approved
+        //    `destructive:false` must re-fire even when an outer scope disclosed.
+        let undisclosed_destructive = intents.is_destructive()
+            && !self
+                .destructive_scope
+                .lock()
+                .unwrap()
+                .last()
+                .copied()
+                .unwrap_or(false);
         if (!self.in_approved_scope() || undisclosed_destructive)
             && (force_approval || perm != PermDecision::Allow)
         {
@@ -1160,7 +1219,10 @@ impl Executor {
                     self.perms.lock().unwrap().add_allow(&rule);
                 }
                 ApprovalChoice::Deny => {
-                    return ToolResult::error(format!("`{name}` denied by user"));
+                    return DispatchOutcome {
+                        result: ToolResult::error(format!("`{name}` denied by user")),
+                        denied: true,
+                    };
                 }
             }
         }
@@ -1186,7 +1248,12 @@ impl Executor {
                 json!({ "tool": name }),
             ));
         }
-        result
+        // The op ran (successfully or not) — never a `denied` outcome, no matter what its own
+        // content says (L-32).
+        DispatchOutcome {
+            result,
+            denied: false,
+        }
     }
 }
 
@@ -1651,6 +1718,36 @@ mod tests {
         assert!(
             approver.asked.load(Ordering::Relaxed),
             "an undisclosed destructive op must re-fire the approval gate inside the scope"
+        );
+        assert!(r.is_error, "the denying approver blocks it: {}", r.content);
+        assert!(r.content.contains("denied by user"));
+    }
+
+    /// C-27: the undisclosed-destructive gate must key on the INNERMOST scope's own disclosure, not
+    /// on whether any ancestor scope disclosed. Before the fix, `destructive_scope` was a bare shared
+    /// depth counter: an outer disclosed scope left it `>0`, so a nested plan approved
+    /// `destructive:false` silently inherited the outer disclosure and never re-fired the gate — a
+    /// `$symbol`-assembled `rm -rf`, invisible to the nested plan's static risk preview, would then
+    /// dispatch with no prompt at all.
+    #[tokio::test]
+    async fn undisclosed_destructive_op_refires_approval_inside_nested_disclosed_scope() {
+        let approver = Arc::new(RecordingApprover {
+            asked: AtomicBool::new(false),
+            choice: || ApprovalChoice::Deny,
+        });
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(RmTool));
+        let ex = Executor::new(reg, PermissionManager::new(), approver.clone(), test_ctx());
+
+        // Outer plan's approval DID disclose a destructive op...
+        let _outer = ex.enter_approved_scope(true);
+        // ...but the nested plan's own approval did NOT.
+        let _inner = ex.enter_approved_scope(false);
+        let r = ex.dispatch("rm", json!({})).await;
+        assert!(
+            approver.asked.load(Ordering::Relaxed),
+            "the nested scope's own (undisclosed) approval must re-fire the gate, regardless of \
+             the outer scope's disclosure"
         );
         assert!(r.is_error, "the denying approver blocks it: {}", r.content);
         assert!(r.content.contains("denied by user"));
