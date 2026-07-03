@@ -6,8 +6,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-07-03
+
 ### Fixed
 
+- **Release pipeline builds again (all platforms) — first green release build since 0.2.4.** Two
+  unguarded unix-only paths broke the `x86_64-pc-windows-msvc` build: flux-tools' dev-mode `ReloadTool`
+  called `execv` (`std::os::unix::process::CommandExt`) unconditionally, and the AWS Bedrock SSO-cache
+  writer set unix `0600` permissions unguarded. Both are now `#[cfg(unix)]`-gated with Windows
+  fallbacks (spawn + wait + exit; default ACLs). Separately, cargo-dist failed on every platform with
+  "failed to find bin fluxlang": `flux-lang`'s `fluxlang` bin is a feature-gated dev tool the default
+  dist profile never builds, so the crate is now marked `dist = false` — only the `flux` binary
+  (flux-cli) ships.
 - **CI green on rust 1.96 clippy.** The GitHub `ci` workflow tracks stable, which moved to 1.96 and
   flagged three `-D warnings` lints: `unnecessary_sort_by` (the flux-skill activation ranking and the
   homer plugin's call-summary sort → `sort_by_key(Reverse(..))`), `collapsible_if`/match-guard in the
