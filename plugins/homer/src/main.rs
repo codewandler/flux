@@ -812,7 +812,7 @@ fn group_calls(records: &[Value], number: &str) -> Vec<CallGroup> {
         })
         .collect();
     // Sort newest first
-    summaries.sort_by(|a, b| b.start_ms.cmp(&a.start_ms));
+    summaries.sort_by_key(|s| std::cmp::Reverse(s.start_ms));
     summaries
 }
 

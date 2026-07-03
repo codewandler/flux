@@ -580,7 +580,7 @@ pub fn active_for<'a>(
         .filter(|(score, _)| *score > 0)
         .collect();
     // Stable sort by score desc keeps original (discovery) order for ties.
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|b| std::cmp::Reverse(b.0));
 
     let mut out = Vec::new();
     let mut bytes = 0usize;

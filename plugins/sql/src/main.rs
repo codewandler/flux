@@ -916,11 +916,7 @@ fn read_only_query(query: &str) -> bool {
             }
             "update" | "delete" | "drop" | "create" | "alter" | "truncate" | "grant" | "revoke"
             | "call" | "do" | "load" | "copy" | "execute" | "merge" => return false,
-            "outfile" | "dumpfile" => {
-                if idx > 0 && tokens[idx - 1].text == "into" {
-                    return false;
-                }
-            }
+            "outfile" | "dumpfile" if idx > 0 && tokens[idx - 1].text == "into" => return false,
             _ => {}
         }
     }

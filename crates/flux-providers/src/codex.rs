@@ -377,6 +377,9 @@ mod tests {
     /// A local WS stub: accepts connections, records each handshake's headers and the client's
     /// request frame, streams `frames` as text messages, then closes cleanly. Returns
     /// (ws url, accept-loop handle, connection counter, handshake headers, request frame).
+    // The tungstenite handshake callback's `Err` type (http::Response) is fixed by the API and
+    // happens to be large; this is a test stub, not a hot Result path.
+    #[allow(clippy::result_large_err)]
     async fn ws_stub_server(
         frames: Vec<String>,
     ) -> (

@@ -6,6 +6,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **CI green on rust 1.96 clippy.** The GitHub `ci` workflow tracks stable, which moved to 1.96 and
+  flagged three `-D warnings` lints: `unnecessary_sort_by` (the flux-skill activation ranking and the
+  homer plugin's call-summary sort → `sort_by_key(Reverse(..))`), `collapsible_if`/match-guard in the
+  sql plugin's read-only detector, and a test-only `result_large_err` on the codex WebSocket stub
+  (allowed — the callback's `Err` type is fixed by the tungstenite API). `cargo clippy --workspace
+  --all-targets -- -D warnings` is green on both the root and `plugins/` workspaces; `plugins/Cargo.lock`
+  synced to the 0.2.8 workspace versions.
+
 ## [0.2.8] - 2026-07-03
 
 ### Documentation
