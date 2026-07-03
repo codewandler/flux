@@ -2485,10 +2485,22 @@ impl Tool for ReloadTool {
             args.push("--resume".to_string());
         }
 
-        // exec() replaces the process image (execv under the hood). Only returns on failure.
-        use std::os::unix::process::CommandExt;
-        let err = std::process::Command::new(&exe).args(&args[1..]).exec();
-        Ok(ToolResult::error(format!("execv failed: {err}")))
+        // Replace the current process with the freshly built binary.
+        #[cfg(unix)]
+        {
+            // exec() replaces the process image (execv under the hood). Only returns on failure.
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new(&exe).args(&args[1..]).exec();
+            Ok(ToolResult::error(format!("execv failed: {err}")))
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows has no execv; spawn the replacement, wait for it, and exit with its code.
+            match std::process::Command::new(&exe).args(&args[1..]).status() {
+                Ok(status) => std::process::exit(status.code().unwrap_or(0)),
+                Err(e) => Ok(ToolResult::error(format!("reload spawn failed: {e}"))),
+            }
+        }
     }
 }
 

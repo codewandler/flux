@@ -1057,17 +1057,20 @@ async fn refresh_sso_token(
     let tmp = cache_path.with_extension("json.tmp");
     let bytes =
         serde_json::to_vec_pretty(cache).map_err(|e| Error::Auth(format!("SSO cache: {e}")))?;
-    // Write 0600 + rename (atomic; matches aws CLI's own cache perms).
+    // Write 0600 + rename (atomic; matches aws CLI's own cache perms; 0600 is unix-only — on
+    // Windows the file gets default ACLs, same as the aws CLI there).
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
             .open(&tmp)
             .map_err(|e| Error::Auth(format!("SSO cache write: {e}")))?;
-        use std::io::Write;
         f.write_all(&bytes)
             .map_err(|e| Error::Auth(format!("SSO cache write: {e}")))?;
     }
