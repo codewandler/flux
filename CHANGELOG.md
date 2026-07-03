@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-07-03
+
 ### Changed
 
 - **Website: complete makeover of the Flux-Lang docs.** The language section grows from 5 stub pages
@@ -23,6 +25,14 @@ All notable changes to this project are documented in this file. The format is b
   in getting-started. The old `text-syntax`/`execution-semantics`/`ast-reference` pages are replaced.
   Fixed en route: an `@effect` example (inherited from syntax.md) that annotated a bare call, which
   the parser rejects — `@effect` only annotates binds.
+
+### Fixed
+
+- **Two invalid examples in the flux-lang syntax spec** (`crates/flux-lang/docs/syntax.md`), caught by
+  running every website snippet through the real parser: the `@effect` section annotated a bare
+  `bash(...)` call (the parser only accepts `@effect` on a bind), and the `each -> flat` example used
+  the aspirational comma-kwarg call form `glob("*.rs", path: $dir)` instead of the implemented
+  single-object form. Both corrected and parser-verified.
 
 ## [0.2.9] - 2026-07-03
 
