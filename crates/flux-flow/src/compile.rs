@@ -635,6 +635,28 @@ async fn compile_turn_inner(
         let mut results = Vec::new();
         let mut done: Option<Compiled> = None;
         for (id, name, input) in tool_uses {
+            // A-32: the wire codec could not parse this call's arguments even after repair — the
+            // model emitted malformed or truncated JSON, and the codec carried the failure as a
+            // sentinel instead of killing the provider stream (s_368: deepseek truncated a 19KB
+            // emit_plan mid-list and the turn died after seven accepted rounds). A rejection like
+            // any other (A-31): the model re-emits, and an exhausted budget names this cause.
+            // Checked before anything reads the input — a sentinel carries no real fields, and
+            // without this gate it would decode as an empty (accepted!) plan.
+            if let Some(perr) = input
+                .get(flux_core::ARGS_PARSE_ERROR_KEY)
+                .and_then(|v| v.as_str())
+            {
+                last_reject = format!(
+                    "your `{name}` arguments were not valid JSON ({perr}) — re-emit the complete \
+                     arguments as one well-formed JSON object and call `{name}` again."
+                );
+                results.push(ContentBlock::tool_result_text(
+                    id,
+                    last_reject.clone(),
+                    true,
+                ));
+                continue;
+            }
             match name.as_str() {
                 "emit_plan" if emit_plan_calls > 1 => {
                     last_reject = format!(
@@ -2349,6 +2371,59 @@ mod tests {
         assert!(
             format!("{err}").contains("not callable"),
             "the turn error names the steering feedback: {err}"
+        );
+    }
+
+    /// A-32 (s_368): a wire codec that could not parse the model's tool-call arguments even after
+    /// repair carries the failure as a sentinel input instead of killing the stream — a truncated
+    /// 19KB emit_plan blob used to be fatal to the turn (after seven accepted rounds). The planner
+    /// must turn the sentinel into repair feedback, and the next attempt can still be accepted.
+    #[tokio::test]
+    async fn sentinel_args_are_rejected_and_the_turn_survives() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let sentinel = json!({
+            (flux_core::ARGS_PARSE_ERROR_KEY): "EOF while parsing a list at line 1 column 19189",
+            (flux_core::ARGS_RAW_PREFIX_KEY): "{\"ast\":{\"body\":[",
+        });
+        let good = json!({
+            "ast": {"body":[{"kind":"call","op":"read","args":[{"kind":"lit","value":"x"}]}]}
+        });
+        let p = mock(vec![
+            tool_call("emit_plan", sentinel),
+            tool_call("emit_plan", good),
+        ]);
+        let (out, _) = turn_with_arm(&p, &ops, EmissionArm::Json, CompileOptions::default())
+            .await
+            .expect("the turn must survive a codec parse-error sentinel");
+        match out {
+            TurnOutput::Plan(c) => {
+                assert_eq!(c.attempts, 2, "one repair round, then accepted");
+            }
+            TurnOutput::Chat(t) => panic!("expected a plan, got chat: {t}"),
+        }
+    }
+
+    /// A-32 + A-31: when every step carries the sentinel, the exhausted-budget error names the
+    /// underlying parse failure — not the bare "did not produce a plan within N steps".
+    #[tokio::test]
+    async fn exhausted_budget_reports_the_args_parse_error() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let sentinel = json!({
+            (flux_core::ARGS_PARSE_ERROR_KEY): "EOF while parsing a list at line 1 column 19189",
+        });
+        let p = mock(vec![tool_call("emit_plan", sentinel)]);
+        let opts = CompileOptions {
+            max_steps: 1,
+            ..Default::default()
+        };
+        let err = turn_with_arm(&p, &ops, EmissionArm::Json, opts)
+            .await
+            .expect_err("sentinel args must never be accepted as a plan");
+        assert!(
+            format!("{err}").contains("EOF while parsing a list"),
+            "the turn error names the parse failure: {err}"
         );
     }
 

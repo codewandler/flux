@@ -15,7 +15,9 @@ pub mod pricing;
 mod stream;
 
 pub use audio::{AudioEncoding, AudioFormat};
-pub use content::{ContentBlock, ImageSource, Role, ToolResultContent};
+pub use content::{
+    ContentBlock, ImageSource, Role, ToolResultContent, ARGS_PARSE_ERROR_KEY, ARGS_RAW_PREFIX_KEY,
+};
 pub use context::{render_knowledge_blocks, ContextBlock};
 pub use error::{Error, Result};
 pub use event::Event;

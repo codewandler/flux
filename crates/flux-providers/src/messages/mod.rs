@@ -212,7 +212,7 @@ fn role_str(role: Role) -> &'static str {
 ///
 /// Reads the first JSON value (ignoring anything after it); if that fails, balances the unclosed
 /// brackets/strings once and retries.
-fn parse_tool_input(json: &str) -> std::result::Result<Value, serde_json::Error> {
+pub(crate) fn parse_tool_input(json: &str) -> std::result::Result<Value, serde_json::Error> {
     fn first_value(s: &str) -> std::result::Result<Value, serde_json::Error> {
         match serde_json::Deserializer::from_str(s)
             .into_iter::<Value>()
@@ -228,6 +228,24 @@ fn parse_tool_input(json: &str) -> std::result::Result<Value, serde_json::Error>
             Some(repaired) => first_value(&repaired),
             None => Err(e),
         },
+    }
+}
+
+/// Parse tool-call arguments with [`parse_tool_input`]'s repairs; when even repair fails, return
+/// a parse-error *sentinel* object instead of an error (A-32). Failing the stream over
+/// unparseable args cost s_368 a turn after seven accepted planning rounds — carried as data, the
+/// failure reaches the planner/tool layer, which rejects the call with feedback the model
+/// retries on.
+pub(crate) fn tool_input_or_sentinel(json: &str) -> Value {
+    if json.trim().is_empty() {
+        return Value::Object(Default::default());
+    }
+    match parse_tool_input(json) {
+        Ok(v) => v,
+        Err(e) => serde_json::json!({
+            (flux_core::ARGS_PARSE_ERROR_KEY): e.to_string(),
+            (flux_core::ARGS_RAW_PREFIX_KEY): json.chars().take(200).collect::<String>(),
+        }),
     }
 }
 
@@ -311,8 +329,8 @@ impl BlockAcc {
         }
     }
 
-    fn finish(self) -> Result<ContentBlock> {
-        Ok(match self {
+    fn finish(self) -> ContentBlock {
+        match self {
             BlockAcc::Text(text) => ContentBlock::Text { text },
             BlockAcc::Thinking {
                 thinking,
@@ -322,20 +340,15 @@ impl BlockAcc {
                 signature,
             },
             BlockAcc::RedactedThinking(data) => ContentBlock::RedactedThinking { data },
-            BlockAcc::ToolUse { id, name, json } => {
-                let input = if json.trim().is_empty() {
-                    Value::Object(Default::default())
-                } else {
-                    parse_tool_input(&json).map_err(|e| {
-                        Error::Provider(format!(
-                            "tool `{name}` input was not valid JSON ({e}); raw: {}",
-                            json.chars().take(300).collect::<String>()
-                        ))
-                    })?
-                };
-                ContentBlock::ToolUse { id, name, input }
-            }
-        })
+            // Unparseable-even-after-repair input becomes a sentinel, never a stream error
+            // (A-32): the consumer rejects the call with repairable feedback instead of the
+            // whole turn dying on a codec failure.
+            BlockAcc::ToolUse { id, name, json } => ContentBlock::ToolUse {
+                id,
+                name,
+                input: tool_input_or_sentinel(&json),
+            },
+        }
     }
 }
 
@@ -407,7 +420,7 @@ fn map_messages_stream_inner(
                 },
                 StreamEvent::ContentBlockStop { index } => {
                     if let Some(acc) = blocks.remove(&index) {
-                        yield Chunk::Block(acc.finish()?);
+                        yield Chunk::Block(acc.finish());
                     }
                 }
                 StreamEvent::MessageDelta { delta, usage } => {
@@ -813,5 +826,22 @@ mod tests {
         );
         // Genuinely broken (a missing value, not just unbalanced) still errors.
         assert!(parse_tool_input(r#"{"path": }"#).is_err());
+    }
+
+    /// A-32: when even repair fails, the input becomes a parse-error sentinel — the stream (and
+    /// with it the turn) survives, and the consumer rejects the call with repairable feedback.
+    #[test]
+    fn unrepairable_tool_input_becomes_a_sentinel() {
+        // Empty stays the empty-object convention.
+        assert_eq!(tool_input_or_sentinel("  "), json!({}));
+        // Repairable shapes pass through the repair, no sentinel.
+        assert_eq!(tool_input_or_sentinel(r#"{"path":"a.tx"#)["path"], "a.tx");
+        // Unrepairable → sentinel with the serde message and a raw prefix.
+        let s = tool_input_or_sentinel(r#"{"path": }"#);
+        assert!(s[flux_core::ARGS_PARSE_ERROR_KEY].is_string(), "{s}");
+        assert!(s[flux_core::ARGS_RAW_PREFIX_KEY]
+            .as_str()
+            .unwrap()
+            .starts_with(r#"{"path"#));
     }
 }

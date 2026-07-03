@@ -6,6 +6,24 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **OpenAI-wire tool-args resilience (A-32 — the s_368 deepseek failure class).** The plain
+  `openrouter`/`openai`/`ollama` chat-completions codec (and the Responses-API path) parsed
+  accumulated tool-call arguments with a bare `serde_json::from_str(&args)?` — one malformed or
+  truncated `emit_plan` blob killed the whole provider stream and with it the turn
+  (`runtime error: step plan failed: serialization error: …`; s_368 lost one turn after seven
+  accepted multipass rounds and another instantly to a 19KB blob the endpoint cut mid-list). Both
+  sites now run the Messages wire's repair (`parse_tool_input`: tolerate trailing junk,
+  balance-close truncation — the shapes deepseek-v4-flash and glm-5.2 actually emit), and when
+  even repair fails the codec yields the tool_use block with a parse-error *sentinel* input
+  (`__args_parse_error` + `__raw_prefix`, keys shared via `flux-core`) instead of a stream error.
+  The planner turns the sentinel into A-31 repair feedback ("your `emit_plan` arguments were not
+  valid JSON (…) — re-emit …") so the model retries in-turn and an exhausted budget names the real
+  cause; without the gate a sentinel would even have decoded as an *empty accepted plan*. The
+  Messages wire gets the same sentinel-instead-of-error treatment on repair failure. Pinned by
+  failing-first tests on both wires plus planner sentinel-rejection/turn-survival tests.
+
 ## [0.2.14] - 2026-07-03
 
 ### Added

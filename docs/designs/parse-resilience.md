@@ -1,6 +1,6 @@
 # Design: Planner parse resilience
 
-**Status:** implemented 2026-07-03 (3/3 stories done, failing-first tests at the compile and loop-host levels, full gate green; A-30 live-verified — the exact s_360 model+prompt now plans on the first emission) · **Pillar:** Agent · **Stories:** [A-30](../stories/A-30-stringified-ast-fallback.md) · [A-31](../stories/A-31-planner-reject-surfacing.md) · [C-31](../stories/C-31-planner-usage-on-error.md)
+**Status:** implemented 2026-07-03 (4/4 stories done, failing-first tests at the codec, compile and loop-host levels, full gate green; A-30 live-verified — the exact s_360 model+prompt now plans on the first emission) · **Pillar:** Agent · **Stories:** [A-30](../stories/A-30-stringified-ast-fallback.md) · [A-31](../stories/A-31-planner-reject-surfacing.md) · [C-31](../stories/C-31-planner-usage-on-error.md) · [A-32](../stories/A-32-openai-wire-tool-args-resilience.md)
 
 ## Why
 
@@ -31,6 +31,16 @@ together made the failure both total and invisible:
    `call_usage` event for ~8 × 37k input tokens, so `flux usage` silently undercounts exactly the
    turns that waste the most money.
 
+Session `s_368` (same day, `openrouter/deepseek/deepseek-v4-flash:nitro`, v0.2.14 binary) exposed a
+**fourth** defect one layer below all of the above: the OpenAI chat-completions codec parsed
+accumulated tool-call arguments with a bare `serde_json::from_str(&args)?`, so args that are not
+JSON *at all* — malformed, or truncated mid-emission by the endpoint (a 19KB `emit_plan` blob cut
+mid-list at ~2.3k output tokens, far under the planner's 16384 budget) — killed the provider stream
+before A-31's reject-feedback loop could engage. Two turns died as
+`runtime error: step plan failed: serialization error: …`, one after seven accepted multipass
+rounds. The Anthropic-Messages codec had repaired exactly these shapes since the glm/deepseek
+incidents (`parse_tool_input`); the hardening had simply never reached the OpenAI wire.
+
 ## Approach
 
 Three small, independent stories, all in `crates/flux-flow/src/compile.rs` plus its callers:
@@ -49,13 +59,25 @@ Three small, independent stories, all in `crates/flux-flow/src/compile.rs` plus 
   accumulated `Usage` alongside the error (shape decided in-story: `(Result<TurnOutput>, Usage)` or
   equivalent) and have the engine's plan step record `call_usage` for failed consultations, so
   `flux usage` counts them.
+- **[A-32](../stories/A-32-openai-wire-tool-args-resilience.md) — OpenAI-wire repair + parse-error
+  sentinel (added after s_368).** Both OpenAI-wire parse sites (chat streaming + Responses API) run
+  the Messages wire's `parse_tool_input` repair (tolerate trailing junk, balance-close truncation);
+  when even repair fails, the codec yields the tool_use block with a sentinel input
+  (`flux_core::ARGS_PARSE_ERROR_KEY` + `ARGS_RAW_PREFIX_KEY`) instead of a stream error, and the
+  planner converts the sentinel into an A-31 rejection so the model re-emits in-turn. The Messages
+  wire's `BlockAcc::finish` gets the same sentinel-instead-of-error treatment (now infallible).
+  Repair is parse-level only — repaired plans traverse the identical downstream gates; the sentinel
+  is checked *before* any field read because a sentinel object would otherwise serde-decode as an
+  empty (accepted!) plan.
 
 ## Alternatives considered
 
 - **Fix in the provider codec (`flux-providers`/openrouter):** un-stringify nested tool args at the
   wire layer. Rejected — the wire layer has no schema knowledge; only the `emit_plan` consumer knows
   `ast` must be an object. A blanket "parse any string arg as JSON" at the codec would corrupt
-  legitimately-string arguments.
+  legitimately-string arguments. (This rejection is about *schema-aware* transformation and does not
+  contradict A-32: A-32's codec-side repair is pure JSON-syntax recovery — trailing junk, unbalanced
+  brackets — with no knowledge of what any field means.)
 - **Rely on repair feedback (status quo):** proven non-convergent — qwen re-emits the identical
   string shape for 8 consecutive steps even with the serde error echoed back verbatim.
 - **Prompt-side mitigation** ("pass `ast` as an object, not a string"): cheap but speculative, and

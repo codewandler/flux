@@ -367,11 +367,10 @@ fn map_chat_stream(byte_stream: ByteStream) -> impl futures::Stream<Item = Resul
                 if name.is_empty() {
                     continue;
                 }
-                let input = if args.trim().is_empty() {
-                    Value::Object(Default::default())
-                } else {
-                    serde_json::from_str(&args)?
-                };
+                // Repair-then-sentinel, never a stream error (A-32): deepseek-v4-flash emits
+                // malformed/truncated args on this wire too (s_368 lost a turn to a 19KB blob
+                // cut mid-list), and the Messages wire's hardening never covered this path.
+                let input = crate::messages::tool_input_or_sentinel(&args);
                 yield Chunk::Block(ContentBlock::ToolUse { id, name, input });
             }
             yield Chunk::Done { stop_reason: stop };
@@ -893,11 +892,8 @@ fn map_responses_stream(byte_stream: ByteStream) -> impl futures::Stream<Item = 
                             .to_string();
                         let name = item["name"].as_str().unwrap_or("").to_string();
                         let args = item["arguments"].as_str().unwrap_or("");
-                        let input = if args.trim().is_empty() {
-                            Value::Object(Default::default())
-                        } else {
-                            serde_json::from_str(args)?
-                        };
+                        // Same repair-then-sentinel treatment as the chat path (A-32).
+                        let input = crate::messages::tool_input_or_sentinel(args);
                         tool_blocks.push(ContentBlock::ToolUse { id, name, input });
                     }
                 }
@@ -1094,6 +1090,143 @@ mod tests {
         assert_eq!(u.output_tokens, 50);
         assert_eq!(u.cache_creation_input_tokens, 0);
         assert_eq!(u.context_tokens(), 1000);
+    }
+
+    /// A-32 (s_368): deepseek-v4-flash:nitro stopped emitting mid-args — a ~19KB `emit_plan`
+    /// blob cut off inside a list ("EOF while parsing a list at line 1 column 19189"). The codec
+    /// must balance-close the truncation and yield a usable tool_use block instead of failing the
+    /// stream, which killed the whole turn.
+    #[tokio::test]
+    async fn chat_tool_args_truncated_mid_list_are_repaired() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"emit_plan\",\"arguments\":\"{\\\"ast\\\":{\\\"body\\\":[1,2\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+
+        let mut blocks = Vec::new();
+        let stream = map_chat_stream(byte_stream);
+        futures::pin_mut!(stream);
+        while let Some(chunk) = stream.next().await {
+            if let Chunk::Block(b) = chunk.unwrap() {
+                blocks.push(b);
+            }
+        }
+
+        match &blocks[0] {
+            ContentBlock::ToolUse { name, input, .. } => {
+                assert_eq!(name, "emit_plan");
+                assert_eq!(input["ast"]["body"], json!([1, 2]));
+            }
+            other => panic!("expected tool_use, got {other:?}"),
+        }
+    }
+
+    /// A-32: the trailing-junk shape (an extra `}` after a complete value — the malformation
+    /// `parse_tool_input`'s doc attributes to deepseek-v4-flash) must be repaired on the
+    /// chat-completions wire too, not just the Messages wire.
+    #[tokio::test]
+    async fn chat_tool_args_with_trailing_junk_are_repaired() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+
+        let mut blocks = Vec::new();
+        let stream = map_chat_stream(byte_stream);
+        futures::pin_mut!(stream);
+        while let Some(chunk) = stream.next().await {
+            if let Chunk::Block(b) = chunk.unwrap() {
+                blocks.push(b);
+            }
+        }
+
+        match &blocks[0] {
+            ContentBlock::ToolUse { input, .. } => assert_eq!(input["path"], "a.txt"),
+            other => panic!("expected tool_use, got {other:?}"),
+        }
+    }
+
+    /// A-32: args that even repair cannot fix (balanced but syntactically broken) must yield a
+    /// tool_use block carrying the parse-error sentinel — the stream completes and the consumer
+    /// rejects the call with repairable feedback instead of the turn dying.
+    #[tokio::test]
+    async fn chat_tool_args_unrepairable_yield_parse_error_sentinel() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"emit_plan\",\"arguments\":\"{\\\"a\\\" \\\"b\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+
+        let mut blocks = Vec::new();
+        let mut done = false;
+        let stream = map_chat_stream(byte_stream);
+        futures::pin_mut!(stream);
+        while let Some(chunk) = stream.next().await {
+            match chunk.expect("the stream must survive unparseable args") {
+                Chunk::Block(b) => blocks.push(b),
+                Chunk::Done { .. } => done = true,
+                _ => {}
+            }
+        }
+
+        assert!(done, "the stream completes");
+        match &blocks[0] {
+            ContentBlock::ToolUse { input, .. } => {
+                assert!(
+                    input[flux_core::ARGS_PARSE_ERROR_KEY].is_string(),
+                    "sentinel carries the serde message: {input}"
+                );
+                assert!(
+                    input[flux_core::ARGS_RAW_PREFIX_KEY]
+                        .as_str()
+                        .unwrap()
+                        .contains("{\"a\""),
+                    "sentinel carries the raw prefix: {input}"
+                );
+            }
+            other => panic!("expected tool_use, got {other:?}"),
+        }
+    }
+
+    /// A-32: the Responses-API path repairs truncated args through the same helper.
+    #[tokio::test]
+    async fn responses_tool_args_truncated_are_repaired() {
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"fc_1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.tx\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":9,\"output_tokens\":4}}}\n\n",
+        );
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+
+        let mut blocks = Vec::new();
+        let stream = map_responses_stream(byte_stream);
+        futures::pin_mut!(stream);
+        while let Some(c) = stream.next().await {
+            if let Chunk::Block(b) = c.unwrap() {
+                blocks.push(b);
+            }
+        }
+
+        match &blocks[0] {
+            ContentBlock::ToolUse { input, .. } => assert_eq!(input["path"], "a.tx"),
+            other => panic!("expected tool_use, got {other:?}"),
+        }
     }
 
     #[test]
