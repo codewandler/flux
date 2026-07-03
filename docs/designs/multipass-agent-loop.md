@@ -284,6 +284,14 @@ executes from the first divergence.
    construction), escalates after 2 consecutive no-new-evidence rounds and force-stops honestly at
    3, and serves exact-repeat filesystem reads from a write-invalidated cache with an
    `already read as $X — reusing` note.
+   *Update (2026-07-03, [A-28](../stories/A-28-read-coverage-stall-guard.md)):* freshness for
+   `read`-shaped dispatches (a `path` plus optional `offset`/`limit`, no other params) is now
+   **coverage-based**: a per-path covered-line interval set decides whether a window contributed
+   unread lines, so sliding the window over an already-covered file (the `s_355` runaway: 25
+   rounds, one file, offsets 2180→2990) stalls exactly like a renamed re-read, while a first pass
+   paging through new regions never trips the guard. The escalate/stop feedback names the covered
+   files and line spans; ops with other semantic params (grep/glob) keep exact `op+args`
+   freshness, and write-invalidation clears coverage along with the cache.
 
 **Residuals (recorded up front):** `patch_plan` token optimization; orphaned-ledger crash recovery
 (recovering `StatementCompleted` trails with no `PlanHalted`); High-risk-rerun confirm escalation;

@@ -6,6 +6,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **A-28 — window-sliding reads no longer defeat the resource stall guard.** The A-20 `ReadTracker`
+  keyed freshness on `op + resolved args`, so a model sliding a `read` window a few lines per round
+  over the same file registered "new evidence" every round and the escalate/stop ladder never armed
+  (the `s_355` runaway: 25 rounds, one file, offsets 2180→2990, no answer). Freshness for
+  `read`-shaped dispatches (`path` + optional `offset`/`limit`) is now coverage-based — a per-path
+  covered-line interval set; a window is fresh only if it adds unread lines — while a first pass
+  paging through new regions never trips the guard, grep/glob keep exact-key freshness, and
+  write-invalidation clears coverage with the cache. The stall feedback now names the covered files
+  and line spans so the model (and the user) see why more reading cannot help.
+
 ## [0.2.12] - 2026-07-03
 
 ### Added

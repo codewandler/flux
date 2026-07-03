@@ -91,6 +91,51 @@ fn classify_spec(spec: &flux_spec::ToolSpec) -> ReadClass {
     }
 }
 
+/// A windowed file-read's identity (A-28): an input whose keys are exactly a string `path` plus
+/// optional numeric `offset`/`limit` — the real `read`'s shape. Returns
+/// `(path, start_line, end_line_exclusive)`; absent `offset` → 0, absent `limit` → unbounded.
+/// Anything with other semantic params (`grep`'s pattern, `glob`'s glob, …) is NOT a window — those
+/// keep exact `op+args` freshness, where a new pattern genuinely is new evidence.
+fn read_window(input: &serde_json::Value) -> Option<(String, u64, u64)> {
+    let obj = input.as_object()?;
+    let path = obj.get("path")?.as_str()?;
+    if !obj
+        .keys()
+        .all(|k| matches!(k.as_str(), "path" | "offset" | "limit"))
+    {
+        return None;
+    }
+    let start = obj.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+    let end = match obj.get("limit").and_then(|v| v.as_u64()) {
+        Some(limit) => start.saturating_add(limit),
+        None => u64::MAX,
+    };
+    Some((path.to_string(), start, end))
+}
+
+/// Merge `[start, end)` into a normalized (sorted, disjoint) covered-interval set. Returns whether
+/// any previously-uncovered line was added — the A-28 freshness signal: a window fully inside one
+/// existing interval contributed nothing, however novel its exact `(offset, limit)` tuple is.
+fn add_coverage(set: &mut Vec<(u64, u64)>, start: u64, end: u64) -> bool {
+    if start >= end {
+        return false;
+    }
+    if set.iter().any(|&(s, e)| s <= start && end <= e) {
+        return false;
+    }
+    set.push((start, end));
+    set.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(set.len());
+    for &(s, e) in set.iter() {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    *set = merged;
+    true
+}
+
 /// Canonical identity of one read dispatch: `op` + the RESOLVED input's canonical JSON.
 /// `serde_json` maps serialize key-sorted (BTreeMap storage) and the input is post-var-resolution,
 /// so renamed symbols and reordered statements produce the SAME key — the property the transcript
@@ -114,6 +159,10 @@ struct ReadEntry {
 #[derive(Default)]
 struct ReadTrackerInner {
     entries: std::collections::HashMap<String, ReadEntry>,
+    /// Per-path covered line intervals for windowed reads (A-28): freshness for a `read`-shaped
+    /// dispatch is "added uncovered lines", not "novel argument tuple" — the s_355 window-slide
+    /// loophole. Cleared with the cache on invalidation (a write means re-reading IS fresh).
+    coverage: std::collections::HashMap<String, Vec<(u64, u64)>>,
     /// Memoized [`ReadClass`] per op name — specs are static per registry.
     class_by_op: std::collections::HashMap<String, ReadClass>,
     /// Bumped on every invalidation; a fill records content only if the generation it dispatched
@@ -184,11 +233,12 @@ impl ReadTracker {
         class
     }
 
-    /// A local-state-mutating dispatch: drop the cache (files may have changed — re-reading them
-    /// is genuinely new evidence now) and mark the round effectful.
+    /// A local-state-mutating dispatch: drop the cache AND the line coverage (files may have
+    /// changed — re-reading them is genuinely new evidence now) and mark the round effectful.
     fn invalidate(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.entries.clear();
+        inner.coverage.clear();
         inner.generation += 1;
         inner.round_effectful = true;
     }
@@ -210,29 +260,83 @@ impl ReadTracker {
         Some(hit)
     }
 
-    /// Record a dispatched read: counts it for the round (fresh when its resource was unseen) and,
-    /// for cacheable reads whose `generation` is still current, retains the content for reuse.
-    fn record(&self, key: String, content: Option<String>, generation: u64) {
+    /// Record a dispatched read: counts it for the round and, for cacheable reads whose
+    /// `generation` is still current, retains the content for reuse. Freshness (A-28): a
+    /// window-shaped read is fresh only if it COVERED previously-unread lines of its path —
+    /// sliding the window inside an already-covered region is redundant however novel the exact
+    /// `(offset, limit)` tuple; every other read is fresh when its `op+args` key is unseen. The
+    /// exact-key reuse cache is independent of freshness — only a byte-identical repeat is served.
+    fn record(
+        &self,
+        key: String,
+        window: Option<(String, u64, u64)>,
+        content: Option<String>,
+        generation: u64,
+    ) {
         let mut inner = self.inner.lock().unwrap();
         inner.round_reads += 1;
         let content = (inner.generation == generation)
             .then_some(content)
             .flatten();
-        let fresh = !inner.entries.contains_key(&key);
+        let fresh = match window {
+            Some((path, start, end)) => {
+                let set = inner.coverage.entry(path).or_default();
+                add_coverage(set, start, end)
+            }
+            None => !inner.entries.contains_key(&key),
+        };
         if fresh {
             inner.round_fresh += 1;
-            inner.entries.insert(
-                key,
-                ReadEntry {
+        }
+        match inner.entries.entry(key) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(ReadEntry {
                     content,
                     symbol: None,
-                },
-            );
-        } else if content.is_some() {
-            if let Some(entry) = inner.entries.get_mut(&key) {
-                entry.content = content;
+                });
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                if content.is_some() {
+                    o.get_mut().content = content;
+                }
             }
         }
+    }
+
+    /// Human-readable per-path covered-line summaries for the stall guard's escalate/stop
+    /// feedback (A-28) — the model (and the user) see exactly WHAT was already read. Sorted for
+    /// determinism, capped at `cap` paths with a `+N more` marker.
+    pub fn coverage_summary(&self, cap: usize) -> Vec<String> {
+        let inner = self.inner.lock().unwrap();
+        let mut paths: Vec<&String> = inner.coverage.keys().collect();
+        paths.sort_unstable();
+        let extra = paths.len().saturating_sub(cap);
+        let mut out: Vec<String> = paths
+            .into_iter()
+            .take(cap)
+            .map(|p| {
+                let spans = inner.coverage[p]
+                    .iter()
+                    .map(|&(s, e)| {
+                        if e == u64::MAX {
+                            if s == 0 {
+                                "entire file".to_string()
+                            } else {
+                                format!("lines {s}..end")
+                            }
+                        } else {
+                            format!("lines {s}..{e}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("`{p}` ({spans})")
+            })
+            .collect();
+        if extra > 0 {
+            out.push(format!("+{extra} more file(s)"));
+        }
+        out
     }
 
     /// Remember the FIRST symbol a tracked read's result was bound to — cited in the reuse note.
@@ -313,12 +417,15 @@ impl OpHost for ExecutorHost<'_> {
                     None
                 }
                 ReadClass::Neutral => None,
-                class @ (ReadClass::CacheableRead | ReadClass::TrackedRead) => {
-                    Some((tracker, class, resource_key(op, &input)))
-                }
+                class @ (ReadClass::CacheableRead | ReadClass::TrackedRead) => Some((
+                    tracker,
+                    class,
+                    resource_key(op, &input),
+                    read_window(&input),
+                )),
             }
         });
-        if let Some((tracker, ReadClass::CacheableRead, key)) = &tracked {
+        if let Some((tracker, ReadClass::CacheableRead, key, _)) = &tracked {
             if self.cap_scope_guards.lock().unwrap().is_empty() {
                 if let Some((content, symbol)) = tracker.serve(key) {
                     let view = reuse_note(op, symbol.as_deref());
@@ -346,10 +453,10 @@ impl OpHost for ExecutorHost<'_> {
             view: outcome.result.view,
             is_error: outcome.result.is_error,
         };
-        if let Some((tracker, class, key)) = tracked {
+        if let Some((tracker, class, key, window)) = tracked {
             if !out.is_error {
                 let content = (class == ReadClass::CacheableRead).then(|| out.content.clone());
-                tracker.record(key, content, generation.unwrap_or_default());
+                tracker.record(key, window, content, generation.unwrap_or_default());
             }
         }
         out
@@ -2727,5 +2834,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.result, "match");
+    }
+
+    /// A-28 — coverage-interval arithmetic: fresh iff the window adds uncovered lines.
+    #[test]
+    fn coverage_freshness_is_by_uncovered_lines() {
+        let mut set = Vec::new();
+        assert!(add_coverage(&mut set, 0, 10), "first window is fresh");
+        assert!(!add_coverage(&mut set, 2, 8), "inner slide adds nothing");
+        assert!(!add_coverage(&mut set, 0, 10), "exact repeat adds nothing");
+        assert!(
+            add_coverage(&mut set, 5, 15),
+            "overlap extending past the end is fresh"
+        );
+        assert!(add_coverage(&mut set, 20, 30), "a disjoint window is fresh");
+        assert!(
+            add_coverage(&mut set, 8, 25),
+            "bridging a gap between two covered intervals is fresh"
+        );
+        assert_eq!(set, vec![(0, 30)], "the set stays normalized");
+        assert!(
+            !add_coverage(&mut set, 7, 7),
+            "an empty window is never fresh"
+        );
+        assert!(
+            add_coverage(&mut set, 0, u64::MAX),
+            "unbounded extends coverage"
+        );
+        assert!(
+            !add_coverage(&mut set, 999, 1000),
+            "everything is covered now"
+        );
+    }
+
+    /// A-28 — only the `read` input shape (path + optional offset/limit) is a window; ops with
+    /// other semantic params keep exact-key freshness.
+    #[test]
+    fn read_window_matches_only_the_read_shape() {
+        use serde_json::json;
+        assert_eq!(
+            read_window(&json!({"path":"f","offset":10,"limit":5})),
+            Some(("f".into(), 10, 15))
+        );
+        assert_eq!(
+            read_window(&json!({"path":"f"})),
+            Some(("f".into(), 0, u64::MAX)),
+            "a whole-file read covers everything"
+        );
+        assert_eq!(
+            read_window(&json!({"path":"f","limit":7})),
+            Some(("f".into(), 0, 7))
+        );
+        assert_eq!(
+            read_window(&json!({"path":"d","pattern":"x"})),
+            None,
+            "grep-shaped inputs are not windows"
+        );
+        assert_eq!(read_window(&json!({"paths":["a","b"]})), None);
+        assert_eq!(read_window(&json!("f")), None);
     }
 }

@@ -703,13 +703,21 @@ impl EngineLoopHost {
         g.resource_stall += 1;
         let stalled = g.resource_stall;
         let gathered = round.seen_total;
+        // A-28: name WHAT is already covered — per-path line spans for windowed reads — so the
+        // model (and the user reading the transcript) see why more reading cannot help.
+        let covered = self.reads.coverage_summary(4);
+        let covered = if covered.is_empty() {
+            String::new()
+        } else {
+            format!(" Already covered: {}.", covered.join("; "))
+        };
         if stalled >= RESOURCE_STALL_STOP {
             if g.force_stop.is_none() {
                 g.force_stop = Some(format!(
                     "Stopping: the last {stalled} rounds only re-read evidence already gathered \
                      this turn ({gathered} distinct read(s), all bound to session symbols) without \
-                     producing an answer. Ask a narrower question, or tell me what specifically is \
-                     still missing."
+                     producing an answer.{covered} Ask a narrower question, or tell me what \
+                     specifically is still missing."
                 ));
             }
             return format!(
@@ -721,9 +729,9 @@ impl EngineLoopHost {
             return format!(
                 "[loop-guard] No NEW evidence in {stalled} consecutive rounds — every read \
                  repeated one of the {gathered} resources already gathered this turn (re-binding \
-                 them under new symbol names changes nothing). STOP reading. Answer the request \
-                 now from the session symbols, or state in prose exactly what you cannot \
-                 determine.\n{transcript}"
+                 them under new symbol names or sliding a read window over covered lines changes \
+                 nothing).{covered} STOP reading. Answer the request now from the session \
+                 symbols, or state in prose exactly what you cannot determine.\n{transcript}"
             );
         }
         // First redundant round: the per-read reuse notes in the transcript are the nudge.
@@ -4801,6 +4809,8 @@ flow agent-loop -> string
     /// A cacheable filesystem-read stand-in, classified exactly like the real `read`
     /// (effects `[Read]`, access `[Filesystem]`) but hermetic: serves from a shared map and
     /// counts every REAL dispatch, so a test can assert the short-circuit performed no second IO.
+    /// Mirrors the real `read`'s windowing too (`offset`/`limit` line window, A-28) so the
+    /// coverage-based freshness tests drive the same input shape the production op has.
     struct CountingReadTool {
         calls: Arc<AtomicUsize>,
         files: Arc<Mutex<std::collections::HashMap<String, String>>>,
@@ -4812,7 +4822,11 @@ flow agent-loop -> string
             ToolSpec::read_only(
                 "cread",
                 "read a mapped file (dispatch-counting)",
-                json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+                json!({"type":"object","properties":{
+                    "path":{"type":"string"},
+                    "offset":{"type":"integer"},
+                    "limit":{"type":"integer"}
+                },"required":["path"]}),
             )
             .with_access(vec![flux_spec::AccessKind::Filesystem])
         }
@@ -4820,7 +4834,14 @@ flow agent-loop -> string
             self.calls.fetch_add(1, Ordering::SeqCst);
             let path = p.get("path").and_then(|v| v.as_str()).unwrap_or("");
             match self.files.lock().unwrap().get(path) {
-                Some(content) => Ok(ToolResult::ok(content.clone())),
+                Some(content) => {
+                    let offset = p.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let window: Vec<&str> = match p.get("limit").and_then(|v| v.as_u64()) {
+                        Some(limit) => content.lines().skip(offset).take(limit as usize).collect(),
+                        None => content.lines().skip(offset).collect(),
+                    };
+                    Ok(ToolResult::ok(window.join("\n")))
+                }
                 None => Ok(ToolResult::error(format!("no such file: {path}"))),
             }
         }
@@ -4870,6 +4891,20 @@ flow agent-loop -> string
             .map(|(name, path)| {
                 json!({"kind":"bind","name":name,
                        "value":{"kind":"call","op":"cread","args":[{"kind":"lit","value":path}]}})
+            })
+            .collect();
+        json!({"kind":"plan","ast":{"body":body}})
+    }
+
+    /// A plan AST that binds `$name = cread(path, offset, limit)` per triple — the s_355
+    /// window-sliding shape (A-28): same file, ever-shifting window, fresh symbol each round.
+    fn cread_window_plan(binds: &[(&str, &str, u64, u64)]) -> Value {
+        let body: Vec<Value> = binds
+            .iter()
+            .map(|(name, path, offset, limit)| {
+                json!({"kind":"bind","name":name,
+                       "value":{"kind":"call","op":"cread","args":[
+                           {"kind":"lit","value":{"path":path,"offset":offset,"limit":limit}}]}})
             })
             .collect();
         json!({"kind":"plan","ast":{"body":body}})
@@ -5030,6 +5065,90 @@ flow agent-loop -> string
             !t5.contains("STOP —"),
             "stall 2 escalates but must not stop yet: {t5}"
         );
+    }
+
+    /// A-28 (the s_355 runaway): window-sliding reads over an ALREADY-COVERED file are not fresh
+    /// evidence — a round whose every read only re-covers lines read earlier this turn stalls the
+    /// guard exactly like a renamed re-read, escalating at RESOURCE_STALL_ESCALATE and force-
+    /// stopping at RESOURCE_STALL_STOP. Before the fix each slid window was a brand-new
+    /// `op+args` key, `round.fresh > 0` reset the counter every round, and the loop spun to the
+    /// repeat budget.
+    #[tokio::test]
+    async fn sliding_window_reads_escalate_and_force_stop() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let big: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+        let files = a20_files(&[("big", big.as_str())]);
+        let (_ex, host) = a20_host(&calls, &files, "a28-window-slide");
+
+        // Round 1: the whole file — fresh coverage, progress.
+        let r1 = host.run_plan(cread_plan(&[("all", "big")])).await.unwrap();
+        assert!(r1["transcript"].as_str().unwrap().contains("line 40"));
+
+        // Round 2: a window inside the covered region, new symbol (stall 1).
+        let r2 = host
+            .run_plan(cread_window_plan(&[("head", "big", 2, 8)]))
+            .await
+            .unwrap();
+        assert!(
+            !r2["transcript"]
+                .as_str()
+                .unwrap()
+                .contains("No NEW evidence"),
+            "first redundant round must not yet escalate: {r2}"
+        );
+
+        // Round 3: another slid window, still nothing uncovered (stall 2) → escalate, naming the file.
+        let r3 = host
+            .run_plan(cread_window_plan(&[("mid", "big", 11, 7)]))
+            .await
+            .unwrap();
+        let t3 = r3["transcript"].as_str().unwrap();
+        assert!(
+            t3.contains("No NEW evidence"),
+            "a slid window over covered lines must escalate: {t3}"
+        );
+        assert!(
+            t3.contains("big"),
+            "the escalation must name the covered file: {t3}"
+        );
+
+        // Round 4: sliding on (stall 3) → the honest stop arms and the next plan ends the turn.
+        let r4 = host
+            .run_plan(cread_window_plan(&[("tail", "big", 25, 9)]))
+            .await
+            .unwrap();
+        let t4 = r4["transcript"].as_str().unwrap();
+        assert!(t4.contains("STOP —"), "third slid round must stop: {t4}");
+        let out = host.plan(json!({ "feedback": t4 })).await.unwrap();
+        assert_eq!(out["kind"], "chat", "{out}");
+        assert!(
+            out["text"].as_str().unwrap().starts_with("Stopping:"),
+            "{out}"
+        );
+    }
+
+    /// A-28 no-false-positive pin: paging through NEW regions of a large file is legitimate
+    /// incremental gathering — every window adds uncovered lines, so the guard never arms across
+    /// a full first pass.
+    #[tokio::test]
+    async fn paging_through_new_windows_never_stalls() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let big: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+        let files = a20_files(&[("big", big.as_str())]);
+        let (_ex, host) = a20_host(&calls, &files, "a28-paging");
+
+        for (i, offset) in (0u64..40).step_by(10).enumerate() {
+            let name = format!("page{i}");
+            let r = host
+                .run_plan(cread_window_plan(&[(name.as_str(), "big", offset, 10)]))
+                .await
+                .unwrap();
+            let t = r["transcript"].as_str().unwrap();
+            assert!(
+                !t.contains("No NEW evidence") && !t.contains("STOP —"),
+                "paging into new lines must never stall (window at {offset}): {t}"
+            );
+        }
     }
 
     /// Correctness guard for the short-circuit: a mutating dispatch invalidates the read cache —
