@@ -116,6 +116,14 @@ fn decode_text(path: &str, bytes: Vec<u8>) -> Decoded {
     }
 }
 
+/// Actionable guidance for a `read` that landed on a directory (C-32) — a weak model routinely
+/// `read()`s a directory; the raw `Is a directory` io error used to propagate via `?` and halt the
+/// plan node. Shared by the single-file and `read_section` (windowed/multi-file) paths so both give
+/// the model the same repairable failure instead of a fatal one.
+fn directory_read_guidance(path: &str) -> String {
+    format!("`{path}` is a directory — list it with glob(\"{path}/**/*\") first, then read specific files")
+}
+
 /// Render `text` with right-aligned 1-based line numbers (`{n}\t{line}`) starting at `start_line` —
 /// the model-facing *view* for `read`/`view`. The canonical content stays un-numbered.
 fn number_lines(text: &str, start_line: usize) -> String {
@@ -517,6 +525,9 @@ impl Tool for ReadTool {
 
         // Single-file path (offset/limit paging applies here only).
         let path = &paths[0];
+        if ctx.system.is_dir(path).await? {
+            return Ok(ToolResult::error(directory_read_guidance(path)));
+        }
         let bytes = ctx.system.read_file_bytes(path).await?;
         let total_bytes = bytes.len();
         let content = match decode_text(path, bytes) {
@@ -1508,6 +1519,19 @@ pub struct ReadManyTool;
 
 /// Read one file for `read_many`, returning `(canonical_section, view_section)`.
 async fn read_section(ctx: &ToolContext, path: &str) -> (String, String) {
+    // C-32: a directory in the list gets the same repairable guidance as the single-file path,
+    // scoped to its own section — it doesn't halt the other paths in the same call.
+    match ctx.system.is_dir(path).await {
+        Ok(true) => {
+            let sec = format!("==> {path} <== ({})", directory_read_guidance(path));
+            return (sec.clone(), sec);
+        }
+        Ok(false) => {}
+        Err(e) => {
+            let sec = format!("==> {path} <== (error: {e})");
+            return (sec.clone(), sec);
+        }
+    }
     match ctx.system.read_file_bytes(path).await {
         Ok(bytes) => {
             let total_bytes = bytes.len();
@@ -2672,6 +2696,76 @@ mod tests {
             capped.view.as_deref().unwrap().contains("truncated"),
             "cap guidance present in the view"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn read_on_a_directory_returns_repairable_guidance_not_a_raw_io_error() {
+        // C-32: weak models routinely `read()` a directory (s_362 did it six times in one orient
+        // plan); the raw `Is a directory (os error 21)` propagated via `?` halted the plan node.
+        // Directory reads must come back as a normal `is_error` ToolResult the loop can react to.
+        let (dir, c) = ctx();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        WriteTool
+            .execute(&c, json!({"path": "sub/a.rs", "content": "fn a() {}\n"}))
+            .await
+            .unwrap();
+
+        // Whole-file read on a directory: guidance, not a halt.
+        let r = ReadTool.execute(&c, json!({"path": "sub"})).await.unwrap();
+        assert!(
+            r.is_error,
+            "directory read is a repairable failure, not silent success"
+        );
+        assert!(
+            r.content.contains("sub"),
+            "guidance names the path: {:?}",
+            r.content
+        );
+        assert!(
+            r.content.to_lowercase().contains("glob"),
+            "guidance suggests glob: {:?}",
+            r.content
+        );
+
+        // Windowed (offset/limit) read on the same directory: same guidance, not a halt.
+        let windowed = ReadTool
+            .execute(&c, json!({"path": "sub", "offset": 0, "limit": 5}))
+            .await
+            .unwrap();
+        assert!(
+            windowed.is_error,
+            "windowed directory read is also repairable"
+        );
+        assert!(windowed.content.to_lowercase().contains("glob"));
+
+        // Multi-path read (the `read_section` machinery `read_many` shares): a directory among
+        // several paths gets guidance in its own section rather than halting the whole call.
+        let multi = ReadTool
+            .execute(&c, json!({"path": ["sub/a.rs", "sub"]}))
+            .await
+            .unwrap();
+        assert!(
+            multi.content.contains("fn a()"),
+            "sibling file is still read: {:?}",
+            multi.content
+        );
+        assert!(
+            multi.content.to_lowercase().contains("glob"),
+            "directory section carries the same guidance: {:?}",
+            multi.content
+        );
+
+        // A genuinely missing file still errors exactly as today (unchanged).
+        let missing = ReadTool
+            .execute(&c, json!({"path": "sub/missing.rs"}))
+            .await;
+        assert!(
+            missing.is_err(),
+            "a missing file still errors: {:?}",
+            missing
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

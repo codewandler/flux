@@ -411,6 +411,12 @@ pub async fn compile(
 /// every operation lives in the emitted plan. Returns [`TurnOutput::Plan`] for a graph the runtime will
 /// execute, or [`TurnOutput::Chat`] for a prose answer. `ops` is the full op catalog (the AST may use
 /// any of them).
+///
+/// The accumulated [`Usage`] rides OUTSIDE the `Result` (C-31): a consultation that fails — budget
+/// exhausted, `max_tokens` truncation, a provider error mid-loop — still spent real tokens on every
+/// step it made, and dropping them undercounted `flux usage` by exactly the most wasteful turns
+/// (s_360: ~8 × 37k input tokens, zero `call_usage` events). Callers account the usage first, then
+/// branch on the outcome.
 // Each argument is a distinct, meaningful input (provider, model, conversation, base system, catalog,
 // session view, user-ask, options); bundling them would obscure rather than clarify.
 #[allow(clippy::too_many_arguments)]
@@ -428,10 +434,14 @@ pub async fn compile_turn(
     thinking_sink: Option<&'_ mut dyn crate::AgentSink>,
     opts: CompileOptions,
     phase: Phase,
-) -> Result<(TurnOutput, Usage)> {
+) -> (Result<TurnOutput>, Usage) {
     // The emission surface is env-selected here — the single front door — so every caller (engine,
     // loop host, CLI) picks the arm up without threading a parameter (the L-20 A/B scaffold).
-    let arm = EmissionArm::from_env()?;
+    let arm = match EmissionArm::from_env() {
+        Ok(arm) => arm,
+        // Rejected before any provider call: nothing was spent.
+        Err(e) => return (Err(e), Usage::default()),
+    };
     compile_turn_with_arm(
         provider,
         model,
@@ -450,9 +460,47 @@ pub async fn compile_turn(
 
 /// [`compile_turn`] with the emission arm made explicit (the L-20 A/B harness entry point — a
 /// measurement runner drives both arms in one process without racing on the `FLUX_EMISSION` env).
-/// Production callers use [`compile_turn`], which reads the arm from the environment.
+/// Production callers use [`compile_turn`], which reads the arm from the environment. Same
+/// usage-outside-the-`Result` shape (C-31).
 #[allow(clippy::too_many_arguments)]
 pub async fn compile_turn_with_arm(
+    provider: &dyn Provider,
+    model: &str,
+    conversation: &[Message],
+    base_system: Option<&str>,
+    ops: &OpRegistry<'_>,
+    view: Option<&SessionView>,
+    ask: Option<&dyn AskUser>,
+    thinking_sink: Option<&'_ mut dyn crate::AgentSink>,
+    opts: CompileOptions,
+    arm: EmissionArm,
+    phase: Phase,
+) -> (Result<TurnOutput>, Usage) {
+    // Usage lives OUTSIDE the loop's `Result` (C-31): the inner fn accumulates into it through
+    // every early return — error paths included — so a failed consultation's spend survives.
+    let mut usage = Usage::default();
+    let out = compile_turn_inner(
+        provider,
+        model,
+        conversation,
+        base_system,
+        ops,
+        view,
+        ask,
+        thinking_sink,
+        opts,
+        arm,
+        phase,
+        &mut usage,
+    )
+    .await;
+    (out, usage)
+}
+
+/// The planner loop proper. `usage` is an out-parameter so the accumulated spend reaches the caller
+/// on EVERY exit — `Ok`, budget exhaustion, truncation, or a provider error surfaced via `?`.
+#[allow(clippy::too_many_arguments)]
+async fn compile_turn_inner(
     provider: &dyn Provider,
     model: &str,
     conversation: &[Message],
@@ -464,7 +512,8 @@ pub async fn compile_turn_with_arm(
     opts: CompileOptions,
     arm: EmissionArm,
     phase: Phase,
-) -> Result<(TurnOutput, Usage)> {
+    usage: &mut Usage,
+) -> Result<TurnOutput> {
     let steps = opts.max_steps.max(1);
     let interactive = ask.is_some();
     let segments = assemble_system_segments(base_system, ops, view, interactive, arm, phase);
@@ -477,9 +526,6 @@ pub async fn compile_turn_with_arm(
     // live instead of silently waiting behind "composing plan\u2026".
     let enable_thinking = thinking_sink.is_some();
 
-    // Token usage for this whole planner consultation: summed across the repair/tool-result steps
-    // below (each is a separate provider call), with the input/cache side reflecting the final step.
-    let mut usage = Usage::default();
     // The most recent rejection fed back to the model (hidden ops, analyzer diagnostics, duplicate
     // emit_plan). When the step budget runs out, the turn is rejected WITH this text (C-17/F2) —
     // never "accepted with diagnostics" for a caller to execute blind.
@@ -535,20 +581,17 @@ pub async fn compile_turn_with_arm(
                     // instead of a tool call bypassed the check entirely.
                     let hidden = ops.hidden_ops_in(&ast.body);
                     if hidden.is_empty() {
-                        return Ok((
-                            TurnOutput::Plan(Compiled {
-                                ast,
-                                attempts: step,
-                                diagnostics: Vec::new(),
-                                complete: None,
-                                // The text fallback has no wrapping JSON object to carry `gather`/
-                                // `brief` from (it's a bare AST parsed out of prose) — same as
-                                // `complete` above, neither rides through this path.
-                                gather: false,
-                                brief: None,
-                            }),
-                            usage,
-                        ));
+                        return Ok(TurnOutput::Plan(Compiled {
+                            ast,
+                            attempts: step,
+                            diagnostics: Vec::new(),
+                            complete: None,
+                            // The text fallback has no wrapping JSON object to carry `gather`/
+                            // `brief` from (it's a bare AST parsed out of prose) — same as
+                            // `complete` above, neither rides through this path.
+                            gather: false,
+                            brief: None,
+                        }));
                     }
                     // No tool_use id to answer here — the rejection rides as a plain user message.
                     last_reject = hidden_ops_rejection(&hidden);
@@ -571,7 +614,7 @@ pub async fn compile_turn_with_arm(
             // turn (no blocks, no text) wasn't pushed, so just retry on the next step.
             let text = assistant.text();
             if !text.trim().is_empty() {
-                return Ok((TurnOutput::Chat(text), usage));
+                return Ok(TurnOutput::Chat(text));
             }
             if step == steps {
                 return Err(Error::Other(format!(
@@ -599,7 +642,11 @@ pub async fn compile_turn_with_arm(
                          turn takes exactly ONE plan. Merge the steps into a single plan and call \
                          emit_plan once."
                     );
-                    results.push(ContentBlock::tool_result_text(id, last_reject.clone(), true));
+                    results.push(ContentBlock::tool_result_text(
+                        id,
+                        last_reject.clone(),
+                        true,
+                    ));
                 }
                 "emit_plan" => {
                     // The model's optional completion directive (captured before `input` is moved):
@@ -617,6 +664,19 @@ pub async fn compile_turn_with_arm(
                     let decoded: std::result::Result<DraftAst, String> = match arm {
                         EmissionArm::Json => {
                             let ast_val = input.get("ast").cloned().unwrap_or(input);
+                            // Stringified-JSON tolerance (A-30): OpenAI-wire-trained models
+                            // habitually double-encode nested tool args — `ast` arrives as a JSON
+                            // *string* containing the plan (qwen3.7, s_360/s_361) and the repair
+                            // feedback never converges on the re-encode. Unwrap that one encoding
+                            // layer here; a string that is not valid JSON falls through unchanged,
+                            // keeping the strict decode's informative error. Encoding-level only:
+                            // the decoded plan traverses the identical gates below.
+                            let ast_val = match ast_val {
+                                serde_json::Value::String(s) => {
+                                    serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s))
+                                }
+                                v => v,
+                            };
                             serde_json::from_value::<DraftAst>(ast_val)
                                 .map_err(|e| format!("emit_plan: invalid AST JSON: {e}"))
                         }
@@ -697,8 +757,9 @@ pub async fn compile_turn_with_arm(
                                     // not even on the last step. If the budget runs out, the turn
                                     // is rejected with this text (below).
                                     let msg = join_diags(&diags);
-                                    last_reject =
-                                        format!("invalid plan: {msg}. Fix it and call emit_plan again.");
+                                    last_reject = format!(
+                                        "invalid plan: {msg}. Fix it and call emit_plan again."
+                                    );
                                     results.push(ContentBlock::tool_result_text(
                                         id,
                                         last_reject.clone(),
@@ -707,7 +768,13 @@ pub async fn compile_turn_with_arm(
                                 }
                             }
                         }
-                        Err(msg) => results.push(ContentBlock::tool_result_text(id, msg, true)),
+                        // A decode failure is repair feedback like any other rejection — record it
+                        // (A-31) so the exhausted-budget error names the actual cause instead of
+                        // the bare "did not produce a plan" that made s_360 undiagnosable.
+                        Err(msg) => {
+                            last_reject = msg.clone();
+                            results.push(ContentBlock::tool_result_text(id, msg, true));
+                        }
                     }
                 }
                 "ask_user" => {
@@ -722,29 +789,36 @@ pub async fn compile_turn_with_arm(
                 }
                 // Pure DAG: nothing but `emit_plan`/`ask_user` is advertised, so any other tool name is
                 // a model error — there is no direct tool execution. Steer it back to `emit_plan`.
-                other => results.push(ContentBlock::tool_result_text(
-                    id,
-                    format!(
+                // The steering is a rejection too (A-31): a model that only hallucinates direct
+                // tools must exhaust the budget with this text as the reported cause.
+                other => {
+                    last_reject = format!(
                         "`{other}` is not callable — you have no direct tools. Put it in a plan node \
                          and call `emit_plan` instead."
-                    ),
-                    true,
-                )),
+                    );
+                    results.push(ContentBlock::tool_result_text(
+                        id,
+                        last_reject.clone(),
+                        true,
+                    ));
+                }
             }
         }
         messages.push(Message::user(results));
         if let Some(c) = done {
-            return Ok((TurnOutput::Plan(c), usage));
+            return Ok(TurnOutput::Plan(c));
         }
     }
     // Reject the turn with the last rejection's text (C-17/F2): the diagnostics are surfaced to the
-    // caller as the turn's error instead of riding out on an "accepted" plan.
+    // caller as the turn's error instead of riding out on an "accepted" plan. "Attempt", not
+    // "plan" (A-31): the recorded rejection may be a decode failure or a hallucinated direct tool
+    // call — feedback the model saw without ever landing a plan.
     Err(Error::Other(if last_reject.is_empty() {
         format!("planner did not produce a plan within {steps} steps")
     } else {
         format!(
             "planner did not produce a valid plan within {steps} step(s) — \
-             the last plan was rejected: {last_reject}"
+             the last attempt was rejected: {last_reject}"
         )
     }))
 }
@@ -766,6 +840,8 @@ pub async fn plan(
     let conversation = [Message::user_text(instruction)];
     // The one-shot `--plan` surface isn't phase-aware yet (design Part 1: unchanged in MVP, A-18
     // brings gather to it later) — always the execute/default contract.
+    // This surface has no per-call usage ledger (the CLI prints the plan and exits), so the
+    // C-31 usage side-channel is deliberately unused here — not silently lost in a `?`.
     let (out, _usage) = compile_turn(
         provider,
         model,
@@ -778,8 +854,8 @@ pub async fn plan(
         opts,
         Phase::Execute,
     )
-    .await?;
-    match out {
+    .await;
+    match out? {
         TurnOutput::Plan(c) => Ok(c),
         TurnOutput::Chat(_) => Err(Error::Other(
             "the model answered without emitting a plan".to_string(),
@@ -1859,6 +1935,8 @@ mod tests {
     }
 
     /// Like [`turn_with_arm`], with the phase made explicit — the A-13 test entry point.
+    /// Re-folds the C-31 `(Result, Usage)` shape into a `Result` tuple so the many outcome-focused
+    /// tests stay untouched; usage-on-error tests call `compile_turn_with_arm` directly.
     async fn turn_with_phase(
         p: &Mock,
         ops: &OpRegistry<'_>,
@@ -1866,7 +1944,7 @@ mod tests {
         phase: Phase,
         opts: CompileOptions,
     ) -> Result<(TurnOutput, Usage)> {
-        compile_turn_with_arm(
+        let (out, usage) = compile_turn_with_arm(
             p,
             "mock",
             &[Message::user_text("do it")],
@@ -1879,7 +1957,8 @@ mod tests {
             arm,
             phase,
         )
-        .await
+        .await;
+        out.map(|o| (o, usage))
     }
 
     #[test]
@@ -2136,6 +2215,141 @@ mod tests {
         .unwrap();
         assert_eq!(out.attempts, 2);
         assert_eq!(out.ast.body.len(), 1);
+    }
+
+    // -- parse resilience (A-30/A-31): stringified-ast tolerance + faithful failure surfacing ----
+
+    /// A-30: the qwen-shaped double encoding (s_360/s_361) — `ast` arrives as a JSON *string*
+    /// containing a valid plan. The decode unwraps that one encoding layer and accepts the plan
+    /// exactly like its object twin, costing no repair round.
+    #[tokio::test]
+    async fn json_arm_accepts_a_string_encoded_ast() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let inner = r#"{"body":[{"kind":"call","op":"read","args":[{"kind":"lit","value":"x"}]}]}"#;
+        let p = mock(vec![tool_call("emit_plan", json!({ "ast": inner }))]);
+        let (out, _) = turn_with_arm(&p, &ops, EmissionArm::Json, CompileOptions::default())
+            .await
+            .expect("a string-encoded valid plan must be accepted");
+        match out {
+            TurnOutput::Plan(c) => {
+                assert_eq!(c.attempts, 1, "a pure encoding quirk costs no repair round");
+                let object_twin: DraftAst = serde_json::from_str(inner).unwrap();
+                assert_eq!(c.ast, object_twin, "same plan as the object form");
+            }
+            TurnOutput::Chat(t) => panic!("expected a plan, got chat: {t}"),
+        }
+    }
+
+    /// A-30: tolerance is encoding-level ONLY — a string-encoded plan naming a hidden op is
+    /// rejected exactly like its object twin (the A-04 gate sees the same `DraftAst`), even on
+    /// the final step.
+    #[tokio::test]
+    async fn json_arm_string_encoded_hidden_op_is_still_rejected() {
+        let reg = full_registry();
+        let ops = ops_without_bash(&reg);
+        let inner =
+            r#"{"body":[{"kind":"call","op":"bash","args":[{"kind":"lit","value":"ls"}]}]}"#;
+        let p = mock(vec![tool_call("emit_plan", json!({ "ast": inner }))]);
+        let opts = CompileOptions {
+            max_steps: 1,
+            ..Default::default()
+        };
+        let err = turn_with_arm(&p, &ops, EmissionArm::Json, opts)
+            .await
+            .expect_err("a hidden-op plan must never be accepted, string-encoded or not");
+        assert!(
+            format!("{err}").contains("not enabled"),
+            "the rejection carries the gate's reason, not a decode error: {err}"
+        );
+    }
+
+    /// A-30 guard + A-31: a string that is NOT valid JSON keeps the strict decode error, and the
+    /// exhausted-budget turn error carries that cause — not the bare "did not produce a plan
+    /// within N steps" that made s_360 undiagnosable.
+    #[tokio::test]
+    async fn json_arm_garbage_string_ast_surfaces_the_decode_error() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let p = mock(vec![tool_call(
+            "emit_plan",
+            json!({ "ast": "not json at all" }),
+        )]);
+        let opts = CompileOptions {
+            max_steps: 1,
+            ..Default::default()
+        };
+        let err = turn_with_arm(&p, &ops, EmissionArm::Json, opts)
+            .await
+            .expect_err("garbage must never be silently accepted");
+        assert!(
+            format!("{err}").contains("invalid AST JSON"),
+            "the turn error names the decode failure: {err}"
+        );
+    }
+
+    /// C-31: a consultation that exhausts its budget still hands back the accumulated usage —
+    /// the spend side-channel is failure-independent. s_360's failed turn made ~8 provider calls
+    /// and surfaced none of them to accounting.
+    #[tokio::test]
+    async fn failed_consultation_still_returns_accumulated_usage() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let round = |input_tokens| Usage {
+            input_tokens,
+            output_tokens: 10,
+            ..Default::default()
+        };
+        let p = mock(vec![
+            tool_call_with_usage("emit_plan", json!({ "ast": 42 }), round(100)),
+            tool_call_with_usage("emit_plan", json!({ "ast": 42 }), round(120)),
+        ]);
+        let opts = CompileOptions {
+            max_steps: 2,
+            ..Default::default()
+        };
+        let (out, usage) = compile_turn_with_arm(
+            &p,
+            "mock",
+            &[Message::user_text("do it")],
+            None,
+            &ops,
+            None,
+            None,
+            None,
+            opts,
+            EmissionArm::Json,
+            Phase::Execute,
+        )
+        .await;
+        let err = out.expect_err("an undecodable plan on every step must fail the turn");
+        assert!(format!("{err}").contains("invalid AST JSON"), "{err}");
+        // `Usage::accumulate` semantics: outputs sum across steps, input reflects the final step.
+        assert_eq!(usage.output_tokens, 20, "both steps' outputs are counted");
+        assert_eq!(usage.input_tokens, 120, "input reflects the final step");
+    }
+
+    /// A-31: a model that only hallucinates direct tool calls (never `emit_plan`) exhausts the
+    /// budget with the steering feedback as the reported cause.
+    #[tokio::test]
+    async fn exhausted_budget_reports_the_not_callable_feedback() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let p = mock(vec![
+            tool_call("read_file", json!({ "path": "x" })),
+            tool_call("read_file", json!({ "path": "x" })),
+        ]);
+        let opts = CompileOptions {
+            max_steps: 2,
+            ..Default::default()
+        };
+        let err = turn_with_arm(&p, &ops, EmissionArm::Json, opts)
+            .await
+            .expect_err("hallucinated tools must not produce a plan");
+        assert!(
+            format!("{err}").contains("not callable"),
+            "the turn error names the steering feedback: {err}"
+        );
     }
 
     // -- A-03: cache-first system segmentation ----------------------------------------------------
@@ -2986,9 +3200,8 @@ mod tests {
             CompileOptions::default(),
             Phase::Execute,
         )
-        .await
-        .unwrap();
-        match out {
+        .await;
+        match out.unwrap() {
             TurnOutput::Chat(t) => assert!(t.contains("explanation")),
             TurnOutput::Plan(_) => panic!("expected a chat answer, got a plan"),
         }
@@ -3018,9 +3231,8 @@ mod tests {
             CompileOptions::default(),
             Phase::Execute,
         )
-        .await
-        .unwrap();
-        match out {
+        .await;
+        match out.unwrap() {
             TurnOutput::Chat(t) => assert_eq!(t, findings_json),
             TurnOutput::Plan(_) => panic!(
                 "a JSON-array reply with an embedded balanced-brace object must not be \
@@ -3046,7 +3258,7 @@ mod tests {
             },
         ];
         let p = mock(vec![truncated]);
-        let err = compile_turn(
+        let (out, _usage) = compile_turn(
             &p,
             "mock",
             &[Message::user_text("implement all the nodes")],
@@ -3058,9 +3270,8 @@ mod tests {
             CompileOptions::default(),
             Phase::Execute,
         )
-        .await
-        .unwrap_err();
-        let msg = format!("{err}");
+        .await;
+        let msg = format!("{}", out.unwrap_err());
         assert!(
             msg.contains("truncated") && msg.contains("max_tokens"),
             "expected a max_tokens truncation error, got: {msg}"
@@ -3093,9 +3304,8 @@ mod tests {
             CompileOptions::default(),
             Phase::Execute,
         )
-        .await
-        .unwrap();
-        assert!(matches!(out, TurnOutput::Plan(_)));
+        .await;
+        assert!(matches!(out.unwrap(), TurnOutput::Plan(_)));
         // The planner call's token usage rides back out alongside the plan.
         assert_eq!(usage.input_tokens, 120);
         assert_eq!(usage.output_tokens, 40);

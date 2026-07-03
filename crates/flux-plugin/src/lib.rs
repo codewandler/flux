@@ -29,6 +29,10 @@ pub use hooks::JsHookEngine;
 /// handshake so the trusted plugin is handed a *post-auth* connection and never receives the password.
 mod pg;
 
+/// Plugin pack distribution (D-47): resolve → verify → versioned store, for
+/// `flux plugin install <name>[@version]`. See the module docs for the trust ladder.
+pub mod pack;
+
 pub const PROTOCOL: &str = "flux.plugin.v1";
 
 /// Whether a frame is a request (host→plugin) or a response (plugin→host).
@@ -2192,7 +2196,12 @@ pub async fn load_plugin_tools(
 
 /// A persisted plugin descriptor (`~/.flux/plugins/<name>.toml`): how to launch the plugin plus an
 /// optional pinned version. `flux plugin add|ls|pin|rollback` manage these; discovery loads them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `version`/`sha256`/`source` are serde-defaulted additions (D-47): a remote `install` populates
+/// all three (the installed version, the sha256 of the installed binary, and the release it came
+/// from, e.g. `plugins-v0.2.0`); a local/dev descriptor (`add`, `install --dir`) carries none of
+/// them and stays valid — `ls`/`status` label it `unverified (local)` rather than `verified`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PluginDescriptor {
     /// The plugin executable (absolute path or a name on `PATH`).
     pub program: String,
@@ -2201,6 +2210,16 @@ pub struct PluginDescriptor {
     /// The pinned version, if any (advisory; surfaced by `flux plugin ls`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned: Option<String>,
+    /// The installed version (remote installs only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// sha256 of the installed binary (remote installs only) — the supply-chain integrity anchor
+    /// that D-48 re-checks at spawn time; absent means the descriptor is unverified/local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Where this install came from, e.g. `plugins-v0.2.0` (remote installs only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// A discovered plugin: its name (the descriptor file stem) and how to launch it.
@@ -2332,6 +2351,7 @@ mod tests {
                 program: "/bin/true".into(),
                 args: vec![],
                 pinned: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -2364,6 +2384,7 @@ mod tests {
             program: "/bin/true".into(),
             args: vec![],
             pinned: None,
+            ..Default::default()
         };
         let bad_names = [
             "../sentinel",
@@ -4131,6 +4152,7 @@ mod tests {
                 program: "/usr/bin/gitlab-plugin".into(),
                 args: vec!["--v2".into()],
                 pinned: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -4141,6 +4163,7 @@ mod tests {
                 program: "slack-plugin".into(),
                 args: vec![],
                 pinned: None,
+                ..Default::default()
             },
         )
         .unwrap();

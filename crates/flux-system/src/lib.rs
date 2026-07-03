@@ -480,6 +480,20 @@ impl System {
         Ok(tokio::fs::read(&p).await?)
     }
 
+    /// Whether `path` (resolved within the workspace/read-roots) is a directory — lets a read tool
+    /// give actionable guidance ("list it with glob first") instead of failing on the raw `Is a
+    /// directory` io error (C-32). Read-only, so it uses the same `resolve_read` jail as
+    /// `file_mtime`/`read_file_bytes`; a path that doesn't resolve (escapes the workspace) still
+    /// errors loudly, but a path that simply doesn't exist yields `Ok(false)` — the caller's own
+    /// read call remains the source of truth for "missing".
+    pub async fn is_dir(&self, path: &str) -> Result<bool> {
+        let p = self.workspace.resolve_read(path)?;
+        Ok(tokio::fs::metadata(&p)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false))
+    }
+
     /// Append text to a file within the workspace, creating it (and parent directories) if absent.
     /// Goes through the same `resolve()` jail as `write_file` (including the dangling-symlink guard)
     /// before opening.
@@ -915,6 +929,29 @@ mod tests {
         sys.write_file("m.txt", "ab").await.unwrap();
         let t2 = sys.file_mtime("m.txt").await.unwrap();
         assert!(t2 >= t1, "mtime should not go backwards");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn is_dir_distinguishes_directories_files_and_missing_paths() {
+        // C-32: `ReadTool` consults this before reading, so a directory becomes guidance instead of
+        // a raw `Is a directory` io error.
+        let (dir, sys) = temp_workspace();
+        sys.write_file("sub/a.txt", "x").await.unwrap();
+        assert!(sys.is_dir("sub").await.unwrap(), "a directory reads true");
+        assert!(
+            !sys.is_dir("sub/a.txt").await.unwrap(),
+            "a regular file reads false"
+        );
+        assert!(
+            !sys.is_dir("does-not-exist").await.unwrap(),
+            "a missing path reads false, not an error — the caller's own read is the source of \
+             truth for \"missing\""
+        );
+        assert!(
+            sys.is_dir("../escape").await.is_err(),
+            "a workspace-escaping path still errors loudly"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

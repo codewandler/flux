@@ -451,9 +451,33 @@ enum PluginAction {
         #[arg(long = "no-validate")]
         no_validate: bool,
     },
-    /// Register every `flux-plugin-*` binary in a directory: `install [dir]`
-    /// (default `plugins/target/release`).
-    Install { dir: Option<String> },
+    /// Install plugins from the signed `plugins-v*` pack release (D-47): `install <name>[@<version>] …`
+    /// (resolves the newest pack release, or an exact `plugins-v<version>` tag), or `install --all`
+    /// for the whole pack. Verifies the index signature and every archive's sha256 before unpacking
+    /// into the versioned store `~/.flux/plugins/bin/<name>/<version>/`. Re-installing a version
+    /// already present is an idempotent no-op.
+    ///
+    /// `install --dir [path]` is the other mode — the pre-D-47 local scan, registering every
+    /// `flux-plugin-*` binary already built in a directory (default `plugins/target/release`) with
+    /// no version/hash recorded. The two modes are exclusive; bare `install` with neither plugin
+    /// names/`--all` nor `--dir` is an error naming both.
+    Install {
+        /// Plugin name(s) to install, each optionally pinned to `@<version>` (remote mode).
+        names: Vec<String>,
+        /// Install every plugin in the pack (remote mode).
+        #[arg(long)]
+        all: bool,
+        /// Scan a local directory for already-built `flux-plugin-*` binaries instead of the
+        /// remote pack channel (local-scan mode; defaults to `plugins/target/release` when given
+        /// with no value).
+        #[arg(
+            long,
+            value_name = "PATH",
+            num_args = 0..=1,
+            default_missing_value = "plugins/target/release"
+        )]
+        dir: Option<String>,
+    },
     /// Remove an installed plugin descriptor: `uninstall <name>`.
     Uninstall { name: String },
     /// Inspect installed plugins — liveness + declared surface: `status [<name>]`.
@@ -2046,7 +2070,7 @@ pub(crate) async fn run_draft_ast_with_composites(
 ) -> Result<()> {
     // Lazy provider (C-11): a pre-authored flow is deterministic unless it actually reaches a
     // model op — replaying one must not demand credentials.
-    let (engine, session_id, _spec, _spawner) = build_agent_lazy(flags).await?;
+    let (engine, session_id, model_spec, _spawner) = build_agent_lazy(flags).await?;
     eprintln!(
         "{}",
         style::dim(&format!("flow · {} · session {session_id}", engine.model))
@@ -2100,8 +2124,9 @@ pub(crate) async fn run_draft_ast_with_composites(
     // Point the engine's installed loop host at this run's session + sink (a flow may call
     // `plan`/`run_plan`, which re-enter the planner/interpreter through this same executor). The sink is
     // shared so the outer flow and any inner `run_plan` stream live onto one surface, sub-steps interleaved.
-    let shared: Arc<std::sync::Mutex<dyn AgentSink>> =
-        Arc::new(std::sync::Mutex::new(CliSink::new(0)));
+    let shared: Arc<std::sync::Mutex<dyn AgentSink>> = Arc::new(std::sync::Mutex::new(
+        CliSink::new(0).with_cost(model_spec, flux_credentials::load_pricing_table()),
+    ));
     // `None` advertised set: this is the pre-authored `flow run` path, which is deliberately
     // unrestricted by surfacing (the file names its ops explicitly; only model-emitted plans gate).
     engine.loop_host.set_turn(
@@ -2143,7 +2168,13 @@ pub(crate) async fn run_draft_ast_with_composites(
             style::dim(&format!("done \u{00b7} {} step(s)", outcome.steps))
         );
     }
-    shared.lock().unwrap().turn_end(None);
+    // A deterministic flow bills nothing (usage stays zero → `None`, today's output); a flow that
+    // reached a model op via `plan`/`run_plan` reports its real spend (C-30).
+    let u = engine.loop_host.turn_usage();
+    shared
+        .lock()
+        .unwrap()
+        .turn_end((u.total() > 0).then_some(u));
     Ok(())
 }
 
@@ -2182,7 +2213,7 @@ async fn run_plan(
             "`flux plan` needs a prompt, e.g. `flux plan \"summarize the README into SUMMARY.txt\"`"
         );
     }
-    let (engine, session_id, _spec, _spawner) = build_agent(&flags).await?;
+    let (engine, session_id, model_spec, _spawner) = build_agent(&flags).await?;
     let cli_ask = CliAsk;
     eprintln!(
         "{}",
@@ -2258,7 +2289,7 @@ async fn run_plan(
             risk.ops.clone(),
             fallback,
         )));
-    let mut sink = CliSink::new(0);
+    let mut sink = CliSink::new(0).with_cost(model_spec, flux_credentials::load_pricing_table());
     let outcome = flux_flow::runtime::execute_flow(
         &engine.flow,
         &engine.executor,
@@ -2670,8 +2701,36 @@ async fn run_a2a(url: String, prompt_words: Vec<String>, token: Option<String>) 
 }
 
 /// Interactive agentic REPL (tools enabled), with slash commands.
+/// Per-turn cost wiring for every REPL/CLI sink (C-30): one pricing table loaded per command; the
+/// model spec is derived from the LIVE engine at each sink construction — the same derivation
+/// `loop_host` uses to key stored usage (C-15) — so what the turn line prices and what
+/// `flux usage` attributes can never diverge, and a `/model` switch is picked up with zero extra
+/// plumbing (the switch arm updates `agent.provider`/`agent.model`, which is all we read).
+struct TurnCost {
+    pricing: flux_core::PricingTable,
+}
+
+impl TurnCost {
+    fn load() -> Self {
+        Self {
+            pricing: flux_credentials::load_pricing_table(),
+        }
+    }
+
+    /// The canonical `provider/model` spec of the engine's CURRENT provider + model.
+    fn spec(agent: &FlowEngine) -> String {
+        flux_core::canonical_model_spec(Some(agent.provider.name()), &agent.model)
+    }
+
+    /// A cost-attached [`CliSink`] for one turn on `agent`.
+    fn sink(&self, agent: &FlowEngine, max_iter: usize) -> CliSink {
+        CliSink::new(max_iter).with_cost(Self::spec(agent), self.pricing.clone())
+    }
+}
+
 async fn run_repl(flags: AgentFlags) -> Result<()> {
     let (mut agent, mut session_id, _spec, spawner) = build_agent(&flags).await?;
+    let cost = TurnCost::load();
     let initial_rules = agent.executor.allow_rules();
     eprintln!(
         "{}",
@@ -2771,9 +2830,10 @@ async fn run_repl(flags: AgentFlags) -> Result<()> {
                 "run" => match pending_plan.take() {
                     Some(ast) => {
                         let agent_ref = &agent;
+                        let cost_ref = &cost;
                         let sid_ref = session_id.as_str();
                         run_interruptible(move |c| async move {
-                            run_pending_plan(agent_ref, sid_ref, &ast, &c).await;
+                            run_pending_plan(agent_ref, cost_ref, sid_ref, &ast, &c).await;
                         })
                         .await;
                     }
@@ -2863,7 +2923,7 @@ async fn run_repl(flags: AgentFlags) -> Result<()> {
                         eprintln!("usage: /goal <condition>");
                     } else {
                         run_interruptible(|c| {
-                            run_goal(&agent, &session_id, spawner.as_ref(), &cond, c)
+                            run_goal(&agent, &cost, &session_id, spawner.as_ref(), &cond, c)
                         })
                         .await;
                     }
@@ -2874,7 +2934,8 @@ async fn run_repl(flags: AgentFlags) -> Result<()> {
                     if task.is_empty() {
                         eprintln!("usage: /loop <count> <task>");
                     } else {
-                        run_interruptible(|c| run_loop(&agent, &session_id, n, &task, c)).await;
+                        run_interruptible(|c| run_loop(&agent, &cost, &session_id, n, &task, c))
+                            .await;
                     }
                 }
                 "tools" => {
@@ -2955,7 +3016,7 @@ async fn run_repl(flags: AgentFlags) -> Result<()> {
                 "compact" => {
                     eprintln!("{}", style::dim("compacting context…"));
                     let cancel = tokio_util::sync::CancellationToken::new();
-                    let mut sink = CliSink::new(0);
+                    let mut sink = cost.sink(&agent, 0);
                     match agent.maybe_compact(&session_id, &mut sink, &cancel).await {
                         Ok(()) => eprintln!("{}", style::dim("context compacted")),
                         Err(e) => eprintln!("{} {e}", style::red("compact error:")),
@@ -2976,11 +3037,12 @@ async fn run_repl(flags: AgentFlags) -> Result<()> {
         // Interruptible: the first Ctrl-C drops the in-flight compose and returns to the prompt.
         if plan_mode {
             let agent_ref = &agent;
+            let cost_ref = &cost;
             let sid_ref = session_id.as_str();
             let mut new_plan: Option<flux_flow::ast::DraftAst> = None;
             let plan_slot = &mut new_plan;
             run_interruptible(move |c| async move {
-                let mut sink = CliSink::new(0);
+                let mut sink = cost_ref.sink(agent_ref, 0);
                 match agent_ref.plan_turn(sid_ref, input, &mut sink, &c).await {
                     Ok(Some(ast)) => {
                         *plan_slot = Some(ast);
@@ -3006,9 +3068,10 @@ async fn run_repl(flags: AgentFlags) -> Result<()> {
         // Normal mode: run the turn interruptibly. The first Ctrl-C cancels it (without killing the
         // REPL); the turn unwinds cleanly and we return to the prompt. (Ctrl-D exits.)
         let agent_ref = &agent;
+        let cost_ref = &cost;
         let sid_ref = session_id.as_str();
         run_interruptible(move |c| async move {
-            let mut sink = CliSink::new(agent_ref.max_iterations);
+            let mut sink = cost_ref.sink(agent_ref, agent_ref.max_iterations);
             if let Err(e) = agent_ref
                 .run_turn_cancellable(sid_ref, input, &mut sink, &c)
                 .await
@@ -3027,6 +3090,7 @@ async fn run_repl(flags: AgentFlags) -> Result<()> {
 /// still apply). The scope guard closes when this returns.
 async fn run_pending_plan(
     agent: &FlowEngine,
+    cost: &TurnCost,
     session_id: &str,
     ast: &flux_flow::ast::DraftAst,
     cancel: &tokio_util::sync::CancellationToken,
@@ -3038,7 +3102,20 @@ async fn run_pending_plan(
     let risk =
         flux_flow::runtime::plan_risk_with_composites(ast, agent.executor.registry(), &composites);
     let _scope = agent.executor.enter_approved_scope(risk.destructive);
-    let mut sink = CliSink::new(0);
+    // Scope the loop host to THIS run (C-30): a plan may call `plan`/`run_plan`, which re-enter
+    // through the same executor — without `set_turn` they'd stream onto the STALE prior turn's
+    // ctx — and scoping is also what lets `turn_usage()` report this run's real model spend
+    // (billed only when the plan reaches a model op) instead of `turn_end(None)` forever.
+    let shared: Arc<std::sync::Mutex<dyn AgentSink>> =
+        Arc::new(std::sync::Mutex::new(cost.sink(agent, 0)));
+    agent.loop_host.set_turn(
+        session_id.to_string(),
+        Some(agent.system_prompt.clone()),
+        shared.clone(),
+        None,
+        None,
+    );
+    let mut sink = flux_flow::loop_host::SharedSink::new(shared.clone());
     // Race execution against `cancel`: `execute_flow` has no cancellation of its own, so Ctrl-C is
     // honored by dropping the in-flight flow future (which aborts the current op's IO). The future
     // borrows `sink`, so scope it in a block and read its result out as owned data; `None` => cancelled.
@@ -3057,17 +3134,24 @@ async fn run_pending_plan(
             res = &mut fut => Some(res.map(|o| o.result).map_err(|e| format!("{e:#}"))),
         }
     };
+    let end_with_usage = || {
+        let u = agent.loop_host.turn_usage();
+        shared
+            .lock()
+            .unwrap()
+            .turn_end((u.total() > 0).then_some(u));
+    };
     match result {
         Some(Ok(out)) => {
             if !out.trim().is_empty() {
                 println!("{out}");
             }
-            sink.turn_end(None);
+            end_with_usage();
         }
         Some(Err(e)) => eprintln!("{} {e}", style::red("error:")),
         None => {
             // Cancelled: stop the in-flight op's spinner and return to the prompt.
-            sink.turn_end(None);
+            end_with_usage();
             eprintln!("{}", style::dim("(cancelled)"));
         }
     }
@@ -3102,6 +3186,7 @@ where
 /// whether the goal is satisfied; stop on SATISFIED, max-iterations, or cancellation.
 async fn run_goal(
     agent: &FlowEngine,
+    cost: &TurnCost,
     session_id: &str,
     spawner: &dyn flux_runtime::Spawner,
     goal: &str,
@@ -3114,7 +3199,10 @@ async fn run_goal(
             break;
         }
         eprintln!("{}", style::dim(&format!("[goal {}/{}]", i + 1, MAX)));
-        let mut sink = GoalSink::default();
+        let mut sink = GoalSink {
+            cost: Some((TurnCost::spec(agent), cost.pricing.clone())),
+            ..Default::default()
+        };
         if let Err(e) = agent
             .run_turn_cancellable(session_id, &next_input, &mut sink, &cancel)
             .await
@@ -3161,6 +3249,7 @@ async fn run_goal(
 /// `/loop <count> <task>`: run `task` up to `count` times (stops early on cancellation).
 async fn run_loop(
     agent: &FlowEngine,
+    cost: &TurnCost,
     session_id: &str,
     count: usize,
     task: &str,
@@ -3171,7 +3260,7 @@ async fn run_loop(
             break;
         }
         eprintln!("{}", style::dim(&format!("[loop {}/{}]", i + 1, count)));
-        let mut sink = CliSink::new(0);
+        let mut sink = cost.sink(agent, 0);
         if let Err(e) = agent
             .run_turn_cancellable(session_id, task, &mut sink, &cancel)
             .await
@@ -3515,18 +3604,10 @@ impl CliSink {
     }
 
     /// The per-turn dollar-cost suffix for the annotation, when a model spec + pricing table are
-    /// attached and the turn reported usage. Returns an empty string otherwise (or when the model is
-    /// unknown to the table — never panics).
+    /// attached and the turn reported usage — see [`cost_suffix`] for the full rendering rules
+    /// (incl. the C-30 `$? (unpriced)` marker for un-tabled metered cloud models).
     fn cost_inline(&self, usage: Option<&Usage>) -> String {
-        let (Some(u), Some(spec), Some(table)) =
-            (usage, self.model_spec.as_deref(), self.pricing.as_ref())
-        else {
-            return String::new();
-        };
-        match table.cost(u, spec) {
-            Some(money) => cost_annotation(&money),
-            None => String::new(),
-        }
+        cost_suffix(self.model_spec.as_deref(), self.pricing.as_ref(), usage)
     }
 
     /// Commit any in-progress assistant render so subsequent stderr lines appear below it.
@@ -3795,6 +3876,49 @@ fn cost_annotation(money: &flux_core::Money) -> String {
     }
 }
 
+/// The complete turn-line cost suffix (shared by every sink): the dollar amount when the table
+/// prices the spec; the C-30 ` · $? (unpriced)` marker when a **metered cloud** model has no
+/// pricing row (real dollars are being spent invisibly — the marker says so and the once-per-run
+/// note points at the `~/.flux/pricing.toml` override); empty when usage/spec/table are absent,
+/// when the priced cost is zero, or for local/unknown specs (`ollama*`, `mock`, ad-hoc providers —
+/// nothing is billed, and hermetic e2e output must stay byte-identical).
+fn cost_suffix(
+    spec: Option<&str>,
+    table: Option<&flux_core::PricingTable>,
+    usage: Option<&Usage>,
+) -> String {
+    let (Some(u), Some(spec), Some(table)) = (usage, spec, table) else {
+        return String::new();
+    };
+    match table.cost(u, spec) {
+        Some(money) => cost_annotation(&money),
+        None if unpriced_marker_applies(spec) => {
+            note_unpriced_once(spec);
+            " · $? (unpriced)".to_string()
+        }
+        None => String::new(),
+    }
+}
+
+/// The `$?` marker fires only for known metered **cloud** providers — a table miss there hides
+/// real spend. Local `ollama*` and unknown/mock providers stay silent.
+fn unpriced_marker_applies(spec: &str) -> bool {
+    match flux_core::canonical_model_parts(spec).0 {
+        Some(p) => !p.starts_with("ollama"),
+        None => false,
+    }
+}
+
+/// One-time (per process) plain-stderr hint explaining the `$?` marker and how to price the model.
+fn note_unpriced_once(spec: &str) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "note: no pricing entry for `{spec}` — add one to ~/.flux/pricing.toml to see $ costs"
+        );
+    });
+}
+
 impl CliSink {
     /// Render a `flow.plan` observation: the syntax-highlighted plan tree + a risk badge header. A
     /// resumed/halted plan (`resumed: true`, A-17) carries per-statement ✓/✗/· status markers in its
@@ -4020,6 +4144,8 @@ fn collect_plan_calls(node: &flux_flow::ast::Node, out: &mut Vec<(String, Value)
 #[derive(Default)]
 struct GoalSink {
     text: String,
+    /// `(model spec, pricing table)` for the per-turn cost suffix (C-30); `None` in tests.
+    cost: Option<(String, flux_core::PricingTable)>,
 }
 
 impl AgentSink for GoalSink {
@@ -4048,8 +4174,16 @@ impl AgentSink for GoalSink {
     fn turn_end(&mut self, usage: Option<Usage>) {
         println!();
         if let Some(u) = usage {
-            // Same figures as the main rule, without the leading separator.
-            let stats = usage_annotation(&u);
+            // Same figures as the main rule (tokens + C-30 cost suffix), without the leading separator.
+            let (spec, table) = match &self.cost {
+                Some((s, t)) => (Some(s.as_str()), Some(t)),
+                None => (None, None),
+            };
+            let stats = format!(
+                "{}{}",
+                usage_annotation(&u),
+                cost_suffix(spec, table, Some(&u))
+            );
             let stats = stats.trim_start_matches(" · ");
             if !stats.is_empty() {
                 eprintln!("{}", style::dim(stats));
@@ -4993,11 +5127,18 @@ async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> R
                     .as_deref()
                     .map(|v| format!("  (pinned {v})"))
                     .unwrap_or_default();
+                let ver = p
+                    .descriptor
+                    .version
+                    .as_deref()
+                    .map(|v| format!("  v{v}"))
+                    .unwrap_or_default();
                 println!(
-                    "{:<16} {} {}{pin}",
+                    "{:<16} {} {}{pin}{ver}  [{}]",
                     p.name,
                     p.descriptor.program,
-                    p.descriptor.args.join(" ")
+                    p.descriptor.args.join(" "),
+                    plugin_verification_label(&p.descriptor)
                 );
             }
             Ok(())
@@ -5014,6 +5155,7 @@ async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> R
                     program: program.clone(),
                     args,
                     pinned: None,
+                    ..Default::default()
                 },
             )
             .context("write plugin descriptor")?;
@@ -5117,36 +5259,94 @@ async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> R
             }
             Ok(())
         }
-        PluginAction::Install { dir: bin_dir } => {
-            let bin_dir = std::path::PathBuf::from(
-                bin_dir.unwrap_or_else(|| "plugins/target/release".to_string()),
-            );
-            let mut installed = 0usize;
-            for (name, program) in plugin_binaries_in(&bin_dir)
-                .with_context(|| format!("scan {}", bin_dir.display()))?
-            {
-                flux_plugin::add_descriptor(
-                    dir,
-                    &name,
-                    &flux_plugin::PluginDescriptor {
-                        program: program.clone(),
-                        args: Vec::new(),
-                        pinned: None,
-                    },
-                )
-                .with_context(|| format!("register plugin `{name}`"))?;
-                println!("installed `{name}` → {program}");
-                installed += 1;
+        PluginAction::Install {
+            names,
+            all,
+            dir: local_dir,
+        } => match local_dir {
+            Some(bin_dir) => {
+                if !names.is_empty() || all {
+                    bail!(
+                        "`--dir` (local scan) cannot be combined with plugin names or `--all` \
+                             (remote pack install) — pick one mode"
+                    );
+                }
+                let bin_dir = std::path::PathBuf::from(bin_dir);
+                let mut installed = 0usize;
+                for (name, program) in plugin_binaries_in(&bin_dir)
+                    .with_context(|| format!("scan {}", bin_dir.display()))?
+                {
+                    flux_plugin::add_descriptor(
+                        dir,
+                        &name,
+                        &flux_plugin::PluginDescriptor {
+                            program: program.clone(),
+                            args: Vec::new(),
+                            pinned: None,
+                            ..Default::default()
+                        },
+                    )
+                    .with_context(|| format!("register plugin `{name}`"))?;
+                    println!("installed `{name}` → {program} (local, unverified)");
+                    installed += 1;
+                }
+                if installed == 0 {
+                    eprintln!(
+                        "no `flux-plugin-*` binaries in {} (build them first: \
+                             `cd plugins && cargo build --release`)",
+                        bin_dir.display()
+                    );
+                }
+                Ok(())
             }
-            if installed == 0 {
-                eprintln!(
-                    "no `flux-plugin-*` binaries in {} (build them first: \
-                     `cd plugins && cargo build --release`)",
-                    bin_dir.display()
-                );
+            None => {
+                if names.is_empty() && !all {
+                    bail!(
+                        "`flux plugin install` needs plugin name(s), `--all` (remote pack \
+                             install), or `--dir [path]` (local scan of a built \
+                             `plugins/target/release`) — bare `install` no longer guesses"
+                    );
+                }
+                if flux_plugin::pack::CURRENT_TARGET.is_empty() {
+                    bail!(
+                        "no prebuilt plugin pack for this platform — build from source: \
+                             `git clone https://github.com/{} && cd plugins && cargo build \
+                             --release && flux plugin install --dir plugins/target/release`",
+                        flux_plugin::pack::DEFAULT_REPO
+                    );
+                }
+                let store_root = dir.join("bin");
+                let fetcher = flux_plugin::pack::GithubFetcher::default();
+                let req = flux_plugin::pack::InstallRequest {
+                    fetcher: &fetcher,
+                    repo: flux_plugin::pack::DEFAULT_REPO,
+                    public_key: flux_plugin::pack::PUBLIC_KEY,
+                    descriptors_dir: dir,
+                    store_root: &store_root,
+                    target: flux_plugin::pack::CURRENT_TARGET,
+                };
+                let installed = flux_plugin::pack::install_many(&req, &names, all)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("remote plugin install: {e}"))?;
+                for p in installed {
+                    if p.already_installed {
+                        println!(
+                            "`{}` {} already installed (source {}) — no-op",
+                            p.name, p.version, p.source
+                        );
+                    } else {
+                        println!(
+                            "installed `{}` {} → {} (verified, source {})",
+                            p.name,
+                            p.version,
+                            p.program.display(),
+                            p.source
+                        );
+                    }
+                }
+                Ok(())
             }
-            Ok(())
-        }
+        },
         PluginAction::Skill {
             install,
             global,
@@ -5202,8 +5402,24 @@ struct PluginStatusReport {
     program: String,
     args: Vec<String>,
     pin: Option<String>,
+    /// The installed version, if the descriptor carries one (remote installs only — D-47).
+    version: Option<String>,
+    /// `true` for a hash-carrying (remote-installed) descriptor, `false` for a hashless local/dev
+    /// one. Full hash *enforcement* (re-hashing the binary on disk) is D-48; this is display only.
+    verified: bool,
     liveness: Liveness,
     manifest: Option<flux_plugin::PluginManifest>,
+}
+
+/// `verified` for a descriptor that carries a `sha256` (a remote `install`), `unverified (local)`
+/// for one that doesn't (`add` / `install --dir`) — D-47. This reads the descriptor field only; it
+/// does not re-hash the binary on disk (that enforcement lands in D-48).
+fn plugin_verification_label(d: &flux_plugin::PluginDescriptor) -> &'static str {
+    if d.sha256.is_some() {
+        "verified"
+    } else {
+        "unverified (local)"
+    }
 }
 
 /// Resolve `program` (an absolute/relative path, or a bare name on `PATH`) to an existing file.
@@ -5237,11 +5453,14 @@ async fn build_status_report(
             Err(e) => (Liveness::Unloadable(e.to_string()), None),
         }
     };
+    let verified = plugin_verification_label(&d) == "verified";
     Ok(PluginStatusReport {
         name: name.to_string(),
         program: d.program,
         args: d.args,
         pin: d.pinned,
+        version: d.version,
+        verified,
         liveness,
         manifest,
     })
@@ -5293,8 +5512,18 @@ fn print_plugin_status_report(r: &PluginStatusReport) {
         .as_deref()
         .map(|v| format!("  (pinned {v})"))
         .unwrap_or_default();
+    let ver = r
+        .version
+        .as_deref()
+        .map(|v| format!("  v{v}"))
+        .unwrap_or_default();
+    let verified_label = if r.verified {
+        style::green("verified")
+    } else {
+        style::dim("unverified (local)")
+    };
     println!(
-        "{:<16} {} {}{pin}  [{liveness_label}]",
+        "{:<16} {} {}{pin}{ver}  [{liveness_label}]  [{verified_label}]",
         r.name,
         r.program,
         r.args.join(" ")
@@ -5768,8 +5997,9 @@ fn write_skill_references(dir: &std::path::Path, refs: &[(String, String)]) -> R
     Ok(())
 }
 
-/// Find every `flux-plugin-<name>` executable in `dir`, returning `(name, absolute-program-path)`
-/// pairs sorted by name. Skips sidecar files (e.g. `*.d`). Missing dir is an error (the caller reports).
+/// Find every `flux-plugin-<name>` (or, on Windows, `flux-plugin-<name>.exe`) executable in `dir`,
+/// returning `(name, absolute-program-path)` pairs sorted by name. Skips sidecar files (e.g.
+/// `*.d`). Missing dir is an error (the caller reports).
 fn plugin_binaries_in(dir: &std::path::Path) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir)?.flatten() {
@@ -5780,13 +6010,17 @@ fn plugin_binaries_in(dir: &std::path::Path) -> Result<Vec<(String, String)>> {
         let Some(file) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        // Only `flux-plugin-<name>` with no extension (skip `flux-plugin-x.d`, etc.).
-        let Some(name) = file.strip_prefix("flux-plugin-") else {
+        let Some(rest) = file.strip_prefix("flux-plugin-") else {
             continue;
         };
-        if name.is_empty() || name.contains('.') {
-            continue;
-        }
+        // `flux-plugin-<name>` with no further extension, or `flux-plugin-<name>.exe` on Windows —
+        // anything else with a `.` is a sidecar (`*.d`, etc.) and is skipped.
+        let name = match rest.strip_suffix(".exe") {
+            Some(base) if !base.is_empty() && !base.contains('.') => base,
+            Some(_) => continue,
+            None if !rest.is_empty() && !rest.contains('.') => rest,
+            None => continue,
+        };
         let name = name.to_string(); // own it before `path` is moved below
         let program = path
             .canonicalize()
@@ -5985,10 +6219,10 @@ mod tests {
     use super::{
         build_datasources, build_invoke_input, coerce_arg_value, cost_annotation,
         credential_location, format_evidence, loop_machinery_label, new_render_suffix,
-        plugin_binaries_in, plugin_status_one, render_endpoint_row, render_review_markdown,
-        resolve_plugin_operation_name, run_plugin_in, run_usage_with, should_fail, tool_preview,
-        truncate, usage_annotation, write_generated_skill, EventStore, Liveness, PluginAction,
-        ReviewSeverity,
+        plugin_binaries_in, plugin_status_one, plugin_verification_label, render_endpoint_row,
+        render_review_markdown, resolve_plugin_operation_name, run_plugin_in, run_usage_with,
+        should_fail, tool_preview, truncate, usage_annotation, write_generated_skill, EventStore,
+        Liveness, PluginAction, ReviewSeverity,
     };
     use flux_flow::AgentSink;
     use serde_json::json;
@@ -6271,17 +6505,27 @@ mod tests {
         for f in [
             "flux-plugin-gitlab",
             "flux-plugin-slack",
-            "flux-plugin-slack.d", // a cargo sidecar — must be skipped
-            "flux-plugin-",        // empty name — skipped
-            "not-a-plugin",        // wrong prefix — skipped
+            "flux-plugin-jira.exe", // a Windows binary — must be picked up, not skipped (D-47)
+            "flux-plugin-slack.d",  // a cargo sidecar — must be skipped
+            "flux-plugin-slack.exe.d", // a sidecar on a Windows-shaped name — must also be skipped
+            "flux-plugin-",         // empty name — skipped
+            "flux-plugin-.exe",     // empty name, `.exe` — skipped
+            "not-a-plugin",         // wrong prefix — skipped
         ] {
             std::fs::write(dir.join(f), b"x").unwrap();
         }
         let found = plugin_binaries_in(&dir).unwrap();
         let names: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["gitlab", "slack"]);
+        assert_eq!(names, vec!["gitlab", "jira", "slack"]);
         // programs are absolute (canonicalized) paths to the binaries
         assert!(found.iter().all(|(_, p)| p.contains("flux-plugin-")));
+        // the Windows binary's registered program path keeps the `.exe` suffix
+        assert!(
+            found
+                .iter()
+                .any(|(n, p)| n == "jira" && p.ends_with("flux-plugin-jira.exe")),
+            "{found:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -6299,6 +6543,7 @@ mod tests {
                 program: "/bin/true".into(),
                 args: vec![],
                 pinned: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -6395,6 +6640,7 @@ mod tests {
                 program: "/nonexistent/binary".into(),
                 args: vec![],
                 pinned: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -6413,6 +6659,151 @@ mod tests {
         // A name that is not registered at all is a clean error (the caller surfaces it).
         let err = plugin_status_one(&dir, "nope").await;
         assert!(err.is_err(), "an unknown name is a clean error");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Bare `flux plugin install` (no names, no `--all`, no `--dir`) is a clean error naming both
+    /// modes — the pre-D-47 implicit default (`plugins/target/release`) no longer applies (clean
+    /// cutover, no guessing).
+    #[tokio::test]
+    async fn plugin_install_bare_errors_naming_both_modes() {
+        let dir = std::env::temp_dir().join(format!("flux-install-bare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let err = run_plugin_in(
+            &dir,
+            Some(PluginAction::Install {
+                names: vec![],
+                all: false,
+                dir: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--all"), "{msg}");
+        assert!(msg.contains("--dir"), "{msg}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `--dir` (local scan) and explicit names/`--all` (remote install) are exclusive modes.
+    #[tokio::test]
+    async fn plugin_install_dir_rejects_combination_with_names_or_all() {
+        let dir = std::env::temp_dir().join(format!("flux-install-combo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let err = run_plugin_in(
+            &dir,
+            Some(PluginAction::Install {
+                names: vec!["gitlab".into()],
+                all: false,
+                dir: Some("plugins/target/release".into()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("--dir"), "{err}");
+
+        let err = run_plugin_in(
+            &dir,
+            Some(PluginAction::Install {
+                names: vec![],
+                all: true,
+                dir: Some("plugins/target/release".into()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("--dir"), "{err}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `flux plugin install --dir <path>` (the pre-D-47 local scan) registers a hashless descriptor
+    /// — `ls`/`status` label it `unverified (local)`, never `verified`.
+    #[tokio::test]
+    async fn plugin_install_dir_scan_registers_unverified_local_descriptor() {
+        let dir = std::env::temp_dir().join(format!("flux-install-dirscan-{}", std::process::id()));
+        let bin_dir = dir.join("bin");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("flux-plugin-gitlab"), b"x").unwrap();
+
+        run_plugin_in(
+            &dir,
+            Some(PluginAction::Install {
+                names: vec![],
+                all: false,
+                dir: Some(bin_dir.to_string_lossy().into_owned()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let desc = flux_plugin::load_descriptor(&dir, "gitlab")
+            .unwrap()
+            .unwrap();
+        assert!(
+            desc.version.is_none(),
+            "a local-scan descriptor carries no version"
+        );
+        assert!(
+            desc.sha256.is_none(),
+            "a local-scan descriptor carries no sha256"
+        );
+        assert_eq!(plugin_verification_label(&desc), "unverified (local)");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `ls`/`status` mark a hash-carrying (remotely installed) descriptor `verified` and a
+    /// hashless (local/dev) one `unverified (local)` — D-47's display half of the trust ladder
+    /// (hash *enforcement* at spawn time is D-48, not tested here).
+    #[tokio::test]
+    async fn plugin_status_marks_hash_carrying_descriptors_verified() {
+        let dir = std::env::temp_dir().join(format!("flux-status-verified-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        flux_plugin::add_descriptor(
+            &dir,
+            "remote-plugin",
+            &flux_plugin::PluginDescriptor {
+                program: "/nonexistent/remote-plugin".into(),
+                args: vec![],
+                pinned: None,
+                version: Some("0.9.0".into()),
+                sha256: Some("deadbeef".into()),
+                source: Some("plugins-v0.9.0".into()),
+            },
+        )
+        .unwrap();
+        flux_plugin::add_descriptor(
+            &dir,
+            "local-plugin",
+            &flux_plugin::PluginDescriptor {
+                program: "/nonexistent/local-plugin".into(),
+                args: vec![],
+                pinned: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let remote = plugin_status_one(&dir, "remote-plugin").await.unwrap();
+        assert!(remote.verified, "a sha256-carrying descriptor is verified");
+        assert_eq!(remote.version.as_deref(), Some("0.9.0"));
+
+        let local = plugin_status_one(&dir, "local-plugin").await.unwrap();
+        assert!(
+            !local.verified,
+            "a hashless descriptor is unverified (local)"
+        );
+        assert!(local.version.is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -6843,6 +7234,77 @@ mod tests {
         );
         // No spec attached → no cost suffix (sub-paths that don't show cost).
         assert_eq!(super::CliSink::new(0).cost_inline(Some(&u)), "");
+    }
+
+    /// C-30: an attached METERED CLOUD model missing from the pricing table renders the visible
+    /// ` · $? (unpriced)` marker — never silent nothing (silence hid real spend); local
+    /// (`ollama*`) and unknown/mock specs stay silent so hermetic e2e output is byte-identical.
+    #[tokio::test]
+    async fn unpriced_model_renders_visible_marker() {
+        use flux_core::Usage;
+        let u = Usage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            ..Default::default()
+        };
+        let table = flux_core::PricingTable::builtin();
+        // A cloud provider with a model the table doesn't know → marker.
+        let unpriced = super::CliSink::new(0)
+            .with_cost(
+                "openrouter/deepseek/deepseek-v4-flash:nitro".into(),
+                table.clone(),
+            )
+            .cost_inline(Some(&u));
+        assert_eq!(unpriced, " · $? (unpriced)", "got: {unpriced:?}");
+        // Local ollama and unknown/mock specs: silent, as before.
+        for quiet in ["ollama/llama3", "mock", "some-ad-hoc-model"] {
+            let s = super::CliSink::new(0)
+                .with_cost(quiet.into(), table.clone())
+                .cost_inline(Some(&u));
+            assert_eq!(s, "", "`{quiet}` must stay silent, got: {s:?}");
+        }
+        // No usage → silent regardless.
+        let none = super::CliSink::new(0)
+            .with_cost("openrouter/deepseek/deepseek-v4-flash:nitro".into(), table)
+            .cost_inline(None);
+        assert_eq!(none, "");
+    }
+
+    /// C-30: the REPL's per-turn sink derives its spec from the LIVE engine — the same
+    /// `canonical_model_spec` derivation loop_host stamps usage with — so a `/model` switch
+    /// changes what the next sink prices, and an openrouter passthrough keeps its serving
+    /// provider (metered), while a claude switch turns the suffix subscription-shaped.
+    #[tokio::test]
+    async fn repl_sink_cost_derives_from_the_live_engine_spec() {
+        use flux_core::Usage;
+        let u = Usage {
+            input_tokens: 100_000,
+            output_tokens: 5_000,
+            ..Default::default()
+        };
+        let table = flux_core::PricingTable::builtin();
+        // The derivation the TurnCost factory applies (provider name + live model string):
+        let spec = flux_core::canonical_model_spec(
+            Some("openrouter-anthropic"),
+            "anthropic/claude-sonnet-4.6",
+        );
+        assert_eq!(spec, "openrouter-anthropic/anthropic/claude-sonnet-4.6");
+        let inline = super::CliSink::new(0)
+            .with_cost(spec, table.clone())
+            .cost_inline(Some(&u));
+        assert!(
+            inline.contains('$') && !inline.contains("(sub)") && !inline.contains("$?"),
+            "openrouter passthrough is metered and priced, got: {inline}"
+        );
+        // Simulated /model switch to a subscription provider: the NEXT sink derives the new spec.
+        let spec = flux_core::canonical_model_spec(Some("claude"), "claude-opus-4-8");
+        let inline = super::CliSink::new(0)
+            .with_cost(spec, table)
+            .cost_inline(Some(&u));
+        assert!(
+            inline.contains("(sub)"),
+            "a switched-to claude model is subscription-labelled, got: {inline}"
+        );
     }
 
     /// A-15 named acceptance (`phase_observations_emitted_per_pass`'s surface half): each

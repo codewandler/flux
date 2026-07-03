@@ -128,6 +128,19 @@ slack-morphism = ">=2.10, <2.18"
 url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Plugin pack distribution (D-47): verify the minisign-signed `plugins-index.json`
+# (`minisign-verify` is pure Rust, zero dependencies) and unpack the per-target archives
+# (`tar` + `lzma-rs` for `.tar.xz` on unix/macOS targets, `zip` for `.zip` on the windows target).
+# `tar` is already resolved in the lockfile (an `ort-sys`/`fastembed` transitive, gated behind the
+# optional `local-embeddings` feature) — declaring it directly adds no new crate to the build.
+minisign-verify = "0.2"
+tar = "0.4"
+lzma-rs = "0.3"
+zip = { version = "8", default-features = false, features = ["deflate"] }
+# Dev-only: signs fixtures in flux-plugin's hermetic pack tests (production signing happens in CI
+# via the real `minisign` CLI against a keypair generated once with this crate's own generator —
+# see `crates/flux-plugin/src/pack.rs`'s `generate_pack_keypair`).
+minisign = "0.9"
 
 [profile.release]
 opt-level = 3

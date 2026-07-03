@@ -2,7 +2,7 @@
 id: D-46
 title: Plugin pack release pipeline — per-plugin artifacts + signed index
 pillar: Core
-status: in-progress
+status: done
 epic: plugin-platform-hardening
 design: docs/designs/plugin-distribution.md
 note: "workflow_dispatch `release-plugins.yml`: build the pack on 5 native runners, package per-plugin archives, emit a minisign-signed `plugins-index.json`, create the `plugins-v<ver>` release (`--latest=false`); core dist release untouched"
@@ -41,7 +41,7 @@ without pulling the excluded `plugins/` workspace into the core cargo-dist relea
       no tag, no release.
 - [x] Core plumbing untouched: `release.yml`, `dist-workspace.toml`, root `Cargo.toml`, and the
       existing `ci.yml` jobs are unmodified; the pack stays excluded from the root gate.
-- [ ] One real (or dry-run) workflow execution attached to the story Progress as evidence.
+- [x] One real (or dry-run) workflow execution attached to the story Progress as evidence.
 
 ## Progress
 - 2026-07-03 in-progress. Implemented both halves: (1) `plugins/pack-index` — a workspace-member
@@ -62,6 +62,14 @@ without pulling the excluded `plugins/` workspace into the core cargo-dist relea
   `sha256sum` (`e28eb338…`). Plugins gate green (fmt/clippy/build/test, 21 test binaries). Core
   plumbing untouched. Remaining: the workflow-dispatch execution (needs the workflow pushed to
   GitHub; dry run needs no secret).
+- 2026-07-03 **DONE — dry-run evidence.** Workflow-dispatch run
+  https://github.com/codewandler/flux/actions/runs/28676061794 (version=0.1.0, publish=false)
+  green END-TO-END: all 5 build legs + the assemble job — `expecting 17 plugins x 5 targets` →
+  `pack-index: wrote ../dist/plugins-index.json (17 plugins × 5 targets)` (85 archives, sanity gate
+  passed), bundle uploaded as the dry-run workflow artifact; unsigned (MINISIGN_SECRET_KEY not yet
+  set — required before the first `publish: true` run). One runner correction along the way: the
+  x86_64-apple-darwin leg starved on the retired `macos-13` label; switched to `macos-15-intel`
+  (what dist's core release resolves to) in `75dbe25`, first run cancelled + re-dispatched.
 
 ## Notes
 - Design: [plugin-distribution](../designs/plugin-distribution.md) — see "Build & release plumbing"

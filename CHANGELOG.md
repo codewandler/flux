@@ -6,6 +6,64 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **Verified remote plugin install (D-47 — the demand side of plugin distribution).**
+  `flux plugin install <name>[@<version>] …` (multiple names; `--all`) resolves the newest
+  `plugins-v*` release (or the exact tag), fetches `plugins-index.json` + `.minisig`, verifies the
+  minisign signature against a public key embedded in the binary (fail-closed, **no bypass flag**),
+  refuses a protocol mismatch, verifies each archive's sha256 against the index *before* unpacking,
+  installs into the versioned store `~/.flux/plugins/bin/<name>/<version>/`, and writes the
+  descriptor with new serde-defaulted `version`/`sha256`/`source` fields. Download URLs are built
+  only from `(repo, tag, asset-name)` — a URL-shaped index asset is rejected. The old local scan
+  moved behind `flux plugin install --dir [path]` (now `.exe`-aware on Windows); bare
+  `flux plugin install` errors naming both modes. `ls`/`status` show the version plus a
+  `verified` / `unverified (local)` marker (spawn-time hash enforcement lands with D-48). All
+  verification paths pinned by hermetic failing-first tests (injectable fetcher, real minisign
+  fixtures — no network in the gate).
+
+### Fixed
+
+- **Planner parse resilience (A-30/A-31/C-31 — the s_360 qwen failure class).**
+  OpenAI-wire-trained models habitually double-encode `emit_plan`'s nested `ast` argument — a JSON
+  **string** containing a perfectly valid plan instead of an object (qwen3.7-max/plus, confirmed
+  live) — and flux's strict decode rejected every repair step, killing the turn after 8 steps with
+  the bare "planner did not produce a plan within 8 steps". Three fixes: **(A-30)** the JSON arm
+  unwraps a string-encoded `ast` (`from_str` first; a non-JSON string keeps the strict error, and
+  the decoded plan traverses the unchanged hidden-op/gather/validate gates) — live-verified: the
+  exact s_360 model+prompt now compiles a clean 15-branch gather plan on the first emission;
+  **(A-31)** the decode-failure and hallucinated-tool branches now record `last_reject`, so an
+  exhausted budget reports "the last attempt was rejected: <cause>" instead of masking it;
+  **(C-31)** `compile_turn` returns its accumulated `Usage` outside the `Result` and the loop host
+  accounts it *before* branching on the outcome — a failed consultation now lands in the per-turn
+  tally and `call_usage` events (s_360 burned ~8 × 37k input tokens invisibly to `flux usage`),
+  and the emission A/B harness reports real spend on failed tasks instead of zeros.
+- **Three weak-model landmines from the s_362 forensics (L-36, L-35, C-32).** *jq missing-data →
+  null:* `jq` paths (and the `$a.b` field-access sugar) now yield `null` when traversing missing
+  data instead of a fatal, turn-killing error — s_362's one substantive turn gathered everything
+  then died at answer synthesis on an absent `.transcript` key; malformed path syntax still errors
+  loudly. *`len()` counts elements:* the expression evaluator gained a real list type
+  (`ExprVal::List`) — `len(glob("**/*.rs"))` returns the number of paths (was: the character count
+  of the stringified array, which the model then confabulated an explanation around); string-stored
+  op results re-parse to their native JSON shape before typing. *`read()` on a directory:* returns
+  actionable, repairable guidance ("…is a directory — list it with glob(...) first") through a new
+  guarded `System::is_dir`, instead of halting the plan with a raw `Is a directory` io error.
+- **Per-turn dollar costs finally render where you work (C-30).** The interactive REPL (and
+  `/plan`, `/compact`, `/run`, `/loop`, `/goal`, `flux plan`, `flux flow run`) never attached the
+  pricing seam — the after-turn dollar suffix was structurally impossible outside one-shot
+  `flux run` and the TUI, which is why costs "never appeared anywhere". Every CLI sink now derives
+  its model spec from the live engine at turn start (so `/model` switches are priced correctly)
+  and attaches the loaded pricing table. Three companions: a **visible ` · $? (unpriced)` marker**
+  when a metered cloud model has no pricing-table row (silent omission hid real spend; a
+  once-per-run note points at the `~/.flux/pricing.toml` override — local/mock specs stay silent),
+  `/run` and `flow run` now report their real model usage at turn end instead of `None` (and `/run`
+  scopes the loop host, so nested plan ops stop streaming onto the stale prior turn), and
+  `canonical_model_spec` keeps the **serving** provider for passthrough ids — OpenRouter spend is
+  no longer silently attributed to `anthropic` in `flux usage` (old mislabeled rows stay separate;
+  the merge never guesses across providers).
+- **CI: the plugins release workflow's Intel-mac leg** targeted the retired `macos-13` runner label
+  (jobs starved waiting for a runner); switched to `macos-15-intel`, matching the core dist release.
+
 ## [0.2.13] - 2026-07-03
 
 ### Fixed

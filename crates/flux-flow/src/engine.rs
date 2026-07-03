@@ -328,6 +328,8 @@ impl FlowEngine {
         };
         // A-13: phased compile_turn — this compile-only surface sticks to the execute/default
         // phase for now (A-14 threads orient/gather through the real loop host).
+        // Compile-only: nothing executes and no session ledger exists here, so the C-31 usage
+        // side-channel is deliberately unused — not silently lost in a `?`.
         let (out, _usage) = compile_turn(
             &*self.provider,
             &self.model,
@@ -340,8 +342,8 @@ impl FlowEngine {
             opts,
             Phase::Execute,
         )
-        .await?;
-        Ok(out)
+        .await;
+        out
     }
 
     /// A plan-mode turn (the REPL `/plan` toggle): compile ONE plan from the conversation, render it,
@@ -402,9 +404,13 @@ impl FlowEngine {
             sink.turn_end(None);
             return Ok(None);
         };
+        // Usage first (C-31 shape), then the outcome: this surface renders usage on `turn_end`
+        // only — there is no per-call ledger on the `/plan` path, so an errored compose's spend
+        // has nowhere durable to go and the drop below is deliberate, not a leak.
+        let (out, usage) = out;
         // Surface a provider failure (credit, auth, rate limit, transport) with a readable message
         // rather than the raw API JSON body — the REPL prints this `error:` line directly.
-        let (out, usage) = out.map_err(|e| flux_core::Error::Other(planner_error(&e)))?;
+        let out = out.map_err(|e| flux_core::Error::Other(planner_error(&e)))?;
         // The compose-a-plan call is the turn's only model call here, so its usage IS the turn's.
         let usage = (usage.total() > 0).then_some(usage);
 

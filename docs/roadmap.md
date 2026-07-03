@@ -71,6 +71,23 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 
 ## Next
 
+### Planner parse resilience (epic) — **shipped 2026-07-03 (3/3, gate green, live-verified on qwen3.7-max)**
+
+Root-caused from session s_360 (2026-07-03): qwen3.7-max via OpenRouter **double-encodes
+`emit_plan`'s `ast`** — a JSON string containing a perfectly valid plan — and flux's strict decode
+rejects it on all 8 repair steps, killing the turn with the uninformative "planner did not produce a
+plan within 8 steps". A live instrumented repro (s_361) confirmed the class (qwen3.7-plus too;
+GLM 5.2 is a sibling; Sonnet unaffected) and surfaced three independent defects: no stringified-JSON
+tolerance in the `EmissionArm::Json` decode ([A-30](stories/A-30-stringified-ast-fallback.md), the
+one-line interop fix that would have made the whole turn succeed); the decode-`Err` and
+hallucinated-tool branches never set `last_reject`, so the exhausted-budget error masks its own
+cause ([A-31](stories/A-31-planner-reject-surfacing.md)); and `compile_turn`'s `Err` path drops the
+accumulated `Usage`, so failed consultations persist **no** `call_usage` event and `flux usage`
+undercounts exactly the most wasteful turns ([C-31](stories/C-31-planner-usage-on-error.md)). Done =
+a qwen-shaped string-encoded plan compiles and runs like its object twin, every exhausted-budget
+error names the last rejection, and failed planner turns are cost-accounted. Epic design:
+[parse-resilience.md](designs/parse-resilience.md).
+
 ### Library hardening (epic) — **shipped 2026-07-03 (13/13, full gate green)**
 
 Three adversarial subsystem audits (2026-07-03, one Opus reader each over the context-assembly,

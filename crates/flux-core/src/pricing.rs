@@ -150,16 +150,28 @@ pub fn is_subscription(spec: &str) -> bool {
 /// resolved and Bedrock's regional routing prefix stripped — stamped at **write** time on
 /// `CallUsage`/`TurnStarted` events so `cost_summary`/`flux usage` never splits one backend's
 /// spend across key variants (`gpt-5.5` vs `openai/gpt-5.5`, `us.anthropic.…` vs `anthropic.…`)
-/// (C-15). A spec that already carries a known provider keeps it; a bare model id is prefixed
-/// with `provider` when that names a known provider (a `mock`/unknown provider leaves the id
-/// bare, so hermetic tests and ad-hoc providers are untouched).
+/// (C-15). A spec that already carries a known provider keeps it — unless a DIFFERENT known
+/// provider is actually serving the call (an OpenRouter passthrough id like
+/// `openrouter-anthropic` serving `anthropic/claude-sonnet-4.6`), in which case the serving
+/// provider becomes the outer prefix and the embedded segment stays part of the model id (C-30).
+/// A bare model id is prefixed with `provider` when that names a known provider (a `mock`/unknown
+/// provider leaves the id bare, so hermetic tests and ad-hoc providers are untouched).
 pub fn canonical_model_spec(provider: Option<&str>, model: &str) -> String {
     let (spec_provider, bare) = split_provider(model);
     let bare = resolve_alias(bare);
     let bare = strip_bedrock_region_prefix(bare).unwrap_or(bare);
-    match spec_provider.or_else(|| provider.filter(|p| known_provider(p))) {
-        Some(p) => format!("{p}/{bare}"),
-        None => bare.to_string(),
+    let passed = provider.filter(|p| known_provider(p));
+    match (passed, spec_provider) {
+        // The spec embeds a DIFFERENT known provider than the one actually serving the call: a
+        // passthrough id (e.g. `openrouter-anthropic` serving `anthropic/claude-sonnet-4.6`).
+        // The serving provider wins the outer prefix and the embedded segment stays part of the
+        // model id — spend must land under the provider that bills for it (C-30). Historical
+        // rows written under the dropped-outer form stay as separate rows; `merge_legacy_keys`
+        // never guesses across providers.
+        (Some(p), Some(sp)) if p != sp => format!("{p}/{sp}/{bare}"),
+        (_, Some(sp)) => format!("{sp}/{bare}"),
+        (Some(p), None) => format!("{p}/{bare}"),
+        (None, None) => bare.to_string(),
     }
 }
 
@@ -430,9 +442,16 @@ mod tests {
             canonical_model_spec(Some("openai"), "gpt-5.5"),
             "openai/gpt-5.5"
         );
-        // An already-prefixed spec keeps ITS provider, even when another is offered.
+        // A spec embedding a DIFFERENT known provider is a passthrough id: the serving
+        // (passed) provider wins the outer prefix and the embedded segment stays part of the
+        // model id — spend must land under the provider that actually bills for it.
         assert_eq!(
             canonical_model_spec(Some("anthropic"), "openai/gpt-5.5"),
+            "anthropic/openai/gpt-5.5"
+        );
+        // Same provider passed and embedded: no double prefix.
+        assert_eq!(
+            canonical_model_spec(Some("openai"), "openai/gpt-5.5"),
             "openai/gpt-5.5"
         );
         // Alias resolution + prefixing.
@@ -448,6 +467,46 @@ mod tests {
         // An unknown provider (mock/ad-hoc) leaves the id bare — hermetic tests untouched.
         assert_eq!(canonical_model_spec(Some("mock"), "mock"), "mock");
         assert_eq!(canonical_model_spec(None, "gpt-5.5"), "gpt-5.5");
+    }
+
+    /// C-30: an OpenRouter passthrough id must keep the SERVING provider as the outer prefix —
+    /// `canonical_model_spec` used to drop `openrouter-anthropic` because the spec's own first
+    /// segment (`anthropic`) is also a known provider, silently mislabeling OpenRouter spend as
+    /// Anthropic in every stored usage key.
+    #[test]
+    fn canonical_model_spec_keeps_outer_openrouter_provider() {
+        assert_eq!(
+            canonical_model_spec(Some("openrouter-anthropic"), "anthropic/claude-sonnet-4.6"),
+            "openrouter-anthropic/anthropic/claude-sonnet-4.6"
+        );
+        assert_eq!(
+            canonical_model_spec(Some("openrouter"), "openai/gpt-4o"),
+            "openrouter/openai/gpt-4o"
+        );
+    }
+
+    /// C-30: the full passthrough spec (as now stamped at write time) still prices via
+    /// `rates_for`'s provider-prefix strip, and reads as metered (not subscription).
+    #[test]
+    fn rates_for_resolves_full_openrouter_spec() {
+        let builtin = PricingTable::builtin();
+        let u = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            ..Default::default()
+        };
+        let full = builtin
+            .cost(&u, "openrouter-anthropic/anthropic/claude-sonnet-4.6")
+            .expect("the full passthrough spec must price");
+        let bare = builtin.cost(&u, "anthropic/claude-sonnet-4.6").unwrap();
+        assert!(
+            (full.usd - bare.usd).abs() < 1e-9,
+            "same row must price both forms"
+        );
+        assert!(
+            !full.subscription,
+            "openrouter passthrough is metered, not subscription"
+        );
     }
 
     /// C-20: pin the headline rows to the vendor-verified rates so accidental edits are caught.

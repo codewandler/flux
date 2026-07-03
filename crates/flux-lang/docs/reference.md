@@ -1087,7 +1087,13 @@ content of `input`. Supports dot-notation (`.bitcoin.usd`), array indexing
 | `input` | Node | yes | any node producing a JSON string or object (`Var` or `Lit`) |
 
 The extracted value is returned as the natural JSON type (`Number`, `String`,
-`Bool`, etc.). If the path does not exist the node errors.
+`Bool`, etc.). Traversal through **missing data** — an absent key, or an array
+index past the end — yields `null` (matching real `jq`), not an error; a chain
+of absent segments (e.g. `.a.b.c` on an object that only has `.a`) cascades to
+`null` at every hop instead of erroring on the first gap. `$a.b` field-access
+sugar lowers to `jq(".b", $a)`, so ordinary dotted field access shares this
+leniency. Only a **malformed path** — an unmatched `[`, or a non-numeric index
+— is a syntax error and still errors loudly.
 
 **The full BTC-double pattern in 4 nodes, 0 bash calls:**
 
@@ -1313,3 +1319,8 @@ gates on a shell exit-code wrapper or a boolean tool output work as expected.
   outside any concurrent branch is unaffected.
 - **`await` and `checkpoint` are top-level only** — they need stable resume cursors.
 - **`obj`/`list` are pure templates** — they cannot contain `call` or control-flow leaves.
+- **`jq` (and `$a.b` field-access sugar) yields `null` for MISSING data, not an error** —
+  an absent key or an out-of-range array index propagates `null` and cascades through
+  the rest of the path (`.a.b.c` on an object that only has `.a` bottoms out at `null`).
+  A genuinely malformed path (unmatched `[`, a non-numeric index) is a syntax error and
+  still errors loudly.

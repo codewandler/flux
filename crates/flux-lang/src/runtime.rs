@@ -3173,6 +3173,7 @@ fn eval_template(
                 ExprVal::Num(n) => J::from(n),
                 ExprVal::Bool(b) => J::Bool(b),
                 ExprVal::Str(s) => J::String(s),
+                ExprVal::List(items) => J::Array(items),
             })
         }
         Node::Fmt { template } => Ok(J::String(interpolate_str(template, store, session_id))),
@@ -3395,37 +3396,45 @@ async fn eval_return(
     }
 }
 
-/// A value produced by the `expr` evaluator: number, string, or bool. Arithmetic, comparison,
+/// A value produced by the `expr` evaluator: number, string, bool, or list. Arithmetic, comparison,
 /// boolean, and string functions all flow through this typed value, with lenient numeric coercion
 /// for backward compatibility (a numeric string participates in arithmetic as the number it spells).
+/// `List` (L-35) exists so `len(...)` on a bound array counts elements rather than falling through
+/// to text-length on the array's stringified JSON; it does not participate in arithmetic.
 #[derive(Clone, Debug, PartialEq)]
 enum ExprVal {
     Num(f64),
     Str(String),
     Bool(bool),
+    List(Vec<serde_json::Value>),
 }
 
 impl ExprVal {
     /// Coerce to a number where it makes sense: bools are 0/1, numeric strings parse. Returns `None`
-    /// for non-numeric strings, so arithmetic on them is a clean error rather than a silent 0.
+    /// for non-numeric strings (and always for a list), so arithmetic on them is a clean error
+    /// rather than a silent 0.
     fn as_num(&self) -> Option<f64> {
         match self {
             ExprVal::Num(n) => Some(*n),
             ExprVal::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
             ExprVal::Str(s) => s.trim().parse::<f64>().ok(),
+            ExprVal::List(_) => None,
         }
     }
 
-    /// Render to canonical text — the form stored and printed (numbers via [`format_number`]).
+    /// Render to canonical text — the form stored and printed (numbers via [`format_number`]; a
+    /// list as its compact JSON, matching how op results already textify arrays).
     fn as_text(&self) -> String {
         match self {
             ExprVal::Num(n) => format_number(*n),
             ExprVal::Str(s) => s.clone(),
             ExprVal::Bool(b) => b.to_string(),
+            ExprVal::List(items) => serde_json::to_string(items).unwrap_or_default(),
         }
     }
 
-    /// Truthiness, matching [`json_truthy`] for strings so `expr` conditions read consistently.
+    /// Truthiness, matching [`json_truthy`] for strings so `expr` conditions read consistently. A
+    /// list is truthy iff non-empty (mirrors `json_truthy`'s empty-array rule).
     fn truthy(&self) -> bool {
         match self {
             ExprVal::Num(n) => *n != 0.0,
@@ -3434,6 +3443,7 @@ impl ExprVal {
                 let t = s.trim();
                 !t.is_empty() && !t.eq_ignore_ascii_case("false") && t != "0"
             }
+            ExprVal::List(items) => !items.is_empty(),
         }
     }
 
@@ -3443,6 +3453,7 @@ impl ExprVal {
             serde_json::Value::Bool(b) => ExprVal::Bool(*b),
             serde_json::Value::String(s) => ExprVal::Str(s.clone()),
             serde_json::Value::Null => ExprVal::Str(String::new()),
+            serde_json::Value::Array(items) => ExprVal::List(items.clone()),
             other => ExprVal::Str(other.to_string()),
         }
     }
@@ -3456,10 +3467,12 @@ fn resolve_expr_vars(
 ) -> Result<std::collections::BTreeMap<String, ExprVal>> {
     vars.iter()
         .map(|(k, v)| {
-            Ok((
-                k.clone(),
-                ExprVal::from_json(&eval_arg(v, store, session_id)?),
-            ))
+            // L-35: op results are stored as JSON *strings* (the same F13 quirk `jq_parse_input`
+            // exists for) — a string-stored array/object is unwrapped to its native JSON shape
+            // before typing, so `len($rs_files)` on a `glob(...)` result sees a real `ExprVal::List`
+            // instead of the array's stringified text.
+            let raw = jq_parse_input(eval_arg(v, store, session_id)?);
+            Ok((k.clone(), ExprVal::from_json(&raw)))
         })
         .collect()
 }
@@ -3837,7 +3850,12 @@ fn expr_call_fn(name: &str, args: &[ExprVal]) -> Option<ExprVal> {
         "max" => Some(ExprVal::Num(
             args.first()?.as_num()?.max(args.get(1)?.as_num()?),
         )),
-        "len" => Some(ExprVal::Num(args.first()?.as_text().chars().count() as f64)),
+        // L-35: a list counts its elements; anything else counts characters of its text form
+        // (unchanged) — a bound array must not silently report the length of its stringified JSON.
+        "len" => Some(ExprVal::Num(match args.first()? {
+            ExprVal::List(items) => items.len() as f64,
+            other => other.as_text().chars().count() as f64,
+        })),
         "lower" => Some(ExprVal::Str(args.first()?.as_text().to_lowercase())),
         "upper" => Some(ExprVal::Str(args.first()?.as_text().to_uppercase())),
         "trim" => Some(ExprVal::Str(args.first()?.as_text().trim().to_string())),
@@ -3947,12 +3965,19 @@ fn jq_parse_input(value: serde_json::Value) -> serde_json::Value {
     value
 }
 
+/// Extract `path` from `value`, real-`jq` style (L-36): traversal through MISSING data — an absent
+/// key, or an array index past the end — yields `null` rather than erroring, and cascades (`.a.b.c`
+/// on an object that only has `.a` bottoms out at `null`, not a fatal at the first gap). `$a.b` is
+/// native-text sugar for `jq(".b", $a)` (ast.rs's `SymbolName::is_identifier` doc), so ordinary
+/// field access shares this leniency — s_362 turn 17535 died on `jq(".transcript", $x)` fatally
+/// discarding a fully-gathered turn's evidence for exactly this reason. A genuinely MALFORMED path
+/// (unmatched `[`, a non-numeric index) is a syntax error, not missing data, and still errors loudly.
 fn eval_jq_path(path: &str, value: &serde_json::Value) -> Result<serde_json::Value> {
     let path = path.trim().trim_start_matches('.');
     if path.is_empty() {
         return Ok(value.clone());
     }
-    let mut cur = value;
+    let mut cur = value.clone();
     // Split on `.` and handle `[n]` inside each segment.
     for raw_seg in path.split('.') {
         let seg = raw_seg.trim();
@@ -3963,9 +3988,10 @@ fn eval_jq_path(path: &str, value: &serde_json::Value) -> Result<serde_json::Val
         let mut parts = seg.splitn(2, '[');
         let key = parts.next().unwrap_or("");
         if !key.is_empty() {
-            cur = cur
-                .get(key)
-                .ok_or_else(|| Error::Other(format!("`jq` path: key `{key}` not found")))?;
+            // Missing key (or `cur` isn't an object at all) → null, not fatal. `.get()` misses the
+            // same way on `Value::Null`, so a chain of absent segments cascades to `null` instead of
+            // erroring on the first gap.
+            cur = cur.get(key).cloned().unwrap_or(serde_json::Value::Null);
         }
         if let Some(rest) = parts.next() {
             // rest is like `0]` or `0][1]`
@@ -3978,14 +4004,14 @@ fn eval_jq_path(path: &str, value: &serde_json::Value) -> Result<serde_json::Val
                 let idx: usize = idx_str
                     .parse()
                     .map_err(|_| Error::Other(format!("`jq` path: invalid index `{idx_str}`")))?;
-                cur = cur
-                    .get(idx)
-                    .ok_or_else(|| Error::Other(format!("`jq` path: index {idx} out of bounds")))?;
+                // Out-of-bounds index is missing data too (real `jq`'s `.a[10]` on a short array is
+                // `null`, not an error) — only the syntax checks above are fatal.
+                cur = cur.get(idx).cloned().unwrap_or(serde_json::Value::Null);
                 bracket = bracket[end + 1..].to_string();
             }
         }
     }
-    Ok(cur.clone())
+    Ok(cur)
 }
 
 /// Render a stored value as text (a string value is itself; anything else is its compact JSON).
@@ -6791,6 +6817,37 @@ mod tests {
         assert!(!ExprVal::Str("  ".into()).truthy());
     }
 
+    /// L-35: `len` over an `ExprVal::List` counts ELEMENTS, mirroring flux-tools'
+    /// `len_counts_arrays_and_strings` (cognition.rs) at the `expr` evaluator layer. `len` on a
+    /// string is unchanged (char count).
+    #[test]
+    fn expr_len_counts_list_elements_not_stringified_chars() {
+        assert_eq!(
+            ev(
+                "len(xs)",
+                &[(
+                    "xs",
+                    ExprVal::List(vec![json!(1), json!(2), json!(3), json!(4)])
+                )]
+            ),
+            ExprVal::Num(4.0)
+        );
+        assert_eq!(ev("len('hello')", &[]), ExprVal::Num(5.0));
+    }
+
+    /// L-35: `ExprVal::List` truthiness (non-empty) and `as_text` (compact JSON) are pinned so a
+    /// bound list participates in `when`/`fmt`/string concatenation predictably.
+    #[test]
+    fn expr_list_truthy_and_as_text() {
+        assert!(ExprVal::List(vec![json!(1)]).truthy());
+        assert!(!ExprVal::List(vec![]).truthy());
+        assert_eq!(
+            ExprVal::List(vec![json!(1), json!("a")]).as_text(),
+            "[1,\"a\"]"
+        );
+        assert_eq!(ExprVal::List(vec![]).as_text(), "[]");
+    }
+
     // ---- L-17: runtime semantics hardening (F13–F20) ----
 
     /// F13: op results/literals are stored as JSON *strings*; the bind arm re-parsed them before
@@ -6864,6 +6921,179 @@ mod tests {
         assert_eq!(
             out.result, "falsy",
             "a present-but-null field must read falsy, not truthy: {}",
+            out.transcript
+        );
+    }
+
+    /// L-36: real `jq` yields `null` for a path that traverses MISSING data — s_362 turn 17535's
+    /// finalization plan did `jq(".transcript", $x)` on an object lacking the key and the whole
+    /// (fully-gathered) turn died on `Error::Other`. A missing key must propagate `null`, not abort
+    /// the flow — `lit_text` already maps `Value::Null` to `""`, so the bind renders empty.
+    #[tokio::test]
+    async fn jq_on_a_missing_key_yields_null_not_a_fatal_error() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![
+                flow_bind("obj", flow_lit(json!({"a": 1}))),
+                flow_bind(
+                    "missing",
+                    Node::Jq {
+                        path: ".b".into(),
+                        input: Box::new(flow_var("obj")),
+                    },
+                ),
+                Node::Return {
+                    value: Box::new(flow_var("missing")),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let out = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap_or_else(|e| panic!("a missing jq key must not be fatal: {e}"));
+        assert_eq!(out.result, "", "missing key renders as null (empty text)");
+
+        // Chained traversal through an absent branch cascades to null at every hop, not just the
+        // first miss (`.a.b.c` on an object that only has `.a` and nothing under it).
+        let ast2 = DraftAst {
+            body: vec![
+                flow_bind("obj", flow_lit(json!({"a": 1}))),
+                flow_bind(
+                    "deep",
+                    Node::Jq {
+                        path: ".a.b.c".into(),
+                        input: Box::new(flow_var("obj")),
+                    },
+                ),
+                Node::Return {
+                    value: Box::new(flow_var("deep")),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink2 = BufferSink::default();
+        let out2 = execute_flow(&store, &host, "s2", &ast2, &mut sink2)
+            .await
+            .unwrap_or_else(|e| panic!("chained missing traversal must not be fatal: {e}"));
+        assert_eq!(
+            out2.result, "",
+            "chained missing traversal cascades to null"
+        );
+    }
+
+    /// L-36: `$a.b` is native-text sugar for `jq(".b", $a)` — the same missing-key-yields-null
+    /// semantics must hold at the sugar surface, since it lowers to the identical `Jq` node before
+    /// execution.
+    #[tokio::test]
+    async fn dollar_dot_sugar_on_a_missing_field_yields_null_not_a_fatal_error() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let ast = crate::parse::parse(
+            "flow f\n  $obj = {\"a\":1}\n  $missing = $obj.b\n  return $missing\n",
+        )
+        .unwrap();
+        let mut sink = BufferSink::default();
+        let out = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap_or_else(|e| panic!("`$a.b` sugar on a missing field must not be fatal: {e}"));
+        assert_eq!(
+            out.result, "",
+            "missing field via `$a.b` sugar renders as null (empty text)"
+        );
+    }
+
+    /// L-36: a genuinely MALFORMED path — not missing data — must still error loudly (unmatched
+    /// `[`, a non-numeric index). Only absent keys/indices become `null`.
+    #[tokio::test]
+    async fn jq_malformed_path_syntax_still_errors() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let unmatched = DraftAst {
+            body: vec![
+                flow_bind("obj", flow_lit(json!({"a": [1, 2, 3]}))),
+                flow_bind(
+                    "bad",
+                    Node::Jq {
+                        path: ".a[0".into(),
+                        input: Box::new(flow_var("obj")),
+                    },
+                ),
+                Node::Return {
+                    value: Box::new(flow_var("bad")),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let err = execute_flow(&store, &host, "s", &unmatched, &mut sink)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unmatched"),
+            "unmatched `[` still errors: {err}"
+        );
+
+        let bad_index = DraftAst {
+            body: vec![
+                flow_bind("obj", flow_lit(json!({"a": [1, 2, 3]}))),
+                flow_bind(
+                    "bad",
+                    Node::Jq {
+                        path: ".a[x]".into(),
+                        input: Box::new(flow_var("obj")),
+                    },
+                ),
+                Node::Return {
+                    value: Box::new(flow_var("bad")),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink2 = BufferSink::default();
+        let err2 = execute_flow(&store, &host, "s2", &bad_index, &mut sink2)
+            .await
+            .unwrap_err();
+        assert!(
+            err2.to_string().contains("invalid index"),
+            "non-numeric index still errors: {err2}"
+        );
+    }
+
+    /// L-35: op results are stored as JSON *strings* (the same F13 quirk `jq` re-parses for) — a
+    /// symbol bound from an op call whose canonical content is JSON array text (e.g. `glob(...)`)
+    /// must count as ELEMENTS through `expr`'s `len`, not the character count of the stringified
+    /// JSON. s_362: `len($rs_files)` on a 232-path glob result returned 8542 (the stringified
+    /// array's char count) because `ExprVal` had no `List` variant.
+    #[tokio::test]
+    async fn expr_len_over_a_bound_op_result_counts_array_elements_not_chars() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let files = json!(["a.rs", "b.rs", "c.rs"]).to_string();
+        let count_expr: Node = serde_json::from_value(json!({
+            "kind": "expr",
+            "formula": "len(files)",
+            "vars": {"files": {"kind": "var", "name": "files"}}
+        }))
+        .unwrap();
+        let ast = DraftAst {
+            body: vec![
+                flow_bind("files", echo(&files)),
+                flow_bind("count", count_expr),
+                Node::Return {
+                    value: Box::new(flow_var("count")),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let out = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.result, "3",
+            "len() must count array elements, not the stringified JSON's characters: {}",
             out.transcript
         );
     }

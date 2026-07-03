@@ -30,12 +30,21 @@ rand.workspace = true
 url.workspace = true
 toml.workspace = true
 rquickjs.workspace = true
+# Plugin pack distribution (D-47, `pack` module): verified fetch-and-install from the signed
+# `plugins-v*` release channel. See `pack.rs` module docs for the trust ladder.
+minisign-verify.workspace = true
+tar.workspace = true
+lzma-rs.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
 async-trait.workspace = true
 flux-runtime.workspace = true
 flux-system.workspace = true
+# Signs fixtures in `pack.rs`'s hermetic tests (never a runtime dep) and generates the production
+# keypair via the ignored `generate_pack_keypair` helper test.
+minisign.workspace = true
 
 [[bin]]
 name = "echo_plugin"

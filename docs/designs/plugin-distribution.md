@@ -163,6 +163,9 @@ criticism, answered).
    deps). One signature covers every artifact transitively via the per-artifact sha256 entries —
    terraform's sign-the-aggregate pattern. The secret key lives in CI (GitHub Actions secret);
    verification failure is fatal, no `--skip-signatures` escape hatch (the no-fallbacks rule).
+   The production key (minted 2026-07-03, D-47; secret half = the operator's `MINISIGN_SECRET_KEY`
+   Actions secret): `RWSd30xfPYIFZc6x0bb9KukLrw2ax49cKMbP6bKpj5wpACesSqZE1qcp`
+   (`flux_plugin::pack::PUBLIC_KEY`).
 3. **Checksum before executable.** The downloaded archive's sha256 is verified against the index
    entry *before* the binary is unpacked into place and made executable.
 4. **Install-time recording.** The descriptor gains `version`, `sha256` (of the installed binary),

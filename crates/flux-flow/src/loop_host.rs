@@ -970,7 +970,7 @@ impl LoopHost for EngineLoopHost {
         // A-14: the phase resolved from `input` at entry threads straight into `compile_turn`,
         // selecting that pass's instruction segment (orient's three-way contract, gather's
         // keep-gathering-or-settle contract, or execute's byte-compatible default).
-        let (out, call_usage) = match compile_turn(
+        let (out, call_usage) = compile_turn(
             &*provider,
             &model,
             &conversation,
@@ -982,8 +982,20 @@ impl LoopHost for EngineLoopHost {
             self.opts.clone(),
             phase,
         )
-        .await
-        {
+        .await;
+        // Fold this planner call's tokens into the per-turn tally the engine reports at turn-end, AND
+        // record it individually (with the model that was ACTIVE for this call) so a mid-turn `/model`
+        // switch attributes tokens/cost to the right model (C-06 attribution) rather than being lost in
+        // the turn's single replace-style total. BEFORE branching on the outcome (C-31): a failed
+        // consultation spent real tokens too — s_360 burned ~8 × 37k input tokens and recorded no
+        // `call_usage` at all. A zero-usage record (errored before the first provider call) is
+        // filtered at emission (`record_call_usage_events` skips `total() == 0`).
+        self.usage.lock().unwrap().accumulate(&call_usage);
+        // Stamped with the CANONICAL provider/model spec (C-15) so `cost_summary` never splits one
+        // backend's spend across key variants.
+        let spec = flux_core::canonical_model_spec(Some(provider.name()), &model);
+        self.calls.lock().unwrap().push((spec, call_usage));
+        let out = match out {
             Ok(v) => v,
             // Surface a provider failure (credit/auth/rate-limit/transport) as a readable sentence —
             // the error flows out through the op envelope and becomes the turn's answer, never raw
@@ -1000,15 +1012,6 @@ impl LoopHost for EngineLoopHost {
                 return Err(Error::Other(msg));
             }
         };
-        // Fold this planner call's tokens into the per-turn tally the engine reports at turn-end, AND
-        // record it individually (with the model that was ACTIVE for this call) so a mid-turn `/model`
-        // switch attributes tokens/cost to the right model (C-06 attribution) rather than being lost in
-        // the turn's single replace-style total.
-        self.usage.lock().unwrap().accumulate(&call_usage);
-        // Stamped with the CANONICAL provider/model spec (C-15) so `cost_summary` never splits one
-        // backend's spend across key variants.
-        let spec = flux_core::canonical_model_spec(Some(provider.name()), &model);
-        self.calls.lock().unwrap().push((spec, call_usage));
 
         let plan = match out {
             // `complete` carries the model's full directive (object) or null — `run_plan` re-parses
@@ -1884,6 +1887,15 @@ mod tests {
     // NB: returns the `Arc<Executor>` too — the host only holds a `Weak` back-reference to it
     // (see `EngineLoopHost::executor`), so the caller must keep this alive for the host to work.
     fn budget_test_host(provider: Arc<dyn Provider>) -> (Arc<Executor>, Arc<EngineLoopHost>) {
+        budget_test_host_with_opts(provider, CompileOptions::default())
+    }
+
+    /// [`budget_test_host`] with the compile options explicit — the C-31 test bounds `max_steps`
+    /// so one canned response deterministically exhausts the planner budget.
+    fn budget_test_host_with_opts(
+        provider: Arc<dyn Provider>,
+        opts: CompileOptions,
+    ) -> (Arc<Executor>, Arc<EngineLoopHost>) {
         let shared: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(RecSink(Recorder::default())));
         let dir = std::env::temp_dir().join(format!("flux-loop-a26-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1906,8 +1918,62 @@ mod tests {
             Arc::new(DynamicComposites::default()),
             "sess".into(),
             shared,
-            CompileOptions::default(),
+            opts,
         )
+    }
+
+    /// C-31: a planner consultation that FAILS still spends real tokens — the plan op accounts
+    /// them (per-turn tally + per-call record) exactly like a successful one, so the engine's
+    /// turn-end `call_usage` emission covers failed turns too. s_360's failed turn made ~8
+    /// provider calls (~37k input each) and recorded none of them.
+    #[tokio::test]
+    async fn failed_plan_consultation_still_records_its_usage() {
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider {
+            responses: Mutex::new(VecDeque::from(vec![vec![
+                Chunk::Block(ContentBlock::ToolUse {
+                    id: "p1".into(),
+                    name: "emit_plan".into(),
+                    // Undecodable `ast` (a number): the consultation is rejected, never a plan.
+                    input: json!({ "ast": 42 }),
+                }),
+                Chunk::Usage(Usage {
+                    input_tokens: 100,
+                    output_tokens: 10,
+                    ..Default::default()
+                }),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::ToolUse),
+                },
+            ]])),
+        });
+        let (_executor, host) = budget_test_host_with_opts(
+            provider,
+            CompileOptions {
+                max_steps: 1,
+                ..Default::default()
+            },
+        );
+
+        let err = host
+            .plan(json!({ "feedback": "" }))
+            .await
+            .expect_err("an undecodable plan must fail the consultation");
+        assert!(
+            format!("{err}").contains("invalid AST JSON"),
+            "the failure carries its cause (A-31): {err}"
+        );
+        let calls = host.turn_calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the failed consultation is recorded per-call"
+        );
+        assert_eq!(calls[0].1.input_tokens, 100);
+        assert_eq!(calls[0].1.output_tokens, 10);
+        assert!(
+            host.turn_usage().total() > 0,
+            "the turn tally includes the failed call"
+        );
     }
 
     /// A-26: the per-turn token budget must bound CUMULATIVE billed tokens across every planner

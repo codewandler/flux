@@ -388,6 +388,11 @@ pub fn cost_summary(events: &[StoredEvent], pricing: &PricingTable) -> Vec<Model
 /// - a BARE key merges into a provider-prefixed row iff exactly ONE prefixed row shares its
 ///   canonical model id — with two candidate providers the bare row stays separate (they may
 ///   bill differently; never guess).
+///
+/// Passthrough note (C-30): keys stamped `openrouter-anthropic/anthropic/<model>` canonicalize
+/// stably to `(openrouter-anthropic, anthropic/<model>)`; rows written before the C-30 attribution
+/// fix under the dropped-outer form `anthropic/<model>` carry a DIFFERENT provider and deliberately
+/// stay separate rows (never guess across providers).
 pub(crate) fn merge_legacy_keys(
     per_model: BTreeMap<String, (Usage, u64)>,
 ) -> BTreeMap<String, (Usage, u64)> {
@@ -1018,6 +1023,41 @@ mod tests {
         ];
         let rows = cost_summary(&events, &pricing);
         assert_eq!(rows.len(), 3, "ambiguous bare key never merges: {rows:?}");
+    }
+
+    /// C-30: a passthrough key (`openrouter-anthropic/anthropic/…`) survives the merge unchanged
+    /// and never folds into a plain `anthropic/…` row — those are different billing providers
+    /// (rows written before the C-30 attribution fix stay separate, by design).
+    #[test]
+    fn merge_keeps_passthrough_provider_rows_separate() {
+        let call = |seq: i64, model: &str| {
+            ev(
+                seq,
+                seq - 1,
+                Some(1),
+                EventKind::CallUsage {
+                    model: model.into(),
+                    usage: usage_with(100, 10),
+                },
+            )
+        };
+        let pricing = PricingTable::builtin();
+        let events = vec![
+            call(1, "openrouter-anthropic/anthropic/claude-sonnet-4.6"),
+            call(2, "anthropic/claude-sonnet-4.6"),
+        ];
+        let rows = cost_summary(&events, &pricing);
+        assert_eq!(
+            rows.len(),
+            2,
+            "passthrough must not fold into anthropic: {rows:?}"
+        );
+        let keys: Vec<&str> = rows.iter().map(|r| r.model.as_str()).collect();
+        assert!(
+            keys.contains(&"openrouter-anthropic/anthropic/claude-sonnet-4.6"),
+            "{keys:?}"
+        );
+        assert!(keys.contains(&"anthropic/claude-sonnet-4.6"), "{keys:?}");
     }
 
     /// `cost_summary` rolls up multiple turns, multiple models, and cache tiers, folding

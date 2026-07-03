@@ -132,7 +132,9 @@ async fn run_arm(
         };
         let conversation = [Message::user_text(&task.prompt)];
         let started = Instant::now();
-        let out = compile_turn_with_arm(
+        // C-31 shape: usage arrives alongside the outcome, so a FAILED task now reports what it
+        // actually spent instead of zeros.
+        let (out, usage) = compile_turn_with_arm(
             provider,
             model,
             &conversation,
@@ -148,7 +150,7 @@ async fn run_arm(
         .await;
         let ms = started.elapsed().as_millis();
         let r = match out {
-            Ok((TurnOutput::Plan(c), usage)) => TaskResult {
+            Ok(TurnOutput::Plan(c)) => TaskResult {
                 id: task.id.clone(),
                 accepted: Some(c.attempts),
                 chat: false,
@@ -156,7 +158,7 @@ async fn run_arm(
                 usage,
                 ms,
             },
-            Ok((TurnOutput::Chat(_), usage)) => TaskResult {
+            Ok(TurnOutput::Chat(_)) => TaskResult {
                 id: task.id.clone(),
                 accepted: None,
                 chat: true,
@@ -169,7 +171,7 @@ async fn run_arm(
                 accepted: None,
                 chat: false,
                 error: Some(e.to_string()),
-                usage: Usage::default(),
+                usage,
                 ms,
             },
         };
