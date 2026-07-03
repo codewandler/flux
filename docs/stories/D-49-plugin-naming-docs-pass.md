@@ -2,7 +2,8 @@
 id: D-49
 title: Plugin naming + docs truth pass — the crate / the pack / the CLI
 pillar: Core
-status: backlog
+status: ready
+priority: 10
 epic: plugin-platform-hardening
 design: docs/designs/plugin-distribution.md
 note: "docs-truth pass (C-16/L-19 pattern): apply the canonical trio vocabulary — the plugin protocol crate (`flux-plugin`) vs the plugin pack (`flux-plugin-<name>` binaries) vs the plugin CLI (`flux plugin …`) — and document the remote install path once it ships"

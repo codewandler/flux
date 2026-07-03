@@ -2,7 +2,8 @@
 id: D-46
 title: Plugin pack release pipeline — per-plugin artifacts + signed index
 pillar: Core
-status: backlog
+status: ready
+priority: 7
 epic: plugin-platform-hardening
 design: docs/designs/plugin-distribution.md
 note: "workflow_dispatch `release-plugins.yml`: build the pack on 5 native runners, package per-plugin archives, emit a minisign-signed `plugins-index.json`, create the `plugins-v<ver>` release (`--latest=false`); core dist release untouched"

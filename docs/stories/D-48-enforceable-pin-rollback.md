@@ -2,7 +2,8 @@
 id: D-48
 title: Enforced pin/rollback — spawn-time hash verification over the versioned store
 pillar: Core
-status: backlog
+status: ready
+priority: 9
 epic: plugin-platform-hardening
 design: docs/designs/plugin-distribution.md
 note: "turn `flux plugin pin`/`rollback` from advisory labels into supply-chain statements: pin fetches+repoints+records hash, rollback is an offline flip to `previous`, and a sha256-carrying descriptor is re-hashed before every spawn (drift = hard refusal); `status` gains the verification column"

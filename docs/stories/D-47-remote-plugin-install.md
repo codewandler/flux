@@ -2,7 +2,8 @@
 id: D-47
 title: Remote `flux plugin install <name>[@version]` — verified fetch into a versioned store
 pillar: Core
-status: backlog
+status: ready
+priority: 8
 epic: plugin-platform-hardening
 design: docs/designs/plugin-distribution.md
 note: "the demand side: resolve the `plugins-v` release → verify minisign-signed index (embedded pubkey, no skip flag) → sha256-check → unpack to `~/.flux/plugins/bin/<name>/<version>/` → descriptor records version+sha256+source; local scan moves behind `install --dir`"
