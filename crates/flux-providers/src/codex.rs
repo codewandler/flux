@@ -851,10 +851,18 @@ mod tests {
 
     #[tokio::test]
     async fn ws_connection_refused_falls_back_to_http() {
-        // Reserve a port, then drop the listener so the WS dial is refused outright.
-        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let ws_url = format!("ws://{}", dead.local_addr().unwrap());
-        drop(dead);
+        // A connect-time WS failure: the listener stays bound for the whole test and slams every
+        // accepted socket shut before the handshake, so the dial fails deterministically. (The
+        // previous fixture reserved a port and dropped it — on a busy runner the ephemeral-port
+        // allocator could hand that exact port to the sse_server bound next, so the "refused" dial
+        // reached the SSE server and http_hits counted the failed upgrade too: 2 connections.)
+        let refuser = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_url = format!("ws://{}", refuser.local_addr().unwrap());
+        let refuse_handle = tokio::spawn(async move {
+            while let Ok((sock, _)) = refuser.accept().await {
+                drop(sock);
+            }
+        });
 
         let (http_url, http_handle, http_hits) = sse_server(fixture_sse()).await;
         let provider = oauth_at(Arc::new(StubTokens), &http_url, &ws_url);
@@ -866,6 +874,7 @@ mod tests {
             "a refused WS connection must fall back to HTTP-SSE"
         );
         assert!(chunks.contains(&Chunk::TextDelta("Hi".to_string())));
+        refuse_handle.abort();
         http_handle.abort();
     }
 
