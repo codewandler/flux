@@ -1034,7 +1034,7 @@ pub(crate) fn surfaced_op_names(
     // the cached `tools+A+phase+B` prefix; accumulating means the catalog only ever grows and the
     // prefix restabilizes. Advertising is not granting — the approval/policy envelope still gates ops.
     let accumulated = {
-        let mut s = sticky.lock().unwrap();
+        let mut s = sticky.lock().unwrap_or_else(|e| e.into_inner());
         s.extend(active);
         s.clone()
     };
