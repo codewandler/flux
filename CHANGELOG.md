@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.2.16] - 2026-07-04
+
 ### Added
 
 - **Breadth guard — freshness-independent convergence pressure on read-only turns (A-29).** The
