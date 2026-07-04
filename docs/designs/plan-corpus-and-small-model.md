@@ -95,3 +95,24 @@ executable plan. So: measure first, train on what has a decode path.
   green; full-workspace gate deferred until the concurrent stream-resilience session settles
   (its in-flight `flux-providers` edits don't compile yet — unrelated). The emission-ab design
   doc's follow-up note is resolved (scaffold kept, projection-not-emission).
+- 2026-07-04 (evening) — **Phase 2 RUN + Phase 3 Gate 1 DECIDED** (details in flux-model's
+  board/go-no-go): full capture over all CC projects (222k events → 3,547 segments → 3,527
+  episodes), generation via Sonnet/OpenRouter with the real L-20 text grammar + live catalog
+  slices (`flux-corpus catalog`) — pilot lower+cycle 10/12; the scale run yielded 47/101
+  before OpenRouter credits ran out (402), salvaged by a local-ollama repair round.
+  **Gate 1 = NO-GO on a compact encoding, exactly as pre-registered**: under the
+  Qwen2.5-Coder-3B tokenizer, ast_json is +39.4% and hir_json +40.8% LARGER than canonical
+  text (phys_json −93.5% but no inverse). The corpus trains ONE arm: canonical text.
+  Fine-tune runs LOCALLY on the user's RTX 3090 (not "external GPU" as designed — the NVML
+  610/595 userland/kernel mismatch broke `nvidia-smi` but NOT new CUDA contexts).
+- 2026-07-04 (night) — **Phase 3 COMPLETE — model trained twice + shipped to ollama;
+  Gate 2 = NOT ship-worthy**: 150-sample corpus (2nd OpenRouter batch after top-up;
+  ~$15 total), Qwen2.5-Coder-3B LoRA → `ollama run flux-planner` (q4_K_M via llama.cpp
+  GGUF — ollama's native safetensors import CORRUPTS the model, always convert first).
+  Val compile **4/12 greedy no-repair, identical bf16 vs q4** (round 1: 2/6). Misses the
+  80% bar and the L-20 60% baseline → `FLUX_EMISSION` stays closed. Dominant failure is
+  REPRESENTATIONAL: literal newlines inside long single-line JSON string args (multi-KB
+  edit payloads); short-arg categories pass (retry-recovery 2/2, read+grep 1/1). Path
+  back to GO recorded in flux-model's go-no-go.md: corpus growth (push-button, ~$8/120
+  episodes) + GBNF inference grammar or a flux-lang multi-line-string spelling + 3-seed
+  re-run. Full detail: flux-model board + `runs/text-3b-r2/`.
