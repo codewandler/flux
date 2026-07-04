@@ -1769,6 +1769,12 @@ async fn build_agent_with(
         })
         .or(cfg.limits.turn_token_budget);
     agent.loop_host.set_token_budget(turn_budget);
+    // Read-only-round breadth ladder (A-29): config-only overrides of the built-in defaults —
+    // raise (or 0-disable) for legitimately read-heavy workflows.
+    agent.loop_host.set_readonly_ladder(
+        cfg.limits.readonly_rounds_escalate,
+        cfg.limits.readonly_rounds_stop,
+    );
     Ok((agent, session_id, canonical_spec, spawner))
 }
 

@@ -292,6 +292,22 @@ executes from the first divergence.
    paging through new regions never trips the guard. The escalate/stop feedback names the covered
    files and line spans; ops with other semantic params (grep/glob) keep exact `op+args`
    freshness, and write-invalidation clears coverage along with the cache.
+   *Update (2026-07-04, [A-29](../stories/A-29-readonly-round-budget.md)):* the claim is now true
+   for the **breadth** case too. Every guard above detects *redundancy*; a novelty treadmill (the
+   `s_356` runaway: 22 rounds, a NEW grep pattern or a fresh window over new lines every round) is
+   genuinely fresh to all of them, so the only remaining exit was the model choosing prose. A
+   freshness-INDEPENDENT ladder now counts **consecutive read-only rounds** (any read, no effectful
+   dispatch — an effect resets it, a no-read round leaves it unchanged): the "answer now from the
+   session symbols" escalation at 6, the honest stop at 10 (`READONLY_ROUNDS_ESCALATE/STOP`), both
+   carrying the evidence inventory (rounds, distinct resources, A-28 coverage spans). Legitimate
+   read-heavy work raises the ceiling via `[limits] readonly_rounds_escalate/_stop` in
+   `.flux/config.toml` (0 disables a rung) rather than defeating the detector.
+   **Recorded decision — per-turn token budget stays default-OFF** (the A-29 acceptance asked for
+   an explicit call now that A-26 measures cumulative billed tokens): the pathological read case is
+   now bounded in *rounds*, which is model- and pricing-independent; a default token ceiling would
+   instead cut off legitimately long turns (multi-file refactors, big-context models) at a
+   threshold no single number gets right across providers. `--turn-budget` / `FLUX_TURN_TOKEN_BUDGET`
+   / `[limits] turn_token_budget` remain the opt-in hard ceiling for cost-sensitive hosts.
 
 **Residuals (recorded up front):** `patch_plan` token optimization; orphaned-ledger crash recovery
 (recovering `StatementCompleted` trails with no `PlanHalted`); High-risk-rerun confirm escalation;

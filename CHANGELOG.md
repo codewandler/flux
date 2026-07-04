@@ -6,6 +6,28 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **Breadth guard — freshness-independent convergence pressure on read-only turns (A-29).** The
+  fourth (and general) member of the read-loop guard family. The shipped guards all detect
+  *redundancy* — identical transcripts, repeated failure keys, renamed re-reads (A-20), slid
+  windows over covered lines (A-28) — so a model on a novelty treadmill (s_356: 22 rounds, a NEW
+  grep pattern or a fresh window over new lines every round) looked legitimately fresh to every
+  one of them and the loop's only exit was the model choosing prose. `guard_breadth` now counts
+  **consecutive read-only rounds regardless of freshness**: at 6 it injects the "ANSWER NOW from
+  the session symbols, or name precisely which fact is missing" directive carrying the full
+  evidence inventory (rounds, distinct resources bound, A-28 coverage spans); at 10 it ends the
+  turn honestly via the existing force-stop seam. Any effectful dispatch resets the counter
+  (read→fix iteration is never punished), a no-read round leaves it unchanged (a no-op round
+  can't launder the count), and a redundancy stop armed in the same round suppresses the breadth
+  banner. Thresholds are named constants (`READONLY_ROUNDS_ESCALATE`/`READONLY_ROUNDS_STOP`,
+  ordering pinned at compile time) overridable for legitimately read-heavy workflows via the new
+  `[limits] readonly_rounds_escalate` / `readonly_rounds_stop` config keys (0 disables a rung,
+  project-over-user scalar merge). Recorded decision: the per-turn token budget **stays
+  default-OFF** — the pathological read case is now bounded in rounds, which is model- and
+  pricing-independent. New "Convergence guards" section in `docs/agent-loop.md` documents the
+  whole ladder family.
+
 ## [0.2.15] - 2026-07-04
 
 ### Added

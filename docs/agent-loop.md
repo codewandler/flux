@@ -165,6 +165,35 @@ This only traces the **outer** agent loop (`agent-loop.flux`) — a plan's own i
 stream via the normal tool-call output, never through this trace. The observations are live-only:
 they never touch the value store, the run-event trail, or `/evidence`'s log.
 
+## Convergence guards — why a turn ends by itself
+
+The execute loop is capped at 25 rounds, but four guards usually end a stuck turn much earlier —
+each with an honest "Stopping: …" message that says what happened and what was gathered:
+
+- **Transcript stall** — the exact same step + result repeating (escalates at 2, stops at 4).
+- **Deterministic-failure stall** — the same structured failure recurring across otherwise-varied
+  plans (same thresholds).
+- **Redundancy** — read-only rounds that bind *no new evidence*: re-reads under renamed symbols and
+  read windows slid over already-covered lines both count as redundant (escalates at 2, stops at 3;
+  exact repeat reads are served from a write-invalidated cache with an `already read as $X` note).
+- **Breadth** — read-only rounds *regardless of freshness*: a model that keeps finding
+  novel-but-marginal things to read (a new grep pattern every round) never trips the redundancy
+  guards, so after 6 consecutive read-only rounds the loop injects "answer now from the session
+  symbols, or name precisely what is missing", and after 10 it ends the turn honestly. Any
+  effectful op (edit/write/bash…) resets the count — read→fix iteration is never punished.
+
+Legitimately read-heavy workflows raise (or disable) the breadth ladder in `.flux/config.toml`
+instead of fighting it:
+
+```toml
+[limits]
+readonly_rounds_escalate = 12   # 0 disables the escalation rung
+readonly_rounds_stop = 20       # 0 disables the honest stop
+```
+
+An opt-in per-turn **token budget** (`--turn-budget`, `FLUX_TURN_TOKEN_BUDGET`, or
+`[limits] turn_token_budget`) adds a hard cost ceiling on top; it stays off by default.
+
 ## Inspect the evidence trail — `/evidence`
 
 The loop and the dispatcher record an audit trail as the turn runs — tool calls, tool errors,

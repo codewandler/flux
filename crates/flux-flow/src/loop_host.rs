@@ -78,6 +78,21 @@ const STALL_STOP: u32 = 4; // 4th identical round → end the turn honestly inst
 const RESOURCE_STALL_ESCALATE: u32 = 2; // 2nd no-new-evidence round → "answer now" directive
 const RESOURCE_STALL_STOP: u32 = 3; // 3rd no-new-evidence round → end the turn honestly
 
+/// Breadth-bounding thresholds (A-29), the freshness-INDEPENDENT ladder. Every guard above
+/// detects REDUNDANCY — identical transcripts, repeated failure keys, re-read resources (A-20),
+/// re-covered lines (A-28). A model on a novelty treadmill (s_356: a NEW grep pattern or a fresh
+/// read window over new lines every round) is genuinely fresh to all of them, so a
+/// question-shaped turn can burn the whole repeat budget doing real-but-unbounded reading and
+/// never answer. What this ladder bounds instead is BREADTH: consecutive read-only rounds,
+/// counted regardless of freshness — reading is research, and research must eventually convert
+/// into an answer or an action. The defaults leave room for legitimate deep dives (the phased
+/// loop's gather cap already spends up to 3 of these rounds before execute begins, and the
+/// redundancy ladders still trip far earlier when the reads repeat); genuinely read-heavy
+/// workflows raise the ceiling via config `[limits] readonly_rounds_escalate` /
+/// `readonly_rounds_stop` (0 disables a rung) rather than by defeating the detector.
+const READONLY_ROUNDS_ESCALATE: u32 = 6; // 6th consecutive read-only round → "answer now" directive
+const READONLY_ROUNDS_STOP: u32 = 10; // 10th → end the turn honestly
+
 /// The identical-plan skip's informational transcript (A-05/A-27): a byte-identical plan re-emitted
 /// right after a SUCCESSFUL run is not re-run — this is what tells the model so. Routed through
 /// [`EngineLoopHost::guard_transcript`] like every other `run_plan` return path, so a model that
@@ -367,6 +382,10 @@ struct LoopGuard {
     /// resource already in the turn's [`ReadTracker`] ledger — however the symbols were renamed or
     /// the statements reordered, which is exactly the variation the transcript hash can't see.
     resource_stall: u32,
+    /// Consecutive read-only rounds (A-29) — rounds that dispatched at least one read and NO
+    /// effectful op, counted REGARDLESS of freshness. The breadth ladder escalates and stops on
+    /// this where the redundancy counters above correctly see nothing wrong.
+    readonly_rounds: u32,
 }
 
 /// The engine-side reflexive host. Holds the stable machinery the two ops need that a `ToolContext`
@@ -413,6 +432,11 @@ pub struct EngineLoopHost {
     /// again. `None` (the default) = no ceiling. Set by the host surface (flag > env > config);
     /// NOT reset per turn — it is engine configuration, not turn state.
     token_budget: Mutex<Option<u64>>,
+    /// Config overrides for the read-only-round breadth ladder (A-29): `(escalate, stop)`, each
+    /// `None` = the built-in default, `Some(0)` = that rung disabled. Engine configuration like
+    /// [`token_budget`](Self::token_budget), not turn state — the per-turn COUNTER lives in
+    /// [`LoopGuard::readonly_rounds`] and resets with it.
+    readonly_ladder: Mutex<(Option<u32>, Option<u32>)>,
     /// The orient/gather grounding artifact (design Part 1's phased loop, A-14): set the moment an
     /// accepted `gather: true` plan carries a `brief`, and prepended to every subsequent planner
     /// feedback message for the rest of the turn (`plan`'s `feedback` reconstruction below) so a
@@ -489,6 +513,7 @@ impl EngineLoopHost {
                 pending_completion: Mutex::new(None),
                 attempt_step: AtomicU32::new(0),
                 token_budget: Mutex::new(None),
+                readonly_ladder: Mutex::new((None, None)),
                 brief: Mutex::new(None),
                 last_phase: Mutex::new(Phase::default()),
                 resume_context_shown: Mutex::new(false),
@@ -590,6 +615,14 @@ impl EngineLoopHost {
     /// concern (`--turn-budget` > `FLUX_TURN_TOKEN_BUDGET` > config `[limits] turn_token_budget`).
     pub fn set_token_budget(&self, budget: Option<u64>) {
         *self.token_budget.lock().unwrap() = budget;
+    }
+
+    /// Install the read-only-round breadth ladder overrides (A-29): consecutive read-only rounds
+    /// before the "answer now" escalation / the honest stop. `None` keeps the built-in default
+    /// ([`READONLY_ROUNDS_ESCALATE`] / [`READONLY_ROUNDS_STOP`]); `Some(0)` disables that rung —
+    /// for legitimately read-heavy workflows (config `[limits]` section).
+    pub fn set_readonly_ladder(&self, escalate: Option<u32>, stop: Option<u32>) {
+        *self.readonly_ladder.lock().unwrap() = (escalate, stop);
     }
 
     fn executor(&self) -> Result<Arc<Executor>> {
@@ -735,6 +768,68 @@ impl EngineLoopHost {
             );
         }
         // First redundant round: the per-read reuse notes in the transcript are the nudge.
+        transcript
+    }
+
+    /// Breadth guard (A-29), applied to a clean round's transcript AFTER
+    /// [`guard_resources`](Self::guard_resources): count consecutive READ-ONLY rounds regardless
+    /// of freshness. The redundancy guards can't — and shouldn't — trip on a novelty treadmill
+    /// (a new grep pattern or a fresh window every round IS new evidence), so the remaining
+    /// pressure is count-based: research must eventually convert into an answer or an action.
+    /// An effectful dispatch resets the counter (read→fix iteration is never punished); a prose
+    /// answer ends the turn (the per-turn guard reset covers it); a round with no reads and no
+    /// effects leaves the counter unchanged — a no-op round is neither research nor progress and
+    /// must not launder the count.
+    fn guard_breadth(&self, transcript: String) -> String {
+        let round = self.reads.round();
+        let mut g = self.guard.lock().unwrap();
+        if round.effectful {
+            g.readonly_rounds = 0;
+            return transcript;
+        }
+        if round.reads == 0 {
+            return transcript;
+        }
+        g.readonly_rounds += 1;
+        // A redundancy stop already armed this turn ends it first — don't stack banners.
+        if g.force_stop.is_some() {
+            return transcript;
+        }
+        let rounds = g.readonly_rounds;
+        let (escalate_cfg, stop_cfg) = *self.readonly_ladder.lock().unwrap();
+        let escalate = escalate_cfg.unwrap_or(READONLY_ROUNDS_ESCALATE);
+        let stop = stop_cfg.unwrap_or(READONLY_ROUNDS_STOP);
+        let gathered = round.seen_total;
+        let covered = self.reads.coverage_summary(4);
+        let covered = if covered.is_empty() {
+            String::new()
+        } else {
+            format!(" Already covered: {}.", covered.join("; "))
+        };
+        if stop > 0 && rounds >= stop {
+            if g.force_stop.is_none() {
+                g.force_stop = Some(format!(
+                    "Stopping: {rounds} consecutive read-only rounds without an answer or an \
+                     action — {gathered} distinct resource(s) are bound to session symbols, but \
+                     the reading kept widening instead of converging.{covered} Ask a narrower \
+                     question, or say which conclusion you need and I will answer from the \
+                     evidence gathered."
+                ));
+            }
+            return format!(
+                "[loop-guard] STOP — {rounds} consecutive read-only rounds; the turn will now \
+                 end.\n{transcript}"
+            );
+        }
+        if escalate > 0 && rounds >= escalate {
+            return format!(
+                "[loop-guard] {rounds} consecutive rounds of ONLY reading — {gathered} distinct \
+                 resource(s) bound to session symbols so far.{covered} More reading will not \
+                 converge by itself: ANSWER NOW from the session symbols, or name precisely \
+                 which fact is still missing and read exactly that. If the request is \
+                 answerable, the next step is prose, not another read.\n{transcript}"
+            );
+        }
         transcript
     }
 
@@ -1505,8 +1600,13 @@ impl EngineLoopHost {
             outcome.transcript.clone()
         } else {
             // Byte-exact stall first (identical transcripts), then the resource-aware guard
-            // (renamed/reshuffled re-reads the byte hash can't see — A-20).
-            self.guard_resources(self.guard_transcript(outcome.transcript.clone()))
+            // (renamed/reshuffled re-reads the byte hash can't see — A-20), then the breadth
+            // ladder (genuinely fresh reads that never converge — A-29). Innermost-first order
+            // also lets the breadth guard see a redundancy stop armed in the same round and
+            // skip stacking a second banner on it.
+            self.guard_breadth(
+                self.guard_resources(self.guard_transcript(outcome.transcript.clone())),
+            )
         };
         let mut transcript = cap_loop_feedback(transcript);
         if let Some(w) = &rerun_warning {
@@ -5269,6 +5369,181 @@ flow agent-loop -> string
                 !t.contains("No NEW evidence") && !t.contains("STOP —"),
                 "paging into new lines must never stall (window at {offset}): {t}"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // A-29 — breadth guard: freshness-INDEPENDENT convergence pressure.
+    // The s_356 novelty treadmill: 22 planner rounds, every round a NEW grep
+    // pattern or a fresh window over new lines — genuinely fresh to the
+    // transcript hash, the resource keys (A-20) AND the line coverage (A-28),
+    // so no redundancy guard could trip; the loop's only exit was the model
+    // choosing prose.
+    // -----------------------------------------------------------------------
+
+    /// A-29 acceptance 1: consecutive read-only rounds of genuinely FRESH reads (a new file
+    /// every round) receive the escalation directive at the escalate threshold (6) and the
+    /// honest stop at the stop threshold (10). Before the fix this turn ran to the repeat
+    /// budget: every round was fresh, so no redundancy guard ever escalated.
+    #[tokio::test]
+    async fn novelty_treadmill_escalates_then_force_stops() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let content: String = (1..=6).map(|i| format!("line {i}\n")).collect();
+        let pairs: Vec<(String, String)> = (1..=10)
+            .map(|i| (format!("f{i}"), content.clone()))
+            .collect();
+        let pairs_ref: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let files = a20_files(&pairs_ref);
+        let (_ex, host) = a20_host(&calls, &files, "a29-treadmill");
+
+        let mut last = String::new();
+        for i in 1u64..=10 {
+            let name = format!("w{i}");
+            let path = format!("f{i}");
+            let r = host
+                .run_plan(cread_window_plan(&[(name.as_str(), path.as_str(), 0, 5)]))
+                .await
+                .unwrap();
+            let t = r["transcript"].as_str().unwrap().to_string();
+            // Every round is genuinely fresh — the redundancy guards must stay silent
+            // throughout; catching this shape is the breadth ladder's job alone.
+            assert!(
+                !t.contains("No NEW evidence"),
+                "fresh reads must never trip the redundancy guard (round {i}): {t}"
+            );
+            if i < 6 {
+                assert!(
+                    !t.contains("[loop-guard]"),
+                    "round {i} is below the escalate threshold: {t}"
+                );
+            } else if i < 10 {
+                assert!(
+                    t.contains("ONLY reading"),
+                    "round {i} must carry the answer-now directive: {t}"
+                );
+                assert!(
+                    t.contains("distinct resource"),
+                    "the directive must carry the evidence inventory (round {i}): {t}"
+                );
+                assert!(
+                    t.contains("Already covered:"),
+                    "the directive must name the covered files (round {i}): {t}"
+                );
+            } else {
+                assert!(
+                    t.contains("STOP —"),
+                    "round {i} must announce the stop: {t}"
+                );
+            }
+            last = t;
+        }
+
+        // The next `plan` must end the turn honestly instead of consulting the model again.
+        let out = host.plan(json!({ "feedback": last })).await.unwrap();
+        assert_eq!(out["kind"], "chat", "{out}");
+        assert!(
+            out["text"].as_str().unwrap().starts_with("Stopping:"),
+            "{out}"
+        );
+    }
+
+    /// A-29 acceptance 3+5: the thresholds are config-overridable (here a tight 3/5 ladder), and
+    /// an effectful dispatch RESETS the counter — a mixed read→fix→read turn never falsely trips
+    /// even when its total read-round count exceeds the escalate rung.
+    #[tokio::test]
+    async fn effectful_dispatch_resets_readonly_ladder() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let files = a20_files(&[
+            ("f1", "alpha"),
+            ("f2", "beta"),
+            ("f3", "gamma"),
+            ("f4", "delta"),
+            ("f5", "epsilon"),
+        ]);
+        let (_ex, host) = a20_host(&calls, &files, "a29-mixed-turn");
+        host.set_readonly_ladder(Some(3), Some(5));
+
+        // Two read-only rounds (count 2, below the overridden escalate rung of 3).
+        for (name, path) in [("a", "f1"), ("b", "f2")] {
+            let r = host.run_plan(cread_plan(&[(name, path)])).await.unwrap();
+            assert!(
+                !r["transcript"].as_str().unwrap().contains("[loop-guard]"),
+                "{r}"
+            );
+        }
+        // An effectful round resets the counter.
+        let write = json!({"kind":"plan","ast":{"body":[
+            {"kind":"call","op":"cwrite","args":[
+                {"kind":"lit","value":"f1"},{"kind":"lit","value":"alpha2"}]}
+        ]}});
+        let r = host.run_plan(write).await.unwrap();
+        assert!(
+            !r["transcript"].as_str().unwrap().contains("[loop-guard]"),
+            "{r}"
+        );
+        // Two more read rounds: 4 read rounds total this turn, but only 2 SINCE the effect —
+        // still below the rung. Without the reset this round would escalate.
+        for (name, path) in [("c", "f3"), ("d", "f4")] {
+            let r = host.run_plan(cread_plan(&[(name, path)])).await.unwrap();
+            assert!(
+                !r["transcript"].as_str().unwrap().contains("[loop-guard]"),
+                "a read round after an effect must not carry over the pre-effect count: {r}"
+            );
+        }
+        // The third consecutive post-effect read round reaches the overridden rung.
+        let r = host.run_plan(cread_plan(&[("e", "f5")])).await.unwrap();
+        assert!(
+            r["transcript"].as_str().unwrap().contains("ONLY reading"),
+            "the overridden escalate threshold (3) must fire on the 3rd consecutive round: {r}"
+        );
+    }
+
+    /// A-29 acceptance 3: `Some(0)` disables a rung — a legitimately read-heavy workflow can turn
+    /// the ladder off entirely and page through 12 fresh files without a single directive.
+    #[tokio::test]
+    async fn zero_disables_readonly_ladder() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pairs: Vec<(String, String)> = (1..=12)
+            .map(|i| (format!("f{i}"), format!("content {i}")))
+            .collect();
+        let pairs_ref: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let files = a20_files(&pairs_ref);
+        let (_ex, host) = a20_host(&calls, &files, "a29-disabled");
+        host.set_readonly_ladder(Some(0), Some(0));
+
+        for i in 1..=12 {
+            let name = format!("x{i}");
+            let path = format!("f{i}");
+            let r = host
+                .run_plan(cread_plan(&[(name.as_str(), path.as_str())]))
+                .await
+                .unwrap();
+            assert!(
+                !r["transcript"].as_str().unwrap().contains("[loop-guard]"),
+                "a 0-disabled ladder must never fire (round {i}): {r}"
+            );
+        }
+    }
+
+    /// A-29 acceptance 3: the default thresholds are named constants, pinned here with their
+    /// rationale so a drive-by retune shows up as a test diff.
+    #[test]
+    fn readonly_ladder_defaults_are_pinned() {
+        assert_eq!(READONLY_ROUNDS_ESCALATE, 6);
+        assert_eq!(READONLY_ROUNDS_STOP, 10);
+        // The escalate rung sits ABOVE the redundancy stop (A-20 ends repetitive turns first —
+        // breadth pressure is for turns redundancy correctly clears) and grants more rounds than
+        // the phased loop's 3-round gather cap, so a full gather plus real execute-phase reading
+        // fits below it. Compile-time pins: a retune that breaks the ordering fails the build.
+        const {
+            assert!(READONLY_ROUNDS_ESCALATE > RESOURCE_STALL_STOP);
+            assert!(READONLY_ROUNDS_STOP > READONLY_ROUNDS_ESCALATE);
         }
     }
 

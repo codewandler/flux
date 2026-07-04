@@ -198,6 +198,15 @@ pub struct Limits {
     /// `FLUX_TURN_TOKEN_BUDGET` and the `--turn-budget` flag (flag > env > config).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_token_budget: Option<u64>,
+    /// Consecutive read-only planner rounds before the loop injects the "answer now" escalation
+    /// (A-29's breadth ladder). Absent = the built-in default (6); 0 disables the rung. Raise it
+    /// for legitimately read-heavy workflows instead of defeating the detector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readonly_rounds_escalate: Option<u32>,
+    /// Consecutive read-only planner rounds before the loop ends the turn honestly (A-29).
+    /// Absent = the built-in default (10); 0 disables the rung.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readonly_rounds_stop: Option<u32>,
 }
 
 impl Limits {
@@ -358,6 +367,14 @@ fn merge(user: Config, project: Config) -> Config {
                 .limits
                 .turn_token_budget
                 .or(user.limits.turn_token_budget),
+            readonly_rounds_escalate: project
+                .limits
+                .readonly_rounds_escalate
+                .or(user.limits.readonly_rounds_escalate),
+            readonly_rounds_stop: project
+                .limits
+                .readonly_rounds_stop
+                .or(user.limits.readonly_rounds_stop),
         },
         server: ServerConfig {
             // Same scalar rule: a project TTL (including an explicit 0 = "never prune")
@@ -718,6 +735,44 @@ actions = ["workspace.read"]
             2,
             "user + project policy grants must concatenate, not replace"
         );
+    }
+
+    #[test]
+    fn limits_readonly_ladder_parses_and_project_overrides_user() {
+        let dir = temp_dir();
+        write_project(
+            &dir,
+            r#"
+[limits]
+readonly_rounds_escalate = 12
+readonly_rounds_stop = 20
+"#,
+        );
+        let cfg = load(&dir).unwrap();
+        assert_eq!(cfg.limits.readonly_rounds_escalate, Some(12));
+        assert_eq!(cfg.limits.readonly_rounds_stop, Some(20));
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Scalar precedence (same rule as turn_token_budget): the project's value — including an
+        // explicit 0 = "rung disabled" — wins; an unset project field falls back to the user's.
+        let user = Config {
+            limits: Limits {
+                readonly_rounds_escalate: Some(8),
+                readonly_rounds_stop: Some(15),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let project = Config {
+            limits: Limits {
+                readonly_rounds_stop: Some(0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let merged = merge(user, project);
+        assert_eq!(merged.limits.readonly_rounds_escalate, Some(8));
+        assert_eq!(merged.limits.readonly_rounds_stop, Some(0));
     }
 
     #[test]

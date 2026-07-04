@@ -26,9 +26,9 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 
 ## Next (ready — take the top one unless the user named a story)
 
-### multi-pass agent loop — orient → gather → plan/execute/revise, with patch-and-continue
-_A flux turn today one-shots a plan per loop iteration. Two costs:_
-- [A-29 — Read-only turns need freshness-INDEPENDENT convergence pressure — a novelty treadmill defeats every redundancy guard](A-29-readonly-round-budget.md) · Agent · s_356 (binary WITH A-28): 22 rounds on one question, user-cancelled — nearly every round adds a NEW grep pattern or a window over new lines, so transcript-hash + A-20 keys + A-28 coverage all correctly say 'fresh' and never trip; the loop's only exit is the model choosing prose. Add a count-based read-only-round ladder (nudge → answer-now → honest stop) orthogonal to freshness
+### flux-planner: from trained-and-usable to shippable
+- [L-39 — Multi-line string literals in flux-lang — kill the escaped-single-line-JSON wall](L-39-multiline-strings.md) · Language · the fine-tune's dominant failure (and a human-authoring pain): multi-KB edit payloads must be ONE escaped single-line JSON string; a triple-quoted spelling removes the failure mode at the source
+- [D-53 — events.db plan_source exporter — flux-native corpus mining (the L-38 hedge cash-out)](D-53-plan-source-exporter.md) · Core · every accepted plan since v0.2.15 carries parseable plan_source; pairing it with its originating user turn yields zero-LLM-cost NL→flux corpus rows that compound with real flux usage
 
 ### Plugin Platform Hardening
 - [D-48 — Enforced pin/rollback — spawn-time hash verification over the versioned store](D-48-enforceable-pin-rollback.md) · Core · turn `flux plugin pin`/`rollback` from advisory labels into supply-chain statements: pin fetches+repoints+records hash, rollback is an offline flip to `previous`, and a sha256-carrying descriptor is re-hashed before every spawn (drift = hard refusal); `status` gains the verification column
@@ -38,6 +38,9 @@ _A flux turn today one-shots a plan per loop iteration. Two costs:_
 _None._
 
 ## Backlog
+
+### flux-planner: from trained-and-usable to shippable
+- [L-40 — Re-run the emission A/B with the fine-tuned local model as the text arm](L-40-emission-ab-finetuned-arm.md) · Language · the ONE pre-registered condition allowed to re-open L-20's keep-json decision: a model that natively speaks the text syntax; blocked on flux-model M-15 producing a candidate that passes the ship gate
 
 ### multi-pass agent loop — orient → gather → plan/execute/revise, with patch-and-continue
 _A flux turn today one-shots a plan per loop iteration. Two costs:_
@@ -75,6 +78,7 @@ _A flux turn today one-shots a plan per loop iteration. Two costs:_
 - [A-26 — Measure the per-turn token budget against cumulative billed tokens](A-26-turn-budget-cumulative.md) · Agent · the A-10 turn budget compares against replace-style usage (only outputs sum; input/cache are overwritten each call), so `used` tracks last-call context occupancy, not the turn's cumulative billed tokens — a runaway 20-call loop re-paying ~90k input each time never trips the ceiling it exists to enforce
 - [A-27 — Route the identical-plan skip transcript through the stall guard](A-27-identical-plan-skip-stall-guard.md) · Agent · the A-05 identical-plan skip returns its informational transcript directly, bypassing guard_transcript, so the transcript-stall counter/force-stop never advances — a model re-emitting the byte-identical succeeded plan spins the full 25-round repeat budget (a planner call per round) instead of force-stopping
 - [A-28 — BUG: window-sliding reads defeat the A-20 resource stall guard — freshness must be coverage-based, not key-based](A-28-read-coverage-stall-guard.md) · Agent · s_355 (post-A-20 binary): 25 rounds re-reading ONE file at ever-shifting offsets (2180→2990) under new symbols — every window is a new op+args ReadTracker key, so round.fresh > 0 resets resource_stall EVERY round and the guard never arms; freshness for windowed reads must mean 'covered new lines', not 'new argument tuple'
+- [A-29 — Read-only turns need freshness-INDEPENDENT convergence pressure — a novelty treadmill defeats every redundancy guard](A-29-readonly-round-budget.md) · Agent · s_356 (binary WITH A-28): 22 rounds on one question, user-cancelled — nearly every round adds a NEW grep pattern or a window over new lines, so transcript-hash + A-20 keys + A-28 coverage all correctly say 'fresh' and never trip; the loop's only exit is the model choosing prose. Add a count-based read-only-round ladder (nudge → answer-now → honest stop) orthogonal to freshness
 - [A-30 — Tolerant stringified-ast decode — accept emit_plan's ast as a JSON string, not just an object](A-30-stringified-ast-fallback.md) · Agent · s_360/s_361: qwen3.7-max (and -plus) double-encode `ast` — a JSON string containing a VALID plan — and re-emit the same shape through all 8 repair steps; one from_str fallback makes the turn succeed
 - [A-31 — Exhausted planner budget must report the last rejection — decode-Err and not-callable branches skip last_reject](A-31-planner-reject-surfacing.md) · Agent · s_360 showed the bare 'planner did not produce a plan within 8 steps' because the decode-failure branch is the ONE rejection path that never records last_reject — the informative variant already exists and was unreachable for this class
 - [A-32 — OpenAI-wire tool-args resilience — malformed/truncated emit_plan JSON must feed back, not kill the turn](A-32-openai-wire-tool-args-resilience.md) · Agent · s_368 (deepseek-v4-flash:nitro via plain `openrouter`): two turns died with `runtime error: step plan failed: serialization error: …` — one after SEVEN successful multipass rounds. The Messages wire already repairs exactly this (`parse_tool_input`, names deepseek as offender); the OpenAI wire has a bare `serde_json::from_str(&args)?`
