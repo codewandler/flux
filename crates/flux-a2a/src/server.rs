@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::types::{
-    new_id, AgentCard, Capabilities, Message, Skill, Task, TaskState, TaskStatus,
+    new_id, AgentCard, Capabilities, Message, Part, Skill, Task, TaskState, TaskStatus,
     TaskStatusUpdateEvent,
 };
 
@@ -26,6 +26,24 @@ use crate::types::{
 pub trait A2aTurn: Send + Sync {
     /// Run one user message to the agent's final answer text.
     async fn run(&self, input: &str) -> Result<String, String>;
+
+    /// As [`run`](Self::run), but the reply may carry **extra parts** beside the answer text —
+    /// e.g. `data` parts with typed UI blocks a chat surface renders natively. The default
+    /// delegates to [`run`](Self::run) with no extra parts, so existing implementors are
+    /// unaffected; [`dispatch`] always goes through this method.
+    async fn run_rich(&self, input: &str) -> Result<A2aReply, String> {
+        Ok(A2aReply {
+            text: self.run(input).await?,
+            extra_parts: Vec::new(),
+        })
+    }
+}
+
+/// A rich turn reply: the final answer text plus extra reply-message parts (see
+/// [`A2aTurn::run_rich`]).
+pub struct A2aReply {
+    pub text: String,
+    pub extra_parts: Vec<Part>,
 }
 
 // ── Agent card ────────────────────────────────────────────────────────────────
@@ -100,13 +118,11 @@ async fn send(runner: &dyn A2aTurn, id: Value, params: Option<&Value>) -> Value 
     // Echo the conversation id for forward-compatibility with a future stateful mode (one session
     // per contextId); today each turn is independent.
     let context_id = extract_context_id(params);
-    match runner.run(&input).await {
-        Ok(answer) => {
-            let status = TaskStatus::new(
-                TaskState::Completed,
-                Some(Message::agent_text(answer)),
-                Some(now_rfc3339()),
-            );
+    match runner.run_rich(&input).await {
+        Ok(reply) => {
+            let mut message = Message::agent_text(reply.text);
+            message.parts.extend(reply.extra_parts);
+            let status = TaskStatus::new(TaskState::Completed, Some(message), Some(now_rfc3339()));
             let task = Task::new(new_id(), context_id, status);
             rpc_ok(id, serde_json::to_value(&task).unwrap_or(Value::Null))
         }
@@ -229,6 +245,37 @@ mod tests {
                 "parts": [{ "kind": "text", "text": text }],
             }},
         })
+    }
+
+    /// A runner that attaches a typed `data` part beside its text — the rich-reply seam.
+    struct BlockRunner;
+
+    #[async_trait]
+    impl A2aTurn for BlockRunner {
+        async fn run(&self, input: &str) -> Result<String, String> {
+            Ok(format!("you said: {input}"))
+        }
+        async fn run_rich(&self, input: &str) -> Result<A2aReply, String> {
+            Ok(A2aReply {
+                text: self.run(input).await?,
+                extra_parts: vec![Part::data(
+                    json!({ "block": { "type": "table", "rows": [{ "a": 1 }] } }),
+                )],
+            })
+        }
+    }
+
+    /// `run_rich` extra parts ride the reply message beside the text part; the default impl
+    /// (StubRunner above, exercised by the sibling test) keeps text-only runners unchanged.
+    #[tokio::test]
+    async fn rich_replies_attach_data_parts_beside_the_text() {
+        let resp = dispatch(&BlockRunner, &send_body("hello")).await;
+        let parts = &resp["result"]["status"]["message"]["parts"];
+        assert_eq!(parts[0]["kind"], "text");
+        assert_eq!(parts[0]["text"], "you said: hello");
+        assert_eq!(parts[1]["kind"], "data");
+        assert_eq!(parts[1]["data"]["block"]["type"], "table");
+        assert_eq!(parts[1]["data"]["block"]["rows"][0]["a"], 1);
     }
 
     #[tokio::test]

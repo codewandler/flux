@@ -62,6 +62,18 @@ impl Part {
         }
     }
 
+    /// An A2A `data` part carrying an arbitrary structured payload under the spec's `data` field
+    /// (e.g. a typed UI block a consumer's chat surface renders natively).
+    pub fn data(value: Value) -> Self {
+        let mut extra = Map::new();
+        extra.insert("data".to_string(), value);
+        Part {
+            kind: "data".to_string(),
+            text: None,
+            extra,
+        }
+    }
+
     /// The text if this is a text part, else `None`.
     pub fn as_text(&self) -> Option<&str> {
         if self.kind == "text" {
