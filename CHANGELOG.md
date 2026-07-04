@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.2.15] - 2026-07-04
+
 ### Added
 
 - **`--trace-loop` — flag-gated structural trace of the outer agent loop (A-39).** Under
