@@ -8,6 +8,37 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **`--trace-loop` — flag-gated structural trace of the outer agent loop (A-39).** Under
+  `--trace-loop` (or `FLUX_TRACE_LOOP=1`), the CLI prints one dim line per outer-loop round
+  (`⟳ round 3/25`) and per structural AST node the agent-loop program executes — op calls with
+  their bind names (`· plan → $plan`), `when`/`unless`/`match` branches taken, `parallel` branch
+  entry, `return`, and until-exit — closing the gap where the loop's position was invisible (the
+  only live signal was the `loop.phase` spinner label, and the transcript's `[N/25]` counts inner
+  tool calls against the outer `repeat 25` cap). Observation-based and live-only: the interpreter
+  emits `loop.round`/`loop.node` observations through the existing sink path, gated once at
+  emission by a default-false `FlowSink::trace_structural()` method — never `executor.observe`,
+  so nothing lands in the evidence log or events.db. Outer-loop scoping is by sink instance
+  (`SinkBridge.trace`, set only by the engine's new `execute_flow_traced` call under the flag);
+  inner `run_plan`, `flow run`, and resume paths stay untraced and are one boolean away from
+  opting in later. Zero default-output change (pinned by a negative test); pure computation nodes
+  (fmt/jq/expr/parse/lit and pure binds) are never traced. Documented in `docs/agent-loop.md`
+  beside `--show-loop`.
+
+- **Multi-perspective example — parallel 3-lens scout fan-out to a cited Answer (L-37).** Second
+  checked-in, test-guarded native-text showcase after `examples/strict_review.flux`:
+  `examples/multi-perspective.flux` runs one query through three sub-agent lenses in `parallel`
+  (tech / product / risk scouts resolved from the new `.flux/agents/{tech,product,risk}-scout.md`
+  role files via the `task` op), extracts each scout's `.evidence`, `merge`s the claim lists, and
+  `synth`esizes a cited prelude `Answer` — fan-out orchestration, role-file sub-agents, and the
+  cognition ops composing in the language, not in host code. Hermetic
+  `crates/flux-sdk/tests/multi_perspective.rs` (no API key): one mock provider serves both the
+  top-level provider (`synth` is CognitionPack provider-injected) and the sub-agent factory,
+  disambiguated on the request's system text, and pins exactly-once spawning per scout, the
+  end-to-end evidence flow into the synth prompt, an Answer-shaped return, and cross-run
+  determinism. Grammar fact that fell out of implementation: flow names DO allow `-`
+  (`is_name_char`), so the header keeps the literal `flow multi-perspective(query: String) -> Answer`;
+  `.gitignore` gained a `!.flux/agents/*-scout.md` negation so the role files actually check in.
+
 - **Structural enforcement for the stream-resilience invariant (A-37 — closes the stream-resilience
   epic).** "Provider bytes never error a chunk stream" (A-33/A-34/A-35/A-36) is now self-enforcing,
   not just a convention. A crate-local `crates/flux-providers/clippy.toml` bans

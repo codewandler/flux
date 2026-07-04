@@ -143,6 +143,12 @@ struct AgentFlags {
     #[arg(long)]
     show_loop: bool,
 
+    /// Trace the outer agent loop's structure: one dim line per round (`⟳ round 3/25`) and per
+    /// structural node (op calls with bind names, match/when branches taken, return) of the
+    /// agent-loop program. Inner plan execution is not traced. Also enabled by `FLUX_TRACE_LOOP`.
+    #[arg(long)]
+    trace_loop: bool,
+
     /// Extra skill directory, layered above `[skills] dirs` from .flux/config.toml and the
     /// well-known set (`.flux/skills`, `.claude/skills`, `~/.flux/skills`, …). Repeatable; earlier
     /// dirs win a skill-name clash.
@@ -3768,6 +3774,14 @@ impl AgentSink for CliSink {
             eprintln!("{}", style::dim("⊘ turn cancelled"));
         } else if o.kind == "loop.phase" {
             self.record_phase(o);
+        } else if o.kind == "loop.round" {
+            // A-39 (`--trace-loop`/`FLUX_TRACE_LOOP`): one dim line per outer-loop round.
+            let round = o.data.get("round").and_then(|v| v.as_u64()).unwrap_or(0);
+            let max = o.data.get("max").and_then(|v| v.as_u64()).unwrap_or(0);
+            eprintln!("{}", style::dim(&format!("⟳ round {round}/{max}")));
+        } else if o.kind == "loop.node" {
+            // A-39: one dim line per structural AST node the outer loop executes.
+            eprintln!("{}", style::dim(&trace_node_line(&o.data)));
         } else if o.kind == "flow.brief" {
             // A brief only ever accompanies a `gather: true` plan (`compile.rs`'s `parse_brief`
             // call site) — its arrival marks gather mode even when the phase alone (`orient`) is
@@ -4060,6 +4074,63 @@ fn halt_line(data: &Value) -> String {
     match data.get("op").and_then(|v| v.as_str()) {
         Some(op) => format!("✗ step {step}/{of} {op} failed — revising…"),
         None => format!("✗ step {step}/{of} failed — revising…"),
+    }
+}
+
+/// Format a `loop.node` observation's `data` (A-39, `--trace-loop`/`FLUX_TRACE_LOOP`) as a plain,
+/// colorless line — one per structural AST node the outer agent loop executes. Falls back to the
+/// raw JSON for any `node` kind this hasn't been taught (defensive: the interpreter's trace helper
+/// is meant to grow new emission sites without this formatter going stale/panicking).
+fn trace_node_line(data: &Value) -> String {
+    let label = |key: &str| data.get(key).and_then(|v| v.as_str());
+    match data.get("node").and_then(|v| v.as_str()) {
+        Some("call") => {
+            let op = label("op").unwrap_or("?");
+            match label("bind") {
+                Some(bind) => format!("· {op} → ${bind}"),
+                None => format!("· {op}"),
+            }
+        }
+        Some("when") => {
+            let branch = label("branch").unwrap_or("?");
+            match label("cond") {
+                Some(cond) => format!("· when {cond} → {branch}"),
+                None => format!("· when → {branch}"),
+            }
+        }
+        Some("unless") => {
+            let entered = data
+                .get("entered")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let word = if entered { "enter" } else { "skip" };
+            match label("cond") {
+                Some(cond) => format!("· unless {cond} → {word}"),
+                None => format!("· unless → {word}"),
+            }
+        }
+        Some("match") => {
+            let value = label("value").unwrap_or("");
+            let arm = label("arm").unwrap_or("?");
+            match label("subject") {
+                Some(subject) => format!("· match {subject} = {value} → {arm}"),
+                None => format!("· match {value} → {arm}"),
+            }
+        }
+        Some("return") => match label("value") {
+            Some(v) => format!("· return {v}"),
+            None => "· return".to_string(),
+        },
+        Some("repeat") => {
+            let rounds = data.get("rounds").and_then(|v| v.as_u64()).unwrap_or(0);
+            let max = data.get("max").and_then(|v| v.as_u64()).unwrap_or(0);
+            format!("· until hit — exit after {rounds}/{max}")
+        }
+        Some("parallel.branch") => {
+            let name = label("name").unwrap_or("?");
+            format!("· parallel branch ${name}")
+        }
+        _ => format!("· {data}"),
     }
 }
 
@@ -4600,13 +4671,17 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Export the per-turn env signals (`FLUX_VERBOSE`, `FLUX_SHOW_LOOP`) the agent-path subcommands honor.
+/// Export the per-turn env signals (`FLUX_VERBOSE`, `FLUX_SHOW_LOOP`, `FLUX_TRACE_LOOP`) the
+/// agent-path subcommands honor.
 fn apply_agent_env(flags: &AgentFlags) {
     if flags.verbose {
         std::env::set_var("FLUX_VERBOSE", "1");
     }
     if flags.show_loop {
         std::env::set_var("FLUX_SHOW_LOOP", "1");
+    }
+    if flags.trace_loop {
+        std::env::set_var("FLUX_TRACE_LOOP", "1");
     }
 }
 
@@ -7587,6 +7662,89 @@ mod tests {
             "flow.halt",
             Phase::Turn,
             serde_json::json!({ "step": 1, "of": 2, "op": "boom", "kind": "runtime", "fatal": false }),
+        ));
+    }
+
+    /// A-39 (`--trace-loop`/`FLUX_TRACE_LOOP`): `trace_node_line` formats every structural `loop.node`
+    /// kind the interpreter can emit, table-driven like `halt_line`'s test above — including the
+    /// defensive fallback for a `node` kind this formatter hasn't been taught yet.
+    #[test]
+    fn trace_node_line_formats_every_structural_kind() {
+        let cases: Vec<(serde_json::Value, &str)> = vec![
+            (
+                serde_json::json!({"node": "call", "op": "plan", "bind": "draft"}),
+                "· plan → $draft",
+            ),
+            (serde_json::json!({"node": "call", "op": "grep"}), "· grep"),
+            (
+                serde_json::json!({"node": "when", "cond": "$draft", "branch": "then"}),
+                "· when $draft → then",
+            ),
+            (
+                serde_json::json!({"node": "when", "branch": "else"}),
+                "· when → else",
+            ),
+            (
+                serde_json::json!({"node": "unless", "cond": "$done", "entered": false}),
+                "· unless $done → skip",
+            ),
+            (
+                serde_json::json!({"node": "unless", "entered": true}),
+                "· unless → enter",
+            ),
+            (
+                serde_json::json!({
+                    "node": "match",
+                    "subject": "$kind",
+                    "value": "\"chat\"",
+                    "arm": "case \"chat\"",
+                }),
+                "· match $kind = \"chat\" → case \"chat\"",
+            ),
+            (
+                serde_json::json!({"node": "match", "value": "1", "arm": "default"}),
+                "· match 1 → default",
+            ),
+            (
+                serde_json::json!({"node": "return", "value": "$answer"}),
+                "· return $answer",
+            ),
+            (serde_json::json!({"node": "return"}), "· return"),
+            (
+                serde_json::json!({"node": "repeat", "until_hit": true, "rounds": 3, "max": 25}),
+                "· until hit — exit after 3/25",
+            ),
+            (
+                serde_json::json!({"node": "parallel.branch", "name": "left"}),
+                "· parallel branch $left",
+            ),
+        ];
+        for (data, expected) in cases {
+            assert_eq!(super::trace_node_line(&data), expected, "data: {data}");
+        }
+
+        // An unrecognized `node` kind falls back to the raw JSON rather than panicking (defensive:
+        // the interpreter's trace helper is meant to grow new emission sites over time).
+        let unknown = serde_json::json!({"node": "each", "foo": "bar"});
+        assert_eq!(super::trace_node_line(&unknown), format!("· {unknown}"));
+    }
+
+    /// A-39: `loop.round`/`loop.node` observations dispatch without panicking (the rendered CONTENT
+    /// is covered by `trace_node_line` above).
+    #[test]
+    fn loop_round_and_node_dispatch_without_panicking() {
+        use flux_evidence::{Observation, Phase};
+
+        let mut sink = super::CliSink::new(0);
+        sink.observation(&Observation::new(
+            "loop.round",
+            Phase::Turn,
+            serde_json::json!({ "round": 1, "max": 25 }),
+        ));
+        sink.observation(&Observation::new(
+            "loop.node",
+            Phase::Turn,
+            serde_json::json!({ "node": "call", "op": "plan", "bind": "draft" }),
         ));
     }
 

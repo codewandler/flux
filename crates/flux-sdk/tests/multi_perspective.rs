@@ -1,0 +1,274 @@
+//! Integration test for the checked-in `multi-perspective` example flow (L-37; design in
+//! `docs/stories/L-37-multi-perspective-example.md`). Drives the REAL native-text flow
+//! (`examples/multi-perspective.flux`) and the REAL checked-in scout role files
+//! (`.flux/agents/{tech,product,risk}-scout.md`) through a `FlowClient` with sub-agents wired to a
+//! mock provider that returns a canned scout `Answer` JSON per role system prompt — hermetic, no API
+//! key.
+//!
+//! Unlike `strict_review.rs`, this flow's tail calls `synth` (`flux-cognition`'s `CognitionPack`),
+//! which is dispatched through the client's TOP-LEVEL provider, not the sub-agent factory. So this
+//! test cannot reuse strict_review's panicking `UnusedTopLevelProvider` — one mock type serves BOTH
+//! roles (top-level provider for `synth`, sub-agent factory provider for the three scouts),
+//! disambiguating on `req.system_text()`. It also mirrors two verified chunk-shape gotchas:
+//! `synth`'s `run_model` (`flux-cognition/src/lib.rs`) collects ONLY `Chunk::TextDelta`, while a
+//! sub-agent `task` result is read from the engine's `Chat(text)` path, which only sees
+//! `Chunk::Block(ContentBlock::Text)` when blocks are non-empty (`compile.rs`'s
+//! `stream_blocks`/`compile_turn_inner`: a non-empty `blocks` vec makes the accumulated `TextDelta`
+//! text a no-op, so emitting `Block(Text)` alone is exactly what strict_review.rs already does for
+//! its reviewer roles).
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use flux_core::{Chunk, ContentBlock, Result, StopReason};
+use flux_orchestrate::{RoleRegistry, SubAgents};
+use flux_provider::{ChunkStream, Provider, Request};
+use flux_runtime::ToolRegistry;
+use flux_sdk::FlowClient;
+use serde_json::{json, Map, Value};
+
+/// The repo root, resolved from this crate's manifest dir (`crates/flux-sdk` -> repo root).
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+}
+
+fn read_flow() -> String {
+    std::fs::read_to_string(repo_root().join("examples/multi-perspective.flux"))
+        .expect("examples/multi-perspective.flux must exist")
+}
+
+/// A single canned scout `Answer` JSON, carrying `marker` in its one evidence claim so a later
+/// assertion can prove that claim actually reached `synth`'s prompt (branch bind -> `.evidence`
+/// field-access -> `merge` composed correctly, not just that the sub-agent ran).
+fn scout_answer(summary: &str, marker: &str) -> String {
+    json!({
+        "status": "answered",
+        "summary": summary,
+        "evidence": [
+            { "claim": { "text": marker, "confidence": 0.9 } }
+        ],
+        "gaps": [],
+        "risks": []
+    })
+    .to_string()
+}
+
+/// The canned `synth` answer — the flow's final return value.
+fn synth_answer() -> String {
+    json!({
+        "status": "answered",
+        "summary": "Combined technical, product, and risk assessment of the query.",
+        "evidence": [
+            { "claim": { "text": "synthesized from three scout lenses", "confidence": 0.85 } }
+        ],
+        "gaps": [],
+        "risks": ["needs a human sanity check before shipping"]
+    })
+    .to_string()
+}
+
+/// A provider that serves BOTH roles a hermetic multi-agent flow needs: the client's top-level
+/// provider (drives `synth`, a `CognitionPack` op) AND, via the sub-agent factory closure, each
+/// scout's provider. Every request's system + first-user-message text is logged (for the
+/// "spawned exactly once" / "markers reached synth" assertions) before a canned reply is picked by
+/// matching on the system prompt.
+struct MultiPerspectiveMockProvider {
+    /// One entry per `stream()` call: `"SYSTEM:<system>\nUSER:<first user message text>"`.
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Provider for MultiPerspectiveMockProvider {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    async fn stream(&self, req: Request) -> Result<ChunkStream> {
+        let system = req.system_text().unwrap_or_default();
+        let user_text = req
+            .messages
+            .iter()
+            .map(|m| m.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("SYSTEM:{system}\nUSER:{user_text}"));
+
+        if system.contains("synthesize") {
+            // `synth`'s `run_model` collects ONLY `Chunk::TextDelta` (flux-cognition/src/lib.rs)
+            // — `Chunk::Block` is never inspected there, so this must be a delta, not a block.
+            let chunks = vec![
+                Chunk::TextDelta(synth_answer()),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::EndTurn),
+                },
+            ];
+            return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+        }
+
+        let text = if system.contains("TECHNICAL scout") {
+            scout_answer(
+                "Architecture supports incremental delivery of partial results.",
+                "TECH-MARKER-ALPHA",
+            )
+        } else if system.contains("PRODUCT scout") {
+            scout_answer(
+                "Users need a visible, low-friction way to notice and retry failures.",
+                "PROD-MARKER-BETA",
+            )
+        } else if system.contains("RISK scout") {
+            scout_answer(
+                "Partial failures must never silently drop events from the stream.",
+                "RISK-MARKER-GAMMA",
+            )
+        } else {
+            panic!("unexpected system prompt (no scout/synth role matched): {system:?}");
+        };
+
+        // A sub-agent `task` result is read from the engine's `Chat(text)` path, which is built
+        // from `Chunk::Block` content (see module docs) — mirrors strict_review.rs's reviewer mock.
+        let chunks = vec![
+            Chunk::Block(ContentBlock::Text { text }),
+            Chunk::Done {
+                stop_reason: Some(StopReason::EndTurn),
+            },
+        ];
+        Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+    }
+}
+
+fn build_client() -> (FlowClient, Arc<Mutex<Vec<String>>>) {
+    // Load the REAL checked-in scout role files.
+    let roles = RoleRegistry::load(&[repo_root().join(".flux/agents")]);
+    assert!(
+        roles.get("tech-scout").is_some(),
+        "tech-scout role must load from .flux/agents"
+    );
+    assert!(
+        roles.get("product-scout").is_some(),
+        "product-scout role must load from .flux/agents"
+    );
+    assert!(
+        roles.get("risk-scout").is_some(),
+        "risk-scout role must load from .flux/agents"
+    );
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+
+    // The scouts answer on their first message (no tool calls needed), so an empty child base
+    // registry is enough — mirrors strict_review.rs.
+    let child_base = ToolRegistry::new();
+    let factory_log = log.clone();
+    let factory = Arc::new(move || {
+        Ok(Box::new(MultiPerspectiveMockProvider {
+            log: factory_log.clone(),
+        }) as Box<dyn Provider>)
+    });
+    let sub_agents = SubAgents::new(roles, child_base, factory, "mock", 4096);
+
+    let top_level = Arc::new(MultiPerspectiveMockProvider { log: log.clone() });
+    let mut client = FlowClient::builder()
+        .model("mock")
+        .auto_approve(true)
+        .build(top_level, repo_root())
+        .expect("build FlowClient");
+    client.with_sub_agents(sub_agents);
+    (client, log)
+}
+
+fn seed_query() -> Map<String, Value> {
+    let mut inputs = Map::new();
+    inputs.insert(
+        "query".to_string(),
+        json!("How should flux surface streaming errors?"),
+    );
+    inputs
+}
+
+#[tokio::test]
+async fn multi_perspective_fans_out_merges_and_synthesizes_a_cited_answer() {
+    let (client, log) = build_client();
+    let text = read_flow();
+
+    let out = client
+        .run_flow(&text, seed_query())
+        .await
+        .expect("multi-perspective should execute end-to-end");
+
+    // All three branches bound: exactly 3 `task` calls at the top level (the fixed lens set).
+    let task_calls = out.tool_calls.iter().filter(|op| *op == "task").count();
+    assert_eq!(
+        task_calls, 3,
+        "expected exactly 3 scout task calls, got {task_calls} (tool_calls: {:?})",
+        out.tool_calls
+    );
+
+    let recorded = log.lock().unwrap().clone();
+
+    // Each scout role was spawned exactly once — its distinctive system-prompt phrase shows up in
+    // exactly one recorded request.
+    for phrase in ["TECHNICAL scout", "PRODUCT scout", "RISK scout"] {
+        let count = recorded.iter().filter(|r| r.contains(phrase)).count();
+        assert_eq!(
+            count, 1,
+            "expected `{phrase}` to appear in exactly one recorded request, got {count}: {recorded:?}"
+        );
+    }
+
+    // The `synth` call's prompt carries all three scouts' evidence — proof that the branch binds,
+    // `.evidence` field-access, and `merge` composed the claim lists end-to-end (not just that the
+    // sub-agents ran).
+    let synth_request = recorded
+        .iter()
+        .find(|r| r.contains("SYSTEM:") && r.to_lowercase().contains("synthesize"))
+        .unwrap_or_else(|| panic!("no synth request recorded: {recorded:?}"));
+    for marker in ["TECH-MARKER-ALPHA", "PROD-MARKER-BETA", "RISK-MARKER-GAMMA"] {
+        assert!(
+            synth_request.contains(marker),
+            "synth request must carry {marker} (merged scout evidence), got: {synth_request}"
+        );
+    }
+
+    // The flow's return value conforms to the prelude `Answer` shape. The declared `-> Answer` is
+    // metadata only (not analyzer-enforced) — this IS the enforcement.
+    let answer = out.answer().unwrap_or_else(|| {
+        panic!(
+            "flow result must parse as a prelude Answer, got: {}",
+            out.result
+        )
+    });
+    assert_eq!(answer.status, "answered");
+    assert!(
+        !answer.summary.is_empty(),
+        "answer summary must be non-empty"
+    );
+    assert!(
+        !answer.evidence.is_empty(),
+        "answer evidence must be non-empty"
+    );
+}
+
+#[tokio::test]
+async fn multi_perspective_is_stable_across_repeated_runs() {
+    let (client, _log) = build_client();
+    let text = read_flow();
+
+    let out1 = client
+        .run_flow(&text, seed_query())
+        .await
+        .expect("first run should execute end-to-end");
+    let out2 = client
+        .run_flow(&text, seed_query())
+        .await
+        .expect("second run should execute end-to-end");
+
+    assert_eq!(
+        out1.result, out2.result,
+        "multi-perspective must produce identical output for the same inputs across runs"
+    );
+}

@@ -2,13 +2,15 @@
 **/*.rs.bk
 # `.flux/` is local scaffolding (session state, seeded self-improvement roles, …) and stays
 # gitignored — EXCEPT a few checked-in artifacts that ship with the repo (they are part of
-# examples/tests, not local scaffolding): the strict-review reviewer roles (L-10) and the flux-flow
-# engine skill, whose generated node-kind table is guarded by a test. A directory-level `.flux/`
-# pattern would block re-inclusion entirely, so exclude by content instead.
+# examples/tests, not local scaffolding): the strict-review reviewer roles (L-10), the
+# multi-perspective scout roles (L-37), and the flux-flow engine skill, whose generated node-kind
+# table is guarded by a test. A directory-level `.flux/` pattern would block re-inclusion entirely,
+# so exclude by content instead.
 .flux/*
 !.flux/agents/
 .flux/agents/*
 !.flux/agents/review-*.md
+!.flux/agents/*-scout.md
 !.flux/skills/
 .flux/skills/*
 !.flux/skills/flux-flow/

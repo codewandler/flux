@@ -525,6 +525,10 @@ impl OpHost for ExecutorHost<'_> {
 /// Bridges the interpreter's [`FlowSink`] back onto the engine's [`AgentSink`].
 struct SinkBridge<'a> {
     inner: &'a mut dyn AgentSink,
+    /// Structural-trace opt-in (A-39) — forwarded to [`FlowSink::trace_structural`]. Only the
+    /// engine's OUTER `execute_flow_traced` call ever sets this; every other bridge (inner
+    /// `run_plan`, `flow run`, resume) stays `false`.
+    trace: bool,
 }
 
 impl FlowSink for SinkBridge<'_> {
@@ -556,6 +560,9 @@ impl FlowSink for SinkBridge<'_> {
     fn turn_end(&mut self, usage: Option<flux_core::Usage>) {
         self.inner.turn_end(usage);
     }
+    fn trace_structural(&self) -> bool {
+        self.trace
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -577,7 +584,8 @@ pub async fn execute_call(
 }
 
 /// Execute a compiled flow — the original signature, delegating to [`flux_lang::runtime::execute_flow`]
-/// with the engine's executor/sink adapted onto the interpreter's traits.
+/// with the engine's executor/sink adapted onto the interpreter's traits. Structural tracing is off
+/// (see [`execute_flow_traced`] for the opt-in entry the engine's OUTER loop uses).
 pub async fn execute_flow(
     store: &FlowStore,
     executor: &Executor,
@@ -585,8 +593,28 @@ pub async fn execute_flow(
     ast: &DraftAst,
     sink: &mut dyn AgentSink,
 ) -> Result<FlowOutcome> {
+    execute_flow_traced(store, executor, session_id, ast, sink, false).await
+}
+
+/// The **structural-trace-aware** analog of [`execute_flow`] (A-39): when `trace_structural` is
+/// `true`, the interpreter emits live-only `loop.round`/`loop.node` observations (never persisted —
+/// see [`flux_lang::runtime`]'s trace helper) through this same sink. Scoping is by call site: the
+/// engine's outer agent-loop call is the ONLY caller that ever passes `true` (from `trace_loop()`
+/// reading `FLUX_TRACE_LOOP`/`--trace-loop`); inner `run_plan`, `flow run`, and resume paths keep
+/// calling plain [`execute_flow`] (`false`), so only the OUTER loop's structure is ever traced.
+pub async fn execute_flow_traced(
+    store: &FlowStore,
+    executor: &Executor,
+    session_id: &str,
+    ast: &DraftAst,
+    sink: &mut dyn AgentSink,
+    trace_structural: bool,
+) -> Result<FlowOutcome> {
     let host = ExecutorHost::new(executor);
-    let mut bridge = SinkBridge { inner: sink };
+    let mut bridge = SinkBridge {
+        inner: sink,
+        trace: trace_structural,
+    };
     flux_lang::runtime::execute_flow(store, &host, session_id, ast, &mut bridge).await
 }
 
@@ -600,7 +628,10 @@ pub async fn execute_flow_with_composites(
     sink: &mut dyn AgentSink,
 ) -> Result<FlowOutcome> {
     let host = ExecutorHost::new_with_composites(executor, composites);
-    let mut bridge = SinkBridge { inner: sink };
+    let mut bridge = SinkBridge {
+        inner: sink,
+        trace: false,
+    };
     flux_lang::runtime::execute_flow(store, &host, session_id, ast, &mut bridge).await
 }
 
@@ -626,7 +657,10 @@ pub async fn execute_flow_resumable_with_composites(
     // A-20: the loop host's per-turn read-resource ledger rides along so every inner dispatch is
     // classified/tracked (and an exact-repeat cacheable read is served with a reuse note).
     host.reads = reads;
-    let mut bridge = SinkBridge { inner: sink };
+    let mut bridge = SinkBridge {
+        inner: sink,
+        trace: false,
+    };
     flux_lang::runtime::execute_flow_resumable(store, &host, session_id, ast, &mut bridge, ledger)
         .await
 }
@@ -644,7 +678,10 @@ pub async fn resume_flow(
     sink: &mut dyn AgentSink,
 ) -> Result<FlowOutcome> {
     let host = ExecutorHost::new(executor);
-    let mut bridge = SinkBridge { inner: sink };
+    let mut bridge = SinkBridge {
+        inner: sink,
+        trace: false,
+    };
     flux_lang::runtime::resume_flow(store, &host, session_id, body, at, input, &mut bridge).await
 }
 
@@ -666,7 +703,10 @@ pub async fn resume_flow_with_composites(
     sink: &mut dyn AgentSink,
 ) -> Result<FlowOutcome> {
     let host = ExecutorHost::new_with_composites(executor, composites);
-    let mut bridge = SinkBridge { inner: sink };
+    let mut bridge = SinkBridge {
+        inner: sink,
+        trace: false,
+    };
     flux_lang::runtime::resume_flow_named(
         store,
         &host,
@@ -692,7 +732,10 @@ pub async fn execute_plan(
     sink: &mut dyn AgentSink,
 ) -> Result<FlowOutcome> {
     let host = ExecutorHost::new(executor);
-    let mut bridge = SinkBridge { inner: sink };
+    let mut bridge = SinkBridge {
+        inner: sink,
+        trace: false,
+    };
     flux_lang::runtime::execute_plan(store, &host, session_id, body, plan, &mut bridge).await
 }
 
@@ -707,7 +750,10 @@ pub async fn execute_plan_with_composites(
     sink: &mut dyn AgentSink,
 ) -> Result<FlowOutcome> {
     let host = ExecutorHost::new_with_composites(executor, composites);
-    let mut bridge = SinkBridge { inner: sink };
+    let mut bridge = SinkBridge {
+        inner: sink,
+        trace: false,
+    };
     flux_lang::runtime::execute_plan(store, &host, session_id, body, plan, &mut bridge).await
 }
 
@@ -1345,14 +1391,20 @@ mod tests {
 
     // ---- flow execution + risk (linear v1) ----
 
-    /// A sink that records the op names it was told about.
+    /// A sink that records the op names it was told about, and (A-39) the `kind` of every
+    /// observation it receives — used by the structural-trace gating test to check for `loop.*`
+    /// observations without depending on any one field shape.
     #[derive(Default)]
     struct CollectSink {
         calls: Vec<String>,
+        observations: Vec<String>,
     }
     impl AgentSink for CollectSink {
         fn tool_call(&mut self, name: &str, _input: &serde_json::Value) {
             self.calls.push(name.to_string());
+        }
+        fn observation(&mut self, o: &flux_evidence::Observation) {
+            self.observations.push(o.kind.clone());
         }
     }
 
@@ -1414,6 +1466,44 @@ mod tests {
             .unwrap()
             .iter()
             .any(|e| matches!(e, RunEvent::FlowReturned { .. })));
+    }
+
+    /// A-39: `execute_flow` never emits structural-trace `loop.*` observations (the outer loop opts
+    /// in explicitly); `execute_flow_traced(..., true)` does — pinning the `SinkBridge` seam the
+    /// engine's outer call uses to scope tracing to the OUTER loop only.
+    #[tokio::test]
+    async fn execute_flow_traced_gates_structural_observations() {
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        let ast = DraftAst {
+            body: vec![Node::Repeat {
+                max: 1,
+                until: None,
+                body: vec![],
+                collect: None,
+            }],
+            ..Default::default()
+        };
+
+        let mut plain = CollectSink::default();
+        execute_flow(&store, &ex, "sess", &ast, &mut plain)
+            .await
+            .unwrap();
+        assert!(
+            plain.observations.iter().all(|k| !k.starts_with("loop.")),
+            "execute_flow must never emit structural-trace observations: {:?}",
+            plain.observations
+        );
+
+        let mut traced = CollectSink::default();
+        execute_flow_traced(&store, &ex, "sess", &ast, &mut traced, true)
+            .await
+            .unwrap();
+        assert!(
+            traced.observations.iter().any(|k| k == "loop.round"),
+            "execute_flow_traced(..., true) must emit loop.round: {:?}",
+            traced.observations
+        );
     }
 
     #[tokio::test]

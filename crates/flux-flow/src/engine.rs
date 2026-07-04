@@ -7,7 +7,7 @@
 //! run, because the same [`compile_turn`] drives the engine and the CLI.
 //!
 //! Per turn: append the user message → compile a plan (pure DAG — the model's only tool is emit_plan) →
-//! risk-gated execution via [`execute_flow`] (per-op approval through the same envelope) → feed the
+//! risk-gated execution via [`execute_flow_traced`] (per-op approval through the same envelope) → feed the
 //! result back *ephemerally* so the model can iterate (read → fix → re-run) → persist **one** assistant
 //! summary. The persisted session log is pure `user → assistant(text)` alternation: raw op outputs
 //! never re-enter history (the "don't re-send" token win), which also removes the session-shape bug
@@ -31,7 +31,7 @@ use crate::ast::DraftAst;
 use crate::compile::{compile_turn, CompileOptions, Phase, TurnOutput};
 use crate::composites::DynamicComposites;
 use crate::registry::OpRegistry;
-use crate::runtime::{execute_flow, resume_flow_with_composites};
+use crate::runtime::{execute_flow_traced, resume_flow_with_composites};
 use crate::state::FlowStore;
 
 /// flux-flow's turn engine: a provider, the tool executor (safety envelope), the unified event store
@@ -239,12 +239,13 @@ impl FlowEngine {
         let subagent_base = self.executor.evidence().by_kind("subagent.usage").count();
 
         let mut outer = crate::loop_host::SharedSink::new(channel.clone());
-        let flow_fut = execute_flow(
+        let flow_fut = execute_flow_traced(
             &self.flow,
             &self.executor,
             session_id,
             &self.agent_loop,
             &mut outer,
+            trace_loop(),
         );
         tokio::pin!(flow_fut);
 
@@ -1103,6 +1104,15 @@ const MACHINERY_OPS: &[&str] = &[
 /// iterate (`plan → run_plan → observe`) instead of only the work the inner plan performs.
 pub fn show_loop() -> bool {
     std::env::var_os("FLUX_SHOW_LOOP").is_some()
+}
+
+/// Whether the OUTER agent loop's structure is traced (A-39) — the CLI `--trace-loop`, exported as
+/// `FLUX_TRACE_LOOP` so the engine reads it without new plumbing. When set, [`execute_flow_traced`]
+/// emits one live `loop.round`/`loop.node` observation per outer-loop round/structural node
+/// executed. Scoped to the outer loop ONLY: inner `run_plan`, `flow run`, and resume paths call
+/// plain `execute_flow` and never see this flag.
+pub fn trace_loop() -> bool {
+    std::env::var_os("FLUX_TRACE_LOOP").is_some()
 }
 
 /// Drain one captured sink event onto the real sink. By default the loop-machinery tool calls/results

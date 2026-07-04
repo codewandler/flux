@@ -139,6 +139,32 @@ call fires `turn.revision` instead of `turn.iteration`:
 The machinery ops are pre-authorized engine control flow, so revealing them never adds approval
 prompts. (`-v`/`--verbose` is separate — it un-caps tool *output*; combine them for the fullest view.)
 
+## Trace the loop's structure — `--trace-loop`
+
+`--show-loop` reveals *which ops* the loop dispatches; `--trace-loop` (or `FLUX_TRACE_LOOP=1`) goes
+one level deeper and traces the loop program's own **structure** — one dim line per outer-loop round
+and per structural AST node it executes (op calls with their bind name, which `when`/`unless`/`match`
+branch was taken, `return`, and an until-guard exit) — while leaving the loop's normal output
+completely unchanged when the flag is off:
+
+```bash
+flux run --trace-loop "fix the failing test"
+```
+
+```
+⟳ round 1/25
+· plan → $plan
+· when $settled → else
+⟳ round 4/25
+· run_plan → $ran
+· match $ran.failure = null → default
+· return $answer
+```
+
+This only traces the **outer** agent loop (`agent-loop.flux`) — a plan's own internal ops still
+stream via the normal tool-call output, never through this trace. The observations are live-only:
+they never touch the value store, the run-event trail, or `/evidence`'s log.
+
 ## Inspect the evidence trail — `/evidence`
 
 The loop and the dispatcher record an audit trail as the turn runs — tool calls, tool errors,

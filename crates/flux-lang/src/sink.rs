@@ -17,4 +17,10 @@ pub trait FlowSink: Send {
     /// An audit observation made during dispatch (e.g. a destructive-command marker).
     fn observation(&mut self, _o: &flux_evidence::Observation) {}
     fn turn_end(&mut self, _usage: Option<flux_core::Usage>) {}
+    /// Whether the interpreter should emit live structural-trace observations
+    /// (`loop.round` / `loop.node`) for this execution. Default off; a host opts in
+    /// per execution via the sink it passes to `execute_flow`.
+    fn trace_structural(&self) -> bool {
+        false
+    }
 }

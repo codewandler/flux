@@ -800,6 +800,10 @@ enum SinkEvent {
 #[derive(Default)]
 struct BufferSink {
     events: Vec<SinkEvent>,
+    /// Whether this branch's structural-trace observations should be emitted (A-39) — captured from
+    /// the parent sink's [`FlowSink::trace_structural`] before the branch futures are built, since a
+    /// branch closure can't borrow the parent sink.
+    trace: bool,
 }
 
 impl BufferSink {
@@ -842,6 +846,9 @@ impl FlowSink for BufferSink {
     }
     fn turn_end(&mut self, usage: Option<Usage>) {
         self.events.push(SinkEvent::TurnEnd(usage));
+    }
+    fn trace_structural(&self) -> bool {
+        self.trace
     }
 }
 
@@ -1564,6 +1571,13 @@ fn exec_body<'a>(
                         ty: ty_label.as_deref(),
                         visibility: Visibility::Visible,
                     };
+                    // Emitted BEFORE dispatch so the trace line appears while the op (e.g. the
+                    // planner) is running, not only after it returns (A-39).
+                    trace_structural(
+                        sink,
+                        "loop.node",
+                        serde_json::json!({"node": "call", "op": op, "bind": name.0}),
+                    );
                     let outcome =
                         run_call(store, executor, session_id, op, args, Some(bind), sink).await?;
                     *steps += 1;
@@ -1581,6 +1595,11 @@ fn exec_body<'a>(
                     last_value = outcome.value_id;
                 }
                 Node::Call { op, args } => {
+                    trace_structural(
+                        sink,
+                        "loop.node",
+                        serde_json::json!({"node": "call", "op": op}),
+                    );
                     let outcome =
                         run_call(store, executor, session_id, op, args, None, sink).await?;
                     *steps += 1;
@@ -1619,6 +1638,11 @@ fn exec_body<'a>(
                     last_value = Some(vid);
                 }
                 Node::Return { value } => {
+                    let mut data = serde_json::json!({"node": "return"});
+                    if let Some(l) = var_label(value) {
+                        data["value"] = serde_json::Value::String(l);
+                    }
+                    trace_structural(sink, "loop.node", data);
                     let (content, vid) =
                         eval_return(store, executor, session_id, value, sink, steps).await?;
                     return Ok((content, vid.clone(), Step::Return(vid)));
@@ -1629,6 +1653,14 @@ fn exec_body<'a>(
                     otherwise,
                 } => {
                     let take = eval_cond(store, executor, session_id, cond, sink, steps).await?;
+                    let mut data = serde_json::json!({
+                        "node": "when",
+                        "branch": if take { "then" } else { "else" },
+                    });
+                    if let Some(l) = var_label(cond) {
+                        data["cond"] = serde_json::Value::String(l);
+                    }
+                    trace_structural(sink, "loop.node", data);
                     let branch = if take { then } else { otherwise };
                     let (blast, bvid, step) = exec_body(
                         store,
@@ -1656,7 +1688,13 @@ fn exec_body<'a>(
                     collect,
                 } => {
                     let mut repeat_collected: Vec<ValueId> = Vec::new();
-                    for _ in 0..*max {
+                    for round in 0..*max {
+                        // Otherwise-discarded round counter (A-39): 1-based, live-only.
+                        trace_structural(
+                            sink,
+                            "loop.round",
+                            serde_json::json!({"round": round + 1, "max": max}),
+                        );
                         let (blast, bvid, step) = exec_body(
                             store,
                             executor,
@@ -1684,6 +1722,16 @@ fn exec_body<'a>(
                             if eval_cond(store, executor, session_id, u, &mut *sink, &mut *steps)
                                 .await?
                             {
+                                trace_structural(
+                                    sink,
+                                    "loop.node",
+                                    serde_json::json!({
+                                        "node": "repeat",
+                                        "until_hit": true,
+                                        "rounds": round + 1,
+                                        "max": max,
+                                    }),
+                                );
                                 break;
                             }
                         }
@@ -1921,8 +1969,20 @@ fn exec_body<'a>(
                     // branch's buffered output, dispatched-step count, or binding — the audit is
                     // merged first, then the first (declaration-order) error propagates (F15). Every
                     // op still dispatches through the same envelope.
+                    // Captured before the branch futures are built (A-39): a branch closure can't
+                    // borrow `sink`, so each branch's own `BufferSink` carries the parent's opt-in
+                    // forward instead of defaulting to untraced.
+                    let trace = sink.trace_structural();
                     let futs = branches.iter().map(|b| async move {
-                        let mut buf = BufferSink::default();
+                        let mut buf = BufferSink {
+                            trace,
+                            ..Default::default()
+                        };
+                        trace_structural(
+                            &mut buf,
+                            "loop.node",
+                            serde_json::json!({"node": "parallel.branch", "name": b.name.0.clone()}),
+                        );
                         let mut s = 0usize;
                         let mut tr: Vec<String> = Vec::new();
                         let res = exec_body(
@@ -2374,6 +2434,11 @@ fn exec_body<'a>(
                     let take =
                         !eval_cond(store, executor, session_id, cond, &mut *sink, &mut *steps)
                             .await?;
+                    let mut data = serde_json::json!({"node": "unless", "entered": take});
+                    if let Some(l) = var_label(cond) {
+                        data["cond"] = serde_json::Value::String(l);
+                    }
+                    trace_structural(sink, "loop.node", data);
                     if take {
                         let (blast, bvid, step) = exec_body(
                             store,
@@ -2448,9 +2513,11 @@ fn exec_body<'a>(
                 } => {
                     let subj = eval_arg(subject, store, session_id)?;
                     let mut branch: Option<&[Node]> = None;
+                    let mut matched = false;
                     for case in cases {
                         if eval_arg(&case.value, store, session_id)? == subj {
                             branch = Some(&case.body);
+                            matched = true;
                             break;
                         }
                     }
@@ -2464,6 +2531,20 @@ fn exec_body<'a>(
                             )));
                         }
                     };
+                    let arm = if matched {
+                        format!("case {}", serde_json::to_string(&subj).unwrap_or_default())
+                    } else {
+                        "default".to_string()
+                    };
+                    let mut trace_data = serde_json::json!({
+                        "node": "match",
+                        "value": truncate_json(&subj, 60),
+                        "arm": arm,
+                    });
+                    if let Some(l) = var_label(subject) {
+                        trace_data["subject"] = serde_json::Value::String(l);
+                    }
+                    trace_structural(sink, "loop.node", trace_data);
                     let (blast, bvid, step) = exec_body(
                         store,
                         executor,
@@ -2980,6 +3061,49 @@ fn json_truthy(v: &serde_json::Value) -> bool {
         }
         serde_json::Value::Array(a) => !a.is_empty(),
         serde_json::Value::Object(o) => !o.is_empty(),
+    }
+}
+
+/// Emit a live-only structural-trace observation (`loop.round` / `loop.node`, A-39) when the sink
+/// has opted in via [`FlowSink::trace_structural`] — checked first so an opted-out sink (the
+/// default) pays no cost, not even the `data` allocation. Goes through `sink.observation` directly,
+/// never `executor.observe`, so it never touches the value store, the run-event trail, or the
+/// evidence log: it is purely a transient signal for whatever live sink is attached to this
+/// execution. Unhandled structural kinds (`each`/`retry`/`try`/`route`/`race`/`seq`/`loop`) can
+/// extend this trace with the same one-line call at their own emission site.
+fn trace_structural(sink: &mut dyn FlowSink, kind: &str, data: serde_json::Value) {
+    if !sink.trace_structural() {
+        return;
+    }
+    sink.observation(&flux_evidence::Observation::new(
+        kind,
+        flux_evidence::Phase::Turn,
+        data,
+    ));
+}
+
+/// A short `$name` label for a plain-var expression — used to annotate a `loop.node` trace line with
+/// what a cond/subject/return operated on. `None` when the expression isn't a simple var reference
+/// (e.g. `when !done`, `return "literal"`), so the trace line omits the field rather than inventing a
+/// label for it.
+fn var_label(n: &Node) -> Option<String> {
+    if let Node::Var { name } = n {
+        Some(format!("${}", name.0))
+    } else {
+        None
+    }
+}
+
+/// The JSON text of `v`, truncated (char-safe) to `max` characters — keeps a `loop.node` `match`
+/// trace line legible even when the subject is a long string/object (A-39).
+fn truncate_json(v: &serde_json::Value, max: usize) -> String {
+    let s = serde_json::to_string(v).unwrap_or_default();
+    if s.chars().count() <= max {
+        s
+    } else {
+        let mut truncated: String = s.chars().take(max).collect();
+        truncated.push('…');
+        truncated
     }
 }
 
@@ -4360,7 +4484,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    use crate::ast::{Node, RunEvent, SymbolName, Value, Visibility};
+    use crate::ast::{Branch, Node, RunEvent, SymbolName, Value, Visibility};
     use crate::opspec::{OpCatalog, OpSignature};
     use crate::store::MemStore;
 
@@ -7937,6 +8061,242 @@ mod tests {
         assert_eq!(
             out.result, "outer",
             "the outer binding is restored past the loop"
+        );
+    }
+
+    // ---- A-39: flag-gated structural trace of the outer agent loop ----
+
+    /// The op catalog for [`TraceHost`]: two zero-arg ops, `plan` and `check_done`.
+    struct TraceCat;
+    impl OpCatalog for TraceCat {
+        fn lookup(&self, name: &str) -> Option<OpSignature> {
+            matches!(name, "plan" | "check_done").then(|| OpSignature {
+                name: name.into(),
+                description: String::new(),
+                effects: Vec::new(),
+                risk: flux_spec::Risk::Low,
+                idempotency: flux_spec::Idempotency::Idempotent,
+                required_params: Vec::new(),
+                optional_params: Vec::new(),
+                param_types: Default::default(),
+            })
+        }
+    }
+
+    /// A host used only to drive the structural-trace tests: `plan` always succeeds (echoing a fixed
+    /// string), and `check_done` reports `"false"` the first time it's dispatched and `"true"` every
+    /// time after — letting a `repeat ... until $check_done()` guard trip deterministically on a known
+    /// round without the test needing to see the (currently discarded) loop counter itself.
+    struct TraceHost {
+        cat: TraceCat,
+        checks: AtomicUsize,
+    }
+    impl TraceHost {
+        fn new() -> Self {
+            TraceHost {
+                cat: TraceCat,
+                checks: AtomicUsize::new(0),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl OpHost for TraceHost {
+        async fn dispatch(&self, op: &str, _input: serde_json::Value) -> OpOutcome {
+            match op {
+                "check_done" => {
+                    let n = self.checks.fetch_add(1, Ordering::SeqCst) + 1;
+                    OpOutcome::ok(if n >= 2 { "true" } else { "false" })
+                }
+                _ => OpOutcome::ok("planned"),
+            }
+        }
+        fn catalog(&self) -> &dyn OpCatalog {
+            &self.cat
+        }
+        async fn request_approval(
+            &self,
+            _label: &str,
+            _intents: &flux_spec::IntentSet,
+        ) -> ApprovalChoice {
+            ApprovalChoice::Allow
+        }
+        fn trim_output(&self, view: String, _op: &str) -> String {
+            view
+        }
+    }
+
+    /// An agent-loop-shaped body: a bind-of-call (`$plan = plan()`), a `match` that falls through to
+    /// its `default` arm, and a `when` whose condition is truthy — wrapped in a `repeat 2 until
+    /// check_done()`, followed by a top-level `return`.
+    fn trace_body() -> Vec<Node> {
+        vec![
+            flow_bind("kind", flow_lit(json!("chat"))),
+            Node::Repeat {
+                max: 2,
+                until: Some(Box::new(call("check_done", vec![]))),
+                body: vec![
+                    flow_bind("plan", call("plan", vec![])),
+                    Node::Match {
+                        subject: Box::new(flow_var("kind")),
+                        cases: vec![crate::ast::MatchCase {
+                            value: flow_lit(json!("other")),
+                            body: vec![],
+                        }],
+                        default: vec![Node::Peek {
+                            name: SymbolName("kind".into()),
+                        }],
+                    },
+                    Node::When {
+                        cond: Box::new(flow_var("kind")),
+                        then: vec![],
+                        otherwise: vec![],
+                    },
+                ],
+                collect: None,
+            },
+            Node::Return {
+                value: Box::new(flow_var("plan")),
+            },
+        ]
+    }
+
+    /// The observation `(kind, data)` pairs a [`BufferSink`] recorded, in order.
+    fn observations(sink: BufferSink) -> Vec<(String, serde_json::Value)> {
+        sink.events
+            .into_iter()
+            .filter_map(|e| match e {
+                SinkEvent::Observation(o) => Some((o.kind, o.data)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn structural_trace_emits_rounds_branches_calls_and_return_when_sink_opts_in() {
+        let host = TraceHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: trace_body(),
+            ..Default::default()
+        };
+        let mut sink = BufferSink {
+            trace: true,
+            ..Default::default()
+        };
+        let out = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(out.result, "planned");
+
+        let obs = observations(sink);
+        let kinds: Vec<&str> = obs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "loop.round",
+                "loop.node", // call: plan
+                "loop.node", // match: default
+                "loop.node", // when: then
+                "loop.round",
+                "loop.node", // call: plan
+                "loop.node", // match: default
+                "loop.node", // when: then
+                "loop.node", // repeat: until-hit
+                "loop.node", // return
+            ],
+            "unexpected trace shape: {obs:?}"
+        );
+
+        assert_eq!(obs[0].1, json!({"round": 1, "max": 2}));
+        assert_eq!(
+            obs[1].1,
+            json!({"node": "call", "op": "plan", "bind": "plan"})
+        );
+        assert_eq!(
+            obs[2].1,
+            json!({"node": "match", "subject": "$kind", "value": "\"chat\"", "arm": "default"})
+        );
+        assert_eq!(
+            obs[3].1,
+            json!({"node": "when", "cond": "$kind", "branch": "then"})
+        );
+        assert_eq!(obs[4].1, json!({"round": 2, "max": 2}));
+        assert_eq!(
+            obs[5].1,
+            json!({"node": "call", "op": "plan", "bind": "plan"})
+        );
+        assert_eq!(
+            obs[6].1,
+            json!({"node": "match", "subject": "$kind", "value": "\"chat\"", "arm": "default"})
+        );
+        assert_eq!(
+            obs[7].1,
+            json!({"node": "when", "cond": "$kind", "branch": "then"})
+        );
+        assert_eq!(
+            obs[8].1,
+            json!({"node": "repeat", "until_hit": true, "rounds": 2, "max": 2})
+        );
+        assert_eq!(obs[9].1, json!({"node": "return", "value": "$plan"}));
+    }
+
+    /// The zero-default-output invariant, pinned at the emission gate: the identical flow run with a
+    /// default (opted-out) sink emits NO trace observations at all.
+    #[tokio::test]
+    async fn structural_trace_is_silent_by_default() {
+        let host = TraceHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: trace_body(),
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        let obs = observations(sink);
+        assert!(
+            obs.is_empty(),
+            "a default sink must never see a trace observation: {obs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn structural_trace_emits_one_parallel_branch_event_per_branch_in_order() {
+        let host = TraceHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![Node::Parallel {
+                branches: vec![
+                    Branch {
+                        name: SymbolName("left".into()),
+                        body: vec![],
+                    },
+                    Branch {
+                        name: SymbolName("right".into()),
+                        body: vec![],
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+        let mut sink = BufferSink {
+            trace: true,
+            ..Default::default()
+        };
+        execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        let obs = observations(sink);
+        let branch_names: Vec<&str> = obs
+            .iter()
+            .filter(|(k, _)| k == "loop.node")
+            .filter_map(|(_, d)| d.get("name").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(
+            branch_names,
+            vec!["left", "right"],
+            "each branch's parallel.branch event fires exactly once, in declaration order: {obs:?}"
         );
     }
 }
