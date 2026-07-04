@@ -65,7 +65,7 @@ follow are hand-written.
 | `unless` | Negated conditional: run `body` only when `cond` is falsey. Sugar for `when !cond`; the body may contain any nodes (reads, writes, sub-plans — anything). |
 | `verify` | Run a command and assert its output contains an expected substring; abort the flow with a structured error if it does not. `cmd` is any node that produces a string (typically a `bash` call); `expect` is the substring the output must contain. |
 | `return` | End the flow with a value. |
-| `peek` | Read the current in-session value of a named symbol without any filesystem IO. Returns the symbol's stored value, or null if the symbol is not yet bound. |
+| `peek` | Read the current in-session value of a named symbol without any filesystem IO. Returns the symbol's stored value, or an empty string if the symbol is not yet bound. |
 | `var` | Reference a bound symbol. |
 | `lit` | A literal value (raw JSON, as written in the AST by the compiler front-end). |
 | `thing` | A reference to an external thing. |
@@ -371,6 +371,7 @@ runs `body`. An optional `collect` symbol gathers the per-iteration results into
 | `as` | string | yes | element symbol bound on each iteration |
 | `body` | Node[] | no | per-element body |
 | `collect` | string | no | symbol bound to the list of per-iteration results |
+| `flat` | bool | no | with `collect`, flattens the per-iteration lists (each must be a list) into one combined list |
 
 `in` must evaluate to a list; any other type is a runtime error.
 

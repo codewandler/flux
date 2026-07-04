@@ -3,7 +3,7 @@ id: D-13
 title: Generated plugin skill — `flux plugin skill`
 pillar: Core
 status: done
-design: docs/designs/plugin-skill-generation.md
+design: docs/archive/designs/plugin-skill-generation.md
 note: renders installed-plugin manifests into a Claude-format `flux-plugin` SKILL.md + `references/` (the flux analogue of fluxplane's `fluxplane-plugin skill`); now also exposed through `flux skill plugin`
 ---
 
@@ -37,7 +37,7 @@ sync with what is installed, with no hand-maintained catalog.
   `flux plugin blob`-style skill cache; progressive `references/` auto-load (L-02).
 
 ## Notes
-- Design: [plugin-skill-generation.md](../designs/plugin-skill-generation.md). Epic:
+- Design: [plugin-skill-generation.md](../archive/designs/plugin-skill-generation.md). Epic:
   [fluxplane-plugins-parity.md](../designs/integration-plugins.md).
 - Touch points: `crates/flux-markdown/src/frontmatter.rs` (+ `lib.rs`), `crates/flux-cli/src/main.rs`
   (`PluginAction`, `run_plugin`).

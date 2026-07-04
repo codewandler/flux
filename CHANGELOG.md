@@ -28,6 +28,32 @@ All notable changes to this project are documented in this file. The format is b
   pricing-independent. New "Convergence guards" section in `docs/agent-loop.md` documents the
   whole ladder family.
 
+### Fixed
+
+- **Docs accuracy sweep — every claim re-verified against the code.** A six-way audit of the
+  committed docs (canon, operational, language, designs, plugins, self-improvement) surfaced ~80
+  verified inaccuracies; all fixed. Highlights: `docs/usage.md` no longer claims destructive ops
+  "always re-confirm / can't be bypassed" (false under `--yes`, which installs an allow-all
+  approver, and for steps already disclosed in an approved plan); `plugins/README.md` +
+  `AUTHORING.md` no longer teach the bare `flux plugin install` scan (now an error) or the deleted
+  `endpoint` URL-handback capability — they document the verified remote install + trust ladder,
+  the full capability set (`conn.authenticate`/`credential`/`fs.read`/`discover`/`config`), and
+  the `*_ref` reference-addressed host methods; `docs/roadmap.md` caught up from v0.2.4 to
+  v0.2.15 reality (eight shipped epics marked shipped, new plugin-distribution section with
+  D-48/D-49 as next, node-kind counts corrected to 43); `docs/model.md` records Bedrock streaming
+  as the wire, marks `--think`/`--effort` as unwired no-ops, and routes GLM guidance at
+  `openrouter-anthropic/z-ai/glm-4.6`; `docs/a2a.md` documents the C-18 session TTL sweep and
+  rich `data` reply parts; the self-improvement docs demote the saturated synthetic suite to
+  regression floor and fix `flow.db`→`events.db`; the flux-lang docs fix the `peek` contract
+  (empty string, not null — corrected at the `ast.rs` source and regenerated into the guarded
+  blocks), the retry `delay` default (500 ms), the missing `each.flat` row, and gain a
+  module-declarations section covering `secret "ENV"`; `docs/architecture.md`/`AGENTS.md` crate
+  tables now cover all 33 crates and the envelope chain includes the capability-scope floor;
+  design docs got truthful Status lines (stream-resilience and openrouter-reported-cost →
+  implemented v0.2.15; plugin-distribution → core shipped v0.2.14) and two fully-realized designs
+  (`plugin-skill-generation.md`, `session-s251-postmortem.md`) moved to `docs/archive/designs/`
+  with every inbound link repointed.
+
 ## [0.2.15] - 2026-07-04
 
 ### Added
@@ -1272,7 +1298,7 @@ All notable changes to this project are documented in this file. The format is b
   forwarded query) so the structured path is reachable without hand-parsing. The `namespace=latest`
   ambiguity is also fixed: the free-text `query`-substring "newest namespace" heuristic is retired —
   only `latest_namespace: true` triggers it, and a literal namespace named `latest` is just
-  `namespace: "latest"`. See [docs/designs/session-s251-postmortem.md](docs/designs/session-s251-postmortem.md).
+  `namespace: "latest"`. See [docs/archive/designs/session-s251-postmortem.md](docs/archive/designs/session-s251-postmortem.md).
 
 - **`ctx` context packs no longer drop the working set on a single oversized member (L-08).** The
   `ctx`/`ctx_append` packer in `flux-lang` packed members greedily with a hard `break` on the first
@@ -1282,7 +1308,7 @@ All notable changes to this project are documented in this file. The format is b
   death spiral). It now **drops the oversized member and continues packing** the rest, while keeping
   the visibility-tier priority (`Pinned` > `Visible` > …, no rank inversion). Prompt caching is
   unaffected: the `Ctx` value is a per-iteration tool result, never the cached system prompt. See
-  [docs/designs/session-s251-postmortem.md](docs/designs/session-s251-postmortem.md).
+  [docs/archive/designs/session-s251-postmortem.md](docs/archive/designs/session-s251-postmortem.md).
 
 ### Changed
 

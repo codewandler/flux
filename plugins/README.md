@@ -25,7 +25,9 @@ plugin protocol, serviced by flux's guarded host (the same safety boundary as th
 - **http** — method/headers/body; the host injects auth per the declared `AuthScheme`
   (Bearer/Basic/Header/Query) so the plugin never sees the raw token; binary bodies via
   `body_b64`/`response_binary` (byte-exact up/download).
-- **endpoint** — a named base URL resolved from declared env keys.
+- **endpoint (by reference)** — endpoints are declared in the manifest and addressed **by
+  reference** (`http_ref`/`get_json_ref`/`send_json_ref`/`conn_dial_ref`): the host resolves the
+  base URL from declared env keys and puts it on the wire; the plugin never sees the URL.
 - **process** — an allow-listed subprocess (e.g. `kubectl`), run to completion or as a long-lived
   host-managed background child (`process.spawn`/`read`/`status`/`kill`, e.g. `kubectl port-forward`).
 - **conn** — a guarded raw TCP/Unix byte stream (`conn.dial`/`read`/`write`/`close`) for non-HTTP
@@ -40,9 +42,10 @@ endpoints, and datasources it uses; the host denies anything undeclared (deny-by
 ## `host-kit`
 
 The shared SDK (`host-kit/`) wraps the guest protocol so a plugin is mostly "declare ops + implement each
-against a vendor API": a typed [`Host`] (`secret`/`endpoint`/`http`/`get_json`/`send_json`/`run`/
-`contribute`), a `PluginBuilder` (collect a manifest + op closures, then `serve()`), `read_op`/`write_op`
-spec helpers, and a `MockHost` for hermetic unit tests. See `gitlab/src/main.rs` for the reference shape.
+against a vendor API": a typed [`Host`] (`secret`/`http`/`get_json`/`send_json` + their `*_ref`
+endpoint-reference forms/`run`/`contribute`), a `PluginBuilder` (collect a manifest + op closures, then
+`serve()`), `read_op`/`write_op` spec helpers, and a `MockHost` for hermetic unit tests. See
+`gitlab/src/main.rs` for the reference shape.
 
 ## The pack
 
@@ -72,15 +75,33 @@ The **Surface** column is indicative; each plugin now carries its fluxplane coun
 
 ## Installing + invoking plugins
 
-Build the binaries, then register them as descriptors under `~/.flux/plugins/<name>.toml`:
+**Verified remote install** (the primary path) — install from the signed `plugins-v*` pack release,
+no source tree needed:
+
+```
+flux plugin install gitlab slack         # newest pack release (or gitlab@<version> for an exact one)
+flux plugin install --all                # the whole pack
+```
+
+The release's `plugins-index.json` is minisign-verified against the public key embedded in flux
+(fail-closed — there is no bypass flag), and every archive's sha256 is checked against the verified
+index before it is unpacked into the versioned store `~/.flux/plugins/bin/<name>/<version>/`.
+`flux plugin pin <name> <version>` / `flux plugin rollback <name>` set/clear a version pin,
+`flux plugin uninstall <name>` removes a plugin, and `flux plugin status [<name>]` inspects
+liveness + declared surface.
+
+**Dev-local builds** — build the binaries, then register them (local, unverified — no version/hash
+recorded) as descriptors under `~/.flux/plugins/<name>.toml`:
 
 ```
 cd plugins && cargo build --release      # → plugins/target/release/flux-plugin-<name>
-flux plugin install                      # register every built flux-plugin-* binary (one-shot)
+flux plugin install --dir plugins/target/release   # register every built flux-plugin-* binary
 #  …or one at a time:
 flux plugin add gitlab  /abs/path/to/flux-plugin-gitlab
 flux plugin ls                           # list installed plugins
 ```
+
+Bare `flux plugin install` (no names, no `--all`, no `--dir`) is an error — it no longer guesses.
 
 `flux` discovers them at startup (`flux run`, `flux app run`) and projects each declared operation as a
 policy-gated tool; the agent's grants decide which ops it may call.

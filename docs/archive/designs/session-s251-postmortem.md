@@ -1,11 +1,14 @@
 # Session `s_251` post-mortem — `ctx`-pack eviction & endpoint-discovery alias resolution
 
+**Status:** shipped — point-in-time postmortem; both child stories done
+([L-08](../../stories/L-08-ctx-pack-eviction.md), [D-33](../../stories/D-33-endpoint-discovery-aliases.md))
+
 **Epic.** Two compounding defects surfaced in stream `s_251` (`openai/gpt-5.5`, 2026-06-30): an
 `endpoint.discover` "check db connectivity" turn that returned `{"candidates": []}`, and the
 follow-up "analyze why it's broken" turn that **looped 7 iterations and was cancelled**. The two
 defects are independent — either can fail on its own — but together they produced the death spiral.
 This design captures the evidence and the fix shape for both child stories
-([L-08](../stories/L-08-ctx-pack-eviction.md) and [D-33](../stories/D-33-endpoint-discovery-aliases.md)).
+([L-08](../../stories/L-08-ctx-pack-eviction.md) and [D-33](../../stories/D-33-endpoint-discovery-aliases.md)).
 
 ## Evidence base
 
@@ -83,7 +86,7 @@ the budget to exceed 493k, which it never did. One shrink (#3, 120k) kept 9 code
 pack happened to declare the code reads **before** the giant evidence bind — so survival is random
 w.r.t. value.
 
-### Fix shape (story [L-08](../stories/L-08-ctx-pack-eviction.md))
+### Fix shape (story [L-08](../../stories/L-08-ctx-pack-eviction.md))
 
 Two independent changes to `build_ctx`, both small:
 
@@ -175,7 +178,7 @@ the newest by `metadata.creationTimestamp`. The agent's own `ai.reason` (seq 153
 `discover_db_secrets` (line 949) then searched *that* newest namespace's Secrets for a host-like key
 + a password key + a crossplane/RDS-ish name, found none, and returned `{"candidates": []}`.
 
-### Fix shape (story [D-33](../stories/D-33-endpoint-discovery-aliases.md))
+### Fix shape (story [D-33](../../stories/D-33-endpoint-discovery-aliases.md))
 
 Depends on the in-flight **positional-args → kwargs** work in the kubernetes plugin: the structured
 form should carry `cluster` and `namespace` as **named fields**, not positional args. Then:

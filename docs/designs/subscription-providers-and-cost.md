@@ -14,7 +14,7 @@ Consolidated docs, in narrative order:
 
 # Design: subscription providers (claude-code + codex) & cross-provider usage/cost
 
-**Status:** planned · **Pillar:** Core · **Layer:** L1 (`flux-provider`/`flux-providers`/`flux-credentials`)
+**Status (at merge; since shipped):** planned (epic completed 2026-07-02 — C-03–C-08 all done) · **Pillar:** Core · **Layer:** L1 (`flux-provider`/`flux-providers`/`flux-credentials`)
 + L0 (`flux-core`) + L2 (`flux-events`) + L6 (`flux-cli`/`flux-tui`/`flux-server`) · **Owner:** Timo ·
 **Stories:** [C-03](../stories/C-03-codex-provider-hardening.md) ·
 [C-04](../stories/C-04-claude-401-refresh.md) · [C-05](../stories/C-05-pricing-cost-model.md) ·

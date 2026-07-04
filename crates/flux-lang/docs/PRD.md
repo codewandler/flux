@@ -22,23 +22,24 @@ description: >-
 
 **Status (shipped).** Flux-Lang is now its own **L0 crate** (`crates/flux-lang`): the typed AST, the
 renderer, the analyzer (against an abstract op catalog), a schemars-driven JSON Schema and the
-generated language skill, a `fluxlang` CLI (`skill`/`schema`/`render`), and a **reference interpreter**
+generated language skill, a `fluxlang` CLI (`skill`/`schema`/`render`/`compile`), and a **reference interpreter**
 that runs a flow against injected `host`/`store`/`sink` traits. The `flux-flow` engine adapts its safety
 envelope onto those traits. The rest of this document is the original source-of-record design.
 
-**Roadmap (near-term), in priority order:**
+**Roadmap (near-term) — all four items have since shipped.** The living tracker is
+[`STATUS.md`](STATUS.md) (§ "Near-term roadmap"); in the original priority order:
 
-1. **Two writable display modes.** Flux-Lang authoring is JSON-on-the-wire today; next is a pair of
-   round-trippable concrete syntaxes:
-   - a **human-readable** form (see [`syntax.md`](syntax.md)) people can read and write, and
-   - a **token-efficient low-level** form optimized for model context — the form we may later
-     **fine-tune a dedicated model** to emit natively.
-2. **`fluxlang compile`** — a parser (text → AST) with **auto-detection** across the input forms
-   (JSON / human / token-efficient), complementing the existing one-way renderer.
-3. **Richer `analyze`** — type and effect checking over the whole flow (the analyzer is name/grammar/
-   bounded-loop today), lowering `DraftAst` → typed `HirFlow`.
-4. **Op-input schema** — project `OpSpec`'s typed, named inputs to a real JSON Schema (today
-   `OpSpec::lower()` ships a placeholder `{"type":"object"}`).
+1. **Two writable display modes — ✅ done.** The round-trippable **human-readable** text syntax
+   shipped (`parse.rs`/`format.rs`, `parse(format(ast)) == ast`; see [`syntax.md`](syntax.md));
+   the **token-efficient** form shipped as the display-only `format_compact` (a model fine-tuned
+   to emit it natively remains an open direction).
+2. **`fluxlang compile` — ✅ done.** Text → AST, wired onto `parse` (`bin/fluxlang.rs`). It reads
+   Flux-Lang text only; the once-planned auto-detection across input forms did not land.
+3. **Richer `analyze` — ✅ done (P4).** `analyze::lower` lowers `DraftAst` → typed `HirFlow` with
+   effect gathering, call arity, and argument type-checking.
+4. **Op-input schema — ✅ done (P0).** `OpSpec`'s typed, named inputs project to a real JSON Schema
+   object via `OpSpec::lower()`/`input_schema()` (`opspec.rs`); the `{"type":"object"}` placeholder
+   is gone.
 
 ## 1. Executive Summary
 

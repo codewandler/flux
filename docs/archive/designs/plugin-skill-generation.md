@@ -1,9 +1,9 @@
 # Design: generated plugin skill — `flux plugin skill` (D-13)
 
-**Status:** shipped; generalized by [generated-flux-skills.md](generated-flux-skills.md) ·
+**Status:** shipped; generalized by [generated-flux-skills.md](../../designs/generated-flux-skills.md) ·
 **Pillar:** Core · **Layer:** L6 (`flux-cli`) + L0 (`flux-markdown` writer) ·
-**Owner:** Timo · **Story:** [D-13](../stories/D-13-plugin-skill-command.md) ·
-**Epic:** [fluxplane-plugins-parity.md](integration-plugins.md)
+**Owner:** Timo · **Story:** [D-13](../../stories/D-13-plugin-skill-command.md) ·
+**Epic:** [fluxplane-plugins-parity.md](../../designs/integration-plugins.md)
 
 ## Why
 
@@ -79,7 +79,7 @@ purpose), keeping the always-injected `SKILL.md` body small.
 
 ## Non-goals
 - A general `flux skill` command surface was out of scope for D-13, then shipped later in
-  [L-07](../stories/L-07-generated-flux-skills.md).
+  [L-07](../../stories/L-07-generated-flux-skills.md).
 - Auto-regeneration on install/auth-change (fluxplane does this) — `refresh` is manual for now.
-- Progressive-disclosure auto-loading of `references/` — that is [L-02](../stories/L-02-flux-markdown-engine.md);
+- Progressive-disclosure auto-loading of `references/` — that is [L-02](../../stories/L-02-flux-markdown-engine.md);
   here the agent `read`s a reference on demand.

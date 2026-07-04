@@ -140,6 +140,10 @@ Response — the `result` is a `Task`:
 }
 ```
 
+The reply message always carries the answer as a `text` part; an agent surface may append spec
+`data` parts beside it (typed payloads, e.g. UI blocks a chat client renders natively) — clients
+that only read text can ignore them.
+
 ### `message/stream` — streaming (SSE)
 
 Runs one flux turn and streams `TaskStatusUpdate` events as Server-Sent Events. Each SSE frame is a
@@ -225,5 +229,7 @@ whether accessed directly or through a reverse proxy.
 - The discovery card and `/health` are the only routes exempt from auth. This is structural
   (registered outside the middleware layer), not a path-string comparison, so percent-encoding
   tricks cannot bypass it.
-- Each A2A task creates a fresh session (stateless mode). Sessions are not currently pruned
-  automatically — see the TODO in `a2a.rs` if you are running at high volume.
+- Each A2A task creates a fresh session (stateless mode). Sessions minted by the A2A surface are
+  pruned lazily: every mint first sweeps A2A sessions whose last activity is older than
+  `[server] a2a_session_ttl_secs` in `.flux/config.toml` (default `3600` = 1 hour; `0` = never
+  prune). Only A2A-minted sessions are eligible — CLI/TUI sessions are never swept.

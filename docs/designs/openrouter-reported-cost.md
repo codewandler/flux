@@ -1,6 +1,6 @@
 # Design: OpenRouter reported cost — price turns from the provider's own `cost`
 
-**Status:** designed 2026-07-04 · **Pillar:** Core · **Stories:** [C-34](../stories/C-34-openrouter-reported-cost.md)
+**Status:** implemented (C-34 done, `39f7f13`; released v0.2.15) · **Pillar:** Core · **Stories:** [C-34](../stories/C-34-openrouter-reported-cost.md)
 
 Extends [subscription providers & cost](subscription-providers-and-cost.md) (C-05 pricing model /
 C-06 accounting): that epic *measures* usage and prices it from a static table; this story makes

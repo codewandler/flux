@@ -1,6 +1,6 @@
 # Design: Stream resilience — provider bytes never kill a turn
 
-**Status:** designed 2026-07-04 · **Pillar:** Agent · **Stories:** [A-33](../stories/A-33-stream-decode-backstop.md) · [A-34](../stories/A-34-openai-wire-envelope-tolerance.md) · [A-35](../stories/A-35-messages-wire-envelope-tolerance.md) · [A-36](../stories/A-36-bedrock-frame-decode.md) · [A-37](../stories/A-37-parse-enforcement.md) · [A-38](../stories/A-38-planner-trace.md)
+**Status:** implemented 2026-07-04 (A-33–A-38 all done; committed `5d7b947`/`39f7f13`, released v0.2.15) · **Pillar:** Agent · **Stories:** [A-33](../stories/A-33-stream-decode-backstop.md) · [A-34](../stories/A-34-openai-wire-envelope-tolerance.md) · [A-35](../stories/A-35-messages-wire-envelope-tolerance.md) · [A-36](../stories/A-36-bedrock-frame-decode.md) · [A-37](../stories/A-37-parse-enforcement.md) · [A-38](../stories/A-38-planner-trace.md)
 
 Wave 2 of [parse resilience](parse-resilience.md) (that epic stays closed — its scope was tool-args;
 this one is everything around them).

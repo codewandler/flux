@@ -535,7 +535,7 @@ pub enum Node {
     /// End the flow with a value.
     Return { value: Box<Node> },
     /// Read the current in-session value of a named symbol without any filesystem IO.
-    /// Returns the symbol's stored value, or null if the symbol is not yet bound.
+    /// Returns the symbol's stored value, or an empty string if the symbol is not yet bound.
     Peek { name: SymbolName },
     /// Reference a bound symbol.
     Var { name: SymbolName },

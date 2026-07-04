@@ -5,7 +5,9 @@ is finished, superseded, or a point-in-time snapshot. For the current picture se
 [docs map](../README.md).
 
 - **`designs/`** — designs whose work has **landed**; the shipped behavior is documented in the living
-  docs. (e.g. `bash-replacement.md` — generic `bash` is now opt-in with dedicated ops.)
+  docs. (e.g. `bash-replacement.md` — generic `bash` is now opt-in with dedicated ops;
+  `plugin-skill-generation.md` — shipped, generalized by the living `designs/generated-flux-skills.md`;
+  `session-s251-postmortem.md` — point-in-time postmortem, both child stories L-08/D-33 done.)
 - **`notes/`** — historical working notes and finished backlogs (`next-2026-06.md`, `improvements.md`,
   `dogfood-notes.md`).
 - **`research/`** — a competitive-landscape and system-prompt **snapshot** from project inception;

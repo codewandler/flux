@@ -40,7 +40,7 @@ Flux-Lang is the planning language for this project. The LLM has no directly-cal
 | `unless` | Negated conditional: run `body` only when `cond` is falsey. Sugar for `when !cond`; the body may contain any nodes (reads, writes, sub-plans — anything). |
 | `verify` | Run a command and assert its output contains an expected substring; abort the flow with a structured error if it does not. `cmd` is any node that produces a string (typically a `bash` call); `expect` is the substring the output must contain. |
 | `return` | End the flow with a value. |
-| `peek` | Read the current in-session value of a named symbol without any filesystem IO. Returns the symbol's stored value, or null if the symbol is not yet bound. |
+| `peek` | Read the current in-session value of a named symbol without any filesystem IO. Returns the symbol's stored value, or an empty string if the symbol is not yet bound. |
 | `var` | Reference a bound symbol. |
 | `lit` | A literal value (raw JSON, as written in the AST by the compiler front-end). |
 | `thing` | A reference to an external thing. |

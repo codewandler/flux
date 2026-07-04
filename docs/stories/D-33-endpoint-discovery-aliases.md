@@ -5,7 +5,7 @@ pillar: Agent
 status: done
 priority:
 epic: session-s251-postmortem
-design: docs/designs/session-s251-postmortem.md
+design: docs/archive/designs/session-s251-postmortem.md
 note: "dev" isn't a kubeconfig context (it's a full EKS ARN); the broker never relays cluster/namespace; and "namespace=latest" is ambiguous with the newest-namespace heuristic
 ---
 
@@ -84,7 +84,7 @@ point, not a manual-recovery puzzle.
 
 ## Notes
 
-- Root cause + evidence in [docs/designs/session-s251-postmortem.md](../designs/session-s251-postmortem.md)
+- Root cause + evidence in [docs/archive/designs/session-s251-postmortem.md](../archive/designs/session-s251-postmortem.md)
   §Defect 2. The model manually recovered via `kubernetes.cluster.list()` then hardcoded the ARN
   (`s_251` plan @seq 38); that manual step should become unnecessary.
 - **Depends on the in-flight positional-args → kwargs work** in the kubernetes plugin: the structured

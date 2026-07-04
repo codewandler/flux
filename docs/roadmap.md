@@ -1,7 +1,7 @@
 # flux — roadmap & status
 
-Status as of **0.2.4 (2026-06-25)**: public + installable at
-[codewandler/flux](https://github.com/codewandler/flux); 31 crates, **450+ tests**, a permanently green
+Status as of **0.2.15 (2026-07-04)**: public + installable at
+[codewandler/flux](https://github.com/codewandler/flux); 33 crates, **1100+ tests**, a permanently green
 gate (tests, clippy `-D warnings`, fmt, the `flux-codegate` layering lint). See
 [CHANGELOG.md](../CHANGELOG.md) for the released history and [architecture.md](architecture.md) for the
 design.
@@ -70,6 +70,31 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 (`FLUX_EMBEDDINGS_API_KEY`); its rerank logic is covered by the default-build unit test.
 
 ## Next
+
+### Plugin distribution (epic) — **channel + verified install shipped 2026-07-03; D-48/D-49 are the live next stories**
+
+A flux user without the source tree had no way to obtain the integration plugin pack.
+[D-21](stories/D-21-plugin-distribution.md) scoped the answer — **fetch-on-install from a signed
+first-party pack channel** (bundling was rejected on coupling, not size) — and both sides shipped:
+[D-46](stories/D-46-plugin-pack-release-pipeline.md) built the supply side (a `workflow_dispatch`
+release pipeline packaging per-plugin per-target archives + a minisign-signed `plugins-index.json`
+into `plugins-v*` GitHub releases; **plugins-v0.1.0 published 2026-07-03 with 87 signed assets**),
+and [D-47](stories/D-47-remote-plugin-install.md) the demand side (released in 0.2.14): remote
+`flux plugin install <name>[@version]` resolves the `plugins-v` release, verifies the signed index
+(embedded pubkey, no skip flag), sha256-checks every archive before anything executes, and unpacks
+into the versioned store `~/.flux/plugins/bin/<name>/<version>/` — live-verified with
+`flux plugin install gitlab`. Epic design: [plugin-distribution.md](designs/plugin-distribution.md).
+The board's only two `ready` stories complete the trust ladder:
+
+- **[D-48](stories/D-48-enforceable-pin-rollback.md) — Enforced pin/rollback** · *Core, ready.* Turn
+  `flux plugin pin`/`rollback` from advisory labels into supply-chain statements: pin fetches through
+  the verified D-47 path, repoints the descriptor, and records the hash; rollback is an offline flip
+  to `previous`; the recorded sha256 is re-verified before **every** spawn (drift = hard refusal),
+  with `status` gaining the verification column.
+- **[D-49](stories/D-49-plugin-naming-docs-pass.md) — Plugin naming + docs truth pass** · *Core,
+  ready.* Apply the canonical trio vocabulary everywhere user-facing — the protocol *crate*
+  (`flux-plugin`) vs the plugin *pack* (`flux-plugin-<name>` binaries) vs the *CLI* (`flux plugin …`)
+  — and document the remote install path now that it ships (the C-16/L-19 docs-truth pattern).
 
 ### Stream resilience + provider-reported cost (epic) — **shipped 2026-07-04 (7/7, full gate green, live-verified)**
 
@@ -140,7 +165,7 @@ release and the plugin platform (D-46..D-49) are explicitly out. Each ships with
 in its Acceptance; order: correctness/security → enforcement/durability → hygiene. Epic design:
 [library-hardening.md](designs/library-hardening.md).
 
-### Review hardening (epic) — 0.2.11 diff-review residuals
+### Review hardening (epic) — 0.2.11 diff-review residuals — **shipped 2026-07-03 (12/12, released 0.2.12)**
 
 An xhigh workflow-backed code review of the 0.2.11 diff (2026-07-03, 192 changed files: six finder angles
 → 38 candidates → an independent verifier per (file, line) → 15 reported) surfaced a batch of residual
@@ -172,7 +197,7 @@ swallowing a spaced thematic break ([L-34](stories/L-34-markdown-parser-thematic
 with the failing-first test named in its Acceptance; order: security/correctness → robustness → hygiene.
 Epic design: [review-hardening.md](designs/review-hardening.md).
 
-### flux-lang v1 hardening (epic)
+### flux-lang v1 hardening (epic) — **shipped 2026-07-02 (C-17 + L-15..L-19 + the L-21 residual burn-down, gate green)**
 
 A full review of the language pillar (2026-07-02: three scoped deep-dives plus first-hand
 parser/spec reading and empirical round-trip probes) confirmed the architecture but surfaced 27
@@ -190,9 +215,10 @@ Epic design: [flux-lang-v1-hardening.md](designs/flux-lang-v1-hardening.md). Sto
 [L-16](stories/L-16-analyzer-contract-completion.md) (analyzer contract) ·
 [L-17](stories/L-17-runtime-semantics-hardening.md) (runtime semantics) ·
 [L-18](stories/L-18-roundtrip-totality-parser-locators.md) (round-trip totality) ·
-[L-19](stories/L-19-flux-lang-docs-truth-pass.md) (spec truth pass).
+[L-19](stories/L-19-flux-lang-docs-truth-pass.md) (spec truth pass) ·
+[L-21](stories/L-21-flux-lang-v1-residual-burndown.md) (residual burn-down).
 
-### Endpoint discovery & brokerage (epic) — **new top priority**
+### Endpoint discovery & brokerage (epic) — **shipped 2026-07-02 (8/8 incl. D-31/D-32, gate green)**
 
 flux's plugins each talk to a single, statically-configured service; the fluxplane pack they were modelled on
 had **cross-plugin endpoint discovery**, which flux deferred in
@@ -205,10 +231,12 @@ so neither the plugin nor the LLM ever sees a secret value. Over that, the kuber
 endpoint **provider** (kubeconfig contexts → clusters; in-cluster services → prometheus/loki/grafana/
 alertmanager/sql endpoints; RDS/crossplane secrets → credential *references*), and a consumer asks the host
 *"which endpoints exist?"* → the host **fans out** to providers and returns weak refs. Epic design:
-[endpoint-discovery.md](designs/endpoint-discovery.md). **[D-20](stories/D-20-scoped-private-net-egress.md) is
-a hard prerequisite** (discovered endpoints are usually private/in-cluster hosts). Built in this order:
+[endpoint-discovery.md](designs/endpoint-discovery.md). **[D-20](stories/D-20-scoped-private-net-egress.md) was
+a hard prerequisite** (discovered endpoints are usually private/in-cluster hosts; ✅ shipped). Built in this
+order (all six shipped, then [D-31](stories/D-31-host-terminated-rawsocket-auth.md) host-terminated SCRAM +
+[D-32](stories/D-32-retire-url-handback.md) retired the URL handback):
 
-- **[D-25](stories/D-25-endpoint-reference-model.md) — Reference model & registry** · *Core, leads (ready).*
+- **[D-25](stories/D-25-endpoint-reference-model.md) — Reference model & registry** · *Core, leads.* ✅
   `EndpointRef` weak refs + `EndpointRegistry` (owner/TTL) + a static env/config resolver that moves env
   binding out of the plugin into host config (clean cutover). The spine; no discovery yet.
 - **[D-26](stories/D-26-endpoint-discovery-broker.md) — Discovery provider role & fan-out broker** · *Core.*
@@ -226,25 +254,25 @@ a hard prerequisite** (discovered endpoints are usually private/in-cluster hosts
 - **[D-30](stories/D-30-endpoint-lifecycle-cli.md) — Endpoint lifecycle: refresh runner, CLI & audit** ·
   *Core.* Periodic rediscovery + `flux endpoint list/show/resolve` (weak refs + health, never secrets) + audit.
 
-### Session `s_251` post-mortem — ctx-pack eviction & discovery aliases (epic)
+### Session `s_251` post-mortem — ctx-pack eviction & discovery aliases (epic) — **both fixes landed 2026-06-30**
 
 A live `openai/gpt-5.5` session surfaced two compounding defects: an `endpoint.discover` "check db
 connectivity" turn that returned `{"candidates": []}`, and the follow-up "analyze why it's broken" turn
 that **looped 7 iterations and was cancelled**. Post-mortem design:
-[session-s251-postmortem.md](designs/session-s251-postmortem.md). The two fixes are independent but
+[session-s251-postmortem.md](archive/designs/session-s251-postmortem.md). The two fixes are independent but
 both are needed for the "check db connectivity" path to be trustworthy:
 
-- **[L-08](stories/L-08-ctx-pack-eviction.md) — Fix ctx-pack eviction** · *Language.* The `ctx` packer's
+- **[L-08](stories/L-08-ctx-pack-eviction.md) — Fix ctx-pack eviction** · *Language.* ✅ The `ctx` packer's
   greedy prefix-fill with a hard `break` drops every member after the first overflow, so one oversized
   early bind (a 493k session-evidence dump) starved the `ai.reason` step of the code reads the same
   flow had just gathered → the reasoning death spiral. Drop-and-continue + a value-aware keep priority.
-- **[D-33](stories/D-33-endpoint-discovery-aliases.md) — Resolve cluster/namespace aliases** · *Agent,
-  blocked on the in-flight positional→kwargs cutover.* `"dev"` isn't a kubeconfig context (it's a full
+- **[D-33](stories/D-33-endpoint-discovery-aliases.md) — Resolve cluster/namespace aliases** · *Agent.*
+  ✅ (was blocked on the positional→kwargs cutover). `"dev"` isn't a kubeconfig context (it's a full
   EKS ARN) and the broker never relays structured `cluster`/`namespace`; `namespace=latest` is
   ambiguous with the newest-namespace heuristic. Provider alias resolution + broker query-parsing +
   disambiguating `latest`.
 
-### Grounded knowledge (epic)
+### Grounded knowledge (epic) — **shipped 2026-07-03 (3/3: A-19 + D-50 + D-51)**
 
 flux's datasource layer (D-07) delivers knowledge to a model **only** as retrieval **tool calls** — there
 is no way to hand a small KB to the model *inline*, and a bare agent (empty system prompt) is ungoverned
@@ -296,8 +324,9 @@ A ranked track that exists to **unblock and de-risk downstream products** that c
 dependency** (no version boundary, so flux churn breaks them directly; tightening these seams also eases
 that coupling): multi-tenant managed-agent services and Slack-channel assistants. Sourced from cross-repo
 audits; filed as the **D- story track** (see the [board](stories/README.md)). Slack-channel assistants
-consume the shipped channel transport (D-04) and drive the **active integration stack** — built in this
-order: a knowledge/RAG datasource (**D-07**, which adds the shared `flux-datasource` schema) → a clean
+consume the shipped channel transport (D-04) and drive the **integration stack** (✅ all four
+shipped) — built in this order: a knowledge/RAG datasource (**D-07**, which adds the shared
+`flux-datasource` schema) → a clean
 **process-plugin protocol redesign** (**D-10**) → a native integration-plugin pack (**D-08**, in an in-repo
 `plugins/` workspace) → an agentic channel target (**D-09**). The app these consumers author is now a single
 **native flux-lang `.flux`** file — `agent`/`channel`/`datasource`/`trigger`/`journey` module declarations
@@ -312,12 +341,12 @@ with secrets as `secret "ENV"` references, replacing the JSON manifest
    unchanged; one-shot (genuine cross-turn `await` stays on the engine). Modules, zero new crates.
    Unblocks downstream behaviour-runner and preset-framework consumers. Design:
    [flow-input-seeding.md](designs/flow-input-seeding.md).
-2. **[D-02](stories/D-02-tenant-event-substrate.md) — Tenant/context-taggable event substrate** · *high.*
-   Tag `flux-events` with an account/agent context + an account-scoped projection read API, so downstream
+2. **[D-02](stories/D-02-tenant-event-substrate.md) — Tenant/context-taggable event substrate** ·
+   ✅ **shipped.** Tag `flux-events` with an account/agent context + an account-scoped projection read API, so downstream
    run-persistence/transparency is a projection over the log, not a parallel store. "Build it in,
    not on" — decide while R-01 lands, or it's a retrofit.
-3. **[D-03](stories/D-03-a2a-server-helpers.md) — Reusable A2A server helpers (current spec)** · *medium.*
-   Lift flux-server's inline A2A routes (`message/send`/`message/stream`/`tasks/get`) into a reusable
+3. **[D-03](stories/D-03-a2a-server-helpers.md) — Reusable A2A server helpers (current spec)** ·
+   ✅ **shipped.** Lift flux-server's inline A2A routes (`message/send`/`message/stream`/`tasks/get`) into a reusable
    helper. Unblocks downstream A2A consumers **and** fixes drift where older consumers still serve the
    deleted `tasks/send` dialect (removed in the A-02 cutover, commit `06065f6`).
 4. **[D-04](stories/D-04-event-trigger-channels.md) — Event-trigger channels (cron/webhook/Slack)** ·
@@ -347,33 +376,33 @@ with secrets as `secret "ENV"` references, replacing the JSON manifest
    cross-turn `await`). Downstream consumer rewiring is a separate pass outside this repo. Design:
    [realtime-voice-provider.md](designs/realtime-voice-provider.md).
 7. **[D-07](stories/D-07-knowledge-datasource-rag.md) — Knowledge datasource (a real RAG layer)** ·
-   *Slack assistant · ready (rank 1).* Turn `flux-capabilities::datasource` from an in-memory keyword index into a
+   *Slack assistant* · ✅ **shipped.** Turn `flux-capabilities::datasource` from an in-memory keyword index into a
    real knowledge layer: a new **L0 `flux-datasource` schema crate** (record/declaration/lookup, shared with
    the plugin layer), a persistent sqlite index, `search`/`list`/`get`/`relation`/`batch_get`, and
    reindex/freshness — keyword/BM25 behind a pluggable embeddings seam. Grounds Slack assistant answers in
    help-center + OpenAPI docs. Design: [datasource-rag.md](designs/datasource-rag.md).
-8. **[D-10](stories/D-10-process-plugin-protocol.md) — Process-plugin protocol redesign** · *Slack assistant ·
-   ready (rank 2).* Redesign `flux-plugin`'s wire protocol/manifest/binding-SDK so a plugin can call ops,
+8. **[D-10](stories/D-10-process-plugin-protocol.md) — Process-plugin protocol redesign** · *Slack
+   assistant* · ✅ **shipped.** Redesign `flux-plugin`'s wire protocol/manifest/binding-SDK so a plugin can call ops,
    contribute & query **datasource records** (feeding D-07), and request host capabilities (HTTP with
    secret-by-purpose injection, process/env/blob/conn) over **one clean unified frame** — informed by
    fluxplane's evolved protocol but dropping its cruft (dual modes, three command families, per-call grant
    negotiation). Clean cutover of `flux.plugin.v1`. Blocks D-08. Design:
    [process-plugin-protocol.md](designs/integration-plugins.md).
-9. **[D-08](stories/D-08-integration-plugin-pack.md) — Integration plugin pack** · *Slack assistant (epic) ·
-   ready (rank 3).* Native flux plugins (capability-gated, over the D-10 protocol) for the DevOps surface —
+9. **[D-08](stories/D-08-integration-plugin-pack.md) — Integration plugin pack** · *Slack assistant
+   (epic)* · ✅ **shipped.** Native flux plugins (capability-gated, over the D-10 protocol) for the DevOps surface —
    Slack ops, websearch, GitLab, Jira, Confluence, Kubernetes, Loki, Prometheus — in an **in-repo
    `plugins/` cargo workspace** (excluded from root, so heavy deps stay out of the main gate; *reverses* the
    earlier sibling-repo plan). Each emits `flux-datasource` records reaching D-07's index via an L5
    `DatasourceHostCaps` bridge. Slice 1 (Slack ops + websearch) unblocks the assistant MVP. Design:
    [integration-plugins.md](designs/integration-plugins.md).
-10. **[D-09](stories/D-09-agentic-channel-target.md) — Agentic channel target** · *Slack assistant · ready
-    (rank 4).* Let a channel wake an `AgentSpec` `run_turn` (model drives RAG + tools) **alongside** the
+10. **[D-09](stories/D-09-agentic-channel-target.md) — Agentic channel target** · *Slack assistant* ·
+    ✅ **shipped.** Let a channel wake an `AgentSpec` `run_turn` (model drives RAG + tools) **alongside** the
     shipped journey route, with per-conversation thread memory + declared op grants — builds the
     `EngineTarget` the D-04 design deferred, via a new `Deliverer` (the Slack adapter is unchanged). Also
     wires the `flux app run` path to **load plugins + register datasource tools** (today CLI-only). Design:
     [agentic-channel-target.md](designs/event-trigger-channels.md).
 
-### fluxplane-plugins parity (epic)
+### fluxplane-plugins parity (epic) — **shipped 2026-06-30 (6/6: D-12..D-17, `plugins/` gate green)**
 
 flux shipped **8** native plugins (D-08) over the D-10 protocol; the fluxplane pack they were modelled on has
 **26 marketplace plugins**, and flux's 8 cover a fraction of their ops (gitlab 6/60+, slack 5/30, jira 3/~20,
@@ -392,7 +421,7 @@ aggregator/generator surfaces (vision/websearch-aggregator/openapi) are explicit
 - **[D-13](stories/D-13-plugin-skill-command.md) — Generated plugin skill (`flux plugin skill`)** · *core.*
   Renders the installed plugin manifests into a Claude-format `flux-plugin` SKILL.md + `references/` (the
   flux analogue of fluxplane's `fluxplane-plugin skill`); adds a frontmatter writer to flux-markdown.
-  Independent of D-12. Design: [plugin-skill-generation.md](designs/plugin-skill-generation.md).
+  Independent of D-12. Design: [plugin-skill-generation.md](archive/designs/plugin-skill-generation.md).
 - **[D-14](stories/D-14-deepen-native-plugins.md) — Deepen the 8 native plugins** to their full fluxplane op
   sets (and drop the base64 hand-rolling). · *epic, per-plugin.*
 - **[D-15](stories/D-15-observability-ai-plugins.md) — Observability & AI pack** (alertmanager, grafana,
@@ -402,11 +431,11 @@ aggregator/generator surfaces (vision/websearch-aggregator/openapi) are explicit
 - **[D-17](stories/D-17-telephony-plugins.md) — Telephony pack** (asterisk, homer; serves downstream voice
   surfaces; asterisk needs D-12 conn).
 
-### Subscription providers & cross-provider cost (epic)
+### Subscription providers & cross-provider cost (epic) — **shipped 2026-07-02 (C-03..C-09 all done, C-07 live-verified)**
 
 flux already drives the two **subscription / passthrough** model backends — `claude` (Claude Max / Claude-Code
 OAuth) and `codex` (ChatGPT/Codex OAuth) — by **reusing the desktop apps' tokens** and refreshing them, with no
-full interactive OAuth2 login (that is the deliberate later stage). `flux-credentials` imports from
+full interactive OAuth2 login (that was the deliberate later stage; C-08 closed it). `flux-credentials` imports from
 `~/.claude/.credentials.json` / `~/.codex/auth.json`, refreshes via a 0600 store, and `-m claude|codex/...`
 routes to them; the `claude` (Bearer + `oauth-2025-04-20` + Claude-Code system prefix) and `codex` (Responses
 API on the ChatGPT backend) providers are wired. This epic **hardens** that against the live-backend quirks,
@@ -433,9 +462,9 @@ makes codex's **websocket** the default transport (HTTP fallback), and adds the 
   C-03.* WS (`wss://chatgpt.com/backend-api/codex/responses`) as the primary path with transparent HTTP-SSE
   fallback (a transport seam in `NativeProvider`; auth on the tungstenite handshake, per the realtime provider).
   Upstream WS is experimental — the fallback is non-negotiable and test-covered.
-- **[C-08](stories/C-08-full-oauth2-login.md) — Full OAuth2 login (codex PKCE)** · *core, later stage.* A
-  flux-native `flux auth login codex` to parity with claude's PKCE login. Explicitly deferred — import + refresh
-  cover the near term.
+- **[C-08](stories/C-08-full-oauth2-login.md) — Full OAuth2 login (codex PKCE)** · *core.* ✅ A
+  flux-native `flux auth login codex` to parity with claude's PKCE login. Initially deferred behind
+  import + refresh; shipped last (2026-07-02) with a real PKCE flow — import stays the default.
 - **[C-09](stories/C-09-aws-bedrock-provider.md) — AWS Bedrock LLM provider** · *core, DONE.* Drives
   Bedrock-provisioned Claude (`us.`/`eu.`/`global.` inference profiles) through the same harness:
   `flux run -m aws`. The wire is native Anthropic Messages (streaming `invoke-with-response-stream`;
@@ -450,7 +479,7 @@ makes codex's **websocket** the default transport (HTTP fallback), and adds the 
   (SSO, eu-central-1) incl. tool-use turns and cost suffixes.
   Design + implementation status in [aws-bedrock-provider.md](designs/subscription-providers-and-cost.md).
 
-### Strict review flows & journeys (epic)
+### Strict review flows & journeys (epic) — **shipped 2026-07-01 (4/4, `flux review` live)**
 
 A skill can *advise* a reviewer, but a review protocol needs guarantees — fixed step order, a bounded
 tool set per phase, sub-agents on a frozen context instead of ambient workspace authority, and
@@ -463,7 +492,7 @@ fails closed on any undeclared tool — reachable both directly and as a `flux-a
 design: [strict-review-flows.md](designs/strict-review-flows.md). Built in four phases:
 
 - **[L-10](stories/L-10-strict-review-example-flow.md) — Example flow + reviewer roles** · *Language,
-  leads (ready).* The `strict_review` flow + role files using only existing primitives (context
+  leads.* ✅ The `strict_review` flow + role files using only existing primitives (context
   gather → capped fan-out → deterministic dedupe/rank), proving the runtime contract with no language
   change. Sub-agent tool restriction stays at the role level here.
 - **[L-11](stories/L-11-strict-review-scoped-capabilities.md) — Scoped capabilities (`with_tools`)** ·
@@ -501,7 +530,7 @@ design: [strict-review-flows.md](designs/strict-review-flows.md). Built in four 
 - **SDK + crates.io** (tier 2) — **P7 landed the bulk:** a **Rust eDSL** (`flux_lang::dsl`, re-exported
   as `flux_sdk::dsl`) whose builder primitives compile to the Flux-Lang AST — loops
   (`each`/`repeat`/`loop_for`/`race`) and control-flow (`match`/`route`/`fallback`/`timeout`/`budget`)
-  first-class, all 36 node kinds covered (drift-guarded by `dsl_covers_every_node_kind`), authored in
+  first-class, all node kinds covered (43 today, drift-guarded by `dsl_covers_every_node_kind`), authored in
   Rust then run through the existing `FlowClient` lifecycle. The public API is **stabilized**
   (`#![warn(missing_docs)]`, crate READMEs, three runnable no-API-key examples, crates.io metadata) and
   **publish-prepped** (the 16-crate closure carries versions; topo order + runbook in
@@ -532,7 +561,7 @@ design: [strict-review-flows.md](designs/strict-review-flows.md). Built in four 
   **P8** removed the language's top authoring friction: `bind` now accepts a `var` (`$b = $a` alias)
   or `lit` (`$x = 5`/`[1,2,3]`/`{…}`) directly, and two pure **value-template** nodes (`obj`/`list`)
   let a record/list assemble from variables (`return { ok: true, n: $count, intent: $x.intent }`) —
-  42 node kinds. Remaining (optional): native `{k:expr}`/`[expr]` text spelling + a strict-JSON-schema
+  43 node kinds today. Remaining (optional): native `{k:expr}`/`[expr]` text spelling + a strict-JSON-schema
   vs. native-text **emission A/B** (measure planner accuracy before switching the model's surface);
   deeper optimizer passes (predicate pushdown, batch/model-call fusion); `checkpoint`∘`await`.
 
@@ -553,10 +582,11 @@ design: [strict-review-flows.md](designs/strict-review-flows.md). Built in four 
 Drift made visible, so it stops being silent. Each maps to a story on the
 [board](stories/README.md):
 
-- **Plugin ops still bind to env-var names + receive raw URLs; no cross-plugin endpoint discovery.**
-  fluxplane's reference / registry / discovery / runner was dropped in D-10/D-12 (a `.dex`-style endpoint
-  registry was an explicit non-goal); it is now a top-priority essentials epic. → endpoint discovery &
-  brokerage ([D-25](stories/D-25-endpoint-reference-model.md)..[D-30](stories/D-30-endpoint-lifecycle-cli.md)).
+- ~~**Plugin ops still bind to env-var names + receive raw URLs; no cross-plugin endpoint
+  discovery.**~~ ✅ done — plugin IO is references-only (opaque `endpoint_ref`/`credential_ref`,
+  host-side resolution + credential injection, the URL handback deleted), with cross-plugin
+  discovery fan-out and the `flux endpoint` operator CLI. → endpoint discovery & brokerage
+  ([D-25](stories/D-25-endpoint-reference-model.md)..[D-32](stories/D-32-retire-url-handback.md)).
 - ~~**Two turn loops.**~~ ✅ done — every surface (CLI/TUI/server/SDK) runs the pure-DAG
   `FlowEngine`; the classic Rust loop is retired. → [A-01](stories/A-01-unify-flowengine.md).
 - ~~**Crate consolidation phases 2–4**~~ ✅ done (35 → 31). → [C-01](stories/C-01-crate-consolidation.md).
@@ -570,13 +600,15 @@ Drift made visible, so it stops being silent. Each maps to a story on the
   [C-15](stories/C-15-efficiency-metrics-and-key-normalization.md).
 - ~~**Codex transport is HTTP-SSE only**~~ ✅ done — WS is the default codex transport (live-verified
   wire contract) with transparent HTTP-SSE fallback. → [C-07](stories/C-07-codex-websocket-transport.md).
-- **Subscription-provider login is import-only for codex** (claude has PKCE); full OAuth2 for codex is the
-  deferred later stage. → [C-08](stories/C-08-full-oauth2-login.md).
+- ~~**Subscription-provider login is import-only for codex**~~ ✅ done — `flux auth login codex` runs
+  a real PKCE flow to parity with claude (import + refresh stay the default path).
+  → [C-08](stories/C-08-full-oauth2-login.md).
 
 ## Backlog (product improvements)
 
-- **Load skills from a user/global dir** (e.g. `~/.flux/skills`) in addition to the project
-  `.flux/skills`, so global skills needn't be copied per-project. → [L-01](stories/L-01-global-skills.md).
+- ~~**Load skills from a user/global dir**~~ ✅ done — skills load from the project `.flux/skills`
+  **and** the user-global dirs (`~/.flux/skills`, `~/.agents/skills`, `~/.claude/skills`; project wins),
+  in both the flux-native and Agent-Skills/Claude formats. → [L-01](stories/L-01-global-skills.md).
 
 ## Direction
 

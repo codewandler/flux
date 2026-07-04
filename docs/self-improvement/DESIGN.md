@@ -24,7 +24,8 @@ trail so any decision can be re-checked after the fact.
 ## The loop (one round)
 
 The loop is a pure-DAG flux-flow graph (`examples/improve-tbench.flux`). Each step is a registered op
-in `crates/flux-eval/src/ops.rs`. A round runs:
+implemented across the `flux-eval` modules (`ops.rs`, `git.rs`, `gate.rs`, `aggregate.rs`) — except
+`git_stage` / `git_commit`, which are the flux-tools built-ins the loop reuses. A round runs:
 
 ```
  1. eval_run (baseline)      run flux on a task subset, N trials, via a BenchmarkAdapter → report
@@ -58,7 +59,9 @@ recursion. That means integrity can't rely on the sub-agent being polite — it'
 paths** before the candidate is ever graded:
 
 ```
-crates/flux-eval   bench/   scripts/   .github/   examples/improve-tbench.flux   examples/eval-smoke.flux
+crates/flux-eval   bench/   scripts/   .github/   examples/improve-tbench.flux
+examples/improve-multi.flux   examples/improve-synthetic.flux   examples/eval-synthetic.flux
+examples/eval-smoke.flux
 ```
 
 A worker that edits the grader has its edit reverted, not rewarded. This fired live: in an early run
@@ -68,7 +71,7 @@ it — and `guard_protected` rolled it back before the candidate eval, so the ta
 
 ### Validity — a kept gain beats noise
 
-- **Multiple trials.** `trials >= 2` (the terminal-bench flow uses 2); the keep decision is on the
+- **Multiple trials.** `trials >= 3` (the terminal-bench flow uses 3); the keep decision is on the
   aggregate, not a single run.
 - **Partial-credit scoring.** Instead of all-or-nothing pass/fail, the terminal-bench adapter reads
   the per-subtest `parser_results` into `mean_check_pass_rate`. The loop can see and keep progress
@@ -131,8 +134,9 @@ A `BenchmarkAdapter` trait keeps benchmarks behind one seam:
   riddles with known answers (`crates/flux-eval/assets/synthetic-suite.json`), graded on the produced
   program's stdout. A fast, cheap diagnostic workload — run ad-hoc with `flux eval synthetic`, **or as
   the stable-baseline self-improvement loop** (`examples/improve-synthetic.flux`, runner
-  `bench/run-synthetic-loop.sh`). Because grading is deterministic and there's no Docker, it is the
-  cheap, low-noise vehicle for a trials ≥ 5 headline gain. See [synthetic-eval.md](synthetic-eval.md).
+  `bench/run-synthetic-loop.sh`). Because grading is deterministic and there's no Docker, it is a
+  cheap, low-noise **regression floor** — calibration (2026-07-02) found the suite saturated, so the
+  headline gain comes from terminal-bench. See [synthetic-eval.md](synthetic-eval.md).
 - **multi** — `MultiAdapter`: run several adapters behind **one combined score** (ids namespaced
   `<member>:<id>`). The keep-gate `score_compare_multi` refuses a candidate that lifts the combined mean
   while regressing any member, so terminal-bench + synthetic can be graded together without one masking
@@ -149,7 +153,7 @@ Nothing in a round is self-reported by the agent; every step leaves a durable tr
 - **`.flux/eval/improve-log.jsonl`** — one record per decision: `decision` (kept / reverted), `reason`
   (`candidate_beat_baseline` / `no_improvement` / `gate_failed`), baseline vs candidate scalar scores,
   the `tag`, and the `guard` / `gate` / `tasks` for that round.
-- **`flow.db` RunEvent trace** — every op call with its inputs and results (including the full baseline
+- **`events.db` RunEvent trace** — every op call with its inputs and results (including the full baseline
   and candidate reports and the `score_compare` verdict). The low-level source of truth.
 - **git history + `improve-tbench-<score>` tags** — kept candidates are real commits; reverts restore
   the snapshot and leave no tree change.
@@ -168,7 +172,8 @@ Observation tooling (in `bench/`, no extra deps):
 There are two real self-improvement loops behind the same machinery: **terminal-bench**
 (`examples/improve-tbench.flux`, runner `bench/run-tbench-loop.sh`) — the hard, Docker-backed eval —
 and **synthetic** (`examples/improve-synthetic.flux`, runner `bench/run-synthetic-loop.sh`) — the
-stable-baseline, no-Docker eval used for a clean trials ≥ 5 headline gain. For free, provider-less,
+stable-baseline, no-Docker **regression floor** (calibrated out as a gain vehicle — the suite is
+saturated; the headline gain comes from terminal-bench). For free, provider-less,
 Docker-less validation of the *flow machinery* (op wiring, mining, aggregation), there is a mock smoke:
 `flux flow run examples/eval-smoke.flux -m mock`. The smoke is a CI fixture, not an evaluation.
 
@@ -185,9 +190,10 @@ flux flow run examples/eval-smoke.flux -m mock   # offline smoke of the flow mac
 
 `run-tbench-loop.sh` creates an isolated worktree from HEAD on a dedicated branch
 (`improve-tbench/<ts>`), seeds the sub-agent roles, builds flux, and runs the flow. `main` is never
-touched; the worktree is left in place for inspection (the script prints the discard command). It
-refuses to start on a dirty tree, and it puts `HOME` **outside** the worktree so `git_snapshot` always
-sees a clean tree — untracked files inside the worktree would make a round refuse to start.
+touched; the worktree is left in place for inspection (the script prints the discard command). The
+dirty-tree refusal lives in the `git_snapshot` op — each round aborts on a dirty tree — and the
+script puts `HOME` **outside** the worktree so `git_snapshot` always sees a clean tree — untracked
+files inside the worktree would make a round refuse to start.
 
 **Requires:** a provider key (`ANTHROPIC_API_KEY` or `flux auth login`). Terminal-bench additionally
 needs `tb` on PATH, Docker, and the `x86_64-unknown-linux-musl` target.
@@ -215,10 +221,13 @@ on hard tasks is not guaranteed — a correct revert is a successful run of the 
 The loop is implemented in the L3 crate `flux-eval`, driven by the flux-flow engine
 ([`docs/designs/flux-flow.md`](../designs/flux-flow.md)):
 
-- `crates/flux-eval/src/ops.rs` — the registered flux-flow ops: `eval_run`, `eval_scalar`,
-  `eval_adopt`, `score_compare`, `guard_protected`, `gate_check`, `git_snapshot` / `git_stage` /
-  `git_commit` / `git_tag` / `git_revert`, `change_implement`, `improvements_aggregate`,
-  `candidates_empty` / `candidates_advance`, `painpoints_collect`, `improve_log`.
+- `crates/flux-eval/src/ops.rs` — the core eval ops: `eval_run`, `eval_sessions`, `eval_scalar`,
+  `eval_adopt`, `score_compare` / `score_compare_multi`, `eval_report_md`, `change_implement`,
+  `painpoints_collect`, `improve_log`.
+- `crates/flux-eval/src/git.rs` — `git_snapshot` / `git_tag` / `git_revert` + `guard_protected`;
+  `gate.rs` — `gate_check`; `aggregate.rs` — `improvements_aggregate`, `candidates_empty` /
+  `candidates_advance`. (`git_stage` / `git_commit` are deliberately the flux-tools built-ins —
+  the loop reuses them rather than duplicating them.)
 - `crates/flux-eval/src/score.rs` — `SuiteScore`, the lexicographic comparison, partial credit.
 - `crates/flux-eval/src/metrics.rs` — `RunResult` / `CaseOutcome` (pass, sub-checks, transcript).
 - `crates/flux-eval/src/adapter.rs` — the `BenchmarkAdapter` trait.

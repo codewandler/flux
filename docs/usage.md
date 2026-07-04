@@ -11,18 +11,21 @@ This page is the practical guide. For the design, see [`docs/designs/flux-flow.m
 
 Every turn, the model does exactly one of two things:
 
-- **emits a plan** — a graph of operations (`read`, `bash`, `edit`, `repeat`, `when`, …), or
+- **emits a plan** — a graph of operations (`read`, `grep`, `edit`, `repeat`, `when`, …), or
 - **answers in prose** — when no operation is needed.
 
-The built-in file operations are: `read` (raw text, with a line-numbered view; refuses binary and
-guides you to a range for very large files), `read_many` (survey several files in one node), `write`
+The built-in file operations are: `read` (one file, a list of files, or a glob pattern — single-file
+reads get a line-numbered view, multi-file reads return `==> path <==` sections; refuses binary and
+guides you to a range for very large files; `read_many` remains only as a legacy alias), `write`
 (create/overwrite, returns a diff), `append` (lower-risk add to a file), `edit` (string replace with
 progressively looser whitespace/indentation matching and a unified diff), `patch` (line-anchored
 `insert_before/after`/`replace_range`/`delete_range`), `glob`, and `grep` (regex by default; pass
 `literal` for a plain substring). A file must be **read before you `edit`/`patch` it** — and if it
-changed on disk since you read it, the edit is refused so you re-read first.
+changed on disk since you read it, the edit is refused so you re-read first. A generic `bash` op
+exists but is **off by default** (the `shell` tool group): opt in with `enable_shell = true` in
+`.flux/config.toml` or `FLUX_ENABLE_BASH=1` — prefer the dedicated ops.
 
-It has **no other tools.** It can't call `bash` or `read` directly; even reading a file is a node in a
+It has **no live tools.** It can't call `bash` or `read` directly; even reading a file is a node in a
 plan. This is what makes a turn auditable: what you see *is* what runs.
 
 ```
@@ -104,8 +107,12 @@ envelope:
 - **Reads** are pre-allowed; they run without prompting.
 - **Writes / commands** prompt for approval unless you pass `--yes` or have an allow-rule in
   `.flux/config.toml`.
-- **Destructive** operations (`rm -rf`, force-push, `mkfs`, …) **always** re-confirm — even with `--yes`
-  off they prompt, and even inside an approved plan they escalate. This can't be bypassed by the plan.
+- **Destructive** operations (`rm -rf`, force-push, `mkfs`, …) escalate to their own confirmation,
+  with two deliberate exceptions: **`--yes` auto-approves everything, destructive steps included**
+  (it installs a headless allow-all approver — that is what unattended means), and a destructive step
+  **already disclosed in the plan preview you approved** does not re-prompt (approving the rendered
+  plan *was* the confirmation; a destructive command assembled at runtime, invisible to the preview,
+  still escalates).
 - Secrets are redacted from tool output and logs.
 
 Approve a prompt with `y` (once), `a` (always — saved to `.flux/config.toml`), or `N` (deny).
@@ -160,9 +167,11 @@ default and shown in full with `-v`.
 
 ## Tips
 
-- **Use `--plan` (or `/plan`) first** when a task is risky or you want to review the approach — then run
-  it once you're happy.
+- **Use `flux plan` (or the REPL `/plan` toggle) first** when a task is risky or you want to review the
+  approach — then run it once you're happy.
 - **Plan mode is single-shot per turn:** great for self-contained tasks ("delete the .tmp files",
   "print 3×"). For exploratory work that needs to read a file *before* deciding what to do, use **normal
   mode** — it reads, sees the result, and plans the next step automatically.
-- Pass `--yes` only when you trust the task to run unattended; destructive steps still re-confirm.
+- Pass `--yes` only when you trust the task to run unattended: it auto-approves **every** step,
+  destructive ones included — there is no re-confirmation under `--yes`. Without it, destructive
+  steps get their own prompt.

@@ -20,13 +20,13 @@ the *surfaces* (CLI/TUI/server/SDK).
 
 | Layer | Crates | Role |
 |---|---|---|
-| **L0 contracts** (pure) | `flux-core` `flux-policy` `flux-secret` `flux-spec` `flux-config` `flux-evidence` `flux-skill` `flux-markdown` `flux-lang` | types, authorization, secrets, tool specs, config, evidence, skills, markdown/frontmatter, the Flux-Lang language + reference interpreter (effects injected via traits) |
-| **L1 providers** | `flux-provider` `flux-providers` `flux-credentials` | the `Provider` abstraction + the concrete clients (`flux-providers` modules: `messages` core, `anthropic`, `openai`, `openrouter`, `ollama`) + credential store |
+| **L0 contracts** (pure) | `flux-core` `flux-policy` `flux-secret` `flux-spec` `flux-config` `flux-evidence` `flux-skill` `flux-markdown` `flux-datasource` `flux-lang` | types, authorization, secrets, tool specs, config, evidence, skills, markdown/frontmatter, datasource record/retrieval contract, the Flux-Lang language + reference interpreter (effects injected via traits) |
+| **L1 providers** | `flux-provider` `flux-providers` `flux-credentials` `flux-a2a` | the `Provider` abstraction + the concrete clients (`flux-providers` modules: `messages` core, `anthropic`, `openai`, `openrouter`, `ollama`, `bedrock`, `codex`, plus `realtime/`) + credential store + the A2A agent-protocol client/wire types |
 | **L2 runtime** | `flux-system` `flux-runtime` `flux-tools` `flux-events` | guarded IO, the safety envelope (+ the `context` projector module), built-in tools, the event store |
 | **L3 agent** | `flux-agent` `flux-orchestrate` `flux-flow` `flux-eval` `flux-cognition` | agent definitions (`AgentSpec`/`Role`) + multi-agent orchestration + the Flux-Lang engine (the one turn loop) + the eval harness + the model-op cognition pack |
 | **L4 extensibility** | `flux-plugin` | subprocess plugins + the JS pre-tool `hooks` module |
 | **L5 capabilities** | `flux-capabilities` `flux-auth` | web egress + datasource/RAG tools (`browser`/`datasource` modules); caller identity (separate) |
-| **L6 surfaces** | `flux-sdk` `flux-server` `flux-tui` `flux-cli` `flux-app` | SDK, HTTP server, TUI, the `flux` binary, the multi-agent program runtime host (`flux run app.flux`) |
+| **L6 surfaces** | `flux-sdk` `flux-server` `flux-tui` `flux-cli` `flux-app` `flux-channels` | SDK, HTTP server, TUI, the `flux` binary, the multi-agent program runtime host (`flux run app.flux`), event-trigger channels (cron/webhook/Slack) |
 
 Why this matters: it keeps the safety core (L0–L2) small and auditable, and makes "route around the
 envelope" structurally hard. Notable rules that fall out:
@@ -57,9 +57,11 @@ shared machinery beneath them. "Disposition" flags a planned move; see
 | `flux-config` | L0 | `.flux/config.toml` loading + precedence | — |
 | `flux-skill` | L0 | multi-format skill defs + discovery/merge + activation (triggers or name/description fallback) | — |
 | `flux-markdown` | L0 | frontmatter parse/validate (`serde_norway`) + feature-gated render wrappers over `codewandler/markdown` | — |
+| `flux-datasource` | L0 | datasource records / entity declarations + retrieval (search/get/list/relation) types — the contract between the knowledge index and integration plugins | — |
 | `flux-provider` | L1 | the `Provider` abstraction (published) | — |
-| `flux-providers` | L1 | concrete clients (anthropic / openai / openrouter / ollama) | — |
+| `flux-providers` | L1 | concrete clients (anthropic / openai / openrouter / ollama / bedrock / codex, + the `realtime` full-duplex module) | — |
 | `flux-credentials` | L1 | credential store (PKCE, token import) | — |
+| `flux-a2a` | L1 | A2A (Agent-to-Agent) protocol: spec-conformant wire types + HTTP/JSON-RPC client for remote agents | — |
 | `flux-system` | L2 | guarded IO — the *only* real fs / proc / net | — |
 | `flux-runtime` | L2 | `Executor::dispatch` — the safety envelope; `context` module = the projector | absorbed `flux-context` (consolidation P4 ✅) |
 | `flux-tools` | L2 | built-in tools (read / write / edit / grep / …) | — |
@@ -92,6 +94,7 @@ shared machinery beneath them. "Disposition" flags a planned move; see
 | `flux-server` | L6 | axum HTTP API + SSE (bearer-auth) | — |
 | `flux-sdk` | L6 | embeddable API (`Client` + `FlowClient`, DSL, recipes) | — |
 | `flux-app` | L6 | multi-agent Program runtime host (`flux run app.flux`) | — |
+| `flux-channels` | L6 | event-trigger channels: cron / webhook / Slack adapters that wake a `flux-app` program's journeys | — |
 | `flux-plugin` | L4 | subprocess plugins (NDJSON, capability-gated) + the JS pre-tool `hooks` module | absorbed `flux-hooks` (P2 ✅) |
 | `flux-capabilities` | L5 | `browser` (`web_fetch`, SSRF-guarded; CDP deferred) + `datasource` (keyword index + search; RAG deferred) modules | merged `flux-browser` + `flux-datasource` (P3 ✅) |
 | `flux-auth` | L5 | caller identity (`LocalIdentity`; OIDC seam) | kept standalone — identity ≠ tool capability |
@@ -102,22 +105,27 @@ Every plan node lowers onto one non-bypassable chain in `flux-runtime::Executor:
 substrate the flow engine executes against:
 
 ```
-pre-tool hooks → authorization policy (default-deny) → permission rules → approval gate → guarded IO
+capability-scope floor → pre-tool hooks → authorization policy (default-deny) → permission rules → approval gate → guarded IO
 ```
 
-1. **Pre-tool hooks** may observe / modify the input / deny the call (and short-circuit everything
+1. **Capability-scope floor** — checked first, before hooks and policy: when a `with_tools` block is
+   active, its tool-name allowlist must contain the op or the dispatch is refused outright (recorded
+   as `cap_scope_denied` evidence). Scopes stack as narrow-only intersections — including into
+   spawned sub-agents — so a scope can only ever be as strict as, or stricter than, the session
+   policy, never looser. No active scope is a strict no-op.
+2. **Pre-tool hooks** may observe / modify the input / deny the call (and short-circuit everything
    below). JS hooks run with a wall-clock interrupt so a runaway hook fails closed.
-2. **Authorization policy** (`flux-policy`, pure, default-deny): the tool's declared `effects` +
+3. **Authorization policy** (`flux-policy`, pure, default-deny): the tool's declared `effects` +
    permission subjects are translated into `(action, resource)` requests and evaluated against grants
    (subjects × resources × actions, gated by trust + scopes). A `Deny` short-circuits; an
    `ApprovalRequired` (e.g. a grant marked `requires_approval`) forces the approval gate below — the
    policy is the floor, permission rules can't widen past it. A usable `default_local_grants()` keeps
    the local user working out of the box.
-3. **Permission rules** (coder-style ergonomics layered on the policy): `Bash(git:*)`, `read`, etc.,
+4. **Permission rules** (coder-style ergonomics layered on the policy): `Bash(git:*)`, `read`, etc.,
    deny-first then allow, otherwise prompt. "Always-allow" choices persist to `.flux/config.toml`.
-4. **Approval gate**: forced for destructive intents, `Risk::Destructive`, policy `ApprovalRequired`,
+5. **Approval gate**: forced for destructive intents, `Risk::Destructive`, policy `ApprovalRequired`,
    and unscoped writes — even under a permissive allow rule.
-5. **Guarded IO** (`flux-system`): the *only* place real filesystem / process / network IO happens.
+6. **Guarded IO** (`flux-system`): the *only* place real filesystem / process / network IO happens.
    Workspace-confined, symlink/escape-rejecting (including dangling symlinks), **argv-only** process
    execution with the parent environment cleared, output-capped, and an SSRF-guarded URL resolver
    (`flux_system::net::guard_url_scoped` / `guard_url`) shared by every egress path. Private or
@@ -142,8 +150,9 @@ A "provider" conflates two orthogonal axes, modeled separately and composed by `
   Chat, OpenAI Responses).
 - **`Credential`** — auth/transport profile: tokens, base URL, gating headers, refresh.
 
-`provider/model` routing selects a cell. v1 ships `anthropic`, `claude`, `openai`, `codex`,
-`openrouter`. Adding a provider is a small composition, never a fork of the loop. Streaming is a
+`provider/model` routing selects a cell. v1 ships `anthropic`, `claude`, `openai`, `codex`, `aws`
+(Bedrock), `openrouter`, `openrouter-anthropic`, `ollama`, and `ollama-anthropic`. Adding a
+provider is a small composition, never a fork of the loop. Streaming is a
 `Chunk` stream; usage accounting preserves input/cache tokens across `message_start`/`message_delta`.
 
 ## Agent loop, sessions, context

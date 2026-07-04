@@ -3,8 +3,8 @@
 **Status: shipped.** This is the consolidated design record for the integration-plugin epic — it
 merges the four design docs that together told the story (stories D-08, D-10, D-12, D-14–D-17). The
 shipped behavior is documented in the living [architecture](../architecture.md#extensibility) and on
-the [story board](../stories/README.md). The remaining forward-looking slice (signed release channel +
-verified remote install) lives on in the active [`plugin-distribution.md`](plugin-distribution.md).
+the [story board](../stories/README.md). The follow-on slice (signed release channel + verified
+remote install) has since shipped too (v0.2.14) — see [`plugin-distribution.md`](plugin-distribution.md).
 
 Consolidated docs, in narrative order:
 1. **Integration plugin pack** (D-08) — the in-repo `plugins/` workspace and the first native plugins.
@@ -16,7 +16,7 @@ Consolidated docs, in narrative order:
 
 # Design: integration plugin pack (in-repo `plugins/`)
 
-**Status:** proposed (story [D-08](../stories/D-08-integration-plugin-pack.md)) · **Layer:** consumes the
+**Status (at merge; since shipped):** proposed (story [D-08](../stories/D-08-integration-plugin-pack.md)) · **Layer:** consumes the
 redesigned `flux-plugin` (L4, [D-10](integration-plugins.md)) + `flux-datasource`/`flux-secret` (L0) ·
 **Home:** an **in-repo nested `plugins/` cargo workspace** (excluded from the root workspace) ·
 **Owner:** Timo
@@ -111,7 +111,7 @@ datasource entities are a proven inventory; reimplement against flux's redesigne
 
 # Design: process-plugin protocol redesign
 
-**Status:** proposed (story [D-10](../stories/D-10-process-plugin-protocol.md)) · **Layer:** L4
+**Status (at merge; since shipped):** proposed (story [D-10](../stories/D-10-process-plugin-protocol.md)) · **Layer:** L4
 (`flux-plugin`) · **Owner:** Timo
 
 ## Why
@@ -215,7 +215,7 @@ stays **L4**; it gains a dep on the L0 `flux-datasource` crate (D-07) for the da
 
 # Design: plugin protocol parity extensions (D-12)
 
-**Status:** in progress · **Pillar:** Core · **Layer:** L4 (`flux-plugin`) + L1 (`flux-system` dialer) ·
+**Status:** shipped (D-12 done) · **Pillar:** Core · **Layer:** L4 (`flux-plugin`) + L1 (`flux-system` dialer) ·
 **Owner:** Timo · **Story:** [D-12](../stories/D-12-plugin-protocol-parity.md) ·
 **Epic:** [fluxplane-plugins-parity.md](integration-plugins.md)
 
@@ -393,7 +393,7 @@ Parity is **operational** (the integrations an agent can drive), not a byte-for-
 
 fluxplane's `fluxplane-plugin skill` command *generates* a Claude-format `SKILL.md` + `references/<plugin>.md`
 from installed-plugin manifests (that is exactly what produced `~/.claude/skills/fluxplane-plugin/`). flux
-gets the analogue **`flux plugin skill`**, designed in [plugin-skill-generation.md](plugin-skill-generation.md):
+gets the analogue **`flux plugin skill`**, designed in [plugin-skill-generation.md](../archive/designs/plugin-skill-generation.md):
 it renders the discovered flux-plugin manifests into a Claude-format `flux-plugin` skill so the agent
 knows which `flux plugin call` ops exist, their inputs, and their auth — without hard-coding a catalog.
 

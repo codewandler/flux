@@ -1,5 +1,7 @@
 # Design: named-argument calls (deprecate positional binding)
 
+**Status:** implemented · **Story:** [L-09](../stories/L-09-named-argument-calls.md) (done)
+
 Companion to story `L-09-named-argument-calls.md`. The "why" and the precise semantics live here;
 the story carries the acceptance + progress log.
 

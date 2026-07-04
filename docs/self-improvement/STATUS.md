@@ -1,6 +1,6 @@
 # Self-improvement: status & journey
 
-_Last updated: 2026-06-29._
+_Last updated: 2026-07-02._
 
 This is the honest, dated record of where the self-improvement loop stands and how it got here —
 including the bugs each live run surfaced, the first kept gain, and the caveats that keep the claims
@@ -14,10 +14,11 @@ defensible. For how the loop works, see [DESIGN.md](DESIGN.md).
 - **It has improved the harness for real, once.** On a `fibonacci-server` run, the loop autonomously
   diagnosed a real failure mode, fixed flux's shipped system prompt, measured the candidate beating the
   baseline on partial credit, and **kept + committed + tagged** the change. Details + caveats below.
-- **It is auditable.** Every decision lands in `improve-log.jsonl`, the `flow.db` RunEvent trace, git
-  tags, and asciinema casts. The agent never grades itself.
-- **What's not yet done:** a statistically clean (trials ≥ 3) headline gain, partial-credit-aware tag
-  scalars, token/cost capture, and breadth. See [Known gaps](#known-gaps).
+- **It is auditable.** Every decision lands in `improve-log.jsonl`, the `events.db` RunEvent trace,
+  git tags, and asciinema casts. The agent never grades itself.
+- **What's not yet done:** a statistically clean (trials ≥ 3) headline gain — which must come from
+  **terminal-bench** (the synthetic suite calibrated out as saturated) — in-container metrics for
+  terminal-bench, and breadth. See [Known gaps](#known-gaps).
 
 ## What's proven
 
@@ -191,10 +192,10 @@ was valid and the revert was correct — the loop did not reward a plausible-but
 - **Partial-credit-aware tag scalar.** ✅ Resolved — `SuiteScore::scalar()` now returns
   `round(mean_check_pass_rate*1000)`, so a partial-credit-only gain tags as `improve-tbench-833`
   rather than `-0`. Faithful for binary adapters (where `mean_check_pass_rate == pass_rate`).
-- **A statistically clean headline gain.** Still open, but now has a stable-baseline vehicle: the
-  **synthetic** suite (16 deterministic, objectively-graded riddles, no Docker). Run
-  `bench/run-synthetic-loop.sh` (`examples/improve-synthetic.flux`, **trials = 5**, strict
-  `score_compare`) on a calibrated, stable baseline so the kept gain isn't flattered by noise.
+- **A statistically clean headline gain.** Still open — and it must come from **terminal-bench**:
+  the 2026-07-02 calibration (journey entry 5) found the synthetic suite stable but **saturated**
+  (two models at 1000/1000, zero headroom), so `bench/run-synthetic-loop.sh` serves as a
+  **regression floor**, not a gain vehicle.
 - **Token/cost capture.** ✅ Resolved for the local/synthetic adapter. flux-flow now surfaces per-turn
   `Usage` through the loop (commit `b9a0b06`); the events store persists it on `TurnEnded`, and the
   eval runner sums it back via `load_usage` into `RunResult.tokens`, so `mean_tokens` is a real
@@ -202,7 +203,7 @@ was valid and the revert was correct — the loop did not reward a plausible-but
   tally must be extracted from the container's `~/.flux/events.db` (the same `TurnEnded.usage` is now
   recorded there). (Task #12.)
 - **In-container metrics.** flux's RunEvent trace lives inside the container, so `mean_iterations` /
-  `mean_tokens` read 0 for terminal-bench; extract `~/.flux/flow.db` from the container for
+  `mean_tokens` read 0 for terminal-bench; extract `~/.flux/events.db` from the container for
   deterministic mining.
 - **Breadth.** A larger terminal-bench subset and a second real benchmark (SWE-bench Lite behind the
   same `BenchmarkAdapter` trait); a held-out scoring slice to guard against overfitting the chosen
@@ -210,9 +211,9 @@ was valid and the revert was correct — the loop did not reward a plausible-but
 
 ## Suggested next steps
 
-1. **Bring the kept prompt fix to `main`** — `3c86874` (runtime verification + background-server +
-   confirm-port) is genuinely good guidance for any shell task and currently lives only on the loop's
-   branch.
+1. ~~**Bring the kept prompt fix to `main`**~~ — ✅ done: `3c86874` (runtime verification +
+   background-server + confirm-port) landed on `main` as `f0ede92`, with the regression test
+   `default_system_prompt_bash_bullet_has_runtime_checks`.
 2. ~~**Fix the tag scalar** to be partial-credit-aware~~ — ✅ done (`score.rs`,
    `round(mean_check_pass_rate*1000)`).
 3. ~~**One trials ≥ 5 run on the synthetic suite** for a clean headline gain~~ — **calibrated out

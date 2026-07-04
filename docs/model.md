@@ -36,14 +36,13 @@ model = "anthropic/claude-sonnet-4-6"
 
 ### Notes
 
-- `--think` enables extended (adaptive) thinking on supported models.
-- `--effort low|medium|high|xhigh|max` controls thinking depth / token budget.
+- `--think` / `--effort` exist as hidden flags but are not yet wired into the engine — currently no-ops.
 - Prompt caching is applied automatically for long context windows.
 - Streaming is fully supported; token deltas are shown in the TUI and REPL.
 
 ## AWS Bedrock
 
-**Wire:** Anthropic Messages (Bedrock's `invoke-model` on an Anthropic model returns native Anthropic Messages JSON — the exact shape flux's `messages` codec already speaks, so the codec is a thin wrapper)  
+**Wire:** Anthropic Messages (Bedrock's `invoke-with-response-stream` on an Anthropic model streams native Anthropic Messages events inside AWS event-stream framing — the exact shape flux's `messages` codec already speaks, so the codec is a thin wrapper plus a deframer)  
 **Auth:** the full AWS default credential chain — **no `aws` CLI binary required**
 
 AWS Bedrock is the compliance-friendly path to Claude for orgs that cannot send data to `api.anthropic.com` directly. flux resolves credentials from the same sources `aws-config` walks, hand-rolled in `flux-providers::bedrock`:
@@ -100,7 +99,7 @@ Bedrock cross-region inference-profile ids are **region-specific**: `us.anthropi
 
 - **Metered, not subscription.** Bedrock is pay-per-token via AWS (Anthropic-direct rates); the per-turn cost annotation shows `· $X` (no `(sub)` label).
 - **No `aws` CLI dependency.** The chain is hand-rolled — SSO token refresh, `GetRoleCredentials`, `AssumeRoleWithWebIdentity` are direct HTTPS calls. The `aws` CLI is only needed for the one-time `aws sso login`.
-- **Non-streaming first.** `invoke-model` (non-streaming) ships; the full response arrives in one round-trip. Event-stream streaming (`invoke-with-response-stream`) is a follow-up (C-09d).
+- **Streaming.** The codec POSTs `/model/{id}/invoke-with-response-stream` and deframes AWS's binary event-stream into native Anthropic streaming events, so token deltas stream live like every other provider.
 - **SigV4 is hand-rolled** (~150 lines, pinned by known-answer tests cross-verified against an independent Python HMAC implementation) — no AWS SDK in the flux core.
 
 ---
@@ -150,16 +149,15 @@ problem at the source and requests tool-capable routing (`provider.require_param
 
 ---
 
-## GLM Z1 / GLM-4 (Zhipu AI) via OpenRouter
+## GLM (Zhipu AI) via OpenRouter
 
-[Zhipu AI's GLM series](https://openrouter.ai/thudm) is available on OpenRouter under the `thudm` namespace. The latest capable model (GLM-Z1, comparable to the 5.x generation) is routed as:
+Zhipu AI's GLM series is available on OpenRouter under the `z-ai` namespace. The two slugs that
+matter for flux:
 
-| Model | OpenRouter slug | Context | Notes |
-|---|---|---|---|
-| GLM-Z1-32B (latest) | `z-ai/glm-5.2` | 32 k tokens | Reasoning-optimised; strong at code & maths |
-| GLM-Z1-9B | `thudm/glm-z1-9b` | 32 k tokens | Lighter, faster |
-| GLM-4-32B | `thudm/glm-4-32b` | 128 k tokens | Long-context general-purpose |
-| GLM-4-Plus | `thudm/glm-4-plus` | 128 k tokens | Flagship GLM-4 variant |
+| Model | OpenRouter slug | Notes |
+|---|---|---|
+| GLM-4.6 | `z-ai/glm-4.6` | The reliable agentic route — use it via `openrouter-anthropic` (see below) |
+| GLM-5.2 | `z-ai/glm-5.2` | Emits malformed/empty plan JSON on the Chat route; not recommended for flux |
 
 > **Slug tip:** model slugs change as Zhipu releases new checkpoints. Always verify the exact identifier at <https://openrouter.ai/models?q=glm> before pinning a slug in config.
 
@@ -168,18 +166,15 @@ problem at the source and requests tool-capable routing (`provider.require_param
 ```bash
 export OPENROUTER_API_KEY=sk-or-...
 
-# Latest GLM-Z1 (the "5.2" generation reasoning model)
-flux run -m openrouter/z-ai/glm-5.2 "write unit tests for the auth module"
-
-# Long-context variant for big codebases
-flux run -m openrouter/thudm/glm-4-32b  "explain the entire provider layer"
+# Recommended: GLM-4.6 over the Anthropic Messages endpoint (structured tool_use)
+flux run -m openrouter-anthropic/z-ai/glm-4.6 "write unit tests for the auth module"
 ```
 
 ### Config file
 
 ```toml
 # .flux/config.toml
-model = "openrouter/z-ai/glm-5.2"
+model = "openrouter-anthropic/z-ai/glm-4.6"
 ```
 
 > **Tool-calling reliability:** GLM emits tool calls far more reliably through the Messages endpoint —
@@ -193,7 +188,7 @@ model = "openrouter/z-ai/glm-5.2"
 You can switch models without restarting a session using the `/model` REPL command:
 
 ```
-/model openrouter/z-ai/glm-5.2
+/model openrouter-anthropic/z-ai/glm-4.6
 ```
 
 ---
@@ -255,8 +250,7 @@ flux is a tool-driven coding agent, so pick a model with solid **function callin
 | Llama 3.1 8B | `llama3.1:8b` | ~4.7 GB | Reliable general-purpose tool calling |
 
 > Tiny models (Llama 3.2 3B, Qwen2.5 3B) technically support tools but are too weak for real
-> agentic coding. Don't pass `--effort` to non-reasoning local models — it sends an OpenAI
-> `reasoning_effort` field they may not understand.
+> agentic coding.
 
 > **Expectations:** even the strongest small local models are noticeably weaker than Sonnet at
 > multi-step tool sequences. Great for offline / CI / cheap iteration; not a drop-in Sonnet
@@ -282,10 +276,10 @@ model = "ollama/qwen2.5-coder:7b"
 | Use case | Recommended | Rationale |
 |---|---|---|
 | Daily coding, file edits | `anthropic/claude-sonnet-4-6` | Fast, strong at code, supports caching |
-| Long planning / reasoning | `anthropic/claude-opus-4-8` | Highest capability; use `--think` |
+| Long planning / reasoning | `anthropic/claude-opus-4-8` | Highest capability |
 | Quick summarise / lint | `anthropic/claude-haiku-4-5-20251001` | Cheapest, low latency |
 | Multi-provider fallback | `openrouter/anthropic/claude-sonnet-4-6` | Same model, OpenRouter routing |
-| GLM / Zhipu AI work | `openrouter/z-ai/glm-5.2` | Latest GLM reasoning model |
+| GLM / Zhipu AI work | `openrouter-anthropic/z-ai/glm-4.6` | Reliable GLM tool calling via the Messages endpoint |
 | Local / offline coding | `ollama/qwen2.5-coder:7b` | Runs on your machine, no key; needs a tool-capable model |
 | AWS / Bedrock (compliance) | `aws/sonnet` | Claude via AWS Bedrock; SSO/IRSA, no `aws` CLI; metered |
 | Offline / CI / testing | `-m mock` | No key required, full pipeline exercised |

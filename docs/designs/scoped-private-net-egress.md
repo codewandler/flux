@@ -1,6 +1,6 @@
 # Design: scoped private-network egress (D-20)
 
-**Status:** implemented core, audit/smoke follow-ups remain · **Pillar:** Core · **Layer:** L2 (`flux-system` net guard) + L4 (`flux-plugin` host
+**Status:** implemented (D-20 done — incl. the `PrivateNetAdmit` audit record, `d58db46`; smoke-script follow-up remains) · **Pillar:** Core · **Layer:** L2 (`flux-system` net guard) + L4 (`flux-plugin` host
 caps) + L0 (`flux-config`) + L6 wiring (`flux-cli`) · **Owner:** Timo ·
 **Story:** [D-20](../stories/D-20-scoped-private-net-egress.md)
 
@@ -96,9 +96,10 @@ The legacy `allow_private_net` scalar remains as a compatibility read. It maps o
 
 ## Audit
 
-Reaching a private host is a security-relevant event. A follow-up should emit a `flux-events` record
-(plugin/tool, host, grant source) when `guard_url_scoped` admits a private address under a grant, so
-an operator can answer "what internal addresses did flux reach, and under whose grant."
+Reaching a private host is a security-relevant event. When `guard_url_scoped` admits a private
+address under a grant, the host emits a `flux-events` record — `PrivateNetAdmit { caller, host,
+grant_source }` (`crates/flux-events/src/kind.rs:95`, landed in `d58db46`) — so an operator can
+answer "what internal addresses did flux reach, and under whose grant."
 DNS-rebinding caveat from `net.rs` is unchanged (this is defense-in-depth, not a TOCTOU fix) and
 stays documented.
 
@@ -126,5 +127,5 @@ stays documented.
 - `crates/flux-config/src/lib.rs` — `[private_net]` grant shape; merge semantics; legacy scalar maps to
   `web_fetch` only.
 - `crates/flux-cli/src/main.rs:957,976,3335` — the three egress wiring sites resolve caller-scoped allows.
-- Follow-up: `crates/flux-events` private-egress audit records.
+- `crates/flux-events/src/kind.rs:95` — `PrivateNetAdmit` private-egress audit record (landed, `d58db46`).
 - Follow-up: `scripts/smoke-plugins.sh` guard-refusal vs. failure distinction + a scoped-grant exercise path.

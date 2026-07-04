@@ -109,6 +109,9 @@ A provider is a **wire codec × credential** cell. Select one with `-m <provider
 | `codex` | OpenAI Responses | ChatGPT/Codex OAuth | imports `~/.codex/auth.json`; opt-in |
 | `aws` | Anthropic Messages (Bedrock) | AWS env / SSO / IRSA / EKS Pod Identity | Claude via AWS Bedrock; full credential chain, no `aws` CLI; metered |
 | `openrouter` | OpenAI Chat | `OPENROUTER_API_KEY` | API key |
+| `openrouter-anthropic` | Anthropic Messages | `OPENROUTER_API_KEY` | OpenRouter's native Messages endpoint — structured `tool_use` blocks |
+| `ollama` | OpenAI Chat | none | local models; endpoint from `OLLAMA_HOST` (default `localhost:11434`) |
+| `ollama-anthropic` | Anthropic Messages | none | local ollama over `/v1/messages` for native tool calls |
 
 ```bash
 flux auth status                 # show what credentials are available and from where
@@ -190,7 +193,7 @@ injects their bodies into that turn's context (ranked and capped to keep the pro
 **Sub-agent roles** (`.flux/agents/<role>.md`): scout / planner / worker / reviewer / evaluator / summarizer — built-in defaults, overridable with your own markdown files.
 
 **Plugins** (`~/.flux/plugins/*.toml`): trusted subprocess binaries in any language over a framed NDJSON protocol. Their operations become policy-gated tools; privileged IO is requested back from the host via declared capabilities. A plugin host callback gets **only** what its manifest declares — runnable programs, readable secret keys, HTTP hosts, connection targets, and private-network hosts are explicit allow-lists checked on every call.
-- `flux plugin add <name> <program> [args…] | ls | pin <name> <ver> | rollback <name>`
+- `flux plugin install <name>[@<ver>]|--all|--dir [path] | add <name> <program> [args…] | ls | status [<name>] | call <name> <op> [json] | pin <name> <ver> | rollback <name> | uninstall <name> | skill`
 
 **Hooks** (`.flux/hooks/*.js`): JavaScript pre-tool hooks that can observe, modify, or deny a call.
 
@@ -200,8 +203,11 @@ injects their bodies into that turn's context (ranked and capped to keep the pro
 /help  /tools  /session  /clear
 /plan               toggle plan mode — show the plan without running it
 /run                execute the plan you just reviewed
+/shell              toggle the opt-in generic bash op for the session (off by default)
+/evidence           show the audit trail this session has recorded
 /model <spec>       switch model/provider mid-session (e.g. /model opus)
 /sessions           list recent sessions; /resume <id> reattaches
+/compact            summarise and compact the context window now
 /pd <goal>          plan-and-dispatch: planner → parallel dependency waves of workers
 /goal <condition>   drive turns toward a goal, judged by an evaluator sub-agent
 /loop <n> <task>    run a task up to n times

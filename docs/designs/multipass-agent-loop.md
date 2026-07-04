@@ -36,7 +36,7 @@ A flux turn today one-shots a plan per loop iteration. Two costs:
 Evidence this bites in practice: a terminal-bench smoke (2026-07-02) functionally solved
 `fibonacci-server` (server up, every curl check correct) yet burned the 30-plan-iteration cap stuck
 on one step — 480s, $0.58, scored 0. The `s_251` postmortem
-([session-s251-postmortem.md](session-s251-postmortem.md)) records the same shape: re-plan →
+([session-s251-postmortem.md](../archive/designs/session-s251-postmortem.md)) records the same shape: re-plan →
 re-gather → re-starve, seven iterations, cancelled.
 
 What the user asked for, verbatim intent: (1) orient/ground the query and figure out what context is

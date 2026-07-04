@@ -41,10 +41,13 @@ callbacks so the manifest gates below actually apply.
 
 ## Lifecycle: install → configure → call
 
-1. **Install** — register the binary as a descriptor at `~/.flux/plugins/<name>.toml`:
+1. **Install** — register the binary as a descriptor at `~/.flux/plugins/<name>.toml`. Users install
+   from the signed pack release: `flux plugin install <name>[@<version>]` (or `--all`) verifies the
+   minisign-signed index + every archive's sha256 and unpacks into the versioned store
+   `~/.flux/plugins/bin/<name>/<version>/`. While authoring, register your local build instead:
    ```
    cd plugins && cargo build --release        # → plugins/target/release/flux-plugin-<name>
-   flux plugin install                        # register every built flux-plugin-* binary
+   flux plugin install --dir plugins/target/release   # register every built binary (local, unverified)
    #  …or one at a time:
    flux plugin add <name> /abs/path/to/flux-plugin-<name>
    ```
@@ -72,23 +75,33 @@ All requested via the `host-kit` `Host`/`GuestHost`; serviced by `SystemHostCaps
 | Capability | Manifest gate | What it does |
 |---|---|---|
 | `secret` | `secrets` (env-key allow-list) | Resolve a secret **by purpose** (manifest auth method) → value. |
-| `endpoint` | — (config, not a secret) | Resolve a named base URL from declared env keys. |
+| `config` | `config` (declared names) | Resolve a declared **non-secret** config value (e.g. jira's `cloud_id`); a secret-classified env key is refused. |
+| `credential` | `credential: true` | Materialize a credential **reference** into its raw value for in-band-auth raw-socket protocols (e.g. Postgres SCRAM); redactor-registered, never returned via any discovery/endpoint path. |
 | `http.do` | `http: true` + `http_hosts` + SSRF guard | HTTP method/headers/body; **auth injected by the host** per `AuthScheme`; binary via `body_b64` (request) / `response_binary` → `body_b64` (response, 16 MiB cap). Private hosts require `private_hosts` plus config. |
 | `process.run` | `process` (argv[0] allow-list) | Run a subprocess to completion; captured, capped output. |
 | `process.spawn`/`read`/`status`/`kill` | `process` | Start/drain/poll/stop a long-lived host-managed child (e.g. `kubectl port-forward`). |
 | `conn.dial`/`read`/`write`/`close` | `conn` (`tcp:host:port` / `unix:/path` allow-list, SSRF-guarded) | A raw TCP/Unix byte stream for non-HTTP protocols (SQL wire, Docker socket, AMI). |
+| `conn.authenticate` | `conn` (an already-dialed `conn_id`) + a declared auth method or endpoint credential ref | **Host-terminated** in-band auth (D-31): the host speaks the startup + SCRAM/MD5 handshake itself and hands back a post-auth connection — the plugin never receives the password. |
+| `endpoint.discover` | `discover: true` | Cross-plugin endpoint discovery (D-26): ask the host what endpoints exist for a product. |
+| `fs.read` | `fs` (`FsReadScope` path allow-list) | Read a **host** file outside the workspace jail matching a declared scope; `..` traversal rejected, size-capped; `secret: true` scopes are redactor-registered. |
 | `blob.put`/`get`/`info` | `blob: true` | A scratch blob store (SHA-256 ref) so file up/downloads aren't inlined as base64. |
 | `contribute` | (datasource declared) | Add `flux-datasource` `Record`s to the D-07 index from list ops. |
+
+There is deliberately **no `endpoint` URL-handback capability** (retired, D-32): endpoints are
+declared in the manifest (`PluginBuilder::endpoint(EndpointSpec)`) and addressed **by reference** —
+the host resolves the base URL (declared env keys, a default, or a host-composed template) and puts
+it on the wire via the `*_ref` IO paths (`http_ref`/`get_json_ref`/`send_json_ref`/`conn_dial_ref`);
+the resolved URL is never returned to the plugin.
 
 ### Secret resolution & auth injection (never hand-roll auth)
 
 A plugin declares an auth method — a `purpose`, the env keys that satisfy it, and an `AuthScheme`
-(`Bearer` / `Basic { user_env }` / `Header { name }` / `Query { name }`). To authenticate a request you
-pass the **purpose**, not a token:
+(`Bearer` / `Basic` / `Header { name }` / `Query { name }`; for `Basic` the username half resolves
+from the method's `user_env` keys). To authenticate a request you pass the **purpose**, not a token:
 
 ```rust
-host.get_json(url, Some("api_token"))?;            // GET, host injects the declared scheme
-host.send_json("POST", url, Some("api_token"), &body)?;
+host.get_json_ref("gitlab.endpoint", path, Some("api_token"))?;   // GET, host injects the declared scheme
+host.send_json_ref("gitlab.endpoint", "POST", path, Some("api_token"), &body)?;
 ```
 
 The host resolves the purpose to a value from the granted env keys and injects it per the scheme
@@ -100,14 +113,14 @@ never base64 in-plugin, never read the token from env — declare the scheme and
 
 ## The rules (checklist)
 
-1. **Declare everything in the manifest** — every op, every `secrets`/`process`/`conn`/`http`/`blob`
-   capability, every `http_hosts`/`private_hosts` entry, every auth method and endpoint, every
-   datasource. Undeclared → denied at runtime with a clear error.
+1. **Declare everything in the manifest** — every op, every `secrets`/`process`/`conn`/`http`/`blob`/
+   `config`/`credential`/`fs`/`discover` capability, every `http_hosts`/`private_hosts` entry, every
+   auth method and endpoint, every datasource. Undeclared → denied at runtime with a clear error.
 2. **Never do IO directly** — no `reqwest`, `std::net`, `std::fs`, `std::process::Command`. Use the
    `Host` callbacks. (Vendor SDKs that insist on owning a `TcpStream` don't fit; sit a minimal client
    on `conn_*` instead.)
 3. **Never read env directly** — you can't (it's cleared), and you shouldn't. Ask the host via the
-   declared `secret`/`endpoint` purposes.
+   declared `secret`/`config` names; endpoints resolve host-side — address them by reference.
 4. **Never hand-roll auth** — declare an `AuthScheme` and pass the purpose; the host injects.
 5. **Pick real effects** — every op is `read_op` (`[Read]`, idempotent) or `write_op`
    (`[Write, Network]`); a write/destructive op sets `Risk`. An empty-effects op is forced through
@@ -124,16 +137,18 @@ Edit `plugins/<name>/src/main.rs` (reference: `plugins/gitlab/src/main.rs` for H
 1. **Declare** in `manifest_builder()`: `.operation(read_op|write_op("<name>", "<desc>", json!(<schema>)), <handler>)`,
    plus any new `Caps.secrets`, `EndpointSpec`, `AuthMethod`, or `.datasource(...)`.
 2. **Handler** `fn <handler>(input: Value, host: &mut Host) -> Result<Value, String>`: validate input,
-   do IO through `host.get_json`/`send_json`/`http_bytes`/`run`/`conn_*`/`blob_*`, and for knowledge
-   ops emit `Record`s via `host.contribute`.
+   do IO through `host.get_json_ref`/`send_json_ref`/`http_ref`/`http_bytes_ref` (endpoint-reference
+   HTTP) or `run`/`conn_*`/`blob_*`, and for knowledge ops emit `Record`s via `host.contribute`.
 3. **Test** against a `MockHost` (`with_http`/`with_process`/`with_http_bytes` match by **substring** in
    insertion order — give each canned response a distinguishing substring): assert the returned value
    **and** `host.contributed`.
 
 `host-kit` (`plugins/host-kit/src/lib.rs`) is the SDK: `PluginBuilder`, `read_op`/`write_op`, the typed
-`Host` (`secret`/`endpoint`/`http`/`get_json`/`send_json`/`http_bytes`/`run`/`process_*`/`conn_*`/
-`blob_*`/`contribute`), and `MockHost`. Contract types (`AuthMethod`/`AuthScheme`/`OperationSpec`/
-`PluginCapabilities`) live in `crates/flux-plugin/src/lib.rs`, re-exported through host-kit.
+`Host` (`secret`/`config`/`http`/`get_json`/`send_json`/`http_bytes`/`http_ref`/`http_bytes_ref`/
+`get_json_ref`/`send_json_ref`/`run`/`process_*`/`conn_*`/`conn_dial_ref`/`conn_authenticate`/
+`credential`/`credential_for_endpoint`/`blob_*`/`contribute`), and `MockHost`. Contract types
+(`AuthMethod`/`AuthScheme`/`OperationSpec`/`PluginCapabilities`) live in `crates/flux-plugin/src/lib.rs`,
+re-exported through host-kit.
 
 ## Gate
 

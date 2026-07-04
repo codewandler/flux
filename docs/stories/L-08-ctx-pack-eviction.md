@@ -5,7 +5,7 @@ pillar: Language
 status: done
 priority:
 epic: session-s251-postmortem
-design: docs/designs/session-s251-postmortem.md
+design: docs/archive/designs/session-s251-postmortem.md
 note: a single oversized early member drops every smaller member after it (hard `break` in build_ctx); the s_251 reasoning spiral
 ---
 
@@ -37,7 +37,7 @@ preserve the highest-information members within budget, not a declared-order pre
 ## Progress
 
 - **Audited the post-mortem files for sensitive data** — redacted the one leaked AWS account ID /
-  EKS ARN in `docs/designs/session-s251-postmortem.md` to a neutral placeholder; re-scanned all created
+  EKS ARN in `docs/archive/designs/session-s251-postmortem.md` to a neutral placeholder; re-scanned all created
   docs (design, two stories, roadmap, board) for AWS account IDs / EKS ARNs / endpoint hostnames:
   clean.
 - **Cache-impact analysis** — confirmed `build_ctx` runs inside the value store and its `Ctx` output
@@ -59,7 +59,7 @@ preserve the highest-information members within budget, not a declared-order pre
 
 ## Notes
 
-- Root cause + evidence in [docs/designs/session-s251-postmortem.md](../designs/session-s251-postmortem.md)
+- Root cause + evidence in [docs/archive/designs/session-s251-postmortem.md](../archive/designs/session-s251-postmortem.md)
   §Defect 1. The oversized member in `s_251` was `analysis_session_evidence_fresh` at 492,648 chars
   (a full session evidence dump); it preempted 11k/24k/12k code reads that would have fit.
 - Implementation site: `crates/flux-lang/src/runtime.rs` `build_ctx` (~line 3275), the `else { break; }`

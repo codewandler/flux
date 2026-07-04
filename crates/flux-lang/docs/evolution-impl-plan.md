@@ -35,7 +35,8 @@ change.
 - `flux-lang`: new `prelude` module — register the **v1-core** subset as `Named` type schemas:
   `Span/Claim/Evidence/Need/Ctx/Query/Answer/Blocked` + the coding types `Patch/TestResult` (handles reuse
   the existing `Thing`/`ThingRef` — no `Ref` type; `Value` already has a `Ref` variant). **Grow on demand**
-  (don't ship yet): `Source/Chunk`, `Hypothesis`, `Decision/Verdict`. These are **new**, distinct from
+  (don't ship yet): `Source/Chunk`, `Hypothesis`, `Decision` (`Verdict` shipped with the 11 v1-core
+  types — see above). These are **new**, distinct from
   `flux-evidence::Observation` (a generic audit bag); optionally a produced `Evidence` is recorded into the
   `EvidenceLog`. No `Value`/`TypeRef` change.
 - `flux-lang::schema`: add `prelude_type_catalog()` + `prelude_schema()` SSOT generator; add a drift test
@@ -98,7 +99,7 @@ change.
 ## P4 — richer analyze (typed HIR) — ✅ DONE
 - **Shipped:** `analyze::lower(ast, ops) -> HirFlow` runs the whole-flow validation, gathers the
   semantic effect set (declared bind/memo effects ∪ host-op effects mapped to `FlowEffect`), and adds a
-  **call-arity** check (`for_each_node` traversal covers all 36 kinds). Full type inference over
+  **call-arity** check (`for_each_node` traversal covers all node kinds — 43 today). Full type inference over
   expressions remains.
 
 ## P5 — parallel tracks (prioritize later)
@@ -113,7 +114,7 @@ change.
   `fallback`/`timeout`/`budget` (tier 1) and `checkpoint`/`compensate`/`once`/`scope` (tier 2); each
   adopted node goes through the node-kind SSOT + docs-sync gates.
 
-## P6 — capability batch: await + Tier-1 control-flow + polish — 🚧 IN PROGRESS
+## P6 — capability batch: await + Tier-1 control-flow + polish — ✅ DONE
 The next batch (directions 1 + 4 + 2). Each sub-phase ships behind the full dev loop + an adversarial
 review, then commits; `STATUS.md` rows flip as each lands.
 
@@ -171,6 +172,17 @@ review, then commits; `STATUS.md` rows flip as each lands.
   explicit `$symbol` names, not NL aliases — there is **no runtime consumer** for "the draft"/"those
   results", so a most-recent-by-type resolver would be dead code. Revisit when a surface needs NL focus
   resolution. Recorded in `STATUS.md` (§9.3).
+
+## P7 — Tier-2 control-flow + durable seam + optimizer passes — ✅ DONE
+- **Shipped:** the Tier-2 nodes (`scope`/`saga`/`once`/`checkpoint`) with the `DurableStore` seam
+  (`FlowStore` event-log folds), plus the **dead-step elimination** and **CSE** optimizer passes
+  (`Stage::Alias`). Detail lives in [`STATUS.md`](STATUS.md) (Evolution build status, P7 row).
+
+## P8 — bind ergonomics + value templates — ✅ DONE
+- **Shipped:** P8a bind-grammar ergonomics (`bind` accepts a `var` or `lit` directly — `$b = $a`,
+  `$x = 5`/`[1,2,3]`/`{…}`) and P8b pure `obj`/`list` **value-template** nodes (records/lists assemble
+  from variables, leaves restricted to pure value nodes), with the native `{k: expr}`/`[expr]` text
+  spellings. Detail lives in [`STATUS.md`](STATUS.md) (P8a/P8b rows).
 
 ## Cross-cutting gates
 - Node-kind SSOT (+3) and the new prelude-type catalog must stay green (drift tests).

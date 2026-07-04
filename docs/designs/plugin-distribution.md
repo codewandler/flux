@@ -1,6 +1,8 @@
 # Design: plugin pack distribution (release channel + verified install)
 
-**Status:** proposed (scoped by [D-21](../stories/D-21-plugin-distribution.md)) · **Pillar:** Core
+**Status:** core shipped (D-46 + D-47 done — released v0.2.14, `plugins-v0.1.0` published
+2026-07-03 with 87 signed assets, commits `325cf94`/`c2afe2e`; D-48 + D-49 remain ready; originally
+scoped by [D-21](../stories/D-21-plugin-distribution.md)) · **Pillar:** Core
 (platform) · **Layer:** CI/release plumbing + L4 (`flux-plugin`) pack store + L6 (`flux-cli`) install
 UX · **Owner:** Timo · **Stories:**
 [D-46](../stories/D-46-plugin-pack-release-pipeline.md) ·
@@ -10,11 +12,12 @@ UX · **Owner:** Timo · **Stories:**
 
 ## Why
 
-A flux user who did **not** clone the repo has no way to obtain the integration plugin pack. The only
-path today is `cd plugins && cargo build --release && flux plugin install` — source tree + Rust
-toolchain required. Anyone who installed flux the documented way (the release installers, or
-`cargo install --git … flux-cli`) gets a `flux` that can *manage* plugins (`flux plugin
-add/ls/pin/rollback/call/install/uninstall/status/skill`) but has nothing to install.
+This design solved the distribution gap: a flux user who did **not** clone the repo had no way to
+obtain the integration plugin pack. The only path was `cd plugins && cargo build --release && flux
+plugin install` — source tree + Rust toolchain required. Anyone who installed flux the documented
+way (the release installers, or `cargo install --git … flux-cli`) got a `flux` that could *manage*
+plugins (`flux plugin add/ls/pin/rollback/call/install/uninstall/status/skill`) but had nothing to
+install. Since v0.2.14, `flux plugin install <name>` fetches from the signed release channel.
 
 The facts the design builds on:
 

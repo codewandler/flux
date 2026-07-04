@@ -1,5 +1,8 @@
 # Design: Flux-Lang composite ops
 
+**Status:** implemented · **Stories:** [L-04](../stories/L-04-composite-ops.md) ·
+[L-06](../stories/L-06-agent-registered-composite-ops.md) (both done)
+
 ## Summary
 
 Composite ops let a `.flux` module define reusable operations in Flux-Lang itself. A composite op is

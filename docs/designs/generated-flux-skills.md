@@ -1,5 +1,8 @@
 # Generated Flux skills
 
+**Status:** shipped — living reference (generalizes
+[plugin-skill-generation.md](../archive/designs/plugin-skill-generation.md))
+
 Flux ships generated Claude-format skills so agents can load focused Flux knowledge without treating
 hand-written docs as catalogs. The command surface is:
 

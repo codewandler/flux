@@ -97,6 +97,31 @@ flow summarise(text: String) -> String
 Each flow starts with a `flow` header at column 0; blank lines and comments between flows are
 allowed (blank lines are not required separators).
 
+### Module declarations
+
+Module declarations (`agent`/`channel`/`datasource`/`trigger`/`journey`) start at column 0 with the
+keyword and a single-identifier name. Except for `journey` (whose body is an `agent` attribute plus
+an inline `flow` block), a declaration body is a **flat list of `key value` attribute lines**, all
+at one indentation level — no nested blocks. Keys the decl kind knows become typed fields (`agent`:
+`model`/`tools`/`datasources`/`description`; `channel`/`datasource`: `kind`, defaulting to the decl
+name, plus `datasource`'s `path`; `trigger` accepts *only* `on`/`run`/`agent`); every other key is
+collected into the decl's `settings` object.
+
+A setting value is one of: a quoted string, a number, `true`/`false`/`null`, a bare identifier
+(kept as a string), a `[a, b]` list, a `{ k: v }` record (lists and records nest), or a **secret
+reference**:
+
+```flux
+channel slack
+  kind slack
+  bot_token secret "SLACK_BOT_TOKEN"
+  mode socket
+```
+
+`secret "ENV_NAME"` compiles to the marker object `{"$secret": "ENV_NAME"}` in the decl's settings
+— the name of the environment variable the host resolves at load time. Plaintext secrets are never
+written inline in `.flux` text.
+
 ### Composite op declarations
 
 A module may also declare reusable custom ops with `op`. A composite op has typed params, optional
@@ -678,7 +703,7 @@ retry 3 backoff exponential delay 500 -> $out
 
 - `max` (positional, required) — maximum attempts including the first
 - `backoff none | linear | exponential` — default `none`
-- `delay <ms>` — base delay in milliseconds, default `0`
+- `delay <ms>` — base delay in milliseconds; when omitted the runtime defaults to `500`
 - `-> $name` — binds the last expression of the body on success
 - Fatal errors (policy denial, unknown op) are never retried
 - A denied `confirm` inside a `retry` body is **not** retried
@@ -1115,8 +1140,9 @@ Round-trip invariant: `parse(&format(&ast)) == ast` — native spellings for the
 property-tested (`tests/roundtrip_property.rs`).
 
 `flux run <app.flux>` runs a multi-agent program through the `flux-app` host (see
-[`../../../docs/designs/flux-lang-evolution.md`](../../../docs/designs/flux-lang-evolution.md) §6); a
-`fluxlang compile` subcommand onto `parse` is the one remaining toolchain step.
+[`../../../docs/designs/flux-lang-evolution.md`](../../../docs/designs/flux-lang-evolution.md) §6); the
+`fluxlang compile [FILE]` subcommand (reads stdin when `FILE` is omitted) runs `parse` on Flux-Lang
+text and emits the resulting `DraftAst` as JSON.
 
 ---
 
