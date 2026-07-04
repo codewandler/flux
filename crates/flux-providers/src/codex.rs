@@ -155,6 +155,11 @@ const DEFAULT_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 /// after the terminal event instead of performing a close handshake (observed 2026-07-02), so the
 /// transport stops reading here — a reset *before* the terminal event still surfaces as a stream
 /// error (real truncation).
+// A-37: the `serde_json::from_str` call here already tolerates failure (`.ok()` /
+// `.unwrap_or(false)`) — a parse miss just means "not terminal yet", never a fatal stream error;
+// this WS frame is re-enveloped as SSE and re-parsed by `map_responses_stream` regardless. Allowed
+// at this tight scope.
+#[allow(clippy::disallowed_methods)]
 fn is_terminal_event(payload: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(payload)
         .ok()
@@ -199,6 +204,11 @@ fn sse_frame(payload: &str) -> Bytes {
 
 #[async_trait]
 impl StreamTransport for CodexWsTransport {
+    // A-37: the WS first-frame kind-sniff below (`serde_json::from_str` inside `wait_for_first`)
+    // is already tolerant (`.ok()` / `.unwrap_or_default()`) — a parse miss just falls through to
+    // "not a recognized control frame" and keeps waiting; it never turns into a fatal stream
+    // error. Allowed at this tight scope.
+    #[allow(clippy::disallowed_methods)]
     async fn connect(&self, body: &Value) -> Result<ByteStream> {
         let mut request = self
             .url
@@ -329,6 +339,10 @@ impl StreamTransport for CodexWsTransport {
 }
 
 #[cfg(test)]
+// A-37: this module's couple of `serde_json::from_str` calls parse test-authored fixture/request
+// JSON with `.expect(...)` — trusted test data, not adversarial provider bytes, so they're outside
+// the model-stream invariant `clippy.toml` guards. Allowed at the module scope.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

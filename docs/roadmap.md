@@ -71,6 +71,30 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 
 ## Next
 
+### Stream resilience + provider-reported cost (epic) — **shipped 2026-07-04 (7/7, full gate green, live-verified)**
+
+Parse resilience wave 2, filed 2026-07-04 after the user pasted a **fourth** turn-killing
+`runtime error: step plan failed: serialization error: …` from an s_368-class deepseek session —
+plus the permanent ` · $? (unpriced)` on every OpenRouter turn. A-32 hardened tool-**args**; the
+SSE **envelope** parses stayed bare-fatal (`openai.rs:269`/`:870`, `messages/mod.rs:381`,
+`bedrock.rs:236`), mid-stream errors are never retried, and `stream_blocks` discards accumulated
+blocks + usage on the way out — so one malformed frame from a weak model still costs the whole
+turn. The epic enforces the invariant **provider bytes never kill a turn** at three layers: a
+planner backstop that turns classified decode errors into one retried step within the existing
+budget ([A-33](stories/A-33-stream-decode-backstop.md)); per-codec skip+count+diagnostic envelope
+tolerance with declared provider errors pinned fatal
+([A-34](stories/A-34-openai-wire-envelope-tolerance.md) ·
+[A-35](stories/A-35-messages-wire-envelope-tolerance.md) ·
+[A-36](stories/A-36-bedrock-frame-decode.md)); and structural enforcement so the class can't
+regress — a crate-local clippy ban on bare `serde_json::from_*` in flux-providers plus a
+malformed-envelope corpus test ([A-37](stories/A-37-parse-enforcement.md)) — with
+`FLUX_PLANNER_TRACE=1` forensics ([A-38](stories/A-38-planner-trace.md)). Riding ahead of the wave:
+[C-34](stories/C-34-openrouter-reported-cost.md) prices turns from OpenRouter's own reported
+`cost` (final usage frame, both wires) instead of the static table — `$? (unpriced)` disappears
+for OpenRouter models with zero table maintenance. Epic design:
+[stream-resilience.md](designs/stream-resilience.md) ·
+[openrouter-reported-cost.md](designs/openrouter-reported-cost.md).
+
 ### Planner parse resilience (epic) — **shipped 2026-07-03 (3/3, gate green, live-verified on qwen3.7-max)**
 
 Root-caused from session s_360 (2026-07-03): qwen3.7-max via OpenRouter **double-encodes

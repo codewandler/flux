@@ -658,6 +658,7 @@ impl EventStore {
                 fingerprint: attempt.fingerprint,
                 plan_text: attempt.plan_text,
                 phase: attempt.phase,
+                plan_source: attempt.plan_source,
             })
             .in_turn(turn_id),
         )?;
@@ -768,23 +769,25 @@ impl EventStore {
 
     /// Token spend + cost across every session, rolled up by model. Folds each stream's events
     /// through the SAME [`projection::cost_summary`] logic, then re-sums the per-model rows across
-    /// streams — so a model that appears in several sessions reports one aggregate row.
+    /// streams — so a model that appears in several sessions reports one aggregate row. Re-merging
+    /// via [`projection::RowAcc`] (C-34) — rather than re-summing raw usage and re-pricing the
+    /// aggregate — keeps a model's reported-vs-table cost honest across streams too: naively
+    /// re-deriving a fresh `Usage` from token totals would drop each stream's already-resolved
+    /// per-call `reported_cost_usd` entirely and silently fall back to table pricing (or `None` for
+    /// an untabled model) for the whole cross-stream row.
     pub fn cost_summary_all(
         &self,
         pricing: &flux_core::PricingTable,
     ) -> Result<Vec<projection::ModelCost>> {
         let streams = self.aggregate_streams()?;
-        let mut per_model: std::collections::BTreeMap<String, (flux_core::Usage, u64)> =
+        let mut per_model: std::collections::BTreeMap<String, projection::RowAcc> =
             std::collections::BTreeMap::new();
         for stream in &streams {
             for row in self.cost_summary(stream, pricing)? {
-                let entry = per_model.entry(row.model).or_default();
-                entry.0.input_tokens += row.usage.input_tokens;
-                entry.0.output_tokens += row.usage.output_tokens;
-                entry.0.cache_creation_input_tokens += row.usage.cache_creation_input_tokens;
-                entry.0.cache_read_input_tokens += row.usage.cache_read_input_tokens;
-                entry.0.reasoning_tokens += row.usage.reasoning_tokens;
-                entry.1 += row.calls;
+                per_model
+                    .entry(row.model.clone())
+                    .or_default()
+                    .record_priced_row(&row);
             }
         }
         // Re-merge after the cross-stream fold (C-15): one stream may carry only the legacy bare
@@ -792,15 +795,7 @@ impl EventStore {
         // across streams, so without this the all-sessions report still splits one backend.
         Ok(projection::merge_legacy_keys(per_model)
             .into_iter()
-            .map(|(model, (usage, calls))| {
-                let cost = pricing.cost(&usage, &model);
-                projection::ModelCost {
-                    model,
-                    usage,
-                    calls,
-                    cost,
-                }
-            })
+            .map(|(model, acc)| projection::finalize_row(model, acc))
             .collect())
     }
 

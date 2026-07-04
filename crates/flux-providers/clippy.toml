@@ -1,0 +1,36 @@
+# Structural enforcement for the stream-resilience invariant (A-37):
+#
+#   provider bytes never error a chunk stream
+#
+# A-34/A-35/A-36 hardened every SSE/frame codec in this crate to skip+count unparseable envelope
+# bytes instead of `?`-propagating a bare parse error (see docs/designs/stream-resilience.md). A
+# bare `serde_json::from_*` call re-introduces exactly that bug class — one bad byte from the
+# provider kills the whole turn. Ban the four raw entry points here so a NEW call site fails the
+# `cargo clippy --workspace --all-targets -- -D warnings` gate instead of waiting for the next
+# s_368-class session kill.
+#
+# This does not (and structurally cannot) forbid every regression: within a function that already
+# has a legitimate call and thus a `#[allow(clippy::disallowed_methods)]`, this lint can't tell a
+# tolerant match from a bare `?`. That residual is covered by the runtime corpus test instead
+# (`crates/flux-providers/src/envelope_corpus.rs`) — the lint stops new sites at merge time, the
+# corpus proves the invariant holds for the codecs that exist today. Both are needed.
+#
+# Legitimate exceptions carry a `#[allow(clippy::disallowed_methods)]` at the tightest reasonable
+# scope (the containing function or, for test-only fixture parsing, the test module) with a comment
+# explaining why:
+#   - openai.rs: `map_chat_stream`, `map_responses_stream` (the tolerant skip+count SSE envelope
+#     parse) and `parse_inline_call_body` (the GLM/Qwen inline tool-call recovery — already
+#     degrades to `None`/best-effort on failure).
+#   - messages/mod.rs: `map_messages_stream_inner` (same tolerant skip+count pattern).
+#   - bedrock.rs: `frame_to_sse` (the tolerant chunk-payload parse + best-effort event-type/message
+#     extraction) and `resolve_sso`/`refresh_sso_token`/`resolve_eks_pod_identity` (AWS
+#     credential-resolution HTTP responses — out of scope for the model-stream invariant, per A-36).
+#   - codex.rs: `is_terminal_event` and `CodexWsTransport::connect` (the WS terminal-event/kind
+#     sniffs — already tolerant via `.ok()`/`.unwrap_or(..)`) and its `mod tests` (fixture parsing).
+
+disallowed-methods = [
+    { path = "serde_json::from_str", reason = "a bare parse can kill a chunk stream on bad provider bytes (docs/designs/stream-resilience.md) — use the tolerant skip+count+diagnostic pattern (see map_chat_stream/map_responses_stream/map_messages_stream_inner), or #[allow(clippy::disallowed_methods)] at the tightest scope for a legitimate inline-recovery/credential-path parse" },
+    { path = "serde_json::from_slice", reason = "same invariant as serde_json::from_str — see this file's header and docs/designs/stream-resilience.md" },
+    { path = "serde_json::from_value", reason = "same invariant as serde_json::from_str — see this file's header and docs/designs/stream-resilience.md" },
+    { path = "serde_json::from_reader", reason = "same invariant as serde_json::from_str — see this file's header and docs/designs/stream-resilience.md" },
+]

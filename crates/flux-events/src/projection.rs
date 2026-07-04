@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use flux_core::{Message, Money, PricingTable, Usage};
+use flux_core::{is_subscription, CostSource, Message, Money, PricingTable, Usage};
 use flux_lang::ast::RunEvent;
 
 use crate::kind::{EventKind, StoredEvent};
@@ -60,6 +60,10 @@ pub struct PlanAttempt {
     /// The multi-pass loop phase (A-14) that produced this attempt — `"orient"`, `"gather"`, or
     /// `"execute"`. `None` for pre-A-14 logs and attempts recorded outside a phase-aware call.
     pub phase: Option<String>,
+    /// The accepted plan's canonical parseable Flux-Lang text (`flux_lang::format::format`, L-38)
+    /// — round-trips via `parse`. `None` for non-accepted outcomes, pre-L-38 logs, and oversized
+    /// plans (never truncated: a present `plan_source` always parses).
+    pub plan_source: Option<String>,
 }
 
 /// A turn's telemetry, folded from its `TurnStarted` / `PlanAttempted` / `TurnEnded`
@@ -117,6 +121,7 @@ pub fn turns(events: &[StoredEvent]) -> Vec<TurnSummary> {
                 fingerprint,
                 plan_text,
                 phase,
+                plan_source,
             } => {
                 if let Some(t) = e.turn_id.and_then(|tid| by_turn.get_mut(&tid)) {
                     t.plan_attempts.push(PlanAttempt {
@@ -126,6 +131,7 @@ pub fn turns(events: &[StoredEvent]) -> Vec<TurnSummary> {
                         fingerprint: fingerprint.clone(),
                         plan_text: plan_text.clone(),
                         phase: phase.clone(),
+                        plan_source: plan_source.clone(),
                     });
                 }
             }
@@ -319,17 +325,131 @@ pub struct ModelCost {
 }
 
 /// Field-wise-sum one call's usage into a running total. Every tier is summed here — including
-/// `reasoning_tokens` — because this is a cost rollup, not a context-window occupancy figure: each
-/// call's reasoning tokens are a real (if usually zero-priced) cost line, and folding them keeps
-/// [`ModelCost::usage`] a faithful total across every tier `pricing::cost` can charge for. This is
-/// deliberately NOT [`Usage::accumulate`] (which replaces the input/cache side per call — correct for
-/// a live turn's context-window occupancy, wrong for summing many independent calls' spend).
+/// `reasoning_tokens` and (C-34) `reported_cost_usd` — because this is a cost rollup, not a
+/// context-window occupancy figure: each call's reasoning tokens are a real (if usually
+/// zero-priced) cost line, and folding them keeps [`ModelCost::usage`] a faithful total across
+/// every tier `pricing::cost` can charge for. This is deliberately NOT [`Usage::accumulate`] (which
+/// replaces the input/cache side per call — correct for a live turn's context-window occupancy,
+/// wrong for summing many independent calls' spend). Note: the summed `reported_cost_usd` on the
+/// returned `Usage` is informational only — [`RowAcc::record_call`] prices each call individually
+/// and never re-derives a row's [`ModelCost::cost`] from this aggregate (see its doc comment for
+/// why that would silently under-report a mixed tabled/reported row).
 fn sum_usage(acc: &mut Usage, call: &Usage) {
     acc.input_tokens += call.input_tokens;
     acc.output_tokens += call.output_tokens;
     acc.cache_creation_input_tokens += call.cache_creation_input_tokens;
     acc.cache_read_input_tokens += call.cache_read_input_tokens;
     acc.reasoning_tokens += call.reasoning_tokens;
+    if let Some(c) = call.reported_cost_usd {
+        *acc.reported_cost_usd.get_or_insert(0.0) += c;
+    }
+}
+
+/// Per-model running fold for [`cost_summary`]/[`EventStore::cost_summary_all`](crate::EventStore::cost_summary_all):
+/// raw usage + call count, plus enough to price the row **honestly** when its calls are a mix of
+/// provider-reported and table-estimated cost (C-34). Pricing the row's already-summed [`Usage`] in
+/// one shot (checking `reported_cost_usd` once on the aggregate) would let a couple of reported
+/// calls short-circuit the table for the rest of a *tabled* model's calls and silently
+/// under-report — so each call is priced individually via [`RowAcc::record_call`] and the row's
+/// cost is the SUM of those individual prices.
+#[derive(Debug, Clone)]
+pub(crate) struct RowAcc {
+    pub usage: Usage,
+    pub calls: u64,
+    /// USD summed from calls that priced (reported or table) — `0.0` when none did.
+    priced_usd: f64,
+    /// How many of `calls` contributed to `priced_usd`. `0` means the whole row is unpriced
+    /// ([`ModelCost::cost`] is `None`) — an untabled model with no reported calls, unchanged from
+    /// before C-34.
+    priced_calls: u64,
+    /// `true` iff every call that contributed to `priced_usd` was provider-reported, not
+    /// table-estimated — the AND across every folded call/row.
+    all_reported: bool,
+}
+
+impl Default for RowAcc {
+    fn default() -> Self {
+        RowAcc {
+            usage: Usage::default(),
+            calls: 0,
+            priced_usd: 0.0,
+            priced_calls: 0,
+            all_reported: true,
+        }
+    }
+}
+
+impl RowAcc {
+    /// Fold one provider call's usage into this row, pricing it individually via `pricing`+`model`
+    /// (reported cost short-circuits inside [`PricingTable::cost`] itself — this just reads back
+    /// which source won via [`Money::source`]).
+    fn record_call(&mut self, usage: &Usage, model: &str, pricing: &PricingTable) {
+        self.calls += 1;
+        sum_usage(&mut self.usage, usage);
+        if let Some(money) = pricing.cost(usage, model) {
+            self.priced_usd += money.usd;
+            self.priced_calls += 1;
+            if money.source != CostSource::Reported {
+                self.all_reported = false;
+            }
+        }
+    }
+
+    /// Fold an already-priced [`ModelCost`] row (e.g. one stream's [`cost_summary`] output) into
+    /// this one — used by the cross-stream re-merge in `EventStore::cost_summary_all`, which only
+    /// has each stream's already-priced total, not its individual calls.
+    pub(crate) fn record_priced_row(&mut self, row: &ModelCost) {
+        sum_usage(&mut self.usage, &row.usage);
+        self.calls += row.calls;
+        if let Some(money) = &row.cost {
+            self.priced_usd += money.usd;
+            // The row itself doesn't say how many of its calls were priced — only whether the row
+            // AS A WHOLE priced. `.max(1)` marks the row priced without needing that granularity;
+            // it never reaches 0 when `row.cost` is `Some`, which is all `to_cost` checks.
+            self.priced_calls += row.calls.max(1);
+            if money.source != CostSource::Reported {
+                self.all_reported = false;
+            }
+        }
+    }
+
+    /// Merge another row's totals into this one (same-key folds across legacy key variants).
+    fn merge(&mut self, other: &RowAcc) {
+        sum_usage(&mut self.usage, &other.usage);
+        self.calls += other.calls;
+        self.priced_usd += other.priced_usd;
+        self.priced_calls += other.priced_calls;
+        self.all_reported = self.all_reported && other.all_reported;
+    }
+
+    /// The row's final priced cost — `None` when nothing in it could be priced (an untabled model
+    /// with no reported calls, exactly today's `$?` case).
+    fn to_cost(&self, model: &str) -> Option<Money> {
+        if self.priced_calls == 0 {
+            return None;
+        }
+        Some(Money {
+            usd: self.priced_usd,
+            subscription: is_subscription(model),
+            source: if self.all_reported {
+                CostSource::Reported
+            } else {
+                CostSource::Estimated
+            },
+        })
+    }
+}
+
+/// Build the final [`ModelCost`] row from a folded [`RowAcc`] — shared by [`cost_summary`] and
+/// `EventStore::cost_summary_all`'s cross-stream re-merge.
+pub(crate) fn finalize_row(model: String, acc: RowAcc) -> ModelCost {
+    let cost = acc.to_cost(&model);
+    ModelCost {
+        model,
+        usage: acc.usage,
+        calls: acc.calls,
+        cost,
+    }
 }
 
 /// Roll up token spend + cost by model, folding a stream's events. Prefers the per-call
@@ -339,43 +459,41 @@ fn sum_usage(acc: &mut Usage, call: &Usage) {
 /// call-level), but every old log still rolls up rather than reporting nothing. The two sources are
 /// never mixed within one stream: a stream that recorded even one `CallUsage` uses ONLY those (the
 /// turn totals they came from would double-count the same spend). Rows are sorted by model id for a
-/// stable, diffable report.
+/// stable, diffable report. Each call (or, in the fallback, each turn total) is priced
+/// INDIVIDUALLY — see [`RowAcc`] — so a mix of provider-reported and table-estimated calls for the
+/// same model sums correctly instead of one source silently eclipsing the other (C-34).
 pub fn cost_summary(events: &[StoredEvent], pricing: &PricingTable) -> Vec<ModelCost> {
-    let mut per_model: BTreeMap<String, (Usage, u64)> = BTreeMap::new();
+    let mut per_model: BTreeMap<String, RowAcc> = BTreeMap::new();
     let mut any_call_usage = false;
 
     for e in events {
         if let EventKind::CallUsage { model, usage } = &e.kind {
             any_call_usage = true;
-            let entry = per_model.entry(model.clone()).or_default();
-            sum_usage(&mut entry.0, usage);
-            entry.1 += 1;
+            per_model
+                .entry(model.clone())
+                .or_default()
+                .record_call(usage, model, pricing);
         }
     }
 
     if !any_call_usage {
         // Fallback: attribute each turn's total to the model active when that turn STARTED (the
-        // `turns()` join point) — the best attribution an old log (no `CallUsage`) can give.
+        // `turns()` join point) — the best attribution an old log (no `CallUsage`) can give. Each
+        // turn's total is still priced as ONE call (single-total pricing, same as before C-34) —
+        // there is no per-call granularity to recover from an old log.
         for t in turns(events) {
             if let Some(usage) = &t.usage {
-                let entry = per_model.entry(t.model.clone()).or_default();
-                sum_usage(&mut entry.0, usage);
-                entry.1 += 1;
+                per_model
+                    .entry(t.model.clone())
+                    .or_default()
+                    .record_call(usage, &t.model, pricing);
             }
         }
     }
 
     merge_legacy_keys(per_model)
         .into_iter()
-        .map(|(model, (usage, calls))| {
-            let cost = pricing.cost(&usage, &model);
-            ModelCost {
-                model,
-                usage,
-                calls,
-                cost,
-            }
-        })
+        .map(|(model, acc)| finalize_row(model, acc))
         .collect()
 }
 
@@ -393,19 +511,16 @@ pub fn cost_summary(events: &[StoredEvent], pricing: &PricingTable) -> Vec<Model
 /// stably to `(openrouter-anthropic, anthropic/<model>)`; rows written before the C-30 attribution
 /// fix under the dropped-outer form `anthropic/<model>` carry a DIFFERENT provider and deliberately
 /// stay separate rows (never guess across providers).
-pub(crate) fn merge_legacy_keys(
-    per_model: BTreeMap<String, (Usage, u64)>,
-) -> BTreeMap<String, (Usage, u64)> {
+pub(crate) fn merge_legacy_keys(per_model: BTreeMap<String, RowAcc>) -> BTreeMap<String, RowAcc> {
     use flux_core::canonical_model_parts;
     // Pass 1: canonicalize each key in place (same-provider variants collapse here).
-    let mut canon: BTreeMap<(Option<String>, String), (Usage, u64)> = BTreeMap::new();
-    for (key, (usage, calls)) in per_model {
+    let mut canon: BTreeMap<(Option<String>, String), RowAcc> = BTreeMap::new();
+    for (key, acc) in per_model {
         let (provider, model) = canonical_model_parts(&key);
-        let entry = canon
+        canon
             .entry((provider.map(str::to_string), model.to_string()))
-            .or_default();
-        sum_usage(&mut entry.0, &usage);
-        entry.1 += calls;
+            .or_default()
+            .merge(&acc);
     }
     // Pass 2: fold each bare row into its sole prefixed sibling, when unambiguous.
     let bare_keys: Vec<String> = canon
@@ -420,10 +535,11 @@ pub(crate) fn merge_legacy_keys(
             .filter_map(|(p, _)| p.clone())
             .collect();
         if let [sole] = providers.as_slice() {
-            let (usage, calls) = canon.remove(&(None, model.clone())).expect("bare row");
-            let entry = canon.entry((Some(sole.clone()), model)).or_default();
-            sum_usage(&mut entry.0, &usage);
-            entry.1 += calls;
+            let acc = canon.remove(&(None, model.clone())).expect("bare row");
+            canon
+                .entry((Some(sole.clone()), model))
+                .or_default()
+                .merge(&acc);
         }
     }
     canon
@@ -585,6 +701,7 @@ mod tests {
                     fingerprint: None,
                     plan_text: None,
                     phase: None,
+                    plan_source: None,
                 },
             ),
             ev(
@@ -598,6 +715,7 @@ mod tests {
                     fingerprint: Some("abc123".into()),
                     plan_text: Some("$x = read(\"a\")".into()),
                     phase: Some("execute".into()),
+                    plan_source: Some("flow\n  $x = read(\"a\")".into()),
                 },
             ),
             ev(
@@ -636,8 +754,44 @@ mod tests {
             Some("execute"),
             "phase folds through"
         );
+        assert_eq!(
+            t.plan_attempts[0].plan_source, None,
+            "non-accepted attempts carry no plan_source"
+        );
+        assert_eq!(
+            t.plan_attempts[1].plan_source.as_deref(),
+            Some("flow\n  $x = read(\"a\")"),
+            "the canonical plan source folds through (L-38)"
+        );
         assert!(t.ended_at_ms.is_some());
         assert_eq!(t.usage.as_ref().map(|u| u.total()), Some(120));
+    }
+
+    /// L-38 back-compat: a `PlanAttempted` event serialized before `plan_source` existed (the
+    /// stored-JSON shape of every pre-L-38 events.db row) decodes with `plan_source: None` — the
+    /// same serde-default contract `phase` established (A-14).
+    #[test]
+    fn pre_l38_plan_attempted_rows_decode_without_plan_source() {
+        let old = serde_json::json!({
+            "kind": "plan_attempted",
+            "data": {
+                "step": 1,
+                "outcome": "accepted",
+                "fingerprint": "abc123",
+                "plan_text": "$x = read(\"a\")",
+                "phase": "execute",
+            },
+        });
+        let kind: EventKind = serde_json::from_value(old).expect("old row decodes");
+        match kind {
+            EventKind::PlanAttempted {
+                plan_source, phase, ..
+            } => {
+                assert_eq!(plan_source, None, "missing field defaults to None");
+                assert_eq!(phase.as_deref(), Some("execute"));
+            }
+            other => panic!("decoded the wrong kind: {other:?}"),
+        }
     }
 
     #[test]
@@ -908,6 +1062,7 @@ mod tests {
             fingerprint: None,
             plan_text: None,
             phase: phase.map(str::to_string),
+            plan_source: None,
         };
         let mut events = Vec::new();
         let mut seq = 0i64;
@@ -1086,6 +1241,7 @@ mod tests {
                         cache_creation_input_tokens: 200_000,
                         cache_read_input_tokens: 500_000,
                         reasoning_tokens: 0,
+                        ..Default::default()
                     },
                 },
             ),
@@ -1243,5 +1399,99 @@ mod tests {
         // opus: 1·5 + 1·25 = 30
         let cost = row.cost.expect("claude-opus-4-8 is a priced model");
         assert!((cost.usd - 30.0).abs() < 1e-9, "got {}", cost.usd);
+    }
+
+    /// C-34: `cost_summary` must price each `CallUsage` INDIVIDUALLY — reported cost when the call
+    /// reported one, else the table — and SUM the per-call prices. Naively re-pricing the row's
+    /// already-summed `Usage` (i.e. checking `usage.reported_cost_usd` once on the aggregate) would
+    /// let a couple of reported calls short-circuit the table for the REST of a tabled model's
+    /// calls and silently under-report the row.
+    #[test]
+    fn cost_summary_prices_each_call_reported_or_table() {
+        let call = |seq: i64, model: &str, usage: Usage| {
+            ev(
+                seq,
+                seq - 1,
+                Some(1),
+                EventKind::CallUsage {
+                    model: model.into(),
+                    usage,
+                },
+            )
+        };
+        let pricing = PricingTable::builtin();
+
+        // A TABLED model (claude-sonnet-4-6): one plain (table-priced) call + one reported call.
+        // The row's total must be the table price for the first PLUS the reported figure for the
+        // second — table math is linear so the table-priced call alone prices at 3+15 = 18.0.
+        let events = vec![
+            call(1, "claude-sonnet-4-6", usage_with(1_000_000, 1_000_000)),
+            call(
+                2,
+                "claude-sonnet-4-6",
+                Usage {
+                    input_tokens: 1_000_000,
+                    output_tokens: 1_000_000,
+                    reported_cost_usd: Some(5.0),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let rows = cost_summary(&events, &pricing);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.calls, 2);
+        let cost = row.cost.expect("mixed row must still price");
+        assert!(
+            (cost.usd - 23.0).abs() < 1e-9,
+            "18.0 table + 5.0 reported, got {}",
+            cost.usd
+        );
+        assert_eq!(
+            cost.source,
+            CostSource::Estimated,
+            "a mix with even one table-priced call is not purely reported"
+        );
+
+        // An UNTABLED model where EVERY call reported → Some/Reported, the summed reported figures
+        // (the exact scenario that used to be permanently `None` / `$?`).
+        let events = vec![
+            call(
+                1,
+                "openrouter/some/untabled-model",
+                Usage {
+                    reported_cost_usd: Some(0.001),
+                    ..Default::default()
+                },
+            ),
+            call(
+                2,
+                "openrouter/some/untabled-model",
+                Usage {
+                    reported_cost_usd: Some(0.002),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let rows = cost_summary(&events, &pricing);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let cost = rows[0]
+            .cost
+            .expect("an all-reported untabled model must price");
+        assert!((cost.usd - 0.003).abs() < 1e-9, "got {}", cost.usd);
+        assert_eq!(cost.source, CostSource::Reported);
+
+        // An UNTABLED model with NO reported calls → None, unchanged from before C-34.
+        let events = vec![call(
+            1,
+            "openrouter/some/untabled-model",
+            usage_with(100, 10),
+        )];
+        let rows = cost_summary(&events, &pricing);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(
+            rows[0].cost.is_none(),
+            "untabled + unreported must stay None"
+        );
     }
 }

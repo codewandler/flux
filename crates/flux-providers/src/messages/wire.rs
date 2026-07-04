@@ -103,6 +103,23 @@ pub struct WireUsage {
     pub cache_creation_input_tokens: u64,
     #[serde(default, deserialize_with = "u64_or_zero")]
     pub cache_read_input_tokens: u64,
+    /// OpenRouter's reported total USD cost for this call (C-34), when it proxies this wire
+    /// (Anthropic-direct never sends this field). `Option`-based — unlike the token counters above,
+    /// no bare-`u64`-style null-tolerance helper is needed.
+    #[serde(default)]
+    pub cost: Option<f64>,
+    /// Whether this call billed against the caller's own upstream key (see
+    /// [`crate::openrouter_reported_cost`]).
+    #[serde(default)]
+    pub is_byok: Option<bool>,
+    #[serde(default)]
+    pub cost_details: Option<WireCostDetails>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct WireCostDetails {
+    #[serde(default)]
+    pub upstream_inference_cost: Option<f64>,
 }
 
 /// Some Messages-compatible gateways (e.g. OpenRouter) send usage counters as an explicit `null`
@@ -124,6 +141,13 @@ pub struct WireError {
 
 impl From<WireUsage> for Usage {
     fn from(u: WireUsage) -> Self {
+        let reported_cost_usd = crate::openrouter_reported_cost(
+            u.cost,
+            u.is_byok,
+            u.cost_details
+                .as_ref()
+                .and_then(|d| d.upstream_inference_cost),
+        );
         Usage {
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
@@ -132,6 +156,7 @@ impl From<WireUsage> for Usage {
             // Anthropic's wire usage folds thinking tokens into output_tokens with no separate
             // count, so there is no reasoning figure to map here.
             reasoning_tokens: 0,
+            reported_cost_usd,
         }
     }
 }

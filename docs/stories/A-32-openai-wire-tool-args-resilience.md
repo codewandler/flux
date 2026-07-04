@@ -79,3 +79,8 @@ Two layers:
   as an empty `DraftAst` — i.e. codec-level garbage could have been *accepted* as an empty plan;
   the gate is checked before any field read. Full gate green (build, clippy `-D warnings`, 87
   workspace test suites, fmt both workspaces). Not committed (per repo rule).
+- 2026-07-03 committed as `5d7b947`.
+- 2026-07-04 third s_368 kill pasted from the live REPL (`EOF while parsing a list at line 1
+  column 5224`, again the `plan` step) — same pre-fix failure class, NOT a regression: no release
+  tag contains `5d7b947` and the installed binary (`~/.cargo/bin/flux` 0.2.13) predates the fix.
+  The fix reaches the REPL only via a rebuild/reinstall or the next release cut.

@@ -1717,6 +1717,7 @@ mod tests {
             cache_creation_input_tokens: 200_000,
             cache_read_input_tokens: 500_000,
             reasoning_tokens: 0,
+            ..Default::default()
         });
 
         // Tokens are accumulated across EVERY tier, not just input/output.
@@ -1757,6 +1758,45 @@ mod tests {
         let content2 = screen(&terminal2);
         assert!(content2.contains("cache"));
         assert!(!content2.contains('$'));
+    }
+
+    /// C-34: an OpenRouter (or any reporting-provider) call with NO pricing-table row still
+    /// accumulates a running dollar cost, because `record_usage` prices through
+    /// `PricingTable::cost`, which now short-circuits on `Usage.reported_cost_usd` — the TUI header
+    /// needs zero code changes to inherit the fix, the same as every other cost sink.
+    #[test]
+    fn record_usage_accumulates_reported_cost_for_untabled_model() {
+        let mut state = ChatState::new("openrouter/deepseek/deepseek-v4-flash:nitro".into())
+            .with_cost(
+                "openrouter/deepseek/deepseek-v4-flash:nitro".into(),
+                flux_core::PricingTable::builtin(),
+            );
+        // The builtin table has no row for this model — without reported cost this would leave
+        // `cost_usd` at `None` forever (the `$?` case).
+        state.record_usage(&Usage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            reported_cost_usd: Some(0.0023),
+            ..Default::default()
+        });
+        assert!(
+            (state.cost_usd.unwrap() - 0.0023).abs() < 1e-9,
+            "got {:?}",
+            state.cost_usd
+        );
+
+        // A second reporting call accumulates (sums), like the token-only path already does.
+        state.record_usage(&Usage {
+            input_tokens: 200,
+            output_tokens: 100,
+            reported_cost_usd: Some(0.0005),
+            ..Default::default()
+        });
+        assert!(
+            (state.cost_usd.unwrap() - 0.0028).abs() < 1e-9,
+            "got {:?}",
+            state.cost_usd
+        );
     }
 
     #[test]

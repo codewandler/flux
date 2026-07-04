@@ -757,6 +757,11 @@ impl EngineLoopHost {
                 if let Some(err) = attempt.error.take() {
                     attempt.error = Some(redactor.redact(&err));
                 }
+                // L-38: same scrub for the canonical source. Redaction replaces the secret
+                // substring INSIDE a string literal, so the redacted text still parses.
+                if let Some(src) = attempt.plan_source.take() {
+                    attempt.plan_source = Some(redactor.redact(&src));
+                }
             }
             let session_id = self.turn.lock().unwrap().session_id.clone();
             let _ = events.record_plan_attempt(&session_id, turn_id, attempt);
@@ -779,6 +784,16 @@ fn cap_plan_text(text: String) -> String {
     }
     let kept: String = text.chars().take(PLAN_TEXT_CAP).collect();
     format!("{kept}\n[plan text truncated]")
+}
+
+/// Cap for the durable CANONICAL plan source on an accepted attempt (L-38). Unlike
+/// [`cap_plan_text`], an over-cap source is dropped (`None`) rather than truncated — the invariant
+/// is that a present `plan_source` always round-trips through `flux_lang::parse`, and a truncation
+/// suffix would poison every downstream miner that trusts it.
+const PLAN_SOURCE_CAP: usize = 32_000;
+
+fn cap_plan_source(source: String) -> Option<String> {
+    (source.chars().count() <= PLAN_SOURCE_CAP).then_some(source)
 }
 
 #[async_trait]
@@ -1027,6 +1042,9 @@ impl LoopHost for EngineLoopHost {
                     fingerprint: Some(fingerprint),
                     plan_text: Some(cap_plan_text(crate::render::render_pretty(&c.ast))),
                     phase: Some(phase.as_str().to_string()),
+                    // L-38: the canonical parseable projection rides alongside the display render —
+                    // the machine-minable record (`parse(plan_source) == c.ast` by L-18 totality).
+                    plan_source: cap_plan_source(flux_lang::format::format(&c.ast)),
                     ..Default::default()
                 });
                 // Design Part 1 — settled: "" only for an accepted `gather: true` plan (the phased
@@ -1720,6 +1738,43 @@ mod tests {
     use std::collections::VecDeque;
 
     use serde_json::json;
+
+    /// L-38: an in-cap canonical source passes through byte-identical; an over-cap one is dropped
+    /// entirely — never truncated (a present `plan_source` must always parse).
+    #[test]
+    fn cap_plan_source_is_none_on_overflow_never_truncated() {
+        let small = "flow\n  $x = read(\"a\")".to_string();
+        assert_eq!(cap_plan_source(small.clone()), Some(small));
+        let big = "x".repeat(PLAN_SOURCE_CAP + 1);
+        assert_eq!(cap_plan_source(big), None, "over-cap source is dropped");
+    }
+
+    /// L-38 + C-22: redacting a canonical plan source replaces the secret INSIDE its string
+    /// literal, so the redacted text still parses — the "redacted-parseable" invariant the
+    /// mining corpus depends on.
+    #[test]
+    fn redacted_plan_source_still_parses() {
+        const SECRET: &str = "supersecretbearervalue12345";
+        let ast: flux_lang::ast::DraftAst = serde_json::from_value(json!({
+            "body": [{
+                "kind": "bind", "name": "out",
+                "value": { "kind": "call", "op": "bash",
+                           "args": [{ "kind": "lit",
+                                      "value": format!("curl -H 'Authorization: Bearer {SECRET}'") }] }
+            }]
+        }))
+        .unwrap();
+        let source = flux_lang::format::format(&ast);
+        assert!(source.contains(SECRET), "fixture carries the secret");
+        let redactor = flux_secret::Redactor::new();
+        redactor.add_secret(SECRET);
+        let redacted = redactor.redact(&source);
+        assert!(
+            !redacted.contains(SECRET),
+            "the secret is scrubbed: {redacted}"
+        );
+        flux_lang::parse::parse(&redacted).expect("redacted plan_source still parses");
+    }
 
     use crate::runtime::execute_flow;
     use flux_core::{Chunk, ContentBlock, StopReason};

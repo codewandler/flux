@@ -1130,20 +1130,27 @@ impl AgentSink for NullSink {}
 /// unwrap it to `error.message` so a credit/billing/auth/rate-limit failure reads as a plain sentence
 /// instead of a JSON dump. Every other error uses its own `Display`.
 pub fn planner_error(e: &flux_core::Error) -> String {
-    if let flux_core::Error::Api { status, message } = e {
-        let detail = serde_json::from_str::<serde_json::Value>(message)
-            .ok()
-            .and_then(|v| {
-                v.get("error")
-                    .and_then(|err| err.get("message"))
-                    .and_then(|m| m.as_str())
-                    .map(str::to_string)
-            })
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| message.clone());
-        format!("the model provider returned an error (HTTP {status}): {detail}")
-    } else {
-        e.to_string()
+    match e {
+        flux_core::Error::Api { status, message } => {
+            let detail = serde_json::from_str::<serde_json::Value>(message)
+                .ok()
+                .and_then(|v| {
+                    v.get("error")
+                        .and_then(|err| err.get("message"))
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string)
+                })
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| message.clone());
+            format!("the model provider returned an error (HTTP {status}): {detail}")
+        }
+        // A-33: a decode-class error that escaped the planner's own step-budgeted retry loop (e.g.
+        // from a one-shot completion call rather than the turn loop) — the same friendly framing as
+        // the API-error case above, instead of the raw "provider stream decode error: …" Display.
+        flux_core::Error::StreamDecode(detail) => format!(
+            "the model provider's response broke mid-stream and could not be decoded: {detail}"
+        ),
+        _ => e.to_string(),
     }
 }
 

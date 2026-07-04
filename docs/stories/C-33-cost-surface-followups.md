@@ -27,3 +27,6 @@ fine today, but re-derive per iteration if `/model` becomes reachable mid-goal.
 ## Progress
 - 2026-07-03 filed as the C-30 follow-up (scope decision: all CliSink surfaces in C-30; these
   non-CliSink surfaces deferred).
+- 2026-07-04 note: once [C-34](C-34-openrouter-reported-cost.md) (provider-reported cost) lands,
+  item (b)'s TUI-`$?` parity only concerns **non-reporting** providers — OpenRouter models will
+  carry a reported cost and never hit the table-miss path. (a) and (c) unaffected.

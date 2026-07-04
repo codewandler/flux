@@ -48,7 +48,10 @@ pub enum EventKind {
     /// rendered graph (`render_pretty`, capped) — the durable "a turn is a readable graph" record
     /// (C-14). `phase` is the multi-pass loop phase that produced this attempt — `"orient"`,
     /// `"gather"`, or `"execute"` (A-14) — `None` for pre-A-14 logs and for attempts recorded outside
-    /// a phase-aware call. All newer fields are `#[serde(default)]` so older logs decode.
+    /// a phase-aware call. `plan_source` is the accepted plan's CANONICAL parseable Flux-Lang text
+    /// (`flux_lang::format::format`, L-38) — machine-minable, round-trips via `parse`; `None` for
+    /// non-accepted outcomes, pre-L-38 logs, and oversized plans (never truncated: a present
+    /// `plan_source` always parses). All newer fields are `#[serde(default)]` so older logs decode.
     PlanAttempted {
         step: u32,
         outcome: String,
@@ -60,6 +63,8 @@ pub enum EventKind {
         plan_text: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         phase: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_source: Option<String>,
     },
     /// A turn closed with its final `outcome`, iteration count, and assistant `answer`. `usage` is
     /// the turn's accumulated token tally — `None` for turns recorded before usage capture, or when
@@ -220,4 +225,65 @@ pub struct StoredEvent {
     /// The owning run's tenant/agent context, stamped from the stream registry on read. Empty
     /// ([`EventContext::is_empty`]) for single-tenant sessions and ad-hoc (non-`s_<n>`) streams.
     pub context: EventContext,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flux_core::Usage;
+
+    /// C-34: `Usage.reported_cost_usd` is `#[serde(default, skip_serializing_if = "Option::is_none")]`
+    /// — a pre-C-34 `call_usage` row (no such key anywhere in its JSON) must still decode, a fresh
+    /// row WITH a reported cost round-trips exactly, and a fresh row with NO reported cost
+    /// serializes byte-identically to a pre-C-34 row (the key is entirely absent, not `null`).
+    #[test]
+    fn call_usage_decodes_pre_c34_rows_and_roundtrips_reported_cost() {
+        // A raw pre-C-34 payload, as it would sit in the `events.payload` column today: no
+        // `reported_cost_usd` key anywhere in `usage`.
+        let pre_c34 = r#"{"kind":"call_usage","data":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"reasoning_tokens":0}}}"#;
+        let decoded: EventKind = serde_json::from_str(pre_c34).expect("pre-C-34 row must decode");
+        match decoded {
+            EventKind::CallUsage { usage, .. } => {
+                assert_eq!(
+                    usage.reported_cost_usd, None,
+                    "an absent key must decode to None, not a spurious Some(0.0) default"
+                );
+            }
+            other => panic!("expected CallUsage, got {other:?}"),
+        }
+
+        // A new event WITH a reported cost round-trips exactly.
+        let with_cost = EventKind::CallUsage {
+            model: "openrouter/deepseek/deepseek-v4-flash:nitro".to_string(),
+            usage: Usage {
+                input_tokens: 1000,
+                output_tokens: 50,
+                reported_cost_usd: Some(0.0000020643),
+                ..Default::default()
+            },
+        };
+        let json = serde_json::to_string(&with_cost).unwrap();
+        assert!(
+            json.contains("reported_cost_usd"),
+            "a Some reported cost must serialize the key: {json}"
+        );
+        let round_tripped: EventKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped, with_cost);
+
+        // A new event with NO reported cost (a non-reporting provider) serializes WITHOUT the key
+        // at all — byte-stable with every pre-C-34 row already on disk.
+        let without_cost = EventKind::CallUsage {
+            model: "anthropic/claude-sonnet-4-6".to_string(),
+            usage: Usage {
+                input_tokens: 1000,
+                output_tokens: 50,
+                ..Default::default()
+            },
+        };
+        let json = serde_json::to_string(&without_cost).unwrap();
+        assert!(
+            !json.contains("reported_cost_usd"),
+            "None must not serialize the key at all: {json}"
+        );
+    }
 }

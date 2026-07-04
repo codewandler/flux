@@ -16,6 +16,7 @@ async-stream.workspace = true
 eventsource-stream.workspace = true
 bytes.workspace = true
 reqwest.workspace = true
+tracing.workspace = true
 
 # AWS Bedrock SigV4 signing (hand-rolled — HMAC-SHA256 over the canonical request) and the
 # event-stream chunk payloads (`{"bytes":"<base64>"}`); base64 also serves realtime audio.

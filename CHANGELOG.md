@@ -6,7 +6,130 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **Structural enforcement for the stream-resilience invariant (A-37 — closes the stream-resilience
+  epic).** "Provider bytes never error a chunk stream" (A-33/A-34/A-35/A-36) is now self-enforcing,
+  not just a convention. A crate-local `crates/flux-providers/clippy.toml` bans
+  `serde_json::from_str/from_slice/from_value/from_reader` via `disallowed-methods`; **verified to
+  fire under `cargo clippy --workspace --all-targets -- -D warnings`** (a scratch call added
+  without an allow failed the gate; removing it restored green) — the speculative per-crate
+  resolution the design flagged as the one open risk does hold under `--workspace`. The dozen
+  legitimate remaining call sites (the tolerant skip+count SSE/frame parses in `openai.rs`,
+  `messages/mod.rs`, and `bedrock.rs`'s `frame_to_sse`; bedrock's out-of-scope SSO/STS/EKS
+  credential-resolution parses; codex's WS terminal-event/kind sniffs and its test fixtures) each
+  carry a targeted `#[allow(clippy::disallowed_methods)]` at the function or module scope, with a
+  reason pointing at why. New `crates/flux-providers/src/envelope_corpus.rs`
+  (`#[cfg(test)] mod envelope_corpus`) systematically corrupts one valid fixture turn per codec —
+  truncation at every byte offset, junk-frame injection at every frame boundary, single-frame
+  corruption — and asserts no `Err` chunk ever escapes the three SSE codecs (chat/responses/
+  messages), and that any bedrock `Err` classifies `Error::StreamDecode`, never `Error::Provider`.
+  Confirmed the corpus is a real regression guard, not just green-by-construction: reverting the
+  messages codec's tolerant match back to a bare `?` turned 2 of its 3 corpus tests red (junk
+  injection and single-frame corruption) before the fix was restored. `map_chat_stream`/
+  `map_responses_stream` are now `pub(crate)` so the corpus can drive them directly. AGENTS.md's
+  safety-invariants list gains a matching bullet linking
+  [docs/designs/stream-resilience.md](docs/designs/stream-resilience.md).
+
+- **`FLUX_PLANNER_TRACE=1` env-gated planner trace (A-38 — the stream-resilience epic's parse-
+  resilience residual).** The A-33 backstop made planner failures *quieter* (retries instead of
+  crashes), which made the next s_360/s_368-class forensic *harder*: a session can now silently
+  retry a few times and still land a plan, burning steps and tokens with nothing on stderr to show
+  why. Setting `FLUX_PLANNER_TRACE=1` writes one greppable line per planner step to stderr — step
+  index, stop reason, tool names called, reject/decode text (A-31's `last_reject`, only when
+  *this* step set it — never a stale echo of an earlier step's rejection), and any dropped-frame
+  diagnostic (A-33's `Chunk::StreamDiagnostic`) — covering every way a step can end (decode-error
+  retry, hidden-op/gather/validate rejection, the text-fallback plan/chat returns, a max_tokens
+  truncation, and plan acceptance). Test-observable per the C-19 `fallback_note_sink` precedent:
+  since the planner loop (`crates/flux-flow/src/compile.rs`) is free functions with no long-lived
+  object to hang a field off, the injection point is a `#[cfg(test)]` thread-local sink instead of
+  a struct field — a test asserts on structured `TraceRecord`s instead of scraping stderr text.
+  Off by default and zero-cost when disabled: every call site checks the flag first and returns
+  before any clone/allocation.
+
+- **Canonical plan source on the plan-lifecycle record (L-38 — plan-corpus initiative).** Every
+  ACCEPTED plan's `PlanAttempted` event now carries `plan_source` — the canonical, parseable
+  Flux-Lang projection (`flux_lang::format::format`) of the accepted AST — alongside the
+  display-only `plan_text` (`render_pretty`). Invariant: a present `plan_source` always parses —
+  it is dropped (`None`) when over its 32k cap rather than truncated, and it is scrubbed through
+  the same C-22 redactor as `plan_text` (redaction rewrites inside string literals, so the result
+  still parses; pinned by `redacted_plan_source_still_parses`). Old events.db rows decode with
+  `None` (serde-default, the `phase`-field precedent). End-to-end roundtrip pinned at the event
+  boundary by `crates/flux-sdk/tests/plan_source.rs`: `parse(plan_source) == accepted ast` (L-18
+  totality). This is the "projection, not emission" half of
+  `docs/designs/plan-corpus-and-small-model.md` — plans become minable as text without touching
+  the L-20 keep-json emission decision (the `FLUX_EMISSION` scaffold stays).
+
 ### Fixed
+
+- **Bedrock frame decode resilience (A-36 — stream-resilience epic).** The AWS event-stream
+  deframer (`flux-providers/src/bedrock.rs`) treated every decode failure the same way: a bare
+  `?` inside the `try_stream!` loop killed the whole stream, whether the failure was one junk AWS
+  chunk or the framing itself breaking. Now split into two classes. A `chunk` event's *payload*
+  being garbage — not valid JSON, the `{"bytes":…}` wrapper's base64 not decoding, the decoded
+  bytes not being UTF-8 — is tolerated: the frame is skipped, counted, and `tracing::warn!`'d, and
+  deframing continues with the next frame (this layer emits raw bytes, not `Chunk`s, so there's no
+  `StreamDiagnostic` to surface — the downstream Messages codec's own A-35 diagnostics cover
+  content accounting). Genuine framing-**integrity** failures — a message or prelude CRC mismatch,
+  an implausible frame length, a header block overrunning the frame or failing to parse, a frame
+  missing `:message-type`, a truncated tail — stay fatal but are now classified
+  `flux_core::Error::StreamDecode` instead of `Error::Provider`, so the A-33 backstop retries the
+  call as one planner step instead of killing the turn. `exception`/`error` frames (a *declared*
+  failure reported by AWS/the model) are unchanged and stay fatal via `Error::Provider` — that's a
+  real failure, not garbage bytes, pinned by the existing `event_stream_surfaces_exception_frames`
+  test.
+
+- **Messages-wire envelope tolerance (A-35 — stream-resilience epic).** The shared Anthropic
+  Messages SSE codec (`crates/flux-providers/src/messages/mod.rs`) — used by anthropic-direct,
+  bedrock (re-enveloped), openrouter-anthropic, and ollama-anthropic — had one bare-fatal envelope
+  parse (`serde_json::from_str::<StreamEvent>(data).map_err(...)?`) that killed the whole stream on
+  either a syntactically-broken `data:` frame *or* a well-formed frame carrying a `type` the
+  `StreamEvent` enum didn't recognize (a new vendor extension, a keep-alive-ish event) — the latter
+  a latent kill found during design review, since the internally-tagged enum has no catch-all arm
+  and rejects an unknown tag with the same `serde_json::Error` as malformed JSON. Both shapes now
+  **skip + count** at that one call site instead of `?`-propagating (with a `tracing::warn!` per
+  drop), and if any frames were dropped, yield exactly one
+  `Chunk::StreamDiagnostic { dropped_frames, detail }` right before the stream's normal terminal
+  chunks. No `wire.rs` catch-all variant was needed — catching the deserialize error generically
+  covers both failure shapes. Declared provider errors (`StreamEvent::Error`, i.e. a real mid-stream
+  outage) are unaffected: that variant still parses successfully and its match arm still propagates
+  `Err`, pinned by a guardrail test (`messages_declared_error_event_stays_fatal`) so tolerance can
+  never mask a real outage as a silent empty turn. Uses A-33's `StreamDecode`/`StreamDiagnostic`
+  seams.
+
+- **OpenAI-wire envelope tolerance (A-34 — stream-resilience epic).** The chat-completions and
+  Responses-API SSE codecs (`crates/flux-providers/src/openai.rs`) each had one bare-fatal envelope
+  parse (`let chunk: ChatChunk = serde_json::from_str(data)?;` and
+  `let v: Value = serde_json::from_str(data)?;`) — the exact source of user-witnessed
+  `runtime error: step plan failed: serialization error: …` turn deaths whenever the wire delivered
+  one syntactically-broken `data:` frame (vendor keep-alive junk, a truncated proxy write). Both
+  sites now **skip + count** an unparseable frame instead of failing the stream (with a
+  `tracing::warn!` per drop), and if any frames were dropped, yield exactly one
+  `Chunk::StreamDiagnostic { dropped_frames, detail }` right before the stream's normal terminal
+  chunks — content that arrived in frames after the junk is never truncated. Declared provider
+  errors (`response.failed`, the Responses `"error"` event type) are unaffected: those run on the
+  successfully-parsed value and stay fatal exactly as before, pinned by a guardrail test
+  (`responses_declared_error_events_stay_fatal`) so a real outage can never be masked as a silent
+  empty turn. Uses A-33's `StreamDecode`/`StreamDiagnostic` seams; `flux-providers` gained a direct
+  `tracing` dependency (previously only transitive) to emit the drop warning.
+
+- **Stream-decode backstop (A-33 — the stream-resilience epic's first story).** A mid-stream
+  provider decode error (malformed/truncated JSON from a weak model) used to `?`-propagate out of
+  the planner's chunk-stream reader, discarding every accumulated block *and* the call's usage and
+  killing the whole turn with `runtime error: step plan failed: serialization error: …` — the
+  A-31 reject/retry loop never saw these errors because they escaped before reaching it. New
+  `flux_core::Error::StreamDecode` classifies provider/model-bytes decode failures distinctly from
+  transport errors, and a new `flux_core::Chunk::StreamDiagnostic { dropped_frames, detail }` lets
+  a tolerant codec report skipped frames without failing the stream. `stream_blocks`
+  (`flux-flow`) now returns its usage unconditionally alongside the `Result` (mirroring C-31's
+  `compile_turn` shape one level down), so a decode error's already-streamed usage is never lost;
+  the planner loop classifies `StreamDecode`/in-context `Serde` errors as retryable, costing one
+  step of the existing `max_steps` budget (with `last_reject` naming the cause) instead of the
+  whole turn, and an empty turn that nonetheless saw a `StreamDiagnostic` names that as the
+  rejection cause too. Non-decode errors (API/HTTP/transport) still propagate and kill the turn as
+  before. This story only adds the classification seams, exercised via mocks — the three SSE/frame
+  codecs (OpenAI-wire, Messages, Bedrock) get their own envelope-tolerance stories next
+  (A-34/A-35/A-36).
 
 - **OpenAI-wire tool-args resilience (A-32 — the s_368 deepseek failure class).** The plain
   `openrouter`/`openai`/`ollama` chat-completions codec (and the Responses-API path) parsed
@@ -23,6 +146,21 @@ All notable changes to this project are documented in this file. The format is b
   cause; without the gate a sentinel would even have decoded as an *empty accepted plan*. The
   Messages wire gets the same sentinel-instead-of-error treatment on repair failure. Pinned by
   failing-first tests on both wires plus planner sentinel-rejection/turn-survival tests.
+
+- **OpenRouter models price from the provider's own reported cost, not just the static table
+  (C-34).** Untabled OpenRouter models (deepseek, glm, qwen, …) always rendered ` · $? (unpriced)` —
+  the pricing table can't keep up with OpenRouter's catalog. Both wires already carry a `cost` field
+  (USD, from the final usage frame) on every response with no opt-in flag required; `Usage` now
+  carries it (`reported_cost_usd`, summed across a turn's calls) and `PricingTable::cost` prefers it
+  over the table at the single choke point every sink (REPL turn line, `flux usage`, TUI, `/goal`)
+  reads from — `$?` disappears for any OpenRouter model the moment it reports a cost, with zero
+  table maintenance. BYOK responses correctly add `cost_details.upstream_inference_cost`; non-BYOK
+  responses don't double it (the field duplicates `cost` there). `flux usage`'s all-sessions rollup
+  prices **per call** (reported where present, table where not) so a model's history mixing old
+  unreported calls with new reported ones sums correctly instead of one reported call silently
+  overriding the whole row's total. Pre-existing `events.db` rows decode unaffected
+  (`reported_cost_usd` is `#[serde(default)]`); non-reporting providers are untouched. Live-verified
+  against real OpenRouter traffic on both wires and against the real `~/.flux/events.db` history.
 
 ## [0.2.14] - 2026-07-03
 

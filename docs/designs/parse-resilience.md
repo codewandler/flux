@@ -2,6 +2,10 @@
 
 **Status:** implemented 2026-07-03 (4/4 stories done, failing-first tests at the codec, compile and loop-host levels, full gate green; A-30 live-verified — the exact s_360 model+prompt now plans on the first emission) · **Pillar:** Agent · **Stories:** [A-30](../stories/A-30-stringified-ast-fallback.md) · [A-31](../stories/A-31-planner-reject-surfacing.md) · [C-31](../stories/C-31-planner-usage-on-error.md) · [A-32](../stories/A-32-openai-wire-tool-args-resilience.md)
 
+Wave 2 — the SSE **envelope** layer this epic never touched, plus structural enforcement — is
+[stream-resilience](stream-resilience.md) (filed 2026-07-04; includes the `FLUX_PLANNER_TRACE`
+residual below as A-38).
+
 ## Why
 
 Session `s_360` (2026-07-03): `flux run -m openrouter/qwen/qwen3.7-max` died on its first turn with

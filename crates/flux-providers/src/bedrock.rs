@@ -141,12 +141,15 @@ fn buffered_frame_len(buf: &[u8]) -> Result<Option<usize>> {
     }
     let total = read_u32_be(buf, 0) as usize;
     if !(MIN_FRAME_LEN..=MAX_FRAME_LEN).contains(&total) {
-        return Err(Error::Provider(format!(
+        // A-36: an implausible length prefix is a framing-integrity failure (the underlying
+        // event-stream framing is broken), not one junk payload — classify `StreamDecode` so the
+        // A-33 backstop retries the call instead of killing the turn.
+        return Err(Error::StreamDecode(format!(
             "bedrock event-stream: implausible frame length {total}"
         )));
     }
     if read_u32_be(buf, 8) != crc32(&buf[..8]) {
-        return Err(Error::Provider(
+        return Err(Error::StreamDecode(
             "bedrock event-stream: prelude CRC mismatch".to_string(),
         ));
     }
@@ -157,9 +160,12 @@ fn buffered_frame_len(buf: &[u8]) -> Result<Option<usize>> {
 /// (`:message-type`, `:event-type`, `:exception-type`, `:content-type`) are all strings (type 7);
 /// non-string value types are length-skipped.
 fn parse_event_headers(block: &[u8]) -> Result<Vec<(String, String)>> {
+    // A-36: every error in this function is a header-block *structure* failure (truncation, a
+    // non-utf8 name/value, an unknown value-type tag) — genuine framing-integrity breakage, not a
+    // junk payload. Classify `StreamDecode` so the A-33 backstop retries the call.
     fn take<'a>(b: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
         if b.len() < n {
-            return Err(Error::Provider(
+            return Err(Error::StreamDecode(
                 "bedrock event-stream: truncated header block".to_string(),
             ));
         }
@@ -172,7 +178,9 @@ fn parse_event_headers(block: &[u8]) -> Result<Vec<(String, String)>> {
     while !b.is_empty() {
         let name_len = take(&mut b, 1)?[0] as usize;
         let name = std::str::from_utf8(take(&mut b, name_len)?)
-            .map_err(|_| Error::Provider("bedrock event-stream: non-utf8 header name".to_string()))?
+            .map_err(|_| {
+                Error::StreamDecode("bedrock event-stream: non-utf8 header name".to_string())
+            })?
             .to_string();
         let value_type = take(&mut b, 1)?[0];
         match value_type {
@@ -189,13 +197,15 @@ fn parse_event_headers(block: &[u8]) -> Result<Vec<(String, String)>> {
                 let value = take(&mut b, len)?;
                 if value_type == 7 {
                     let v = std::str::from_utf8(value).map_err(|_| {
-                        Error::Provider("bedrock event-stream: non-utf8 header value".to_string())
+                        Error::StreamDecode(
+                            "bedrock event-stream: non-utf8 header value".to_string(),
+                        )
                     })?;
                     out.push((name, v.to_string()));
                 }
             }
             t => {
-                return Err(Error::Provider(format!(
+                return Err(Error::StreamDecode(format!(
                     "bedrock event-stream: unknown header value type {t}"
                 )))
             }
@@ -204,14 +214,35 @@ fn parse_event_headers(block: &[u8]) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-/// Map one complete frame to a synthesized SSE event (`Ok(None)` = a non-chunk event to skip).
-/// A `chunk` event's payload is `{"bytes":"<base64 of one Anthropic stream event>"}` (plus a `p`
-/// padding field, ignored); `exception`/`error` frames surface as errors carrying their
-/// `:exception-type` and payload message.
-fn frame_to_sse(frame: &[u8]) -> Result<Option<String>> {
+/// The outcome of mapping one complete frame (A-36).
+enum FrameOutcome {
+    /// Emit this synthesized SSE event downstream.
+    Sse(String),
+    /// A non-chunk event with nothing to emit (tolerated — e.g. a future Bedrock event type).
+    Skip,
+    /// A `chunk` event whose *payload* failed to decode (not valid JSON / the `bytes` wrapper's
+    /// base64 doesn't decode / the decoded bytes aren't UTF-8) — one AWS-level chunk was junk. The
+    /// caller skips it, counts it, and warns; deframing continues with the next frame.
+    Garbage(String),
+}
+
+/// Map one complete frame to a [`FrameOutcome`]. A `chunk` event's payload is
+/// `{"bytes":"<base64 of one Anthropic stream event>"}` (plus a `p` padding field, ignored) —
+/// payload-level decode failures become [`FrameOutcome::Garbage`] (tolerated). `exception`/`error`
+/// frames are a **declared** failure reported by AWS/the model (not garbage bytes) and stay fatal
+/// via `Error::Provider`, unchanged from before A-36 — do not reclassify this path. Genuine
+/// framing-integrity failures (message CRC mismatch, a header block that overruns the frame, a
+/// frame missing `:message-type`) surface as `Error::StreamDecode` so the A-33 planner backstop
+/// retries the call instead of killing the turn.
+// A-37: the three `serde_json::from_slice`/`from_str` calls in this fn are the tolerant
+// chunk-payload parse (→ `FrameOutcome::Garbage`, never fatal) and the best-effort event-type/
+// message-text extraction (`.ok()`, falls back on failure) — allowed at this tight scope;
+// `envelope_corpus.rs` proves the tolerance holds.
+#[allow(clippy::disallowed_methods)]
+fn frame_to_sse(frame: &[u8]) -> Result<FrameOutcome> {
     let total = frame.len();
     if read_u32_be(frame, total - 4) != crc32(&frame[..total - 4]) {
-        return Err(Error::Provider(
+        return Err(Error::StreamDecode(
             "bedrock event-stream: message CRC mismatch".to_string(),
         ));
     }
@@ -220,7 +251,7 @@ fn frame_to_sse(frame: &[u8]) -> Result<Option<String>> {
         .checked_add(headers_len)
         .filter(|&e| e <= total - 4)
         .ok_or_else(|| {
-            Error::Provider("bedrock event-stream: header block overruns frame".to_string())
+            Error::StreamDecode("bedrock event-stream: header block overruns frame".to_string())
         })?;
     let headers = parse_event_headers(&frame[12..headers_end])?;
     let payload = &frame[headers_end..total - 4];
@@ -233,36 +264,50 @@ fn frame_to_sse(frame: &[u8]) -> Result<Option<String>> {
 
     match header(":message-type") {
         Some("event") if header(":event-type") == Some("chunk") => {
-            let wrapper: Value = serde_json::from_slice(payload).map_err(|e| {
-                Error::Provider(format!(
-                    "bedrock event-stream: chunk payload is not JSON ({e})"
-                ))
-            })?;
-            let b64 = wrapper
-                .get("bytes")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    Error::Provider("bedrock event-stream: chunk without `bytes`".to_string())
-                })?;
-            let event_bytes = BASE64.decode(b64).map_err(|e| {
-                Error::Provider(format!(
-                    "bedrock event-stream: chunk bytes are not base64 ({e})"
-                ))
-            })?;
-            let event_json = String::from_utf8(event_bytes).map_err(|_| {
-                Error::Provider("bedrock event-stream: chunk bytes are not utf8".to_string())
-            })?;
+            let wrapper: Value = match serde_json::from_slice(payload) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(FrameOutcome::Garbage(format!(
+                        "chunk payload is not JSON ({e})"
+                    )))
+                }
+            };
+            let b64 = match wrapper.get("bytes").and_then(|v| v.as_str()) {
+                Some(b) => b,
+                None => return Ok(FrameOutcome::Garbage("chunk without `bytes`".to_string())),
+            };
+            let event_bytes = match BASE64.decode(b64) {
+                Ok(b) => b,
+                Err(e) => {
+                    return Ok(FrameOutcome::Garbage(format!(
+                        "chunk bytes are not base64 ({e})"
+                    )))
+                }
+            };
+            let event_json = match String::from_utf8(event_bytes) {
+                Ok(s) => s,
+                Err(_) => {
+                    return Ok(FrameOutcome::Garbage(
+                        "chunk bytes are not utf8".to_string(),
+                    ))
+                }
+            };
             // The decoded bytes are one Anthropic Messages stream event; its `type` becomes the
             // SSE event name (the shared mapper dispatches on the JSON `type` tag anyway).
             let event_type = serde_json::from_str::<Value>(&event_json)
                 .ok()
                 .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
                 .unwrap_or_else(|| "message".to_string());
-            Ok(Some(format!("event: {event_type}\ndata: {event_json}\n\n")))
+            Ok(FrameOutcome::Sse(format!(
+                "event: {event_type}\ndata: {event_json}\n\n"
+            )))
         }
-        Some("event") => Ok(None), // no other event types today; tolerate future additions
+        Some("event") => Ok(FrameOutcome::Skip), // no other event types today; tolerate future additions
         Some(other) => {
-            // `exception` / `error` frames: the payload is `{"message": "..."}`.
+            // `exception` / `error` frames: a DECLARED failure reported by AWS/the model — the
+            // payload is `{"message": "..."}`. Stays fatal via `Error::Provider`, exactly as
+            // before A-36: this is a real failure being reported by the provider, not garbage
+            // bytes, and must not be reclassified (or masked as a retryable decode error).
             let kind = header(":exception-type")
                 .or_else(|| header(":error-code"))
                 .unwrap_or(other);
@@ -272,7 +317,7 @@ fn frame_to_sse(frame: &[u8]) -> Result<Option<String>> {
                 .unwrap_or_else(|| String::from_utf8_lossy(payload).into_owned());
             Err(Error::Provider(format!("bedrock stream {kind}: {message}")))
         }
-        None => Err(Error::Provider(
+        None => Err(Error::StreamDecode(
             "bedrock event-stream: frame without :message-type".to_string(),
         )),
     }
@@ -280,23 +325,41 @@ fn frame_to_sse(frame: &[u8]) -> Result<Option<String>> {
 
 /// Decode an AWS binary event-stream into Anthropic SSE bytes. Stateful: frames arrive split
 /// across arbitrary HTTP chunk boundaries, so bytes accumulate until a complete frame is buffered.
-/// A truncated tail (connection cut mid-frame) is an error — silently dropping it would swallow a
-/// `PayloadPart`.
+///
+/// A-36 draws two DIFFERENT lines here. A **truncated tail** (connection cut mid-frame) or any
+/// other framing-**integrity** failure (CRC mismatch, a header block overrunning the buffer) means
+/// the AWS event-stream framing itself is broken — silently dropping it would swallow a
+/// `PayloadPart`, so it stays an error, just classified `Error::StreamDecode` so the A-33 planner
+/// backstop retries the call instead of killing the turn. A single `chunk` event's **payload**
+/// being garbage (not JSON / bad base64 / not UTF-8) is a different, lower-stakes failure — "one
+/// AWS-level chunk was junk" — so it is skipped, counted, and warned, and deframing continues.
+/// This layer emits raw bytes (not `Chunk`s), so there's no `StreamDiagnostic` to surface here;
+/// the downstream Messages codec's own diagnostics (A-35) cover content-level accounting.
 pub fn map_bedrock_event_stream(byte_stream: ByteStream) -> ByteStream {
     Box::pin(async_stream::try_stream! {
         let mut s = byte_stream;
         let mut buf: Vec<u8> = Vec::new();
+        let mut dropped_frames: u32 = 0;
         while let Some(chunk) = s.next().await {
             buf.extend_from_slice(&chunk?);
             while let Some(len) = buffered_frame_len(&buf)? {
                 let frame: Vec<u8> = buf.drain(..len).collect();
-                if let Some(sse) = frame_to_sse(&frame)? {
-                    yield bytes::Bytes::from(sse);
+                match frame_to_sse(&frame)? {
+                    FrameOutcome::Sse(sse) => yield bytes::Bytes::from(sse),
+                    FrameOutcome::Skip => {}
+                    FrameOutcome::Garbage(detail) => {
+                        dropped_frames += 1;
+                        tracing::warn!(
+                            dropped_frames,
+                            detail = %detail,
+                            "bedrock event-stream: skipping unparseable chunk payload"
+                        );
+                    }
                 }
             }
         }
         if !buf.is_empty() {
-            Err(Error::Provider(format!(
+            Err(Error::StreamDecode(format!(
                 "bedrock event-stream: {} trailing bytes (truncated frame)",
                 buf.len()
             )))?;
@@ -850,6 +913,10 @@ fn token_expired(expires_at: &str) -> bool {
 /// Resolve SSO credentials: read the profile's sso_session, read/refresh the cached access token,
 /// call `sso:GetRoleCredentials`. Returns `None` (not an error) if no SSO profile is configured —
 /// the chain falls through to the next source.
+// A-37: the `serde_json::from_str` calls here parse the local SSO token cache and the
+// `GetRoleCredentials` response — the AWS credential-resolution path, not the model-stream
+// invariant this story enforces (A-36 explicitly left it untouched). Allowed at this tight scope.
+#[allow(clippy::disallowed_methods)]
 async fn resolve_sso() -> Result<Option<BedrockCreds>> {
     let profile = std::env::var("AWS_PROFILE")
         .or_else(|_| std::env::var("AWS_DEFAULT_PROFILE"))
@@ -990,6 +1057,9 @@ async fn resolve_sso() -> Result<Option<BedrockCreds>> {
 /// Refresh an expired SSO access token via SSO-OIDC `CreateToken` (refresh_token grant) and persist
 /// the new token + refresh token back to the cache file (so `aws sso login` need not run again
 /// until the refresh token itself expires).
+// A-37: same credential-path exception as `resolve_sso` — parses the `CreateToken` response, not
+// model-stream bytes.
+#[allow(clippy::disallowed_methods)]
 async fn refresh_sso_token(
     cache: &mut serde_json::Value,
     cache_path: &std::path::Path,
@@ -1129,6 +1199,9 @@ async fn resolve_irsa() -> Result<Option<BedrockCreds>> {
 
 /// Resolve EKS Pod Identity credentials: `AWS_CONTAINER_CREDENTIALS_FULL_URI` (+ optional auth
 /// token) → HTTP GET. Returns `None` if the env var isn't set.
+// A-37: same credential-path exception as `resolve_sso` — parses the Pod Identity HTTP response,
+// not model-stream bytes.
+#[allow(clippy::disallowed_methods)]
 async fn resolve_eks_pod_identity() -> Result<Option<BedrockCreds>> {
     let uri = match std::env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI").ok() {
         Some(u) => u,
@@ -1458,7 +1531,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn event_stream_errors_on_truncated_tail() {
+    async fn bedrock_truncated_tail_is_a_classified_stream_decode_error() {
+        // A-36: a stream that ends mid-frame is a genuine framing-integrity failure — the
+        // underlying AWS event-stream framing itself is broken, not one bad payload. It must stay
+        // fatal, but classified `StreamDecode` so the A-33 backstop retries the call.
         let mut wire = chunk_frame(r#"{"type":"message_stop"}"#);
         let next = chunk_frame(r#"{"type":"ping"}"#);
         wire.extend_from_slice(&next[..10]); // connection cut mid-frame
@@ -1472,10 +1548,68 @@ mod tests {
             .as_ref()
             .expect_err("trailing bytes must error, not be dropped");
         assert!(err.to_string().contains("truncated"), "{err}");
+        assert!(
+            matches!(err, Error::StreamDecode(_)),
+            "a truncated tail must classify as StreamDecode, not Provider: {err:?}"
+        );
     }
 
     #[tokio::test]
-    async fn event_stream_rejects_corrupt_prelude_crc() {
+    async fn bedrock_non_json_chunk_payload_is_skipped() {
+        // A-36: a `chunk` event whose payload bytes aren't valid JSON is "one AWS-level chunk was
+        // junk" — skip it (count it, warn) and keep deframing subsequent frames; it must NOT kill
+        // the stream.
+        let garbage = encode_frame(
+            &[(":message-type", "event"), (":event-type", "chunk")],
+            b"not json at all",
+        );
+        let good = chunk_frame(r#"{"type":"message_stop"}"#);
+        let mut wire = garbage;
+        wire.extend_from_slice(&good);
+        let out: Vec<bytes::Bytes> = map_bedrock_event_stream(byte_stream_from(wire, 4096))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.expect("a garbage chunk payload must be skipped, not fatal"))
+            .collect();
+        let sse = String::from_utf8(out.concat()).unwrap();
+        assert_eq!(
+            sse, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            "deframing continues past the garbage frame to the good one"
+        );
+    }
+
+    #[tokio::test]
+    async fn bedrock_bad_base64_chunk_is_skipped() {
+        // A-36: the outer `{"bytes": "<base64>"}` wrapper's base64 doesn't decode — same "one
+        // AWS-level chunk was junk" tolerance as non-JSON payloads.
+        let payload = json!({ "bytes": "not-valid-base64!!!" }).to_string();
+        let garbage = encode_frame(
+            &[(":message-type", "event"), (":event-type", "chunk")],
+            payload.as_bytes(),
+        );
+        let good = chunk_frame(r#"{"type":"message_stop"}"#);
+        let mut wire = garbage;
+        wire.extend_from_slice(&good);
+        let out: Vec<bytes::Bytes> = map_bedrock_event_stream(byte_stream_from(wire, 4096))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.expect("bad base64 must be skipped, not fatal"))
+            .collect();
+        let sse = String::from_utf8(out.concat()).unwrap();
+        assert_eq!(
+            sse, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            "deframing continues past the garbage frame to the good one"
+        );
+    }
+
+    #[tokio::test]
+    async fn bedrock_crc_mismatch_is_a_classified_stream_decode_error() {
+        // A-36: a CRC mismatch is a genuine framing-integrity failure (the underlying AWS
+        // event-stream framing is broken), not "one chunk's payload was junk" — it must still be
+        // fatal, but classified `StreamDecode` (not `Provider`) so the A-33 planner backstop
+        // retries the call as one step instead of killing the whole turn.
         let mut wire = chunk_frame(r#"{"type":"message_stop"}"#);
         wire[8] ^= 0xFF; // flip a prelude-CRC byte
         let results: Vec<_> = map_bedrock_event_stream(byte_stream_from(wire, 4096))
@@ -1483,6 +1617,30 @@ mod tests {
             .await;
         let err = results[0].as_ref().expect_err("corrupt prelude must error");
         assert!(err.to_string().contains("prelude CRC"), "{err}");
+        assert!(
+            matches!(err, Error::StreamDecode(_)),
+            "CRC mismatch must classify as StreamDecode, not Provider: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bedrock_message_crc_mismatch_is_also_classified_stream_decode_error() {
+        // The message-level CRC (frame_to_sse), a distinct integrity check from the prelude CRC
+        // above, must reclassify the same way.
+        let mut wire = chunk_frame(r#"{"type":"message_stop"}"#);
+        let last = wire.len() - 1;
+        wire[last] ^= 0xFF; // flip a message-CRC byte (the trailing 4 bytes of the frame)
+        let results: Vec<_> = map_bedrock_event_stream(byte_stream_from(wire, 4096))
+            .collect::<Vec<_>>()
+            .await;
+        let err = results[0]
+            .as_ref()
+            .expect_err("corrupt message CRC must error");
+        assert!(err.to_string().contains("message CRC"), "{err}");
+        assert!(
+            matches!(err, Error::StreamDecode(_)),
+            "message CRC mismatch must classify as StreamDecode, not Provider: {err:?}"
+        );
     }
 
     #[test]

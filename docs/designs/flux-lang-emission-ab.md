@@ -183,3 +183,11 @@ and selector outright, or first re-measure with the construct-level fixes the ho
 (e.g. a `when`/`retry` worked example in the text grammar) if the ~15% cost edge is judged worth
 chasing. The semantic (terminal-bench pass-rate) leg was not run — both arms produce the same
 `DraftAst`s once accepted, and the syntactic gap was decisive under the pre-registered rule.
+
+**Follow-up resolved (2026-07-04):** the scaffold is deliberately **kept** (neither arm deleted,
+no re-measure now). The [plan-corpus-and-small-model](plan-corpus-and-small-model.md) initiative
+reframes the text question as *projection, not emission* — corpus/training text comes from
+`format::format` over accepted `DraftAst`s, so production keeps `json` per the table above. The
+one contender that could re-open this A/B is a fine-tuned small model natively speaking text (its
+first-emission validity would not be limited by in-prompt grammar learning); the text arm +
+selector stay as the ready-made harness for that future re-measure.

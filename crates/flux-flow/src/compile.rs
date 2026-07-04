@@ -531,6 +531,10 @@ async fn compile_turn_inner(
     // never "accepted with diagnostics" for a caller to execute blind.
     let mut last_reject = String::new();
     for step in 1..=steps {
+        // A-38: snapshot `last_reject` before this step can touch it, so `step_reject` below can
+        // tell "this step rejected something" apart from "last_reject still holds an earlier
+        // step's text" — one clone, taken only when tracing is actually active.
+        let step_reject_snapshot = planner_trace_enabled().then(|| last_reject.clone());
         let req = Request {
             model: model.to_string(),
             system: None,
@@ -551,14 +555,46 @@ async fn compile_turn_inner(
         // before the next iteration reborrows, so no `unsafe` is needed. (`stream_blocks` keeps its
         // reference and trait-object lifetimes independent for exactly this reborrow.)
         let ts = thinking_sink.as_deref_mut();
-        let (mut blocks, acc_text, stop_reason, call_usage) =
-            stream_blocks(provider, req, ts).await?;
+        let (result, call_usage) = stream_blocks(provider, req, ts).await;
         usage.accumulate(&call_usage);
+        let (mut blocks, acc_text, stop_reason, diagnostic) = match result {
+            Ok(v) => v,
+            // A-33: a decode-class error (malformed/truncated provider bytes) is provider/model
+            // -originated, never a transport/availability failure — a fresh identical call is the
+            // correct retry, and it costs exactly one step of the existing budget, never the whole
+            // turn. No message is pushed: there is no coherent assistant turn to answer, so the next
+            // iteration re-sends the same conversation unchanged.
+            Err(e) if is_stream_decode(&e) => {
+                last_reject =
+                    format!("the provider stream broke while decoding the model's output: {e}");
+                trace_step(
+                    step,
+                    steps,
+                    None,
+                    &[],
+                    step_reject(&step_reject_snapshot, &last_reject),
+                    None,
+                );
+                continue;
+            }
+            // Transport/availability errors (`Api`, `Http`, a transport-flavored `Provider`) keep
+            // propagating exactly as before — swallowing a real outage would misreport it as budget
+            // exhaustion.
+            Err(e) => return Err(e),
+        };
         if blocks.is_empty() && !acc_text.trim().is_empty() {
             blocks.push(ContentBlock::Text { text: acc_text });
         }
         let assistant = Message::assistant(blocks);
         let tool_uses = collect_tool_uses(&assistant);
+        // A-38: snapshot the tool names for this step's trace before `tool_uses` is consumed
+        // below (the emit_plan/ask_user processing loop moves out of it) — stays empty when
+        // tracing is off, so nothing allocates on the hot path.
+        let step_tool_names: Vec<String> = if planner_trace_enabled() {
+            tool_uses.iter().map(|(_, name, _)| name.clone()).collect()
+        } else {
+            Vec::new()
+        };
         if !assistant.content.is_empty() {
             messages.push(assistant.clone());
         }
@@ -581,6 +617,14 @@ async fn compile_turn_inner(
                     // instead of a tool call bypassed the check entirely.
                     let hidden = ops.hidden_ops_in(&ast.body);
                     if hidden.is_empty() {
+                        trace_step(
+                            step,
+                            steps,
+                            stop_reason,
+                            &step_tool_names,
+                            step_reject(&step_reject_snapshot, &last_reject),
+                            diagnostic.as_ref(),
+                        );
                         return Ok(TurnOutput::Plan(Compiled {
                             ast,
                             attempts: step,
@@ -596,6 +640,14 @@ async fn compile_turn_inner(
                     // No tool_use id to answer here — the rejection rides as a plain user message.
                     last_reject = hidden_ops_rejection(&hidden);
                     messages.push(Message::user_text(last_reject.clone()));
+                    trace_step(
+                        step,
+                        steps,
+                        stop_reason,
+                        &step_tool_names,
+                        step_reject(&step_reject_snapshot, &last_reject),
+                        diagnostic.as_ref(),
+                    );
                     continue;
                 }
             }
@@ -604,6 +656,14 @@ async fn compile_turn_inner(
             // truncation for a finished prose answer (which would silently end the turn with no work
             // done); surface it so the user can raise the budget or narrow the request.
             if stop_reason == Some(StopReason::MaxTokens) {
+                trace_step(
+                    step,
+                    steps,
+                    stop_reason,
+                    &step_tool_names,
+                    step_reject(&step_reject_snapshot, &last_reject),
+                    diagnostic.as_ref(),
+                );
                 return Err(Error::Other(format!(
                     "planner output was truncated at max_tokens ({}) before it finished the plan — \
                      raise --max-tokens or split the request into smaller steps",
@@ -614,12 +674,50 @@ async fn compile_turn_inner(
             // turn (no blocks, no text) wasn't pushed, so just retry on the next step.
             let text = assistant.text();
             if !text.trim().is_empty() {
+                trace_step(
+                    step,
+                    steps,
+                    stop_reason,
+                    &step_tool_names,
+                    step_reject(&step_reject_snapshot, &last_reject),
+                    diagnostic.as_ref(),
+                );
                 return Ok(TurnOutput::Chat(text));
             }
+            // A-33: the stream completed without error but a codec tolerated and skipped
+            // unparseable frames (`Chunk::StreamDiagnostic`) AND the turn produced nothing usable —
+            // name the cause so an exhausted budget doesn't just say "no plan" with zero diagnostic
+            // value. A turn that produced something real despite the drops took one of the earlier
+            // return paths instead and never reaches here.
+            // A-38: snapshot the diagnostic for the trace before it's (possibly) consumed below —
+            // stays `None` when tracing is off.
+            let diag_for_trace = planner_trace_enabled()
+                .then(|| diagnostic.clone())
+                .flatten();
+            if let Some(diag) = diagnostic {
+                last_reject = format!(
+                    "the provider stream tolerated {} dropped frame(s) and produced no usable \
+                     output: {}",
+                    diag.dropped_frames, diag.detail
+                );
+            }
+            trace_step(
+                step,
+                steps,
+                stop_reason,
+                &step_tool_names,
+                step_reject(&step_reject_snapshot, &last_reject),
+                diag_for_trace.as_ref(),
+            );
             if step == steps {
-                return Err(Error::Other(format!(
-                    "planner produced neither a plan nor an answer within {steps} steps"
-                )));
+                return Err(Error::Other(if last_reject.is_empty() {
+                    format!("planner produced neither a plan nor an answer within {steps} steps")
+                } else {
+                    format!(
+                        "planner did not produce a valid plan within {steps} step(s) — \
+                         the last attempt was rejected: {last_reject}"
+                    )
+                }));
             }
             continue;
         }
@@ -827,6 +925,14 @@ async fn compile_turn_inner(
             }
         }
         messages.push(Message::user(results));
+        trace_step(
+            step,
+            steps,
+            stop_reason,
+            &step_tool_names,
+            step_reject(&step_reject_snapshot, &last_reject),
+            diagnostic.as_ref(),
+        );
         if let Some(c) = done {
             return Ok(TurnOutput::Plan(c));
         }
@@ -999,11 +1105,168 @@ pub async fn render_completion(
         effort: None,
         metadata: serde_json::Map::new(),
     };
-    let (mut blocks, acc_text, _stop, usage) = stream_blocks(provider, req, None).await?;
+    let (result, usage) = stream_blocks(provider, req, None).await;
+    let (mut blocks, acc_text, _stop, _diagnostic) = result?;
     if blocks.is_empty() && !acc_text.trim().is_empty() {
         blocks.push(ContentBlock::Text { text: acc_text });
     }
     Ok((Message::assistant(blocks).text(), usage))
+}
+
+/// A codec tolerated and skipped unparseable frames mid-stream (informational, not a failure — the
+/// [`Chunk::StreamDiagnostic`] carried out of a call). Folded into `last_reject` by
+/// [`compile_turn_inner`] only when the turn that carried it produced nothing usable; a turn that
+/// produced real content despite the drops proceeds normally.
+#[derive(Debug, Clone)]
+struct StreamDiagnostic {
+    dropped_frames: u32,
+    detail: String,
+}
+
+/// A-33: classifies an error observed while consuming a provider's chunk stream as
+/// model/provider-bytes-originated — safe to retry as a fresh identical call, priced against the
+/// existing step budget — vs. everything else (transport/availability, which keeps its own
+/// connection-level retry and must propagate). Scoped to this stream-consuming context ONLY: a
+/// `Serde` error anywhere else in the codebase is not necessarily provider-originated.
+fn is_stream_decode(e: &Error) -> bool {
+    matches!(e, Error::StreamDecode(_) | Error::Serde(_))
+}
+
+// -- A-38: env-gated planner trace ("FLUX_PLANNER_TRACE=1") --------------------------------------
+//
+// The parse-resilience residual (`docs/designs/parse-resilience.md`), promoted in the
+// stream-resilience epic once the A-33 backstop made planner failures *quieter* — retries instead
+// of crashes — which is exactly what makes forensics harder without a trace: a s_360/s_368-class
+// session used to just die loudly; now it can silently retry a few times and still land a plan,
+// burning steps and tokens with nothing on stderr to show why. `FLUX_PLANNER_TRACE=1` writes one
+// line per planner step: step index, stop reason, tool names, reject/decode text (A-31's
+// `last_reject`), and dropped-frame diagnostics (A-33's `StreamDiagnostic`) — so the next
+// occurrence needs zero ad-hoc instrumentation.
+//
+// Purely observational: everything here READS values `compile_turn_inner` already computed —
+// `last_reject`'s semantics and the decode-classification logic are exactly A-33's, untouched.
+
+/// One planner step's trace record — the structured payload behind a `FLUX_PLANNER_TRACE=1`
+/// line. Test-observable (mirrors the C-19 `fallback_note_sink` pattern in
+/// `flux-provider/src/lib.rs`): production formats this to stderr; a test installs a sink (see
+/// `tests::install_trace_sink`) and asserts on these fields directly instead of scraping text.
+#[derive(Debug, Clone, PartialEq)]
+struct TraceRecord {
+    step: u32,
+    max_steps: u32,
+    stop_reason: Option<StopReason>,
+    tool_names: Vec<String>,
+    reject: Option<String>,
+    dropped_frames: Option<u32>,
+    diagnostic_detail: Option<String>,
+}
+
+impl TraceRecord {
+    /// Render the stderr line — one record, one line, `key=value` pairs so it stays greppable.
+    fn to_line(&self) -> String {
+        let stop_reason = self
+            .stop_reason
+            .map(|r| format!("{r:?}"))
+            .unwrap_or_else(|| "-".to_string());
+        let tools = if self.tool_names.is_empty() {
+            "-".to_string()
+        } else {
+            self.tool_names.join(",")
+        };
+        let reject = self.reject.as_deref().unwrap_or("-");
+        let dropped_frames = self
+            .dropped_frames
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let diagnostic = self.diagnostic_detail.as_deref().unwrap_or("-");
+        format!(
+            "flux: planner_trace step={step}/{max_steps} stop_reason={stop_reason} \
+             tools={tools} reject={reject:?} dropped_frames={dropped_frames} \
+             diagnostic={diagnostic:?}",
+            step = self.step,
+            max_steps = self.max_steps,
+        )
+    }
+}
+
+/// Test-only sink for [`TraceRecord`] — a thread-local rather than a struct field, since this
+/// loop lives in free functions with no long-lived object to hang a field off (the shape
+/// `NativeProvider::fallback_note_sink` uses for the same C-19 test-observable pattern one crate
+/// over). `#[tokio::test]` runs on the default current-thread executor, so a sink installed here
+/// stays visible across the `.await` points inside the call under test.
+#[cfg(test)]
+type TraceSink = std::sync::Arc<dyn Fn(&TraceRecord) + Send + Sync>;
+
+#[cfg(test)]
+thread_local! {
+    static TRACE_SINK: std::cell::RefCell<Option<TraceSink>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Whether the trace is active on this call path: a test sink installed on this thread, or the
+/// real `FLUX_PLANNER_TRACE=1` env switch (read once and cached). Every trace call site checks
+/// this FIRST and returns immediately when it's `false` — no record is built, nothing is cloned
+/// or allocated — so tracing costs nothing on the hot path when disabled.
+fn planner_trace_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if TRACE_SINK.with(|s| s.borrow().is_some()) {
+            return true;
+        }
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("FLUX_PLANNER_TRACE").as_deref() == Ok("1"))
+}
+
+/// Deliver a trace record: the test sink when one is installed, else a stderr line.
+fn emit_trace(record: &TraceRecord) {
+    #[cfg(test)]
+    {
+        let delivered = TRACE_SINK.with(|s| -> bool {
+            if let Some(sink) = s.borrow().as_ref() {
+                sink(record);
+                true
+            } else {
+                false
+            }
+        });
+        if delivered {
+            return;
+        }
+    }
+    eprintln!("{}", record.to_line());
+}
+
+/// The reject text to attribute to THIS step — `None` unless `last_reject` was freshly set since
+/// the step began (compared against the snapshot [`compile_turn_inner`] takes at the top of each
+/// iteration), so a step that rejected nothing never echoes a stale rejection carried over from
+/// an earlier step. Purely a read of `last_reject`; never writes it.
+fn step_reject<'a>(snapshot: &Option<String>, last_reject: &'a str) -> Option<&'a str> {
+    let before = snapshot.as_deref()?;
+    (before != last_reject).then_some(last_reject)
+}
+
+/// Build and emit ONE [`TraceRecord`] for this planner step — a no-op (no allocation, no
+/// `to_vec`/`to_string` calls) unless [`planner_trace_enabled`] is true.
+fn trace_step(
+    step: u32,
+    max_steps: u32,
+    stop_reason: Option<StopReason>,
+    tool_names: &[String],
+    reject: Option<&str>,
+    diagnostic: Option<&StreamDiagnostic>,
+) {
+    if !planner_trace_enabled() {
+        return;
+    }
+    emit_trace(&TraceRecord {
+        step,
+        max_steps,
+        stop_reason,
+        tool_names: tool_names.to_vec(),
+        reject: reject.map(str::to_string),
+        dropped_frames: diagnostic.map(|d| d.dropped_frames),
+        diagnostic_detail: diagnostic.map(|d| d.detail.clone()),
+    });
 }
 
 /// Stream a turn, collecting content blocks (tool_use, text), the accumulated text delta, and the
@@ -1018,33 +1281,64 @@ pub async fn render_completion(
 /// `&mut` is invariant, so unifying them (the `&mut dyn AgentSink` default) would force a caller's
 /// per-iteration reborrow to last as long as the original sink borrow — the lifetime cycle the old
 /// `unsafe` raw-pointer reborrow in [`compile_turn`] existed to break (C-17/F4).
+///
+/// Usage rides OUTSIDE the `Result` (A-33, mirroring C-31's `compile_turn`/`compile_turn_with_arm`
+/// shape one level down): a mid-stream decode error still spent real tokens on everything the call
+/// streamed before it broke, and dropping that on the `?`-propagated error path is exactly the C-31
+/// bug recurring here. Callers account the usage first, then branch on the outcome.
 async fn stream_blocks<'a, 'b>(
     provider: &dyn Provider,
     req: Request,
     mut on_thinking: Option<&'a mut (dyn crate::AgentSink + 'b)>,
-) -> Result<(Vec<ContentBlock>, String, Option<StopReason>, Usage)> {
-    let mut stream = provider.stream(req).await?;
+) -> (
+    Result<(
+        Vec<ContentBlock>,
+        String,
+        Option<StopReason>,
+        Option<StreamDiagnostic>,
+    )>,
+    Usage,
+) {
+    let mut usage = Usage::default();
+    let mut stream = match provider.stream(req).await {
+        Ok(s) => s,
+        Err(e) => return (Err(e), usage),
+    };
     let mut blocks = Vec::new();
     let mut text = String::new();
     let mut stop_reason = None;
-    // Providers emit usage cumulatively (the codec carries the input/cache counts from `message_start`
-    // forward onto the final `message_delta`), so the last chunk holds the complete picture — last wins.
-    let mut usage = Usage::default();
+    let mut diagnostic = None;
     while let Some(chunk) = stream.next().await {
-        match chunk? {
-            Chunk::ThinkingDelta(t) => {
+        match chunk {
+            Ok(Chunk::ThinkingDelta(t)) => {
                 if let Some(sink) = on_thinking.as_deref_mut() {
                     sink.thinking_delta(&t);
                 }
             }
-            Chunk::TextDelta(t) => text.push_str(&t),
-            Chunk::Block(b) => blocks.push(b),
-            Chunk::Usage(u) => usage = u,
-            Chunk::Done { stop_reason: r } => stop_reason = r,
-            _ => {}
+            Ok(Chunk::TextDelta(t)) => text.push_str(&t),
+            Ok(Chunk::Block(b)) => blocks.push(b),
+            // Providers emit usage cumulatively (the codec carries the input/cache counts from
+            // `message_start` forward onto the final `message_delta`), so the last chunk holds the
+            // complete picture — last wins.
+            Ok(Chunk::Usage(u)) => usage = u,
+            Ok(Chunk::Done { stop_reason: r }) => stop_reason = r,
+            Ok(Chunk::StreamDiagnostic {
+                dropped_frames,
+                detail,
+            }) => {
+                diagnostic = Some(StreamDiagnostic {
+                    dropped_frames,
+                    detail,
+                });
+            }
+            Ok(_) => {}
+            // A-33: whatever usage arrived on earlier chunks of THIS call rides out alongside the
+            // error — the caller accounts it before deciding whether the failure is a retryable
+            // decode error or a fatal one.
+            Err(e) => return (Err(e), usage),
         }
     }
-    Ok((blocks, text, stop_reason, usage))
+    (Ok((blocks, text, stop_reason, diagnostic)), usage)
 }
 
 /// Extract `(id, name, input)` for every tool_use block in a message.
@@ -1576,7 +1870,7 @@ fn planner_tools(interactive: bool, arm: EmissionArm) -> Vec<ToolDef> {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use serde_json::json;
@@ -1634,6 +1928,34 @@ mod tests {
 
     fn mock(responses: Vec<Vec<Chunk>>) -> Mock {
         Mock {
+            responses: Mutex::new(responses.into_iter().collect()),
+        }
+    }
+
+    /// A-33: like [`Mock`], but a call's replayed sequence may include an `Err` mid-stream — the
+    /// shape [`Mock`] can't express (it always wraps chunks in `Ok`). Used to exercise the
+    /// stream-decode backstop without touching any real codec.
+    struct MockChunks {
+        responses: Mutex<VecDeque<Vec<Result<Chunk>>>>,
+    }
+    #[async_trait]
+    impl Provider for MockChunks {
+        fn name(&self) -> &str {
+            "mock-chunks"
+        }
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            let chunks = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default();
+            Ok(Box::pin(futures::stream::iter(chunks)))
+        }
+    }
+
+    fn mock_chunks(responses: Vec<Vec<Result<Chunk>>>) -> MockChunks {
+        MockChunks {
             responses: Mutex::new(responses.into_iter().collect()),
         }
     }
@@ -2424,6 +2746,271 @@ mod tests {
         assert!(
             format!("{err}").contains("EOF while parsing a list"),
             "the turn error names the parse failure: {err}"
+        );
+    }
+
+    // -- A-33: stream-decode backstop ---------------------------------------------------------------
+
+    /// A-33: a mid-stream decode failure (malformed/truncated provider bytes) must cost one
+    /// planner step, never the whole turn — the next identical call is the correct retry.
+    #[tokio::test]
+    async fn stream_decode_error_becomes_a_planner_retry_and_the_turn_survives() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let good = json!({
+            "ast": {"body":[{"kind":"call","op":"read","args":[{"kind":"lit","value":"x"}]}]}
+        });
+        let p = mock_chunks(vec![
+            vec![Err(Error::StreamDecode("boom".into()))],
+            tool_call("emit_plan", good).into_iter().map(Ok).collect(),
+        ]);
+        let (out, _usage) = compile_turn_with_arm(
+            &p,
+            "mock",
+            &[Message::user_text("do it")],
+            None,
+            &ops,
+            None,
+            None,
+            None,
+            CompileOptions::default(),
+            EmissionArm::Json,
+            Phase::Execute,
+        )
+        .await;
+        match out.expect("the turn must survive a mid-stream decode error") {
+            TurnOutput::Plan(c) => {
+                assert_eq!(
+                    c.attempts, 2,
+                    "one retry after the decode error, then accepted"
+                );
+            }
+            TurnOutput::Chat(t) => panic!("expected a plan, got chat: {t}"),
+        }
+    }
+
+    /// A-33: when every step in the budget hits the decode error, the exhausted-budget error names
+    /// the stream-decode failure as the cause — not the bare "did not produce a plan within N
+    /// steps".
+    #[tokio::test]
+    async fn exhausted_budget_reports_the_stream_decode_error() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let p = mock_chunks(vec![vec![Err(Error::StreamDecode(
+            "unexpected end of JSON input".into(),
+        ))]]);
+        let opts = CompileOptions {
+            max_steps: 1,
+            ..Default::default()
+        };
+        let (out, _usage) = compile_turn_with_arm(
+            &p,
+            "mock",
+            &[Message::user_text("do it")],
+            None,
+            &ops,
+            None,
+            None,
+            None,
+            opts,
+            EmissionArm::Json,
+            Phase::Execute,
+        )
+        .await;
+        let err = out.expect_err("a decode error on every step must never be accepted as a plan");
+        assert!(
+            format!("{err}").contains("provider stream broke while decoding")
+                && format!("{err}").contains("unexpected end of JSON input"),
+            "the turn error names the stream-decode failure: {err}"
+        );
+    }
+
+    /// A-33 (mirrors C-31's `failed_consultation_still_returns_accumulated_usage` one level down):
+    /// a mid-stream decode error discards the call's blocks, but the usage that call already
+    /// streamed before it broke must still reach the turn's accumulated total.
+    #[tokio::test]
+    async fn usage_survives_a_mid_stream_decode_error() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let good = json!({
+            "ast": {"body":[{"kind":"call","op":"read","args":[{"kind":"lit","value":"x"}]}]}
+        });
+        let p = mock_chunks(vec![
+            vec![
+                Ok(Chunk::Usage(Usage {
+                    input_tokens: 500,
+                    output_tokens: 37,
+                    ..Default::default()
+                })),
+                Err(Error::StreamDecode("boom".into())),
+            ],
+            tool_call_with_usage(
+                "emit_plan",
+                good,
+                Usage {
+                    input_tokens: 600,
+                    output_tokens: 12,
+                    ..Default::default()
+                },
+            )
+            .into_iter()
+            .map(Ok)
+            .collect(),
+        ]);
+        let (out, usage) = compile_turn_with_arm(
+            &p,
+            "mock",
+            &[Message::user_text("do it")],
+            None,
+            &ops,
+            None,
+            None,
+            None,
+            CompileOptions::default(),
+            EmissionArm::Json,
+            Phase::Execute,
+        )
+        .await;
+        out.expect("the turn must survive a mid-stream decode error");
+        // `Usage::accumulate` sums output tokens across calls — the failed call's 37 must show up
+        // alongside the accepted call's 12, proving the discarded call's spend wasn't dropped.
+        assert_eq!(
+            usage.output_tokens, 49,
+            "the failed call's output tokens are counted alongside the accepted call's: {usage:?}"
+        );
+    }
+
+    /// A-33: a stream that completes without error, but whose codec tolerated and skipped
+    /// unparseable frames (`Chunk::StreamDiagnostic`) and produced no usable content, still names
+    /// the diagnostic as the rejection cause when the budget runs out — not a bare "no plan"
+    /// message with zero forensic value.
+    #[tokio::test]
+    async fn empty_turn_with_stream_diagnostic_sets_last_reject() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let p = mock_chunks(vec![vec![
+            Ok(Chunk::StreamDiagnostic {
+                dropped_frames: 3,
+                detail: "unparseable data: frame at offset 118".to_string(),
+            }),
+            Ok(Chunk::Done {
+                stop_reason: Some(flux_core::StopReason::EndTurn),
+            }),
+        ]]);
+        let opts = CompileOptions {
+            max_steps: 1,
+            ..Default::default()
+        };
+        let (out, _usage) = compile_turn_with_arm(
+            &p,
+            "mock",
+            &[Message::user_text("do it")],
+            None,
+            &ops,
+            None,
+            None,
+            None,
+            opts,
+            EmissionArm::Json,
+            Phase::Execute,
+        )
+        .await;
+        let err = out.expect_err("an empty turn must never be accepted as a plan");
+        assert!(
+            format!("{err}").contains("dropped frame")
+                && format!("{err}").contains("unparseable data: frame at offset 118"),
+            "the turn error names the stream diagnostic: {err}"
+        );
+    }
+
+    // -- A-38: env-gated planner trace ---------------------------------------------------------------
+
+    /// Install a trace sink for the guard's lifetime — the C-19 `fallback_note_sink`
+    /// test-observable pattern (`flux-provider/src/lib.rs`) adapted to a thread-local since this
+    /// loop has no long-lived object to hang a field off. `#[tokio::test]` defaults to the
+    /// current-thread executor, so the thread-local set here is visible across every `.await`
+    /// point inside the call under test.
+    struct TraceSinkGuard;
+    impl Drop for TraceSinkGuard {
+        fn drop(&mut self) {
+            TRACE_SINK.with(|s| *s.borrow_mut() = None);
+        }
+    }
+    fn install_trace_sink(sink: TraceSink) -> TraceSinkGuard {
+        TRACE_SINK.with(|s| *s.borrow_mut() = Some(sink));
+        TraceSinkGuard
+    }
+
+    /// Failing-first (A-38): with the trace sink installed — the test-observable equivalent of
+    /// `FLUX_PLANNER_TRACE=1` — a rejected step's record carries the step index, the stop
+    /// reason, the tool name(s) called, and the reject text; the accepted step that follows must
+    /// NOT echo the earlier step's stale rejection.
+    #[tokio::test]
+    async fn planner_trace_records_step_stop_reason_and_reject_when_enabled() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        // Step 1: emit_plan references an op that doesn't exist at all → `validate_plan` rejects
+        // it with an "unknown operation" diagnostic. Step 2: emit_plan calls a real op → accepted.
+        let bad = json!({
+            "ast": {"body":[{"kind":"call","op":"totally.unknown","args":[]}]}
+        });
+        let good = json!({
+            "ast": {"body":[{"kind":"call","op":"read","args":[{"kind":"lit","value":"x"}]}]}
+        });
+        let p = mock(vec![
+            tool_call("emit_plan", bad),
+            tool_call("emit_plan", good),
+        ]);
+
+        let records: Arc<Mutex<Vec<TraceRecord>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_records = records.clone();
+        let guard = install_trace_sink(Arc::new(move |r: &TraceRecord| {
+            sink_records.lock().unwrap().push(r.clone());
+        }));
+
+        let (out, _usage) = compile_turn_with_arm(
+            &p,
+            "mock",
+            &[Message::user_text("do it")],
+            None,
+            &ops,
+            None,
+            None,
+            None,
+            CompileOptions::default(),
+            EmissionArm::Json,
+            Phase::Execute,
+        )
+        .await;
+        drop(guard);
+        out.expect("the turn accepts the plan on the second step");
+
+        let records = records.lock().unwrap();
+        assert_eq!(
+            records.len(),
+            2,
+            "one trace record per planner step: {records:?}"
+        );
+
+        let rejected = &records[0];
+        assert_eq!(rejected.step, 1);
+        assert_eq!(rejected.max_steps, CompileOptions::default().max_steps);
+        assert_eq!(rejected.stop_reason, Some(flux_core::StopReason::ToolUse));
+        assert_eq!(rejected.tool_names, vec!["emit_plan".to_string()]);
+        assert!(
+            rejected
+                .reject
+                .as_deref()
+                .is_some_and(|r| r.contains("totally.unknown")),
+            "the rejected step's trace names the unknown op: {rejected:?}"
+        );
+
+        let accepted = &records[1];
+        assert_eq!(accepted.step, 2);
+        assert_eq!(accepted.tool_names, vec!["emit_plan".to_string()]);
+        assert!(
+            accepted.reject.is_none(),
+            "the accepted step must not echo the earlier step's stale rejection: {accepted:?}"
         );
     }
 

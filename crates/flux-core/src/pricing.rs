@@ -48,6 +48,16 @@ pub struct Rates {
     pub reasoning: f64,
 }
 
+/// Where a [`Money`] figure came from (C-34).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CostSource {
+    /// The provider itself reported this call's dollar cost (currently: OpenRouter's `cost` field
+    /// on both wires) — strictly more truthful than the static table (routing/discount-aware).
+    Reported,
+    /// Computed from [`PricingTable`]'s static per-tier rates.
+    Estimated,
+}
+
 /// A computed cost.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Money {
@@ -56,6 +66,8 @@ pub struct Money {
     /// `true` when this spend bills against a flat-rate subscription (claude/codex) rather than
     /// metered API usage — the figure is the *equivalent* metered cost, not an incremental charge.
     pub subscription: bool,
+    /// Whether `usd` came from the provider's own reported figure or from the static table (C-34).
+    pub source: CostSource,
 }
 
 /// A partial override for one model's [`Rates`]: any field left `None` keeps the built-in value.
@@ -347,8 +359,25 @@ impl PricingTable {
     }
 
     /// Compute the cost of a usage record under a model spec. Returns `None` for an unknown model
-    /// (never panics). The [`Money::subscription`] flag is set per [`is_subscription`].
+    /// with no reported cost either (never panics). The [`Money::subscription`] flag is set per
+    /// [`is_subscription`].
+    ///
+    /// **C-34: reported cost short-circuits the table.** When `usage.reported_cost_usd` is `Some`
+    /// (currently only OpenRouter, on both wires), that figure is authoritative — it is the
+    /// provider's own charge, routing/discount-aware in a way the static table can never be — and is
+    /// returned directly as [`CostSource::Reported`], **without** consulting the table at all. This
+    /// is what prices models the table has no row for (killing the `$? (unpriced)` marker) and lets
+    /// a reported `0.0` (a `:free` model) correctly return `Some(0.0)` rather than `None`. Only when
+    /// no cost was reported does this fall through to the table math, returning
+    /// [`CostSource::Estimated`].
     pub fn cost(&self, usage: &Usage, model: &str) -> Option<Money> {
+        if let Some(usd) = usage.reported_cost_usd {
+            return Some(Money {
+                usd,
+                subscription: is_subscription(model),
+                source: CostSource::Reported,
+            });
+        }
         let r = self.rates_for(model)?;
         let usd = (usage.input_tokens as f64 * r.input
             + usage.output_tokens as f64 * r.output
@@ -359,6 +388,7 @@ impl PricingTable {
         Some(Money {
             usd,
             subscription: is_subscription(model),
+            source: CostSource::Estimated,
         })
     }
 
@@ -410,6 +440,7 @@ mod tests {
             cache_creation_input_tokens: 200_000,
             cache_read_input_tokens: 2_000_000,
             reasoning_tokens: 100_000,
+            ..Default::default()
         };
         // 1.0·2 + 0.5·4 + 0.2·6 + 2.0·1 + 0.1·8 = 2 + 2 + 1.2 + 2 + 0.8 = 8.0
         let money = table.cost(&usage, "test-model").unwrap();
@@ -617,6 +648,87 @@ mod tests {
         assert!(is_subscription("codex/gpt-5.5"));
         assert!(!is_subscription("anthropic/claude-opus-4-8"));
         assert!(!is_subscription("claude-opus-4-8"));
+    }
+
+    /// C-34: `PricingTable::cost` prefers a call's provider-reported cost over the static table —
+    /// the single choke point that kills `$? (unpriced)` for OpenRouter models. An untabled model
+    /// prices when the caller reported cost (previously `None`, forever). A TABLED model's reported
+    /// figure still wins over the table math (routing/discounts the static table can't know). A
+    /// tabled model with NO reported figure prices exactly as before (table math, unaffected). A
+    /// reported `0.0` (a `:free` OpenRouter model) must still be `Some` — `0.0` is a real answer,
+    /// not "unknown" — so it never shows the `$?` marker.
+    #[test]
+    fn reported_cost_beats_table_and_prices_untabled_models() {
+        let table = PricingTable::builtin();
+
+        // An untabled model: no reported cost → None (today's behavior, the `$?` marker case).
+        let plain = Usage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            ..Default::default()
+        };
+        assert!(
+            table
+                .cost(&plain, "openrouter/some/untabled-model")
+                .is_none(),
+            "untabled + unreported must stay None"
+        );
+
+        // An untabled model WITH reported cost → Some(Reported), the exact reported figure —
+        // this is the whole point of the story.
+        let reported = Usage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            reported_cost_usd: Some(0.001234),
+            ..Default::default()
+        };
+        let money = table
+            .cost(&reported, "openrouter/some/untabled-model")
+            .expect("reported cost must price an untabled model");
+        assert_eq!(money.usd, 0.001234);
+        assert_eq!(money.source, CostSource::Reported);
+
+        // A TABLED model (claude-sonnet-4-6) with a reported figure: the reported figure wins over
+        // the table math, even though the table could price it too.
+        let tabled_reported = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            reported_cost_usd: Some(9.99),
+            ..Default::default()
+        };
+        let money = table
+            .cost(&tabled_reported, "claude-sonnet-4-6")
+            .expect("tabled model still prices");
+        assert_eq!(
+            money.usd, 9.99,
+            "reported cost must short-circuit the table, not just supplement it"
+        );
+        assert_eq!(money.source, CostSource::Reported);
+
+        // The SAME tabled model with NO reported figure: exact table math, unchanged — table
+        // pricing must not regress for the vast majority of (non-OpenRouter) calls.
+        let tabled_plain = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+        let money = table.cost(&tabled_plain, "claude-sonnet-4-6").unwrap();
+        assert!((money.usd - 18.0).abs() < 1e-9, "got {}", money.usd);
+        assert_eq!(money.source, CostSource::Estimated);
+
+        // A reported 0.0 (a `:free` OpenRouter model) must still be Some — 0.0 is a real answer,
+        // not "unknown" — so the caller never renders the `$?` marker for it.
+        let free = Usage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            reported_cost_usd: Some(0.0),
+            ..Default::default()
+        };
+        let money = table
+            .cost(&free, "openrouter/some/free-model")
+            .expect("reported 0.0 must still be Some, not None");
+        assert_eq!(money.usd, 0.0);
+        assert_eq!(money.source, CostSource::Reported);
     }
 
     #[test]

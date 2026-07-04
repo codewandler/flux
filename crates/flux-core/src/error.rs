@@ -13,6 +13,11 @@ pub enum Error {
     #[error("provider error: {0}")]
     Provider(String),
 
+    /// Provider/model-originated bytes failed to decode mid-stream. Distinct from `Provider`
+    /// (transport/protocol) so consumers can retry the call rather than kill the turn.
+    #[error("provider stream decode error: {0}")]
+    StreamDecode(String),
+
     /// A non-success HTTP response from a provider API.
     #[error("api error (status {status}): {message}")]
     Api { status: u16, message: String },

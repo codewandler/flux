@@ -357,6 +357,11 @@ pub fn map_messages_stream(byte_stream: ByteStream) -> ChunkStream {
     Box::pin(map_messages_stream_inner(byte_stream))
 }
 
+// A-37: this fn's one `serde_json::from_str` call is the tolerant skip+count/unrecognized-variant
+// envelope parse (matched, never `?`-propagated) — allowed at this tight scope; the crate-local
+// `clippy.toml` disallowed-methods ban would otherwise flag it. `envelope_corpus.rs`'s corpus test
+// drives the public `map_messages_stream` wrapper to prove the tolerance holds.
+#[allow(clippy::disallowed_methods)]
 fn map_messages_stream_inner(
     byte_stream: ByteStream,
 ) -> impl futures::Stream<Item = Result<Chunk>> {
@@ -367,6 +372,14 @@ fn map_messages_stream_inner(
         // only the running output count (its input fields default to 0). Remember the input side so
         // the final usage chunk keeps it, instead of consumers' last-wins assignment zeroing it.
         let mut prior_usage = flux_core::Usage::default();
+        // A-35: a `data:` frame that isn't valid JSON, and a well-formed frame whose `type` the
+        // enum doesn't recognize (a new vendor extension, a keep-alive-ish event), both surface as
+        // the same `serde_json::Error` from this one deserialize call — `StreamEvent`'s internally
+        // tagged representation rejects an unknown tag exactly like malformed JSON. Skip + count
+        // both instead of killing the stream; a *declared* provider error (`StreamEvent::Error`,
+        // matched below) still parses successfully and stays fatal via its own arm.
+        let mut dropped_frames: u32 = 0;
+        let mut first_drop_detail: Option<String> = None;
 
         while let Some(event) = events.next().await {
             let event = event.map_err(|e| Error::Provider(format!("sse stream: {e}")))?;
@@ -378,12 +391,21 @@ fn map_messages_stream_inner(
                 continue;
             }
 
-            let parsed: StreamEvent = serde_json::from_str(data).map_err(|e| {
-                Error::Provider(format!(
-                    "messages SSE: bad event JSON ({e}); raw: {}",
-                    data.chars().take(200).collect::<String>()
-                ))
-            })?;
+            let parsed: StreamEvent = match serde_json::from_str(data) {
+                Ok(v) => v,
+                Err(e) => {
+                    dropped_frames += 1;
+                    if first_drop_detail.is_none() {
+                        first_drop_detail = Some(e.to_string());
+                    }
+                    tracing::warn!(
+                        error = %e,
+                        frame = %data.chars().take(200).collect::<String>(),
+                        "messages SSE: skipping unparseable or unrecognized event frame"
+                    );
+                    continue;
+                }
+            };
             match parsed {
                 StreamEvent::MessageStart { message } => {
                     yield Chunk::MessageStart { model: message.model };
@@ -425,8 +447,9 @@ fn map_messages_stream_inner(
                 }
                 StreamEvent::MessageDelta { delta, usage } => {
                     if let Some(u) = usage {
-                        // Carry the input/cache counts forward from message_start so they aren't
-                        // clobbered to 0 by the delta (which only reports output tokens).
+                        // Carry the input/cache counts forward from the prior usage frame so they
+                        // aren't clobbered to 0 by this delta (which only reports output tokens —
+                        // and, per C-34, reported cost may or may not repeat on every frame).
                         let mut u: flux_core::Usage = u.into();
                         if u.input_tokens == 0 {
                             u.input_tokens = prior_usage.input_tokens;
@@ -437,6 +460,17 @@ fn map_messages_stream_inner(
                         if u.cache_read_input_tokens == 0 {
                             u.cache_read_input_tokens = prior_usage.cache_read_input_tokens;
                         }
+                        // C-34: OpenRouter's `cost` isn't guaranteed to repeat on every
+                        // `message_delta` — once seen it is sticky, carried forward like the
+                        // token counts above, so a cost reported on an early frame survives to
+                        // the final one even if that final frame's usage omits it.
+                        if u.reported_cost_usd.is_none() {
+                            u.reported_cost_usd = prior_usage.reported_cost_usd;
+                        }
+                        // Refresh `prior_usage` after EVERY usage frame (not just message_start) —
+                        // otherwise a cost/count seen on an early delta can't survive to a LATER
+                        // delta that only carries the next slice.
+                        prior_usage = u.clone();
                         yield Chunk::Usage(u);
                     }
                     if let Some(reason) = delta.stop_reason {
@@ -449,6 +483,16 @@ fn map_messages_stream_inner(
                     Err(Error::Provider(format!("{}: {}", error.kind, error.message)))?;
                 }
             }
+        }
+
+        if dropped_frames > 0 {
+            yield Chunk::StreamDiagnostic {
+                dropped_frames,
+                detail: format!(
+                    "{dropped_frames} unparseable or unrecognized messages SSE frame(s) dropped; first error: {}",
+                    first_drop_detail.unwrap_or_default(),
+                ),
+            };
         }
     }
 }
@@ -704,6 +748,7 @@ mod tests {
                 Chunk::Done { stop_reason } => stop = stop_reason,
                 Chunk::MessageStart { .. } => {}
                 Chunk::ThinkingDelta(_) => {}
+                Chunk::StreamDiagnostic { .. } => {}
             }
         }
 
@@ -725,6 +770,86 @@ mod tests {
             }
             other => panic!("expected tool_use, got {other:?}"),
         }
+    }
+
+    /// C-34: the Messages wire (glm live probe, 2026-07-04) puts OpenRouter's `cost` on the FINAL
+    /// `message_delta` usage frame — `message_start` usage never carries it. The final `Usage`
+    /// chunk must carry that cost AND the carried-forward input/cache counts together.
+    #[tokio::test]
+    async fn messages_stream_carries_reported_cost_through_final_delta() {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"z-ai/glm-4.6\",\"usage\":{\"input_tokens\":20,\"output_tokens\":1}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":10}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42,\"cost\":0.0005052,\"is_byok\":false}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+
+        let mut last_usage = None;
+        let mut stream = map_messages_stream(byte_stream);
+        while let Some(chunk) = stream.next().await {
+            if let Chunk::Usage(u) = chunk.unwrap() {
+                last_usage = Some(u);
+            }
+        }
+        let usage = last_usage.expect("a final usage chunk");
+        assert_eq!(usage.output_tokens, 42);
+        assert_eq!(
+            usage.input_tokens, 20,
+            "input tokens from message_start must still carry to the final delta"
+        );
+        assert!(
+            (usage
+                .reported_cost_usd
+                .expect("reported cost on the final delta")
+                - 0.0005052)
+                .abs()
+                < 1e-12,
+            "got {:?}",
+            usage.reported_cost_usd
+        );
+
+        // Variant: the cost arrives on an EARLIER usage frame, not the final one — it must still
+        // survive (sticky) to the last `Usage` chunk despite that frame not repeating it.
+        let sse_early_cost = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"z-ai/glm-4.6\",\"usage\":{\"input_tokens\":20,\"output_tokens\":1}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":10,\"cost\":0.0001,\"is_byok\":false}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let byte_stream: ByteStream = Box::pin(futures::stream::once(async move {
+            Ok(bytes::Bytes::from(sse_early_cost))
+        }));
+        let mut last_usage = None;
+        let mut stream = map_messages_stream(byte_stream);
+        while let Some(chunk) = stream.next().await {
+            if let Chunk::Usage(u) = chunk.unwrap() {
+                last_usage = Some(u);
+            }
+        }
+        let usage = last_usage.expect("a final usage chunk");
+        assert_eq!(usage.output_tokens, 42);
+        assert!(
+            (usage
+                .reported_cost_usd
+                .expect("cost from an earlier frame must stick")
+                - 0.0001)
+                .abs()
+                < 1e-12,
+            "got {:?}",
+            usage.reported_cost_usd
+        );
     }
 
     #[tokio::test]
@@ -767,6 +892,162 @@ mod tests {
             }
             other => panic!("expected tool_use, got {other:?}"),
         }
+    }
+
+    /// A-35: a `data:` frame whose bytes don't even parse as JSON is skipped and counted, never
+    /// fatal — the good frames around it still process normally.
+    #[tokio::test]
+    async fn messages_bad_event_json_is_skipped_and_the_stream_survives() {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            // Syntactically broken — not valid JSON at all.
+            "data: {this is not json at all}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+
+        let mut text = String::new();
+        let mut stop = None;
+        let mut stream = map_messages_stream(byte_stream);
+        while let Some(chunk) = stream.next().await {
+            match chunk.expect("a bad-JSON frame must not fail the stream") {
+                Chunk::TextDelta(t) => text.push_str(&t),
+                Chunk::Done { stop_reason } => stop = stop_reason,
+                _ => {}
+            }
+        }
+        assert_eq!(text, "Hello");
+        assert_eq!(stop, Some(StopReason::EndTurn));
+    }
+
+    /// A-35: a *well-formed* JSON frame whose `type` the enum doesn't know (a new vendor
+    /// extension, a keep-alive-ish event) must be tolerated the same way — `StreamEvent` has no
+    /// catch-all arm, so this is a normal serde "unknown variant" error, not a syntax error.
+    #[tokio::test]
+    async fn messages_unknown_event_type_is_tolerated() {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"some_future_vendor_event\",\"foo\":\"bar\"}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+
+        let mut text = String::new();
+        let mut stop = None;
+        let mut stream = map_messages_stream(byte_stream);
+        while let Some(chunk) = stream.next().await {
+            match chunk.expect("an unknown event type must not fail the stream") {
+                Chunk::TextDelta(t) => text.push_str(&t),
+                Chunk::Done { stop_reason } => stop = stop_reason,
+                _ => {}
+            }
+        }
+        assert_eq!(text, "Hi");
+        assert_eq!(stop, Some(StopReason::EndTurn));
+    }
+
+    /// A-35: both drop shapes (bad JSON + unknown type) land in the same counter and surface as
+    /// exactly ONE end-of-stream `StreamDiagnostic`.
+    #[tokio::test]
+    async fn messages_dropped_frames_surface_a_stream_diagnostic() {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+            // Shape 1: syntactically broken JSON.
+            "data: {this is not json at all}\n\n",
+            // Shape 2: well-formed JSON, unrecognized type.
+            "data: {\"type\":\"some_future_vendor_event\",\"foo\":\"bar\"}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+
+        let mut diagnostics = Vec::new();
+        let mut stream = map_messages_stream(byte_stream);
+        while let Some(chunk) = stream.next().await {
+            if let Chunk::StreamDiagnostic {
+                dropped_frames,
+                detail,
+            } = chunk.expect("dropped frames must not fail the stream")
+            {
+                diagnostics.push((dropped_frames, detail));
+            }
+        }
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "exactly one end-of-stream diagnostic, got {diagnostics:?}"
+        );
+        assert_eq!(diagnostics[0].0, 2, "both drop shapes counted together");
+        assert!(!diagnostics[0].1.is_empty());
+    }
+
+    /// A-35 guardrail pin: a *declared* provider error event (`type: "error"`) must stay fatal —
+    /// tolerance is for unparseable/unrecognized bytes only, never for a real outage the provider
+    /// told us about. This must pass both before and after the tolerance change.
+    #[tokio::test]
+    async fn messages_declared_error_event_stays_fatal() {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+        );
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+
+        let mut stream = map_messages_stream(byte_stream);
+        let mut saw_err = false;
+        while let Some(chunk) = stream.next().await {
+            if let Err(e) = chunk {
+                saw_err = true;
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("overloaded_error") && msg.contains("Overloaded"),
+                    "got: {msg}"
+                );
+            }
+        }
+        assert!(saw_err, "a declared error event must still fail the stream");
     }
 
     #[tokio::test]

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::content::ContentBlock;
 
 /// Token accounting for a single provider turn.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     #[serde(default)]
     pub input_tokens: u64,
@@ -28,6 +28,15 @@ pub struct Usage {
     /// (written before this field existed) decodable.
     #[serde(default)]
     pub reasoning_tokens: u64,
+    /// The provider's own dollar figure for this call (C-34), when it reports one (OpenRouter's
+    /// `cost` field on both wires; `None` for providers that don't report — e.g. direct
+    /// Anthropic/OpenAI/Bedrock). When present, [`PricingTable::cost`](crate::PricingTable::cost)
+    /// prefers it over the static table — the provider's own number is strictly more truthful
+    /// (routing/discount-aware) and needs zero table maintenance. `#[serde(default,
+    /// skip_serializing_if = "Option::is_none")]` keeps old event-log rows (written before this
+    /// field existed) decodable AND keeps the wire byte-identical for every non-reporting provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_cost_usd: Option<f64>,
 }
 
 impl Usage {
@@ -62,6 +71,12 @@ impl Usage {
             self.cache_read_input_tokens = call.cache_read_input_tokens;
             self.cache_creation_input_tokens = call.cache_creation_input_tokens;
         }
+        // Reported cost is spend, not a snapshot — like output tokens, every call's slice adds to
+        // the turn total. A call that doesn't report cost (`None`) leaves the accumulator
+        // untouched, so a non-reporting follow-up can't erase cost already recorded.
+        if let Some(c) = call.reported_cost_usd {
+            *self.reported_cost_usd.get_or_insert(0.0) += c;
+        }
     }
 }
 
@@ -94,6 +109,9 @@ pub enum Chunk {
     Usage(Usage),
     /// The turn is complete.
     Done { stop_reason: Option<StopReason> },
+    /// Emitted when a codec tolerated and skipped unparseable provider bytes mid-stream.
+    /// Not a failure — informational, for planner-side accounting and diagnostics.
+    StreamDiagnostic { dropped_frames: u32, detail: String },
 }
 
 #[cfg(test)]
@@ -142,5 +160,56 @@ mod tests {
         assert_eq!(acc.output_tokens, 55);
         assert_eq!(acc.reasoning_tokens, 23);
         assert_eq!(acc.input_tokens, 150);
+    }
+
+    /// C-34: `reported_cost_usd` sums across calls like `output_tokens`/`reasoning_tokens` — a
+    /// turn's total spend is the sum of what every call in it actually cost, not a replace. A
+    /// `None` call (a provider that doesn't report cost, or a usage-less follow-up) must not erase
+    /// cost already accumulated from an earlier reporting call.
+    #[test]
+    fn usage_accumulate_sums_reported_cost() {
+        let mut acc = Usage::default();
+        assert_eq!(acc.reported_cost_usd, None, "nothing accumulated yet");
+
+        // First call reports cost.
+        acc.accumulate(&Usage {
+            output_tokens: 10,
+            reported_cost_usd: Some(0.002),
+            ..Default::default()
+        });
+        assert_eq!(acc.reported_cost_usd, Some(0.002));
+
+        // A second reporting call SUMS, not replaces.
+        acc.accumulate(&Usage {
+            output_tokens: 5,
+            reported_cost_usd: Some(0.0005),
+            ..Default::default()
+        });
+        assert!(
+            (acc.reported_cost_usd.unwrap() - 0.0025).abs() < 1e-12,
+            "got {:?}",
+            acc.reported_cost_usd
+        );
+
+        // A follow-up call that reports NO cost (e.g. a usage-less/non-reporting call) must not
+        // erase the cost already recorded.
+        acc.accumulate(&Usage {
+            output_tokens: 1,
+            ..Default::default()
+        });
+        assert!(
+            (acc.reported_cost_usd.unwrap() - 0.0025).abs() < 1e-12,
+            "a None call must not erase prior recorded cost: {:?}",
+            acc.reported_cost_usd
+        );
+
+        // A fresh accumulator that never sees a reporting call stays None throughout (a
+        // non-reporting provider's turn must not spuriously show Some(0.0)).
+        let mut never_reported = Usage::default();
+        never_reported.accumulate(&Usage {
+            output_tokens: 20,
+            ..Default::default()
+        });
+        assert_eq!(never_reported.reported_cost_usd, None);
     }
 }

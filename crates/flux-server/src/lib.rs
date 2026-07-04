@@ -689,6 +689,7 @@ mod tests {
                     cache_creation_input_tokens: 200_000,
                     cache_read_input_tokens: 500_000,
                     reasoning_tokens: 0,
+                    ..Default::default()
                 },
             )
             .unwrap();

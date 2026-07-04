@@ -238,6 +238,23 @@ struct ChatUsage {
     completion_tokens: u64,
     #[serde(default)]
     prompt_tokens_details: Option<PromptTokensDetails>,
+    /// OpenRouter's reported total USD cost for this call (C-34). `serde(default)` + `Option`
+    /// tolerates both an absent field (every non-OpenRouter backend) and an explicit `null`.
+    #[serde(default)]
+    cost: Option<f64>,
+    /// Whether this call billed against the caller's own upstream key (bring-your-own-key) — flips
+    /// how `cost_details.upstream_inference_cost` combines with `cost` (see
+    /// [`crate::openrouter_reported_cost`]).
+    #[serde(default)]
+    is_byok: Option<bool>,
+    #[serde(default)]
+    cost_details: Option<ChatCostDetails>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChatCostDetails {
+    #[serde(default)]
+    upstream_inference_cost: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -253,12 +270,25 @@ struct PromptTokensDetails {
 const MAX_TOOL_CALLS: usize = 256;
 
 /// assembled `tool_use` block at stream end (matching the Anthropic codec's contract).
-fn map_chat_stream(byte_stream: ByteStream) -> impl futures::Stream<Item = Result<Chunk>> {
+///
+/// `pub(crate)` (not private) so the crate-wide malformed-envelope corpus (A-37,
+/// `envelope_corpus.rs`) can drive it directly with corrupted fixture streams.
+// A-37: this fn's one `serde_json::from_str` call is the tolerant skip+count envelope parse
+// (matched, never `?`-propagated) that the crate-local `clippy.toml` disallowed-methods ban would
+// otherwise flag — allowed at this tight scope; `envelope_corpus.rs` proves the tolerance holds.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn map_chat_stream(
+    byte_stream: ByteStream,
+) -> impl futures::Stream<Item = Result<Chunk>> {
     try_stream! {
         let mut events = byte_stream.eventsource();
         let mut text = String::new();
         let mut calls: Vec<(String, String, String)> = Vec::new(); // (id, name, args) by index
         let mut stop: Option<StopReason> = None;
+        // A-34: an unparseable envelope frame is skipped and counted, never fatal — a real API
+        // outage stays fatal via the declared-error paths below, which run on the parsed value.
+        let mut dropped_frames: u32 = 0;
+        let mut first_drop_detail: Option<String> = None;
 
         while let Some(event) = events.next().await {
             let event = event.map_err(|e| Error::Provider(format!("sse stream: {e}")))?;
@@ -266,7 +296,21 @@ fn map_chat_stream(byte_stream: ByteStream) -> impl futures::Stream<Item = Resul
             if data.is_empty() || data == "[DONE]" {
                 continue;
             }
-            let chunk: ChatChunk = serde_json::from_str(data)?;
+            let chunk: ChatChunk = match serde_json::from_str(data) {
+                Ok(c) => c,
+                Err(e) => {
+                    dropped_frames += 1;
+                    if first_drop_detail.is_none() {
+                        first_drop_detail = Some(e.to_string());
+                    }
+                    tracing::warn!(
+                        error = %e,
+                        frame = %data.chars().take(200).collect::<String>(),
+                        "openai chat SSE: skipping unparseable envelope frame"
+                    );
+                    continue;
+                }
+            };
 
             if let Some(u) = chunk.usage {
                 // OpenAI's `prompt_tokens` is the *whole* prompt incl. the cached prefix. Normalize
@@ -278,10 +322,16 @@ fn map_chat_stream(byte_stream: ByteStream) -> impl futures::Stream<Item = Resul
                     .as_ref()
                     .map(|d| d.cached_tokens)
                     .unwrap_or(0);
+                let reported_cost_usd = crate::openrouter_reported_cost(
+                    u.cost,
+                    u.is_byok,
+                    u.cost_details.as_ref().and_then(|d| d.upstream_inference_cost),
+                );
                 yield Chunk::Usage(Usage {
                     input_tokens: u.prompt_tokens.saturating_sub(cached),
                     output_tokens: u.completion_tokens,
                     cache_read_input_tokens: cached,
+                    reported_cost_usd,
                     ..Default::default()
                 });
             }
@@ -336,6 +386,16 @@ fn map_chat_stream(byte_stream: ByteStream) -> impl futures::Stream<Item = Resul
                     stop = Some(map_chat_stop(&fr));
                 }
             }
+        }
+
+        if dropped_frames > 0 {
+            yield Chunk::StreamDiagnostic {
+                dropped_frames,
+                detail: format!(
+                    "{dropped_frames} unparseable chat SSE frame(s) dropped; first error: {}",
+                    first_drop_detail.unwrap_or_default(),
+                ),
+            };
         }
 
         // Recovery: if no native tool calls arrived but the assistant text carries inline tool-call
@@ -412,6 +472,10 @@ fn span_inners(text: &str, open: &str, close: &str) -> Vec<String> {
 /// Parse one inline call body into `(name, input)`. Handles the GLM XML form
 /// (`<function=NAME><parameter=KEY>VALUE</parameter>…`) and the Qwen/Hermes JSON form
 /// (`{"name":…,"arguments":{…}|"…"}`). Returns `None` for anything unrecognized.
+// A-37: the three `serde_json::from_str` calls in this fn are the GLM/Qwen inline-recovery
+// repair — already tolerant (`.unwrap_or_else`/`?` on an `Option`, never a fatal stream error) —
+// allowed at this tight scope; see clippy.toml.
+#[allow(clippy::disallowed_methods)]
 fn parse_inline_call_body(body: &str) -> Option<(String, Value)> {
     let t = body.trim();
     if let Some(fpos) = t.find("<function=") {
@@ -854,12 +918,23 @@ fn build_responses_body(req: &Request, codex: bool) -> Result<Value> {
 
 /// Parse the OpenAI Responses typed-SSE event stream into normalized [`Chunk`]s. Unknown event
 /// types are ignored, so the parser tolerates backend variation.
-fn map_responses_stream(byte_stream: ByteStream) -> impl futures::Stream<Item = Result<Chunk>> {
+///
+/// `pub(crate)` so the malformed-envelope corpus (A-37, `envelope_corpus.rs`) can drive it directly.
+// A-37: same tolerant skip+count envelope parse as `map_chat_stream` — allowed at this tight scope.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn map_responses_stream(
+    byte_stream: ByteStream,
+) -> impl futures::Stream<Item = Result<Chunk>> {
     try_stream! {
         let mut events = byte_stream.eventsource();
         let mut text = String::new();
         let mut tool_blocks: Vec<ContentBlock> = Vec::new();
         let mut stop: Option<StopReason> = None;
+        // A-34: same skip+count tolerance as the chat codec. Declared errors (`response.failed`,
+        // `error`) are handled below on the parsed value and stay fatal — this only guards
+        // syntactically-unparseable bytes.
+        let mut dropped_frames: u32 = 0;
+        let mut first_drop_detail: Option<String> = None;
 
         while let Some(event) = events.next().await {
             let event = event.map_err(|e| Error::Provider(format!("sse stream: {e}")))?;
@@ -867,7 +942,21 @@ fn map_responses_stream(byte_stream: ByteStream) -> impl futures::Stream<Item = 
             if data.is_empty() || data == "[DONE]" {
                 continue;
             }
-            let v: Value = serde_json::from_str(data)?;
+            let v: Value = match serde_json::from_str(data) {
+                Ok(v) => v,
+                Err(e) => {
+                    dropped_frames += 1;
+                    if first_drop_detail.is_none() {
+                        first_drop_detail = Some(e.to_string());
+                    }
+                    tracing::warn!(
+                        error = %e,
+                        frame = %data.chars().take(200).collect::<String>(),
+                        "openai responses SSE: skipping unparseable envelope frame"
+                    );
+                    continue;
+                }
+            };
             match v["type"].as_str().unwrap_or("") {
                 "response.output_text.delta" => {
                     let d = v["delta"].as_str().unwrap_or("");
@@ -950,6 +1039,16 @@ fn map_responses_stream(byte_stream: ByteStream) -> impl futures::Stream<Item = 
                 }
                 _ => {}
             }
+        }
+
+        if dropped_frames > 0 {
+            yield Chunk::StreamDiagnostic {
+                dropped_frames,
+                detail: format!(
+                    "{dropped_frames} unparseable responses SSE frame(s) dropped; first error: {}",
+                    first_drop_detail.unwrap_or_default(),
+                ),
+            };
         }
 
         if !text.is_empty() {
@@ -1090,6 +1189,67 @@ mod tests {
         assert_eq!(u.output_tokens, 50);
         assert_eq!(u.cache_creation_input_tokens, 0);
         assert_eq!(u.context_tokens(), 1000);
+    }
+
+    /// C-34: the final chat-completions SSE usage frame carries OpenRouter's `cost` field — the
+    /// live probe (2026-07-04, deepseek-v4-flash:nitro) shape: `cost`, `is_byok:false`, and
+    /// `cost_details.upstream_inference_cost` echoing the SAME figure as `cost` for a non-BYOK
+    /// response. The codec must take `cost` as-is here, NOT `cost + upstream_inference_cost` — that
+    /// would double-count, since for non-BYOK the two fields are the same number.
+    #[tokio::test]
+    async fn chat_usage_captures_openrouter_reported_cost() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":50,\
+             \"cost\":0.0000020643,\"is_byok\":false,\
+             \"cost_details\":{\"upstream_inference_cost\":0.0000020643}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+
+        let mut usage = None;
+        let stream = map_chat_stream(byte_stream);
+        futures::pin_mut!(stream);
+        while let Some(chunk) = stream.next().await {
+            if let Chunk::Usage(u) = chunk.unwrap() {
+                usage = Some(u);
+            }
+        }
+
+        let u = usage.expect("usage chunk");
+        // Token normalization is unaffected by the new fields.
+        assert_eq!(u.input_tokens, 1000);
+        assert_eq!(u.output_tokens, 50);
+        assert!(
+            (u.reported_cost_usd.expect("reported cost must be captured") - 0.0000020643).abs()
+                < 1e-12,
+            "must equal `cost` exactly — summing upstream_inference_cost would double-count for \
+             non-BYOK, got {:?}",
+            u.reported_cost_usd
+        );
+
+        // A provider that doesn't report cost (`"cost":null`, or the field simply absent) yields
+        // `None` — table pricing stays the fallback.
+        let sse_no_cost = concat!(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\
+             \"cost\":null}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let byte_stream: ByteStream = Box::pin(futures::stream::once(async move {
+            Ok(bytes::Bytes::from(sse_no_cost))
+        }));
+        let mut usage = None;
+        let stream = map_chat_stream(byte_stream);
+        futures::pin_mut!(stream);
+        while let Some(chunk) = stream.next().await {
+            if let Chunk::Usage(u) = chunk.unwrap() {
+                usage = Some(u);
+            }
+        }
+        assert_eq!(usage.expect("usage chunk").reported_cost_usd, None);
     }
 
     /// A-32 (s_368): deepseek-v4-flash:nitro stopped emitting mid-args — a ~19KB `emit_plan`
@@ -1437,6 +1597,142 @@ mod tests {
             }
             other => panic!("expected tool_use, got {other:?}"),
         }
+    }
+
+    /// A-34: an SSE `data:` frame that isn't valid JSON at all must be skipped, not fatal — the
+    /// stream completes without ever yielding an `Err`.
+    #[tokio::test]
+    async fn chat_malformed_envelope_frame_is_skipped_and_the_stream_survives() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            "data: not json at all {{{\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+
+        let stream = map_chat_stream(byte_stream);
+        futures::pin_mut!(stream);
+        while let Some(chunk) = stream.next().await {
+            assert!(chunk.is_ok(), "a junk frame must not fail the stream");
+        }
+    }
+
+    /// A-34: content that arrives in frames *after* a junk frame must still reach the collected
+    /// output — proves skip+continue, not truncate-on-first-bad-frame.
+    #[tokio::test]
+    async fn chat_content_after_a_junk_frame_still_arrives() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            "data: not json at all {{{\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+
+        let mut text = String::new();
+        let stream = map_chat_stream(byte_stream);
+        futures::pin_mut!(stream);
+        while let Some(chunk) = stream.next().await {
+            if let Chunk::TextDelta(t) = chunk.expect("the stream must survive the junk frame") {
+                text.push_str(&t);
+            }
+        }
+
+        assert_eq!(
+            text, "Hello",
+            "the tail after the junk frame must not be truncated"
+        );
+    }
+
+    /// A-34: dropped frames must surface exactly one end-of-stream `StreamDiagnostic` carrying the
+    /// count of frames that were skipped.
+    #[tokio::test]
+    async fn chat_dropped_frames_surface_a_stream_diagnostic() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            "data: not json at all {{{\n\n",
+            "data: also not json ]][\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+
+        let mut diagnostics = Vec::new();
+        let stream = map_chat_stream(byte_stream);
+        futures::pin_mut!(stream);
+        while let Some(chunk) = stream.next().await {
+            if let Chunk::StreamDiagnostic {
+                dropped_frames,
+                detail,
+            } = chunk.expect("the stream must survive the junk frames")
+            {
+                diagnostics.push((dropped_frames, detail));
+            }
+        }
+
+        assert_eq!(diagnostics.len(), 1, "exactly one diagnostic chunk");
+        assert_eq!(diagnostics[0].0, 2, "both bad frames counted");
+        assert!(!diagnostics[0].1.is_empty(), "detail carries a summary");
+    }
+
+    /// A-34: the Responses-API envelope parse must tolerate the same class of junk frame.
+    #[tokio::test]
+    async fn responses_malformed_envelope_frame_is_skipped() {
+        let sse = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n",
+            "data: not json at all {{{\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":9,\"output_tokens\":4}}}\n\n",
+        );
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+
+        let mut text = String::new();
+        let stream = map_responses_stream(byte_stream);
+        futures::pin_mut!(stream);
+        while let Some(chunk) = stream.next().await {
+            if let Chunk::TextDelta(t) = chunk.expect("a junk frame must not fail the stream") {
+                text.push_str(&t);
+            }
+        }
+
+        assert_eq!(text, "Hi");
+    }
+
+    /// A-34 guardrail pin: a well-formed `response.failed` event is a *declared* provider error,
+    /// not unparseable bytes — it must stay fatal exactly as before this story's change. This test
+    /// passes unchanged both before and after the tolerance change; it only pins the behavior.
+    #[tokio::test]
+    async fn responses_declared_error_events_stay_fatal() {
+        let sse =
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}\n\n";
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+
+        let mut saw_err = false;
+        let stream = map_responses_stream(byte_stream);
+        futures::pin_mut!(stream);
+        while let Some(chunk) = stream.next().await {
+            if let Err(e) = chunk {
+                saw_err = true;
+                assert!(e.to_string().contains("boom"), "got: {e}");
+            }
+        }
+
+        assert!(saw_err, "a declared response.failed event must stay fatal");
     }
 
     #[tokio::test]

@@ -7012,6 +7012,7 @@ mod tests {
             cache_read_input_tokens: 9_000,
             cache_creation_input_tokens: 0,
             reasoning_tokens: 0,
+            ..Default::default()
         };
         let s = usage_annotation(&u);
         assert_eq!(s, " · ctx 10.0k · out 500 · cache 9.0k (90% hit)");
@@ -7043,6 +7044,7 @@ mod tests {
             cache_creation_input_tokens: 2_000,
             cache_read_input_tokens: 9_000,
             reasoning_tokens: 300,
+            ..Default::default()
         };
         let s = usage_annotation(&u);
         assert!(s.contains("cache 9.0k"), "cache-read still shown: {s}");
@@ -7072,6 +7074,7 @@ mod tests {
         let cost = cost_annotation(&Money {
             usd: 0.0456,
             subscription: false,
+            source: flux_core::CostSource::Estimated,
         });
         assert_eq!(format!("{s}{cost}"), format!("{s} · $0.0456"));
     }
@@ -7086,26 +7089,30 @@ mod tests {
         let metered = cost_annotation(&Money {
             usd: 0.0023,
             subscription: false,
+            source: flux_core::CostSource::Estimated,
         });
         assert_eq!(metered, " · $0.0023");
         // Subscription spend → equivalent metered cost, tagged `(sub)`.
         let sub = cost_annotation(&Money {
             usd: 0.0023,
             subscription: true,
+            source: flux_core::CostSource::Estimated,
         });
         assert_eq!(sub, " · ~$0.0023 (sub)");
         // A zero-cost turn (e.g. fully cached, or no usage) → empty, so the rule stays clean.
         assert_eq!(
             cost_annotation(&Money {
                 usd: 0.0,
-                subscription: false
+                subscription: false,
+                source: flux_core::CostSource::Estimated,
             }),
             ""
         );
         assert_eq!(
             cost_annotation(&Money {
                 usd: 0.0,
-                subscription: true
+                subscription: true,
+                source: flux_core::CostSource::Estimated,
             }),
             ""
         );
@@ -7268,6 +7275,30 @@ mod tests {
             .with_cost("openrouter/deepseek/deepseek-v4-flash:nitro".into(), table)
             .cost_inline(None);
         assert_eq!(none, "");
+    }
+
+    /// C-34: a call that reported its own cost (OpenRouter, both wires) prices even though the
+    /// static builtin table has no row for it — the `$? (unpriced)` marker (and its once-per-run
+    /// note) must NOT fire; `cost_suffix` takes the `Some(money) => cost_annotation` branch, never
+    /// reaching `unpriced_marker_applies`/`note_unpriced_once` at all.
+    #[tokio::test]
+    async fn cost_suffix_prefers_reported_cost_over_unpriced_marker() {
+        use flux_core::Usage;
+        let u = Usage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            reported_cost_usd: Some(0.0023),
+            ..Default::default()
+        };
+        let table = flux_core::PricingTable::builtin();
+        let inline = super::CliSink::new(0)
+            .with_cost("openrouter/deepseek/deepseek-v4-flash:nitro".into(), table)
+            .cost_inline(Some(&u));
+        assert!(
+            !inline.contains("$?"),
+            "reported cost must beat the unpriced marker, got: {inline:?}"
+        );
+        assert_eq!(inline, " · $0.0023", "the real reported figure, not $?");
     }
 
     /// C-30: the REPL's per-turn sink derives its spec from the LIVE engine — the same
