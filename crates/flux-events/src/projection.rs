@@ -175,6 +175,100 @@ pub fn observations(events: &[StoredEvent]) -> Vec<flux_evidence::Observation> {
         .collect()
 }
 
+/// One paired (user instruction, accepted plan) row — the D-53 corpus-mining projection over the
+/// L-38 `plan_source` field: flux-native, zero-LLM-cost NL→Flux-Lang training data mined straight
+/// from real usage. `id` is the owning `PlanAttempted` event's stable id (a ULID unless the writer
+/// supplied one) — stable, unique, and traceable back to the exact log row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CorpusRow {
+    /// The `PlanAttempted` event's stable id — this row's identity.
+    pub id: String,
+    /// The natural-language instruction that produced `source` — the enclosing turn's
+    /// `TurnStarted.user_input`. A `PlanAttempted` is always recorded scoped to the turn it was
+    /// attempted within (C-14's `turn_id`), so that turn's `user_input` *is* "the most recent user
+    /// turn before it in the same session" — no separate conversation walk is needed.
+    pub nl_goal: String,
+    /// The accepted plan's canonical Flux-Lang text (`PlanAttempted.plan_source`, L-38).
+    pub source: String,
+    /// The owning session/stream id (e.g. `"s_42"`).
+    pub session: String,
+    /// The owning turn id (`TurnStarted`'s `global_seq`).
+    pub turn: i64,
+}
+
+/// Why a candidate accepted-plan row was skipped rather than exported (D-53) — "precision over
+/// recall": every skip is counted so an operator sees how much of the log didn't qualify, instead
+/// of a silent undercount.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CorpusSkipCounts {
+    /// `PlanAttempted.plan_source` was `None` — a pre-L-38 log, or the plan was too large to
+    /// record (per [`EventKind::PlanAttempted`]'s doc comment, `plan_source` is never truncated:
+    /// present means parseable, so `None` always means "not recorded", not "recorded empty").
+    pub no_plan_source: u64,
+    /// The plan's `turn_id` was absent, or didn't resolve to a `TurnStarted` event in this stream
+    /// — pairing would be a guess, so the row is dropped rather than paired ambiguously.
+    pub ambiguous_pairing: u64,
+}
+
+impl CorpusSkipCounts {
+    /// Fold another stream's skip counts into this one (raw sums — used to aggregate across
+    /// streams, mirroring [`EfficiencySummary::merge`]).
+    pub fn merge(&mut self, other: &Self) {
+        self.no_plan_source += other.no_plan_source;
+        self.ambiguous_pairing += other.ambiguous_pairing;
+    }
+
+    /// Total rows skipped, across every reason.
+    pub fn total(&self) -> u64 {
+        self.no_plan_source + self.ambiguous_pairing
+    }
+}
+
+/// Pair every accepted plan's canonical `plan_source` (L-38) with the `user_input` of the turn it
+/// was attempted within, for one stream (D-53). `stream` stamps the row's `session` field (the fold
+/// itself is over `events`, which carry no stream id of their own outside [`StoredEvent::stream`]).
+///
+/// Skips (counted, never guessed at): a `PlanAttempted` with `plan_source: None` (pre-L-38 log, or
+/// an oversized plan); a `PlanAttempted` with no `turn_id`, or one whose `turn_id` never matches a
+/// `TurnStarted` in this stream (both would require guessing the originating instruction).
+pub fn corpus_rows(stream: &str, events: &[StoredEvent]) -> (Vec<CorpusRow>, CorpusSkipCounts) {
+    let mut user_input_by_turn: std::collections::HashMap<i64, String> =
+        std::collections::HashMap::new();
+    let mut rows = Vec::new();
+    let mut skips = CorpusSkipCounts::default();
+    for e in events {
+        match &e.kind {
+            EventKind::TurnStarted { user_input, .. } => {
+                user_input_by_turn.insert(e.global_seq, user_input.clone());
+            }
+            EventKind::PlanAttempted { plan_source, .. } => {
+                let Some(source) = plan_source.clone() else {
+                    skips.no_plan_source += 1;
+                    continue;
+                };
+                let nl_goal = e
+                    .turn_id
+                    .and_then(|tid| user_input_by_turn.get(&tid).cloned());
+                let Some(nl_goal) = nl_goal else {
+                    skips.ambiguous_pairing += 1;
+                    continue;
+                };
+                rows.push(CorpusRow {
+                    id: e.id.clone(),
+                    nl_goal,
+                    source,
+                    session: stream.to_string(),
+                    turn: e
+                        .turn_id
+                        .expect("nl_goal resolved only when turn_id is Some"),
+                });
+            }
+            _ => {}
+        }
+    }
+    (rows, skips)
+}
+
 /// Turn-efficiency counters folded from a stream's turn telemetry (C-15) — the Improve pillar's
 /// measurability rollup: how many model calls and loop iterations a turn takes, and how much of
 /// the prompt side is served from cache. Raw sums, so summaries from many streams merge by
@@ -792,6 +886,100 @@ mod tests {
             }
             other => panic!("decoded the wrong kind: {other:?}"),
         }
+    }
+
+    /// D-53's failing-first test: a stream with two accepted plans — one carrying `plan_source`
+    /// (L-38), one in the pre-L-38 shape (`plan_source: None`) — pairs and exports exactly the
+    /// ONE row with `plan_source`, skipping the other and counting it rather than guessing.
+    #[test]
+    fn corpus_rows_pairs_accepted_plan_with_its_turn_and_skips_missing_plan_source() {
+        let events = vec![
+            // Turn 10: a pre-L-38 accepted plan (no plan_source) — must be skipped and counted.
+            ev(
+                10,
+                0,
+                None,
+                EventKind::TurnStarted {
+                    user_input: "old-style request".into(),
+                    model: "m".into(),
+                },
+            ),
+            ev(
+                11,
+                1,
+                Some(10),
+                EventKind::PlanAttempted {
+                    step: 0,
+                    outcome: "accepted".into(),
+                    error: None,
+                    fingerprint: Some("fp-old".into()),
+                    plan_text: Some("$x = read(\"a\")".into()),
+                    phase: None,
+                    plan_source: None,
+                },
+            ),
+            // Turn 20: a real L-38 accepted plan — must export, paired with THIS turn's user_input.
+            ev(
+                20,
+                2,
+                None,
+                EventKind::TurnStarted {
+                    user_input: "summarize the README".into(),
+                    model: "m".into(),
+                },
+            ),
+            ev(
+                21,
+                3,
+                Some(20),
+                EventKind::PlanAttempted {
+                    step: 0,
+                    outcome: "accepted".into(),
+                    error: None,
+                    fingerprint: Some("fp-new".into()),
+                    plan_text: Some("$x = read(\"README.md\")".into()),
+                    phase: Some("execute".into()),
+                    plan_source: Some("flow\n  $x = read(\"README.md\")".into()),
+                },
+            ),
+        ];
+
+        let (rows, skips) = corpus_rows("s_1", &events);
+        assert_eq!(rows.len(), 1, "exactly one row exports: {rows:?}");
+        assert_eq!(skips.no_plan_source, 1, "the pre-L-38 row is counted");
+        assert_eq!(skips.ambiguous_pairing, 0);
+        assert_eq!(skips.total(), 1);
+
+        let row = &rows[0];
+        assert_eq!(row.id, "e21", "the PlanAttempted event's own stable id");
+        assert_eq!(row.nl_goal, "summarize the README");
+        assert_eq!(row.source, "flow\n  $x = read(\"README.md\")");
+        assert_eq!(row.session, "s_1");
+        assert_eq!(row.turn, 20);
+    }
+
+    /// An accepted plan whose `turn_id` never resolves to a `TurnStarted` in the stream (orphaned —
+    /// e.g. a truncated/corrupted log) is dropped as an ambiguous pairing, not guessed at.
+    #[test]
+    fn corpus_rows_skips_plan_attempted_with_unresolved_turn_id() {
+        let events = vec![ev(
+            5,
+            0,
+            Some(999), // no TurnStarted with global_seq 999 in this stream
+            EventKind::PlanAttempted {
+                step: 0,
+                outcome: "accepted".into(),
+                error: None,
+                fingerprint: None,
+                plan_text: None,
+                phase: None,
+                plan_source: Some("flow\n  $x = read(\"a\")".into()),
+            },
+        )];
+        let (rows, skips) = corpus_rows("s_1", &events);
+        assert!(rows.is_empty());
+        assert_eq!(skips.ambiguous_pairing, 1);
+        assert_eq!(skips.no_plan_source, 0);
     }
 
     #[test]

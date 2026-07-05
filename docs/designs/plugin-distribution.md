@@ -179,6 +179,13 @@ criticism, answered).
    `PluginHost::spawn` (1–4 MB, sub-millisecond) — drift is a hard refusal naming the expected/actual
    hash. `flux plugin status` re-verifies hash + manifest-version agreement and reports drift loudly.
    This is what turns `pin` from advisory into enforced.
+   *Delivered (D-48)* as `PluginHost::spawn_verified` + `verify_descriptor` — all three
+   descriptor-based spawn sites (agent-startup discovery, `call`, `status`) route through it, and
+   `ls` re-hashes too. One mechanism beyond this sketch: install writes a **hash sidecar**
+   (`<store>/<name>/<version>/<exe>.sha256`) at verified-unpack time, which is what lets `pin`
+   repoint to an already-stored version and `rollback` flip to `previous` offline without
+   re-fetching the signed index — and without re-hashing store bytes into trust (a sidecar-less
+   pre-D-48 store entry is a clean refusal pointing at `flux plugin pin` to re-record).
 
 **Residual risk, stated honestly:** a compromised repo or CI can sign malicious artifacts — the key
 custody is only as strong as the Actions secret. The upgrade path is GitHub artifact attestations
@@ -263,6 +270,8 @@ Canonical vocabulary for all user-facing docs and help text (today the three are
 | **the plugin CLI** (`flux plugin …`, with the space) | the lifecycle surface in flux-cli | "flux-plugin" |
 
 Rule of thumb: hyphen-no-suffix = the crate; hyphen-with-name = a pack binary; space = the CLI.
+The user-facing home of this vocabulary is [`plugins/README.md`](../../plugins/README.md)
+("Naming: three things read as 'flux plugin'", D-49); `flux plugin --help` follows it.
 Release-page disambiguation is structural: core assets are `flux-cli-*` (the dist app name), pack
 assets are `flux-plugin-<name>-*`, and the tag prefixes (`v` vs `plugins-v`) separate the series. A
 future crates.io vanity prefix (`codewandler-flux-*`, see `crates/flux-sdk/PUBLISHING.md`) renames

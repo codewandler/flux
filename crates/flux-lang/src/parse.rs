@@ -696,53 +696,118 @@ struct Line {
     number: usize,
 }
 
+/// Split source text into logical [`Line`]s: normally one physical line each, comment-stripped
+/// (`#` outside a string) and indentation-measured — **except** a `"""…"""` multi-line string
+/// literal (L-39), which is read verbatim (no comment-stripping, no escape processing) up to the
+/// next literal `"""`, however many physical lines that spans, and spliced back in as a standard
+/// escaped JSON string. This is a pure lexer-level desugaring: every later stage (`take_json`,
+/// `parse_expr`, …) only ever sees ordinary escaped `"…"` strings, so a `"""` block works in
+/// **every** position a JSON string can appear (bind value, call arg, object/array template leaf,
+/// `@json` escape, …) with zero changes below this function. See `docs/syntax.md`'s "Multi-line
+/// strings" section for the full grammar and its documented edge cases.
 fn preprocess(src: &str) -> Result<Vec<Line>> {
+    // Normalize CRLF so the char scanner below (which only special-cases `\n`) matches the old
+    // `str::lines()`-based behavior on Windows-authored sources.
+    let src = src.replace("\r\n", "\n");
+    let chars: Vec<char> = src.chars().collect();
+    let n = chars.len();
     let mut out = Vec::new();
-    for (idx, raw) in src.lines().enumerate() {
-        let number = idx + 1;
-        let code = strip_comment(raw);
+    let mut i = 0usize;
+    let mut line_no = 1usize;
+    while i < n {
+        let this_line_no = line_no;
         let mut indent = 0usize;
-        for c in code.chars() {
-            match c {
-                ' ' => indent += 1,
-                '\t' => return Err(perr_at(number, "tabs are not allowed for indentation")),
-                _ => break,
+        while i < n && chars[i] == ' ' {
+            indent += 1;
+            i += 1;
+        }
+        if i < n && chars[i] == '\t' {
+            return Err(perr_at(
+                this_line_no,
+                "tabs are not allowed for indentation",
+            ));
+        }
+
+        let mut text = String::new();
+        let mut in_str = false;
+        let mut esc = false;
+        loop {
+            if i >= n {
+                break;
             }
+            let c = chars[i];
+            if c == '\n' {
+                i += 1;
+                line_no += 1;
+                break;
+            }
+            if !in_str && c == '#' {
+                while i < n && chars[i] != '\n' {
+                    i += 1;
+                }
+                if i < n {
+                    i += 1;
+                    line_no += 1;
+                }
+                break;
+            }
+            if !in_str && c == '"' && i + 2 < n && chars[i + 1] == '"' && chars[i + 2] == '"' {
+                // Opening `"""` delimiter: read verbatim to the next literal `"""`, across as many
+                // physical lines as needed, then re-encode as a standard escaped JSON string so
+                // every downstream parser stays unchanged.
+                i += 3;
+                let mut content = String::new();
+                loop {
+                    if i + 2 < n && chars[i] == '"' && chars[i + 1] == '"' && chars[i + 2] == '"' {
+                        i += 3;
+                        break;
+                    }
+                    if i >= n {
+                        return Err(perr_at(
+                            this_line_no,
+                            "unterminated multi-line string: missing closing `\"\"\"`",
+                        ));
+                    }
+                    if chars[i] == '\n' {
+                        line_no += 1;
+                    }
+                    content.push(chars[i]);
+                    i += 1;
+                }
+                let escaped =
+                    serde_json::to_string(&content).unwrap_or_else(|_| "\"\"".to_string());
+                text.push_str(&escaped);
+                continue;
+            }
+            if !in_str && c == '"' {
+                in_str = true;
+                text.push(c);
+                i += 1;
+                continue;
+            }
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+            }
+            text.push(c);
+            i += 1;
         }
-        let text = code.trim();
-        if text.is_empty() {
-            continue;
+
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            out.push(Line {
+                indent,
+                text: trimmed.to_string(),
+                number: this_line_no,
+            });
         }
-        out.push(Line {
-            indent,
-            text: text.to_string(),
-            number,
-        });
     }
     Ok(out)
-}
-
-/// Remove a `#` line comment, ignoring `#` inside JSON double-quoted strings.
-fn strip_comment(line: &str) -> &str {
-    let bytes = line.as_bytes();
-    let mut in_str = false;
-    let mut esc = false;
-    for (i, &b) in bytes.iter().enumerate() {
-        if in_str {
-            if esc {
-                esc = false;
-            } else if b == b'\\' {
-                esc = true;
-            } else if b == b'"' {
-                in_str = false;
-            }
-        } else if b == b'"' {
-            in_str = true;
-        } else if b == b'#' {
-            return &line[..i];
-        }
-    }
-    line
 }
 
 // ---------------------------------------------------------------------------
@@ -3109,6 +3174,150 @@ flow pack-it
                     add: vec!["d".into()],
                 },
             ]
+        );
+    }
+
+    // ----- Multi-line string literals (L-39): `"""…"""`, verbatim, delimiter-terminated -----
+
+    #[test]
+    fn multiline_string_literal_parses_verbatim_across_physical_lines() {
+        let src = "\
+flow
+  $x = \"\"\"first line
+second line
+third line\"\"\"
+";
+        let ast = parse(src).unwrap();
+        assert_eq!(
+            ast.body,
+            vec![bind("x", lit(s("first line\nsecond line\nthird line")))]
+        );
+    }
+
+    #[test]
+    fn multiline_string_content_is_taken_literally_no_comment_no_escape_processing() {
+        // `#` and backslashes inside the block are ordinary characters, not a comment start or an
+        // escape sequence — the whole point of the spelling is "no interpretation between the
+        // delimiters".
+        let src = "\
+flow
+  $x = \"\"\"line one # not a comment
+back\\slash and a \"single\" quote are literal\"\"\"
+";
+        let ast = parse(src).unwrap();
+        assert_eq!(
+            ast.body,
+            vec![bind(
+                "x",
+                lit(s(
+                    "line one # not a comment\nback\\slash and a \"single\" quote are literal"
+                ))
+            )]
+        );
+    }
+
+    #[test]
+    fn multiline_string_works_as_a_call_arg_and_inside_an_object_template() {
+        let src = "\
+flow
+  do write \"out.txt\", \"\"\"payload
+line 2\"\"\"
+  $t = { path: \"out.txt\", content: \"\"\"templated
+value\"\"\" }
+";
+        let ast = parse(src).unwrap();
+        assert_eq!(
+            ast.body,
+            vec![
+                call("write", vec![lit(s("out.txt")), lit(s("payload\nline 2"))]),
+                bind(
+                    "t",
+                    Node::Obj {
+                        fields: {
+                            let mut m = std::collections::BTreeMap::new();
+                            m.insert("path".to_string(), Box::new(lit(s("out.txt"))));
+                            m.insert("content".to_string(), Box::new(lit(s("templated\nvalue"))));
+                            m
+                        },
+                    }
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_multiline_string_parses_as_empty_string() {
+        let src = "flow\n  $x = \"\"\"\"\"\"\n";
+        let ast = parse(src).unwrap();
+        assert_eq!(ast.body, vec![bind("x", lit(s("")))]);
+    }
+
+    #[test]
+    fn unterminated_multiline_string_is_a_located_parse_error() {
+        let src = "flow\n  $x = \"\"\"never closed\n";
+        let err = parse(src).unwrap_err();
+        assert!(
+            err.to_string().contains("line 2:"),
+            "expected the opening line in the error, got: {err}"
+        );
+        assert!(
+            err.to_string().to_lowercase().contains("unterminated"),
+            "expected an 'unterminated' diagnostic, got: {err}"
+        );
+    }
+
+    #[test]
+    fn multiline_block_inside_a_pure_json_object_stays_a_lit_not_a_template() {
+        // The dominant corpus case (`do edit {"path":...,"content":"""..."""}`): quoted keys make
+        // this valid JSON, so it must desugar to a plain escaped string BEFORE the parser's
+        // try-JSON-then-template split runs, staying a `Lit`, not falling through to the `Obj`
+        // value-template reader (bareword-key path).
+        let src = "\
+flow
+  do edit {\"path\": \"f.txt\", \"content\": \"\"\"line1
+line2\"\"\"}
+";
+        let ast = parse(src).unwrap();
+        assert_eq!(
+            ast.body,
+            vec![call(
+                "edit",
+                vec![lit(
+                    serde_json::json!({"path": "f.txt", "content": "line1\nline2"})
+                )]
+            )]
+        );
+    }
+
+    #[test]
+    fn escaped_triple_quotes_inside_a_normal_string_are_not_mistaken_for_a_block() {
+        // `\"\"\"` (three ESCAPED quotes) inside an ordinary `"…"` string must stay ordinary string
+        // content — the in-string escape tracking keeps the multi-line-block detector from firing
+        // while a normal string is open.
+        let src = "flow\n  $x = \"a\\\"\\\"\\\"b\"\n";
+        let ast = parse(src).unwrap();
+        assert_eq!(ast.body, vec![bind("x", lit(s("a\"\"\"b")))]);
+    }
+
+    #[test]
+    fn two_multiline_blocks_in_one_statement() {
+        let src = "flow\n  do op \"\"\"x\ny\"\"\", \"\"\"a\nb\"\"\"\n";
+        let ast = parse(src).unwrap();
+        assert_eq!(
+            ast.body,
+            vec![call("op", vec![lit(s("x\ny")), lit(s("a\nb"))])]
+        );
+    }
+
+    #[test]
+    fn multiline_content_preserves_blank_lines_indentation_and_statement_look_alikes() {
+        // `#`, blank lines, indentation, and a line that looks like its own statement are all just
+        // literal characters inside the block — nothing about it is interpreted.
+        let src = "flow\n  $x = \"\"\"# not a comment\n\n  indented\n$y = 1\"\"\"\n";
+        let ast = parse(src).unwrap();
+        assert_eq!(
+            ast.body,
+            vec![bind("x", lit(s("# not a comment\n\n  indented\n$y = 1")))]
         );
     }
 

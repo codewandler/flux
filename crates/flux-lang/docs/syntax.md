@@ -36,13 +36,19 @@ accept today; everything unmarked is implemented.
   (`.items[0]`) — those round-trip through `@json`. Beware: writing `expr(…)`, `peek(…)`, or
   `jq(…)` call-style in text parses as an ordinary **op call** named `expr`/`peek`/`jq`, *not* the
   pure node — only `fmt(…)` is special-cased, and the native `jq` spelling is the `$var.path` sugar.
-- **Aspirational** (described below as the *target* language, **not** yet parsed): triple-quoted
-  `"""` multi-line strings; comma-form named arguments in call argument lists
-  (`grep("ERROR", glob: "*.log")` — the shipped form is a single object argument,
-  see [§ Named arguments](#named-arguments)); comma-kwarg flow-control headers
-  (`retry 3, backoff: exponential`); multi-line literals inside call arguments (the parser is
-  strictly line-based); `@kind(…)` thing references; a `memo` keyword; `verify … in …`; file-scope
-  `type`/union declarations; and the `block`/`watch` spellings (the implemented keywords are `seq`
+- **Multi-line strings** (L-39, implemented): a `"""…"""` block — content taken **verbatim**, no
+  escaping, no dedent — usable anywhere a string literal is valid (bind values, call args, `lit`
+  values at any nesting depth inside an object/array, value-template leaves, and the natively
+  spelled `fmt`/`assert`-message/`ctx`-purpose/`route`-case-label strings). `format` emits it
+  automatically for any string containing a newline; see [§ Multi-line strings](#multi-line-strings)
+  below for the full grammar.
+- **Aspirational** (described below as the *target* language, **not** yet parsed): comma-form named
+  arguments in call argument lists (`grep("ERROR", glob: "*.log")` — the shipped form is a single
+  object argument, see [§ Named arguments](#named-arguments)); comma-kwarg flow-control headers
+  (`retry 3, backoff: exponential`); multi-line *literals* inside call arguments other than a
+  `"""…"""` string (e.g. a multi-line `{…}` object — the parser is otherwise strictly line-based);
+  `@kind(…)` thing references; a `memo` keyword; `verify … in …`; file-scope `type`/union
+  declarations; and the `block`/`watch` spellings (the implemented keywords are `seq`
   and `loop`). The AST type is **`DraftAst`** (this doc historically said `FlowAst`, which does
   not exist).
 
@@ -246,7 +252,7 @@ $x = read("a.txt")   # inline comment
 | Kind | Syntax | Example |
 |---|---|---|
 | String | double-quoted | `"hello"` |
-| Multi-line string | *(aspirational)* triple-quoted | `"""..."""` — **not parsed today**; use `\n` escapes in a `"…"` string |
+| Multi-line string | triple-quoted, verbatim | `"""` + real newlines, no escaping + `"""` — see [§ Multi-line strings](#multi-line-strings) |
 | Number | bare numeric | `42`, `3.14` |
 | Bool | bare keyword | `true`, `false` |
 | Null | bare keyword | `null` |
@@ -276,28 +282,56 @@ $example = "use {{key: value}} syntax"   # outputs: use {key: value} syntax
 The JSON wire format uses the same `{sym}` / `{{` / `}}` convention inside string
 values — there is no difference between the text and wire formats for interpolation.
 
-### Multi-line strings *(aspirational — not implemented)*
+### Multi-line strings
 
-The parser has **no** triple-quote handling: a `"""` token is a parse error. Long text today is a
-single-line double-quoted string with `\n` escapes (or an `@json` node). The *target* syntax, kept
-here for the eventual design, is a triple-quoted string that strips the common leading indent:
+A `"""` token opens a multi-line string literal (L-39). Everything between the opening `"""` and
+the **next literal `"""`** is the string's content, taken completely **verbatim**: no escape
+processing (`\n`, `\"`, `\\` are literal characters, not escapes), no comment stripping (a `#`
+inside the block is content, not a comment start), and no indentation stripping (the block's own
+indentation, if any, is part of the value — there is no dedent). This is deliberately the simplest
+possible rule: it removes escaping as a failure mode entirely, which is the point (see the story's
+"why now" — a fine-tuned planner's dominant failure was breaking multi-KB JSON-string payloads with
+literal newlines).
 
 ```flux
-# ASPIRATIONAL — does not parse today
-$prompt = """
-  Analyse this diff and suggest improvements.
-  Focus on correctness, not style.
+$prompt = """Analyse this diff and suggest improvements.
+Focus on correctness, not style.
 
-  Diff:
-  {diff}
-"""
+Diff:
+{diff}"""
 ```
+
+The block may span any number of physical lines and works in **every** position a `"…"` string can:
+a bind value, a call argument, a `lit` value nested inside an object/array, a value-template leaf,
+or any of the natively-spelled string fields (`fmt("…")`'s template, `assert`'s message, `ctx`'s
+purpose, `route`'s case label). `{symbol}` interpolation applies exactly as it does to a normal
+string — interpolation is a property of the *value*, not the spelling used to write it.
+
+**Grammar note (why delimiter-based, not indentation-based):** the block's end is found by scanning
+forward for the next `"""`, not by dedent/column tracking — this is a lexer-level rule (see
+`flux_lang::parse`'s `preprocess`), independent of the line-based statement grammar everywhere else,
+so a `"""` block is the one construct allowed to span multiple physical lines.
+
+**Known limitation (accepted, documented):** because the terminator is "the next literal `\"\"\"`",
+content cannot itself contain `"""`, and cannot **end** in a `"` character (that final quote would
+merge with the closing delimiter into an ambiguous run of 4+ quotes). Both are vanishingly rare in
+real payloads (source code, diffs, prose); `format` detects them and falls back to the standard
+escaped single-line spelling automatically, so `parse(&format(&ast)) == ast` always holds — there is
+no case where round-tripping is unsafe, only a small set of inputs that don't get the nicer
+spelling.
+
+`format_compact` (the display-only, non-round-tripping preview variant) never emits the multi-line
+spelling — it always uses the escaped single-line form, so a compact plan preview stays visually one
+line per statement.
 
 ### Inline object literals
 
 Object (and array) literals are valid inside call arguments — **on one line**. The parser is
 strictly line-based: a statement is a single line, so a multi-line literal inside a call is a parse
-error.
+error. (This is about the object/array *shape* — one field per line, closing brace on its own line.
+A `"""…"""` string **value** nested inside a one-line object literal is fine and may itself contain
+real newlines; see [§ Multi-line strings](#multi-line-strings) — that block is the one exception to
+"statement = one physical line", handled at the lexer level, not the object/array grammar.)
 
 ```flux
 $result = eval_run({adapter: "terminal-bench", tasks: ["chess-best-move"], trials: 1, agent_timeout: 180})
@@ -1154,7 +1188,7 @@ text and emits the resulting `DraftAst` as JSON.
 | Where it lives | `examples/`, user repos | `.flux/flows/`, session storage |
 | Round-trips | via `parse` + `format` | via `serde_json` |
 | Comments | yes (`#`) | no |
-| Multi-line strings | no (`"""` aspirational) — escaped `\n` in a `"…"` string | escaped `\n` in JSON string |
+| Multi-line strings | yes — verbatim `"""…"""` (L-39), auto-emitted for any newline-bearing string | escaped `\n` in JSON string (the wire format has no triple-quote form) |
 | Named args | single object argument (`op({k: v})`) | same — one object argument names the params |
 | Type annotations | yes (params/returns) | yes (same `TypeRef` serde) |
 | String interpolation | `{sym}`, escape `{{` `}}` | same `{sym}` inside JSON strings |

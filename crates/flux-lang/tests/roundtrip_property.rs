@@ -76,6 +76,15 @@ const OPS: &[&str] = &[
 ];
 
 /// Free-form string slots (labels, messages, purposes, templates, sources, keys, tools).
+///
+/// L-39: several entries specifically exercise the multi-line `"""…"""` spelling — a plain
+/// newline-bearing string (the common case `format` now spells with `"""`), a multi-KB-shaped
+/// multi-line payload (the fine-tune's `each-bulk-edit` failure mode this story targets), and three
+/// "unsafe" shapes (ending in `"`, an embedded `"""`, and an embedded `\r`) that must fall back to
+/// the escaped spelling instead — all three hazards documented on
+/// `format::is_safe_for_multiline_spelling`. Each unsafe entry also contains a real `\n` — without
+/// one, `compact_str` never even considers the multi-line spelling, so the fallback branch would go
+/// untested.
 const STRINGS: &[&str] = &[
     "",
     "hello",
@@ -85,6 +94,10 @@ const STRINGS: &[&str] = &[
     "emoji 🦀",
     "{name} and {{brace}}",
     "a, b]",
+    "diff --git a/f b/f\n@@ -1,3 +1,3 @@\n-old line\n+new line\n context\n",
+    "line one\nline two ends in a quote\"",
+    "an embedded \"\"\" triple quote\nnext to a newline",
+    "windows line endings\r\nin the middle",
 ];
 
 /// `jq` path slots (only simple dotted paths over a `$var` are native).

@@ -150,3 +150,60 @@ async fn plugin_operations_project_as_tools() {
         .unwrap();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// D-48 acceptance: a descriptor carrying a `sha256` is re-hashed before spawn — a tampered
+/// binary is a hard refusal naming the plugin and both hashes; the untampered binary loads; a
+/// hashless (dev/local) descriptor spawns exactly as before.
+#[tokio::test]
+async fn spawn_refuses_hash_drift() {
+    let exe = env!("CARGO_BIN_EXE_echo_plugin");
+    let dir = std::env::temp_dir().join(format!("flux-spawn-drift-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let stored = dir.join("flux-plugin-echo");
+    std::fs::copy(exe, &stored).unwrap();
+    let recorded = flux_plugin::pack::sha256_hex(&std::fs::read(&stored).unwrap());
+    let system = test_system();
+
+    // Untampered: the recorded hash matches → the plugin loads normally.
+    let desc = flux_plugin::PluginDescriptor {
+        program: stored.to_string_lossy().into_owned(),
+        sha256: Some(recorded.clone()),
+        ..Default::default()
+    };
+    let mut host = PluginHost::spawn_verified(&system, "echo", &desc)
+        .await
+        .expect("matching hash spawns");
+    assert_eq!(host.manifest().await.unwrap().name, "echo");
+    let _ = host.shutdown().await;
+
+    // Tamper the stored binary → the same descriptor is a hard refusal naming plugin + hashes.
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&stored)
+            .unwrap();
+        f.write_all(b"tampered").unwrap();
+    }
+    let err = match PluginHost::spawn_verified(&system, "echo", &desc).await {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("hash drift must refuse to spawn"),
+    };
+    let actual = flux_plugin::pack::sha256_hex(&std::fs::read(&stored).unwrap());
+    assert!(err.contains("echo"), "names the plugin: {err}");
+    assert!(err.contains(&recorded), "names the expected hash: {err}");
+    assert!(err.contains(&actual), "names the actual hash: {err}");
+
+    // Hashless (dev/local) descriptors spawn as today — even over the tampered file.
+    let dev = flux_plugin::PluginDescriptor {
+        program: stored.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let host = PluginHost::spawn_verified(&system, "echo", &dev)
+        .await
+        .expect("hashless descriptor spawns unverified");
+    let _ = host.shutdown().await;
+
+    std::fs::remove_dir_all(&dir).ok();
+}

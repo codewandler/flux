@@ -52,9 +52,10 @@ use crate::program::CompositeOpDecl;
 use flux_spec::{Effect, Idempotency, Risk};
 
 /// Render a [`DraftAst`] as canonical Flux-Lang text. Always 2-space indentation; deterministic.
-/// Round-trips: `parse(&format(&ast)) == ast`.
+/// Round-trips: `parse(&format(&ast)) == ast`. Emits the multi-line `"""…"""` spelling (L-39) for
+/// any string literal containing a newline.
 pub fn format(ast: &DraftAst) -> String {
-    format_with(ast, "  ")
+    format_with(ast, "  ", true)
 }
 
 /// Render one top-level composite op declaration as canonical Flux-Lang source.
@@ -134,7 +135,7 @@ pub fn format_composite_op(op: &CompositeOpDecl) -> String {
     }
     if !op.body.body.is_empty() {
         out.push('\n');
-        fmt_body(&op.body.body, 1, "  ", &mut out);
+        fmt_body(&op.body.body, 1, "  ", true, &mut out);
     }
     out
 }
@@ -143,8 +144,13 @@ pub fn format_composite_op(op: &CompositeOpDecl) -> String {
 /// but single-space block indentation (≈half the indentation characters on nested plans). For cheap
 /// model-facing *display* of a plan. **Display-only:** [`crate::parse`] expects canonical two-space
 /// indentation, so this surface does not round-trip — use [`format`] for the writable, parseable form.
+///
+/// Never emits the multi-line `"""…"""` spelling (L-39): a newline-bearing string stays the
+/// standard escaped single-line form, so a compact plan preview stays visually one line per
+/// statement (the property this variant exists for) — it was never round-trippable, so there is no
+/// invariant to preserve by teaching it the new spelling too.
 pub fn format_compact(ast: &DraftAst) -> String {
-    format_with(ast, " ")
+    format_with(ast, " ", false)
 }
 
 fn risk_label(risk: Risk) -> &'static str {
@@ -176,8 +182,10 @@ fn effect_label(effect: Effect) -> &'static str {
     }
 }
 
-/// Shared renderer: `indent` is the per-level indentation unit (`"  "` canonical, `" "` compact).
-fn format_with(ast: &DraftAst, indent: &str) -> String {
+/// Shared renderer: `indent` is the per-level indentation unit (`"  "` canonical, `" "` compact);
+/// `multiline` enables the `"""…"""` string spelling (L-39) — on for [`format`], off for
+/// [`format_compact`].
+fn format_with(ast: &DraftAst, indent: &str, multiline: bool) -> String {
     let mut out = String::new();
     out.push_str("flow");
     if let Some(name) = &ast.name {
@@ -200,13 +208,72 @@ fn format_with(ast: &DraftAst, indent: &str) -> String {
     }
     out.push('\n');
 
-    fmt_body(&ast.body, 1, indent, &mut out);
+    fmt_body(&ast.body, 1, indent, multiline, &mut out);
     out
 }
 
-/// Compact (no-whitespace) JSON for any serializable value. Total: never panics.
+/// Compact (no-whitespace) JSON for any serializable value. Total: never panics. Uses the standard
+/// escaped-string spelling only — see [`compact_value`]/[`compact_str`] for the multiline-aware
+/// variants used everywhere a string literal can appear in the text surface.
 fn compact<T: serde::Serialize>(v: &T) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "null".to_string())
+}
+
+/// Whether `s` can be safely spelled as `"""<s>"""` (L-39). Three hazards, each of which would
+/// break `parse(&format(&ast)) == ast`:
+/// - The closing delimiter is discovered by scanning forward for the *next* literal `"""` (see
+///   `parse.rs`'s `preprocess`), so content that itself contains `"""` cannot round-trip.
+/// - Content **ending** in a `"` would merge with the closer into an accidental run of 3+ quotes
+///   and get swallowed one character short.
+/// - `preprocess` normalizes `\r\n` -> `\n` on the *whole source* before scanning for blocks (to
+///   keep the char scanner simple), so a `\r` anywhere in the content — most commonly as part of a
+///   `\r\n` pair — would silently lose it on the way back through `parse`.
+///
+/// All three are vanishingly rare in real payloads; the formatter falls back to the always-safe
+/// escaped form for them, so the round-trip invariant stays total.
+fn is_safe_for_multiline_spelling(s: &str) -> bool {
+    !s.contains("\"\"\"") && !s.ends_with('"') && !s.contains('\r')
+}
+
+/// Render a string literal as canonical text: the verbatim `"""…"""` spelling when `multiline` is
+/// enabled, the string contains a newline, and it is safe to spell that way (see
+/// [`is_safe_for_multiline_spelling`]); the standard escaped JSON string otherwise. Deterministic —
+/// the string's own content is the only input to the choice, never configuration.
+fn compact_str(s: &str, multiline: bool) -> String {
+    if multiline && s.contains('\n') && is_safe_for_multiline_spelling(s) {
+        format!("\"\"\"{s}\"\"\"")
+    } else {
+        compact(&serde_json::Value::String(s.to_string()))
+    }
+}
+
+/// Render any JSON value as canonical text, recursing into arrays/objects so a string **leaf** at
+/// any nesting depth (an argument object's field, a list item, …) can use the multi-line spelling —
+/// this is what makes a `Lit` node cover "argument objects" and "bare args" per the L-39 Acceptance.
+/// Object *keys* always use the standard spelling (never `"""…"""`) — multi-line keys are not a
+/// case this story targets, and keeping keys plain keeps `{"key": …` visually recognizable.
+fn compact_value(v: &serde_json::Value, multiline: bool) -> String {
+    match v {
+        serde_json::Value::String(s) => compact_str(s, multiline),
+        serde_json::Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(|i| compact_value(i, multiline)).collect();
+            format!("[{}]", parts.join(","))
+        }
+        serde_json::Value::Object(map) => {
+            let parts: Vec<String> = map
+                .iter()
+                .map(|(k, val)| {
+                    format!(
+                        "{}:{}",
+                        compact_str(k, false),
+                        compact_value(val, multiline)
+                    )
+                })
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+        other => compact(other),
+    }
 }
 
 /// Render a list of plain strings as a compact JSON array (`["a", "b"]`) — the native `with_tools`
@@ -219,21 +286,19 @@ fn fmt_string_list(items: &[String]) -> String {
 /// Render a node *inline* (as a bind value, call argument, condition, or return value). Only `var`,
 /// `lit` and `call` have a native inline form; everything else falls back to `@json`. Unspellable
 /// names (a non-identifier `$var`, an invalid op name, an op literally named `fmt` whose paren form
-/// would reparse as the `Fmt` node) also fall back to `@json`.
-fn fmt_expr(node: &Node) -> String {
+/// would reparse as the `Fmt` node) also fall back to `@json`. `multiline` enables the `"""…"""`
+/// string spelling (L-39) inside any `Lit`/`Fmt`/template string leaf.
+fn fmt_expr(node: &Node, multiline: bool) -> String {
     match node {
         Node::Var { name } if name.is_identifier() => format!("${}", name.0),
-        Node::Lit { value } => compact(value),
+        Node::Lit { value } => compact_value(value, multiline),
         Node::Call { op, args } if is_valid_op_name(op) && op != "fmt" => {
-            let a: Vec<String> = args.iter().map(fmt_expr).collect();
+            let a: Vec<String> = args.iter().map(|n| fmt_expr(n, multiline)).collect();
             format!("{}({})", op, a.join(", "))
         }
         // `fmt("template")` — the string-interpolation node.
         Node::Fmt { template } => {
-            format!(
-                "fmt({})",
-                compact(&serde_json::Value::String(template.clone()))
-            )
+            format!("fmt({})", compact_str(template, multiline))
         }
         // Field-access sugar: a `jq` over a plain `$var` with a simple dotted path renders as
         // `$var.path` (parse re-derives the same `Jq`). Bracket paths, non-`Var` inputs, or a
@@ -254,12 +319,12 @@ fn fmt_expr(node: &Node) -> String {
         Node::Obj { fields } if node_is_dynamic(node) => {
             let parts: Vec<String> = fields
                 .iter()
-                .map(|(k, v)| format!("{}: {}", fmt_obj_key(k), fmt_expr(v)))
+                .map(|(k, v)| format!("{}: {}", fmt_obj_key(k), fmt_expr(v, multiline)))
                 .collect();
             format!("{{ {} }}", parts.join(", "))
         }
         Node::List { items } if node_is_dynamic(node) => {
-            let parts: Vec<String> = items.iter().map(fmt_expr).collect();
+            let parts: Vec<String> = items.iter().map(|n| fmt_expr(n, multiline)).collect();
             format!("[ {} ]", parts.join(", "))
         }
         other => format!("@json {}", compact(other)),
@@ -348,9 +413,9 @@ fn indent_of(level: usize, unit: &str) -> String {
     unit.repeat(level)
 }
 
-fn fmt_body(body: &[Node], level: usize, indent: &str, out: &mut String) {
+fn fmt_body(body: &[Node], level: usize, indent: &str, multiline: bool, out: &mut String) {
     for n in body {
-        fmt_stmt(n, level, indent, out);
+        fmt_stmt(n, level, indent, multiline, out);
     }
 }
 
@@ -361,7 +426,7 @@ fn join_syms(syms: &[SymbolName]) -> String {
         .join(", ")
 }
 
-fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
+fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut String) {
     let ind = indent_of(level, indent);
     match node {
         Node::Bind {
@@ -384,7 +449,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
                 out.push_str(&t.label());
             }
             out.push_str(" = ");
-            out.push_str(&fmt_expr(value));
+            out.push_str(&fmt_expr(value, multiline));
             out.push('\n');
         }
         Node::CtxAppend { ctx, add } if ctx.is_identifier() && all_idents(add) => {
@@ -406,7 +471,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
             out.push_str(op);
             if !args.is_empty() {
                 out.push(' ');
-                let a: Vec<String> = args.iter().map(fmt_expr).collect();
+                let a: Vec<String> = args.iter().map(|n| fmt_expr(n, multiline)).collect();
                 out.push_str(&a.join(", "));
             }
             out.push('\n');
@@ -414,7 +479,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
         Node::Return { value } => {
             out.push_str(&ind);
             out.push_str("return ");
-            out.push_str(&fmt_expr(value));
+            out.push_str(&fmt_expr(value, multiline));
             out.push('\n');
         }
         Node::Var { name } if name.is_identifier() => {
@@ -425,7 +490,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
         }
         Node::Lit { value } => {
             out.push_str(&ind);
-            out.push_str(&compact(value));
+            out.push_str(&compact_value(value, multiline));
             out.push('\n');
         }
         Node::When {
@@ -435,21 +500,21 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
         } => {
             out.push_str(&ind);
             out.push_str("when ");
-            out.push_str(&fmt_expr(cond));
+            out.push_str(&fmt_expr(cond, multiline));
             out.push('\n');
-            fmt_body(then, level + 1, indent, out);
+            fmt_body(then, level + 1, indent, multiline, out);
             if !otherwise.is_empty() {
                 out.push_str(&ind);
                 out.push_str("else\n");
-                fmt_body(otherwise, level + 1, indent, out);
+                fmt_body(otherwise, level + 1, indent, multiline, out);
             }
         }
         Node::Unless { cond, body } => {
             out.push_str(&ind);
             out.push_str("unless ");
-            out.push_str(&fmt_expr(cond));
+            out.push_str(&fmt_expr(cond, multiline));
             out.push('\n');
-            fmt_body(body, level + 1, indent, out);
+            fmt_body(body, level + 1, indent, multiline, out);
         }
         Node::Each {
             source,
@@ -466,7 +531,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
             out.push_str("each $");
             out.push_str(&item.0);
             out.push_str(" in ");
-            out.push_str(&fmt_expr(source));
+            out.push_str(&fmt_expr(source, multiline));
             if let Some(c) = collect {
                 out.push_str(" -> ");
                 if *flat {
@@ -476,7 +541,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
                 out.push_str(&c.0);
             }
             out.push('\n');
-            fmt_body(body, level + 1, indent, out);
+            fmt_body(body, level + 1, indent, multiline, out);
         }
         Node::Repeat {
             max,
@@ -495,10 +560,10 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
             if let Some(u) = until {
                 out.push_str(&indent_of(level + 1, indent));
                 out.push_str("until ");
-                out.push_str(&fmt_expr(u));
+                out.push_str(&fmt_expr(u, multiline));
                 out.push('\n');
             }
-            fmt_body(body, level + 1, indent, out);
+            fmt_body(body, level + 1, indent, multiline, out);
         }
         Node::Seq { body, bind } if opt_ident(bind) => {
             out.push_str(&ind);
@@ -508,7 +573,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
                 out.push_str(&b.0);
             }
             out.push('\n');
-            fmt_body(body, level + 1, indent, out);
+            fmt_body(body, level + 1, indent, multiline, out);
         }
         Node::Ctx {
             name,
@@ -525,7 +590,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
             if let Some(p) = purpose {
                 out.push_str(&ind1);
                 out.push_str("purpose ");
-                out.push_str(&compact(&serde_json::Value::String(p.clone())));
+                out.push_str(&compact_str(p, multiline));
                 out.push('\n');
             }
             if let Some(b) = budget {
@@ -554,20 +619,20 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
         } => {
             out.push_str(&ind);
             out.push_str("match ");
-            out.push_str(&fmt_expr(subject));
+            out.push_str(&fmt_expr(subject, multiline));
             out.push('\n');
             let ind1 = indent_of(level + 1, indent);
             for c in cases {
                 out.push_str(&ind1);
                 out.push_str("case ");
-                out.push_str(&fmt_expr(&c.value));
+                out.push_str(&fmt_expr(&c.value, multiline));
                 out.push('\n');
-                fmt_body(&c.body, level + 2, indent, out);
+                fmt_body(&c.body, level + 2, indent, multiline, out);
             }
             if !default.is_empty() {
                 out.push_str(&ind1);
                 out.push_str("default\n");
-                fmt_body(default, level + 2, indent, out);
+                fmt_body(default, level + 2, indent, multiline, out);
             }
         }
         Node::Route {
@@ -577,20 +642,20 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
         } => {
             out.push_str(&ind);
             out.push_str("route ");
-            out.push_str(&fmt_expr(selector));
+            out.push_str(&fmt_expr(selector, multiline));
             out.push('\n');
             let ind1 = indent_of(level + 1, indent);
             for c in cases {
                 out.push_str(&ind1);
                 out.push_str("case ");
-                out.push_str(&compact(&serde_json::Value::String(c.label.clone())));
+                out.push_str(&compact_str(&c.label, multiline));
                 out.push('\n');
-                fmt_body(&c.body, level + 2, indent, out);
+                fmt_body(&c.body, level + 2, indent, multiline, out);
             }
             if !default.is_empty() {
                 out.push_str(&ind1);
                 out.push_str("default\n");
-                fmt_body(default, level + 2, indent, out);
+                fmt_body(default, level + 2, indent, multiline, out);
             }
         }
         Node::Fallback { branches, bind } if opt_ident(bind) => {
@@ -605,7 +670,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
             for br in branches {
                 out.push_str(&ind1);
                 out.push_str("branch\n");
-                fmt_body(&br.body, level + 2, indent, out);
+                fmt_body(&br.body, level + 2, indent, multiline, out);
             }
         }
         Node::Loop {
@@ -628,10 +693,10 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
             if let Some(u) = until {
                 out.push_str(&indent_of(level + 1, indent));
                 out.push_str("until ");
-                out.push_str(&fmt_expr(u));
+                out.push_str(&fmt_expr(u, multiline));
                 out.push('\n');
             }
-            fmt_body(body, level + 1, indent, out);
+            fmt_body(body, level + 1, indent, multiline, out);
         }
         Node::Timeout { ms, body, bind } if opt_ident(bind) => {
             out.push_str(&ind);
@@ -642,7 +707,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
                 out.push_str(&b.0);
             }
             out.push('\n');
-            fmt_body(body, level + 1, indent, out);
+            fmt_body(body, level + 1, indent, multiline, out);
         }
         Node::Budget { limit, body, bind } if opt_ident(bind) => {
             out.push_str(&ind);
@@ -653,7 +718,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
                 out.push_str(&b.0);
             }
             out.push('\n');
-            fmt_body(body, level + 1, indent, out);
+            fmt_body(body, level + 1, indent, multiline, out);
         }
         Node::CapScope { tools, body, bind } if opt_ident(bind) => {
             out.push_str(&ind);
@@ -664,7 +729,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
                 out.push_str(&b.0);
             }
             out.push('\n');
-            fmt_body(body, level + 1, indent, out);
+            fmt_body(body, level + 1, indent, multiline, out);
         }
         // `parallel` + indented `branch $name` arms. Native only when every branch name is an
         // identifier (so the `$name` reader recovers it exactly); otherwise fall through to `@json`.
@@ -676,7 +741,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
                 out.push_str("branch $");
                 out.push_str(&br.name.0);
                 out.push('\n');
-                fmt_body(&br.body, level + 2, indent, out);
+                fmt_body(&br.body, level + 2, indent, multiline, out);
             }
         }
         // `retry <max> [backoff <ident>] [delay <ms>] [-> $bind]` + body. Native only when `backoff`
@@ -705,17 +770,17 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, out: &mut String) {
                 out.push_str(&s.0);
             }
             out.push('\n');
-            fmt_body(body, level + 1, indent, out);
+            fmt_body(body, level + 1, indent, multiline, out);
         }
         // `assert <cond> [, "<message>"]` — a one-line guard; the condition delegates to `fmt_expr`
         // (with its own `@json` fallback), so `assert` itself always renders natively.
         Node::Assert { cond, message } => {
             out.push_str(&ind);
             out.push_str("assert ");
-            out.push_str(&fmt_expr(cond));
+            out.push_str(&fmt_expr(cond, multiline));
             if let Some(m) = message {
                 out.push_str(", ");
-                out.push_str(&compact(&serde_json::Value::String(m.clone())));
+                out.push_str(&compact_str(m, multiline));
             }
             out.push('\n');
         }
@@ -852,5 +917,296 @@ mod tests {
         let txt = format(&ast);
         assert!(txt.contains("  @json {"), "got: {txt}");
         assert!(txt.contains("\"kind\":\"thing\""), "got: {txt}");
+    }
+
+    // ----- Multi-line strings (L-39) -----
+
+    #[test]
+    fn emits_multiline_spelling_for_a_lit_string_containing_a_newline() {
+        let ast = DraftAst {
+            body: vec![Node::Bind {
+                name: "x".into(),
+                value: Box::new(Node::Lit {
+                    value: serde_json::json!("first\nsecond"),
+                }),
+                ty: None,
+                effect: None,
+            }],
+            ..Default::default()
+        };
+        let txt = format(&ast);
+        assert!(
+            txt.contains("$x = \"\"\"first\nsecond\"\"\""),
+            "expected the verbatim triple-quote spelling, got: {txt}"
+        );
+        assert!(
+            !txt.contains("\\n"),
+            "must not fall back to the escaped spelling: {txt}"
+        );
+        assert_eq!(crate::parse::parse(&txt).unwrap(), ast);
+    }
+
+    #[test]
+    fn a_single_line_string_never_uses_the_multiline_spelling() {
+        let ast = DraftAst {
+            body: vec![Node::Lit {
+                value: serde_json::json!("no newline here"),
+            }],
+            ..Default::default()
+        };
+        let txt = format(&ast);
+        assert!(!txt.contains("\"\"\""), "got: {txt}");
+    }
+
+    #[test]
+    fn falls_back_to_the_escaped_spelling_when_content_would_collide_with_the_delimiter() {
+        // Content containing a literal `"""`, or ending in a `"`, cannot be told apart from the
+        // closing delimiter by the "scan for the next `\"\"\"`" grammar rule (see parse.rs) — the
+        // formatter must recognize both hazards and fall back to the always-safe escaped spelling,
+        // so `parse(format(x)) == x` stays total.
+        for value in [
+            serde_json::json!("has \"\"\" triple quotes\nand a newline"),
+            serde_json::json!("first line\nsecond line ends in a quote\""),
+        ] {
+            let ast = DraftAst {
+                body: vec![Node::Lit {
+                    value: value.clone(),
+                }],
+                ..Default::default()
+            };
+            let txt = format(&ast);
+            assert!(
+                !txt.contains("\"\"\""),
+                "expected the escaped fallback for {value:?}, got: {txt}"
+            );
+            assert_eq!(
+                crate::parse::parse(&txt).unwrap().body,
+                vec![Node::Lit { value }]
+            );
+        }
+    }
+
+    #[test]
+    fn crlf_content_falls_back_to_the_escaped_spelling() {
+        // `parse.rs`'s `preprocess` normalizes `\r\n` -> `\n` on the *whole source* before
+        // scanning for `"""` blocks (so the char-by-char scanner only has to special-case `\n`,
+        // matching old `str::lines()` behavior on Windows-authored sources). That means a `\r`
+        // immediately followed by `\n` inside a `"""..."""` block would silently lose the `\r` on
+        // the way back through `parse` — a real round-trip violation if the formatter ever chose
+        // the multi-line spelling for such a string. The formatter must treat `\r` as unsafe (like
+        // the `"""`/trailing-`"` hazards) and fall back to the escaped spelling instead.
+        let value = serde_json::json!("line one\r\nline two");
+        let ast = DraftAst {
+            body: vec![Node::Lit {
+                value: value.clone(),
+            }],
+            ..Default::default()
+        };
+        let txt = format(&ast);
+        assert!(
+            !txt.contains("\"\"\""),
+            "a `\\r\\n`-bearing string must use the escaped spelling, got: {txt}"
+        );
+        assert_eq!(
+            crate::parse::parse(&txt).unwrap().body,
+            vec![Node::Lit { value }],
+            "parse(format(x)) == x must hold for CRLF content"
+        );
+    }
+
+    #[test]
+    fn format_compact_keeps_the_escaped_single_line_spelling_for_display() {
+        // `format_compact` is display-only (doesn't round-trip; see its doc comment) — it never
+        // emits the multi-line spelling, so a compact plan preview always stays visually single-line
+        // per statement.
+        let ast = DraftAst {
+            body: vec![Node::Lit {
+                value: serde_json::json!("first\nsecond"),
+            }],
+            ..Default::default()
+        };
+        let compact = format_compact(&ast);
+        assert!(!compact.contains("\"\"\""), "got: {compact}");
+        assert!(compact.contains("\\n"), "got: {compact}");
+    }
+
+    #[test]
+    fn assert_ctx_route_fmt_native_string_fields_support_the_multiline_spelling() {
+        let assert_ast = DraftAst {
+            body: vec![Node::Assert {
+                cond: Box::new(Node::Lit {
+                    value: serde_json::json!(true),
+                }),
+                message: Some("line one\nline two".into()),
+            }],
+            ..Default::default()
+        };
+        let txt = format(&assert_ast);
+        assert!(txt.contains("\"\"\"line one\nline two\"\"\""), "got: {txt}");
+        assert_eq!(crate::parse::parse(&txt).unwrap(), assert_ast);
+
+        let ctx_ast = DraftAst {
+            body: vec![Node::Ctx {
+                name: "pack".into(),
+                purpose: Some("first\nsecond".into()),
+                include: vec![],
+                exclude: vec![],
+                budget: None,
+            }],
+            ..Default::default()
+        };
+        let txt = format(&ctx_ast);
+        assert!(txt.contains("\"\"\"first\nsecond\"\"\""), "got: {txt}");
+        assert_eq!(crate::parse::parse(&txt).unwrap(), ctx_ast);
+
+        let route_ast = DraftAst {
+            body: vec![Node::Route {
+                selector: Box::new(Node::Var {
+                    name: "kind".into(),
+                }),
+                cases: vec![crate::ast::RouteCase {
+                    label: "a\nb".into(),
+                    body: vec![Node::Return {
+                        value: Box::new(Node::Lit {
+                            value: serde_json::json!(1),
+                        }),
+                    }],
+                }],
+                default: vec![],
+            }],
+            ..Default::default()
+        };
+        let txt = format(&route_ast);
+        assert!(txt.contains("\"\"\"a\nb\"\"\""), "got: {txt}");
+        assert_eq!(crate::parse::parse(&txt).unwrap(), route_ast);
+
+        // `Fmt` only has a native spelling in *expression* position (a bare statement falls to
+        // `@json`, since there's no `do`/bind marker for it) — exercise it as a `return` value.
+        let fmt_ast = DraftAst {
+            body: vec![Node::Return {
+                value: Box::new(Node::Fmt {
+                    template: "hello\n{name}".into(),
+                }),
+            }],
+            ..Default::default()
+        };
+        let txt = format(&fmt_ast);
+        assert!(txt.contains("fmt(\"\"\"hello\n{name}\"\"\")"), "got: {txt}");
+        assert_eq!(crate::parse::parse(&txt).unwrap(), fmt_ast);
+    }
+
+    /// Golden nested case named by the story's Acceptance: a multi-line string inside an object
+    /// value-template inside an `each` body.
+    #[test]
+    fn multiline_string_inside_an_object_template_inside_each_round_trips() {
+        let ast = DraftAst {
+            body: vec![Node::Each {
+                source: Box::new(Node::Var {
+                    name: "files".into(),
+                }),
+                item: "f".into(),
+                body: vec![Node::Call {
+                    op: "write".into(),
+                    args: vec![Node::Obj {
+                        fields: {
+                            let mut m = std::collections::BTreeMap::new();
+                            m.insert("path".to_string(), Box::new(Node::Var { name: "f".into() }));
+                            m.insert(
+                                "content".to_string(),
+                                Box::new(Node::Lit {
+                                    value: serde_json::json!("line one\nline two\nline three"),
+                                }),
+                            );
+                            m
+                        },
+                    }],
+                }],
+                collect: None,
+                flat: false,
+            }],
+            ..Default::default()
+        };
+        let txt = format(&ast);
+        assert!(
+            txt.contains("\"\"\"line one\nline two\nline three\"\"\""),
+            "got: {txt}"
+        );
+        assert_eq!(crate::parse::parse(&txt).unwrap(), ast);
+    }
+
+    /// The other dominant corpus shape: a pure-JSON `Lit` object (quoted keys) rather than a
+    /// dynamic value template — `do edit {"path":...,"content":"""..."""}`. `compact_value`
+    /// recurses into `Lit`'s nested JSON, so a string *leaf* at any depth gets the multi-line
+    /// spelling while the surrounding object stays ordinary compact JSON syntax.
+    #[test]
+    fn multiline_string_inside_a_pure_json_lit_object_round_trips() {
+        let ast = DraftAst {
+            body: vec![Node::Call {
+                op: "edit".into(),
+                args: vec![Node::Lit {
+                    value: serde_json::json!({"path": "f.txt", "content": "line one\nline two"}),
+                }],
+            }],
+            ..Default::default()
+        };
+        let txt = format(&ast);
+        assert!(
+            txt.contains("\"content\":\"\"\"line one\nline two\"\"\""),
+            "got: {txt}"
+        );
+        assert!(
+            txt.contains("\"path\":\"f.txt\""),
+            "the rest of the object stays plain compact JSON: {txt}"
+        );
+        assert_eq!(crate::parse::parse(&txt).unwrap(), ast);
+    }
+
+    /// Scope pin: the `@json` escape line is documented as "exactly the wire format" — it stays
+    /// pure single-line compact JSON even when the node it carries has a newline-bearing string
+    /// field, never the multi-line spelling. (Only the natively-spelled positions this story names
+    /// — `lit`, value templates, `fmt`, `assert`'s message, `ctx`'s purpose, `route`'s case label —
+    /// get the new spelling; a node with no native form is out of scope.)
+    #[test]
+    fn json_escape_line_never_uses_the_multiline_spelling() {
+        let ast = DraftAst {
+            body: vec![Node::Confirm {
+                message: "are you\nsure?".into(),
+                risk: None,
+                body: vec![],
+            }],
+            ..Default::default()
+        };
+        let txt = format(&ast);
+        let json_line = txt
+            .lines()
+            .find(|l| l.trim_start().starts_with("@json "))
+            .unwrap_or_else(|| panic!("expected an @json line, got: {txt}"));
+        assert!(
+            !json_line.contains("\"\"\"") && json_line.contains("\\n"),
+            "the @json line stays single-line compact JSON: {json_line}"
+        );
+        assert_eq!(crate::parse::parse(&txt).unwrap(), ast);
+    }
+
+    /// General edge-shape fuzzing beyond the property test's fixed pool: newline-only content, a
+    /// leading newline, consecutive blank lines, and trailing spaces mid-content all round-trip.
+    #[test]
+    fn edge_content_shapes_round_trip() {
+        for s in ["\n", "\nX", "a\n\n\nb", "x  \ny  \n", "a\nb"] {
+            let ast = DraftAst {
+                body: vec![Node::Lit {
+                    value: serde_json::json!(s),
+                }],
+                ..Default::default()
+            };
+            let txt = format(&ast);
+            assert_eq!(
+                crate::parse::parse(&txt).unwrap().body,
+                vec![Node::Lit {
+                    value: serde_json::json!(s)
+                }],
+                "round-trip failed for {s:?}: {txt}"
+            );
+        }
     }
 }

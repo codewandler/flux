@@ -148,7 +148,8 @@ flux tui                         # ratatui chat UI (in-UI approval modal)
 flux app run --serve 127.0.0.1:8787 --yes  # HTTP/A2A daemon (REST + SSE)
 flux run app.flux                # run a multi-agent program (event bus + triggers + journeys); deny-destructive unless --yes
 flux sessions                    # list recent sessions
-flux plugin ls                   # manage subprocess plugins (any-language ops)
+flux plugin install <name>       # the plugin CLI — verified install from the signed plugin pack (@<version>, --all;
+                                 #   --dir registers local builds); also ls / status / call / pin / rollback / uninstall / skill
 flux eval synthetic --watch      # run a benchmark suite (synthetic riddles / mock / terminal-bench / multi);
                                  #   --watch streams the agent live, --report out.md writes a categorized report
 ```

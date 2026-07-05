@@ -820,6 +820,25 @@ impl EventStore {
         Ok(acc)
     }
 
+    /// The D-53 corpus-mining rollup, across EVERY session (see [`projection::corpus_rows`]).
+    /// Unlike [`cost_summary_all`](Self::cost_summary_all)/[`efficiency_all`](Self::efficiency_all),
+    /// this folds [`all_streams`](Self::all_streams) rather than [`aggregate_streams`](Self::aggregate_streams):
+    /// a correlated sub-agent child stream's accepted plans are independent, real training examples
+    /// (not spend that would double-count against its parent), so they belong in the corpus too.
+    pub fn corpus_rows_all(
+        &self,
+    ) -> Result<(Vec<projection::CorpusRow>, projection::CorpusSkipCounts)> {
+        let mut rows = Vec::new();
+        let mut skips = projection::CorpusSkipCounts::default();
+        for stream in self.all_streams()? {
+            let events = self.load_stream(&stream, None)?;
+            let (r, s) = projection::corpus_rows(&stream, &events);
+            rows.extend(r);
+            skips.merge(&s);
+        }
+        Ok((rows, skips))
+    }
+
     /// The session ids the all-sessions rollups ([`cost_summary_all`](Self::cost_summary_all),
     /// [`efficiency_all`](Self::efficiency_all)) fold over — every stream EXCEPT a correlated
     /// sub-agent child (C-23). A `task` sub-agent runs a full turn on its own child stream in the

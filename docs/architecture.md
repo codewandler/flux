@@ -187,7 +187,9 @@ provider is a small composition, never a fork of the loop. Streaming is a
 ## Extensibility
 
 - **Hooks** (`flux-plugin`'s `hooks` module): JavaScript pre-tool hooks (observe/modify/deny), run with a timeout.
-- **Plugins** (`flux-plugin`): any-language subprocess binaries over a framed NDJSON protocol. A
+- **Plugins** (protocol crate `flux-plugin`; binaries `flux-plugin-<name>`): any-language subprocess
+  binaries over a framed NDJSON protocol, installed and managed by the plugin CLI (`flux plugin …`,
+  verified install from the signed `plugins-v*` pack releases). A
   plugin's operations are projected as policy-gated tools; its privileged IO is requested back from the
   host as **capabilities the plugin declares in its manifest** (`process` allow-list, `secret` key
   allow-list, HTTP host allow-list, connection targets, private-network hosts) and the host checks

@@ -46,8 +46,8 @@ callbacks so the manifest gates below actually apply.
    minisign-signed index + every archive's sha256 and unpacks into the versioned store
    `~/.flux/plugins/bin/<name>/<version>/`. While authoring, register your local build instead:
    ```
-   cd plugins && cargo build --release        # → plugins/target/release/flux-plugin-<name>
-   flux plugin install --dir plugins/target/release   # register every built binary (local, unverified)
+   (cd plugins && cargo build --release)      # → plugins/target/release/flux-plugin-<name>
+   flux plugin install --dir                  # register every built binary (local, unverified; default dir: plugins/target/release)
    #  …or one at a time:
    flux plugin add <name> /abs/path/to/flux-plugin-<name>
    ```
@@ -164,3 +164,16 @@ cargo fmt    -p flux-plugin-<name>
 
 A new plugin is a new member in `plugins/Cargo.toml`. Heavy vendor deps live here, never in the root
 flux gate. Add a representative op to `scripts/smoke-plugins.sh` (env-gated) before release.
+
+## Releasing: where your binary ends up
+
+A merged plugin ships with the next **pack release** — the plugin release channel, separate from the
+core `v*` releases. `.github/workflows/release-plugins.yml` (dispatched manually with a `version`
+input; never triggered by a tag) builds the whole `plugins/` workspace on five native runners,
+packages one archive per plugin per target (`flux-plugin-<name>-<version>-<target>.tar.xz`, `.zip`
+on Windows), generates + minisign-signs `plugins-index.json`, and publishes everything as the
+**`plugins-v<version>`** GitHub release. A new workspace member is picked up automatically — no
+workflow edit needed. Users then get it via the plugin CLI: `flux plugin install <name>`.
+
+**Never hand-push a `plugins-v*` tag.** The workflow creates the tag itself at release time; a
+hand-pushed one triggers the core cargo-dist plan job against a tag it can't build and red-Xs it.

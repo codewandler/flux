@@ -309,12 +309,21 @@ enum Commands {
     },
     /// Per-model token usage + cost: the current/last session, and an all-sessions total.
     Usage,
+    /// Mine `~/.flux/events.db` for flux-native NL→Flux-Lang training data (D-53).
+    Corpus {
+        #[command(subcommand)]
+        action: CorpusAction,
+    },
     /// Provider authentication (status / login).
     Auth {
         #[command(subcommand)]
         action: Option<AuthAction>,
     },
-    /// Manage subprocess plugins (any-language ops).
+    /// The plugin CLI — manage subprocess plugins (any-language ops).
+    ///
+    /// Lifecycle over the signed plugin pack (`plugins-v*` releases): `install` (verified remote;
+    /// `--dir` registers local builds), `pin`/`rollback` (enforced version switches over the
+    /// versioned store), plus `ls`/`status`/`call`/`uninstall`/`skill`.
     Plugin {
         #[command(subcommand)]
         action: Option<PluginAction>,
@@ -406,6 +415,21 @@ enum LoopAction {
     },
 }
 
+/// `flux corpus …`
+#[derive(clap::Subcommand, Debug)]
+enum CorpusAction {
+    /// Pair every accepted plan's canonical text (`plan_source`, L-38) with the user instruction
+    /// that produced it and emit corpus-shaped JSONL (one row per line):
+    /// `{id, nl_goal, source, provenance: {session, turn}, flux_rev}`. Reads events.db read-only;
+    /// prints a skip-count summary to stderr (precision over recall — an ambiguous or pre-L-38 row
+    /// is dropped and counted, never guessed at).
+    Export {
+        /// Write JSONL to this file instead of stdout.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+}
+
 /// `flux auth …`
 #[derive(clap::Subcommand, Debug)]
 enum AuthAction {
@@ -430,9 +454,16 @@ enum PluginAction {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Pin a plugin to a version: `pin <name> <version>`.
+    /// Pin a plugin to a pack version — a verified version switch (D-48): `pin <name> <version>`.
+    /// The version is fetched into the versioned store if absent (the same signed-index +
+    /// checksum path as `install`; already-stored versions repoint offline), the descriptor is
+    /// repointed with its sha256 recorded (re-checked at every spawn — drift refuses to run),
+    /// and the replaced version is remembered for `rollback`.
     Pin { name: String, version: String },
-    /// Clear a plugin's version pin: `rollback <name>`.
+    /// Roll back to the version in place before the last switch: `rollback <name>` — offline and
+    /// instant (the side-by-side versioned store keeps it on disk). Current and previous swap,
+    /// so a second `rollback` flips forward again. (Pre-D-48 this merely cleared the advisory
+    /// pin; it now switches versions.)
     Rollback { name: String },
     /// Invoke one operation of an installed plugin directly: `call <name> <op> [json-input]`
     /// (alias: `run`). Input is built from the optional `<json-input>` object plus any
@@ -484,8 +515,15 @@ enum PluginAction {
         )]
         dir: Option<String>,
     },
-    /// Remove an installed plugin descriptor: `uninstall <name>`.
-    Uninstall { name: String },
+    /// Remove an installed plugin descriptor: `uninstall <name>`. With `--purge`, also delete
+    /// the plugin's versioned-store directory (`~/.flux/plugins/bin/<name>/`) — every downloaded
+    /// version, including what `rollback` would flip to.
+    Uninstall {
+        name: String,
+        /// Also remove the plugin's versioned binary store (all downloaded versions).
+        #[arg(long)]
+        purge: bool,
+    },
     /// Inspect installed plugins — liveness + declared surface: `status [<name>]`.
     /// With no argument it summarizes every installed plugin; `ls` stays the terse default.
     Status {
@@ -1031,6 +1069,106 @@ fn print_usage_rows(rows: &[flux_events::ModelCost]) {
     if any_priced && rows.len() > 1 {
         println!("  {:<28} total ${:.4}", "", total_usd);
     }
+}
+
+/// `flux corpus …` (D-53).
+fn run_corpus(action: CorpusAction) -> Result<()> {
+    match action {
+        CorpusAction::Export { out } => run_corpus_export(out),
+    }
+}
+
+/// The provenance anchor stamped on every exported row (D-53): the exporting binary's OWN
+/// `CARGO_PKG_VERSION`, baked in at compile time — the same figure `flux --version` reports. This is
+/// deliberately NOT a runtime `git describe`: an installed binary has no `.git` directory next to it
+/// (and a caller's cwd is arbitrary), so a runtime git shell-out would be silently wrong or fail far
+/// from where the plan was actually recorded. The crate version is the honest anchor actually
+/// available wherever this binary runs — precise enough to tell flux-model whether a corpus row's
+/// `plan_source` was recorded under a flux-lang grammar old enough to need re-lowering.
+const FLUX_REV: &str = env!("CARGO_PKG_VERSION");
+
+/// `flux corpus export [--out <file>]` — walk `~/.flux/events.db` and emit corpus-shaped JSONL: one
+/// accepted plan's canonical text (`plan_source`, L-38) paired with its originating user instruction,
+/// per line. Read-only; writes rows to stdout (or `--out`) and a skip-count summary to stderr, so the
+/// data stream stays pipeable (`flux corpus export | wc -l`) while the audit trail is still visible.
+fn run_corpus_export(out: Option<std::path::PathBuf>) -> Result<()> {
+    let store = open_event_store()?;
+    let summary = match &out {
+        Some(path) => {
+            let file = std::fs::File::create(path)
+                .with_context(|| format!("create {}", path.display()))?;
+            run_corpus_export_with(&store, FLUX_REV, file)?
+        }
+        None => run_corpus_export_with(&store, FLUX_REV, std::io::stdout())?,
+    };
+    eprintln!(
+        "{} {} row{} exported · skipped {} (no plan_source {} · ambiguous pairing {} · unparseable at HEAD {})",
+        style::bold("corpus export:"),
+        summary.exported,
+        if summary.exported == 1 { "" } else { "s" },
+        summary.no_plan_source + summary.ambiguous_pairing + summary.unparseable_at_head,
+        summary.no_plan_source,
+        summary.ambiguous_pairing,
+        summary.unparseable_at_head,
+    );
+    Ok(())
+}
+
+/// The `flux corpus export` outcome, printed to stderr — every row skipped (not just the exported
+/// count) is visible, so "precision over recall" never reads as a silent undercount.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CorpusExportSummary {
+    exported: u64,
+    no_plan_source: u64,
+    ambiguous_pairing: u64,
+    /// A `plan_source` that failed to re-parse against the flux-lang parser LINKED INTO THIS BINARY
+    /// — a scoped, in-repo stand-in for "lower_ok at current flux HEAD" (the fuller flux-model
+    /// corpus ladder additionally lowers against a live op catalog + prior-turn symbol state, which
+    /// is that repo's concern, not this exporter's). Expected to be 0 in practice: `plan_source` is
+    /// documented as "present means parseable" at write time, so this only ever fires when the
+    /// text grammar changed incompatibly since the plan was recorded.
+    unparseable_at_head: u64,
+}
+
+/// The store-parameterized body of [`run_corpus_export`] (tests pass an in-memory store + an in-memory
+/// writer so they touch neither `HOME`'s real `~/.flux/events.db` nor the filesystem).
+fn run_corpus_export_with(
+    store: &EventStore,
+    flux_rev: &str,
+    mut out: impl Write,
+) -> Result<CorpusExportSummary> {
+    let (rows, skips) = store.corpus_rows_all()?;
+    let mut summary = CorpusExportSummary {
+        no_plan_source: skips.no_plan_source,
+        ambiguous_pairing: skips.ambiguous_pairing,
+        ..Default::default()
+    };
+    // C-22 restated at the export boundary: `row.source` (plan_source) is already redacted with the
+    // LIVE session redactor at record time (`loop_host.rs`'s `attempt.plan_source = redactor.redact(&src)`)
+    // — nothing to redo here. `row.nl_goal` (the raw `TurnStarted.user_input`) is NOT redacted at
+    // record time (only the agent's own outputs are), so it gets an equivalent scrub here: a bare
+    // `Redactor` has no registered secret VALUES for a long-closed session to replay, but its
+    // credential-SHAPED-token pattern match (`sk-…`, `ghp_…`, …) still fires independently of any
+    // registry — the same class of scrub `capture.py` applies to raw corpus text.
+    let redactor = flux_secret::Redactor::new();
+    for row in rows {
+        // Re-parse against the CURRENTLY LINKED flux-lang parser (Acceptance's "lower_ok at current
+        // flux HEAD", scoped to parse validity — see CorpusExportSummary::unparseable_at_head).
+        if flux_lang::parse::parse(&row.source).is_err() {
+            summary.unparseable_at_head += 1;
+            continue;
+        }
+        let line = serde_json::json!({
+            "id": row.id,
+            "nl_goal": redactor.redact(&row.nl_goal),
+            "source": row.source,
+            "provenance": { "session": row.session, "turn": row.turn },
+            "flux_rev": flux_rev,
+        });
+        writeln!(out, "{}", serde_json::to_string(&line)?)?;
+        summary.exported += 1;
+    }
+    Ok(summary)
 }
 
 /// `flux loop [show|eject]` — inspect and customize the flux-lang agent loop that drives every turn.
@@ -4656,6 +4794,7 @@ async fn main() -> Result<()> {
             Some(Commands::Loop { action }) => run_loop_cmd(action),
             Some(Commands::Sessions { prune }) => run_sessions(prune),
             Some(Commands::Usage) => run_usage(),
+            Some(Commands::Corpus { action }) => run_corpus(action),
             Some(Commands::Auth { action }) => run_auth(action).await,
             Some(Commands::Plugin { action }) => run_plugin(action).await,
             Some(Commands::Endpoint { action }) => run_endpoint(action),
@@ -5214,12 +5353,18 @@ async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> R
                     .as_deref()
                     .map(|v| format!("  v{v}"))
                     .unwrap_or_default();
+                // Re-hash against the recorded sha256 (D-48) — sub-millisecond per plugin, so
+                // even the terse listing shows drift instead of a stale descriptor-field label.
+                let verification = match flux_plugin::verify_descriptor(&p.descriptor) {
+                    flux_plugin::Verification::Verified => style::green("verified"),
+                    flux_plugin::Verification::HashDrift { .. } => style::red("hash drift"),
+                    flux_plugin::Verification::UnverifiedLocal => style::dim("unverified (local)"),
+                };
                 println!(
-                    "{:<16} {} {}{pin}{ver}  [{}]",
+                    "{:<16} {} {}{pin}{ver}  [{verification}]",
                     p.name,
                     p.descriptor.program,
                     p.descriptor.args.join(" "),
-                    plugin_verification_label(&p.descriptor)
                 );
             }
             Ok(())
@@ -5244,13 +5389,55 @@ async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> R
             Ok(())
         }
         PluginAction::Pin { name, version } => {
-            flux_plugin::set_pinned(dir, &name, Some(version.clone())).context("pin plugin")?;
-            println!("pinned `{name}` to {version}");
+            if flux_plugin::pack::CURRENT_TARGET.is_empty() {
+                bail!(
+                    "no prebuilt plugin pack for this platform — build from source and use \
+                     `flux plugin install --dir` instead (pin manages the versioned store)"
+                );
+            }
+            let store_root = dir.join("bin");
+            let fetcher = flux_plugin::pack::GithubFetcher::default();
+            let req = flux_plugin::pack::InstallRequest {
+                fetcher: &fetcher,
+                repo: flux_plugin::pack::DEFAULT_REPO,
+                public_key: flux_plugin::pack::PUBLIC_KEY,
+                descriptors_dir: dir,
+                store_root: &store_root,
+                target: flux_plugin::pack::CURRENT_TARGET,
+            };
+            let out = flux_plugin::pack::pin(&req, &name, &version)
+                .await
+                .map_err(|e| anyhow::anyhow!("pin plugin: {e}"))?;
+            let how = if out.fetched {
+                "fetched into the versioned store"
+            } else {
+                "already in the versioned store — offline repoint"
+            };
+            let prev = out
+                .previous
+                .map(|p| format!("; previous {p} kept for rollback"))
+                .unwrap_or_default();
+            println!(
+                "pinned `{}` to {} ({how}; sha256 recorded, enforced at every spawn{prev})",
+                out.name, out.version
+            );
             Ok(())
         }
         PluginAction::Rollback { name } => {
-            flux_plugin::set_pinned(dir, &name, None).context("rollback plugin")?;
-            println!("cleared pin on `{name}`");
+            let store_root = dir.join("bin");
+            let out = flux_plugin::pack::rollback(
+                dir,
+                &store_root,
+                flux_plugin::pack::CURRENT_TARGET,
+                &name,
+            )
+            .map_err(|e| anyhow::anyhow!("rollback plugin: {e}"))?;
+            println!(
+                "rolled back `{}`: {} → {} (offline flip; `rollback` again to return)",
+                out.name,
+                out.from.unwrap_or_else(|| "<unversioned>".into()),
+                out.to
+            );
             Ok(())
         }
         PluginAction::Call {
@@ -5280,7 +5467,7 @@ async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> R
             ));
             let backend: Arc<dyn flux_capabilities::DatasourceBackend> =
                 Arc::new(flux_capabilities::MemoryBackend::new());
-            let mut host = flux_plugin::PluginHost::spawn(&system, &desc.program, &desc.args)
+            let mut host = flux_plugin::PluginHost::spawn_verified(&system, &name, &desc)
                 .await
                 .with_context(|| format!("spawn plugin `{name}` ({})", desc.program))?;
             let manifest = host.manifest().await.context("fetch plugin manifest")?;
@@ -5433,11 +5620,21 @@ async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> R
             global,
             out,
         } => run_plugin_skill(dir, install, global, out).await,
-        PluginAction::Uninstall { name } => {
+        PluginAction::Uninstall { name, purge } => {
             let removed = flux_plugin::remove_descriptor(dir, &name).context("uninstall plugin")?;
+            let purged = if purge {
+                flux_plugin::pack::purge_store(&dir.join("bin"), &name)
+                    .map_err(|e| anyhow::anyhow!("purge versioned store: {e}"))?
+            } else {
+                false
+            };
             if removed {
                 println!("uninstalled plugin `{name}`");
-            } else {
+            }
+            if purged {
+                println!("purged versioned store for `{name}` (all downloaded versions)");
+            }
+            if !removed && !purged {
                 bail!("no such plugin `{name}` — nothing to uninstall");
             }
             Ok(())
@@ -5485,22 +5682,12 @@ struct PluginStatusReport {
     pin: Option<String>,
     /// The installed version, if the descriptor carries one (remote installs only — D-47).
     version: Option<String>,
-    /// `true` for a hash-carrying (remote-installed) descriptor, `false` for a hashless local/dev
-    /// one. Full hash *enforcement* (re-hashing the binary on disk) is D-48; this is display only.
-    verified: bool,
+    /// The D-48 verification outcome: the binary on disk **re-hashed** against the descriptor's
+    /// recorded `sha256` — `verified`, `hash drift` (also a spawn refusal), or
+    /// `unverified (local)` for hashless dev descriptors.
+    verification: flux_plugin::Verification,
     liveness: Liveness,
     manifest: Option<flux_plugin::PluginManifest>,
-}
-
-/// `verified` for a descriptor that carries a `sha256` (a remote `install`), `unverified (local)`
-/// for one that doesn't (`add` / `install --dir`) — D-47. This reads the descriptor field only; it
-/// does not re-hash the binary on disk (that enforcement lands in D-48).
-fn plugin_verification_label(d: &flux_plugin::PluginDescriptor) -> &'static str {
-    if d.sha256.is_some() {
-        "verified"
-    } else {
-        "unverified (local)"
-    }
 }
 
 /// Resolve `program` (an absolute/relative path, or a bare name on `PATH`) to an existing file.
@@ -5526,22 +5713,29 @@ async fn build_status_report(
     d: flux_plugin::PluginDescriptor,
 ) -> Result<PluginStatusReport> {
     let binary_exists = program_resolves(&d.program);
+    // Re-hash against the recorded sha256 (D-48). On drift the probe below is skipped — the
+    // verified spawn path would refuse anyway; skipping keeps `status` from paying a doomed spawn.
+    let verification = flux_plugin::verify_descriptor(&d);
     let (liveness, manifest) = if !binary_exists {
         (Liveness::Missing, None)
+    } else if let flux_plugin::Verification::HashDrift { .. } = &verification {
+        (
+            Liveness::Unloadable("refused: hash drift (see verification)".into()),
+            None,
+        )
     } else {
-        match spawn_and_load_manifest(&d).await {
+        match spawn_and_load_manifest(name, &d).await {
             Ok(m) => (Liveness::Live, Some(m)),
             Err(e) => (Liveness::Unloadable(e.to_string()), None),
         }
     };
-    let verified = plugin_verification_label(&d) == "verified";
     Ok(PluginStatusReport {
         name: name.to_string(),
         program: d.program,
         args: d.args,
         pin: d.pinned,
         version: d.version,
-        verified,
+        verification,
         liveness,
         manifest,
     })
@@ -5564,15 +5758,17 @@ async fn plugin_status_all(dir: &std::path::Path) -> Result<Vec<PluginStatusRepo
     Ok(out)
 }
 
-/// Spawn the plugin and load its manifest (liveness probe). Reuses the one guarded spawn path
-/// (`PluginHost::spawn` over a workspace-rooted `System`), the same boundary `call` uses.
+/// Spawn the plugin and load its manifest (liveness probe). Reuses the one guarded, D-48
+/// hash-verified spawn path (`PluginHost::spawn_verified` over a workspace-rooted `System`), the
+/// same boundary `call` and agent discovery use.
 async fn spawn_and_load_manifest(
+    name: &str,
     d: &flux_plugin::PluginDescriptor,
 ) -> Result<flux_plugin::PluginManifest> {
     let system = System::new(
         Workspace::from_env(&std::env::current_dir()?).map_err(|e| anyhow::anyhow!("{e}"))?,
     );
-    let mut host = flux_plugin::PluginHost::spawn(&system, &d.program, &d.args)
+    let mut host = flux_plugin::PluginHost::spawn_verified(&system, name, d)
         .await
         .with_context(|| format!("spawn `{}`", d.program))?;
     let m = host.manifest().await.context("fetch plugin manifest")?;
@@ -5598,10 +5794,15 @@ fn print_plugin_status_report(r: &PluginStatusReport) {
         .as_deref()
         .map(|v| format!("  v{v}"))
         .unwrap_or_default();
-    let verified_label = if r.verified {
-        style::green("verified")
-    } else {
-        style::dim("unverified (local)")
+    let short = |h: &str| h.chars().take(12).collect::<String>();
+    let verified_label = match &r.verification {
+        flux_plugin::Verification::Verified => style::green("verified"),
+        flux_plugin::Verification::HashDrift { expected, actual } => style::red(&format!(
+            "hash drift: descriptor {}…, binary {}…",
+            short(expected),
+            short(actual)
+        )),
+        flux_plugin::Verification::UnverifiedLocal => style::dim("unverified (local)"),
     };
     println!(
         "{:<16} {} {}{pin}{ver}  [{liveness_label}]  [{verified_label}]",
@@ -5652,6 +5853,21 @@ fn print_plugin_status_report(r: &PluginStatusReport) {
             format!("  v{}", m.version)
         };
         println!("    manifest:{ver}  {}", surface.join("  ·  "));
+        // Version-agreement check (D-48): a manifest that reports a different version than the
+        // descriptor records is reported loudly — but it is a labeling disagreement, not
+        // tampering (the hash column above is the integrity statement), so it is not fatal.
+        if let Some(dv) = r.version.as_deref() {
+            if !m.version.is_empty() && m.version != dv {
+                println!(
+                    "    {}",
+                    style::yellow(&format!(
+                        "version mismatch: the descriptor records v{dv} but the manifest \
+                         reports v{}",
+                        m.version
+                    ))
+                );
+            }
+        }
     }
 }
 
@@ -5999,9 +6215,7 @@ async fn load_plugin_manifests(
         Workspace::from_env(&std::env::current_dir()?).map_err(|e| anyhow::anyhow!("{e}"))?,
     );
     for p in flux_plugin::discover(dir) {
-        match flux_plugin::PluginHost::spawn(&system, &p.descriptor.program, &p.descriptor.args)
-            .await
-        {
+        match flux_plugin::PluginHost::spawn_verified(&system, &p.name, &p.descriptor).await {
             Ok(mut host) => {
                 match host.manifest().await {
                     Ok(m) => plugins.push((p.name.clone(), m)),
@@ -6300,8 +6514,8 @@ mod tests {
     use super::{
         build_datasources, build_invoke_input, coerce_arg_value, cost_annotation,
         credential_location, format_evidence, loop_machinery_label, new_render_suffix,
-        plugin_binaries_in, plugin_status_one, plugin_verification_label, render_endpoint_row,
-        render_review_markdown, resolve_plugin_operation_name, run_plugin_in, run_usage_with,
+        plugin_binaries_in, plugin_status_one, render_endpoint_row, render_review_markdown,
+        resolve_plugin_operation_name, run_corpus_export_with, run_plugin_in, run_usage_with,
         should_fail, tool_preview, truncate, usage_annotation, write_generated_skill, EventStore,
         Liveness, PluginAction, ReviewSeverity,
     };
@@ -6634,9 +6848,15 @@ mod tests {
             "the descriptor is registered"
         );
 
-        run_plugin_in(&dir, Some(PluginAction::Uninstall { name: "p".into() }))
-            .await
-            .unwrap();
+        run_plugin_in(
+            &dir,
+            Some(PluginAction::Uninstall {
+                name: "p".into(),
+                purge: false,
+            }),
+        )
+        .await
+        .unwrap();
         assert!(
             flux_plugin::discover(&dir).is_empty(),
             "uninstall removed the descriptor"
@@ -6647,6 +6867,7 @@ mod tests {
             &dir,
             Some(PluginAction::Uninstall {
                 name: "ghost".into(),
+                purge: false,
             }),
         )
         .await;
@@ -6677,6 +6898,7 @@ mod tests {
             &dir,
             Some(PluginAction::Uninstall {
                 name: "../../flux-uninstall-traversal-sentinel".into(),
+                purge: false,
             }),
         )
         .await;
@@ -6695,6 +6917,7 @@ mod tests {
             &dir,
             Some(PluginAction::Uninstall {
                 name: "/etc/passwd".into(),
+                purge: false,
             }),
         )
         .await;
@@ -6704,6 +6927,146 @@ mod tests {
         );
 
         std::fs::remove_file(&outside).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-48 acceptance: `status` re-hashes the binary against the descriptor's recorded sha256 —
+    /// drift shows in the verification column (and the doomed liveness probe is skipped);
+    /// a matching hash reports `Verified`; a hashless dev descriptor stays `UnverifiedLocal`.
+    #[tokio::test]
+    async fn status_reports_hash_drift() {
+        let dir = std::env::temp_dir().join(format!("flux-status-drift-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("flux-plugin-alpha");
+        std::fs::write(&bin, b"alpha-bytes").unwrap();
+        let good = flux_plugin::pack::sha256_hex(b"alpha-bytes");
+        flux_plugin::add_descriptor(
+            &dir,
+            "alpha",
+            &flux_plugin::PluginDescriptor {
+                program: bin.to_string_lossy().into_owned(),
+                sha256: Some(good.clone()),
+                version: Some("0.9.0".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Untampered: verified. (The probe still runs and fails — a text file is no plugin —
+        // but the verification column is independent of liveness.)
+        let r = plugin_status_one(&dir, "alpha").await.unwrap();
+        assert_eq!(r.verification, flux_plugin::Verification::Verified);
+
+        // Tamper the binary → drift, and the spawn probe is refused/skipped.
+        std::fs::write(&bin, b"tampered-bytes").unwrap();
+        let r = plugin_status_one(&dir, "alpha").await.unwrap();
+        match &r.verification {
+            flux_plugin::Verification::HashDrift { expected, actual } => {
+                assert_eq!(expected, &good);
+                assert_eq!(actual, &flux_plugin::pack::sha256_hex(b"tampered-bytes"));
+            }
+            other => panic!("expected drift, got {other:?}"),
+        }
+        assert!(
+            matches!(&r.liveness, Liveness::Unloadable(msg) if msg.contains("hash drift")),
+            "drift refuses the probe: {:?}",
+            r.liveness
+        );
+
+        // Hashless dev descriptor: unverified (local), exactly as before D-48.
+        flux_plugin::add_descriptor(
+            &dir,
+            "dev",
+            &flux_plugin::PluginDescriptor {
+                program: bin.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let r = plugin_status_one(&dir, "dev").await.unwrap();
+        assert_eq!(r.verification, flux_plugin::Verification::UnverifiedLocal);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-48 acceptance: `uninstall --purge` also removes the plugin's versioned-store directory;
+    /// without `--purge` the store is left in place (unchanged pre-D-48 behavior).
+    #[tokio::test]
+    async fn uninstall_purge_removes_versioned_store() {
+        let dir = std::env::temp_dir().join(format!("flux-uninst-purge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let seed = |name: &str| {
+            let store = dir.join("bin").join(name).join("0.9.0");
+            std::fs::create_dir_all(&store).unwrap();
+            std::fs::write(store.join(format!("flux-plugin-{name}")), b"bytes").unwrap();
+            flux_plugin::add_descriptor(
+                &dir,
+                name,
+                &flux_plugin::PluginDescriptor {
+                    program: "/bin/true".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        };
+
+        // Without --purge: descriptor gone, store kept (unchanged behavior).
+        seed("keep");
+        run_plugin_in(
+            &dir,
+            Some(PluginAction::Uninstall {
+                name: "keep".into(),
+                purge: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(flux_plugin::load_descriptor(&dir, "keep")
+            .unwrap()
+            .is_none());
+        assert!(
+            dir.join("bin").join("keep").exists(),
+            "store kept without --purge"
+        );
+
+        // With --purge: descriptor AND the versioned store dir are gone.
+        seed("gone");
+        run_plugin_in(
+            &dir,
+            Some(PluginAction::Uninstall {
+                name: "gone".into(),
+                purge: true,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(flux_plugin::load_descriptor(&dir, "gone")
+            .unwrap()
+            .is_none());
+        assert!(
+            !dir.join("bin").join("gone").exists(),
+            "--purge removed the store"
+        );
+
+        // --purge on a name with no descriptor still cleans an orphaned store dir.
+        let orphan = dir.join("bin").join("orphan").join("0.9.0");
+        std::fs::create_dir_all(&orphan).unwrap();
+        run_plugin_in(
+            &dir,
+            Some(PluginAction::Uninstall {
+                name: "orphan".into(),
+                purge: true,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !dir.join("bin").join("orphan").exists(),
+            "orphaned store purged"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -6836,16 +7199,19 @@ mod tests {
             desc.sha256.is_none(),
             "a local-scan descriptor carries no sha256"
         );
-        assert_eq!(plugin_verification_label(&desc), "unverified (local)");
+        assert_eq!(
+            flux_plugin::verify_descriptor(&desc),
+            flux_plugin::Verification::UnverifiedLocal
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `ls`/`status` mark a hash-carrying (remotely installed) descriptor `verified` and a
-    /// hashless (local/dev) one `unverified (local)` — D-47's display half of the trust ladder
-    /// (hash *enforcement* at spawn time is D-48, not tested here).
+    /// D-48 superseded D-47's descriptor-field-only `verified` label: a hash-carrying descriptor
+    /// is now **re-hashed** — one whose binary cannot be read is drift (never a silent
+    /// `verified`), and a hashless (local/dev) one stays `unverified (local)`.
     #[tokio::test]
-    async fn plugin_status_marks_hash_carrying_descriptors_verified() {
+    async fn plugin_status_rehashes_hash_carrying_descriptors() {
         let dir = std::env::temp_dir().join(format!("flux-status-verified-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -6855,11 +7221,10 @@ mod tests {
             "remote-plugin",
             &flux_plugin::PluginDescriptor {
                 program: "/nonexistent/remote-plugin".into(),
-                args: vec![],
-                pinned: None,
                 version: Some("0.9.0".into()),
                 sha256: Some("deadbeef".into()),
                 source: Some("plugins-v0.9.0".into()),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -6868,20 +7233,26 @@ mod tests {
             "local-plugin",
             &flux_plugin::PluginDescriptor {
                 program: "/nonexistent/local-plugin".into(),
-                args: vec![],
-                pinned: None,
                 ..Default::default()
             },
         )
         .unwrap();
 
         let remote = plugin_status_one(&dir, "remote-plugin").await.unwrap();
-        assert!(remote.verified, "a sha256-carrying descriptor is verified");
+        assert!(
+            matches!(
+                &remote.verification,
+                flux_plugin::Verification::HashDrift { expected, .. } if expected == "deadbeef"
+            ),
+            "a recorded hash over an unreadable binary is drift, not verified: {:?}",
+            remote.verification
+        );
         assert_eq!(remote.version.as_deref(), Some("0.9.0"));
 
         let local = plugin_status_one(&dir, "local-plugin").await.unwrap();
-        assert!(
-            !local.verified,
+        assert_eq!(
+            local.verification,
+            flux_plugin::Verification::UnverifiedLocal,
             "a hashless descriptor is unverified (local)"
         );
         assert!(local.version.is_none());
@@ -7283,6 +7654,98 @@ mod tests {
             .unwrap();
         assert_eq!(opus.usage.input_tokens, 1_000_000);
         assert!(opus.cost.unwrap().usd > 0.0);
+    }
+
+    /// D-53's failing-first test: `flux corpus export` over a seeded events.db with two accepted
+    /// plans — one carrying `plan_source` (L-38), one in the pre-L-38 shape (no `plan_source`) —
+    /// exports exactly the ONE qualifying row, paired with its OWN turn's user instruction, in the
+    /// documented JSONL shape, and counts (never silently drops) the row it skipped.
+    #[test]
+    fn flux_corpus_export_pairs_accepted_plan_with_its_turn_and_skips_pre_l38_row() {
+        let store = EventStore::in_memory().unwrap();
+        let session = store.create_session("m").unwrap();
+
+        // Pre-L-38 accepted plan: no plan_source recorded — must be skipped and counted, not paired.
+        let t1 = store
+            .begin_turn(&session, "old-style request", "m")
+            .unwrap();
+        store
+            .record_plan_attempt(
+                &session,
+                t1,
+                flux_events::PlanAttempt {
+                    step: 0,
+                    outcome: "accepted".into(),
+                    plan_text: Some("$x = read(\"a\")".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .end_turn(&session, t1, "accepted", 1, "done", None)
+            .unwrap();
+
+        // A real L-38 accepted plan: must export, paired with THIS turn's own user_input. The
+        // instruction carries a credential-shaped token (raw `user_input` is NOT redacted at
+        // record time — only the agent's own outputs are) to exercise the export-time nl_goal scrub.
+        let t2 = store
+            .begin_turn(
+                &session,
+                "summarize the README using key AKIAABCDEFGHIJKLMNOP",
+                "m",
+            )
+            .unwrap();
+        store
+            .record_plan_attempt(
+                &session,
+                t2,
+                flux_events::PlanAttempt {
+                    step: 0,
+                    outcome: "accepted".into(),
+                    phase: Some("execute".into()),
+                    plan_source: Some("flow\n  $x = read(\"README.md\")".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .end_turn(&session, t2, "accepted", 1, "done", None)
+            .unwrap();
+
+        // Cross-check against the underlying projection (already unit-tested in flux-events) so this
+        // test's expectations about *which* row qualifies don't drift from it.
+        let (expected_rows, _) = store.corpus_rows_all().unwrap();
+        assert_eq!(
+            expected_rows.len(),
+            1,
+            "one row qualifies before export-time re-parsing: {expected_rows:?}"
+        );
+
+        let mut buf: Vec<u8> = Vec::new();
+        let summary = run_corpus_export_with(&store, "test-rev", &mut buf).unwrap();
+
+        assert_eq!(summary.exported, 1, "{summary:?}");
+        assert_eq!(
+            summary.no_plan_source, 1,
+            "the pre-L-38 row is counted, not silently dropped"
+        );
+        assert_eq!(summary.ambiguous_pairing, 0);
+        assert_eq!(summary.unparseable_at_head, 0);
+
+        let text = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "exactly one exported JSONL row: {text:?}");
+
+        let row: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(row["id"], expected_rows[0].id);
+        assert_eq!(
+            row["nl_goal"], "summarize the README using key [redacted]",
+            "the credential-shaped token is scrubbed from the raw user_input at export time"
+        );
+        assert_eq!(row["source"], "flow\n  $x = read(\"README.md\")");
+        assert_eq!(row["provenance"]["session"], session);
+        assert_eq!(row["provenance"]["turn"], t2);
+        assert_eq!(row["flux_rev"], "test-rev");
     }
 
     /// A `CliSink` with an attached model spec + pricing table prices a turn's usage through the
@@ -7887,6 +8350,60 @@ mod tests {
         let help = eval.clone().render_long_help().to_string();
         for want in ["--watch", "--report", "--tasks", "--members", "synthetic"] {
             assert!(help.contains(want), "`flux eval --help` missing {want:?}");
+        }
+    }
+
+    /// `flux plugin …` help tells the truth about the current lifecycle and follows the naming
+    /// trio (the protocol crate / a pack binary / the CLI, D-49): verified remote install from the
+    /// signed pack with `--dir` as the local-scan mode (D-47), and enforced pin/rollback over the
+    /// versioned store (D-48).
+    #[test]
+    fn plugin_help_documents_install_modes_and_pin_rollback() {
+        use clap::CommandFactory;
+        let cmd = super::Cli::command();
+        let plugin = cmd.find_subcommand("plugin").expect("plugin subcommand");
+        let top = plugin.clone().render_long_help().to_string();
+        assert!(
+            top.contains("plugin CLI"),
+            "`flux plugin --help` should name the plugin CLI leg of the trio"
+        );
+        for want in ["install", "pin", "rollback", "status", "uninstall", "skill"] {
+            assert!(top.contains(want), "`flux plugin --help` missing {want:?}");
+        }
+        let sub_help = |name: &str| {
+            plugin
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("plugin subcommand {name}"))
+                .clone()
+                .render_long_help()
+                .to_string()
+        };
+        let install = sub_help("install");
+        for want in [
+            "signed",
+            "sha256",
+            "versioned store",
+            "--dir",
+            "flux-plugin-*",
+        ] {
+            assert!(
+                install.contains(want),
+                "`flux plugin install --help` missing {want:?}"
+            );
+        }
+        let pin = sub_help("pin");
+        for want in ["versioned store", "sha256", "spawn", "rollback"] {
+            assert!(
+                pin.contains(want),
+                "`flux plugin pin --help` missing {want:?}"
+            );
+        }
+        let rollback = sub_help("rollback");
+        for want in ["offline", "versioned store"] {
+            assert!(
+                rollback.contains(want),
+                "`flux plugin rollback --help` missing {want:?}"
+            );
         }
     }
 

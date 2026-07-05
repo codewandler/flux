@@ -1937,6 +1937,28 @@ impl PluginHost {
         })
     }
 
+    /// Spawn from a **descriptor**, enforcing its recorded `sha256` first (D-48): the binary is
+    /// re-hashed (1–4 MB, sub-millisecond) and drift is a hard refusal naming the plugin, the
+    /// expected, and the actual hash — never a silent fallback. Hashless (dev/local) descriptors
+    /// spawn exactly as [`PluginHost::spawn`] always has. Every descriptor-based load path
+    /// (agent-startup discovery, `flux plugin call`, `status`) goes through here — the no-bypass
+    /// discipline, same as `Executor::dispatch`.
+    pub async fn spawn_verified(
+        system: &flux_system::System,
+        name: &str,
+        d: &PluginDescriptor,
+    ) -> Result<Self> {
+        if let Verification::HashDrift { expected, actual } = verify_descriptor(d) {
+            return Err(Error::Other(format!(
+                "plugin `{name}`: refusing to spawn — binary hash drift: the descriptor records \
+                 sha256 {expected} but `{}` hashes to {actual} (restore a verified binary with \
+                 `flux plugin install {name}` or `flux plugin pin {name} <version>`)",
+                d.program
+            )));
+        }
+        Self::spawn(system, &d.program, &d.args).await
+    }
+
     async fn write_frame(&mut self, frame: &Frame) -> Result<()> {
         use tokio::io::AsyncWriteExt;
         let mut line = serde_json::to_string(frame)?;
@@ -2220,6 +2242,51 @@ pub struct PluginDescriptor {
     /// Where this install came from, e.g. `plugins-v0.2.0` (remote installs only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// The version in place before the last version switch (`pin`, or an `install` that changed
+    /// versions) — what `flux plugin rollback` flips back to, offline, via the side-by-side
+    /// versioned store (D-48).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+}
+
+/// The outcome of re-hashing a descriptor's binary against its recorded `sha256` (D-48) — the
+/// enforcement step that turns `pin` from an advisory label into a supply-chain statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verification {
+    /// The binary on disk hashes to exactly the descriptor's recorded `sha256`.
+    Verified,
+    /// The descriptor records a `sha256` but the binary hashes differently (or cannot be read) —
+    /// a hard spawn refusal, never a silent fallback.
+    HashDrift { expected: String, actual: String },
+    /// The descriptor carries no `sha256` (a dev/local `add` or `install --dir`) — spawns as
+    /// always, visibly labeled `unverified (local)` in `ls`/`status`.
+    UnverifiedLocal,
+}
+
+/// Re-hash the binary a descriptor points at against its recorded `sha256`. A hashless descriptor
+/// is [`Verification::UnverifiedLocal`]; an unreadable binary under a recorded hash is reported as
+/// drift (the read error stands in for the actual hash) — verification never silently passes.
+pub fn verify_descriptor(d: &PluginDescriptor) -> Verification {
+    let Some(expected) = &d.sha256 else {
+        return Verification::UnverifiedLocal;
+    };
+    let actual = match std::fs::read(&d.program) {
+        Ok(bytes) => pack::sha256_hex(&bytes),
+        Err(e) => {
+            return Verification::HashDrift {
+                expected: expected.clone(),
+                actual: format!("<unreadable: {e}>"),
+            }
+        }
+    };
+    if &actual == expected {
+        Verification::Verified
+    } else {
+        Verification::HashDrift {
+            expected: expected.clone(),
+            actual,
+        }
+    }
 }
 
 /// A discovered plugin: its name (the descriptor file stem) and how to launch it.
@@ -2233,8 +2300,8 @@ pub struct DiscoveredPlugin {
 /// escape `dir` when joined. `Path::join` treats `..` and absolute components literally, so an
 /// unsanitized name like `../../config` or `/etc/passwd` would resolve outside the plugins
 /// directory — a destructive traversal for `remove_descriptor`. The single guard here covers
-/// every caller (`add`/`load`/`set_pinned`/`remove`): a valid plugin name is a bare file name with
-/// no path separators, no `..`/`.` component, and no absolute/prefix component.
+/// every caller (`add`/`load`/`remove`, and the pack store paths): a valid plugin name is a bare
+/// file name with no path separators, no `..`/`.` component, and no absolute/prefix component.
 fn descriptor_path(dir: &std::path::Path, name: &str) -> Result<std::path::PathBuf> {
     invalid_plugin_name(name)?;
     Ok(dir.join(format!("{name}.toml")))
@@ -2311,14 +2378,6 @@ pub fn load_descriptor(dir: &std::path::Path, name: &str) -> Result<Option<Plugi
     }
 }
 
-/// Set or clear the pinned version of a plugin (`flux plugin pin` / `rollback`).
-pub fn set_pinned(dir: &std::path::Path, name: &str, version: Option<String>) -> Result<()> {
-    let mut d = load_descriptor(dir, name)?
-        .ok_or_else(|| Error::Other(format!("no such plugin: {name}")))?;
-    d.pinned = version;
-    add_descriptor(dir, name, &d)
-}
-
 /// Remove a plugin descriptor (`flux plugin uninstall`); returns whether a descriptor existed
 /// (a missing name is `Ok(false)` — a clean "nothing to uninstall", not an error). Other IO
 /// failures (permissions, etc.) propagate as `Err`.
@@ -2367,7 +2426,7 @@ mod tests {
     /// A plugin name with `..`, a path separator, or an absolute component must be rejected before
     /// any filesystem op — `remove_descriptor` is a destructive `remove_file`, so an escaped name
     /// would delete a file outside the plugins dir (D-35). One guard in `descriptor_path` covers
-    /// `add` / `load` / `set_pinned` / `remove`.
+    /// `add` / `load` / `remove` (and the pack's versioned-store paths).
     #[test]
     fn descriptor_path_rejects_traversal_names() {
         let dir = std::env::temp_dir().join(format!("flux-desc-traversal-{}", std::process::id()));
@@ -2409,8 +2468,8 @@ mod tests {
                 "load_descriptor(`{name}`) must be rejected"
             );
             assert!(
-                set_pinned(&dir, name, None).is_err(),
-                "set_pinned(`{name}`) must be rejected"
+                pack::purge_store(&dir, name).is_err(),
+                "purge_store(`{name}`) must be rejected"
             );
         }
 
@@ -4138,7 +4197,7 @@ mod tests {
     }
 
     #[test]
-    fn descriptors_add_discover_pin_rollback() {
+    fn descriptors_add_and_discover() {
         let dir = std::env::temp_dir().join(format!("flux-plugins-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -4173,21 +4232,48 @@ mod tests {
         assert_eq!(found[0].name, "gitlab"); // sorted
         assert_eq!(found[0].descriptor.args, vec!["--v2"]);
 
-        set_pinned(&dir, "gitlab", Some("1.2.3".into())).unwrap();
-        assert_eq!(
-            load_descriptor(&dir, "gitlab")
-                .unwrap()
-                .unwrap()
-                .pinned
-                .as_deref(),
-            Some("1.2.3")
-        );
-        set_pinned(&dir, "gitlab", None).unwrap(); // rollback clears the pin
-        assert!(load_descriptor(&dir, "gitlab")
-            .unwrap()
-            .unwrap()
-            .pinned
-            .is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-48: `verify_descriptor` — the three verification states. Hashless → unverified-local;
+    /// matching hash → verified; mismatching hash (or unreadable binary) → drift, never a pass.
+    #[test]
+    fn verify_descriptor_reports_verified_drift_and_unverified() {
+        let dir = std::env::temp_dir().join(format!("flux-verify-desc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("flux-plugin-alpha");
+        std::fs::write(&bin, b"alpha-bytes").unwrap();
+        let good = pack::sha256_hex(b"alpha-bytes");
+
+        let hashless = PluginDescriptor {
+            program: bin.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        assert_eq!(verify_descriptor(&hashless), Verification::UnverifiedLocal);
+
+        let verified = PluginDescriptor {
+            sha256: Some(good.clone()),
+            ..hashless.clone()
+        };
+        assert_eq!(verify_descriptor(&verified), Verification::Verified);
+
+        // Tamper the binary → drift naming both hashes.
+        std::fs::write(&bin, b"tampered-bytes").unwrap();
+        match verify_descriptor(&verified) {
+            Verification::HashDrift { expected, actual } => {
+                assert_eq!(expected, good);
+                assert_eq!(actual, pack::sha256_hex(b"tampered-bytes"));
+            }
+            other => panic!("expected drift, got {other:?}"),
+        }
+
+        // A recorded hash over a missing binary is drift too (never a silent pass).
+        std::fs::remove_file(&bin).unwrap();
+        assert!(matches!(
+            verify_descriptor(&verified),
+            Verification::HashDrift { .. }
+        ));
 
         std::fs::remove_dir_all(&dir).ok();
     }

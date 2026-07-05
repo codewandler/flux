@@ -15,6 +15,17 @@ cargo clippy --all-targets -- -D warnings
 lifecycle (install → configure → call), the host-does-all-IO invariant, the full host-capability set,
 and the authoring rules.
 
+## Naming: three things read as "flux plugin"
+
+| Say | Meaning |
+| --- | --- |
+| **the plugin protocol crate** — `flux-plugin` | `crates/flux-plugin`, the `flux.plugin.v1` host+guest library |
+| **the plugin pack** / **a plugin binary** — `flux-plugin-<name>` | this workspace and its released binaries; release series `plugins-v<version>` |
+| **the plugin CLI** — `flux plugin …` (with the space) | the lifecycle surface in `flux-cli`: `install` / `ls` / `status` / `call` / `pin` / `rollback` / `uninstall` / `skill` |
+
+Rule of thumb: hyphen with no suffix = the crate; hyphen with a name = a pack binary; a space = the
+CLI. (Design rationale: [plugin distribution — "Naming: the trio"](../docs/designs/plugin-distribution.md).)
+
 ## How a plugin reaches the outside world
 
 Plugins do **no privileged IO of their own**. Every side effect is a host-capability callback over the
@@ -86,16 +97,21 @@ flux plugin install --all                # the whole pack
 The release's `plugins-index.json` is minisign-verified against the public key embedded in flux
 (fail-closed — there is no bypass flag), and every archive's sha256 is checked against the verified
 index before it is unpacked into the versioned store `~/.flux/plugins/bin/<name>/<version>/`.
-`flux plugin pin <name> <version>` / `flux plugin rollback <name>` set/clear a version pin,
-`flux plugin uninstall <name>` removes a plugin, and `flux plugin status [<name>]` inspects
-liveness + declared surface.
+`flux plugin pin <name> <version>` is an enforced version switch: the version is fetched through
+the same signed-index + checksum path if absent (already-stored versions repoint offline), and the
+descriptor's recorded sha256 is re-checked at every spawn — drift refuses to run.
+`flux plugin rollback <name>` flips back to the previously active version, offline and instant
+(the side-by-side versioned store keeps it on disk; a second `rollback` flips forward again).
+`flux plugin uninstall <name>` removes a plugin (`--purge` also deletes its versioned store), and
+`flux plugin status [<name>]` inspects liveness + declared surface.
 
-**Dev-local builds** — build the binaries, then register them (local, unverified — no version/hash
-recorded) as descriptors under `~/.flux/plugins/<name>.toml`:
+**Dev-local builds** (contributor / fallback path) — build the binaries, then register them (local,
+unverified — no version/hash recorded) as descriptors under `~/.flux/plugins/<name>.toml`. From the
+repo root:
 
 ```
-cd plugins && cargo build --release      # → plugins/target/release/flux-plugin-<name>
-flux plugin install --dir plugins/target/release   # register every built flux-plugin-* binary
+(cd plugins && cargo build --release)    # → plugins/target/release/flux-plugin-<name>
+flux plugin install --dir                # register every built flux-plugin-* binary (default dir: plugins/target/release)
 #  …or one at a time:
 flux plugin add gitlab  /abs/path/to/flux-plugin-gitlab
 flux plugin ls                           # list installed plugins

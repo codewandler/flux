@@ -1617,6 +1617,10 @@ fn build_ast_grammar() -> String {
   {{\"kind\":\"each\",\"in\":{{\"kind\":\"var\",\"name\":\"files\"}},\"as\":\"f\",\"body\":[\n\
     {{\"kind\":\"bind\",\"name\":\"text\",\"value\":{{\"kind\":\"call\",\"op\":\"read\",\"args\":[{{\"kind\":\"var\",\"name\":\"f\"}}]}}}}\n\
   ],\"collect\":\"all\"}}\n\
+]}}\n\
+\nExample for \"write release notes with a multi-line message\" (a string literal containing a newline — the text arm below spells this verbatim with `\"\"\"`, never with a `\\n` escape):\n\
+{{\"body\":[\n\
+  {{\"kind\":\"call\",\"op\":\"write\",\"args\":[{{\"kind\":\"lit\",\"value\":\"notes.txt\"}},{{\"kind\":\"lit\",\"value\":\"Release 1.2\\n\\n- Fix crash on startup\\n- Improve logging\"}}]}}\n\
 ]}}",
         node_kinds = crate::schema::node_kind_catalog(),
         artifact_types = crate::prelude::PRELUDE_TYPES.join(", "),
@@ -1661,6 +1665,7 @@ Statements:\n\
 - `return <expr>` — the flow's result.\n\
 - `@json {{\"kind\":...}}` — single-line compact-JSON escape for any node with no text spelling.\n\
 Expressions: `$var` (a bound symbol), `$var.field.path` (field access), JSON literals (`\"s\"`, `3`, `[\"a\"]`, `{{\"k\":\"v\"}}`), `op(<arg>, ...)` (inline call), `fmt(\"...{{var}}...\")` (string interpolation), and value templates with dynamic leaves: `{{ key: <expr>, ... }}` / `[ <expr>, ... ]`.\n\
+A string containing a newline can be written `\"\"\"<verbatim text, no escaping>\"\"\"` instead of `\"...\\n...\"` — content runs to the NEXT literal `\"\"\"`, so never put `\"\"\"` or a trailing `\"` inside it. Use this for any multi-line payload (file content, diffs, long messages) instead of escaping newlines.\n\
 Call a multi-param op with ONE object argument naming each parameter — `write({{\"path\":\"out.txt\",\"content\":\"hi\"}})`, or `write({{ path: \"out.txt\", content: $body }})` when a value is dynamic.\n\
 \nNode semantics (each maps to a statement/expression above; anything else spells as `@json`):\n\
 {node_kinds}Independent reads/calls over a KNOWN set run CONCURRENTLY with `parallel` (each branch binds its result to its name) — `each` runs strictly in order, so keep it for steps that depend on each other, and for iterating a DYNAMIC list value (`parallel` branches are static). Prefer `each` over `repeat` for list iteration.\n\

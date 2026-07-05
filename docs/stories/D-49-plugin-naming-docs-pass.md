@@ -2,8 +2,7 @@
 id: D-49
 title: Plugin naming + docs truth pass — the crate / the pack / the CLI
 pillar: Core
-status: ready
-priority: 10
+status: done
 epic: plugin-platform-hardening
 design: docs/designs/plugin-distribution.md
 note: "docs-truth pass (C-16/L-19 pattern): apply the canonical trio vocabulary — the plugin protocol crate (`flux-plugin`) vs the plugin pack (`flux-plugin-<name>` binaries) vs the plugin CLI (`flux plugin …`) — and document the remote install path once it ships"
@@ -19,27 +18,39 @@ surface (`flux plugin …`). Apply the canonical vocabulary decided in
 reads, and make the install docs tell the truth once the remote path (D-47) exists.
 
 ## Acceptance
-- [ ] The trio vocabulary is applied consistently: **the plugin protocol crate** (`flux-plugin`),
+- [x] The trio vocabulary is applied consistently: **the plugin protocol crate** (`flux-plugin`),
       **the plugin pack / a plugin binary** (`flux-plugin-<name>`), **the plugin CLI**
       (`flux plugin …`, always with the space). Rule of thumb documented once (hyphen-no-suffix =
       crate; hyphen-with-name = pack binary; space = CLI) and linked from the design doc.
-- [ ] `README.md` "Install" gains an "Install plugins" subsection: the remote one-liner
+- [x] `README.md` "Install" gains an "Install plugins" subsection: the remote one-liner
       (`flux plugin install <name>`), what verification the user gets (signed index + checksums,
       one sentence), and the source fallback (`cd plugins && cargo build --release &&
       flux plugin install --dir`).
-- [ ] `plugins/README.md` "Installing + invoking plugins" leads with the remote path and demotes the
+- [x] `plugins/README.md` "Installing + invoking plugins" leads with the remote path and demotes the
       source build to the contributor/fallback path; `plugins/AUTHORING.md` states where a new
       plugin's binary ends up (pack release) and what the release channel is.
-- [ ] `docs/usage.md` and `docs/architecture.md` plugin mentions audited against the trio; the
+- [x] `docs/usage.md` and `docs/architecture.md` plugin mentions audited against the trio; the
       release-process doc (wherever D-46 documents it) carries the "never hand-push a `plugins-v*`
       tag" warning.
-- [ ] `flux plugin --help` and its subcommand help strings follow the trio and describe the
+- [x] `flux plugin --help` and its subcommand help strings follow the trio and describe the
       *current* semantics (remote install, `--dir`, enforced pin/rollback once D-48 lands) — help
       text asserted by the existing CLI help tests where present.
-- [ ] Docs-only + help-string-only change: no behavioral code paths touched; gate green.
+- [x] Docs-only + help-string-only change: no behavioral code paths touched; gate green.
 
 ## Progress
-- (not started)
+- 2026-07-05 — implemented in one pass. Trio rule-of-thumb documented in `plugins/README.md`
+  ("Naming: three things read as 'flux plugin'") and linked from the design doc's "Naming: the
+  trio"; `README.md` Install gained the "Install plugins" subsection; `plugins/AUTHORING.md` gained
+  "## Releasing: where your binary ends up" (pack release channel + the never-hand-push-a-
+  `plugins-v*`-tag warning); `docs/usage.md`/`docs/architecture.md` plugin mentions trio-fied;
+  `flux plugin` top-level about now names the plugin CLI + current lifecycle. D-48 had landed, so
+  pin/rollback is documented as enforced (sha256 re-checked at every spawn), verified against
+  `run_plugin_in`/`pack::pin`/`pack::rollback`. New CLI help test
+  `plugin_help_documents_install_modes_and_pin_rollback` asserts install modes + pin/rollback truth.
+  Docs-truth catch: the acceptance's literal fallback one-liner (`cd plugins && … && flux plugin
+  install --dir`) would scan the wrong dir (`--dir`'s default resolves against the cwd), so docs use
+  the subshell form `(cd plugins && cargo build --release) && flux plugin install --dir`. Full root
+  gate + plugins fmt green.
 
 ## Notes
 - Depends on [D-47](D-47-remote-plugin-install.md) (docs must not promise an unshipped install

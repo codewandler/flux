@@ -1876,6 +1876,40 @@ mod tests {
         flux_lang::parse::parse(&redacted).expect("redacted plan_source still parses");
     }
 
+    /// L-39 + C-22: the multi-line `"""…"""` spelling survives redaction too — the same
+    /// "redacted-parseable" invariant `redacted_plan_source_still_parses` proves for the escaped
+    /// single-line spelling, now proven for a payload long enough that `format` chooses the
+    /// verbatim multi-line form (the shape the fine-tune's edit-payload failure mode was hitting).
+    #[test]
+    fn redacted_multiline_string_still_parses() {
+        const SECRET: &str = "supersecretbearervalue12345";
+        let ast: flux_lang::ast::DraftAst = serde_json::from_value(json!({
+            "body": [{
+                "kind": "bind", "name": "out",
+                "value": { "kind": "call", "op": "bash",
+                           "args": [{ "kind": "lit",
+                                      "value": format!(
+                                          "line one\ncurl -H 'Authorization: Bearer {SECRET}'\nline three"
+                                      ) }] }
+            }]
+        }))
+        .unwrap();
+        let source = flux_lang::format::format(&ast);
+        assert!(
+            source.contains("\"\"\""),
+            "fixture uses the multi-line spelling: {source}"
+        );
+        assert!(source.contains(SECRET), "fixture carries the secret");
+        let redactor = flux_secret::Redactor::new();
+        redactor.add_secret(SECRET);
+        let redacted = redactor.redact(&source);
+        assert!(
+            !redacted.contains(SECRET),
+            "the secret is scrubbed: {redacted}"
+        );
+        flux_lang::parse::parse(&redacted).expect("redacted multi-line string still parses");
+    }
+
     use crate::runtime::execute_flow;
     use flux_core::{Chunk, ContentBlock, StopReason};
     use flux_provider::{ChunkStream, Request};

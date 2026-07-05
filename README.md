@@ -61,6 +61,19 @@ cargo install --git https://github.com/codewandler/flux flux-cli
 Prebuilt binaries, installers, and checksums are attached to every
 [tagged release](https://github.com/codewandler/flux/releases/latest).
 
+**Install plugins** — the integration plugins (GitLab, Slack, Kubernetes, SQL, …) ship separately
+as the signed **plugin pack** (`plugins-v*` releases), installed by the plugin CLI:
+
+```bash
+flux plugin install gitlab        # one plugin (or gitlab@<version>); --all for the whole pack
+```
+
+The install is verified end-to-end: the release's index is minisign-checked against the public key
+embedded in flux, and every archive's sha256 is checked against that index — fail-closed. Fallback
+from a source tree (local, unverified):
+`(cd plugins && cargo build --release) && flux plugin install --dir`. See
+[plugins/README.md](plugins/README.md).
+
 ---
 
 ## Quickstart

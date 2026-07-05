@@ -1,6 +1,17 @@
 # flux-planner: from trained-and-usable to shippable
 
-**Status:** designed 2026-07-05 · epic spanning flux (L-39, L-40, D-53) and flux-model (M-11..M-16)
+**Status:** designed 2026-07-05; **all non-training work SHIPPED the same day** —
+flux: L-39 (multi-line strings, `"""` verbatim blocks, 1000-seed roundtrip green) +
+D-53 (`flux corpus export`) implemented, full both-workspace gate green, UNCOMMITTED;
+flux-model: M-11 corpus v2 done (421 base / 132 sessions / +419 paraphrase variants =
+840 training rows, ALL at post-L-39 canonicalization — 345 rows multi-line; escaped
+spelling measured +4.1% tokens over multi-line), M-12 data+harness done (386 repair
+triples, with-one-repair metric), M-13 licenses verified (1.5B/7B apache-2.0; 3B
+non-commercial), M-14 re-canonicalize done, M-15 benchmark runner done — committed
+through flux-model `92775c1`. **Remaining work is exclusively training-gated**
+(M-13 arms → M-12 ablation → M-14 retrain → M-15 gate → L-40 + M-16); training awaits
+user approval (+ ~20 GB disk headroom for the 7B — root disk is chronically ≥99%).
+· epic spanning flux (L-39, L-40, D-53) and flux-model (M-11..M-16)
 **Prior art:** `docs/designs/plan-corpus-and-small-model.md` (the corpus/training initiative this
 extends; its Phase 3 shipped `ollama run flux-planner` on 2026-07-04) · L-20 emission A/B
 (`docs/designs/flux-lang-emission-ab.md`: json 93% vs text 60% first-emission, keep-json) ·

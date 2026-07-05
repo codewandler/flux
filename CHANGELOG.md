@@ -6,6 +6,77 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **Enforced pin/rollback — spawn-time hash verification over the versioned store (D-48).**
+  `flux plugin pin`/`rollback` stop being advisory labels and become supply-chain statements
+  (trust-ladder step 5, `docs/designs/plugin-distribution.md`). `pin <name> <version>` is a
+  verified version switch: an already-stored version repoints **offline** (no download), anything
+  else rides the same signed-index + checksum path as `install`; the descriptor records the
+  binary's `sha256` + `version` and remembers the replaced version in the new `previous` field.
+  `rollback <name>` flips to `previous` — offline and instant by construction (`pack::rollback`
+  takes no fetcher), with current/previous swapping so a second rollback returns; its old
+  clear-the-advisory-pin semantics (and `set_pinned`) are gone, a clean cutover. Enforcement:
+  every descriptor-based spawn (`agent-startup discovery`, `flux plugin call`, `status`) goes
+  through the new `PluginHost::spawn_verified`, which re-hashes a `sha256`-carrying descriptor's
+  binary (sub-millisecond) and **refuses drift** naming plugin + expected + actual hash — an
+  unreadable binary under a recorded hash is drift too, never a silent pass; hashless dev
+  descriptors spawn as before, labeled `unverified (local)`. The offline paths are anchored by a
+  hash **sidecar** written beside each stored binary at verified-unpack time — a store entry
+  without one (pre-D-48) is a clean refusal rather than a re-hash that would bless tampered bytes.
+  `flux plugin status` (and `ls`, which previously trusted the descriptor field and could say
+  `verified` over tampered bytes) now show re-hashed verification — `verified` / `hash drift` /
+  `unverified (local)` — plus a loud-but-nonfatal manifest-vs-descriptor version-agreement
+  warning; `uninstall --purge` also removes the plugin's versioned store (traversal-guarded,
+  and it cleans orphaned store dirs).
+- **Multi-line string literals in Flux-Lang — `"""…"""` (L-39).** The fine-tune's dominant failure
+  mode (and a human-authoring pain) was representational: a multi-KB edit payload had to be ONE
+  escaped single-line JSON string, and models (the 3B fine-tune always, Sonnet sometimes) break such
+  strings with literal newlines. The text surface now accepts a triple-quoted spelling anywhere a
+  JSON string literal can appear — bind values, call args, string leaves at any depth inside
+  pure-JSON `Lit` objects/arrays, value-template leaves, `fmt` templates, `assert` messages, `ctx`
+  purposes, `route` case labels — implemented as a lexer-level desugar in `parse::preprocess`
+  (content is **fully verbatim** to the next literal `"""`: no escapes, no comment stripping, no
+  dedent), so every downstream parser is unchanged and the Lit-vs-template disjointness rule is
+  untouched. `format::format` emits the spelling for any string containing a newline unless one of
+  three narrow safety guards forces the escaped fallback — embedded `"""`, trailing `"`, or an
+  embedded `\r` (the `\r` guard closes a real `parse(format(A)) != A` violation against
+  `preprocess`'s CRLF normalization, caught in cross-session review of the in-progress diff and
+  fixed failing-first). `format_compact` deliberately never emits it (the single-line display
+  variant stays single-line). The planner text grammar teaches the spelling with a fourth worked
+  example; the L-18 roundtrip property suite (1000 seeds × 43 node kinds) now exercises it incl.
+  the unsafe-shape fallbacks; the grammar is specified in `crates/flux-lang/docs/syntax.md`
+  § "Multi-line strings"; and a redaction test proves a secret scrubbed mid-block leaves the text
+  parseable (the L-38/C-22 invariant).
+- **`flux corpus export` — mine NL→Flux-Lang corpus rows from events.db (D-53).** The L-38 hedge
+  cashed out: every accepted plan since v0.2.15 records a parseable `plan_source`, and the exporter
+  pairs each one with the user turn that produced it, emitting corpus-shaped JSONL
+  (`{id, nl_goal, source, provenance{session, turn}, flux_rev}`) compatible with flux-model's
+  validation ladder — zero LLM cost per row, compounding with real flux usage. A new pure
+  `flux_events::corpus_rows` projection does the pairing exactly (a `PlanAttempted` is recorded
+  scoped to its turn's `TurnStarted.global_seq`, so no conversation-walk heuristic),
+  `EventStore::corpus_rows_all()` folds it over every stream (a sub-agent child's accepted plans
+  are independent training examples, deliberately not the cost rollups' double-count-guarded
+  aggregation), and skip counters (`no_plan_source`, `ambiguous_pairing`, `unparseable_at_head`)
+  go to stderr while rows go to stdout or `--out <file>`. `plan_source` is already redacted at
+  record time; `nl_goal` (raw user input, which record time never redacts) gets an export-time
+  credential-shaped-token scrub (`AKIA…`/`sk-…`/`ghp_…`/JWT patterns) independent of any
+  per-session secret registry. `flux_rev` is the exporting binary's crate version — the anchor
+  honestly available wherever an installed binary runs.
+- **D-49** — Plugin naming + docs truth pass — the crate / the pack / the CLI: the canonical trio
+  vocabulary (the plugin protocol crate `flux-plugin` / a pack binary `flux-plugin-<name>` / the
+  plugin CLI `flux plugin …`) is now documented once in `plugins/README.md` (rule of thumb:
+  hyphen-no-suffix = crate, hyphen-with-name = pack binary, space = CLI) and applied across
+  `README.md`, `docs/usage.md`, `docs/architecture.md`, and the `flux plugin` help strings.
+  `README.md` Install gained an "Install plugins" subsection (verified remote one-liner + source
+  fallback); `plugins/AUTHORING.md` gained "Releasing: where your binary ends up" (the
+  `plugins-v*` pack channel + the never-hand-push-a-`plugins-v*`-tag warning); pin/rollback docs
+  updated from advisory to D-48's enforced semantics. Docs fix along the way: the source-fallback
+  examples now use `(cd plugins && cargo build --release) && flux plugin install --dir` — the
+  chained `cd` form would have scanned the wrong directory, since bare `--dir`'s default resolves
+  against the cwd. New help test `plugin_help_documents_install_modes_and_pin_rollback` asserts
+  the CLI help stays truthful. Docs + help strings only; no behavioral code paths touched.
+
 ## [0.2.16] - 2026-07-04
 
 ### Added

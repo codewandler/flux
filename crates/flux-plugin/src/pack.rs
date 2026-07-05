@@ -131,11 +131,33 @@ fn exe_name(plugin_name: &str, target: &str) -> String {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+/// Hex-encoded SHA-256 — the one hash spelled everywhere in the pack ladder (index entries,
+/// descriptors, store sidecars, spawn-time verification).
+pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+/// The versioned-store location of one plugin version's binary:
+/// `<store_root>/<name>/<version>/flux-plugin-<name>[.exe]`.
+pub fn stored_binary_path(store_root: &Path, name: &str, version: &str, target: &str) -> PathBuf {
+    store_root
+        .join(name)
+        .join(version)
+        .join(exe_name(name, target))
+}
+
+/// The sidecar file recording a stored binary's sha256, written at (verified) unpack time —
+/// what lets `pin` repoint to an already-stored version and `rollback` flip to `previous`
+/// **offline** without re-fetching the signed index and without blessing unverified bytes.
+fn sidecar_path(binary: &Path) -> PathBuf {
+    let name = binary
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    binary.with_file_name(format!("{name}.sha256"))
 }
 
 // ---------------------------------------------------------------------------
@@ -526,6 +548,20 @@ async fn install_one(
     let windows = is_windows_target(req.target);
     let binary_bytes = unpack_single_binary(&archive_bytes, windows, &exe, &dest_dir)?;
     let binary_sha256 = sha256_hex(&binary_bytes);
+    // Record the verified binary's hash beside it (D-48): the store sidecar is what makes a later
+    // `pin` to this version, or a `rollback` onto it, an offline repoint instead of a re-fetch.
+    std::fs::write(sidecar_path(&dest_path), &binary_sha256).map_err(Error::Io)?;
+
+    // A version *switch* remembers what it replaced (D-48): `rollback` flips back to `previous`
+    // offline. A fresh install (or one replacing an unversioned local descriptor) has nothing in
+    // the store to roll back to, so any earlier `previous` is carried forward unchanged.
+    let (prior_pinned, prior_version, prior_previous) = existing
+        .map(|d| (d.pinned, d.version, d.previous))
+        .unwrap_or_default();
+    let previous = match prior_version {
+        Some(v) if v != entry.version => Some(v),
+        _ => prior_previous,
+    };
 
     crate::add_descriptor(
         req.descriptors_dir,
@@ -533,10 +569,11 @@ async fn install_one(
         &crate::PluginDescriptor {
             program: dest_path.to_string_lossy().into_owned(),
             args: Vec::new(),
-            pinned: existing.and_then(|d| d.pinned),
+            pinned: prior_pinned,
             version: Some(entry.version.clone()),
             sha256: Some(binary_sha256.clone()),
             source: Some(tag.to_string()),
+            previous,
         },
     )?;
 
@@ -548,6 +585,182 @@ async fn install_one(
         program: dest_path,
         already_installed: false,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Pin / rollback / purge — the D-48 verified version switches over the store
+// ---------------------------------------------------------------------------
+
+/// The result of a [`pin`]: what the descriptor now points at, and how it got there.
+#[derive(Debug, Clone)]
+pub struct PinOutcome {
+    pub name: String,
+    pub version: String,
+    pub sha256: String,
+    /// The version this pin replaced (now the descriptor's `previous`), if any.
+    pub previous: Option<String>,
+    /// `false` when the version was already in the versioned store with a recorded hash —
+    /// the pin was an offline repoint, nothing downloaded.
+    pub fetched: bool,
+}
+
+/// `flux plugin pin <name> <version>` (D-48): a **verified version switch**, not an advisory
+/// label. Ensures the version is present in the versioned store — an already-stored version with
+/// a hash sidecar is repointed **offline**; anything else goes through the same signed-index +
+/// checksum path as `install` (`install_many`), so a version the index does not offer fails
+/// cleanly there. The descriptor is repointed at the stored binary with its `sha256` + `version`
+/// recorded (enforced at every spawn by [`crate::PluginHost::spawn_verified`]) and the replaced
+/// version remembered in `previous` for [`rollback`]. Operator-set `args` survive the switch.
+///
+/// The offline path stamps `source` as `plugins-v<version>` — faithful because the pack is
+/// released lockstep (a stored `<name>/<version>` can only have come from that release tag).
+pub async fn pin(req: &InstallRequest<'_>, name: &str, version: &str) -> Result<PinOutcome> {
+    crate::invalid_plugin_name(name)?;
+    let prior = crate::load_descriptor(req.descriptors_dir, name)?;
+    let (prior_args, prior_version, prior_previous) = prior
+        .map(|d| (d.args, d.version, d.previous))
+        .unwrap_or_default();
+
+    let stored = stored_binary_path(req.store_root, name, version, req.target);
+    let sidecar = sidecar_path(&stored);
+    let (program, actual_version, sha256, source, fetched) =
+        if stored.is_file() && sidecar.is_file() {
+            let sha = std::fs::read_to_string(&sidecar)
+                .map_err(Error::Io)?
+                .trim()
+                .to_string();
+            (
+                stored,
+                version.to_string(),
+                sha,
+                format!("plugins-v{version}"),
+                false,
+            )
+        } else {
+            let installed = install_many(req, &[format!("{name}@{version}")], false).await?;
+            let p = installed.into_iter().next().ok_or_else(|| {
+                Error::Other(format!("install returned no result for `{name}@{version}`"))
+            })?;
+            (p.program, p.version, p.sha256, p.source, true)
+        };
+
+    let previous = match &prior_version {
+        Some(v) if v != &actual_version => Some(v.clone()),
+        _ => prior_previous,
+    };
+    crate::add_descriptor(
+        req.descriptors_dir,
+        name,
+        &crate::PluginDescriptor {
+            program: program.to_string_lossy().into_owned(),
+            args: prior_args,
+            pinned: Some(actual_version.clone()),
+            version: Some(actual_version.clone()),
+            sha256: Some(sha256.clone()),
+            source: Some(source),
+            previous: previous.clone(),
+        },
+    )?;
+    Ok(PinOutcome {
+        name: name.to_string(),
+        version: actual_version,
+        sha256,
+        previous,
+        fetched,
+    })
+}
+
+/// The result of a [`rollback`]: the flip that happened.
+#[derive(Debug, Clone)]
+pub struct RollbackOutcome {
+    pub name: String,
+    /// The version rolled back *from* (now the descriptor's `previous`, so a second rollback
+    /// flips forward again).
+    pub from: Option<String>,
+    pub to: String,
+    pub sha256: String,
+}
+
+/// `flux plugin rollback <name>` (D-48): repoint the descriptor at its `previous` version —
+/// **offline and instant** by construction (this function has no fetcher: the side-by-side
+/// versioned store plus the hash sidecar recorded at install time are all it reads). The current
+/// and previous versions swap, so `rollback` twice is a round trip. A missing sidecar (a store
+/// entry from before D-48) is a clean refusal, not a re-hash — recording whatever bytes happen to
+/// be on disk would bless a tampered binary.
+///
+/// Clean cutover: `rollback` used to *clear the advisory pin*; it now flips versions. The
+/// no-`previous` error says so explicitly.
+pub fn rollback(
+    descriptors_dir: &Path,
+    store_root: &Path,
+    target: &str,
+    name: &str,
+) -> Result<RollbackOutcome> {
+    let d = crate::load_descriptor(descriptors_dir, name)?
+        .ok_or_else(|| Error::Other(format!("no such plugin: {name}")))?;
+    let Some(prev) = d.previous.clone() else {
+        return Err(Error::Other(format!(
+            "plugin `{name}` has no previous version recorded — `rollback` flips to the version \
+             in place before the last version switch (it no longer clears the advisory pin); \
+             switch versions explicitly with `flux plugin pin {name} <version>`"
+        )));
+    };
+    let stored = stored_binary_path(store_root, name, &prev, target);
+    if !stored.is_file() {
+        return Err(Error::Other(format!(
+            "previous version {prev} of `{name}` is not in the versioned store ({}) — nothing to \
+             flip to offline; re-fetch it with `flux plugin pin {name} {prev}`",
+            stored.display()
+        )));
+    }
+    let sha256 = std::fs::read_to_string(sidecar_path(&stored))
+        .map(|s| s.trim().to_string())
+        .map_err(|_| {
+            Error::Other(format!(
+                "the versioned store has no recorded hash for `{name}` {prev} (installed before \
+                 D-48's sidecars) — refusing to bless unverified bytes offline; re-record it with \
+                 `flux plugin pin {name} {prev}` (verified fetch)"
+            ))
+        })?;
+
+    let from = d.version.clone();
+    crate::add_descriptor(
+        descriptors_dir,
+        name,
+        &crate::PluginDescriptor {
+            program: stored.to_string_lossy().into_owned(),
+            args: d.args,
+            pinned: Some(prev.clone()),
+            version: Some(prev.clone()),
+            sha256: Some(sha256.clone()),
+            source: Some(format!("plugins-v{prev}")),
+            previous: match &from {
+                Some(v) if v != &prev => Some(v.clone()),
+                _ => None,
+            },
+        },
+    )?;
+    Ok(RollbackOutcome {
+        name: name.to_string(),
+        from,
+        to: prev,
+        sha256,
+    })
+}
+
+/// Remove a plugin's entire versioned-store directory (`flux plugin uninstall --purge`).
+/// Returns whether anything existed. The name is sanitized like every descriptor path (D-35) —
+/// this is a destructive `remove_dir_all`, so a traversal name must be rejected before any
+/// filesystem op.
+pub fn purge_store(store_root: &Path, name: &str) -> Result<bool> {
+    crate::invalid_plugin_name(name)?;
+    let dir = store_root.join(name);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).map_err(Error::Io)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 #[cfg(test)]
@@ -750,6 +963,230 @@ mod tests {
             store_root,
             target: TEST_TARGET,
         }
+    }
+
+    /// A second signed release (same keypair — one `InstallRequest.public_key` verifies both) so
+    /// pin/rollback tests can switch between side-by-side store versions.
+    fn versioned_release(
+        kp: &minisign::KeyPair,
+        version: &str,
+        contents: &[u8],
+    ) -> (Vec<u8>, String, Vec<u8>, String) {
+        let archive = tar_xz_fixture("flux-plugin-alpha", contents);
+        let asset_name = format!("flux-plugin-alpha-{version}-x86_64-unknown-linux-gnu.tar.xz");
+        let index_json = serde_json::json!({
+            "schema": 1,
+            "pack_version": version,
+            "protocol": crate::PROTOCOL,
+            "released_at": "2026-07-03T00:00:00Z",
+            "plugins": {
+                "alpha": {
+                    "version": version,
+                    "artifacts": {
+                        TEST_TARGET: {
+                            "asset": asset_name,
+                            "sha256": sha256_hex(&archive),
+                            "size": archive.len(),
+                        }
+                    }
+                }
+            }
+        });
+        let index_bytes = serde_json::to_vec_pretty(&index_json).unwrap();
+        let sig = sign(kp, &index_bytes);
+        (index_bytes, sig, archive, asset_name)
+    }
+
+    /// D-48 acceptance: `pin` is a verified version switch — an already-stored version is
+    /// repointed OFFLINE (no re-fetch), the hash + `previous` are recorded, and a version the
+    /// index does not offer fails cleanly.
+    #[tokio::test]
+    async fn pin_switches_descriptor_to_stored_version() {
+        let kp = test_keypair();
+        let (idx8, sig8, arc8, asset8) = versioned_release(&kp, "0.8.0", b"alpha-bytes-0.8.0");
+        let (idx9, sig9, arc9, asset9) = versioned_release(&kp, "0.9.0", b"alpha-bytes-0.9.0");
+        let fetcher = MockFetcher::new(vec!["plugins-v0.8.0", "plugins-v0.9.0"])
+            .with_asset("plugins-v0.8.0", "plugins-index.json", idx8)
+            .with_asset(
+                "plugins-v0.8.0",
+                "plugins-index.json.minisig",
+                sig8.into_bytes(),
+            )
+            .with_asset("plugins-v0.8.0", &asset8, arc8)
+            .with_asset("plugins-v0.9.0", "plugins-index.json", idx9)
+            .with_asset(
+                "plugins-v0.9.0",
+                "plugins-index.json.minisig",
+                sig9.into_bytes(),
+            )
+            .with_asset("plugins-v0.9.0", &asset9, arc9);
+        let (descriptors_dir, store_root) = scratch("pin");
+        let pk = kp.pk.to_base64();
+        let r = req(&fetcher, &descriptors_dir, &store_root, &pk);
+
+        // Plain install resolves the newest release (0.9.0) — and records the hash sidecar.
+        install_many(&r, &["alpha".to_string()], false)
+            .await
+            .unwrap();
+        let stored9 = stored_binary_path(&store_root, "alpha", "0.9.0", TEST_TARGET);
+        assert_eq!(
+            std::fs::read_to_string(sidecar_path(&stored9)).unwrap(),
+            sha256_hex(b"alpha-bytes-0.9.0"),
+            "install records the hash sidecar beside the stored binary"
+        );
+
+        // Pin to 0.8.0 — not in the store yet, so it goes through the verified fetch path.
+        let out = pin(&r, "alpha", "0.8.0").await.unwrap();
+        assert!(out.fetched, "0.8.0 was not in the store — fetched");
+        assert_eq!(out.previous.as_deref(), Some("0.9.0"));
+        let d = crate::load_descriptor(&descriptors_dir, "alpha")
+            .unwrap()
+            .unwrap();
+        let stored8 = stored_binary_path(&store_root, "alpha", "0.8.0", TEST_TARGET);
+        assert_eq!(d.program, stored8.to_string_lossy());
+        assert_eq!(d.version.as_deref(), Some("0.8.0"));
+        assert_eq!(d.pinned.as_deref(), Some("0.8.0"));
+        assert_eq!(
+            d.sha256.as_deref(),
+            Some(sha256_hex(b"alpha-bytes-0.8.0").as_str())
+        );
+        assert_eq!(d.previous.as_deref(), Some("0.9.0"));
+
+        // Pin back to 0.9.0 — already stored side-by-side: an OFFLINE repoint, nothing re-fetched.
+        let before = fetcher.fetch_count("plugins-v0.9.0", &asset9);
+        let out = pin(&r, "alpha", "0.9.0").await.unwrap();
+        assert!(!out.fetched, "0.9.0 was in the store — offline repoint");
+        assert_eq!(
+            fetcher.fetch_count("plugins-v0.9.0", &asset9),
+            before,
+            "the archive was not re-downloaded for an offline pin"
+        );
+        let d = crate::load_descriptor(&descriptors_dir, "alpha")
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.program, stored9.to_string_lossy());
+        assert_eq!(d.version.as_deref(), Some("0.9.0"));
+        assert_eq!(d.pinned.as_deref(), Some("0.9.0"));
+        assert_eq!(
+            d.sha256.as_deref(),
+            Some(sha256_hex(b"alpha-bytes-0.9.0").as_str())
+        );
+        assert_eq!(d.previous.as_deref(), Some("0.8.0"));
+
+        // A version no release offers fails cleanly (nothing repointed).
+        let err = pin(&r, "alpha", "0.7.0").await.unwrap_err().to_string();
+        assert!(
+            err.contains("0.7.0"),
+            "clean error names the version: {err}"
+        );
+        let d = crate::load_descriptor(&descriptors_dir, "alpha")
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.version.as_deref(), Some("0.9.0"), "descriptor untouched");
+
+        std::fs::remove_dir_all(descriptors_dir.parent().unwrap()).ok();
+    }
+
+    /// D-48 acceptance: `rollback` flips to `previous` offline — by construction (no fetcher in
+    /// scope), reading only the side-by-side store + hash sidecars. Current/previous swap, so a
+    /// second rollback is the round trip; no `previous` and a sidecar-less store entry are clean,
+    /// explanatory refusals.
+    #[test]
+    fn rollback_flips_to_previous_version_offline() {
+        let (descriptors_dir, store_root) = scratch("rollback");
+        let seed = |version: &str, bytes: &[u8]| {
+            let p = stored_binary_path(&store_root, "alpha", version, TEST_TARGET);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, bytes).unwrap();
+            std::fs::write(sidecar_path(&p), sha256_hex(bytes)).unwrap();
+            p
+        };
+        let p8 = seed("0.8.0", b"alpha-bytes-0.8.0");
+        let p9 = seed("0.9.0", b"alpha-bytes-0.9.0");
+        crate::add_descriptor(
+            &descriptors_dir,
+            "alpha",
+            &crate::PluginDescriptor {
+                program: p9.to_string_lossy().into_owned(),
+                args: vec!["--flag".into()],
+                pinned: Some("0.9.0".into()),
+                version: Some("0.9.0".into()),
+                sha256: Some(sha256_hex(b"alpha-bytes-0.9.0")),
+                source: Some("plugins-v0.9.0".into()),
+                previous: Some("0.8.0".into()),
+            },
+        )
+        .unwrap();
+
+        let out = rollback(&descriptors_dir, &store_root, TEST_TARGET, "alpha").unwrap();
+        assert_eq!(out.from.as_deref(), Some("0.9.0"));
+        assert_eq!(out.to, "0.8.0");
+        let d = crate::load_descriptor(&descriptors_dir, "alpha")
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.program, p8.to_string_lossy());
+        assert_eq!(d.version.as_deref(), Some("0.8.0"));
+        assert_eq!(d.pinned.as_deref(), Some("0.8.0"));
+        assert_eq!(
+            d.sha256.as_deref(),
+            Some(sha256_hex(b"alpha-bytes-0.8.0").as_str())
+        );
+        assert_eq!(d.previous.as_deref(), Some("0.9.0"), "versions swapped");
+        assert_eq!(d.args, vec!["--flag"], "operator args survive the flip");
+
+        // The swap makes a second rollback the round trip.
+        let out = rollback(&descriptors_dir, &store_root, TEST_TARGET, "alpha").unwrap();
+        assert_eq!(out.to, "0.9.0");
+        assert_eq!(out.from.as_deref(), Some("0.8.0"));
+
+        // No `previous` → a clean error explaining the new semantics.
+        let mut d = crate::load_descriptor(&descriptors_dir, "alpha")
+            .unwrap()
+            .unwrap();
+        d.previous = None;
+        crate::add_descriptor(&descriptors_dir, "alpha", &d).unwrap();
+        let err = rollback(&descriptors_dir, &store_root, TEST_TARGET, "alpha")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no previous version"), "{err}");
+        assert!(
+            err.contains("pin"),
+            "the error names the explicit alternative: {err}"
+        );
+
+        // A pre-sidecar store entry refuses rather than blessing unverified bytes.
+        d.previous = Some("0.8.0".into());
+        crate::add_descriptor(&descriptors_dir, "alpha", &d).unwrap();
+        std::fs::remove_file(sidecar_path(&p8)).unwrap();
+        let err = rollback(&descriptors_dir, &store_root, TEST_TARGET, "alpha")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no recorded hash"), "{err}");
+
+        std::fs::remove_dir_all(descriptors_dir.parent().unwrap()).ok();
+    }
+
+    /// D-48: `purge_store` removes exactly the plugin's own store directory (and reports a
+    /// missing one as `false`, not an error).
+    #[test]
+    fn purge_store_removes_the_plugin_dir_only() {
+        let (descriptors_dir, store_root) = scratch("purge");
+        let p = stored_binary_path(&store_root, "alpha", "0.9.0", TEST_TARGET);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"bytes").unwrap();
+        let other = stored_binary_path(&store_root, "beta", "0.9.0", TEST_TARGET);
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, b"bytes").unwrap();
+
+        assert!(purge_store(&store_root, "alpha").unwrap());
+        assert!(!store_root.join("alpha").exists());
+        assert!(other.is_file(), "another plugin's store is untouched");
+        assert!(
+            !purge_store(&store_root, "alpha").unwrap(),
+            "already gone → false"
+        );
+
+        std::fs::remove_dir_all(descriptors_dir.parent().unwrap()).ok();
     }
 
     #[tokio::test]
