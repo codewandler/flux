@@ -6,6 +6,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **I-03** — Measure the multi-pass cutover: the epic's acceptance gate ran on funded keys
+  (baseline `b528772` vs post v0.2.17, `openrouter-anthropic/anthropic/claude-sonnet-4.6`; raw
+  recordings + both legs' reports under `bench/*/results/i03-go/`). Time-to-first-feedback: post
+  wins all 5 corpus prompts, −0.4s (trivial chat) to −5.1s (explore-complex), 30/30 trials clean,
+  first planning indicator ~71ms vs baseline's silent planning. Rounds/tokens: no tiny-plan
+  dribble, no call inflation on trivial turns, revise 0.0/turn; honest regression — gather rounds
+  re-pay the ~20k prefix uncached on the caching-disabled openrouter wire (corpus spend +35%,
+  filed C-35). Terminal-bench (2 tasks × 3 trials): pass-all ties 0/6 vs 0/6, but baseline keeps
+  14% partial checks where post keeps 0% and pays ~4× to fail — execute-phase plans truncate at
+  the 16384 emission ceiling and retry whole (filed A-40). Full tables + verdicts in
+  `docs/designs/multipass-agent-loop.md` "I-03 measurement results"; the multipass-agent-loop
+  epic's cutover is now judged on evidence. New backlog stories: **C-35** (prompt caching on the
+  openrouter-anthropic wire) and **A-40** (split oversized plan emission instead of whole-plan
+  retries).
+
 ## [0.2.17] - 2026-07-05
 
 ### Added

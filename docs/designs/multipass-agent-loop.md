@@ -327,3 +327,77 @@ tolerant run-event reads; per-iteration ledger granularity inside `each`/`repeat
 - Full dev-gate green; I-03 reports time-to-first-feedback, gather/revise rounds, tokens/turn, and
   terminal-bench pass-rate against the pre-cutover baseline — the cutover is judged on that
   evidence, not vibes.
+
+## I-03 measurement results (2026-07-05)
+
+Setup: baseline = pre-cutover main `b528772` (parent of cutover `e3ba495`), post = current main
+(v0.2.17 release commit — the cutover plus the read-loop follow-ups A-20/A-28/A-29 that shipped on
+top of it). Model for every run: `openrouter-anthropic/anthropic/claude-sonnet-4.6`. Harnesses:
+`bench/run-ttff.sh` / `bench/run-tbench-compare.sh` (raw recordings + both legs' full reports kept
+under `bench/*/results/i03-go/`).
+
+**Time-to-first-feedback** (spawn → first rendered artifact, median over 3 trials per leg,
+5-prompt fixed corpus, 30/30 runs clean — `failed_trials: 0` in every cell):
+
+| prompt | baseline | post | delta |
+|---|---|---|---|
+| chat-trivial | 3615.0ms | 3189.8ms | −425.2ms |
+| read-one-file | 4180.5ms | 2344.2ms | −1836.3ms |
+| grep-count | 6982.0ms | 2342.7ms | −4639.3ms |
+| write-summary | 8168.8ms | 3363.9ms | −4804.9ms |
+| explore-complex | 7569.5ms | 2457.4ms | −5112.1ms |
+
+Post wins every prompt. The win scales with task complexity (−0.4s trivial chat → −5.1s
+multi-file exploration): the phased loop starts rendering gather-phase activity while the
+pre-cutover loop was still silently composing one big plan. `planning_ms` (first planning-state
+indicator) is ~71ms on post and null on baseline — the A-12 "silent while planning" bug is
+measurably gone.
+
+**Rounds / tokens per turn** (C-15 efficiency projections over the same 30 trial event stores,
+`flux usage` per isolated trial HOME; median of 3 trials, spread noted where trials diverged):
+
+| prompt | calls/turn b→p | plans/turn b→p | gather/turn (post) | revise/turn (post) | uncached-in b→p |
+|---|---|---|---|---|---|
+| chat-trivial | 1 → 1 | 0 → 0 | 0.0 | 0.0 | 19.9k → 20.5k |
+| read-one-file | 2 → 2 | 1 → 1 | 0.0 | 0.0 | 20.1k → 20.7k |
+| grep-count | 2 → 2 | 1 → 1 | 1.0 | 0.0 | 20.1k → 41.1k |
+| write-summary | 2 → 2 (one trial 3) | 1 → 1 (one trial 2) | 0.0 (one trial 1) | 0.0 | 21.0k → 22.2k |
+| explore-complex | 3 → 3 (one trial 2) | 2 → 2 (one trial 1) | 2.0 (one trial 1) | 0.0 | 61.2k → 62.8k |
+
+Verdicts, honestly reported:
+- **No tiny-plan dribble**: plans/turn is identical or lower on post for every prompt.
+- **No call inflation**: trivial/simple turns make exactly as many provider calls as baseline (the
+  design's acceptance bar); complex turns are the same or one fewer.
+- **Revise rounds: 0.0 everywhere** — no revise-round churn on this corpus.
+- **Token regression on gather-shaped prompts**: when post spends a gather round it re-pays the
+  ~20k prompt prefix uncached — grep-count doubles uncached-in (20.1k → 41.1k). Total corpus spend:
+  baseline $1.35 vs post $1.82 (+35%). This is the A-03 erosion watch firing: `cache-read` reports
+  0% on BOTH legs on the `openrouter-anthropic` wire, so the gather round's prefix re-read is billed
+  fully uncached here. Leg-neutral wire, honest caveat: on a cache-serving wire (direct Anthropic)
+  the gather round's re-read should mostly hit cache and shrink this delta; not measured in this
+  run. Follow-up candidate: verify prompt-cache headers ride the openrouter-anthropic codec.
+
+**Terminal-bench pass-rate** (`terminal-bench-core==0.1.1`, tasks `chess-best-move` +
+`fibonacci-server`, 3 trials/leg, same model; `bench/tbench-compare/results/i03-go/`):
+
+- **baseline (valid)**: 0/2 tasks pass-all, mean checks 14%. `chess-best-move` 0% — all trials
+  burned the 30-plan-iteration cap and one wrote the stop-notice into `move.txt` instead of a move;
+  `fibonacci-server` 27.8% checks, 0 passes — Node was absent in the container and the loop
+  improvised a Python server, failing the server-contract checks.
+- **post (valid re-run after a key top-up; the first attempt 402'd at the first planner call and
+  is kept as `post-report-402.txt`, excluded from scoring)**: 0/2 tasks pass-all, mean checks
+  **0%** — a regression on partial credit. Failure signature, both tasks: **plan emission
+  truncated at `max_tokens` (16384) before the plan finished**, retried repeatedly —
+  `fibonacci-server` burned 31 steps / 22.9k output tokens / $0.76 per trial (baseline: $0.19)
+  without ever standing up the server; `chess-best-move` lost its sub-agent turn to the same
+  truncation and wrote a wrong move. Post is also slower to fail (mean wall 429s/269s vs baseline
+  150s/111s).
+
+**Verdict, honestly**: pass-all ties at 0/6 vs 0/6 — neither loop solves these two tasks with this
+model — but baseline kept 14% partial checks where post kept 0%, and post pays more to fail. The
+regression is not "the phased loop reasons worse": it's mechanical — execute-phase plans on
+write-heavy tasks exceed the 16k emission ceiling, truncate, and the repair loop re-pays the
+attempt. Filed as **A-40** (split/stream oversized plan emission; L-39's `"""` strings shrink the
+representational bloat and the flux-planner corpus now records these truncations). Small-n caveat
+throughout: 2 tasks × 3 trials, one vision-gated (chess) — directional evidence, not a pass-rate
+claim.

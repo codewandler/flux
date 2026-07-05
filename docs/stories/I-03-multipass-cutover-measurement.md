@@ -2,8 +2,7 @@
 id: I-03
 title: Measure the multi-pass cutover — time-to-first-feedback, rounds, tokens, tbench pass-rate
 pillar: Improve
-status: in-progress
-priority: 6
+status: done
 epic: multipass-agent-loop
 design: docs/designs/multipass-agent-loop.md
 note: the epic's acceptance gate — judged on evidence, not vibes; runs after the MVP stories land; baseline = pre-cutover main
@@ -18,16 +17,16 @@ regression watch), tokens/turn, prompt-cache hit rate (A-03 erosion watch), and 
 pass-rate. The agent never grades itself — graders are the eval adapters.
 
 ## Acceptance
-- [ ] Baseline captured on pre-cutover main (same tasks/trials/model) and recorded before the
+- [x] Baseline captured on pre-cutover main (same tasks/trials/model) and recorded before the
       comparison run.
-- [ ] `PlanAttempt.phase` + C-15 efficiency projections report gather-rounds/turn and
+- [x] `PlanAttempt.phase` + C-15 efficiency projections report gather-rounds/turn and
       revise-rounds/turn (extend `efficiency_all` if needed).
-- [ ] Time-to-first-feedback measured (planning-state timestamp → first rendered artifact) on a
+- [x] Time-to-first-feedback measured (planning-state timestamp → first rendered artifact) on a
       small fixed prompt corpus; before/after reported.
-- [ ] Terminal-bench: same task set, trials ≥ 3, same model, pre vs post; strict comparison (no
+- [x] Terminal-bench: same task set, trials ≥ 3, same model, pre vs post; strict comparison (no
       cherry-picking; regressions reported honestly).
-- [ ] Results recorded in the epic design doc (and `docs/self-improvement/STATUS.md` if the loop is
-      exercised); the cutover is only called done when this story is.
+- [x] Results recorded in the epic design doc (`docs/self-improvement/STATUS.md` untouched — the
+      improve loop itself was not exercised); the cutover is only called done when this story is.
 
 ## Progress
 - 2026-07-02 — everything that doesn't spend API credits is built, verified, and gate-green
@@ -58,6 +57,21 @@ pass-rate. The agent never grades itself — graders are the eval adapters.
     target confirmed present.
   - Model for both harnesses: `openrouter-anthropic/anthropic/claude-sonnet-4.6`
     (override via `FLUX_TTFF_MODEL`/`FLUX_TBC_MODEL`).
+
+- 2026-07-05 — **paid legs ran** (results in the design doc "I-03 measurement results"):
+  - **TTFF DONE, clean (30/30, `failed_trials: 0`)**: post wins all 5 prompts, −0.4s (trivial) to
+    −5.1s (explore-complex); post `planning_ms` ≈ 71ms vs baseline null (A-12 silence gone).
+  - **Rounds/tokens DONE**: no tiny-plan dribble, no call inflation, revise 0.0/turn; honest
+    regression — gather-shaped prompts double uncached-in (corpus spend +35%), root-caused to
+    `prompt_caching: false` in the openrouter profile → filed **C-35**.
+  - **tbench baseline leg DONE** (0/2 pass-all, 14% checks); first post attempt **402'd**
+    (key credit; kept as `post-report-402.txt`, excluded) → key topped up, post leg re-run valid.
+- 2026-07-05 (later) — **post tbench leg DONE (valid re-run)**: 0/2 pass-all, 0% checks. Pass-all
+  ties 0/6 vs 0/6; baseline keeps 14% partial checks, post keeps 0% and pays ~4× to fail on
+  fibonacci-server — mechanical signature: execute-phase plans truncate at the 16384 emission
+  ceiling and retry whole (→ filed **A-40**). Full verdict + small-n caveats in the design doc
+  "I-03 measurement results". **Story complete** — all legs measured and recorded; regressions
+  reported as found.
 
 ## Notes
 - Sequenced after A-12..A-17 + L-22 land; listed ready so the board shows the full MVP set.
