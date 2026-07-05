@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.2.17] - 2026-07-05
+
 ### Added
 
 - **Enforced pin/rollback — spawn-time hash verification over the versioned store (D-48).**
