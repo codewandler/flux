@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.2.18] - 2026-07-06
+
 ### Added
 
 - **I-03** — Measure the multi-pass cutover: the epic's acceptance gate ran on funded keys
