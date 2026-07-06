@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.2.21] - 2026-07-06
+
 ### Added
 
 - **I-05** — Sharpened improve round (then put ON HOLD with I-01, user call): the scored eval set
