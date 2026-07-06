@@ -1,6 +1,6 @@
 # Self-improvement: status & journey
 
-_Last updated: 2026-07-02._
+_Last updated: 2026-07-06._
 
 This is the honest, dated record of where the self-improvement loop stands and how it got here —
 including the bugs each live run surfaced, the first kept gain, and the caveats that keep the claims
@@ -133,6 +133,23 @@ loop misbehaving — each was the machinery working and exposing a bug, which wa
    **multi-pass agent loop epic** (`docs/designs/multipass-agent-loop.md`). The full improve-loop run
    was postponed (user call, 2026-07-02); known CLI gap: `flux eval terminal-bench` can't pass
    `flux_binary` (workaround: an `eval_run` flow via `flux flow run`).
+
+6. **2026-07-06 — two eval-infrastructure defects found and fixed; the funded I-01 round launched.**
+   (a) **I-04 — the shell group was OFF inside every tbench container to date**: `flux_agent.py`
+   forwarded only provider keys, so in-container flux never surfaced `bash` — on the A-40 validation
+   run the agent wrote a correct `server.py` and then honestly said it couldn't start it. Fixed
+   (`FLUX_ENABLE_BASH=1` + a pinning test in flux-eval); single-trial verify: fibonacci checks
+   **0% → 83%**. All pre-2026-07-06 containerized numbers are equally depressed (run 5's
+   "functionally solved" shows other ops occasionally compensated, but the handicap was
+   structural); decision: corrected harness carries forward, **no I-03 re-baseline**, result dirs
+   are era-labeled. (b) **The improve loop was unrunnable on `main`**: `improve_log` grew a
+   required `record` param and the checked-in flows went stale — invisible to CI because
+   `flows_validate` ran only `analyze_flow` while `flux flow run` gates on `lower`
+   (required-param/type walk). The fixture test now runs the same `lower` gate (reproduced the
+   exact runtime rejection first), and both improve flows are fixed. (c) With both fixed, the
+   **funded I-01 round is running** on branch `improve-tbench/20260706-130553` (HEAD = corrected
+   harness, in-container evals routed via OpenRouter by an operator commit on the disposable
+   branch — provider routing, not a graded change). Verdict to be recorded here.
 
 A separate **correct revert** is worth calling out as a soundness check: a candidate built a
 *working-looking* fibonacci server that still reverted, because the grader's hidden
