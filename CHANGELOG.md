@@ -22,6 +22,41 @@ All notable changes to this project are documented in this file. The format is b
   epic's cutover is now judged on evidence. New backlog stories: **C-35** (prompt caching on the
   openrouter-anthropic wire) and **A-40** (split oversized plan emission instead of whole-plan
   retries).
+- **SDK** — `FlowClientBuilder::approver`: inject a custom per-op `Approver` policy into
+  declarative flow runs — the seam between blanket `auto_approve` and the headless default deny
+  (e.g. a risk-aware confirm gate), mirroring `LocalSpawner::with_approver` on the sub-agent path
+  so both paths take the same policy.
+
+### Fixed
+
+- **A-41** — Role `model:` override goes through provider-spec parsing, not verbatim to the wire:
+  a sub-agent role's `model:` frontmatter now resolves via the new `flux_core::resolve_role_model`
+  at the spawn call site (`flux-orchestrate`). A prefix naming the parent's own provider is
+  stripped to the provider-local slug; a prefix naming a *different* known provider fails fast at
+  spawn with a diagnostic naming both providers and the inherit-parent-provider constraint —
+  instead of an opaque HTTP 400 mid-turn. Bare slugs and unknown leading segments (openrouter's
+  `vendor/model` ids) pass through unchanged; `openrouter` vs `openrouter-anthropic` never
+  prefix-match each other. Docs: accepted forms in `docs/usage.md` + AGENTS.md's sub-agent-role
+  bullet. (Hit live 2026-07-06 running `examples/god-review.flux`.)
+- **D-54** — Guest SDK `serve()` must not silently skip malformed host frames: the plugin-side
+  protocol loop (`flux_plugin::serve`) now writes a one-line stderr diagnostic per unparseable
+  frame (byte length + parse error only — never frame content) and exits after
+  `MAX_CONSECUTIVE_MALFORMED_FRAMES` (5) consecutive failures, so the host surfaces its existing
+  "plugin closed the connection" error instead of hanging on a response that will never come. A
+  parsed frame resets the counter. `serve()` now delegates to a testable `serve_io` seam; its
+  public signature is unchanged. (The one validated kernel of god-review finding #4 — the host
+  side was already hardened.)
+
+### Changed
+
+- **C-36** — Error/Result convention adherence: AGENTS.md's Errors bullet now codifies the
+  wire-seam exception (plugin frame `err`, A2A JSON-RPC error objects, host-capability callback
+  results legitimately carry `String` errors); every other bare `Result<_, String>` in `crates/`
+  was either converted to the convention (`flux-capabilities` `EndpointRegistry`, the `fluxlang`
+  CLI bin, `flux-cli` strays → `anyhow`, `flux-tools` `sqlite_query` closure) or classified
+  wire-seam in the story's Progress table. Also: `flux-a2a` re-exports `new_id` on its own
+  `pub use` line instead of hiding a function inside the type re-export block. Pure refactor, no
+  behavior change.
 
 ## [0.2.17] - 2026-07-05
 
