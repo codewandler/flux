@@ -809,7 +809,7 @@ impl Tool for TaskTool {
 mod tests {
     use super::*;
     use flux_core::{Chunk, ContentBlock, StopReason};
-    use flux_provider::{ChunkStream, Request};
+    use flux_provider::{ChunkStream, Request, StaticProvider};
     use flux_system::Workspace;
     use serde_json::json;
 
@@ -879,8 +879,11 @@ mod tests {
             "---\ndescription: recon\ntools: [read]\n---\nYou are a scout.",
             "scout",
         ));
+        // D-60 dogfood: `StaticProvider` is a drop-in for the hand-rolled fixed-text `MockProvider`
+        // below (same canned reply, same shape) — this call site swaps to it so it isn't the only
+        // place still rolling its own.
         let spawner = LocalSpawner::new(
-            Arc::new(|| Ok(Box::new(MockProvider))),
+            Arc::new(|| Ok(Box::new(StaticProvider::new("scouted: 3 files")))),
             Arc::new(roles),
             ToolRegistry::new(),
             temp_system(),

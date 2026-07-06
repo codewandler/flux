@@ -21,6 +21,9 @@ pub use realtime::{
     RealtimeSession, TurnDetection,
 };
 
+pub mod static_providers;
+pub use static_providers::{NullProvider, StaticProvider};
+
 /// A boxed, sendable stream of response chunks.
 pub type ChunkStream = Pin<Box<dyn Stream<Item = Result<Chunk>> + Send>>;
 

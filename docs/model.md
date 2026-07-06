@@ -93,7 +93,7 @@ model = "aws/sonnet"
 
 ### Region-aware model resolution
 
-Bedrock cross-region inference-profile ids are **region-specific**: `us.anthropic.*` is invalid in `eu-central-1` (Bedrock 400 "The provided model identifier is invalid"), and `eu.anthropic.*` is invalid in `us-east-1`. `resolve_model` reads `AWS_REGION` (set by the credential chain) and picks the matching prefix — `eu-*` → `eu.`, everything else → `us.`. `haiku` stays `global.` (a global profile, valid everywhere). If you pass an explicit full id (`aws/us.anthropic.claude-sonnet-4-6`), make sure it matches your region.
+Bedrock cross-region inference-profile ids are **region-specific**: `us.anthropic.*` is invalid in `eu-central-1` (Bedrock 400 "The provided model identifier is invalid"), and `eu.anthropic.*` is invalid in `us-east-1`. `resolve_model` reads `AWS_REGION` (set by the credential chain) and picks the matching prefix — `eu-*` → `eu.`, everything else → `us.`. `haiku` stays `global.` (a global profile, valid everywhere) by default. If your IAM setup doesn't grant `bedrock:InvokeModel*` on `global.*` inference profiles — only region-specific ones — set `FLUX_BEDROCK_HAIKU_PROFILE` (e.g. `us`/`eu`) to pin haiku to a region-specific prefix instead. If you pass an explicit full id (`aws/us.anthropic.claude-sonnet-4-6`), make sure it matches your region.
 
 ### Notes
 

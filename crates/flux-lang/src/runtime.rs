@@ -8334,4 +8334,103 @@ mod tests {
             "each branch's parallel.branch event fires exactly once, in declaration order: {obs:?}"
         );
     }
+
+    // -- D-60: DraftAst::scoped -----------------------------------------------------------------
+
+    /// A minimal `OpHost` with a real cap-scope stack — mirroring `flux_runtime::Executor`'s
+    /// enforcement (narrow-on-push intersection, membership check at dispatch) — just enough to
+    /// prove `DraftAst::scoped` actually restricts dispatch once the flow it wraps runs, without
+    /// pulling the whole runtime crate into a flux-lang-only test.
+    struct CapScopeHost {
+        cat: MockCatalog,
+        scopes: Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl OpHost for CapScopeHost {
+        async fn dispatch(&self, op: &str, _input: serde_json::Value) -> OpOutcome {
+            if let Some(scope) = self.scopes.lock().unwrap().last() {
+                if !scope.iter().any(|t| t == op) {
+                    return OpOutcome::denial(format!(
+                        "`{op}` denied by capability scope (not in the active with_tools allowlist)"
+                    ));
+                }
+            }
+            OpOutcome::ok(format!("ran {op}"))
+        }
+        fn catalog(&self) -> &dyn OpCatalog {
+            &self.cat
+        }
+        async fn request_approval(
+            &self,
+            _label: &str,
+            _intents: &flux_spec::IntentSet,
+        ) -> ApprovalChoice {
+            ApprovalChoice::Allow
+        }
+        fn trim_output(&self, view: String, _op: &str) -> String {
+            view
+        }
+        async fn push_cap_scope(&self, tools: &[String]) {
+            let mut stack = self.scopes.lock().unwrap();
+            let effective: Vec<String> = match stack.last() {
+                Some(outer) => tools
+                    .iter()
+                    .filter(|t| outer.contains(t))
+                    .cloned()
+                    .collect(),
+                None => tools.to_vec(),
+            };
+            stack.push(effective);
+        }
+        async fn pop_cap_scope(&self) {
+            self.scopes.lock().unwrap().pop();
+        }
+    }
+
+    fn cap_scope_host() -> CapScopeHost {
+        CapScopeHost {
+            cat: MockCatalog(vec![sig("read", &[], &[]), sig("write", &[], &[])]),
+            scopes: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn draft_ast_scoped_allows_an_op_inside_and_denies_one_outside_the_allowlist() {
+        let host = cap_scope_host();
+
+        // `read` is inside the with_tools(["read"]) allowlist `.scoped` installs — the flow runs.
+        let allowed = DraftAst {
+            body: vec![Node::Call {
+                op: "read".into(),
+                args: vec![],
+            }],
+            ..Default::default()
+        }
+        .scoped(["read"]);
+        let store = MemStore::new();
+        let mut sink = BufferSink::default();
+        execute_flow(&store, &host, "s-allowed", &allowed, &mut sink)
+            .await
+            .expect("an op inside the allowlist must run");
+
+        // `write` is outside it — the same dispatch gate must deny it.
+        let denied = DraftAst {
+            body: vec![Node::Call {
+                op: "write".into(),
+                args: vec![],
+            }],
+            ..Default::default()
+        }
+        .scoped(["read"]);
+        let store2 = MemStore::new();
+        let mut sink2 = BufferSink::default();
+        let err = execute_flow(&store2, &host, "s-denied", &denied, &mut sink2)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FlowError::Denied(_)),
+            "an op outside the allowlist must be denied, got: {err:?}"
+        );
+    }
 }

@@ -739,9 +739,29 @@ pub fn resolve_model(alias: &str) -> String {
         // respective region catalogs. `global.` is not available for sonnet-4-6 in all regions.
         "" | "sonnet" => format!("{prefix}.anthropic.claude-sonnet-4-6"),
         "opus" => format!("{prefix}.anthropic.claude-opus-4-6-v1"),
-        // Haiku is a `global.` profile (works in every region) — don't region-prefix it.
-        "haiku" => "global.anthropic.claude-haiku-4-5-20251001-v1:0".to_string(),
+        // Haiku is a `global.` profile (works in every region) by default — don't region-prefix it
+        // unless overridden (see `haiku_profile_prefix`): some IAM setups only grant
+        // `bedrock:InvokeModel`/`InvokeModelWithResponseStream` on region-specific inference
+        // profiles, not `global.*` ones, and would otherwise have to fork the whole alias table
+        // just to keep haiku regional.
+        "haiku" => format!(
+            "{}.anthropic.claude-haiku-4-5-20251001-v1:0",
+            haiku_profile_prefix()
+        ),
         other => other.to_string(),
+    }
+}
+
+/// The cross-region inference-profile prefix used for the `haiku` alias. Defaults to `global`
+/// (today's behavior — a global profile, valid in every region); set `FLUX_BEDROCK_HAIKU_PROFILE`
+/// to override it — e.g. to `us`/`eu` to pin haiku to the same region-specific prefix `sonnet`/
+/// `opus` already use, for an IAM setup without `global.*` inference-profile access. Read the same
+/// way every other Bedrock knob in this module is (a plain `std::env::var` with a default), so it
+/// composes with `AWS_REGION`/`AWS_PROFILE`/… without any new configuration mechanism.
+fn haiku_profile_prefix() -> String {
+    match std::env::var("FLUX_BEDROCK_HAIKU_PROFILE") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => "global".to_string(),
     }
 }
 
@@ -1757,10 +1777,11 @@ mod tests {
     #[test]
     fn resolve_model_maps_aliases_to_cross_region_profiles() {
         let _env = env_guard();
-        // Default (no AWS_REGION set) → us-prefix.
+        // Default (no AWS_REGION set, no haiku override) → us-prefix, haiku stays global.
         unsafe {
             std::env::remove_var("AWS_REGION");
             std::env::remove_var("AWS_DEFAULT_REGION");
+            std::env::remove_var("FLUX_BEDROCK_HAIKU_PROFILE");
         }
         assert_eq!(resolve_model("sonnet"), "us.anthropic.claude-sonnet-4-6");
         assert_eq!(resolve_model("opus"), "us.anthropic.claude-opus-4-6-v1");
@@ -1775,6 +1796,40 @@ mod tests {
             resolve_model("us.anthropic.claude-opus-4-8"),
             "us.anthropic.claude-opus-4-8"
         );
+    }
+
+    /// D-60: `FLUX_BEDROCK_HAIKU_PROFILE` overrides haiku's cross-region inference-profile prefix
+    /// — for IAM setups that don't grant `bedrock:InvokeModel*` on `global.*` profiles, only
+    /// region-specific ones. Unset (the default) keeps today's behavior (`global.`); set, it
+    /// replaces the prefix outright — sonnet/opus are untouched either way.
+    #[test]
+    fn resolve_model_haiku_profile_is_overridable_and_defaults_to_global() {
+        let _env = env_guard();
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+            std::env::remove_var("AWS_DEFAULT_REGION");
+            std::env::remove_var("FLUX_BEDROCK_HAIKU_PROFILE");
+        }
+        // Default: unchanged `global.` behavior.
+        assert_eq!(
+            resolve_model("haiku"),
+            "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+        );
+
+        // Override: pin haiku to the region-specific prefix instead.
+        unsafe {
+            std::env::set_var("FLUX_BEDROCK_HAIKU_PROFILE", "us");
+        }
+        assert_eq!(
+            resolve_model("haiku"),
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+        );
+        // sonnet/opus are unaffected by the haiku-only override.
+        assert_eq!(resolve_model("sonnet"), "us.anthropic.claude-sonnet-4-6");
+
+        unsafe {
+            std::env::remove_var("FLUX_BEDROCK_HAIKU_PROFILE");
+        }
     }
 
     #[test]

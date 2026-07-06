@@ -813,6 +813,22 @@ pub struct DraftAst {
     pub body: Vec<Node>,
 }
 
+impl DraftAst {
+    /// Wrap the whole body in a [`Node::CapScope`] restricting op dispatch to `tools` — the
+    /// `DraftAst`-level counterpart of [`Block::with_tools`](crate::dsl::Block::with_tools) for a
+    /// flow that's already been parsed/compiled rather than built through the DSL (e.g. applying a
+    /// role's tool allowlist to a flow after the fact). `name`/`params`/`returns` are untouched —
+    /// only `body` is re-nested under the new scope.
+    pub fn scoped(mut self, tools: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.body = vec![Node::CapScope {
+            tools: tools.into_iter().map(Into::into).collect(),
+            body: std::mem::take(&mut self.body),
+            bind: None,
+        }];
+        self
+    }
+}
+
 // ---------------------------------------------------------------------------
 // HIR
 // ---------------------------------------------------------------------------

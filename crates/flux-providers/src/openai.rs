@@ -663,10 +663,20 @@ pub fn openai_api(api_key: impl Into<String>) -> NativeProvider {
     )
 }
 
-/// `openai` provider from `OPENAI_API_KEY`.
+/// Resolve the OpenAI API key from the environment: `OPENAI_API_KEY`, falling back to the common
+/// `OPENAI_KEY` alias when it's unset. `OPENAI_API_KEY` wins when both are set. Split out from
+/// [`openai_from_env`] so the precedence itself (not just "some key was found") is directly
+/// testable, the same way `bedrock::region_prefix` is split out from `resolve_model`.
+fn openai_key_from_env() -> Result<String> {
+    std::env::var("OPENAI_API_KEY")
+        .or_else(|_| std::env::var("OPENAI_KEY"))
+        .map_err(|_| Error::Auth("OPENAI_API_KEY is not set".to_string()))
+}
+
+/// `openai` provider from `OPENAI_API_KEY` (falling back to the common `OPENAI_KEY` alias when
+/// `OPENAI_API_KEY` is unset; `OPENAI_API_KEY` wins when both are set).
 pub fn openai_from_env() -> Result<NativeProvider> {
-    let key = std::env::var("OPENAI_API_KEY")
-        .map_err(|_| Error::Auth("OPENAI_API_KEY is not set".to_string()))?;
+    let key = openai_key_from_env()?;
     if key.trim().is_empty() {
         return Err(Error::Auth("OPENAI_API_KEY is empty".to_string()));
     }
@@ -1849,5 +1859,68 @@ mod tests {
         assert_eq!(u.reasoning_tokens, 120); // subset of output_tokens
         assert_eq!(u.cache_creation_input_tokens, 0);
         assert_eq!(u.context_tokens(), 1000);
+    }
+
+    // -- openai_from_env / OPENAI_KEY alias (D-60) ----------------------------------------------
+    //
+    // Serializes the tests that mutate process-global `OPENAI_API_KEY`/`OPENAI_KEY` env — without
+    // it they race across test threads (mirrors `bedrock`'s `ENV_LOCK`/`env_guard`).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn openai_key_from_env_falls_back_to_openai_key_alias() {
+        let _env = env_guard();
+        unsafe {
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::set_var("OPENAI_KEY", "alias-key");
+        }
+        assert_eq!(openai_key_from_env().unwrap(), "alias-key");
+        unsafe {
+            std::env::remove_var("OPENAI_KEY");
+        }
+    }
+
+    #[test]
+    fn openai_key_from_env_prefers_openai_api_key_when_both_are_set() {
+        let _env = env_guard();
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "primary-key");
+            std::env::set_var("OPENAI_KEY", "alias-key");
+        }
+        assert_eq!(openai_key_from_env().unwrap(), "primary-key");
+        unsafe {
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("OPENAI_KEY");
+        }
+    }
+
+    #[test]
+    fn openai_key_from_env_errors_when_neither_is_set() {
+        let _env = env_guard();
+        unsafe {
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("OPENAI_KEY");
+        }
+        assert!(openai_key_from_env().is_err());
+    }
+
+    #[test]
+    fn openai_from_env_succeeds_end_to_end_from_the_openai_key_alias() {
+        let _env = env_guard();
+        unsafe {
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::set_var("OPENAI_KEY", "alias-key");
+        }
+        assert!(
+            openai_from_env().is_ok(),
+            "OPENAI_KEY alone must suffice for openai_from_env"
+        );
+        unsafe {
+            std::env::remove_var("OPENAI_KEY");
+        }
     }
 }
