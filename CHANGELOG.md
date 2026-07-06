@@ -6,7 +6,29 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **A-18** — Multi-pass plan mode: `flux plan` and the REPL `/plan` toggle now run the same
+  orient → bounded read-only gather → settle contract as normal mode (shared
+  `GATHER_ROUND_BUDGET = 3`, drift-tested against `agent-loop.flux`'s `repeat 3`). Gather plans
+  auto-execute (compile-enforced read-only via the A-13 gate — verified through the new seam with
+  a real `Write` tool that is never dispatched), the settled final plan is shown and never run,
+  and piped/`-o json|yaml` stays print-and-exit. docs/usage.md's "single-shot" caveat retired.
+  Deferred (filed **A-42**): gather rounds render through a null sink for now — live streaming
+  needs the loop host's ChannelSink shape.
+
 ### Fixed
+
+- **I-01 (round infra)** — The self-improvement flows work again end-to-end: both improve flows
+  predated the explicit `obj`/`list` value-template nodes and carried node-maps inside `lit` args
+  (no longer implicitly resolved) — `task` calls crashed, and `improvements_aggregate`/
+  `change_implement`/`score_compare` silently operated on unresolved maps (a whole round's review
+  signal vanished as "0 candidates"). All call sites converted to obj templates;
+  `improvements_aggregate` now names non-empty-but-unparseable input in its view instead of a
+  silent zero (failing-first test). The funded round then ran the complete pipeline with real
+  payloads for the first time and produced a correct strict revert (278 vs 278) — machinery
+  proven; the trials≥3 headline gain remains open (full record in
+  `docs/self-improvement/STATUS.md` journey entry 6).
 
 - **I-04** — Terminal-bench containers now run flux with the `shell` group enabled: the tb custom
   agent (`flux_agent.py`) sets `FLUX_ENABLE_BASH=1` for the in-container run (disposable task
