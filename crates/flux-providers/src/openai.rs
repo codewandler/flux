@@ -368,16 +368,29 @@ pub(crate) fn map_chat_stream(
                             }
                         }
                         if let Some(a) = f.arguments {
-                            match a {
+                            let fragment = match a {
                                 // Normal OpenAI path: arguments arrive as a JSON string fragment.
-                                serde_json::Value::String(s) => slot.2.push_str(&s),
+                                serde_json::Value::String(s) => Some(s),
                                 // Some models (e.g. GLM via OpenRouter) send arguments as a
                                 // pre-parsed JSON object instead of a string.  Serialise it back
                                 // so the existing accumulator / parse path works unchanged.
-                                other if !other.is_null() => {
-                                    slot.2.push_str(&other.to_string());
-                                }
-                                _ => {}
+                                other if !other.is_null() => Some(other.to_string()),
+                                _ => None,
+                            };
+                            if let Some(fragment) = fragment {
+                                slot.2.push_str(&fragment);
+                                // A-43: surface the fragment as a `ToolInputDelta` too (in addition
+                                // to the existing accumulation this codec always did), mirroring
+                                // the Messages codec's L-23 wiring, so a caller can render an
+                                // `emit_plan` plan skeleton progressively on this wire too — purely
+                                // additive, the completed `Chunk::Block` below remains the sole
+                                // source of truth for the final call. `name` carries forward from
+                                // `slot.1` since only the first fragment's delta typically carries
+                                // the function name.
+                                yield Chunk::ToolInputDelta {
+                                    name: slot.1.clone(),
+                                    partial_json: fragment,
+                                };
                             }
                         }
                     }
@@ -1151,6 +1164,76 @@ mod tests {
         assert_eq!(blocks.len(), 2); // text block + tool_use block
         match &blocks[1] {
             ContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "read");
+                assert_eq!(input["path"], "a.txt");
+            }
+            other => panic!("expected tool_use, got {other:?}"),
+        }
+    }
+
+    /// A-43: mirrors the Messages codec's L-23 `ToolInputDelta` surfacing — as `arguments`
+    /// fragments arrive across multiple chat-completions deltas, the codec must yield a
+    /// `Chunk::ToolInputDelta` for each fragment (in order, ahead of the completed tool_use
+    /// block) so a plan skeleton can render progressively on this wire too. Only the first
+    /// fragment's delta carries the function `name`; later fragments must carry the name forward
+    /// from that call's index, exactly as the OpenAI wire actually streams it.
+    #[tokio::test]
+    async fn chat_tool_call_args_stream_as_tool_input_delta() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"a\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\".txt\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+
+        let stream = map_chat_stream(byte_stream);
+        futures::pin_mut!(stream);
+        let chunks: Vec<Chunk> = stream.map(|c| c.unwrap()).collect().await;
+
+        let deltas: Vec<&Chunk> = chunks
+            .iter()
+            .filter(|c| matches!(c, Chunk::ToolInputDelta { .. }))
+            .collect();
+        assert_eq!(
+            deltas.len(),
+            3,
+            "expected one delta per arguments fragment, got {chunks:?}"
+        );
+        let fragments = ["{\"path\":", "\"a", ".txt\"}"];
+        for (d, expected_fragment) in deltas.iter().zip(fragments) {
+            match d {
+                Chunk::ToolInputDelta { name, partial_json } => {
+                    assert_eq!(name, "read", "name must carry forward to every fragment");
+                    assert_eq!(partial_json, expected_fragment);
+                }
+                other => panic!("expected ToolInputDelta, got {other:?}"),
+            }
+        }
+
+        // All deltas must precede the completed tool_use block — a consumer streaming the
+        // skeleton must never see it after the call is already known complete.
+        let delta_pos = chunks
+            .iter()
+            .position(|c| matches!(c, Chunk::ToolInputDelta { .. }))
+            .unwrap();
+        let block_pos = chunks
+            .iter()
+            .position(|c| matches!(c, Chunk::Block(ContentBlock::ToolUse { .. })))
+            .unwrap();
+        assert!(
+            delta_pos < block_pos,
+            "deltas must stream ahead of the completed block"
+        );
+
+        // The final completed block is unaffected — the accumulation this codec always did.
+        match &chunks[block_pos] {
+            Chunk::Block(ContentBlock::ToolUse { id, name, input }) => {
                 assert_eq!(id, "call_1");
                 assert_eq!(name, "read");
                 assert_eq!(input["path"], "a.txt");

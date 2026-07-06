@@ -4818,8 +4818,11 @@ mod tests {
 
     /// Script a streamed `emit_plan` tool call: `json_text` is delivered as `Chunk::ToolInputDelta`
     /// fragments split at `split_at` (ascending byte offsets), followed by the usual completed
-    /// `Chunk::Block`/`Chunk::Done` — mirrors how the shared Messages-protocol codec now surfaces
-    /// `input_json_delta` fragments (L-23) ahead of the block's `content_block_stop`.
+    /// `Chunk::Block`/`Chunk::Done` — mirrors how the shared Messages-protocol codec surfaces
+    /// `input_json_delta` fragments (L-23) ahead of the block's `content_block_stop`, and equally
+    /// how the OpenAI-wire codec now surfaces `tool_calls[].function.arguments` fragments (A-43)
+    /// ahead of its completed `tool_use` block — this seam only matches on the `Chunk` shape, not
+    /// which wire produced it.
     fn tool_call_streamed(name: &str, json_text: &str, split_at: &[usize]) -> Vec<Chunk> {
         let mut chunks = Vec::new();
         let mut start = 0usize;
@@ -4896,6 +4899,45 @@ mod tests {
             crate::render::render_pretty(&compiled.ast),
             crate::render::render_pretty(&expected_ast)
         );
+    }
+
+    /// A-43: the OpenAI-wire codec (`map_chat_stream`) now surfaces `Chunk::ToolInputDelta` too —
+    /// this compile-layer seam only matches on the `Chunk::ToolInputDelta { name, .. }` shape (see
+    /// `compile_turn`'s match arm above), never on which wire produced it, so the plan skeleton
+    /// must render identically for an OpenAI-wire-shaped delta sequence. Split widths here are
+    /// small and ragged (~3 bytes each, closer to the OpenAI wire's per-token `arguments` string
+    /// deltas) rather than the test above's even fifths, to prove the scanner's resumability isn't
+    /// tied to one particular chunking granularity.
+    #[tokio::test]
+    async fn compile_turn_streams_plan_skeleton_headlines_from_openai_wire_shaped_deltas() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let n = STREAMED_PLAN_JSON.len();
+        let split_at: Vec<usize> = (1..n).step_by(3).collect();
+        let p = mock(vec![tool_call_streamed(
+            "emit_plan",
+            STREAMED_PLAN_JSON,
+            &split_at,
+        )]);
+        let mut sink = RecSink::default();
+        let (out, _usage) = compile_turn(
+            &p,
+            "mock",
+            &[Message::user_text("write and verify server.py")],
+            None,
+            &ops,
+            None,
+            None,
+            Some(&mut sink),
+            CompileOptions::default(),
+            Phase::Execute,
+        )
+        .await;
+        assert_eq!(
+            sink.headlines,
+            vec!["1 write".to_string(), "2 read /app/server.py".to_string()]
+        );
+        out.unwrap();
     }
 
     #[tokio::test]

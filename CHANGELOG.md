@@ -6,6 +6,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+- **A-43** — OpenAI-wire plan skeletons: `map_chat_stream` now yields the same additive
+  `Chunk::ToolInputDelta` the Messages codec has surfaced since L-23, one per `tool_calls[].
+  function.arguments` fragment (name carried forward from the first delta of that call index),
+  so `emit_plan` plan skeletons stream live on plain `openrouter`/`openai` too, not just
+  Anthropic-family wires. Purely additive — the existing accumulation and A-32/A-33 malformed-args
+  tolerance are unchanged. The codex path (re-enveloped through the Responses codec) is scoped
+  out: `map_responses_stream` has no per-fragment tool-args accumulator at all today (only the
+  fully-formed `response.output_item.done`), so wiring it would be new state, not an additive
+  one-liner — left for a future story.
+
 ## [0.2.22] - 2026-07-06
 
 ### Added
