@@ -8,6 +8,9 @@
 mod perm;
 pub use perm::{Pattern, PermDecision, PermissionManager};
 
+mod approval;
+pub use approval::{RiskApprover, DEFAULT_CONSENT_MARKER};
+
 pub mod context;
 
 use std::collections::{HashMap, HashSet};
