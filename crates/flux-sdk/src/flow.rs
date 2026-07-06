@@ -330,11 +330,30 @@ impl FlowClient {
     /// resolves and every `$var` is defined; `Err` carries the [`Diagnostic`]s (e.g. unknown ops,
     /// unbound symbols). A symbol supplied at run time via [`execute_with`](Self::execute_with)
     /// seeding must be declared as a flow param (`flow(name: Type)`) to analyze clean — params count
-    /// as bound; undeclared seed-only names are reported unbound (L-15).
+    /// as bound; undeclared seed-only names are reported unbound (L-15). To analyze a flow *as it
+    /// will actually run* under `execute_with` seeding, without a flow-param declaration, use
+    /// [`analyze_seeded`](Self::analyze_seeded) instead.
     pub fn analyze(&self, ast: &DraftAst) -> std::result::Result<(), Vec<Diagnostic>> {
         analyze_composites(&self.composites, &self.registry)?;
         let ops = OpRegistry::new(&self.registry).with_composites(&self.composites);
         analyze_flow(ast, &ops, &std::collections::HashSet::new())
+    }
+
+    /// The seeded counterpart of [`analyze`](Self::analyze): `seed_names` are passed through as the
+    /// prebound set, so a name the caller intends to inject via
+    /// [`execute_with`](Self::execute_with) counts as bound without requiring a flow-param
+    /// declaration or a hand-prepended `Bind` node. An empty `seed_names` behaves exactly like
+    /// `analyze`; a seeded name the flow never references is harmless.
+    pub fn analyze_seeded(
+        &self,
+        ast: &DraftAst,
+        seed_names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> std::result::Result<(), Vec<Diagnostic>> {
+        analyze_composites(&self.composites, &self.registry)?;
+        let ops = OpRegistry::new(&self.registry).with_composites(&self.composites);
+        let prebound: std::collections::HashSet<String> =
+            seed_names.into_iter().map(Into::into).collect();
+        analyze_flow(ast, &ops, &prebound)
     }
 
     /// Execute a compiled [`DraftAst`] through the real safety envelope (`Executor::dispatch` under
@@ -371,6 +390,10 @@ impl FlowClient {
     /// inputs never leak symbols between them. A flow-local `bind` to a seeded name shadows the seed
     /// (ordinary lexical shadowing); a referenced-but-unseeded `$name` fails at runtime exactly like any
     /// unbound var; extra inputs the flow never references are ignored.
+    ///
+    /// Its analysis partner is [`analyze_seeded`](Self::analyze_seeded) — pass the same input names
+    /// so the flow analyzes clean without a flow-param declaration (plain [`analyze`](Self::analyze)
+    /// reports a seed-only, undeclared `$name` as unbound).
     pub async fn execute_with(
         &self,
         ast: &DraftAst,
@@ -412,6 +435,21 @@ impl FlowClient {
     ) -> std::result::Result<flux_flow::ast::PhysicalPlan, Vec<Diagnostic>> {
         let ops = OpRegistry::new(&self.registry).with_composites(&self.composites);
         let hir = flux_flow::analyze::lower(ast, &ops, &std::collections::HashSet::new())?;
+        Ok(flux_flow::optimize::optimize(&hir, &ops))
+    }
+
+    /// The seeded counterpart of [`optimize`](Self::optimize): `seed_names` are passed through to
+    /// `analyze::lower` as the prebound set, mirroring [`analyze_seeded`](Self::analyze_seeded) for
+    /// the optimizer path.
+    pub fn optimize_seeded(
+        &self,
+        ast: &DraftAst,
+        seed_names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> std::result::Result<flux_flow::ast::PhysicalPlan, Vec<Diagnostic>> {
+        let ops = OpRegistry::new(&self.registry).with_composites(&self.composites);
+        let prebound: std::collections::HashSet<String> =
+            seed_names.into_iter().map(Into::into).collect();
+        let hir = flux_flow::analyze::lower(ast, &ops, &prebound)?;
         Ok(flux_flow::optimize::optimize(&hir, &ops))
     }
 
@@ -1218,6 +1256,73 @@ flow main
         let diags = client.analyze(&ast).unwrap_err();
         assert!(!diags.is_empty());
         assert!(diags[0].message.contains("no.such.op"));
+    }
+
+    // ----- D-56: analyze with pre-bound seed names -----
+
+    #[tokio::test]
+    async fn analyze_seeded_accepts_an_undeclared_execute_with_seed() {
+        // `$settings` is referenced but neither a flow param nor bound anywhere in the body — the
+        // exact shape ai-agents had to work around with hand-prepended `Bind` nodes.
+        let client = FlowClient::builder()
+            .model("mock")
+            .build(MockProvider::one("noop"), temp_root("seeded-analyze"))
+            .unwrap();
+        let ast = client.parse("flow\n  return $settings").unwrap();
+
+        // (a) plain `analyze` reports it unbound.
+        let diags = client.analyze(&ast).unwrap_err();
+        assert!(
+            !diags.is_empty(),
+            "an undeclared, unseeded $settings must be reported unbound"
+        );
+
+        // (b) `analyze_seeded` with the intended seed name analyzes clean.
+        client
+            .analyze_seeded(&ast, ["settings"])
+            .expect("a seeded name should count as bound, no flow-param declaration required");
+
+        // (c) it actually executes end-to-end via `execute_with` seeding that same name.
+        let out = client
+            .execute_with(&ast, one_input("settings", json!("prod-config")))
+            .await
+            .unwrap();
+        assert!(
+            out.result.contains("prod-config"),
+            "the seeded value should surface as the result, got: {}",
+            out.result
+        );
+    }
+
+    #[tokio::test]
+    async fn analyze_seeded_with_unreferenced_name_is_harmless() {
+        let client = FlowClient::builder()
+            .model("mock")
+            .build(MockProvider::one("noop"), temp_root("seeded-unused"))
+            .unwrap();
+        let ast = client.parse("flow\n  return \"ok\"").unwrap();
+        client
+            .analyze_seeded(&ast, ["never_referenced"])
+            .expect("a seeded name the flow never references must not break analysis");
+    }
+
+    #[tokio::test]
+    async fn analyze_seeded_with_empty_set_matches_analyze() {
+        let client = FlowClient::builder()
+            .model("mock")
+            .build(MockProvider::one("noop"), temp_root("seeded-empty"))
+            .unwrap();
+        let ast = client.parse("flow\n  return $settings").unwrap();
+
+        let plain = client.analyze(&ast).unwrap_err();
+        let seeded_empty = client
+            .analyze_seeded(&ast, std::iter::empty::<String>())
+            .unwrap_err();
+        assert_eq!(
+            join_diags(&plain),
+            join_diags(&seeded_empty),
+            "an empty seed set must behave exactly like `analyze`"
+        );
     }
 
     #[tokio::test]
