@@ -3269,7 +3269,7 @@ async fn run_pending_plan(
     // Race execution against `cancel`: `execute_flow` has no cancellation of its own, so Ctrl-C is
     // honored by dropping the in-flight flow future (which aborts the current op's IO). The future
     // borrows `sink`, so scope it in a block and read its result out as owned data; `None` => cancelled.
-    let result: Option<Result<String, String>> = {
+    let result: Option<Result<String>> = {
         let fut = flux_flow::runtime::execute_flow(
             &agent.flow,
             &agent.executor,
@@ -3281,7 +3281,7 @@ async fn run_pending_plan(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => None,
-            res = &mut fut => Some(res.map(|o| o.result).map_err(|e| format!("{e:#}"))),
+            res = &mut fut => Some(res.map(|o| o.result).map_err(|e| anyhow::anyhow!("{e:#}"))),
         }
     };
     let end_with_usage = || {
@@ -5942,7 +5942,7 @@ fn field_base_type(node: &Value) -> Option<String> {
 /// Coerce a raw `--arg` string value to the type declared by `field_schema`. Returns the coerced
 /// JSON value or an error message describing the coercion failure (surfaced as a validation
 /// problem by the caller).
-fn coerce_arg_value(field_schema: &Value, defs: &Value, raw: &str) -> Result<Value, String> {
+fn coerce_arg_value(field_schema: &Value, defs: &Value, raw: &str) -> Result<Value> {
     let resolved = resolve_field_schema(field_schema, defs);
     let ty = field_base_type(resolved).unwrap_or_else(|| "string".to_string());
     match ty.as_str() {
@@ -5950,16 +5950,18 @@ fn coerce_arg_value(field_schema: &Value, defs: &Value, raw: &str) -> Result<Val
             .trim()
             .parse::<i64>()
             .map(Value::from)
-            .map_err(|_| format!("expected an integer, got `{raw}`")),
+            .map_err(|_| anyhow::anyhow!("expected an integer, got `{raw}`")),
         "number" => raw
             .trim()
             .parse::<f64>()
             .map(Value::from)
-            .map_err(|_| format!("expected a number, got `{raw}`")),
+            .map_err(|_| anyhow::anyhow!("expected a number, got `{raw}`")),
         "boolean" => match raw.trim().to_ascii_lowercase().as_str() {
             "true" | "1" => Ok(Value::Bool(true)),
             "false" | "0" => Ok(Value::Bool(false)),
-            _ => Err(format!("expected a boolean (true/false), got `{raw}`")),
+            _ => Err(anyhow::anyhow!(
+                "expected a boolean (true/false), got `{raw}`"
+            )),
         },
         "array" => {
             // A JSON array literal is parsed verbatim; otherwise comma-split into trimmed
@@ -5967,7 +5969,7 @@ fn coerce_arg_value(field_schema: &Value, defs: &Value, raw: &str) -> Result<Val
             let trimmed = raw.trim();
             if trimmed.starts_with('[') {
                 serde_json::from_str(trimmed)
-                    .map_err(|e| format!("expected a JSON array, got `{raw}` ({e})"))
+                    .map_err(|e| anyhow::anyhow!("expected a JSON array, got `{raw}` ({e})"))
             } else {
                 let items: Vec<Value> = trimmed
                     .split(',')
@@ -5978,7 +5980,7 @@ fn coerce_arg_value(field_schema: &Value, defs: &Value, raw: &str) -> Result<Val
             }
         }
         "object" => serde_json::from_str(raw.trim())
-            .map_err(|e| format!("expected a JSON object, got `{raw}` ({e})")),
+            .map_err(|e| anyhow::anyhow!("expected a JSON object, got `{raw}` ({e})")),
         _ => {
             // string (default). Validate enum membership if the field declares one.
             if let Some(en) = resolved.get("enum").and_then(|v| v.as_array()) {
@@ -5987,7 +5989,10 @@ fn coerce_arg_value(field_schema: &Value, defs: &Value, raw: &str) -> Result<Val
                         .iter()
                         .filter_map(|v| v.as_str().map(String::from))
                         .collect();
-                    return Err(format!("`{raw}` is not one of: {}", allowed.join(", ")));
+                    return Err(anyhow::anyhow!(
+                        "`{raw}` is not one of: {}",
+                        allowed.join(", ")
+                    ));
                 }
             }
             Ok(Value::String(raw.to_string()))
@@ -7429,7 +7434,7 @@ mod tests {
         let defs = schema["definitions"].clone();
         assert_eq!(coerce_arg_value(&schema, &defs, "on").unwrap(), "on");
         let err = coerce_arg_value(&schema, &defs, "nope").unwrap_err();
-        assert!(err.contains("not one of"));
+        assert!(err.to_string().contains("not one of"));
     }
 
     #[test]

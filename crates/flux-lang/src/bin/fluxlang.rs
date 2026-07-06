@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use flux_core::{Error, Result};
 use flux_lang::ast::DraftAst;
 use flux_lang::render::Palette;
 
@@ -51,18 +52,18 @@ fn main() {
     }
 }
 
-fn run() -> Result<(), String> {
+fn run() -> Result<()> {
     let out = match Cli::parse().command {
         Command::Skill => flux_lang::skill::render(),
         Command::Schema => serde_json::to_string_pretty(&flux_lang::schema::ast_schema())
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| Error::Other(e.to_string()))?,
         Command::Render { file } => render_ast(file)?,
         Command::Compile { file } => compile_text(file)?,
     };
     let mut stdout = std::io::stdout();
     stdout
         .write_all(out.as_bytes())
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| Error::Other(e.to_string()))?;
     if !out.ends_with('\n') {
         let _ = stdout.write_all(b"\n");
     }
@@ -70,14 +71,15 @@ fn run() -> Result<(), String> {
 }
 
 /// Read the contents of `file`, or stdin when omitted.
-fn read_source(file: Option<PathBuf>) -> Result<String, String> {
+fn read_source(file: Option<PathBuf>) -> Result<String> {
     match file {
-        Some(p) => std::fs::read_to_string(&p).map_err(|e| format!("read {}: {e}", p.display())),
+        Some(p) => std::fs::read_to_string(&p)
+            .map_err(|e| Error::Other(format!("read {}: {e}", p.display()))),
         None => {
             let mut s = String::new();
             std::io::stdin()
                 .read_to_string(&mut s)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| Error::Other(e.to_string()))?;
             Ok(s)
         }
     }
@@ -85,9 +87,10 @@ fn read_source(file: Option<PathBuf>) -> Result<String, String> {
 
 /// Read a JSON `DraftAst` from `file` (or stdin) and render it as a tree — colored on a TTY, plain
 /// otherwise (so piped output stays clean).
-fn render_ast(file: Option<PathBuf>) -> Result<String, String> {
+fn render_ast(file: Option<PathBuf>) -> Result<String> {
     let raw = read_source(file)?;
-    let ast: DraftAst = serde_json::from_str(&raw).map_err(|e| format!("invalid AST JSON: {e}"))?;
+    let ast: DraftAst =
+        serde_json::from_str(&raw).map_err(|e| Error::Other(format!("invalid AST JSON: {e}")))?;
     Ok(if std::io::stdout().is_terminal() {
         flux_lang::render::render_styled(&ast, &ANSI)
     } else {
@@ -97,10 +100,11 @@ fn render_ast(file: Option<PathBuf>) -> Result<String, String> {
 
 /// Read Flux-Lang text from `file` (or stdin), parse it, and emit the `DraftAst` as pretty JSON. The
 /// inverse of `format` — `compile(format(ast))` round-trips back to the same AST.
-fn compile_text(file: Option<PathBuf>) -> Result<String, String> {
+fn compile_text(file: Option<PathBuf>) -> Result<String> {
     let src = read_source(file)?;
-    let ast = flux_lang::parse::parse(&src).map_err(|e| format!("parse error: {e}"))?;
-    serde_json::to_string_pretty(&ast).map_err(|e| e.to_string())
+    let ast =
+        flux_lang::parse::parse(&src).map_err(|e| Error::Other(format!("parse error: {e}")))?;
+    serde_json::to_string_pretty(&ast).map_err(|e| Error::Other(e.to_string()))
 }
 
 /// A small ANSI palette for terminal rendering.
@@ -151,15 +155,16 @@ mod tests {
     }
 
     /// Render from an in-memory string (test helper mirroring `render_ast`'s parse+render).
-    fn render_ast_str(raw: &str) -> Result<String, String> {
-        let ast: DraftAst =
-            serde_json::from_str(raw).map_err(|e| format!("invalid AST JSON: {e}"))?;
+    fn render_ast_str(raw: &str) -> Result<String> {
+        let ast: DraftAst = serde_json::from_str(raw)
+            .map_err(|e| Error::Other(format!("invalid AST JSON: {e}")))?;
         Ok(flux_lang::render::render_pretty(&ast))
     }
 
     /// Compile from an in-memory string (test helper mirroring `compile_text`'s parse+serialize).
-    fn compile_str(src: &str) -> Result<String, String> {
-        let ast = flux_lang::parse::parse(src).map_err(|e| format!("parse error: {e}"))?;
-        serde_json::to_string_pretty(&ast).map_err(|e| e.to_string())
+    fn compile_str(src: &str) -> Result<String> {
+        let ast =
+            flux_lang::parse::parse(src).map_err(|e| Error::Other(format!("parse error: {e}")))?;
+        serde_json::to_string_pretty(&ast).map_err(|e| Error::Other(e.to_string()))
     }
 }

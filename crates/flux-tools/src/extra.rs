@@ -296,18 +296,20 @@ impl Tool for SqliteQueryTool {
         let sql = sql.to_string();
 
         // Open read-only and run the query on a blocking thread.
-        let result = tokio::task::spawn_blocking(
-            move || -> std::result::Result<Vec<serde_json::Map<String, Value>>, String> {
+        let result =
+            tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Map<String, Value>>> {
                 let conn = rusqlite::Connection::open_with_flags(
                     &db_path,
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                         | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
                 )
-                .map_err(|e| format!("sqlite_query: could not open {db_path}: {e}"))?;
+                .map_err(|e| {
+                    Error::Other(format!("sqlite_query: could not open {db_path}: {e}"))
+                })?;
 
                 let mut stmt = conn
                     .prepare(&sql)
-                    .map_err(|e| format!("sqlite_query: prepare failed: {e}"))?;
+                    .map_err(|e| Error::Other(format!("sqlite_query: prepare failed: {e}")))?;
 
                 let col_names: Vec<String> =
                     stmt.column_names().iter().map(|s| s.to_string()).collect();
@@ -315,20 +317,20 @@ impl Tool for SqliteQueryTool {
                 let mut rows_out = Vec::new();
                 let mut rows = stmt
                     .query([])
-                    .map_err(|e| format!("sqlite_query: query failed: {e}"))?;
+                    .map_err(|e| Error::Other(format!("sqlite_query: query failed: {e}")))?;
 
                 while let Some(row) = rows
                     .next()
-                    .map_err(|e| format!("sqlite_query: row error: {e}"))?
+                    .map_err(|e| Error::Other(format!("sqlite_query: row error: {e}")))?
                 {
                     if rows_out.len() >= max_rows {
                         break;
                     }
                     let mut map = serde_json::Map::new();
                     for (i, col) in col_names.iter().enumerate() {
-                        let val: rusqlite::types::Value = row
-                            .get(i)
-                            .map_err(|e| format!("sqlite_query: column {col} error: {e}"))?;
+                        let val: rusqlite::types::Value = row.get(i).map_err(|e| {
+                            Error::Other(format!("sqlite_query: column {col} error: {e}"))
+                        })?;
                         let jv = match val {
                             rusqlite::types::Value::Null => Value::Null,
                             rusqlite::types::Value::Integer(n) => Value::Number(n.into()),
@@ -345,11 +347,9 @@ impl Tool for SqliteQueryTool {
                     rows_out.push(map);
                 }
                 Ok(rows_out)
-            },
-        )
-        .await
-        .map_err(|e| Error::Other(format!("sqlite_query: task panicked: {e}")))?
-        .map_err(Error::Other)?;
+            })
+            .await
+            .map_err(|e| Error::Other(format!("sqlite_query: task panicked: {e}")))??;
 
         let json_out = Value::Array(result.into_iter().map(Value::Object).collect());
         Ok(ToolResult::ok(json_out.to_string()))

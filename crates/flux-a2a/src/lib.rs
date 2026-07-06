@@ -20,8 +20,9 @@ pub mod server;
 pub mod types;
 
 pub use client::{A2aClient, A2aError, EventStream, Result};
+pub use types::new_id;
 pub use types::{
-    new_id, AgentCard, AgentInterface, Artifact, Capabilities, JsonRpcError, JsonRpcRequest,
+    AgentCard, AgentInterface, Artifact, Capabilities, JsonRpcError, JsonRpcRequest,
     JsonRpcResponse, Message, Part, Role, SendConfiguration, SendMessageParams, SendOutcome, Skill,
     StreamEvent, Task, TaskArtifactUpdateEvent, TaskGetParams, TaskState, TaskStatus,
     TaskStatusUpdateEvent,

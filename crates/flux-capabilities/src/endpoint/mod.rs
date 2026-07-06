@@ -26,6 +26,7 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 
+use flux_core::{Error, Result};
 use flux_plugin::ReferenceResolver;
 use flux_secret::endpoint::{EndpointRecord, EndpointRef, ResolvedEndpoint, SourceKind};
 use flux_secret::{Kind, Material, Ref, Scheme};
@@ -103,12 +104,14 @@ impl EndpointRegistry {
     /// secret) so this id survives across sessions, re-resolved live each time. Errors if `id` is not
     /// known to this session, or if no persistence path is configured. Returns the imported record's
     /// weak [`EndpointRef`].
-    pub fn import(&self, id: &str) -> Result<EndpointRef, String> {
+    pub fn import(&self, id: &str) -> Result<EndpointRef> {
         let record = self
             .resolve(id)
-            .ok_or_else(|| format!("no endpoint `{id}` to import"))?;
+            .ok_or_else(|| Error::Other(format!("no endpoint `{id}` to import")))?;
         if self.path.is_none() {
-            return Err("no endpoints store configured (set a path via `with_path`)".to_string());
+            return Err(Error::Other(
+                "no endpoints store configured (set a path via `with_path`)".to_string(),
+            ));
         }
         self.save()?;
         Ok(record.endpoint)
@@ -116,20 +119,20 @@ impl EndpointRegistry {
 
     /// Load persisted records from `path` into memory (merge). A missing file is fine; a corrupt one
     /// is an error so a later `save` cannot silently clobber it.
-    pub fn load(&self) -> Result<(), String> {
+    pub fn load(&self) -> Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
         };
         let body = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(format!("read {}: {e}", path.display())),
+            Err(e) => return Err(Error::Other(format!("read {}: {e}", path.display()))),
         };
         let persisted: Persisted = toml::from_str(&body).map_err(|e| {
-            format!(
+            Error::Other(format!(
                 "endpoints store {} is corrupt ({e}); fix or remove it",
                 path.display()
-            )
+            ))
         })?;
         let mut guard = self.records.write().unwrap();
         for r in persisted.endpoint {
@@ -140,22 +143,24 @@ impl EndpointRegistry {
 
     /// Persist all current records to `path` atomically (temp file + rename). The file is **not**
     /// secret (weak refs only), so it is written 0644.
-    pub fn save(&self) -> Result<(), String> {
+    pub fn save(&self) -> Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
         };
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+            std::fs::create_dir_all(dir)
+                .map_err(|e| Error::Other(format!("create {}: {e}", dir.display())))?;
         }
         let persisted = Persisted {
             endpoint: self.list(),
         };
-        let body =
-            toml::to_string_pretty(&persisted).map_err(|e| format!("serialize endpoints: {e}"))?;
+        let body = toml::to_string_pretty(&persisted)
+            .map_err(|e| Error::Other(format!("serialize endpoints: {e}")))?;
         let tmp = path.with_extension("toml.tmp");
         std::fs::write(&tmp, body.as_bytes())
-            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, path).map_err(|e| format!("rename into {}: {e}", path.display()))?;
+            .map_err(|e| Error::Other(format!("write {}: {e}", tmp.display())))?;
+        std::fs::rename(&tmp, path)
+            .map_err(|e| Error::Other(format!("rename into {}: {e}", path.display())))?;
         Ok(())
     }
 }
@@ -181,7 +186,9 @@ impl StaticResolver {
         Self { system, bindings }
     }
 
-    fn materialize(&self, reference: &Ref) -> Result<Material, String> {
+    // Wire-seam: feeds the `ReferenceResolver` impl below, whose signature is fixed by the
+    // flux-plugin trait (host-capability callback result) — see AGENTS.md's Errors bullet.
+    fn materialize(&self, reference: &Ref) -> std::result::Result<Material, String> {
         match reference.scheme {
             Scheme::Env => {
                 let value = self
@@ -203,9 +210,14 @@ impl StaticResolver {
     }
 }
 
+// Wire-seam: `ReferenceResolver` is a flux-plugin trait whose `String` error is the
+// host-capability callback result (see AGENTS.md's Errors bullet) — not a local choice.
 #[async_trait]
 impl ReferenceResolver for StaticResolver {
-    async fn resolve_endpoint(&self, reference: &str) -> Result<ResolvedEndpoint, String> {
+    async fn resolve_endpoint(
+        &self,
+        reference: &str,
+    ) -> std::result::Result<ResolvedEndpoint, String> {
         let ep = self
             .bindings
             .get(reference)
@@ -221,7 +233,7 @@ impl ReferenceResolver for StaticResolver {
         Ok(resolved)
     }
 
-    async fn resolve_credential(&self, reference: &Ref) -> Result<Material, String> {
+    async fn resolve_credential(&self, reference: &Ref) -> std::result::Result<Material, String> {
         self.materialize(reference)
     }
 }
