@@ -401,3 +401,47 @@ attempt. Filed as **A-40** (split/stream oversized plan emission; L-39's `"""` s
 representational bloat and the flux-planner corpus now records these truncations). Small-n caveat
 throughout: 2 tasks × 3 trials, one vision-gated (chess) — directional evidence, not a pass-rate
 claim.
+
+## A-40: truncation split-repair (2026-07-06)
+
+The mechanical failure above — a `max_tokens` cutoff drops the in-flight `emit_plan` tool_use block
+(the provider never sends its `content_block_stop`), so `compile_turn` saw only a preamble (often
+empty) and errored the whole turn — used to force the *caller* to re-plan from scratch: the same
+oversized plan, re-emitted whole, at full price, forever (the fibonacci-server signature above).
+
+The fix makes truncation its own bounded **repair class inside `compile_turn_inner`**, the same
+shape as the existing hidden-op/diagnostics/decode-error repairs, instead of an immediate `Err`:
+
+- A `max_tokens` stop gets up to `TRUNCATION_REPAIRS` (2) split-repair attempts before the turn
+  fails. Each repair tells the model, arm-aware: emit a **smaller** complete plan (first few
+  statements only, `complete` omitted so the phased loop's existing continuation contract — A-14 —
+  calls `plan()` again for the rest), and hoist large literal payloads (e.g. one big file write) into
+  their own follow-up plan. The text arm additionally points at the `"""` verbatim multi-line string
+  spelling the grammar already teaches (L-39) — JSON-escaped `\n` payloads are exactly what inflates
+  a text-arm emission; the JSON arm doesn't get that hint (`"""` has no meaning inside the `ast`
+  payload's plain JSON strings).
+- A further truncation past the repair budget still fails legibly, naming the ceiling and that the
+  split repair was attempted — never a silent loop to step-budget exhaustion.
+- Message-shape discipline (the session-alternation safety invariant) holds through the repair: if
+  the truncated response had a non-empty preamble, the assistant message was already pushed, so the
+  repair rides as a fresh user message; if the preamble was empty, nothing was pushed for that step,
+  so the repair is appended onto the tail of the already-pending user message instead of adding a new
+  one (which would be user-after-user). Both cases go through one helper so the two shapes can't
+  drift apart.
+- No new continuation machinery: the phased loop already re-plans after any plan without `complete`,
+  so a split plan simply continues on the next round exactly as A-14 designed.
+
+This turns "truncation kills the turn and forces a whole-plan retry" into "truncation shrinks the
+plan and the loop keeps going" — bounded, so a plan that structurally cannot fit under any split
+(one irreducible giant literal) still fails fast instead of spinning. (The repair mechanism and its
+message-shape/arm-gating tests are covered by `crates/flux-flow/src/compile.rs`'s A-40 test group.)
+
+**Live re-run verdict (2026-07-06, fibonacci-server × 3 trials, same model/dataset/ceiling, fixed
+binary — `bench/tbench-compare/results/a40-fix/`):** the failure mode is **eliminated** —
+`truncated at max_tokens` occurs 0 times across all trials (the repair is silent by design, so
+signature absence is the success condition), and the sampled trial completes the write-heavy plan
+first-shot at **4 steps / 73.3s / $0.3482** vs the I-03 post leg's 31 steps / $0.7553 per trial
+that never completed. Honest residual: task checks stayed 0% for an independent, pre-existing
+harness gap found during this validation — the tb container agent never enables the `shell` group,
+so no leg (I-03 baseline included) could ever *start* the server it wrote → filed **I-04**; tbench
+pass-rates before and after A-40 are equally depressed by it and remain comparable.

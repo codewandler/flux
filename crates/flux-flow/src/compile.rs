@@ -497,6 +497,14 @@ pub async fn compile_turn_with_arm(
     (out, usage)
 }
 
+/// Bound on `max_tokens`-truncation split-repairs within one turn (A-40): a truncated `emit_plan`
+/// is its own repair class — the model is told to emit a SMALLER plan instead of re-emitting the
+/// same oversized one (see [`truncation_repair_text`]) — but that repair gets only this many
+/// chances before the turn fails with a legible error naming the ceiling. Without a bound, a plan
+/// that structurally cannot fit under `max_tokens` (e.g. one irreducible giant literal) would spin
+/// the planner step budget on identical truncations instead of failing fast.
+const TRUNCATION_REPAIRS: u32 = 2;
+
 /// The planner loop proper. `usage` is an out-parameter so the accumulated spend reaches the caller
 /// on EVERY exit — `Ok`, budget exhaustion, truncation, or a provider error surfaced via `?`.
 #[allow(clippy::too_many_arguments)]
@@ -530,6 +538,9 @@ async fn compile_turn_inner(
     // emit_plan). When the step budget runs out, the turn is rejected WITH this text (C-17/F2) —
     // never "accepted with diagnostics" for a caller to execute blind.
     let mut last_reject = String::new();
+    // A-40: how many `max_tokens`-truncation split-repairs this turn has already spent, bounded by
+    // [`TRUNCATION_REPAIRS`].
+    let mut truncation_repairs: u32 = 0;
     for step in 1..=steps {
         // A-38: snapshot `last_reject` before this step can touch it, so `step_reject` below can
         // tell "this step rejected something" apart from "last_reject still holds an earlier
@@ -654,8 +665,33 @@ async fn compile_turn_inner(
             // A `max_tokens` cutoff drops the in-flight `emit_plan` block — the provider never sends its
             // `content_block_stop`, so only the model's preamble text survives. Don't mistake that
             // truncation for a finished prose answer (which would silently end the turn with no work
-            // done); surface it so the user can raise the budget or narrow the request.
+            // done). A-40: this is its own bounded repair class — the model is told to emit a SMALLER
+            // plan instead of re-emitting the same oversized one (rather than erroring the whole turn,
+            // which used to force the caller into a full whole-plan retry at full price — I-03).
             if stop_reason == Some(StopReason::MaxTokens) {
+                if truncation_repairs < TRUNCATION_REPAIRS {
+                    truncation_repairs += 1;
+                    last_reject = truncation_repair_text(arm, opts.max_tokens);
+                    // Message-shape discipline (safety invariant): only push a NEW user message when
+                    // this step's assistant message was itself pushed (non-empty preamble) above —
+                    // otherwise nothing was pushed this step and a fresh user message would create a
+                    // user-after-user sequence, so the repair rides on the tail of the last user
+                    // message already in `messages` instead.
+                    push_truncation_repair(
+                        &mut messages,
+                        !assistant.content.is_empty(),
+                        last_reject.clone(),
+                    );
+                    trace_step(
+                        step,
+                        steps,
+                        stop_reason,
+                        &step_tool_names,
+                        step_reject(&step_reject_snapshot, &last_reject),
+                        diagnostic.as_ref(),
+                    );
+                    continue;
+                }
                 trace_step(
                     step,
                     steps,
@@ -665,9 +701,10 @@ async fn compile_turn_inner(
                     diagnostic.as_ref(),
                 );
                 return Err(Error::Other(format!(
-                    "planner output was truncated at max_tokens ({}) before it finished the plan — \
-                     raise --max-tokens or split the request into smaller steps",
-                    opts.max_tokens
+                    "planner output was truncated at max_tokens ({}) before it finished the plan, \
+                     even after {} split-repair attempt(s) — raise --max-tokens or split the request \
+                     into smaller steps",
+                    opts.max_tokens, TRUNCATION_REPAIRS
                 )));
             }
             // Otherwise prose is a chat answer (the engine surfaces it; the turn ends). A *truly empty*
@@ -1423,6 +1460,63 @@ fn hidden_ops_rejection(hidden: &[String]) -> String {
          the catalog, then call emit_plan again.",
         hidden.join("`, `")
     )
+}
+
+// -- A-40: max_tokens-truncation split-repair --------------------------------------------------
+
+/// Repair feedback for a `max_tokens`-truncated `emit_plan` (A-40): the plan is too big for one
+/// call, so the model is told to shrink it — fewer statements now (omitting `complete` so the
+/// engine's phased loop, A-14, calls plan() again for the rest) and to hoist large literal payloads
+/// (e.g. a big file write) into their own follow-up plan — rather than being told nothing and
+/// re-emitting the identical oversized plan next attempt.
+///
+/// Arm-aware: the text arm additionally reminds the model of the `"""` verbatim multi-line string
+/// spelling ([`build_text_grammar`] already teaches it, L-39) since JSON-escaped `\n` payloads are
+/// exactly what inflates a text-arm emission past the ceiling. The JSON arm must NOT get this hint —
+/// `"""` has no meaning inside the `ast` payload's plain JSON string literals.
+fn truncation_repair_text(arm: EmissionArm, max_tokens: u32) -> String {
+    let mut text = format!(
+        "your plan emission was cut off at max_tokens ({max_tokens}) — the plan is too big for one \
+         call. Do NOT re-emit the same plan. Emit a SMALLER complete plan with only the FIRST few \
+         statements toward the goal, and OMIT `complete` so the results come back and you can \
+         continue with the next plan. If the plan writes large file contents, put ONE file write \
+         per plan and move everything else out."
+    );
+    if arm == EmissionArm::Text {
+        text.push_str(
+            " write multi-line payloads as `\"\"\"…\"\"\"` verbatim (never `\\n`-escaped) — escaped \
+             newlines inflate the emission.",
+        );
+    }
+    text
+}
+
+/// Feed the truncation split-repair (`repair`) back into the conversation while preserving the
+/// valid-alternation safety invariant (no empty assistant message, no user-after-user):
+/// - `assistant_pushed` (this step's non-empty preamble text was already pushed onto `messages`
+///   above) → the repair rides as a fresh user message, mirroring the hidden-ops rejection
+///   precedent (`messages.push(Message::user_text(...))` beside [`hidden_ops_rejection`]).
+/// - otherwise (an empty preamble — nothing was pushed this step) → pushing a new user message
+///   here would create user-after-user, so instead append the repair onto the tail of the last
+///   user message already in `messages` (it exists by construction: the turn prompt or a prior
+///   repair/tool-result exchange). Mutating that tail message is cache-acceptable: only its
+///   trailing, already-uncached content changes — the byte-stable cached system segments (A-03/
+///   A-09) are untouched.
+fn push_truncation_repair(messages: &mut Vec<Message>, assistant_pushed: bool, repair: String) {
+    if assistant_pushed {
+        messages.push(Message::user_text(repair));
+        return;
+    }
+    let tail = messages
+        .last_mut()
+        .expect("a prior user message exists by construction — the turn always opens with one");
+    debug_assert_eq!(
+        tail.role,
+        flux_core::Role::User,
+        "the message a truncation repair appends to must be the user turn"
+    );
+    tail.content
+        .push(ContentBlock::text(format!("\n\n{repair}")));
 }
 
 // -- A-13: gather-plan enforcement (design Part 1 — "enforced, not trusted") -------------------
@@ -3914,8 +4008,10 @@ mod tests {
         let ops = OpRegistry::new(&reg);
         // Regression: a large `emit_plan` cut off by `max_tokens` yields only the model's preamble text
         // (the tool_use block never gets its `content_block_stop`, so the provider drops it) plus a
-        // `Done { MaxTokens }`. This must surface as an error — NOT a silent chat answer that ends the
-        // turn with the preamble and no work done.
+        // `Done { MaxTokens }`. A-40: this is now a bounded repair class (`TRUNCATION_REPAIRS` split
+        // attempts) rather than an immediate error — an always-truncating provider (every attempt cut
+        // off, never producing a smaller plan) must still fail LEGIBLY once the repair budget is spent,
+        // never as a silent chat answer or a bare "step budget exhausted".
         let truncated = vec![
             Chunk::TextDelta(
                 "Now I have everything I need. Let me implement it all in one go.".into(),
@@ -3924,7 +4020,7 @@ mod tests {
                 stop_reason: Some(flux_core::StopReason::MaxTokens),
             },
         ];
-        let p = mock(vec![truncated]);
+        let p = mock(vec![truncated; (1 + TRUNCATION_REPAIRS) as usize]);
         let (out, _usage) = compile_turn(
             &p,
             "mock",
@@ -3940,9 +4036,317 @@ mod tests {
         .await;
         let msg = format!("{}", out.unwrap_err());
         assert!(
-            msg.contains("truncated") && msg.contains("max_tokens"),
-            "expected a max_tokens truncation error, got: {msg}"
+            msg.contains("truncated") && msg.contains("max_tokens") && msg.contains("16384"),
+            "expected a max_tokens truncation error naming the ceiling, got: {msg}"
         );
+        assert!(
+            msg.contains("split-repair attempt"),
+            "expected the error to say the split repair was attempted, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compile_turn_bounds_truncation_repairs_then_errors() {
+        // Same always-truncating provider as above, but asserted the strict way the story asks for:
+        // the exact number of provider calls (1 initial + TRUNCATION_REPAIRS repairs), NOT step-budget
+        // exhaustion — `max_steps` defaults to 8, well above the 3 calls this must stop at.
+        struct CountingMock {
+            responses: Mutex<VecDeque<Vec<Chunk>>>,
+            calls: Mutex<u32>,
+        }
+        #[async_trait]
+        impl Provider for CountingMock {
+            fn name(&self) -> &str {
+                "mock"
+            }
+            async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+                *self.calls.lock().unwrap() += 1;
+                let chunks = self
+                    .responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_default();
+                Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+            }
+        }
+        let truncated = || {
+            vec![
+                Chunk::TextDelta("still working on the giant plan".into()),
+                Chunk::Done {
+                    stop_reason: Some(flux_core::StopReason::MaxTokens),
+                },
+            ]
+        };
+        let expected_calls = 1 + TRUNCATION_REPAIRS;
+        let provider = CountingMock {
+            // One extra response queued past the expected call count: if the bound were NOT
+            // enforced, this call would succeed (still truncated) instead of erroring, and the
+            // call-count assertion below would catch it before the message assertion even runs.
+            responses: Mutex::new(vec![truncated(); (expected_calls + 1) as usize].into()),
+            calls: Mutex::new(0),
+        };
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let (out, _usage) = compile_turn(
+            &provider,
+            "mock",
+            &[Message::user_text("implement all the nodes")],
+            None,
+            &ops,
+            None,
+            None,
+            None,
+            CompileOptions::default(),
+            Phase::Execute,
+        )
+        .await;
+        let msg = format!("{}", out.unwrap_err());
+        assert!(
+            msg.contains("truncated") && msg.contains("max_tokens") && msg.contains("16384"),
+            "expected a max_tokens truncation error naming the ceiling, got: {msg}"
+        );
+        assert!(
+            msg.contains("split-repair attempt"),
+            "expected the error to say the split repair was attempted, got: {msg}"
+        );
+        assert_eq!(
+            *provider.calls.lock().unwrap(),
+            expected_calls,
+            "expected exactly 1 + TRUNCATION_REPAIRS provider calls, not step-budget exhaustion"
+        );
+    }
+
+    /// Assert `messages` stays a valid provider history: no empty message, and no two consecutive
+    /// messages share a role (in particular, no user-after-user) — the safety invariant a truncation
+    /// split-repair must never regress.
+    fn assert_valid_alternation(messages: &[Message]) {
+        for (i, m) in messages.iter().enumerate() {
+            assert!(
+                !m.content.is_empty(),
+                "message {i} ({:?}) has empty content",
+                m.role
+            );
+            if i > 0 {
+                assert_ne!(
+                    messages[i - 1].role,
+                    m.role,
+                    "messages {} and {} are both {:?} — invalid alternation",
+                    i - 1,
+                    i,
+                    m.role
+                );
+            }
+        }
+    }
+
+    /// A provider that replays canned chunk sequences AND records every `Request` it saw — used by
+    /// the A-40 truncation-repair tests to inspect the second call's `messages` (the repair prompt).
+    struct RequestCapturingMock {
+        responses: Mutex<VecDeque<Vec<Chunk>>>,
+        requests: Mutex<Vec<Request>>,
+    }
+    #[async_trait]
+    impl Provider for RequestCapturingMock {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            self.requests.lock().unwrap().push(req);
+            let chunks = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default();
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    fn request_capturing_mock(responses: Vec<Vec<Chunk>>) -> RequestCapturingMock {
+        RequestCapturingMock {
+            responses: Mutex::new(responses.into_iter().collect()),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn compile_turn_repairs_max_tokens_truncation_with_empty_preamble() {
+        // Truncation with NO preamble text at all: nothing is pushed for this step's (non-existent)
+        // assistant message, so the repair must ride on the tail of the existing user message rather
+        // than as a fresh one (which would be user-after-user).
+        let truncated = vec![Chunk::Done {
+            stop_reason: Some(flux_core::StopReason::MaxTokens),
+        }];
+        let p = request_capturing_mock(vec![
+            truncated,
+            tool_call("emit_plan", serde_json::from_str(VALID_AST).unwrap()),
+        ]);
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let (out, _usage) = compile_turn(
+            &p,
+            "mock",
+            &[Message::user_text("implement all the nodes")],
+            None,
+            &ops,
+            None,
+            None,
+            None,
+            CompileOptions::default(),
+            Phase::Execute,
+        )
+        .await;
+        assert!(
+            matches!(out.unwrap(), TurnOutput::Plan(_)),
+            "the split-repair round must still land the plan"
+        );
+
+        let requests = p.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "one initial call + one repaired retry");
+        let second_messages = &requests[1].messages;
+        assert_valid_alternation(second_messages);
+        // Nothing was pushed for the empty-preamble assistant turn, so the repair landed on the SAME
+        // (only) message rather than adding a new one.
+        assert_eq!(
+            second_messages.len(),
+            1,
+            "the repair must append to the existing user message, not add a new one"
+        );
+        let repaired_text = second_messages[0].text();
+        assert!(
+            repaired_text.contains("16384"),
+            "repair text must name the max_tokens ceiling: {repaired_text}"
+        );
+        assert!(
+            repaired_text.contains("SMALLER"),
+            "repair text must instruct a smaller plan: {repaired_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compile_turn_repairs_max_tokens_truncation_with_preamble_text() {
+        // Truncation WITH non-empty preamble text: the assistant message IS pushed, so the repair
+        // must ride as a SEPARATE user message (mirroring the hidden-ops rejection precedent) —
+        // never appended onto the assistant's own message.
+        let truncated = vec![
+            Chunk::TextDelta(
+                "Now I have everything I need. Let me implement it all in one go.".into(),
+            ),
+            Chunk::Done {
+                stop_reason: Some(flux_core::StopReason::MaxTokens),
+            },
+        ];
+        let p = request_capturing_mock(vec![
+            truncated,
+            tool_call("emit_plan", serde_json::from_str(VALID_AST).unwrap()),
+        ]);
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let (out, _usage) = compile_turn(
+            &p,
+            "mock",
+            &[Message::user_text("implement all the nodes")],
+            None,
+            &ops,
+            None,
+            None,
+            None,
+            CompileOptions::default(),
+            Phase::Execute,
+        )
+        .await;
+        assert!(matches!(out.unwrap(), TurnOutput::Plan(_)));
+
+        let requests = p.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let second_messages = &requests[1].messages;
+        assert_valid_alternation(second_messages);
+        // initial user prompt, the truncated assistant preamble, and the repair as its own user turn.
+        assert_eq!(
+            second_messages.len(),
+            3,
+            "expected [user prompt, assistant preamble, user repair]"
+        );
+        assert_eq!(second_messages[1].role, flux_core::Role::Assistant);
+        assert!(second_messages[1].text().contains("implement it all"));
+        assert_eq!(second_messages[2].role, flux_core::Role::User);
+        let repaired_text = second_messages[2].text();
+        assert!(repaired_text.contains("16384"));
+        assert!(repaired_text.contains("SMALLER"));
+    }
+
+    #[test]
+    fn truncation_repair_text_is_arm_aware() {
+        // L-39: the `"""` verbatim multi-line spelling only helps the text arm (the JSON arm's `ast`
+        // payload has no such syntax — it's a plain JSON string), so only the text arm's repair may
+        // reference it.
+        let json_repair = truncation_repair_text(EmissionArm::Json, 16384);
+        let text_repair = truncation_repair_text(EmissionArm::Text, 16384);
+        assert!(
+            !json_repair.contains("\"\"\""),
+            "the JSON arm's repair must not teach the `\"\"\"` text-only spelling: {json_repair}"
+        );
+        assert!(
+            text_repair.contains("\"\"\""),
+            "the text arm's repair must reference the `\"\"\"` multi-line spelling: {text_repair}"
+        );
+        // Both arms name the ceiling and the split instruction regardless.
+        for repair in [&json_repair, &text_repair] {
+            assert!(repair.contains("16384"));
+            assert!(repair.contains("SMALLER"));
+        }
+    }
+
+    #[tokio::test]
+    async fn compile_turn_completes_fibonacci_scenario_via_truncation_split_repair() {
+        // The I-03 tbench regression signature (docs/designs/multipass-agent-loop.md): a write-heavy
+        // execute-phase plan (server.js + start + verify) truncated at the 16384 emission ceiling and
+        // the loop re-paid a whole-plan retry every time, never completing. This fixture mirrors that
+        // shape: the first emission truncates mid-plan; the split-repair guidance leads to a SMALL
+        // plan (no `complete`, so the phased loop — A-14 — calls plan() again for the rest) that runs.
+        // Asserts the turn completes through the repair path instead of erroring the whole turn.
+        let truncated = vec![
+            Chunk::TextDelta(
+                "I'll write server.js, start it, and verify the response in one plan.".into(),
+            ),
+            Chunk::Done {
+                stop_reason: Some(flux_core::StopReason::MaxTokens),
+            },
+        ];
+        // The post-split emission: a small plan with no `complete` — the model continues next turn.
+        let small_plan = serde_json::json!({
+            "ast": { "body": [
+                { "kind": "call", "op": "read", "args": [{ "kind": "lit", "value": "server.js" }] }
+            ] }
+        });
+        let p = mock(vec![truncated, tool_call("emit_plan", small_plan)]);
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let (out, _usage) = compile_turn(
+            &p,
+            "mock",
+            &[Message::user_text(
+                "write server.js, start it, and verify it responds",
+            )],
+            None,
+            &ops,
+            None,
+            None,
+            None,
+            CompileOptions::default(),
+            Phase::Execute,
+        )
+        .await;
+        match out.unwrap() {
+            TurnOutput::Plan(compiled) => {
+                assert!(
+                    compiled.complete.is_none(),
+                    "the split plan omits `complete` so the phased loop continues"
+                );
+            }
+            TurnOutput::Chat(_) => panic!("expected the split-repaired plan, got a chat answer"),
+        }
     }
 
     #[tokio::test]
