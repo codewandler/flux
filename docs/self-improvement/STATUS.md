@@ -174,7 +174,16 @@ loop misbehaving — each was the machinery working and exposing a bug, which wa
    severity-5 finding — failed-`bash` output truncated to `last: [exit 1] (-v for full)`, hiding
    the error body from the model — was NOT among the planner's two picks and remains the top
    unplayed candidate (4 more queued in the round record). **I-01 stays open**: the machinery is
-   now proven; the statistically clean gain is not yet achieved.
+   now proven; the statistically clean gain is not yet achieved. (f) **Round 3** (the I-05
+   sharpened setup: fibonacci-server×5 scored substrate, `FLUX_IMPROVE_EVAL_MODEL` knob,
+   weight-ranked planner prompt — all worked) surfaced chain defect #3: the **planner answered in
+   prose** instead of the bare JSON array → `change_implement` extracted 0 tasks → the candidate
+   leg measured an unchanged tree → tie → correct revert. Two fixes queued in I-05 (skip the
+   candidate leg on `implemented == 0`; planner-output hardening + loud `change_implement`).
+   **The initiative is ON HOLD as of 2026-07-06 (user priority call)** — resume at I-05's queued
+   fixes, then fund round 4 on the fully-hardened chain. Every chain seam has now either worked
+   live or carries a named guard; the loop found and permanently fixed four eval-infra defects
+   (I-04 shell, two value-template drifts, the flows_validate lower-gate) in one funded day.
 
 A separate **correct revert** is worth calling out as a soundness check: a candidate built a
 *working-looking* fibonacci server that still reverted, because the grader's hidden

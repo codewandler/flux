@@ -6,6 +6,22 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **I-05** — Sharpened improve round (then put ON HOLD with I-01, user call): the scored eval set
+  becomes fibonacci-server × 5 trials (chess-best-move excluded from scoring with recorded
+  evidence — 28↔42% cross-round noise), the planner consumes candidates in weight order, and
+  `bench/run-tbench-loop.sh` gains `FLUX_IMPROVE_EVAL_MODEL` for operator provider routing.
+  Round 3 on this setup surfaced the next chain defect (planner prose → 0 tasks → null candidate
+  leg) — two fixes are queued in the story for resumption. Full state: I-01/I-05 stories +
+  `docs/self-improvement/STATUS.md` journey entry 6.
+- **A-42** — Plan-mode gather rounds stream live: `compile_with_gather` takes an owned
+  `Arc<Mutex<dyn AgentSink>>` and hands each round a fresh `SharedSink` (the loop host's
+  ChannelSink/drain shape — the NLL wall A-18 hit never arises because nothing is reborrowed),
+  so `flux plan` and REPL `/plan` show gather ops/results as they run, with per-round planning
+  spinner + `loop.phase` labels (A-15 parity). Rendering only — same read-only gate, same shared
+  budget, settled plan still never runs.
+
 ## [0.2.20] - 2026-07-06
 
 ### Added

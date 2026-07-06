@@ -2,7 +2,7 @@
 id: I-01
 title: Statistically clean self-improvement headline gain (trials ≥ 3)
 pillar: Improve
-status: in-progress
+status: backlog
 priority: 1
 note: offline half done; 2026-07-02 calibration VERDICT — the synthetic suite is stable but SATURATED (Sonnet 4.6 AND Haiku 4.5 via OpenRouter both score 1000/1000, mean_iters 1.0, twice) → zero headroom, it is a regression floor not a gain vehicle; the headline gain must come from terminal-bench (tb + Docker + musl all present; OpenRouter key forwards into the container) — full loop run postponed by user 2026-07-02
 ---
@@ -21,6 +21,13 @@ proof currently missing from `docs/self-improvement/STATUS.md`.
       casts, `improve-log.jsonl` entries). The agent never grades itself.
 
 ## Progress
+- 2026-07-06 (later) — **ON HOLD** (user priority call). Where things stand: the loop machinery
+  is PROVEN end-to-end (round 2: real tasks implemented, gate green, correct strict revert 278 vs
+  278); the scored substrate is stabilized (I-05: fibonacci-server×5, chess excluded with
+  evidence); remaining known defect: the planner can emit prose instead of the JSON task array
+  (round 3 → 0 tasks → null candidate leg). Resume path: I-05's two queued fixes, then fund a
+  round on the hardened chain. All round records: STATUS.md journey entry 6,
+  `improve-tbench/20260706-*` branches' improve-log.jsonl.
 - 2026-07-06 — **funded round ran; machinery proven end-to-end; correct revert; story stays
   open.** Four attempts on branch `improve-tbench/20260706-130553`: attempts 1-3 shook out three
   real infra defects (I-04 container shell; two classes of stale-flow drift — all fixed on main
