@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.2.19] - 2026-07-06
+
 ### Added
 
 - **C-33** — Cost-surface follow-ups: app-run/journey/agent-target turns now surface cost — the
