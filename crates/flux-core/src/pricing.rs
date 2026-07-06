@@ -196,6 +196,39 @@ pub fn canonical_model_parts(spec: &str) -> (Option<&str>, &str) {
     (provider, bare)
 }
 
+/// Resolve a sub-agent role's `model:` frontmatter override against the **parent's** provider
+/// (A-41). Sub-agents always run on the parent's provider — there is no per-sub-agent provider
+/// factory — but a role's `model:` value speaks the same provider-prefixed spec form `-m` accepts
+/// (e.g. `openrouter/deepseek/deepseek-v4-flash`), so a naive verbatim pass-through reaches the
+/// wire and 400s mid-turn the moment a user writes that natural form in role frontmatter. This
+/// reuses [`split_provider`]/[`known_provider`] (the same prefix-matching [`canonical_model_spec`]
+/// uses) rather than a second ad-hoc parser, so it never naively splits on the first `/` — an
+/// OpenRouter model id legitimately contains one (`vendor/model`).
+///
+/// - A **bare** model id, or one prefixed by any segment that isn't a recognised provider name, is
+///   not a prefix at all — it's just part of the model id — and passes through **unchanged**.
+/// - A model id prefixed by exactly the **parent's own** provider name (string-exact — `openrouter`
+///   and `openrouter-anthropic` are distinct providers, never treated as a prefix of one another)
+///   has that prefix **stripped**, leaving the provider-local slug the wire expects.
+/// - A model id prefixed by any **other** known provider name is rejected: sub-agents cannot
+///   target a different provider than their parent, so this fails fast with a diagnostic naming
+///   both providers instead of surfacing as a raw wire error mid-turn.
+pub fn resolve_role_model(parent_provider: &str, role_model: &str) -> crate::Result<String> {
+    if let Some(bare) = role_model.strip_prefix(&format!("{parent_provider}/")) {
+        return Ok(bare.to_string());
+    }
+    if let (Some(other), _) = split_provider(role_model) {
+        if other != parent_provider {
+            return Err(crate::Error::Config(format!(
+                "role model '{role_model}' targets provider '{other}', but sub-agents always run \
+                 on the parent's provider ('{parent_provider}'); drop the '{other}/' prefix, or \
+                 omit `model:` to inherit '{parent_provider}'"
+            )));
+        }
+    }
+    Ok(role_model.to_string())
+}
+
 impl PricingTable {
     /// The built-in curated rate table. Prices are USD per 1M tokens.
     ///
@@ -513,6 +546,70 @@ mod tests {
         assert_eq!(
             canonical_model_spec(Some("openrouter"), "openai/gpt-4o"),
             "openrouter/openai/gpt-4o"
+        );
+    }
+
+    /// A-41: a role `model:` prefixed by the parent's OWN provider is accepted — the prefix is
+    /// stripped so the provider-local slug reaches the wire, not the full spec verbatim (the live
+    /// failure: `openrouter/deepseek/deepseek-v4-flash` under a parent on `openrouter` 400ed).
+    #[test]
+    fn resolve_role_model_strips_matching_parent_provider_prefix() {
+        assert_eq!(
+            resolve_role_model("openrouter", "openrouter/deepseek/deepseek-v4-flash").unwrap(),
+            "deepseek/deepseek-v4-flash"
+        );
+    }
+
+    /// A-41: a role `model:` naming a DIFFERENT known provider than the parent fails fast with a
+    /// diagnostic naming both providers, instead of reaching the wire as a raw spec and 400ing
+    /// mid-turn.
+    #[test]
+    fn resolve_role_model_rejects_a_different_known_provider() {
+        let err = resolve_role_model("openrouter", "anthropic/claude-sonnet-4-6").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("openrouter"),
+            "names the parent provider: {msg}"
+        );
+        assert!(
+            msg.contains("anthropic"),
+            "names the requested provider: {msg}"
+        );
+    }
+
+    /// A-41: `openrouter` and `openrouter-anthropic` are distinct providers — exact-string prefix
+    /// matching only, never a substring/prefix-of-prefix match either direction.
+    #[test]
+    fn resolve_role_model_distinguishes_openrouter_variants() {
+        // Parent is plain `openrouter`; role names the passthrough variant `openrouter-anthropic` —
+        // a DIFFERENT provider, must reject even though it shares a textual prefix.
+        assert!(resolve_role_model(
+            "openrouter",
+            "openrouter-anthropic/anthropic/claude-sonnet-4.6"
+        )
+        .is_err());
+        // Parent is `openrouter-anthropic`; role names plain `openrouter` — also different, must
+        // reject.
+        assert!(resolve_role_model("openrouter-anthropic", "openrouter/openai/gpt-4o").is_err());
+        // Parent is `openrouter-anthropic`; role matches it exactly — strips.
+        assert_eq!(
+            resolve_role_model(
+                "openrouter-anthropic",
+                "openrouter-anthropic/anthropic/claude-sonnet-4.6"
+            )
+            .unwrap(),
+            "anthropic/claude-sonnet-4.6"
+        );
+    }
+
+    /// A-41: bare provider-local slugs (the current working form) and ids with an unrecognised
+    /// leading segment (not a known provider name, so not a prefix at all) pass through unchanged.
+    #[test]
+    fn resolve_role_model_passes_bare_and_unknown_prefixed_ids_unchanged() {
+        assert_eq!(resolve_role_model("openrouter", "haiku").unwrap(), "haiku");
+        assert_eq!(
+            resolve_role_model("openrouter", "deepseek/deepseek-v4-flash").unwrap(),
+            "deepseek/deepseek-v4-flash"
         );
     }
 

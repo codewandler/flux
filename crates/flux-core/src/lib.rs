@@ -23,7 +23,7 @@ pub use error::{Error, Result};
 pub use event::Event;
 pub use message::Message;
 pub use pricing::{
-    canonical_model_parts, canonical_model_spec, is_subscription, CostSource, Money, PricingTable,
-    RateOverride, Rates,
+    canonical_model_parts, canonical_model_spec, is_subscription, resolve_role_model, CostSource,
+    Money, PricingTable, RateOverride, Rates,
 };
 pub use stream::{Chunk, StopReason, Usage};

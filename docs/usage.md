@@ -129,6 +129,18 @@ flux auth login claude                   # Claude subscription (OAuth)
 
 Default model is `sonnet`, overridable in `.flux/config.toml` (`model = "..."`) or per-call with `-m`.
 
+**Sub-agent role `model:` overrides** (`.flux/agents/<role>.md` frontmatter) speak the same spec
+form as `-m` above, but with one constraint: **a sub-agent always runs on its parent's provider** —
+there is no per-sub-agent provider factory. So a role's `model:` value may be:
+- a bare model id (no provider prefix), or a spec prefixed by the **parent's own** provider — either
+  way it resolves to what the parent's provider expects (a spec like
+  `openrouter/deepseek/deepseek-v4-flash` under an `openrouter` parent has the `openrouter/` prefix
+  stripped before it reaches the wire);
+- but **not** a spec naming a *different* provider than the parent's — that fails fast at spawn time
+  with a diagnostic naming both providers, rather than reaching the wire and failing mid-turn.
+
+Omit `model:` (or leave it blank) to inherit the parent's model outright.
+
 ## Configuration (`.flux/config.toml`)
 
 ```toml

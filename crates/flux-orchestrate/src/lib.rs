@@ -308,6 +308,16 @@ impl Spawner for LocalSpawner {
         // The role *is* the agent definition: body → system prompt, `tools` already applied to the
         // scoped registry above, model inherits the spawner default when the role doesn't override it.
         let mut spec = role.to_spec(&self.default_model);
+        // A-41: a role's `model:` override speaks the same provider-prefixed spec form `-m` accepts
+        // (e.g. `openrouter/deepseek/deepseek-v4-flash`), but sub-agents always run on the PARENT's
+        // provider — there is no per-sub-agent provider factory. Resolve it here, fast, at
+        // spawn-time: the parent's own provider prefix is stripped (the natural form users write in
+        // role frontmatter); any OTHER known provider prefix fails fast with a diagnostic naming
+        // both providers, instead of reaching the wire and 400ing mid-turn. `default_model` (no
+        // override) is untouched — it is already correct for this provider by construction.
+        if let Some(role_model) = &role.model {
+            spec.model = flux_core::resolve_role_model(&provider_name, role_model)?;
+        }
         spec.max_tokens = self.limits.max_tokens;
         spec.max_iterations = self.limits.max_iterations;
 
@@ -887,6 +897,125 @@ mod tests {
             .spawn(SpawnRequest::new("nope", "x"), &cancel)
             .await
             .is_err());
+    }
+
+    /// A mock provider that names a real provider (not `"mock"`) and records the `model` string it
+    /// actually received on the wire — used to prove a role's `model:` override reaches the
+    /// provider request through [`flux_core::resolve_role_model`], not verbatim (A-41).
+    struct ModelCapturingProvider {
+        provider_name: &'static str,
+        seen_model: std::sync::Mutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl Provider for ModelCapturingProvider {
+        fn name(&self) -> &str {
+            self.provider_name
+        }
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            *self.seen_model.lock().unwrap() = Some(req.model.clone());
+            let chunks = vec![
+                Chunk::Block(ContentBlock::Text { text: "ok".into() }),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::EndTurn),
+                },
+            ];
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    /// A-41: a role's `model:` prefixed by the parent's OWN provider name must have that prefix
+    /// stripped before it reaches the wire — the live failure was the full spec
+    /// (`openrouter/deepseek/deepseek-v4-flash`) going out verbatim and 400ing mid-turn.
+    #[tokio::test]
+    async fn spawn_strips_role_model_prefix_matching_parent_provider() {
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role(
+            "---\nmodel: openrouter/deepseek/deepseek-v4-flash\n---\nYou are a scout.",
+            "scout",
+        ));
+        let provider = Arc::new(ModelCapturingProvider {
+            provider_name: "openrouter",
+            seen_model: std::sync::Mutex::new(None),
+        });
+        let provider_for_factory = provider.clone();
+        let spawner = LocalSpawner::new(
+            Arc::new(move || {
+                let p = provider_for_factory.clone();
+                Ok(Box::new(NameForwarding(p)) as Box<dyn Provider>)
+            }),
+            Arc::new(roles),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1024,
+        );
+        let out = spawner
+            .spawn(
+                SpawnRequest::new("scout", "look around"),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.text, "ok");
+        assert_eq!(
+            provider.seen_model.lock().unwrap().as_deref(),
+            Some("deepseek/deepseek-v4-flash"),
+            "the parent's own provider prefix must be stripped before hitting the wire"
+        );
+    }
+
+    /// Wraps a shared [`ModelCapturingProvider`] so the spawner's `provider_factory` (which returns
+    /// an owned `Box<dyn Provider>` per sub-agent) can still forward calls into one shared instance
+    /// the test asserts against afterwards.
+    struct NameForwarding(Arc<ModelCapturingProvider>);
+    #[async_trait]
+    impl Provider for NameForwarding {
+        fn name(&self) -> &str {
+            self.0.name()
+        }
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            self.0.stream(req).await
+        }
+    }
+
+    /// A-41: a role's `model:` naming a DIFFERENT provider than the parent must fail fast at spawn
+    /// time with a diagnostic naming both providers — never reach the wire as a raw spec.
+    #[tokio::test]
+    async fn spawn_rejects_role_model_naming_a_different_provider() {
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role(
+            "---\nmodel: anthropic/claude-sonnet-4-6\n---\nYou are a scout.",
+            "scout",
+        ));
+        let provider = Arc::new(ModelCapturingProvider {
+            provider_name: "openrouter",
+            seen_model: std::sync::Mutex::new(None),
+        });
+        let spawner = LocalSpawner::new(
+            Arc::new(move || Ok(Box::new(NameForwarding(provider.clone())) as Box<dyn Provider>)),
+            Arc::new(roles),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1024,
+        );
+        let err = spawner
+            .spawn(
+                SpawnRequest::new("scout", "look around"),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("openrouter"),
+            "names the parent provider: {msg}"
+        );
+        assert!(
+            msg.contains("anthropic"),
+            "names the requested provider: {msg}"
+        );
     }
 
     #[tokio::test]
