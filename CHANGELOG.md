@@ -6,6 +6,37 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **C-33** — Cost-surface follow-ups: app-run/journey/agent-target turns now surface cost — the
+  app's `RecordingSink` captures `turn_end` usage, `JourneyRun` carries `usage` + the canonical
+  model spec, and the `flux app run` operator console (stdin channel loop) prints a dim stderr
+  cost line per completed run under the same contract as CLI turn ends (priced / `$? (unpriced)`
+  metered-cloud miss / silent local). The TUI stops silently under-reporting on pricing-table
+  misses: its cumulative header switches to `$X.XXXX+? (unpriced)` (or bare `$?`) once any turn is
+  unpriced, sharing the new `flux_core::is_metered_cloud_spec` predicate with the CLI's marker.
+  GoalSink verified already-correct (spec re-derived per goal iteration; `/model` unreachable
+  mid-goal) — no change needed.
+
+### Fixed
+
+- **A-40** — Oversized plan emission dies at max_tokens — split, don't retry the whole plan: a
+  `max_tokens`-truncated `emit_plan` is now its own in-loop repair class in `compile_turn` instead
+  of a turn-killing error. The repair instructs a *split* (smaller plan now, omit `complete`, one
+  large file write per plan; the text arm additionally cites L-39's `"""` verbatim spelling),
+  installs shape-safely (no empty assistant message, no user-after-user — empty-preamble repairs
+  append to the trailing user message), and is bounded by `TRUNCATION_REPAIRS` (2) before a legible
+  failure naming the ceiling. Live re-run (fibonacci-server × 3): the I-03 signature is gone —
+  0 truncation deaths, sampled trial 4 steps/$0.35 vs 31 steps/$0.76 never completing. Validation
+  also uncovered that tb containers never enable the `shell` group (depresses every historical
+  tbench number equally) → filed **I-04**.
+- **C-35** — Prompt caching on the openrouter-anthropic wire: `OpenRouterProfile::quirks_for` now
+  keys on the model and enables `cache_control` for `anthropic/…` slugs (vendor-prefix match; all
+  other gateway upstreams stay conservative — the original A-03 rationale for `false` still holds
+  for them). Live-verified: a prefix-sharing second call reads 27.2k cached (99% hit) at $0.0093
+  vs $0.1033 uncached — the I-03-measured +35% gather-round overhead on openrouter is gone;
+  `flux usage` prices the cached reads (C-30 intact).
+
 ## [0.2.18] - 2026-07-06
 
 ### Added

@@ -30,5 +30,9 @@ Record the ship/no-ship decision against the pre-registered bar in the epic desi
 
 ## Notes
 - Blocked by: flux-model M-15 (ship gate) — do not run against the research-licensed 3B.
+- Cross-repo tracking (2026-07-06): all flux-model intents (corpus/training/ship-gate stories
+  M-01..M-16 and the epic designs) are tracked in `../flux-model` (`docs/stories/`,
+  `docs/designs/flux-planner-ship.md`); the `design:` link above resolves to a redirect stub.
+  This story is the flux-side gate consumer and deliberately stays on this board.
 - The L-20 scaffold was deliberately kept for exactly this story (projection-not-emission
   decision, 2026-07-04).
