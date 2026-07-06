@@ -1719,10 +1719,13 @@ impl Drop for DepthGuard<'_> {
 /// `sink.planning(true)` immediately, and `Drop` guarantees the matching `planning(false)` on every
 /// exit — the happy path, a compile error, or any future early `?` — so a surface's "composing plan…"
 /// indicator (or spinner) can never get stuck on. Mirrors [`DepthGuard`]'s drop-based bracketing.
-struct PlanningGuard(Arc<Mutex<dyn AgentSink>>);
+/// `pub(crate)` so `engine::FlowEngine::compile_with_gather` (A-42) brackets each of its own
+/// planner rounds with the SAME RAII guard normal-mode `plan()` uses, instead of a second
+/// hand-rolled `planning(true)`/`planning(false)` pair that could drift or leak on an early return.
+pub(crate) struct PlanningGuard(Arc<Mutex<dyn AgentSink>>);
 
 impl PlanningGuard {
-    fn start(sink: Arc<Mutex<dyn AgentSink>>) -> Self {
+    pub(crate) fn start(sink: Arc<Mutex<dyn AgentSink>>) -> Self {
         SharedSink(sink.clone()).planning(true);
         Self(sink)
     }

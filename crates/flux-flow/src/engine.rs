@@ -321,17 +321,23 @@ impl FlowEngine {
     /// settling on the full execution plan this function returns. Only the settled plan is handed
     /// back; it is never executed here — `flux plan`'s contract ("show me the plan before anything
     /// runs") holds for the FINAL plan even though gather already ran.
+    ///
+    /// A-42: `sink` streams every gather round's ops/results live (the CLI's one-shot `flux plan`
+    /// now has somewhere to render them, matching `plan_turn`'s REPL `/plan`) — see
+    /// [`Self::compile_with_gather`]'s doc comment for the channel/drain-loop shape.
     pub async fn compile_once(
         &self,
         session_id: &str,
         prompt: &str,
+        sink: &mut dyn AgentSink,
         ask: Option<&dyn crate::compile::AskUser>,
     ) -> Result<TurnOutput> {
         self.composites
             .ensure_session_loaded(&self.flow, session_id)?;
-        // No sink here, so (matching today's pre-A-18 shape) the evidence-gated catalog is
-        // computed WITHOUT a `groups.active` observation — `surfaced_op_names` directly, not
-        // `surfaced_for_turn`/`advertised_registry`, which both require a sink to observe through.
+        // Unrelated to the sink threading below: `flux plan` has never observed `groups.active`
+        // (`surfaced_op_names` directly, not `surfaced_for_turn`) — preserved as-is, since wiring a
+        // live sink for gather rendering is no reason to also start emitting a new observation kind
+        // this surface never has.
         let (advertised, _surfaced) = surfaced_op_names(
             self.executor.registry(),
             &self.groups,
@@ -342,20 +348,39 @@ impl FlowEngine {
             max_tokens: self.max_tokens,
             ..CompileOptions::default()
         };
-        // Compile-only surface, no sink: gather rounds run silently (no live streaming) and their
-        // usage is folded into `_usage`, deliberately unused — same C-31 stance as before A-18,
-        // just now covering however many planner calls (orient + gather rounds) this turn made
-        // instead of always exactly one.
-        let (out, _usage) = self
-            .compile_with_gather(
-                session_id,
-                &[Message::user_text(prompt)],
-                Some(&self.system_prompt),
-                Some(advertised),
-                ask,
-                opts,
-            )
-            .await;
+        // A-42: drive `compile_with_gather` over an owned, channel-backed sink and drain the
+        // channel onto the caller's borrowed `sink` concurrently — the same ChannelSink/drain-loop
+        // shape `run_turn_cancellable` uses, so gather rounds stream live instead of through the
+        // internal `NullSink` A-18 shipped with. Usage is folded into `_usage`, deliberately
+        // unused — same C-31 stance as before A-18.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::loop_host::SinkEvent>();
+        let channel: Arc<std::sync::Mutex<dyn AgentSink>> = Arc::new(std::sync::Mutex::new(
+            crate::loop_host::ChannelSink::new(tx),
+        ));
+        let reveal = show_loop();
+        let messages = [Message::user_text(prompt)];
+        let fut = self.compile_with_gather(
+            session_id,
+            &messages,
+            Some(&self.system_prompt),
+            Some(advertised),
+            ask,
+            channel,
+            opts,
+        );
+        tokio::pin!(fut);
+        let (out, _usage) = loop {
+            tokio::select! {
+                biased;
+                maybe = rx.recv() => {
+                    if let Some(ev) = maybe { drain_event(ev, sink, reveal); }
+                }
+                res = &mut fut => {
+                    while let Ok(ev) = rx.try_recv() { drain_event(ev, sink, reveal); }
+                    break res;
+                }
+            }
+        };
         out
     }
 
@@ -375,16 +400,20 @@ impl FlowEngine {
     /// `GATHER_ROUND_BUDGET` rounds, so the next call is forced into [`Phase::Execute`] (whose
     /// contract rejects `gather: true`) to compel a real settlement instead.
     ///
-    /// No sink is threaded through the gather rounds themselves (unlike normal mode's `run_plan`,
-    /// which streams inner ops live via `SharedSink`'s clonable `Arc<Mutex<dyn AgentSink>>`): the
-    /// caller here holds a plain, non-'static `&mut dyn AgentSink` with no cheap way to clone a
-    /// handle to it, and reborrowing it across a multi-round loop where a later round needs to
-    /// *reuse* an earlier reborrow's binding runs into a well-known NLL limitation (a reborrow
-    /// taken for one purpose is, in practice, held for the reference's whole declared lifetime, so
-    /// a second, later use of the same binding conflicts even though the first use already ended).
-    /// Gather is internal grounding, not user-facing output, so this only means its intermediate
-    /// reads aren't streamed live — the caller still brackets `planning(true/false)` around the
-    /// whole call, and the settled result is rendered exactly as before.
+    /// A-42: every round streams live through `sink` — an owned, clonable `Arc<Mutex<dyn
+    /// AgentSink>>`, exactly the handle normal-mode `run_plan` shares via `SharedSink` — instead of
+    /// the internal `NullSink` A-18 shipped with. A-18's attempt to thread the caller's plain,
+    /// non-'static `&mut dyn AgentSink` straight into this loop hit a well-known NLL limitation
+    /// (reborrowing it more than once per iteration — once for `compile_turn`'s thinking-sink,
+    /// again for the gather dispatch — unifies the reborrow's lifetime with the loop's back-edge);
+    /// an owned `Arc` clone per round sidesteps that entirely, since each round's `SharedSink` is a
+    /// brand-new value, never a reborrow of a captured outer reference. The caller (`compile_once`/
+    /// `plan_turn`) owns the OTHER half of the channel this `sink` was built from and drains it onto
+    /// its own borrowed sink concurrently with this future — the same ChannelSink/drain-loop shape
+    /// `run_turn_cancellable` already uses. `thinking_sink` stays `None` (unchanged from A-18): that
+    /// would also flip `Request.thinking` on, a real behavioral change this rendering-only story
+    /// must not make.
+    #[allow(clippy::too_many_arguments)]
     async fn compile_with_gather(
         &self,
         session_id: &str,
@@ -392,6 +421,7 @@ impl FlowEngine {
         base_system: Option<&str>,
         advertised: Option<std::collections::HashSet<String>>,
         ask: Option<&dyn crate::compile::AskUser>,
+        sink: Arc<std::sync::Mutex<dyn AgentSink>>,
         opts: CompileOptions,
     ) -> (Result<TurnOutput>, Usage) {
         let mut usage_total = Usage::default();
@@ -425,19 +455,37 @@ impl FlowEngine {
             };
             let view_ref = (!view.symbols.is_empty()).then_some(&view);
 
-            let (out, call_usage) = compile_turn(
-                &*self.provider,
-                &self.model,
-                &conversation,
-                base_system,
-                &ops,
-                view_ref,
-                ask,
-                None,
-                opts.clone(),
-                phase,
-            )
-            .await;
+            // A-42 (A-15 parity): announce this round's phase on the live sink before the
+            // otherwise-silent planner call — mirrors `EngineLoopHost::plan`'s own `loop.phase`
+            // observation (loop_host.rs), so the CLI's phase-aware spinner label
+            // ("orienting…"/"gathering…") applies to plan mode's rounds too. Sink-only (unlike
+            // `plan()`, this does not also record it to durable evidence — the phased Rust loop
+            // isn't the reflexive `plan()` op, and this story is rendering-only).
+            crate::loop_host::SharedSink::new(sink.clone()).observation(
+                &flux_evidence::Observation::new(
+                    "loop.phase",
+                    flux_evidence::Phase::Turn,
+                    serde_json::json!({ "phase": phase.as_str() }),
+                ),
+            );
+            let (out, call_usage) = {
+                // Scoped so the spinner stops the instant `compile_turn` returns — the round's
+                // gather dispatch below streams its own tool_call/tool_result progress instead.
+                let _planning = crate::loop_host::PlanningGuard::start(sink.clone());
+                compile_turn(
+                    &*self.provider,
+                    &self.model,
+                    &conversation,
+                    base_system,
+                    &ops,
+                    view_ref,
+                    ask,
+                    None,
+                    opts.clone(),
+                    phase,
+                )
+                .await
+            };
             usage_total.accumulate(&call_usage);
 
             let out = match out {
@@ -466,9 +514,10 @@ impl FlowEngine {
             // Automatic, read-only gather round: A-13's `gather_violation` check inside
             // `compile_turn` already refused this plan if it named a mutating op or exceeded the
             // node cap, so running it here is exactly as safe as `run_plan` already treats any
-            // non-mutating plan (no approval prompt).
+            // non-mutating plan (no approval prompt). A-42: dispatched through the SAME shared
+            // sink every other round uses (no more `NullSink`), so the ops/results stream live.
             gather_rounds += 1;
-            let mut null_sink = NullSink;
+            let mut round_sink = crate::loop_host::SharedSink::new(sink.clone());
             let outcome = execute_flow_resumable_with_composites(
                 self.flow.as_ref(),
                 self.executor.as_ref(),
@@ -477,7 +526,7 @@ impl FlowEngine {
                 &composites,
                 None,
                 None,
-                &mut null_sink,
+                &mut round_sink,
             )
             .await;
 
@@ -520,6 +569,12 @@ impl FlowEngine {
     /// returns `None`. Abortable via `cancel`: a Ctrl-C mid-compose (whether during a planner call
     /// or a gather round's execution) drops the in-flight work and returns `Ok(None)` (nothing to
     /// run).
+    ///
+    /// A-42: `sink` streams every gather round's ops/results live, and each round brackets its own
+    /// `planning(true/false)` (moved inside [`Self::compile_with_gather`], mirroring normal-mode
+    /// `plan()`'s per-round [`crate::loop_host::PlanningGuard`]) rather than one bracket around the
+    /// whole phased sequence — see `compile_with_gather`'s doc comment for the channel/drain-loop
+    /// shape this reuses from `run_turn_cancellable`.
     pub async fn plan_turn(
         &self,
         session_id: &str,
@@ -541,10 +596,15 @@ impl FlowEngine {
             ..CompileOptions::default()
         };
         let conversation = self.events.conversation(session_id)?;
-        sink.planning(true);
-        // Race the whole orient/gather/settle sequence against `cancel` so Ctrl-C drops the
-        // in-flight request (dropping the future aborts its HTTP, or any in-flight gather
-        // dispatch) instead of blocking until it lands. `None` => cancelled.
+        // A-42: an owned, channel-backed sink for `compile_with_gather` to share across rounds;
+        // drained onto the caller's borrowed `sink` concurrently, racing `cancel` too so Ctrl-C
+        // still drops the in-flight request/dispatch and returns promptly (dropping `fut` aborts
+        // whatever it was awaiting).
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::loop_host::SinkEvent>();
+        let channel: Arc<std::sync::Mutex<dyn AgentSink>> = Arc::new(std::sync::Mutex::new(
+            crate::loop_host::ChannelSink::new(tx),
+        ));
+        let reveal = show_loop();
         let out = {
             let fut = self.compile_with_gather(
                 session_id,
@@ -552,16 +612,27 @@ impl FlowEngine {
                 Some(&base_system),
                 Some(advertised),
                 None,
+                channel,
                 opts,
             );
             tokio::pin!(fut);
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => None,
-                res = &mut fut => Some(res),
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        while let Ok(ev) = rx.try_recv() { drain_event(ev, sink, reveal); }
+                        break None;
+                    }
+                    maybe = rx.recv() => {
+                        if let Some(ev) = maybe { drain_event(ev, sink, reveal); }
+                    }
+                    res = &mut fut => {
+                        while let Ok(ev) = rx.try_recv() { drain_event(ev, sink, reveal); }
+                        break Some(res);
+                    }
+                }
             }
         };
-        sink.planning(false);
         let Some(out) = out else {
             // Cancelled mid-compose: nothing to run; end the turn cleanly.
             sink.turn_end(None);
@@ -1375,6 +1446,10 @@ mod tests {
     struct CollectSink {
         text: String,
         tools: Vec<String>,
+        /// A-42: the op name of every `tool_result` this sink observed, in order — lets a test
+        /// assert a gather round's dispatch streamed both the call AND its result live, not just
+        /// one half of the pair.
+        results: Vec<String>,
     }
     impl AgentSink for CollectSink {
         fn text_delta(&mut self, t: &str) {
@@ -1382,6 +1457,9 @@ mod tests {
         }
         fn tool_call(&mut self, name: &str, _input: &serde_json::Value) {
             self.tools.push(name.to_string());
+        }
+        fn tool_result(&mut self, name: &str, _result: &ToolResult) {
+            self.results.push(name.to_string());
         }
     }
 
@@ -1900,8 +1978,9 @@ mod tests {
         };
         let engine = engine_with_provider(Box::new(provider), store.clone());
 
+        let mut sink = CollectSink::default();
         let out = engine
-            .compile_once(&sid, "read a file then answer", None)
+            .compile_once(&sid, "read a file then answer", &mut sink, None)
             .await
             .unwrap();
         match out {
@@ -1949,8 +2028,9 @@ mod tests {
         let responses = VecDeque::from(vec![emit_gather_plan(gather_ast), emit_plan(final_ast)]);
         let engine = engine_with(responses, store.clone());
 
+        let mut sink = CollectSink::default();
         let out = engine
-            .compile_once(&sid, "investigate then fix", None)
+            .compile_once(&sid, "investigate then fix", &mut sink, None)
             .await
             .unwrap();
 
@@ -2076,7 +2156,11 @@ mod tests {
         ]);
         let engine = engine_with(responses, store.clone());
 
-        let out = engine.compile_once(&sid, "dig deep", None).await.unwrap();
+        let mut sink = CollectSink::default();
+        let out = engine
+            .compile_once(&sid, "dig deep", &mut sink, None)
+            .await
+            .unwrap();
 
         for n in 1..=GATHER_ROUND_BUDGET {
             assert!(
@@ -2141,8 +2225,9 @@ mod tests {
         ]);
         let (engine, write_calls) = engine_with_write_tool(responses, store.clone());
 
+        let mut sink = CollectSink::default();
         let out = engine
-            .compile_once(&sid, "change something", None)
+            .compile_once(&sid, "change something", &mut sink, None)
             .await
             .unwrap();
 
@@ -2164,6 +2249,87 @@ mod tests {
             }
             TurnOutput::Chat(t) => panic!("expected the settled plan, got chat: {t}"),
         }
+    }
+
+    /// A-42 named acceptance: a plan-mode gather round's op dispatch/result stream LIVE to the
+    /// caller's sink through `compile_once` (the one-shot `flux plan` seam) — before this story
+    /// they ran through an internal `NullSink` (A-18's documented deviation), so `sink.tools`/
+    /// `sink.results` stayed empty even though the gather round genuinely executed (proven by the
+    /// `g` symbol landing in the session, exactly like `compile_once_runs_gather_then_shows_the_final_plan_unexecuted`).
+    #[tokio::test]
+    async fn compile_once_streams_gather_round_ops_to_the_live_sink() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let gather_ast = json!({ "body": [{
+            "kind": "bind", "name": "g",
+            "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "GATHER" }] }
+        }]});
+        let final_ast = json!({ "body": [{
+            "kind": "bind", "name": "f",
+            "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "FINAL" }] }
+        }]});
+        let responses = VecDeque::from(vec![emit_gather_plan(gather_ast), emit_plan(final_ast)]);
+        let engine = engine_with(responses, store.clone());
+        let mut sink = CollectSink::default();
+
+        let _ = engine
+            .compile_once(&sid, "investigate then fix", &mut sink, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sink.tools,
+            vec!["echo".to_string()],
+            "the gather round's op dispatch streamed to the caller's sink live: {:?}",
+            sink.tools
+        );
+        assert_eq!(
+            sink.results,
+            vec!["echo".to_string()],
+            "the gather round's result streamed too: {:?}",
+            sink.results
+        );
+    }
+
+    /// The same A-42 contract through the REPL `/plan` seam (`plan_turn`, not `compile_once`).
+    #[tokio::test]
+    async fn plan_turn_streams_gather_round_ops_to_the_live_sink() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let gather_ast = json!({ "body": [{
+            "kind": "bind", "name": "g",
+            "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "GATHER" }] }
+        }]});
+        let final_ast = json!({ "body": [{
+            "kind": "bind", "name": "f",
+            "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "FINAL" }] }
+        }]});
+        let responses = VecDeque::from(vec![emit_gather_plan(gather_ast), emit_plan(final_ast)]);
+        let engine = engine_with(responses, store.clone());
+        let mut sink = CollectSink::default();
+
+        let _ = engine
+            .plan_turn(
+                &sid,
+                "investigate then propose a fix",
+                &mut sink,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sink.tools,
+            vec!["echo".to_string()],
+            "the gather round's op dispatch streamed to the caller's sink live: {:?}",
+            sink.tools
+        );
+        assert_eq!(
+            sink.results,
+            vec!["echo".to_string()],
+            "the gather round's result streamed too: {:?}",
+            sink.results
+        );
     }
 
     /// Reified await (post-cutover; see the design's turn-boundary section): a top-level `await` inside a

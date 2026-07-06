@@ -2370,8 +2370,17 @@ async fn run_plan(
         style::dim(&format!("plan · {} · agentic", engine.model))
     );
 
+    // A-42: a live sink so any auto-run gather rounds stream (ops/results, phase-aware spinner)
+    // instead of the prior silence — no cost/turn-end rendering needed here, `compile_once` never
+    // calls `turn_end` on it (this is a compile, not a turn).
+    let mut gather_sink = CliSink::new(0);
     let compiled = match engine
-        .compile_once(&session_id, &prompt, terminal_ask(&cli_ask))
+        .compile_once(
+            &session_id,
+            &prompt,
+            &mut gather_sink,
+            terminal_ask(&cli_ask),
+        )
         .await
         .map_err(|e| anyhow::anyhow!("{}", flux_flow::engine::planner_error(&e)))?
     {
