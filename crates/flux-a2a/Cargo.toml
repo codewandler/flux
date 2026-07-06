@@ -17,6 +17,14 @@ rand.workspace = true
 url.workspace = true
 # The server-side `A2aTurn` seam is an async trait used behind `&dyn` (object-safe via boxing).
 async-trait.workspace = true
+# OpenAPI/JSON-Schema derives on the wire types (optional, D-57): lets a consumer generate docs
+# straight from `flux_a2a::types` instead of hand-mirroring them. Off by default.
+utoipa = { version = "5", optional = true }
+
+[features]
+# `#[derive(utoipa::ToSchema)]` on the wire types (`Message`, `Task`, `AgentCard`, the JSON-RPC
+# envelope, …). Off by default — the utoipa dep only compiles under this feature.
+utoipa = ["dep:utoipa"]
 
 [dev-dependencies]
 tokio.workspace = true

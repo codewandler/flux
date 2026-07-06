@@ -34,6 +34,7 @@ fn kind_artifact_update() -> String {
 
 /// Who authored a [`Message`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     User,
@@ -43,6 +44,7 @@ pub enum Role {
 /// A single content part. Modeled as a struct (not an enum) so any `kind` round-trips and unknown
 /// part shapes (file/data + their fields) survive via [`Part::extra`]. The MVP only emits/reads text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct Part {
     /// Discriminator: `"text"`, `"file"`, `"data"`, …
     pub kind: String,
@@ -86,6 +88,7 @@ impl Part {
 
 /// An A2A message: a turn of conversation carrying ordered [`Part`]s.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
     #[serde(default = "kind_message")]
@@ -144,6 +147,7 @@ impl Message {
 
 /// Lifecycle state of a [`Task`]. JSON values are lowercase, kebab-cased.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum TaskState {
     Submitted,
@@ -169,6 +173,7 @@ impl TaskState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct TaskStatus {
     pub state: TaskState,
@@ -190,6 +195,7 @@ impl TaskStatus {
 
 /// A produced output unit (a file, a block of text, …). We only read its text parts.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Artifact {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -204,6 +210,7 @@ pub struct Artifact {
 
 /// A stateful unit of work the remote agent runs on our behalf.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Task {
     #[serde(default = "kind_task")]
@@ -255,6 +262,7 @@ impl Task {
 // ── Streaming events ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct TaskStatusUpdateEvent {
     #[serde(default = "kind_status_update")]
@@ -286,6 +294,7 @@ impl TaskStatusUpdateEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct TaskArtifactUpdateEvent {
     #[serde(default = "kind_artifact_update")]
@@ -364,6 +373,7 @@ impl SendOutcome {
 // ── Agent card ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Capabilities {
     #[serde(default)]
@@ -375,6 +385,7 @@ pub struct Capabilities {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Skill {
     #[serde(default)]
@@ -391,6 +402,7 @@ pub struct Skill {
 
 /// A newer-spec transport interface declaration (`{ transport|type, url }`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct AgentInterface {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -401,6 +413,7 @@ pub struct AgentInterface {
 
 /// The A2A discovery document served at `/.well-known/agent-card.json` (or `…/agent.json`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct AgentCard {
     #[serde(default)]
@@ -447,6 +460,7 @@ impl AgentCard {
 // ── JSON-RPC envelope ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct JsonRpcRequest<P> {
     pub jsonrpc: &'static str,
     pub id: String,
@@ -466,6 +480,7 @@ impl<P> JsonRpcRequest<P> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 // `#[serde(default)]` on a generic field would otherwise make serde infer a spurious `T: Default`
 // bound; pin the deserialize bound to just `Deserialize`.
 #[serde(bound(deserialize = "T: Deserialize<'de>"))]
@@ -477,6 +492,7 @@ pub struct JsonRpcResponse<T> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct JsonRpcError {
     pub code: i64,
     pub message: String,
@@ -486,6 +502,7 @@ pub struct JsonRpcError {
 
 /// `params` for `message/send` and `message/stream`.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SendMessageParams {
     pub message: Message,
@@ -494,6 +511,7 @@ pub struct SendMessageParams {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SendConfiguration {
     pub blocking: bool,
@@ -501,7 +519,98 @@ pub struct SendConfiguration {
 
 /// `params` for `tasks/get`.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct TaskGetParams {
     pub id: String,
+}
+
+// ── Schema derives (D-57) ────────────────────────────────────────────────────
+//
+// Proves the `utoipa` feature actually compiles a faithful schema for the wire types a consumer
+// documents (`ai-agents/src/openapi.rs`'s hand-mirrored structs), not just that the derive macro
+// runs without complaint: it inspects the generated `Object` schema shape (property names honor
+// `#[serde(rename_all)]`, enums carry their `#[serde(rename_all)]`-cased variants) for the two
+// richest root types — [`AgentCard`] (the discovery document) and [`Message`] (nested through
+// `TaskStatus`/`Task`) — plus their enum fields ([`Role`], [`TaskState`]).
+
+#[cfg(all(test, feature = "utoipa"))]
+mod schema_tests {
+    use super::*;
+    use utoipa::openapi::{RefOr, Schema};
+    use utoipa::PartialSchema;
+
+    /// Unwrap a top-level `object` schema (not a `$ref` or a composite `allOf`/`oneOf`).
+    fn as_object(schema: RefOr<Schema>) -> utoipa::openapi::schema::Object {
+        match schema {
+            RefOr::T(Schema::Object(obj)) => obj,
+            RefOr::Ref(_) => panic!("expected an inline object schema, got a $ref"),
+            RefOr::T(_) => panic!("expected an inline object schema, got a composite schema"),
+        }
+    }
+
+    #[test]
+    fn agent_card_schema_exposes_the_discovery_document_fields() {
+        let obj = as_object(AgentCard::schema());
+        for field in [
+            "name",
+            "description",
+            "url",
+            "version",
+            "capabilities",
+            "defaultInputModes",
+            "defaultOutputModes",
+            "skills",
+            "interfaces",
+        ] {
+            assert!(
+                obj.properties.contains_key(field),
+                "AgentCard schema missing `{field}`: {:?}",
+                obj.properties.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn message_schema_uses_camel_case_field_names() {
+        let obj = as_object(Message::schema());
+        for field in ["kind", "messageId", "contextId", "taskId", "role", "parts"] {
+            assert!(
+                obj.properties.contains_key(field),
+                "Message schema missing `{field}`: {:?}",
+                obj.properties.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn role_schema_is_a_lowercase_two_value_enum() {
+        let obj = as_object(Role::schema());
+        let values: Vec<String> = obj
+            .enum_values
+            .expect("Role is a fieldless enum")
+            .iter()
+            .map(|v| v.as_str().expect("string enum value").to_string())
+            .collect();
+        assert_eq!(values.len(), 2, "unexpected Role variants: {values:?}");
+        assert!(values.contains(&"user".to_string()));
+        assert!(values.contains(&"agent".to_string()));
+    }
+
+    #[test]
+    fn task_state_schema_is_kebab_case_and_carries_the_unknown_fallback() {
+        let obj = as_object(TaskState::schema());
+        let values: Vec<String> = obj
+            .enum_values
+            .expect("TaskState is a fieldless enum")
+            .iter()
+            .map(|v| v.as_str().expect("string enum value").to_string())
+            .collect();
+        assert!(values.contains(&"completed".to_string()));
+        assert!(values.contains(&"input-required".to_string()));
+        // `#[serde(other)]`'s fallback variant renders as its own value — not perfectly faithful
+        // to serde's catch-all semantics, but JSON Schema has no equivalent, and the value list
+        // still enumerates every state a client can observe.
+        assert!(values.contains(&"unknown".to_string()));
+    }
 }

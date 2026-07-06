@@ -48,6 +48,20 @@ pub struct A2aReply {
 
 // ── Agent card ────────────────────────────────────────────────────────────────
 
+/// Build an absolute URL for `path` from a request's scheme + host, so a served discovery card's
+/// `url` is correct whether the agent is reached directly or through a reverse proxy.
+///
+/// Pure and framework-free (D-57): callers resolve their own `Host`/`X-Forwarded-Proto` header
+/// values (each HTTP framework has its own header-map type) and pass plain strings — this is the
+/// one shared home for the scheme/host → URL derivation, used by `flux-server`'s axum handler and
+/// any other A2A surface. `forwarded_proto` is the `X-Forwarded-Proto` value, if the request carries
+/// one; absent, the scheme falls back to `"http"`. `path` is appended verbatim (callers pass a
+/// leading `/`).
+pub fn card_url(forwarded_proto: Option<&str>, host: &str, path: &str) -> String {
+    let scheme = forwarded_proto.unwrap_or("http");
+    format!("{scheme}://{host}{path}")
+}
+
 /// Build an A2A discovery [`AgentCard`]. `url` is the JSON-RPC endpoint (else the client derives
 /// `<base>/a2a`); `version` is the serving agent's version; `skills` are `(id, name, description)`
 /// triples surfaced as the card's skills (pass `id == name` when there is no separate identifier).
@@ -214,6 +228,36 @@ pub fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn card_url_defaults_to_http_without_forwarded_proto() {
+        assert_eq!(
+            card_url(None, "example.com", "/a2a"),
+            "http://example.com/a2a"
+        );
+    }
+
+    #[test]
+    fn card_url_honors_forwarded_proto_when_present() {
+        assert_eq!(
+            card_url(Some("https"), "example.com", "/agent/a2a"),
+            "https://example.com/agent/a2a"
+        );
+    }
+
+    #[test]
+    fn card_url_joins_the_path_verbatim() {
+        // No inserted separator beyond what the caller's `path` already carries — a caller that
+        // forgets the leading `/` gets a malformed URL back, same as the inlined derivation did.
+        assert_eq!(
+            card_url(
+                Some("http"),
+                "localhost:8080",
+                "/.well-known/agent-card.json"
+            ),
+            "http://localhost:8080/.well-known/agent-card.json"
+        );
+    }
 
     /// A canned runner: echoes the input as the answer — no model, no key.
     struct StubRunner;

@@ -140,11 +140,10 @@ pub async fn agent_card(State(card): State<Arc<CardInfo>>, headers: HeaderMap) -
         .get("host")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("localhost");
-    let scheme = headers
+    let forwarded_proto = headers
         .get("x-forwarded-proto")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("http");
-    let url = format!("{scheme}://{host}/a2a");
+        .and_then(|h| h.to_str().ok());
+    let url = server::card_url(forwarded_proto, host, "/a2a");
 
     Json(server::agent_card(
         &card.name,
