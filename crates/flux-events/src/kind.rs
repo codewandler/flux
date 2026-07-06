@@ -1,12 +1,26 @@
 //! Event kinds and the append/read envelopes.
 //!
-//! [`EventKind`] is the **closed set** of facts flux logs. A single Rust enum (not an
-//! open type registry) is the right model for a single closed binary: serde gives free
-//! (de)serialization and an exhaustive `match` forces every projection to handle every
-//! kind at compile time. It is **adjacently tagged** (`{"kind": …, "data": …}`) because
-//! two variants wrap another enum/struct ([`EventKind::Run`] wraps [`RunEvent`],
-//! [`EventKind::Message`] wraps [`Message`]) — internal tagging cannot flatten a nested
-//! enum, and the split mirrors the DB's `kind`-column-plus-`payload`-JSON layout.
+//! The set of **flux** facts — the things the engine itself decides happened (a turn started,
+//! a plan was attempted, a call billed tokens, …) — is **closed** and stays that way. A single
+//! Rust enum (not an open type registry) is the right model for those: serde gives free
+//! (de)serialization and an exhaustive `match` forces every projection to handle every flux
+//! kind at compile time, so a new fact can never silently fail to show up in the conversation,
+//! cost, or evidence read models.
+//!
+//! [`EventKind::Custom`] is the **one** deliberate extension point, for **app** facts: a
+//! consumer embedding flux (an audit trail, a domain event, …) gets to ride the same
+//! append-only, account-scoped, ordered log instead of standing up a parallel store, without
+//! flux ever needing to understand what the fact means. It stays a variant of this same enum
+//! (not a bypass around it) so the exhaustive-match discipline still applies — adding it forced
+//! one arm onto every existing match, and every future flux match must keep deciding what
+//! `Custom` means for it (almost always: pass it through unread). The enum is deliberately kept
+//! *not* `#[non_exhaustive]` for exactly that reason: an open registry inside a closed enum
+//! would defeat the compile-time guarantee the module exists to give.
+//!
+//! It is **adjacently tagged** (`{"kind": …, "data": …}`) because several variants wrap another
+//! enum/struct ([`EventKind::Run`] wraps [`RunEvent`], [`EventKind::Message`] wraps [`Message`])
+//! — internal tagging cannot flatten a nested enum, and the split mirrors the DB's
+//! `kind`-column-plus-`payload`-JSON layout.
 
 use serde::{Deserialize, Serialize};
 
@@ -15,8 +29,10 @@ use flux_lang::ast::RunEvent;
 
 use crate::context::EventContext;
 
-/// The closed set of event kinds in flux's unified log. Adding a kind of fact is one
-/// new variant here plus one projection arm — never a new table and new methods.
+/// The event kinds in flux's unified log: a closed set of *flux* facts, plus the single open
+/// [`EventKind::Custom`] extension point for *app* facts. Adding a kind of **flux** fact is one
+/// new variant here plus one projection arm — never a new table and new methods; an **app**
+/// fact needs no new variant at all — it rides [`EventKind::Custom`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum EventKind {
@@ -125,6 +141,19 @@ pub enum EventKind {
     /// the offline one (`projection::observations`). The inner type is reused verbatim from
     /// `flux-evidence` (L0), never re-defined.
     Observation(flux_evidence::Observation),
+
+    /// An **app-defined** fact (D-55) — the one open extension point in an otherwise closed enum.
+    /// `name` namespaces the fact so unrelated consumers sharing one log don't collide; dotted
+    /// names are recommended (e.g. `"audit.tool_call"`, mirroring the `Observation.kind` string
+    /// convention). `payload` is opaque — **flux never interprets it**, never validates its shape,
+    /// and never folds it into any flux projection; it exists purely so the consumer that wrote it
+    /// can read it back, byte-for-byte, through the ordered, account-scoped log instead of a
+    /// parallel store. Every flux projection must still decide what `Custom` means for *it*
+    /// (compile-forced by the exhaustive match) — the answer is almost always "skip".
+    Custom {
+        name: String,
+        payload: serde_json::Value,
+    },
 }
 
 impl EventKind {
@@ -145,6 +174,7 @@ impl EventKind {
             EventKind::CrossPluginResolve { .. } => "cross_plugin_resolve",
             EventKind::EndpointDiscovered { .. } => "endpoint_discovered",
             EventKind::Observation(_) => "observation",
+            EventKind::Custom { .. } => "custom",
         }
     }
 }
@@ -285,5 +315,73 @@ mod tests {
             !json.contains("reported_cost_usd"),
             "None must not serialize the key at all: {json}"
         );
+    }
+
+    /// D-55: `Custom` is adjacently tagged exactly like every other variant
+    /// (`{"kind":"custom","data":{...}}`, not internally tagged, not flattened) and round-trips its
+    /// opaque `payload` byte-for-byte regardless of shape (object, array, scalar).
+    #[test]
+    fn custom_round_trips_with_adjacent_tag_shape() {
+        let kind = EventKind::Custom {
+            name: "audit.tool_call".to_string(),
+            payload: serde_json::json!({"tool": "read_file", "path": "a.rs", "bytes": 128}),
+        };
+
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "kind": "custom",
+                "data": {
+                    "name": "audit.tool_call",
+                    "payload": {"tool": "read_file", "path": "a.rs", "bytes": 128}
+                }
+            }),
+            "Custom must be adjacently tagged like every other EventKind variant: {json}"
+        );
+
+        let round_tripped: EventKind = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped, kind);
+        assert_eq!(round_tripped.kind_tag(), "custom");
+
+        // The payload is opaque: flux never validates its shape. A non-object payload round-trips
+        // just as well.
+        let scalar_payload = EventKind::Custom {
+            name: "app.counter".to_string(),
+            payload: serde_json::json!(42),
+        };
+        let json = serde_json::to_string(&scalar_payload).unwrap();
+        let decoded: EventKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, scalar_payload);
+    }
+
+    /// D-55: adding `EventKind::Custom` must not perturb decoding of any pre-existing kind already
+    /// on disk — every case here is a raw JSON payload shaped exactly as a pre-D-55 log row, with no
+    /// `custom` key anywhere near it.
+    #[test]
+    fn pre_d55_logs_without_custom_still_decode() {
+        let cases: &[(&str, &str)] = &[
+            (
+                r#"{"kind":"session_started","data":{"model":"m"}}"#,
+                "session_started",
+            ),
+            (
+                r#"{"kind":"turn_started","data":{"user_input":"hi","model":"m"}}"#,
+                "turn_started",
+            ),
+            (
+                r#"{"kind":"call_usage","data":{"model":"m","usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"reasoning_tokens":0}}}"#,
+                "call_usage",
+            ),
+            (
+                r#"{"kind":"turn_ended","data":{"outcome":"accepted","iterations":1,"answer":"done"}}"#,
+                "turn_ended",
+            ),
+        ];
+        for (raw, tag) in cases {
+            let decoded: EventKind = serde_json::from_str(raw)
+                .unwrap_or_else(|e| panic!("{tag} must still decode: {e}"));
+            assert_eq!(decoded.kind_tag(), *tag, "decoded the wrong kind for {raw}");
+        }
     }
 }

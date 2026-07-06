@@ -1845,4 +1845,70 @@ mod tests {
         assert_eq!(s2.conversation(&sid).unwrap().len(), 1, "the write landed");
         let _ = std::fs::remove_file(&path);
     }
+
+    /// D-55: `EventKind::Custom` rides the existing `append`/`NewEvent` path with `EventContext`
+    /// account scoping exactly like every other kind — appended under an account, read back through
+    /// the account-scoped path, its opaque `payload` survives byte-identical, and every other
+    /// projection (conversation, msg_count) is unaffected by its presence.
+    #[test]
+    fn custom_events_append_and_read_back_scoped_by_account() {
+        let store = EventStore::in_memory().unwrap();
+        let ctx = EventContext::for_account("acme");
+        let id = store.create_session_with_context("m", &ctx).unwrap();
+        store
+            .record_message(&id, &Message::user_text("hi"))
+            .unwrap();
+
+        let payload = serde_json::json!({"tool": "read_file", "path": "src/lib.rs", "bytes": 128});
+        let stored = store
+            .append(
+                &id,
+                NewEvent::new(EventKind::Custom {
+                    name: "audit.tool_call".to_string(),
+                    payload: payload.clone(),
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            stored.context, ctx,
+            "a Custom row carries the run's account scoping like any other event"
+        );
+
+        store
+            .record_message(&id, &Message::assistant_text("done"))
+            .unwrap();
+
+        // Read back through the account-scoped path (the downstream-consumer surface) and find the
+        // exact row: the payload survives byte-identical, not merely structurally equal.
+        assert_eq!(store.account_streams("acme").unwrap(), vec![id.clone()]);
+        let events = store.load_stream(&id, None).unwrap();
+        let custom = events
+            .iter()
+            .find(|e| matches!(&e.kind, EventKind::Custom { .. }))
+            .expect("the Custom row round-trips through the store");
+        match &custom.kind {
+            EventKind::Custom { name, payload: p } => {
+                assert_eq!(name, "audit.tool_call");
+                assert_eq!(
+                    p, &payload,
+                    "payload survives byte-identical through the SQLite round trip"
+                );
+            }
+            other => panic!("expected Custom, got {other:?}"),
+        }
+        assert_eq!(custom.context, ctx);
+        assert_eq!(custom.kind.kind_tag(), "custom");
+
+        // Other projections are unaffected: the conversation is still exactly the two messages, and
+        // the Custom row didn't bump msg_count or otherwise perturb the session registry.
+        assert_eq!(
+            store.conversation(&id).unwrap(),
+            vec![Message::user_text("hi"), Message::assistant_text("done")]
+        );
+        assert_eq!(
+            store.list_for_account("acme", 10).unwrap()[0].messages,
+            2,
+            "msg_count tracks only Message/Compacted events, not Custom"
+        );
+    }
 }

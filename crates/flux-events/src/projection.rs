@@ -1682,4 +1682,150 @@ mod tests {
             "untabled + unreported must stay None"
         );
     }
+
+    /// D-55: one flux stream, `Message`/`TurnStarted`/`CallUsage`/`TurnEnded` events, folded once
+    /// plain and once with an app's `Custom` rows (an audit trail riding the same log) interleaved
+    /// at several points — before the turn, mid-turn, and after it closes. The `conversation`,
+    /// `cost_summary`, and `turns` projections must fold to IDENTICAL results either way: a
+    /// consumer's app facts must be fully invisible to flux's own read models.
+    #[test]
+    fn custom_events_interleaved_dont_affect_conversation_cost_or_turns_projections() {
+        /// One logical event plus whether it belongs to the turn (stamped with that turn's
+        /// `global_seq` once the final position is known — the position shifts depending on how
+        /// many `Custom` rows precede it).
+        struct Logical {
+            kind: EventKind,
+            in_turn: bool,
+        }
+
+        fn build(items: Vec<Logical>) -> Vec<StoredEvent> {
+            let turn_seq = items
+                .iter()
+                .enumerate()
+                .find_map(|(i, e)| matches!(e.kind, EventKind::TurnStarted { .. }).then_some(i))
+                .map(|i| (i as i64) + 1);
+            items
+                .into_iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let seq = (i as i64) + 1;
+                    let turn_id = if e.in_turn { turn_seq } else { None };
+                    ev(seq, i as i64, turn_id, e.kind)
+                })
+                .collect()
+        }
+
+        fn scenario(with_custom: bool) -> Vec<StoredEvent> {
+            let custom = |n: u32| Logical {
+                kind: EventKind::Custom {
+                    name: "audit.tool_call".into(),
+                    payload: serde_json::json!({"n": n}),
+                },
+                in_turn: false,
+            };
+            let mut items = Vec::new();
+            if with_custom {
+                items.push(custom(0)); // before the turn even starts
+            }
+            items.push(Logical {
+                kind: EventKind::TurnStarted {
+                    user_input: "summarize the log".into(),
+                    model: "m".into(),
+                },
+                in_turn: false,
+            });
+            if with_custom {
+                items.push(custom(1)); // mid-turn, before the first message
+            }
+            items.push(Logical {
+                kind: EventKind::Message(Message::user_text("summarize the log")),
+                in_turn: false,
+            });
+            items.push(Logical {
+                kind: EventKind::CallUsage {
+                    model: "m".into(),
+                    usage: usage_with(10, 2),
+                },
+                in_turn: true,
+            });
+            if with_custom {
+                items.push(custom(2)); // mid-turn, between the call and the answer
+            }
+            items.push(Logical {
+                kind: EventKind::Message(Message::assistant_text("here's the summary")),
+                in_turn: false,
+            });
+            items.push(Logical {
+                kind: EventKind::TurnEnded {
+                    outcome: "accepted".into(),
+                    iterations: 1,
+                    answer: "here's the summary".into(),
+                    usage: Some(usage_with(10, 2)),
+                },
+                in_turn: true,
+            });
+            if with_custom {
+                items.push(custom(3)); // after the turn closes
+            }
+            build(items)
+        }
+
+        let plain = scenario(false);
+        let with_custom = scenario(true);
+        assert_eq!(
+            with_custom.len(),
+            plain.len() + 4,
+            "sanity: the interleaved stream really does carry 4 extra Custom rows"
+        );
+
+        assert_eq!(
+            conversation(&plain),
+            conversation(&with_custom),
+            "Custom rows must not perturb the conversation fold"
+        );
+
+        let pricing = PricingTable::builtin();
+        assert_eq!(
+            cost_summary(&plain, &pricing),
+            cost_summary(&with_custom, &pricing),
+            "Custom rows must not perturb the cost_summary fold"
+        );
+
+        // `turns()` keys turn identity off `TurnStarted`'s `global_seq`, which legitimately shifts
+        // when Custom rows are appended ahead of it in the same ordered log (that's not a fold bug
+        // — it's the same thing a real concurrent app-fact writer would cause). Compare the folded
+        // VALUES (what the turn IS), not the position-derived identity/timestamps.
+        fn shape(
+            t: &TurnSummary,
+        ) -> (
+            &str,
+            &str,
+            &str,
+            u32,
+            Option<&str>,
+            u64,
+            Usage,
+            Option<Usage>,
+        ) {
+            (
+                &t.user_input,
+                &t.model,
+                &t.outcome,
+                t.iterations,
+                t.answer.as_deref(),
+                t.calls,
+                t.call_usage.clone(),
+                t.usage.clone(),
+            )
+        }
+        let plain_turns = turns(&plain);
+        let with_custom_turns = turns(&with_custom);
+        assert_eq!(plain_turns.len(), 1);
+        assert_eq!(with_custom_turns.len(), 1);
+        assert_eq!(
+            shape(&plain_turns[0]),
+            shape(&with_custom_turns[0]),
+            "Custom rows must not perturb what the turns fold computes"
+        );
+    }
 }
