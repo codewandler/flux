@@ -26,6 +26,8 @@ impl Deliverer for Recorder {
             journey: "j".to_string(),
             result: "done".to_string(),
             steps: 1,
+            usage: None,
+            model: "mock".to_string(),
         }])
     }
 }

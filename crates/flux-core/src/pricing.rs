@@ -196,6 +196,19 @@ pub fn canonical_model_parts(spec: &str) -> (Option<&str>, &str) {
     (provider, bare)
 }
 
+/// `true` when a model spec names a metered **cloud** provider — i.e. a pricing-table miss there
+/// hides real spend and should surface as the `$?` (unpriced) marker rather than staying silent.
+/// Local `ollama*` and unrecognized/mock providers return `false` (nothing is billed there, so
+/// silence on a table miss is correct). Shared by every cost-display surface (`flux-cli`'s turn
+/// suffix, the TUI's cumulative header) so "which specs get the `$?` marker" has one definition —
+/// see `unpriced_marker_applies` in `flux-cli` (thin delegate) and `record_usage` in `flux-tui`.
+pub fn is_metered_cloud_spec(spec: &str) -> bool {
+    match canonical_model_parts(spec).0 {
+        Some(p) => !p.starts_with("ollama"),
+        None => false,
+    }
+}
+
 /// Resolve a sub-agent role's `model:` frontmatter override against the **parent's** provider
 /// (A-41). Sub-agents always run on the parent's provider — there is no per-sub-agent provider
 /// factory — but a role's `model:` value speaks the same provider-prefixed spec form `-m` accepts

@@ -4059,12 +4059,11 @@ fn cost_suffix(
 }
 
 /// The `$?` marker fires only for known metered **cloud** providers — a table miss there hides
-/// real spend. Local `ollama*` and unknown/mock providers stay silent.
+/// real spend. Local `ollama*` and unknown/mock providers stay silent. Thin delegate onto
+/// `flux_core::is_metered_cloud_spec` (C-33) — the TUI's header uses the same predicate, so the
+/// rule has one definition.
 fn unpriced_marker_applies(spec: &str) -> bool {
-    match flux_core::canonical_model_parts(spec).0 {
-        Some(p) => !p.starts_with("ollama"),
-        None => false,
-    }
+    flux_core::is_metered_cloud_spec(spec)
 }
 
 /// One-time (per process) plain-stderr hint explaining the `$?` marker and how to price the model.

@@ -271,6 +271,13 @@ pub struct ChatState {
     /// The resolved `provider/model` spec + pricing table for cost computation, attached by
     /// [`with_cost`](Self::with_cost). `None` when the TUI wasn't given one (cost stays hidden).
     cost_model: Option<(String, flux_core::PricingTable)>,
+    /// C-33: set once any turn hits a pricing-table miss on a **metered cloud** spec (see
+    /// [`flux_core::is_metered_cloud_spec`]) — i.e. real dollars were spent but not counted into
+    /// `cost_usd`. Once set, the header's cost segment switches to the `$?` (unpriced) state
+    /// instead of silently under-reporting the running total; mirrors flux-cli's
+    /// `cost_suffix`/`unpriced_marker_applies` rule (local `ollama*`/mock specs never set this,
+    /// since nothing is billed there).
+    cost_unpriced: bool,
     /// Tool ops run during the in-progress / most recent turn.
     steps: usize,
     /// Wall-clock of the most recent finished turn.
@@ -331,6 +338,7 @@ impl ChatState {
             tokens_reasoning: 0,
             cost_usd: None,
             cost_model: None,
+            cost_unpriced: false,
             steps: 0,
             last_elapsed: None,
             history: Vec::new(),
@@ -375,6 +383,12 @@ impl ChatState {
     /// Fold one turn's [`Usage`] into the session's cumulative header metrics — EVERY tier (C-06:
     /// the header used to sum only input/output, silently dropping cache reads/writes and
     /// reasoning), and the running dollar cost when a model spec + pricing table are attached.
+    ///
+    /// C-33: a pricing-table miss on a **metered cloud** spec (no row, and no provider-reported
+    /// cost either — see [`flux_core::PricingTable::cost`]'s C-34 short-circuit) sets
+    /// `cost_unpriced` instead of silently skipping the turn; otherwise the cumulative header
+    /// total would under-report once any turn went unpriced. A local/mock spec (`ollama*`, `mock`)
+    /// never sets it — nothing is billed there, so silence stays correct.
     fn record_usage(&mut self, u: &Usage) {
         self.tokens_in += u.input_tokens;
         self.tokens_out += u.output_tokens;
@@ -382,8 +396,10 @@ impl ChatState {
         self.tokens_cache_write += u.cache_creation_input_tokens;
         self.tokens_reasoning += u.reasoning_tokens;
         if let Some((spec, pricing)) = &self.cost_model {
-            if let Some(money) = pricing.cost(u, spec) {
-                *self.cost_usd.get_or_insert(0.0) += money.usd;
+            match pricing.cost(u, spec) {
+                Some(money) => *self.cost_usd.get_or_insert(0.0) += money.usd,
+                None if flux_core::is_metered_cloud_spec(spec) => self.cost_unpriced = true,
+                None => {}
             }
         }
     }
@@ -764,8 +780,15 @@ impl ChatState {
             if cache > 0 {
                 s.push_str(&format!(" · cache {}", fmt_count(cache)));
             }
-            if let Some(usd) = self.cost_usd {
-                s.push_str(&format!(" · ${usd:.4}"));
+            // C-33: an unpriced metered-cloud turn switches the cost segment to the `$?` state
+            // (`$X.XXXX+?` when part of the run WAS priced, bare `$?` when none of it was) rather
+            // than rendering a total that silently omits real spend — mirrors flux-cli's
+            // ` · $? (unpriced)` marker.
+            match (self.cost_usd, self.cost_unpriced) {
+                (Some(usd), true) => s.push_str(&format!(" · ${usd:.4}+? (unpriced)")),
+                (Some(usd), false) => s.push_str(&format!(" · ${usd:.4}")),
+                (None, true) => s.push_str(" · $? (unpriced)"),
+                (None, false) => {}
             }
             s.push(' ');
             right.push(Span::styled(s, t.muted_style()));
@@ -1796,6 +1819,71 @@ mod tests {
             (state.cost_usd.unwrap() - 0.0028).abs() < 1e-9,
             "got {:?}",
             state.cost_usd
+        );
+    }
+
+    /// C-33: a pricing-table miss on a **metered cloud** spec (no row, no `reported_cost_usd`)
+    /// must flip the header's cost segment to the `$?` (unpriced) state instead of silently
+    /// leaving `cost_usd` untouched — the cumulative total would otherwise under-report once any
+    /// turn went unpriced. This is the story's named failing-first test.
+    #[test]
+    fn unpriced_metered_cloud_turn_switches_header_to_question_mark() {
+        let mut state = ChatState::new("anthropic/claude-nonexistent-model".into()).with_cost(
+            "anthropic/claude-nonexistent-model".into(),
+            flux_core::PricingTable::builtin(),
+        );
+        // The builtin table has no row for this model, and there's no provider-reported cost
+        // either — a genuine table miss on a metered cloud provider.
+        state.record_usage(&Usage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            ..Default::default()
+        });
+        assert!(
+            state.cost_unpriced,
+            "table miss on a cloud spec must set cost_unpriced"
+        );
+        assert!(state.cost_usd.is_none());
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(
+            content.contains("$?"),
+            "the header must show the unpriced marker, not silently omit cost: {content}"
+        );
+
+        // A mock/ollama spec with the same kind of table miss must NOT flip the marker — nothing
+        // is billed there, so silence stays correct.
+        let mut ollama = ChatState::new("ollama/llama3".into())
+            .with_cost("ollama/llama3".into(), flux_core::PricingTable::builtin());
+        ollama.record_usage(&Usage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            ..Default::default()
+        });
+        assert!(
+            !ollama.cost_unpriced,
+            "a local/ollama spec must never set cost_unpriced"
+        );
+        let mut terminal2 = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal2.draw(|f| render(f, &ollama)).unwrap();
+        let content2 = screen(&terminal2);
+        assert!(
+            !content2.contains('$'),
+            "a local/ollama spec must show no cost segment at all: {content2}"
+        );
+
+        let mut mock = ChatState::new("mock".into())
+            .with_cost("mock".into(), flux_core::PricingTable::builtin());
+        mock.record_usage(&Usage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            ..Default::default()
+        });
+        assert!(
+            !mock.cost_unpriced,
+            "a mock spec must never set cost_unpriced"
         );
     }
 

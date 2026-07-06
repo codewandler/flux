@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 use flux_agent::{AgentSpec, Permissions, DEFAULT_COMPACT_THRESHOLD_CHARS};
-use flux_core::{Error, Result};
+use flux_core::{Error, Result, Usage};
 use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
 use flux_flow::registry::analyze_composites;
@@ -34,7 +34,7 @@ use flux_orchestrate::{SubAgents, TaskTool};
 use flux_provider::Provider;
 use flux_runtime::{
     AllowApprover, Approver, DenyApprover, Executor, PermissionManager, Spawner, Tool, ToolContext,
-    ToolRegistry,
+    ToolRegistry, ToolResult,
 };
 use flux_secret::Redactor;
 use flux_system::{System, Workspace};
@@ -59,6 +59,17 @@ pub struct JourneyRun {
     pub journey: String,
     pub result: String,
     pub steps: usize,
+    /// The turn(s)' accumulated token usage (C-33), when the run drove at least one model call that
+    /// reported it — `None` for a run that dispatched no model turn (a pure-op journey, or a journey
+    /// whose cognition ops don't yet report usage). Summed across every `turn_end` the run's sink saw,
+    /// so a journey/agent turn that makes more than one model call still attributes its full cost.
+    pub usage: Option<Usage>,
+    /// The canonical `provider/model` spec of the engine that drove this run (C-33) — an
+    /// `agent`-bound trigger's actual engine (`flux_core::canonical_model_spec` over its provider +
+    /// model), or the app's default model for a plain journey (a journey has no single "engine"; the
+    /// app default is the honest stand-in, and it's only ever paired with real cost when `usage` is
+    /// `Some`). A cost-display surface should ignore this when `usage` is `None`.
+    pub model: String,
 }
 
 /// The runtime host for a multi-agent [`Program`]. Cheap to clone is *not* a goal — hold one `App` and
@@ -444,8 +455,15 @@ impl Engine {
         // Where the asked channel is read from if this run parks: the expects-reply sends recorded
         // from here on belong to this segment.
         let sent_before = self.bus.sent().len();
+        // C-33: capture this run's own usage rather than accumulating into the caller's (possibly
+        // shared/reused, and always type-erased) `sink` — see `UsageCapture`'s doc comment.
+        let mut capture = UsageCapture {
+            inner: sink,
+            usage: None,
+        };
         let outcome = if self.program.ops.is_empty() {
-            flux_flow::runtime::execute_flow(&store, &executor, &session_id, &ast, sink).await
+            flux_flow::runtime::execute_flow(&store, &executor, &session_id, &ast, &mut capture)
+                .await
         } else {
             flux_flow::runtime::execute_flow_with_composites(
                 &store,
@@ -453,11 +471,13 @@ impl Engine {
                 &session_id,
                 &ast,
                 &self.program.ops,
-                sink,
+                &mut capture,
             )
             .await
         }
         .map_err(other)?;
+        let usage = capture.usage;
+        let model = self.default_model_spec();
 
         if let Some(parked) = self.park_if_asked(
             name,
@@ -467,6 +487,8 @@ impl Engine {
             &outcome,
             sent_before,
             0,
+            usage.clone(),
+            model.clone(),
         )? {
             return Ok(parked);
         }
@@ -475,7 +497,19 @@ impl Engine {
             journey: name.to_string(),
             result: outcome.result,
             steps: outcome.steps,
+            usage,
+            model,
         })
+    }
+
+    /// The canonical `provider/model` spec of the app's default model (C-33) — the "driving engine
+    /// spec" attributed to a plain journey run, which (unlike an `agent`-bound trigger's own
+    /// [`FlowEngine`], used in [`Self::run_agent`]) has no per-op engine of its own.
+    fn default_model_spec(&self) -> String {
+        flux_core::canonical_model_spec(
+            self.provider.as_ref().map(|p| p.name()),
+            &self.default_model,
+        )
     }
 
     /// Park the run when `outcome` suspended on an ask-lowered `await`: persist the resume point on
@@ -494,6 +528,8 @@ impl Engine {
         outcome: &FlowOutcome,
         sent_before: usize,
         prior_steps: usize,
+        usage: Option<Usage>,
+        model: String,
     ) -> Result<Option<JourneyRun>> {
         let Some(susp) = &outcome.suspension else {
             return Ok(None);
@@ -533,6 +569,8 @@ impl Engine {
             journey: journey.to_string(),
             result: String::new(),
             steps,
+            usage,
+            model,
         }))
     }
 
@@ -597,6 +635,11 @@ impl Engine {
 
         let sent_before = self.bus.sent().len();
         let input = FluxValue::String(reply);
+        // C-33: same per-run usage capture as `run_journey` — see `UsageCapture`.
+        let mut capture = UsageCapture {
+            inner: sink,
+            usage: None,
+        };
         let outcome = if self.program.ops.is_empty() {
             flux_flow::runtime::resume_flow(
                 &store,
@@ -605,7 +648,7 @@ impl Engine {
                 &body,
                 node,
                 input,
-                sink,
+                &mut capture,
             )
             .await
         } else {
@@ -618,11 +661,13 @@ impl Engine {
                 node,
                 input,
                 &self.program.ops,
-                sink,
+                &mut capture,
             )
             .await
         }
         .map_err(other)?;
+        let usage = capture.usage;
+        let model = self.default_model_spec();
 
         if let Some(parked) = self.park_if_asked(
             &journey,
@@ -632,6 +677,8 @@ impl Engine {
             &outcome,
             sent_before,
             prior_steps,
+            usage.clone(),
+            model.clone(),
         )? {
             return Ok(parked);
         }
@@ -640,6 +687,8 @@ impl Engine {
             journey,
             result: outcome.result,
             steps: prior_steps + outcome.steps,
+            usage,
+            model,
         })
     }
 
@@ -725,10 +774,16 @@ impl Engine {
             .run_turn(&session_id, &input, &mut sink)
             .await
             .map_err(other)?;
+        // C-33: the engine's own provider + model IS the driving engine spec for this run — unlike a
+        // plain journey, an agent-bound trigger has exactly one engine, so there is no aggregation
+        // question here.
+        let model = flux_core::canonical_model_spec(Some(engine.provider.name()), &engine.model);
         Ok(JourneyRun {
             journey: name.to_string(),
             result: sink.text,
             steps: sink.tools.len(),
+            usage: sink.usage,
+            model,
         })
     }
 }
@@ -1007,10 +1062,15 @@ impl Drop for DepthGuard<'_> {
 
 /// A minimal [`AgentSink`] that records streamed text and the op names dispatched. The journey's
 /// canonical result is taken from the `FlowOutcome`, so this only needs to capture for inspection.
+///
+/// C-33: also accumulates every `turn_end`'s [`Usage`] (summed field-by-field — a run may drive
+/// more than one model call, e.g. an `agent`-bound trigger's turn), so [`Engine::run_agent`] can
+/// attribute the run's real cost onto its [`JourneyRun`].
 #[derive(Default)]
 pub struct RecordingSink {
     pub text: String,
     pub tools: Vec<String>,
+    pub usage: Option<Usage>,
 }
 
 impl AgentSink for RecordingSink {
@@ -1019,6 +1079,68 @@ impl AgentSink for RecordingSink {
     }
     fn tool_call(&mut self, name: &str, _input: &Value) {
         self.tools.push(name.to_string());
+    }
+    fn turn_end(&mut self, usage: Option<Usage>) {
+        accumulate_usage(&mut self.usage, usage);
+    }
+}
+
+/// Fold `next` into `acc` field-by-field (C-33): `None` on either side leaves the other untouched,
+/// `Some` on both sums every counter, including `reported_cost_usd` — a run may drive more than one
+/// priced model call and the running total must stay additive, not last-write-wins.
+fn accumulate_usage(acc: &mut Option<Usage>, next: Option<Usage>) {
+    let Some(next) = next else { return };
+    match acc {
+        Some(acc) => {
+            acc.input_tokens += next.input_tokens;
+            acc.output_tokens += next.output_tokens;
+            acc.cache_creation_input_tokens += next.cache_creation_input_tokens;
+            acc.cache_read_input_tokens += next.cache_read_input_tokens;
+            acc.reasoning_tokens += next.reasoning_tokens;
+            acc.reported_cost_usd = match (acc.reported_cost_usd, next.reported_cost_usd) {
+                (Some(a), Some(b)) => Some(a + b),
+                (Some(a), None) => Some(a),
+                (None, other) => other,
+            };
+        }
+        None => *acc = Some(next),
+    }
+}
+
+/// Wraps a caller-supplied [`AgentSink`] to attribute [`Usage`] to exactly the run this wrapper
+/// spans (C-33), while forwarding every event through unchanged. `run_journey`/`resume_parked`
+/// receive a `&mut dyn AgentSink` that may be shared/reused across several journey runs in one
+/// [`Engine::deliver`] call — reading a concrete field off a trait object isn't possible, and
+/// summing directly into the shared sink would misattribute one journey's cost to the next. A
+/// fresh wrapper per run gives each [`JourneyRun`] its own accurate total without changing what the
+/// outer sink observes.
+struct UsageCapture<'a> {
+    inner: &'a mut dyn AgentSink,
+    usage: Option<Usage>,
+}
+
+impl AgentSink for UsageCapture<'_> {
+    fn text_delta(&mut self, text: &str) {
+        self.inner.text_delta(text);
+    }
+    fn thinking_delta(&mut self, text: &str) {
+        self.inner.thinking_delta(text);
+    }
+    fn planning(&mut self, active: bool) {
+        self.inner.planning(active);
+    }
+    fn tool_call(&mut self, name: &str, input: &Value) {
+        self.inner.tool_call(name, input);
+    }
+    fn tool_result(&mut self, name: &str, result: &ToolResult) {
+        self.inner.tool_result(name, result);
+    }
+    fn observation(&mut self, o: &flux_evidence::Observation) {
+        self.inner.observation(o);
+    }
+    fn turn_end(&mut self, usage: Option<Usage>) {
+        self.inner.turn_end(usage.clone());
+        accumulate_usage(&mut self.usage, usage);
     }
 }
 
@@ -1043,6 +1165,33 @@ mod agent_target_tests {
         async fn stream(&self, _req: Request) -> Result<ChunkStream> {
             let chunks = vec![
                 Chunk::TextDelta(self.reply.clone()),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::EndTurn),
+                },
+            ];
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    /// Like [`ReplyProvider`] but also reports real token usage (a `Chunk::Usage` before `Done`) —
+    /// drives an agent turn whose `turn_end` usage is `Some`, so C-33's `JourneyRun::usage`/`::model`
+    /// wiring can be exercised hermetically (no network, no real model).
+    struct ReplyWithUsageProvider {
+        reply: String,
+    }
+    #[async_trait]
+    impl Provider for ReplyWithUsageProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            let chunks = vec![
+                Chunk::TextDelta(self.reply.clone()),
+                Chunk::Usage(Usage {
+                    input_tokens: 100,
+                    output_tokens: 40,
+                    ..Default::default()
+                }),
                 Chunk::Done {
                     stop_reason: Some(StopReason::EndTurn),
                 },
@@ -1322,6 +1471,43 @@ trigger t1
         );
     }
 
+    /// C-33: an `agent`-bound trigger's turn carries its real usage and the engine's own canonical
+    /// model spec onto the returned [`JourneyRun`] — the seam an operator-console surface (the
+    /// `flux app run` CLI channel, `flux-channels::host::serve`) needs to render a cost annotation.
+    /// The story's named failing-first test for the app-run/journey/agent-target surface.
+    #[tokio::test]
+    async fn agent_trigger_run_carries_usage_and_model_spec() {
+        let src = "\
+agent assistant
+  description \"be terse\"
+  tools []
+
+trigger t1
+  on \"slack\"
+  run _
+  agent assistant
+";
+        let provider: Arc<dyn Provider> = Arc::new(ReplyWithUsageProvider {
+            reply: "hi back".to_string(),
+        });
+        let app = App::with_options(program(src), Some(provider), "mock", false);
+        let runs = app
+            .deliver("slack", json!({ "text": "hello", "conversation": "T1" }))
+            .await
+            .expect("deliver");
+        assert_eq!(runs.len(), 1);
+        let usage = runs[0]
+            .usage
+            .as_ref()
+            .expect("an agent turn that reports usage must carry it onto the JourneyRun");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 40);
+        assert_eq!(
+            runs[0].model, "mock",
+            "the driving engine's own canonical model spec, not some other default"
+        );
+    }
+
     #[tokio::test]
     async fn same_conversation_reuses_one_session_distinct_ones_isolate() {
         let app = app_with_agent("ok");
@@ -1374,6 +1560,31 @@ journey pong
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].journey, "pong");
         assert_eq!(runs[0].result, "pong!");
+    }
+
+    /// C-33: a plain journey that dispatches no model call carries no usage — but still reports the
+    /// host's default model spec (the "driving engine spec" honest stand-in for a journey, which has
+    /// no per-op engine of its own) so a cost-display surface has something to show *if* usage were
+    /// ever present, without inventing a fake dollar figure now.
+    #[tokio::test]
+    async fn journey_run_carries_no_usage_but_reports_the_host_default_model() {
+        let src = "\
+trigger t1
+  on \"ping\"
+  run pong
+
+journey pong
+  flow
+    return \"pong!\"
+";
+        let app = App::with_options(program(src), None, "mock", false);
+        let runs = app.deliver("ping", json!({})).await.expect("deliver");
+        assert_eq!(runs.len(), 1);
+        assert!(
+            runs[0].usage.is_none(),
+            "a pure-op journey drives no model call, so there's no usage to report"
+        );
+        assert_eq!(runs[0].model, "mock");
     }
 
     #[tokio::test]

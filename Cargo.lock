@@ -1293,6 +1293,8 @@ dependencies = [
  "chrono",
  "cron",
  "flux-app",
+ "flux-core",
+ "flux-credentials",
  "flux-flow",
  "flux-lang",
  "flux-server",
