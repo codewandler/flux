@@ -24,19 +24,23 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 // Quirks profile
 // ---------------------------------------------------------------------------
 
-/// OpenRouter quirks. Conservative across the gateway's many non-Claude models: prompt caching and
-/// the Anthropic `output_config.effort` are off (not all upstreams accept them); adaptive thinking
-/// stays on. `provider.require_parameters` makes OpenRouter route tool requests only to upstreams
-/// that actually support `tools`. Per-model refinements (e.g. caching on for Claude slugs) belong
-/// in `quirks_for`, which currently ignores the model.
+/// OpenRouter quirks. Conservative across the gateway's many non-Claude models: the Anthropic
+/// `output_config.effort` is off (not all upstreams accept it); adaptive thinking stays on.
+/// `provider.require_parameters` makes OpenRouter route tool requests only to upstreams that
+/// actually support `tools`. Prompt caching is the first model-keyed refinement (C-35): OpenRouter
+/// passes `cache_control` through to Anthropic-served models — where I-03 measured gather-shaped
+/// turns billing the ~20k prefix fully uncached (+35% corpus spend) — so `anthropic/…` slugs cache
+/// and every other vendor stays conservative (an upstream that rejects the field would 4xx).
 pub struct OpenRouterProfile;
 
 impl ProviderProfile for OpenRouterProfile {
-    fn quirks_for(&self, _model: &str) -> MessagesQuirks {
+    fn quirks_for(&self, model: &str) -> MessagesQuirks {
         let mut extra_body = serde_json::Map::new();
         extra_body.insert("provider".into(), json!({ "require_parameters": true }));
         MessagesQuirks {
-            prompt_caching: false,
+            // Vendor-prefix match, not substring: `anthropic/claude-…` is Anthropic-served by
+            // construction; a third-party slug that merely mentions "claude" is not.
+            prompt_caching: model.starts_with("anthropic/"),
             thinking_adaptive: true,
             effort_output_config: false,
             extra_body,
@@ -162,6 +166,35 @@ mod tests {
         assert_eq!(body["provider"]["require_parameters"], true);
         assert!(body["system"].is_string()); // caching off → plain string, not a cache_control array
         assert!(body.get("output_config").is_none()); // effort off
+    }
+
+    #[test]
+    fn profile_enables_prompt_caching_for_anthropic_slugs_only() {
+        // C-35: OpenRouter passes `cache_control` through to Anthropic-served models, so the
+        // caching flip is scoped by the vendor prefix — every other upstream stays conservative.
+        let q = OpenRouterProfile.quirks_for("anthropic/claude-sonnet-4.6");
+        assert!(q.prompt_caching);
+        assert!(q.thinking_adaptive);
+        assert_eq!(q.extra_body["provider"]["require_parameters"], true);
+        // A vendor whose slug merely mentions claude must NOT flip (prefix match, not substring).
+        assert!(!OpenRouterProfile.quirks_for("z-ai/glm-4.6").prompt_caching);
+        assert!(
+            !OpenRouterProfile
+                .quirks_for("someone/claude-clone")
+                .prompt_caching
+        );
+    }
+
+    #[test]
+    fn codec_body_carries_cache_control_for_anthropic_slugs() {
+        // Mirrors anthropic.rs's codec test (C-35): a long system prompt on an `anthropic/` slug
+        // comes back cache-controlled through the same crate::messages path; the routing
+        // directive still rides along.
+        let big = "x".repeat(8192);
+        let req = Request::new("anthropic/claude-sonnet-4.6", "hi").with_system(big);
+        let body = OpenRouterMessages.build_body(&req).unwrap();
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["provider"]["require_parameters"], true);
     }
 
     #[test]
