@@ -91,6 +91,7 @@ pub struct FlowClientBuilder {
     allow: Vec<String>,
     deny: Vec<String>,
     auto_approve: bool,
+    approver: Option<Arc<dyn Approver>>,
     seed_prelude: bool,
     compile_opts: CompileOptions,
 }
@@ -103,6 +104,7 @@ impl Default for FlowClientBuilder {
             allow: vec!["read".to_string(), "glob".to_string(), "grep".to_string()],
             deny: Vec::new(),
             auto_approve: false,
+            approver: None,
             // Seed the planner catalog `$defs` with the v1-core artifact ontology by default.
             seed_prelude: true,
             compile_opts: CompileOptions::default(),
@@ -130,6 +132,14 @@ impl FlowClientBuilder {
     /// cognition ops egress over the network, so they gate by default.
     pub fn auto_approve(mut self, yes: bool) -> Self {
         self.auto_approve = yes;
+        self
+    }
+    /// Inject a custom [`Approver`] the executor consults per op — a policy between the blanket
+    /// allow of [`auto_approve`](Self::auto_approve) and the headless default deny (e.g. a
+    /// risk-aware confirm gate). Overrides `auto_approve`. Mirrors flux-orchestrate's
+    /// `LocalSpawner::with_approver`, so the flow path and the sub-agent path take the same policy.
+    pub fn approver(mut self, approver: Arc<dyn Approver>) -> Self {
+        self.approver = Some(approver);
         self
     }
     /// Skip seeding the planner catalog `$defs` with the prelude artifact ontology (default: seed).
@@ -167,6 +177,7 @@ impl FlowClientBuilder {
             allow: self.allow,
             deny: self.deny,
             auto_approve: self.auto_approve,
+            approver: self.approver,
             compile_opts: self.compile_opts,
             prelude_defs,
             session_id: "flux-sdk".to_string(),
@@ -187,6 +198,8 @@ pub struct FlowClient {
     allow: Vec<String>,
     deny: Vec<String>,
     auto_approve: bool,
+    /// Custom per-op approval policy (see [`FlowClientBuilder::approver`]); overrides `auto_approve`.
+    approver: Option<Arc<dyn Approver>>,
     compile_opts: CompileOptions,
     /// The merged `$defs` artifact map, seeded from `prelude_schema()` and extended by
     /// [`register_prelude`](Self::register_prelude); available for catalog enrichment / inspection.
@@ -496,10 +509,10 @@ impl FlowClient {
 
     fn build_executor(&self) -> Executor {
         let perms = PermissionManager::from_rules(&self.allow, &self.deny);
-        let approver: Arc<dyn Approver> = if self.auto_approve {
-            Arc::new(AllowApprover)
-        } else {
-            Arc::new(DenyApprover)
+        let approver: Arc<dyn Approver> = match &self.approver {
+            Some(custom) => custom.clone(),
+            None if self.auto_approve => Arc::new(AllowApprover),
+            None => Arc::new(DenyApprover),
         };
         // Thread the sub-agent spawner into the per-run context when one is attached, so a `task` call
         // can delegate. `None` (the common case) leaves the context exactly as before.
@@ -1028,6 +1041,65 @@ mod tests {
             !ran,
             "a destructive op must be gated by the default approver"
         );
+    }
+
+    /// A consumer-injected approver (`FlowClientBuilder::approver`) — not the `auto_approve`
+    /// binary — decides per op: the policy allows the echo but denies the boom, with no permission
+    /// rules involved. The seam a multi-tenant consumer needs for a risk-aware confirm gate
+    /// (ai-agents R-10), mirroring `LocalSpawner::with_approver` on the sub-agent path.
+    #[tokio::test]
+    async fn an_injected_approver_policy_gates_per_op() {
+        struct DenyBoom;
+        #[async_trait]
+        impl flux_runtime::Approver for DenyBoom {
+            async fn request(
+                &self,
+                tool: &str,
+                _subjects: &[String],
+                _intents: &flux_spec::IntentSet,
+            ) -> flux_runtime::ApprovalChoice {
+                if tool == "boom" {
+                    flux_runtime::ApprovalChoice::Deny
+                } else {
+                    flux_runtime::ApprovalChoice::Allow
+                }
+            }
+        }
+
+        let mut client = FlowClient::builder()
+            .approver(Arc::new(DenyBoom))
+            .build(MockProvider::one("noop"), temp_root("approver-policy"))
+            .unwrap();
+        client.register_op(Arc::new(EchoArgsTool));
+        client.register_op(Arc::new(BoomTool));
+
+        // The policy-allowed op dispatches (auto_approve was never set)...
+        let echo: DraftAst = serde_json::from_value(json!({
+            "body": [ { "kind": "return", "value": {
+                "kind": "call", "op": "echo_args",
+                "args": [ { "kind": "lit", "value": "ALLOWED" } ] } } ]
+        }))
+        .unwrap();
+        let out = client
+            .execute_with(&echo, serde_json::Map::new())
+            .await
+            .unwrap();
+        assert!(
+            out.result.contains("ALLOWED"),
+            "the policy-allowed op must run, got: {}",
+            out.result
+        );
+
+        // ...while the policy-denied op never executes and surfaces as a soft denial.
+        let boom: DraftAst = serde_json::from_value(json!({
+            "body": [ { "kind": "call", "op": "boom", "args": [] } ]
+        }))
+        .unwrap();
+        let res = client.execute_with(&boom, serde_json::Map::new()).await;
+        let ran = res
+            .map(|r| r.result.contains("BOOM EXECUTED"))
+            .unwrap_or(false);
+        assert!(!ran, "the injected policy must gate the denied op");
     }
 
     #[tokio::test]
