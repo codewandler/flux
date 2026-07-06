@@ -166,6 +166,17 @@ flux --color always|auto|never   # colorize output (auto = a terminal, NO_COLOR 
 flux tui                         # ratatui chat UI (in-UI approval modal)
 flux app run --serve 127.0.0.1:8787 --yes  # HTTP/A2A daemon (REST + SSE)
 flux run app.flux                # run a multi-agent program (event bus + triggers + journeys); deny-destructive unless --yes
+flux flow run <file.flux>        # run one checked-in Flux-Lang flow directly (native text or DraftAst JSON),
+                                 #   skipping NL→plan; opt-in resumable mode (L-25):
+                                 #   --resumable          a halt (a failed statement, or a paused `await`) prints
+                                 #                        a structured halt report (✓/✗/· marked statements,
+                                 #                        machine-readable failure, session id) and exits non-zero
+                                 #                        instead of erroring the whole run
+                                 #   --resume <session>   re-parse the (corrected) file, fold that session's
+                                 #     | --resume last     halt ledger, fast-forward the matching completed prefix
+                                 #                        (values rehydrated), and execute from the first changed
+                                 #                        statement; `last` needs the flow to declare a name
+                                 #                        (`flow <name> -> …`) to find its session unambiguously
 flux sessions                    # list recent sessions
 flux plugin install <name>       # the plugin CLI — verified install from the signed plugin pack (@<version>, --all;
                                  #   --dir registers local builds); also ls / status / call / pin / rollback / uninstall / skill

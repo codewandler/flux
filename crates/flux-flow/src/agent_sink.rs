@@ -17,6 +17,13 @@ pub trait AgentSink: Send {
     /// The planner is composing a plan (`true`) / has finished (`false`). Surfaces the otherwise-silent
     /// compile wait as a "composing plan…" indicator; the compiled plan is then shown via [`Self::observation`].
     fn planning(&mut self, _active: bool) {}
+    /// A progressive plan-skeleton headline (L-23): fires once per top-level plan statement as
+    /// `emit_plan`'s JSON arguments finish streaming that statement — e.g. `"1 write /app/server.py"`
+    /// — while the model is still composing a (possibly large) plan, instead of the tree appearing
+    /// only once the whole call completes. Progress feedback only: the plan actually accepted and
+    /// executed is unaffected, and the eventual `flow.plan` observation's full tree render remains
+    /// authoritative. Default no-op so existing sinks stay source-compatible.
+    fn plan_delta(&mut self, _headline: &str) {}
     fn tool_call(&mut self, _name: &str, _input: &Value) {}
     fn tool_result(&mut self, _name: &str, _result: &ToolResult) {}
     /// An audit observation made during dispatch (e.g. a destructive-command marker).

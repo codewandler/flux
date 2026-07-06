@@ -1311,8 +1311,9 @@ fn trace_step(
 /// tool_use block (the provider never sends its `content_block_stop`), so the caller must distinguish a
 /// truncated turn from a finished prose answer.
 ///
-/// `on_thinking` receives each incremental thinking-token delta as it arrives; pass `None` when the
-/// caller doesn't need live thinking output (e.g. the one-shot `compile` path).
+/// `on_thinking` receives each incremental thinking-token delta as it arrives, AND (L-23) each
+/// progressive plan-skeleton headline as the `emit_plan` call's JSON arguments stream in — pass
+/// `None` when the caller needs neither (e.g. the one-shot `compile` path).
 ///
 /// The sink's reference lifetime and trait-object bound are deliberately independent (`+ 'b`):
 /// `&mut` is invariant, so unifying them (the `&mut dyn AgentSink` default) would force a caller's
@@ -1345,6 +1346,11 @@ async fn stream_blocks<'a, 'b>(
     let mut text = String::new();
     let mut stop_reason = None;
     let mut diagnostic = None;
+    // L-23: progressive plan-skeleton rendering (JSON arm only — see `PlanSkeletonScanner`'s doc).
+    // Read-only over the same bytes the codec already carries; never influences `blocks`/`text`/
+    // `stop_reason`/`diagnostic` above, so the repair loop and the final decode are unaffected by
+    // construction, truncated streams included.
+    let mut skeleton = PlanSkeletonScanner::default();
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(Chunk::ThinkingDelta(t)) => {
@@ -1353,6 +1359,13 @@ async fn stream_blocks<'a, 'b>(
                 }
             }
             Ok(Chunk::TextDelta(t)) => text.push_str(&t),
+            Ok(Chunk::ToolInputDelta { name, partial_json }) if name == "emit_plan" => {
+                for headline in skeleton.feed(&partial_json) {
+                    if let Some(sink) = on_thinking.as_deref_mut() {
+                        sink.plan_delta(&headline);
+                    }
+                }
+            }
             Ok(Chunk::Block(b)) => blocks.push(b),
             // Providers emit usage cumulatively (the codec carries the input/cache counts from
             // `message_start` forward onto the final `message_delta`), so the last chunk holds the
@@ -1376,6 +1389,250 @@ async fn stream_blocks<'a, 'b>(
         }
     }
     (Ok((blocks, text, stop_reason, diagnostic)), usage)
+}
+
+// -- L-23: progressive plan-skeleton rendering ---------------------------------------------------
+
+/// Incremental scanner over an `emit_plan` tool call's accumulating raw JSON `input` text: as
+/// `input_json` fragments arrive from the wire ([`Chunk::ToolInputDelta`]), extracts each
+/// **top-level** `ast.body[i]` element's JSON text the instant it closes, so a plan-skeleton
+/// headline can render while a large plan is still streaming. Purely a progress-feedback side
+/// channel: it never touches the accumulating tool-call buffer the codec/`stream_blocks` build for
+/// the real decode, so it cannot change what a turn ultimately accepts or rejects — the final
+/// `serde_json::from_value::<DraftAst>` decode and every gate downstream (hidden-op, gather,
+/// analyze/lower) run exactly as before, over the completed [`Chunk::Block`] as always.
+///
+/// Deliberately not a general JSON parser (none is needed, and `flux-providers`' ban on bare
+/// `serde_json` parses for provider bytes is honored in spirit here too — every `serde_json` call
+/// below is over a slice this scanner already proved is one balanced, self-contained JSON value,
+/// and any parse failure is swallowed, never propagated). A hand-rolled depth/string tracker:
+///
+/// 1. Locate the first `"body"` key — necessarily the *outermost* one: a nested composite node's
+///    own `body` field (e.g. `repeat`/`each`) can only appear textually *after* the outer array has
+///    already opened, since JSON nesting requires a parent's own text to start before any child's.
+/// 2. Once inside that array, watch the running brace/bracket depth return to the array's element
+///    depth to detect each completed element (an element is always a JSON object — every [`Node`]
+///    serializes with a `kind` tag), slicing its exact source text out of the accumulated buffer.
+///
+/// Never panics and never gets stuck: malformed/truncated input just stops producing further
+/// headlines (the A-40 truncation-repair test group asserts this explicitly), and a per-call
+/// resumable cursor (`scanned`) means each delta is processed exactly once, not re-scanned from
+/// the start of a potentially large plan.
+#[derive(Default)]
+struct PlanSkeletonScanner {
+    /// The full accumulated `input` JSON text seen so far for this tool call.
+    buffer: String,
+    /// Byte offset already processed — `feed` only scans the newly-appended tail.
+    scanned: usize,
+    phase: ScanPhase,
+    in_string: bool,
+    escaped: bool,
+    /// Running JSON nesting depth (braces and brackets share one counter — only their balance,
+    /// never which kind, matters for this scanner).
+    depth: i32,
+    /// Bytes matched so far of the string literal currently open — only used while `phase ==
+    /// SearchingKey`, to test a completed key string against `"body"` without accumulating
+    /// arbitrarily long unrelated strings byte-by-byte (`key_overflowed` latches once a string
+    /// exceeds [`PlanSkeletonScanner::KEY_LEN`], so this array never needs to grow).
+    key_buf: [u8; 4],
+    key_len: usize,
+    key_overflowed: bool,
+    /// The depth at which the target array's elements sit, once found.
+    element_depth: i32,
+    /// Byte offset of the currently-open element's leading `{`.
+    element_start: usize,
+    /// 1-based index of the next element to report.
+    next_index: usize,
+}
+
+#[derive(Default, PartialEq, Eq, Clone, Copy)]
+enum ScanPhase {
+    #[default]
+    SearchingKey,
+    AwaitingColon,
+    AwaitingBracket,
+    InArray,
+    Closed,
+}
+
+impl PlanSkeletonScanner {
+    const KEY_LEN: usize = 4; // "body"
+
+    /// Feed a newly-arrived raw JSON fragment, returning the headline for every top-level
+    /// `body[i]` element that closed as a result (usually zero or one, occasionally more if a
+    /// fragment closes several short elements at once).
+    fn feed(&mut self, delta: &str) -> Vec<String> {
+        if self.phase == ScanPhase::Closed {
+            return Vec::new(); // nothing left worth tracking for this call
+        }
+        self.buffer.push_str(delta);
+        let mut headlines = Vec::new();
+        let bytes = self.buffer.as_bytes();
+        let mut i = self.scanned;
+        while i < bytes.len() {
+            if self.phase == ScanPhase::Closed {
+                break;
+            }
+            let b = bytes[i];
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if b == b'\\' {
+                    self.escaped = true;
+                } else if b == b'"' {
+                    self.in_string = false;
+                    if self.phase == ScanPhase::SearchingKey
+                        && !self.key_overflowed
+                        && self.key_len == Self::KEY_LEN
+                        && &self.key_buf == b"body"
+                    {
+                        self.phase = ScanPhase::AwaitingColon;
+                    }
+                } else if self.phase == ScanPhase::SearchingKey {
+                    if self.key_len < Self::KEY_LEN {
+                        self.key_buf[self.key_len] = b;
+                        self.key_len += 1;
+                    } else {
+                        self.key_overflowed = true;
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            match b {
+                b'"' => {
+                    if self.phase == ScanPhase::AwaitingBracket {
+                        // The key's value is a string, not an array — not our target.
+                        self.phase = ScanPhase::SearchingKey;
+                    }
+                    self.in_string = true;
+                    if self.phase == ScanPhase::SearchingKey {
+                        self.key_len = 0;
+                        self.key_overflowed = false;
+                    }
+                }
+                b'{' | b'[' => {
+                    self.depth += 1;
+                    match self.phase {
+                        ScanPhase::AwaitingBracket if b == b'[' => {
+                            self.phase = ScanPhase::InArray;
+                            self.element_depth = self.depth;
+                        }
+                        ScanPhase::AwaitingBracket => self.phase = ScanPhase::SearchingKey,
+                        ScanPhase::InArray if b == b'{' && self.depth == self.element_depth + 1 => {
+                            self.element_start = i;
+                        }
+                        _ => {}
+                    }
+                }
+                b'}' | b']' => {
+                    self.depth -= 1;
+                    if self.phase == ScanPhase::InArray {
+                        if b == b'}' && self.depth == self.element_depth {
+                            // One top-level element just closed.
+                            let slice = &self.buffer[self.element_start..i + 1];
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(slice) {
+                                self.next_index += 1;
+                                headlines.push(skeleton_headline(self.next_index, &value));
+                            }
+                        } else if b == b']' && self.depth == self.element_depth - 1 {
+                            // The array itself closed — nothing more to extract for this call.
+                            self.phase = ScanPhase::Closed;
+                        }
+                    }
+                }
+                _ => {
+                    if !b.is_ascii_whitespace() {
+                        match self.phase {
+                            ScanPhase::AwaitingColon => {
+                                self.phase = if b == b':' {
+                                    ScanPhase::AwaitingBracket
+                                } else {
+                                    ScanPhase::SearchingKey
+                                };
+                            }
+                            ScanPhase::AwaitingBracket => self.phase = ScanPhase::SearchingKey,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        self.scanned = i;
+        if self.phase == ScanPhase::Closed {
+            // Nothing further is extracted from this call — drop the (possibly large) remaining
+            // buffer growth rather than keep appending to it for no reason.
+            self.buffer.clear();
+            self.scanned = 0;
+        }
+        headlines
+    }
+}
+
+/// A terse one-line headline for a just-completed top-level plan statement (L-23) — progress
+/// feedback only; the final tree render (`flux_lang::render`) stays the authoritative, unabridged
+/// artifact. Works over a generic [`serde_json::Value`] rather than the typed [`Node`] on purpose:
+/// the slice this is called on is proven balanced but not yet known to satisfy every `Node` field
+/// requirement, and a generic read never fails to at least show the statement's `kind`/`op`.
+fn skeleton_headline(index: usize, value: &serde_json::Value) -> String {
+    let kind = value
+        .as_object()
+        .and_then(|o| o.get("kind"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("statement");
+    match skeleton_as_call(value) {
+        Some((op, args)) => match args.iter().find_map(skeleton_arg_hint) {
+            Some(hint) => format!("{index} {op} {hint}"),
+            None => format!("{index} {op}"),
+        },
+        None => format!("{index} {kind}"),
+    }
+}
+
+/// If `value` is a `call` node, or a `bind`/`memo` node wrapping one, return its `(op, args)` — the
+/// common case for a plan's top-level statements (`$x = op(...)`), which is what the headline
+/// wants to show. Anything else (control-flow nodes, a bare literal/var bind, …) yields `None` —
+/// the headline falls back to the statement's own `kind` tag.
+fn skeleton_as_call(value: &serde_json::Value) -> Option<(&str, &[serde_json::Value])> {
+    let obj = value.as_object()?;
+    match obj.get("kind").and_then(|v| v.as_str())? {
+        "call" => {
+            let op = obj.get("op")?.as_str()?;
+            let args = obj
+                .get("args")
+                .and_then(|v| v.as_array())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            Some((op, args))
+        }
+        "bind" | "memo" => skeleton_as_call(obj.get("value")?),
+        _ => None,
+    }
+}
+
+/// A short scalar hint for one call argument — a bare string/number/bool literal (`Node::Lit`),
+/// truncated. Any other argument shape (nested call, symbol ref, template, …) yields no hint rather
+/// than a long or misleading rendering; the first arg with a usable hint wins (usually the
+/// operative one — a path, a query, a command), and every argument stays visible in the final tree
+/// regardless.
+fn skeleton_arg_hint(arg: &serde_json::Value) -> Option<String> {
+    let obj = arg.as_object()?;
+    if obj.get("kind").and_then(|v| v.as_str())? != "lit" {
+        return None;
+    }
+    const CAP: usize = 48;
+    let s = match obj.get("value")? {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        _ => return None,
+    };
+    if s.chars().count() > CAP {
+        Some(format!("{}…", s.chars().take(CAP).collect::<String>()))
+    } else {
+        Some(s)
+    }
 }
 
 /// Extract `(id, name, input)` for every tool_use block in a message.
@@ -4543,6 +4800,292 @@ mod tests {
         };
         assert!(!c.gather);
         assert!(c.brief.is_none());
+    }
+
+    // -- L-23: progressive plan-skeleton rendering --------------------------------------------------
+
+    /// A minimal `AgentSink` that only records `plan_delta` headlines, in order — enough to assert
+    /// the plan skeleton streams progressively without pulling in the full CLI/TUI sink machinery.
+    #[derive(Default)]
+    struct RecSink {
+        headlines: Vec<String>,
+    }
+    impl crate::AgentSink for RecSink {
+        fn plan_delta(&mut self, headline: &str) {
+            self.headlines.push(headline.to_string());
+        }
+    }
+
+    /// Script a streamed `emit_plan` tool call: `json_text` is delivered as `Chunk::ToolInputDelta`
+    /// fragments split at `split_at` (ascending byte offsets), followed by the usual completed
+    /// `Chunk::Block`/`Chunk::Done` — mirrors how the shared Messages-protocol codec now surfaces
+    /// `input_json_delta` fragments (L-23) ahead of the block's `content_block_stop`.
+    fn tool_call_streamed(name: &str, json_text: &str, split_at: &[usize]) -> Vec<Chunk> {
+        let mut chunks = Vec::new();
+        let mut start = 0usize;
+        for &at in split_at {
+            chunks.push(Chunk::ToolInputDelta {
+                name: name.to_string(),
+                partial_json: json_text[start..at].to_string(),
+            });
+            start = at;
+        }
+        chunks.push(Chunk::ToolInputDelta {
+            name: name.to_string(),
+            partial_json: json_text[start..].to_string(),
+        });
+        chunks.push(Chunk::Block(ContentBlock::ToolUse {
+            id: format!("{name}_1"),
+            name: name.to_string(),
+            input: serde_json::from_str(json_text).unwrap(),
+        }));
+        chunks.push(Chunk::Done {
+            stop_reason: Some(flux_core::StopReason::ToolUse),
+        });
+        chunks
+    }
+
+    // `write` takes ONE object argument bundling its named params (the analyzer's enforced
+    // calling convention for multi-param ops — `lower` rejects positional args for it) — so its
+    // headline hint falls back to the bare op name, while `read`'s single-param convention keeps
+    // its bare-string path as a hint.
+    const STREAMED_PLAN_JSON: &str = r#"{"ast":{"body":[{"kind":"bind","name":"r1","value":{"kind":"call","op":"write","args":[{"kind":"lit","value":{"path":"/app/server.py","content":"print(1)"}}]}},{"kind":"call","op":"read","args":[{"kind":"lit","value":"/app/server.py"}]}]}}"#;
+
+    #[tokio::test]
+    async fn compile_turn_streams_plan_skeleton_headlines_as_emit_plan_arguments_arrive() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        // Deliver the tool call's JSON in five arbitrary-width fragments (not aligned to any node
+        // boundary) — the scanner must still report exactly the two top-level statements, in
+        // order, with the SAME final decoded plan an unsplit response would produce.
+        let n = STREAMED_PLAN_JSON.len();
+        let split_at = [n / 5, 2 * n / 5, 3 * n / 5, 4 * n / 5];
+        let p = mock(vec![tool_call_streamed(
+            "emit_plan",
+            STREAMED_PLAN_JSON,
+            &split_at,
+        )]);
+        let mut sink = RecSink::default();
+        let (out, _usage) = compile_turn(
+            &p,
+            "mock",
+            &[Message::user_text("write and verify server.py")],
+            None,
+            &ops,
+            None,
+            None,
+            Some(&mut sink),
+            CompileOptions::default(),
+            Phase::Execute,
+        )
+        .await;
+        assert_eq!(
+            sink.headlines,
+            vec!["1 write".to_string(), "2 read /app/server.py".to_string(),]
+        );
+        let compiled = match out.unwrap() {
+            TurnOutput::Plan(c) => c,
+            TurnOutput::Chat(t) => panic!("expected a plan, got chat: {t}"),
+        };
+        // Acceptance #1: the final render is byte-identical to the unsplit case — the skeleton
+        // scan is a read-only side channel over the same bytes, never the real decode.
+        let ast_value =
+            serde_json::from_str::<serde_json::Value>(STREAMED_PLAN_JSON).unwrap()["ast"].clone();
+        let expected_ast: DraftAst = serde_json::from_value(ast_value).unwrap();
+        assert_eq!(
+            crate::render::render_pretty(&compiled.ast),
+            crate::render::render_pretty(&expected_ast)
+        );
+    }
+
+    #[tokio::test]
+    async fn compile_turn_truncation_stops_plan_skeleton_without_crash_and_repair_is_unaffected() {
+        // Acceptance #2 / A-40 no-regression: a `max_tokens` cutoff mid-`emit_plan` must still (a)
+        // report a skeleton headline for every statement that fully closed before the cut, (b)
+        // report NOTHING for the statement left open by the truncation, (c) never panic, and (d)
+        // leave the existing truncation split-repair behavior (attempt count, error text) exactly
+        // as `compile_turn_bounds_truncation_repairs_then_errors` already pins it.
+        struct CountingMock {
+            responses: Mutex<VecDeque<Vec<Chunk>>>,
+            calls: Mutex<u32>,
+        }
+        #[async_trait]
+        impl Provider for CountingMock {
+            fn name(&self) -> &str {
+                "mock"
+            }
+            async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+                *self.calls.lock().unwrap() += 1;
+                let chunks = self
+                    .responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_default();
+                Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+            }
+        }
+        // The first top-level statement's args stream in and CLOSE (one skeleton headline); the
+        // second opens (`bash`) and is cut off mid-argument — the provider never sends this
+        // tool_use block's `content_block_stop`, so (as in the existing A-40 fixtures) no
+        // `Chunk::Block` ever arrives for it, only the truncated `Done`.
+        let truncated_with_partial_skeleton = || {
+            vec![
+                Chunk::ToolInputDelta {
+                    name: "emit_plan".into(),
+                    partial_json: r#"{"ast":{"body":[{"kind":"call","op":"write","args":["#.into(),
+                },
+                Chunk::ToolInputDelta {
+                    name: "emit_plan".into(),
+                    partial_json: r#"{"kind":"lit","value":"/app/server.py"}]},"#.into(),
+                },
+                Chunk::ToolInputDelta {
+                    name: "emit_plan".into(),
+                    partial_json:
+                        r#"{"kind":"call","op":"bash","args":[{"kind":"lit","value":"pytest"#.into(),
+                },
+                Chunk::Done {
+                    stop_reason: Some(flux_core::StopReason::MaxTokens),
+                },
+            ]
+        };
+        let expected_calls = 1 + TRUNCATION_REPAIRS;
+        let provider = CountingMock {
+            responses: Mutex::new(
+                vec![truncated_with_partial_skeleton(); (expected_calls + 1) as usize].into(),
+            ),
+            calls: Mutex::new(0),
+        };
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let mut sink = RecSink::default();
+        let (out, _usage) = compile_turn(
+            &provider,
+            "mock",
+            &[Message::user_text("implement all the nodes")],
+            None,
+            &ops,
+            None,
+            None,
+            Some(&mut sink),
+            CompileOptions::default(),
+            Phase::Execute,
+        )
+        .await;
+        // (d) repair behavior unchanged — same message shape and same call count as the pre-L-23
+        // truncation test.
+        let msg = format!("{}", out.unwrap_err());
+        assert!(
+            msg.contains("truncated") && msg.contains("max_tokens") && msg.contains("16384"),
+            "expected a max_tokens truncation error naming the ceiling, got: {msg}"
+        );
+        assert!(
+            msg.contains("split-repair attempt"),
+            "expected the error to say the split repair was attempted, got: {msg}"
+        );
+        assert_eq!(
+            *provider.calls.lock().unwrap(),
+            expected_calls,
+            "expected exactly 1 + TRUNCATION_REPAIRS provider calls, not step-budget exhaustion"
+        );
+        // (a)/(b)/(c) — one headline per attempt (the `write` statement, which fully closed
+        // before the cut), nothing for the never-closed `bash` statement, no panic.
+        assert_eq!(
+            sink.headlines,
+            vec!["1 write /app/server.py".to_string(); expected_calls as usize]
+        );
+    }
+
+    /// `PlanSkeletonScanner` in isolation (no provider/compile_turn involved): a top-level `call`,
+    /// a top-level `bind` wrapping a `call` (headline reflects the wrapped call, not `bind`
+    /// itself), and a top-level composite (`repeat`) with its OWN nested `body` array — only the
+    /// three TOP-level statements are reported; the nested `bash` inside `repeat` is not.
+    #[test]
+    fn plan_skeleton_scanner_extracts_top_level_headlines_only() {
+        let json = r#"{"ast":{"body":[
+            {"kind":"call","op":"write","args":[{"kind":"lit","value":"/app/server.py"},{"kind":"lit","value":"x"}]},
+            {"kind":"repeat","max":3,"body":[
+                {"kind":"call","op":"bash","args":[{"kind":"lit","value":"pytest -q"}]}
+            ]},
+            {"kind":"bind","name":"r","value":{"kind":"call","op":"read","args":[{"kind":"lit","value":"/app/server.py"}]}}
+        ]}}"#;
+        let mut scanner = PlanSkeletonScanner::default();
+        let headlines = scanner.feed(json);
+        assert_eq!(
+            headlines,
+            vec![
+                "1 write /app/server.py".to_string(),
+                "2 repeat".to_string(),
+                "3 read /app/server.py".to_string(),
+            ]
+        );
+    }
+
+    /// Resumability: feeding the exact same JSON one character at a time — including a split that
+    /// lands squarely inside the literal `"body"` key itself — must produce identical headlines to
+    /// a single whole-buffer feed. This is the shape a real provider stream actually delivers
+    /// (`input_json_delta` fragments rarely align to any JSON token boundary, let alone a key).
+    #[test]
+    fn plan_skeleton_scanner_is_resumable_across_arbitrary_chunk_boundaries() {
+        let json = r#"{"ast":{"body":[{"kind":"call","op":"write","args":[{"kind":"lit","value":"/app/server.py"},{"kind":"lit","value":"x"}]},{"kind":"call","op":"read","args":[{"kind":"lit","value":"/app/server.py"}]}]}}"#;
+
+        let mut whole = PlanSkeletonScanner::default();
+        let expected = whole.feed(json);
+        assert_eq!(
+            expected.len(),
+            2,
+            "sanity: fixture has two top-level statements"
+        );
+
+        let mut scanner = PlanSkeletonScanner::default();
+        let mut got = Vec::new();
+        for c in json.chars() {
+            got.extend(scanner.feed(&c.to_string()));
+        }
+        assert_eq!(got, expected);
+    }
+
+    /// Never panics on malformed/truncated input — a cut-off element and pure non-JSON garbage
+    /// both just stop producing headlines (the A-40 truncation test above pins the same contract
+    /// through the full `compile_turn` path; this pins the scanner directly).
+    #[test]
+    fn plan_skeleton_scanner_never_panics_on_malformed_or_truncated_input() {
+        let mut scanner = PlanSkeletonScanner::default();
+        let headlines =
+            scanner.feed(r#"{"ast":{"body":[{"kind":"call","op":"write","args":[{"kind":"l"#);
+        assert!(headlines.is_empty());
+
+        let mut scanner2 = PlanSkeletonScanner::default();
+        let headlines2 = scanner2.feed("not json at all { [ \" unbalanced");
+        assert!(headlines2.is_empty());
+    }
+
+    /// Once the target `body` array itself closes, the scanner stops for good — a coincidental
+    /// `"body"` key appearing later (e.g. inside an unrelated trailing object) is never mistaken
+    /// for a second array to scan, and feeding more afterward is a cheap no-op.
+    #[test]
+    fn plan_skeleton_scanner_stops_after_the_body_array_closes() {
+        let mut scanner = PlanSkeletonScanner::default();
+        let json = r#"{"ast":{"body":[{"kind":"call","op":"read","args":[{"kind":"lit","value":"x"}]}]},"decoy":{"body":["should never be scanned"]}}"#;
+        let headlines = scanner.feed(json);
+        assert_eq!(headlines, vec!["1 read x".to_string()]);
+        assert!(scanner.feed(r#","more":{"body":[1,2,3]}"#).is_empty());
+    }
+
+    /// Headline argument hints stay terse — a long string literal is truncated with an ellipsis
+    /// rather than dumping a potentially huge argument (e.g. a `write`'s file content) inline.
+    #[test]
+    fn skeleton_arg_hint_truncates_long_string_literals() {
+        let long = "x".repeat(80);
+        let arg = serde_json::json!({"kind": "lit", "value": long});
+        let hint = skeleton_arg_hint(&arg).expect("string literal yields a hint");
+        assert_eq!(hint.chars().count(), 49); // 48 kept + one ellipsis char
+        assert!(hint.ends_with('…'));
+
+        // A non-scalar literal (e.g. an object, as `write`'s combined-params calling convention
+        // uses) yields no hint — the headline falls back to the bare op name.
+        let obj_arg = serde_json::json!({"kind": "lit", "value": {"path": "x", "content": "y"}});
+        assert!(skeleton_arg_hint(&obj_arg).is_none());
     }
 
     // ---- one-shot compile (with the view param) ----

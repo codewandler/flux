@@ -1080,9 +1080,9 @@ async fn run_top_level(
 }
 
 /// The resumable-mode top-level statement driver behind [`execute_flow_resumable`]. Mirrors
-/// [`run_top_level`] (checkpoint fast-forward, `await` suspend, `return` unwind) with two additions,
-/// active ONLY at this top-level statement boundary — composites and nested bodies keep strict `Err`
-/// propagation and structural fatality (F14), unchanged:
+/// [`run_top_level`] (checkpoint fast-forward, `await` suspend, `return` unwind) with three
+/// additions, active ONLY at this top-level statement boundary — composites and nested bodies keep
+/// strict `Err` propagation and structural fatality (F14), unchanged:
 ///
 /// 1. **Ledger fast-forward.** Walk `body` from index 0: a `checkpoint`/`await` node is a free
 ///    pass-through (neither ledgers, and `checkpoint` has its own separate durable cursor, handled
@@ -1096,6 +1096,12 @@ async fn run_top_level(
 /// 2. **Reified halt.** A failing statement at or after `start` does NOT propagate `Err` — it is
 ///    classified into a [`PlanHalt`], `PlanHalted` is appended, and
 ///    `Ok(FlowOutcome { failure: Some(halt), transcript: <prefix> })` is returned instead.
+/// 3. **Reified await (L-24).** A top-level `await` still suspends (`FlowOutcome::suspension`,
+///    exactly as [`run_top_level`]) but ALSO opens a halt latch — `PlanHalt{kind: Awaiting}` —
+///    over the same completed-prefix ledger, so a plan the model re-emits once the awaited input
+///    arrives fast-forwards past the prefix instead of re-running it (design Part 2's loop-side
+///    case of `checkpoint`∘`await`). The strict driver [`run_top_level`] is untouched: this is a
+///    resumable-mode-only addition.
 ///
 /// Every other top-level statement that completes is ledgered (`StatementCompleted{skipped:false}`).
 #[allow(clippy::too_many_arguments)]
@@ -1246,6 +1252,35 @@ async fn run_top_level_resumable(
                     node,
                 },
             )?;
+            // L-24: fold the reified await into the SAME halt-latch machinery a top-level failure
+            // uses — `PlanHalted{kind: Awaiting}` opens the latch (see `ResumeLedger::fold`) over
+            // exactly the prefix already ledgered above (`StatementCompleted` per completed
+            // statement), so the plan the model re-emits once the awaited input is available
+            // (design Part 2's cross-turn `[resume context]`) fast-forwards past that prefix instead
+            // of re-running it. `Awaiting` is never fatal and never matched by the denial
+            // re-emission guard (`run_plan_dispatch`'s step 3), so this never blocks a re-emission —
+            // and the ledger walk's `Node::Await` free-pass-through means a byte-identical `await`
+            // at this position in the new plan costs nothing to skip over.
+            let stmt = stmt_hash16(&body[i]);
+            let halt = PlanHalt {
+                node,
+                stmt: stmt.clone(),
+                op: None,
+                kind: FailureKind::Awaiting,
+                message: format!("plan paused: awaiting `{source}`"),
+                plan: flow_key.to_string(),
+            };
+            store.append_event(
+                session_id,
+                &RunEvent::PlanHalted {
+                    plan: flow_key.to_string(),
+                    node,
+                    stmt,
+                    op: None,
+                    kind: FailureKind::Awaiting,
+                    error: halt.message.clone(),
+                },
+            )?;
             return Ok(FlowOutcome {
                 returned: None,
                 result: last,
@@ -1255,7 +1290,7 @@ async fn run_top_level_resumable(
                     node,
                     source: source.clone(),
                 }),
-                failure: None,
+                failure: Some(halt),
             });
         }
 

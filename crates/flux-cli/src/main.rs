@@ -399,6 +399,20 @@ enum FlowAction {
         /// Auto-approve every tool call (programs deny destructive ops without it).
         #[arg(long)]
         yes: bool,
+        /// Opt into resumable mode (L-25): a halt (a failed top-level statement, or the L-24
+        /// reified `await` pause) prints a structured halt report — a ✓/✗/· marked statement tree,
+        /// a machine-readable failure summary, and the session id — and exits non-zero, instead of
+        /// erroring the whole run. Implied by `--resume`.
+        #[arg(long)]
+        resumable: bool,
+        /// Resume a previously halted run of THIS file: a literal session id (printed by the halt
+        /// report), or `last` — the most recent halted `flow run` session for this flow's declared
+        /// name (`flow <name> -> …`; an unnamed flow can't be disambiguated this way and needs the
+        /// explicit session id). Re-parses this (possibly corrected) file, folds the halted
+        /// session's statement ledger, fast-forwards the matching completed prefix (values
+        /// rehydrated), and executes from the first changed statement.
+        #[arg(long, value_name = "SESSION|last")]
+        resume: Option<String>,
     },
 }
 
@@ -1516,21 +1530,26 @@ fn load_roles(cwd: &std::path::Path) -> RoleRegistry {
 async fn build_agent(
     flags: &AgentFlags,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
-    build_agent_with(flags, true).await
+    build_agent_with(flags, true, None).await
 }
 
 /// [`build_agent`] with a LAZY provider (C-11): `flux flow run` / `flux preset --run` replay
 /// pre-authored plans that may contain no model op — they must not demand a credential up front.
 /// The provider constructs on the first actual model call (same error, surfaced only if needed).
+/// `session_override`, when given (L-25's `flux flow run --resume`), is used as the run's session id
+/// verbatim instead of minting a fresh one — so a corrected re-run lands in the SAME session whose
+/// halt latch it is folding.
 async fn build_agent_lazy(
     flags: &AgentFlags,
+    session_override: Option<String>,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
-    build_agent_with(flags, false).await
+    build_agent_with(flags, false, session_override).await
 }
 
 async fn build_agent_with(
     flags: &AgentFlags,
     eager_provider: bool,
+    session_override: Option<String>,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
     // Guarded system rooted at the current directory; layered config loaded from it.
     let cwd = std::env::current_dir().context("current dir")?;
@@ -1678,8 +1697,12 @@ async fn build_agent_with(
     let backend = build_doc_index(&system).await;
     flux_capabilities::register_datasource_ops(&mut registry, backend);
 
-    // This run's session on the store opened above.
-    let session_id = if flags.continue_ || flags.resume {
+    // This run's session on the store opened above. `session_override` (L-25's `flow run --resume`)
+    // wins outright — it names an already-halted session to continue, distinct from the REPL's own
+    // `--continue`/`--resume` (latest session) semantics.
+    let session_id = if let Some(id) = session_override {
+        id
+    } else if flags.continue_ || flags.resume {
         events
             .latest_session()
             .context("latest session")?
@@ -2165,7 +2188,13 @@ fn should_fail(
         .any(|f| ReviewSeverity::from_finding_str(&f.severity) >= threshold)
 }
 
-async fn run_flow(file: &str, model: Option<String>, yes: bool) -> Result<()> {
+async fn run_flow(
+    file: &str,
+    model: Option<String>,
+    yes: bool,
+    resumable: bool,
+    resume: Option<String>,
+) -> Result<()> {
     // Build the agent flags from the command's own model/`--yes` (reuses the shared agent wiring).
     let flags = AgentFlags::from_model_yes(model.as_deref(), yes);
 
@@ -2199,7 +2228,7 @@ async fn run_flow(file: &str, model: Option<String>, yes: bool) -> Result<()> {
         }
     };
 
-    run_draft_ast_with_composites(&flags, &ast, &composites).await
+    run_draft_ast_with_composites_resumable(&flags, &ast, &composites, resumable, resume).await
 }
 
 /// Execute a pre-built `DraftAst` through the full envelope — the shared core behind both
@@ -2218,9 +2247,44 @@ pub(crate) async fn run_draft_ast_with_composites(
     ast: &flux_flow::ast::DraftAst,
     composites: &[flux_lang::program::CompositeOpDecl],
 ) -> Result<()> {
+    run_draft_ast_with_composites_resumable(flags, ast, composites, false, None).await
+}
+
+/// [`run_draft_ast_with_composites`] plus L-25's opt-in resumable mode for `flux flow run`.
+/// `resumable` alone reifies a halting top-level statement (a failure, or the L-24 `Awaiting`
+/// reified pause) as a printed, structured halt report + non-zero exit instead of erroring the
+/// whole run (design `multipass-agent-loop.md`'s "L-25: pre-authored resumable mode"); `resume`
+/// additionally targets a PRIOR halted session (a literal id, or `last`) and folds its statement
+/// ledger before executing, so a corrected re-run fast-forwards the matching completed prefix.
+/// `resume` implies resumable execution even when `--resumable` was not also passed. `flux preset
+/// --run` and every other caller of [`run_draft_ast_with_composites`] pass `false, None` here and
+/// keep today's exact strict (non-resumable) behavior — this is additive, not a mode switch.
+pub(crate) async fn run_draft_ast_with_composites_resumable(
+    flags: &AgentFlags,
+    ast: &flux_flow::ast::DraftAst,
+    composites: &[flux_lang::program::CompositeOpDecl],
+    resumable: bool,
+    resume: Option<String>,
+) -> Result<()> {
+    let resumable = resumable || resume.is_some();
+
+    // L-25: `--resume` targets a specific, ALREADY-halted session instead of minting a fresh one.
+    // Resolved against throwaway store handles before `build_agent_lazy` opens its own — SQLite/WAL
+    // supports the sequential opens, and this avoids wasting a session record or mis-tagging plugin
+    // audit streams the way overriding `session_id` after construction would.
+    let resume_session = match &resume {
+        Some(arg) => {
+            let events = Arc::new(open_event_store()?);
+            let flow = open_flow_store(events.clone())?;
+            Some(resolve_resume_session(&events, &flow, ast, arg)?)
+        }
+        None => None,
+    };
+
     // Lazy provider (C-11): a pre-authored flow is deterministic unless it actually reaches a
     // model op — replaying one must not demand credentials.
-    let (engine, session_id, model_spec, _spawner) = build_agent_lazy(flags).await?;
+    let (engine, session_id, model_spec, _spawner) =
+        build_agent_lazy(flags, resume_session).await?;
     eprintln!(
         "{}",
         style::dim(&format!("flow · {} · session {session_id}", engine.model))
@@ -2253,8 +2317,47 @@ pub(crate) async fn run_draft_ast_with_composites(
         bail!("flow validation failed — see diagnostics above");
     }
 
+    // L-25: fold the session's open halt latch. `None` for a fresh `--resumable`-only run (a
+    // brand-new session never halted before); on `--resume`, the ledger to fast-forward against.
+    // A resume target MUST have an open halt — silently continuing on a stale/typo'd session id
+    // would hide a mistake rather than fail loudly.
+    let open_halt = if resumable {
+        engine.flow.open_halted_plan(&session_id)?
+    } else {
+        None
+    };
+    if resume.is_some() && open_halt.is_none() {
+        bail!("session {session_id} has no open halt to resume — nothing to fast-forward");
+    }
+
+    // Denial re-emission guard (design Part 2 / A-16): a statement policy or the user already
+    // refused must never be silently re-dispatched just because it re-appears unchanged in a
+    // corrected re-emission. Checked BEFORE executing anything — this authored path never goes
+    // through `run_plan`, so it must enforce the same invariant itself.
+    if let Some(open) = &open_halt {
+        if flux_flow::runtime::denied_reemission_guard(&ast.body, &open.halt) {
+            eprintln!(
+                "{}",
+                style::red(&flux_flow::runtime::render_halt_report(
+                    ast,
+                    &open.halt,
+                    &session_id
+                ))
+            );
+            eprintln!(
+                "{}",
+                style::dim(
+                    "the statement previously refused is unchanged in this file — it was NOT \
+                     re-run. Edit it to a different approach, or have an operator re-approve."
+                )
+            );
+            std::process::exit(1);
+        }
+    }
+
     // Risk preview (informational; every op still gates at dispatch through the engine's approver,
-    // which `build_agent` set from `--yes`).
+    // which `build_agent` set from `--yes`). Scoped to the whole plan even when resuming — dispatch
+    // itself never re-runs the skipped prefix, so this stays a harmless over-approval preview.
     let risk = if active_composites.is_empty() {
         flux_flow::runtime::plan_risk(ast, engine.executor.registry())
     } else {
@@ -2288,7 +2391,22 @@ pub(crate) async fn run_draft_ast_with_composites(
     );
 
     let mut sink = flux_flow::loop_host::SharedSink::new(shared.clone());
-    let outcome = if active_composites.is_empty() {
+    let outcome = if resumable {
+        // L-25: the SAME resumable entry point `run_plan` uses (`docs/designs/multipass-agent-loop.md`
+        // Part 2) — a failing top-level statement reifies onto `outcome.failure` instead of
+        // propagating `Err`; `open_halt`'s ledger (when resuming) fast-forwards the matching prefix.
+        flux_flow::runtime::execute_flow_resumable_with_composites(
+            engine.flow.as_ref(),
+            engine.executor.as_ref(),
+            &session_id,
+            ast,
+            &active_composites,
+            open_halt.as_ref().map(|o| &o.ledger),
+            None,
+            &mut sink,
+        )
+        .await
+    } else if active_composites.is_empty() {
         flux_flow::runtime::execute_flow(
             engine.flow.as_ref(),
             engine.executor.as_ref(),
@@ -2309,6 +2427,22 @@ pub(crate) async fn run_draft_ast_with_composites(
         .await
     }
     .context("execute flow")?;
+
+    // A reified halt (L-25): print the structured report and exit non-zero instead of the normal
+    // success printing below — the caller corrects the file and re-runs with `--resume`.
+    if let Some(halt) = &outcome.failure {
+        eprintln!(
+            "{}",
+            flux_flow::runtime::render_halt_report(ast, halt, &session_id)
+        );
+        let u = engine.loop_host.turn_usage();
+        shared
+            .lock()
+            .unwrap()
+            .turn_end((u.total() > 0).then_some(u));
+        std::process::exit(1);
+    }
+
     if !outcome.result.trim().is_empty() {
         println!("{}", outcome.result);
     } else {
@@ -2326,6 +2460,51 @@ pub(crate) async fn run_draft_ast_with_composites(
         .unwrap()
         .turn_end((u.total() > 0).then_some(u));
     Ok(())
+}
+
+/// Resolve `flux flow run <file> --resume <arg>` to a concrete session id (L-25). A literal id is
+/// used as-is (the caller finds out soon enough — via [`FlowStore::open_halted_plan`] returning
+/// `None` — if it names a session with no open halt). `last` searches the workspace's session store
+/// (newest-first) for the most recent session with an open halt latch whose halted plan's key is
+/// prefixed by this flow's declared name (the same `name#`/`h:` prefix
+/// [`flow_key`](flux_lang::runtime) derives) — an UNNAMED flow can't be disambiguated this way (a
+/// bare `h:<hash>` prefix could match ANY unnamed halted plan, including an ordinary chat turn's
+/// inner `run_plan` halt, since they share the same session store and ledger machinery), so `last`
+/// is refused for it and the caller is pointed at the explicit session id the halt report printed.
+fn resolve_resume_session(
+    events: &EventStore,
+    flow: &FlowStore,
+    ast: &flux_flow::ast::DraftAst,
+    arg: &str,
+) -> Result<String> {
+    if arg != "last" {
+        return Ok(arg.to_string());
+    }
+    let name = ast
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "`--resume last` needs the flow to declare a name (`flow <name> -> …`) to find its \
+                 halted session unambiguously — pass the explicit session id the halt report \
+                 printed instead"
+            )
+        })?;
+    let prefix = format!("{name}#");
+    const SEARCH_LIMIT: usize = 500;
+    for s in events.list(SEARCH_LIMIT).context("list sessions")? {
+        if let Some(open) = flow
+            .open_halted_plan(&s.id)
+            .with_context(|| format!("open halted plan for session {}", s.id))?
+        {
+            if open.halt.plan.starts_with(&prefix) {
+                return Ok(s.id);
+            }
+        }
+    }
+    bail!("no halted `flow run` session found for flow `{name}` — nothing to resume");
 }
 
 /// An `AskUser` that prompts on stdin — used by `flux plan` when attached to a terminal.
@@ -3857,6 +4036,24 @@ impl AgentSink for CliSink {
             self.stop_spinner();
         }
     }
+    /// L-23: a plan-skeleton headline for one top-level statement, the instant its `emit_plan`
+    /// JSON arguments finish streaming — while composing a large plan takes a while, the running
+    /// spinner already started by `planning(true)` shows the tree taking shape node by node
+    /// instead of sitting on a bare "planning…" until the whole call completes. The eventual
+    /// `flow.plan` observation (`render_plan`) replaces this with the full, authoritative tree.
+    fn plan_delta(&mut self, headline: &str) {
+        let label = style::dim(&format!(
+            "{} · {headline}",
+            phase_spinner_label(self.phase.as_deref(), self.execute_rounds)
+        ));
+        if let Some((state, _)) = &self.spinner {
+            state.lock().unwrap().label = label;
+        } else if self.stderr_tty {
+            // No animated spinner (styling disabled / non-interactive stderr) — still show
+            // progress as plain dim lines rather than going silent.
+            eprintln!("{}", style::dim(&format!("· {headline}")));
+        }
+    }
     fn tool_call(&mut self, name: &str, input: &Value) {
         self.commit();
         self.steps += 1;
@@ -4788,8 +4985,15 @@ async fn main() -> Result<()> {
                 run_app(program.as_deref(), &agent, serve).await
             }
             Some(Commands::Flow {
-                action: FlowAction::Run { file, model, yes },
-            }) => run_flow(&file, model, yes).await,
+                action:
+                    FlowAction::Run {
+                        file,
+                        model,
+                        yes,
+                        resumable,
+                        resume,
+                    },
+            }) => run_flow(&file, model, yes, resumable, resume).await,
             Some(Commands::Review {
                 agent,
                 files,
@@ -8717,5 +8921,78 @@ mod tests {
         assert!(md.contains("No findings."));
         assert!(md.contains("## Gaps"));
         assert!(md.contains("dropped malformed entry"));
+    }
+
+    /// L-25 — `flux flow run --resume <session|last>`'s own session-resolution logic (the CLI-level
+    /// seam, distinct from flux-flow's engine-level fast-forward tests): a literal session id passes
+    /// straight through; an unnamed flow can't use `last` (nothing disambiguates it from any other
+    /// unnamed halted plan, including an ordinary chat turn's inner `run_plan` halt — same store,
+    /// same ledger machinery); and `last` finds the most recent halted session matching THIS flow's
+    /// declared name, skipping a more-recent halted session that belongs to a different flow.
+    #[test]
+    fn resolve_resume_session_passes_through_literals_and_last_matches_by_flow_name() {
+        use flux_flow::ast::{DraftAst, FailureKind, NodeId, RunEvent};
+        use flux_flow::state::FlowStore;
+        use std::sync::Arc;
+
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let flow = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let named = DraftAst {
+            name: Some("greet".into()),
+            ..Default::default()
+        };
+
+        // A literal (non-"last") argument passes straight through, whatever it is — the caller
+        // finds out soon enough (via `open_halted_plan` returning `None`) if it's wrong.
+        assert_eq!(
+            super::resolve_resume_session(&events, &flow, &named, "s_999").unwrap(),
+            "s_999"
+        );
+
+        // An unnamed flow can't use `last` — refused with a clear, actionable error.
+        let unnamed = DraftAst::default();
+        let err = super::resolve_resume_session(&events, &flow, &unnamed, "last")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("declare a name"), "{err}");
+
+        // `last` with nothing halted yet for this name is a clean error, not a silent no-op.
+        assert!(super::resolve_resume_session(&events, &flow, &named, "last").is_err());
+
+        // OLDER session, halted under THIS flow's name.
+        let this_flow_session = events.create_session("mock").unwrap();
+        flow.append_event(
+            &this_flow_session,
+            &RunEvent::PlanHalted {
+                plan: "greet#aaaaaaaaaaaaaaaa".into(),
+                node: NodeId(0),
+                stmt: "s1".into(),
+                op: None,
+                kind: FailureKind::Runtime,
+                error: "boom".into(),
+            },
+        )
+        .unwrap();
+        // NEWER session, halted under a DIFFERENT flow's name — `last` must not just grab the
+        // newest halted session overall.
+        let other_flow_session = events.create_session("mock").unwrap();
+        flow.append_event(
+            &other_flow_session,
+            &RunEvent::PlanHalted {
+                plan: "other-flow#bbbbbbbbbbbbbbbb".into(),
+                node: NodeId(0),
+                stmt: "s1".into(),
+                op: None,
+                kind: FailureKind::Runtime,
+                error: "boom".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            super::resolve_resume_session(&events, &flow, &named, "last").unwrap(),
+            this_flow_session,
+            "matches by flow name, not just recency"
+        );
     }
 }

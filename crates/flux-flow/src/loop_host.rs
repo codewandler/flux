@@ -282,6 +282,19 @@ pub(crate) fn halt_guidance(kind: FailureKind, node: NodeId) -> String {
              choose a different approach, ask the user, or answer in prose to end the turn.",
             node.0
         ),
+        // L-24: an await is not a failure — the plan paused for external input, and this round's
+        // turn already ended (in prose, asking for it). If the input is now available (e.g. the
+        // user's reply), incorporate it directly and continue the plan from step N+1; re-emitting
+        // the SAME `await` unchanged at step N costs nothing — the runtime treats it as a free
+        // pass-through and skips straight to the divergence.
+        FailureKind::Awaiting => format!(
+            "{keep}Step {} paused the plan awaiting external input. If that input is now available, \
+             incorporate it directly (e.g. bind the value you now have) and continue from step {} — \
+             an unchanged `await` at step {} is skipped for free.",
+            node.0,
+            node.0 + 1,
+            node.0
+        ),
     }
 }
 
@@ -1761,6 +1774,9 @@ impl AgentSink for SharedSink {
     fn planning(&mut self, active: bool) {
         self.0.lock().unwrap().planning(active);
     }
+    fn plan_delta(&mut self, headline: &str) {
+        self.0.lock().unwrap().plan_delta(headline);
+    }
     fn tool_call(&mut self, name: &str, input: &Value) {
         self.0.lock().unwrap().tool_call(name, input);
     }
@@ -1784,6 +1800,7 @@ pub enum SinkEvent {
     Text(String),
     Thinking(String),
     Planning(bool),
+    PlanDelta(String),
     ToolCall(String, Value),
     ToolResult(String, ToolResult),
     Observation(flux_evidence::Observation),
@@ -1797,6 +1814,7 @@ impl SinkEvent {
             SinkEvent::Text(t) => sink.text_delta(&t),
             SinkEvent::Thinking(t) => sink.thinking_delta(&t),
             SinkEvent::Planning(a) => sink.planning(a),
+            SinkEvent::PlanDelta(h) => sink.plan_delta(&h),
             SinkEvent::ToolCall(n, i) => sink.tool_call(&n, &i),
             SinkEvent::ToolResult(n, r) => sink.tool_result(&n, &r),
             SinkEvent::Observation(o) => sink.observation(&o),
@@ -1825,6 +1843,9 @@ impl AgentSink for ChannelSink {
     }
     fn planning(&mut self, active: bool) {
         let _ = self.0.send(SinkEvent::Planning(active));
+    }
+    fn plan_delta(&mut self, headline: &str) {
+        let _ = self.0.send(SinkEvent::PlanDelta(headline.to_string()));
     }
     fn tool_call(&mut self, name: &str, input: &Value) {
         let _ = self
@@ -4704,6 +4725,104 @@ flow agent-loop -> string
         assert!(
             host.store.open_halted_plan("sess").unwrap().is_none(),
             "the latch must be consumed (PlanResumed appended) even at zero skips"
+        );
+    }
+
+    /// A read-only op that counts every dispatch — stands in for an effectful pre-await statement
+    /// in `post_await_reemission_keeps_completed_prefix` (L-24): the whole point of folding the
+    /// reified await into the halt-latch machinery is that this MUST dispatch exactly once across
+    /// the halt and its follow-up re-emission, never twice.
+    struct CountingTool {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only(
+                "counter",
+                "counts dispatches",
+                json!({"type":"object","properties":{}}),
+            )
+        }
+        async fn execute(&self, _c: &ToolContext, _p: Value) -> Result<ToolResult> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(ToolResult::ok(format!("count={n}")))
+        }
+    }
+
+    /// L-24 acceptance / `post_await_reemission_keeps_completed_prefix`: a top-level `await` reified
+    /// by the resumable runtime now opens the SAME halt latch a plain runtime failure does
+    /// (`PlanHalted{kind: "awaiting"}`) — so the plan the model re-emits once the awaited input is
+    /// available (design Part 2's cross-turn `[resume context]`) fast-forwards past the completed
+    /// prefix (AND the await itself, a free pass-through) instead of re-running it. The counting op
+    /// standing in for the pre-await effectful statement proves it: exactly one dispatch across both
+    /// rounds, never two.
+    #[tokio::test]
+    async fn post_await_reemission_keeps_completed_prefix() {
+        let rec = Recorder::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(CountingTool {
+            calls: calls.clone(),
+        }));
+        reg.register(Arc::new(EchoTool));
+        let (_ex, host) = setup_host(
+            reg,
+            PermissionManager::from_rules(&["counter".into(), "echo".into()], &[]),
+            Arc::new(AllowApprover),
+            rec,
+            "l24-await-ledger",
+        );
+
+        // Round 1: the effectful prefix runs, then a top-level `await` reifies — the run halts
+        // there; nothing after it runs.
+        let awaiting = json!({"kind":"plan","ast":{"body":[
+            {"kind":"bind","name":"a","value":{"kind":"call","op":"counter","args":[]}},
+            {"kind":"await","binding":"reply","source":"user_input"}
+        ]}});
+        let first = host.run_plan(awaiting).await.unwrap();
+        assert_eq!(
+            first["steps"], 1,
+            "only the pre-await statement dispatched: {first}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the counting op ran once");
+        let failure = &first["failure"];
+        assert!(
+            !failure.is_null(),
+            "the reified await must open a halt latch (a reified halt), not a silent no-op: {first}"
+        );
+        assert_eq!(failure["kind"], "awaiting");
+        assert_eq!(failure["fatal"], false, "an await is never fatal");
+        assert!(
+            host.store.open_halted_plan("sess").unwrap().is_some(),
+            "the latch is open after the reified await"
+        );
+
+        // Round 2 — the "re-emission" once the awaited input is available: the SAME prefix + the
+        // SAME await, byte-identical, plus a NEW statement after it.
+        let reemitted = json!({"kind":"plan","ast":{"body":[
+            {"kind":"bind","name":"a","value":{"kind":"call","op":"counter","args":[]}},
+            {"kind":"await","binding":"reply","source":"user_input"},
+            {"kind":"bind","name":"b","value":{"kind":"call","op":"echo","args":[{"kind":"lit","value":"after"}]}}
+        ]}});
+        let second = host.run_plan(reemitted).await.unwrap();
+        assert!(
+            second.get("failure").map(|f| f.is_null()).unwrap_or(true),
+            "the re-emission completes cleanly past the await: {second}"
+        );
+        assert_eq!(
+            second["steps"], 1,
+            "only the NEW post-await statement dispatched — the prefix AND the await were both \
+             skipped by the fast-forward: {second}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the counting op must NEVER double-run across the await — still exactly once"
+        );
+        assert!(
+            host.store.open_halted_plan("sess").unwrap().is_none(),
+            "the latch is consumed by the resumed run"
         );
     }
 

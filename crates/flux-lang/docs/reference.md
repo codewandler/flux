@@ -1003,6 +1003,18 @@ not repeated) and continues from here. Targets authored, named flows. Pairs with
 {"kind": "checkpoint", "label": "phase-1"}
 ```
 
+**Coexists with the statement-halt ledger, not merged into it** (L-25, `flux flow run --resumable`/
+`--resume`, mirroring `run_plan`'s patch-and-continue): `checkpoint` is the *cross-run caching*
+primitive — an explicit, body-hash-keyed, durably-stored cursor that survives arbitrary re-runs of
+an unchanged flow. The ledger is the *halt-resume* primitive — a per-statement content-hash fold
+over the run-event log that fast-forwards a *corrected* re-emission's matching completed prefix,
+tolerating an edited suffix. They compose (`start = ledger_end.max(checkpoint_next)`): a checkpointed
+statement that fast-forwards via the ledger simply never consults its checkpoint cache. Kept separate
+rather than merged because their invalidation semantics differ on purpose — any edit defeats
+`checkpoint` (it exists to skip a byte-identical re-run), while the ledger tolerates a suffix edit
+(it exists to skip everything BEFORE the edit) — that difference is the feature, not an accident to
+reconcile.
+
 ---
 
 ## Pure expression nodes (no IO, no approval gate)

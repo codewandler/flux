@@ -901,12 +901,15 @@ pub struct AwaitPlan {
 // Run-event trace
 // ---------------------------------------------------------------------------
 
-/// The kind of failure a halted top-level statement surfaced (see [`crate::runtime::PlanHalt`]),
-/// classified from the existing [`crate::error::FlowError`] variants — never a new failure mode.
-/// Lives here beside [`RunEvent`] (rather than in `runtime.rs`, which depends on this module) so the
-/// run-event log stays a pure, dependency-free data model; the classification logic itself
-/// (`FlowError` -> `FailureKind`) is an inherent `impl` in `runtime.rs`, the one place that already
-/// depends on both.
+/// The kind of halt a resumable top-level run reified (see [`crate::runtime::PlanHalt`]). Most
+/// variants classify an existing [`crate::error::FlowError`] (the classification logic itself —
+/// `FlowError` -> `FailureKind` — is an inherent `impl` in `runtime.rs`, the one place that already
+/// depends on both); [`Awaiting`](Self::Awaiting) is the one exception (L-24): it is reified
+/// directly by [`crate::runtime::execute_flow_resumable`] when it hits a top-level `await`, no
+/// `FlowError` involved — a pause, not a failure, folded into the same halt-latch machinery so the
+/// completed prefix survives to the re-emitted plan. Lives here beside [`RunEvent`] (rather than in
+/// `runtime.rs`, which depends on this module) so the run-event log stays a pure, dependency-free
+/// data model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureKind {
@@ -918,6 +921,13 @@ pub enum FailureKind {
     AssertFailed,
     /// Any other failure — the retryable, patch-and-continue default.
     Runtime,
+    /// A top-level `await` reified by the resumable runtime (L-24) — not a failure at all, but
+    /// folded into the halt latch so the completed prefix fast-forwards on the plan the model
+    /// re-emits once the awaited input is available. Never fatal (see [`Self::is_fatal`]) and never
+    /// matched by the denial re-emission guard, so a re-emitted plan carrying the same `await` is
+    /// simply skipped over (the ledger walk already treats `await` as a free pass-through) rather
+    /// than refused.
+    Awaiting,
 }
 
 impl FailureKind {

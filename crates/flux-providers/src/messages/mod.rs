@@ -435,8 +435,20 @@ fn map_messages_stream_inner(
                         }
                     }
                     WireDelta::InputJsonDelta { partial_json } => {
-                        if let Some(BlockAcc::ToolUse { json, .. }) = blocks.get_mut(&index) {
+                        // L-23: surface the fragment as a `ToolInputDelta` too (in addition to the
+                        // existing accumulation this codec always did) so a caller can render an
+                        // `emit_plan` plan skeleton progressively — purely additive, the completed
+                        // `Chunk::Block` below remains the sole source of truth for the final call.
+                        let name = if let Some(BlockAcc::ToolUse { json, name, .. }) =
+                            blocks.get_mut(&index)
+                        {
                             json.push_str(&partial_json);
+                            Some(name.clone())
+                        } else {
+                            None
+                        };
+                        if let Some(name) = name {
+                            yield Chunk::ToolInputDelta { name, partial_json };
                         }
                     }
                 },
@@ -738,6 +750,10 @@ mod tests {
         let mut blocks = Vec::new();
         let mut stop = None;
         let mut last_usage = None;
+        // L-23: the codec now ALSO surfaces each `input_json_delta` fragment as a `ToolInputDelta`
+        // (in addition to the accumulation it always did internally) so a caller can render a
+        // plan skeleton progressively — collected here to prove it rides alongside, unaffected.
+        let mut tool_input_deltas = Vec::new();
 
         let mut stream = map_messages_stream(byte_stream);
         while let Some(chunk) = stream.next().await {
@@ -746,6 +762,9 @@ mod tests {
                 Chunk::Block(b) => blocks.push(b),
                 Chunk::Usage(u) => last_usage = Some(u),
                 Chunk::Done { stop_reason } => stop = stop_reason,
+                Chunk::ToolInputDelta { name, partial_json } => {
+                    tool_input_deltas.push((name, partial_json))
+                }
                 Chunk::MessageStart { .. } => {}
                 Chunk::ThinkingDelta(_) => {}
                 Chunk::StreamDiagnostic { .. } => {}
@@ -754,6 +773,13 @@ mod tests {
 
         assert_eq!(text, "Hello world");
         assert_eq!(stop, Some(StopReason::ToolUse));
+        assert_eq!(
+            tool_input_deltas,
+            vec![
+                ("read".to_string(), "{\"path\":".to_string()),
+                ("read".to_string(), "\"a.txt\"}".to_string()),
+            ]
+        );
         let usage = last_usage.unwrap();
         assert_eq!(usage.output_tokens, 15);
         // The final (message_delta) usage must preserve message_start's input_tokens, not zero it.

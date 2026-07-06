@@ -22,7 +22,7 @@ use flux_lang::opspec::OpCatalog;
 use flux_lang::program::CompositeOpDecl;
 use flux_lang::sink::FlowSink;
 
-use crate::ast::{DraftAst, Node};
+use crate::ast::{DraftAst, FailureKind, Node};
 use crate::registry::{schema_params, OpRegistry};
 use crate::state::FlowStore;
 use crate::Result;
@@ -635,13 +635,14 @@ pub async fn execute_flow_with_composites(
     flux_lang::runtime::execute_flow(store, &host, session_id, ast, &mut bridge).await
 }
 
-/// The **resumable** analog of [`execute_flow_with_composites`] — used ONLY by `run_plan`'s loop-plan
-/// execution (design Part 2, patch-and-continue). A failing TOP-LEVEL statement is reified onto
+/// The **resumable** analog of [`execute_flow_with_composites`] — the shared entry point behind both
+/// `run_plan`'s loop-plan execution and the authored `flux flow run --resumable`/`--resume` path
+/// (design Part 2, patch-and-continue; L-25). A failing TOP-LEVEL statement is reified onto
 /// `FlowOutcome::failure` instead of propagating `Err`; `ledger`, when given (folded via
 /// [`FlowStore::open_halted_plan`](crate::state::FlowStore::open_halted_plan) over the session's
 /// run-event log), fast-forwards the longest content-hash-matching completed prefix before executing
-/// from the first divergence. The authored `flux flow run` path stays on the strict
-/// [`execute_flow_with_composites`] (L-25) — this wrapper is loop-host-only.
+/// from the first divergence. `reads` is the loop's per-turn read-resource ledger (A-20) — the
+/// authored path has no analogous per-turn concept, so it always passes `None`.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_flow_resumable_with_composites(
     store: &FlowStore,
@@ -663,6 +664,69 @@ pub async fn execute_flow_resumable_with_composites(
     };
     flux_lang::runtime::execute_flow_resumable(store, &host, session_id, ast, &mut bridge, ledger)
         .await
+}
+
+/// The design Part-2 **denial re-emission guard**, factored out so the authored `flux flow run
+/// --resume` path (L-25) enforces the identical invariant the loop host's `run_plan` checks before
+/// ever calling [`execute_flow_resumable_with_composites`] (`crates/flux-flow/src/loop_host.rs`):
+/// once policy or the user has refused a statement (`Denied`/`ConfirmDenied`), that EXACT statement
+/// must never be silently re-dispatched just because it re-appears unchanged in a corrected
+/// re-emission (the A-16 rule) — the caller must see the refusal again, not a silent retry. Returns
+/// `true` when `halt` was a denial AND `body` still contains a statement with `halt`'s exact
+/// `stmt_hash16` anywhere (mirroring the loop host's own scan, which is position-independent so a
+/// reordered-but-unchanged statement is still caught); the caller should refuse to execute rather
+/// than fast-forward at all. A genuinely edited statement (any change to its content) has a
+/// different hash and is unaffected — it flows through fast-forward normally, exactly like any other
+/// correction.
+pub fn denied_reemission_guard(body: &[Node], halt: &PlanHalt) -> bool {
+    matches!(halt.kind, FailureKind::Denied | FailureKind::ConfirmDenied)
+        && body.iter().any(|n| stmt_hash16(n) == halt.stmt)
+}
+
+/// Render a resumable-mode halt for a **human-facing** surface (`flux flow run --resumable`/
+/// `--resume`, L-25) — design Part 2's ✓/✗/· marked statement tree (the same convention the loop
+/// host's model-facing `render_marked_plan` uses, just addressed at a developer editing the `.flux`
+/// file instead of an LLM re-emitting a plan) plus a machine-readable failure summary and the
+/// session id needed to correct-and-continue. Reuses [`crate::render::render_statement`] and the loop
+/// host's own [`crate::loop_host::failure_kind_label`] wire labels, so the two halt surfaces never
+/// drift on vocabulary even though they render to different audiences and through different call
+/// sites (this one never goes through `run_plan`).
+pub fn render_halt_report(ast: &DraftAst, halt: &PlanHalt, session_id: &str) -> String {
+    let marked = ast
+        .body
+        .iter()
+        .enumerate()
+        .map(|(i, node)| {
+            let marker = match i as u32 {
+                n if n == halt.node.0 => "\u{2717}", // ✗
+                n if n < halt.node.0 => "\u{2713}",  // ✓
+                _ => "\u{b7}",                       // ·
+            };
+            format!(
+                "{marker} {i}: {}",
+                crate::render::render_statement(node, &crate::render::Palette::PLAIN)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let failure = serde_json::json!({
+        "node": halt.node.0,
+        "stmt": halt.stmt,
+        "op": halt.op,
+        "kind": crate::loop_host::failure_kind_label(halt.kind),
+        "fatal": halt.kind.is_fatal(),
+        "message": halt.message,
+        "plan": halt.plan,
+        "session": session_id,
+    });
+    format!(
+        "{marked}\n\n[flow halted at step {} of {}] {}\n{}\n\n\
+Correct the flow and continue: `flux flow run <file> --resume {session_id}` (or `--resume last`).",
+        halt.node.0 + 1,
+        ast.body.len(),
+        halt.message,
+        serde_json::to_string(&failure).unwrap_or_default(),
+    )
 }
 
 /// Resume a flow suspended on a top-level `await` — the engine wrapper over
@@ -1143,7 +1207,7 @@ impl Approver for PlanApprover {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{RunEvent, SymbolName, Value, Visibility};
+    use crate::ast::{NodeId, RunEvent, SagaStep, SymbolName, Value, Visibility};
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -2982,5 +3046,429 @@ mod tests {
         );
         assert_eq!(read_window(&json!({"paths":["a","b"]})), None);
         assert_eq!(read_window(&json!("f")), None);
+    }
+
+    // ---- L-25: authored `flux flow run --resumable`/`--resume` engine seam ----
+
+    /// A tool that always fails (an ordinary `is_error`, never `denied`) — reifies a
+    /// `FailureKind::Runtime` halt without touching permissions/approval.
+    struct BoomTool;
+
+    #[async_trait]
+    impl Tool for BoomTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only(
+                "boom",
+                "always fails",
+                json!({"type": "object", "properties": {}}),
+            )
+        }
+        async fn execute(
+            &self,
+            _ctx: &ToolContext,
+            _params: serde_json::Value,
+        ) -> flux_core::Result<ToolResult> {
+            Ok(ToolResult::error("boom failed"))
+        }
+    }
+
+    /// A tool that records its `text` arg into a shared, order-preserving log — used to observe
+    /// exactly which statements actually dispatched across two resumable runs. A ledger-skipped
+    /// (fast-forwarded) statement never touches this, which is exactly the property the `once`/
+    /// `saga` invariant tests below check for.
+    #[derive(Clone, Default)]
+    struct MarkTool {
+        marks: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Tool for MarkTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only(
+                "mark",
+                "record a mark",
+                json!({
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } },
+                    "required": ["text"]
+                }),
+            )
+        }
+        async fn execute(
+            &self,
+            _ctx: &ToolContext,
+            params: serde_json::Value,
+        ) -> flux_core::Result<ToolResult> {
+            let text = params
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            self.marks.lock().unwrap().push(text.clone());
+            Ok(ToolResult::ok(text))
+        }
+    }
+
+    /// An executor with `mark` (recording, always succeeds) and `boom` (always fails) registered
+    /// and allowed — the L-25 authored-resumable-path fixture. Returns the `MarkTool` handle so a
+    /// test can inspect the dispatch log directly, independent of the transcript.
+    fn temp_executor_l25() -> (Executor, MarkTool) {
+        let dir = std::env::temp_dir().join(format!(
+            "flux-flow-rt-l25-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mark = MarkTool::default();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(mark.clone()));
+        reg.register(Arc::new(BoomTool));
+        let perms = PermissionManager::from_rules(&["mark".into(), "boom".into()], &[]);
+        let ex = Executor::new(
+            reg,
+            perms,
+            Arc::new(AllowApprover),
+            ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap()))),
+        );
+        (ex, mark)
+    }
+
+    /// A bare `mark("text")` call node (a single literal binds to `mark`'s sole required param,
+    /// same sugar `flow_bind`'s "echo" calls above rely on).
+    fn mark_call(text: &str) -> Node {
+        Node::Call {
+            op: "mark".into(),
+            args: vec![flow_lit(json!(text))],
+        }
+    }
+
+    /// [`render_halt_report`] marks the completed prefix `✓`, the failed statement `✗`, and the rest
+    /// `·`; embeds a machine-readable `failure` object (node/stmt/op/kind/fatal/message/plan/session);
+    /// and tells the reader the exact `--resume <session>` command to correct-and-continue with.
+    #[test]
+    fn render_halt_report_marks_prefix_and_embeds_machine_readable_failure() {
+        let ast = DraftAst {
+            body: vec![
+                flow_bind("a", "echo", vec![flow_lit(json!("hi"))]),
+                flow_bind("b", "boom", vec![]),
+                Node::Return {
+                    value: Box::new(flow_var("b")),
+                },
+            ],
+            ..Default::default()
+        };
+        let halt = PlanHalt {
+            node: NodeId(1),
+            stmt: stmt_hash16(&ast.body[1]),
+            op: Some("boom".into()),
+            kind: FailureKind::Runtime,
+            message: "boom failed: boom failed".into(),
+            plan: "h:deadbeefdeadbeef".into(),
+        };
+        let report = render_halt_report(&ast, &halt, "s_42");
+        assert!(
+            report.contains("\u{2713} 0:"),
+            "step 0 marked done: {report}"
+        );
+        assert!(
+            report.contains("\u{2717} 1:"),
+            "the failed step marked: {report}"
+        );
+        assert!(
+            report.contains("\u{b7} 2:"),
+            "the not-yet-run step marked: {report}"
+        );
+        assert!(report.contains("[flow halted at step 2 of 3]"));
+        assert!(report.contains("\"session\":\"s_42\""));
+        assert!(report.contains("\"kind\":\"runtime\""));
+        assert!(report.contains("\"fatal\":false"));
+        assert!(report.contains("--resume s_42"));
+    }
+
+    /// The denial re-emission guard (A-16): a `Denied`/`ConfirmDenied` halt whose exact statement is
+    /// still present anywhere in the body is blocked; an EDITED statement (different content hash)
+    /// is not; a non-denial halt kind is never guarded (a plain runtime failure IS meant to be
+    /// retried unchanged — that's patch-and-continue).
+    #[test]
+    fn denied_reemission_guard_blocks_only_the_unchanged_denied_statement() {
+        let unchanged = flow_bind("a", "echo", vec![flow_lit(json!("x"))]);
+        let edited = flow_bind("a", "echo", vec![flow_lit(json!("y"))]);
+        let halt = PlanHalt {
+            node: NodeId(0),
+            stmt: stmt_hash16(&unchanged),
+            op: Some("echo".into()),
+            kind: FailureKind::Denied,
+            message: "denied by policy".into(),
+            plan: "h:aaaa111122223333".into(),
+        };
+        assert!(
+            denied_reemission_guard(std::slice::from_ref(&unchanged), &halt),
+            "the exact refused statement, unchanged, is blocked"
+        );
+        assert!(
+            !denied_reemission_guard(std::slice::from_ref(&edited), &halt),
+            "an edited statement (different content hash) is not blocked"
+        );
+        let runtime_halt = PlanHalt {
+            kind: FailureKind::Runtime,
+            ..halt.clone()
+        };
+        assert!(
+            !denied_reemission_guard(std::slice::from_ref(&unchanged), &runtime_halt),
+            "only Denied/ConfirmDenied are guarded — a plain runtime failure is meant to be retried"
+        );
+    }
+
+    /// The authored path's denial invariant end to end: a denied statement halts; folding the
+    /// session's ledger and re-checking the SAME unchanged statement blocks it (the guard a
+    /// `flux flow run --resume` caller must consult before calling
+    /// [`execute_flow_resumable_with_composites`] again) — and, showing why the guard is needed,
+    /// the interpreter itself has no memory of the refusal: nothing in the ledger machinery stops a
+    /// second attempt from re-dispatching the same denied call (it was never ledgered as completed),
+    /// so the CLI-level guard is what actually enforces "never re-dispatch unchanged" (A-16).
+    #[tokio::test]
+    async fn resumable_authored_path_denied_statement_would_redispatch_without_the_guard() {
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(false); // "echo" registered but denied by permission rules
+        let session = "sess-l25-denied";
+        let ast = DraftAst {
+            body: vec![flow_bind("a", "echo", vec![flow_lit(json!("x"))])],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+
+        let outcome = execute_flow_resumable_with_composites(
+            &store,
+            &ex,
+            session,
+            &ast,
+            &[],
+            None,
+            None,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        let halt = outcome.failure.clone().expect("the denied call halts");
+        assert_eq!(halt.kind, FailureKind::Denied);
+
+        let open = store
+            .open_halted_plan(session)
+            .unwrap()
+            .expect("the halt latch is open");
+        assert!(
+            open.ledger.completed.is_empty(),
+            "the denied statement never ledgers as completed"
+        );
+
+        // The guard says: block. A caller that (incorrectly) skipped the guard and ran again anyway
+        // would re-dispatch the identical denied call — proving the guard, not the ledger, is what
+        // must stop it.
+        assert!(denied_reemission_guard(&ast.body, &halt));
+        let outcome2 = execute_flow_resumable_with_composites(
+            &store,
+            &ex,
+            session,
+            &ast,
+            &[],
+            Some(&open.ledger),
+            None,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome2.failure.map(|h| h.kind),
+            Some(FailureKind::Denied),
+            "without the guard, the interpreter alone re-dispatches the same denied statement"
+        );
+    }
+
+    /// L-25 acceptance: `once` must not re-fire across a ledger fast-forward on the authored path —
+    /// verified through the REAL flux-flow engine adapter (`execute_flow_resumable_with_composites`
+    /// over a live `Executor`/`FlowStore`), not just flux-lang's generic interpreter tests.
+    #[tokio::test]
+    async fn resumable_authored_path_never_refires_once_across_fast_forward() {
+        let store = FlowStore::in_memory().unwrap();
+        let (ex, mark) = temp_executor_l25();
+        let session = "sess-l25-once";
+
+        // First attempt: `once` fires, then the second statement BOOMs.
+        let ast1 = DraftAst {
+            body: vec![
+                Node::Once {
+                    label: "greet".into(),
+                    body: vec![mark_call("once-body")],
+                    bind: None,
+                },
+                flow_bind("b", "boom", vec![]),
+                Node::Return {
+                    value: Box::new(flow_var("b")),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow_resumable_with_composites(
+            &store,
+            &ex,
+            session,
+            &ast1,
+            &[],
+            None,
+            None,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.failure.is_some(), "the boom statement halts");
+        assert_eq!(*mark.marks.lock().unwrap(), vec!["once-body".to_string()]);
+
+        let open = store
+            .open_halted_plan(session)
+            .unwrap()
+            .expect("the halt latch is open");
+        assert_eq!(
+            open.ledger.completed.len(),
+            1,
+            "the `once` statement completed"
+        );
+
+        // Corrected re-emission: the SAME `once` statement, byte-identical; the failing statement
+        // replaced with one that succeeds.
+        let ast2 = DraftAst {
+            body: vec![
+                Node::Once {
+                    label: "greet".into(),
+                    body: vec![mark_call("once-body")],
+                    bind: None,
+                },
+                flow_bind("b", "mark", vec![flow_lit(json!("fixed"))]),
+                Node::Return {
+                    value: Box::new(flow_var("b")),
+                },
+            ],
+            ..Default::default()
+        };
+        let outcome2 = execute_flow_resumable_with_composites(
+            &store,
+            &ex,
+            session,
+            &ast2,
+            &[],
+            Some(&open.ledger),
+            None,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert!(outcome2.failure.is_none(), "the corrected plan completes");
+        assert_eq!(
+            *mark.marks.lock().unwrap(),
+            vec!["once-body".to_string(), "fixed".to_string()],
+            "the fast-forwarded `once` statement must not re-dispatch its body"
+        );
+    }
+
+    /// L-25 acceptance: a `saga` halted mid-body re-enters compensation bookkeeping consistently on
+    /// resume — the whole saga statement re-runs (it never ledgers as completed, F14), so a SECOND
+    /// genuine failure would compensate the SAME steps again, and a resume that now succeeds fires
+    /// NO extra compensation (the first attempt's `undo` is not repeated, and no phantom undo leaks
+    /// into the successful second attempt).
+    #[tokio::test]
+    async fn resumable_authored_path_saga_recompensates_consistently_on_resume() {
+        let store = FlowStore::in_memory().unwrap();
+        let (ex, mark) = temp_executor_l25();
+        let session = "sess-l25-saga";
+
+        // First attempt: step1 ok (undo registered), step2 BOOMs -> undo(step1) fires, then the
+        // saga's own error propagates from this bare top-level statement, which halts (never
+        // ledgers). `Saga` has no `bind` of its own (unlike `seq`/`scope`/…), so it stands alone —
+        // exactly how flux-lang's own saga tests construct it.
+        let ast1 = DraftAst {
+            body: vec![Node::Saga {
+                steps: vec![
+                    SagaStep {
+                        body: vec![mark_call("s1")],
+                        undo: vec![mark_call("r1")],
+                    },
+                    SagaStep {
+                        body: vec![Node::Call {
+                            op: "boom".into(),
+                            args: vec![],
+                        }],
+                        undo: vec![],
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow_resumable_with_composites(
+            &store,
+            &ex,
+            session,
+            &ast1,
+            &[],
+            None,
+            None,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.failure.is_some(), "the saga's own failure halts");
+        assert_eq!(
+            *mark.marks.lock().unwrap(),
+            vec!["s1".to_string(), "r1".to_string()],
+            "step1 ran and step2's failure compensated it (reverse order)"
+        );
+
+        let open = store
+            .open_halted_plan(session)
+            .unwrap()
+            .expect("the halt latch is open");
+        assert!(
+            open.ledger.completed.is_empty(),
+            "the saga statement never ledgers as completed — F14"
+        );
+
+        // Corrected re-emission: step2 now succeeds too.
+        let ast2 = DraftAst {
+            body: vec![Node::Saga {
+                steps: vec![
+                    SagaStep {
+                        body: vec![mark_call("s1")],
+                        undo: vec![mark_call("r1")],
+                    },
+                    SagaStep {
+                        body: vec![mark_call("s2")],
+                        undo: vec![],
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+        let outcome2 = execute_flow_resumable_with_composites(
+            &store,
+            &ex,
+            session,
+            &ast2,
+            &[],
+            Some(&open.ledger),
+            None,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert!(outcome2.failure.is_none(), "the saga completes on resume");
+        assert_eq!(
+            *mark.marks.lock().unwrap(),
+            vec!["s1", "r1", "s1", "s2"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>(),
+            "the whole saga re-runs wholly (step1 dispatches again) and, since it now succeeds, \
+             fires NO extra compensation — `r1` appears exactly once, from the first genuine failure"
+        );
     }
 }
