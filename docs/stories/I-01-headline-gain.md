@@ -21,6 +21,15 @@ proof currently missing from `docs/self-improvement/STATUS.md`.
       casts, `improve-log.jsonl` entries). The agent never grades itself.
 
 ## Progress
+- 2026-07-06 — **funded round ran; machinery proven end-to-end; correct revert; story stays
+  open.** Four attempts on branch `improve-tbench/20260706-130553`: attempts 1-3 shook out three
+  real infra defects (I-04 container shell; two classes of stale-flow drift — all fixed on main
+  with guards); attempt 4 ran the COMPLETE pipeline with real payloads — reviewer 6 candidates,
+  planner 2 tasks, worker implemented both, guard/gate green, candidate eval — and reverted
+  correctly on 278 vs 278. Corrected-harness baselines: 28-42% checks (vs 14% shell-off era);
+  cross-round noise (chess flakiness + tb registry 429s) means the headline needs a stabler task
+  set or more trials. Top unplayed candidate: bash error-body visibility (reviewer severity-5).
+  Full record: STATUS.md journey entry 6 + the branch's improve-log.jsonl.
 - **Offline half done (gate-green).** Partial-credit-aware tag scalar (`score.rs`,
   `round(mean_check_pass_rate*1000)`); durable per-turn token capture (persisted on the event store's
   `TurnEnded`, summed back into `RunResult.tokens` so `mean_tokens` is a real tiebreaker); and the

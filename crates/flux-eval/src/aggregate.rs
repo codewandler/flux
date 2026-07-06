@@ -206,10 +206,40 @@ impl Tool for ImprovementsAggregateTool {
     }
 
     async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let mined = extract_array(&arg(&params, "mined"));
-        let reviewed = extract_array(&arg(&params, "reviewed"));
+        let mined_raw = arg(&params, "mined");
+        let reviewed_raw = arg(&params, "reviewed");
+        let mined = extract_array(&mined_raw);
+        let reviewed = extract_array(&reviewed_raw);
         let candidates = aggregate(&mined, &reviewed);
-        let view = format!("{} improvement candidate(s)", candidates.len());
+        // A non-trivial input that contributed NOTHING must be named, not silently dropped: the
+        // 2026-07-06 null round handed this op an unresolved node-map for `reviewed`, extract_array
+        // yielded [], and the loop sailed on with "0 improvement candidate(s)" styled as success —
+        // the reviewer's six real findings vanished without a trace at the op line.
+        let mut swallowed = Vec::new();
+        for (name, raw, parsed_len) in [
+            ("mined", &mined_raw, mined.len()),
+            ("reviewed", &reviewed_raw, reviewed.len()),
+        ] {
+            let non_trivial = match raw {
+                Value::Null => false,
+                Value::String(s) => !s.trim().is_empty() && s.trim() != "[]",
+                Value::Array(a) => !a.is_empty(),
+                _ => true, // an object/number here is never a valid empty input
+            };
+            if non_trivial && parsed_len == 0 {
+                swallowed.push(name);
+            }
+        }
+        let view = if swallowed.is_empty() {
+            format!("{} improvement candidate(s)", candidates.len())
+        } else {
+            format!(
+                "{} improvement candidate(s) — WARNING: non-empty {} input was unparseable as a \
+                 JSON array and contributed nothing",
+                candidates.len(),
+                swallowed.join("+")
+            )
+        };
         json_result(&Value::Array(candidates), view)
     }
 }
@@ -282,6 +312,32 @@ mod tests {
             2
         );
         assert!(extract_array(&json!("no array here")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn aggregate_op_names_swallowed_input_instead_of_silent_zero() {
+        // The 2026-07-06 null round: a stale flow handed the op an unresolved node-map, extract_array
+        // yielded [], and the loop proceeded on "0 improvement candidate(s)" styled as success — the
+        // reviewer's six real findings vanished. Non-trivial input that contributes nothing must be
+        // NAMED in the view so a null round is diagnosable from the op line alone.
+        let dir = std::env::temp_dir().join(format!("agg-op-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ToolContext::new(std::sync::Arc::new(flux_system::System::new(
+            flux_system::Workspace::new(&dir).unwrap(),
+        )));
+        let params = json!({
+            "mined": "[]",
+            "reviewed": {"kind": "var", "name": "reviewed"},
+        });
+        let out = ImprovementsAggregateTool
+            .execute(&ctx, params)
+            .await
+            .unwrap();
+        assert!(
+            out.view().contains("unparseable"),
+            "a non-empty reviewed input that yields zero candidates must be called out, got: {}",
+            out.view()
+        );
     }
 
     #[test]

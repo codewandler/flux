@@ -53,15 +53,15 @@
         "op": "task",
         "args": [
           {
-            "kind": "lit",
-            "value": {
+            "kind": "obj",
+            "fields": {
               "role": {
                 "kind": "lit",
                 "value": "reviewer"
               },
               "task": {
-                "kind": "lit",
-                "value": "These are flux's terminal-bench results. Each failing case names a task, a failure_mode, and (when partial) which sub-checks failed (failed_checks). Identify flux HARNESS improvements (tools, tool output/views, system prompt, a new tool, or an agent-loop efficiency fix) that would help flux pass more. Results:\n{{baseline}}\n\nReturn ONLY a JSON array: [{\"area\":..,\"symptom\":..,\"suggested_fix\":..,\"severity\":1-5}]."
+                "kind": "fmt",
+                "template": "These are flux's terminal-bench results. Each failing case names a task, a failure_mode, and (when partial) which sub-checks failed (failed_checks). Identify flux HARNESS improvements (tools, tool output/views, system prompt, a new tool, or an agent-loop efficiency fix) that would help flux pass more. Results:\n{baseline}\n\nReturn ONLY a JSON array: [{\"area\":..,\"symptom\":..,\"suggested_fix\":..,\"severity\":1-5}]."
               }
             }
           }
@@ -76,8 +76,8 @@
         "op": "improvements_aggregate",
         "args": [
           {
-            "kind": "lit",
-            "value": {
+            "kind": "obj",
+            "fields": {
               "mined": {
                 "kind": "lit",
                 "value": "[]"
@@ -113,15 +113,15 @@
             "op": "task",
             "args": [
               {
-                "kind": "lit",
-                "value": {
+                "kind": "obj",
+                "fields": {
                   "role": {
                     "kind": "lit",
                     "value": "planner"
                   },
                   "task": {
-                    "kind": "lit",
-                    "value": "Turn these flux-harness improvement candidates into AT MOST 2 concrete, small, safe engineering tasks for the flux codebase (tool specs, tool output/views, system prompt, a new tool, or an agent-loop efficiency fix). Do NOT touch crates/flux-eval, bench/, the loop flows, or CI. Candidates:\n{{candidates}}\n\nReturn ONLY the JSON array of tasks."
+                    "kind": "fmt",
+                    "template": "Turn these flux-harness improvement candidates into AT MOST 2 concrete, small, safe engineering tasks for the flux codebase (tool specs, tool output/views, system prompt, a new tool, or an agent-loop efficiency fix). Do NOT touch crates/flux-eval, bench/, the loop flows, or CI. Candidates:\n{candidates}\n\nReturn ONLY the JSON array of tasks."
                   }
                 }
               }
@@ -145,8 +145,8 @@
             "op": "change_implement",
             "args": [
               {
-                "kind": "lit",
-                "value": {
+                "kind": "obj",
+                "fields": {
                   "tasks": {
                     "kind": "var",
                     "name": "tasks"
@@ -237,8 +237,8 @@
                 "op": "score_compare",
                 "args": [
                   {
-                    "kind": "lit",
-                    "value": {
+                    "kind": "obj",
+                    "fields": {
                       "baseline": {
                         "kind": "var",
                         "name": "baseline"

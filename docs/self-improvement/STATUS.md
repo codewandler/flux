@@ -149,7 +149,32 @@ loop misbehaving — each was the machinery working and exposing a bug, which wa
    exact runtime rejection first), and both improve flows are fixed. (c) With both fixed, the
    **funded I-01 round is running** on branch `improve-tbench/20260706-130553` (HEAD = corrected
    harness, in-container evals routed via OpenRouter by an operator commit on the disposable
-   branch — provider routing, not a graded change). Verdict to be recorded here.
+   branch — provider routing, not a graded change). (d) The first full round (attempt 3) completed
+   end-to-end but was a **null round**: the flows predate the explicit `obj`/`list` value-template
+   nodes and carried node-maps *inside* `lit` args — the runtime no longer implicitly resolves
+   those, so `task` crashed (fixed first), then `improvements_aggregate`/`change_implement`/
+   `score_compare` silently operated on unresolved maps: the reviewer's six REAL findings (its top
+   one: failed-`bash` output is truncated to `last: [exit 1] (-v for full)`, hiding the actual
+   error body from the model — prime next-round fodder) collapsed to "0 improvement candidate(s)"
+   styled as success, the worker had nothing to do, and score_compare tied 0-vs-0 → correct revert
+   of a no-op. All call sites converted to obj templates (both flows, main + loop branch), and
+   `improvements_aggregate` now NAMES swallowed non-empty input in its view instead of silent zero
+   (failing-first test). Corrected-era baselines for the record: checks 28% (attempt 2) / 42%
+   (attempt 3) vs the shell-off era's 14% — and within attempt 3, fibonacci hit 83% checks with
+   the agent starting its server via `bash`. (e) **Attempt 4 (the fully-fixed flow): the complete
+   machinery ran end-to-end with real payloads for the first time, and produced a correct
+   revert.** Reviewer → 6 candidates → planner → 2 concrete tasks → worker IMPLEMENTED both
+   (write-tool full-content echo view; a verify-before-declaring-done bullet in
+   DEFAULT_SYSTEM_PROMPT) → guard intact → gate green (29.4s) → candidate eval → **278 vs 278**
+   → strict revert, `reason: no_improvement`, both tasks preserved verbatim in
+   `improve-log.jsonl`. Two lessons for the next round: (1) cross-round baseline noise is real —
+   28% vs 42% between attempts, driven by chess-best-move flakiness (vision-dependent, plus tb
+   registry HTTP 429s polluting one grading leg) — within-round comparison stays valid but a
+   stabler task set (or higher trials) is needed for a defensible headline; (2) the reviewer's
+   severity-5 finding — failed-`bash` output truncated to `last: [exit 1] (-v for full)`, hiding
+   the error body from the model — was NOT among the planner's two picks and remains the top
+   unplayed candidate (4 more queued in the round record). **I-01 stays open**: the machinery is
+   now proven; the statistically clean gain is not yet achieved.
 
 A separate **correct revert** is worth calling out as a soundness check: a candidate built a
 *working-looking* fibonacci server that still reverted, because the grader's hidden
