@@ -130,7 +130,11 @@ fn cap_loop_feedback_with_cap(transcript: String, cap: usize) -> String {
     )
 }
 
-fn cap_loop_feedback(transcript: String) -> String {
+/// Cap a `run_plan`-style feedback transcript at [`DEFAULT_LOOP_FEEDBACK_CAP`] (or
+/// `FLUX_LOOP_FEEDBACK_CAP`). `pub(crate)` so `engine::FlowEngine::compile_with_gather` (A-18 —
+/// plan mode's bounded gather) caps its own gather-round feedback with the SAME budget normal-mode
+/// gather uses, rather than inventing a second cap.
+pub(crate) fn cap_loop_feedback(transcript: String) -> String {
     cap_loop_feedback_with_cap(transcript, loop_feedback_cap())
 }
 
@@ -143,7 +147,9 @@ fn transcript_hash(transcript: &str) -> String {
 /// Render the host-carried [`Brief`] as the text prepended to a planner feedback message (design
 /// Part 1 — "the brief is host-carried per-turn and prepended to feedback"). Kept short and
 /// machine-legible: the model already saw the fuller `brief` framing in the phase contract.
-fn format_brief(b: &Brief) -> String {
+/// `pub(crate)` so `engine::FlowEngine::compile_with_gather` (A-18) carries a plan-mode gather's
+/// brief the same way normal-mode gather does, instead of a second hand-rolled formatter.
+pub(crate) fn format_brief(b: &Brief) -> String {
     if b.needs.is_empty() {
         format!("[brief] goal: {}", b.goal)
     } else {
@@ -233,8 +239,8 @@ fn render_marked_plan(body: &[Node], done_before: usize, failed: Option<NodeId>)
 
 /// The wire label for a [`FailureKind`] — derived via the SAME `#[serde(rename_all = "snake_case")]`
 /// its `RunEvent`/`PlanHalt` fields serialize with, rather than a second hand-written match that could
-/// drift from it.
-fn failure_kind_label(kind: FailureKind) -> String {
+/// drift from it. `pub(crate)` — also used by `halt_guidance`'s plan-mode caller (A-18).
+pub(crate) fn failure_kind_label(kind: FailureKind) -> String {
     serde_json::to_value(kind)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
@@ -246,7 +252,10 @@ fn failure_kind_label(kind: FailureKind) -> String {
 /// failure invites a surgical retry, an `assert` demands re-planning the remainder, and a denial must
 /// never be silently re-emitted (the guard above already refuses that; this is the same message for
 /// when the model asks a HUMAN or changes its approach instead).
-fn halt_guidance(kind: FailureKind, node: NodeId) -> String {
+/// `pub(crate)` so `engine::FlowEngine::compile_with_gather` (A-18) gives a plan-mode gather
+/// round's failure the same guidance text a normal-mode halt gets, instead of a duplicate
+/// hand-written message.
+pub(crate) fn halt_guidance(kind: FailureKind, node: NodeId) -> String {
     let keep = if node.0 > 0 {
         format!(
             "Keep steps 0–{} byte-identical — the runtime will skip them; it re-runs any step you \

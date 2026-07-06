@@ -1527,6 +1527,15 @@ fn push_truncation_repair(messages: &mut Vec<Message>, assistant_pushed: bool, r
 /// composite's own expansion (whose effects `OpRegistry::mutating_ops_in` already vouches for).
 const GATHER_NODE_CAP: usize = 12;
 
+/// The bounded number of read-only gather rounds a phased turn may auto-run before it must settle
+/// (design Part 1 — "repeat 3"). `crates/flux-flow/assets/agent-loop.flux`'s Pass 2 spells this
+/// budget as a literal `repeat 3` for the flux-lang interpreter to enforce in normal mode (A-14);
+/// `engine::FlowEngine::compile_with_gather` (A-18 — plan mode) reads THIS constant instead of a
+/// second hard-coded number, so the two surfaces cannot silently drift onto different bounds. A
+/// drift test (`engine::tests::agent_loop_flux_gather_budget_matches_the_shared_constant`) checks
+/// the asset text against this value.
+pub(crate) const GATHER_ROUND_BUDGET: u32 = 3;
+
 /// The repair feedback for a `gather: true` emission arriving in the execute phase (design Part 1):
 /// the gather budget is spent by the time execute runs, so no further gather rounds are granted — a
 /// rejection, not a silent downgrade to an ordinary plan, so the model corrects and re-emits rather

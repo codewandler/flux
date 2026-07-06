@@ -28,10 +28,12 @@ use flux_provider::{Provider, Request};
 use flux_runtime::Executor;
 
 use crate::ast::DraftAst;
-use crate::compile::{compile_turn, CompileOptions, Phase, TurnOutput};
+use crate::compile::{compile_turn, Brief, CompileOptions, Phase, TurnOutput, GATHER_ROUND_BUDGET};
 use crate::composites::DynamicComposites;
 use crate::registry::OpRegistry;
-use crate::runtime::{execute_flow_traced, resume_flow_with_composites};
+use crate::runtime::{
+    execute_flow_resumable_with_composites, execute_flow_traced, resume_flow_with_composites,
+};
 use crate::state::FlowStore;
 
 /// flux-flow's turn engine: a provider, the tool executor (safety envelope), the unified event store
@@ -310,8 +312,15 @@ impl FlowEngine {
     }
 
     /// Compile a single instruction into a [`TurnOutput`] using this engine's full catalog + current
-    /// session symbols — *without executing*. The one-shot `--plan` surface uses this, so what it shows
-    /// is exactly what the engine would run.
+    /// session symbols — *without executing the settled result*. The one-shot `--plan` surface uses
+    /// this, so what it shows is exactly what the engine would run.
+    ///
+    /// A-18: this now runs the SAME orient/gather contract normal turns do
+    /// ([`Self::compile_with_gather`]) — a complex/context-hungry prompt may auto-run a bounded
+    /// number of read-only gather rounds (A-13 enforces them non-mutating at compile time) before
+    /// settling on the full execution plan this function returns. Only the settled plan is handed
+    /// back; it is never executed here — `flux plan`'s contract ("show me the plan before anything
+    /// runs") holds for the FINAL plan even though gather already ran.
     pub async fn compile_once(
         &self,
         session_id: &str,
@@ -320,38 +329,197 @@ impl FlowEngine {
     ) -> Result<TurnOutput> {
         self.composites
             .ensure_session_loaded(&self.flow, session_id)?;
-        let ops = self.advertised_registry(Some(session_id), None);
-        let view = self.flow.view(session_id)?;
-        let view_ref = (!view.symbols.is_empty()).then_some(&view);
+        // No sink here, so (matching today's pre-A-18 shape) the evidence-gated catalog is
+        // computed WITHOUT a `groups.active` observation — `surfaced_op_names` directly, not
+        // `surfaced_for_turn`/`advertised_registry`, which both require a sink to observe through.
+        let (advertised, _surfaced) = surfaced_op_names(
+            self.executor.registry(),
+            &self.groups,
+            &self.cwd,
+            &self.sticky_groups,
+        );
         let opts = CompileOptions {
             max_tokens: self.max_tokens,
             ..CompileOptions::default()
         };
-        // A-13: phased compile_turn — this compile-only surface sticks to the execute/default
-        // phase for now (A-14 threads orient/gather through the real loop host).
-        // Compile-only: nothing executes and no session ledger exists here, so the C-31 usage
-        // side-channel is deliberately unused — not silently lost in a `?`.
-        let (out, _usage) = compile_turn(
-            &*self.provider,
-            &self.model,
-            &[Message::user_text(prompt)],
-            Some(&self.system_prompt),
-            &ops,
-            view_ref,
-            ask,
-            None,
-            opts,
-            Phase::Execute,
-        )
-        .await;
+        // Compile-only surface, no sink: gather rounds run silently (no live streaming) and their
+        // usage is folded into `_usage`, deliberately unused — same C-31 stance as before A-18,
+        // just now covering however many planner calls (orient + gather rounds) this turn made
+        // instead of always exactly one.
+        let (out, _usage) = self
+            .compile_with_gather(
+                session_id,
+                &[Message::user_text(prompt)],
+                Some(&self.system_prompt),
+                Some(advertised),
+                ask,
+                opts,
+            )
+            .await;
         out
     }
 
-    /// A plan-mode turn (the REPL `/plan` toggle): compile ONE plan from the conversation, render it,
-    /// and persist it as the assistant turn (so a refinement sees it) — but DO NOT execute. Returns the
-    /// AST for the caller to hold and run later (`/run`); a chat answer is surfaced and returns `None`.
-    /// Abortable via `cancel`: a Ctrl-C mid-compose drops the in-flight planner request and returns
-    /// `Ok(None)` (nothing to run).
+    /// A-18 — the phased orient/gather contract, shared by [`Self::compile_once`] and
+    /// [`Self::plan_turn`]: call `compile_turn` with [`Phase::Orient`], and if the model tags the
+    /// result `gather: true`, execute that plan (A-13 already guarantees it is read-only and small
+    /// at compile time — the SAME trust `run_plan` already grants a non-mutating plan, so it runs
+    /// without an approval prompt) and feed its transcript back through up to
+    /// [`GATHER_ROUND_BUDGET`] rounds of [`Phase::Gather`] — the identical bound normal-mode
+    /// gather uses (`agent-loop.flux`'s `repeat 3`), not a second invented budget.
+    ///
+    /// Once the model settles (an ordinary execution plan, or a chat answer) the settled
+    /// [`TurnOutput`] is returned UNEXECUTED. If the budget is spent while the model is still
+    /// tagging `gather: true`, this deliberately does **not** run that leftover plan (unlike
+    /// normal mode's Part-1 graceful degradation, which folds it into the very next execute-loop
+    /// round): plan mode's contract is that ONLY gather ever runs automatically, capped at exactly
+    /// `GATHER_ROUND_BUDGET` rounds, so the next call is forced into [`Phase::Execute`] (whose
+    /// contract rejects `gather: true`) to compel a real settlement instead.
+    ///
+    /// No sink is threaded through the gather rounds themselves (unlike normal mode's `run_plan`,
+    /// which streams inner ops live via `SharedSink`'s clonable `Arc<Mutex<dyn AgentSink>>`): the
+    /// caller here holds a plain, non-'static `&mut dyn AgentSink` with no cheap way to clone a
+    /// handle to it, and reborrowing it across a multi-round loop where a later round needs to
+    /// *reuse* an earlier reborrow's binding runs into a well-known NLL limitation (a reborrow
+    /// taken for one purpose is, in practice, held for the reference's whole declared lifetime, so
+    /// a second, later use of the same binding conflicts even though the first use already ended).
+    /// Gather is internal grounding, not user-facing output, so this only means its intermediate
+    /// reads aren't streamed live — the caller still brackets `planning(true/false)` around the
+    /// whole call, and the settled result is rendered exactly as before.
+    async fn compile_with_gather(
+        &self,
+        session_id: &str,
+        base_conversation: &[Message],
+        base_system: Option<&str>,
+        advertised: Option<std::collections::HashSet<String>>,
+        ask: Option<&dyn crate::compile::AskUser>,
+        opts: CompileOptions,
+    ) -> (Result<TurnOutput>, Usage) {
+        let mut usage_total = Usage::default();
+        let mut phase = Phase::Orient;
+        let mut feedback: Option<String> = None;
+        let mut brief: Option<Brief> = None;
+        let mut gather_rounds: u32 = 0;
+
+        loop {
+            let mut conversation = base_conversation.to_vec();
+            if let Some(fb) = &feedback {
+                conversation.push(Message::user_text(fb.clone()));
+            }
+            if conversation.is_empty() {
+                conversation.push(Message::user_text(""));
+            }
+
+            // Same per-round freshness as normal mode's `plan()` (loop_host.rs): the op registry
+            // is rebuilt each round from the CURRENT composites (so any newly registered composite
+            // is visible) but reuses the ONE advertised-name set computed for this whole turn — A-04
+            // gating stays turn-stable rather than re-probing workspace signals every round.
+            let composites = self.composites.active_for_session(session_id);
+            let mut ops =
+                OpRegistry::new(self.executor.registry()).with_owned_composites(composites.clone());
+            if let Some(adv) = advertised.clone() {
+                ops = ops.with_advertised(adv);
+            }
+            let view = match self.flow.view(session_id) {
+                Ok(v) => v,
+                Err(e) => return (Err(e), usage_total),
+            };
+            let view_ref = (!view.symbols.is_empty()).then_some(&view);
+
+            let (out, call_usage) = compile_turn(
+                &*self.provider,
+                &self.model,
+                &conversation,
+                base_system,
+                &ops,
+                view_ref,
+                ask,
+                None,
+                opts.clone(),
+                phase,
+            )
+            .await;
+            usage_total.accumulate(&call_usage);
+
+            let out = match out {
+                Ok(v) => v,
+                Err(e) => return (Err(e), usage_total),
+            };
+            let compiled = match out {
+                TurnOutput::Chat(text) => return (Ok(TurnOutput::Chat(text)), usage_total),
+                TurnOutput::Plan(c) => c,
+            };
+
+            if !compiled.gather {
+                // Settled: either the model emitted the full execution plan directly (the common,
+                // zero-added-latency case), or `phase == Execute` forced settlement after the
+                // gather budget was spent. Either way, return it UNEXECUTED.
+                return (Ok(TurnOutput::Plan(compiled)), usage_total);
+            }
+
+            if gather_rounds >= GATHER_ROUND_BUDGET {
+                // Budget spent and the model is still gathering — force a real settlement rather
+                // than running this leftover plan (see the doc comment above).
+                phase = Phase::Execute;
+                continue;
+            }
+
+            // Automatic, read-only gather round: A-13's `gather_violation` check inside
+            // `compile_turn` already refused this plan if it named a mutating op or exceeded the
+            // node cap, so running it here is exactly as safe as `run_plan` already treats any
+            // non-mutating plan (no approval prompt).
+            gather_rounds += 1;
+            let mut null_sink = NullSink;
+            let outcome = execute_flow_resumable_with_composites(
+                self.flow.as_ref(),
+                self.executor.as_ref(),
+                session_id,
+                &compiled.ast,
+                &composites,
+                None,
+                None,
+                &mut null_sink,
+            )
+            .await;
+
+            let mut fb = match outcome {
+                Ok(o) => {
+                    let mut fb = o.transcript;
+                    if let Some(halt) = &o.failure {
+                        fb = format!(
+                            "{fb}\n\n[gather step {} failed] {}\n{}",
+                            halt.node.0 + 1,
+                            halt.message,
+                            crate::loop_host::halt_guidance(halt.kind, halt.node),
+                        );
+                    }
+                    fb
+                }
+                // An infrastructure failure only (store IO, …) — a statement's own failure is
+                // reified onto `outcome.failure` above instead. Feed the error back so the next
+                // round can adjust, exactly like `run_plan` does for the same case.
+                Err(e) => {
+                    format!("[plan error] {e}\nAdjust and emit another plan, or answer in prose.")
+                }
+            };
+            fb = crate::loop_host::cap_loop_feedback(fb);
+            if let Some(b) = compiled.brief.clone().or_else(|| brief.clone()) {
+                fb = format!("{}\n\n{fb}", crate::loop_host::format_brief(&b));
+                brief = Some(b);
+            }
+            feedback = Some(fb);
+            phase = Phase::Gather;
+        }
+    }
+
+    /// A plan-mode turn (the REPL `/plan` toggle): run the phased orient/gather contract
+    /// ([`Self::compile_with_gather`], A-18) over the conversation, render the settled result, and
+    /// persist it as the assistant turn (so a refinement sees it) — but DO NOT execute it. A
+    /// complex/context-hungry prompt may auto-run a bounded number of read-only gather rounds first
+    /// (A-13 enforces them non-mutating at compile time); only the settled plan is ever surfaced.
+    /// Returns the AST for the caller to hold and run later (`/run`); a chat answer is surfaced and
+    /// returns `None`. Abortable via `cancel`: a Ctrl-C mid-compose (whether during a planner call
+    /// or a gather round's execution) drops the in-flight work and returns `Ok(None)` (nothing to
+    /// run).
     pub async fn plan_turn(
         &self,
         session_id: &str,
@@ -364,33 +532,27 @@ impl FlowEngine {
         let base_system = self.base_system_with_skills(user_input, sink);
         self.composites
             .ensure_session_loaded(&self.flow, session_id)?;
-        let ops = self.advertised_registry(Some(session_id), Some(sink));
-        let view = self.flow.view(session_id)?;
-        let view_ref = (!view.symbols.is_empty()).then_some(&view);
+        // Computed ONCE for the whole phased sequence (mirrors `run_turn_cancellable`'s
+        // `surfaced_for_turn`) — A-04 gating stays turn-stable across orient/gather rounds rather
+        // than re-probing workspace signals (and re-observing `groups.active`) every round.
+        let advertised = self.surfaced_for_turn(sink);
         let opts = CompileOptions {
             max_tokens: self.max_tokens,
             ..CompileOptions::default()
         };
         let conversation = self.events.conversation(session_id)?;
         sink.planning(true);
-        // Race the planner call against `cancel` so Ctrl-C mid-compose drops the in-flight request
-        // (dropping the future aborts its HTTP) instead of blocking until the plan lands. The future
-        // borrows `sink`, so scope it in a block: its drop at the block's end releases the borrow
-        // before we touch `sink` again. `None` => cancelled.
+        // Race the whole orient/gather/settle sequence against `cancel` so Ctrl-C drops the
+        // in-flight request (dropping the future aborts its HTTP, or any in-flight gather
+        // dispatch) instead of blocking until it lands. `None` => cancelled.
         let out = {
-            // A-13: the REPL `/plan` toggle is unchanged in MVP (design Part 1) — execute/default
-            // phase; A-18 brings gather to plan mode later.
-            let fut = compile_turn(
-                &*self.provider,
-                &self.model,
+            let fut = self.compile_with_gather(
+                session_id,
                 &conversation,
                 Some(&base_system),
-                &ops,
-                view_ref,
+                Some(advertised),
                 None,
-                Some(sink),
                 opts,
-                Phase::Execute,
             );
             tokio::pin!(fut);
             tokio::select! {
@@ -412,7 +574,9 @@ impl FlowEngine {
         // Surface a provider failure (credit, auth, rate limit, transport) with a readable message
         // rather than the raw API JSON body — the REPL prints this `error:` line directly.
         let out = out.map_err(|e| flux_core::Error::Other(planner_error(&e)))?;
-        // The compose-a-plan call is the turn's only model call here, so its usage IS the turn's.
+        // This turn's total spend across every planner call it made (orient + any gather/settle
+        // rounds) — `compile_with_gather` accumulates them all, so this is no longer always
+        // exactly one call's usage as it was pre-A-18.
         let usage = (usage.total() > 0).then_some(usage);
 
         match out {
@@ -483,30 +647,6 @@ impl FlowEngine {
                 "ops": risk.ops.len(),
             }),
         )
-    }
-
-    /// Build the op catalog view for a turn, advertising only ops whose group is surfaced by the
-    /// current workspace signals (an empty `groups` manifest disables gating, advertising everything).
-    /// Execution is unaffected — `OpRegistry::get` still resolves any registered op, so a pre-authored
-    /// flow naming a hidden-group op keeps working. `sink`, when given, receives a `groups.active`
-    /// observation for visibility.
-    fn advertised_registry(
-        &self,
-        session_id: Option<&str>,
-        sink: Option<&mut dyn AgentSink>,
-    ) -> OpRegistry<'_> {
-        let reg = self.executor.registry();
-        let composites = session_id
-            .map(|sid| self.composites.active_for_session(sid))
-            .unwrap_or_default();
-        let (advertised, surfaced) =
-            surfaced_op_names(reg, &self.groups, &self.cwd, &self.sticky_groups);
-        if let (Some(sink), Some(surfaced)) = (sink, surfaced.as_ref()) {
-            self.record_active_groups(surfaced, sink);
-        }
-        OpRegistry::new(reg)
-            .with_owned_composites(composites)
-            .with_advertised(advertised)
     }
 
     /// This turn's advertised op-name set, computed once per turn and handed to the loop host so the
@@ -1349,6 +1489,27 @@ mod tests {
         }
     }
 
+    /// A MUTATING op (declared `Effect::Write`) — used to prove A-13's `gather_violation` gate
+    /// holds through the plan-mode seam (A-18) too. Records every dispatch into a shared log so a
+    /// test can assert it was NEVER called, not merely that its symbol wasn't bound.
+    struct WriteTool(Arc<Mutex<Vec<String>>>);
+    #[async_trait]
+    impl Tool for WriteTool {
+        fn spec(&self) -> flux_spec::ToolSpec {
+            flux_spec::ToolSpec::read_only("write_file", "write a file", json!({"type": "object"}))
+                .with_effects(vec![flux_spec::Effect::Write])
+                .with_risk(flux_spec::Risk::Medium)
+        }
+        async fn execute(
+            &self,
+            _c: &ToolContext,
+            _params: serde_json::Value,
+        ) -> Result<ToolResult> {
+            self.0.lock().unwrap().push("write_file".to_string());
+            Ok(ToolResult::ok("wrote"))
+        }
+    }
+
     /// A provider whose every `stream()` fails — simulates a provider/API failure (e.g. credit
     /// exhausted) so the engine's error-surfacing path is exercised.
     struct FailProvider {
@@ -1443,6 +1604,63 @@ mod tests {
         .unwrap()
     }
 
+    /// Like [`engine_with`], but with an extra registered [`WriteTool`] (a mutating op) — for tests
+    /// proving A-13's gather enforcement holds through the plan-mode seam (A-18). Returns the
+    /// engine plus the shared dispatch log `WriteTool` records into, so a test can assert it stayed
+    /// empty.
+    fn engine_with_write_tool(
+        responses: VecDeque<Vec<Chunk>>,
+        events: Arc<EventStore>,
+    ) -> (FlowEngine, Arc<Mutex<Vec<String>>>) {
+        let write_calls = Arc::new(Mutex::new(Vec::new()));
+        let dir = std::env::temp_dir().join(format!(
+            "flux-flow-engine-write-{}-{}",
+            std::process::id(),
+            events.latest_session().ok().flatten().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        registry.register(Arc::new(WriteTool(write_calls.clone())));
+        flux_tools::register_reflect(&mut registry);
+        flux_tools::register_evidence(&mut registry);
+        let executor = Executor::new(
+            registry,
+            PermissionManager::from_rules(
+                &[
+                    "echo".into(),
+                    "write_file".into(),
+                    "plan".into(),
+                    "run_plan".into(),
+                    "observe".into(),
+                ],
+                &[],
+            ),
+            Arc::new(AllowApprover),
+            ToolContext::new(system),
+        );
+        let flow = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let engine = FlowEngine::assemble(
+            Arc::from(Box::new(MockProvider {
+                responses: Mutex::new(responses),
+            }) as Box<dyn Provider>),
+            executor,
+            events,
+            flow,
+            "mock".into(),
+            "test".into(),
+            1024,
+            5,
+            Vec::new(),
+            0,
+            Vec::new(),
+            dir,
+        )
+        .unwrap();
+        (engine, write_calls)
+    }
+
     /// The built-in `agent-loop.flux` is readable Flux-Lang text: it parses, formats back to a stable
     /// (idempotent) text, and uses NO `@json` escape — every construct it uses has a native surface.
     #[test]
@@ -1458,6 +1676,22 @@ mod tests {
         assert_eq!(
             ast, reparsed,
             "agent-loop.flux round-trips through format/parse"
+        );
+    }
+
+    /// A-18: `FlowEngine::compile_with_gather` (plan mode's bounded gather) reads
+    /// `compile::GATHER_ROUND_BUDGET` for its round cap instead of a second hard-coded number —
+    /// this asserts that constant still matches the literal `repeat 3` normal mode's Pass 2 spells
+    /// in the built-in loop text, so the two surfaces cannot silently drift onto different bounds.
+    #[test]
+    fn agent_loop_flux_gather_budget_matches_the_shared_constant() {
+        const SRC: &str = include_str!("../assets/agent-loop.flux");
+        let needle = format!("repeat {}", crate::compile::GATHER_ROUND_BUDGET);
+        assert!(
+            SRC.contains(&needle),
+            "agent-loop.flux's gather pass should read `{needle}` — update either the asset or \
+             `compile::GATHER_ROUND_BUDGET` so normal-mode and plan-mode gather stay bounded \
+             identically"
         );
     }
 
@@ -1644,6 +1878,291 @@ mod tests {
                 e.to_string().contains("unknown operation"),
                 "the rejection carries the diagnostic text: {e}"
             ),
+        }
+    }
+
+    /// A-18 named acceptance: single-shot behavior is unchanged when the model emits a full plan
+    /// immediately (the common "simple/actionable request" case) — the orient call settles right
+    /// away, so `compile_once` makes exactly ONE planner call, byte-compatible with pre-A-18
+    /// `flux plan`.
+    #[tokio::test]
+    async fn compile_once_stays_single_shot_when_orient_settles_immediately() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let plan_ast = json!({ "body": [{
+            "kind": "bind", "name": "greeting",
+            "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "hi" }] }
+        }]});
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = CaptureProvider {
+            responses: Mutex::new(VecDeque::from(vec![emit_plan(plan_ast)])),
+            requests: requests.clone(),
+        };
+        let engine = engine_with_provider(Box::new(provider), store.clone());
+
+        let out = engine
+            .compile_once(&sid, "read a file then answer", None)
+            .await
+            .unwrap();
+        match out {
+            TurnOutput::Plan(compiled) => {
+                assert!(
+                    !compiled.gather,
+                    "a simple request settles directly, untagged"
+                );
+                assert!(crate::render::render_pretty(&compiled.ast).contains("echo"));
+            }
+            TurnOutput::Chat(t) => panic!("expected a plan, got chat: {t}"),
+        }
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "no added latency for a simple request: exactly one planner call"
+        );
+        // Never executed — `flux plan`'s contract holds for the settled plan too.
+        assert!(
+            engine
+                .flow
+                .resolve(&sid, &SymbolName("greeting".into()))
+                .unwrap()
+                .is_none(),
+            "compile_once must never execute the plan it returns"
+        );
+    }
+
+    /// A-18 named acceptance: a complex/context-hungry `flux plan` prompt auto-runs its read-only
+    /// gather plan (A-13 already enforces it non-mutating at compile time), then the SETTLED
+    /// execution plan is returned UNEXECUTED — `flux plan`'s "show me the plan before anything
+    /// runs" contract holds for the final plan even though gather already ran automatically.
+    #[tokio::test]
+    async fn compile_once_runs_gather_then_shows_the_final_plan_unexecuted() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let gather_ast = json!({ "body": [{
+            "kind": "bind", "name": "g",
+            "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "GATHER" }] }
+        }]});
+        let final_ast = json!({ "body": [{
+            "kind": "bind", "name": "f",
+            "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "FINAL" }] }
+        }]});
+        let responses = VecDeque::from(vec![emit_gather_plan(gather_ast), emit_plan(final_ast)]);
+        let engine = engine_with(responses, store.clone());
+
+        let out = engine
+            .compile_once(&sid, "investigate then fix", None)
+            .await
+            .unwrap();
+
+        // The gather round ran for real: its read-only op dispatched and bound a session symbol.
+        assert!(
+            engine
+                .flow
+                .resolve(&sid, &SymbolName("g".into()))
+                .unwrap()
+                .is_some(),
+            "the gather plan's op actually executed automatically"
+        );
+        // The settled result is the FINAL plan — and it is NOT the one that ran.
+        match out {
+            TurnOutput::Plan(compiled) => {
+                assert!(
+                    !compiled.gather,
+                    "the returned plan is not itself tagged gather"
+                );
+                let rendered = crate::render::render_pretty(&compiled.ast);
+                assert!(
+                    rendered.contains("FINAL"),
+                    "the returned plan is settled: {rendered}"
+                );
+            }
+            TurnOutput::Chat(t) => panic!("expected the settled plan, got chat: {t}"),
+        }
+        assert!(
+            engine
+                .flow
+                .resolve(&sid, &SymbolName("f".into()))
+                .unwrap()
+                .is_none(),
+            "the final plan is shown, never auto-run"
+        );
+    }
+
+    /// The same A-18 contract through the REPL `/plan` seam (`plan_turn`, not `compile_once`):
+    /// gather auto-runs, and the AST handed back for `/run` is the settled plan, never the one that
+    /// already ran.
+    #[tokio::test]
+    async fn plan_turn_runs_gather_then_returns_only_the_settled_plan() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let gather_ast = json!({ "body": [{
+            "kind": "bind", "name": "g",
+            "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "GATHER" }] }
+        }]});
+        let final_ast = json!({ "body": [{
+            "kind": "bind", "name": "f",
+            "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "FINAL" }] }
+        }]});
+        let responses = VecDeque::from(vec![emit_gather_plan(gather_ast), emit_plan(final_ast)]);
+        let engine = engine_with(responses, store.clone());
+        let mut sink = CollectSink::default();
+
+        let ast = engine
+            .plan_turn(
+                &sid,
+                "investigate then propose a fix",
+                &mut sink,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+            .expect("the settled plan is returned for /run");
+
+        let rendered = crate::render::render_pretty(&ast);
+        assert!(
+            rendered.contains("FINAL"),
+            "the returned AST is the settled plan: {rendered}"
+        );
+        assert!(
+            engine
+                .flow
+                .resolve(&sid, &SymbolName("g".into()))
+                .unwrap()
+                .is_some(),
+            "the gather round executed automatically"
+        );
+        assert!(
+            engine
+                .flow
+                .resolve(&sid, &SymbolName("f".into()))
+                .unwrap()
+                .is_none(),
+            "the settled plan is surfaced for /run, never auto-executed"
+        );
+        let msgs = store.conversation(&sid).unwrap();
+        assert_eq!(msgs.len(), 2, "user + the proposed-plan assistant message");
+        assert!(msgs[1].text().contains("Proposed plan"));
+    }
+
+    /// A-18 named acceptance: gather is bounded to `GATHER_ROUND_BUDGET` — the same repeat-3-style
+    /// budget normal mode's `agent-loop.flux` uses (checked against drift by
+    /// `agent_loop_flux_gather_budget_matches_the_shared_constant`), not a second invented one. A
+    /// model that keeps tagging `gather: true` past the budget gets forced into `Phase::Execute`
+    /// instead of having that (budget+1)-th plan run automatically.
+    #[tokio::test]
+    async fn compile_once_bounds_gather_to_the_shared_round_budget() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let gather_ast = |n: u32| {
+            json!({ "body": [{
+                "kind": "bind", "name": format!("g{n}"),
+                "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": format!("GATHER {n}") }] }
+            }]})
+        };
+        let final_ast = json!({ "body": [{
+            "kind": "bind", "name": "f",
+            "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "FINAL" }] }
+        }]});
+        // Orient + GATHER_ROUND_BUDGET (3) gather rounds all keep tagging `gather: true`; the 4th
+        // such plan (past the budget) must never execute. The clean, untagged final response is
+        // accepted immediately once `Phase::Execute` is forced (it must NOT be gather-tagged, or
+        // the compiler would reject it as repair feedback instead of settling).
+        let responses = VecDeque::from(vec![
+            emit_gather_plan(gather_ast(1)),
+            emit_gather_plan(gather_ast(2)),
+            emit_gather_plan(gather_ast(3)),
+            emit_gather_plan(gather_ast(4)),
+            emit_plan(final_ast),
+        ]);
+        let engine = engine_with(responses, store.clone());
+
+        let out = engine.compile_once(&sid, "dig deep", None).await.unwrap();
+
+        for n in 1..=GATHER_ROUND_BUDGET {
+            assert!(
+                engine
+                    .flow
+                    .resolve(&sid, &SymbolName(format!("g{n}")))
+                    .unwrap()
+                    .is_some(),
+                "gather round {n} (within budget) executed"
+            );
+        }
+        assert!(
+            engine
+                .flow
+                .resolve(&sid, &SymbolName(format!("g{}", GATHER_ROUND_BUDGET + 1)))
+                .unwrap()
+                .is_none(),
+            "the gather-tagged plan past the budget is never executed"
+        );
+        match out {
+            TurnOutput::Plan(compiled) => {
+                assert!(!compiled.gather);
+                assert!(crate::render::render_pretty(&compiled.ast).contains("FINAL"));
+            }
+            TurnOutput::Chat(t) => panic!("expected the settled plan, got chat: {t}"),
+        }
+        assert!(
+            engine
+                .flow
+                .resolve(&sid, &SymbolName("f".into()))
+                .unwrap()
+                .is_none(),
+            "the settled plan is shown, never run"
+        );
+    }
+
+    /// SAFETY (A-13, threaded through the new A-18 seam): a `gather: true` plan naming a MUTATING
+    /// op must be rejected as repair feedback and NEVER dispatched — plan mode's entire contract is
+    /// "nothing but read-only gather ever runs automatically." `WriteTool` records every dispatch;
+    /// this test fails loudly if that log is ever non-empty.
+    #[tokio::test]
+    async fn compile_once_rejects_a_mutating_gather_plan_via_the_same_a13_gate() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let mutating_gather_ast =
+            json!({ "body": [{ "kind": "call", "op": "write_file", "args": [] }] });
+        let clean_gather_ast = json!({ "body": [{
+            "kind": "bind", "name": "g",
+            "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "ok" }] }
+        }]});
+        let final_ast = json!({ "body": [{
+            "kind": "bind", "name": "f",
+            "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "FINAL" }] }
+        }]});
+        // First attempt tags a WRITE op as `gather: true` — must be rejected inside the SAME
+        // planner call (repair feedback), never accepted and auto-run. The model's corrected
+        // second attempt is effect-clean.
+        let responses = VecDeque::from(vec![
+            emit_gather_plan(mutating_gather_ast),
+            emit_gather_plan(clean_gather_ast),
+            emit_plan(final_ast),
+        ]);
+        let (engine, write_calls) = engine_with_write_tool(responses, store.clone());
+
+        let out = engine
+            .compile_once(&sid, "change something", None)
+            .await
+            .unwrap();
+
+        assert!(
+            write_calls.lock().unwrap().is_empty(),
+            "a mutating op must NEVER dispatch during automatic gather execution"
+        );
+        assert!(
+            engine
+                .flow
+                .resolve(&sid, &SymbolName("g".into()))
+                .unwrap()
+                .is_some(),
+            "the corrected, effect-clean gather plan ran instead"
+        );
+        match out {
+            TurnOutput::Plan(compiled) => {
+                assert!(crate::render::render_pretty(&compiled.ast).contains("FINAL"));
+            }
+            TurnOutput::Chat(t) => panic!("expected the settled plan, got chat: {t}"),
         }
     }
 

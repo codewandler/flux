@@ -50,10 +50,17 @@ one shot. See [`docs/agent-loop.md`](agent-loop.md) for the phased loop that dri
 | Mode | What a turn does |
 |---|---|
 | **normal** (default) | the model plans → the runtime **shows the plan, then runs it** (risky steps prompt for approval) |
-| **plan** | the model plans → the runtime **shows the plan but does NOT run it**; you review/refine, then approve to run |
+| **plan** | the model plans (auto-running a bounded read-only look-around first, if it needs one) → the runtime **shows the final plan but does NOT run it**; you review/refine, then approve to run |
 
 Plan mode is for "let me see (and shape) the whole plan before anything happens." Normal mode just does
 the work, gating risky steps as they come.
+
+A complex or context-hungry `flux plan`/`/plan` prompt gets the same bounded, read-only "gather" pass
+normal mode does (see above): the model may look around — read a few files, grep, list a directory —
+before committing to the real plan. Gather is compile-time enforced non-mutating (no write, no
+destructive op), so it runs automatically without a prompt, exactly the trust `run_plan` already
+grants a non-mutating plan. Only the **final** plan — the one that would make the actual change — is
+ever shown-and-not-run; gather never counts as "the plan you're reviewing."
 
 ## One-shot commands
 
@@ -182,9 +189,12 @@ default and shown in full with `-v`.
 
 - **Use `flux plan` (or the REPL `/plan` toggle) first** when a task is risky or you want to review the
   approach — then run it once you're happy.
-- **Plan mode is single-shot per turn:** great for self-contained tasks ("delete the .tmp files",
-  "print 3×"). For exploratory work that needs to read a file *before* deciding what to do, use **normal
-  mode** — it reads, sees the result, and plans the next step automatically.
+- **Plan mode auto-runs a bounded read-only gather pass, then shows (and never auto-runs) the final
+  plan:** a self-contained task ("delete the .tmp files", "print 3×") settles on the full plan
+  immediately, same as before — no added latency. A task that needs to look around first ("refactor
+  the biggest file in src/") gets to read/grep/list on its own before proposing the real plan, instead
+  of guessing blind; what runs automatically is always read-only (compile-time enforced), and what
+  changes anything is always the plan you review and approve.
 - Pass `--yes` only when you trust the task to run unattended: it auto-approves **every** step,
   destructive ones included — there is no re-confirmation under `--yes`. Without it, destructive
   steps get their own prompt.
