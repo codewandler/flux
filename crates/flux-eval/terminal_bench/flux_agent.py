@@ -39,7 +39,14 @@ class FluxAgent(AbstractInstalledAgent):
     def _env(self) -> dict[str, str]:
         # Forward whatever provider keys are present so `flux run -m <model>` can authenticate.
         keys = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "FLUX_SECRET")
-        return {k: os.environ[k] for k in keys if k in os.environ}
+        env = {k: os.environ[k] for k in keys if k in os.environ}
+        # Enable flux's off-by-default `shell` group inside the container (I-04): a terminal-bench
+        # container is a disposable, task-scoped sandbox whose whole point is terminal work —
+        # without this the agent can write a server but never start it, failing every check that
+        # needs a running process. The safety envelope still gates each call exactly as before
+        # (`--yes` auto-approves, as it always has for eval runs).
+        env["FLUX_ENABLE_BASH"] = "1"
+        return env
 
     @property
     def _install_agent_script_path(self) -> Path:

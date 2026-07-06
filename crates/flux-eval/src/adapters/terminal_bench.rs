@@ -558,4 +558,22 @@ mod tests {
         assert!(find_file(&dir, "missing.cast", 7).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn container_agent_enables_the_shell_group() {
+        // I-04: the container agent must run flux with the `shell` group enabled — a terminal-bench
+        // container is a disposable task sandbox whose whole point is terminal work, and without
+        // FLUX_ENABLE_BASH the agent writes files it can never execute/start (every check that
+        // needs a running process fails). Pins the bundled python agent, which tb imports live via
+        // PYTHONPATH, so a regression here silently depresses every containerized eval number.
+        let py = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/terminal_bench/flux_agent.py"
+        ))
+        .expect("bundled flux_agent.py exists");
+        assert!(
+            py.contains("FLUX_ENABLE_BASH"),
+            "flux_agent.py must enable the shell group for the in-container flux run (I-04)"
+        );
+    }
 }

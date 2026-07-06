@@ -6,6 +6,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **I-04** — Terminal-bench containers now run flux with the `shell` group enabled: the tb custom
+  agent (`flux_agent.py`) sets `FLUX_ENABLE_BASH=1` for the in-container run (disposable task
+  sandbox; the envelope still gates every call), pinned by a flux-eval test. Live verify on
+  fibonacci-server: checks 0% → 83% — the agent finally *starts* the server it writes (only a
+  genuine behavior edge case remains). Every historical containerized number was equally depressed
+  by this; decision recorded in the story: corrected harness carries forward, no I-03 re-baseline.
+
 ## [0.2.19] - 2026-07-06
 
 ### Added
