@@ -11,6 +11,9 @@ pub use perm::{Pattern, PermDecision, PermissionManager};
 mod approval;
 pub use approval::{RiskApprover, DEFAULT_CONSENT_MARKER};
 
+mod fn_tool;
+pub use fn_tool::{tool_fn, FnTool};
+
 pub mod context;
 
 use std::collections::{HashMap, HashSet};
@@ -1347,16 +1350,13 @@ mod tests {
     }
 
     /// A second read-only tool, distinct from `echo`, used to prove capability-scope narrowing (one
-    /// tool allowed inside the scope, the other denied).
-    struct PingTool;
-    #[async_trait]
-    impl Tool for PingTool {
-        fn spec(&self) -> ToolSpec {
-            ToolSpec::read_only("ping", "ping", json!({"type": "object"}))
-        }
-        async fn execute(&self, _ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
-            Ok(ToolResult::ok("pong"))
-        }
+    /// tool allowed inside the scope, the other denied). Dogfoods [`crate::tool_fn`] (D-59): a plain
+    /// closure tool needs no bespoke `impl Tool` struct.
+    fn ping_tool() -> Arc<dyn Tool> {
+        crate::tool_fn(
+            ToolSpec::read_only("ping", "ping", json!({"type": "object"})),
+            |_params: Value| async move { Ok(Value::String("pong".to_string())) },
+        )
     }
 
     fn registry() -> ToolRegistry {
@@ -1371,20 +1371,20 @@ mod tests {
     #[test]
     fn registry_specs_and_names_are_name_sorted() {
         let mut r = ToolRegistry::new();
-        r.register(Arc::new(PingTool));
+        r.register(ping_tool());
         r.register(Arc::new(EchoTool));
         assert_eq!(r.names(), vec!["echo".to_string(), "ping".to_string()]);
         let spec_names: Vec<String> = r.specs().into_iter().map(|s| s.name).collect();
         assert_eq!(spec_names, vec!["echo".to_string(), "ping".to_string()]);
     }
 
-    /// Like [`registry`], plus [`PingTool`] — used only by the capability-scope tests below, which
+    /// Like [`registry`], plus [`ping_tool`] — used only by the capability-scope tests below, which
     /// need two distinct tools to prove narrowing (one allowed inside a scope, the other denied). Kept
     /// separate from `registry()` so the many pre-existing tests asserting the registry's exact name
     /// set (e.g. `subset_none_inherits_all_some_empty_grants_none`) are unaffected.
     fn registry_two_tools() -> ToolRegistry {
         let mut r = registry();
-        r.register(Arc::new(PingTool));
+        r.register(ping_tool());
         r
     }
 

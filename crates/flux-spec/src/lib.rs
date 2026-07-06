@@ -8,6 +8,9 @@
 
 use serde::{Deserialize, Serialize};
 
+mod schema;
+pub use schema::{empty_schema, object_schema, opt, req, Field, FieldType};
+
 /// Generate the provider-facing JSON Schema for a typed tool input.
 ///
 /// Tool schemas are an API contract with models/providers, so keep them derived from Rust input
