@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.2.20] - 2026-07-06
+
 ### Added
 
 - **A-18** — Multi-pass plan mode: `flux plan` and the REPL `/plan` toggle now run the same
