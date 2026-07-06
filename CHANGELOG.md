@@ -6,6 +6,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.2.23] - 2026-07-06
+
+### Added
+
 - **A-43** — OpenAI-wire plan skeletons: `map_chat_stream` now yields the same additive
   `Chunk::ToolInputDelta` the Messages codec has surfaced since L-23, one per `tool_calls[].
   function.arguments` fragment (name carried forward from the first delta of that call index),
