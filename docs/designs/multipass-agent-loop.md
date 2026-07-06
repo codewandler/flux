@@ -436,6 +436,33 @@ plan and the loop keeps going" — bounded, so a plan that structurally cannot f
 (one irreducible giant literal) still fails fast instead of spinning. (The repair mechanism and its
 message-shape/arm-gating tests are covered by `crates/flux-flow/src/compile.rs`'s A-40 test group.)
 
+## L-25: pre-authored resumable mode (surface design, 2026-07-06)
+
+The story's open surface question — how a human corrects an authored flow mid-halt — resolves to
+the smallest coherent CLI shape:
+
+- **Opt-in flag**: `flux flow run <file> --resumable`. On a halt (failure or L-24 `awaiting`),
+  the run exits non-zero printing the structured halt: the A-16 transcript rendering (✓ markers
+  for the completed prefix, ✗ + machine-readable failure for the halted statement) plus the
+  session id. The halt latch + statement ledger persist in the session's events.db exactly as the
+  loop's do — no new table, same `ResumeLedger` fold.
+- **Correct + continue**: the user edits the `.flux` file, then `flux flow run <file> --resume
+  <session|last>`. The engine re-parses the corrected flow, folds the ledger, fast-forwards the
+  `stmt_hash16`-matching completed prefix (values rehydrated), and executes from the first
+  changed/new statement. `--resume last` resolves the most recent halted flow-run session for
+  this flow name in the workspace's store.
+- **Checkpoint interplay — coexist, not subsume**: `checkpoint` remains the *cross-run caching*
+  primitive (explicit node, body-hash-keyed, DurableStore-backed, survives arbitrary re-runs);
+  the ledger is the *halt-resume* primitive (prefix fast-forward across a correction). They
+  compose: a checkpointed statement that fast-forwards via the ledger simply never consults its
+  cache. Documented rather than merged because their invalidation semantics differ (any-edit
+  defeats checkpoint by design; the ledger tolerates suffix edits — that difference is the
+  feature).
+- **Invariants re-verified on this path**: `once` must not re-fire across a fast-forward (ledger
+  skip = no dispatch, inherited); a `saga` scope halted mid-body must re-enter compensation
+  bookkeeping consistently on resume (test-pinned); denied statements never re-dispatch unchanged
+  (A-16 rule, inherited).
+
 **Live re-run verdict (2026-07-06, fibonacci-server × 3 trials, same model/dataset/ceiling, fixed
 binary — `bench/tbench-compare/results/a40-fix/`):** the failure mode is **eliminated** —
 `truncated at max_tokens` occurs 0 times across all trials (the repair is silent by design, so

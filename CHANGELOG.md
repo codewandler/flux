@@ -8,6 +8,28 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **L-25** — Pre-authored flow-run resumable mode: `flux flow run <file> --resumable` reports a
+  structured halt on failure/await (✓/✗ statement tree + machine-readable failure + session id)
+  and persists the same halt latch + statement ledger the loop uses; `--resume <session|last>`
+  re-parses the corrected flow, folds the ledger, and fast-forwards the hash-matching completed
+  prefix — the denial guard enforced on the authored path too (an unchanged denied statement
+  never re-dispatches). `once` never re-fires across a fast-forward and `saga` recompensates
+  consistently (both test-pinned); checkpoint deliberately coexists (cross-run caching) rather
+  than being subsumed — documented in the language reference. Live-smoked end-to-end.
+- **C-37** — Bedrock credential lifecycle: expiry re-resolution + lazy chain constructor.
+- **L-23** — Streaming plan-emission render: plan skeletons appear while `emit_plan` streams.
+  New additive `Chunk::ToolInputDelta` surfaces the Messages codec's already-accumulated
+  `input_json_delta` fragments; a tolerant, resumable `PlanSkeletonScanner` (depth/string
+  tracker, never a parser on the decode path) extracts completed top-level statements as
+  headlines; a default-no-op `AgentSink::plan_delta` relays them and the CLI spinner shows
+  `planning… · 2 read /app/server.py` live. Final tree render byte-identical; the A-40
+  truncation/repair machinery proven unaffected. OpenAI-wire skeletons filed as **A-43**.
+- **L-24** — Reified-await ledger fold: a top-level `await` inside a loop plan now opens the same
+  halt latch + statement ledger as a failure halt (`FailureKind::Awaiting`, non-fatal, reified
+  directly in `run_top_level_resumable`), so the model's post-await re-emission fast-forwards the
+  hash-matching completed prefix instead of re-running it — effectful pre-await statements
+  dispatch exactly once (pinned by `post_await_reemission_keeps_completed_prefix`). The engine's
+  pre-authored await-suspension path (journeys/reply-parking) is untouched.
 - **C-37** — Bedrock credential lifecycle: `BedrockCreds` carries the source-reported expiration
   (IRSA/Pod-Identity ISO stamps, SSO epoch-millis), `BedrockCredential::apply()` re-resolves
   through the stored resolver when creds are absent or within a 5-minute expiry window (the

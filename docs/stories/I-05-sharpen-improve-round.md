@@ -36,13 +36,23 @@ consume the ranking, so the next funded round measures the change instead of the
   FLUX_IMPROVE_EVAL_MODEL knob, ranked-planner prompt), but a THIRD chain defect surfaced: the
   planner answered in PROSE ("I'll look up the exact system prompt text before writing the…")
   instead of the bare JSON array, so `change_implement` extracted **0 tasks** and the candidate
-  leg measured an unchanged tree (tie → correct revert; verdict record in this round's
-  improve-log). QUEUED NEXT STEPS (implement before funding round 4):
+  leg measured an unchanged tree (tie → correct revert, base 667 = cand 667 on the fibonacci×5
+  substrate; full planner output preserved in the round's improve-log). SHARPER POST-MORTEM from
+  the final record: the planner DID end with a valid 2-task JSON array — but only after a
+  **hallucinated tool transcript** (fake `<tool_call>`/`<tool_response>` blocks "reading"
+  `crates/flux/src/lib.rs`, a file that does not exist, with a fabricated DEFAULT_SYSTEM_PROMPT),
+  and `extract_array`'s first-`[`…last-`]` fallback latched onto a `#[cfg(test)]` bracket inside
+  the fake transcript → parse fail → 0 tasks. Even if extracted, both tasks target the
+  nonexistent file. QUEUED NEXT STEPS (implement before funding round 4):
   1. Flow guard: `when implemented == 0` → skip the candidate eval entirely (a no-op candidate
      can never beat baseline; the leg is pure spend), record the null round, stop.
-  2. Planner seam hardening: planner role prompt gets "your FINAL message must be ONLY the JSON
-     array — no prose"; `change_implement` names non-empty-but-unparseable `tasks` input in its
-     view (mirror the improvements_aggregate hardening from `fbec793`).
+  2. Planner seam hardening, three parts: (a) role contract — FINAL message must be ONLY the JSON
+     array, and fabricated tool transcripts are forbidden (the planner role has no tools — give
+     it read/grep so it can GROUND file paths instead of inventing them, or forbid file-level
+     detail); (b) `extract_array` gains a last-`[`-first tail scan (an LLM's answer array is at
+     the END; the current first-`[` heuristic is bracket-trapped by prose/code); (c)
+     `change_implement` validates each task's `files` exist before counting it implementable and
+     names non-empty-but-unparseable `tasks` input in its view (mirror `fbec793`).
 - 2026-07-06 — **ON HOLD** (user priority call): machinery proven, three chain defects found+
   fixed or queued, headline gain not yet attempted on a fully-hardened chain. Resume here.
 
