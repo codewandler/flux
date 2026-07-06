@@ -6,6 +6,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **C-37** — Bedrock credential lifecycle: `BedrockCreds` carries the source-reported expiration
+  (IRSA/Pod-Identity ISO stamps, SSO epoch-millis), `BedrockCredential::apply()` re-resolves
+  through the stored resolver when creds are absent or within a 5-minute expiry window (the
+  resolve-once C-09 seam went dark at the first STS rotation in a long-running process), the
+  request region is pinned at construction and coerced onto every resolve so URL host and SigV4
+  scope always agree, and `bedrock_with_chain(model_id)` builds the chain-backed provider
+  **sync + lazily** (first request resolves — no `materialize_chain_into_env` snapshot needed).
+
 ## [0.2.21] - 2026-07-06
 
 ### Added

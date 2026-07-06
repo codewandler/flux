@@ -12,7 +12,10 @@
 //! test) over an injected [`BedrockCredentialsResolver`] — the seam that lets the credential source
 //! be swapped without touching L1. The shipped resolvers: [`EnvStaticResolver`] (reads
 //! `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN`/`AWS_REGION`) and
-//! [`AwsChainResolver`] (the full env → SSO → IRSA → EKS Pod Identity chain, below). See
+//! [`AwsChainResolver`] (the full env → SSO → IRSA → EKS Pod Identity chain, below). Resolved
+//! creds are cached and **re-resolved through the resolver when they near expiry** (C-37) — the
+//! chain's STS sessions rotate under a long-running process — and [`bedrock_with_chain`] builds
+//! the chain-backed provider **sync + lazily** (first request resolves). See
 //! `docs/designs/subscription-providers-and-cost.md` (consolidated providers & cost design).
 //!
 //! Layering: L1, no flux deps above L0/L1. Crypto (`sha2`/`hmac`) is pure; the credential reads
@@ -23,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
@@ -379,6 +382,32 @@ pub struct BedrockCreds {
     pub secret_key: String,
     pub session_token: Option<String>,
     pub region: String,
+    /// When these credentials stop working (STS session expiry). `None` for sources that don't
+    /// report one (static env keys) — such creds are never considered stale (C-37).
+    pub expiration: Option<DateTime<Utc>>,
+}
+
+/// How close to expiry credentials are still considered usable. Within this window `apply()`
+/// re-resolves through the stored resolver instead of signing with soon-dead creds (C-37) —
+/// the same 5-minute guard AWS SDKs use for their credential caches.
+const BEDROCK_CREDS_EXPIRY_WINDOW_SECS: i64 = 300;
+
+/// Are these creds absent-of-expiry-fresh? Stale = an expiration exists and lies within the
+/// [`BEDROCK_CREDS_EXPIRY_WINDOW_SECS`] buffer from now.
+fn creds_stale(creds: &BedrockCreds) -> bool {
+    match creds.expiration {
+        Some(at) => (at - Utc::now()).num_seconds() <= BEDROCK_CREDS_EXPIRY_WINDOW_SECS,
+        None => false,
+    }
+}
+
+/// Parse an ISO-8601/RFC-3339 expiration stamp (the STS / Pod Identity wire form, `Z` suffix and
+/// fractional seconds tolerated). Unparseable input degrades to `None` — never-refresh, today's
+/// behavior — rather than erroring a working credential path.
+fn parse_expiration_iso(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw.trim())
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
 }
 
 /// Resolves AWS credentials + region for a Bedrock request. The seam: implemented by
@@ -423,6 +452,7 @@ fn creds_from_env() -> Result<BedrockCreds> {
         secret_key,
         session_token,
         region,
+        expiration: None,
     })
 }
 
@@ -433,44 +463,65 @@ impl BedrockCredentialsResolver for EnvStaticResolver {
     }
 }
 
-/// A Bedrock [`Credential`]: holds the model id + resolved creds (cached, refreshed on 401) and
-/// signs each request with SigV4. `endpoint()` needs the region, which comes from the resolver — so
-/// the creds are resolved once at construction (by [`bedrock_from_env`]) and cached; the C-04
-/// 401-refresh path re-resolves via the stored resolver.
+/// A Bedrock [`Credential`]: holds the model id + a creds cache and signs each request with SigV4.
+/// The **region is pinned at construction** (eager constructors pin it from the first resolved
+/// creds; the lazy [`bedrock_with_chain`] pins it from `AWS_REGION`/`AWS_DEFAULT_REGION`) so
+/// `endpoint()` is answerable before any resolution, and every resolved cred is coerced to the pin
+/// so the URL host and the SigV4 credential scope always agree. Creds start `None` for the lazy
+/// constructor and are (re-)resolved by [`apply`](Credential::apply) whenever absent or within the
+/// expiry window (C-37) — temporary STS sessions (SSO / IRSA / EKS Pod Identity) rotate under a
+/// long-running process, so resolve-once would go dark at the first expiry.
 pub struct BedrockCredential {
     model_id: String,
-    creds: Mutex<BedrockCreds>,
-    #[allow(dead_code)]
-    // C-04: wired when the 401-refresh TokenSource lands (Option C plugin resolver).
+    /// The region requests are routed to and signed against — pinned for the credential's life.
+    region: String,
+    /// The resolved-creds cache. `None` until the first request for the lazy constructor.
+    creds: Mutex<Option<BedrockCreds>>,
+    /// Re-resolves the chain when the cache is empty or stale (C-37).
     resolver: Arc<dyn BedrockCredentialsResolver>,
 }
 
 impl BedrockCredential {
-    fn endpoint_url(&self, creds: &BedrockCreds) -> String {
+    fn endpoint_url(&self) -> String {
         // Streaming invoke. The model id may contain `.`/`:`/`-` — percent-encode the path
         // segment (not the slashes between segments).
         let encoded = percent_encode_segment(&self.model_id);
         format!(
             "https://bedrock-runtime.{}.amazonaws.com/model/{}/invoke-with-response-stream",
-            creds.region, encoded
+            self.region, encoded
         )
+    }
+
+    /// The cached creds if still fresh, else a re-resolve through the stored resolver. The
+    /// resolve runs **outside** the (std) creds lock — it can't be held across `.await` — so
+    /// concurrent turns may race a duplicate resolve; that's benign (the chain sources are
+    /// idempotent local reads / metadata GETs) and both results are valid.
+    async fn fresh_creds(&self) -> Result<BedrockCreds> {
+        {
+            let cached = self.creds.lock().expect("bedrock creds mutex poisoned");
+            if let Some(c) = cached.as_ref() {
+                if !creds_stale(c) {
+                    return Ok(c.clone());
+                }
+            }
+        }
+        let mut resolved = self.resolver.resolve().await?;
+        // Coerce to the pinned region: `endpoint()` already routed there, and the SigV4 scope
+        // must match the URL host. (STS-family creds are region-agnostic.)
+        resolved.region = self.region.clone();
+        *self.creds.lock().expect("bedrock creds mutex poisoned") = Some(resolved.clone());
+        Ok(resolved)
     }
 }
 
 #[async_trait]
 impl Credential for BedrockCredential {
     fn endpoint(&self) -> String {
-        // Sync: read the cached creds. (Resolved once at construction; refreshed on 401.)
-        let creds = self.creds.lock().expect("bedrock creds mutex poisoned");
-        self.endpoint_url(&creds)
+        self.endpoint_url()
     }
 
     async fn apply(&self, rb: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
-        let creds = self
-            .creds
-            .lock()
-            .expect("bedrock creds mutex poisoned")
-            .clone();
+        let creds = self.fresh_creds().await?;
         sign_v4(rb, &creds, self.model_id.clone())
     }
 }
@@ -721,7 +772,8 @@ pub fn bedrock_with_env(model_id: String) -> Result<NativeProvider> {
         Arc::new(BedrockAnthropic),
         Arc::new(BedrockCredential {
             model_id,
-            creds: Mutex::new(creds),
+            region: creds.region.clone(),
+            creds: Mutex::new(Some(creds)),
             resolver: Arc::new(EnvStaticResolver),
         }),
     ))
@@ -739,7 +791,8 @@ pub async fn bedrock_with(
         Arc::new(BedrockAnthropic),
         Arc::new(BedrockCredential {
             model_id,
-            creds: Mutex::new(creds),
+            region: creds.region.clone(),
+            creds: Mutex::new(Some(creds)),
             resolver,
         }),
     ))
@@ -834,6 +887,33 @@ impl BedrockCredentialsResolver for AwsChainResolver {
 /// EKS Pod Identity, stores the [`AwsChainResolver`] for the 401-refresh path.
 pub async fn bedrock_with_default_chain(model_id: String) -> Result<NativeProvider> {
     bedrock_with(model_id, Arc::new(AwsChainResolver)).await
+}
+
+/// Build the `aws` Bedrock provider from the default chain, **sync + lazy** (C-37): construction
+/// resolves nothing — the first request's `apply()` walks the chain, and every later request
+/// re-resolves whenever the cached creds near expiry. This is the constructor for sync call sites
+/// (sub-agent provider factories, server startup paths) that want chain-backed credentials
+/// without async plumbing and without the [`materialize_chain_into_env`] snapshot (which freezes
+/// temporary creds into env, where chain step 1 re-reads them forever — defeating refresh).
+///
+/// The request **region is pinned here** from `AWS_REGION`/`AWS_DEFAULT_REGION` (default
+/// `us-east-1`) — set it explicitly; an SSO profile's `region` does not apply to this
+/// constructor. Credential misconfiguration surfaces as a per-request auth error, not a
+/// construction failure.
+pub fn bedrock_with_chain(model_id: String) -> NativeProvider {
+    let region = std::env::var("AWS_REGION")
+        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+        .unwrap_or_else(|_| "us-east-1".to_string());
+    NativeProvider::new(
+        "aws",
+        Arc::new(BedrockAnthropic),
+        Arc::new(BedrockCredential {
+            model_id,
+            region,
+            creds: Mutex::new(None),
+            resolver: Arc::new(AwsChainResolver),
+        }),
+    )
 }
 
 // --- minimal `~/.aws/config` INI parser -------------------------------------
@@ -1051,6 +1131,12 @@ async fn resolve_sso() -> Result<Option<BedrockCreds>> {
             .and_then(|v| v.as_str())
             .map(String::from),
         region,
+        // `roleCredentials.expiration` is epoch **milliseconds** (the one non-ISO stamp in the
+        // chain); absent/odd values degrade to `None` (never-stale).
+        expiration: rc
+            .get("expiration")
+            .and_then(|v| v.as_i64())
+            .and_then(DateTime::from_timestamp_millis),
     }))
 }
 
@@ -1187,11 +1273,15 @@ async fn resolve_irsa() -> Result<Option<BedrockCreds>> {
     let secret_key = extract_xml_text(&body, "SecretAccessKey")
         .ok_or_else(|| Error::Auth("STS: SecretAccessKey missing".to_string()))?;
     let session_token = extract_xml_text(&body, "SessionToken");
+    let expiration = extract_xml_text(&body, "Expiration")
+        .as_deref()
+        .and_then(parse_expiration_iso);
     Ok(Some(BedrockCreds {
         access_key,
         secret_key,
         session_token,
         region,
+        expiration,
     }))
 }
 
@@ -1246,6 +1336,10 @@ async fn resolve_eks_pod_identity() -> Result<Option<BedrockCreds>> {
             .to_string(),
         session_token: v.get("Token").and_then(|v| v.as_str()).map(String::from),
         region,
+        expiration: v
+            .get("Expiration")
+            .and_then(|v| v.as_str())
+            .and_then(parse_expiration_iso),
     }))
 }
 
@@ -1295,6 +1389,7 @@ mod tests {
             secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
             session_token: None,
             region: "us-east-1".to_string(),
+            expiration: None,
         }
     }
 
@@ -1647,7 +1742,8 @@ mod tests {
     fn endpoint_is_streaming_invoke() {
         let cred = BedrockCredential {
             model_id: "us.anthropic.claude-sonnet-4-6".to_string(),
-            creds: Mutex::new(example_creds()),
+            region: "us-east-1".to_string(),
+            creds: Mutex::new(Some(example_creds())),
             resolver: Arc::new(EnvStaticResolver),
         };
         assert_eq!(
@@ -1829,5 +1925,129 @@ sso_region = eu-central-1
             Some("TOK".to_string())
         );
         assert_eq!(extract_xml_text(xml, "Missing"), None);
+    }
+
+    // -- C-37: credential lifecycle — lazy resolve + expiry re-resolution ------------------------
+
+    /// Counts its resolves and hands out creds with a configurable expiration (and a region that
+    /// deliberately differs from the credential's pin, to prove the coercion).
+    struct CountingResolver {
+        calls: std::sync::atomic::AtomicUsize,
+        expiration: Option<DateTime<Utc>>,
+    }
+
+    impl CountingResolver {
+        fn new(expiration: Option<DateTime<Utc>>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                expiration,
+            })
+        }
+        fn count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl BedrockCredentialsResolver for CountingResolver {
+        async fn resolve(&self) -> Result<BedrockCreds> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(BedrockCreds {
+                access_key: "AKIDEXAMPLE".to_string(),
+                secret_key: "SECRET".to_string(),
+                session_token: None,
+                region: "us-west-2".to_string(), // ≠ the pin — coercion must overwrite it
+                expiration: self.expiration,
+            })
+        }
+    }
+
+    fn lazy_credential(resolver: Arc<CountingResolver>) -> BedrockCredential {
+        BedrockCredential {
+            model_id: "eu.anthropic.claude-sonnet-4-6".to_string(),
+            region: "eu-central-1".to_string(),
+            creds: Mutex::new(None),
+            resolver,
+        }
+    }
+
+    #[tokio::test]
+    async fn lazy_credential_resolves_on_first_apply_not_construction() {
+        let resolver = CountingResolver::new(None);
+        let cred = lazy_credential(resolver.clone());
+        assert_eq!(resolver.count(), 0, "construction must not resolve");
+        let rb = reqwest::Client::new()
+            .post(cred.endpoint())
+            .json(&json!({}));
+        let _signed = cred.apply(rb).await.expect("apply signs after resolving");
+        assert_eq!(resolver.count(), 1, "first apply walks the chain");
+    }
+
+    #[tokio::test]
+    async fn fresh_creds_resolve_once_across_applies() {
+        // Far-future expiry (and the None case via the lazy test above): the cache holds.
+        let resolver = CountingResolver::new(Some(Utc::now() + chrono::Duration::hours(2)));
+        let cred = lazy_credential(resolver.clone());
+        cred.fresh_creds().await.unwrap();
+        cred.fresh_creds().await.unwrap();
+        assert_eq!(resolver.count(), 1, "fresh creds are not re-resolved");
+    }
+
+    #[tokio::test]
+    async fn near_expiry_creds_re_resolve_on_apply() {
+        // Inside the 5-minute window: every use re-resolves (the resolver keeps returning
+        // near-expiry creds, so each call is stale again — in production the chain returns a
+        // fresh session).
+        let resolver = CountingResolver::new(Some(Utc::now() + chrono::Duration::seconds(60)));
+        let cred = lazy_credential(resolver.clone());
+        cred.fresh_creds().await.unwrap();
+        cred.fresh_creds().await.unwrap();
+        assert_eq!(resolver.count(), 2, "near-expiry creds must re-resolve");
+    }
+
+    #[tokio::test]
+    async fn resolved_creds_are_coerced_to_the_pinned_region() {
+        let resolver = CountingResolver::new(None);
+        let cred = lazy_credential(resolver);
+        let creds = cred.fresh_creds().await.unwrap();
+        // The resolver said us-west-2; the pin wins so the SigV4 scope matches the URL host.
+        assert_eq!(creds.region, "eu-central-1");
+    }
+
+    #[test]
+    fn lazy_endpoint_uses_pinned_region_before_resolve() {
+        let cred = lazy_credential(CountingResolver::new(None));
+        assert_eq!(
+            cred.endpoint(),
+            "https://bedrock-runtime.eu-central-1.amazonaws.com/model/eu.anthropic.claude-sonnet-4-6/invoke-with-response-stream"
+        );
+    }
+
+    #[test]
+    fn creds_stale_only_within_window() {
+        let with = |expiration| BedrockCreds {
+            expiration,
+            ..example_creds()
+        };
+        assert!(!creds_stale(&with(None)), "no expiry → never stale");
+        assert!(!creds_stale(&with(Some(
+            Utc::now() + chrono::Duration::hours(1)
+        ))));
+        assert!(creds_stale(&with(Some(
+            Utc::now() + chrono::Duration::seconds(60)
+        ))));
+        assert!(creds_stale(&with(Some(
+            Utc::now() - chrono::Duration::seconds(10)
+        ))));
+    }
+
+    #[test]
+    fn parse_expiration_tolerates_wire_formats() {
+        assert!(parse_expiration_iso("2030-01-01T00:00:00Z").is_some());
+        assert!(parse_expiration_iso("2030-01-01T00:00:00.123456Z").is_some());
+        assert!(parse_expiration_iso("2030-01-01T02:00:00+02:00").is_some());
+        assert!(parse_expiration_iso(" 2030-01-01T00:00:00Z ").is_some());
+        assert!(parse_expiration_iso("not-a-date").is_none());
+        assert!(parse_expiration_iso("").is_none());
     }
 }
