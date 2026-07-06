@@ -1,0 +1,6 @@
+[package]
+name = "flux-audio"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Sample-rate math for realtime voice pipelines: PCM16 byte/sample conversion, resampling (stateless + phase-carrying streaming), and frame re-chunking (pure, dependency-free)"

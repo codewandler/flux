@@ -1254,6 +1254,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "flux-audio"
+version = "0.2.23"
+
+[[package]]
 name = "flux-auth"
 version = "0.2.23"
 dependencies = [

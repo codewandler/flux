@@ -2,8 +2,10 @@
 //!
 //! These mirror the role [`crate::ImageSource`] plays for images: pure descriptors that both the
 //! provider layer and any consumer (a telephony or WebRTC channel) can name without inventing
-//! duplicates. A realtime provider speaks its **model-native** format; resampling to a transport's
-//! rate (telephony 8 kHz, WebRTC 48 kHz, a 16 kHz mic, …) is the consumer's concern, not flux's.
+//! duplicates. A realtime provider speaks its **model-native** format; formats are the vocabulary
+//! this module owns. Sample *math* — resampling between rates (telephony 8 kHz, WebRTC 48 kHz, a
+//! 16 kHz mic, …), PCM16 byte/sample codecs, and stream re-chunking — lives in the optional
+//! `flux-audio` leaf crate, not here.
 
 use serde::{Deserialize, Serialize};
 

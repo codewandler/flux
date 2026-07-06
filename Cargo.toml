@@ -34,6 +34,7 @@ members = [
     "crates/flux-app",
     "crates/flux-markdown",
     "crates/flux-channels",
+    "crates/flux-audio",
 ]
 # `plugins/` is its own nested cargo workspace (the integration plugin pack, D-08): subprocess binaries
 # with heavy vendor deps (k8s client, cloud SDKs) kept OUT of the main flux gate. Built separately.
@@ -85,6 +86,7 @@ flux-cognition = { path = "crates/flux-cognition", version = "0.2.23" }
 flux-app = { path = "crates/flux-app" }
 flux-markdown = { path = "crates/flux-markdown" }
 flux-channels = { path = "crates/flux-channels" }
+flux-audio = { path = "crates/flux-audio" }
 
 # external
 serde = { version = "1", features = ["derive"] }
