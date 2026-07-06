@@ -433,27 +433,74 @@ fn write_line<W: std::io::Write>(writer: &mut W, frame: &Frame) {
     }
 }
 
+/// Bound on consecutive host frames that fail to parse before [`serve_io`] gives up (D-54). A lone
+/// malformed frame is tolerated (skip + diagnostic) — frames arrive only from the trusted parent
+/// host, so a single bad one is transient noise. This many *in a row* means the framing itself is
+/// broken (host bug or stream corruption): further reads won't self-heal, and silently spinning
+/// would strand the host awaiting responses to request ids that will never come. Exiting lets the
+/// host's own hard error ("plugin closed the connection") surface instead of an indefinite hang.
+const MAX_CONSECUTIVE_MALFORMED_FRAMES: u32 = 5;
+
 /// Run the plugin: read request frames from stdin, dispatch, write response frames to stdout.
 /// Operation calls may issue host-capability callbacks via the provided [`GuestHost`]. Blocks
 /// until stdin closes. Call this from a plugin binary's `main`.
 pub fn serve(handler: impl PluginHandler) {
-    use std::io::BufRead;
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    let mut reader = stdin.lock();
-    let mut writer = stdout.lock();
+    serve_io(stdin.lock(), stdout.lock(), std::io::stderr(), handler);
+}
+
+/// The testable core of [`serve`]: reader, writer, and diagnostic sink are injected so tests can
+/// drive the loop in-process without spawning a binary. Behavior for well-formed traffic is
+/// unchanged from the direct-stdio loop.
+///
+/// A line that fails to parse as a [`Frame`] is skipped (never treated as fatal on its own): one
+/// diagnostic line is written to `diag` — stdout stays the protocol channel, so diagnostics never go
+/// there — naming only the line's byte length and the parse error, never the raw content (well-formed
+/// frames can carry secrets, and there is no way to tell a merely-truncated well-formed frame from
+/// genuine garbage). [`MAX_CONSECUTIVE_MALFORMED_FRAMES`] malformed frames *in a row* end the loop
+/// (with a final diagnostic); any frame that parses successfully resets the counter.
+fn serve_io<R: std::io::BufRead, W: std::io::Write, D: std::io::Write>(
+    mut reader: R,
+    mut writer: W,
+    mut diag: D,
+    handler: impl PluginHandler,
+) {
     let mut line = String::new();
+    let mut consecutive_malformed: u32 = 0;
     loop {
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) | Err(_) => break, // EOF or read error
             Ok(_) => {}
         }
-        if line.trim().is_empty() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        let Ok(req) = serde_json::from_str::<Frame>(line.trim()) else {
-            continue;
+        let req = match serde_json::from_str::<Frame>(trimmed) {
+            Ok(req) => {
+                consecutive_malformed = 0;
+                req
+            }
+            Err(e) => {
+                consecutive_malformed += 1;
+                let _ = writeln!(
+                    diag,
+                    "flux-plugin: dropped malformed frame from host ({} bytes; parse error: {e}) \
+                     [{consecutive_malformed}/{MAX_CONSECUTIVE_MALFORMED_FRAMES} consecutive]",
+                    trimmed.len(),
+                );
+                if consecutive_malformed >= MAX_CONSECUTIVE_MALFORMED_FRAMES {
+                    let _ = writeln!(
+                        diag,
+                        "flux-plugin: {MAX_CONSECUTIVE_MALFORMED_FRAMES} consecutive malformed \
+                         frames from host — exiting serve loop"
+                    );
+                    break;
+                }
+                continue;
+            }
         };
         let resp = match req.command.as_str() {
             "manifest" => match serde_json::to_value(handler.manifest()) {
@@ -4687,5 +4734,128 @@ mod tests {
             .ok();
         std::env::remove_var("FLUX_TEST_PG_PW_D31");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------
+    // D-54: serve_io malformed-frame handling
+    // -----------------------------------------------------------------
+
+    /// Minimal [`PluginHandler`] for driving [`serve_io`] in-process: `manifest` answers a fixed
+    /// manifest, `echo` answers back whatever input it was given.
+    struct EchoHandler;
+
+    impl PluginHandler for EchoHandler {
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest {
+                name: "d54-test".into(),
+                ..PluginManifest::default()
+            }
+        }
+
+        fn call(
+            &self,
+            operation: &str,
+            input: Value,
+            _host: &mut dyn GuestHost,
+        ) -> std::result::Result<Value, String> {
+            match operation {
+                "echo" => Ok(input),
+                other => Err(format!("unknown operation: {other}")),
+            }
+        }
+    }
+
+    fn frame_line(id: &str, command: &str, payload: Value) -> String {
+        let mut s = serde_json::to_string(&Frame::request(id, command, payload)).unwrap();
+        s.push('\n');
+        s
+    }
+
+    /// A single malformed line from the host must not vanish without trace, and must not stop the
+    /// loop from answering the next, well-formed request.
+    #[test]
+    fn serve_io_skips_single_malformed_frame_and_answers_next_request() {
+        let mut input = String::new();
+        input.push_str("not a valid frame at all\n");
+        input.push_str(&frame_line("r1", "manifest", Value::Null));
+
+        let reader = std::io::Cursor::new(input.into_bytes());
+        let mut writer: Vec<u8> = Vec::new();
+        let mut diag: Vec<u8> = Vec::new();
+        serve_io(reader, &mut writer, &mut diag, EchoHandler);
+
+        let diag = String::from_utf8(diag).unwrap();
+        assert_eq!(
+            diag.lines().count(),
+            1,
+            "exactly one diagnostic for the one malformed line: {diag:?}"
+        );
+        assert!(
+            diag.contains("malformed"),
+            "diagnostic names the problem: {diag}"
+        );
+        assert!(
+            !diag.contains("not a valid frame at all"),
+            "diagnostic must not echo the raw malformed content: {diag}"
+        );
+
+        let out = String::from_utf8(writer).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "the valid request after the bad line is still answered: {out:?}"
+        );
+        let resp: Frame = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(resp.id, "r1");
+        assert!(resp.ok, "manifest request answered ok: {resp:?}");
+        assert_eq!(resp.result["name"], "d54-test");
+    }
+
+    /// `MAX_CONSECUTIVE_MALFORMED_FRAMES` malformed frames in a row terminate the loop with a final
+    /// diagnostic instead of spinning forever — the host would otherwise hang awaiting a response
+    /// that never arrives. A valid frame in between resets the counter, so it takes a genuinely
+    /// unbroken run of bad frames to trip the bound.
+    #[test]
+    fn serve_io_terminates_after_consecutive_malformed_frames_but_valid_frame_resets_counter() {
+        let mut input = String::new();
+        // One below the bound, then a valid frame: must NOT terminate.
+        for _ in 0..MAX_CONSECUTIVE_MALFORMED_FRAMES - 1 {
+            input.push_str("garbage\n");
+        }
+        input.push_str(&frame_line("r1", "manifest", Value::Null));
+        // A full run of the bound now: must terminate here...
+        for _ in 0..MAX_CONSECUTIVE_MALFORMED_FRAMES {
+            input.push_str("garbage\n");
+        }
+        // ...and never reach this trailing valid request.
+        input.push_str(&frame_line("r2", "manifest", Value::Null));
+
+        let reader = std::io::Cursor::new(input.into_bytes());
+        let mut writer: Vec<u8> = Vec::new();
+        let mut diag: Vec<u8> = Vec::new();
+        serve_io(reader, &mut writer, &mut diag, EchoHandler);
+
+        let out = String::from_utf8(writer).unwrap();
+        let responses: Vec<Frame> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            responses.len(),
+            1,
+            "only the reset-point request (r1) is answered, not the trailing r2: {out:?}"
+        );
+        assert_eq!(responses[0].id, "r1");
+
+        let diag = String::from_utf8(diag).unwrap();
+        assert!(
+            diag.contains(&MAX_CONSECUTIVE_MALFORMED_FRAMES.to_string()),
+            "final diagnostic names the bound: {diag}"
+        );
+        assert!(
+            diag.lines().last().unwrap().contains("exiting"),
+            "loop ends with a termination diagnostic, not silence: {diag}"
+        );
     }
 }
