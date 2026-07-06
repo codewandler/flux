@@ -17,10 +17,9 @@
             "value": {
               "adapter": "terminal-bench",
               "tasks": [
-                "chess-best-move",
                 "fibonacci-server"
               ],
-              "trials": 3,
+              "trials": 5,
               "dataset": "terminal-bench-core==0.1.1",
               "model": "anthropic/claude-sonnet-4-6",
               "flux_binary": "target/x86_64-unknown-linux-musl/release/flux",
@@ -121,7 +120,7 @@
                   },
                   "task": {
                     "kind": "fmt",
-                    "template": "Turn these flux-harness improvement candidates into AT MOST 2 concrete, small, safe engineering tasks for the flux codebase (tool specs, tool output/views, system prompt, a new tool, or an agent-loop efficiency fix). Do NOT touch crates/flux-eval, bench/, the loop flows, or CI. Candidates:\n{candidates}\n\nReturn ONLY the JSON array of tasks."
+                    "template": "Turn these flux-harness improvement candidates into AT MOST 2 concrete, small, safe engineering tasks for the flux codebase (tool specs, tool output/views, system prompt, a new tool, or an agent-loop efficiency fix). Do NOT touch crates/flux-eval, bench/, the loop flows, or CI. The candidates are RANKED by measured weight \u2014 take them in order and only skip one if it is infeasible or out of bounds; every task must name the candidate id it addresses in an `addresses` field. Candidates:\n{candidates}\n\nReturn ONLY the JSON array of tasks."
                   }
                 }
               }
@@ -202,10 +201,9 @@
                     "value": {
                       "adapter": "terminal-bench",
                       "tasks": [
-                        "chess-best-move",
                         "fibonacci-server"
                       ],
-                      "trials": 3,
+                      "trials": 5,
                       "dataset": "terminal-bench-core==0.1.1",
                       "model": "anthropic/claude-sonnet-4-6",
                       "flux_binary": "target/x86_64-unknown-linux-musl/release/flux",
