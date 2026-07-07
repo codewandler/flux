@@ -6,6 +6,87 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-07
+
+**Multi-tenant A2A: per-request principal auth, per-principal isolation, and a resolver-keyed
+multi-agent mount.** A flux server can now authenticate *callers* (not just the deployment):
+per-request bearer→principal resolution via RFC 7662 introspection, sessions tagged with and scoped
+to the caller's tenant realm, and one server serving N agents by path — each with flux's A2A session
+machinery. Breaking: `flux_server::{serve, serve_on, router}` take `ServerAuth` and
+`flux_a2a::server::dispatch` takes an authenticated realm.
+
+Per-request auth + per-principal isolation (D-64 design → D-68 + D-69) + the multi-agent A2A mount
+(D-63) + channel principal-auth parity (D-70), grounded against the A2A spec, the reference
+downstream shape, and an adversarial security review (15 design-level fixes folded in before a line
+of code). Design: `docs/designs/request-auth-seam.md`, `docs/designs/multi-agent-a2a-mount.md`.
+
+A final pre-release code review (8-angle, high-effort) then hardened the implementation: realm keys
+are `acct:`/`user:`-namespaced so an account value can't collide with a principal-derived realm
+(cross-tenant break); realm-scoped `/usage` reuses the store's canonical pricing fold
+(`cost_summary_for_account`) instead of a hand-rolled merge that could split model keys or drop a
+priced total; shared-secret mode gained `external_url` so its public card isn't Host-phishable;
+`serve_multi`/`serve_multi_on` refuse an unauthenticated non-loopback bind; the duplicate-header
+rejection and the refresh-token guard were broadened; and secret-without-client-id / account-claim-
+without-require-account are now hard errors / warnings.
+
+### Added
+
+- **D-68** — `flux-auth` gains the per-request bearer→principal seam its docs always deferred:
+  `flux_auth::request` with `RequestAuthenticator::authenticate(bearer) -> AuthContext { account,
+  caller, trust }` (object-safe; one claims→identity projection point — `AuthContext` carries the
+  already-projected `(Caller, Trust)`, and the envelope stays the sole authorization source of
+  truth), `AuthError { Unauthorized, Unavailable }` (payload log-only; byte-constant
+  `WWW_AUTHENTICATE` challenge), and `bearer_from_header` (RFC 6750 parsing: case-insensitive
+  scheme, b64token charset, 8 KiB cap — all before any hashing or network). Behind the new
+  `introspect` feature: an RFC 7662 `Introspector` (optional `client_secret_basic`; redirects
+  refused outright — a 307 would forward the token body; https required unless `allow_http`;
+  256 KiB response cap; non-access tokens rejected so a leaked refresh token is not a bearer
+  credential; account claim literal-key-first then dot-path; roles as JSON array or
+  space-separated string with the reserved `account:` prefix stripped — the authenticator is that
+  mirror group's sole writer; principal chain `sub`→`username`→`client_id` with a namespaced
+  account fallback; trust clamped ≤ `Verified`) and a `CachedAuthenticator` decorator (SHA-256
+  keys, segregated positive/negative stores so garbage floods cannot evict legitimate entries,
+  `exp`-bounded saturating TTLs, `Unavailable` never cached). 42 new hermetic tests against a
+  live mock endpoint.
+- **D-69** — flux-server per-principal isolation over that seam, closing the A-48 single-realm
+  caveat. Three explicit `ServerAuth` modes (open / shared-secret unchanged / principal); in
+  principal mode every request resolves to a principal, sessions are tagged with the caller's
+  realm (`account`, else `user:<principal>` — never a shared "no account" pool), one structural
+  guard wraps every `/sessions/:id/*` route **including the write path** with 404s byte-identical
+  to nonexistent ids (A2A §13.1), `/usage` is realm-scoped, A-48 `contextId` continuity is
+  realm-keyed (`find_correlated_in_realm`; `contextId` is a grouping key, not a security
+  boundary), and every turn — sub-agents included, via the shared `IdentityCell` threaded from
+  `Executor` through the spawner — runs the safety envelope under the request principal's
+  `(Caller, Trust)`, enforced by a gate-witnessed `enter_turn` (the realm is only obtainable from
+  the function that swaps the identity). The agent card declares `securitySchemes`/`security`
+  whenever auth is enabled, and in principal mode its `url` comes from the configured
+  `[server] external_url`, never the Host header. CLI wiring: `[server] introspect_url` (+
+  claim/client/allow-http knobs; the client secret arrives via a NAMED env var, never config).
+  Auth failures are constant-shape (401 with the RFC 6750 challenge on every cause; 503 with
+  backend detail logged server-side only; duplicate `Authorization` headers rejected).
+- **D-63** — resolver-keyed **multi-agent A2A mount**: `flux_server::router_multi` serves N agents
+  under `/:agent_id/.well-known/agent-card.json` + `/:agent_id/a2a`, each with flux's full A2A
+  session machinery (TTL, `contextId` continuity, SSE) — the surface a multi-tenant host otherwise
+  hand-rolls while forgoing that machinery. Agents are resolved per request by an `AgentResolver`
+  (`StaticResolver` built in; dynamic per-tenant resolvers implement the trait and may key on the
+  authenticated principal). Auth stays **one outer layer** — the resolver consumes the
+  `AuthContext`, never verifies tokens (answering D-63's and D-64's shared open question); each
+  agent's card advertises its own `/:agent_id/a2a`; unknown agent → constant 404; agents are
+  isolated by construction (own engine + store). Design: `docs/designs/multi-agent-a2a-mount.md`.
+- **D-70** — per-request principal auth **parity for a program's `a2a` channel** (`flux app run`):
+  the channel adapter gains the same introspection knobs as `--serve` (client secret as a
+  host-resolved `secret "ENV"`), routed through one shared construction point
+  (`PrincipalAuth::from_introspection`) so the claim mapping never diverges between surfaces.
+
+### Changed
+
+- **BREAKING (D-69)** — `flux_server::{serve, serve_on, router}` take `ServerAuth` instead of
+  `Option<String>` (`ServerAuth::from_token` is the drop-in mapping), and
+  `flux_a2a::server::dispatch` gains a required authenticated-realm parameter
+  (`dispatch(runner, realm, body)`) with `A2aTurnContext.realm` carrying it to the turn — the
+  realm comes from the mount's own request authentication, never from message content. One-line
+  changes at existing call sites.
+
 ## [0.3.3] - 2026-07-07
 
 ### Fixed
