@@ -413,11 +413,37 @@ pub struct AgentInterface {
     pub transport: Option<String>,
 }
 
+/// The A2A protocol version flux implements, emitted as the AgentCard's spec-**required**
+/// `protocolVersion`. Single source of truth — bump when flux tracks a newer A2A spec revision.
+/// The value is informational to clients (they record it; the ecosystem SDKs do not reject on it),
+/// but the field's *presence* is required for a conformant card.
+pub const PROTOCOL_VERSION: &str = "0.3.0";
+
+/// The transport of a JSON-RPC-over-HTTP A2A interface — the one binding flux serves, named as the
+/// spec's `TransportProtocol` enumerates it (`"JSONRPC"`). Used for both an [`AgentInterface`]'s
+/// `transport` and the card's `preferredTransport`.
+pub const TRANSPORT_JSONRPC: &str = "JSONRPC";
+
+/// The agent's provider/organization, as advertised on the card (A2A `provider`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProvider {
+    /// The organization that provides the agent.
+    pub organization: String,
+    /// A URL for the provider organization.
+    pub url: String,
+}
+
 /// The A2A discovery document served at `/.well-known/agent-card.json` (or `…/agent.json`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct AgentCard {
+    /// The version of the A2A protocol this agent implements (spec-**required**, so always emitted;
+    /// see [`PROTOCOL_VERSION`]). Absent on an inbound card decodes to the empty string.
+    #[serde(default)]
+    pub protocol_version: String,
     #[serde(default)]
     pub name: String,
     #[serde(default)]
@@ -450,6 +476,23 @@ pub struct AgentCard {
     /// the scheme with no particular scopes). Absent → the key is omitted, as above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security: Option<Vec<BTreeMap<String, Vec<String>>>>,
+    /// The transport of the primary [`url`](Self::url) endpoint — [`TRANSPORT_JSONRPC`] for flux.
+    /// Absent → the key is omitted, so pre-existing cards serialize byte-identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_transport: Option<String>,
+    /// The agent's provider/organization, when advertised. Absent → omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<AgentProvider>,
+    /// A human-readable documentation URL for the agent, when advertised. Absent → omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub documentation_url: Option<String>,
+    /// An icon URL for the agent, when advertised. Absent → omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_url: Option<String>,
+    /// Whether the agent supports `agent/getAuthenticatedExtendedCard`. flux advertises `false`
+    /// (honest — there is no extended-card method yet). Absent → omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_authenticated_extended_card: Option<bool>,
 }
 
 impl AgentCard {
@@ -483,6 +526,25 @@ impl AgentCard {
     /// scheme name to the scopes the caller must hold. See [`security`](Self::security).
     pub fn with_security(mut self, security: Vec<BTreeMap<String, Vec<String>>>) -> Self {
         self.security = Some(security);
+        self
+    }
+
+    /// Declare the agent's provider/organization (builder-style). See [`provider`](Self::provider).
+    pub fn with_provider(mut self, provider: AgentProvider) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
+    /// Declare the agent's documentation URL (builder-style). See
+    /// [`documentation_url`](Self::documentation_url).
+    pub fn with_documentation_url(mut self, url: impl Into<String>) -> Self {
+        self.documentation_url = Some(url.into());
+        self
+    }
+
+    /// Declare the agent's icon URL (builder-style). See [`icon_url`](Self::icon_url).
+    pub fn with_icon_url(mut self, url: impl Into<String>) -> Self {
+        self.icon_url = Some(url.into());
         self
     }
 }

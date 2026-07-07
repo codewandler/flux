@@ -13,9 +13,10 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::error;
 use crate::types::{
-    new_id, AgentCard, Capabilities, Message, Part, Skill, Task, TaskState, TaskStatus,
-    TaskStatusUpdateEvent,
+    new_id, AgentCard, AgentInterface, Capabilities, Message, Part, Skill, Task, TaskState,
+    TaskStatus, TaskStatusUpdateEvent, PROTOCOL_VERSION, TRANSPORT_JSONRPC,
 };
 
 /// One text turn of an agent: run a user message to the agent's final answer. The only seam
@@ -102,7 +103,21 @@ pub fn agent_card(
     skills: &[(String, String, String)],
     streaming: bool,
 ) -> AgentCard {
+    // Declare the JSON-RPC interface flux actually serves (A-49): one `interfaces` entry and a
+    // matching `preferredTransport`, both keyed to the endpoint `url`. A card with no `url` (a
+    // never-served/degenerate card) declares no transport, which is the honest empty state.
+    let (interfaces, preferred_transport) = match &url {
+        Some(u) => (
+            vec![AgentInterface {
+                url: Some(u.clone()),
+                transport: Some(TRANSPORT_JSONRPC.to_string()),
+            }],
+            Some(TRANSPORT_JSONRPC.to_string()),
+        ),
+        None => (Vec::new(), None),
+    };
     AgentCard {
+        protocol_version: PROTOCOL_VERSION.to_string(),
         name: name.to_string(),
         description: description.to_string(),
         url,
@@ -124,7 +139,13 @@ pub fn agent_card(
                 output_modes: vec!["text/plain".to_string()],
             })
             .collect(),
-        interfaces: Vec::new(),
+        interfaces,
+        preferred_transport,
+        // Honest: flux has no `agent/getAuthenticatedExtendedCard` method yet.
+        supports_authenticated_extended_card: Some(false),
+        provider: None,
+        documentation_url: None,
+        icon_url: None,
         security_schemes: None,
         security: None,
     }
@@ -152,7 +173,53 @@ pub async fn dispatch(runner: &dyn A2aTurn, realm: Option<&str>, body: &Value) -
         .unwrap_or_default()
     {
         "message/send" => send(runner, realm, id, body.get("params")).await,
+        other if is_unsupported_a2a_method(other) => rpc_err(
+            id,
+            error::UNSUPPORTED_OPERATION,
+            format!("unsupported operation: {other}"),
+        ),
         other => rpc_err(id, -32601, format!("method not found: {other}")),
+    }
+}
+
+/// Whether `method` is an A2A method flux **recognizes but does not implement** — so a dispatcher
+/// should answer [`error::UNSUPPORTED_OPERATION`] (`-32004`) rather than the generic `-32601 Method
+/// not found` (reserved for genuinely-unrecognized names). These all depend on an addressable,
+/// retained task or an extended card that flux's synchronous-turn model has no notion of (A-53).
+///
+/// This is the **one** classifier every A2A dispatch site shares (the reusable [`dispatch`] here and
+/// `flux-server`'s HTTP handlers) so the set cannot drift between them. `tasks/get` is deliberately
+/// excluded: its spec-correct answer is task-retention-dependent (`-32001 TaskNotFound` vs a value
+/// once tasks are retained) and arrives with the stateful task model, so it keeps today's fall-through.
+pub fn is_unsupported_a2a_method(method: &str) -> bool {
+    matches!(
+        method,
+        "tasks/cancel"
+            | "tasks/resubscribe"
+            | "tasks/pushNotificationConfig/set"
+            | "tasks/pushNotificationConfig/get"
+            | "tasks/pushNotificationConfig/list"
+            | "tasks/pushNotificationConfig/delete"
+            | "agent/getAuthenticatedExtendedCard"
+    )
+}
+
+/// The JSON-RPC error code for an inbound `message/send`/`message/stream` whose message yields no
+/// usable text (see [`extract_text`]): [`error::CONTENT_TYPE_NOT_SUPPORTED`] (`-32005`) when the
+/// message carries parts but none is text — flux accepts only text input today, so this is the
+/// honest refusal rather than running an empty turn — else `-32602` invalid params (an absent
+/// message or an empty parts array is a malformed request, not an unusable content type). Shared by
+/// both dispatch sites so the two agree on when it's which.
+pub fn no_text_error_code(params: &Value) -> i32 {
+    let has_parts = params
+        .get("message")
+        .and_then(|m| m.get("parts"))
+        .and_then(Value::as_array)
+        .is_some_and(|parts| !parts.is_empty());
+    if has_parts {
+        error::CONTENT_TYPE_NOT_SUPPORTED
+    } else {
+        -32602
     }
 }
 
@@ -167,7 +234,11 @@ async fn send(
         return rpc_err(id, -32602, "missing params");
     };
     let Some(input) = extract_text(params) else {
-        return rpc_err(id, -32602, "no text found in message parts");
+        return rpc_err(
+            id,
+            no_text_error_code(params),
+            "message has no usable text part",
+        );
     };
     // A-48: the conversation id crosses the seam, so a stateful runner can key one session per
     // `contextId` (and it is echoed on the task either way). A runner that only implements
@@ -432,6 +503,121 @@ mod tests {
         // The id and the human name are preserved independently.
         let skill = card.skills.iter().find(|s| s.id == "search").unwrap();
         assert_eq!(skill.name, "FAQ Search");
+    }
+
+    /// A-49 (failing-first): a served card carries the spec-required `protocolVersion`, a non-empty
+    /// `interfaces` whose JSON-RPC entry's url equals the card `url`, and a matching
+    /// `preferredTransport`; `supportsAuthenticatedExtendedCard` is an honest `false`. The
+    /// `rpc_endpoint()` resolver still resolves against the now-populated interfaces.
+    #[test]
+    fn card_declares_protocol_version_interface_and_preferred_transport() {
+        let url = "http://h/support/a2a";
+        let card = agent_card(
+            "support",
+            "Answer from the FAQ.",
+            Some(url.to_string()),
+            "9.9.9",
+            &[],
+            true,
+        );
+        assert_eq!(card.protocol_version, PROTOCOL_VERSION);
+        assert!(
+            !card.protocol_version.is_empty(),
+            "protocolVersion is required"
+        );
+        assert_eq!(card.preferred_transport.as_deref(), Some(TRANSPORT_JSONRPC));
+        assert_eq!(card.interfaces.len(), 1, "one declared transport interface");
+        assert_eq!(
+            card.interfaces[0].transport.as_deref(),
+            Some(TRANSPORT_JSONRPC)
+        );
+        assert_eq!(
+            card.interfaces[0].url.as_deref(),
+            Some(url),
+            "the JSON-RPC interface url equals the card url"
+        );
+        assert_eq!(card.supports_authenticated_extended_card, Some(false));
+        // The resolver still works now that the interfaces path is live (it prefers `url`).
+        assert_eq!(card.rpc_endpoint().as_deref(), Some(url));
+
+        // Serializes under the spec's camelCase keys.
+        let v = serde_json::to_value(&card).unwrap();
+        assert_eq!(v["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(v["preferredTransport"], TRANSPORT_JSONRPC);
+        assert_eq!(v["interfaces"][0]["transport"], TRANSPORT_JSONRPC);
+        assert_eq!(v["interfaces"][0]["url"], url);
+        assert_eq!(v["supportsAuthenticatedExtendedCard"], false);
+    }
+
+    /// A card built without a `url` (degenerate/never-served) declares no transport — an honest
+    /// empty state, not a `preferredTransport` pointing at nothing.
+    #[test]
+    fn card_without_url_declares_no_transport() {
+        let card = agent_card("x", "d", None, "1.0.0", &[], false);
+        assert!(card.interfaces.is_empty());
+        assert!(card.preferred_transport.is_none());
+        assert_eq!(
+            card.protocol_version, PROTOCOL_VERSION,
+            "still spec-versioned"
+        );
+    }
+
+    /// A-50 (failing-first): a defined-but-unsupported A2A method dispatches to `-32004`
+    /// UnsupportedOperation, a genuinely-unknown name keeps `-32601`, and `is_unsupported_a2a_method`
+    /// is the shared classifier both dispatch sites use (so they cannot drift).
+    #[tokio::test]
+    async fn unsupported_a2a_method_returns_unsupported_operation() {
+        let body =
+            |method: &str| json!({ "jsonrpc": "2.0", "id": 7, "method": method, "params": {} });
+        for method in [
+            "tasks/cancel",
+            "tasks/resubscribe",
+            "tasks/pushNotificationConfig/set",
+            "tasks/pushNotificationConfig/get",
+            "tasks/pushNotificationConfig/list",
+            "tasks/pushNotificationConfig/delete",
+            "agent/getAuthenticatedExtendedCard",
+        ] {
+            assert!(
+                is_unsupported_a2a_method(method),
+                "{method} must be classified"
+            );
+            let resp = dispatch(&StubRunner, None, &body(method)).await;
+            assert_eq!(
+                resp["error"]["code"],
+                error::UNSUPPORTED_OPERATION,
+                "{method} → -32004: {resp}"
+            );
+        }
+        // A genuinely-unrecognized method name is still -32601 (correct JSON-RPC).
+        assert!(!is_unsupported_a2a_method("foo/bar"));
+        let resp = dispatch(&StubRunner, None, &body("foo/bar")).await;
+        assert_eq!(resp["error"]["code"], -32601, "{resp}");
+    }
+
+    /// A-50 (failing-first): a `message/send` whose message carries a part but no text part is
+    /// refused with `-32005` ContentTypeNotSupported (rather than running an empty turn), while an
+    /// empty/absent parts array stays `-32602` invalid params.
+    #[tokio::test]
+    async fn no_usable_text_is_content_type_not_supported() {
+        let file_only = json!({
+            "jsonrpc": "2.0", "id": 8, "method": "message/send",
+            "params": { "message": { "parts": [{ "kind": "file", "file": {} }] } },
+        });
+        let resp = dispatch(&StubRunner, None, &file_only).await;
+        assert_eq!(
+            resp["error"]["code"],
+            error::CONTENT_TYPE_NOT_SUPPORTED,
+            "file-only message → -32005: {resp}"
+        );
+
+        // Empty parts is a malformed request, not an unusable content type → -32602.
+        let empty = json!({
+            "jsonrpc": "2.0", "id": 9, "method": "message/send",
+            "params": { "message": { "parts": [] } },
+        });
+        let resp = dispatch(&StubRunner, None, &empty).await;
+        assert_eq!(resp["error"]["code"], -32602, "{resp}");
     }
 
     #[test]

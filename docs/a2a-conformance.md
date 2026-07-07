@@ -24,10 +24,10 @@ half of the spec (`tasks/get` server-side, `tasks/cancel`, `tasks/resubscribe`, 
 | `message/send` | ✅ | Server + client. Synchronous; returns a `completed` Task. |
 | `message/stream` | ✅ | HTTP server + client (SSE). Client disconnect cancels the turn between plan rounds. |
 | `tasks/get` | ⚠️ | The **client** can call it; there is **no server handler** (→ `-32601`). Needs task retention. |
-| `tasks/cancel` | ❌ | No server code; needs an addressable in-flight task. |
-| `tasks/resubscribe` | ❌ | No server code; needs a retained task stream. |
-| `tasks/pushNotificationConfig/{set,get,list,delete}` | ❌ | No server code. |
-| `agent/getAuthenticatedExtendedCard` | ❌ | No extended card. |
+| `tasks/cancel` | ❌ | No server code; returns `-32004 UnsupportedOperation` (A-50). Needs an addressable in-flight task. |
+| `tasks/resubscribe` | ❌ | No server code; returns `-32004` (A-50). Needs a retained task stream. |
+| `tasks/pushNotificationConfig/{set,get,list,delete}` | ❌ | No server code; returns `-32004` (A-50). |
+| `agent/getAuthenticatedExtendedCard` | ❌ | No extended card; returns `-32004` (A-50). |
 
 Reusable `flux-a2a::server::dispatch` handles only `message/send`; `message/stream` is added by the
 `flux-server` HTTP layer.
@@ -37,9 +37,9 @@ Reusable `flux-a2a::server::dispatch` handles only `message/send`; `message/stre
 | Field | Status | Notes |
 |---|---|---|
 | `name`, `description`, `url`, `version` | ✅ | |
-| `protocolVersion` | ❌ | **Spec-required** and absent from the struct. |
-| `preferredTransport` | ❌ | Not modeled. |
-| `interfaces` (`additionalInterfaces`) | ⚠️ | Modeled (`AgentInterface`) but the server emits it **empty**, so no transport is declared. |
+| `protocolVersion` | ✅ | Emitted (A-49); single-source `flux_a2a::PROTOCOL_VERSION`. |
+| `preferredTransport` | ✅ | `JSONRPC` (A-49), keyed to the served `url`. |
+| `interfaces` (`additionalInterfaces`) | ✅ | One JSON-RPC entry advertising the served `url` (A-49); the `AgentInterface` is no longer emitted empty. |
 | `capabilities.streaming` | ✅ | |
 | `capabilities.pushNotifications` | ✅ | Advertised `false` (honest); flips true only with push support. |
 | `capabilities.stateTransitionHistory` | ❌ | Survives inbound via passthrough; never emitted. |
@@ -47,8 +47,8 @@ Reusable `flux-a2a::server::dispatch` handles only `message/send`; `message/stre
 | `defaultInputModes`, `defaultOutputModes` | ✅ | `text/plain`. |
 | `skills` | ✅ | |
 | `securitySchemes`, `security` | ✅ | Advertised whenever auth is enabled (v0.4.0). |
-| `provider`, `documentationUrl`, `iconUrl` | ❌ | Optional; not modeled. |
-| `supportsAuthenticatedExtendedCard` | ❌ | Not modeled. |
+| `provider`, `documentationUrl`, `iconUrl` | ✅ | Modeled + emitted when the served agent's `CardInfo` sets them (A-49); the default card sets none, so the keys stay omitted. |
+| `supportsAuthenticatedExtendedCard` | ✅ | Emitted `false` (A-49; honest — no extended-card method yet). |
 | `signatures` | 🚫 | Card signing — out of scope for now. |
 
 ## Task lifecycle
@@ -72,8 +72,8 @@ Reusable `flux-a2a::server::dispatch` handles only `message/send`; `message/stre
 | `Message.taskId` | ⚠️ | Parsed; ignored. |
 | `Message.referenceTaskIds`, `metadata`, `extensions` | ❌ | Not modeled on `Message`. |
 | Part: `text` | ✅ | |
-| Part: `data` | ⚠️ | Emittable via the rich-output seam; **ignored on input**. |
-| Part: `file` | ⚠️ | Round-trips via passthrough; never produced, ignored on input. |
+| Part: `data` | ⚠️ | Emittable via the rich-output seam; on input a message with no text part is refused with `-32005` (A-50), not silently dropped. |
+| Part: `file` | ⚠️ | Round-trips via passthrough; never produced. On input a text-less message is refused with `-32005` (A-50); *accepting* file/data input is A-51. |
 
 ## Streaming events
 
@@ -97,7 +97,9 @@ Reusable `flux-a2a::server::dispatch` handles only `message/send`; `message/stre
 |---|---|---|
 | `-32600` / `-32601` / `-32602` / `-32603` | ✅ | Emitted. |
 | `-32700` Parse error | ⚠️ | Malformed JSON is rejected by the HTTP JSON extractor, not as an A2A-coded body. |
-| `-32001..-32007` (A2A-specific) | ❌ | None emitted. A-50 lands `-32004`/`-32005`; the task-method codes arrive with A-53. |
+| `-32004` UnsupportedOperation | ✅ | Emitted (A-50) for a defined-but-unsupported method; a genuinely-unknown name keeps `-32601`. |
+| `-32005` ContentTypeNotSupported | ✅ | Emitted (A-50) when an inbound message carries parts but no usable text part. |
+| `-32001` / `-32002` / `-32003` / `-32006` / `-32007` | ❌ | Constants defined (`flux_a2a::error`); the task-lifecycle codes await the retained-task model (A-53). |
 
 ## Push notifications & extensions
 
@@ -120,8 +122,8 @@ Tracked under the [`a2a-conformance`](designs/a2a-conformance.md) epic:
 
 | Tier | Story | Closes |
 |---|---|---|
-| 1 (ready) | [A-49](stories/A-49-agent-card-conformance-fields.md) | `protocolVersion`, `preferredTransport`, populated `interfaces`, `provider`/`documentationUrl`/`iconUrl`, `supportsAuthenticatedExtendedCard` |
-| 1 (ready) | [A-50](stories/A-50-a2a-error-codes.md) | A2A error codes: `-32004` for unsupported methods, `-32005` for unusable content |
+| 1 (✅ shipped) | [A-49](stories/A-49-agent-card-conformance-fields.md) | `protocolVersion`, `preferredTransport`, populated `interfaces`, `provider`/`documentationUrl`/`iconUrl`, `supportsAuthenticatedExtendedCard` |
+| 1 (✅ shipped) | [A-50](stories/A-50-a2a-error-codes.md) | A2A error codes: `-32004` for unsupported methods, `-32005` for unusable content |
 | 2 (backlog) | [A-51](stories/A-51-inbound-multimodal-parts.md) | Inbound `file`/`data` parts (accept or refuse cleanly) |
 | 2 (backlog) | [A-52](stories/A-52-outbound-task-fidelity.md) | `Task.history` + `historyLength`, artifact emission |
 | 3 (design-first) | [A-53](stories/A-53-stateful-a2a-task-model.md) | The stateful task model: `tasks/get` server-side, `cancel`, `resubscribe`, non-blocking send, `input-required`, push |

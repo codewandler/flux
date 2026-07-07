@@ -6,6 +6,26 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **A-49** — A2A AgentCard conformance fields. The discovery card now emits the spec-required
+  `protocolVersion` (single-source `flux_a2a::PROTOCOL_VERSION`), declares the JSON-RPC transport it
+  actually serves (`preferredTransport: "JSONRPC"` plus one `interfaces` entry keyed to the card
+  `url`, instead of an empty `interfaces`), advertises `supportsAuthenticatedExtendedCard: false`
+  (honest — no extended-card method yet), and carries optional `provider` / `documentationUrl` /
+  `iconUrl` when the served agent configures them. Additive: the new fields serialize only when set,
+  so a card that configures none stays byte-stable.
+- **A-50** — A2A-specific JSON-RPC error codes (the `-32001..-32007` binding set, as named constants
+  in `flux_a2a::error`). A defined-but-unsupported A2A method (`tasks/cancel`, `tasks/resubscribe`,
+  `tasks/pushNotificationConfig/*`, `agent/getAuthenticatedExtendedCard`) now returns
+  `-32004 UnsupportedOperation` rather than a generic `-32601`, while a genuinely-unknown method name
+  keeps `-32601`; an inbound message that carries parts but no usable text part returns
+  `-32005 ContentTypeNotSupported` instead of silently running an empty turn. One shared classifier
+  governs every dispatch site (the reusable dispatcher and both HTTP handlers) so the codes cannot
+  drift between them.
+
+The A2A conformance epic, Tier 1 (`a2a-conformance`). Docs: `docs/a2a-conformance.md`.
+
 ## [0.4.1] - 2026-07-07
 
 **Postgres storage backend (opt-in): a shared, durable, multi-writer-safe home for the two

@@ -282,6 +282,12 @@ pub struct CardInfo {
     pub description: String,
     /// Advertised skills as `(id, name, description)` tuples.
     pub skills: Vec<(String, String, String)>,
+    /// Optional provider/organization advertised on the card (A2A `provider`). `None` → omitted.
+    pub provider: Option<flux_a2a::AgentProvider>,
+    /// Optional documentation URL advertised on the card (A2A `documentationUrl`). `None` → omitted.
+    pub documentation_url: Option<String>,
+    /// Optional icon URL advertised on the card (A2A `iconUrl`). `None` → omitted.
+    pub icon_url: Option<String>,
 }
 
 impl CardInfo {
@@ -301,6 +307,9 @@ impl CardInfo {
                  agent plans, executes, and verifies — then reports back."
                     .to_string(),
             )],
+            provider: None,
+            documentation_url: None,
+            icon_url: None,
         }
     }
 
@@ -312,7 +321,29 @@ impl CardInfo {
             skills: vec![("agent".to_string(), name.clone(), description.clone())],
             name,
             description,
+            provider: None,
+            documentation_url: None,
+            icon_url: None,
         }
+    }
+
+    /// Advertise a provider/organization on the card (builder-style). See [`provider`](Self::provider).
+    pub fn with_provider(mut self, provider: flux_a2a::AgentProvider) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
+    /// Advertise a documentation URL on the card (builder-style). See
+    /// [`documentation_url`](Self::documentation_url).
+    pub fn with_documentation_url(mut self, url: impl Into<String>) -> Self {
+        self.documentation_url = Some(url.into());
+        self
+    }
+
+    /// Advertise an icon URL on the card (builder-style). See [`icon_url`](Self::icon_url).
+    pub fn with_icon_url(mut self, url: impl Into<String>) -> Self {
+        self.icon_url = Some(url.into());
+        self
     }
 }
 

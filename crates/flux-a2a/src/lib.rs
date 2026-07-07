@@ -16,16 +16,17 @@
 //!   (axum in `flux-server` or another downstream HTTP host) provides the route + state and calls these.
 
 mod client;
+pub mod error;
 pub mod server;
 pub mod types;
 
 pub use client::{A2aClient, A2aError, EventStream, Result};
 pub use types::new_id;
 pub use types::{
-    AgentCard, AgentInterface, Artifact, Capabilities, JsonRpcError, JsonRpcRequest,
+    AgentCard, AgentInterface, AgentProvider, Artifact, Capabilities, JsonRpcError, JsonRpcRequest,
     JsonRpcResponse, Message, Part, Role, SendConfiguration, SendMessageParams, SendOutcome, Skill,
     StreamEvent, Task, TaskArtifactUpdateEvent, TaskGetParams, TaskState, TaskStatus,
-    TaskStatusUpdateEvent,
+    TaskStatusUpdateEvent, PROTOCOL_VERSION,
 };
 
 #[cfg(test)]

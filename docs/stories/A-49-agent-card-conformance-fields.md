@@ -2,8 +2,7 @@
 id: A-49
 title: AgentCard conformance fields — protocolVersion, honest interfaces/preferredTransport, optional metadata
 pillar: Agent
-status: ready
-priority: 3
+status: done
 epic: a2a-conformance
 design: docs/designs/a2a-conformance.md
 note: "Tier-1 quick-win: the card omits protocolVersion (spec-required) and emits interfaces: [] though it serves a JSON-RPC endpoint"
@@ -44,7 +43,18 @@ card-shape only.
 - [ ] Docs: the AgentCard row(s) in the support matrix flip to ✅.
 
 ## Progress
-- (not started)
+- 2026-07-07 done. `AgentCard` gained `protocol_version` (always emitted; single-source
+  `flux_a2a::PROTOCOL_VERSION`), `preferred_transport`, `provider` (new `AgentProvider` type),
+  `documentation_url`, `icon_url`, `supports_authenticated_extended_card` — all `skip_serializing_if`
+  except the required `protocolVersion`. `server::agent_card` populates `protocolVersion`, one
+  `interfaces` entry `{ transport: "JSONRPC", url }` keyed to the card url, `preferredTransport:
+  "JSONRPC"`, and `supportsAuthenticatedExtendedCard: false`; a url-less card declares no transport
+  (honest empty state). `CardInfo` gained optional `provider`/`documentation_url`/`icon_url` (+
+  builder setters) that `build_agent_card` threads through when set. `rpc_endpoint()` still resolves
+  (prefers `url`). Tests: `flux-a2a` unit (`card_declares_protocol_version_interface_and_preferred_transport`,
+  `card_without_url_declares_no_transport`) + `flux-server` integration (`served_card_is_conformant`,
+  `optional_card_metadata_is_emitted_when_set`). Full workspace gate green. Support matrix + website
+  copy flipped to ✅.
 
 ## Notes
 - Additive/non-breaking: new fields serialize only when present; `protocolVersion` is the one always-on

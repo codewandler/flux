@@ -41,7 +41,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use flux_a2a::server;
+use flux_a2a::{error, server};
 use flux_a2a::{AgentCard, Message, Task, TaskState, TaskStatus};
 use flux_flow::AgentSink;
 
@@ -216,6 +216,17 @@ pub(crate) fn build_agent_card(
         &card.skills,
         true,
     );
+    // Optional discovery metadata (A-49): emitted only when the served agent's `CardInfo` carries
+    // it, so a card that sets none stays byte-stable.
+    if let Some(provider) = &card.provider {
+        out = out.with_provider(provider.clone());
+    }
+    if let Some(doc) = &card.documentation_url {
+        out = out.with_documentation_url(doc.clone());
+    }
+    if let Some(icon) = &card.icon_url {
+        out = out.with_icon_url(icon.clone());
+    }
     if !matches!(auth, crate::ServerAuth::Open) {
         out = out
             .with_security_schemes(std::collections::BTreeMap::from([(
@@ -288,9 +299,15 @@ pub async fn a2a_handler_multi(
             .await
             {
                 Ok(sse) => sse.into_response(),
-                Err(msg) => rpc_err(req.id, -32602, msg).into_response(),
+                Err((code, msg)) => rpc_err(req.id, code, msg).into_response(),
             }
         }
+        m if server::is_unsupported_a2a_method(m) => rpc_err(
+            req.id,
+            error::UNSUPPORTED_OPERATION,
+            format!("Unsupported operation: {m}"),
+        )
+        .into_response(),
         m => rpc_err(req.id, -32601, format!("Method not found: {m}")).into_response(),
     }
 }
@@ -369,10 +386,17 @@ pub async fn a2a_handler(
             .await
             {
                 Ok(sse) => sse.into_response(),
-                // Format pre-SSE errors as JSON-RPC so the `id` is not silently dropped.
-                Err(msg) => rpc_err(req.id, -32602, msg).into_response(),
+                // Format pre-SSE errors as JSON-RPC so the `id` is not silently dropped; `subscribe`
+                // carries the A2A-specific code (e.g. `-32005` for an unusable content type).
+                Err((code, msg)) => rpc_err(req.id, code, msg).into_response(),
             }
         }
+        m if server::is_unsupported_a2a_method(m) => rpc_err(
+            req.id,
+            error::UNSUPPORTED_OPERATION,
+            format!("Unsupported operation: {m}"),
+        )
+        .into_response(),
         m => rpc_err(req.id, -32601, format!("Method not found: {m}")).into_response(),
     }
 }
@@ -394,7 +418,13 @@ async fn send(
     };
     let input = match server::extract_text(&params) {
         Some(t) => t,
-        None => return rpc_err(id, -32602, "No text found in message parts"),
+        None => {
+            return rpc_err(
+                id,
+                server::no_text_error_code(&params),
+                "Message has no usable text part",
+            )
+        }
     };
     let requested_context = server::extract_context_id(&params);
     // Acquire the gate BEFORE minting (C-29) — see `create_a2a_session`'s doc for why. The
@@ -441,14 +471,21 @@ async fn subscribe(
     ctx: Option<flux_auth::request::AuthContext>,
     id: Option<Value>,
     params: Option<Value>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, String> {
-    let params = params.ok_or_else(|| "Missing params".to_string())?;
-    let input =
-        server::extract_text(&params).ok_or_else(|| "No text in message parts".to_string())?;
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (i32, String)> {
+    let params = params.ok_or((-32602, "Missing params".to_string()))?;
+    let input = match server::extract_text(&params) {
+        Some(t) => t,
+        None => {
+            return Err((
+                server::no_text_error_code(&params),
+                "Message has no usable text part".to_string(),
+            ))
+        }
+    };
     let requested_context = server::extract_context_id(&params);
     // Fail closed before the SSE response is established (unreachable behind `require_auth`).
     if matches!(auth.as_ref(), crate::ServerAuth::Principal(_)) && ctx.is_none() {
-        return Err(crate::UNAUTHORIZED_BODY.to_string());
+        return Err((-32603, crate::UNAUTHORIZED_BODY.to_string()));
     }
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();

@@ -2,8 +2,7 @@
 id: A-50
 title: A2A-specific JSON-RPC error codes — UnsupportedOperation / ContentTypeNotSupported (and the -32001..-32007 set)
 pillar: Agent
-status: ready
-priority: 4
+status: done
 epic: a2a-conformance
 design: docs/designs/a2a-conformance.md
 note: "Tier-1 quick-win: unsupported A2A methods return generic -32601 and non-text input is silently dropped; the A2A binding defines dedicated codes"
@@ -47,7 +46,18 @@ use this content type" from a blanket method-not-found / silent success.
 - [ ] Docs: the error-code table in the support matrix reflects the newly-emitted codes.
 
 ## Progress
-- (not started)
+- 2026-07-07 done. Added the `-32001..-32007` constants as a new `flux_a2a::error` module (doc
+  comments distinguish the two flux emits today from the task-lifecycle codes reserved for A-53). Two
+  shared classifiers in `flux_a2a::server` are the anti-drift mechanism: `is_unsupported_a2a_method`
+  (matches `tasks/cancel`, `tasks/resubscribe`, `tasks/pushNotificationConfig/{set,get,list,delete}`,
+  `agent/getAuthenticatedExtendedCard` — `tasks/get` deliberately excluded, its correct code is
+  task-retention-dependent) → `-32004`; and `no_text_error_code` → `-32005` when a message carries
+  parts but no text, else `-32602` (empty/absent parts stays invalid-params, preserving the existing
+  test). Wired into all three dispatch sites: `flux_a2a::server::dispatch` + the two `flux-server`
+  HTTP handlers (`a2a_handler`, `a2a_handler_multi`); `subscribe`'s error type became `(i32, String)`
+  so streaming carries the A2A code too. Tests cover both dispatch sites (`flux-a2a` unit +
+  `flux-server` `error_codes_on_the_single_agent_dispatcher` / `unsupported_method_on_the_multi_agent_dispatcher`).
+  Full workspace gate green.
 
 ## Notes
 - Numeric codes are from the A2A JSON-RPC binding (stable; used by the a2a-python / a2a-js SDKs); the

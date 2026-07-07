@@ -1,6 +1,6 @@
 # A2A protocol conformance (epic)
 
-**Status:** proposed (2026-07-07) · **Pillar:** Agent · **Epic slug:** `a2a-conformance`
+**Status:** Tier 1 shipped (2026-07-07); Tiers 2–3 backlog · **Pillar:** Agent · **Epic slug:** `a2a-conformance`
 
 Tracks the gap between the [A2A protocol](https://a2a-protocol.org/) (v1.0) and flux's
 implementation, and sequences the work to close it. The living support matrix lives in
@@ -30,31 +30,35 @@ current model* (Tiers 1–2) and *a deliberate model change* (Tier 3).
 ## Gap analysis (condensed; full matrix + file:line evidence in the support doc)
 
 - **Methods** — `message/send` ✅, `message/stream` ✅, `tasks/get` client-only ⚠️. `tasks/cancel`,
-  `tasks/resubscribe`, `tasks/pushNotificationConfig/*`, `agent/getAuthenticatedExtendedCard` ❌ (all
-  fall through to `-32601`).
-- **AgentCard** — missing `protocolVersion` (spec-required), `preferredTransport`, populated
-  `interfaces` (emitted empty), and the optional `provider`/`documentationUrl`/`iconUrl`/
-  `supportsAuthenticatedExtendedCard`.
+  `tasks/resubscribe`, `tasks/pushNotificationConfig/*`, `agent/getAuthenticatedExtendedCard` ❌
+  (unimplemented, but now answered `-32004 UnsupportedOperation` rather than generic `-32601` — A-50).
+- **AgentCard** — ✅ closed by A-49: `protocolVersion`, `preferredTransport`, a populated `interfaces`
+  entry, the optional `provider`/`documentationUrl`/`iconUrl`, and `supportsAuthenticatedExtendedCard: false`.
 - **Fidelity** — `Task.history`/`artifacts`, `TaskArtifactUpdateEvent`, file/data `Part`s,
   `Message.taskId`/`referenceTaskIds`, and non-terminal `TaskState`s are *modeled and
-  client-decodable but never produced* by the server.
-- **Error codes** — only base JSON-RPC `-32600/-32601/-32602/-32603`; none of A2A's `-32001..-32007`.
+  client-decodable but never produced* by the server. (Text-less inbound messages are now refused
+  with `-32005` — A-50 — rather than silently run empty; *accepting* file/data input is A-51.)
+- **Error codes** — base JSON-RPC `-32600/-32601/-32602/-32603` ✅; A2A `-32004`/`-32005` ✅ (A-50);
+  the task-lifecycle codes `-32001/-32002/-32003/-32006/-32007` are defined but await A-53.
 - **Transports** — JSON-RPC/HTTP only.
 - **Solid** — realm-keyed `contextId` continuity (A-48), security-scheme advertisement + external-URL
   card (v0.4.0), SSE streaming with disconnect-cancels-turn.
 
 ## Tiers
 
-### Tier 1 — conformance quick-wins (`ready`)
+### Tier 1 — conformance quick-wins (✅ shipped)
 
 Cheap, high interop value, no architecture change.
 
-- **[A-49](../stories/A-49-agent-card-conformance-fields.md)** — AgentCard conformance fields:
-  `protocolVersion`, honest `interfaces` + `preferredTransport` (declare the JSON-RPC interface we
-  actually serve), optional `provider`/`documentationUrl`/`iconUrl`, `supportsAuthenticatedExtendedCard: false`.
-- **[A-50](../stories/A-50-a2a-error-codes.md)** — A2A-specific JSON-RPC error codes: the
-  `-32001..-32007` constants; `-32004 UnsupportedOperation` for defined-but-unsupported methods
-  (instead of generic `-32601`); `-32005 ContentTypeNotSupported` when no usable text part is present.
+- **[A-49](../stories/A-49-agent-card-conformance-fields.md)** ✅ — AgentCard conformance fields:
+  `protocolVersion` (single-source `flux_a2a::PROTOCOL_VERSION`), honest `interfaces` +
+  `preferredTransport` (the JSON-RPC interface we actually serve, keyed to `url`), optional
+  `provider`/`documentationUrl`/`iconUrl` (emitted from `CardInfo` when set), and
+  `supportsAuthenticatedExtendedCard: false`.
+- **[A-50](../stories/A-50-a2a-error-codes.md)** ✅ — A2A-specific JSON-RPC error codes: the
+  `-32001..-32007` constants (`flux_a2a::error`); `-32004 UnsupportedOperation` for
+  defined-but-unsupported methods (instead of generic `-32601`) via one shared classifier both
+  dispatch sites use; `-32005 ContentTypeNotSupported` when a message has no usable text part.
 
 ### Tier 2 — I/O fidelity (`backlog`)
 

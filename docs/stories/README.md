@@ -27,10 +27,6 @@ _None._
 ## Next (ready — take the top one unless the user named a story)
 - [D-62 — Async paged live-backend datasource seam](D-62-async-live-datasource-seam.md) · Agent · design-first (2026-07-06 downstream-consumer review): flux's DatasourceBackend is sync + index-shaped — wrong for live paginated APIs; the reviewed consumer built its own paged list/get tool projection
 
-### A2A protocol conformance (epic)
-- [A-49 — AgentCard conformance fields — protocolVersion, honest interfaces/preferredTransport, optional metadata](A-49-agent-card-conformance-fields.md) · Agent · Tier-1 quick-win: the card omits protocolVersion (spec-required) and emits interfaces: [] though it serves a JSON-RPC endpoint
-- [A-50 — A2A-specific JSON-RPC error codes — UnsupportedOperation / ContentTypeNotSupported (and the -32001..-32007 set)](A-50-a2a-error-codes.md) · Agent · Tier-1 quick-win: unsupported A2A methods return generic -32601 and non-text input is silently dropped; the A2A binding defines dedicated codes
-
 ## Blocked
 _None._
 
@@ -98,6 +94,8 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [A-45 — Hermetic replay engine + `flux replay` — re-execute a past run, offline, model-free](A-45-hermetic-replay-engine.md) · Agent · Time Machine Phase 1 SHIPPED 2026-07-07 — `flux replay <session|last>` re-executes any recorded run offline (plans from plan_source, ops from tape, ~400µs vs 78ms live in the smoke); divergence = loud exit 1
 - [A-46 — Fork-at-node + `flux fork` — branch a run at any decision and explore a different path](A-46-fork-at-node.md) · Agent · Time Machine Phase 2 SHIPPED 2026-07-07 — `flux fork <s> --at N` with inject/edit/replan; boundary = the Replay→Record scope swap, so forks are first-class replayable/diffable sessions; envelope-on-tail pinned by a deny-approver test
 - [A-48 — A2A stateful mode — one session per contextId, and a conversation-carrying A2aTurn seam](A-48-a2a-session-continuity.md) · Agent · SHIPPED 2026-07-07 (same day as the live downstream report): flux-server reuses one session per contextId (memory with no client change) + additive A2aTurn::run_in_context seam so downstream mounts can key their own continuity
+- [A-49 — AgentCard conformance fields — protocolVersion, honest interfaces/preferredTransport, optional metadata](A-49-agent-card-conformance-fields.md) · Agent · Tier-1 quick-win: the card omits protocolVersion (spec-required) and emits interfaces: [] though it serves a JSON-RPC endpoint
+- [A-50 — A2A-specific JSON-RPC error codes — UnsupportedOperation / ContentTypeNotSupported (and the -32001..-32007 set)](A-50-a2a-error-codes.md) · Agent · Tier-1 quick-win: unsupported A2A methods return generic -32601 and non-text input is silently dropped; the A2A binding defines dedicated codes
 - [C-01 — Crate consolidation, phases 2–4](C-01-crate-consolidation.md) · Core · hooks→plugin, browser+datasource→capabilities, context→runtime; removed dead integrations (35 → 31 crates)
 - [C-02 — Integration-stack hardening — embeddings backend, plugin install/call + CI, live smoke](C-02-integration-stack-hardening.md) · Core · `flux plugin call`/`install` + a `plugins/` CI job (`a8092dc`); feature-gated embeddings/semantic backend — `OpenAiEmbedder` + a `SemanticIndex` hybrid-rerank decorator, default build unchanged (`f912c24`); a live env-gated `scripts/smoke-plugins.sh` (`5fda8be`)
 - [C-03 — Codex provider hardening — account-id, usage tiers, reasoning continuity](C-03-codex-provider-hardening.md) · Core · `account_id` from the `id_token` JWT, cache+reasoning token capture, reasoning continuity under `store:false`

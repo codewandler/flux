@@ -26,10 +26,10 @@ non-blocking send, push notifications) are Not-yet.
 | `message/send` | ✅ | Synchronous; returns a `completed` Task. |
 | `message/stream` | ✅ | Server-Sent Events. Disconnecting cancels the remote turn. |
 | `tasks/get` | ⚠️ | flux's **client** can call it against remote agents; flux's **server** does not implement it. |
-| `tasks/cancel` | ❌ | Cancel a streaming turn by dropping the SSE connection instead. |
-| `tasks/resubscribe` | ❌ | |
-| `tasks/pushNotificationConfig/{set,get,list,delete}` | ❌ | |
-| `agent/getAuthenticatedExtendedCard` | ❌ | |
+| `tasks/cancel` | ❌ | Returns `-32004 UnsupportedOperation`. Cancel a streaming turn by dropping the SSE connection instead. |
+| `tasks/resubscribe` | ❌ | Returns `-32004 UnsupportedOperation`. |
+| `tasks/pushNotificationConfig/{set,get,list,delete}` | ❌ | Returns `-32004 UnsupportedOperation`. |
+| `agent/getAuthenticatedExtendedCard` | ❌ | Returns `-32004 UnsupportedOperation`. |
 
 ## AgentCard
 
@@ -41,9 +41,10 @@ non-blocking send, push notifications) are Not-yet.
 | `defaultInputModes`, `defaultOutputModes` | ✅ | `text/plain`. |
 | `skills` | ✅ | |
 | `securitySchemes`, `security` | ✅ | Declared whenever the server enforces auth. |
-| `protocolVersion` | ❌ | Planned. |
-| `preferredTransport`, `interfaces` | ⚠️ | JSON-RPC is served at `url`; a dedicated interface entry is planned. |
-| `provider`, `documentationUrl`, `iconUrl`, `supportsAuthenticatedExtendedCard` | ❌ | Planned (optional metadata). |
+| `protocolVersion` | ✅ | Emitted (spec-required). |
+| `preferredTransport`, `interfaces` | ✅ | The card declares its JSON-RPC interface (`preferredTransport: "JSONRPC"` + one `interfaces` entry at `url`). |
+| `provider`, `documentationUrl`, `iconUrl` | ✅ | Optional; emitted when configured for the served agent, otherwise omitted. |
+| `supportsAuthenticatedExtendedCard` | ✅ | Emitted `false` (no extended-card method yet). |
 | `signatures` | 🚫 | Card signing is out of scope. |
 
 ## Tasks, messages & streaming
@@ -56,7 +57,7 @@ non-blocking send, push notifications) are Not-yet.
 | `Message` (`messageId`, `role`, `parts`, `contextId`) | ✅ | `contextId` drives continuity. |
 | `Message.taskId` / `referenceTaskIds` | ⚠️/❌ | Not used for task addressing yet. |
 | Part: `text` | ✅ | |
-| Part: `file` / `data` (inbound) | ⚠️ | Currently ignored on input — send text. |
+| Part: `file` / `data` (inbound) | ⚠️ | A message with no text part is refused with `-32005 ContentTypeNotSupported` (rather than run empty) — send text. Accepting file/data input is planned. |
 | `TaskStatusUpdateEvent` (streaming) | ✅ | Incremental `working` deltas + a final event. |
 | `TaskArtifactUpdateEvent` (streaming) | ⚠️ | Decoded by the client; not emitted by the server. |
 
@@ -67,14 +68,15 @@ non-blocking send, push notifications) are Not-yet.
 | JSON-RPC 2.0 over HTTP | ✅ | The transport flux serves and speaks. |
 | gRPC, HTTP+JSON/REST bindings | 🚫 | Non-goals. |
 | Base JSON-RPC errors (`-32600`/`-32601`/`-32602`/`-32603`) | ✅ | |
-| A2A-specific errors (`-32001..-32007`) | ❌ | Unsupported methods currently return `-32601`; dedicated codes are planned. |
+| A2A errors `-32004` UnsupportedOperation, `-32005` ContentTypeNotSupported | ✅ | Emitted for defined-but-unsupported methods and text-less messages; a genuinely-unknown method still returns `-32601`. |
+| Task-lifecycle errors (`-32001`/`-32002`/`-32003`/`-32006`/`-32007`) | ❌ | Await the stateful task model. |
 
 ## What's next
 
-Conformance work is tracked as an epic: near-term, the card gains `protocolVersion` and honest
-transport interfaces and the server returns A2A-specific error codes; further out, structured
-artifacts and full task history; and, as a larger effort, a stateful task model that unlocks
-`tasks/get`, cancellation, resubscription, non-blocking sends, and push notifications.
+Conformance work is tracked as an epic. The card now declares `protocolVersion`, its transport
+interface, and A2A-specific error codes; further out are structured artifacts and full task history;
+and, as a larger effort, a stateful task model that unlocks `tasks/get`, cancellation, resubscription,
+non-blocking sends, and push notifications.
 
 **Non-goals:** gRPC and A2A REST transport bindings, an extensions-negotiation framework, and
 `tasks/list`. flux keeps to a single JSON-RPC/HTTP binding and a tolerant pass-through for unknown
