@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-07-08
+
 **A2A protocol conformance, Tier 2 — I/O fidelity within the synchronous-turn model** (the
 `a2a-conformance` epic). Inbound `data` parts now drive a real turn, inbound `file` parts are refused
 cleanly, and a returned `Task` carries conversation `history` and (for runners with structured output)
