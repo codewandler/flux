@@ -86,6 +86,29 @@ impl Part {
             None
         }
     }
+
+    /// The structured payload if this is a `data` part (the spec's `data` field), else `None` —
+    /// the first-class accessor for inbound/outbound structured parts that otherwise live only in
+    /// [`Part::extra`] (A-51).
+    pub fn as_data(&self) -> Option<&Value> {
+        if self.kind == "data" {
+            self.extra.get("data")
+        } else {
+            None
+        }
+    }
+
+    /// The `file` descriptor if this is a `file` part (the spec's `file` object: `{ uri | bytes,
+    /// mimeType, name }`), else `None`. flux's text turn cannot consume file bytes, so inbound
+    /// file parts are refused rather than surfaced (A-51) — this accessor is for clients decoding
+    /// a peer agent's file output.
+    pub fn as_file(&self) -> Option<&Value> {
+        if self.kind == "file" {
+            self.extra.get("file")
+        } else {
+            None
+        }
+    }
 }
 
 /// An A2A message: a turn of conversation carrying ordered [`Part`]s.
@@ -607,6 +630,11 @@ pub struct SendMessageParams {
 #[serde(rename_all = "camelCase")]
 pub struct SendConfiguration {
     pub blocking: bool,
+    /// The maximum number of most-recent conversation messages the server should include in the
+    /// returned `Task.history` (A2A `historyLength`, A-52). Absent → the server's default (all
+    /// retained history). Serialized only when set, so a config that omits it stays byte-stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_length: Option<u32>,
 }
 
 /// `params` for `tasks/get`.

@@ -39,7 +39,10 @@ mod tests {
         let msg = Message::user_text("hello flux", Some("ctx-1".to_string()));
         let params = SendMessageParams {
             message: msg,
-            configuration: Some(SendConfiguration { blocking: true }),
+            configuration: Some(SendConfiguration {
+                blocking: true,
+                ..Default::default()
+            }),
         };
         let v = serde_json::to_value(&params).unwrap();
         // Message is nested under `message`; parts carry a `kind` discriminator; config blocking.

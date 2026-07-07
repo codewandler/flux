@@ -181,7 +181,10 @@ impl A2aClient {
     pub async fn send(&self, message: Message, blocking: bool) -> Result<SendOutcome> {
         let params = SendMessageParams {
             message,
-            configuration: Some(SendConfiguration { blocking }),
+            configuration: Some(SendConfiguration {
+                blocking,
+                ..Default::default()
+            }),
         };
         let v: Value = self.rpc("message/send", params).await?;
         SendOutcome::from_value(v).map_err(|e| A2aError::Decode(e.to_string()))

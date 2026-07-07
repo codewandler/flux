@@ -60,8 +60,8 @@ Reusable `flux-a2a::server::dispatch` handles only `message/send`; `message/stre
 | `TaskState`: `unknown` | ✅ | Serde catch-all. |
 | `TaskState`: `submitted`, `rejected` | ⚠️ | Defined; never emitted (synchronous model). |
 | `TaskState`: `input-required`, `auth-required`, `canceled` | ❌ | Need suspension / cancellation (A-53). |
-| `Task.history` | ⚠️ | Modeled + client-read; server never populates. |
-| `Task.artifacts` | ⚠️ | Modeled + client-read; server never populates. |
+| `Task.history` | ✅ | Populated from the conversation projection, capped to `configuration.historyLength` (A-52). |
+| `Task.artifacts` | ✅ | Emitted for a runner's structured (non-text) reply parts via the `A2aTurn` rich-output seam (A-52); the built-in text agent produces none, so its tasks stay `[]`. |
 
 ## Message & Parts
 
@@ -72,8 +72,8 @@ Reusable `flux-a2a::server::dispatch` handles only `message/send`; `message/stre
 | `Message.taskId` | ⚠️ | Parsed; ignored. |
 | `Message.referenceTaskIds`, `metadata`, `extensions` | ❌ | Not modeled on `Message`. |
 | Part: `text` | ✅ | |
-| Part: `data` | ⚠️ | Emittable via the rich-output seam; on input a message with no text part is refused with `-32005` (A-50), not silently dropped. |
-| Part: `file` | ⚠️ | Round-trips via passthrough; never produced. On input a text-less message is refused with `-32005` (A-50); *accepting* file/data input is A-51. |
+| Part: `data` | ✅ | Inbound: surfaced into the turn input as structured JSON, so a data-only message runs a real turn (A-51). Outbound: a runner's structured parts become `Task.artifacts` (A-52). |
+| Part: `file` | ⚠️ | Inbound `file` parts are refused with `-32005` (A-51 scope decision — flux's text turn can't consume file bytes), never silently dropped; still never produced outbound. |
 
 ## Streaming events
 
@@ -81,7 +81,7 @@ Reusable `flux-a2a::server::dispatch` handles only `message/send`; `message/stre
 |---|---|---|
 | `TaskStatusUpdateEvent` | ✅ | Emitted (initial `working`, per-delta, final) + decoded. |
 | `Task` / `Message` as stream result | ✅ | Client-decodable. |
-| `TaskArtifactUpdateEvent` | ⚠️ | Client-decode only; server never emits. |
+| `TaskArtifactUpdateEvent` | ⚠️ | Frame shaping added (`flux_a2a::server::artifact_update_value`, A-52) for a streaming surface with structured outputs; flux's built-in text agent produces none, so it emits none. |
 
 ## Transports
 
@@ -98,7 +98,7 @@ Reusable `flux-a2a::server::dispatch` handles only `message/send`; `message/stre
 | `-32600` / `-32601` / `-32602` / `-32603` | ✅ | Emitted. |
 | `-32700` Parse error | ⚠️ | Malformed JSON is rejected by the HTTP JSON extractor, not as an A2A-coded body. |
 | `-32004` UnsupportedOperation | ✅ | Emitted (A-50) for a defined-but-unsupported method; a genuinely-unknown name keeps `-32601`. |
-| `-32005` ContentTypeNotSupported | ✅ | Emitted (A-50) when an inbound message carries parts but no usable text part. |
+| `-32005` ContentTypeNotSupported | ✅ | Emitted when an inbound message carries a `file` part (A-51) or otherwise has parts but no usable text/data part (A-50). |
 | `-32001` / `-32002` / `-32003` / `-32006` / `-32007` | ❌ | Constants defined (`flux_a2a::error`); the task-lifecycle codes await the retained-task model (A-53). |
 
 ## Push notifications & extensions
@@ -124,8 +124,8 @@ Tracked under the [`a2a-conformance`](designs/a2a-conformance.md) epic:
 |---|---|---|
 | 1 (✅ shipped) | [A-49](stories/A-49-agent-card-conformance-fields.md) | `protocolVersion`, `preferredTransport`, populated `interfaces`, `provider`/`documentationUrl`/`iconUrl`, `supportsAuthenticatedExtendedCard` |
 | 1 (✅ shipped) | [A-50](stories/A-50-a2a-error-codes.md) | A2A error codes: `-32004` for unsupported methods, `-32005` for unusable content |
-| 2 (backlog) | [A-51](stories/A-51-inbound-multimodal-parts.md) | Inbound `file`/`data` parts (accept or refuse cleanly) |
-| 2 (backlog) | [A-52](stories/A-52-outbound-task-fidelity.md) | `Task.history` + `historyLength`, artifact emission |
+| 2 (✅ shipped) | [A-51](stories/A-51-inbound-multimodal-parts.md) | Inbound `data` parts surfaced into the turn; `file` parts refused with `-32005` |
+| 2 (✅ shipped) | [A-52](stories/A-52-outbound-task-fidelity.md) | `Task.history` + `historyLength`; artifacts from a runner's structured outputs |
 | 3 (design-first) | [A-53](stories/A-53-stateful-a2a-task-model.md) | The stateful task model: `tasks/get` server-side, `cancel`, `resubscribe`, non-blocking send, `input-required`, push |
 
 **Non-goals** (documented, not filed): gRPC + A2A REST bindings, extensions-negotiation framework,

@@ -6,6 +6,33 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+**A2A protocol conformance, Tier 2 — I/O fidelity within the synchronous-turn model** (the
+`a2a-conformance` epic). Inbound `data` parts now drive a real turn, inbound `file` parts are refused
+cleanly, and a returned `Task` carries conversation `history` and (for runners with structured output)
+`artifacts`. Additive/non-breaking. Docs: `docs/a2a-conformance.md`.
+
+### Added
+
+- **A-51** — inbound multimodal parts, decided per part kind in one shared boundary
+  (`flux_a2a::server::extract_input`, used by the reusable dispatcher and both HTTP handlers, so the
+  decision cannot drift). A `data` part is **surfaced** into the turn input as structured JSON — a
+  message whose only part is a `data` part now runs a real turn instead of an empty one — while a
+  `file` part is **refused** with `-32005 ContentTypeNotSupported` (flux's turn is text-only, so a
+  file is never silently dropped, even alongside text). `Part` gained first-class `as_data`/`as_file`
+  accessors.
+- **A-52** — outbound `Task` fidelity. A blocking `message/send` now returns `Task.history` from the
+  conversation projection, capped to the new `configuration.historyLength` when the client sets it; a
+  runner's structured (non-text) reply parts become `Task.artifacts` (the spec-faithful home — clients
+  read artifacts first), and a reusable `artifact_update_value` frame shaper is added for streaming
+  `TaskArtifactUpdateEvent`s. flux's built-in text agent produces no structured output, so its tasks
+  carry history but empty artifacts.
+
+### Changed
+
+- A runner's structured reply parts (`A2aReply.extra_parts`) now surface as `Task.artifacts` rather
+  than riding on `status.message` — a fidelity correction (the text answer stays in `status.message`;
+  `Task.final_text()` is unaffected since data parts carry no text).
+
 ## [0.4.2] - 2026-07-07
 
 **A2A protocol conformance, Tier 1 — an honest, spec-conformant discovery card and the A2A-specific

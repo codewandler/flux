@@ -2,10 +2,9 @@
 id: A-53
 title: Stateful A2A task model (design) — addressable async tasks for get/cancel/resubscribe/non-blocking/push
 pillar: Agent
-status: backlog
-priority:
+status: done
 epic: a2a-conformance
-design: docs/designs/a2a-conformance.md
+design: docs/designs/a2a-stateful-task-model.md
 note: "Tier-3 design-first: the whole task-management half of the spec depends on flux retaining an addressable async Task; produces its own design, then fans into impl stories"
 ---
 
@@ -39,8 +38,27 @@ that design into implementation stories.
       non-blocking send, `tasks/cancel`, `tasks/resubscribe`, push notifications.
 
 ## Progress
-- (not started — design-first; blocked on nothing, but larger than a quick-win so it waits behind
-  Tier-1/2)
+- **Done (design-first): the deliverable is the design + the filed impl stories, not code.**
+- Wrote [`docs/designs/a2a-stateful-task-model.md`](../designs/a2a-stateful-task-model.md), which
+  answers the Tier-3 questions: **identity** (`task-id` = the flux stream id, already what today's
+  synchronous `Task.id` is, so the blocking id becomes retro-actively addressable); **retention** (a
+  `task(events) -> Task` projection over `events.db`, reusing the A-52 history/artifacts folds and the
+  C-18 session tag + lazy TTL sweep); **realm scoping** (the D-69 realm key — cross-tenant access is a
+  constant `-32001`); **async execution** (non-blocking send returns `submitted`+id and runs on a
+  background task, poll via `tasks/get` / stream via `tasks/resubscribe`); **cancellation** (generalize
+  the SSE-disconnect `CancellationToken` into a realm-scoped in-flight registry); **suspension**
+  (`input-required`/`auth-required` = the engine suspend/resume seam surfaced as task states, resumed
+  on the next send carrying the same `taskId`); and **push** (per-task webhook config + delivery, last
+  and optional).
+- **Fast-path guarantee:** the design preserves `blocking: true` bit-for-bit (no regression) and calls
+  out the likely breaking surface — `router`/`serve`/dispatch `State` gains a task store (a **minor**
+  bump per the SemVer rule); the wire protocol for existing methods is unchanged.
+- **Impl stories filed** (backlog, sequenced, each independently shippable):
+  [A-54](A-54-addressable-tasks-get-nonblocking.md) (foundation: projection + non-blocking send +
+  server-side `tasks/get`), [A-55](A-55-tasks-cancel.md) (`tasks/cancel`),
+  [A-56](A-56-tasks-resubscribe.md) (`tasks/resubscribe`), [A-57](A-57-a2a-push-notifications.md)
+  (push notifications). `input-required`/`auth-required` rides A-54.
+- No implementation in this story — Tier-3 execution is the A-54..A-57 fan-out, greenlit separately.
 
 ## Notes
 - Reuses established substrate: `events.db` projections ([event-store-unification](../designs/event-store-unification.md)),

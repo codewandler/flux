@@ -27,20 +27,29 @@ _None._
 ## Next (ready — take the top one unless the user named a story)
 - [D-62 — Async paged live-backend datasource seam](D-62-async-live-datasource-seam.md) · Agent · design-first (2026-07-06 downstream-consumer review): flux's DatasourceBackend is sync + index-shaped — wrong for live paginated APIs; the reviewed consumer built its own paged list/get tool projection
 
+### Postgres storage backend (epic)
+- [D-76 — Postgres DDL hardening — advisory-lock the bootstrap, split ensure_schema from construction, tolerate a missing table in namespaces()](D-76-pg-ddl-hardening.md) · Core · post-ship review of D-71/73/74: concurrent first-boot DDL races Postgres's non-atomic IF NOT EXISTS (pg_type_typname_nsp_index errors); PostgresBackend::new re-runs shared-table DDL per construction; namespaces() errors on a fresh database
+
 ## Blocked
 _None._
 
 ## Backlog
+- [D-77 — Retention for ad-hoc (unregistered) event streams — prune_older_than cannot reach them](D-77-adhoc-stream-retention.md) · Core · the D-55 Custom-facts pattern writes ad-hoc streams (no `streams` registry row); every prune primitive enumerates ONLY the registry, so ad-hoc streams grow forever — a deployment's retention policy silently excludes exactly the app-fact data it most needs to bound
 - [I-01 — Statistically clean self-improvement headline gain (trials ≥ 3)](I-01-headline-gain.md) · Improve · DE-PRIORITIZED 2026-07-06 (user call — focus shifts to hardening/docs/cleanup; resume via I-05's queued fixes first); offline half done; 2026-07-02 calibration VERDICT — the synthetic suite is stable but SATURATED (Sonnet 4.6 AND Haiku 4.5 via OpenRouter both score 1000/1000, mean_iters 1.0, twice) → zero headroom, it is a regression floor not a gain vehicle; the headline gain must come from terminal-bench (tb + Docker + musl all present; OpenRouter key forwards into the container) — full loop run postponed by user 2026-07-02
 - [I-05 — Sharpen the improve round — stable scored task set, severity-ordered planner picks](I-05-sharpen-improve-round.md) · Improve · ON HOLD + DE-PRIORITIZED (user call 2026-07-06; focus shifts to hardening/docs/cleanup after v0.2.23) — resume by implementing the two queued fixes below, then fund round 4; the 2026-07-06 funded round proved the machinery and exposed the two odds-killers: chess-best-move is too flaky to score (vision + tb-registry 429s; baseline swung 28↔42%), and the planner skipped the reviewer's severity-5 candidate
 
 ### A2A protocol conformance (epic)
-- [A-51 — Inbound multimodal parts — accept file/data Parts or refuse cleanly](A-51-inbound-multimodal-parts.md) · Agent · Tier-2: file/data input parts are silently dropped in extract_text; the turn runs on empty input
-- [A-52 — Outbound Task fidelity — populate Task.history/historyLength and emit artifacts](A-52-outbound-task-fidelity.md) · Agent · Tier-2: Task.history/artifacts and TaskArtifactUpdateEvent are modeled and client-decodable but never produced by the server
-- [A-53 — Stateful A2A task model (design) — addressable async tasks for get/cancel/resubscribe/non-blocking/push](A-53-stateful-a2a-task-model.md) · Agent · Tier-3 design-first: the whole task-management half of the spec depends on flux retaining an addressable async Task; produces its own design, then fans into impl stories
+- [A-54 — Addressable tasks — task-state projection, non-blocking send, server-side tasks/get](A-54-addressable-tasks-get-nonblocking.md) · Agent · Tier-3 foundation: everything else (cancel/resubscribe/push) builds on retained, addressable tasks
+- [A-55 — tasks/cancel — cancel an in-flight task via the realm-scoped CancellationToken registry](A-55-tasks-cancel.md) · Agent · Tier-3: generalizes the SSE-disconnect CancellationToken to an out-of-band signal; needs A-54
+- [A-56 — tasks/resubscribe — re-attach an SSE stream to a live or retained task](A-56-tasks-resubscribe.md) · Agent · Tier-3: replay a task's status/artifact updates then follow live; needs A-54
+- [A-57 — A2A push notifications — pushNotificationConfig methods + webhook delivery](A-57-a2a-push-notifications.md) · Agent · Tier-3, last/optional slice: per-task webhook config + delivery; flips capabilities.pushNotifications
 
 ### flux-planner: from trained-and-usable to shippable
 - [L-40 — Re-run the emission A/B with the fine-tuned local model as the text arm](L-40-emission-ab-finetuned-arm.md) · Language · the ONE pre-registered condition allowed to re-open L-20's keep-json decision: a model that natively speaks the text syntax; blocked on flux-model M-15 producing a candidate that passes the ship gate
+
+### Postgres storage backend (epic)
+- [D-78 — Cross-namespace entity scan for the Postgres datasource backend — one query instead of N per-scope round trips](D-78-pg-cross-namespace-scan.md) · Core · global lookups over per-scope namespaces (token→scope resolution, registry sweeps) currently cost namespaces() + a per-scope backend + list() each — 1+N..1+3N serial round trips; a prefix+entity scan is one
+- [D-79 — flux-pg owns DSN redaction — a safe-to-print form so no consumer hand-rolls it](D-79-pg-redacted-dsn.md) · Core · every consumer that logs its storage target must currently invent its own redaction; naive string surgery leaks ?password= query params (sqlx honors them!) and mis-splits on '@' in the query — the DSN contract owner should expose the one correct redacted form
 
 ### Time Machine — hermetic replay, fork-at-any-decision, run-diff
 _Every mainstream agent framework lets the LLM *be* the control flow, so its runs are irreproducible_
@@ -96,6 +105,9 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [A-48 — A2A stateful mode — one session per contextId, and a conversation-carrying A2aTurn seam](A-48-a2a-session-continuity.md) · Agent · SHIPPED 2026-07-07 (same day as the live downstream report): flux-server reuses one session per contextId (memory with no client change) + additive A2aTurn::run_in_context seam so downstream mounts can key their own continuity
 - [A-49 — AgentCard conformance fields — protocolVersion, honest interfaces/preferredTransport, optional metadata](A-49-agent-card-conformance-fields.md) · Agent · Tier-1 quick-win: the card omits protocolVersion (spec-required) and emits interfaces: [] though it serves a JSON-RPC endpoint
 - [A-50 — A2A-specific JSON-RPC error codes — UnsupportedOperation / ContentTypeNotSupported (and the -32001..-32007 set)](A-50-a2a-error-codes.md) · Agent · Tier-1 quick-win: unsupported A2A methods return generic -32601 and non-text input is silently dropped; the A2A binding defines dedicated codes
+- [A-51 — Inbound multimodal parts — accept file/data Parts or refuse cleanly](A-51-inbound-multimodal-parts.md) · Agent · Tier-2: file/data input parts are silently dropped in extract_text; the turn runs on empty input
+- [A-52 — Outbound Task fidelity — populate Task.history/historyLength and emit artifacts](A-52-outbound-task-fidelity.md) · Agent · Tier-2: Task.history/artifacts and TaskArtifactUpdateEvent are modeled and client-decodable but never produced by the server
+- [A-53 — Stateful A2A task model (design) — addressable async tasks for get/cancel/resubscribe/non-blocking/push](A-53-stateful-a2a-task-model.md) · Agent · Tier-3 design-first: the whole task-management half of the spec depends on flux retaining an addressable async Task; produces its own design, then fans into impl stories
 - [C-01 — Crate consolidation, phases 2–4](C-01-crate-consolidation.md) · Core · hooks→plugin, browser+datasource→capabilities, context→runtime; removed dead integrations (35 → 31 crates)
 - [C-02 — Integration-stack hardening — embeddings backend, plugin install/call + CI, live smoke](C-02-integration-stack-hardening.md) · Core · `flux plugin call`/`install` + a `plugins/` CI job (`a8092dc`); feature-gated embeddings/semantic backend — `OpenAiEmbedder` + a `SemanticIndex` hybrid-rerank decorator, default build unchanged (`f912c24`); a live env-gated `scripts/smoke-plugins.sh` (`5fda8be`)
 - [C-03 — Codex provider hardening — account-id, usage tiers, reasoning continuity](C-03-codex-provider-hardening.md) · Core · `account_id` from the `id_token` JWT, cache+reasoning token capture, reasoning continuity under `store:false`

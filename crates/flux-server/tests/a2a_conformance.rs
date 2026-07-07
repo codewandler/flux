@@ -1,10 +1,12 @@
-//! A2A conformance quick-wins over the real router (A-49 card shape, A-50 error codes).
+//! A2A conformance over the real router: card shape (A-49), error codes (A-50), inbound part
+//! handling (A-51), and outbound `Task` fidelity — history + artifacts (A-52).
 //!
 //! These exercise the `flux-server` HTTP dispatch sites — the single-agent `a2a_handler` and the
 //! resolver-keyed `a2a_handler_multi` — through the production router, so the shared
-//! `flux_a2a::server` classifiers (`is_unsupported_a2a_method` / `no_text_error_code`) are proven
-//! wired at every dispatch site, not just unit-tested in `flux-a2a`. The two sites share those
-//! classifiers precisely so the emitted codes cannot drift between them.
+//! `flux_a2a::server` boundary (`is_unsupported_a2a_method` for method classification, `extract_input`
+//! for the accept/refuse decision on inbound parts) is proven wired at every dispatch site, not just
+//! unit-tested in `flux-a2a`. The sites share those helpers precisely so behavior cannot drift
+//! between them.
 
 mod support;
 
@@ -97,6 +99,89 @@ async fn optional_card_metadata_is_emitted_when_set() {
 
 fn rpc(method: &str, params: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
+}
+
+/// A2A `message/send` params over `contextId`, optionally capping `historyLength`.
+fn send_over_context(text: &str, context_id: &str, history_length: Option<u64>) -> Value {
+    let mut msg = json!({
+        "message": { "contextId": context_id, "parts": [{ "kind": "text", "text": text }] },
+    });
+    if let Some(n) = history_length {
+        msg["configuration"] = json!({ "historyLength": n });
+    }
+    rpc("message/send", msg)
+}
+
+/// A-52: a blocking `message/send` returns `Task.history` from the engine's conversation
+/// projection, it accumulates across turns of the same `contextId`, and `configuration.historyLength`
+/// caps it to the most-recent messages. (One router reused across turns so all three requests hit
+/// the same engine/event store.)
+#[tokio::test]
+async fn task_history_is_populated_and_bounded() {
+    let engine = test_engine(Arc::new(ProseProvider));
+    let app = flux_server::router(engine, ServerAuth::Open, CardInfo::flux_coding());
+
+    // Turn 1 over a fresh context: history holds this turn's user + agent messages.
+    let (_, r1) = post_json(
+        app.clone(),
+        "/a2a",
+        send_over_context("first", "ctx-hist", None),
+    )
+    .await;
+    let h1 = r1["result"]["history"].as_array().expect("history array");
+    assert!(!h1.is_empty(), "turn-1 history is populated: {r1}");
+
+    // Turn 2 over the same context accumulates — history grows beyond turn 1.
+    let (_, r2) = post_json(
+        app.clone(),
+        "/a2a",
+        send_over_context("second", "ctx-hist", None),
+    )
+    .await;
+    let full = r2["result"]["history"].as_array().unwrap().len();
+    assert!(full > h1.len(), "same-context history accumulates: {r2}");
+
+    // Turn 3 caps to the two most-recent messages (this turn's user + agent).
+    let (_, r3) = post_json(
+        app.clone(),
+        "/a2a",
+        send_over_context("third", "ctx-hist", Some(2)),
+    )
+    .await;
+    let capped = r3["result"]["history"].as_array().unwrap();
+    assert_eq!(capped.len(), 2, "historyLength=2 caps to 2 messages: {r3}");
+    assert_eq!(capped[0]["role"], "user", "the just-sent user turn is kept");
+    assert_eq!(capped[0]["parts"][0]["text"], "third");
+    assert_eq!(capped[1]["role"], "agent", "followed by the agent reply");
+}
+
+/// A-51: a `message/send` whose only part is a `data` part runs a real turn — the structured
+/// payload is surfaced into the input, so the task completes normally (not an empty-input turn),
+/// while a `file` part is refused with `-32005` rather than silently dropped.
+#[tokio::test]
+async fn inbound_data_part_is_surfaced_and_file_part_is_refused() {
+    let data_only = rpc(
+        "message/send",
+        json!({ "message": { "parts": [{ "kind": "data", "data": { "ticket": 42 } }] } }),
+    );
+    let (_, ok) = post_json(app(None), "/a2a", data_only).await;
+    assert_eq!(
+        ok["result"]["status"]["state"], "completed",
+        "a data-only message runs a real turn: {ok}"
+    );
+
+    let with_file = rpc(
+        "message/send",
+        json!({ "message": { "parts": [
+            { "kind": "text", "text": "handle this" },
+            { "kind": "file", "file": { "uri": "http://x/y.pdf" } },
+        ] } }),
+    );
+    let (_, refused) = post_json(app(None), "/a2a", with_file).await;
+    assert_eq!(
+        refused["error"]["code"], -32005,
+        "a file part is refused, not silently dropped: {refused}"
+    );
 }
 
 /// A-50 (single-agent `a2a_handler`): a defined-but-unsupported method → `-32004`; a

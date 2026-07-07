@@ -1,6 +1,6 @@
 # A2A protocol conformance (epic)
 
-**Status:** Tier 1 shipped (2026-07-07); Tiers 2–3 backlog · **Pillar:** Agent · **Epic slug:** `a2a-conformance`
+**Status:** Tiers 1–2 shipped (2026-07-07); Tier 3 design-first · **Pillar:** Agent · **Epic slug:** `a2a-conformance`
 
 Tracks the gap between the [A2A protocol](https://a2a-protocol.org/) (v1.0) and flux's
 implementation, and sequences the work to close it. The living support matrix lives in
@@ -34,10 +34,11 @@ current model* (Tiers 1–2) and *a deliberate model change* (Tier 3).
   (unimplemented, but now answered `-32004 UnsupportedOperation` rather than generic `-32601` — A-50).
 - **AgentCard** — ✅ closed by A-49: `protocolVersion`, `preferredTransport`, a populated `interfaces`
   entry, the optional `provider`/`documentationUrl`/`iconUrl`, and `supportsAuthenticatedExtendedCard: false`.
-- **Fidelity** — `Task.history`/`artifacts`, `TaskArtifactUpdateEvent`, file/data `Part`s,
-  `Message.taskId`/`referenceTaskIds`, and non-terminal `TaskState`s are *modeled and
-  client-decodable but never produced* by the server. (Text-less inbound messages are now refused
-  with `-32005` — A-50 — rather than silently run empty; *accepting* file/data input is A-51.)
+- **Fidelity** — `Task.history` (from the conversation projection, bounded by `historyLength`) and
+  inbound `data` parts (surfaced into the turn) are now produced (A-51/A-52); `Task.artifacts` +
+  `TaskArtifactUpdateEvent` are produced for a runner's structured outputs at the `A2aTurn` seam
+  (A-52), and inbound `file` parts are refused with `-32005` (A-51). Still *modeled but not produced*:
+  `Message.taskId`/`referenceTaskIds`, non-terminal `TaskState`s, and outbound `file` parts.
 - **Error codes** — base JSON-RPC `-32600/-32601/-32602/-32603` ✅; A2A `-32004`/`-32005` ✅ (A-50);
   the task-lifecycle codes `-32001/-32002/-32003/-32006/-32007` are defined but await A-53.
 - **Transports** — JSON-RPC/HTTP only.
@@ -60,25 +61,45 @@ Cheap, high interop value, no architecture change.
   defined-but-unsupported methods (instead of generic `-32601`) via one shared classifier both
   dispatch sites use; `-32005 ContentTypeNotSupported` when a message has no usable text part.
 
-### Tier 2 — I/O fidelity (`backlog`)
+### Tier 2 — I/O fidelity (✅ shipped)
 
 Moderate; still within the synchronous-turn model.
 
-- **[A-51](../stories/A-51-inbound-multimodal-parts.md)** — accept `file`/`data` input `Part`s
-  (surface to the agent) or refuse cleanly with `-32005`, rather than silently dropping them.
-- **[A-52](../stories/A-52-outbound-task-fidelity.md)** — populate `Task.history` + honor
-  `historyLength`; emit `TaskArtifactUpdateEvent`/`Task.artifacts` for structured outputs.
+- **[A-51](../stories/A-51-inbound-multimodal-parts.md)** ✅ — inbound parts, decided per kind in one
+  shared boundary (`flux_a2a::server::extract_input`, used by every dispatch site): `data` parts are
+  **surfaced** into the turn input as structured JSON (a data-only message now runs a real turn, not
+  an empty one); `file` parts are **refused** with `-32005` (flux's turn is text-only, so a file is
+  never silently dropped — even alongside text). `Part` gained first-class `as_data`/`as_file`
+  accessors.
+- **[A-52](../stories/A-52-outbound-task-fidelity.md)** ✅ — `Task.history` is populated from the
+  conversation projection, capped to `configuration.historyLength` (new field); a runner's structured
+  (non-text) reply parts become `Task.artifacts` at the `A2aTurn` seam, plus a reusable
+  `artifact_update_value` frame shaper for streaming surfaces.
 
-### Tier 3 — stateful task model (`backlog`, design-first)
+  **Scope boundary (documented, not a gap):** flux's engine emits only text — there is no structured
+  (non-text) output channel in `AgentSink`. So artifacts are a capability of the reusable `A2aTurn`
+  server seam (a runner that produces `A2aReply.extra_parts` gets them); flux-server's built-in text
+  agent produces none, so its tasks carry `history` but empty `artifacts` — which is correct, not
+  missing. Native flux-server artifact emission would first need an engine structured-output seam;
+  that is out of scope here and left as a future follow-up if a structured-output producer lands.
 
-- **[A-53](../stories/A-53-stateful-a2a-task-model.md)** — the architectural decision below, captured
-  as its own design doc, which then fans into implementation stories.
+### Tier 3 — stateful task model (design ✅; impl `backlog`)
 
-## The Tier-3 architectural question (for A-53's design)
+- **[A-53](../stories/A-53-stateful-a2a-task-model.md)** ✅ — the architectural decision below is now
+  captured in its own design doc, [a2a-stateful-task-model](a2a-stateful-task-model.md), which fans
+  into implementation stories **[A-54](../stories/A-54-addressable-tasks-get-nonblocking.md)**
+  (foundation: task projection + non-blocking send + server-side `tasks/get`),
+  **[A-55](../stories/A-55-tasks-cancel.md)** (`tasks/cancel`),
+  **[A-56](../stories/A-56-tasks-resubscribe.md)** (`tasks/resubscribe`), and
+  **[A-57](../stories/A-57-a2a-push-notifications.md)** (push notifications). Those are the deliberate
+  model change; they are greenlit and executed separately.
+
+## The Tier-3 architectural question (answered in the A-53 design)
 
 To support the task-management half of the spec, an A2A `Task` must become a **first-class,
-addressable, potentially-async** object rather than a synchronous return value. Open questions the
-A-53 design must answer:
+addressable, potentially-async** object rather than a synchronous return value. The questions below
+are now answered in [a2a-stateful-task-model](a2a-stateful-task-model.md); they remain here as the
+epic-level statement of the problem:
 
 1. **Retention & identity.** Where does a `Task` live between calls? The natural home is a projection
    over `events.db` (like conversation/run-trace already are — see [event-store

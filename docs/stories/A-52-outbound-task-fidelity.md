@@ -2,8 +2,7 @@
 id: A-52
 title: Outbound Task fidelity — populate Task.history/historyLength and emit artifacts
 pillar: Agent
-status: backlog
-priority:
+status: done
 epic: a2a-conformance
 design: docs/designs/a2a-conformance.md
 note: "Tier-2: Task.history/artifacts and TaskArtifactUpdateEvent are modeled and client-decodable but never produced by the server"
@@ -37,7 +36,31 @@ history or consume artifacts get real data instead of empty arrays.
 - [ ] Docs: the Task lifecycle + Streaming events rows in the support matrix update.
 
 ## Progress
-- (not started)
+- **Done**, in two wired pieces plus a documented scope boundary.
+- **History (flux-server):** `SendConfiguration` gained `history_length: Option<u32>` (wire
+  `historyLength`, serialized only when set). A blocking `message/send` now populates `Task.history`
+  from the engine's conversation projection (`EventStore::conversation`) via a private `a2a_history`
+  helper: each user/agent message → an A2A `Message` (system messages and text-less tool-only turns
+  dropped), capped to the most-recent `historyLength` when the client sets it. Read via the shared
+  `flux_a2a::server::history_length` extractor. Projection failure degrades to empty history rather
+  than failing the (already-successful) turn.
+- **Artifacts (reusable seam):** the `A2aTurn` runner's structured (non-text) reply parts
+  (`A2aReply.extra_parts`) now become `Task.artifacts` (one grouped `Artifact` with a minted
+  `artifactId`) instead of hitchhiking on `status.message` — the spec-faithful home (clients read
+  artifacts first). A plain text answer yields `artifacts: []`. Added the reusable
+  `flux_a2a::server::artifact_update_value` streaming frame shaper (mirrors `status_update_value`)
+  for `TaskArtifactUpdateEvent`.
+- **Scope boundary (documented in the epic design):** flux's engine emits only text — there is no
+  structured-output channel in `AgentSink`. So artifacts are a capability of the reusable `A2aTurn`
+  server seam; flux-server's built-in text agent produces none, so its tasks carry `history` but
+  empty `artifacts` (correct, not a gap). Native flux-server artifact emission would first need an
+  engine structured-output seam — out of scope, noted as a future follow-up.
+- **Tests (failing-first):** `flux_a2a::server` unit tests `rich_replies_surface_data_parts_as_artifacts`
+  (structured part → artifact; message text-only), `message_send_returns_a_completed_task_*` (text-only
+  → `artifacts: []`), `artifact_update_value_shapes_a_frame`, `history_length_reads_configuration`;
+  `flux-server` integration test `task_history_is_populated_and_bounded` (two-turn `contextId`
+  conversation → history accumulates; `historyLength=2` caps to the most-recent two, newest kept).
+- **Docs:** Task-lifecycle + Streaming-events rows (contributor + website) updated.
 
 ## Notes
 - Still within the synchronous-turn model (no task retention needed). The `input-required`/async

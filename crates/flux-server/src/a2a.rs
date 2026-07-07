@@ -416,15 +416,9 @@ async fn send(
         Some(p) => p,
         None => return rpc_err(id, -32602, "Missing params"),
     };
-    let input = match server::extract_text(&params) {
-        Some(t) => t,
-        None => {
-            return rpc_err(
-                id,
-                server::no_text_error_code(&params),
-                "Message has no usable text part",
-            )
-        }
+    let input = match server::extract_input(&params) {
+        Ok(t) => t,
+        Err(code) => return rpc_err(id, code, "Message has no usable text or data part"),
     };
     let requested_context = server::extract_context_id(&params);
     // Acquire the gate BEFORE minting (C-29) — see `create_a2a_session`'s doc for why. The
@@ -446,18 +440,58 @@ async fn send(
     let mut sink = Collect::default();
     match engine.run_turn(&session_id, &input, &mut sink).await {
         Ok(()) => {
+            // A-52: return the conversation so far as `Task.history`, capped to the client's
+            // `historyLength` when set. Read before `session_id` is moved into the `Task`.
+            let history = a2a_history(&engine, &session_id, server::history_length(&params));
             let status = TaskStatus::new(
                 TaskState::Completed,
                 Some(Message::agent_text(sink.text)),
                 Some(server::now_rfc3339()),
             );
-            let task = Task::new(session_id, Some(context_id), status);
+            let mut task = Task::new(session_id, Some(context_id), status);
+            task.history = history;
             match serde_json::to_value(&task) {
                 Ok(v) => rpc_json(id, v),
                 Err(e) => rpc_err(id, -32603, format!("encode error: {e}")),
             }
         }
         Err(e) => rpc_err(id, -32603, format!("Agent error: {e}")),
+    }
+}
+
+/// Build the A2A `Task.history` for a completed turn from the engine's conversation projection
+/// (A-52): the session's user/agent messages as A2A [`Message`]s, capped to the most-recent
+/// `limit` when the client set `configuration.historyLength`. System messages (the agent's own
+/// prompt) and text-less turns (a pure tool-call round) are omitted — history is the
+/// caller-visible conversation, not flux's internals. A projection read failure degrades to empty
+/// history rather than failing the (already-successful) turn.
+fn a2a_history(engine: &Shared, session_id: &str, limit: Option<usize>) -> Vec<Message> {
+    let mut msgs: Vec<Message> = match engine.events.conversation(session_id) {
+        Ok(convo) => convo.into_iter().filter_map(to_a2a_message).collect(),
+        Err(e) => {
+            eprintln!("(a2a: history projection failed for {session_id}: {e})");
+            Vec::new()
+        }
+    };
+    if let Some(n) = limit {
+        if msgs.len() > n {
+            msgs.drain(0..msgs.len() - n); // keep the most-recent `n`
+        }
+    }
+    msgs
+}
+
+/// Convert one projected conversation message to an A2A [`Message`], or `None` to drop it from
+/// history (a system message, or a message with no text — e.g. a pure tool-call turn).
+fn to_a2a_message(m: flux_core::Message) -> Option<Message> {
+    let text = m.text();
+    if text.is_empty() {
+        return None;
+    }
+    match m.role {
+        flux_core::Role::User => Some(Message::user_text(text, None)),
+        flux_core::Role::Assistant => Some(Message::agent_text(text)),
+        flux_core::Role::System => None,
     }
 }
 
@@ -473,14 +507,9 @@ async fn subscribe(
     params: Option<Value>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (i32, String)> {
     let params = params.ok_or((-32602, "Missing params".to_string()))?;
-    let input = match server::extract_text(&params) {
-        Some(t) => t,
-        None => {
-            return Err((
-                server::no_text_error_code(&params),
-                "Message has no usable text part".to_string(),
-            ))
-        }
+    let input = match server::extract_input(&params) {
+        Ok(t) => t,
+        Err(code) => return Err((code, "Message has no usable text or data part".to_string())),
     };
     let requested_context = server::extract_context_id(&params);
     // Fail closed before the SSE response is established (unreachable behind `require_auth`).

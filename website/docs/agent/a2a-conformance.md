@@ -53,13 +53,15 @@ non-blocking send, push notifications) are Not-yet.
 |---|---|---|
 | `Task` / `TaskStatus`; states `working` / `completed` / `failed` | ✅ | |
 | Task states `input-required` / `auth-required` / `canceled` / `submitted` | ❌/⚠️ | Not emitted under the synchronous model. |
-| `Task.history`, `Task.artifacts` | ⚠️ | Present in the type; the server does not yet populate them. |
+| `Task.history` | ✅ | Populated from the conversation; set `configuration.historyLength` to cap it to the most-recent messages. |
+| `Task.artifacts` | ✅ | Carries a turn's structured (non-text) outputs. flux's built-in text agent produces none, so its tasks stay `[]`. |
 | `Message` (`messageId`, `role`, `parts`, `contextId`) | ✅ | `contextId` drives continuity. |
 | `Message.taskId` / `referenceTaskIds` | ⚠️/❌ | Not used for task addressing yet. |
 | Part: `text` | ✅ | |
-| Part: `file` / `data` (inbound) | ⚠️ | A message with no text part is refused with `-32005 ContentTypeNotSupported` (rather than run empty) — send text. Accepting file/data input is planned. |
+| Part: `data` (inbound) | ✅ | Surfaced into the turn as structured JSON, so a data-only message runs a real turn. |
+| Part: `file` (inbound) | ⚠️ | Refused with `-32005 ContentTypeNotSupported` (flux's turn is text-only) rather than silently dropped — send text or a `data` part. |
 | `TaskStatusUpdateEvent` (streaming) | ✅ | Incremental `working` deltas + a final event. |
-| `TaskArtifactUpdateEvent` (streaming) | ⚠️ | Decoded by the client; not emitted by the server. |
+| `TaskArtifactUpdateEvent` (streaming) | ⚠️ | Emitted by a streaming surface that produces structured outputs; flux's built-in text agent produces none. |
 
 ## Transports & errors
 
@@ -68,14 +70,15 @@ non-blocking send, push notifications) are Not-yet.
 | JSON-RPC 2.0 over HTTP | ✅ | The transport flux serves and speaks. |
 | gRPC, HTTP+JSON/REST bindings | 🚫 | Non-goals. |
 | Base JSON-RPC errors (`-32600`/`-32601`/`-32602`/`-32603`) | ✅ | |
-| A2A errors `-32004` UnsupportedOperation, `-32005` ContentTypeNotSupported | ✅ | Emitted for defined-but-unsupported methods and text-less messages; a genuinely-unknown method still returns `-32601`. |
+| A2A errors `-32004` UnsupportedOperation, `-32005` ContentTypeNotSupported | ✅ | Emitted for defined-but-unsupported methods and for messages with a `file` part / no usable text or data; a genuinely-unknown method still returns `-32601`. |
 | Task-lifecycle errors (`-32001`/`-32002`/`-32003`/`-32006`/`-32007`) | ❌ | Await the stateful task model. |
 
 ## What's next
 
-Conformance work is tracked as an epic. The card now declares `protocolVersion`, its transport
-interface, and A2A-specific error codes; further out are structured artifacts and full task history;
-and, as a larger effort, a stateful task model that unlocks `tasks/get`, cancellation, resubscription,
+Conformance work is tracked as an epic. The card declares `protocolVersion`, its transport
+interface, and A2A-specific error codes; tasks now carry conversation `history` (bounded by
+`historyLength`) and structured `artifacts`, and inbound `data` parts run a real turn. The larger
+remaining effort is a stateful task model that unlocks `tasks/get`, cancellation, resubscription,
 non-blocking sends, and push notifications.
 
 **Non-goals:** gRPC and A2A REST transport bindings, an extensions-negotiation framework, and

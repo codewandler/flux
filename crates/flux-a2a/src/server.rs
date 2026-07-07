@@ -6,17 +6,18 @@
 //!
 //! The blocking [`dispatch`] handles `message/send` end-to-end (run a turn → completed [`Task`]).
 //! `message/stream` (SSE) is not handled here — it needs the surface's streaming machinery — but the
-//! frame shaping ([`status_update_value`]) and the pure helpers ([`extract_text`],
-//! [`extract_context_id`], [`agent_card`], [`now_rfc3339`], [`rpc_ok`]/[`rpc_err`]) are shared so a
-//! streaming surface re-uses them too.
+//! frame shaping ([`status_update_value`], [`artifact_update_value`]) and the pure helpers
+//! ([`extract_input`], [`extract_context_id`], [`history_length`], [`agent_card`], [`now_rfc3339`],
+//! [`rpc_ok`]/[`rpc_err`]) are shared so a streaming surface re-uses them too.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::error;
 use crate::types::{
-    new_id, AgentCard, AgentInterface, Capabilities, Message, Part, Skill, Task, TaskState,
-    TaskStatus, TaskStatusUpdateEvent, PROTOCOL_VERSION, TRANSPORT_JSONRPC,
+    new_id, AgentCard, AgentInterface, Artifact, Capabilities, Message, Part, Skill, Task,
+    TaskArtifactUpdateEvent, TaskState, TaskStatus, TaskStatusUpdateEvent, PROTOCOL_VERSION,
+    TRANSPORT_JSONRPC,
 };
 
 /// One text turn of an agent: run a user message to the agent's final answer. The only seam
@@ -204,23 +205,85 @@ pub fn is_unsupported_a2a_method(method: &str) -> bool {
     )
 }
 
-/// The JSON-RPC error code for an inbound `message/send`/`message/stream` whose message yields no
-/// usable text (see [`extract_text`]): [`error::CONTENT_TYPE_NOT_SUPPORTED`] (`-32005`) when the
-/// message carries parts but none is text — flux accepts only text input today, so this is the
-/// honest refusal rather than running an empty turn — else `-32602` invalid params (an absent
-/// message or an empty parts array is a malformed request, not an unusable content type). Shared by
-/// both dispatch sites so the two agree on when it's which.
-pub fn no_text_error_code(params: &Value) -> i32 {
-    let has_parts = params
+/// Compose the turn input from an inbound A2A `message`'s parts, or return the JSON-RPC error code
+/// to refuse with — the single boundary that decides what flux's text turn runs on (A-51).
+///
+/// flux serves a **text** agent, so:
+/// - `text` parts contribute their text;
+/// - `data` parts are surfaced as their structured JSON payload (via [`render_data_part`]), so a
+///   message that carries only a `data` part runs a *real* turn — the agent sees the data — instead
+///   of the empty turn `extract_text` alone would have produced;
+/// - `file` parts cannot be consumed by a text turn, so a message carrying one is refused with
+///   [`error::CONTENT_TYPE_NOT_SUPPORTED`] (`-32005`) rather than silently dropped: the client
+///   learns flux took no file, instead of getting a `completed` task that ignored it.
+///
+/// Refusal codes: an absent message / empty parts array is a malformed request (`-32602`); parts
+/// present but none usable (a lone `file` part, or only unknown kinds) is an unusable content type
+/// (`-32005`). This supersedes the old `extract_text` + `no_text_error_code` split at every dispatch
+/// site, so "what do we run / how do we refuse" lives in exactly one place and cannot drift.
+pub fn extract_input(params: &Value) -> Result<String, i32> {
+    let Some(parts) = params
         .get("message")
         .and_then(|m| m.get("parts"))
         .and_then(Value::as_array)
-        .is_some_and(|parts| !parts.is_empty());
-    if has_parts {
-        error::CONTENT_TYPE_NOT_SUPPORTED
-    } else {
-        -32602
+    else {
+        return Err(-32602);
+    };
+    if parts.is_empty() {
+        return Err(-32602);
     }
+    // A file part is unconsumable by a text turn: refuse the whole message rather than drop it,
+    // even when it rides alongside text — a silently-ignored attachment is exactly the A-51 gap.
+    if parts
+        .iter()
+        .any(|p| p.get("kind").and_then(Value::as_str) == Some("file"))
+    {
+        return Err(error::CONTENT_TYPE_NOT_SUPPORTED);
+    }
+    let mut pieces: Vec<String> = Vec::new();
+    for p in parts {
+        match p.get("kind").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(t) = p.get("text").and_then(Value::as_str) {
+                    pieces.push(t.to_string());
+                }
+            }
+            // Surface the structured payload as JSON so the text turn can read it (A-51).
+            Some("data") => {
+                if let Some(d) = p.get("data") {
+                    pieces.push(render_data_part(d));
+                }
+            }
+            // Unknown part kinds are ignored (tolerant, like the `extra` passthrough); if they were
+            // the *only* content the emptiness check below refuses with `-32005`.
+            _ => {}
+        }
+    }
+    if pieces.is_empty() {
+        return Err(error::CONTENT_TYPE_NOT_SUPPORTED);
+    }
+    Ok(pieces.join("\n"))
+}
+
+/// Render an A2A `data` part's structured payload as turn-input text (A-51): a labeled compact-JSON
+/// block, so the agent can tell structured input apart from prose.
+fn render_data_part(data: &Value) -> String {
+    format!(
+        "[structured data]\n{}",
+        serde_json::to_string(data).unwrap_or_default()
+    )
+}
+
+/// The client's requested `configuration.historyLength` (A2A, A-52): the cap on how many
+/// most-recent conversation messages the returned `Task.history` should carry. Absent/invalid →
+/// `None` (the server includes all retained history). Shared so every surface reads the cap
+/// identically.
+pub fn history_length(params: &Value) -> Option<usize> {
+    params
+        .get("configuration")?
+        .get("historyLength")?
+        .as_u64()
+        .map(|n| n as usize)
 }
 
 /// `message/send`: extract the user's text, run one turn, and wrap the answer in a completed `Task`.
@@ -233,12 +296,9 @@ async fn send(
     let Some(params) = params else {
         return rpc_err(id, -32602, "missing params");
     };
-    let Some(input) = extract_text(params) else {
-        return rpc_err(
-            id,
-            no_text_error_code(params),
-            "message has no usable text part",
-        );
+    let input = match extract_input(params) {
+        Ok(t) => t,
+        Err(code) => return rpc_err(id, code, "message has no usable text or data part"),
     };
     // A-48: the conversation id crosses the seam, so a stateful runner can key one session per
     // `contextId` (and it is echoed on the task either way). A runner that only implements
@@ -250,13 +310,31 @@ async fn send(
     };
     match runner.run_in_context(&turn_ctx, &input).await {
         Ok(reply) => {
-            let mut message = Message::agent_text(reply.text);
-            message.parts.extend(reply.extra_parts);
+            // A-52: the answer text is the task's `status.message`; the runner's structured
+            // (non-text) reply parts become `Task.artifacts` — the spec-faithful home for a task's
+            // structured outputs (clients read artifacts first). A plain text answer yields none.
+            let message = Message::agent_text(reply.text);
             let status = TaskStatus::new(TaskState::Completed, Some(message), Some(now_rfc3339()));
-            let task = Task::new(new_id(), context_id, status);
+            let mut task = Task::new(new_id(), context_id, status);
+            task.artifacts = artifacts_from_parts(reply.extra_parts);
             rpc_ok(id, serde_json::to_value(&task).unwrap_or(Value::Null))
         }
         Err(e) => rpc_err(id, -32603, format!("agent error: {e}")),
+    }
+}
+
+/// Wrap a turn's structured (non-text) reply parts as a task's [`Artifact`]s (A-52). All extra
+/// parts group into one artifact (a turn's structured output is one deliverable); a turn with no
+/// extra parts produces no artifact, so a plain text answer stays `artifacts: []`.
+fn artifacts_from_parts(parts: Vec<Part>) -> Vec<Artifact> {
+    if parts.is_empty() {
+        Vec::new()
+    } else {
+        vec![Artifact {
+            artifact_id: Some(new_id()),
+            parts,
+            ..Default::default()
+        }]
     }
 }
 
@@ -301,6 +379,28 @@ pub fn status_update_value(
 ) -> Value {
     let status = TaskStatus::new(state, message, Some(now_rfc3339()));
     let evt = TaskStatusUpdateEvent::new(task_id, Some(context_id.to_string()), status, is_final);
+    serde_json::to_value(&evt).unwrap_or(Value::Null)
+}
+
+/// Build the `result` value of a `message/stream` SSE frame carrying a produced artifact: a
+/// serialized [`TaskArtifactUpdateEvent`] (A-52). The reusable home for artifact framing, mirroring
+/// [`status_update_value`] — a streaming surface that produces structured outputs wraps this in a
+/// JSON-RPC response and emits it as an SSE `data:` line. `last_chunk` marks the final frame of a
+/// (possibly chunked) artifact; `append` is left `false` (each frame is a whole artifact).
+pub fn artifact_update_value(
+    task_id: &str,
+    context_id: &str,
+    artifact: Artifact,
+    last_chunk: bool,
+) -> Value {
+    let evt = TaskArtifactUpdateEvent {
+        kind: "artifact-update".to_string(),
+        task_id: task_id.to_string(),
+        context_id: Some(context_id.to_string()),
+        artifact,
+        append: false,
+        last_chunk,
+    };
     serde_json::to_value(&evt).unwrap_or(Value::Null)
 }
 
@@ -425,17 +525,32 @@ mod tests {
         }
     }
 
-    /// `run_rich` extra parts ride the reply message beside the text part; the default impl
-    /// (StubRunner above, exercised by the sibling test) keeps text-only runners unchanged.
+    /// A-52 (failing-first): a runner that produces structured (non-text) reply parts surfaces them
+    /// as `Task.artifacts` — the spec-faithful home for a task's structured outputs — while the
+    /// answer text stays in `status.message`. (Supersedes the earlier "data parts ride beside the
+    /// answer text in the message" shaping; the default text-only runner is unaffected — see the
+    /// sibling `message_send_*` test asserting `artifacts: []`.)
     #[tokio::test]
-    async fn rich_replies_attach_data_parts_beside_the_text() {
+    async fn rich_replies_surface_data_parts_as_artifacts() {
         let resp = dispatch(&BlockRunner, None, &send_body("hello")).await;
+        // The message carries only the answer text (no extra parts hitchhiking on it).
         let parts = &resp["result"]["status"]["message"]["parts"];
         assert_eq!(parts[0]["kind"], "text");
         assert_eq!(parts[0]["text"], "you said: hello");
-        assert_eq!(parts[1]["kind"], "data");
-        assert_eq!(parts[1]["data"]["block"]["type"], "table");
-        assert_eq!(parts[1]["data"]["block"]["rows"][0]["a"], 1);
+        assert!(parts[1].is_null(), "no extra parts on the message: {resp}");
+        // The structured `data` part is a task artifact.
+        let artifacts = resp["result"]["artifacts"]
+            .as_array()
+            .expect("artifacts array");
+        assert_eq!(artifacts.len(), 1, "one artifact: {resp}");
+        assert!(
+            artifacts[0]["artifactId"].as_str().is_some(),
+            "artifact has an id: {resp}"
+        );
+        let apart = &artifacts[0]["parts"][0];
+        assert_eq!(apart["kind"], "data");
+        assert_eq!(apart["data"]["block"]["type"], "table");
+        assert_eq!(apart["data"]["block"]["rows"][0]["a"], 1);
     }
 
     #[tokio::test]
@@ -450,6 +565,11 @@ mod tests {
         );
         // The completed status carries a timestamp.
         assert!(result["status"]["timestamp"].as_str().is_some());
+        // A plain text answer produces no artifacts (A-52).
+        assert!(
+            result["artifacts"].as_array().is_some_and(|a| a.is_empty()),
+            "text-only answer has empty artifacts: {result}"
+        );
     }
 
     #[tokio::test]
@@ -641,6 +761,71 @@ mod tests {
         assert_eq!(extract_context_id(&params).as_deref(), Some("ctx-7"));
         let none = json!({ "message": { "parts": [] } });
         assert!(extract_context_id(&none).is_none());
+    }
+
+    /// A-51 (failing-first): `extract_input` composes text parts and surfaces `data` parts as their
+    /// structured JSON, so a message carrying a `data` part runs a real turn (not an empty one).
+    #[test]
+    fn extract_input_composes_text_and_surfaces_data_parts() {
+        let params = json!({ "message": { "parts": [
+            { "kind": "text", "text": "look:" },
+            { "kind": "data", "data": { "temp": 21, "unit": "C" } },
+        ]}});
+        let input = extract_input(&params).expect("text+data is usable");
+        assert!(input.contains("look:"), "text surfaced: {input}");
+        assert!(
+            input.contains("\"temp\":21"),
+            "data payload surfaced: {input}"
+        );
+
+        // A data-only message is no longer an empty turn — the payload is the input.
+        let data_only = json!({ "message": { "parts": [{ "kind": "data", "data": { "x": 1 } }] }});
+        assert!(extract_input(&data_only).unwrap().contains("\"x\":1"));
+    }
+
+    /// A-51 (failing-first): a `file` part is refused with `-32005` (flux's text turn can't consume
+    /// it) even alongside text — never silently dropped; an empty/absent parts array stays `-32602`.
+    #[test]
+    fn extract_input_refuses_files_and_malformed() {
+        let with_file = json!({ "message": { "parts": [
+            { "kind": "text", "text": "hi" },
+            { "kind": "file", "file": { "uri": "http://x/y.png" } },
+        ]}});
+        assert_eq!(
+            extract_input(&with_file),
+            Err(error::CONTENT_TYPE_NOT_SUPPORTED),
+            "a file part refuses the whole message"
+        );
+        assert_eq!(
+            extract_input(&json!({ "message": { "parts": [] }})),
+            Err(-32602)
+        );
+        assert_eq!(extract_input(&json!({ "params": {} })), Err(-32602));
+    }
+
+    #[test]
+    fn history_length_reads_configuration() {
+        let p = json!({ "configuration": { "historyLength": 5 }, "message": {} });
+        assert_eq!(history_length(&p), Some(5));
+        assert_eq!(history_length(&json!({ "message": {} })), None);
+    }
+
+    /// A-52 (failing-first): the reusable artifact-update frame shaper carries the produced
+    /// artifact under the spec's `artifact-update` kind + camelCase keys.
+    #[test]
+    fn artifact_update_value_shapes_a_frame() {
+        let artifact = Artifact {
+            artifact_id: Some("a1".to_string()),
+            parts: vec![Part::data(json!({ "k": "v" }))],
+            ..Default::default()
+        };
+        let v = artifact_update_value("task-1", "ctx-1", artifact, true);
+        assert_eq!(v["kind"], "artifact-update");
+        assert_eq!(v["taskId"], "task-1");
+        assert_eq!(v["contextId"], "ctx-1");
+        assert_eq!(v["artifact"]["artifactId"], "a1");
+        assert_eq!(v["artifact"]["parts"][0]["kind"], "data");
+        assert_eq!(v["lastChunk"], true);
     }
 
     /// A-48 (failing-first acceptance): the conversation id crosses the seam — a STATEFUL runner
