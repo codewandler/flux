@@ -16,6 +16,7 @@ use flux_datasource::{
     BatchGetInput, GetInput, Link, ListInput, Match, Record, RelationInput, SearchInput, Source,
 };
 
+use super::text::{matched_fields, snippet};
 use super::DatasourceBackend;
 
 fn map_sql<E: std::fmt::Display>(e: E) -> Error {
@@ -342,53 +343,6 @@ fn get_record(conn: &Connection, source: &str, entity: &str, id: &str) -> Result
     )
     .optional()
     .map_err(map_sql)
-}
-
-/// Which fields (`title`/`body`) contain any query term (case-insensitive).
-fn matched_fields(record: &Record, query: &str) -> Vec<String> {
-    let terms: Vec<String> = query
-        .to_lowercase()
-        .split_whitespace()
-        .map(String::from)
-        .collect();
-    let title = record.title.to_lowercase();
-    let body = record.body.to_lowercase();
-    let mut out = Vec::new();
-    if terms.iter().any(|t| title.contains(t.as_str())) {
-        out.push("title".to_string());
-    }
-    if terms.iter().any(|t| body.contains(t.as_str())) {
-        out.push("body".to_string());
-    }
-    out
-}
-
-/// A ~160-char snippet around the first matching term in `body`.
-fn snippet(body: &str, query: &str) -> String {
-    let lower = body.to_lowercase();
-    let terms: Vec<String> = query
-        .to_lowercase()
-        .split_whitespace()
-        .map(String::from)
-        .collect();
-    let byte_pos = terms
-        .iter()
-        .filter_map(|t| lower.find(t.as_str()))
-        .min()
-        .unwrap_or(0);
-    let pos = lower.get(..byte_pos).map_or(0, |s| s.chars().count());
-    let start = pos.saturating_sub(40);
-    let take = 160;
-    let snip: String = body.chars().skip(start).take(take).collect();
-    let mut out = String::new();
-    if start > 0 {
-        out.push('…');
-    }
-    out.push_str(snip.trim());
-    if start + take < body.chars().count() {
-        out.push('…');
-    }
-    out
 }
 
 #[cfg(test)]

@@ -6,6 +6,50 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+**Postgres storage backend (opt-in): a shared, durable, multi-writer-safe home for the two
+persistence primitives server deployments run against — the unified event log and the datasource
+record store.** Embedded SQLite stays the default and the default build is entirely DB-free; a
+`postgres` cargo feature adds a Postgres backend behind each, so a multi-replica / load-balanced
+deployment gets what an embedded file structurally cannot provide (cross-process/replica append
+serialization, managed backups and failover). Additive — no public API change, and the SQLite path
+stays byte-identical.
+
+The `pg-backend` epic (D-71…D-75). Design: `docs/designs/pg-backend.md`.
+
+### Added
+
+- **D-71** — `flux-pg`, a new L1 crate that owns the sole `sqlx` dependency, the connection pool, the
+  DSN contract (`pool_max` / `acquire_timeout_ms` / `schema` params — the last doubling as a
+  search-path test-isolation knob), and a **panic-safe sync↔async bridge**: `PgHandle::block_on`
+  runs a query future to completion from any calling context — a plain thread, a multi-thread tokio
+  worker, or a current-thread runtime — by spawning onto the handle's own dedicated runtime and
+  blocking on a `std::sync::mpsc` channel (the naive bridges each panic somewhere in that matrix).
+  `PgHandle`'s `Drop` shuts the runtime down non-blockingly, so it is safe to release from inside
+  another runtime.
+- **D-72** — `flux-events::EventStore` restructured onto an internal backend seam (`enum Backend` +
+  a private `EventBackend` trait): the ~20 SQL primitives delegate per-backend while every
+  projection, wrapper, and serde decode stays shared over the `RawEvent` row tuple. Pure refactor —
+  the public API is byte-identical and no consumer changed.
+- **D-73** — a Postgres `EventStore` backend behind `flux-events`'s `postgres` feature
+  (`EventStore::open_postgres(Arc<PgHandle>)`). `BIGSERIAL` + `INSERT … RETURNING` preserve the
+  `s_<n>` session-id and turn-id contracts; `payload` stays `TEXT` for a byte-exact serde
+  round-trip; appends serialize per-stream via a transaction-scoped
+  `pg_advisory_xact_lock(hashtextextended(stream, 0))` — strictly stronger than the SQLite in-process
+  lock because it also serializes appends across processes and replicas. A shared conformance suite
+  runs the store's tests against both backends, plus a Postgres-only test proving N concurrent
+  appends to one stream stay contiguous.
+- **D-74** — a Postgres `DatasourceBackend` behind `flux-capabilities`'s `postgres` feature
+  (`PostgresBackend`). Isolation is structural — a `namespace` bound once at construction is part of
+  the primary key, the exact analog of one SQLite file per scope. Keyword search reaches
+  FTS5/bm25 parity through a stored generated `tsvector` column + GIN index with `websearch_to_tsquery`
+  + `ts_rank`; snippet / matched-field shaping is shared with the SQLite backend, so a `Match` is
+  shape-identical across backends.
+- **D-75** — `EventStore::prune_older_than(cutoff_ms)`, a whole-store retention primitive (deletes
+  every stream whose `updated_at` predates the cutoff) on both backends — the tag-agnostic sibling
+  of `prune_inactive`, for scheduled retention in long-running deployments.
+- **CI** — a `postgres` job (`services: postgres:16`) runs the feature-gated crates against a live
+  database; the default `check` job stays DB-free.
+
 ## [0.4.0] - 2026-07-07
 
 **Multi-tenant A2A: per-request principal auth, per-principal isolation, and a resolver-keyed

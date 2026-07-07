@@ -1,14 +1,22 @@
-//! The SQLite-backed append-only event store.
+//! The append-only event store.
 //!
-//! One ordered `events` log (WAL) holds every fact; a small `streams` registry mints the
-//! `s_<n>` session ids and serves the session-list read model (it is rebuildable from the
-//! log). A *stream* is one session, so messages, run events, and turn telemetry interleave
-//! in one causal order — the whole point of unifying the three old logs.
+//! One ordered log holds every fact; a small `streams` registry mints the `s_<n>` session ids and
+//! serves the session-list read model (it is rebuildable from the log). A *stream* is one session,
+//! so messages, run events, and turn telemetry interleave in one causal order — the whole point of
+//! unifying the three old logs.
+//!
+//! [`EventStore`] is a thin façade over an internal [`Backend`] enum: the ~20 storage primitives
+//! ([`EventBackend`]) delegate per-backend, while every wrapper, projection, and serde decode lives
+//! here, backend-neutral, over the shared [`RawEvent`] row tuple. The default backend is embedded
+//! SQLite ([`sqlite::SqliteEvents`]); a Postgres backend plugs into the same seam behind a feature.
+//! There is deliberately **no public trait** — 23 consumer files hold `Arc<EventStore>` concretely,
+//! so the public API stays a concrete struct with a byte-identical surface across backends.
+
+#[cfg(feature = "postgres")]
+mod postgres;
+mod sqlite;
 
 use std::path::Path;
-use std::sync::Mutex;
-
-use rusqlite::{Connection, OptionalExtension};
 
 use flux_core::{Error, Message, Result, Usage};
 use flux_lang::ast::RunEvent;
@@ -17,20 +25,7 @@ use crate::context::EventContext;
 use crate::kind::{EventKind, NewEvent, StoredEvent};
 use crate::projection;
 
-fn map_sql<E: std::fmt::Display>(e: E) -> Error {
-    Error::Other(format!("event store: {e}"))
-}
-
-/// Begin a write transaction that takes the WAL write lock up front (`BEGIN IMMEDIATE`) (C-25). A
-/// deferred transaction (rusqlite's default `unchecked_transaction`) takes a read lock first and only
-/// tries to promote to the write lock at its first write — and SQLite refuses to run the busy handler
-/// on that read→write upgrade (it could deadlock), returning `SQLITE_BUSY` immediately. So a
-/// cross-process contender would still abort despite the `busy_timeout` set in [`EventStore::open`].
-/// Acquiring the write lock at `BEGIN` instead lets the busy handler wait the other writer out.
-fn begin_write(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
-    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
-        .map_err(map_sql)
-}
+use sqlite::SqliteEvents;
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -47,94 +42,30 @@ fn parse_id(id: &str) -> Result<i64> {
         .ok_or_else(|| Error::Other(format!("invalid session id: {id:?}")))
 }
 
-/// The `streams` columns a [`SessionSummary`] reads, in `row_to_summary` order. Shared by
-/// [`EventStore::list`] and [`EventStore::list_for_account`] so the two never drift.
-const SUMMARY_COLS: &str =
-    "n, model, created_at, updated_at, msg_count, account, agent_id, agent_version, correlation_id";
+/// Raw event columns as read from a row, before the `payload` JSON is decoded. Backend-neutral:
+/// every backend's load primitives produce these tuples, and [`decode_all`] turns them into
+/// [`StoredEvent`]s in one shared place — so the serde contract can never drift between backends.
+type RawEvent = (i64, i64, String, u32, i64, String, Option<i64>);
 
-/// Decode a `streams` row selected as [`SUMMARY_COLS`] into a [`SessionSummary`].
-fn row_to_summary(r: &rusqlite::Row) -> rusqlite::Result<SessionSummary> {
-    let n: i64 = r.get(0)?;
-    Ok(SessionSummary {
-        id: format!("s_{n}"),
-        model: r.get(1)?,
-        created_at_ms: r.get(2)?,
-        updated_at_ms: r.get(3)?,
-        messages: r.get::<_, i64>(4)? as usize,
-        context: EventContext {
-            account: r.get(5)?,
-            agent_id: r.get(6)?,
-            agent_version: r.get(7)?,
-            correlation_id: r.get(8)?,
-        },
-    })
-}
-
-/// The run context tagged on a stream's registry row, or empty for ad-hoc / unknown streams.
-/// All events in a stream share one context, so reads look it up once and stamp every event.
-fn read_context(conn: &Connection, stream: &str) -> Result<EventContext> {
-    let Ok(n) = parse_id(stream) else {
-        return Ok(EventContext::default());
-    };
-    let ctx = conn
-        .prepare_cached(
-            "SELECT account, agent_id, agent_version, correlation_id FROM streams WHERE n = ?1",
-        )
-        .map_err(map_sql)?
-        .query_row([n], |r| {
-            Ok(EventContext {
-                account: r.get(0)?,
-                agent_id: r.get(1)?,
-                agent_version: r.get(2)?,
-                correlation_id: r.get(3)?,
-            })
-        })
-        .optional()
-        .map_err(map_sql)?;
-    Ok(ctx.unwrap_or_default())
-}
-
-/// Add the optional run-context columns + account index to `streams` (idempotent). The
-/// `CREATE TABLE` in [`EventStore::init`] makes the base table; this fills in the additive
-/// columns, so a fresh store and a pre-existing one converge on the same schema with no
-/// destructive migration.
-fn migrate_stream_context(conn: &Connection) -> Result<()> {
-    for col in ["account", "agent_id", "agent_version", "correlation_id"] {
-        add_column_if_missing(conn, "streams", col)?;
+/// Decode a batch of raw rows (all from `stream`, all sharing its run `ctx`) into [`StoredEvent`]s.
+/// The single serde-decode point, shared by every backend.
+fn decode_all(stream: &str, ctx: &EventContext, raw: Vec<RawEvent>) -> Result<Vec<StoredEvent>> {
+    let mut out = Vec::with_capacity(raw.len());
+    for (global_seq, stream_seq, id, schema_version, ts, payload, turn_id) in raw {
+        let kind: EventKind = serde_json::from_str(&payload)?;
+        out.push(StoredEvent {
+            global_seq,
+            stream: stream.to_string(),
+            stream_seq,
+            id,
+            turn_id,
+            schema_version,
+            ts_ms: ts,
+            kind,
+            context: ctx.clone(),
+        });
     }
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_streams_account ON streams(account)",
-        [],
-    )
-    .map_err(map_sql)?;
-    Ok(())
-}
-
-/// `ALTER TABLE <table> ADD COLUMN <col> TEXT`, but only if the column is absent — SQLite has
-/// no `ADD COLUMN IF NOT EXISTS`, so we consult `PRAGMA table_info`. `table`/`col` are internal
-/// `&'static str` constants (never user input), so the formatted SQL is safe.
-fn add_column_if_missing(conn: &Connection, table: &str, col: &str) -> Result<()> {
-    let present = {
-        let mut stmt = conn
-            .prepare(&format!("PRAGMA table_info({table})"))
-            .map_err(map_sql)?;
-        let names = stmt
-            .query_map([], |r| r.get::<_, String>(1))
-            .map_err(map_sql)?;
-        let mut found = false;
-        for name in names {
-            if name.map_err(map_sql)? == col {
-                found = true;
-                break;
-            }
-        }
-        found
-    };
-    if !present {
-        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} TEXT"), [])
-            .map_err(map_sql)?;
-    }
-    Ok(())
+    Ok(out)
 }
 
 /// Metadata about a session, projected from its events. (The session registry view —
@@ -163,70 +94,95 @@ pub struct SessionSummary {
     pub context: EventContext,
 }
 
-/// The append-only event store. Backed by SQLite (WAL); serialized in-process by a `Mutex`,
-/// with `UNIQUE(id)` and `UNIQUE(stream, stream_seq)` as durable backstops.
+/// The storage primitives every backend provides. These are exactly the methods that touch SQL;
+/// every wrapper (`record_*`, `begin_turn`, …) and projection (`conversation`, `cost_summary_all`,
+/// …) is implemented once on [`EventStore`] over these, so a new backend only reimplements this
+/// trait. Object-safe (all `&self`, owned args/returns) so [`Backend`] can dispatch through
+/// `&dyn EventBackend`.
+///
+/// The read primitives return fully-decoded [`StoredEvent`]s (each produces [`RawEvent`] tuples its
+/// own way, then calls the shared [`decode_all`]); the write primitives own their transaction.
+trait EventBackend: Send + Sync {
+    fn create_session_with_context(&self, model: &str, ctx: &EventContext) -> Result<String>;
+    fn latest_session(&self) -> Result<Option<String>>;
+    fn info(&self, stream: &str) -> Result<SessionInfo>;
+    fn list(&self, limit: usize) -> Result<Vec<SessionSummary>>;
+    fn list_for_account(&self, account: &str, limit: usize) -> Result<Vec<SessionSummary>>;
+    fn account_streams(&self, account: &str) -> Result<Vec<String>>;
+    fn find_correlated(&self, correlation_id: &str, agent_id: &str) -> Result<Option<String>>;
+    fn find_correlated_in_realm(
+        &self,
+        correlation_id: &str,
+        agent_id: &str,
+        realm: &str,
+    ) -> Result<Option<String>>;
+    fn children_of(&self, stream: &str) -> Result<Vec<String>>;
+    fn prune_empty(&self) -> Result<usize>;
+    fn prune_inactive(&self, agent_id: &str, cutoff_ms: i64) -> Result<usize>;
+    fn append(&self, stream: &str, ev: NewEvent) -> Result<StoredEvent>;
+    fn load_stream(&self, stream: &str, after_seq: Option<i64>) -> Result<Vec<StoredEvent>>;
+    fn load_by_kind(&self, stream: &str, kind: &str) -> Result<Vec<StoredEvent>>;
+    fn conversation_delta(&self, stream: &str, after_seq: i64) -> Result<Vec<StoredEvent>>;
+    fn load_turn(&self, stream: &str, turn_id: i64) -> Result<Vec<StoredEvent>>;
+    fn head_seq(&self, stream: &str) -> Result<i64>;
+    fn all_streams(&self) -> Result<Vec<String>>;
+    /// The SQL half of [`EventStore::aggregate_streams`]: every `(n, correlation_id)` in `n` order.
+    /// The cross-stream fold that drops correlated children stays backend-neutral on [`EventStore`].
+    fn streams_with_correlation(&self) -> Result<Vec<(i64, Option<String>)>>;
+    /// D-75: delete every stream (registry row + events) whose `updated_at` is strictly older than
+    /// `cutoff_ms`, regardless of tag; returns the count. The whole-store sibling of
+    /// [`prune_inactive`](Self::prune_inactive) (same delete shape, minus the `agent_id` predicate).
+    fn prune_older_than(&self, cutoff_ms: i64) -> Result<usize>;
+}
+
+/// The concrete storage backend behind an [`EventStore`]. The default build carries only the
+/// embedded SQLite arm; a Postgres arm plugs in behind the `postgres` feature (D-73).
+enum Backend {
+    Sqlite(SqliteEvents),
+    #[cfg(feature = "postgres")]
+    Postgres(postgres::PgEvents),
+}
+
+/// The append-only event store — one ordered log projected into conversations, run traces, and turn
+/// telemetry. Backed by [`SqliteEvents`] (WAL) by default; the public API is backend-independent.
 pub struct EventStore {
-    conn: Mutex<Connection>,
+    backend: Backend,
 }
 
 impl EventStore {
-    /// Open (creating if needed) a store at `path`, with WAL enabled for concurrent reads.
+    /// Dispatch to the active backend's storage primitives.
+    fn backend(&self) -> &dyn EventBackend {
+        match &self.backend {
+            Backend::Sqlite(s) => s,
+            #[cfg(feature = "postgres")]
+            Backend::Postgres(p) => p,
+        }
+    }
+
+    /// Open (creating if needed) a SQLite store at `path`, with WAL enabled for concurrent reads.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let conn = Connection::open(path).map_err(map_sql)?;
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(map_sql)?;
-        // C-25: coordinate cross-process writers on the shared `~/.flux/events.db`. WAL permits a
-        // single writer at a time; without a busy handler a second process (a `flux app run --serve`
-        // daemon + a CLI turn on the same file) gets `SQLITE_BUSY` immediately and the write is lost
-        // — `record_message` `?`-propagates and aborts the turn. A ~5s busy_timeout makes a contended
-        // writer WAIT for the lock instead of failing; the in-process `Mutex` still serializes one
-        // process's own writers, so this only ever matters across processes.
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(map_sql)?;
-        // NORMAL is the recommended durability level under WAL: durable against application crashes
-        // (only a power loss can drop the last few committed transactions) while avoiding an fsync
-        // per commit — so single-process throughput does not regress.
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(map_sql)?;
-        Self::init(conn)
-    }
-
-    /// An in-memory store (for tests and the SDK's ephemeral sessions).
-    pub fn in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory().map_err(map_sql)?)
-    }
-
-    fn init(conn: Connection) -> Result<Self> {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS events (
-                 global_seq     INTEGER PRIMARY KEY AUTOINCREMENT,
-                 stream         TEXT    NOT NULL,
-                 stream_seq     INTEGER NOT NULL,
-                 id             TEXT    NOT NULL,
-                 kind           TEXT    NOT NULL,
-                 schema_version INTEGER NOT NULL DEFAULT 1,
-                 ts             INTEGER NOT NULL,
-                 payload        TEXT    NOT NULL,
-                 turn_id        INTEGER,
-                 UNIQUE(id),
-                 UNIQUE(stream, stream_seq)
-             );
-             CREATE INDEX IF NOT EXISTS idx_events_stream_kind ON events(stream, kind, stream_seq);
-             CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
-             CREATE INDEX IF NOT EXISTS idx_events_turn ON events(stream, turn_id) WHERE turn_id IS NOT NULL;
-             CREATE TABLE IF NOT EXISTS streams (
-                 n          INTEGER PRIMARY KEY AUTOINCREMENT,
-                 model      TEXT    NOT NULL DEFAULT '',
-                 created_at INTEGER NOT NULL,
-                 updated_at INTEGER NOT NULL,
-                 last_seq   INTEGER NOT NULL DEFAULT -1,
-                 msg_count  INTEGER NOT NULL DEFAULT 0
-             );",
-        )
-        .map_err(map_sql)?;
-        migrate_stream_context(&conn)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            backend: Backend::Sqlite(SqliteEvents::open(path)?),
+        })
+    }
+
+    /// An in-memory SQLite store (for tests and the SDK's ephemeral sessions).
+    pub fn in_memory() -> Result<Self> {
+        Ok(Self {
+            backend: Backend::Sqlite(SqliteEvents::in_memory()?),
+        })
+    }
+
+    /// Open a store backed by a shared Postgres (D-73), reusing an already-built [`flux_pg::PgHandle`]
+    /// (pool + sync↔async bridge). Creates the schema inline on first use (`CREATE TABLE IF NOT
+    /// EXISTS …`), then returns a store whose public API is byte-identical to the SQLite backend —
+    /// with the added property that appends serialize across processes/replicas (a per-stream
+    /// `pg_advisory_xact_lock`), which an embedded file structurally cannot do. The `postgres` feature
+    /// gates this; the default build stays rusqlite-only and DB-free.
+    #[cfg(feature = "postgres")]
+    pub fn open_postgres(handle: std::sync::Arc<flux_pg::PgHandle>) -> Result<Self> {
+        Ok(Self {
+            backend: Backend::Postgres(postgres::PgEvents::connect(handle)?),
         })
     }
 
@@ -247,128 +203,36 @@ impl EventStore {
     /// carry it back, and [`list_for_account`](Self::list_for_account) scopes to it. An empty
     /// `ctx` is exactly equivalent to [`create_session`](Self::create_session).
     pub fn create_session_with_context(&self, model: &str, ctx: &EventContext) -> Result<String> {
-        let ts = now_ms();
-        let conn = self.conn.lock().unwrap();
-        let tx = begin_write(&conn)?;
-        tx.execute(
-            "INSERT INTO streams \
-             (model, created_at, updated_at, last_seq, msg_count, \
-              account, agent_id, agent_version, correlation_id) \
-             VALUES (?1, ?2, ?2, 0, 0, ?3, ?4, ?5, ?6)",
-            rusqlite::params![
-                model,
-                ts,
-                ctx.account,
-                ctx.agent_id,
-                ctx.agent_version,
-                ctx.correlation_id
-            ],
-        )
-        .map_err(map_sql)?;
-        let n = tx.last_insert_rowid();
-        let stream = format!("s_{n}");
-        let ev = NewEvent::new(EventKind::SessionStarted {
-            model: model.to_string(),
-        });
-        insert_event(&tx, &stream, &ev, 0, ctx)?;
-        tx.commit().map_err(map_sql)?;
-        Ok(stream)
+        self.backend().create_session_with_context(model, ctx)
     }
 
     /// The most recently created session id, if any (for `--continue`).
     pub fn latest_session(&self) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
-        // Distinguish "no sessions yet" from a real DB error so `--continue` fails loudly
-        // on corruption instead of silently starting fresh.
-        let n: Option<i64> =
-            match conn.query_row("SELECT n FROM streams ORDER BY n DESC LIMIT 1", [], |r| {
-                r.get(0)
-            }) {
-                Ok(n) => Some(n),
-                Err(rusqlite::Error::QueryReturnedNoRows) => None,
-                Err(e) => return Err(map_sql(e)),
-            };
-        Ok(n.map(|n| format!("s_{n}")))
+        self.backend().latest_session()
     }
 
     /// Session metadata, from the registry.
     pub fn info(&self, stream: &str) -> Result<SessionInfo> {
-        let n = parse_id(stream)?;
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT model, created_at, updated_at, account, agent_id, agent_version, correlation_id \
-             FROM streams WHERE n = ?1",
-            [n],
-            |r| {
-                Ok(SessionInfo {
-                    id: stream.to_string(),
-                    model: r.get(0)?,
-                    created_at_ms: r.get(1)?,
-                    updated_at_ms: r.get(2)?,
-                    context: EventContext {
-                        account: r.get(3)?,
-                        agent_id: r.get(4)?,
-                        agent_version: r.get(5)?,
-                        correlation_id: r.get(6)?,
-                    },
-                })
-            },
-        )
-        .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => {
-                Error::Other(format!("session {stream} not found"))
-            }
-            other => map_sql(other),
-        })
+        self.backend().info(stream)
     }
 
     /// The most recent sessions (newest-active first), with current message counts.
     pub fn list(&self, limit: usize) -> Result<Vec<SessionSummary>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {SUMMARY_COLS} FROM streams \
-                 ORDER BY updated_at DESC, n DESC LIMIT ?1"
-            ))
-            .map_err(map_sql)?;
-        let rows = stmt
-            .query_map([limit as i64], row_to_summary)
-            .map_err(map_sql)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(map_sql)
+        self.backend().list(limit)
     }
 
     /// The most recent runs for `account` (newest-active first) — the account-scoped sibling of
     /// [`list`](Self::list). Returns **only** streams tagged with that account, so a downstream
     /// multi-tenant service can enumerate one tenant's runs without seeing any other's.
     pub fn list_for_account(&self, account: &str, limit: usize) -> Result<Vec<SessionSummary>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {SUMMARY_COLS} FROM streams \
-                 WHERE account = ?1 ORDER BY updated_at DESC, n DESC LIMIT ?2"
-            ))
-            .map_err(map_sql)?;
-        let rows = stmt
-            .query_map(rusqlite::params![account, limit as i64], row_to_summary)
-            .map_err(map_sql)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(map_sql)
+        self.backend().list_for_account(account, limit)
     }
 
     /// The stream ids for `account`, newest-active first — the enumeration primitive a downstream
     /// consumer folds over (`account_streams` → per-stream [`conversation`](Self::conversation) /
     /// [`turns`](Self::turns)) to replay a tenant's transcripts as projections over the log.
     pub fn account_streams(&self, account: &str) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT n FROM streams WHERE account = ?1 ORDER BY updated_at DESC, n DESC")
-            .map_err(map_sql)?;
-        let rows = stmt
-            .query_map([account], |r| Ok(format!("s_{}", r.get::<_, i64>(0)?)))
-            .map_err(map_sql)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(map_sql)
+        self.backend().account_streams(account)
     }
 
     /// A-48: the most recent stream tagged `agent_id` whose `correlation_id` equals
@@ -376,17 +240,7 @@ impl EventStore {
     /// reuse-or-mint keys on this. Newest-first so a client re-using a `contextId` after its old
     /// session was TTL-pruned (and a new one minted) always continues the LIVE session.
     pub fn find_correlated(&self, correlation_id: &str, agent_id: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
-        let n: Option<i64> = conn
-            .query_row(
-                "SELECT n FROM streams WHERE correlation_id = ?1 AND agent_id = ?2 \
-                 ORDER BY n DESC LIMIT 1",
-                [correlation_id, agent_id],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(map_sql)?;
-        Ok(n.map(|n| format!("s_{n}")))
+        self.backend().find_correlated(correlation_id, agent_id)
     }
 
     /// D-69: the realm-scoped sibling of [`find_correlated`](Self::find_correlated) — the most
@@ -419,17 +273,8 @@ impl EventStore {
         agent_id: &str,
         realm: &str,
     ) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
-        let n: Option<i64> = conn
-            .query_row(
-                "SELECT n FROM streams WHERE correlation_id = ?1 AND agent_id = ?2 \
-                 AND account = ?3 ORDER BY n DESC LIMIT 1",
-                [correlation_id, agent_id, realm],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(map_sql)?;
-        Ok(n.map(|n| format!("s_{n}")))
+        self.backend()
+            .find_correlated_in_realm(correlation_id, agent_id, realm)
     }
 
     /// A-45/C-44: the sub-agent children of `stream` — every stream whose `correlation_id` points
@@ -437,15 +282,7 @@ impl EventStore {
     /// parent session). Oldest-first, so a replay recurses children in spawn order. One level per
     /// call; a grandchild's `correlation_id` points at ITS parent, so tree walks recurse.
     pub fn children_of(&self, stream: &str) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT n FROM streams WHERE correlation_id = ?1 ORDER BY n ASC")
-            .map_err(map_sql)?;
-        let rows = stmt
-            .query_map([stream], |r| Ok(format!("s_{}", r.get::<_, i64>(0)?)))
-            .map_err(map_sql)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(map_sql)
+        self.backend().children_of(stream)
     }
 
     /// Switch the session's model (records a `ModelChanged` event; the registry follows).
@@ -463,27 +300,7 @@ impl EventStore {
     /// their events. Returns the number of sessions removed. An empty stream has no history
     /// worth preserving, so real deletion is append-only-safe.
     pub fn prune_empty(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
-        let tx = begin_write(&conn)?;
-        let empty: Vec<i64> = {
-            let mut stmt = tx
-                .prepare("SELECT n FROM streams WHERE msg_count = 0")
-                .map_err(map_sql)?;
-            let rows = stmt
-                .query_map([], |r| r.get::<_, i64>(0))
-                .map_err(map_sql)?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(map_sql)?
-        };
-        for n in &empty {
-            let stream = format!("s_{n}");
-            tx.execute("DELETE FROM events WHERE stream = ?1", [&stream])
-                .map_err(map_sql)?;
-            tx.execute("DELETE FROM streams WHERE n = ?1", [n])
-                .map_err(map_sql)?;
-        }
-        tx.commit().map_err(map_sql)?;
-        Ok(empty.len())
+        self.backend().prune_empty()
     }
 
     /// Delete sessions tagged with `agent_id` whose last activity (`updated_at`) is strictly
@@ -506,29 +323,29 @@ impl EventStore {
     /// - **Age = last activity.** `updated_at` advances on every append, so a recently-active
     ///   stream survives even when it was created long before the cutoff.
     pub fn prune_inactive(&self, agent_id: &str, cutoff_ms: i64) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
-        let tx = begin_write(&conn)?;
-        let expired: Vec<i64> = {
-            let mut stmt = tx
-                .prepare("SELECT n FROM streams WHERE agent_id = ?1 AND updated_at < ?2")
-                .map_err(map_sql)?;
-            let rows = stmt
-                .query_map(rusqlite::params![agent_id, cutoff_ms], |r| {
-                    r.get::<_, i64>(0)
-                })
-                .map_err(map_sql)?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(map_sql)?
-        };
-        for n in &expired {
-            let stream = format!("s_{n}");
-            tx.execute("DELETE FROM events WHERE stream = ?1", [&stream])
-                .map_err(map_sql)?;
-            tx.execute("DELETE FROM streams WHERE n = ?1", [n])
-                .map_err(map_sql)?;
-        }
-        tx.commit().map_err(map_sql)?;
-        Ok(expired.len())
+        self.backend().prune_inactive(agent_id, cutoff_ms)
+    }
+
+    /// D-75: delete **every** stream (registry row + its whole event stream) whose last activity
+    /// (`updated_at`) is strictly older than `cutoff_ms`, regardless of tag, and return the number
+    /// of sessions removed. The whole-store retention primitive for long-running server deployments:
+    /// scheduled "retain N days" against an unbounded log needs one call that expresses it, and
+    /// [`prune_inactive`](Self::prune_inactive) structurally cannot — it is tag-scoped (matches one
+    /// `agent_id`), so a deployment whose streams carry many agent tags could never sweep them all.
+    ///
+    /// The same delete shape as [`prune_inactive`](Self::prune_inactive) minus the tag predicate, and
+    /// the same append-only reasoning: removing a *whole expired stream* is a retention decision, not
+    /// a history rewrite (no event is ever mutated), and the all-streams projections stay consistent
+    /// by construction because they enumerate `streams`. The same TTL/rollup trade-off applies — a
+    /// pruned session's spend leaves the aggregate rollups, so a deployment that must retain spend
+    /// indefinitely should snapshot usage upstream before pruning.
+    ///
+    /// Unlike the interactive CLI's TTL sweep, there is **no "protect the current session" carve-out**
+    /// here: this is the primitive a caller that owns its store schedules against its own retention
+    /// policy, so "old" means exactly `updated_at < cutoff_ms` with nothing exempt. A caller that
+    /// wants to keep a live session simply keeps its `cutoff_ms` behind that session's last activity.
+    pub fn prune_older_than(&self, cutoff_ms: i64) -> Result<usize> {
+        self.backend().prune_older_than(cutoff_ms)
     }
 
     // --- append -------------------------------------------------------------
@@ -538,59 +355,7 @@ impl EventStore {
     /// log. If the event carries a caller-supplied `id` that already exists, this is a no-op
     /// returning the prior event (idempotent retry).
     pub fn append(&self, stream: &str, ev: NewEvent) -> Result<StoredEvent> {
-        let conn = self.conn.lock().unwrap();
-        if let Some(id) = &ev.id {
-            if let Some(existing) = load_by_id(&conn, id)? {
-                return Ok(existing);
-            }
-        }
-        let tx = begin_write(&conn)?;
-        // All events in a stream share its run context; read it once and stamp the stored event.
-        let ctx = read_context(&tx, stream)?;
-        let next_seq: i64 = tx
-            .prepare_cached(
-                "SELECT COALESCE(MAX(stream_seq), -1) + 1 FROM events WHERE stream = ?1",
-            )
-            .map_err(map_sql)?
-            .query_row([stream], |r| r.get(0))
-            .map_err(map_sql)?;
-        let stored = insert_event(&tx, stream, &ev, next_seq, &ctx)?;
-        // Maintain the session registry — but only for real `s_<n>` sessions. The log itself accepts
-        // any stream string (the interpreter writes run events under ad-hoc ids like `"sess"`), so a
-        // non-session stream simply has no registry row to update.
-        if let Ok(n) = parse_id(stream) {
-            let model_opt = match &ev.kind {
-                EventKind::SessionStarted { model } | EventKind::ModelChanged { model } => {
-                    Some(model.as_str())
-                }
-                _ => None,
-            };
-            tx.prepare_cached(
-                "UPDATE streams SET updated_at = ?1, last_seq = ?2, model = COALESCE(?3, model) \
-                 WHERE n = ?4",
-            )
-            .map_err(map_sql)?
-            .execute(rusqlite::params![stored.ts_ms, next_seq, model_opt, n])
-            .map_err(map_sql)?;
-            // Keep msg_count equal to the live conversation length (so `list` matches a replay).
-            match &ev.kind {
-                EventKind::Message(_) => {
-                    tx.prepare_cached("UPDATE streams SET msg_count = msg_count + 1 WHERE n = ?1")
-                        .map_err(map_sql)?
-                        .execute([n])
-                        .map_err(map_sql)?;
-                }
-                EventKind::Compacted { messages } => {
-                    tx.prepare_cached("UPDATE streams SET msg_count = ?1 WHERE n = ?2")
-                        .map_err(map_sql)?
-                        .execute(rusqlite::params![messages.len() as i64, n])
-                        .map_err(map_sql)?;
-                }
-                _ => {}
-            }
-        }
-        tx.commit().map_err(map_sql)?;
-        Ok(stored)
+        self.backend().append(stream, ev)
     }
 
     /// Append several events to a stream atomically (all-or-nothing, consecutive seqs).
@@ -606,31 +371,12 @@ impl EventStore {
 
     /// All events of a stream in order; `after_seq` enables incremental replay.
     pub fn load_stream(&self, stream: &str, after_seq: Option<i64>) -> Result<Vec<StoredEvent>> {
-        let conn = self.conn.lock().unwrap();
-        let ctx = read_context(&conn, stream)?;
-        let after = after_seq.unwrap_or(-1);
-        let mut stmt = conn
-            .prepare(
-                "SELECT global_seq, stream_seq, id, schema_version, ts, payload, turn_id \
-                 FROM events WHERE stream = ?1 AND stream_seq > ?2 ORDER BY stream_seq",
-            )
-            .map_err(map_sql)?;
-        let raw = collect_raw(&mut stmt, rusqlite::params![stream, after])?;
-        decode_all(stream, &ctx, raw)
+        self.backend().load_stream(stream, after_seq)
     }
 
     /// Events of a stream filtered by `kind` tag (e.g. `"message"`, `"run"`), in order.
     pub fn load_by_kind(&self, stream: &str, kind: &str) -> Result<Vec<StoredEvent>> {
-        let conn = self.conn.lock().unwrap();
-        let ctx = read_context(&conn, stream)?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT global_seq, stream_seq, id, schema_version, ts, payload, turn_id \
-                 FROM events WHERE stream = ?1 AND kind = ?2 ORDER BY stream_seq",
-            )
-            .map_err(map_sql)?;
-        let raw = collect_raw(&mut stmt, rusqlite::params![stream, kind])?;
-        decode_all(stream, &ctx, raw)
+        self.backend().load_by_kind(stream, kind)
     }
 
     /// The message-affecting events (`message`/`compacted`) of a stream with `stream_seq > after_seq`,
@@ -639,46 +385,18 @@ impl EventStore {
     /// The kind filter is served by `idx_events_stream_kind`, so this skips the bulky plan/run/usage
     /// payloads the conversation projection would otherwise decode and discard.
     pub fn conversation_delta(&self, stream: &str, after_seq: i64) -> Result<Vec<StoredEvent>> {
-        let conn = self.conn.lock().unwrap();
-        let ctx = read_context(&conn, stream)?;
-        // `prepare_cached` — this is the one query that runs on EVERY planner round (the point of
-        // the incremental cache is that it usually returns nothing), so don't re-compile it each time.
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT global_seq, stream_seq, id, schema_version, ts, payload, turn_id \
-                 FROM events WHERE stream = ?1 AND stream_seq > ?2 AND kind IN ('message', 'compacted') \
-                 ORDER BY stream_seq",
-            )
-            .map_err(map_sql)?;
-        let raw = collect_raw(&mut stmt, rusqlite::params![stream, after_seq])?;
-        decode_all(stream, &ctx, raw)
+        self.backend().conversation_delta(stream, after_seq)
     }
 
     /// Every event tagged with `turn_id`, plus its `TurnStarted` anchor (whose `global_seq`
     /// *is* the turn id), in order — the old `turn_log` + `plan_attempts` join.
     pub fn load_turn(&self, stream: &str, turn_id: i64) -> Result<Vec<StoredEvent>> {
-        let conn = self.conn.lock().unwrap();
-        let ctx = read_context(&conn, stream)?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT global_seq, stream_seq, id, schema_version, ts, payload, turn_id \
-                 FROM events WHERE stream = ?1 AND (global_seq = ?2 OR turn_id = ?2) \
-                 ORDER BY stream_seq",
-            )
-            .map_err(map_sql)?;
-        let raw = collect_raw(&mut stmt, rusqlite::params![stream, turn_id])?;
-        decode_all(stream, &ctx, raw)
+        self.backend().load_turn(stream, turn_id)
     }
 
     /// The current head sequence of a stream (`-1` if empty) — the optimistic-concurrency anchor.
     pub fn head_seq(&self, stream: &str) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT COALESCE(MAX(stream_seq), -1) FROM events WHERE stream = ?1",
-            [stream],
-            |r| r.get(0),
-        )
-        .map_err(map_sql)
+        self.backend().head_seq(stream)
     }
 
     // --- ergonomic event-native helpers (used at call sites) ----------------
@@ -956,17 +674,7 @@ impl EventStore {
     /// ([`cost_summary`](Self::cost_summary) / [`efficiency`](Self::efficiency)) are unaffected: a
     /// child's own session still reports its full spend.
     fn aggregate_streams(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT n, correlation_id FROM streams ORDER BY n")
-            .map_err(map_sql)?;
-        let rows: Vec<(i64, Option<String>)> = stmt
-            .query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
-            })
-            .map_err(map_sql)?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(map_sql)?;
+        let rows = self.backend().streams_with_correlation()?;
         let ids: std::collections::HashSet<String> =
             rows.iter().map(|(n, _)| format!("s_{n}")).collect();
         Ok(rows
@@ -985,148 +693,7 @@ impl EventStore {
     /// returns everything. (The all-sessions rollups fold over [`aggregate_streams`](Self::aggregate_streams)
     /// instead, which excludes correlated sub-agent children to avoid double-counting — C-23.)
     pub fn all_streams(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT n FROM streams ORDER BY n")
-            .map_err(map_sql)?;
-        let rows = stmt
-            .query_map([], |r| Ok(format!("s_{}", r.get::<_, i64>(0)?)))
-            .map_err(map_sql)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(map_sql)
-    }
-}
-
-/// Raw event columns as read from a row, before the `payload` JSON is decoded.
-type RawEvent = (i64, i64, String, u32, i64, String, Option<i64>);
-
-fn collect_raw(
-    stmt: &mut rusqlite::Statement,
-    params: &[&dyn rusqlite::ToSql],
-) -> Result<Vec<RawEvent>> {
-    let rows = stmt
-        .query_map(params, |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, u32>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, Option<i64>>(6)?,
-            ))
-        })
-        .map_err(map_sql)?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(map_sql)
-}
-
-/// Decode a batch of raw rows (all from `stream`, all sharing its run `ctx`) into [`StoredEvent`]s.
-fn decode_all(stream: &str, ctx: &EventContext, raw: Vec<RawEvent>) -> Result<Vec<StoredEvent>> {
-    let mut out = Vec::with_capacity(raw.len());
-    for (global_seq, stream_seq, id, schema_version, ts, payload, turn_id) in raw {
-        let kind: EventKind = serde_json::from_str(&payload)?;
-        out.push(StoredEvent {
-            global_seq,
-            stream: stream.to_string(),
-            stream_seq,
-            id,
-            turn_id,
-            schema_version,
-            ts_ms: ts,
-            kind,
-            context: ctx.clone(),
-        });
-    }
-    Ok(out)
-}
-
-/// Insert one event row (no registry update — callers handle that). Mints a ULID id when
-/// the event has none. `conn` is the active transaction (a `Transaction` derefs here). `ctx` is
-/// the stream's run context, stamped onto the returned [`StoredEvent`] (it lives on the registry,
-/// not the event row, so it is not persisted here — only surfaced).
-fn insert_event(
-    conn: &Connection,
-    stream: &str,
-    ev: &NewEvent,
-    stream_seq: i64,
-    ctx: &EventContext,
-) -> Result<StoredEvent> {
-    let id = ev
-        .id
-        .clone()
-        .unwrap_or_else(|| ulid::Ulid::new().to_string());
-    let ts = now_ms();
-    let kind_tag = ev.kind.kind_tag();
-    let payload = serde_json::to_string(&ev.kind)?;
-    conn.prepare_cached(
-        "INSERT INTO events (stream, stream_seq, id, kind, schema_version, ts, payload, turn_id) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-    )
-    .map_err(map_sql)?
-    .execute(rusqlite::params![
-        stream,
-        stream_seq,
-        id,
-        kind_tag,
-        ev.schema_version,
-        ts,
-        payload,
-        ev.turn_id
-    ])
-    .map_err(map_sql)?;
-    let global_seq = conn.last_insert_rowid();
-    Ok(StoredEvent {
-        global_seq,
-        stream: stream.to_string(),
-        stream_seq,
-        id,
-        turn_id: ev.turn_id,
-        schema_version: ev.schema_version,
-        ts_ms: ts,
-        kind: ev.kind.clone(),
-        context: ctx.clone(),
-    })
-}
-
-/// Fetch a single event by its stable id (for idempotent retries).
-fn load_by_id(conn: &Connection, id: &str) -> Result<Option<StoredEvent>> {
-    let row = conn
-        .query_row(
-            "SELECT global_seq, stream, stream_seq, schema_version, ts, payload, turn_id \
-             FROM events WHERE id = ?1",
-            [id],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, u32>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, Option<i64>>(6)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(map_sql)?;
-    match row {
-        Some((global_seq, stream, stream_seq, schema_version, ts, payload, turn_id)) => {
-            let kind = serde_json::from_str(&payload)?;
-            let context = read_context(conn, &stream)?;
-            Ok(Some(StoredEvent {
-                global_seq,
-                stream,
-                stream_seq,
-                id: id.to_string(),
-                turn_id,
-                schema_version,
-                ts_ms: ts,
-                kind,
-                context,
-            }))
-        }
-        None => Ok(None),
+        self.backend().all_streams()
     }
 }
 
@@ -1137,9 +704,7 @@ mod tests {
 
     // --- conformance: ported from flux-session's test module, adapted to the event API ---
 
-    #[test]
-    fn create_append_load_roundtrip() {
-        let store = EventStore::in_memory().unwrap();
+    fn create_append_load_roundtrip(store: &EventStore) {
         let id = store.create_session("claude-sonnet-4-6").unwrap();
         assert!(id.starts_with("s_"));
 
@@ -1157,9 +722,7 @@ mod tests {
         assert_eq!(store.info(&id).unwrap().model, "claude-sonnet-4-6");
     }
 
-    #[test]
-    fn updated_at_advances_on_append() {
-        let store = EventStore::in_memory().unwrap();
+    fn updated_at_advances_on_append(store: &EventStore) {
         let id = store.create_session("m").unwrap();
         let created = store.info(&id).unwrap().updated_at_ms;
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -1171,9 +734,7 @@ mod tests {
         assert_eq!(store.list(1).unwrap()[0].updated_at_ms, after);
     }
 
-    #[test]
-    fn updated_at_advances_on_set_model() {
-        let store = EventStore::in_memory().unwrap();
+    fn updated_at_advances_on_set_model(store: &EventStore) {
         let id = store.create_session("sonnet").unwrap();
         let before = store.info(&id).unwrap().updated_at_ms;
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -1187,9 +748,7 @@ mod tests {
     /// full `conversation()` replay at every step — after plain appends AND across a compaction
     /// (which resets the fold). This is the correctness contract behind the loop host's cached
     /// conversation replacing the per-round full re-read.
-    #[test]
-    fn conversation_delta_folds_incrementally_like_a_full_replay() {
-        let store = EventStore::in_memory().unwrap();
+    fn conversation_delta_folds_incrementally_like_a_full_replay(store: &EventStore) {
         let sid = store.create_session("m").unwrap();
         let mut msgs: Vec<Message> = Vec::new();
         let mut cursor = -1i64;
@@ -1213,7 +772,7 @@ mod tests {
         store
             .record_message(&sid, &Message::assistant_text("a1"))
             .unwrap();
-        fold(&store, &mut msgs, &mut cursor);
+        fold(store, &mut msgs, &mut cursor);
         assert_eq!(
             msgs,
             store.conversation(&sid).unwrap(),
@@ -1227,7 +786,7 @@ mod tests {
         store
             .record_message(&sid, &Message::assistant_text("a2"))
             .unwrap();
-        fold(&store, &mut msgs, &mut cursor);
+        fold(store, &mut msgs, &mut cursor);
         assert_eq!(
             msgs,
             store.conversation(&sid).unwrap(),
@@ -1241,7 +800,7 @@ mod tests {
             Message::assistant_text("a2"),
         ];
         store.record_compaction(&sid, &snapshot).unwrap();
-        fold(&store, &mut msgs, &mut cursor);
+        fold(store, &mut msgs, &mut cursor);
         assert_eq!(msgs, store.conversation(&sid).unwrap(), "after compaction");
         assert_eq!(msgs, snapshot);
 
@@ -1249,7 +808,7 @@ mod tests {
         store
             .record_message(&sid, &Message::user_text("u3"))
             .unwrap();
-        fold(&store, &mut msgs, &mut cursor);
+        fold(store, &mut msgs, &mut cursor);
         assert_eq!(
             msgs,
             store.conversation(&sid).unwrap(),
@@ -1258,9 +817,7 @@ mod tests {
         assert_eq!(msgs.len(), 3);
     }
 
-    #[test]
-    fn compaction_replaces_the_live_view_but_keeps_history() {
-        let store = EventStore::in_memory().unwrap();
+    fn compaction_replaces_the_live_view_but_keeps_history(store: &EventStore) {
         let id = store.create_session("m").unwrap();
         for i in 0..5 {
             store
@@ -1307,18 +864,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn latest_session_tracks_newest() {
-        let store = EventStore::in_memory().unwrap();
+    fn latest_session_tracks_newest(store: &EventStore) {
         assert!(store.latest_session().unwrap().is_none());
         let _a = store.create_session("m").unwrap();
         let b = store.create_session("m").unwrap();
         assert_eq!(store.latest_session().unwrap(), Some(b));
     }
 
-    #[test]
-    fn unknown_session_has_no_conversation_but_info_errors() {
-        let store = EventStore::in_memory().unwrap();
+    fn unknown_session_has_no_conversation_but_info_errors(store: &EventStore) {
         // The log accepts any stream; an unknown one simply has no events.
         assert!(store.conversation("s_999").unwrap().is_empty());
         assert!(store.conversation("nope").unwrap().is_empty());
@@ -1326,9 +879,7 @@ mod tests {
         assert!(store.info("s_999").is_err());
     }
 
-    #[test]
-    fn list_returns_newest_first_with_counts() {
-        let store = EventStore::in_memory().unwrap();
+    fn list_returns_newest_first_with_counts(store: &EventStore) {
         let a = store.create_session("m1").unwrap();
         store.record_message(&a, &Message::user_text("hi")).unwrap();
         store
@@ -1350,9 +901,7 @@ mod tests {
         assert_eq!(store.list(1).unwrap().len(), 1);
     }
 
-    #[test]
-    fn set_model_updates_listing() {
-        let store = EventStore::in_memory().unwrap();
+    fn set_model_updates_listing(store: &EventStore) {
         let a = store.create_session("sonnet").unwrap();
         store.set_model(&a, "opus").unwrap();
         assert_eq!(store.list(1).unwrap()[0].model, "opus");
@@ -1361,9 +910,7 @@ mod tests {
 
     /// A-48: the stateful-A2A lookup — newest live stream by (correlation_id, agent_id); other
     /// agent tags and other correlation ids never match.
-    #[test]
-    fn find_correlated_returns_newest_matching_tagged_stream() {
-        let store = EventStore::in_memory().unwrap();
+    fn find_correlated_returns_newest_matching_tagged_stream(store: &EventStore) {
         let mk = |agent: &str, corr: &str| {
             store
                 .create_session_with_context(
@@ -1393,9 +940,7 @@ mod tests {
     /// D-69: a correlation id is a grouping mechanism, not a security boundary — the same
     /// (correlation_id, agent_id) presented under two different realms names two DIFFERENT
     /// sessions, and each realm's lookup returns only its own.
-    #[test]
-    fn find_correlated_in_realm_isolates_realms() {
-        let store = EventStore::in_memory().unwrap();
+    fn find_correlated_in_realm_isolates_realms(store: &EventStore) {
         let mk = |realm: &str| {
             store
                 .create_session_with_context(
@@ -1440,9 +985,7 @@ mod tests {
     /// unreachable through the realm-scoped lookup for EVERY realm — while the untouched
     /// [`EventStore::find_correlated`] still finds it (non-principal server modes keep today's
     /// behavior byte-for-byte).
-    #[test]
-    fn find_correlated_in_realm_never_matches_legacy_untagged_sessions() {
-        let store = EventStore::in_memory().unwrap();
+    fn find_correlated_in_realm_never_matches_legacy_untagged_sessions(store: &EventStore) {
         let legacy = store
             .create_session_with_context(
                 "m",
@@ -1472,9 +1015,7 @@ mod tests {
 
     /// D-69: within one realm the newest matching stream wins, mirroring `find_correlated`'s
     /// TTL-prune reasoning — a re-used contextId always continues the LIVE session.
-    #[test]
-    fn find_correlated_in_realm_returns_newest_within_the_realm() {
-        let store = EventStore::in_memory().unwrap();
+    fn find_correlated_in_realm_returns_newest_within_the_realm(store: &EventStore) {
         let ctx = EventContext {
             account: Some("acme".into()),
             agent_id: Some("a2a".into()),
@@ -1494,9 +1035,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn record_call_usage_is_turn_scoped_and_a_noop_on_negative_turn_id() {
-        let store = EventStore::in_memory().unwrap();
+    fn record_call_usage_is_turn_scoped_and_a_noop_on_negative_turn_id(store: &EventStore) {
         let a = store.create_session("m").unwrap();
         let turn_id = store.begin_turn(&a, "hi", "m").unwrap();
         store
@@ -1524,9 +1063,7 @@ mod tests {
         assert_eq!(calls.len(), 1, "the negative-turn_id call recorded nothing");
     }
 
-    #[test]
-    fn cost_summary_wraps_the_projection_over_one_stream() {
-        let store = EventStore::in_memory().unwrap();
+    fn cost_summary_wraps_the_projection_over_one_stream(store: &EventStore) {
         let a = store.create_session("claude-sonnet-4-6").unwrap();
         let turn_id = store.begin_turn(&a, "hi", "claude-sonnet-4-6").unwrap();
         store
@@ -1554,9 +1091,7 @@ mod tests {
         assert!((summary[0].cost.unwrap().usd - 18.0).abs() < 1e-9);
     }
 
-    #[test]
-    fn cost_summary_all_aggregates_across_sessions() {
-        let store = EventStore::in_memory().unwrap();
+    fn cost_summary_all_aggregates_across_sessions(store: &EventStore) {
         let a = store.create_session("claude-sonnet-4-6").unwrap();
         let ta = store.begin_turn(&a, "hi", "claude-sonnet-4-6").unwrap();
         store
@@ -1596,9 +1131,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cost_summary_for_account_scopes_and_sums_through_the_shared_fold() {
-        let store = EventStore::in_memory().unwrap();
+    fn cost_summary_for_account_scopes_and_sums_through_the_shared_fold(store: &EventStore) {
         let acct = |a: &str| EventContext {
             account: Some(a.to_string()),
             ..Default::default()
@@ -1641,9 +1174,7 @@ mod tests {
             .is_empty());
     }
 
-    #[test]
-    fn prune_empty_removes_zero_message_sessions() {
-        let store = EventStore::in_memory().unwrap();
+    fn prune_empty_removes_zero_message_sessions(store: &EventStore) {
         let a = store.create_session("m").unwrap();
         store.record_message(&a, &Message::user_text("hi")).unwrap();
         let _b = store.create_session("m").unwrap();
@@ -1658,9 +1189,7 @@ mod tests {
         assert_eq!(store.latest_session().unwrap(), Some(a));
     }
 
-    #[test]
-    fn prune_inactive_deletes_only_expired_streams_with_the_tag() {
-        let store = EventStore::in_memory().unwrap();
+    fn prune_inactive_deletes_only_expired_streams_with_the_tag(store: &EventStore) {
         let a2a = EventContext {
             agent_id: Some("a2a".into()),
             ..Default::default()
@@ -1741,9 +1270,7 @@ mod tests {
         assert_eq!(store.prune_inactive("a2a", cutoff).unwrap(), 0);
     }
 
-    #[test]
-    fn roles_round_trip_through_the_conversation() {
-        let store = EventStore::in_memory().unwrap();
+    fn roles_round_trip_through_the_conversation(store: &EventStore) {
         let id = store.create_session("m").unwrap();
         store.record_message(&id, &Message::user_text("q")).unwrap();
         store
@@ -1758,9 +1285,7 @@ mod tests {
         assert_eq!(roles, vec!["user", "assistant"]);
     }
 
-    #[test]
-    fn append_is_transactional_and_sequences_monotonically() {
-        let store = EventStore::in_memory().unwrap();
+    fn append_is_transactional_and_sequences_monotonically(store: &EventStore) {
         let id = store.create_session("m").unwrap();
         for i in 0..10 {
             store
@@ -1774,9 +1299,7 @@ mod tests {
 
     // --- event-store specific behavior ---
 
-    #[test]
-    fn run_events_and_turn_telemetry_share_the_log() {
-        let store = EventStore::in_memory().unwrap();
+    fn run_events_and_turn_telemetry_share_the_log(store: &EventStore) {
         let id = store.create_session("m").unwrap();
 
         let turn = store.begin_turn(&id, "do it", "m").unwrap();
@@ -1861,9 +1384,7 @@ mod tests {
         assert_eq!(store.conversation(&id).unwrap().len(), 1);
     }
 
-    #[test]
-    fn idempotent_append_with_a_stable_id() {
-        let store = EventStore::in_memory().unwrap();
+    fn idempotent_append_with_a_stable_id(store: &EventStore) {
         let id = store.create_session("m").unwrap();
         let first = store
             .append(
@@ -1883,9 +1404,7 @@ mod tests {
 
     // --- D-02: tenant/agent context envelope ---
 
-    #[test]
-    fn context_round_trips_on_stored_events_and_summaries() {
-        let store = EventStore::in_memory().unwrap();
+    fn context_round_trips_on_stored_events_and_summaries(store: &EventStore) {
         let ctx = EventContext {
             account: Some("acme".into()),
             agent_id: Some("support-bot".into()),
@@ -1911,9 +1430,7 @@ mod tests {
         assert_eq!(store.list(1).unwrap()[0].context, ctx);
     }
 
-    #[test]
-    fn accounts_are_isolated_in_scoped_reads() {
-        let store = EventStore::in_memory().unwrap();
+    fn accounts_are_isolated_in_scoped_reads(store: &EventStore) {
         let a = store
             .create_session_with_context("m", &EventContext::for_account("a"))
             .unwrap();
@@ -1936,9 +1453,7 @@ mod tests {
         assert_eq!(store.list(10).unwrap().len(), 2);
     }
 
-    #[test]
-    fn single_tenant_session_has_empty_context() {
-        let store = EventStore::in_memory().unwrap();
+    fn single_tenant_session_has_empty_context(store: &EventStore) {
         let id = store.create_session("m").unwrap();
         store
             .record_message(&id, &Message::user_text("hi"))
@@ -1957,34 +1472,13 @@ mod tests {
         assert!(store.account_streams("anything").unwrap().is_empty());
     }
 
-    #[test]
-    fn context_survives_reopen() {
-        let path =
-            std::env::temp_dir().join(format!("flux-events-d02-reopen-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let ctx = EventContext::for_account("tenant-7");
-        let id = {
-            let store = EventStore::open(&path).unwrap();
-            store.create_session_with_context("m", &ctx).unwrap()
-        };
-        // Reopen: the additive column migration is idempotent (columns already exist) and the
-        // context persists across the process boundary.
-        let store = EventStore::open(&path).unwrap();
-        assert_eq!(store.info(&id).unwrap().context, ctx);
-        assert_eq!(store.list_for_account("tenant-7", 10).unwrap()[0].id, id);
-        let _ = std::fs::remove_file(&path);
-    }
-
     /// C-23: the `flux usage` all-sessions rollups must not double-count sub-agent spend. A sub-agent
     /// runs a full turn on its OWN correlated child stream in the shared audit store (A-08) AND its
     /// total is rolled up as a synthetic `CallUsage` on the parent turn (C-06). `cost_summary_all` /
     /// `efficiency_all` fold every stream, so unless correlated child streams are excluded the child's
     /// N tokens land twice. The parent-side rollup is the single authoritative source; the child
     /// stream's own per-session reporting stays intact.
-    #[test]
-    fn cost_summary_all_does_not_double_count_correlated_children() {
-        let store = EventStore::in_memory().unwrap();
-
+    fn cost_summary_all_does_not_double_count_correlated_children(store: &EventStore) {
         // Parent turn: records the child's total as a synthetic `CallUsage` (the C-06 rollup).
         let parent = store.create_session("claude-sonnet-4-6").unwrap();
         let tp = store
@@ -2086,58 +1580,11 @@ mod tests {
         );
     }
 
-    /// C-25: two `EventStore` handles on the same file (a `serve` daemon + a CLI turn on the shared
-    /// `~/.flux/events.db`) must not lose a write to `SQLITE_BUSY`. WAL permits one writer at a time;
-    /// here a raw connection holds the write lock, released after a short delay. With `busy_timeout`
-    /// set the contended writer WAITS for the lock and succeeds; without it the write returns
-    /// `SQLITE_BUSY` immediately and aborts.
-    #[test]
-    fn concurrent_writers_wait_on_busy_timeout_instead_of_erroring() {
-        use std::time::Duration;
-        let path = std::env::temp_dir().join(format!(
-            "flux-events-c25-busy-{}-{:?}.db",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_file(&path);
-
-        // Set up a session via one handle.
-        let s1 = EventStore::open(&path).unwrap();
-        let sid = s1.create_session("m").unwrap();
-
-        // A second handle on the SAME file (a separate connection = a separate process's writer).
-        let s2 = EventStore::open(&path).unwrap();
-
-        // Hold the single WAL write lock on a raw connection: BEGIN IMMEDIATE acquires it now.
-        let blocker = rusqlite::Connection::open(&path).unwrap();
-        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
-
-        // Release the lock after a short delay, from another thread.
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            blocker.execute_batch("COMMIT").unwrap();
-        });
-
-        // With busy_timeout set this append waits ~300ms for the lock and succeeds; without it the
-        // write returns SQLITE_BUSY at once → Err.
-        let res = s2.record_message(&sid, &Message::user_text("under contention"));
-        releaser.join().unwrap();
-
-        assert!(
-            res.is_ok(),
-            "a contended writer must wait on busy_timeout, not error: {res:?}"
-        );
-        assert_eq!(s2.conversation(&sid).unwrap().len(), 1, "the write landed");
-        let _ = std::fs::remove_file(&path);
-    }
-
     /// D-55: `EventKind::Custom` rides the existing `append`/`NewEvent` path with `EventContext`
     /// account scoping exactly like every other kind — appended under an account, read back through
     /// the account-scoped path, its opaque `payload` survives byte-identical, and every other
     /// projection (conversation, msg_count) is unaffected by its presence.
-    #[test]
-    fn custom_events_append_and_read_back_scoped_by_account() {
-        let store = EventStore::in_memory().unwrap();
+    fn custom_events_append_and_read_back_scoped_by_account(store: &EventStore) {
         let ctx = EventContext::for_account("acme");
         let id = store.create_session_with_context("m", &ctx).unwrap();
         store
@@ -2195,5 +1642,298 @@ mod tests {
             2,
             "msg_count tracks only Message/Compacted events, not Custom"
         );
+    }
+
+    /// D-75: `prune_older_than` deletes every stream older than the cutoff regardless of tag — the
+    /// whole-store retention primitive. Streams straddling the cutoff: the old ones (registry row
+    /// AND events) go, a fresh one survives; an empty-store call is a no-op.
+    fn prune_older_than_deletes_streams_straddling_the_cutoff(store: &EventStore) {
+        // Empty-store call is a no-op.
+        assert_eq!(
+            store.prune_older_than(now_ms()).unwrap(),
+            0,
+            "empty store prunes nothing"
+        );
+
+        // Two old streams with DIFFERENT tags — prune_older_than is tag-agnostic (unlike prune_inactive).
+        let old = store.create_session("m").unwrap();
+        store
+            .record_message(&old, &Message::user_text("old"))
+            .unwrap();
+        let tagged_old = store
+            .create_session_with_context(
+                "m",
+                &EventContext {
+                    agent_id: Some("a2a".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .record_message(&tagged_old, &Message::user_text("old2"))
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let cutoff = now_ms(); // everything above is now strictly older than this
+        std::thread::sleep(std::time::Duration::from_millis(3));
+
+        // A fresh stream created after the cutoff — must survive.
+        let fresh = store.create_session("m").unwrap();
+        store
+            .record_message(&fresh, &Message::user_text("new"))
+            .unwrap();
+
+        assert_eq!(
+            store.prune_older_than(cutoff).unwrap(),
+            2,
+            "both old streams pruned regardless of their tags"
+        );
+        assert!(store.info(&old).is_err(), "old registry row gone");
+        assert!(
+            store.load_stream(&old, None).unwrap().is_empty(),
+            "old events gone too (no partial streams)"
+        );
+        assert!(
+            store.info(&tagged_old).is_err(),
+            "the tagged old stream is pruned too (whole-store, not tag-scoped)"
+        );
+        assert!(store.load_stream(&tagged_old, None).unwrap().is_empty());
+        assert!(store.info(&fresh).is_ok(), "the fresh stream survives");
+        assert_eq!(store.conversation(&fresh).unwrap().len(), 1);
+
+        // A second sweep at the same cutoff is a no-op (idempotent).
+        assert_eq!(store.prune_older_than(cutoff).unwrap(), 0);
+    }
+
+    /// The SQLite backend: every backend-agnostic conformance body against a fresh in-memory store
+    /// (today's behavior — must stay green), plus the SQLite-specific tests (file reopen, cross-process
+    /// busy-timeout) that have no Postgres analog.
+    mod sqlite_tests {
+        use super::*;
+
+        /// Run a conformance body against a fresh in-memory SQLite store.
+        macro_rules! sqlite_case {
+            ($name:ident) => {
+                #[test]
+                fn $name() {
+                    super::$name(&EventStore::in_memory().unwrap());
+                }
+            };
+        }
+
+        sqlite_case!(create_append_load_roundtrip);
+        sqlite_case!(updated_at_advances_on_append);
+        sqlite_case!(updated_at_advances_on_set_model);
+        sqlite_case!(conversation_delta_folds_incrementally_like_a_full_replay);
+        sqlite_case!(compaction_replaces_the_live_view_but_keeps_history);
+        sqlite_case!(latest_session_tracks_newest);
+        sqlite_case!(unknown_session_has_no_conversation_but_info_errors);
+        sqlite_case!(list_returns_newest_first_with_counts);
+        sqlite_case!(set_model_updates_listing);
+        sqlite_case!(find_correlated_returns_newest_matching_tagged_stream);
+        sqlite_case!(find_correlated_in_realm_isolates_realms);
+        sqlite_case!(find_correlated_in_realm_never_matches_legacy_untagged_sessions);
+        sqlite_case!(find_correlated_in_realm_returns_newest_within_the_realm);
+        sqlite_case!(record_call_usage_is_turn_scoped_and_a_noop_on_negative_turn_id);
+        sqlite_case!(cost_summary_wraps_the_projection_over_one_stream);
+        sqlite_case!(cost_summary_all_aggregates_across_sessions);
+        sqlite_case!(cost_summary_for_account_scopes_and_sums_through_the_shared_fold);
+        sqlite_case!(prune_empty_removes_zero_message_sessions);
+        sqlite_case!(prune_inactive_deletes_only_expired_streams_with_the_tag);
+        sqlite_case!(roles_round_trip_through_the_conversation);
+        sqlite_case!(append_is_transactional_and_sequences_monotonically);
+        sqlite_case!(run_events_and_turn_telemetry_share_the_log);
+        sqlite_case!(idempotent_append_with_a_stable_id);
+        sqlite_case!(context_round_trips_on_stored_events_and_summaries);
+        sqlite_case!(accounts_are_isolated_in_scoped_reads);
+        sqlite_case!(single_tenant_session_has_empty_context);
+        sqlite_case!(cost_summary_all_does_not_double_count_correlated_children);
+        sqlite_case!(custom_events_append_and_read_back_scoped_by_account);
+        sqlite_case!(prune_older_than_deletes_streams_straddling_the_cutoff);
+
+        // --- SQLite-specific: no Postgres analog (file reopen / cross-process busy-timeout) ---
+
+        #[test]
+        fn context_survives_reopen() {
+            let path = std::env::temp_dir()
+                .join(format!("flux-events-d02-reopen-{}.db", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let ctx = EventContext::for_account("tenant-7");
+            let id = {
+                let store = EventStore::open(&path).unwrap();
+                store.create_session_with_context("m", &ctx).unwrap()
+            };
+            // Reopen: the additive column migration is idempotent (columns already exist) and the
+            // context persists across the process boundary.
+            let store = EventStore::open(&path).unwrap();
+            assert_eq!(store.info(&id).unwrap().context, ctx);
+            assert_eq!(store.list_for_account("tenant-7", 10).unwrap()[0].id, id);
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// C-25: two `EventStore` handles on the same file (a `serve` daemon + a CLI turn on the shared
+        /// `~/.flux/events.db`) must not lose a write to `SQLITE_BUSY`. WAL permits one writer at a time;
+        /// here a raw connection holds the write lock, released after a short delay. With `busy_timeout`
+        /// set the contended writer WAITS for the lock and succeeds; without it the write returns
+        /// `SQLITE_BUSY` immediately and aborts.
+        #[test]
+        fn concurrent_writers_wait_on_busy_timeout_instead_of_erroring() {
+            use std::time::Duration;
+            let path = std::env::temp_dir().join(format!(
+                "flux-events-c25-busy-{}-{:?}.db",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_file(&path);
+
+            // Set up a session via one handle.
+            let s1 = EventStore::open(&path).unwrap();
+            let sid = s1.create_session("m").unwrap();
+
+            // A second handle on the SAME file (a separate connection = a separate process's writer).
+            let s2 = EventStore::open(&path).unwrap();
+
+            // Hold the single WAL write lock on a raw connection: BEGIN IMMEDIATE acquires it now.
+            let blocker = rusqlite::Connection::open(&path).unwrap();
+            blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+            // Release the lock after a short delay, from another thread.
+            let releaser = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                blocker.execute_batch("COMMIT").unwrap();
+            });
+
+            // With busy_timeout set this append waits ~300ms for the lock and succeeds; without it the
+            // write returns SQLITE_BUSY at once → Err.
+            let res = s2.record_message(&sid, &Message::user_text("under contention"));
+            releaser.join().unwrap();
+
+            assert!(
+                res.is_ok(),
+                "a contended writer must wait on busy_timeout, not error: {res:?}"
+            );
+            assert_eq!(s2.conversation(&sid).unwrap().len(), 1, "the write landed");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// The Postgres backend: every backend-agnostic conformance body against a throwaway schema on
+    /// the DSN in `TEST_POSTGRES_URL`. Skipped with a notice (never failed) when that env var is
+    /// unset, so the default `cargo test` stays DB-free. Each test isolates itself in its own
+    /// `?schema=t_<ulid>`, so the whole module is parallel-safe.
+    #[cfg(feature = "postgres")]
+    mod postgres_tests {
+        use super::*;
+        use flux_pg::PgHandle;
+
+        /// A fresh `EventStore` in a throwaway schema, or `None` when `TEST_POSTGRES_URL` is unset.
+        fn pg_store() -> Option<EventStore> {
+            let base = std::env::var("TEST_POSTGRES_URL").ok()?;
+            let schema = format!("t_{}", ulid::Ulid::new().to_string().to_lowercase());
+            let sep = if base.contains('?') { '&' } else { '?' };
+            let url = format!("{base}{sep}schema={schema}");
+            Some(EventStore::open_postgres(PgHandle::connect(&url).unwrap()).unwrap())
+        }
+
+        /// Run a conformance body against a throwaway-schema Postgres store, or skip with a notice.
+        macro_rules! pg_case {
+            ($name:ident) => {
+                #[test]
+                fn $name() {
+                    let Some(store) = pg_store() else {
+                        eprintln!(concat!(
+                            "skipping ",
+                            stringify!($name),
+                            ": TEST_POSTGRES_URL unset"
+                        ));
+                        return;
+                    };
+                    super::$name(&store);
+                }
+            };
+        }
+
+        pg_case!(create_append_load_roundtrip);
+        pg_case!(updated_at_advances_on_append);
+        pg_case!(updated_at_advances_on_set_model);
+        pg_case!(conversation_delta_folds_incrementally_like_a_full_replay);
+        pg_case!(compaction_replaces_the_live_view_but_keeps_history);
+        pg_case!(latest_session_tracks_newest);
+        pg_case!(unknown_session_has_no_conversation_but_info_errors);
+        pg_case!(list_returns_newest_first_with_counts);
+        pg_case!(set_model_updates_listing);
+        pg_case!(find_correlated_returns_newest_matching_tagged_stream);
+        pg_case!(find_correlated_in_realm_isolates_realms);
+        pg_case!(find_correlated_in_realm_never_matches_legacy_untagged_sessions);
+        pg_case!(find_correlated_in_realm_returns_newest_within_the_realm);
+        pg_case!(record_call_usage_is_turn_scoped_and_a_noop_on_negative_turn_id);
+        pg_case!(cost_summary_wraps_the_projection_over_one_stream);
+        pg_case!(cost_summary_all_aggregates_across_sessions);
+        pg_case!(cost_summary_for_account_scopes_and_sums_through_the_shared_fold);
+        pg_case!(prune_empty_removes_zero_message_sessions);
+        pg_case!(prune_inactive_deletes_only_expired_streams_with_the_tag);
+        pg_case!(roles_round_trip_through_the_conversation);
+        pg_case!(append_is_transactional_and_sequences_monotonically);
+        pg_case!(run_events_and_turn_telemetry_share_the_log);
+        pg_case!(idempotent_append_with_a_stable_id);
+        pg_case!(context_round_trips_on_stored_events_and_summaries);
+        pg_case!(accounts_are_isolated_in_scoped_reads);
+        pg_case!(single_tenant_session_has_empty_context);
+        pg_case!(cost_summary_all_does_not_double_count_correlated_children);
+        pg_case!(custom_events_append_and_read_back_scoped_by_account);
+        pg_case!(prune_older_than_deletes_streams_straddling_the_cutoff);
+
+        /// PG-only: N concurrent appends to ONE stream from a multi-thread tokio context must yield
+        /// contiguous `stream_seq`s — no gaps, no duplicates, no panic — proving the per-stream
+        /// `pg_advisory_xact_lock` and the flux-pg sync↔async bridge together.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn concurrent_appends_to_one_stream_are_contiguous() {
+            let Some(store) = pg_store() else {
+                eprintln!(
+                    "skipping concurrent_appends_to_one_stream_are_contiguous: TEST_POSTGRES_URL unset"
+                );
+                return;
+            };
+            let store = std::sync::Arc::new(store);
+            let sid = store.create_session("m").unwrap();
+
+            const N: usize = 16;
+            let mut handles = Vec::new();
+            for i in 0..N {
+                let store = store.clone();
+                let sid = sid.clone();
+                // spawn_blocking: each append drives the sync bridge (block_on) from a tokio worker —
+                // exactly the context that panics the naive sync-over-async bridges.
+                handles.push(tokio::task::spawn_blocking(move || {
+                    store
+                        .append(&sid, NewEvent::message(Message::user_text(format!("m{i}"))))
+                        .unwrap()
+                        .stream_seq
+                }));
+            }
+            let mut seqs = Vec::new();
+            for h in handles {
+                seqs.push(h.await.unwrap());
+            }
+            seqs.sort_unstable();
+            // SessionStarted holds stream_seq 0; the N concurrent appends must fill 1..=N with no
+            // gaps or duplicates — the advisory lock serialized them under one contiguous sequence.
+            assert_eq!(
+                seqs,
+                (1..=N as i64).collect::<Vec<_>>(),
+                "contiguous stream_seqs, no gaps or duplicates: {seqs:?}"
+            );
+
+            // The final head-check + store teardown run on a blocking thread on purpose: the store
+            // owns the flux-pg `tokio::runtime::Runtime`, and dropping a runtime from within an async
+            // context panics ("Cannot drop a runtime …"). Moving the last `Arc` into `spawn_blocking`
+            // drops it off the async worker. (`store` is the sole remaining ref — every per-append
+            // clone was dropped as its task completed above.)
+            tokio::task::spawn_blocking(move || {
+                assert_eq!(store.head_seq(&sid).unwrap(), N as i64);
+            })
+            .await
+            .unwrap();
+        }
     }
 }

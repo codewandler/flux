@@ -32,6 +32,10 @@ fastembed = { version = "4", optional = true }
 # Durable vector store (optional, D-51): the sqlite-vec loadable extension, so vectors persist in a
 # SQLite `vec0` table co-located with the records (no external DB).
 sqlite-vec = { version = "0.1", optional = true }
+# Postgres datasource backend (optional, D-74): the shared Postgres driver-owner. Off by default —
+# the default build stays DB-free (no sqlx). sqlx is reached through `flux_pg::sqlx`, never declared
+# here directly, so there is exactly one sqlx in the tree.
+flux-pg = { workspace = true, optional = true }
 
 [features]
 # Wire the semantic/embeddings datasource backend (the `OpenAiEmbedder` over /v1/embeddings). Off by
@@ -41,6 +45,11 @@ embeddings = ["dep:ureq"]
 local-embeddings = ["dep:fastembed"]
 # The durable `sqlite-vec`-backed `VectorStore` (`SqliteVecStore`). Off by default.
 sqlite-vec = ["dep:sqlite-vec"]
+# The Postgres `PostgresBackend` for the datasource trait (D-74). Off by default — pulls the
+# `flux-pg` driver-owner (sqlx/tokio). Tests are gated on `TEST_POSTGRES_URL`.
+postgres = ["dep:flux-pg"]
 
 [dev-dependencies]
 tokio.workspace = true
+# Unique throwaway schema names (`?schema=t_<ulid>`) for the env-gated Postgres conformance tests.
+ulid.workspace = true

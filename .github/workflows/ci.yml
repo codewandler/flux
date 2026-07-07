@@ -83,3 +83,49 @@ jobs:
       - name: Test
         working-directory: plugins
         run: cargo test --workspace
+
+  postgres:
+    name: postgres backend · flux-events · flux-capabilities · flux-pg
+    runs-on: ubuntu-latest
+    # The opt-in Postgres backends (`pg-backend` epic) are behind the `postgres` feature; the default
+    # `check` job above builds DB-free and never exercises them. This job spins up a throwaway
+    # Postgres and runs the feature-gated crates against it — the ONLY job that needs a database.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: flux
+          POSTGRES_PASSWORD: flux
+          POSTGRES_DB: flux
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U flux"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # Env-gated tests connect here; each test isolates itself in a throwaway `?schema=t_<ulid>`.
+      TEST_POSTGRES_URL: postgres://flux:flux@localhost:5432/flux
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # `flux-pg` is always Postgres (no `postgres` feature to toggle); the two backend crates gate it.
+      - name: Clippy (postgres feature, deny warnings)
+        run: |
+          cargo clippy -p flux-pg --all-targets -- -D warnings
+          cargo clippy -p flux-events -p flux-capabilities --features postgres --all-targets -- -D warnings
+
+      - name: Test flux-pg (bridge + pool + DSN)
+        run: cargo test -p flux-pg
+
+      - name: Test Postgres backends (flux-events + flux-capabilities)
+        run: cargo test -p flux-events -p flux-capabilities --features postgres

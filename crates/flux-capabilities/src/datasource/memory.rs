@@ -56,29 +56,6 @@ fn score(record: &Record, terms: &[String]) -> (usize, Vec<String>) {
     (score, matched)
 }
 
-/// A ~160-char snippet around the first matching term in `body` (or its start).
-fn snippet(body: &str, terms: &[String]) -> String {
-    let lower = body.to_lowercase();
-    let byte_pos = terms
-        .iter()
-        .filter_map(|t| lower.find(t.as_str()))
-        .min()
-        .unwrap_or(0);
-    let pos = lower.get(..byte_pos).map_or(0, |s| s.chars().count());
-    let start = pos.saturating_sub(40);
-    let take = 160;
-    let snip: String = body.chars().skip(start).take(take).collect();
-    let mut out = String::new();
-    if start > 0 {
-        out.push('…');
-    }
-    out.push_str(snip.trim());
-    if start + take < body.chars().count() {
-        out.push('…');
-    }
-    out
-}
-
 impl DatasourceBackend for MemoryBackend {
     fn upsert(&self, records: &[Record]) -> Result<()> {
         let mut store = self.records.lock().expect("datasource records poisoned");
@@ -109,7 +86,7 @@ impl DatasourceBackend for MemoryBackend {
                     // The stored body stays intact; the snippet is a display aid carried in the match's
                     // record body so the model sees only the relevant window.
                     let mut rec = r.clone();
-                    rec.body = snippet(&r.body, &terms);
+                    rec.body = super::text::snippet(&r.body, &input.query);
                     Match {
                         record: rec,
                         score: s as f64,

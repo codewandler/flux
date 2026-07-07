@@ -14,7 +14,11 @@ mod memory;
 mod ops;
 mod semantic;
 mod sqlite;
+mod text;
 mod vector;
+
+#[cfg(feature = "postgres")]
+mod postgres;
 
 #[cfg(feature = "embeddings")]
 mod embeddings;
@@ -30,6 +34,9 @@ pub use memory::MemoryBackend;
 pub use ops::{datasource_tools, register_datasource_ops};
 pub use semantic::SemanticIndex;
 pub use sqlite::SqliteBackend;
+
+#[cfg(feature = "postgres")]
+pub use postgres::PostgresBackend;
 pub use vector::{MemoryVectorStore, VectorAddr, VectorStore};
 
 #[cfg(feature = "embeddings")]

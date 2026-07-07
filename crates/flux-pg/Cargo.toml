@@ -1,0 +1,21 @@
+[package]
+name = "flux-pg"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "The flux Postgres driver-owner: the sole sqlx dependency, a connection pool, a DSN contract, and a panic-safe sync↔async bridge so sync flux stores can add Postgres backends without touching a driver."
+
+[dependencies]
+flux-core.workspace = true
+# The ONE place in the workspace that depends on sqlx. Re-exported (`pub use sqlx`) so backend crates
+# (flux-events, flux-capabilities) write queries through `flux_pg::sqlx` without declaring their own.
+sqlx.workspace = true
+# A dedicated multi-thread runtime lives on the handle (see the bridge doc in lib.rs). `full` is
+# inherited from the workspace pin; only rt-multi-thread + time are actually needed here.
+tokio.workspace = true
+url.workspace = true
+percent-encoding.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+ulid.workspace = true

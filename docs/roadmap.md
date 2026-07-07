@@ -97,6 +97,31 @@ unlocks `tasks/get` server-side, cancel, resubscribe, non-blocking send, `input-
 Non-goals: gRPC/REST bindings, extensions negotiation, `tasks/list`. Living support matrix:
 [a2a-conformance.md](a2a-conformance.md); design: [designs/a2a-conformance.md](designs/a2a-conformance.md).
 
+### Postgres storage backend (epic) — **SHIPPED 2026-07-07 (v0.4.1; D-71…D-75)**
+
+flux's durable persistence is embedded SQLite — the right default for CLI and demos, but server
+deployments (multi-tenant managed-agent services, >1 replica, ephemeral or network-mounted disks)
+need a shared, multi-writer-safe backend with real operational tooling. This epic adds **Postgres**
+as a second backend for the two primitives deployments actually persist through — the unified event
+log (`flux-events::EventStore`) and the datasource records store (`flux-capabilities::
+DatasourceBackend`) — behind opt-in `postgres` features; the default build stays rusqlite-only and
+never needs a database. Shape: one new L1 crate **[D-71](stories/D-71-flux-pg-bridge-crate.md)
+`flux-pg`** owns sqlx, the pool, and a panic-safe sync↔async bridge (spawn onto an owned runtime +
+mpsc-block — the only shape that survives plain threads, tokio workers, AND current-thread
+runtimes); **[D-72](stories/D-72-eventstore-backend-seam.md)** splits `EventStore` into an internal
+backend enum with the public API byte-identical (no trait — 23 consumer files hold it concretely);
+**[D-73](stories/D-73-postgres-eventstore-backend.md)** implements the Postgres event log
+(`BIGSERIAL` preserves the `s_<n>`/turn-id contracts, `payload` stays TEXT for byte-exact serde,
+per-stream `pg_advisory_xact_lock` replaces Mutex+`BEGIN IMMEDIATE` and — new capability —
+serializes appends **across replicas**) plus a run-twice conformance suite and a CI postgres job;
+**[D-74](stories/D-74-postgres-datasource-backend.md)** adds the purely-additive
+`PostgresBackend` (namespace-column-per-scope replaces one-file-per-scope;
+`websearch_to_tsquery`+`ts_rank` for FTS5/bm25 parity); **[D-75](stories/D-75-eventstore-prune-older-than.md)**
+adds the whole-store retention primitive the tag-scoped `prune_inactive` can't express. Critical
+path D-71→D-72→D-73 (D-71 ∥ D-72; D-74 parallel after D-71). Non-goals: `FlowStore`/`ValueStore` on
+Postgres (traits exist; on demand), pgvector `VectorStore`, MySQL, SQLite→PG data migration.
+Design: [designs/pg-backend.md](designs/pg-backend.md).
+
 ### Time Machine (epic) — **SHIPPED 2026-07-07 (phases 0–3: C-43 · A-45 · A-46 · C-44; A-47 cockpit optional)**
 
 The capstone of *the LLM is not the runtime*: because a flux run is a deterministic artifact (the

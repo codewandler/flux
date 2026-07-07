@@ -5,6 +5,11 @@ version.workspace = true
 license.workspace = true
 description = "flux unified append-only event store: one ordered log projected into conversations, run traces, and turn metrics (SQLite/WAL)"
 
+[features]
+# Opt-in Postgres backend for the EventStore (D-73). The default build stays DB-free and
+# rusqlite-only: `flux-pg` (the sole sqlx owner) is pulled in only when this feature is on.
+postgres = ["dep:flux-pg"]
+
 [dependencies]
 flux-core.workspace = true
 flux-lang.workspace = true
@@ -13,3 +18,11 @@ serde.workspace = true
 serde_json.workspace = true
 rusqlite.workspace = true
 ulid.workspace = true
+# The Postgres driver-owner (sqlx + pool + sync↔async bridge). Optional: gated behind `postgres`.
+flux-pg = { workspace = true, optional = true }
+
+[dev-dependencies]
+# For the PG-only concurrent-append conformance test, which drives `store.append` from a
+# multi-thread tokio context to prove the advisory lock + the flux-pg bridge together. Only
+# referenced from the `postgres`-gated test module; harmless to the default build.
+tokio.workspace = true
