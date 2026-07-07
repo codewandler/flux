@@ -21,8 +21,8 @@ the *surfaces* (CLI/TUI/server/SDK).
 | Layer | Crates | Role |
 |---|---|---|
 | **L0 contracts** (pure) | `flux-core` `flux-policy` `flux-secret` `flux-spec` `flux-config` `flux-evidence` `flux-skill` `flux-markdown` `flux-datasource` `flux-audio` `flux-lang` | types, authorization, secrets, tool specs, config, evidence, skills, markdown/frontmatter, datasource record/retrieval contract, PCM16 audio sample math (codecs/resampling/framing), the Flux-Lang language + reference interpreter (effects injected via traits) |
-| **L1 providers** | `flux-provider` `flux-providers` `flux-credentials` `flux-a2a` | the `Provider` abstraction + the concrete clients (`flux-providers` modules: `messages` core, `anthropic`, `openai`, `openrouter`, `ollama`, `bedrock`, `codex`, plus `realtime/`) + credential store + the A2A agent-protocol client/wire types |
-| **L2 runtime** | `flux-system` `flux-runtime` `flux-tools` `flux-events` | guarded IO, the safety envelope (+ the `context` projector module), built-in tools, the event store |
+| **L1 providers** | `flux-provider` `flux-providers` `flux-credentials` `flux-a2a` `flux-pg` | the `Provider` abstraction + the concrete clients (`flux-providers` modules: `messages` core, `anthropic`, `openai`, `openrouter`, `ollama`, `bedrock`, `codex`, plus `realtime/`) + credential store + the A2A agent-protocol client/wire types + `flux-pg` (the Postgres driver-owner: the sole `sqlx` dep, a pool, and a panic-safe sync↔async bridge) |
+| **L2 runtime** | `flux-system` `flux-runtime` `flux-tools` `flux-events` | guarded IO, the safety envelope (+ the `context` projector module), built-in tools, the event store (embedded SQLite by default; opt-in Postgres) |
 | **L3 agent** | `flux-agent` `flux-orchestrate` `flux-flow` `flux-eval` `flux-cognition` | agent definitions (`AgentSpec`/`Role`) + multi-agent orchestration + the Flux-Lang engine (the one turn loop) + the eval harness + the model-op cognition pack |
 | **L4 extensibility** | `flux-plugin` | subprocess plugins + the JS pre-tool `hooks` module |
 | **L5 capabilities** | `flux-capabilities` `flux-auth` | web egress + datasource/RAG tools (`browser`/`datasource` modules); caller identity (separate) |
@@ -63,10 +63,11 @@ shared machinery beneath them. "Disposition" flags a planned move; see
 | `flux-providers` | L1 | concrete clients (anthropic / openai / openrouter / ollama / bedrock / codex, + the `realtime` full-duplex module) | — |
 | `flux-credentials` | L1 | credential store (PKCE, token import) | — |
 | `flux-a2a` | L1 | A2A (Agent-to-Agent) protocol: spec-conformant wire types + HTTP/JSON-RPC client for remote agents | — |
+| `flux-pg` | L1 | Postgres driver-owner: the sole `sqlx` dep + pool + DSN contract + a panic-safe sync↔async bridge; backs the opt-in `postgres` feature on `flux-events` / `flux-capabilities` | — |
 | `flux-system` | L2 | guarded IO — the *only* real fs / proc / net | — |
 | `flux-runtime` | L2 | `Executor::dispatch` — the safety envelope; `context` module = the projector | absorbed `flux-context` (consolidation P4 ✅) |
 | `flux-tools` | L2 | built-in tools (read / write / edit / grep / …) | — |
-| `flux-events` | L2 | append-only event store (SQLite) | — |
+| `flux-events` | L2 | append-only event store (SQLite default; opt-in Postgres backend behind the `postgres` feature) | — |
 | `flux-codegate` | infra | the layering lint (enforces L0→L6) | — |
 
 ### Agent pillar
@@ -178,10 +179,14 @@ provider is a small composition, never a fork of the loop. Streaming is a
   user-after-user sequence. The cancel, compaction, and max-iteration exit paths each append a final
   assistant/synthetic-result so the next turn isn't poisoned. (This is a recurring bug class — treat
   any new turn-termination path as suspect.)
-- **`flux-events`** is a unified append-only event store (SQLite/WAL): one ordered log holds
-  conversation messages, the flow run-trace, and per-turn telemetry. The "conversations view" is a
-  *projection* over the log (replay message-kind events), and compaction is an append-only `Compacted`
-  snapshot the projection resets to — history is never deleted. Turn events are just one event kind.
+- **`flux-events`** is a unified append-only event store (embedded SQLite/WAL by default; an opt-in
+  Postgres backend behind the `postgres` feature — `EventStore::open_postgres` — gives multi-replica
+  server deployments a shared, cross-process-safe log, see [designs/pg-backend.md](designs/pg-backend.md)):
+  one ordered log holds conversation messages, the flow run-trace, and per-turn telemetry. The
+  "conversations view" is a *projection* over the log (replay message-kind events), and compaction is
+  an append-only `Compacted` snapshot the projection resets to — history is never deleted. Turn events
+  are just one event kind. The public API is backend-independent (an internal `Backend` enum), so
+  every consumer is unchanged whichever backend is configured.
 - **`flux-runtime`'s `context` module** projects an ordered provider chain (system / files / skills /
   task) under token budgets; long sessions compact older turns into a synthetic summary.
 

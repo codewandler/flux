@@ -1,7 +1,7 @@
 # flux — roadmap & status
 
-Status as of **0.3.0 (2026-07-07)**: public + installable at
-[codewandler/flux](https://github.com/codewandler/flux); 34 crates, **1900+ tests** across the root
+Status as of **0.4.1 (2026-07-07)**: public + installable at
+[codewandler/flux](https://github.com/codewandler/flux); 35 crates, **1900+ tests** across the root
 and `plugins/` workspaces, a permanently green
 gate (tests, clippy `-D warnings`, fmt, the `flux-codegate` layering lint). See
 [CHANGELOG.md](../CHANGELOG.md) for the released history and [architecture.md](architecture.md) for the
