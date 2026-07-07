@@ -52,6 +52,15 @@ fn map_pg<E: std::fmt::Display>(e: E) -> Error {
     Error::Other(format!("datasource postgres: {e}"))
 }
 
+/// `true` when a query failed because `ds_records` does not exist (Postgres SQLSTATE `42P01`,
+/// `undefined_table`). The shared tolerance check for the cross-scope reads ([`namespaces`]
+/// (PostgresBackend::namespaces), [`scan`](PostgresBackend::scan)): an enumeration over a database
+/// where [`PostgresBackend::ensure_schema`] never ran means "no records yet" — the same empty
+/// answer a scan over zero per-scope SQLite files gives — not an error.
+fn is_undefined_table(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("42P01"))
+}
+
 /// A Postgres-backed datasource index, scoped to one namespace bound at construction.
 pub struct PostgresBackend {
     handle: Arc<PgHandle>,
@@ -59,40 +68,103 @@ pub struct PostgresBackend {
 }
 
 impl PostgresBackend {
-    /// Bind `namespace` for the life of this backend (the equivalent of one SQLite file per scope)
-    /// and ensure the shared `ds_records` table + GIN index exist. The table is created once and
-    /// shared across every namespace; `new` is idempotent.
-    pub fn new(handle: Arc<PgHandle>, namespace: impl Into<String>) -> Result<Self> {
-        let ns = namespace.into();
+    /// Bind `namespace` for the life of this backend (the equivalent of one SQLite file per scope).
+    /// I/O-free and infallible: construction runs **no** DDL — call [`Self::ensure_schema`] once
+    /// from wherever the deployment opens its stores, before the first backend touches the table.
+    pub fn new(handle: Arc<PgHandle>, namespace: impl Into<String>) -> Self {
+        Self {
+            handle,
+            ns: namespace.into(),
+        }
+    }
+
+    /// Create the shared `ds_records` table + GIN index. Idempotent — call it **once** from
+    /// wherever a deployment opens its stores; per-scope construction ([`Self::new`]) then stays
+    /// free of I/O.
+    ///
+    /// The DDL runs inside one transaction whose **first** statement is the global flux DDL
+    /// advisory lock ([`flux_pg::ddl_lock`]): Postgres `IF NOT EXISTS` DDL is not atomic, so
+    /// concurrent first-boots would otherwise race the catalog insert and the loser errors.
+    pub fn ensure_schema(handle: &Arc<PgHandle>) -> Result<()> {
         let pool = handle.pool().clone();
         handle.block_on(async move {
+            let mut tx = pool.begin().await.map_err(map_pg)?;
+            flux_pg::ddl_lock(&mut tx).await?;
             sqlx::query(CREATE_TABLE)
-                .execute(&pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(map_pg)?;
             sqlx::query(CREATE_INDEX)
-                .execute(&pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(map_pg)?;
-            Ok::<(), Error>(())
-        })?;
-        Ok(Self { handle, ns })
+            tx.commit().await.map_err(map_pg)?;
+            Ok(())
+        })
     }
 
     /// Enumerate the distinct namespaces whose key starts with `prefix` — the analog of scanning a
     /// directory of per-scope SQLite files. Only namespaces that hold at least one record appear.
+    /// A database where [`Self::ensure_schema`] never ran yields `Ok(vec![])`, matching that
+    /// zero-files scan.
     pub fn namespaces(handle: &Arc<PgHandle>, prefix: &str) -> Result<Vec<String>> {
         let pool = handle.pool().clone();
         let prefix = prefix.to_string();
         handle.block_on(async move {
-            let rows: Vec<String> = sqlx::query_scalar(
+            let rows = match sqlx::query_scalar::<_, String>(
                 "SELECT DISTINCT ns FROM ds_records WHERE ns LIKE $1 || '%' ORDER BY ns",
             )
             .bind(prefix.as_str())
             .fetch_all(&pool)
             .await
-            .map_err(map_pg)?;
+            {
+                Ok(rows) => rows,
+                Err(e) if is_undefined_table(&e) => Vec::new(),
+                Err(e) => return Err(map_pg(e)),
+            };
             Ok(rows)
+        })
+    }
+
+    /// Cross-namespace entity scan: every record of `entity` in every namespace starting with
+    /// `ns_prefix`, as `(namespace, record)` pairs ordered by `(ns, id)`. One query replaces the
+    /// 1+N per-scope round-trip loop ([`Self::namespaces`] + a per-scope backend + `list` each)
+    /// that a global lookup over per-scope namespaces otherwise costs.
+    ///
+    /// Prefix matching mirrors [`Self::namespaces`]; records are built by the same row mapping as
+    /// `list` (`source` round-trips intact) and `ns` is returned verbatim from its own column.
+    /// Deliberately an associated fn, not a [`DatasourceBackend`] method — the trait stays
+    /// per-scope by design. No limit: callers filter. A database where [`Self::ensure_schema`]
+    /// never ran yields `Ok(vec![])`, like [`Self::namespaces`].
+    pub fn scan(
+        handle: &Arc<PgHandle>,
+        ns_prefix: &str,
+        entity: &str,
+    ) -> Result<Vec<(String, Record)>> {
+        let pool = handle.pool().clone();
+        let prefix = ns_prefix.to_string();
+        let entity = entity.to_string();
+        handle.block_on(async move {
+            let rows = match sqlx::query(
+                "SELECT ns, source, entity, id, title, body, links, meta FROM ds_records \
+                 WHERE ns LIKE $1 || '%' AND entity = $2 ORDER BY ns, id",
+            )
+            .bind(prefix.as_str())
+            .bind(entity.as_str())
+            .fetch_all(&pool)
+            .await
+            {
+                Ok(rows) => rows,
+                Err(e) if is_undefined_table(&e) => Vec::new(),
+                Err(e) => return Err(map_pg(e)),
+            };
+            Ok(rows
+                .into_iter()
+                .map(|row| {
+                    let ns: String = row.get("ns");
+                    (ns, row_to_record(row))
+                })
+                .collect())
         })
     }
 }
@@ -472,7 +544,8 @@ mod tests {
             return;
         };
         let h1 = PgHandle::connect(&url).unwrap();
-        let b = PostgresBackend::new(h1.clone(), "kb").unwrap();
+        PostgresBackend::ensure_schema(&h1).unwrap();
+        let b = PostgresBackend::new(h1.clone(), "kb");
         b.upsert(&[
             doc(
                 "warm-transfer",
@@ -503,7 +576,7 @@ mod tests {
 
         // Reconnect a brand-new handle to the same schema + ns: the rows persist (durability).
         let h2 = PgHandle::connect(&url).unwrap();
-        let b2 = PostgresBackend::new(h2.clone(), "kb").unwrap();
+        let b2 = PostgresBackend::new(h2.clone(), "kb");
         assert_eq!(b2.len(), 2);
         let got = b2
             .get(&GetInput {
@@ -527,7 +600,8 @@ mod tests {
             return;
         };
         let h = PgHandle::connect(&url).unwrap();
-        let b = PostgresBackend::new(h.clone(), "kb").unwrap();
+        PostgresBackend::ensure_schema(&h).unwrap();
+        let b = PostgresBackend::new(h.clone(), "kb");
         b.upsert(&[doc("x", "alpha", "first body")]).unwrap();
         b.upsert(&[doc("x", "beta", "second body")]).unwrap();
         assert_eq!(b.len(), 1);
@@ -559,7 +633,8 @@ mod tests {
             return;
         };
         let h = PgHandle::connect(&url).unwrap();
-        let b = PostgresBackend::new(h.clone(), "kb").unwrap();
+        PostgresBackend::ensure_schema(&h).unwrap();
+        let b = PostgresBackend::new(h.clone(), "kb");
         b.upsert(&[
             Record::new(Source::new("kb-a"), "doc", "1", "alpha one", "body a1"),
             Record::new(Source::new("kb-a"), "doc", "2", "alpha two", "body a2"),
@@ -595,7 +670,7 @@ mod tests {
 
         // Reconnect: the deletions persisted; only kb-b survives.
         let h2 = PgHandle::connect(&url).unwrap();
-        let b2 = PostgresBackend::new(h2.clone(), "kb").unwrap();
+        let b2 = PostgresBackend::new(h2.clone(), "kb");
         assert_eq!(b2.len(), 1);
         let only = b2
             .list(&ListInput {
@@ -617,9 +692,10 @@ mod tests {
             return;
         };
         let h = PgHandle::connect(&url).unwrap();
+        PostgresBackend::ensure_schema(&h).unwrap();
         // Two backends on ONE pool, different namespaces — the exact analog of two SQLite files.
-        let a = PostgresBackend::new(h.clone(), "kb-a").unwrap();
-        let b = PostgresBackend::new(h.clone(), "kb-b").unwrap();
+        let a = PostgresBackend::new(h.clone(), "kb-a");
+        let b = PostgresBackend::new(h.clone(), "kb-b");
 
         a.upsert(&[doc(
             "only-a",
@@ -678,6 +754,132 @@ mod tests {
             "empty namespace is not listed: {names:?}"
         );
 
+        drop_schema(&h, &schema);
+    }
+
+    #[test]
+    fn pg_namespaces_tolerates_missing_table() {
+        let Some((url, schema)) = test_env() else {
+            eprintln!("skipping pg_namespaces_tolerates_missing_table: TEST_POSTGRES_URL unset");
+            return;
+        };
+        let h = PgHandle::connect(&url).unwrap();
+        // `ensure_schema` never ran in this throwaway schema: enumerating namespaces over "no
+        // records yet" is Ok and empty, exactly like scanning zero per-scope SQLite files.
+        let names = PostgresBackend::namespaces(&h, "").unwrap();
+        assert!(names.is_empty(), "fresh schema lists nothing: {names:?}");
+        drop_schema(&h, &schema);
+    }
+
+    #[test]
+    fn pg_concurrent_ensure_schema_bootstrap() {
+        let Some((url, schema)) = test_env() else {
+            eprintln!("skipping pg_concurrent_ensure_schema_bootstrap: TEST_POSTGRES_URL unset");
+            return;
+        };
+        // Regression tripwire for the non-atomic IF-NOT-EXISTS race (D-76): N first-boots against
+        // ONE fresh schema, barrier-aligned so the DDL transactions overlap. Without the advisory
+        // lock the losers can error with a duplicate-key catalog violation; the red state is
+        // probabilistic, so this is a tripwire, not a reliable reproducer.
+        const N: usize = 8;
+        let handles: Vec<_> = (0..N).map(|_| PgHandle::connect(&url).unwrap()).collect();
+        let barrier = Arc::new(std::sync::Barrier::new(N));
+        let results: Vec<Result<()>> = handles
+            .into_iter()
+            .map(|h| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    PostgresBackend::ensure_schema(&h)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().expect("bootstrap thread panicked"))
+            .collect();
+
+        // Clean up before asserting so a failure never leaks the throwaway schema.
+        let h = PgHandle::connect(&url).unwrap();
+        drop_schema(&h, &schema);
+        for (i, r) in results.into_iter().enumerate() {
+            r.unwrap_or_else(|e| panic!("concurrent bootstrap {i} failed: {e}"));
+        }
+    }
+
+    #[test]
+    fn pg_scan_across_namespaces() {
+        let Some((url, schema)) = test_env() else {
+            eprintln!("skipping pg_scan_across_namespaces: TEST_POSTGRES_URL unset");
+            return;
+        };
+        let h = PgHandle::connect(&url).unwrap();
+        PostgresBackend::ensure_schema(&h).unwrap();
+
+        // Three namespaces under two prefixes; each holds one `head` record plus other-entity
+        // noise. The head sources include a `plugin/instance` split to prove source round-trip.
+        for ns in ["a:1", "a:2", "b:1"] {
+            let b = PostgresBackend::new(h.clone(), ns);
+            b.upsert(&[
+                Record::new(
+                    Source::with_instance("registry", "main"),
+                    "head",
+                    format!("head-{ns}"),
+                    format!("Head of {ns}"),
+                    format!("head body for {ns}"),
+                ),
+                Record::new(
+                    Source::new("registry"),
+                    "noise",
+                    "n1",
+                    "Noise",
+                    "not a head",
+                ),
+            ])
+            .unwrap();
+        }
+
+        let hits = PostgresBackend::scan(&h, "a:", "head").unwrap();
+        assert_eq!(hits.len(), 2, "exactly the a:* heads: {hits:?}");
+        // Ordered by (ns, id); ns comes back verbatim, paired with its own record.
+        assert_eq!(hits[0].0, "a:1");
+        assert_eq!(hits[0].1.id, "head-a:1");
+        assert_eq!(hits[1].0, "a:2");
+        assert_eq!(hits[1].1.id, "head-a:2");
+        assert!(
+            hits.iter().all(|(_, r)| r.entity == "head"),
+            "noise entities excluded: {hits:?}"
+        );
+
+        // Record shape is identical to `list` on the scoped backend (source round-trips intact).
+        let listed = PostgresBackend::new(h.clone(), "a:1")
+            .list(&ListInput {
+                source: "registry/main".into(),
+                entity: Some("head".into()),
+                offset: None,
+                limit: None,
+            })
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(hits[0].1, listed[0], "scan record == list record");
+        assert_eq!(hits[0].1.source.plugin, "registry");
+        assert_eq!(hits[0].1.source.instance.as_deref(), Some("main"));
+
+        // A prefix that matches no namespace is empty, not an error.
+        assert!(PostgresBackend::scan(&h, "z:", "head").unwrap().is_empty());
+
+        drop_schema(&h, &schema);
+    }
+
+    #[test]
+    fn pg_scan_tolerates_missing_table() {
+        let Some((url, schema)) = test_env() else {
+            eprintln!("skipping pg_scan_tolerates_missing_table: TEST_POSTGRES_URL unset");
+            return;
+        };
+        let h = PgHandle::connect(&url).unwrap();
+        // `ensure_schema` never ran: same 42P01 tolerance as `namespaces()`.
+        let hits = PostgresBackend::scan(&h, "a:", "head").unwrap();
+        assert!(hits.is_empty(), "fresh schema scans empty: {hits:?}");
         drop_schema(&h, &schema);
     }
 }

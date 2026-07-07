@@ -98,17 +98,36 @@ pub(crate) struct PgEvents {
 
 impl PgEvents {
     /// Reuse an already-built handle, create the schema inline once, and return the backend.
+    ///
+    /// The bootstrap stays eager (once per store), but runs in a transaction that takes the global
+    /// flux DDL advisory lock ([`flux_pg::ddl_lock`]) as its first statement (D-76): Postgres's
+    /// `IF NOT EXISTS` DDL is not atomic — two replicas cold-booting against a fresh database both
+    /// pass the catalog check, race the insert, and the loser errors (`pg_type_typname_nsp_index`
+    /// duplicate key). The lock serializes concurrent cold-boots across processes/replicas, so the
+    /// loser waits and then sees the objects exist; it is transaction-scoped, so it releases at
+    /// commit with nothing to clean up.
     pub(crate) fn connect(handle: Arc<PgHandle>) -> Result<Self> {
         let pool = handle.pool().clone();
-        // `raw_sql` runs the multi-statement DDL batch via the simple-query protocol.
         handle.block_on(async move {
-            sqlx::raw_sql(SCHEMA_DDL)
-                .execute(&pool)
-                .await
-                .map_err(map_sql)
+            let mut tx = pool.begin().await.map_err(map_sql)?;
+            flux_pg::ddl_lock(&mut tx).await?;
+            run_schema_ddl(&mut tx).await?;
+            tx.commit().await.map_err(map_sql)
         })?;
         Ok(Self { handle })
     }
+}
+
+/// Run the multi-statement [`SCHEMA_DDL`] batch on the bootstrap transaction's connection.
+/// `Executor::execute` with a bare `&str` (no arguments) goes through the simple-query protocol,
+/// exactly like `sqlx::raw_sql` — but `raw_sql`'s executor lifetime binds in a way rustc's
+/// higher-ranked inference rejects inside the `Send + 'static` future `PgHandle::block_on`
+/// requires ("implementation of `Executor` is not general enough"), so the batch runs through
+/// this named `async fn`, whose signature pins the connection lifetime.
+async fn run_schema_ddl(conn: &mut PgConnection) -> Result<()> {
+    use sqlx::Executor as _;
+    conn.execute(SCHEMA_DDL).await.map_err(map_sql)?;
+    Ok(())
 }
 
 /// Decode a `streams` row selected as [`SUMMARY_COLS`] into a [`SessionSummary`].
@@ -497,6 +516,38 @@ impl EventBackend for PgEvents {
                 .await
                 .map_err(map_sql)?;
             delete_streams(&pool, ns).await
+        })
+    }
+
+    fn prune_adhoc_older_than(&self, cutoff_ms: i64) -> Result<usize> {
+        // D-77: retention for ad-hoc streams — the ones with no `streams` registry row, which the
+        // registry-enumerating prunes structurally cannot reach. Per-stream horizon on the NEWEST
+        // event (`HAVING MAX(ts) < cutoff`), so a still-active ad-hoc stream keeps its FULL
+        // history. Select + delete in one transaction; the delete batches by stream TEXT id
+        // (mirroring `delete_streams`' `= ANY($1)` shape — there are no registry rows to delete).
+        let pool = self.handle.pool().clone();
+        self.handle.block_on(async move {
+            let mut tx = pool.begin().await.map_err(map_sql)?;
+            let expired: Vec<String> = sqlx::query_scalar(
+                "SELECT stream FROM events \
+                 WHERE stream NOT IN (SELECT 's_' || n FROM streams) \
+                 GROUP BY stream HAVING MAX(ts) < $1",
+            )
+            .bind(cutoff_ms)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_sql)?;
+            if expired.is_empty() {
+                return Ok(0);
+            }
+            let count = expired.len();
+            sqlx::query("DELETE FROM events WHERE stream = ANY($1)")
+                .bind(expired)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sql)?;
+            tx.commit().await.map_err(map_sql)?;
+            Ok(count)
         })
     }
 

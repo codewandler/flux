@@ -55,6 +55,10 @@ use flux_datasource::{
 
 /// A datasource index backend: upsert records and answer the five retrieval verbs. All methods take
 /// `&self` (interior mutability) so a backend is shared as `Arc<dyn DatasourceBackend>` across the ops.
+///
+/// The trait is **per-scope by design** — an implementor instance is bound to exactly one scope (a
+/// SQLite file, a Postgres `ns`). Cross-scope reads (`namespaces`, `scan`) are deliberately
+/// associated fns on the Postgres impl, not trait methods.
 pub trait DatasourceBackend: Send + Sync {
     /// Insert or replace records, keyed by their `(source, entity, id)` address.
     fn upsert(&self, records: &[Record]) -> Result<()>;

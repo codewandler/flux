@@ -6,6 +6,42 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+**Postgres backend post-ship hardening** (the `pg-backend` epic's review follow-ups, D-76..D-79).
+One breaking signature (`PostgresBackend::new`) → the next release is a minor bump.
+
+### Added
+
+- **D-77** — retention for ad-hoc (unregistered) event streams: new
+  `EventStore::prune_adhoc_older_than(cutoff_ms)` deletes every stream that has no session-registry
+  row and whose *newest* event predates the cutoff (per-stream horizon — a still-active ad-hoc
+  stream keeps its full history), on both backends. Previously all three prune primitives
+  enumerated only the registry, so ad-hoc fact streams grew without bound; `prune_older_than`'s
+  docs now state its registry-only coverage explicitly.
+- **D-78** — cross-namespace entity scan for the Postgres datasource backend:
+  `PostgresBackend::scan(handle, ns_prefix, entity)` answers a global lookup over per-scope
+  namespaces in **one** query instead of the 1+N serial round trips of `namespaces()` + a per-scope
+  backend + `list()` each. Like `namespaces()`, it is an associated fn on the Postgres impl — the
+  `DatasourceBackend` trait stays per-scope by design.
+- **D-79** — `PgHandle::redacted_dsn()`: the one safe-to-print DSN form, rebuilt from the *parsed*
+  components (userinfo → `…`; `password`-class query params masked — sqlx honors `password` as an
+  authenticating query param, which naive split-at-`@` redaction prints verbatim; flux-owned params
+  stay visible). `PgHandle`'s `Debug` shows exactly this form, and a DSN parse error no longer
+  echoes the raw (credential-bearing) string.
+
+### Changed
+
+- **D-76** — Postgres bootstrap DDL is now safe under concurrent cold boots: every bootstrap path
+  (the `schema` `CREATE SCHEMA` hook, the event-store schema, the datasource schema) runs in a
+  transaction under one global advisory lock (`flux_pg::ddl_lock`), so concurrent first-boots
+  serialize instead of flaking on Postgres's non-atomic `IF NOT EXISTS` (duplicate-key errors on
+  the catalog indexes). `namespaces()` on a never-bootstrapped database now returns `Ok([])`
+  instead of `undefined_table`.
+- **D-76 (BREAKING)** — `PostgresBackend::new(handle, ns)` is now I/O-free and returns `Self` (not
+  `Result<Self>`): it binds the namespace only. The shared-table DDL moved to the new
+  `PostgresBackend::ensure_schema(handle)` — call it once from wherever a deployment opens its
+  stores. The signature change is deliberate: adopters get a compile error pointing at
+  `ensure_schema` instead of a silent runtime `undefined_table`.
+
 ## [0.4.3] - 2026-07-08
 
 **A2A protocol conformance, Tier 2 — I/O fidelity within the synchronous-turn model** (the

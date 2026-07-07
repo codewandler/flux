@@ -542,6 +542,35 @@ impl EventBackend for SqliteEvents {
         Ok(expired.len())
     }
 
+    fn prune_adhoc_older_than(&self, cutoff_ms: i64) -> Result<usize> {
+        // D-77: retention for ad-hoc streams — the ones with no `streams` registry row, which the
+        // registry-enumerating prunes structurally cannot reach. Per-stream horizon on the NEWEST
+        // event (`HAVING MAX(ts) < cutoff`), so a still-active ad-hoc stream keeps its FULL
+        // history. Same transaction shape as the other prunes; no registry rows to delete.
+        let conn = self.conn.lock().unwrap();
+        let tx = begin_write(&conn)?;
+        let expired: Vec<String> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT stream FROM events \
+                     WHERE stream NOT IN (SELECT 's_' || n FROM streams) \
+                     GROUP BY stream HAVING MAX(ts) < ?1",
+                )
+                .map_err(map_sql)?;
+            let rows = stmt
+                .query_map([cutoff_ms], |r| r.get::<_, String>(0))
+                .map_err(map_sql)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(map_sql)?
+        };
+        for stream in &expired {
+            tx.execute("DELETE FROM events WHERE stream = ?1", [stream])
+                .map_err(map_sql)?;
+        }
+        tx.commit().map_err(map_sql)?;
+        Ok(expired.len())
+    }
+
     fn append(&self, stream: &str, ev: NewEvent) -> Result<StoredEvent> {
         let conn = self.conn.lock().unwrap();
         if let Some(id) = &ev.id {

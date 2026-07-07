@@ -2,7 +2,7 @@
 id: D-78
 title: Cross-namespace entity scan for the Postgres datasource backend — one query instead of N per-scope round trips
 pillar: Core
-status: backlog
+status: done
 epic: pg-backend
 design: docs/designs/pg-backend.md
 note: "global lookups over per-scope namespaces (token→scope resolution, registry sweeps) currently cost namespaces() + a per-scope backend + list() each — 1+N..1+3N serial round trips; a prefix+entity scan is one"
@@ -35,7 +35,17 @@ this backend's contract.
       an associated fn on the Postgres impl, like `namespaces`).
 
 ## Progress
-- (not started)
+- 2026-07-08 — done. `PostgresBackend::scan(handle, ns_prefix, entity) -> Result<Vec<(String,
+  Record)>>` — one query (`WHERE ns LIKE $1 || '%' AND entity = $2 ORDER BY ns, id`), records via
+  the existing `row_to_record` (source `plugin/instance` round-trip intact), `ns` verbatim from its
+  own column, no limit param (callers filter), prefix semantics mirroring `namespaces()`.
+  Missing-table tolerance shared with `namespaces()` via one `is_undefined_table` helper
+  (`42P01 → Ok(vec![])`) so the two can't drift (see D-76). Deliberately an associated fn on the
+  Postgres impl, not a trait method — doc note added on `DatasourceBackend` stating the trait stays
+  per-scope by design. Env-gated tests: exact (ns, record) pairing/ordering across `a:1`/`a:2`/`b:1`
+  with noise entities, record equality vs `list()`, empty prefix result, never-bootstrapped schema →
+  `Ok(vec![])`. Full package gate green (fmt, default + `--features postgres` tests vs live PG,
+  clippy `-D warnings` both ways).
 
 ## Notes
 - Found in a post-ship review: the per-scope-loop shape was tolerable over local SQLite files but

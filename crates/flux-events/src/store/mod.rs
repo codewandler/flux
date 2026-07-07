@@ -132,7 +132,15 @@ trait EventBackend: Send + Sync {
     /// D-75: delete every stream (registry row + events) whose `updated_at` is strictly older than
     /// `cutoff_ms`, regardless of tag; returns the count. The whole-store sibling of
     /// [`prune_inactive`](Self::prune_inactive) (same delete shape, minus the `agent_id` predicate).
+    /// Covers ONLY registry-listed sessions (`s_<n>` — it enumerates `streams`); ad-hoc streams are
+    /// reached by [`prune_adhoc_older_than`](Self::prune_adhoc_older_than).
     fn prune_older_than(&self, cutoff_ms: i64) -> Result<usize>;
+    /// D-77: delete all events of every **ad-hoc** stream — one with no `streams` registry row —
+    /// whose NEWEST event `ts` is strictly older than `cutoff_ms`; returns the count of streams
+    /// removed. The horizon is per-stream, not per-event (`HAVING MAX(ts) < cutoff`), so a
+    /// still-active ad-hoc stream keeps its FULL history. The ad-hoc complement of
+    /// [`prune_older_than`](Self::prune_older_than), which covers only registry-listed sessions.
+    fn prune_adhoc_older_than(&self, cutoff_ms: i64) -> Result<usize>;
 }
 
 /// The concrete storage backend behind an [`EventStore`]. The default build carries only the
@@ -344,8 +352,35 @@ impl EventStore {
     /// here: this is the primitive a caller that owns its store schedules against its own retention
     /// policy, so "old" means exactly `updated_at < cutoff_ms` with nothing exempt. A caller that
     /// wants to keep a live session simply keeps its `cutoff_ms` behind that session's last activity.
+    ///
+    /// **Scope: registry-listed sessions ONLY.** Like every registry-enumerating prune, this walks
+    /// `SELECT n FROM streams …` and deletes `s_<n>` streams — an ad-hoc stream (any id that never
+    /// got a registry row, e.g. a D-55 Custom-facts log) is structurally unreachable here and is
+    /// reached by [`prune_adhoc_older_than`](Self::prune_adhoc_older_than) instead; a whole-store
+    /// retention policy schedules both.
     pub fn prune_older_than(&self, cutoff_ms: i64) -> Result<usize> {
         self.backend().prune_older_than(cutoff_ms)
+    }
+
+    /// D-77: delete all events of every **ad-hoc** stream — one with no `streams` registry row
+    /// (any stream id that doesn't name a registered `s_<n>` session, e.g. a per-tenant D-55
+    /// Custom-facts log) — whose NEWEST event `ts` is strictly older than `cutoff_ms`, and return
+    /// the number of streams removed (matching the other prunes' return semantics).
+    ///
+    /// **The horizon is per-stream, not per-event.** A stream qualifies only when its newest event
+    /// predates the cutoff (`HAVING MAX(ts) < cutoff_ms`), and then its WHOLE event history is
+    /// deleted; a still-active ad-hoc stream — one appended to inside the horizon — keeps its FULL
+    /// history, old events included. That mirrors [`prune_older_than`](Self::prune_older_than)'s
+    /// last-activity semantics (`updated_at` advances on every append) at the only granularity an
+    /// unregistered stream has: its own events' timestamps.
+    ///
+    /// The contrast with [`prune_older_than`](Self::prune_older_than): that primitive covers ONLY
+    /// registry-listed sessions (it enumerates `streams` and deletes registry row + events); this
+    /// one covers ONLY unregistered streams (there is no registry row to age-check or delete — the
+    /// events themselves are the whole footprint). Together they make a scheduled retention horizon
+    /// actually cover the whole store.
+    pub fn prune_adhoc_older_than(&self, cutoff_ms: i64) -> Result<usize> {
+        self.backend().prune_adhoc_older_than(cutoff_ms)
     }
 
     // --- append -------------------------------------------------------------
@@ -1705,6 +1740,70 @@ mod tests {
         assert_eq!(store.prune_older_than(cutoff).unwrap(), 0);
     }
 
+    /// D-77: `prune_adhoc_older_than` reaches the streams the registry-enumerating prunes
+    /// structurally cannot — ad-hoc streams (non-`s_<n>` ids, no `streams` row) — and ONLY those.
+    /// The horizon is per-stream on the NEWEST event: an aged ad-hoc stream is deleted whole, a
+    /// still-active one keeps its FULL history (old events included), and registered sessions are
+    /// out of scope entirely — even one older than the cutoff.
+    fn prune_adhoc_older_than_reaches_only_aged_unregistered_streams(store: &EventStore) {
+        let fact = |n: u32| {
+            NewEvent::new(EventKind::Custom {
+                name: "audit.fact".to_string(),
+                payload: serde_json::json!({ "n": n }),
+            })
+        };
+
+        // Before the cutoff: an ad-hoc stream that will age out entirely…
+        store.append("audit-old", fact(1)).unwrap();
+        store.append("audit-old", fact(2)).unwrap();
+        // …an ad-hoc stream that gets an OLD event but stays active past the cutoff…
+        store.append("audit-fresh", fact(3)).unwrap();
+        // …and an aged REGISTERED session — registry rows are prune_older_than's territory, so
+        // this primitive must leave it alone regardless of age.
+        let aged_registered = store.create_session("m").unwrap();
+        store
+            .record_message(&aged_registered, &Message::user_text("old"))
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let cutoff = now_ms(); // everything above is now strictly older than this
+        std::thread::sleep(std::time::Duration::from_millis(3));
+
+        // Inside the horizon: the second ad-hoc stream stays active, and a fresh session appears.
+        store.append("audit-fresh", fact(4)).unwrap();
+        let fresh_registered = store.create_session("m").unwrap();
+        store
+            .record_message(&fresh_registered, &Message::user_text("new"))
+            .unwrap();
+
+        assert_eq!(
+            store.prune_adhoc_older_than(cutoff).unwrap(),
+            1,
+            "exactly the one aged ad-hoc stream is removed"
+        );
+        assert!(
+            store.load_stream("audit-old", None).unwrap().is_empty(),
+            "the aged ad-hoc stream's events are gone"
+        );
+        assert_eq!(store.head_seq("audit-old").unwrap(), -1);
+        // Per-stream horizon, not per-event: the active ad-hoc stream keeps its FULL history,
+        // including the event older than the cutoff.
+        assert_eq!(
+            store.load_stream("audit-fresh", None).unwrap().len(),
+            2,
+            "a still-active ad-hoc stream keeps its whole history"
+        );
+        // Registered sessions are untouched — including the AGED one (its retention belongs to
+        // prune_older_than, not this primitive).
+        assert!(store.info(&aged_registered).is_ok());
+        assert_eq!(store.conversation(&aged_registered).unwrap().len(), 1);
+        assert!(store.info(&fresh_registered).is_ok());
+        assert_eq!(store.conversation(&fresh_registered).unwrap().len(), 1);
+
+        // A second sweep at the same cutoff is a no-op (idempotent).
+        assert_eq!(store.prune_adhoc_older_than(cutoff).unwrap(), 0);
+    }
+
     /// The SQLite backend: every backend-agnostic conformance body against a fresh in-memory store
     /// (today's behavior — must stay green), plus the SQLite-specific tests (file reopen, cross-process
     /// busy-timeout) that have no Postgres analog.
@@ -1750,6 +1849,7 @@ mod tests {
         sqlite_case!(cost_summary_all_does_not_double_count_correlated_children);
         sqlite_case!(custom_events_append_and_read_back_scoped_by_account);
         sqlite_case!(prune_older_than_deletes_streams_straddling_the_cutoff);
+        sqlite_case!(prune_adhoc_older_than_reaches_only_aged_unregistered_streams);
 
         // --- SQLite-specific: no Postgres analog (file reopen / cross-process busy-timeout) ---
 
@@ -1824,7 +1924,7 @@ mod tests {
     #[cfg(feature = "postgres")]
     mod postgres_tests {
         use super::*;
-        use flux_pg::PgHandle;
+        use flux_pg::{sqlx, PgHandle};
 
         /// A fresh `EventStore` in a throwaway schema, or `None` when `TEST_POSTGRES_URL` is unset.
         fn pg_store() -> Option<EventStore> {
@@ -1882,6 +1982,66 @@ mod tests {
         pg_case!(cost_summary_all_does_not_double_count_correlated_children);
         pg_case!(custom_events_append_and_read_back_scoped_by_account);
         pg_case!(prune_older_than_deletes_streams_straddling_the_cutoff);
+        pg_case!(prune_adhoc_older_than_reaches_only_aged_unregistered_streams);
+
+        /// D-76 (PG-only): eight simultaneous cold-boots against ONE fresh schema must ALL succeed.
+        /// Postgres's `IF NOT EXISTS` DDL is not atomic — without the global `flux:ddl` advisory
+        /// lock taken first in `PgEvents::connect`'s bootstrap transaction, concurrent first-boots
+        /// race the catalog insert and the loser errors (`pg_type_typname_nsp_index` duplicate
+        /// key). The race is probabilistic and does not reliably reproduce against a local server,
+        /// so this is a regression tripwire rather than a deterministic red/green proof.
+        #[test]
+        fn concurrent_cold_boots_serialize_bootstrap_ddl() {
+            let Ok(base) = std::env::var("TEST_POSTGRES_URL") else {
+                eprintln!(
+                    "skipping concurrent_cold_boots_serialize_bootstrap_ddl: TEST_POSTGRES_URL unset"
+                );
+                return;
+            };
+            let schema = format!("t_{}", ulid::Ulid::new().to_string().to_lowercase());
+            let sep = if base.contains('?') { '&' } else { '?' };
+            let url = format!("{base}{sep}schema={schema}");
+
+            const N: usize = 8;
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+            let threads: Vec<_> = (0..N)
+                .map(|_| {
+                    let url = url.clone();
+                    let barrier = barrier.clone();
+                    // Each thread is its own "replica": its own PgHandle (own pool + runtime)
+                    // against the SAME fresh schema. `PgHandle::connect` is lazy — the schema
+                    // create + bootstrap DDL fire inside `open_postgres` — so the barrier
+                    // releases all eight bootstraps simultaneously.
+                    std::thread::spawn(move || -> std::result::Result<(), String> {
+                        let handle = PgHandle::connect(&url).map_err(|e| e.to_string())?;
+                        barrier.wait();
+                        let store = EventStore::open_postgres(handle).map_err(|e| e.to_string())?;
+                        // The store must be usable, not merely constructed.
+                        store.create_session("m").map_err(|e| e.to_string())?;
+                        Ok(())
+                    })
+                })
+                .collect();
+            let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+
+            // Drop the throwaway schema BEFORE asserting, so a red run doesn't leak it.
+            let admin = PgHandle::connect(&base).unwrap();
+            let pool = admin.pool().clone();
+            let drop_sql = format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE");
+            admin
+                .block_on(async move {
+                    sqlx::raw_sql(&drop_sql)
+                        .execute(&pool)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| flux_core::Error::Other(format!("drop schema: {e}")))
+                })
+                .unwrap();
+
+            for (i, r) in results.iter().enumerate() {
+                assert!(r.is_ok(), "cold-boot {i} failed: {r:?}");
+            }
+        }
 
         /// PG-only: N concurrent appends to ONE stream from a multi-thread tokio context must yield
         /// contiguous `stream_seq`s — no gaps, no duplicates, no panic — proving the per-stream

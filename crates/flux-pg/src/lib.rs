@@ -41,6 +41,32 @@ use flux_core::{Error, Result};
 pub use sqlx;
 
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use sqlx::Connection as _;
+
+/// The one advisory-lock statement every flux bootstrap-DDL transaction takes **first**.
+///
+/// Postgres's `IF NOT EXISTS` DDL is not atomic: two sessions that both pass the catalog check race
+/// the insert, and the loser errors (`duplicate key value violates unique constraint
+/// "pg_type_typname_nsp_index"` for `CREATE TABLE`; `pg_namespace_nspname_index` for
+/// `CREATE SCHEMA`; `CREATE INDEX` races analogously). Two replicas cold-booting against a fresh
+/// database would fail their first connect for a transient, non-config reason. Taking this
+/// transaction-scoped lock (one global key — bootstrap is rare, contention is irrelevant) as the
+/// first statement serializes the racers, so the loser *waits* and then sees the object exists.
+///
+/// Prefer [`ddl_lock`] where you hold a [`sqlx::Transaction`]; the raw SQL is exported for contexts
+/// that only have a connection (e.g. pool hooks).
+pub const DDL_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(hashtextextended('flux:ddl', 0))";
+
+/// Take the global flux DDL advisory lock on an open transaction — run this as the **first**
+/// statement of any bootstrap-DDL transaction (see [`DDL_LOCK_SQL`] for why). The lock is
+/// transaction-scoped: it releases automatically at commit or rollback.
+pub async fn ddl_lock(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<()> {
+    sqlx::query(DDL_LOCK_SQL)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| Error::Other(format!("flux-pg: ddl lock: {e}")))?;
+    Ok(())
+}
 
 /// A live Postgres connection pool plus the dedicated runtime that drives it.
 ///
@@ -53,6 +79,9 @@ pub struct PgHandle {
     /// handle is live).
     rt: Option<tokio::runtime::Runtime>,
     pool: PgPool,
+    /// The safe-to-print DSN, built from the *parsed* components at connect time — see
+    /// [`PgHandle::redacted_dsn`].
+    redacted_dsn: String,
 }
 
 impl Drop for PgHandle {
@@ -70,7 +99,11 @@ impl Drop for PgHandle {
 
 impl std::fmt::Debug for PgHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PgHandle").finish_non_exhaustive()
+        // Deliberately shows only the redacted DSN — a `{:?}` of a handle must never leak
+        // credentials, whether they arrived as userinfo or as a `?password=` query param.
+        f.debug_struct("PgHandle")
+            .field("dsn", &self.redacted_dsn)
+            .finish_non_exhaustive()
     }
 }
 
@@ -110,9 +143,15 @@ impl PgHandle {
                             // `schema` doubles as the test-isolation mechanism, so make it
                             // self-contained: create it if absent, then pin the search_path. The
                             // name is validated as a bare identifier at parse time, so the inline
-                            // quoting below cannot be an injection vector.
+                            // quoting below cannot be an injection vector. The create runs in a
+                            // transaction under the global DDL lock ([`DDL_LOCK_SQL`]) because
+                            // `IF NOT EXISTS` is not atomic — concurrent cold-booting pools race
+                            // the pg_namespace insert and the loser errors without it.
+                            let mut tx = conn.begin().await?;
+                            sqlx::query(DDL_LOCK_SQL).execute(&mut *tx).await?;
                             let ddl = format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\"");
-                            sqlx::query(&ddl).execute(&mut *conn).await?;
+                            sqlx::query(&ddl).execute(&mut *tx).await?;
+                            tx.commit().await?;
                             let set = format!("SET search_path TO \"{schema}\"");
                             sqlx::query(&set).execute(&mut *conn).await?;
                         }
@@ -122,7 +161,22 @@ impl PgHandle {
                 .connect_lazy_with(dsn.connect_options)
         };
 
-        Ok(Arc::new(Self { rt: Some(rt), pool }))
+        Ok(Arc::new(Self {
+            rt: Some(rt),
+            pool,
+            redacted_dsn: dsn.redacted,
+        }))
+    }
+
+    /// The DSN with every credential masked — the **one** safe-to-print form, for startup banners
+    /// and logs. Consumers must use this instead of hand-rolling redaction over the raw URL: naive
+    /// string surgery gets it wrong in ways that leak secrets (sqlx honors `password` as a *query
+    /// parameter* — a valid, authenticating DSN with no userinfo at all — and an `@` inside the
+    /// query string defeats split-at-`@` heuristics). This form is rebuilt from the parsed
+    /// components: scheme and host:port/db kept, userinfo shown as `…`, `password`-class query
+    /// params masked, flux-owned params echoed visibly.
+    pub fn redacted_dsn(&self) -> &str {
+        &self.redacted_dsn
     }
 
     /// Run a future to completion from **any** calling context (plain thread, tokio worker, or
@@ -161,6 +215,43 @@ struct Dsn {
     pool_max: u32,
     acquire_timeout_ms: u64,
     schema: Option<String>,
+    /// The safe-to-print rendering, built by [`redact`] from the parsed URL (never string surgery).
+    redacted: String,
+}
+
+/// Rebuild a safe-to-print DSN from a *parsed* URL: scheme preserved, host:port and path kept,
+/// userinfo collapsed to `…`, `password`-class query params (sqlx honors `password` and
+/// `sslpassword` as authenticating query params!) masked, everything else — including the
+/// flux-owned params — echoed visibly. Working from components is the whole point: raw string
+/// surgery mis-splits on `@` inside the query and misses `?password=` DSNs with no userinfo.
+fn redact(u: &url::Url) -> String {
+    let mut out = format!("{}://", u.scheme());
+    if !u.username().is_empty() || u.password().is_some() {
+        out.push('…');
+        out.push('@');
+    }
+    if let Some(host) = u.host_str() {
+        out.push_str(host);
+    }
+    if let Some(port) = u.port() {
+        out.push_str(&format!(":{port}"));
+    }
+    out.push_str(u.path());
+    let pairs: Vec<String> = u
+        .query_pairs()
+        .map(|(k, v)| {
+            if k.to_ascii_lowercase().contains("password") {
+                format!("{k}=…")
+            } else {
+                format!("{k}={v}")
+            }
+        })
+        .collect();
+    if !pairs.is_empty() {
+        out.push('?');
+        out.push_str(&pairs.join("&"));
+    }
+    out
 }
 
 impl Dsn {
@@ -175,7 +266,10 @@ impl Dsn {
     /// | `schema` | *(none → `public`)* | `SET search_path` per connection; the test-isolation knob |
     fn parse(url: &str) -> Result<Self> {
         let mut u = url::Url::parse(url)
-            .map_err(|e| Error::Config(format!("flux-pg: invalid DSN {url:?}: {e}")))?;
+            .map_err(|e| Error::Config(format!("flux-pg: invalid DSN: {e}")))?;
+
+        // Built before the flux-owned params are stripped, so they stay visible in the rendering.
+        let redacted = redact(&u);
 
         let mut pool_max = 5u32;
         let mut acquire_timeout_ms = 5000u64;
@@ -229,6 +323,7 @@ impl Dsn {
             pool_max,
             acquire_timeout_ms,
             schema,
+            redacted,
         })
     }
 }
@@ -300,6 +395,82 @@ mod tests {
     fn rejects_bad_flux_param_values() {
         assert!(Dsn::parse("postgres://u@h/db?pool_max=lots").is_err());
         assert!(Dsn::parse("postgres://u@h/db?acquire_timeout_ms=-5").is_err());
+    }
+
+    // ---- D-79: the redacted DSN (no database) ----------------------------------------------------
+
+    #[test]
+    fn redacts_userinfo_credentials() {
+        let dsn = Dsn::parse("postgres://alice:secret@db.example.com:5433/mydb").unwrap();
+        assert_eq!(dsn.redacted, "postgres://…@db.example.com:5433/mydb");
+        assert!(!dsn.redacted.contains("alice") && !dsn.redacted.contains("secret"));
+    }
+
+    #[test]
+    fn redacts_password_query_param_without_userinfo() {
+        // sqlx honors `password` as a query param: this DSN authenticates with NO userinfo at all —
+        // the case naive split-at-'@' redaction prints verbatim.
+        let dsn = Dsn::parse("postgres://db.example.com/mydb?user=svc&password=hunter2").unwrap();
+        assert_eq!(
+            dsn.redacted,
+            "postgres://db.example.com/mydb?user=svc&password=…"
+        );
+        assert!(!dsn.redacted.contains("hunter2"));
+    }
+
+    #[test]
+    fn redacts_both_userinfo_and_password_class_params() {
+        let dsn = Dsn::parse("postgres://u:pw@h/db?sslpassword=keypw&sslmode=require").unwrap();
+        assert_eq!(
+            dsn.redacted,
+            "postgres://…@h/db?sslpassword=…&sslmode=require"
+        );
+        assert!(!dsn.redacted.contains("pw"));
+    }
+
+    #[test]
+    fn redaction_survives_at_sign_inside_query_values() {
+        // An '@' inside a query param value defeats rsplit-at-'@' heuristics; the component-based
+        // rendering is unaffected.
+        let dsn = Dsn::parse("postgres://u:pw@h/db?options=-c%20app%3Da%40b").unwrap();
+        assert!(dsn.redacted.starts_with("postgres://…@h/db?options="));
+        assert!(!dsn.redacted.contains("pw@"), "redacted: {}", dsn.redacted);
+    }
+
+    #[test]
+    fn redaction_preserves_scheme_and_shows_flux_params() {
+        let dsn =
+            Dsn::parse("postgresql://u:pw@h:6432/db?pool_max=9&schema=tenant_1&password=extra")
+                .unwrap();
+        assert_eq!(
+            dsn.redacted,
+            "postgresql://…@h:6432/db?pool_max=9&schema=tenant_1&password=…"
+        );
+    }
+
+    #[test]
+    fn parse_error_does_not_echo_the_dsn() {
+        // The error for an unparseable DSN must not reproduce the raw string — it may hold
+        // credentials even when malformed.
+        // (No `unwrap_err`: `Dsn` deliberately has no `Debug` — its connect options could print
+        // the credentials this test exists to keep out of output.)
+        let err = match Dsn::parse("postgres://u:topsecret@[bad/db") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected a parse error"),
+        };
+        assert!(!err.contains("topsecret"), "error leaked the DSN: {err}");
+    }
+
+    #[test]
+    fn handle_debug_shows_only_the_redacted_dsn() {
+        let h = PgHandle::connect("postgres://u:supersecret@127.0.0.1:1/db?password=alsosecret")
+            .expect("lazy connect never dials");
+        let dbg = format!("{h:?}");
+        assert!(dbg.contains("postgres://…@127.0.0.1:1/db"), "debug: {dbg}");
+        assert!(
+            !dbg.contains("supersecret") && !dbg.contains("alsosecret"),
+            "debug leaked credentials: {dbg}"
+        );
     }
 
     #[test]
@@ -383,6 +554,56 @@ mod tests {
         let base = std::env::var("TEST_POSTGRES_URL").ok()?;
         let sep = if base.contains('?') { '&' } else { '?' };
         Some(format!("{base}{sep}schema={schema}"))
+    }
+
+    #[test]
+    fn concurrent_first_boot_bootstrap_is_serialized() {
+        // D-76: `CREATE SCHEMA IF NOT EXISTS` is not atomic — two sessions that both pass the
+        // catalog check race the pg_namespace insert and the loser errors. Eight handles (own
+        // pools, as eight cold-booting replicas) all fire `after_connect` against a schema that
+        // does not exist yet; every one must succeed because the bootstrap runs under the global
+        // flux DDL advisory lock.
+        let schema = format!("t_{}", ulid::Ulid::new().to_string().to_lowercase());
+        let Some(url) = test_url_with_schema(&schema) else {
+            eprintln!(
+                "skipping concurrent_first_boot_bootstrap_is_serialized: TEST_POSTGRES_URL unset"
+            );
+            return;
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let url = url.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let h = PgHandle::connect(&url)?;
+                    let pool = h.pool().clone();
+                    // Line all eight up so the first queries — and with them the `after_connect`
+                    // bootstrap — fire as simultaneously as the scheduler allows.
+                    barrier.wait();
+                    // The pool is lazy: this first query opens the connection and runs the hook.
+                    h.block_on(async move {
+                        sqlx::query_scalar::<_, i64>("SELECT 1::bigint")
+                            .fetch_one(&pool)
+                            .await
+                            .map_err(|e| Error::Other(format!("first query: {e}")))
+                    })
+                })
+            })
+            .collect();
+        let results: Vec<Result<i64>> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+
+        // Clean up the throwaway schema before asserting, so a red run doesn't leak it.
+        let h = PgHandle::connect(&url).unwrap();
+        let pool = h.pool().clone();
+        let drop = format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE");
+        h.block_on(async move {
+            let _ = sqlx::query(&drop).execute(&pool).await;
+        });
+
+        for r in results {
+            r.expect("concurrent first-boot connect must not error");
+        }
     }
 
     #[test]
