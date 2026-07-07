@@ -10,9 +10,11 @@
 //! - `message/stream` — run one flux turn, stream `TaskStatusUpdate` events as Server-Sent Events
 //!
 //! The wire shapes come from the shared [`flux_a2a`] types, so client and server agree on one
-//! definition. Each task creates a fresh session (stateless A2A mode); the `contextId` from the
-//! request is echoed (and recorded as the session's correlation id) so a future stateful mode
-//! (one session per `contextId`) needs no client change.
+//! definition. **Stateful A2A mode (A-48): one session per `contextId`** — a request whose
+//! `contextId` matches a live A2A session continues that session (the engine's conversation
+//! projection provides multi-turn memory), exactly the promise the earlier stateless-mode comment
+//! made ("needs no client change"): the id was already echoed and recorded as the session's
+//! correlation id. A request without a `contextId` mints a fresh session per task, as before.
 //! The agent card is exempt from bearer-token auth so external agents can discover flux without a key.
 //!
 //! Session retention (C-18): every session minted here is tagged `agent_id = "a2a"` in its D-02
@@ -55,9 +57,12 @@ use crate::{A2aTtl, CardInfo, Shared, TurnGate};
 /// is scoped to exactly this tag, so a CLI/TUI session (empty context) is never eligible.
 pub(crate) const A2A_AGENT_ID: &str = "a2a";
 
-/// Mint the session for one A2A task: sweep expired A2A sessions first (the lazy TTL pass), then
-/// create the new session tagged `agent_id = "a2a"` with the request's `contextId` (if any) as
-/// the correlation id.
+/// Resolve the session for one A2A task: sweep expired A2A sessions first (the lazy TTL pass),
+/// then **reuse the live session whose correlation id equals the request's `contextId`** (A-48
+/// stateful mode) or create a new one tagged `agent_id = "a2a"` with that `contextId` (if any) as
+/// the correlation id. Sweep-before-lookup means an expired conversation is never resumed: its
+/// session is gone, so the same `contextId` mints a fresh session that becomes the new
+/// continuation target.
 ///
 /// Callers MUST hold the `turn_gate` before calling this (C-29): minting ahead of the gate would
 /// let a session sit queued — alive but idle, its `updated_at` frozen at mint — where a *different*
@@ -83,6 +88,11 @@ fn create_a2a_session(
             "(a2a: pruned {pruned} expired session(s) past the {}s TTL)",
             ttl.0
         );
+    }
+    if let Some(cid) = context_id {
+        if let Some(existing) = engine.events.find_correlated(cid, A2A_AGENT_ID)? {
+            return Ok(existing);
+        }
     }
     let ctx = flux_events::EventContext {
         agent_id: Some(A2A_AGENT_ID.to_string()),

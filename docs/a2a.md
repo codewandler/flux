@@ -46,9 +46,10 @@ On connect, the client fetches the agent card (`/.well-known/agent-card.json`, f
 The `<URL>` may be a base origin (`http://host:port` → the client targets `<origin>/a2a`) or a full
 JSON-RPC endpoint URL. The client adopts the endpoint advertised by the agent card when present.
 
-> **Continuity.** Each turn is sent as an independent task, matching today's stateless `flux app run --serve`.
-> The client carries the A2A `contextId`/`messageId`/`taskId` identifiers, so a *stateful* remote
-> keeps conversation memory and server-side statefulness can be added later without client changes.
+> **Continuity (A-48).** The client mints one A2A `contextId` per chat session and sends it with
+> every message. A flux server (and any stateful remote) keys **one session per `contextId`**, so
+> multi-turn conversations keep memory across `message/send` calls — slot-filling presets work
+> over plain A2A text. A remote that ignores the id simply behaves per-turn.
 
 ---
 
@@ -229,7 +230,12 @@ whether accessed directly or through a reverse proxy.
 - The discovery card and `/health` are the only routes exempt from auth. This is structural
   (registered outside the middleware layer), not a path-string comparison, so percent-encoding
   tricks cannot bypass it.
-- Each A2A task creates a fresh session (stateless mode). Sessions minted by the A2A surface are
-  pruned lazily: every mint first sweeps A2A sessions whose last activity is older than
-  `[server] a2a_session_ttl_secs` in `.flux/config.toml` (default `3600` = 1 hour; `0` = never
-  prune). Only A2A-minted sessions are eligible — CLI/TUI sessions are never swept.
+- **Stateful mode (A-48): one session per `contextId`.** A request whose `contextId` matches a
+  live A2A session continues it (multi-turn memory via the engine's conversation projection); a
+  request without a `contextId` gets a fresh session per task, as before. Sessions minted by the
+  A2A surface are pruned lazily: every request first sweeps A2A sessions whose last activity is
+  older than `[server] a2a_session_ttl_secs` in `.flux/config.toml` (default `3600` = 1 hour;
+  `0` = never prune) — the sweep runs *before* the continuity lookup, so an expired conversation
+  is never resumed (the same `contextId` then starts a fresh one). Only A2A-minted sessions are
+  eligible — CLI/TUI sessions are never swept. Continuity is keyed within the server's single
+  bearer-auth realm; per-principal isolation arrives with the request-auth seam (D-64).

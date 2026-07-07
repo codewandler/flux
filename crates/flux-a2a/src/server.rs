@@ -30,13 +30,32 @@ pub trait A2aTurn: Send + Sync {
     /// As [`run`](Self::run), but the reply may carry **extra parts** beside the answer text —
     /// e.g. `data` parts with typed UI blocks a chat surface renders natively. The default
     /// delegates to [`run`](Self::run) with no extra parts, so existing implementors are
-    /// unaffected; [`dispatch`] always goes through this method.
+    /// unaffected.
     async fn run_rich(&self, input: &str) -> Result<A2aReply, String> {
         Ok(A2aReply {
             text: self.run(input).await?,
             extra_parts: Vec::new(),
         })
     }
+
+    /// As [`run_rich`](Self::run_rich), with the turn's **conversation identity** (A-48) —
+    /// implement THIS to key multi-turn continuity on the client's `contextId` (e.g. one engine
+    /// session per `contextId`, the stateful mode `flux-server` ships). The default ignores the
+    /// context and delegates, so existing implementors keep today's per-turn independence
+    /// unchanged; [`dispatch`] always goes through this method.
+    async fn run_in_context(&self, ctx: &A2aTurnContext, input: &str) -> Result<A2aReply, String> {
+        let _ = ctx;
+        self.run_rich(input).await
+    }
+}
+
+/// The conversation identity of one dispatched turn (A-48): what a stateful [`A2aTurn`]
+/// implementor keys session continuity on. `context_id` is the request's `contextId`, when the
+/// client sent one — a client that never repeats a `contextId` gets exactly the old per-turn
+/// isolation.
+#[derive(Debug, Clone, Default)]
+pub struct A2aTurnContext {
+    pub context_id: Option<String>,
 }
 
 /// A rich turn reply: the final answer text plus extra reply-message parts (see
@@ -129,10 +148,14 @@ async fn send(runner: &dyn A2aTurn, id: Value, params: Option<&Value>) -> Value 
     let Some(input) = extract_text(params) else {
         return rpc_err(id, -32602, "no text found in message parts");
     };
-    // Echo the conversation id for forward-compatibility with a future stateful mode (one session
-    // per contextId); today each turn is independent.
+    // A-48: the conversation id crosses the seam, so a stateful runner can key one session per
+    // `contextId` (and it is echoed on the task either way). A runner that only implements
+    // `run`/`run_rich` keeps per-turn independence via the default `run_in_context`.
     let context_id = extract_context_id(params);
-    match runner.run_rich(&input).await {
+    let turn_ctx = A2aTurnContext {
+        context_id: context_id.clone(),
+    };
+    match runner.run_in_context(&turn_ctx, &input).await {
         Ok(reply) => {
             let mut message = Message::agent_text(reply.text);
             message.parts.extend(reply.extra_parts);
@@ -410,6 +433,73 @@ mod tests {
         assert_eq!(extract_context_id(&params).as_deref(), Some("ctx-7"));
         let none = json!({ "message": { "parts": [] } });
         assert!(extract_context_id(&none).is_none());
+    }
+
+    /// A-48 (failing-first acceptance): the conversation id crosses the seam — a STATEFUL runner
+    /// keyed on `context_id` accumulates turns across two `dispatch` calls (and sees `None` when
+    /// the client sent no id). Legacy runners (StubRunner &co above) keep compiling and behaving
+    /// per-turn via the default `run_in_context`.
+    #[tokio::test]
+    async fn dispatch_passes_context_so_a_stateful_runner_accumulates() {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        struct StatefulRunner {
+            history: Mutex<HashMap<String, Vec<String>>>,
+        }
+
+        #[async_trait]
+        impl A2aTurn for StatefulRunner {
+            async fn run(&self, _input: &str) -> Result<String, String> {
+                Err("stateful runner must be driven through run_in_context".into())
+            }
+            async fn run_in_context(
+                &self,
+                ctx: &A2aTurnContext,
+                input: &str,
+            ) -> Result<A2aReply, String> {
+                let key = ctx.context_id.clone().unwrap_or_else(|| "<none>".into());
+                let mut h = self.history.lock().unwrap();
+                let turns = h.entry(key).or_default();
+                turns.push(input.to_string());
+                Ok(A2aReply {
+                    text: format!("turns:{}", turns.len()),
+                    extra_parts: Vec::new(),
+                })
+            }
+        }
+
+        fn body_with_ctx(text: &str, ctx: &str) -> Value {
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "message/send",
+                "params": { "message": {
+                    "kind": "message", "messageId": "m1", "role": "user",
+                    "contextId": ctx,
+                    "parts": [{ "kind": "text", "text": text }],
+                }},
+            })
+        }
+
+        let runner = StatefulRunner {
+            history: Mutex::new(HashMap::new()),
+        };
+        let answer = |v: &Value| {
+            v["result"]["status"]["message"]["parts"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        let r1 = dispatch(&runner, &body_with_ctx("one", "ctx-s")).await;
+        let r2 = dispatch(&runner, &body_with_ctx("two", "ctx-s")).await;
+        let other = dispatch(&runner, &body_with_ctx("hi", "ctx-other")).await;
+        assert_eq!(answer(&r1), "turns:1");
+        assert_eq!(answer(&r2), "turns:2", "same contextId accumulates: {r2}");
+        assert_eq!(
+            answer(&other),
+            "turns:1",
+            "a different contextId is isolated"
+        );
     }
 
     #[test]

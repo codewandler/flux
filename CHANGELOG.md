@@ -6,6 +6,22 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **A-48** — A2A stateful mode: **one session per `contextId`**. Multi-turn agents (slot-filling
+  presets) looped forever over the A2A text channel because both A2A surfaces were stateless per
+  turn — each answer wiped the last. Now: (1) `flux-server`'s mount reuses the live session whose
+  correlation id matches the request's `contextId` (the C-18 tagging already persisted the key;
+  sweep-before-lookup means an expired conversation is never resumed; no-`contextId` requests keep
+  per-task isolation), so the engine's conversation projection provides memory with **no client
+  change** — the `flux a2a` chat client already sends one `contextId` per session; and (2) the
+  reusable `flux_a2a::server` seam gains `A2aTurn::run_in_context(&A2aTurnContext, …)` (additive,
+  default delegates to `run_rich`) so downstream A2A mounts can key their own continuity —
+  previously the seam structurally could not carry a conversation id. Pinned by a memory-probe
+  integration test (same `contextId` → same task id + the second answer proves it saw turn one;
+  different/absent ids stay isolated), a stateful-runner dispatch test, and a store-level
+  `find_correlated` test. Reported live by a downstream consumer.
+
 ## [0.3.2] - 2026-07-07
 
 The **Time Machine** (epic, phases 0–3: C-43 → A-45 → A-46 → C-44): hermetic replay,

@@ -371,6 +371,24 @@ impl EventStore {
             .map_err(map_sql)
     }
 
+    /// A-48: the most recent stream tagged `agent_id` whose `correlation_id` equals
+    /// `correlation_id` — the stateful-A2A lookup (one session per `contextId`): the server's
+    /// reuse-or-mint keys on this. Newest-first so a client re-using a `contextId` after its old
+    /// session was TTL-pruned (and a new one minted) always continues the LIVE session.
+    pub fn find_correlated(&self, correlation_id: &str, agent_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let n: Option<i64> = conn
+            .query_row(
+                "SELECT n FROM streams WHERE correlation_id = ?1 AND agent_id = ?2 \
+                 ORDER BY n DESC LIMIT 1",
+                [correlation_id, agent_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_sql)?;
+        Ok(n.map(|n| format!("s_{n}")))
+    }
+
     /// A-45/C-44: the sub-agent children of `stream` — every stream whose `correlation_id` points
     /// at it (the A-08 spawn linkage: `agent_id = "subagent:<role>"`, `correlation_id` = the
     /// parent session). Oldest-first, so a replay recurses children in spawn order. One level per
@@ -1268,6 +1286,37 @@ mod tests {
         store.set_model(&a, "opus").unwrap();
         assert_eq!(store.list(1).unwrap()[0].model, "opus");
         assert_eq!(store.info(&a).unwrap().model, "opus");
+    }
+
+    /// A-48: the stateful-A2A lookup — newest live stream by (correlation_id, agent_id); other
+    /// agent tags and other correlation ids never match.
+    #[test]
+    fn find_correlated_returns_newest_matching_tagged_stream() {
+        let store = EventStore::in_memory().unwrap();
+        let mk = |agent: &str, corr: &str| {
+            store
+                .create_session_with_context(
+                    "m",
+                    &EventContext {
+                        agent_id: Some(agent.into()),
+                        correlation_id: Some(corr.into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        let _old = mk("a2a", "ctx-1");
+        let newest = mk("a2a", "ctx-1");
+        let _other_tag = mk("subagent:review", "ctx-1");
+        let _other_ctx = mk("a2a", "ctx-2");
+
+        assert_eq!(
+            store.find_correlated("ctx-1", "a2a").unwrap().as_deref(),
+            Some(newest.as_str()),
+            "newest a2a stream for the contextId wins"
+        );
+        assert_eq!(store.find_correlated("ctx-404", "a2a").unwrap(), None);
+        assert_eq!(store.find_correlated("ctx-2", "other").unwrap(), None);
     }
 
     #[test]
