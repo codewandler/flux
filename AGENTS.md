@@ -144,6 +144,25 @@ Each invariant below was established (and several re-learned the hard way) durin
 
 ---
 
+## Releases
+
+- **Versioning follows Cargo's pre-1.0 SemVer semantics.** For `0.y.z` the **minor** position is
+  the breaking-change signal (`^0.y` ranges resolve across `z` only). Before choosing the bump,
+  scan the `[Unreleased]` CHANGELOG section and the commits since the last tag for anything
+  breaking (`!` commit titles, "BREAKING" entries):
+  - **any breaking change → bump minor** (`0.2.x` → `0.3.0`);
+  - **additive features / fixes only → bump patch.**
+  Do not use the patch position as a rolling release counter. (Established 2026-07-07 when v0.2.24
+  shipped a breaking realtime-seam change and had to be re-cut as v0.3.0.)
+- Release mechanics: bump every `version = "..."` occurrence in the root `Cargo.toml`, run
+  `cargo update --workspace` in **both** workspaces (root and `plugins/`), roll `[Unreleased]` into
+  a dated version section in `CHANGELOG.md`, run the full dev-loop gate, then commit
+  `chore(release): cut X.Y.Z`, tag `vX.Y.Z`, and push the branch **and** the tag — the tag triggers
+  the Release workflow (verify it completes with all assets).
+- Breaking changes must be flagged in the CHANGELOG entry and the commit title (`type(scope)!:`).
+
+---
+
 ## Keeping the Flux-Lang language and its docs in sync
 
 The Flux-Lang **language + reference interpreter** lives in **`flux-lang`** (L0: `crates/flux-lang/src/` — `ast.rs`, `render.rs`, `analyze.rs` (`lower` → typed HIR), `opspec.rs`, `schema.rs`, `runtime.rs` behind injected `host`/`store`/`sink` traits, plus `prelude.rs` (artifact types), `program.rs` (multi-agent Program), `parse.rs`/`format.rs` (text syntax), `optimize.rs` (optimizer/`PhysicalPlan`), the `fluxlang` CLI and `skill.rs`). `flux-flow` is the L3 **engine** (compile/engine/state + the `Executor`/`FlowStore`/`AgentSink` adapters and the thin `execute_flow`/`plan_risk` wrappers) and re-exports `flux-lang` as a facade, so `flux_flow::{ast, render, analyze, host, store, runtime, …}` still resolve. The language's own docs live in `crates/flux-lang/docs/` (`reference.md`, `syntax.md`, `PRD.md`, `STATUS.md`, `evolution-impl-plan.md`, `design-review.md`) + `crates/flux-lang/{README,AGENTS}.md` + the forward design `docs/designs/flux-lang-evolution.md`; the engine's ops live in `crates/flux-flow/docs/ops-reference.md`. See [`crates/flux-lang/AGENTS.md`](crates/flux-lang/AGENTS.md) for the full flux-lang design/plan docs map.
