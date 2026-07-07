@@ -6,6 +6,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-07
+
+**A2A protocol conformance, Tier 1 — an honest, spec-conformant discovery card and the A2A-specific
+JSON-RPC error codes** (the `a2a-conformance` epic). Additive and non-breaking: the new card fields
+serialize only when set, and the new error codes only replace today's generic codes on
+already-failing paths. Docs: `docs/a2a-conformance.md`.
+
 ### Added
 
 - **A-49** — A2A AgentCard conformance fields. The discovery card now emits the spec-required
@@ -23,8 +30,6 @@ All notable changes to this project are documented in this file. The format is b
   `-32005 ContentTypeNotSupported` instead of silently running an empty turn. One shared classifier
   governs every dispatch site (the reusable dispatcher and both HTTP handlers) so the codes cannot
   drift between them.
-
-The A2A conformance epic, Tier 1 (`a2a-conformance`). Docs: `docs/a2a-conformance.md`.
 
 ## [0.4.1] - 2026-07-07
 
