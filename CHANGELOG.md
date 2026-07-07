@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-07-07
+
 ### Fixed
 
 - **A-48** — A2A stateful mode: **one session per `contextId`**. Multi-turn agents (slot-filling
