@@ -1747,8 +1747,11 @@ async fn build_agent_with(
                 store: events.clone(),
                 stream: session_id.clone(),
             });
-        // TODO(D-27): wire an interactive `CrossPluginApprover` here (a modal/stdin first-use prompt).
-        // The seam exists on the broker; running headless, the operator config grant alone authorizes.
+        // NOTE(D-27): no interactive `CrossPluginApprover` (a modal/stdin first-use prompt) is wired
+        // here — deliberate, not a gap: the seam exists on the broker, but running headless, the
+        // operator config grant alone authorizes. An interactive approver is a filed-separately
+        // follow-up if wanted (flux D-65 leaves this posture unchanged on both the `build_agent` and
+        // `flux app run` paths).
         let broker = Arc::new(
             flux_capabilities::EndpointBroker::new(
                 invoker,
@@ -5078,6 +5081,45 @@ async fn run_app_cmd(prompt: Vec<String>, flags: &AgentFlags) -> Result<()> {
     run_app(Some(path), flags, None).await
 }
 
+/// Build one plugin's [`HostCapabilities`](flux_plugin::HostCapabilities) for the `flux app run`
+/// path: the guarded `System` + datasource bridge + endpoint-broker fan-out, with the SAME
+/// egress-audit, cross-plugin resolver, and redactor-backed secret sink hooks the `build_agent`
+/// path installs on its plugins (flux D-65 parity) — a resolved cross-plugin credential is
+/// registered with `secret_sink` so it never appears raw in model-visible tool output, and a
+/// private-net admission is recorded through `audit`. A standalone function (not an inline closure)
+/// so `run_app`'s wiring is directly unit-testable.
+#[allow(clippy::too_many_arguments)]
+fn app_plugin_caps(
+    system: Arc<System>,
+    backend: Arc<dyn flux_capabilities::DatasourceBackend>,
+    manifest: &flux_plugin::PluginManifest,
+    private_hosts: Vec<String>,
+    resolver: Arc<dyn flux_plugin::ReferenceResolver>,
+    audit: Arc<dyn flux_plugin::EgressAudit>,
+    secret_sink: Arc<dyn flux_plugin::SecretSink>,
+    broker: Arc<flux_capabilities::EndpointBroker>,
+) -> Arc<dyn flux_plugin::HostCapabilities> {
+    // Inject the broker as the resolver (ref-based IO + the `credential` capability) and the
+    // redactor-backed secret sink BEFORE wrapping with the datasource + endpoint-broker host-caps.
+    let inner = Arc::new(flux_capabilities::DatasourceHostCaps::new(
+        flux_plugin::SystemHostCaps::new(system)
+            .with_manifest(manifest)
+            .with_private_net_grants(private_hosts)
+            .with_egress_audit(audit)
+            .with_resolver(resolver)
+            .with_secret_sink(secret_sink),
+        backend,
+    )) as Arc<dyn flux_plugin::HostCapabilities>;
+    // Compose the endpoint broker OVER the datasource caps so this plugin's `endpoint.discover`
+    // calls fan out (deny-by-default, gated by `discover`).
+    Arc::new(flux_capabilities::EndpointBrokerHostCaps::new(
+        inner,
+        broker,
+        manifest.name.clone(),
+        manifest.capabilities.discover,
+    )) as Arc<dyn flux_plugin::HostCapabilities>
+}
+
 /// Build and run a multi-agent program together with its declared **channels**, the shared body behind
 /// both `flux run <app.flux>` (auto-detect) and `flux app run [program.flux]`. Cron/webhook/Slack
 /// channels start as background tasks that deliver events into the program's bus (→ triggers → journeys)
@@ -5210,11 +5252,20 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
     let backend = build_datasources(&program.datasources, &system).await?;
     let mut extra_tools: Vec<Arc<dyn flux_runtime::Tool>> =
         flux_capabilities::datasource_tools(backend.clone());
+    // The app-path event store + this run's stream identity (D-65): built here, BEFORE `App`, so the
+    // plugin/endpoint wiring below can install the SAME audit/secret-sink hooks the `build_agent` path
+    // installs (`with_egress_audit`/`with_cross_plugin_audit`/the credential secret sink) — then handed
+    // to `App::with_events` further down so this wiring's audit trail lands in the SAME log as
+    // everything else the app records (agent-target session memory, sub-agent spawn audit), rather than
+    // a second, disconnected store.
+    let app_events = Arc::new(
+        EventStore::in_memory().map_err(|e| anyhow::anyhow!("app: in-memory event store: {e}"))?,
+    );
+    let app_run_stream = app_events
+        .create_session(&model)
+        .map_err(|e| anyhow::anyhow!("app: open run stream: {e}"))?;
     // Discover subprocess plugins (~/.flux/plugins/*.toml) and project their ops as tools; their host
     // capabilities are the datasource bridge over the guarded System (same boundary as built-in tools).
-    // TODO(D-20): wire `SystemHostCaps::with_egress_audit` here once the app path exposes its
-    // per-run EventStore stream (the seam exists; `flux_app::App` owns its own store/bus, so there is
-    // no `EventStore` in scope at this point to back the audit — unlike the `build_agent` path).
     if let Some(dir) = plugins_dir() {
         // The cross-plugin endpoint-discovery broker (D-26/D-27), analogous to the `build_agent` path:
         // a registry of loaded plugins + the shared endpoint registry, so a consumer plugin's
@@ -5232,11 +5283,18 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
             system.clone(),
             std::collections::HashMap::new(),
         ));
-        // TODO(D-27): wire the cross-plugin credential AUDIT + the SECRET SINK (redactor) here once the
-        // app path exposes its per-run EventStore stream + the executor's redactor — `flux_app::App`
-        // owns its own store/bus, so neither is in scope at this point (same gap as the D-20 egress
-        // audit). The grant + resolver seams ARE wired; an interactive approver is likewise a TODO
-        // (the operator config grant alone authorizes, headless).
+        // Cross-plugin credential audit (D-27) + endpoint discovery audit (D-30): records
+        // consumer->provider resolutions and per-provider discovery counts onto this run's stream —
+        // parity with the `build_agent` path's `xplugin_audit`. NOTE(D-27): an interactive
+        // `CrossPluginApprover` (a modal/stdin first-use prompt) is not wired here either, same as the
+        // `build_agent` path — deliberate: the seam exists on the broker, but running headless, the
+        // operator config grant alone authorizes; the interactive approver is a filed-separately
+        // follow-up if wanted.
+        let xplugin_audit: Arc<dyn flux_capabilities::CrossPluginAudit> =
+            Arc::new(EventStoreCrossPluginAudit {
+                store: app_events.clone(),
+                stream: app_run_stream.clone(),
+            });
         let broker = Arc::new(
             flux_capabilities::EndpointBroker::new(
                 invoker,
@@ -5246,14 +5304,13 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
             .with_static_resolver(static_resolver)
             .with_cross_plugin_grants(flux_capabilities::CrossPluginGrants::new(
                 cfg.endpoint.cross_plugin_credentials.clone(),
-            )),
+            ))
+            .with_cross_plugin_audit(xplugin_audit),
         );
         // Agent-facing endpoint ops (D-28/D-30): added to the program's tool set so the app's agent
-        // target can discover/select/import endpoints. TODO(D-30): the app path has no per-run
-        // EventStore in scope, so the cross-plugin resolution audit AND the D-30 discovery audit
-        // (`EndpointDiscovered`) stay unwired here (same gap as the D-20 egress audit above —
-        // `with_cross_plugin_audit` is not installed, so both audit hooks default to no-op); the
-        // broker + registry the ops drive are fully wired.
+        // target can discover/select/import endpoints. The broker installed above already carries the
+        // D-30 discovery audit, so `endpoint.discover`/`refresh` calls through these ops are audited
+        // exactly like the `build_agent` path's.
         extra_tools.extend(flux_capabilities::endpoint_tools(
             broker.clone(),
             endpoint_registry.clone(),
@@ -5265,25 +5322,27 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
             let cfg_for_caps = cfg.clone();
             let broker_for_caps = broker.clone();
             let resolver_for_caps = broker.clone() as Arc<dyn flux_plugin::ReferenceResolver>;
+            let audit: Arc<dyn flux_plugin::EgressAudit> = Arc::new(EventStoreEgressAudit {
+                store: app_events.clone(),
+                stream: app_run_stream.clone(),
+            });
+            let secret_sink = Arc::new(RedactorSecretSink {
+                redactor: redactor.clone(),
+            }) as Arc<dyn flux_plugin::SecretSink>;
             let make_caps = move |m: &flux_plugin::PluginManifest| {
                 let plugin_private_hosts = cfg_for_caps.plugin_private_hosts(&m.name);
-                // Inject the broker as the resolver (ref-based IO + the `credential` capability) BEFORE
-                // wrapping with the datasource + endpoint-broker host-caps.
-                let inner = Arc::new(flux_capabilities::DatasourceHostCaps::new(
-                    flux_plugin::SystemHostCaps::new(caps_system)
-                        .with_manifest(m)
-                        .with_private_net_grants(plugin_private_hosts)
-                        .with_resolver(resolver_for_caps),
+                // Parity with the `build_agent` path (D-20 egress audit + D-27 secret sink) — the SAME
+                // function both `run_app`'s wiring and its own unit test call (flux D-65).
+                app_plugin_caps(
+                    caps_system,
                     backend,
-                )) as Arc<dyn flux_plugin::HostCapabilities>;
-                // Compose the endpoint broker OVER the datasource caps so this plugin's
-                // `endpoint.discover` calls fan out (deny-by-default, gated by `discover`).
-                Arc::new(flux_capabilities::EndpointBrokerHostCaps::new(
-                    inner,
+                    m,
+                    plugin_private_hosts,
+                    resolver_for_caps,
+                    audit,
+                    secret_sink,
                     broker_for_caps,
-                    m.name.clone(),
-                    m.capabilities.discover,
-                )) as Arc<dyn flux_plugin::HostCapabilities>
+                )
             };
             match flux_plugin::load_plugin_tools(
                 &system,
@@ -5318,7 +5377,7 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
     // uses, so the two surfaces delegate through the identical envelope, never a re-derived one.
     let sub_agents = is_builtin_strict_review
         .then(|| build_review_sub_agents(&cwd, &spec, model.clone(), flags.max_tokens));
-    let app = std::sync::Arc::new(flux_app::App::with_sub_agents(
+    let app = std::sync::Arc::new(flux_app::App::with_events(
         program,
         provider,
         model,
@@ -5326,6 +5385,7 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
         extra_tools,
         sub_agents,
         redactor,
+        app_events,
     ));
     let channels = flux_channels::build_channels(&channel_decls)?;
     // Serve stdin when an interactive `cli` channel is declared, or when the program declares no
@@ -6729,12 +6789,13 @@ async fn run_prompt(flags: AgentFlags, prompt_words: Vec<String>) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_datasources, build_invoke_input, coerce_arg_value, cost_annotation,
+        app_plugin_caps, build_datasources, build_invoke_input, coerce_arg_value, cost_annotation,
         credential_location, format_evidence, loop_machinery_label, new_render_suffix,
         plugin_binaries_in, plugin_status_one, render_endpoint_row, render_review_markdown,
         resolve_plugin_operation_name, run_corpus_export_with, run_plugin_in, run_usage_with,
         should_fail, tool_preview, truncate, usage_annotation, write_generated_skill, EventStore,
-        Liveness, PluginAction, ReviewSeverity,
+        EventStoreCrossPluginAudit, EventStoreEgressAudit, Liveness, PluginAction,
+        RedactorSecretSink, ReviewSeverity,
     };
     use flux_flow::AgentSink;
     use serde_json::json;
@@ -8994,5 +9055,228 @@ mod tests {
             this_flow_session,
             "matches by flow name, not just recency"
         );
+    }
+
+    // --- D-65: app-path redaction + audit parity -----------------------------------------------
+
+    /// Direct unit test of the `flux_plugin::EgressAudit` L6 binding both the `build_agent` and
+    /// `flux app run` plugin-wiring sites construct (`EventStoreEgressAudit`): appends a
+    /// `PrivateNetAdmit` event onto the given run's stream — never a fabricated one — so a private-net
+    /// admission is auditable regardless of which surface's plugin loop installed the hook.
+    #[test]
+    fn egress_audit_adapter_records_private_net_admit_on_the_runs_stream() {
+        use flux_plugin::EgressAudit;
+        use std::sync::Arc;
+
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let stream = events.create_session("mock").unwrap();
+        let audit = EventStoreEgressAudit {
+            store: events.clone(),
+            stream: stream.clone(),
+        };
+        audit.record_private_admit("some-plugin", "127.0.0.1", "config:plugin/some-plugin");
+
+        let recorded = events.load_by_kind(&stream, "private_net_admit").unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "exactly one PrivateNetAdmit landed on this run's stream"
+        );
+        match &recorded[0].kind {
+            flux_events::EventKind::PrivateNetAdmit {
+                caller,
+                host,
+                grant_source,
+            } => {
+                assert_eq!(caller, "some-plugin");
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(grant_source, "config:plugin/some-plugin");
+            }
+            other => panic!("expected PrivateNetAdmit, got {other:?}"),
+        }
+    }
+
+    /// Direct unit test of the `flux_capabilities::CrossPluginAudit` L6 binding
+    /// (`EventStoreCrossPluginAudit`): records a `CrossPluginResolve` per successful cross-plugin
+    /// credential resolution (D-27) and an `EndpointDiscovered` per provider whose discovery returned
+    /// candidates (D-30), both onto the given run's stream. The SAME struct backs
+    /// `.with_cross_plugin_audit(...)` on both the `build_agent` and `flux app run` paths' brokers.
+    #[test]
+    fn cross_plugin_audit_adapter_records_resolve_and_discovery_on_the_runs_stream() {
+        use flux_capabilities::CrossPluginAudit;
+        use std::sync::Arc;
+
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let stream = events.create_session("mock").unwrap();
+        let audit = EventStoreCrossPluginAudit {
+            store: events.clone(),
+            stream: stream.clone(),
+        };
+        audit.record_cross_plugin_resolve("consumer", "kubernetes", "kubernetes/ns/name/key");
+        audit.record_discovery("postgres", "kubernetes", 3);
+
+        let resolves = events
+            .load_by_kind(&stream, "cross_plugin_resolve")
+            .unwrap();
+        assert_eq!(resolves.len(), 1);
+        match &resolves[0].kind {
+            flux_events::EventKind::CrossPluginResolve {
+                consumer,
+                provider,
+                reference_location,
+            } => {
+                assert_eq!(consumer, "consumer");
+                assert_eq!(provider, "kubernetes");
+                assert_eq!(reference_location, "kubernetes/ns/name/key");
+            }
+            other => panic!("expected CrossPluginResolve, got {other:?}"),
+        }
+
+        let discoveries = events.load_by_kind(&stream, "endpoint_discovered").unwrap();
+        assert_eq!(discoveries.len(), 1);
+        match &discoveries[0].kind {
+            flux_events::EventKind::EndpointDiscovered {
+                product,
+                provider,
+                count,
+            } => {
+                assert_eq!(product, "postgres");
+                assert_eq!(provider, "kubernetes");
+                assert_eq!(*count, 3);
+            }
+            other => panic!("expected EndpointDiscovered, got {other:?}"),
+        }
+    }
+
+    /// D-65's acceptance centerpiece — mirror of flux-app's C-13 seeding guarantee, but through the
+    /// CROSS-PLUGIN credential path (`SystemHostCaps`'s `credential` capability, resolved via the
+    /// endpoint broker) that both the `build_agent` and `flux app run` plugin-wiring sites install a
+    /// `RedactorSecretSink` on. Drives `app_plugin_caps` — the SAME function `run_app`'s plugin loop
+    /// calls to build a plugin's caps — so a regression in the production wiring (e.g. dropping
+    /// `.with_secret_sink(...)`) fails this test too, not just a hand-rolled re-implementation. A
+    /// credential resolved this way must land in the SAME redactor an executor dispatches with, so it
+    /// is scrubbed from model-visible tool output even though the trusted plugin binary received the
+    /// raw value.
+    #[tokio::test]
+    async fn cross_plugin_credential_resolution_seeds_the_redactor_used_by_dispatch() {
+        use async_trait::async_trait;
+        use flux_capabilities::{
+            CredentialReader, CrossPluginGrants, EndpointBroker, EndpointRegistry,
+            HostProviderInvoker, MemoryBackend, PluginRegistry,
+        };
+        use flux_plugin::{PluginCapabilities, PluginManifest};
+        use flux_runtime::{
+            AllowApprover, Approver, Executor, PermissionManager, ToolContext, ToolRegistry,
+            ToolResult,
+        };
+        use flux_secret::{Redactor, Ref};
+        use flux_system::{System, Workspace};
+        use std::sync::Arc;
+
+        /// A fake credential reader (mirrors flux-capabilities' own broker-test double) so the
+        /// cross-plugin gate resolves without a provider subprocess.
+        struct FakeReader {
+            value: String,
+        }
+        #[async_trait]
+        impl CredentialReader for FakeReader {
+            async fn read(&self, _provider: &str, _reference: &Ref) -> Result<String, String> {
+                Ok(self.value.clone())
+            }
+        }
+
+        let secret = "k8s-pg-password-d65";
+        let broker = Arc::new(
+            EndpointBroker::new(
+                Arc::new(HostProviderInvoker::new(Arc::new(PluginRegistry::new()))),
+                Arc::new(PluginRegistry::new()),
+                Arc::new(EndpointRegistry::new()),
+            )
+            .with_credential_reader(Arc::new(FakeReader {
+                value: secret.to_string(),
+            }))
+            .with_cross_plugin_grants(CrossPluginGrants::new(vec!["consumer:kubernetes".into()])),
+        );
+
+        let redactor = Redactor::new();
+        let secret_sink = Arc::new(RedactorSecretSink {
+            redactor: redactor.clone(),
+        }) as Arc<dyn flux_plugin::SecretSink>;
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let stream = events.create_session("mock").unwrap();
+        let audit: Arc<dyn flux_plugin::EgressAudit> = Arc::new(EventStoreEgressAudit {
+            store: events,
+            stream,
+        });
+        let manifest = PluginManifest {
+            name: "consumer".into(),
+            capabilities: PluginCapabilities {
+                credential: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let dir = std::env::temp_dir().join(format!("flux-d65-secret-sink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let backend =
+            Arc::new(MemoryBackend::new()) as Arc<dyn flux_capabilities::DatasourceBackend>;
+        let caps = app_plugin_caps(
+            system.clone(),
+            backend,
+            &manifest,
+            Vec::new(),
+            broker.clone() as Arc<dyn flux_plugin::ReferenceResolver>,
+            audit,
+            secret_sink,
+            broker.clone(),
+        );
+
+        let cred = Ref::kubernetes("monitoring", "pg-creds", "password");
+        let result = caps
+            .handle("credential", &json!({ "credential_ref": cred.to_string() }))
+            .await
+            .expect("credential capability granted + resolver installed");
+        assert_eq!(
+            result["value"], secret,
+            "the trusted plugin still receives the raw value"
+        );
+
+        // The resolved credential is now a known secret to `redactor` — a tool leaking it comes back
+        // scrubbed, exactly like flux-app's C-13 guarantee (`journey_executor_scrubs_resolved_secrets_
+        // from_tool_output`).
+        struct LeakyTool {
+            secret: String,
+        }
+        #[async_trait]
+        impl flux_runtime::Tool for LeakyTool {
+            fn spec(&self) -> flux_spec::ToolSpec {
+                flux_spec::ToolSpec::read_only("search", "leaks", json!({"type": "object"}))
+            }
+            async fn execute(
+                &self,
+                _ctx: &ToolContext,
+                _params: serde_json::Value,
+            ) -> flux_core::Result<ToolResult> {
+                Ok(ToolResult::ok(format!("found: {}", self.secret)))
+            }
+        }
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(LeakyTool {
+            secret: secret.to_string(),
+        }));
+        let ctx = ToolContext::new(system).with_redactor(redactor);
+        let perms = PermissionManager::from_rules(&["search".to_string()], &[]);
+        let approver: Arc<dyn Approver> = Arc::new(AllowApprover);
+        let executor = Executor::new(registry, perms, approver, ctx);
+        let r = executor.dispatch("search", json!({})).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            !r.content.contains(secret),
+            "the cross-plugin-resolved credential must be scrubbed from tool output: {}",
+            r.content
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

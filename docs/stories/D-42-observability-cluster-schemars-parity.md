@@ -36,6 +36,6 @@ re-audit, and porting the gaps surfaced.
       prometheus 16, loki 19, alertmanager 7) + the full plugin workspace build/clippy/fmt.
 
 ## Notes
-- Each plugin's exact ported gaps are recorded in `DRIFT.md` § D-42 (per-plugin).
+- Each plugin's exact ported gaps are recorded in `docs/archive/drift-reports.md` § D-42 (per-plugin).
 - `endpoint_ref` architectural split (do-not-port) applies to all 4: flux resolves
       `<plugin>.endpoint` via `host.endpoint(...)` + reference-IO (D-29).

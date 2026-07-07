@@ -40,6 +40,7 @@ Everything else (providers, tools, skills, orchestration, plugins) is machinery 
 | Public docs site source | [../website](../website) — Docusaurus docs for users and integrators |
 | Active designs | [designs/](designs/) |
 | Finished / superseded material | [archive/](archive/) |
+| Schema-migration drift ledger (D-31/D-34/D-36..D-45) | [archive/drift-reports.md](archive/drift-reports.md) |
 
 ## Working on flux
 Every contributor — human or agent — starts at [AGENTS.md](../AGENTS.md) → **"Start here"**: read the

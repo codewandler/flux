@@ -20,7 +20,7 @@ the *surfaces* (CLI/TUI/server/SDK).
 
 | Layer | Crates | Role |
 |---|---|---|
-| **L0 contracts** (pure) | `flux-core` `flux-policy` `flux-secret` `flux-spec` `flux-config` `flux-evidence` `flux-skill` `flux-markdown` `flux-datasource` `flux-lang` | types, authorization, secrets, tool specs, config, evidence, skills, markdown/frontmatter, datasource record/retrieval contract, the Flux-Lang language + reference interpreter (effects injected via traits) |
+| **L0 contracts** (pure) | `flux-core` `flux-policy` `flux-secret` `flux-spec` `flux-config` `flux-evidence` `flux-skill` `flux-markdown` `flux-datasource` `flux-audio` `flux-lang` | types, authorization, secrets, tool specs, config, evidence, skills, markdown/frontmatter, datasource record/retrieval contract, PCM16 audio sample math (codecs/resampling/framing), the Flux-Lang language + reference interpreter (effects injected via traits) |
 | **L1 providers** | `flux-provider` `flux-providers` `flux-credentials` `flux-a2a` | the `Provider` abstraction + the concrete clients (`flux-providers` modules: `messages` core, `anthropic`, `openai`, `openrouter`, `ollama`, `bedrock`, `codex`, plus `realtime/`) + credential store + the A2A agent-protocol client/wire types |
 | **L2 runtime** | `flux-system` `flux-runtime` `flux-tools` `flux-events` | guarded IO, the safety envelope (+ the `context` projector module), built-in tools, the event store |
 | **L3 agent** | `flux-agent` `flux-orchestrate` `flux-flow` `flux-eval` `flux-cognition` | agent definitions (`AgentSpec`/`Role`) + multi-agent orchestration + the Flux-Lang engine (the one turn loop) + the eval harness + the model-op cognition pack |
@@ -58,6 +58,7 @@ shared machinery beneath them. "Disposition" flags a planned move; see
 | `flux-skill` | L0 | multi-format skill defs + discovery/merge + activation (triggers or name/description fallback) | — |
 | `flux-markdown` | L0 | frontmatter parse/validate (`serde_norway`) + feature-gated render wrappers over `codewandler/markdown` | — |
 | `flux-datasource` | L0 | datasource records / entity declarations + retrieval (search/get/list/relation) types — the contract between the knowledge index and integration plugins | — |
+| `flux-audio` | L0 | PCM16 LE/BE codecs, stateless + streaming resampling (phase carried across packets), `Framer` re-chunking — the sample-math layer for realtime-voice consumers | — |
 | `flux-provider` | L1 | the `Provider` abstraction (published) | — |
 | `flux-providers` | L1 | concrete clients (anthropic / openai / openrouter / ollama / bedrock / codex, + the `realtime` full-duplex module) | — |
 | `flux-credentials` | L1 | credential store (PKCE, token import) | — |
@@ -96,7 +97,7 @@ shared machinery beneath them. "Disposition" flags a planned move; see
 | `flux-app` | L6 | multi-agent Program runtime host (`flux run app.flux`) | — |
 | `flux-channels` | L6 | event-trigger channels: cron / webhook / Slack adapters that wake a `flux-app` program's journeys | — |
 | `flux-plugin` | L4 | subprocess plugins (NDJSON, capability-gated) + the JS pre-tool `hooks` module | absorbed `flux-hooks` (P2 ✅) |
-| `flux-capabilities` | L5 | `browser` (`web_fetch`, SSRF-guarded; CDP deferred) + `datasource` (keyword index + search; RAG deferred) modules | merged `flux-browser` + `flux-datasource` (P3 ✅) |
+| `flux-capabilities` | L5 | `browser` (`web_fetch`, SSRF-guarded; CDP deferred) + `datasource` (keyword index + search; RAG deferred) modules | merged `flux-browser` (P3 ✅); depends on the standalone L0 `flux-datasource` contract crate |
 | `flux-auth` | L5 | caller identity (`LocalIdentity`; OIDC seam) | kept standalone — identity ≠ tool capability |
 
 ## The safety envelope (the execution substrate)

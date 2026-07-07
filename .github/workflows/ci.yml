@@ -43,6 +43,13 @@ jobs:
       - name: Architecture layering lint
         run: cargo test -p flux-codegate
 
+      # Hermetic drift guard for the live smoke gate (C-39): re-runs steps 1-5's invocation *shapes*
+      # from scripts/smoke-live.sh against the offline `mock` provider — no credentials, no live
+      # spend — so a future CLI-surface change (renamed subcommand, dropped flag) fails here instead
+      # of only being caught the next time someone remembers to run the real live gate by hand.
+      - name: Live smoke gate — CLI shape guard (hermetic, no credentials)
+        run: FLUX_BIN="$PWD/target/debug/flux" ./scripts/smoke-live.sh --shapes
+
   plugins:
     name: plugins workspace · build · test · clippy · fmt
     runs-on: ubuntu-latest

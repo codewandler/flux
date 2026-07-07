@@ -227,18 +227,30 @@ pub fn prelude_schema() -> serde_json::Value {
         .unwrap_or_else(|| serde_json::json!({}))
 }
 
+/// The `(type, description)` pairs behind [`prelude_type_catalog`], for consumers that need to
+/// render the table differently than the verbatim catalog (e.g. escaping literal `|` characters
+/// for a strict markdown-table renderer, as the website generator does).
+pub fn prelude_type_rows() -> Vec<(String, String)> {
+    let defs = prelude_schema();
+    PRELUDE_TYPES
+        .iter()
+        .map(|name| {
+            let desc = defs
+                .get(name)
+                .and_then(|d| d.get("description"))
+                .and_then(|d| d.as_str())
+                .unwrap_or_default()
+                .replace('\n', " ");
+            ((*name).to_string(), desc)
+        })
+        .collect()
+}
+
 /// A markdown `| type | description |` table of every prelude type, generated from the structs'
 /// doc-comments — the SSOT mirror of [`crate::schema::node_kind_catalog`].
 pub fn prelude_type_catalog() -> String {
-    let defs = prelude_schema();
     let mut out = String::from("| type | description |\n|---|---|\n");
-    for name in PRELUDE_TYPES {
-        let desc = defs
-            .get(name)
-            .and_then(|d| d.get("description"))
-            .and_then(|d| d.as_str())
-            .unwrap_or_default()
-            .replace('\n', " ");
+    for (name, desc) in prelude_type_rows() {
         out.push_str(&format!("| `{name}` | {desc} |\n"));
     }
     out

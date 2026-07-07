@@ -143,6 +143,39 @@ impl App {
         sub_agents: Option<SubAgents>,
         redactor: Redactor,
     ) -> Self {
+        Self::with_events(
+            program,
+            provider,
+            model,
+            auto_approve,
+            extra_tools,
+            sub_agents,
+            redactor,
+            Arc::new(EventStore::in_memory().expect("flux-app: in-memory event store")),
+        )
+    }
+
+    /// Like [`with_sub_agents`](Self::with_sub_agents) but takes the host's [`EventStore`] explicitly
+    /// (flux D-65). The seam a surface uses when ITS OWN plugin/endpoint wiring must reach the same
+    /// per-run stream `App` records agent-target session memory and sub-agent spawn audit into: build
+    /// the store before constructing `App`, install whatever audit/secret-sink hooks the surface needs
+    /// on its plugin hosts (e.g. `flux_plugin::SystemHostCaps::with_egress_audit`/`with_secret_sink`,
+    /// `flux_capabilities::EndpointBroker::with_cross_plugin_audit`) against a stream id minted from
+    /// THIS store, then hand the store to `App` here — so the wiring's own audit trail lands in the
+    /// SAME log as everything else the app records, rather than a second, disconnected store.
+    /// [`with_sub_agents`](Self::with_sub_agents) is this constructor with a fresh in-memory store, so
+    /// every existing caller is unaffected — this is strictly additive.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_events(
+        program: Program,
+        provider: Option<Arc<dyn Provider>>,
+        model: impl Into<String>,
+        auto_approve: bool,
+        extra_tools: Vec<Arc<dyn Tool>>,
+        sub_agents: Option<SubAgents>,
+        redactor: Redactor,
+        events: Arc<EventStore>,
+    ) -> Self {
         App {
             engine: Engine::new(
                 program,
@@ -152,6 +185,7 @@ impl App {
                 extra_tools,
                 sub_agents,
                 redactor,
+                events,
             ),
         }
     }
@@ -169,6 +203,14 @@ impl App {
     /// A handle to the event bus (clone it to emit from another task).
     pub fn bus(&self) -> &Bus {
         &self.engine.bus
+    }
+
+    /// A handle to the host's shared [`EventStore`] — the same log agent-target session memory and
+    /// sub-agent spawn audit land in, and (when a surface built this `App` via
+    /// [`with_events`](Self::with_events)) the surface's own plugin/endpoint audit trail too (flux
+    /// D-65).
+    pub fn events(&self) -> Arc<EventStore> {
+        self.engine.events.clone()
     }
 
     /// Build (or fetch the cached) [`FlowEngine`] for a declared agent — the seam the `a2a` channel
@@ -288,6 +330,7 @@ pub(crate) struct Engine {
 }
 
 impl Engine {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         program: Program,
         provider: Option<Arc<dyn Provider>>,
@@ -296,12 +339,15 @@ impl Engine {
         extra_tools: Vec<Arc<dyn Tool>>,
         sub_agents: Option<SubAgents>,
         redactor: Redactor,
+        events: Arc<EventStore>,
     ) -> Arc<Self> {
         let bus = Bus::new();
         let channels = Arc::new(program.channels.clone());
-        // Agent-target turns persist per-thread conversation memory here; in-memory is fine for v1
-        // (a restart starts threads fresh — flagged, pairs with D-02 later).
-        let events = Arc::new(EventStore::in_memory().expect("flux-app: in-memory event store"));
+        // `events` backs agent-target session memory (see the field doc): an in-memory store is fine
+        // for v1 (a restart starts threads fresh — flagged, pairs with D-02 later), but the store is
+        // now always handed in by the caller (`App::with_sub_agents` passes a fresh in-memory one;
+        // `App::with_events` lets a surface share its own, flux D-65) rather than created here, so
+        // both constructors share one code path.
         // A guarded `System` rooted at the cwd, built ONCE and shared by every journey run's executor
         // and, when `sub_agents` is set, the spawner it builds — so a journey and the sub-agents it
         // spawns always resolve paths against the identical workspace root (never two independent
@@ -1285,6 +1331,41 @@ trigger t1
             "the resolved secret must be scrubbed from tool output: {}",
             r.content
         );
+    }
+
+    /// D-65: a surface (e.g. the `flux app run` CLI path) builds its OWN `EventStore` up front so its
+    /// plugin/endpoint wiring can install audit hooks against a stream minted from it, THEN hands that
+    /// same store to `App::with_events`. The seam must keep using exactly that store — never silently
+    /// swap in a fresh internal one, which would disconnect the wiring's audit trail from the app.
+    #[tokio::test]
+    async fn with_events_shares_the_given_store_not_a_fresh_one() {
+        let src = "\
+trigger t1
+  on \"ping\"
+  run pong
+
+journey pong
+  flow
+    return \"pong!\"
+";
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let app = App::with_events(
+            program(src),
+            None,
+            "mock",
+            false,
+            Vec::new(),
+            None,
+            Redactor::new(),
+            events.clone(),
+        );
+        assert!(
+            Arc::ptr_eq(&app.events(), &events),
+            "App::with_events must keep the caller's store, not build its own"
+        );
+        // The seam doesn't disturb ordinary journey behavior.
+        let runs = app.deliver("ping", json!({})).await.expect("deliver");
+        assert_eq!(runs[0].result, "pong!");
     }
 
     #[tokio::test]

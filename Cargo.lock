@@ -1435,6 +1435,7 @@ name = "flux-eval"
 version = "0.3.0"
 dependencies = [
  "async-trait",
+ "flux-cognition",
  "flux-core",
  "flux-events",
  "flux-evidence",

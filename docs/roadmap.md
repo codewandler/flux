@@ -1,7 +1,8 @@
 # flux — roadmap & status
 
-Status as of **0.2.15 (2026-07-04)**: public + installable at
-[codewandler/flux](https://github.com/codewandler/flux); 33 crates, **1100+ tests**, a permanently green
+Status as of **0.3.0 (2026-07-07)**: public + installable at
+[codewandler/flux](https://github.com/codewandler/flux); 34 crates, **1900+ tests** across the root
+and `plugins/` workspaces, a permanently green
 gate (tests, clippy `-D warnings`, fmt, the `flux-codegate` layering lint). See
 [CHANGELOG.md](../CHANGELOG.md) for the released history and [architecture.md](architecture.md) for the
 design.
@@ -61,6 +62,12 @@ one tiny `codex` turn, each SKIPped when the credential is absent — and the co
 behind the transparent HTTP fallback (the C-07 lesson: live wire-contract drift is invisible to
 hermetic stubs *and* to a fallback that works).
 
+Because the manual gate only runs before a release, a CLI-surface change (a renamed subcommand, a
+dropped flag) could otherwise rot it silently between runs (C-39). CI therefore also runs
+`scripts/smoke-live.sh --shapes`: the same steps 1-5 invocation shapes replayed against the offline
+`mock` provider in scratch dirs — no credentials, no live spend — failing fast on a clap parse error
+instead of waiting for the next live run to notice.
+
 A second, **integration-plugin** smoke (`scripts/smoke-plugins.sh`) exercises the D-08 plugin pack against
 real vendor APIs: for each integration whose credential is in the environment it builds the plugin,
 registers it in an isolated registry, and drives one op via `flux plugin call`, asserting a non-error
@@ -71,7 +78,7 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 
 ## Next
 
-### Plugin distribution (epic) — **channel + verified install shipped 2026-07-03; D-48/D-49 are the live next stories**
+### Plugin distribution (epic) — **complete 2026-07-05 (D-46..D-49 all shipped)**
 
 A flux user without the source tree had no way to obtain the integration plugin pack.
 [D-21](stories/D-21-plugin-distribution.md) scoped the answer — **fetch-on-install from a signed
@@ -84,15 +91,15 @@ and [D-47](stories/D-47-remote-plugin-install.md) the demand side (released in 0
 (embedded pubkey, no skip flag), sha256-checks every archive before anything executes, and unpacks
 into the versioned store `~/.flux/plugins/bin/<name>/<version>/` — live-verified with
 `flux plugin install gitlab`. Epic design: [plugin-distribution.md](designs/plugin-distribution.md).
-The board's only two `ready` stories complete the trust ladder:
+The final two stories completed the trust ladder (both shipped 2026-07-05):
 
-- **[D-48](stories/D-48-enforceable-pin-rollback.md) — Enforced pin/rollback** · *Core, ready.* Turn
+- **[D-48](stories/D-48-enforceable-pin-rollback.md) — Enforced pin/rollback** · *Core, done.* Turn
   `flux plugin pin`/`rollback` from advisory labels into supply-chain statements: pin fetches through
   the verified D-47 path, repoints the descriptor, and records the hash; rollback is an offline flip
   to `previous`; the recorded sha256 is re-verified before **every** spawn (drift = hard refusal),
   with `status` gaining the verification column.
 - **[D-49](stories/D-49-plugin-naming-docs-pass.md) — Plugin naming + docs truth pass** · *Core,
-  ready.* Apply the canonical trio vocabulary everywhere user-facing — the protocol *crate*
+  done.* Apply the canonical trio vocabulary everywhere user-facing — the protocol *crate*
   (`flux-plugin`) vs the plugin *pack* (`flux-plugin-<name>` binaries) vs the *CLI* (`flux plugin …`)
   — and document the remote install path now that it ships (the C-16/L-19 docs-truth pattern).
 

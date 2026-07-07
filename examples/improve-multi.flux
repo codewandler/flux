@@ -309,15 +309,17 @@
                     {
                       "kind": "lit",
                       "value": {
-                        "bench": "multi",
-                        "decision": "kept",
-                        "reason": "candidate_beat_baseline",
-                        "base_score": "{{base_score}}",
-                        "cand_score": "{{cand_score}}",
-                        "tag": "improve-multi-{{cand_score}}",
-                        "guard": "{{guard}}",
-                        "gate": "{{gate}}",
-                        "tasks": "{{tasks}}"
+                        "record": {
+                          "bench": "multi",
+                          "decision": "kept",
+                          "reason": "candidate_beat_baseline",
+                          "base_score": "{{base_score}}",
+                          "cand_score": "{{cand_score}}",
+                          "tag": "improve-multi-{{cand_score}}",
+                          "guard": "{{guard}}",
+                          "gate": "{{gate}}",
+                          "tasks": "{{tasks}}"
+                        }
                       }
                     }
                   ]
@@ -355,14 +357,16 @@
                     {
                       "kind": "lit",
                       "value": {
-                        "bench": "multi",
-                        "decision": "reverted",
-                        "reason": "no_improvement",
-                        "base_score": "{{base_score}}",
-                        "cand_score": "{{cand_score}}",
-                        "guard": "{{guard}}",
-                        "gate": "{{gate}}",
-                        "tasks": "{{tasks}}"
+                        "record": {
+                          "bench": "multi",
+                          "decision": "reverted",
+                          "reason": "no_improvement",
+                          "base_score": "{{base_score}}",
+                          "cand_score": "{{cand_score}}",
+                          "guard": "{{guard}}",
+                          "gate": "{{gate}}",
+                          "tasks": "{{tasks}}"
+                        }
                       }
                     }
                   ]
@@ -388,13 +392,15 @@
                 {
                   "kind": "lit",
                   "value": {
-                    "bench": "multi",
-                    "decision": "reverted",
-                    "reason": "gate_failed",
-                    "base_score": "{{base_score}}",
-                    "guard": "{{guard}}",
-                    "gate": "{{gate}}",
-                    "tasks": "{{tasks}}"
+                    "record": {
+                      "bench": "multi",
+                      "decision": "reverted",
+                      "reason": "gate_failed",
+                      "base_score": "{{base_score}}",
+                      "guard": "{{guard}}",
+                      "gate": "{{gate}}",
+                      "tasks": "{{tasks}}"
+                    }
                   }
                 }
               ]

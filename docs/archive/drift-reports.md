@@ -1,3 +1,10 @@
+# Drift ledger — schema↔handler mismatches surfaced by the schemars migrations
+
+This is the living ledger for the D-31/D-34/D-36..D-45 schema-migration family (moved here from
+the repo root by C-42): future migrations in this family append their drift reports here.
+
+---
+
 # D-31 drift report — schema↔handler mismatches found & fixed
 
 The schemars migration makes each op's `input_schema` and its runtime parsing derive from
@@ -16,7 +23,8 @@ type mismatches). Each is now fixed by construction; the notes record what was w
   schema struct is `#[allow(dead_code)]`, schema-only). Full SSoT (handler parses the struct via
   `parse_params`) is wired for `write` (flux-tools) and `task` (flux-orchestrate). The rest are
   schema-only by design — the story's hard requirement is "no hand-written schemas"; full SSoT is
-  a follow-up where the handler is a simple 1:1 field extraction.
+  a follow-up where the handler is a simple 1:1 field extraction. **Update (D-66, 2026-07-07):** a
+  first tranche of the follow-up landed — see the D-66 report below for the ops converted.
 
 ## Drifts found
 
@@ -537,3 +545,91 @@ complicate retry semantics.
 The user's C-09a WIP (`internal` op flag across `flux-plugin`/`host-kit`/`kubernetes`) was stashed
 together before this work, consistency restored, then re-applied untouched. D-45's changes are
 orthogonal (the `conn.read` arm + `ConnStream` deadline).
+
+---
+
+# D-66 — first schema-SSoT increment: handler-parsed structs for the simple flux-tools ops
+
+The recorded D-31 follow-up ("full SSoT where the handler is a simple 1:1 field extraction") gets
+its first tranche. Scope, conversions, and the drift this surfaced, per the story's Acceptance.
+
+## Tranche scoped
+
+Candidates were every `flux-tools` op whose handler does plain field extraction matching its
+already-derived schema struct, **excluding**: any op reading a numeric field via the `u64_arg`
+helper (it deliberately tolerates a JSON string like `"120"` — a documented accommodation for
+models that emit stringly-typed numbers; a strict `u64` struct field would reject it, a real
+regression) — this ruled out `read`, `grep`, `bash`, `proc.run`, `git_log`, and `patch` (which also
+does non-trivial custom validation, not 1:1 extraction); ops built on shared `&Value`-based
+argv-builder helpers whose own unit tests call them with raw `Value` (`cargo_check`/`cargo_build`/
+`cargo_test`/`cargo_clippy`/`cargo_fmt`) — converting cleanly means threading typed fields through
+those helpers and rewriting their tests too, a larger refactor deferred to a later tranche; and
+`toolchains.rs`/`extra.rs`/`cognition.rs` wholesale (not audited this pass — left for tranche 2 so
+this pass stays fully reviewed rather than rushed). `reflect.rs`'s `plan`/`run_plan`/`op.register`
+stay excluded per the existing D-31 entry (validate-only forwarding / richer-schema-than-runtime).
+
+## Converted (parse_params wired, `#[allow(dead_code)]` removed)
+
+`flux-tools/src/lib.rs`: `edit`, `glob`, `append`, `read_many`, `git_stage`, `git_commit`,
+`git_status`, `git_diff`, `git_push`, `git_checkout`, `git_unstage`, `flux_reload`.
+`flux-tools/src/evidence.rs`: `evidence`, `metrics` (handler now parses `EvidenceInput`/
+`MetricsInput`), and `observe` — which turned out to **already** parse `ObserveInput` via
+`parse_params` (done in an earlier, uncommitted pass), just left carrying a stale
+`#[allow(dead_code)]`; the attribute is removed as a pure cleanup, no behavior change.
+
+No struct's fields changed, so every derived `input_schema` is byte-identical before/after
+(`crates/flux-tools/tests/no_manual_schema.rs` stays green — it doesn't snapshot schema bytes, but
+schemars derives purely from the Rust type, and the type declarations are untouched).
+
+## Drift found: two intentional strictness alignments
+
+Both converted structs already carry `#[serde(deny_unknown_fields)]` — a convention this crate
+adopted for *every* schema-only struct back in D-31/D-34, `write` included. That means the
+model-facing schema has always advertised `additionalProperties: false` (and, for array fields,
+`items: {"type": "string"}`), even while the ad-hoc handler enforced neither:
+
+1. **Unknown fields.** The old `str_param`/`params.get(...)` extraction reads only the keys it
+   wants and silently ignores everything else. `parse_params` now enforces the schema's own
+   `additionalProperties: false`, so an extra key hard-errors instead of being dropped. Pinned by
+   `append_rejects_unknown_field` (failing-first: on the pre-conversion handler the same call
+   silently succeeds).
+2. **Non-string array elements.** `path_list`'s `filter_map` silently drops any non-string entry
+   from a `paths` array instead of failing (used by `read_many`/`git_stage`/`git_unstage`). The
+   struct's `paths: Vec<String>` now deserializes strictly, so `["a.txt", 5]` hard-errors instead
+   of silently becoming `["a.txt"]`. Pinned by `read_many_rejects_non_string_path_element`
+   (failing-first, same shape of proof).
+
+Both are treated as **aligning enforcement with the schema that was already published**, not as
+new drift introduced by this tranche — the same call the `write` conversion already made (D-31)
+without a separate callout. No existing test exercised the old lenient-drop behavior for either
+case (checked before converting), so nothing in the suite broke. This is the interesting edge the
+story's Acceptance asked to watch for; it was deliberately **not** papered over with a lenient
+custom deserializer, to keep the schema the single source of truth for both shape *and*
+enforcement.
+
+The `u64_arg` numeric-string tolerance is a different case — a documented, deliberate
+accommodation for a real observed model behavior (see `u64_arg`'s doc comment) — which is exactly
+why ops built on it were excluded from this tranche rather than silently tightened.
+
+## New test coverage
+
+`git_stage`/`git_commit`/`git_status`/`git_diff`/`git_push`/`git_checkout`/`git_unstage` had zero
+direct execute-level tests before this tranche (only a name assertion in `builtins_register`).
+Added `git_ops_stage_commit_status_diff_unstage_checkout` (a local-repo end-to-end walk: stage →
+status → commit → modify → unstaged diff → stage → staged diff → unstage → checkout -b) and
+`git_push_pushes_to_a_local_remote` (push to a local bare repo, no network). `edit`/`append`/
+`glob`/`read_many` already had passing coverage through `.execute()`; those tests continued to pass
+unmodified through the conversion — the regression pin for the "everything else stays the same"
+half of the Acceptance. `evidence`/`metrics`/`observe` were already exercised via
+`Executor::dispatch` in `evidence.rs`'s existing tests and continued to pass unmodified.
+
+## Deferred to a later tranche
+
+`toolchains.rs` (python/pytest/npm/node/go/make), `extra.rs` (file_stat/path_exists/sqlite_query/
+websearch/home_dir/now/cwd/sys_info), `cognition.rs` (need/gaps/compare/dedupe/sort/top/merge/len/
+first/last/filter/review_normalize/review_aggregate/cite) — not audited this pass. `cargo_*` needs
+the argv-builder-helper refactor noted above. `read`/`grep`/`bash`/`proc.run`/`git_log`/`patch` stay
+ad-hoc pending a decision on how to preserve `u64_arg`'s string-tolerance (e.g. a
+`deserialize_with` shim that keeps the field's Rust type — and therefore the derived schema —
+unchanged) without silently making those ops stricter for models that emit `"120"` instead of
+`120`. Plugin `OperationSpec` ops remain out of scope (D-36's own, separate track).

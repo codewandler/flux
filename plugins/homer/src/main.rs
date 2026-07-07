@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 // (`host_kit::read_op_typed::<T>`), instead of a hand-written `json!({...})` object, so the
 // schema the model sees cannot drift from a separately-maintained literal. The structs are
 // schema-only: handlers keep their existing `str_opt`/`bool_opt`/`i64_opt`/`str_array` extractors
-// (the D-34 schema-only precedent). Drifts the migration surfaced are recorded in `DRIFT.md`.
+// (the D-34 schema-only precedent). Drifts the migration surfaced are recorded in `docs/archive/drift-reports.md`.
 // schemars emits no `additionalProperties` by default, matching the legacy `so(...)` form.
 
 /// `homer.test` — no params.
@@ -51,7 +51,7 @@ struct SearchInput {
 /// `homer.call.list` — call grouping filters. NOTE (drift): the handler shares
 /// `build_search_filters` with `homer.search`, so it also reads `ua`/`method`/`call_id`,
 /// but the legacy schema never advertised those for `call.list` — they stay out here to
-/// preserve the contract; see `DRIFT.md` (D-36).
+/// preserve the contract; see `docs/archive/drift-reports.md` (D-36).
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
 struct CallListInput {
@@ -67,7 +67,7 @@ struct CallListInput {
 
 /// `homer.call.show` — ordered SIP flow. NOTE (drift): the legacy schema advertises a
 /// `render` (enum `svg`) field the handler never reads; it is kept here to preserve the
-/// contract — see `DRIFT.md` (D-36).
+/// contract — see `docs/archive/drift-reports.md` (D-36).
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
 struct CallShowInput {
@@ -95,7 +95,7 @@ struct CallQosInput {
 /// Seed by `call_id` **or** `from_user`+`to_user`; fan out by the seed caller + extra `numbers`;
 /// legs are confirmed by a shared `correlation_header` value + temporal overlap, or by involving
 /// an extra number. `render` (svg) is advertised for parity but SVG rendering is deferred (needs
-/// the `ladder_svg` port shared with `call.show`) — see `DRIFT.md` § D-37.
+/// the `ladder_svg` port shared with `call.show`) — see `docs/archive/drift-reports.md` § D-37.
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
 struct CallAnalyzeInput {
@@ -1401,7 +1401,7 @@ fn op_call_analyze(input: Value, host: &mut Host) -> Result<Value, String> {
     let numbers = str_array(&input, "numbers");
     let extra_headers = str_array(&input, "headers");
     let limit = clamp_limit(i64_opt(&input, "limit").unwrap_or(0), 50, 200);
-    // `render` (svg) is accepted for parity but SVG rendering is deferred (DRIFT.md § D-37).
+    // `render` (svg) is accepted for parity but SVG rendering is deferred (docs/archive/drift-reports.md § D-37).
     let _render = str_opt(&input, "render");
 
     let seed_by_id = call_id.is_some();

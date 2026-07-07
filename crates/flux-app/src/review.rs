@@ -117,8 +117,7 @@ pub fn review_code_journey() -> JourneyDecl {
 /// Build the full checked-in strict-review app program: the `strict_review` composite op (wrapping
 /// [`STRICT_REVIEW_FLOW_SRC`] unmodified), the `review_code` journey that calls it, and a `review`
 /// trigger so `flux app run <program>` wakes the journey on a `review` event
-/// (`App::deliver("review", json!({"files": [...]}))` — the same event shape
-/// `examples/strict-review-app.flux` declares for interactive/documentation use).
+/// (`App::deliver("review", json!({"files": [...]}))`).
 pub fn strict_review_program() -> Result<Program> {
     let op = strict_review_op()?;
     let journey = review_code_journey();

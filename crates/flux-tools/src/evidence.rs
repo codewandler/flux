@@ -28,7 +28,6 @@ pub fn register_evidence(registry: &mut ToolRegistry) {
 struct ObserveOp;
 
 /// Arguments for the `observe` op.
-#[allow(dead_code)]
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ObserveInput {
@@ -75,7 +74,6 @@ impl Tool for ObserveOp {
 struct EvidenceOp;
 
 /// Arguments for the `evidence` op.
-#[allow(dead_code)]
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct EvidenceInput {
@@ -105,8 +103,9 @@ impl Tool for EvidenceOp {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let args: EvidenceInput = crate::parse_params(params, "evidence")?;
         let log = ctx.evidence.lock().unwrap();
-        let matched: Vec<&Observation> = match params.get("kind").and_then(|v| v.as_str()) {
+        let matched: Vec<&Observation> = match args.kind.as_deref() {
             Some(kind) => log.by_kind(kind).collect(),
             None => log.all().iter().collect(),
         };
@@ -122,7 +121,6 @@ impl Tool for EvidenceOp {
 struct MetricsOp;
 
 /// Arguments for the `metrics` op.
-#[allow(dead_code)]
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct MetricsInput {}
@@ -146,7 +144,8 @@ impl Tool for MetricsOp {
         }
     }
 
-    async fn execute(&self, ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let _: MetricsInput = crate::parse_params(params, "metrics")?;
         let log = ctx.evidence.lock().unwrap();
         let metrics = json!({
             "tool_calls": log.by_kind("tool_call").count(),

@@ -19,18 +19,18 @@ pub fn ast_schema() -> serde_json::Value {
     .clone()
 }
 
-/// A markdown `| kind | description |` table of every [`Node`] variant, generated from the derived
-/// schema's per-variant doc-comments. Replaces the former build-time `NODE_KIND_CATALOG` (the same
-/// content, now derived from the type rather than parsed out of `ast.rs` by `syn`).
-pub fn node_kind_catalog() -> String {
-    // Memoized: the table is a compile-time constant, but building it runs `schema_for!(Node)` (a
-    // full reflective build of the 40+-variant AST enum) plus a per-variant walk. It feeds the
-    // planner prompt on every turn, so cache the finished string and hand back a clone.
-    static CELL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// The `(kind, description)` pairs behind [`node_kind_catalog`], for consumers that need to
+/// render the table differently than the verbatim catalog (e.g. escaping literal `|` characters
+/// for a strict markdown-table renderer, as the website generator does).
+pub fn node_kind_rows() -> Vec<(String, String)> {
+    // Memoized: building this runs `schema_for!(Node)` (a full reflective build of the 40+-variant
+    // AST enum) plus a per-variant walk. `node_kind_catalog` feeds the planner prompt on every turn,
+    // so cache the rows and hand back a clone.
+    static CELL: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
     CELL.get_or_init(|| {
         let schema =
             serde_json::to_value(schemars::schema_for!(Node)).expect("Node schema serializes");
-        let mut out = String::from("| kind | description |\n|---|---|\n");
+        let mut rows = Vec::new();
         if let Some(variants) = schema.get("oneOf").and_then(|v| v.as_array()) {
             for v in variants {
                 let kind = variant_kind(v).unwrap_or_default();
@@ -40,8 +40,23 @@ pub fn node_kind_catalog() -> String {
                     .and_then(|d| d.as_str())
                     .unwrap_or_default()
                     .replace('\n', " ");
-                out.push_str(&format!("| `{kind}` | {desc} |\n"));
+                rows.push((kind, desc));
             }
+        }
+        rows
+    })
+    .clone()
+}
+
+/// A markdown `| kind | description |` table of every [`Node`] variant, generated from the derived
+/// schema's per-variant doc-comments. Replaces the former build-time `NODE_KIND_CATALOG` (the same
+/// content, now derived from the type rather than parsed out of `ast.rs` by `syn`).
+pub fn node_kind_catalog() -> String {
+    static CELL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let mut out = String::from("| kind | description |\n|---|---|\n");
+        for (kind, desc) in node_kind_rows() {
+            out.push_str(&format!("| `{kind}` | {desc} |\n"));
         }
         out
     })

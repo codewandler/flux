@@ -17,7 +17,7 @@ No plugin `OperationSpec` may hand-write its JSON Schema: every op's `input_sche
 derived from a typed Rust struct via `schemars`, so the schema the model sees and the params
 the handler parses cannot drift. This is the **plugin-side continuation of [D-34](D-34-schemars-op-schemas.md)**,
 which finished the in-process `ToolSpec` ops and explicitly deferred the plugin ops ("tracked as
-a separate story"). The deferral is recorded in [`DRIFT.md`](../../DRIFT.md) §"Out of scope".
+a separate story"). The deferral is recorded in [`docs/archive/drift-reports.md`](../../docs/archive/drift-reports.md) §"Out of scope".
 
 The same single-source-of-truth principle, just on the L4 plugin side: today each plugin declares
 ops with a local `so(props, required)` helper that emits a `json!({...})` object, then the handler
@@ -65,7 +65,7 @@ host-kit derives the schema + parses the call in one typed step.
 - **Not a contract change:** op names, params, effects, and risk levels stay identical; only the
   schema's authorship moves from hand-written `json!` to schemars-derived. Any drift found during
   migration (a field the schema advertised but the handler never read, or vice-versa) is recorded
-  in `DRIFT.md` as D-34 did, not silently "fixed" — a contract change is a separate story.
+  in `docs/archive/drift-reports.md` as D-34 did, not silently "fixed" — a contract change is a separate story.
 
 ## Progress
 - **Infrastructure landed.** `host-kit` grew `read_op_typed::<T>` / `write_op_typed::<T>`
@@ -94,7 +94,7 @@ host-kit derives the schema + parses the call in one typed step.
 - **Guard landed.** `plugins/host-kit/tests/no_manual_plugin_schema.rs` (scoped to
   `MIGRATED_PLUGINS = ["homer"]`) fails on a reintroduced `fn so(` / `so(json!{...})` and on a
   partial migration (no `*_op_typed::<`); verified failing-first by reintroducing `so`.
-- **Drift collected.** `DRIFT.md` § D-36 records two `homer` drifts (`call.list` handler reads
+- **Drift collected.** `docs/archive/drift-reports.md` § D-36 records two `homer` drifts (`call.list` handler reads
   `ua`/`method`/`call_id` the schema omits; `call.show` advertises a `render` field the handler
   ignores) — preserved as-is (pure schema-source change), plus schemars representation notes.
 - **D-36 COMPLETE:** all 17 in-repo plugins now schemars-derive every op `input_schema` via
@@ -107,7 +107,7 @@ host-kit derives the schema + parses the call in one typed step.
 
 ## Notes
 - **Origin:** explicitly deferred by [D-34](D-34-schemars-op-schemas.md) (Scope + Progress) and
-  recorded in [`DRIFT.md`](../../DRIFT.md) §"Out of scope (deferred / correctly non-manual)".
+  recorded in [`docs/archive/drift-reports.md`](../../docs/archive/drift-reports.md) §"Out of scope (deferred / correctly non-manual)".
 - **Unblocked by D-34** (pattern + precedent: `WriteInput`/`WriteTool` full-SSoT; the
   `#[allow(dead_code)]` schema-only struct precedent) and **by [L-09](L-09-named-argument-calls.md)**
   (named-argument calls: `x-param-order` is gone and `required` is a set, so schemars-derived

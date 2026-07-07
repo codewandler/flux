@@ -6,6 +6,76 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+The hardening/docs/cleanup push: nine stories from the 2026-07-07 repo survey, closing the
+release-gate rot, docs drift, and drift-guard holes the survey verified.
+
+### Fixed
+
+- **C-39** — The live smoke gate works again: `scripts/smoke-live.sh` steps 1–5 invoked the
+  retired flag-style CLI (`flux -p -m`, `--agent`, `--serve`) and died on clap parse errors before
+  testing anything; rewritten onto the subcommand CLI (`flux run [-c] [--yes]`,
+  `flux app run --serve`) via shared wrapper functions, plus a hermetic `--shapes` guard run in CI
+  against the mock provider so CLI drift fails fast instead of rotting until the next release.
+  Same pass: step 5's JSON-RPC payloads moved off the stale `tasks/send`/`tasks/sendSubscribe`
+  method names onto `message/send`/`message/stream` (shapes pinned by the new C-41 tests), and
+  step 6's ollama leg was moved off the same retired flags. Live-verified end to end
+  (steps 1–4 + 7 + 8 green over openrouter-anthropic + subscription credentials).
+- **C-40** — Docs truth pass after v0.3.0: roadmap header (0.2.15/"33 crates" → 0.3.0/34 crates/
+  1900+ tests re-counted), the board's hand-written Status block (was still "v0.2.4"),
+  `docs/architecture.md`'s false "merged flux-datasource" claim (it is a live standalone L0 crate)
+  and its missing `flux-audio` rows (AGENTS.md's L0 table had the same gap), README's under-listed
+  providers/L6 rows, the stale plugin-distribution "live next stories" epic heading (complete
+  since 2026-07-05), and a dangling `examples/strict-review-app.flux` doc-comment reference.
+- **L-41** — Every checked-in `examples/*.flux` now validates in CI
+  (`crates/flux-eval/tests/examples_validate.rs`, directory-enumerating — a new example is guarded
+  by default; JSON via serde, native text via the real parser, programs via the Program gate; the
+  fullest registry buildable from flux-eval incl. the cognition pack). The sweep immediately
+  caught real drift: `advanced-code-review.flux` was written in a fictional dialect and never
+  parsed (rewritten in the real grammar), `improve-multi.flux` was missing `improve_log`'s
+  required `record` param at all three call sites (fixed), and the unreferenced `loop-poc.flux`
+  failed `lower` against the registry (deleted; superseded by the real `agent-loop.flux`).
+- **D-65** — App-path redaction + audit parity: on `flux app run`, a cross-plugin-resolved
+  credential is now seeded into the executor's redactor (closing a narrow breach of the
+  "secrets never appear raw in model-visible output" invariant — the CLI agent path already had
+  this via C-13), and the three dormant audit hooks now record on the run's stream:
+  `PrivateNetAdmit` (D-20), `CrossPluginResolve` (D-27), `EndpointDiscovered` (D-30). One
+  root-cause seam: additive `App::with_events(...)` hands the host's `EventStore` to the wiring
+  sites; the redaction test was verified to catch the regression (fails with the sink removed).
+
+### Added
+
+- **C-41** — flux-server integration suite (`crates/flux-server/tests/`, 10 tests): `message/send`
+  completes, `message/stream` SSE framing asserted structurally (working → completed, final flag),
+  discovery-card/health auth-exemption vs 401 on guarded routes, malformed JSON-RPC handling, and
+  C-18 TTL pruning driven through the real HTTP surface. One defect documented (garbage bodies get
+  axum's generic 400, not a JSON-RPC `-32700` envelope) with an `#[ignore]`d failing-first test
+  pinning the ideal shape for a follow-up.
+- **L-42** — The website's language tables are now generated + drift-guarded like every other
+  catalog consumer: `website/docs/language/{node-reference,types-and-effects}.md` carry
+  `generated:node-kinds`/`generated:prelude-types` marker blocks synced by
+  `crates/flux-lang/tests/website_in_sync.rs` (`UPDATE=1` to regenerate). The failing-first run
+  caught real published drift (a wrong `peek` description and a hand-stripped `Blocked` link);
+  new public `node_kind_rows()`/`prelude_type_rows()` accessors feed per-consumer rendering
+  (Docusaurus needs `\|` cell escaping).
+
+### Changed
+
+- **C-42** — The schema-migration drift ledger moved from repo-root `DRIFT.md` to
+  `docs/archive/drift-reports.md` (living ledger header added; all references repointed; repo
+  root keeps only the canonical top-level files).
+- **D-66** — Schema-SSoT tranche 1: 14 flux-tools ops (+1 cleanup) now parse their schemars
+  struct via `parse_params` instead of ad-hoc `&Value` extraction (`edit`, `glob`, `append`,
+  `read_many`, the seven `git_*` ops, `flux_reload`, `evidence`, `metrics`; `observe` was already
+  converted), retiring their `#[allow(dead_code)]`. Derived schemas byte-identical; two
+  strictness alignments now enforce what the schema always published (unknown keys and non-string
+  `paths[]` elements hard-error), each pinned by a failing-first test; the seven git ops gained
+  their first execute-level tests. Numeric-field ops (`read`/`grep`/`bash`/…) deliberately
+  deferred to tranche 2 to preserve `u64_arg`'s stringly-number tolerance.
+- **A-44** — flux-flow unwrap/expect triage: all 101 non-test sites audited and classified
+  (94 mutex-lock poisoned-panic policy + 7 invariant-backed `expect`s) — zero fallible sites,
+  zero code changes; the classification table lives in the story, and a crate-wide clippy
+  unwrap ban was evaluated and rejected as pure noise (recorded with reasoning).
+
 ## [0.3.0] - 2026-07-07
 
 The consumer-gaps release: a review of flux's first production SDK consumer surfaced the places it
@@ -1488,7 +1558,7 @@ had to re-implement or work around flux — this release closes them upstream.
   (handlers unchanged — schema-only, the D-34 precedent). A contract test asserts each derived
   schema's fields/required/types/enums match the legacy `so(...)` contract, and a workspace
   guard (`plugins/host-kit/tests/no_manual_plugin_schema.rs`, scoped to `MIGRATED_PLUGINS`) fails
-  on a reintroduced `so(json!{...})`. Drift the migration surfaced is recorded in `DRIFT.md`
+  on a reintroduced `so(json!{...})`. Drift the migration surfaced is recorded in `docs/archive/drift-reports.md`
   (two `homer` drifts, preserved as-is — pure schema-source change, not a contract change).
   16 plugins remain under D-36.
 
@@ -1732,7 +1802,7 @@ had to re-implement or work around flux — this release closes them upstream.
   `json!({...})` schemas across `flux-tools`, `flux-eval`, and `flux-orchestrate` — so an
   op's schema and its runtime parsing can no longer drift. A regression guard
   (`crates/flux-tools/tests/no_manual_schema.rs`) fails on a reintroduced hand-written
-  schema; `DRIFT.md` records the mismatches found + fixed (notably broken `$ref`s in the
+  schema; `docs/archive/drift-reports.md` records the mismatches found + fixed (notably broken `$ref`s in the
   eval comparison ops and the dropped `x-param-order` cargo extension). Plugin
   `OperationSpec` ops (~275) remain deferred.
 

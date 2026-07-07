@@ -301,12 +301,12 @@ flux is a single Cargo workspace of strictly-layered crates — inner crates nev
 | Layer | Role |
 |---|---|
 | **Contracts (L0)** | pure types, policy, secrets, tool specs, config, evidence, skills — no IO |
-| **Providers (L1)** | wire codec × credential cells; Anthropic, OpenAI, OpenRouter |
+| **Providers (L1)** | wire codec × credential cells; Anthropic, OpenAI, OpenRouter, Ollama, AWS Bedrock, and the claude/codex subscription providers |
 | **Runtime (L2)** | guarded IO, the safety envelope, built-in tools, sessions, context |
 | **Agent (L3)** | the Flux-Lang engine (the one turn loop) + agent definitions (`AgentSpec`/`Role`) + multi-agent orchestration |
 | **Extensibility (L4)** | JavaScript hooks + subprocess plugins |
 | **Capabilities (L5)** | browser/web egress, datasource/RAG, caller identity |
-| **Surfaces (L6)** | SDK, HTTP server, integrations, TUI, the `flux` CLI |
+| **Surfaces (L6)** | SDK, HTTP server, TUI, the `flux` CLI, the multi-agent app host (`flux app run`), event-trigger channels |
 
 The thesis runs all the way down: the agent's **turn loop is itself written in Flux-Lang** (`agent-loop.flux`) — the model compiles each step into a typed plan the runtime executes, and even the loop that orchestrates those steps is a plan you can read, gated by the same safety envelope. Watch it with `flux run --show-loop`, inspect its evidence with `/evidence`, and read or customize it with `flux loop show`/`eject` — see [docs/agent-loop.md](docs/agent-loop.md).
 

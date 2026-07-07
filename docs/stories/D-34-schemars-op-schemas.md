@@ -31,7 +31,7 @@ so `schemars`-derived schemas (which don't emit `x-param-order`) bind correctly.
   schema + runtime, or documented deferral).
 - [x] A **regression guard** test (`crates/flux-tools/tests/no_manual_schema.rs`) fails on a
   deliberately reintroduced `input_schema: json!({...})` and passes on the migrated tree.
-- [x] A **drift report** (`DRIFT.md`) records every schema↔handler mismatch found + fixed.
+- [x] A **drift report** (`docs/archive/drift-reports.md`) records every schema↔handler mismatch found + fixed.
 - [x] Dev loop green: `cargo build/test --workspace`, `clippy -D warnings`, `fmt`, `flux-codegate`.
 
 ## Scope
@@ -43,7 +43,7 @@ The **275 plugin `OperationSpec` ops** are deferred — tracked separately (host
 ## Progress
 
 Done. All in-process `ToolSpec` ops derive their schema via `tool_input_schema::<T>()`;
-`crates/flux-tools/tests/no_manual_schema.rs` guards it; `DRIFT.md` records the drifts.
+`crates/flux-tools/tests/no_manual_schema.rs` guards it; `docs/archive/drift-reports.md` records the drifts.
 The 275 plugin `OperationSpec` ops remain deferred (separate story).
 
 ## Notes

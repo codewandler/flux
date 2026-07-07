@@ -266,7 +266,6 @@ struct ReadInput {
     limit: Option<u64>,
 }
 
-#[allow(dead_code)]
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct EditInput {
@@ -297,7 +296,6 @@ struct ProcRunInput {
     timeout_secs: Option<u64>,
 }
 
-#[allow(dead_code)]
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct GlobInput {
@@ -328,7 +326,6 @@ struct GrepInput {
     max_results: Option<u64>,
 }
 
-#[allow(dead_code)]
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct AppendInput {
@@ -336,7 +333,6 @@ struct AppendInput {
     content: String,
 }
 
-#[allow(dead_code)]
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ReadManyInput {
@@ -378,7 +374,6 @@ struct PatchInput {
     edits: Vec<PatchEdit>,
 }
 
-#[allow(dead_code)]
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct GitStageInput {
@@ -386,7 +381,6 @@ struct GitStageInput {
     paths: Vec<String>,
 }
 
-#[allow(dead_code)]
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct GitCommitInput {
@@ -397,7 +391,6 @@ struct GitCommitInput {
     body: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct GitDiffInput {
@@ -418,7 +411,6 @@ struct GitLogInput {
     limit: Option<u64>,
 }
 
-#[allow(dead_code)]
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct GitPushInput {
@@ -430,7 +422,6 @@ struct GitPushInput {
     branch: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct GitCheckoutInput {
@@ -441,7 +432,6 @@ struct GitCheckoutInput {
     create: Option<bool>,
 }
 
-#[allow(dead_code)]
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct GitUnstageInput {
@@ -449,12 +439,10 @@ struct GitUnstageInput {
     paths: Vec<String>,
 }
 
-#[allow(dead_code)]
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct GitStatusInput {}
 
-#[allow(dead_code)]
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct FluxReloadInput {}
@@ -709,13 +697,11 @@ impl Tool for EditTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let path = str_param(&params, "path", "edit")?;
-        let old = str_param(&params, "old_string", "edit")?;
-        let new = str_param(&params, "new_string", "edit")?;
-        let replace_all = params
-            .get("replace_all")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let args: EditInput = parse_params(params, "edit")?;
+        let path = args.path.as_str();
+        let old = args.old_string.as_str();
+        let new = args.new_string.as_str();
+        let replace_all = args.replace_all.unwrap_or(false);
 
         // Must have read (or written) this file this session, and it must not have changed since.
         guard_unchanged(ctx, path, true).await?;
@@ -1329,8 +1315,9 @@ impl Tool for GlobTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let pattern = str_param(&params, "pattern", "glob")?;
-        let base = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let args: GlobInput = parse_params(params, "glob")?;
+        let pattern = args.pattern.as_str();
+        let base = args.path.as_deref().unwrap_or(".");
         let files = ctx.system.walk_files(base, WALK_FILE_CAP).await?;
         let mut matches: Vec<String> = files
             .into_iter()
@@ -1499,8 +1486,9 @@ impl Tool for AppendTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let path = str_param(&params, "path", "append")?;
-        let content = str_param(&params, "content", "append")?;
+        let args: AppendInput = parse_params(params, "append")?;
+        let path = args.path.as_str();
+        let content = args.content.as_str();
         guard_unchanged(ctx, path, false).await?;
         ctx.system.append_file(path, content).await?;
         note_read(ctx, path).await;
@@ -1599,13 +1587,14 @@ impl Tool for ReadManyTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let paths = path_list(&params);
-        if paths.is_empty() {
+        let args: ReadManyInput = parse_params(params, "read_many")?;
+        if args.paths.is_empty() {
             return Err(Error::Other(
                 "read_many: `paths` must be a non-empty array of strings".to_string(),
             ));
         }
-        let sections = futures::future::join_all(paths.iter().map(|p| read_section(ctx, p))).await;
+        let sections =
+            futures::future::join_all(args.paths.iter().map(|p| read_section(ctx, p))).await;
         let mut canonical = Vec::with_capacity(sections.len());
         let mut view = Vec::with_capacity(sections.len());
         for (c, v) in sections {
@@ -1942,14 +1931,14 @@ impl Tool for GitStageTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let paths = path_list(&params);
-        if paths.is_empty() {
+        let args: GitStageInput = parse_params(params, "git_stage")?;
+        if args.paths.is_empty() {
             return Err(Error::Other(
                 "git_stage: `paths` must be a non-empty array of strings".to_string(),
             ));
         }
         let mut argv = vec!["git".to_string(), "add".to_string(), "--".to_string()];
-        argv.extend(paths);
+        argv.extend(args.paths);
         let out = ctx.system.run(&argv, Duration::from_secs(30)).await?;
         let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
         if out.exit_code != 0 {
@@ -2010,8 +1999,9 @@ impl Tool for GitCommitTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let message = str_param(&params, "message", "git_commit")?;
-        let full_message = match params.get("body").and_then(|v| v.as_str()) {
+        let args: GitCommitInput = parse_params(params, "git_commit")?;
+        let message = args.message.as_str();
+        let full_message = match args.body.as_deref() {
             Some(b) if !b.trim().is_empty() => format!("{message}\n\n{b}"),
             _ => message.to_string(),
         };
@@ -2075,7 +2065,8 @@ impl Tool for GitStatusTool {
         set
     }
 
-    async fn execute(&self, ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let _: GitStatusInput = parse_params(params, "git_status")?;
         let argv = vec![
             "git".to_string(),
             "status".to_string(),
@@ -2143,15 +2134,13 @@ impl Tool for GitDiffTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let staged = params
-            .get("staged")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let args: GitDiffInput = parse_params(params, "git_diff")?;
+        let staged = args.staged.unwrap_or(false);
         let mut argv = vec!["git".to_string(), "diff".to_string()];
         if staged {
             argv.push("--staged".to_string());
         }
-        if let Some(p) = params.get("path").and_then(|v| v.as_str()) {
+        if let Some(p) = args.path.as_deref() {
             argv.push("--".to_string());
             argv.push(p.to_string());
         }
@@ -2283,14 +2272,11 @@ impl Tool for GitPushTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let remote = params
-            .get("remote")
-            .and_then(|v| v.as_str())
-            .unwrap_or("origin")
-            .to_string();
+        let args: GitPushInput = parse_params(params, "git_push")?;
+        let remote = args.remote.unwrap_or_else(|| "origin".to_string());
         let mut argv = vec!["git".to_string(), "push".to_string(), remote];
-        if let Some(b) = params.get("branch").and_then(|v| v.as_str()) {
-            argv.push(b.to_string());
+        if let Some(b) = args.branch {
+            argv.push(b);
         }
         let out = ctx.system.run(&argv, Duration::from_secs(60)).await?;
         let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
@@ -2351,16 +2337,14 @@ impl Tool for GitCheckoutTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let branch = str_param(&params, "branch", "git_checkout")?;
-        let create = params
-            .get("create")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let args: GitCheckoutInput = parse_params(params, "git_checkout")?;
+        let branch = args.branch;
+        let create = args.create.unwrap_or(false);
         let mut argv = vec!["git".to_string(), "checkout".to_string()];
         if create {
             argv.push("-b".to_string());
         }
-        argv.push(branch.to_string());
+        argv.push(branch.clone());
         let out = ctx.system.run(&argv, Duration::from_secs(30)).await?;
         let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
         if out.exit_code != 0 {
@@ -2421,8 +2405,8 @@ impl Tool for GitUnstageTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let paths = path_list(&params);
-        if paths.is_empty() {
+        let args: GitUnstageInput = parse_params(params, "git_unstage")?;
+        if args.paths.is_empty() {
             return Err(Error::Other(
                 "git_unstage: `paths` must be a non-empty array".to_string(),
             ));
@@ -2432,7 +2416,7 @@ impl Tool for GitUnstageTool {
             "restore".to_string(),
             "--staged".to_string(),
         ];
-        argv.extend(paths);
+        argv.extend(args.paths);
         let out = ctx.system.run(&argv, Duration::from_secs(30)).await?;
         let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
         if out.exit_code != 0 {
@@ -2497,7 +2481,8 @@ impl Tool for ReloadTool {
         set
     }
 
-    async fn execute(&self, ctx: &ToolContext, _params: Value) -> flux_core::Result<ToolResult> {
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> flux_core::Result<ToolResult> {
+        let _: FluxReloadInput = parse_params(params, "flux_reload")?;
         // Run `cargo build -p flux-cli` via the guarded system (fixed argv — not model input).
         let argv = [
             "cargo".to_string(),
@@ -3555,6 +3540,22 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// D-66: converting `append` to parse `AppendInput` via `parse_params` makes the already-published
+    /// schema's `additionalProperties: false` (from `#[serde(deny_unknown_fields)]`) actually enforced —
+    /// previously the ad-hoc `str_param` extraction silently ignored any extra key. This test pins the
+    /// new, intentional behavior (see docs/archive/drift-reports.md's D-66 section).
+    #[tokio::test]
+    async fn append_rejects_unknown_field() {
+        let (dir, c) = ctx();
+        let err = AppendTool
+            .execute(&c, json!({"path": "a.txt", "content": "x", "bogus": 1}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid arguments"), "got: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn read_many_returns_all_sections() {
         let (dir, c) = ctx();
@@ -3574,6 +3575,22 @@ mod tests {
         assert!(r.content.contains("==> b.txt <==") && r.content.contains("bbb"));
         // A missing path shows an error section but does not fail the whole call.
         assert!(r.content.contains("==> missing.txt <== (error"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-66: the old `path_list` extraction (`filter_map`) silently dropped any non-string element
+    /// from `paths` instead of failing. `ReadManyInput.paths: Vec<String>` now deserializes strictly —
+    /// a non-string element hard-errors instead of being silently skipped. Documented, intentional
+    /// tightening (matches the `additionalProperties: false` precedent); see drift-reports.md D-66.
+    #[tokio::test]
+    async fn read_many_rejects_non_string_path_element() {
+        let (dir, c) = ctx();
+        let err = ReadManyTool
+            .execute(&c, json!({"paths": ["a.txt", 5]}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid arguments"), "got: {err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3795,5 +3812,154 @@ mod tests {
         assert!(all.content.contains("src/a.rs"));
         assert!(all.content.contains("notes.txt"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `ctx()` workspace with a git repo initialized in it (deterministic `main` default branch,
+    /// fixed identity so `git commit` doesn't depend on the host's global config).
+    fn git_ctx() -> (std::path::PathBuf, ToolContext) {
+        let (dir, c) = ctx();
+        let sh = |args: &[&str]| {
+            let ok = std::process::Command::new(args[0])
+                .args(&args[1..])
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "command failed: {args:?}");
+        };
+        sh(&["git", "init", "-q", "-b", "main"]);
+        sh(&["git", "config", "user.email", "test@example.com"]);
+        sh(&["git", "config", "user.name", "flux-tools tests"]);
+        (dir, c)
+    }
+
+    /// D-66: end-to-end coverage for the git ops converted to `parse_params` in this tranche
+    /// (`git_stage`, `git_commit`, `git_status`, `git_diff`, `git_unstage`, `git_checkout`) — none had
+    /// direct execute-level tests before (only a name assertion in `builtins_register`), so this pins
+    /// their behavior for the conversion.
+    #[tokio::test]
+    async fn git_ops_stage_commit_status_diff_unstage_checkout() {
+        let (dir, c) = git_ctx();
+        WriteTool
+            .execute(&c, json!({"path": "a.txt", "content": "one\n"}))
+            .await
+            .unwrap();
+
+        // git_stage
+        let r = GitStageTool
+            .execute(&c, json!({"paths": ["a.txt"]}))
+            .await
+            .unwrap();
+        assert!(!r.is_error, "{}", r.content);
+
+        // git_status shows the staged file.
+        let r = GitStatusTool.execute(&c, json!({})).await.unwrap();
+        assert!(r.content.contains("a.txt"), "got: {}", r.content);
+
+        // git_commit (message + body).
+        let r = GitCommitTool
+            .execute(&c, json!({"message": "add a.txt", "body": "details here"}))
+            .await
+            .unwrap();
+        assert!(!r.is_error, "{}", r.content);
+
+        // Modify the file — unstaged diff shows it.
+        WriteTool
+            .execute(&c, json!({"path": "a.txt", "content": "one\ntwo\n"}))
+            .await
+            .unwrap();
+        let r = GitDiffTool.execute(&c, json!({})).await.unwrap();
+        assert!(r.content.contains("+two"), "got: {}", r.content);
+
+        // Stage it, then a staged diff shows it too.
+        GitStageTool
+            .execute(&c, json!({"paths": ["a.txt"]}))
+            .await
+            .unwrap();
+        let r = GitDiffTool
+            .execute(&c, json!({"staged": true}))
+            .await
+            .unwrap();
+        assert!(r.content.contains("+two"), "got: {}", r.content);
+
+        // git_unstage removes it from the index; the staged diff is empty again.
+        let r = GitUnstageTool
+            .execute(&c, json!({"paths": ["a.txt"]}))
+            .await
+            .unwrap();
+        assert!(!r.is_error, "{}", r.content);
+        let r = GitDiffTool
+            .execute(&c, json!({"staged": true}))
+            .await
+            .unwrap();
+        assert_eq!(r.content, "no changes", "got: {}", r.content);
+
+        // git_checkout creates and switches to a new branch.
+        let r = GitCheckoutTool
+            .execute(&c, json!({"branch": "feature", "create": true}))
+            .await
+            .unwrap();
+        assert!(!r.is_error, "{}", r.content);
+        let out = std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "feature");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-66: `git_push` end-to-end against a local bare "remote" (no network needed).
+    #[tokio::test]
+    async fn git_push_pushes_to_a_local_remote() {
+        let (dir, c) = git_ctx();
+        WriteTool
+            .execute(&c, json!({"path": "a.txt", "content": "one\n"}))
+            .await
+            .unwrap();
+        GitStageTool
+            .execute(&c, json!({"paths": ["a.txt"]}))
+            .await
+            .unwrap();
+        GitCommitTool
+            .execute(&c, json!({"message": "init"}))
+            .await
+            .unwrap();
+
+        // A local bare repo stands in for a remote.
+        let remote_dir =
+            std::env::temp_dir().join(format!("flux-tools-remote-{}", std::process::id()));
+        std::fs::remove_dir_all(&remote_dir).ok();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .arg(&remote_dir)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["remote", "add", "origin"])
+            .arg(&remote_dir)
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success());
+
+        let r = GitPushTool
+            .execute(&c, json!({"remote": "origin", "branch": "main"}))
+            .await
+            .unwrap();
+        assert!(!r.is_error, "{}", r.content);
+
+        // The remote now has the pushed commit.
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "main"])
+            .current_dir(&remote_dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "remote missing branch: {out:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&remote_dir).ok();
     }
 }
