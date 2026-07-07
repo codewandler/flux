@@ -6,11 +6,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-08
+
 **A2A conformance Tier 3 — the stateful task model** (the `a2a-conformance` epic, A-54..A-57,
 implementing the A-53 design). An A2A task is now first-class and addressable: task id = the flux
 session id, a `Task` is a projection over the session's own turn-lifecycle events (no second
-store), and live runs are held in an in-process registry. One wire-behavior change (the
-non-blocking spec default) → the next release is a minor bump.
+store), and live runs are held in an in-process registry. Minor bump: one wire-behavior change
+(the non-blocking spec default).
 
 ### Added
 
