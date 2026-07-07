@@ -17,7 +17,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::Stream;
 
-use flux_core::{AudioFormat, Result};
+use flux_core::{AudioFormat, Result, Usage};
 
 use crate::ToolDef;
 
@@ -98,8 +98,15 @@ pub enum RealtimeEvent {
         /// JSON-encoded arguments object.
         arguments: String,
     },
-    /// The model finished a response.
-    ResponseDone,
+    /// The model finished a response. `usage` (C-38) is the response's token accounting, when the
+    /// provider reported one that parsed — `None` for a usage-less or malformed report (never a
+    /// stream error). **Deliberate breaking change** (pre-1.0): usage arrives atomically on
+    /// `response.done` rather than a parallel event, so a consumer never has to correlate two
+    /// callbacks per response.
+    ResponseDone {
+        /// This response's token usage, when reported.
+        usage: Option<Usage>,
+    },
     /// A provider error.
     Error {
         /// Provider error code, if any.
@@ -157,6 +164,18 @@ impl RealtimeConfig {
         self.tools = tools;
         self
     }
+
+    /// Set the voice name (e.g. `"alloy"`, `"verse"`).
+    pub fn with_voice(mut self, voice: impl Into<String>) -> Self {
+        self.voice = Some(voice.into());
+        self
+    }
+
+    /// Set the sampling temperature.
+    pub fn with_temperature(mut self, temperature: f32) -> Self {
+        self.temperature = Some(temperature);
+        self
+    }
 }
 
 /// How turn boundaries are detected.
@@ -179,4 +198,24 @@ pub enum TurnDetection {
     /// No detection — the client delimits turns via [`RealtimeSession::commit_audio`] +
     /// [`RealtimeSession::create_response`].
     None,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// C-38: the builders set exactly their own field, leaving the rest of `voice_agent`'s defaults
+    /// untouched, and chain like `with_tools`.
+    #[test]
+    fn with_voice_and_with_temperature_set_only_their_own_field() {
+        let cfg = RealtimeConfig::voice_agent("gpt-realtime", "be brief")
+            .with_voice("alloy")
+            .with_temperature(0.4);
+        assert_eq!(cfg.voice, Some("alloy".to_string()));
+        assert_eq!(cfg.temperature, Some(0.4));
+        // Untouched defaults from `voice_agent`.
+        assert_eq!(cfg.model, "gpt-realtime");
+        assert_eq!(cfg.system, Some("be brief".to_string()));
+        assert!(cfg.tools.is_empty());
+    }
 }

@@ -8,6 +8,8 @@ use futures::stream::{self, StreamExt};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
+use flux_core::{canonical_model_spec, Usage};
+use flux_events::{cost_summary, EventStore};
 use flux_provider::{RealtimeConnection, RealtimeEvent, RealtimeEventStream, RealtimeSession};
 use flux_runtime::{
     AllowApprover, Approver, DenyApprover, Executor, PermissionManager, Tool, ToolContext,
@@ -16,7 +18,9 @@ use flux_runtime::{
 use flux_spec::{Effect, Risk, ToolSpec};
 use flux_system::{System, Workspace};
 
-use super::{tool_defs_from_registry, VoiceSessionDriver, VoiceSink, VoiceTurnHandler};
+use super::{
+    tool_defs_from_registry, UsageRecording, VoiceSessionDriver, VoiceSink, VoiceTurnHandler,
+};
 
 // --- mock session --------------------------------------------------------------------------------
 
@@ -78,6 +82,7 @@ struct CaptureSink {
     tool_results: Vec<(String, bool)>, // (name, is_error)
     barge_ins: usize,
     audio_frames: usize,
+    usages: Vec<Option<Usage>>,
 }
 
 impl VoiceSink for CaptureSink {
@@ -92,6 +97,9 @@ impl VoiceSink for CaptureSink {
     }
     fn barge_in(&mut self) {
         self.barge_ins += 1;
+    }
+    fn response_done(&mut self, usage: Option<&Usage>) {
+        self.usages.push(usage.cloned());
     }
 }
 
@@ -199,7 +207,13 @@ async fn tool_call_routes_through_executor() {
             name: "echo".into(),
             arguments: json!({"text": "hello"}).to_string(),
         },
-        RealtimeEvent::ResponseDone,
+        RealtimeEvent::ResponseDone {
+            usage: Some(Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+                ..Default::default()
+            }),
+        },
     ]);
     let mut sink = CaptureSink::default();
     let log2 = log.clone();
@@ -213,6 +227,15 @@ async fn tool_call_routes_through_executor() {
     assert_eq!(
         log.tool_results,
         vec![("c1".to_string(), "hello".to_string())]
+    );
+    // The response's usage reached the sink via `response_done` (C-38).
+    assert_eq!(
+        sink.usages,
+        vec![Some(Usage {
+            input_tokens: 100,
+            output_tokens: 20,
+            ..Default::default()
+        })]
     );
     assert_eq!(sink.tool_calls, vec!["echo".to_string()]);
     assert_eq!(sink.tool_results, vec![("echo".to_string(), false)]);
@@ -264,7 +287,7 @@ async fn barge_in_disarms_pending_continuation() {
             arguments: json!({"text": "x"}).to_string(),
         },
         RealtimeEvent::SpeechStarted, // user interrupts while the tool is running
-        RealtimeEvent::ResponseDone,  // the cancelled response completes
+        RealtimeEvent::ResponseDone { usage: None }, // the cancelled response completes
     ]);
     let mut sink = CaptureSink::default();
     let log2 = log.clone();
@@ -302,7 +325,7 @@ async fn create_response_debounced() {
             name: "echo".into(),
             arguments: json!({"text": "b"}).to_string(),
         },
-        RealtimeEvent::ResponseDone,
+        RealtimeEvent::ResponseDone { usage: None },
     ]);
     let mut sink = CaptureSink::default();
     let log2 = log.clone();
@@ -329,7 +352,7 @@ async fn denied_tool_is_gated() {
             name: "boom".into(),
             arguments: json!({}).to_string(),
         },
-        RealtimeEvent::ResponseDone,
+        RealtimeEvent::ResponseDone { usage: None },
     ]);
     let mut sink = CaptureSink::default();
     let log2 = log.clone();
@@ -399,5 +422,100 @@ async fn flow_owns_two_voice_turns() {
     assert_eq!(
         log.lock().unwrap().spoken,
         vec!["what day?".to_string(), "booked for friday".to_string()]
+    );
+}
+
+// --- C-38: usage recording -------------------------------------------------------------------------
+
+/// End-to-end: a usage-bearing response appends exactly one `CallUsage` row stamped with the
+/// canonical model spec, a zero-usage response appends none, and `cost_summary` prices the
+/// resulting stream to the hand-computed dollar figure — proving the wire→driver→store→pricing
+/// chain, not just one link of it.
+#[tokio::test]
+async fn usage_recording_appends_one_row_and_cost_summary_prices_it() {
+    let exec = executor(Arc::new(AllowApprover), registry(Arc::new(EchoTool)));
+    let log = Arc::new(Mutex::new(SessionLog::default()));
+    let events = scripted(vec![
+        RealtimeEvent::ResponseStarted,
+        RealtimeEvent::ResponseDone {
+            usage: Some(Usage {
+                input_tokens: 1_000_000,
+                output_tokens: 500_000,
+                ..Default::default()
+            }),
+        },
+        RealtimeEvent::ResponseStarted,
+        RealtimeEvent::ResponseDone { usage: None }, // must not append a placeholder row
+    ]);
+    let session: Arc<dyn RealtimeSession> = Arc::new(MockSession { log });
+    let conn = RealtimeConnection { session, events };
+    let cancel = CancellationToken::new();
+    let mut sink = CaptureSink::default();
+
+    let store = Arc::new(EventStore::in_memory().unwrap());
+    let session_id = "s_voice_usage_test".to_string();
+    let model_spec = canonical_model_spec(Some("openai"), "gpt-realtime");
+    let driver = VoiceSessionDriver::new(exec).with_usage_recording(UsageRecording {
+        events: store.clone(),
+        session_id: session_id.clone(),
+        model_spec: model_spec.clone(),
+    });
+
+    let controller = {
+        let cancel = cancel.clone();
+        let store = store.clone();
+        let session_id = session_id.clone();
+        async move {
+            wait_until(move || {
+                store
+                    .load_stream(&session_id, None)
+                    .map(|evs| !evs.is_empty())
+                    .unwrap_or(false)
+            })
+            .await;
+            // Grace period so a hypothetical second (buggy) append from the zero-usage response
+            // would have landed before we assert.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            cancel.cancel();
+        }
+    };
+    tokio::join!(driver.run(conn, &mut sink, &cancel), controller);
+
+    let recorded = store.load_stream(&session_id, None).unwrap();
+    let usage_rows: Vec<_> = recorded
+        .iter()
+        .filter_map(|e| match &e.kind {
+            flux_events::EventKind::CallUsage { model, usage } => {
+                Some((model.clone(), usage.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        usage_rows.len(),
+        1,
+        "the zero-usage response must not append a row"
+    );
+    assert_eq!(usage_rows[0].0, model_spec);
+    assert_eq!(usage_rows[0].1.input_tokens, 1_000_000);
+    assert_eq!(usage_rows[0].1.output_tokens, 500_000);
+
+    // The usage also reached the sink's `response_done` for BOTH responses (Some, then None) —
+    // recording is additive to, not instead of, the existing sink callback.
+    assert_eq!(sink.usages.len(), 2);
+    assert!(sink.usages[0].is_some());
+    assert!(sink.usages[1].is_none());
+
+    // cost_summary prices the stream end-to-end: gpt-realtime bills $4.00/M input, $24.00/M output.
+    let pricing = flux_core::PricingTable::builtin();
+    let summary = cost_summary(&recorded, &pricing);
+    assert_eq!(summary.len(), 1);
+    let row = &summary[0];
+    assert_eq!(row.model, model_spec);
+    let money = row.cost.expect("gpt-realtime must price");
+    assert!(
+        (money.usd - 16.0).abs() < 1e-9,
+        "1.0·4.0 + 0.5·24.0 = 16.0, got {}",
+        money.usd
     );
 }

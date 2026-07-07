@@ -27,6 +27,10 @@
 #     credential-resolution HTTP responses — out of scope for the model-stream invariant, per A-36).
 #   - codex.rs: `is_terminal_event` and `CodexWsTransport::connect` (the WS terminal-event/kind
 #     sniffs — already tolerant via `.ok()`/`.unwrap_or(..)`) and its `mod tests` (fixture parsing).
+#   - realtime/event.rs: `ServerEvent::parse` (the WS frame parse — `client.rs`'s
+#     `if let Ok(ev) = ServerEvent::parse(&text)` already skips a malformed frame rather than
+#     failing the stream; the nested `response.done` usage parse, C-38, degrades to `None` via
+#     `.ok()` the same way) and its `mod tests` (fixture parsing).
 
 disallowed-methods = [
     { path = "serde_json::from_str", reason = "a bare parse can kill a chunk stream on bad provider bytes (docs/designs/stream-resilience.md) — use the tolerant skip+count+diagnostic pattern (see map_chat_stream/map_responses_stream/map_messages_stream_inner), or #[allow(clippy::disallowed_methods)] at the tightest scope for a legitimate inline-recovery/credential-path parse" },

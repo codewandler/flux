@@ -9,9 +9,11 @@ mod driver;
 mod sink;
 #[cfg(test)]
 mod tests;
+mod transcript;
 
-pub use driver::{VoiceSessionDriver, VoiceTurnHandler};
+pub use driver::{UsageRecording, VoiceSessionDriver, VoiceTurnHandler};
 pub use sink::VoiceSink;
+pub use transcript::TranscriptAccumulator;
 
 use flux_provider::ToolDef;
 use flux_runtime::ToolRegistry;

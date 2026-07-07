@@ -27,10 +27,13 @@ use flux_provider::realtime::{
 use flux_provider::TokenSource;
 
 use client::{connect_ws, RealtimeHandle};
-use config::{
-    default_model, ClientConfig, SessionConfig, Tool, TurnDetection as WireTurnDetection,
-};
+use config::{ClientConfig, SessionConfig, Tool, TurnDetection as WireTurnDetection};
 use event::{is_benign_cancel_race, ServerEvent};
+
+// The default model id (`connect` falls back to this when `RealtimeConfig::model` is empty) — a
+// consumer building its own `RealtimeConfig` wants the same default without duplicating the env var
+// name.
+pub use config::default_model;
 
 /// How the provider authenticates — an API key or a refreshing OAuth token source. Mirrors the
 /// HTTP `OpenAiCred` pattern; `Credential::apply` is reqwest-bound and useless against a tungstenite
@@ -226,7 +229,7 @@ fn map_event(ev: ServerEvent) -> Option<RealtimeEvent> {
         ServerEvent::SpeechStarted => RealtimeEvent::SpeechStarted,
         ServerEvent::SpeechStopped => RealtimeEvent::SpeechStopped,
         ServerEvent::ResponseCreated => RealtimeEvent::ResponseStarted,
-        ServerEvent::ResponseDone => RealtimeEvent::ResponseDone,
+        ServerEvent::ResponseDone(usage) => RealtimeEvent::ResponseDone { usage },
         ServerEvent::Error(v) => {
             if is_benign_cancel_race(&v) {
                 return None;
@@ -246,4 +249,40 @@ fn map_event(ev: ServerEvent) -> Option<RealtimeEvent> {
         // session.updated and any other event carry nothing the driver acts on.
         ServerEvent::SessionUpdated | ServerEvent::Other => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flux_core::Usage;
+
+    /// C-38: `map_event` threads a `response.done`'s usage through unchanged, both when present and
+    /// when absent — the provider-agnostic `RealtimeEvent::ResponseDone` carries exactly what the
+    /// wire `ServerEvent::ResponseDone` parsed.
+    #[test]
+    fn map_event_threads_response_done_usage_through() {
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 20,
+            ..Default::default()
+        };
+        match map_event(ServerEvent::ResponseDone(Some(usage.clone()))) {
+            Some(RealtimeEvent::ResponseDone { usage: mapped }) => {
+                assert_eq!(mapped, Some(usage));
+            }
+            other => panic!("expected ResponseDone, got {other:?}"),
+        }
+
+        match map_event(ServerEvent::ResponseDone(None)) {
+            Some(RealtimeEvent::ResponseDone { usage: None }) => {}
+            other => panic!("expected ResponseDone with no usage, got {other:?}"),
+        }
+    }
+
+    /// C-38: `default_model` is re-exported from the crate root of this module (the shape a
+    /// consumer building its own `RealtimeConfig` uses), not just an internal `config::` detail.
+    #[test]
+    fn default_model_is_reachable_via_the_module_reexport() {
+        assert!(!crate::realtime::default_model().is_empty());
+    }
 }

@@ -8,10 +8,28 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use flux_core::Usage;
+use flux_events::{EventKind, EventStore, NewEvent};
 use flux_provider::{RealtimeConnection, RealtimeEvent};
 use flux_runtime::{Executor, ToolResult};
 
 use super::sink::VoiceSink;
+
+/// Optional `CallUsage` persistence for a [`VoiceSessionDriver`] (C-38) — the voice analogue of the
+/// engine emitting one `EventKind::CallUsage` per provider call (see `flux-flow`'s engine). Configure
+/// via [`VoiceSessionDriver::with_usage_recording`]; every response that reports usage appends one
+/// un-turn-scoped row (voice sessions have no turns), so `cost_summary` prices a voice session
+/// exactly like a text one.
+pub struct UsageRecording {
+    /// The event log to append `CallUsage` rows to.
+    pub events: Arc<EventStore>,
+    /// The stream (session id) rows are appended under.
+    pub session_id: String,
+    /// The canonical attribution key (C-15) stamped on every row. Callers should build this with
+    /// `flux_core::canonical_model_spec(Some("openai"), model)` — `"openai"` names the realtime
+    /// family's provider, matching the C-15 convention every other call-site uses.
+    pub model_spec: String,
+}
 
 /// A flux-side handler that owns one voice **turn** — in production, a wrapper over
 /// `FlowEngine::run_turn` (the same `session_id` across turns accumulates the conversation) so a
@@ -28,12 +46,42 @@ pub trait VoiceTurnHandler: Send + Sync {
 /// a text agent's: there is no bypass.
 pub struct VoiceSessionDriver {
     executor: Arc<Executor>,
+    usage_recording: Option<UsageRecording>,
 }
 
 impl VoiceSessionDriver {
     /// Build a driver over a runtime executor.
     pub fn new(executor: Arc<Executor>) -> Self {
-        Self { executor }
+        Self {
+            executor,
+            usage_recording: None,
+        }
+    }
+
+    /// Enable `CallUsage` persistence for this driver's sessions (C-38) — see [`UsageRecording`].
+    pub fn with_usage_recording(mut self, rec: UsageRecording) -> Self {
+        self.usage_recording = Some(rec);
+        self
+    }
+
+    /// Persist one response's usage as an un-turn-scoped `CallUsage` row, when
+    /// [`Self::with_usage_recording`] configured it. Mirrors the engine's own zero-usage skip (no
+    /// placeholder rows for a token-less response, `usage.total() == 0`) and is non-fatal — a DB
+    /// hiccup must never break the audio loop.
+    fn record_usage(&self, usage: Option<&Usage>) {
+        let (Some(rec), Some(usage)) = (&self.usage_recording, usage) else {
+            return;
+        };
+        if usage.total() == 0 {
+            return;
+        }
+        let _ = rec.events.append(
+            &rec.session_id,
+            NewEvent::new(EventKind::CallUsage {
+                model: rec.model_spec.clone(),
+                usage: usage.clone(),
+            }),
+        );
     }
 
     /// Run the session until the event stream ends or `cancel` fires.
@@ -98,10 +146,11 @@ impl VoiceSessionDriver {
                             response_done = false;
                             response_had_tools = false;
                         }
-                        RealtimeEvent::ResponseDone => {
+                        RealtimeEvent::ResponseDone { usage } => {
                             response_active = false;
                             response_done = true;
-                            sink.response_done();
+                            self.record_usage(usage.as_ref());
+                            sink.response_done(usage.as_ref());
                         }
                         RealtimeEvent::ToolCall { call_id, name, arguments } => {
                             // Default malformed/empty args to an empty object (tools expect an object).
@@ -189,9 +238,10 @@ impl VoiceSessionDriver {
                             sink.barge_in();
                         }
                         RealtimeEvent::ResponseStarted => response_active = true,
-                        RealtimeEvent::ResponseDone => {
+                        RealtimeEvent::ResponseDone { usage } => {
                             response_active = false;
-                            sink.response_done();
+                            self.record_usage(usage.as_ref());
+                            sink.response_done(usage.as_ref());
                         }
                         // In engine mode the flow owns tools; the model is STT/TTS only.
                         RealtimeEvent::SpeechStopped

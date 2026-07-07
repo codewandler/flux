@@ -749,7 +749,7 @@ mod tests {
                     name,
                     arguments: json!({"day": "fri"}).to_string(),
                 },
-                RealtimeEvent::ResponseDone,
+                RealtimeEvent::ResponseDone { usage: None },
             ];
             let head = futures::stream::iter(events.into_iter().map(Ok::<_, flux_core::Error>));
             let events: RealtimeEventStream =

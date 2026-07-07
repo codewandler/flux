@@ -1,5 +1,6 @@
 //! The output half of a voice session.
 
+use flux_core::Usage;
 use flux_runtime::ToolResult;
 use serde_json::Value;
 
@@ -19,8 +20,11 @@ pub trait VoiceSink: Send {
     fn tool_call(&mut self, _name: &str, _input: &Value) {}
     /// A tool returned (after the envelope).
     fn tool_result(&mut self, _name: &str, _result: &ToolResult) {}
-    /// The model finished a response.
-    fn response_done(&mut self) {}
+    /// The model finished a response. `usage` (C-38) is this response's token accounting, when the
+    /// provider reported one that parsed — `None` for a usage-less or malformed report; never assume
+    /// it's always present. **Deliberate breaking change** (pre-1.0): the default no-op body keeps a
+    /// non-overriding implementor compiling.
+    fn response_done(&mut self, _usage: Option<&Usage>) {}
     /// A provider/session error.
     fn error(&mut self, _message: &str) {}
 }

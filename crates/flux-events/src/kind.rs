@@ -317,6 +317,41 @@ mod tests {
         );
     }
 
+    /// C-38: `Usage.audio_input_tokens`/`audio_output_tokens` are plain `#[serde(default)]` `u64`s
+    /// (unlike `reported_cost_usd`, always serialized — no `skip_serializing_if`) — a pre-C-38
+    /// `call_usage` row (neither key present anywhere in its JSON) must still decode with both
+    /// audio fields zeroed, and a fresh row with non-zero audio counts round-trips exactly.
+    #[test]
+    fn call_usage_decodes_pre_c38_rows_and_roundtrips_audio_tokens() {
+        // A raw pre-C-38 payload: no `audio_input_tokens`/`audio_output_tokens` key anywhere.
+        let pre_c38 = r#"{"kind":"call_usage","data":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"reasoning_tokens":0}}}"#;
+        let decoded: EventKind = serde_json::from_str(pre_c38).expect("pre-C-38 row must decode");
+        match decoded {
+            EventKind::CallUsage { usage, .. } => {
+                assert_eq!(usage.audio_input_tokens, 0, "absent key must default to 0");
+                assert_eq!(usage.audio_output_tokens, 0, "absent key must default to 0");
+            }
+            other => panic!("expected CallUsage, got {other:?}"),
+        }
+
+        // A new event WITH audio usage round-trips exactly.
+        let with_audio = EventKind::CallUsage {
+            model: "openai/gpt-realtime".to_string(),
+            usage: Usage {
+                input_tokens: 1000,
+                output_tokens: 200,
+                audio_input_tokens: 400,
+                audio_output_tokens: 150,
+                ..Default::default()
+            },
+        };
+        let json = serde_json::to_string(&with_audio).unwrap();
+        assert!(json.contains("audio_input_tokens"));
+        assert!(json.contains("audio_output_tokens"));
+        let round_tripped: EventKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped, with_audio);
+    }
+
     /// D-55: `Custom` is adjacently tagged exactly like every other variant
     /// (`{"kind":"custom","data":{...}}`, not internally tagged, not flattened) and round-trips its
     /// opaque `payload` byte-for-byte regardless of shape (object, array, scalar).

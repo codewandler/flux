@@ -156,6 +156,9 @@ impl From<WireUsage> for Usage {
             // Anthropic's wire usage folds thinking tokens into output_tokens with no separate
             // count, so there is no reasoning figure to map here.
             reasoning_tokens: 0,
+            // The Messages wire is text-only — no audio tokens to map (C-38).
+            audio_input_tokens: 0,
+            audio_output_tokens: 0,
             reported_cost_usd,
         }
     }

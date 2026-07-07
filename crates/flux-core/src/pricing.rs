@@ -2,10 +2,11 @@
 //!
 //! This module turns a [`Usage`] record plus a model id into a [`Money`] cost. It carries a
 //! built-in curated table of per-model, per-tier rates (input / output / cache-write / cache-read /
-//! reasoning, each a price **per 1,000,000 tokens**), and computes
+//! reasoning / audio-input / audio-output, each a price **per 1,000,000 tokens**), and computes
 //!
 //! ```text
-//! cost = (input·r_in + output·r_out + cache_write·r_cw + cache_read·r_cr + reasoning·r_re) / 1e6
+//! cost = (input·r_in + output·r_out + cache_write·r_cw + cache_read·r_cr + reasoning·r_re
+//!         + audio_input·r_ai + audio_output·r_ao) / 1e6
 //! ```
 //!
 //! It is deliberately pure: there is no IO here. The optional user override file
@@ -19,6 +20,14 @@
 //! output already covers reasoning at the output rate. The reasoning tier exists as a **surcharge**
 //! knob so a user (or a future provider) that prices reasoning apart from ordinary output can set a
 //! non-zero rate via `pricing.toml`.
+//!
+//! ## Audio tokens (C-38)
+//! `audio_input_tokens`/`audio_output_tokens` are likewise **subsets** of `input_tokens`/
+//! `output_tokens` (realtime voice-to-voice models report them as a split of the same totals, not
+//! extra tokens) — so `audio_input`/`audio_output` are **surcharge** tiers over `input`/`output`,
+//! exactly like `reasoning`. Every built-in row defaults them to `0.0` (audio bills as plain text);
+//! the `gpt-realtime` family is the only row that sets them, since it is the only provider that
+//! bills audio tokens apart from text.
 //!
 //! ## Subscription providers
 //! `claude` (Claude Max / Claude-Code OAuth) and `codex` (ChatGPT/Codex OAuth) bill against a flat
@@ -46,6 +55,16 @@ pub struct Rates {
     /// Reasoning tokens — a **surcharge** over `output`. Default `0.0` because reasoning is a subset
     /// of output and already billed at the output rate; set it non-zero only to price reasoning apart.
     pub reasoning: f64,
+    /// Audio-input tokens (C-38) — a **surcharge** over `input` per `audio_input_tokens` (already a
+    /// subset of `input_tokens`, already billed once at `input`). `0.0` (default, and every
+    /// pre-C-38 row) means audio bills as plain text. `#[serde(default)]` keeps existing serialized
+    /// rates and `~/.flux/pricing.toml` overrides decoding without this field.
+    #[serde(default)]
+    pub audio_input: f64,
+    /// Audio-output tokens (C-38) — a **surcharge** over `output` per `audio_output_tokens`. See
+    /// `audio_input`.
+    #[serde(default)]
+    pub audio_output: f64,
 }
 
 /// Where a [`Money`] figure came from (C-34).
@@ -85,6 +104,10 @@ pub struct RateOverride {
     pub cache_read: Option<f64>,
     #[serde(default)]
     pub reasoning: Option<f64>,
+    #[serde(default)]
+    pub audio_input: Option<f64>,
+    #[serde(default)]
+    pub audio_output: Option<f64>,
 }
 
 /// A price book: model id → per-tier [`Rates`]. Build the curated defaults with
@@ -255,11 +278,19 @@ impl PricingTable {
     /// - OpenRouter: <https://openrouter.ai/anthropic/claude-sonnet-4.6> and
     ///   <https://openrouter.ai/meta-llama/llama-3.3-70b-instruct>
     ///
+    /// `gpt-realtime`/`gpt-realtime-2` (C-38) verified separately against
+    /// <https://developers.openai.com/api/docs/pricing> on **2026-07-06**.
+    ///
     /// Cache tiers per vendor: Anthropic bills ephemeral (5-minute) cache writes at 1.25× input
     /// and cache reads at 0.1× input — both confirmed on the sheet; the 1-hour cache-write tier
     /// (2× input) is NOT modelled because flux never requests it. OpenAI has no cache-write tier —
     /// cached input is simply discounted (0.1× input on the current sheet) — so `cache_write`
     /// mirrors `input` there.
+    ///
+    /// Audio tiers (`audio_input`/`audio_output`, C-38): a **surcharge** over the text rate, since
+    /// `Usage::audio_input_tokens`/`audio_output_tokens` are subsets of `input_tokens`/
+    /// `output_tokens` and already billed once at the text rate via those terms — see
+    /// [`Usage`](crate::Usage) and [`PricingTable::cost`]'s doc comment.
     ///
     /// Known, deliberate approximations (the vendor sheet disagrees at the margin):
     /// - Bedrock regional/multi-region cross-region profiles (`us.`/`eu.`/`apac.`) carry a ~10%
@@ -280,6 +311,8 @@ impl PricingTable {
             cache_write: 6.25,
             cache_read: 0.50,
             reasoning: 0.0,
+            audio_input: 0.0,
+            audio_output: 0.0,
         };
         rates.insert("claude-opus-4-8".to_string(), opus);
         rates.insert("claude-opus-4-7".to_string(), opus);
@@ -291,6 +324,8 @@ impl PricingTable {
                 cache_write: 3.75,
                 cache_read: 0.30,
                 reasoning: 0.0,
+                audio_input: 0.0,
+                audio_output: 0.0,
             },
         );
         let haiku = Rates {
@@ -299,6 +334,8 @@ impl PricingTable {
             cache_write: 1.25,
             cache_read: 0.10,
             reasoning: 0.0,
+            audio_input: 0.0,
+            audio_output: 0.0,
         };
         rates.insert("claude-haiku-4-5-20251001".to_string(), haiku);
         rates.insert("claude-haiku-4-5".to_string(), haiku);
@@ -316,6 +353,8 @@ impl PricingTable {
                 cache_write: 3.75,
                 cache_read: 0.30,
                 reasoning: 0.0,
+                audio_input: 0.0,
+                audio_output: 0.0,
             },
         );
         rates.insert("anthropic.claude-opus-4-6-v1".to_string(), opus);
@@ -331,6 +370,8 @@ impl PricingTable {
             cache_write: 1.25,
             cache_read: 0.125,
             reasoning: 0.0,
+            audio_input: 0.0,
+            audio_output: 0.0,
         };
         rates.insert("gpt-5".to_string(), gpt5);
         rates.insert(
@@ -341,6 +382,8 @@ impl PricingTable {
                 cache_write: 5.0,
                 cache_read: 0.50,
                 reasoning: 0.0,
+                audio_input: 0.0,
+                audio_output: 0.0,
             },
         );
         // Legacy alias: the `codex` provider resolves `*-codex` → `gpt-5.5` before cost, but keep the
@@ -348,6 +391,28 @@ impl PricingTable {
         // ESTIMATED: delisted from OpenAI's current sheet; kept at its last published list price
         // (which matched gpt-5), the rate historical events with the raw legacy id actually ran at.
         rates.insert("gpt-5-codex".to_string(), gpt5);
+
+        // --- OpenAI Realtime (gpt-realtime family; voice-to-voice, C-38) --------------------------
+        // Sheet as of 2026-07-06 (https://developers.openai.com/api/docs/pricing): text $4.00 in /
+        // $0.40 cached / $24.00 out; audio $32.00 in / $0.40 cached / $64.00 out. `cache_write`
+        // mirrors `input` (no OpenAI cache-write tier, same convention as gpt-5/gpt-5.5 above). The
+        // `audio_input`/`audio_output` surcharges are the audio-over-text delta ($32-$4=$28 in,
+        // $64-$24=$40 out) — the subset fields are already billed once at the text rate via the
+        // parent `input`/`output` terms, so the surcharge tops that up to the audio rate rather than
+        // billing audio twice. Cached audio folds into `cache_read` at the same $0.40 as cached
+        // text — exact for this family (would diverge for a hypothetical tier with a different
+        // cached-audio rate; documented approximation).
+        let gpt_realtime = Rates {
+            input: 4.0,
+            output: 24.0,
+            cache_write: 4.0,
+            cache_read: 0.40,
+            reasoning: 0.0,
+            audio_input: 28.0,
+            audio_output: 40.0,
+        };
+        rates.insert("gpt-realtime".to_string(), gpt_realtime);
+        rates.insert("gpt-realtime-2".to_string(), gpt_realtime);
 
         // --- OpenRouter passthrough models (keyed by the OpenRouter model id, slash and all) -------
         rates.insert(
@@ -358,6 +423,8 @@ impl PricingTable {
                 cache_write: 3.75,
                 cache_read: 0.30,
                 reasoning: 0.0,
+                audio_input: 0.0,
+                audio_output: 0.0,
             },
         );
         // ESTIMATED: multi-provider routed — the OpenRouter listed price as of 2026-07-02; the
@@ -371,6 +438,8 @@ impl PricingTable {
                 cache_write: 0.10,
                 cache_read: 0.10,
                 reasoning: 0.0,
+                audio_input: 0.0,
+                audio_output: 0.0,
             },
         );
 
@@ -429,7 +498,9 @@ impl PricingTable {
             + usage.output_tokens as f64 * r.output
             + usage.cache_creation_input_tokens as f64 * r.cache_write
             + usage.cache_read_input_tokens as f64 * r.cache_read
-            + usage.reasoning_tokens as f64 * r.reasoning)
+            + usage.reasoning_tokens as f64 * r.reasoning
+            + usage.audio_input_tokens as f64 * r.audio_input
+            + usage.audio_output_tokens as f64 * r.audio_output)
             / 1_000_000.0;
         Some(Money {
             usd,
@@ -450,6 +521,8 @@ impl PricingTable {
             cache_write: ov.cache_write.unwrap_or(base.cache_write),
             cache_read: ov.cache_read.unwrap_or(base.cache_read),
             reasoning: ov.reasoning.unwrap_or(base.reasoning),
+            audio_input: ov.audio_input.unwrap_or(base.audio_input),
+            audio_output: ov.audio_output.unwrap_or(base.audio_output),
         };
         self.rates.insert(model.to_string(), merged);
     }
@@ -466,8 +539,8 @@ mod tests {
 
     #[test]
     fn cost_applies_per_tier_rates() {
-        // A bespoke table with a distinct, non-zero rate on every tier — including reasoning — so the
-        // per-tier multiplication is unambiguous.
+        // A bespoke table with a distinct, non-zero rate on every tier — including reasoning and
+        // (C-38) the audio surcharges — so the per-tier multiplication is unambiguous.
         let mut table = PricingTable::default();
         table.set(
             "test-model",
@@ -477,6 +550,8 @@ mod tests {
                 cache_write: 6.0,
                 cache_read: 1.0,
                 reasoning: 8.0,
+                audio_input: 10.0,
+                audio_output: 20.0,
             },
         );
 
@@ -486,11 +561,14 @@ mod tests {
             cache_creation_input_tokens: 200_000,
             cache_read_input_tokens: 2_000_000,
             reasoning_tokens: 100_000,
+            audio_input_tokens: 50_000,
+            audio_output_tokens: 25_000,
             ..Default::default()
         };
-        // 1.0·2 + 0.5·4 + 0.2·6 + 2.0·1 + 0.1·8 = 2 + 2 + 1.2 + 2 + 0.8 = 8.0
+        // 1.0·2 + 0.5·4 + 0.2·6 + 2.0·1 + 0.1·8 + 0.05·10 + 0.025·20
+        // = 2 + 2 + 1.2 + 2 + 0.8 + 0.5 + 0.5 = 9.0
         let money = table.cost(&usage, "test-model").unwrap();
-        assert!((money.usd - 8.0).abs() < 1e-9, "got {}", money.usd);
+        assert!((money.usd - 9.0).abs() < 1e-9, "got {}", money.usd);
         assert!(!money.subscription);
 
         // Unknown model → None, no panic.
@@ -672,6 +750,11 @@ mod tests {
                 r.reasoning, 0.0,
                 "{model}: reasoning is a surcharge tier, 0.0 in every built-in row"
             );
+            assert_eq!(
+                (r.audio_input, r.audio_output),
+                (0.0, 0.0),
+                "{model}: audio is a surcharge tier, 0.0 in every non-realtime built-in row"
+            );
         };
 
         // Anthropic (5-minute ephemeral cache: write = 1.25x input, read = 0.1x input).
@@ -694,6 +777,54 @@ mod tests {
         // OpenRouter passthrough + the listed llama price as of 2026-07-02 (floats across routes).
         pin("anthropic/claude-sonnet-4.6", 3.0, 15.0, 3.75, 0.30);
         pin("meta-llama/llama-3.3-70b-instruct", 0.10, 0.32, 0.10, 0.10);
+    }
+
+    /// C-38: the `gpt-realtime` family's headline rates, INCLUDING the audio surcharges — pinned
+    /// separately from [`builtin_pins_vendor_verified_headline_rates`] since it's the only built-in
+    /// row where `audio_input`/`audio_output` are non-zero. Verified against
+    /// <https://developers.openai.com/api/docs/pricing> on 2026-07-06.
+    #[test]
+    fn builtin_pins_gpt_realtime_audio_surcharges() {
+        let t = PricingTable::builtin();
+        for model in ["gpt-realtime", "gpt-realtime-2"] {
+            let r = t
+                .rates_for(model)
+                .unwrap_or_else(|| panic!("{model} must be in the builtin table"));
+            assert_eq!(
+                (r.input, r.output, r.cache_write, r.cache_read, r.reasoning),
+                (4.0, 24.0, 4.0, 0.40, 0.0),
+                "{model}: text tiers"
+            );
+            assert_eq!(
+                (r.audio_input, r.audio_output),
+                (28.0, 40.0),
+                "{model}: audio surcharge = audio rate ($32/$64) minus text rate ($4/$24)"
+            );
+        }
+    }
+
+    /// C-38: a realistic mixed text/audio/cached call on the built-in `gpt-realtime` row prices to a
+    /// hand-computed dollar figure — proves the surcharge terms actually reach `cost()`'s dot
+    /// product (not just that the rate row carries the right numbers).
+    #[test]
+    fn builtin_gpt_realtime_prices_mixed_audio_usage() {
+        let t = PricingTable::builtin();
+        let usage = Usage {
+            input_tokens: 1_000_000, // fresh text input
+            output_tokens: 500_000,  // total output (incl. the audio subset below)
+            cache_read_input_tokens: 200_000,
+            audio_input_tokens: 100_000, // subset of input_tokens
+            audio_output_tokens: 50_000, // subset of output_tokens
+            ..Default::default()
+        };
+        // input 1.0·4.0 + output 0.5·24.0 + cache_read 0.2·0.40
+        // + audio_input 0.1·28.0 + audio_output 0.05·40.0
+        // = 4.0 + 12.0 + 0.08 + 2.8 + 2.0 = 20.88
+        let money = t
+            .cost(&usage, "gpt-realtime")
+            .expect("gpt-realtime must price");
+        assert!((money.usd - 20.88).abs() < 1e-9, "got {}", money.usd);
+        assert!(!money.subscription);
     }
 
     #[test]
@@ -859,5 +990,27 @@ mod tests {
         // Other tiers are untouched.
         assert_eq!(after.output, before.output);
         assert_eq!(after.cache_read, before.cache_read);
+    }
+
+    /// C-38: the audio surcharge tiers fold through `apply_override`/`RateOverride` exactly like
+    /// every other tier — partial (only the overridden field moves) and available on a model the
+    /// built-in table already has a row for.
+    #[test]
+    fn apply_override_folds_audio_surcharges() {
+        let mut table = PricingTable::builtin();
+        let before = *table.rates_for("gpt-realtime").unwrap();
+
+        table.apply_override(
+            "gpt-realtime",
+            &RateOverride {
+                audio_input: Some(50.0),
+                ..Default::default()
+            },
+        );
+        let after = *table.rates_for("gpt-realtime").unwrap();
+        assert_eq!(after.audio_input, 50.0);
+        // Untouched tiers, including the other audio surcharge, keep their built-in values.
+        assert_eq!(after.audio_output, before.audio_output);
+        assert_eq!(after.input, before.input);
     }
 }

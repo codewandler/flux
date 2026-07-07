@@ -28,6 +28,17 @@ pub struct Usage {
     /// (written before this field existed) decodable.
     #[serde(default)]
     pub reasoning_tokens: u64,
+    /// Audio-input tokens for this call (realtime voice-to-voice models, C-38) — a **subset of
+    /// `input_tokens`** (the fresh, non-cached portion; cached audio folds into
+    /// `cache_read_input_tokens` — see `flux_core::pricing`). Deliberately **not** added in
+    /// [`Self::total`] / [`Self::context_tokens`], mirroring `reasoning_tokens`. `#[serde(default)]`
+    /// keeps old event logs (written before this field existed) decodable.
+    #[serde(default)]
+    pub audio_input_tokens: u64,
+    /// Audio-output tokens generated this call (C-38) — a **subset of `output_tokens`**. Mirrors
+    /// `audio_input_tokens`.
+    #[serde(default)]
+    pub audio_output_tokens: u64,
     /// The provider's own dollar figure for this call (C-34), when it reports one (OpenRouter's
     /// `cost` field on both wires; `None` for providers that don't report — e.g. direct
     /// Anthropic/OpenAI/Bedrock). When present, [`PricingTable::cost`](crate::PricingTable::cost)
@@ -66,10 +77,12 @@ impl Usage {
     pub fn accumulate(&mut self, call: &Usage) {
         self.output_tokens += call.output_tokens;
         self.reasoning_tokens += call.reasoning_tokens;
+        self.audio_output_tokens += call.audio_output_tokens;
         if call.context_tokens() > 0 {
             self.input_tokens = call.input_tokens;
             self.cache_read_input_tokens = call.cache_read_input_tokens;
             self.cache_creation_input_tokens = call.cache_creation_input_tokens;
+            self.audio_input_tokens = call.audio_input_tokens;
         }
         // Reported cost is spend, not a snapshot — like output tokens, every call's slice adds to
         // the turn total. A call that doesn't report cost (`None`) leaves the accumulator
@@ -222,5 +235,54 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(never_reported.reported_cost_usd, None);
+    }
+
+    /// C-38: `audio_output_tokens` sums across calls like `reasoning_tokens`; `audio_input_tokens`
+    /// replaces alongside the other prompt-side counts (inside the same `context_tokens() > 0`
+    /// gate), so a usage-less follow-up can't zero an already-recorded audio-input count. Both are
+    /// subsets of `input_tokens`/`output_tokens`, so they never move `total()`/`context_tokens()`.
+    #[test]
+    fn usage_accumulate_folds_audio() {
+        let mut acc = Usage::default();
+
+        // First call: 100 input tokens (40 of them audio), 30 output tokens (12 audio).
+        acc.accumulate(&Usage {
+            input_tokens: 100,
+            output_tokens: 30,
+            audio_input_tokens: 40,
+            audio_output_tokens: 12,
+            ..Default::default()
+        });
+        // Second call re-sends a larger (still partly audio) prompt, generates more audio output.
+        acc.accumulate(&Usage {
+            input_tokens: 150,
+            output_tokens: 20,
+            audio_input_tokens: 60,
+            audio_output_tokens: 8,
+            ..Default::default()
+        });
+
+        // Output-side audio sums across calls.
+        assert_eq!(acc.audio_output_tokens, 20);
+        // Prompt-side audio is replaced by the latest call, like input_tokens itself.
+        assert_eq!(acc.audio_input_tokens, 60);
+        assert_eq!(acc.input_tokens, 150);
+
+        // Audio is a subset of input/output, so it never perturbs total()/context_tokens().
+        assert_eq!(acc.total(), 150 + 50);
+        assert_eq!(acc.context_tokens(), 150);
+
+        // A usage-less follow-up sums the output-side audio but must not zero the replaced
+        // prompt-side audio count.
+        acc.accumulate(&Usage {
+            output_tokens: 5,
+            audio_output_tokens: 3,
+            ..Default::default()
+        });
+        assert_eq!(acc.audio_output_tokens, 23);
+        assert_eq!(
+            acc.audio_input_tokens, 60,
+            "usage-less call must not zero it"
+        );
     }
 }
