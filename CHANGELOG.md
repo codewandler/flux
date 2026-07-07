@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-07
+
 **Postgres storage backend (opt-in): a shared, durable, multi-writer-safe home for the two
 persistence primitives server deployments run against — the unified event log and the datasource
 record store.** Embedded SQLite stays the default and the default build is entirely DB-free; a
