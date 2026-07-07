@@ -2,7 +2,7 @@
 id: A-54
 title: Addressable tasks — task-state projection, non-blocking send, server-side tasks/get
 pillar: Agent
-status: backlog
+status: done
 epic: a2a-conformance
 design: docs/designs/a2a-stateful-task-model.md
 note: "Tier-3 foundation: everything else (cancel/resubscribe/push) builds on retained, addressable tasks"
@@ -36,8 +36,34 @@ builds on.
       observes it reach `completed`; a blocking send is unchanged; `tasks/get` on an unknown id is
       `-32001`; a cross-realm `tasks/get` is `-32001` (not distinguishable from unknown).
 
+## Progress
+- 2026-07-08 — done. `Task` projection = `project_task`/`project_stored_task` in
+  `crates/flux-server/src/a2a.rs`: registry-first (live state), else a fold over the engine's own
+  `turn_started`/`turn_ended` events (no second store; `cancelled`→canceled, `error`→failed,
+  else completed; started-without-ended → optimistic `working` for cross-replica truthfulness;
+  no turn events → `submitted`), realm-scoped exactly like the conversation projection (non-A2A
+  and cross-realm ids = constant `-32001`). Non-blocking `message/send` (spec default; shared
+  `flux_a2a::server::blocking_requested`) answers `submitted`+id immediately and drives the turn
+  via `run_background` (gate → `enter_turn` identity swap → working → `run_turn_cancellable` →
+  terminal transition). Blocking fast path preserved (same completed-Task shape; existing tests
+  now opt in via `blocking: true`). Server-side `tasks/get` wired through the shared
+  `dispatch_rpc` (single + multi mounts). **C-29 generalized:** every A2A run (blocking,
+  streaming, non-blocking) registers in the new in-process `TaskRegistry` under ONE lock hold
+  with the mint + TTL sweep (`mint_and_register`), and the sweep excludes live tasks via the new
+  `EventStore::prune_inactive_excluding` — non-blocking mints made mid-turn sweeps possible, so
+  the gate-held-mint rule alone no longer protects queued/running sessions. Realm for non-turn
+  ops/mint = new `crate::caller_realm` (documented narrow relaxation of the D-69 coupling; the
+  swap still happens gate-held before any turn). Tests: conformance
+  (`non_blocking_send_returns_submitted_then_get_observes_completed`,
+  `tasks_get_unknown_and_non_a2a_ids_are_not_found`, multi-mount `tasks/get`) + principal-mode
+  `task_surface_is_realm_scoped_with_constant_not_found`. NOT a breaking signature change in the
+  end (registry is internal state) — but the non-blocking DEFAULT is a wire-behavior change →
+  minor bump.
+
 ## Notes
 - `input-required`/`auth-required` (resume-on-`taskId` via the suspend/resume seam) rides this story's
-  async model; split it out if the resume seam proves large.
-- Likely a minor bump (router/serve `State` gains a task store). Epic:
-  [a2a-conformance](../designs/a2a-conformance.md).
+  async model; split it out if the resume seam proves large. **Still open after this story — the
+  one remaining Tier-3 slice.**
+- One context runs one task at a time (task id = session id): a concurrent second send on a live
+  context is refused with a clear error; blocking sends queue on the gate as before.
+- Epic: [a2a-conformance](../designs/a2a-conformance.md).

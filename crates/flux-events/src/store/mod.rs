@@ -118,7 +118,20 @@ trait EventBackend: Send + Sync {
     ) -> Result<Option<String>>;
     fn children_of(&self, stream: &str) -> Result<Vec<String>>;
     fn prune_empty(&self) -> Result<usize>;
-    fn prune_inactive(&self, agent_id: &str, cutoff_ms: i64) -> Result<usize>;
+    fn prune_inactive(&self, agent_id: &str, cutoff_ms: i64) -> Result<usize> {
+        self.prune_inactive_excluding(agent_id, cutoff_ms, &[])
+    }
+    /// [`prune_inactive`](Self::prune_inactive) with a keep-list: a stream in `keep` is never
+    /// pruned even when expired. The A2A surface passes its in-process live-task ids (A-54): a
+    /// task queued behind the single-turn gate has a frozen `updated_at`, so without the
+    /// exclusion a long queue could look expired to a concurrent request's mint-time sweep —
+    /// the C-29 hazard, re-opened by non-blocking sends minting before the gate.
+    fn prune_inactive_excluding(
+        &self,
+        agent_id: &str,
+        cutoff_ms: i64,
+        keep: &[String],
+    ) -> Result<usize>;
     fn append(&self, stream: &str, ev: NewEvent) -> Result<StoredEvent>;
     fn load_stream(&self, stream: &str, after_seq: Option<i64>) -> Result<Vec<StoredEvent>>;
     fn load_by_kind(&self, stream: &str, kind: &str) -> Result<Vec<StoredEvent>>;
@@ -332,6 +345,22 @@ impl EventStore {
     ///   stream survives even when it was created long before the cutoff.
     pub fn prune_inactive(&self, agent_id: &str, cutoff_ms: i64) -> Result<usize> {
         self.backend().prune_inactive(agent_id, cutoff_ms)
+    }
+
+    /// [`prune_inactive`](Self::prune_inactive) with a keep-list: a stream named in `keep` is never
+    /// pruned even when its `updated_at` is past the cutoff. The A2A surface passes its in-process
+    /// live-task ids (A-54): a non-blocking task queued behind the single-turn gate has a frozen
+    /// `updated_at`, so without the exclusion a long queue could look expired to a *concurrent*
+    /// request's mint-time sweep and be pruned out from under the queue — the C-29 hazard, re-opened
+    /// by minting before the gate. Ids that don't parse as `s_<n>` are ignored (nothing to protect).
+    pub fn prune_inactive_excluding(
+        &self,
+        agent_id: &str,
+        cutoff_ms: i64,
+        keep: &[String],
+    ) -> Result<usize> {
+        self.backend()
+            .prune_inactive_excluding(agent_id, cutoff_ms, keep)
     }
 
     /// D-75: delete **every** stream (registry row + its whole event stream) whose last activity
@@ -1305,6 +1334,41 @@ mod tests {
         assert_eq!(store.prune_inactive("a2a", cutoff).unwrap(), 0);
     }
 
+    fn prune_inactive_excluding_protects_the_keep_list(store: &EventStore) {
+        let a2a = EventContext {
+            agent_id: Some("a2a".into()),
+            ..Default::default()
+        };
+        // Two a2a sessions that will both look expired…
+        let queued = store.create_session_with_context("m", &a2a).unwrap();
+        let stale = store.create_session_with_context("m", &a2a).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let cutoff = now_ms();
+        // …but `queued` is on the keep-list (an in-process task merely queued behind the turn
+        // gate, A-54), so only `stale` is swept.
+        assert_eq!(
+            store
+                .prune_inactive_excluding("a2a", cutoff, std::slice::from_ref(&queued))
+                .unwrap(),
+            1
+        );
+        assert!(store.info(&queued).is_ok(), "kept session survives");
+        assert!(store.info(&stale).is_err(), "unprotected session is swept");
+        // An empty keep-list behaves exactly like `prune_inactive` (sweeps the remainder)…
+        assert_eq!(
+            store.prune_inactive_excluding("a2a", cutoff, &[]).unwrap(),
+            1
+        );
+        assert!(store.info(&queued).is_err());
+        // …and a non-`s_<n>` id on the keep-list is ignored, never an error.
+        assert_eq!(
+            store
+                .prune_inactive_excluding("a2a", cutoff, &["audit-x".into()])
+                .unwrap(),
+            0
+        );
+    }
+
     fn roles_round_trip_through_the_conversation(store: &EventStore) {
         let id = store.create_session("m").unwrap();
         store.record_message(&id, &Message::user_text("q")).unwrap();
@@ -1839,6 +1903,7 @@ mod tests {
         sqlite_case!(cost_summary_for_account_scopes_and_sums_through_the_shared_fold);
         sqlite_case!(prune_empty_removes_zero_message_sessions);
         sqlite_case!(prune_inactive_deletes_only_expired_streams_with_the_tag);
+        sqlite_case!(prune_inactive_excluding_protects_the_keep_list);
         sqlite_case!(roles_round_trip_through_the_conversation);
         sqlite_case!(append_is_transactional_and_sequences_monotonically);
         sqlite_case!(run_events_and_turn_telemetry_share_the_log);
@@ -1972,6 +2037,7 @@ mod tests {
         pg_case!(cost_summary_for_account_scopes_and_sums_through_the_shared_fold);
         pg_case!(prune_empty_removes_zero_message_sessions);
         pg_case!(prune_inactive_deletes_only_expired_streams_with_the_tag);
+        pg_case!(prune_inactive_excluding_protects_the_keep_list);
         pg_case!(roles_round_trip_through_the_conversation);
         pg_case!(append_is_transactional_and_sequences_monotonically);
         pg_case!(run_events_and_turn_telemetry_share_the_log);

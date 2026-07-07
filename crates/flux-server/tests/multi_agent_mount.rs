@@ -33,7 +33,12 @@ fn send_body(text: &str, context_id: Option<&str>) -> Value {
     if let Some(cid) = context_id {
         message["contextId"] = json!(cid);
     }
-    json!({ "jsonrpc": "2.0", "id": 1, "method": "message/send", "params": { "message": message } })
+    // Blocking send: these tests assert the synchronous completed-Task shape (A-54 makes
+    // non-blocking the default).
+    json!({
+        "jsonrpc": "2.0", "id": 1, "method": "message/send",
+        "params": { "message": message, "configuration": { "blocking": true } },
+    })
 }
 
 async fn get_json(app: Router, path: &str) -> (StatusCode, Value) {

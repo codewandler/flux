@@ -6,8 +6,19 @@
 //!   `POST /a2a`                         — JSON-RPC 2.0 dispatcher
 //!
 //! Supported methods (current A2A spec):
-//! - `message/send`   — run one flux turn, return the resulting `Task` synchronously
+//! - `message/send`   — run one flux turn; `configuration.blocking: true` returns the finished
+//!   `Task` synchronously, otherwise (the spec default) a `submitted` task returns immediately
+//!   and the turn runs in the background (A-54)
 //! - `message/stream` — run one flux turn, stream `TaskStatusUpdate` events as Server-Sent Events
+//! - `tasks/get`         — poll a live or retained task to its current state (A-54)
+//! - `tasks/cancel`      — fire a live task's cancellation out-of-band (A-55)
+//! - `tasks/resubscribe` — re-attach an SSE stream to a live or retained task (A-56)
+//! - `tasks/pushNotificationConfig/{set,get,list,delete}` — per-task webhooks (A-57)
+//!
+//! **The task model (A-53 design):** task id = the flux session id; a `Task` is a *projection*
+//! over the session's own turn-lifecycle events (no second store), realm-scoped like every A2A
+//! lookup; an in-process [`TaskRegistry`] holds the live runs' cancellation/broadcast handles and
+//! the sweep keep-list. See `docs/designs/a2a-stateful-task-model.md`.
 //!
 //! The wire shapes come from the shared [`flux_a2a`] types, so client and server agree on one
 //! definition. **Stateful A2A mode (A-48): one session per `contextId`** — a request whose
@@ -29,7 +40,9 @@
 //! `streams`), but its already-tagged registry row is gone, so every future append to its stream
 //! becomes an orphaned, unenumerable event row and its spend drops out of the usage rollups.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
+use std::pin::Pin;
 
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
@@ -43,6 +56,7 @@ use tokio_util::sync::CancellationToken;
 
 use flux_a2a::{error, server};
 use flux_a2a::{AgentCard, Message, Task, TaskState, TaskStatus};
+use flux_events::EventKind;
 use flux_flow::AgentSink;
 
 use std::sync::Arc;
@@ -57,39 +71,16 @@ use crate::{A2aTtl, AgentResolver, CardInfo, Shared, TurnGate};
 /// is scoped to exactly this tag, so a CLI/TUI session (empty context) is never eligible.
 pub(crate) const A2A_AGENT_ID: &str = "a2a";
 
-/// Resolve the session for one A2A task: sweep expired A2A sessions first (the lazy TTL pass),
-/// then **reuse the live session whose correlation id equals the request's `contextId`** (A-48
-/// stateful mode) or create a new one tagged `agent_id = "a2a"` with that `contextId` (if any) as
-/// the correlation id. Sweep-before-lookup means an expired conversation is never resumed: its
-/// session is gone, so the same `contextId` mints a fresh session that becomes the new
-/// continuation target.
-///
-/// Callers MUST hold the `turn_gate` before calling this (C-29): minting ahead of the gate would
-/// let a session sit queued — alive but idle, its `updated_at` frozen at mint — where a *different*
-/// concurrent request's mint-time sweep (this same lazy pass) could prune it before it ever gets
-/// its turn. Minting inside the gate closes that window: a session's lifetime never has a
-/// queued-but-unswept-safe gap, because mint and run happen back to back under one gate hold.
-///
-/// The sweep runs lazily per request rather than on a background timer in `serve_on`, because:
-/// (a) it then covers *every* mount of [`crate::router`] — the standalone server and the `a2a`
-/// channel (which serves the router itself) — with no per-caller wiring; (b) growth only happens
-/// when tasks arrive, so sweeping at mint time bounds the registry exactly where it can grow (an
-/// idle server accretes nothing, so nothing goes stale while idle); and (c) it needs no
-/// background-task lifecycle/shutdown handling. The pass is one indexed query over `streams`
-/// plus a whole-stream delete per expired session — negligible next to the model turn it precedes.
-fn create_a2a_session(
+/// Resolve the session for one A2A task: **reuse the live session whose correlation id equals the
+/// request's `contextId`** (A-48 stateful mode) or create a new one tagged `agent_id = "a2a"` with
+/// that `contextId` (if any) as the correlation id. This is the find-or-mint half only — call it
+/// through [`mint_and_register`], which couples it to the TTL sweep and the live-task registration
+/// under one registry lock hold (the C-29 protection for the async era).
+fn find_or_mint_session(
     engine: &Shared,
-    ttl: A2aTtl,
     context_id: Option<&str>,
     realm: Option<&str>,
 ) -> flux_core::Result<String> {
-    let pruned = prune_expired_a2a_sessions_at(&engine.events, ttl.0, now_ms());
-    if pruned > 0 {
-        eprintln!(
-            "(a2a: pruned {pruned} expired session(s) past the {}s TTL)",
-            ttl.0
-        );
-    }
     if let Some(cid) = context_id {
         // `contextId` is a grouping key, NOT a security boundary (A2A spec) — in principal mode
         // (`realm` set) continuity is keyed within the caller's realm, so the same `contextId`
@@ -116,14 +107,24 @@ fn create_a2a_session(
         .create_session_with_context(&engine.model, &ctx)
 }
 
-/// Sweep A2A-tagged sessions whose last activity is more than `ttl_secs` old, as of `now_ms`.
-/// `ttl_secs == 0` disables pruning entirely (the documented `[server] a2a_session_ttl_secs = 0`).
-/// Non-fatal by design: a failed sweep logs and returns 0 — it must never block the task that
-/// triggered it. Returns the number of sessions pruned.
+/// Sweep A2A-tagged sessions whose last activity is more than `ttl_secs` old, as of `now_ms` —
+/// except the streams named in `keep` (the in-process live tasks, A-54). `ttl_secs == 0` disables
+/// pruning entirely (the documented `[server] a2a_session_ttl_secs = 0`). Non-fatal by design: a
+/// failed sweep logs and returns 0 — it must never block the task that triggered it. Returns the
+/// number of sessions pruned.
+///
+/// The sweep runs lazily per mint rather than on a background timer in `serve_on`, because:
+/// (a) it then covers *every* mount of [`crate::router`] — the standalone server and the `a2a`
+/// channel (which serves the router itself) — with no per-caller wiring; (b) growth only happens
+/// when tasks arrive, so sweeping at mint time bounds the registry exactly where it can grow (an
+/// idle server accretes nothing, so nothing goes stale while idle); and (c) it needs no
+/// background-task lifecycle/shutdown handling. The pass is one indexed query over `streams`
+/// plus a whole-stream delete per expired session — negligible next to the model turn it precedes.
 pub(crate) fn prune_expired_a2a_sessions_at(
     events: &flux_events::EventStore,
     ttl_secs: u64,
     now_ms: i64,
+    keep: &[String],
 ) -> usize {
     if ttl_secs == 0 {
         return 0;
@@ -131,7 +132,7 @@ pub(crate) fn prune_expired_a2a_sessions_at(
     let ttl_ms = i64::try_from(ttl_secs)
         .unwrap_or(i64::MAX)
         .saturating_mul(1000);
-    match events.prune_inactive(A2A_AGENT_ID, now_ms.saturating_sub(ttl_ms)) {
+    match events.prune_inactive_excluding(A2A_AGENT_ID, now_ms.saturating_sub(ttl_ms), keep) {
         Ok(n) => n,
         Err(e) => {
             eprintln!("(a2a session sweep failed: {e})");
@@ -146,6 +147,210 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+// ── Live-task registry (A-54/A-55/A-56/A-57) ─────────────────────────────────
+
+/// One in-process live A2A task: the handles `tasks/cancel` and `tasks/resubscribe` need while a
+/// run is queued or in flight. Terminal tasks have no entry — they are served purely from the
+/// event-log projection ([`project_stored_task`]), so a restart still answers `tasks/get` for
+/// finished work; only *live* cancel/resubscribe require the run to be in-process.
+struct LiveTask {
+    state: TaskState,
+    /// The realm the task was minted in (D-69). Every registry lookup is realm-checked; a
+    /// mismatch answers exactly like an unknown id (`-32001`), never a distinguishable "exists
+    /// but forbidden".
+    realm: Option<String>,
+    context_id: String,
+    /// Fired by `tasks/cancel` (A-55) or the owning SSE stream's disconnect drop-guard; observed
+    /// between plan rounds by `run_turn_cancellable`.
+    cancel: CancellationToken,
+    /// Live status/artifact update frames as bare JSON-RPC `result` values — each SSE surface
+    /// wraps them in its own envelope (a resubscriber's request id differs from the sender's).
+    /// Send errors (no subscriber) are normal and ignored.
+    updates: tokio::sync::broadcast::Sender<Value>,
+}
+
+/// The in-process registry of live A2A tasks, plus per-task push-notification configs (A-57) and
+/// the webhook delivery client. One per router (like the turn gate), shared across the mount's
+/// agents: keys are `(scope, task_id)` — scope is `""` on the single-agent mount and the
+/// `agent_id` on a multi-agent mount — so two agents' identical `s_<n>` ids never collide.
+#[derive(Default)]
+pub struct TaskRegistry {
+    live: std::sync::Mutex<HashMap<(String, String), LiveTask>>,
+    /// Push configs live beside (not inside) the live map so a config set while running is still
+    /// readable after the task finishes. In-process only, like the live map: a restart drops
+    /// them, and delivery only happens for in-process runs anyway.
+    push: std::sync::Mutex<HashMap<(String, String), Vec<Value>>>,
+    /// One pooled HTTP client for webhook delivery (A-57).
+    http: reqwest::Client,
+}
+
+/// What [`mint_and_register`] hands the run that was just registered.
+struct RegisteredTask {
+    session_id: String,
+    context_id: String,
+    cancel: CancellationToken,
+}
+
+/// The outcome of [`TaskRegistry::request_cancel`].
+enum CancelHit {
+    /// The live run's token was fired; carries the task's `contextId`.
+    Cancelled(String),
+    /// The live task is already cancel-requested — a terminal state per spec (`-32002`).
+    AlreadyCanceled,
+    /// No live, realm-matching entry — fall through to the stored projection.
+    NotLive,
+}
+
+/// Why [`mint_and_register`] declined.
+enum MintError {
+    /// The resolved session already has a live in-process task. One session runs one task at a
+    /// time (task-id = session id); the caller reports it and the client polls `tasks/get`.
+    AlreadyRunning(String),
+    Store(flux_core::Error),
+}
+
+impl TaskRegistry {
+    /// Realm-checked lookup: `Some` only when the task is live **and** minted in the caller's
+    /// realm; a cross-realm hit is `None`, indistinguishable from an unknown id.
+    fn snapshot(&self, scope: &str, id: &str, realm: Option<&str>) -> Option<(TaskState, String)> {
+        let live = self.live.lock().unwrap();
+        let t = live.get(&(scope.to_string(), id.to_string()))?;
+        (t.realm.as_deref() == realm).then(|| (t.state, t.context_id.clone()))
+    }
+
+    /// Realm-checked subscribe (A-56): the current state + a receiver for the live frames.
+    /// Subscribing and snapshotting under one lock hold means no frame can fall between the
+    /// snapshot and the subscription.
+    fn subscribe(
+        &self,
+        scope: &str,
+        id: &str,
+        realm: Option<&str>,
+    ) -> Option<(TaskState, String, tokio::sync::broadcast::Receiver<Value>)> {
+        let live = self.live.lock().unwrap();
+        let t = live.get(&(scope.to_string(), id.to_string()))?;
+        (t.realm.as_deref() == realm)
+            .then(|| (t.state, t.context_id.clone(), t.updates.subscribe()))
+    }
+
+    /// Advance a live task's state (`submitted → working`, or `→ canceled` on a cancel request).
+    fn set_state(&self, scope: &str, id: &str, state: TaskState) {
+        if let Some(t) = self
+            .live
+            .lock()
+            .unwrap()
+            .get_mut(&(scope.to_string(), id.to_string()))
+        {
+            t.state = state;
+        }
+    }
+
+    /// Fire a live task's cancellation (A-55), realm-checked.
+    fn request_cancel(&self, scope: &str, id: &str, realm: Option<&str>) -> CancelHit {
+        let mut live = self.live.lock().unwrap();
+        let Some(t) = live.get_mut(&(scope.to_string(), id.to_string())) else {
+            return CancelHit::NotLive;
+        };
+        if t.realm.as_deref() != realm {
+            return CancelHit::NotLive; // cross-realm == unknown, constant
+        }
+        if t.state == TaskState::Canceled {
+            // Already cancel-requested (the run is still draining to its durable terminal
+            // state) — `canceled` is a terminal state per spec, so a repeat is not cancelable.
+            return CancelHit::AlreadyCanceled;
+        }
+        t.cancel.cancel();
+        t.state = TaskState::Canceled;
+        CancelHit::Cancelled(t.context_id.clone())
+    }
+
+    /// Remove a finished run's entry. Call *before* releasing the turn gate, so a follow-up send
+    /// on the same context (queued at the gate) never collides with a completed run's entry.
+    fn finish(&self, scope: &str, id: &str) {
+        self.live
+            .lock()
+            .unwrap()
+            .remove(&(scope.to_string(), id.to_string()));
+    }
+
+    /// Publish one update frame to a live task's subscribers (send errors — no subscriber — are
+    /// normal), and, for status *transitions* (never per-token deltas — see [`deliver_push`]'s
+    /// caller contract), the caller also fans it out to push webhooks.
+    fn broadcast(&self, scope: &str, id: &str, frame: Value) {
+        if let Some(t) = self
+            .live
+            .lock()
+            .unwrap()
+            .get(&(scope.to_string(), id.to_string()))
+        {
+            let _ = t.updates.send(frame);
+        }
+    }
+}
+
+/// Sweep + find-or-mint + register, atomically with respect to the registry (A-54).
+///
+/// The lock choreography is the point. Pre-A-54 the C-29 rule was "mint only under the turn
+/// gate", which worked because every sweep was a mint-time sweep and every mint ran its turn
+/// back-to-back under one gate hold. Non-blocking sends break that: the task id must be answered
+/// *now*, so the mint cannot wait behind an in-flight turn — and a session minted (or merely
+/// still queued/running) outside the gate is exposed to a concurrent request's sweep again. The
+/// registry is the new protection: the keep-list snapshot, the sweep (which excludes it), the
+/// mint, and the registration all happen under ONE registry lock hold, so no concurrent sweep
+/// can ever observe a live task's session without its keep-list entry. Blocking and streaming
+/// sends register here too (they are just as swept-at while running — pre-A-54 no sweep could
+/// run mid-turn, now a non-blocking mint's sweep can), which is also what makes them cancelable
+/// and resubscribable (A-55/A-56).
+///
+/// The DB work under the lock is the same few indexed statements the mint always ran; contention
+/// is per-request, not per-token.
+#[allow(clippy::too_many_arguments)]
+fn mint_and_register(
+    registry: &TaskRegistry,
+    scope: &str,
+    engine: &Shared,
+    ttl: A2aTtl,
+    requested_context: Option<&str>,
+    realm: Option<&str>,
+    initial: TaskState,
+    cancel: CancellationToken,
+) -> Result<RegisteredTask, MintError> {
+    let mut live = registry.live.lock().unwrap();
+    let keep: Vec<String> = live.keys().map(|(_, id)| id.clone()).collect();
+    let pruned = prune_expired_a2a_sessions_at(&engine.events, ttl.0, now_ms(), &keep);
+    if pruned > 0 {
+        eprintln!(
+            "(a2a: pruned {pruned} expired session(s) past the {}s TTL)",
+            ttl.0
+        );
+    }
+    let session_id =
+        find_or_mint_session(engine, requested_context, realm).map_err(MintError::Store)?;
+    let key = (scope.to_string(), session_id.clone());
+    if live.contains_key(&key) {
+        return Err(MintError::AlreadyRunning(session_id));
+    }
+    let context_id = requested_context
+        .map(str::to_string)
+        .unwrap_or_else(|| session_id.clone());
+    let (updates, _) = tokio::sync::broadcast::channel(256);
+    live.insert(
+        key,
+        LiveTask {
+            state: initial,
+            realm: realm.map(str::to_string),
+            context_id: context_id.clone(),
+            cancel: cancel.clone(),
+            updates,
+        },
+    );
+    Ok(RegisteredTask {
+        session_id,
+        context_id,
+        cancel,
+    })
 }
 
 // ── Agent Card ────────────────────────────────────────────────────────────────
@@ -215,7 +420,9 @@ pub(crate) fn build_agent_card(
         env!("CARGO_PKG_VERSION"),
         &card.skills,
         true,
-    );
+    )
+    // A-57: this surface implements `tasks/pushNotificationConfig/*` + webhook delivery.
+    .with_push_notifications(true);
     // Optional discovery metadata (A-49): emitted only when the served agent's `CardInfo` carries
     // it, so a card that sets none stays byte-stable.
     if let Some(provider) = &card.provider {
@@ -269,6 +476,7 @@ pub async fn a2a_handler_multi(
     State(resolver): State<Arc<dyn AgentResolver>>,
     State(auth): State<Arc<crate::ServerAuth>>,
     State(turn_gate): State<TurnGate>,
+    State(tasks): State<Arc<TaskRegistry>>,
     State(a2a_ttl): State<A2aTtl>,
     Path(agent_id): Path<String>,
     ctx: Option<axum::Extension<flux_auth::request::AuthContext>>,
@@ -281,17 +489,71 @@ pub async fn a2a_handler_multi(
     let Some(resolved) = resolver.resolve(&agent_id, ctx.as_ref()).await else {
         return crate::realm_not_found();
     };
-    let engine = resolved.engine;
+    // The agent id scopes every registry key, so two agents' identical session ids never collide.
+    dispatch_rpc(
+        resolved.engine,
+        auth,
+        turn_gate,
+        tasks,
+        agent_id,
+        a2a_ttl,
+        ctx,
+        req,
+    )
+    .await
+}
+
+/// Dispatch one parsed JSON-RPC request against `engine` under `scope`. Shared by the
+/// single-agent and multi-agent handlers so the A2A method surface cannot drift between mounts.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_rpc(
+    engine: Shared,
+    auth: Arc<crate::ServerAuth>,
+    turn_gate: TurnGate,
+    registry: Arc<TaskRegistry>,
+    scope: String,
+    a2a_ttl: A2aTtl,
+    ctx: Option<flux_auth::request::AuthContext>,
+    req: JsonRpcRequest,
+) -> Response {
     match req.method.as_str() {
-        "message/send" => send(engine, auth, turn_gate, a2a_ttl, ctx, req.id, req.params)
-            .await
-            .into_response(),
+        "message/send" => send(
+            engine, auth, turn_gate, registry, scope, a2a_ttl, ctx, req.id, req.params,
+        )
+        .await
+        .into_response(),
         "message/stream" => {
             match subscribe(
                 engine,
                 auth,
                 turn_gate,
+                registry,
+                scope,
                 a2a_ttl,
+                ctx,
+                req.id.clone(),
+                req.params,
+            )
+            .await
+            {
+                Ok(sse) => sse.into_response(),
+                // Format pre-SSE errors as JSON-RPC so the `id` is not silently dropped;
+                // `subscribe` carries the A2A-specific code (e.g. `-32005`).
+                Err((code, msg)) => rpc_err(req.id, code, msg).into_response(),
+            }
+        }
+        "tasks/get" => tasks_get(engine, registry, scope, auth, ctx, req.id, req.params)
+            .await
+            .into_response(),
+        "tasks/cancel" => tasks_cancel(engine, registry, scope, auth, ctx, req.id, req.params)
+            .await
+            .into_response(),
+        "tasks/resubscribe" => {
+            match tasks_resubscribe(
+                engine,
+                registry,
+                scope,
+                auth,
                 ctx,
                 req.id.clone(),
                 req.params,
@@ -301,6 +563,17 @@ pub async fn a2a_handler_multi(
                 Ok(sse) => sse.into_response(),
                 Err((code, msg)) => rpc_err(req.id, code, msg).into_response(),
             }
+        }
+        "tasks/pushNotificationConfig/set"
+        | "tasks/pushNotificationConfig/get"
+        | "tasks/pushNotificationConfig/list"
+        | "tasks/pushNotificationConfig/delete" => {
+            let method = req.method.clone();
+            push_config(
+                engine, registry, scope, auth, ctx, &method, req.id, req.params,
+            )
+            .await
+            .into_response()
         }
         m if server::is_unsupported_a2a_method(m) => rpc_err(
             req.id,
@@ -353,14 +626,17 @@ fn status_frame(
 
 // ── Main dispatcher ───────────────────────────────────────────────────────────
 
-/// `POST /a2a` — JSON-RPC 2.0 endpoint.
+/// `POST /a2a` — JSON-RPC 2.0 endpoint (the single-agent mount; scope `""`).
 ///
-/// - `message/send`   → [`send`] (synchronous, returns a `Task`)
+/// - `message/send`   → [`send`] (blocking or non-blocking per `configuration.blocking`)
 /// - `message/stream` → [`subscribe`] (SSE stream of `TaskStatusUpdate`s)
+/// - `tasks/get` / `tasks/cancel` / `tasks/resubscribe` → the stateful task surface (A-54/55/56)
+/// - `tasks/pushNotificationConfig/*` → per-task webhooks (A-57)
 pub async fn a2a_handler(
     State(engine): State<Shared>,
     State(auth): State<Arc<crate::ServerAuth>>,
     State(turn_gate): State<TurnGate>,
+    State(tasks): State<Arc<TaskRegistry>>,
     State(a2a_ttl): State<A2aTtl>,
     ctx: Option<axum::Extension<flux_auth::request::AuthContext>>,
     Json(req): Json<JsonRpcRequest>,
@@ -369,44 +645,31 @@ pub async fn a2a_handler(
         return rpc_err(req.id, -32600, "jsonrpc must be \"2.0\"").into_response();
     }
     let ctx = ctx.map(|e| e.0);
-    match req.method.as_str() {
-        "message/send" => send(engine, auth, turn_gate, a2a_ttl, ctx, req.id, req.params)
-            .await
-            .into_response(),
-        "message/stream" => {
-            match subscribe(
-                engine,
-                auth,
-                turn_gate,
-                a2a_ttl,
-                ctx,
-                req.id.clone(),
-                req.params,
-            )
-            .await
-            {
-                Ok(sse) => sse.into_response(),
-                // Format pre-SSE errors as JSON-RPC so the `id` is not silently dropped; `subscribe`
-                // carries the A2A-specific code (e.g. `-32005` for an unusable content type).
-                Err((code, msg)) => rpc_err(req.id, code, msg).into_response(),
-            }
-        }
-        m if server::is_unsupported_a2a_method(m) => rpc_err(
-            req.id,
-            error::UNSUPPORTED_OPERATION,
-            format!("Unsupported operation: {m}"),
-        )
-        .into_response(),
-        m => rpc_err(req.id, -32601, format!("Method not found: {m}")).into_response(),
-    }
+    dispatch_rpc(
+        engine,
+        auth,
+        turn_gate,
+        tasks,
+        String::new(),
+        a2a_ttl,
+        ctx,
+        req,
+    )
+    .await
 }
 
 // ── message/send ──────────────────────────────────────────────────────────────
 
+/// `message/send`, branched on the client's `configuration.blocking` (A-54). The A2A spec default
+/// is **non-blocking**: absent/`false` returns a `submitted` task immediately and runs the turn in
+/// the background; `blocking: true` keeps the synchronous run-to-completion behavior.
+#[allow(clippy::too_many_arguments)]
 async fn send(
     engine: Shared,
     auth: Arc<crate::ServerAuth>,
     turn_gate: TurnGate,
+    registry: Arc<TaskRegistry>,
+    scope: String,
     ttl: A2aTtl,
     ctx: Option<flux_auth::request::AuthContext>,
     id: Option<Value>,
@@ -420,43 +683,287 @@ async fn send(
         Ok(t) => t,
         Err(code) => return rpc_err(id, code, "Message has no usable text or data part"),
     };
+    if server::blocking_requested(&params) {
+        send_blocking(
+            engine, auth, turn_gate, registry, scope, ttl, ctx, id, params, input,
+        )
+        .await
+    } else {
+        send_nonblocking(
+            engine, auth, turn_gate, registry, scope, ttl, ctx, id, params, input,
+        )
+        .await
+    }
+}
+
+/// Report a [`MintError`] as a JSON-RPC error response.
+fn mint_err(id: Option<Value>, e: MintError) -> Json<Value> {
+    match e {
+        MintError::AlreadyRunning(sid) => rpc_err(
+            id,
+            -32603,
+            format!("a task is already running in this context (task {sid}); poll tasks/get"),
+        ),
+        MintError::Store(e) => rpc_err(id, -32603, format!("Session error: {e}")),
+    }
+}
+
+/// The blocking fast path — today's synchronous behavior, preserved: run the turn to completion
+/// under the gate and return the finished `Task` (A-52 history, answer in `status.message`). New
+/// in A-54: the run is registered while in flight (so it is sweep-protected, cancelable, and
+/// resubscribable like any other live task) and runs on the cancellable path.
+#[allow(clippy::too_many_arguments)]
+async fn send_blocking(
+    engine: Shared,
+    auth: Arc<crate::ServerAuth>,
+    turn_gate: TurnGate,
+    registry: Arc<TaskRegistry>,
+    scope: String,
+    ttl: A2aTtl,
+    ctx: Option<flux_auth::request::AuthContext>,
+    id: Option<Value>,
+    params: Value,
+    input: String,
+) -> Json<Value> {
     let requested_context = server::extract_context_id(&params);
-    // Acquire the gate BEFORE minting (C-29) — see `create_a2a_session`'s doc for why. The
-    // identity swap + realm derivation happen through `enter_turn` under the same gate hold:
-    // the realm used for continuity keying is obtainable only from the function that also sets
-    // the executor identity (D-69 coupling).
+    // Acquire the gate BEFORE minting (C-29) — the identity swap + realm derivation happen
+    // through `enter_turn` under the same gate hold: the realm used for continuity keying is
+    // obtainable only from the function that also sets the executor identity (D-69 coupling).
     let _turn = turn_gate.lock().await;
     let realm = match crate::enter_turn(&auth, &engine, ctx.as_ref(), &_turn) {
         Ok(r) => r,
         // Constant text: unreachable behind `require_auth`, fail-closed if a mount forgets it.
         Err(_) => return rpc_err(id, -32603, crate::UNAUTHORIZED_BODY),
     };
-    let session_id =
-        match create_a2a_session(&engine, ttl, requested_context.as_deref(), realm.as_deref()) {
-            Ok(s) => s,
-            Err(e) => return rpc_err(id, -32603, format!("Session error: {e}")),
-        };
-    let context_id = requested_context.unwrap_or_else(|| session_id.clone());
+    let task = match mint_and_register(
+        &registry,
+        &scope,
+        &engine,
+        ttl,
+        requested_context.as_deref(),
+        realm.as_deref(),
+        TaskState::Working,
+        CancellationToken::new(),
+    ) {
+        Ok(t) => t,
+        Err(e) => return mint_err(id, e),
+    };
     let mut sink = Collect::default();
-    match engine.run_turn(&session_id, &input, &mut sink).await {
-        Ok(()) => {
-            // A-52: return the conversation so far as `Task.history`, capped to the client's
-            // `historyLength` when set. Read before `session_id` is moved into the `Task`.
-            let history = a2a_history(&engine, &session_id, server::history_length(&params));
-            let status = TaskStatus::new(
-                TaskState::Completed,
-                Some(Message::agent_text(sink.text)),
-                Some(server::now_rfc3339()),
-            );
-            let mut task = Task::new(session_id, Some(context_id), status);
-            task.history = history;
-            match serde_json::to_value(&task) {
-                Ok(v) => rpc_json(id, v),
-                Err(e) => rpc_err(id, -32603, format!("encode error: {e}")),
-            }
-        }
-        Err(e) => rpc_err(id, -32603, format!("Agent error: {e}")),
+    let result = engine
+        .run_turn_cancellable(&task.session_id, &input, &mut sink, &task.cancel)
+        .await;
+    // Publish the terminal transition for any resubscriber/webhook, then release the entry
+    // BEFORE the gate drops (a queued follow-up on this context must not collide with it).
+    if let Err(e) = result {
+        publish_transition(
+            &registry,
+            &scope,
+            &task.session_id,
+            &task.context_id,
+            TaskState::Failed,
+            Some(Message::agent_text(e.to_string())),
+            true,
+        );
+        registry.finish(&scope, &task.session_id);
+        return rpc_err(id, -32603, format!("Agent error: {e}"));
     }
+    // A cancel that landed mid-run (A-55) surfaces as a canceled task, not a completed one.
+    let (state, message) = if task.cancel.is_cancelled() {
+        (TaskState::Canceled, None)
+    } else {
+        (TaskState::Completed, Some(Message::agent_text(sink.text)))
+    };
+    publish_transition(
+        &registry,
+        &scope,
+        &task.session_id,
+        &task.context_id,
+        state,
+        None,
+        true,
+    );
+    registry.finish(&scope, &task.session_id);
+    // A-52: return the conversation so far as `Task.history`, capped to the client's
+    // `historyLength` when set.
+    let history = a2a_history(&engine, &task.session_id, server::history_length(&params));
+    let status = TaskStatus::new(state, message, Some(server::now_rfc3339()));
+    let mut out = Task::new(task.session_id, Some(task.context_id), status);
+    out.history = history;
+    match serde_json::to_value(&out) {
+        Ok(v) => rpc_json(id, v),
+        Err(e) => rpc_err(id, -32603, format!("encode error: {e}")),
+    }
+}
+
+/// The non-blocking path (A-54): answer `submitted` + the task id immediately and drive the turn
+/// on a background task. The client advances via `tasks/get` (poll) or `tasks/resubscribe`
+/// (stream). Realm comes from [`crate::caller_realm`] — the D-69 identity swap is deferred to the
+/// background task's gate-held [`crate::enter_turn`], so no turn ever runs under the service
+/// identity.
+#[allow(clippy::too_many_arguments)]
+async fn send_nonblocking(
+    engine: Shared,
+    auth: Arc<crate::ServerAuth>,
+    turn_gate: TurnGate,
+    registry: Arc<TaskRegistry>,
+    scope: String,
+    ttl: A2aTtl,
+    ctx: Option<flux_auth::request::AuthContext>,
+    id: Option<Value>,
+    params: Value,
+    input: String,
+) -> Json<Value> {
+    let requested_context = server::extract_context_id(&params);
+    let Ok(realm) = crate::caller_realm(&auth, ctx.as_ref()) else {
+        return rpc_err(id, -32603, crate::UNAUTHORIZED_BODY);
+    };
+    let task = match mint_and_register(
+        &registry,
+        &scope,
+        &engine,
+        ttl,
+        requested_context.as_deref(),
+        realm.as_deref(),
+        TaskState::Submitted,
+        CancellationToken::new(),
+    ) {
+        Ok(t) => t,
+        Err(e) => return mint_err(id, e),
+    };
+    let status = TaskStatus::new(TaskState::Submitted, None, Some(server::now_rfc3339()));
+    let submitted = Task::new(
+        task.session_id.clone(),
+        Some(task.context_id.clone()),
+        status,
+    );
+    let response = match serde_json::to_value(&submitted) {
+        Ok(v) => rpc_json(id, v),
+        Err(e) => {
+            registry.finish(&scope, &task.session_id);
+            return rpc_err(id, -32603, format!("encode error: {e}"));
+        }
+    };
+    tokio::spawn(run_background(
+        engine, auth, turn_gate, registry, scope, task, input, ctx,
+    ));
+    response
+}
+
+/// Drive one non-blocking send to its terminal state: queue on the single-turn gate, swap the
+/// executor identity ([`crate::enter_turn`] — the D-69 swap deferred from mint), advance
+/// `submitted → working`, run the cancellable turn, publish the terminal transition, and release
+/// the registry entry (before the gate, so a queued follow-up never collides with it).
+#[allow(clippy::too_many_arguments)]
+async fn run_background(
+    engine: Shared,
+    auth: Arc<crate::ServerAuth>,
+    turn_gate: TurnGate,
+    registry: Arc<TaskRegistry>,
+    scope: String,
+    task: RegisteredTask,
+    input: String,
+    ctx: Option<flux_auth::request::AuthContext>,
+) {
+    let _turn = turn_gate.lock().await;
+    // Fail-closed belt+braces: `caller_realm` already vetted the context at mint.
+    if crate::enter_turn(&auth, &engine, ctx.as_ref(), &_turn).is_err() {
+        publish_transition(
+            &registry,
+            &scope,
+            &task.session_id,
+            &task.context_id,
+            TaskState::Failed,
+            Some(Message::agent_text(crate::UNAUTHORIZED_BODY)),
+            true,
+        );
+        registry.finish(&scope, &task.session_id);
+        return;
+    }
+    // A cancel can land while the task is still queued (A-55): keep the registry state
+    // `canceled` — the engine's first cancellation check ends the run immediately either way.
+    if !task.cancel.is_cancelled() {
+        registry.set_state(&scope, &task.session_id, TaskState::Working);
+        publish_transition(
+            &registry,
+            &scope,
+            &task.session_id,
+            &task.context_id,
+            TaskState::Working,
+            None,
+            false,
+        );
+    }
+    let mut sink = BroadcastSink {
+        registry: registry.clone(),
+        scope: scope.clone(),
+        task_id: task.session_id.clone(),
+        context_id: task.context_id.clone(),
+    };
+    let result = engine
+        .run_turn_cancellable(&task.session_id, &input, &mut sink, &task.cancel)
+        .await;
+    // The final frame carries no message on success — the deltas already broadcast are
+    // authoritative, and the answer is durable in the task projection (`tasks/get`).
+    let (state, message) = if task.cancel.is_cancelled() {
+        (TaskState::Canceled, None)
+    } else {
+        match result {
+            Ok(()) => (TaskState::Completed, None),
+            Err(e) => (TaskState::Failed, Some(Message::agent_text(e.to_string()))),
+        }
+    };
+    publish_transition(
+        &registry,
+        &scope,
+        &task.session_id,
+        &task.context_id,
+        state,
+        message,
+        true,
+    );
+    registry.finish(&scope, &task.session_id);
+}
+
+/// Streams a background run's text deltas as `working` frames to any live subscriber (A-56).
+/// Unlike [`StreamSink`], a zero-subscriber send is NOT a disconnect — the task's owner is the
+/// registry, not a socket — so nothing cancels; unobserved frames are simply dropped. Deltas
+/// broadcast directly (never through [`publish_transition`]), so they are never pushed to
+/// webhooks — a POST per token would hammer the receiver.
+struct BroadcastSink {
+    registry: Arc<TaskRegistry>,
+    scope: String,
+    task_id: String,
+    context_id: String,
+}
+
+impl AgentSink for BroadcastSink {
+    fn text_delta(&mut self, t: &str) {
+        let frame = server::status_update_value(
+            &self.task_id,
+            &self.context_id,
+            TaskState::Working,
+            Some(Message::agent_text(t)),
+            false,
+        );
+        self.registry.broadcast(&self.scope, &self.task_id, frame);
+    }
+}
+
+/// Publish a status **transition** frame: broadcast to resubscribers (A-56) and fan out to any
+/// registered push webhooks (A-57). Per-token deltas never come through here (see
+/// [`BroadcastSink`]).
+fn publish_transition(
+    registry: &Arc<TaskRegistry>,
+    scope: &str,
+    task_id: &str,
+    context_id: &str,
+    state: TaskState,
+    message: Option<Message>,
+    is_final: bool,
+) {
+    let frame = server::status_update_value(task_id, context_id, state, message, is_final);
+    registry.broadcast(scope, task_id, frame.clone());
+    deliver_push(registry, scope, task_id, &frame);
 }
 
 /// Build the A2A `Task.history` for a completed turn from the engine's conversation projection
@@ -495,12 +1002,497 @@ fn to_a2a_message(m: flux_core::Message) -> Option<Message> {
     }
 }
 
+// ── Task projection (A-54) ────────────────────────────────────────────────────
+
+/// Project the current [`Task`] for `task_id`, realm-scoped: a live in-process task answers from
+/// the registry; otherwise the retained event log is folded ([`project_stored_task`]). `Err`
+/// carries the JSON-RPC error code: `-32001` for unknown/cross-realm/non-A2A ids (one constant
+/// answer — existence is never distinguishable), `-32603` for a store read failure.
+fn project_task(
+    engine: &Shared,
+    registry: &TaskRegistry,
+    scope: &str,
+    task_id: &str,
+    realm: Option<&str>,
+    history_limit: Option<usize>,
+) -> Result<Task, i32> {
+    if let Some((state, context_id)) = registry.snapshot(scope, task_id, realm) {
+        let status = TaskStatus::new(state, None, Some(server::now_rfc3339()));
+        let mut task = Task::new(task_id.to_string(), Some(context_id), status);
+        task.history = a2a_history(engine, task_id, history_limit);
+        return Ok(task);
+    }
+    project_stored_task(engine, task_id, realm, history_limit)
+}
+
+/// Fold a retained A2A session's events into its terminal (or last-known) [`Task`] — the
+/// "task-as-projection" half of the A-53 design: no second store, reconstructable for as long as
+/// the stream is retained, realm-scoped like every A2A lookup.
+///
+/// The state folds over the engine's own turn-lifecycle events:
+/// - no `turn_started` at all → `submitted` (minted, never ran — e.g. the process died before a
+///   queued run started);
+/// - a `turn_started` newer than the last `turn_ended` → `working` — with no in-process registry
+///   entry this means "in flight on another replica" (shared-store deployments) or "crashed
+///   mid-turn"; the optimistic answer keeps cross-replica polling truthful, and a crashed task's
+///   session ages out via the TTL sweep rather than reporting a false `failed`;
+/// - otherwise the last `turn_ended.outcome` decides: `cancelled` → canceled, `error` → failed,
+///   anything else (`ok`, `max_iter`) → completed — with the recorded answer as the status
+///   message and the event's own timestamp.
+fn project_stored_task(
+    engine: &Shared,
+    task_id: &str,
+    realm: Option<&str>,
+    history_limit: Option<usize>,
+) -> Result<Task, i32> {
+    let Ok(info) = engine.events.info(task_id) else {
+        return Err(error::TASK_NOT_FOUND);
+    };
+    // Only A2A-minted sessions are addressable tasks: session ids are guessable (`s_<n>`), so a
+    // CLI/TUI session must not be readable through the task surface.
+    if info.context.agent_id.as_deref() != Some(A2A_AGENT_ID) {
+        return Err(error::TASK_NOT_FOUND);
+    }
+    // Realm scoping (D-69): cross-realm is the same constant answer as unknown. The open/
+    // shared-secret modes (`realm == None`) are single-tenant — every A2A session is theirs.
+    if let Some(realm) = realm {
+        if info.context.account.as_deref() != Some(realm) {
+            return Err(error::TASK_NOT_FOUND);
+        }
+    }
+    let context_id = info
+        .context
+        .correlation_id
+        .clone()
+        .unwrap_or_else(|| task_id.to_string());
+    let started = engine
+        .events
+        .load_by_kind(task_id, "turn_started")
+        .map_err(|_| -32603)?;
+    let ended = engine
+        .events
+        .load_by_kind(task_id, "turn_ended")
+        .map_err(|_| -32603)?;
+    let last_start = started.last().map(|e| e.stream_seq).unwrap_or(-1);
+    let (state, message, ts_ms) = match ended.last() {
+        Some(end) if end.stream_seq > last_start => {
+            let EventKind::TurnEnded {
+                outcome, answer, ..
+            } = &end.kind
+            else {
+                return Err(-32603);
+            };
+            let state = match outcome.as_str() {
+                "cancelled" => TaskState::Canceled,
+                "error" => TaskState::Failed,
+                _ => TaskState::Completed,
+            };
+            let message = (!answer.is_empty()).then(|| Message::agent_text(answer.clone()));
+            (state, message, end.ts_ms)
+        }
+        _ if last_start >= 0 => (TaskState::Working, None, info.updated_at_ms),
+        _ => (TaskState::Submitted, None, info.updated_at_ms),
+    };
+    let status = TaskStatus::new(state, message, Some(server::rfc3339_ms(ts_ms)));
+    let mut task = Task::new(task_id.to_string(), Some(context_id), status);
+    task.history = a2a_history(engine, task_id, history_limit);
+    Ok(task)
+}
+
+// ── tasks/get · tasks/cancel · tasks/resubscribe (A-54/A-55/A-56) ────────────
+
+/// Validate a `tasks/*` request: the task id from `params.id` plus the caller's realm (no
+/// identity swap — these operations never run a turn).
+fn task_request(
+    auth: &crate::ServerAuth,
+    ctx: &Option<flux_auth::request::AuthContext>,
+    params: &Option<Value>,
+) -> Result<(String, Option<String>), (i32, String)> {
+    let Some(params) = params else {
+        return Err((-32602, "Missing params".to_string()));
+    };
+    let Some(task_id) = server::extract_task_id(params) else {
+        return Err((-32602, "Missing task id".to_string()));
+    };
+    let Ok(realm) = crate::caller_realm(auth, ctx.as_ref()) else {
+        return Err((-32603, crate::UNAUTHORIZED_BODY.to_string()));
+    };
+    Ok((task_id, realm))
+}
+
+/// `tasks/get` (A-54): resolve a task id to its current [`Task`] within the caller's realm.
+async fn tasks_get(
+    engine: Shared,
+    registry: Arc<TaskRegistry>,
+    scope: String,
+    auth: Arc<crate::ServerAuth>,
+    ctx: Option<flux_auth::request::AuthContext>,
+    id: Option<Value>,
+    params: Option<Value>,
+) -> Json<Value> {
+    let (task_id, realm) = match task_request(&auth, &ctx, &params) {
+        Ok(x) => x,
+        Err((code, msg)) => return rpc_err(id, code, msg),
+    };
+    let limit = params.as_ref().and_then(server::history_length);
+    match project_task(
+        &engine,
+        &registry,
+        &scope,
+        &task_id,
+        realm.as_deref(),
+        limit,
+    ) {
+        Ok(task) => match serde_json::to_value(&task) {
+            Ok(v) => rpc_json(id, v),
+            Err(e) => rpc_err(id, -32603, format!("encode error: {e}")),
+        },
+        Err(error::TASK_NOT_FOUND) => rpc_err(id, error::TASK_NOT_FOUND, "Task not found"),
+        Err(code) => rpc_err(id, code, "task state unavailable"),
+    }
+}
+
+/// `tasks/cancel` (A-55): fire a live task's `CancellationToken` from an out-of-band request —
+/// the same token an SSE disconnect fires, generalized. The run observes it between plan rounds
+/// (`run_turn_cancellable`) and records the durable `cancelled` turn event; the response reflects
+/// the requested state immediately. A task with no live run answers `-32002 TaskNotCancelable`
+/// (terminal, or running on another replica — only in-process runs are cancelable); an
+/// unknown/cross-realm id answers `-32001`.
+async fn tasks_cancel(
+    engine: Shared,
+    registry: Arc<TaskRegistry>,
+    scope: String,
+    auth: Arc<crate::ServerAuth>,
+    ctx: Option<flux_auth::request::AuthContext>,
+    id: Option<Value>,
+    params: Option<Value>,
+) -> Json<Value> {
+    let (task_id, realm) = match task_request(&auth, &ctx, &params) {
+        Ok(x) => x,
+        Err((code, msg)) => return rpc_err(id, code, msg),
+    };
+    match registry.request_cancel(&scope, &task_id, realm.as_deref()) {
+        CancelHit::Cancelled(context_id) => {
+            let status = TaskStatus::new(TaskState::Canceled, None, Some(server::now_rfc3339()));
+            let mut task = Task::new(task_id.clone(), Some(context_id), status);
+            task.history = a2a_history(&engine, &task_id, None);
+            return match serde_json::to_value(&task) {
+                Ok(v) => rpc_json(id, v),
+                Err(e) => rpc_err(id, -32603, format!("encode error: {e}")),
+            };
+        }
+        CancelHit::AlreadyCanceled => {
+            return rpc_err(
+                id,
+                error::TASK_NOT_CANCELABLE,
+                "task is already in a terminal state",
+            );
+        }
+        CancelHit::NotLive => {}
+    }
+    match project_task(&engine, &registry, &scope, &task_id, realm.as_deref(), None) {
+        Ok(t) if t.status.state.is_terminal() => rpc_err(
+            id,
+            error::TASK_NOT_CANCELABLE,
+            "task is already in a terminal state",
+        ),
+        Ok(_) => rpc_err(
+            id,
+            error::TASK_NOT_CANCELABLE,
+            "task has no live run on this instance",
+        ),
+        Err(error::TASK_NOT_FOUND) => rpc_err(id, error::TASK_NOT_FOUND, "Task not found"),
+        Err(code) => rpc_err(id, code, "task state unavailable"),
+    }
+}
+
+/// The boxed SSE type `tasks/resubscribe` returns — its two arms (live follow vs. terminal
+/// replay) build different stream shapes.
+type BoxedSse = Sse<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>>;
+
+/// `tasks/resubscribe` (A-56): re-attach an SSE stream to a task. A **live** task yields a
+/// snapshot frame of its current state and then follows the run's broadcast to the terminal
+/// frame — the same framing as `message/stream`, wrapped in THIS request's JSON-RPC id. A
+/// **retained terminal** task yields its final state as one frame and closes. Unknown/cross-realm
+/// → `-32001` before the SSE is established.
+///
+/// A resubscriber is an observer, not the owner: dropping this stream cancels nothing (unlike
+/// `message/stream`, whose disconnect drop-guard cancels the turn it owns).
+async fn tasks_resubscribe(
+    engine: Shared,
+    registry: Arc<TaskRegistry>,
+    scope: String,
+    auth: Arc<crate::ServerAuth>,
+    ctx: Option<flux_auth::request::AuthContext>,
+    id: Option<Value>,
+    params: Option<Value>,
+) -> Result<BoxedSse, (i32, String)> {
+    let (task_id, realm) = task_request(&auth, &ctx, &params)?;
+    if let Some((state, context_id, mut rx)) =
+        registry.subscribe(&scope, &task_id, realm.as_deref())
+    {
+        // Subscribed-then-snapshotted under one registry lock: no frame falls in between. A
+        // repeated `working` frame (snapshot + a broadcast transition) is harmless per spec.
+        let snapshot = server::status_update_value(&task_id, &context_id, state, None, false);
+        let req_id = id.clone();
+        let stream = async_stream::stream! {
+            yield Ok(rpc_frame(&req_id, snapshot));
+            loop {
+                match rx.recv().await {
+                    Ok(frame) => {
+                        let is_final = frame
+                            .get("final")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        yield Ok(rpc_frame(&req_id, frame));
+                        if is_final {
+                            break;
+                        }
+                    }
+                    // Lagged: a slow consumer missed some deltas — status transitions are rare
+                    // and re-derivable via tasks/get, so skip forward rather than erroring.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        };
+        return Ok(Sse::new(Box::pin(stream) as _).keep_alive(KeepAlive::default()));
+    }
+    match project_stored_task(&engine, &task_id, realm.as_deref(), None) {
+        Ok(task) => {
+            let frame = server::status_update_value(
+                &task_id,
+                task.context_id.as_deref().unwrap_or(&task_id),
+                task.status.state,
+                task.status.message.clone(),
+                true,
+            );
+            let req_id = id.clone();
+            let stream = async_stream::stream! {
+                yield Ok(rpc_frame(&req_id, frame));
+            };
+            Ok(Sse::new(Box::pin(stream) as _).keep_alive(KeepAlive::default()))
+        }
+        Err(error::TASK_NOT_FOUND) => Err((error::TASK_NOT_FOUND, "Task not found".to_string())),
+        Err(code) => Err((code, "task state unavailable".to_string())),
+    }
+}
+
+/// Wrap a broadcast `result` value in a JSON-RPC SSE frame carrying `req_id` — each subscriber
+/// wraps the shared frames in its OWN request id.
+fn rpc_frame(req_id: &Option<Value>, result: Value) -> Event {
+    Event::default().data(json!({ "jsonrpc": "2.0", "id": req_id, "result": result }).to_string())
+}
+
+// ── Push notifications (A-57) ─────────────────────────────────────────────────
+
+/// `tasks/pushNotificationConfig/{set,get,list,delete}` (A-57): a per-task webhook registration,
+/// realm-scoped like every task operation. Configs are held in-process beside the live-task map —
+/// delivery only happens for in-process runs, so durability beyond the process buys nothing.
+///
+/// `set` params: `{ taskId, pushNotificationConfig: { url, token?, id? } }` (the spec shape; a
+/// plain `id` is accepted for the task id too). The others take `{ id, pushNotificationConfigId? }`.
+#[allow(clippy::too_many_arguments)]
+async fn push_config(
+    engine: Shared,
+    registry: Arc<TaskRegistry>,
+    scope: String,
+    auth: Arc<crate::ServerAuth>,
+    ctx: Option<flux_auth::request::AuthContext>,
+    method: &str,
+    id: Option<Value>,
+    params: Option<Value>,
+) -> Json<Value> {
+    let Some(params) = params else {
+        return rpc_err(id, -32602, "Missing params");
+    };
+    // `set` addresses the task as `taskId` (its params ARE a TaskPushNotificationConfig);
+    // get/list/delete use `id`.
+    let task_id = params
+        .get("taskId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| server::extract_task_id(&params));
+    let Some(task_id) = task_id else {
+        return rpc_err(id, -32602, "Missing task id");
+    };
+    let Ok(realm) = crate::caller_realm(&auth, ctx.as_ref()) else {
+        return rpc_err(id, -32603, crate::UNAUTHORIZED_BODY);
+    };
+    // The task must resolve within the caller's realm before any config surface is touched.
+    if let Err(code) = project_task(&engine, &registry, &scope, &task_id, realm.as_deref(), None) {
+        let msg = if code == error::TASK_NOT_FOUND {
+            "Task not found"
+        } else {
+            "task state unavailable"
+        };
+        return rpc_err(id, code, msg);
+    }
+    let key = (scope.clone(), task_id.clone());
+    match method {
+        "tasks/pushNotificationConfig/set" => {
+            let Some(cfg) = params.get("pushNotificationConfig") else {
+                return rpc_err(id, -32602, "Missing pushNotificationConfig");
+            };
+            let Some(url) = cfg.get("url").and_then(Value::as_str) else {
+                return rpc_err(id, -32602, "pushNotificationConfig.url is required");
+            };
+            if !push_url_allowed(url) {
+                // -32003: this server does not push to that destination (scheme/host policy).
+                return rpc_err(
+                    id,
+                    error::PUSH_NOTIFICATION_NOT_SUPPORTED,
+                    "push URL not supported: only public http(s) endpoints are allowed",
+                );
+            }
+            // The config id defaults to its URL (the spec lets servers key configs that way).
+            let mut cfg = cfg.clone();
+            if cfg.get("id").is_none() {
+                cfg["id"] = Value::String(url.to_string());
+            }
+            let cfg_id = cfg.get("id").cloned();
+            let mut push = registry.push.lock().unwrap();
+            let entry = push.entry(key).or_default();
+            entry.retain(|c| c.get("id") != cfg_id.as_ref());
+            entry.push(cfg.clone());
+            rpc_json(
+                id,
+                json!({ "taskId": task_id, "pushNotificationConfig": cfg }),
+            )
+        }
+        "tasks/pushNotificationConfig/get" => {
+            let wanted = params.get("pushNotificationConfigId");
+            let push = registry.push.lock().unwrap();
+            let found = push.get(&key).and_then(|cfgs| match wanted {
+                Some(w) => cfgs.iter().find(|c| c.get("id") == Some(w)).cloned(),
+                None => cfgs.first().cloned(),
+            });
+            match found {
+                Some(cfg) => rpc_json(
+                    id,
+                    json!({ "taskId": task_id, "pushNotificationConfig": cfg }),
+                ),
+                None => rpc_err(
+                    id,
+                    error::TASK_NOT_FOUND,
+                    "no push-notification config for this task",
+                ),
+            }
+        }
+        "tasks/pushNotificationConfig/list" => {
+            let push = registry.push.lock().unwrap();
+            let list: Vec<Value> = push
+                .get(&key)
+                .map(|cfgs| {
+                    cfgs.iter()
+                        .map(|c| json!({ "taskId": task_id, "pushNotificationConfig": c }))
+                        .collect()
+                })
+                .unwrap_or_default();
+            rpc_json(id, Value::Array(list))
+        }
+        "tasks/pushNotificationConfig/delete" => {
+            let wanted = params.get("pushNotificationConfigId");
+            let mut push = registry.push.lock().unwrap();
+            if let Some(cfgs) = push.get_mut(&key) {
+                match wanted {
+                    Some(w) => cfgs.retain(|c| c.get("id") != Some(w)),
+                    None => cfgs.clear(),
+                }
+                if cfgs.is_empty() {
+                    push.remove(&key);
+                }
+            }
+            rpc_json(id, Value::Null)
+        }
+        _ => rpc_err(id, -32601, format!("Method not found: {method}")),
+    }
+}
+
+/// The push-destination policy (documented SSRF posture): only `http`/`https`, and never a
+/// loopback, private, link-local, or unspecified **literal** address (nor `localhost`) — a
+/// webhook must be a public endpoint. Resolution-time tricks (DNS rebinding) are out of scope:
+/// deployments that need stronger egress guarantees should enforce them at the network layer.
+/// `FLUX_A2A_PUSH_ALLOW_LOCAL=1` lifts the host policy for local development and tests.
+fn push_url_allowed(url: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(u.scheme(), "http" | "https") {
+        return false;
+    }
+    if std::env::var("FLUX_A2A_PUSH_ALLOW_LOCAL").is_ok_and(|v| v == "1") {
+        return true;
+    }
+    let Some(host) = u.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return false;
+    }
+    if let Ok(ip) = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+    {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                !(v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified())
+            }
+            std::net::IpAddr::V6(v6) => !(v6.is_loopback() || v6.is_unspecified()),
+        };
+    }
+    true
+}
+
+/// Best-effort webhook delivery of one transition frame (A-57): one POST per registered config,
+/// fire-and-forget on a spawned task, 10s timeout, failures logged, **no retry** (the documented
+/// policy — the durable task projection is the source of truth; push is a hint to poll). A
+/// config's `token` rides along as `X-A2A-Notification-Token` so receivers can authenticate the
+/// caller.
+fn deliver_push(registry: &Arc<TaskRegistry>, scope: &str, task_id: &str, frame: &Value) {
+    let configs: Vec<Value> = registry
+        .push
+        .lock()
+        .unwrap()
+        .get(&(scope.to_string(), task_id.to_string()))
+        .cloned()
+        .unwrap_or_default();
+    for cfg in configs {
+        let Some(url) = cfg.get("url").and_then(Value::as_str).map(str::to_string) else {
+            continue;
+        };
+        let token = cfg.get("token").and_then(Value::as_str).map(str::to_string);
+        let client = registry.http.clone();
+        let frame = frame.clone();
+        tokio::spawn(async move {
+            let mut req = client
+                .post(&url)
+                .timeout(std::time::Duration::from_secs(10))
+                .json(&frame);
+            if let Some(t) = token {
+                req = req.header("X-A2A-Notification-Token", t);
+            }
+            match req.send().await {
+                Ok(resp) if !resp.status().is_success() => {
+                    eprintln!("(a2a push: {url} answered {})", resp.status());
+                }
+                Err(e) => eprintln!("(a2a push: delivery to {url} failed: {e})"),
+                _ => {}
+            }
+        });
+    }
+}
+
 // ── message/stream ────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn subscribe(
     engine: Shared,
     auth: Arc<crate::ServerAuth>,
     turn_gate: TurnGate,
+    registry: Arc<TaskRegistry>,
+    scope: String,
     ttl: A2aTtl,
     ctx: Option<flux_auth::request::AuthContext>,
     id: Option<Value>,
@@ -548,33 +1540,48 @@ async fn subscribe(
                 return;
             }
         };
-        let session_id =
-            match create_a2a_session(
-                &engine_clone,
-                ttl,
-                requested_context.as_deref(),
-                realm.as_deref(),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    // The SSE response is already established by the time minting can fail here, so
-                    // report it as a JSON-RPC error frame inside the stream (mirroring `rpc_err`)
-                    // rather than a pre-SSE HTTP error.
-                    let _ = tx.send(Event::default().data(
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": { "code": -32603, "message": format!("Session error: {e}") },
-                    })
-                    .to_string(),
-                ));
-                    return;
-                }
-            };
-        let context_id = requested_context.unwrap_or_else(|| session_id.clone());
+        // Mint + register under the gate (A-54: registration makes the streaming run
+        // sweep-protected, cancelable by `tasks/cancel`, and observable by `tasks/resubscribe`).
+        let task = match mint_and_register(
+            &registry,
+            &scope,
+            &engine_clone,
+            ttl,
+            requested_context.as_deref(),
+            realm.as_deref(),
+            TaskState::Working,
+            cancel_task.clone(),
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                // The SSE response is already established by the time minting can fail here, so
+                // report it as a JSON-RPC error frame inside the stream (mirroring `rpc_err`)
+                // rather than a pre-SSE HTTP error.
+                let msg = match e {
+                    MintError::AlreadyRunning(sid) => format!(
+                        "a task is already running in this context (task {sid}); poll tasks/get"
+                    ),
+                    MintError::Store(e) => format!("Session error: {e}"),
+                };
+                let _ = tx.send(
+                    Event::default().data(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": -32603, "message": msg },
+                        })
+                        .to_string(),
+                    ),
+                );
+                return;
+            }
+        };
+        let session_id = task.session_id.clone();
+        let context_id = task.context_id.clone();
         let task_id = session_id.clone();
 
-        // Initial "working" update so the caller knows the task started.
+        // Initial "working" update so the caller knows the task started (the transition also
+        // reaches resubscribers/webhooks).
         let _ = tx.send(status_frame(
             &id,
             &task_id,
@@ -583,33 +1590,61 @@ async fn subscribe(
             None,
             false,
         ));
+        publish_transition(
+            &registry,
+            &scope,
+            &task_id,
+            &context_id,
+            TaskState::Working,
+            None,
+            false,
+        );
         let mut sink = StreamSink {
             tx: tx.clone(),
             id: id.clone(),
             task_id: task_id.clone(),
             context_id: context_id.clone(),
             cancel: cancel_task.clone(),
+            registry: registry.clone(),
+            scope: scope.clone(),
         };
         let result = engine_clone
             .run_turn_cancellable(&session_id, &input, &mut sink, &cancel_task)
             .await;
-        // If the client disconnected mid-stream, skip the final event — nobody is listening.
-        if !cancel_task.is_cancelled() {
-            // The final event carries no message on success — the deltas already streamed are
-            // authoritative; on failure it carries the error text.
-            let (state, message) = match result {
+        // The terminal state: a disconnect-cancelled run is `canceled`, otherwise the run's own
+        // outcome. The final event carries no message on success — the deltas already streamed
+        // are authoritative; on failure it carries the error text.
+        let (state, message) = if cancel_task.is_cancelled() {
+            (TaskState::Canceled, None)
+        } else {
+            match result {
                 Ok(()) => (TaskState::Completed, None),
                 Err(e) => (TaskState::Failed, Some(Message::agent_text(e.to_string()))),
-            };
+            }
+        };
+        // If the client disconnected mid-stream, skip its final event — nobody is listening —
+        // but the transition still reaches resubscribers and webhooks.
+        if !cancel_task.is_cancelled() {
             let _ = tx.send(status_frame(
                 &id,
                 &task_id,
                 &context_id,
                 state,
-                message,
+                message.clone(),
                 true,
             ));
         }
+        publish_transition(
+            &registry,
+            &scope,
+            &task_id,
+            &context_id,
+            state,
+            message,
+            true,
+        );
+        // Release the entry before the gate drops (a queued follow-up must not collide with it).
+        registry.finish(&scope, &task_id);
         // `tx` (and sink.tx clone) drop here → channel closes → stream ends.
     });
 
@@ -626,6 +1661,8 @@ async fn subscribe(
 
 /// Streams text deltas back as SSE `working` status updates. Each delta is an incremental
 /// status-update message; the final `completed` event (sent by the spawner) carries no message.
+/// Deltas also broadcast to the task's registry entry (A-56), so a resubscriber of a streaming
+/// task observes the same frames as the owning stream.
 struct StreamSink {
     tx: tokio::sync::mpsc::UnboundedSender<Event>,
     /// The originating JSON-RPC request id, echoed in every frame.
@@ -635,20 +1672,26 @@ struct StreamSink {
     /// Cancelled when the SSE receiver is dropped (client disconnect); checked between plan rounds
     /// by `run_turn_cancellable`.
     cancel: CancellationToken,
+    registry: Arc<TaskRegistry>,
+    scope: String,
 }
 
 impl AgentSink for StreamSink {
     fn text_delta(&mut self, t: &str) {
         // Send only the delta in working events; sending the full accumulated text on every token
         // would be O(N²) in response length.
-        let frame = status_frame(
-            &self.id,
+        let result = server::status_update_value(
             &self.task_id,
             &self.context_id,
             TaskState::Working,
             Some(Message::agent_text(t)),
             false,
         );
+        // Broadcast to resubscribers (zero subscribers is normal — never a disconnect signal).
+        self.registry
+            .broadcast(&self.scope, &self.task_id, result.clone());
+        let frame = Event::default()
+            .data(json!({ "jsonrpc": "2.0", "id": self.id, "result": result }).to_string());
         if self.tx.send(frame).is_err() {
             // Receiver gone — client disconnected; stop doing work as soon as possible.
             self.cancel.cancel();
@@ -754,19 +1797,26 @@ mod tests {
         // Simulate a long turn already in flight: something else holds the single-turn gate.
         let held = turn_gate.clone().lock_owned().await;
 
-        // Fire request X through the real `send` handler. It must queue behind the held gate
-        // before its turn can run.
+        // Fire request X through the real `send` handler — a BLOCKING send (the path whose C-29
+        // protection is the gate-held mint). It must queue behind the held gate before its turn
+        // can run.
+        let registry = Arc::new(TaskRegistry::default());
         let engine_x = engine.clone();
         let gate_x = turn_gate.clone();
+        let registry_x = registry.clone();
         let x_task = tokio::spawn(async move {
+            let mut params = send_params("hi");
+            params["configuration"] = json!({ "blocking": true });
             send(
                 engine_x,
                 Arc::new(crate::ServerAuth::Open),
                 gate_x,
+                registry_x,
+                String::new(),
                 ttl,
                 None,
                 Some(json!(1)),
-                Some(send_params("hi")),
+                Some(params),
             )
             .await
         });
@@ -779,7 +1829,18 @@ mod tests {
 
         // Request Y arrives while X is still queued: its mint runs the lazy TTL sweep — the exact
         // moment the bug prunes a queued session out from under the queue.
-        let _session_y = create_a2a_session(&engine, ttl, None, None).unwrap();
+        let _session_y = mint_and_register(
+            &registry,
+            "",
+            &engine,
+            ttl,
+            None,
+            None,
+            TaskState::Submitted,
+            CancellationToken::new(),
+        )
+        .map_err(|_| "mint failed")
+        .unwrap();
 
         // Release the gate: X's queued turn can finally run.
         drop(held);

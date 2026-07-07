@@ -1,6 +1,6 @@
 # A2A protocol conformance (epic)
 
-**Status:** Tiers 1–2 shipped (2026-07-07); Tier 3 design-first · **Pillar:** Agent · **Epic slug:** `a2a-conformance`
+**Status:** Tiers 1–3 implemented (Tier 3 core 2026-07-08; the `input-required` suspension slice remains open) · **Pillar:** Agent · **Epic slug:** `a2a-conformance`
 
 Tracks the gap between the [A2A protocol](https://a2a-protocol.org/) (v1.0) and flux's
 implementation, and sequences the work to close it. The living support matrix lives in
@@ -40,7 +40,7 @@ current model* (Tiers 1–2) and *a deliberate model change* (Tier 3).
   (A-52), and inbound `file` parts are refused with `-32005` (A-51). Still *modeled but not produced*:
   `Message.taskId`/`referenceTaskIds`, non-terminal `TaskState`s, and outbound `file` parts.
 - **Error codes** — base JSON-RPC `-32600/-32601/-32602/-32603` ✅; A2A `-32004`/`-32005` ✅ (A-50);
-  the task-lifecycle codes `-32001/-32002/-32003/-32006/-32007` are defined but await A-53.
+  the task-lifecycle codes `-32001/-32002/-32003` are emitted since A-54/55/57; `-32006/-32007` remain defined-only.
 - **Transports** — JSON-RPC/HTTP only.
 - **Solid** — realm-keyed `contextId` continuity (A-48), security-scheme advertisement + external-URL
   card (v0.4.0), SSE streaming with disconnect-cancels-turn.
@@ -83,7 +83,7 @@ Moderate; still within the synchronous-turn model.
   missing. Native flux-server artifact emission would first need an engine structured-output seam;
   that is out of scope here and left as a future follow-up if a structured-output producer lands.
 
-### Tier 3 — stateful task model (design ✅; impl `backlog`)
+### Tier 3 — stateful task model (design ✅; A-54..A-57 implemented 2026-07-08)
 
 - **[A-53](../stories/A-53-stateful-a2a-task-model.md)** ✅ — the architectural decision below is now
   captured in its own design doc, [a2a-stateful-task-model](a2a-stateful-task-model.md), which fans

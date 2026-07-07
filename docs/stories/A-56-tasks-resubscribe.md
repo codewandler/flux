@@ -2,7 +2,7 @@
 id: A-56
 title: tasks/resubscribe — re-attach an SSE stream to a live or retained task
 pillar: Agent
-status: backlog
+status: done
 epic: a2a-conformance
 design: docs/designs/a2a-stateful-task-model.md
 note: "Tier-3: replay a task's status/artifact updates then follow live; needs A-54"
@@ -29,6 +29,22 @@ non-blocking task (or dropped a `message/stream`) can re-attach and observe it t
 - [ ] Failing-first tests: resubscribe to a running task observes ≥1 `working` frame then the terminal
       frame; resubscribe to a finished task yields the terminal frame and closes; unknown id → `-32001`.
 
+## Progress
+- 2026-07-08 — done. `tasks/resubscribe`: a **live** task subscribes to its registry broadcast
+  (subscribe + state snapshot under one lock hold, so no frame falls in between), yields the
+  snapshot `working` frame, then follows the run's frames — per-token deltas included — to the
+  `final: true` frame; a **finished** task replays one terminal frame (state + recorded answer)
+  and closes; unknown/cross-realm → `-32001` before any SSE is established. Frames ride the
+  broadcast as bare `result` values and each subscriber wraps them in its OWN JSON-RPC id
+  (`rpc_frame`). Every A2A run publishes: `BroadcastSink` (non-blocking) and `StreamSink`
+  (message/stream) broadcast deltas; `publish_transition` broadcasts status transitions. A
+  resubscriber is an observer — dropping its stream cancels nothing (no drop-guard), unlike the
+  owning `message/stream`. Lagged broadcast consumers skip forward (transitions are re-derivable
+  via `tasks/get`). Test: `tasks_resubscribe_follows_live_and_replays_terminal` (live: ≥1 working
+  frame then final; terminal: exactly one final frame; unknown: -32001).
+
 ## Notes
-- Reuses the SSE plumbing (`Sse`, keep-alive, disconnect-cancels via the drop-guard) already in
-  `message/stream`. Epic: [a2a-conformance](../designs/a2a-conformance.md).
+- Reuses the SSE plumbing (`Sse`, keep-alive) already in `message/stream`; the replay is a state
+  snapshot + live follow rather than a from-zero frame log (repeat `working` frames are harmless
+  per spec, and the durable answer is always in `tasks/get`).
+  Epic: [a2a-conformance](../designs/a2a-conformance.md).

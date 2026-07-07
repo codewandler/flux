@@ -6,6 +6,45 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+**A2A conformance Tier 3 — the stateful task model** (the `a2a-conformance` epic, A-54..A-57,
+implementing the A-53 design). An A2A task is now first-class and addressable: task id = the flux
+session id, a `Task` is a projection over the session's own turn-lifecycle events (no second
+store), and live runs are held in an in-process registry. One wire-behavior change (the
+non-blocking spec default) → the next release is a minor bump.
+
+### Added
+
+- **A-54** — addressable tasks. `message/send` honors `configuration.blocking`: the spec default
+  (absent/`false`) returns a `submitted` task immediately and runs the turn in the background;
+  `blocking: true` keeps the synchronous completed-Task fast path bit-for-bit. Server-side
+  `tasks/get` resolves a live or retained task to its current state (realm-scoped;
+  unknown/cross-realm/non-A2A ids are one constant `-32001 TaskNotFound`), on both the
+  single-agent and multi-agent mounts. A finished task stays readable for as long as its session
+  is retained — across restarts, since terminal state folds from the event log.
+- **A-55** — `tasks/cancel`: fires a live run's `CancellationToken` out-of-band (the same token an
+  SSE disconnect fires); the run stops between plan rounds and records the durable `cancelled`
+  outcome. Terminal or not-in-process tasks → `-32002 TaskNotCancelable`. Blocking and streaming
+  runs are cancelable too — every A2A run now registers while in flight.
+- **A-56** — `tasks/resubscribe`: re-attach an SSE stream to a task — a live task replays its
+  current state and follows the run's frames (deltas included) to the final frame; a finished
+  task replays its terminal state and closes. Resubscribers are observers: disconnecting one
+  cancels nothing.
+- **A-57** — push notifications: `tasks/pushNotificationConfig/{set,get,list,delete}` register
+  per-task webhooks; status transitions POST to the URL (config `token` echoed as
+  `X-A2A-Notification-Token`; one attempt, 10s timeout, no retry — the durable task state is the
+  source of truth). Only public `http(s)` endpoints are accepted (`-32003` otherwise;
+  `FLUX_A2A_PUSH_ALLOW_LOCAL=1` for local development). `capabilities.pushNotifications` is now
+  advertised `true`.
+- `EventStore::prune_inactive_excluding(agent_id, cutoff, keep)` — the tag-scoped sweep with a
+  keep-list, so the A2A TTL sweep can never prune a session whose task is queued or running
+  in-process (the C-29 protection, generalized for the async era).
+
+### Changed
+
+- **A2A wire behavior:** a `message/send` that omits `blocking: true` now returns a `submitted`
+  task instead of blocking to completion (the A2A spec default) — poll `tasks/get` or use
+  `tasks/resubscribe`; flux's own client/CLI always sent `blocking: true` and is unaffected.
+
 ## [0.5.0] - 2026-07-08
 
 **Postgres backend post-ship hardening** (the `pg-backend` epic's review follow-ups, D-76..D-79).

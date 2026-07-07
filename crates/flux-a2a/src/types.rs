@@ -570,6 +570,14 @@ impl AgentCard {
         self.icon_url = Some(url.into());
         self
     }
+
+    /// Declare push-notification support (builder-style, A-57): a surface that implements
+    /// `tasks/pushNotificationConfig/*` + webhook delivery flips this to `true`; the default
+    /// card stays honest (`false`).
+    pub fn with_push_notifications(mut self, enabled: bool) -> Self {
+        self.capabilities.push_notifications = enabled;
+        self
+    }
 }
 
 // ── JSON-RPC envelope ───────────────────────────────────────────────────────

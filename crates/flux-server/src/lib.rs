@@ -267,6 +267,33 @@ pub(crate) fn enter_turn(
     }
 }
 
+/// The caller's realm **without** the identity swap — for A2A operations that never run a turn
+/// (`tasks/get`, `tasks/cancel`, `tasks/resubscribe`, `tasks/pushNotificationConfig/*`) and for
+/// the non-blocking mint (A-54), where the task id must be answered before the single-turn gate
+/// can be acquired.
+///
+/// This is a deliberate, narrow relaxation of the D-69 type-coupling ([`enter_turn`] binds
+/// realm-derivation to the gate-held identity swap): the coupling's invariant is that **no turn
+/// runs under the service identity**, and it still holds — a non-blocking send's background task
+/// calls [`enter_turn`] under the gate before any model work; the read-only task operations run
+/// no turn at all. What this function must never be used for is minting-then-running inside one
+/// gate hold — that path keeps using [`enter_turn`]'s realm.
+///
+/// Same fail-closed posture: principal mode without an [`AuthContext`] is an error (unreachable
+/// behind [`require_auth`]).
+pub(crate) fn caller_realm(
+    auth: &ServerAuth,
+    ctx: Option<&AuthContext>,
+) -> Result<Option<String>, ()> {
+    match auth {
+        ServerAuth::Open | ServerAuth::SharedSecret { .. } => Ok(None),
+        ServerAuth::Principal(_) => match ctx {
+            Some(ctx) => Ok(Some(realm_of(ctx))),
+            None => Err(()),
+        },
+    }
+}
+
 /// The A2A session TTL in seconds (C-18): A2A-minted sessions whose last activity is older than
 /// this are swept lazily before the next A2A session is created. `0` disables pruning.
 #[derive(Clone, Copy, Debug)]
@@ -356,6 +383,9 @@ pub struct ServerState {
     turn_gate: TurnGate,
     a2a_ttl: A2aTtl,
     auth: Arc<ServerAuth>,
+    /// The in-process registry of live A2A tasks (A-54): cancel/resubscribe handles + the
+    /// sweep keep-list. One per router, like the turn gate.
+    tasks: Arc<a2a::TaskRegistry>,
 }
 
 impl FromRef<ServerState> for Arc<FlowEngine> {
@@ -385,6 +415,12 @@ impl FromRef<ServerState> for A2aTtl {
 impl FromRef<ServerState> for Arc<ServerAuth> {
     fn from_ref(s: &ServerState) -> Self {
         s.auth.clone()
+    }
+}
+
+impl FromRef<ServerState> for Arc<a2a::TaskRegistry> {
+    fn from_ref(s: &ServerState) -> Self {
+        s.tasks.clone()
     }
 }
 
@@ -531,6 +567,7 @@ fn router_with_ttl(
         turn_gate: Arc::new(tokio::sync::Mutex::new(())),
         a2a_ttl,
         auth: auth.clone(),
+        tasks: Arc::new(a2a::TaskRegistry::default()),
     };
     // Auth-exempt routes — registered outside the middleware layer so path-string comparison
     // cannot be bypassed by percent-encoding or double-slash tricks.
@@ -654,6 +691,9 @@ pub struct MultiState {
     pub(crate) turn_gate: TurnGate,
     pub(crate) a2a_ttl: A2aTtl,
     pub(crate) auth: Arc<ServerAuth>,
+    /// Live A2A tasks across every mounted agent (A-54); entries are scoped by `agent_id`, so
+    /// two agents' identical session ids can never collide.
+    pub(crate) tasks: Arc<a2a::TaskRegistry>,
 }
 
 impl FromRef<MultiState> for TurnGate {
@@ -674,6 +714,11 @@ impl FromRef<MultiState> for Arc<ServerAuth> {
 impl FromRef<MultiState> for Arc<dyn AgentResolver> {
     fn from_ref(s: &MultiState) -> Self {
         s.resolver.clone()
+    }
+}
+impl FromRef<MultiState> for Arc<a2a::TaskRegistry> {
+    fn from_ref(s: &MultiState) -> Self {
+        s.tasks.clone()
     }
 }
 
@@ -707,6 +752,7 @@ fn router_multi_with_ttl(
         turn_gate: Arc::new(tokio::sync::Mutex::new(())),
         a2a_ttl,
         auth: auth.clone(),
+        tasks: Arc::new(a2a::TaskRegistry::default()),
     };
     // Discovery card is public (structurally auth-exempt), exactly as in the single-agent mount.
     let exempt = Router::new()
@@ -1412,7 +1458,7 @@ mod tests {
         // One TTL (plus ε) after the a2a session's last activity: it has expired; the CLI
         // session is even older, but untagged — never eligible.
         let now = events.info(&a2a_id).unwrap().updated_at_ms + 60_000 + 1;
-        assert_eq!(a2a::prune_expired_a2a_sessions_at(&events, 60, now), 1);
+        assert_eq!(a2a::prune_expired_a2a_sessions_at(&events, 60, now, &[]), 1);
         assert!(
             events.info(&a2a_id).is_err(),
             "expired a2a session is pruned"
@@ -1451,7 +1497,7 @@ mod tests {
             "sanity: the touch moved last-activity past the cutoff"
         );
         assert_eq!(
-            a2a::prune_expired_a2a_sessions_at(&events, 1, cutoff + 1_000),
+            a2a::prune_expired_a2a_sessions_at(&events, 1, cutoff + 1_000, &[]),
             1
         );
         assert!(
@@ -1476,7 +1522,7 @@ mod tests {
         // "Ten years later", with pruning disabled, nothing is swept.
         let far_future = events.info(&old).unwrap().updated_at_ms + 315_360_000_000;
         assert_eq!(
-            a2a::prune_expired_a2a_sessions_at(&events, 0, far_future),
+            a2a::prune_expired_a2a_sessions_at(&events, 0, far_future, &[]),
             0
         );
         assert!(events.info(&old).is_ok(), "ttl 0 means never prune");

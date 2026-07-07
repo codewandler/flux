@@ -74,7 +74,12 @@ fn send_params(text: &str, context_id: Option<&str>) -> Value {
     if let Some(cid) = context_id {
         message["contextId"] = json!(cid);
     }
-    json!({ "jsonrpc": "2.0", "id": 1, "method": "message/send", "params": { "message": message } })
+    // Blocking send: these tests assert the synchronous completed-Task shape (A-54 makes
+    // non-blocking the default).
+    json!({
+        "jsonrpc": "2.0", "id": 1, "method": "message/send",
+        "params": { "message": message, "configuration": { "blocking": true } },
+    })
 }
 
 /// Full-response GET (status + headers + body) — the constant-shape assertions need headers.
@@ -497,4 +502,70 @@ async fn usage_is_realm_scoped() {
         .map(|m| m["model"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(models, ["model-alice"], "only the caller's realm's rows");
+}
+
+/// A-54: the stateful task surface is realm-scoped — a task minted by alice resolves for alice,
+/// while bob's probe of the same id answers the SAME constant `-32001` an unknown id gets, across
+/// every task method (get, cancel, resubscribe, push-config). Cross-realm existence is never
+/// distinguishable.
+#[tokio::test]
+async fn task_surface_is_realm_scoped_with_constant_not_found() {
+    let (app, _) = principal_app();
+
+    // alice mints + completes a task (blocking send); task id = her session id.
+    let (_, minted) = post_json_auth(
+        app.clone(),
+        "/a2a",
+        send_params("hi", Some("ctx-realm-task")),
+        Some("Bearer tok-alice"),
+    )
+    .await;
+    let task_id = minted["result"]["id"].as_str().unwrap().to_string();
+
+    // alice reads her task back through `tasks/get`.
+    let task_rpc = |method: &str, id: &str| {
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": method, "params": { "id": id },
+        })
+    };
+    let (_, mine) = post_json_auth(
+        app.clone(),
+        "/a2a",
+        task_rpc("tasks/get", &task_id),
+        Some("Bearer tok-alice"),
+    )
+    .await;
+    assert_eq!(
+        mine["result"]["status"]["state"], "completed",
+        "own-realm get resolves: {mine}"
+    );
+
+    // bob's probes of alice's task: one constant -32001 across the whole surface…
+    for method in [
+        "tasks/get",
+        "tasks/cancel",
+        "tasks/resubscribe",
+        "tasks/pushNotificationConfig/list",
+    ] {
+        let (_, res) = post_json_auth(
+            app.clone(),
+            "/a2a",
+            task_rpc(method, &task_id),
+            Some("Bearer tok-bob"),
+        )
+        .await;
+        assert_eq!(
+            res["error"]["code"], -32001,
+            "{method} cross-realm probe is constant not-found: {res}"
+        );
+    }
+    // …indistinguishable from a genuinely unknown id.
+    let (_, unknown) = post_json_auth(
+        app.clone(),
+        "/a2a",
+        task_rpc("tasks/get", "s_424242"),
+        Some("Bearer tok-bob"),
+    )
+    .await;
+    assert_eq!(unknown["error"]["code"], -32001);
 }

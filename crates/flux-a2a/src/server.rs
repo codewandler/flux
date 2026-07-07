@@ -286,6 +286,26 @@ pub fn history_length(params: &Value) -> Option<usize> {
         .map(|n| n as usize)
 }
 
+/// Whether the client asked for a **blocking** send (`configuration.blocking == true`). The A2A
+/// spec default is non-blocking — absent or `false` means "return a `submitted` task now and run
+/// in the background" — so a stateful surface (A-54) branches on exactly this. Shared so every
+/// surface reads the flag identically. (The reusable [`dispatch`] runner surface stays
+/// synchronous-turn and does not consult it.)
+pub fn blocking_requested(params: &Value) -> bool {
+    params
+        .get("configuration")
+        .and_then(|c| c.get("blocking"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// The task id of a `tasks/*` request (`params.id`), if present. Shared by the stateful task
+/// methods (`tasks/get`, `tasks/cancel`, `tasks/resubscribe`, `tasks/pushNotificationConfig/*`)
+/// so id extraction cannot drift across them.
+pub fn extract_task_id(params: &Value) -> Option<String> {
+    params.get("id").and_then(Value::as_str).map(str::to_string)
+}
+
 /// `message/send`: extract the user's text, run one turn, and wrap the answer in a completed `Task`.
 async fn send(
     runner: &dyn A2aTurn,
@@ -425,11 +445,25 @@ pub fn now_rfc3339() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0) as i64;
-    let s = secs % 60;
-    let min = (secs / 60) % 60;
-    let h = (secs / 3_600) % 24;
+    rfc3339_secs(secs)
+}
+
+/// RFC 3339 UTC timestamp from milliseconds since the Unix epoch — the event store's clock
+/// convention — so a projected task's `status.timestamp` can reflect *when the state was reached*
+/// (the stored event's `ts`), not when it was read (A-54). Sub-second precision is dropped: the
+/// A2A timestamps are whole-second, matching [`now_rfc3339`].
+pub fn rfc3339_ms(ms: i64) -> String {
+    rfc3339_secs(ms.div_euclid(1000))
+}
+
+fn rfc3339_secs(secs: i64) -> String {
+    // Euclidean arithmetic throughout so a pre-epoch (negative) input still formats a valid
+    // timestamp — identical to truncating division for every non-negative input.
+    let s = secs.rem_euclid(60);
+    let min = secs.div_euclid(60).rem_euclid(60);
+    let h = secs.div_euclid(3_600).rem_euclid(24);
     // civil_from_days
-    let z = secs / 86_400 + 719_468;
+    let z = secs.div_euclid(86_400) + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097; // 0 <= doe < 146097
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
@@ -444,6 +478,45 @@ pub fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocking_requested_defaults_to_non_blocking() {
+        // The A2A spec default: absent configuration (or absent/false flag) = non-blocking.
+        assert!(!blocking_requested(&json!({ "message": {} })));
+        assert!(!blocking_requested(
+            &json!({ "configuration": { "historyLength": 3 } })
+        ));
+        assert!(!blocking_requested(
+            &json!({ "configuration": { "blocking": false } })
+        ));
+        assert!(blocking_requested(
+            &json!({ "configuration": { "blocking": true } })
+        ));
+        // A non-boolean value is treated as absent, never as true.
+        assert!(!blocking_requested(
+            &json!({ "configuration": { "blocking": "yes" } })
+        ));
+    }
+
+    #[test]
+    fn extract_task_id_reads_params_id() {
+        assert_eq!(
+            extract_task_id(&json!({ "id": "s_42" })).as_deref(),
+            Some("s_42")
+        );
+        assert!(extract_task_id(&json!({ "taskId": "s_42" })).is_none());
+        assert!(extract_task_id(&json!({ "id": 42 })).is_none());
+    }
+
+    #[test]
+    fn rfc3339_ms_matches_the_seconds_formatter_and_truncates() {
+        // 2026-01-02T03:04:05.678Z → the millisecond part is dropped, not rounded.
+        let ms = 1_767_323_045_678i64;
+        assert_eq!(rfc3339_ms(ms), "2026-01-02T03:04:05Z");
+        // Epoch and a negative (pre-epoch) value stay well-formed via div_euclid.
+        assert_eq!(rfc3339_ms(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_ms(-1), "1969-12-31T23:59:59Z");
+    }
 
     #[test]
     fn card_url_defaults_to_http_without_forwarded_proto() {

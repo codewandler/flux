@@ -42,7 +42,12 @@ fn send_body(context_id: Option<&str>, text: &str, id: u64) -> serde_json::Value
     if let Some(cid) = context_id {
         message["contextId"] = json!(cid);
     }
-    json!({ "jsonrpc": "2.0", "id": id, "method": "message/send", "params": { "message": message } })
+    // Blocking send: these tests assert the synchronous completed-Task shape (A-54 makes
+    // non-blocking the default).
+    json!({
+        "jsonrpc": "2.0", "id": id, "method": "message/send",
+        "params": { "message": message, "configuration": { "blocking": true } },
+    })
 }
 
 fn answer(task: &serde_json::Value) -> String {

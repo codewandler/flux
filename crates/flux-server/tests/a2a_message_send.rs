@@ -18,7 +18,9 @@ async fn message_send_completes_with_completed_task_state() {
             "message": {
                 "contextId": "ctx-1",
                 "parts": [{ "kind": "text", "text": "hello" }],
-            }
+            },
+            // The A-54 spec default is non-blocking; this test asserts the synchronous shape.
+            "configuration": { "blocking": true },
         }
     });
     let (status, res) = support::post_json(app, "/a2a", body).await;

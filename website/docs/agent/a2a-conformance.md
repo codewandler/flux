@@ -12,23 +12,28 @@ flux or drive a remote agent with `flux a2a`. For how to use it, see [Agent-to-a
 
 ## The one thing to know
 
-flux runs an A2A request as **one synchronous turn** and returns a `completed` `Task`. There is no
-retained, addressable async task: `message/send` blocks until the turn finishes, `configuration.blocking`
-is ignored, and the returned `Task` has no id you can look up later. Multi-turn continuity is by
-`contextId` (the same `contextId` continues a conversation), not by task id. This is why the
-task-management methods below (`tasks/get` server-side, `tasks/cancel`, `tasks/resubscribe`,
-non-blocking send, push notifications) are Not-yet.
+An A2A task on flux is **addressable**: `message/send` honors `configuration.blocking` — the spec
+default (absent/`false`) returns a `submitted` task immediately and runs the turn in the
+background, while `blocking: true` blocks to the finished `Task`. Poll a task with `tasks/get`,
+stream it with `tasks/resubscribe`, stop it with `tasks/cancel`, or register a webhook with
+`tasks/pushNotificationConfig/set`. A finished task stays readable for as long as its session is
+retained (the TTL sweep). Multi-turn continuity is by `contextId`; a context runs one task at a
+time, and its task id is stable across the context's turns.
+
+**Upgrading:** a send that omits `blocking: true` now returns a `submitted` task instead of
+blocking to completion — set `blocking: true` for the old synchronous behavior. Clients using
+flux's own client/CLI are unaffected (they always sent `blocking: true`).
 
 ## Methods
 
 | Method | Status | Notes |
 |---|---|---|
-| `message/send` | ✅ | Synchronous; returns a `completed` Task. |
+| `message/send` | ✅ | `blocking: true` → synchronous completed Task; absent/`false` (the spec default) → `submitted` immediately, run in background. |
 | `message/stream` | ✅ | Server-Sent Events. Disconnecting cancels the remote turn. |
-| `tasks/get` | ⚠️ | flux's **client** can call it against remote agents; flux's **server** does not implement it. |
-| `tasks/cancel` | ❌ | Returns `-32004 UnsupportedOperation`. Cancel a streaming turn by dropping the SSE connection instead. |
-| `tasks/resubscribe` | ❌ | Returns `-32004 UnsupportedOperation`. |
-| `tasks/pushNotificationConfig/{set,get,list,delete}` | ❌ | Returns `-32004 UnsupportedOperation`. |
+| `tasks/get` | ✅ | Poll a live or finished task to its current state; unknown ids → `-32001`. |
+| `tasks/cancel` | ✅ | Stops a live run between plan rounds; terminal tasks → `-32002`. |
+| `tasks/resubscribe` | ✅ | Re-attach an SSE stream: live tasks stream to the final frame, finished tasks replay their terminal state. |
+| `tasks/pushNotificationConfig/{set,get,list,delete}` | ✅ | Per-task webhooks; status transitions POST to your URL (`token` echoes back as `X-A2A-Notification-Token`). |
 | `agent/getAuthenticatedExtendedCard` | ❌ | Returns `-32004 UnsupportedOperation`. |
 
 ## AgentCard
@@ -37,7 +42,7 @@ non-blocking send, push notifications) are Not-yet.
 |---|---|---|
 | `name`, `description`, `url`, `version` | ✅ | |
 | `capabilities.streaming` | ✅ | |
-| `capabilities.pushNotifications` | ✅ | Advertised `false` — flux does not send push notifications. |
+| `capabilities.pushNotifications` | ✅ | Advertised `true` — per-task webhook delivery is implemented. |
 | `defaultInputModes`, `defaultOutputModes` | ✅ | `text/plain`. |
 | `skills` | ✅ | |
 | `securitySchemes`, `security` | ✅ | Declared whenever the server enforces auth. |
@@ -51,12 +56,12 @@ non-blocking send, push notifications) are Not-yet.
 
 | Item | Status | Notes |
 |---|---|---|
-| `Task` / `TaskStatus`; states `working` / `completed` / `failed` | ✅ | |
-| Task states `input-required` / `auth-required` / `canceled` / `submitted` | ❌/⚠️ | Not emitted under the synchronous model. |
+| `Task` / `TaskStatus`; states `submitted` / `working` / `completed` / `canceled` / `failed` | ✅ | The full non-suspension lifecycle. |
+| Task states `input-required` / `auth-required` | ❌ | Need the suspend/resume seam (resume on `taskId`). |
 | `Task.history` | ✅ | Populated from the conversation; set `configuration.historyLength` to cap it to the most-recent messages. |
 | `Task.artifacts` | ✅ | Carries a turn's structured (non-text) outputs. flux's built-in text agent produces none, so its tasks stay `[]`. |
 | `Message` (`messageId`, `role`, `parts`, `contextId`) | ✅ | `contextId` drives continuity. |
-| `Message.taskId` / `referenceTaskIds` | ⚠️/❌ | Not used for task addressing yet. |
+| `Message.taskId` / `referenceTaskIds` | ⚠️/❌ | Parsed but not yet used to resume a task (`input-required` is the open slice). |
 | Part: `text` | ✅ | |
 | Part: `data` (inbound) | ✅ | Surfaced into the turn as structured JSON, so a data-only message runs a real turn. |
 | Part: `file` (inbound) | ⚠️ | Refused with `-32005 ContentTypeNotSupported` (flux's turn is text-only) rather than silently dropped — send text or a `data` part. |
@@ -71,15 +76,22 @@ non-blocking send, push notifications) are Not-yet.
 | gRPC, HTTP+JSON/REST bindings | 🚫 | Non-goals. |
 | Base JSON-RPC errors (`-32600`/`-32601`/`-32602`/`-32603`) | ✅ | |
 | A2A errors `-32004` UnsupportedOperation, `-32005` ContentTypeNotSupported | ✅ | Emitted for defined-but-unsupported methods and for messages with a `file` part / no usable text or data; a genuinely-unknown method still returns `-32601`. |
-| Task-lifecycle errors (`-32001`/`-32002`/`-32003`/`-32006`/`-32007`) | ❌ | Await the stateful task model. |
+| Task errors `-32001` TaskNotFound, `-32002` TaskNotCancelable, `-32003` PushNotificationNotSupported | ✅ | Unknown/foreign task ids are one constant `-32001`; `-32003` refuses non-public push URLs. |
+| `-32006` / `-32007` | ❌ | No producing path yet. |
+
+## Push notification delivery
+
+Delivery is best-effort by design: one POST per status transition (never per-token deltas), a 10s
+timeout, and no retries — the durable task state from `tasks/get` is the source of truth; a push
+is a hint to poll. Webhook URLs must be public `http(s)` endpoints (loopback, private, and
+link-local addresses are refused with `-32003`; set `FLUX_A2A_PUSH_ALLOW_LOCAL=1` for local
+development). Configs live in server memory: re-register after a server restart.
 
 ## What's next
 
-Conformance work is tracked as an epic. The card declares `protocolVersion`, its transport
-interface, and A2A-specific error codes; tasks now carry conversation `history` (bounded by
-`historyLength`) and structured `artifacts`, and inbound `data` parts run a real turn. The larger
-remaining effort is a stateful task model that unlocks `tasks/get`, cancellation, resubscription,
-non-blocking sends, and push notifications.
+The one remaining lifecycle slice is suspension: surfacing the engine's suspend/resume seam as
+`input-required` / `auth-required` tasks that a follow-up `message/send` carrying the same
+`taskId` resumes.
 
 **Non-goals:** gRPC and A2A REST transport bindings, an extensions-negotiation framework, and
 `tasks/list`. flux keeps to a single JSON-RPC/HTTP binding and a tolerant pass-through for unknown

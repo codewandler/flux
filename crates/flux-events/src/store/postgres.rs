@@ -491,7 +491,16 @@ impl EventBackend for PgEvents {
         })
     }
 
-    fn prune_inactive(&self, agent_id: &str, cutoff_ms: i64) -> Result<usize> {
+    fn prune_inactive_excluding(
+        &self,
+        agent_id: &str,
+        cutoff_ms: i64,
+        keep: &[String],
+    ) -> Result<usize> {
+        // The keep-list is filtered in Rust (it is small — the in-process live tasks), so the SQL
+        // stays the same indexed select as before.
+        let keep: std::collections::HashSet<i64> =
+            keep.iter().filter_map(|s| parse_id(s).ok()).collect();
         let pool = self.handle.pool().clone();
         let agent_id = agent_id.to_string();
         self.handle.block_on(async move {
@@ -502,6 +511,7 @@ impl EventBackend for PgEvents {
                     .fetch_all(&pool)
                     .await
                     .map_err(map_sql)?;
+            let ns: Vec<i64> = ns.into_iter().filter(|n| !keep.contains(n)).collect();
             delete_streams(&pool, ns).await
         })
     }

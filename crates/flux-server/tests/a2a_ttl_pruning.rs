@@ -95,7 +95,9 @@ async fn send_and_get_task_id(app: axum::Router, context_id: &str) -> String {
             "message": {
                 "contextId": context_id,
                 "parts": [{ "kind": "text", "text": "hi" }],
-            }
+            },
+            // Blocking: the TTL assertions need the turn finished when the response returns.
+            "configuration": { "blocking": true },
         }
     });
     let (status, res) = support::post_json(app, "/a2a", body).await;

@@ -2,7 +2,7 @@
 id: A-57
 title: A2A push notifications — pushNotificationConfig methods + webhook delivery
 pillar: Agent
-status: backlog
+status: done
 epic: a2a-conformance
 design: docs/designs/a2a-stateful-task-model.md
 note: "Tier-3, last/optional slice: per-task webhook config + delivery; flips capabilities.pushNotifications"
@@ -32,7 +32,24 @@ and a delivery layer, and flipping `capabilities.pushNotifications` to `true`.
 - [ ] Failing-first tests: a `set` then a task run delivers ≥1 update to a test webhook; `get`/`list`
       reflect the config; `delete` stops delivery; the card capability flips.
 
+## Progress
+- 2026-07-08 — done. `tasks/pushNotificationConfig/{set,get,list,delete}` in
+  `crates/flux-server/src/a2a.rs` (`push_config`), realm-scoped (the task must resolve within the
+  caller's realm before the config surface is touched; unknown/cross-realm → `-32001`). Configs
+  live in-process beside the live-task map (delivery only happens for in-process runs, so
+  durability beyond the process buys nothing — documented: re-register after restart); config id
+  defaults to its URL. Delivery = `deliver_push` fanned out from `publish_transition`: one POST
+  per status **transition** (never per-token deltas), fire-and-forget on a spawned task, 10s
+  timeout, failures logged, **no retry** (documented policy — the durable projection is the
+  source of truth; push is a hint to poll); config `token` rides as `X-A2A-Notification-Token`.
+  SSRF posture (`push_url_allowed`, documented): only public `http(s)` — loopback/private/
+  link-local/unspecified literals and `localhost` refused with `-32003
+  PushNotificationNotSupported`; DNS-rebinding out of scope (network-layer concern);
+  `FLUX_A2A_PUSH_ALLOW_LOCAL=1` for local dev/tests. `capabilities.pushNotifications` flipped to
+  `true` (new `AgentCard::with_push_notifications`). Test:
+  `push_notification_config_and_delivery` (set/list/refused-URL/delivery-to-live-webhook/delete
+  stops delivery; card flip).
+
 ## Notes
-- Last and optional Tier-3 slice; ship A-54..A-56 first. Webhook egress needs a documented
-  security/SSRF posture (allowed schemes/hosts). Epic:
+- Shipped with A-54..A-56 in one Tier-3 pass. Epic:
   [a2a-conformance](../designs/a2a-conformance.md).

@@ -28,10 +28,11 @@ anyhow.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 futures.workspace = true
+# A-57: push-notification webhook delivery (one pooled client on the task registry).
+reqwest.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
-reqwest.workspace = true
 tower = { version = "0.5", features = ["util"] }
 flux-policy.workspace = true
 flux-provider.workspace = true

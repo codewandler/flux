@@ -490,7 +490,18 @@ impl EventBackend for SqliteEvents {
         Ok(empty.len())
     }
 
-    fn prune_inactive(&self, agent_id: &str, cutoff_ms: i64) -> Result<usize> {
+    fn prune_inactive_excluding(
+        &self,
+        agent_id: &str,
+        cutoff_ms: i64,
+        keep: &[String],
+    ) -> Result<usize> {
+        // The keep-list is filtered in Rust (it is small — the in-process live tasks), so the SQL
+        // stays the same indexed select as `prune_inactive`.
+        let keep: std::collections::HashSet<i64> = keep
+            .iter()
+            .filter_map(|s| super::parse_id(s).ok())
+            .collect();
         let conn = self.conn.lock().unwrap();
         let tx = begin_write(&conn)?;
         let expired: Vec<i64> = {
@@ -505,6 +516,7 @@ impl EventBackend for SqliteEvents {
             rows.collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(map_sql)?
         };
+        let expired: Vec<i64> = expired.into_iter().filter(|n| !keep.contains(n)).collect();
         for n in &expired {
             let stream = format!("s_{n}");
             tx.execute("DELETE FROM events WHERE stream = ?1", [&stream])

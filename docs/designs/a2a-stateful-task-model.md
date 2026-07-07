@@ -1,11 +1,14 @@
 # A2A stateful task model (Tier 3)
 
-**Status:** design (2026-07-07) · **Pillar:** Agent · **Epic:** [a2a-conformance](a2a-conformance.md) ·
+**Status:** implemented (A-54..A-57, 2026-07-08; suspension slice open) · **Pillar:** Agent · **Epic:** [a2a-conformance](a2a-conformance.md) ·
 **Story:** [A-53](../stories/A-53-stateful-a2a-task-model.md)
 
 This design answers the single architectural question that gates the whole task-management half of
-the A2A spec, and fans it into implementation stories. It is the Tier-3 follow-on to the shipped
-Tier-1/2 conformance work; nothing here is implemented yet.
+the A2A spec, and fans it into implementation stories. A-54..A-57 are implemented (2026-07-08);
+the `input-required`/`auth-required` suspension slice is the one part still open. One deviation
+from the sketch below: the C-29 sweep protection generalized — every A2A run (blocking, streaming,
+non-blocking) registers in the live-task registry, and the mint-time TTL sweep excludes live
+tasks (`prune_inactive_excluding`), because non-blocking mints made mid-turn sweeps possible.
 
 ## The problem
 
