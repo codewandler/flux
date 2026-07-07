@@ -45,9 +45,42 @@ pub struct A2aSettings {
     #[serde(default)]
     pub agent: Option<String>,
     /// Optional bearer token (host-resolved — use `token secret "KEY"` in the program). Required for a
-    /// non-loopback `addr`, since the served agent has no interactive approver.
+    /// non-loopback `addr`, since the served agent has no interactive approver. Ignored (with a
+    /// warning) when `introspect_url` selects per-request principal auth.
     #[serde(default)]
     pub token: Option<String>,
+
+    // ── Per-request principal auth (D-69), parity with `flux --serve` ──
+    /// RFC 7662 token-introspection endpoint. Setting this switches the channel into per-request
+    /// principal auth: every request's bearer is resolved to a principal, sessions are
+    /// realm-scoped, and `external_url` becomes required.
+    #[serde(default)]
+    pub introspect_url: Option<String>,
+    /// Externally reachable base URL advertised on the agent card (e.g. `https://x.example.com`).
+    /// Required with `introspect_url`: the public card tells clients where to send bearer tokens,
+    /// so it must come from config, never the request `Host` header.
+    #[serde(default)]
+    pub external_url: Option<String>,
+    /// Optional introspection client id (`client_secret_basic`); paired with `introspect_secret`.
+    #[serde(default)]
+    pub introspect_client_id: Option<String>,
+    /// The introspection client secret — host-resolved like `token`, so write it as
+    /// `introspect_secret secret "KEY"` in the program (never a plaintext literal).
+    #[serde(default)]
+    pub introspect_secret: Option<String>,
+    /// Claim (literal key first, dot-path on miss) carrying the caller's account/tenant id.
+    #[serde(default)]
+    pub introspect_account_claim: Option<String>,
+    /// Claim carrying roles (JSON array or one space-separated string).
+    #[serde(default)]
+    pub introspect_roles_claim: Option<String>,
+    /// Reject tokens whose account claim is missing/empty.
+    #[serde(default)]
+    pub introspect_require_account: Option<bool>,
+    /// Allow a plain-`http` introspection endpoint (trusted-network deployments; bearer tokens
+    /// transit this connection, so default is https-only).
+    #[serde(default)]
+    pub introspect_allow_http: Option<bool>,
 }
 
 // Secrets are a single mechanism: `secret "ENV"` references in the program (lowered to a

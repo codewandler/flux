@@ -2093,6 +2093,10 @@ async fn build_agent_with(
     }
     let (caller, trust) =
         flux_auth::IdentityProvider::resolve(&flux_auth::LocalIdentity::current());
+    // ONE shared identity cell backs the top-level executor AND the sub-agent spawner: a
+    // per-request surface (server principal mode, D-69) swaps it between turns and children
+    // spawned afterwards inherit the request principal, never a stale build-time identity.
+    let identity = flux_runtime::IdentityCell::new(caller, trust);
 
     // The unified event store, opened BEFORE the sub-agent spawner (A-08: child runs audit into
     // this same store by default) and before plugins (the egress-audit hook appends
@@ -2114,7 +2118,7 @@ async fn build_agent_with(
     // the shared event store by default (A-08) — each child gets its own correlated session stream.
     let spawner: Arc<dyn flux_runtime::Spawner> =
         SubAgents::new(roles, child_base, factory, model.clone(), flags.max_tokens)
-            .with_authorization(policy.clone(), caller.clone(), trust.clone())
+            .with_authorization_cell(policy.clone(), identity.clone())
             .with_audit(events.clone())
             .into_spawner(system.clone());
 
@@ -2341,7 +2345,7 @@ async fn build_agent_with(
     let executor = Executor::new(registry, perms, approver, ctx)
         .with_hooks(hook_vec)
         .with_policy(policy)
-        .with_identity(caller, trust);
+        .with_identity_cell(identity);
     // Record the available toolchain as a startup observation (audit backbone).
     executor.observe(flux_evidence::Observation::new(
         "toolchain",
@@ -5665,18 +5669,18 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
             );
         }
         // The coding agent auto-approves every tool call, so an unauthenticated listener is remote code
-        // execution. Require a bearer token (`FLUX_SERVER_TOKEN`) for any non-loopback bind.
-        let token = std::env::var("FLUX_SERVER_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty());
-        if token.is_none() && !addr_is_loopback(&addr) {
+        // execution. Require authentication for any non-loopback bind: per-request principal auth
+        // when `[server] introspect_url` is configured (D-69), else a bearer token (`FLUX_SERVER_TOKEN`).
+        let auth = server_auth_from_config()?;
+        if matches!(auth, flux_server::ServerAuth::Open) && !addr_is_loopback(&addr) {
             bail!(
                 "refusing to serve on a non-loopback address ({addr}) without authentication — set \
-                 FLUX_SERVER_TOKEN to require `Authorization: Bearer <token>`, or bind 127.0.0.1"
+                 FLUX_SERVER_TOKEN to require `Authorization: Bearer <token>` (or configure \
+                 `[server] introspect_url` for per-request principal auth), or bind 127.0.0.1"
             );
         }
         let (agent, _session_id, _spec, _spawner) = build_agent(flags).await?;
-        return flux_server::serve(&addr, agent, token).await;
+        return flux_server::serve(&addr, agent, auth).await;
     };
 
     let auto_approve = flags.yes;
@@ -5910,6 +5914,71 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
     let run_stdin = channel_decls.is_empty() || channel_decls.iter().any(|c| c.kind == "cli");
     let cancel = tokio_util::sync::CancellationToken::new();
     flux_channels::serve(app, channels, run_stdin, cancel).await
+}
+
+/// Resolve the server's auth mode (D-69). `[server] introspect_url` in the layered config turns
+/// on per-request principal auth (RFC 7662 introspection + caching); otherwise `FLUX_SERVER_TOKEN`
+/// selects the shared-secret mode, and no configuration at all is the open, loopback-only mode.
+/// The introspection client secret is sourced from the env var NAMED by
+/// `introspect_client_secret_env` — the secret itself never lives in a config file.
+fn server_auth_from_config() -> Result<flux_server::ServerAuth> {
+    let token = std::env::var("FLUX_SERVER_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    let cwd = std::env::current_dir()?;
+    let server = flux_config::load(&cwd)?.server;
+    let Some(url) = server.introspect_url else {
+        // Shared-secret (or open) mode. Advertise `[server] external_url` on the card when set, so
+        // a non-loopback shared-secret deployment isn't exposed to Host-poisoning of its card.
+        return Ok(flux_server::ServerAuth::shared_secret(
+            token,
+            server.external_url,
+        ));
+    };
+    let external_url = server.external_url.ok_or_else(|| {
+        anyhow::anyhow!(
+            "[server] external_url is required with introspect_url — in principal mode the agent \
+             card advertises where clients send bearer tokens, so it must come from config, never \
+             the request's Host header"
+        )
+    })?;
+    // The client secret is sourced from the env var NAMED by `introspect_client_secret_env` — the
+    // secret itself never lives in a committed config file.
+    let client = match (
+        server.introspect_client_id,
+        server.introspect_client_secret_env,
+    ) {
+        (Some(id), Some(env_name)) => {
+            let secret = std::env::var(&env_name).map_err(|_| {
+                anyhow::anyhow!("env var `{env_name}` (the introspection client secret) is not set")
+            })?;
+            Some((id, secret))
+        }
+        (Some(_), None) => anyhow::bail!(
+            "[server] introspect_client_secret_env is required with introspect_client_id"
+        ),
+        (None, Some(_)) => anyhow::bail!(
+            "[server] introspect_client_secret_env is set without introspect_client_id — the \
+             client secret would be silently ignored; set introspect_client_id or remove it"
+        ),
+        (None, None) => None,
+    };
+    let auth = flux_server::PrincipalAuth::from_introspection(flux_server::IntrospectionParams {
+        endpoint: url,
+        client,
+        allow_http: server.introspect_allow_http.unwrap_or(false),
+        account_claim: server.introspect_account_claim,
+        roles_claim: server.introspect_roles_claim,
+        require_account: server.introspect_require_account.unwrap_or(false),
+        external_url,
+    })
+    .map_err(|e| anyhow::anyhow!("[server] introspection config: {e}"))?;
+    if token.is_some() {
+        eprintln!(
+            "(FLUX_SERVER_TOKEN ignored: `[server] introspect_url` enables per-request principal auth)"
+        );
+    }
+    Ok(flux_server::ServerAuth::Principal(auth))
 }
 
 /// Whether `addr` (host:port or bare host) binds only the loopback interface.

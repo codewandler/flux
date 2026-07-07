@@ -182,6 +182,37 @@ pub struct ServerConfig {
     /// session's last activity, not its creation — see [`Config::a2a_session_ttl_secs`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub a2a_session_ttl_secs: Option<u64>,
+    /// RFC 7662 token-introspection endpoint (D-69). Setting this switches `--serve` into
+    /// per-request principal auth: every request's bearer is resolved to a principal, sessions
+    /// are realm-scoped, and `external_url` becomes required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub introspect_url: Option<String>,
+    /// Optional introspection client id (`client_secret_basic`); paired with
+    /// `introspect_client_secret_env`. Absent → the endpoint is called without client auth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub introspect_client_id: Option<String>,
+    /// The NAME of the environment variable holding the introspection client secret — never the
+    /// secret itself (config files are committed; secrets are env refs, as everywhere in flux).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub introspect_client_secret_env: Option<String>,
+    /// Claim (literal key first, dot-path on miss) that carries the caller's account/tenant id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub introspect_account_claim: Option<String>,
+    /// Claim carrying roles (JSON array or one space-separated string).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub introspect_roles_claim: Option<String>,
+    /// Reject tokens whose account claim is missing/empty (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub introspect_require_account: Option<bool>,
+    /// Allow a plain-http introspection endpoint (trusted-network deployments; default false —
+    /// bearer tokens transit this connection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub introspect_allow_http: Option<bool>,
+    /// Externally reachable base URL advertised on the agent card (e.g.
+    /// `https://agents.example.com`). Required in principal mode: the card tells clients where to
+    /// send bearer tokens, so it must come from config, never the request's Host header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_url: Option<String>,
 }
 
 impl ServerConfig {
@@ -377,12 +408,38 @@ fn merge(user: Config, project: Config) -> Config {
                 .or(user.limits.readonly_rounds_stop),
         },
         server: ServerConfig {
-            // Same scalar rule: a project TTL (including an explicit 0 = "never prune")
+            // Same scalar rule throughout: a project value (including an explicit 0/false)
             // overrides the user's.
             a2a_session_ttl_secs: project
                 .server
                 .a2a_session_ttl_secs
                 .or(user.server.a2a_session_ttl_secs),
+            introspect_url: project.server.introspect_url.or(user.server.introspect_url),
+            introspect_client_id: project
+                .server
+                .introspect_client_id
+                .or(user.server.introspect_client_id),
+            introspect_client_secret_env: project
+                .server
+                .introspect_client_secret_env
+                .or(user.server.introspect_client_secret_env),
+            introspect_account_claim: project
+                .server
+                .introspect_account_claim
+                .or(user.server.introspect_account_claim),
+            introspect_roles_claim: project
+                .server
+                .introspect_roles_claim
+                .or(user.server.introspect_roles_claim),
+            introspect_require_account: project
+                .server
+                .introspect_require_account
+                .or(user.server.introspect_require_account),
+            introspect_allow_http: project
+                .server
+                .introspect_allow_http
+                .or(user.server.introspect_allow_http),
+            external_url: project.server.external_url.or(user.server.external_url),
         },
         // Skill-dir order is name-clash precedence, so the project's dirs come FIRST (project >
         // user) — deliberately the opposite concatenation order from the permission lists, where

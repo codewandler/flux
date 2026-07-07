@@ -389,6 +389,49 @@ impl EventStore {
         Ok(n.map(|n| format!("s_{n}")))
     }
 
+    /// D-69: the realm-scoped sibling of [`find_correlated`](Self::find_correlated) — the most
+    /// recent stream tagged `agent_id` whose `correlation_id` matches AND whose `account` equals
+    /// `realm`. In a per-request-principal deployment a correlation id (an A2A `contextId`) is a
+    /// logical grouping mechanism, **not** a security boundary, so continuity must be keyed within
+    /// the caller's realm: two realms presenting the same correlation id continue two different
+    /// sessions.
+    ///
+    /// `realm` is deliberately non-optional (`&str`, not `Option`). In principal mode every caller
+    /// has a realm — the account when present, else a principal-derived key — so there is no
+    /// legitimate `None` caller, and an `Option`-taking variant could only pick between two silent
+    /// failure modes: SQL `account = ?` never matches NULL, so a `None` realm would never find its
+    /// own prior session (continuity silently broken); matching NULL with `IS` instead would
+    /// collapse every account-less caller into one shared NULL realm (cross-caller session
+    /// leakage). Requiring the key makes both states unrepresentable. The same `=`-vs-NULL
+    /// semantics is a feature here: legacy untagged streams (`account` NULL) are *structurally*
+    /// unreachable through this method — they stay reachable via
+    /// [`find_correlated`](Self::find_correlated), which non-principal server modes keep using
+    /// unchanged.
+    ///
+    /// Newest-first for the same reason as [`find_correlated`](Self::find_correlated): a client
+    /// re-using a correlation id after its old session was TTL-pruned always continues the LIVE
+    /// session. The `account = ?3` equality is served by `idx_streams_account` (D-02), whose
+    /// entries within one account come back in `n` order — so the lookup is a backward index scan
+    /// bounded by the realm's own sessions, never a table scan.
+    pub fn find_correlated_in_realm(
+        &self,
+        correlation_id: &str,
+        agent_id: &str,
+        realm: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let n: Option<i64> = conn
+            .query_row(
+                "SELECT n FROM streams WHERE correlation_id = ?1 AND agent_id = ?2 \
+                 AND account = ?3 ORDER BY n DESC LIMIT 1",
+                [correlation_id, agent_id, realm],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_sql)?;
+        Ok(n.map(|n| format!("s_{n}")))
+    }
+
     /// A-45/C-44: the sub-agent children of `stream` — every stream whose `correlation_id` points
     /// at it (the A-08 spawn linkage: `agent_id = "subagent:<role>"`, `correlation_id` = the
     /// parent session). Oldest-first, so a replay recurses children in spawn order. One level per
@@ -827,6 +870,34 @@ impl EventStore {
         // Re-merge after the cross-stream fold (C-15): one stream may carry only the legacy bare
         // key while another carries the canonical prefixed one — the per-stream merge can't see
         // across streams, so without this the all-sessions report still splits one backend.
+        Ok(projection::merge_legacy_keys(per_model)
+            .into_iter()
+            .map(|(model, acc)| projection::finalize_row(model, acc))
+            .collect())
+    }
+
+    /// [`cost_summary_all`](Self::cost_summary_all) scoped to ONE account's streams (D-69: the
+    /// realm-scoped `/usage` a multi-tenant server serves). Same fold — per-stream
+    /// [`cost_summary`](Self::cost_summary) rows folded through `RowAcc` and re-merged across the
+    /// legacy/canonical model-key split — so a tenant's realm-scoped total is priced and de-split
+    /// **identically** to the unscoped rollup; the only difference is the stream set. Sub-agent
+    /// child streams are `account = NULL` (they inherit no envelope account), so scoping to an
+    /// account already excludes them, matching `cost_summary_all`'s C-23 child exclusion.
+    pub fn cost_summary_for_account(
+        &self,
+        account: &str,
+        pricing: &flux_core::PricingTable,
+    ) -> Result<Vec<projection::ModelCost>> {
+        let mut per_model: std::collections::BTreeMap<String, projection::RowAcc> =
+            std::collections::BTreeMap::new();
+        for stream in self.account_streams(account)? {
+            for row in self.cost_summary(&stream, pricing)? {
+                per_model
+                    .entry(row.model.clone())
+                    .or_default()
+                    .record_priced_row(&row);
+            }
+        }
         Ok(projection::merge_legacy_keys(per_model)
             .into_iter()
             .map(|(model, acc)| projection::finalize_row(model, acc))
@@ -1319,6 +1390,110 @@ mod tests {
         assert_eq!(store.find_correlated("ctx-2", "other").unwrap(), None);
     }
 
+    /// D-69: a correlation id is a grouping mechanism, not a security boundary — the same
+    /// (correlation_id, agent_id) presented under two different realms names two DIFFERENT
+    /// sessions, and each realm's lookup returns only its own.
+    #[test]
+    fn find_correlated_in_realm_isolates_realms() {
+        let store = EventStore::in_memory().unwrap();
+        let mk = |realm: &str| {
+            store
+                .create_session_with_context(
+                    "m",
+                    &EventContext {
+                        account: Some(realm.into()),
+                        agent_id: Some("a2a".into()),
+                        correlation_id: Some("ctx-1".into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        let acme = mk("acme");
+        let globex = mk("globex");
+        assert_ne!(acme, globex, "one session per (realm, contextId)");
+
+        assert_eq!(
+            store
+                .find_correlated_in_realm("ctx-1", "a2a", "acme")
+                .unwrap()
+                .as_deref(),
+            Some(acme.as_str())
+        );
+        assert_eq!(
+            store
+                .find_correlated_in_realm("ctx-1", "a2a", "globex")
+                .unwrap()
+                .as_deref(),
+            Some(globex.as_str())
+        );
+        // A realm with no session for the contextId sees nothing — not another realm's session.
+        assert_eq!(
+            store
+                .find_correlated_in_realm("ctx-1", "a2a", "initech")
+                .unwrap(),
+            None
+        );
+    }
+
+    /// D-69: `account = ?` never matches SQL NULL, so a legacy untagged session is structurally
+    /// unreachable through the realm-scoped lookup for EVERY realm — while the untouched
+    /// [`EventStore::find_correlated`] still finds it (non-principal server modes keep today's
+    /// behavior byte-for-byte).
+    #[test]
+    fn find_correlated_in_realm_never_matches_legacy_untagged_sessions() {
+        let store = EventStore::in_memory().unwrap();
+        let legacy = store
+            .create_session_with_context(
+                "m",
+                &EventContext {
+                    agent_id: Some("a2a".into()),
+                    correlation_id: Some("ctx-old".into()),
+                    ..Default::default() // account: None — a pre-principal-mode session
+                },
+            )
+            .unwrap();
+
+        for realm in ["acme", "globex", ""] {
+            assert_eq!(
+                store
+                    .find_correlated_in_realm("ctx-old", "a2a", realm)
+                    .unwrap(),
+                None,
+                "NULL-account session must not surface in realm {realm:?}"
+            );
+        }
+        assert_eq!(
+            store.find_correlated("ctx-old", "a2a").unwrap().as_deref(),
+            Some(legacy.as_str()),
+            "the unscoped lookup still serves non-principal modes"
+        );
+    }
+
+    /// D-69: within one realm the newest matching stream wins, mirroring `find_correlated`'s
+    /// TTL-prune reasoning — a re-used contextId always continues the LIVE session.
+    #[test]
+    fn find_correlated_in_realm_returns_newest_within_the_realm() {
+        let store = EventStore::in_memory().unwrap();
+        let ctx = EventContext {
+            account: Some("acme".into()),
+            agent_id: Some("a2a".into()),
+            correlation_id: Some("ctx-1".into()),
+            ..Default::default()
+        };
+        let _old = store.create_session_with_context("m", &ctx).unwrap();
+        let newest = store.create_session_with_context("m", &ctx).unwrap();
+
+        assert_eq!(
+            store
+                .find_correlated_in_realm("ctx-1", "a2a", "acme")
+                .unwrap()
+                .as_deref(),
+            Some(newest.as_str()),
+            "newest stream in the realm wins"
+        );
+    }
+
     #[test]
     fn record_call_usage_is_turn_scoped_and_a_noop_on_negative_turn_id() {
         let store = EventStore::in_memory().unwrap();
@@ -1419,6 +1594,51 @@ mod tests {
             summary[0].usage.input_tokens, 1_500_000,
             "the two sessions' spend is summed, not just the last one's"
         );
+    }
+
+    #[test]
+    fn cost_summary_for_account_scopes_and_sums_through_the_shared_fold() {
+        let store = EventStore::in_memory().unwrap();
+        let acct = |a: &str| EventContext {
+            account: Some(a.to_string()),
+            ..Default::default()
+        };
+        let record = |ctx: &EventContext, tokens: u64| {
+            let s = store
+                .create_session_with_context("claude-sonnet-4-6", ctx)
+                .unwrap();
+            let t = store.begin_turn(&s, "hi", "claude-sonnet-4-6").unwrap();
+            store
+                .record_call_usage(
+                    &s,
+                    t,
+                    "claude-sonnet-4-6",
+                    Usage {
+                        input_tokens: tokens,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        };
+        // Two acme streams + one globex stream.
+        record(&acct("acme"), 1_000_000);
+        record(&acct("acme"), 500_000);
+        record(&acct("globex"), 9_000_000);
+
+        let pricing = flux_core::PricingTable::builtin();
+        let acme = store.cost_summary_for_account("acme", &pricing).unwrap();
+        assert_eq!(acme.len(), 1, "one model row across acme's two streams");
+        assert_eq!(
+            acme[0].usage.input_tokens, 1_500_000,
+            "acme's two streams are summed through the same fold as cost_summary_all"
+        );
+        // Isolation: globex's spend is not visible under acme, and vice versa.
+        let globex = store.cost_summary_for_account("globex", &pricing).unwrap();
+        assert_eq!(globex[0].usage.input_tokens, 9_000_000);
+        assert!(store
+            .cost_summary_for_account("nobody", &pricing)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

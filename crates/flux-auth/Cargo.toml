@@ -3,7 +3,22 @@ name = "flux-auth"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-description = "flux caller identity: IdentityProvider trait, local single-user default, OIDC plugin seam"
+description = "flux caller identity: IdentityProvider trait, local single-user default, OIDC plugin seam, per-request RequestAuthenticator seam"
+
+[features]
+# RFC 7662 token introspection (`Introspector`) + the caching decorator. Off by default so the
+# seam itself (trait + types + header helper) stays dependency-light for CLI builds.
+introspect = ["dep:reqwest", "dep:serde", "dep:serde_json", "dep:sha2"]
 
 [dependencies]
 flux-policy.workspace = true
+async-trait.workspace = true
+reqwest = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+
+[dev-dependencies]
+axum.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

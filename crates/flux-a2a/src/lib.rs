@@ -167,6 +167,57 @@ mod tests {
     }
 
     #[test]
+    fn agent_card_security_fields_round_trip() {
+        use std::collections::BTreeMap;
+
+        let mut schemes = BTreeMap::new();
+        schemes.insert(
+            "bearer".to_string(),
+            json!({ "type": "http", "scheme": "bearer" }),
+        );
+        let requirement: Vec<BTreeMap<String, Vec<String>>> =
+            vec![[("bearer".to_string(), Vec::new())].into_iter().collect()];
+        let card = AgentCard {
+            name: "flux".to_string(),
+            ..Default::default()
+        }
+        .with_security_schemes(schemes)
+        .with_security(requirement);
+
+        // Serializes under the spec's camelCase keys…
+        let v = serde_json::to_value(&card).unwrap();
+        assert_eq!(v["securitySchemes"]["bearer"]["type"], "http");
+        assert_eq!(v["securitySchemes"]["bearer"]["scheme"], "bearer");
+        assert_eq!(v["security"][0]["bearer"], json!([]));
+
+        // …and round-trips back.
+        let back: AgentCard = serde_json::from_value(v).unwrap();
+        assert_eq!(back.security_schemes, card.security_schemes);
+        assert_eq!(back.security, card.security);
+    }
+
+    #[test]
+    fn agent_card_without_security_serializes_without_the_keys() {
+        // Byte-stability for existing consumers: a card with no declared schemes adds NO keys.
+        let card = AgentCard {
+            name: "flux".to_string(),
+            version: "1.0.0".to_string(),
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&card).unwrap();
+        assert!(!s.contains("securitySchemes"), "unexpected key in {s}");
+        assert!(!s.contains("\"security\""), "unexpected key in {s}");
+
+        // Legacy card JSON (predating the fields) still deserializes, with both fields absent.
+        let legacy: AgentCard = serde_json::from_value(json!({
+            "name": "old", "url": "http://host/a2a"
+        }))
+        .unwrap();
+        assert!(legacy.security_schemes.is_none());
+        assert!(legacy.security.is_none());
+    }
+
+    #[test]
     fn client_url_normalization() {
         // Bare origin → <origin>/a2a.
         let c = A2aClient::new("http://127.0.0.1:8787").unwrap();

@@ -31,7 +31,7 @@
 
 use std::convert::Infallible;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -48,7 +48,7 @@ use flux_flow::AgentSink;
 use std::sync::Arc;
 
 use super::Collect;
-use crate::{A2aTtl, CardInfo, Shared, TurnGate};
+use crate::{A2aTtl, AgentResolver, CardInfo, Shared, TurnGate};
 
 // ── A2A session lifecycle (C-18) ─────────────────────────────────────────────
 
@@ -81,6 +81,7 @@ fn create_a2a_session(
     engine: &Shared,
     ttl: A2aTtl,
     context_id: Option<&str>,
+    realm: Option<&str>,
 ) -> flux_core::Result<String> {
     let pruned = prune_expired_a2a_sessions_at(&engine.events, ttl.0, now_ms());
     if pruned > 0 {
@@ -90,11 +91,22 @@ fn create_a2a_session(
         );
     }
     if let Some(cid) = context_id {
-        if let Some(existing) = engine.events.find_correlated(cid, A2A_AGENT_ID)? {
+        // `contextId` is a grouping key, NOT a security boundary (A2A spec) — in principal mode
+        // (`realm` set) continuity is keyed within the caller's realm, so the same `contextId`
+        // presented by two tenants yields two isolated sessions. The realm-scoped lookup matches
+        // `account =` (never NULL), so pre-D-69 untagged sessions are structurally unreachable.
+        let existing = match realm {
+            Some(r) => engine
+                .events
+                .find_correlated_in_realm(cid, A2A_AGENT_ID, r)?,
+            None => engine.events.find_correlated(cid, A2A_AGENT_ID)?,
+        };
+        if let Some(existing) = existing {
             return Ok(existing);
         }
     }
     let ctx = flux_events::EventContext {
+        account: realm.map(str::to_string),
         agent_id: Some(A2A_AGENT_ID.to_string()),
         correlation_id: context_id.map(str::to_string),
         ..Default::default()
@@ -142,27 +154,145 @@ fn now_ms() -> i64 {
 ///
 /// The card's `name`/`description`/`skills` come from the served agent's [`CardInfo`] (the built-in
 /// coding agent by default, or a program-declared agent when mounted by the `a2a` channel). The `url`
-/// field points to the `/a2a` JSON-RPC endpoint on the same host, derived from the request's `Host`
-/// (and `X-Forwarded-Proto`) headers so the card is correct whether accessed directly or through a
-/// reverse proxy.
-pub async fn agent_card(State(card): State<Arc<CardInfo>>, headers: HeaderMap) -> Json<AgentCard> {
-    let host = headers
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("localhost");
-    let forwarded_proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|h| h.to_str().ok());
-    let url = server::card_url(forwarded_proto, host, "/a2a");
+/// field points to the `/a2a` JSON-RPC endpoint: in principal mode it derives from the configured
+/// external base ONLY — the card tells clients where to send bearer tokens, and this route is
+/// (deliberately, per spec) public, so deriving from the request's `Host` header would let a
+/// Host-poisoned request phish tokens toward an attacker host. The open/shared-secret modes keep
+/// the pre-D-69 `Host`/`X-Forwarded-Proto` derivation.
+///
+/// Whenever auth is enabled the card declares its scheme (`securitySchemes` + `security`): the A2A
+/// spec has clients authenticate "using one of the schemes declared in the card", which is only
+/// satisfiable if servers actually declare one.
+pub async fn agent_card(
+    State(card): State<Arc<CardInfo>>,
+    State(auth): State<Arc<crate::ServerAuth>>,
+    headers: HeaderMap,
+) -> Json<AgentCard> {
+    // Single-agent mount: the `/a2a` endpoint sits at the server root (no path prefix).
+    Json(build_agent_card(&card, &auth, &headers, ""))
+}
 
-    Json(server::agent_card(
+/// Build the A2A discovery card for one agent. `a2a_path_prefix` is the mount prefix before
+/// `/a2a` — `""` for the single-agent surface, `"/<agent_id>"` for a resolver-keyed multi-agent
+/// mount (D-63) — so the advertised `url` is always the endpoint clients should actually POST to.
+///
+/// The `url` derivation: in principal mode it comes from the configured external base ONLY — the
+/// card tells clients where to send bearer tokens, and this route is (deliberately, per spec)
+/// public, so deriving from the request `Host` header would let a Host-poisoned request phish
+/// tokens toward an attacker host. Open/shared-secret modes keep the `Host`/`X-Forwarded-Proto`
+/// derivation. Whenever auth is enabled the card declares its scheme (`securitySchemes` +
+/// `security`): the A2A spec has clients authenticate "using one of the schemes declared in the
+/// card", satisfiable only if the server declares one.
+pub(crate) fn build_agent_card(
+    card: &CardInfo,
+    auth: &crate::ServerAuth,
+    headers: &HeaderMap,
+    a2a_path_prefix: &str,
+) -> AgentCard {
+    let a2a_path = format!("{a2a_path_prefix}/a2a");
+    // Prefer the configured external base (both Principal and, when set, SharedSecret) over the
+    // request `Host` header: the public card tells clients where to send bearer tokens, so a
+    // Host-poisoned fetch would otherwise phish the credential to an attacker host. Host derivation
+    // remains only when no base is configured (a loopback/dev bind).
+    let url = match auth.card_external_url() {
+        Some(base) => format!("{}{a2a_path}", base.trim_end_matches('/')),
+        None => {
+            let host = headers
+                .get("host")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("localhost");
+            let forwarded_proto = headers
+                .get("x-forwarded-proto")
+                .and_then(|h| h.to_str().ok());
+            server::card_url(forwarded_proto, host, &a2a_path)
+        }
+    };
+
+    let mut out = server::agent_card(
         &card.name,
         &card.description,
         Some(url),
         env!("CARGO_PKG_VERSION"),
         &card.skills,
         true,
-    ))
+    );
+    if !matches!(auth, crate::ServerAuth::Open) {
+        out = out
+            .with_security_schemes(std::collections::BTreeMap::from([(
+                "bearer".to_string(),
+                json!({ "type": "http", "scheme": "bearer" }),
+            )]))
+            .with_security(vec![std::collections::BTreeMap::from([(
+                "bearer".to_string(),
+                Vec::new(),
+            )])]);
+    }
+    out
+}
+
+// ── Multi-agent mount (D-63) ────────────────────────────────────────────────────
+
+/// `GET /:agent_id/.well-known/agent-card.json` — discovery for one agent of a resolver-keyed
+/// multi-agent mount. Resolves the agent (public route: no `AuthContext` available), then builds
+/// its card advertising `<base>/<agent_id>/a2a` so a client reads the endpoint it must actually
+/// POST to. An unknown agent is a constant 404 (§13.1).
+pub async fn agent_card_multi(
+    State(resolver): State<Arc<dyn AgentResolver>>,
+    State(auth): State<Arc<crate::ServerAuth>>,
+    Path(agent_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(resolved) = resolver.resolve(&agent_id, None).await else {
+        return crate::realm_not_found();
+    };
+    let prefix = format!("/{agent_id}");
+    Json(build_agent_card(&resolved.card, &auth, &headers, &prefix)).into_response()
+}
+
+/// `POST /:agent_id/a2a` — the JSON-RPC dispatcher for one agent of a resolver-keyed mount.
+/// Auth has already run ([`crate::require_auth`]), so the resolver sees the authenticated
+/// principal; the resolved engine is pinned for the request (and for a streaming turn's whole
+/// lifetime, since `send`/`subscribe` own their engine clone). An unknown agent → constant 404.
+#[allow(clippy::too_many_arguments)]
+pub async fn a2a_handler_multi(
+    State(resolver): State<Arc<dyn AgentResolver>>,
+    State(auth): State<Arc<crate::ServerAuth>>,
+    State(turn_gate): State<TurnGate>,
+    State(a2a_ttl): State<A2aTtl>,
+    Path(agent_id): Path<String>,
+    ctx: Option<axum::Extension<flux_auth::request::AuthContext>>,
+    Json(req): Json<JsonRpcRequest>,
+) -> Response {
+    if req.jsonrpc != "2.0" {
+        return rpc_err(req.id, -32600, "jsonrpc must be \"2.0\"").into_response();
+    }
+    let ctx = ctx.map(|e| e.0);
+    let Some(resolved) = resolver.resolve(&agent_id, ctx.as_ref()).await else {
+        return crate::realm_not_found();
+    };
+    let engine = resolved.engine;
+    match req.method.as_str() {
+        "message/send" => send(engine, auth, turn_gate, a2a_ttl, ctx, req.id, req.params)
+            .await
+            .into_response(),
+        "message/stream" => {
+            match subscribe(
+                engine,
+                auth,
+                turn_gate,
+                a2a_ttl,
+                ctx,
+                req.id.clone(),
+                req.params,
+            )
+            .await
+            {
+                Ok(sse) => sse.into_response(),
+                Err(msg) => rpc_err(req.id, -32602, msg).into_response(),
+            }
+        }
+        m => rpc_err(req.id, -32601, format!("Method not found: {m}")).into_response(),
+    }
 }
 
 // ── JSON-RPC 2.0 helpers ──────────────────────────────────────────────────────
@@ -212,19 +342,32 @@ fn status_frame(
 /// - `message/stream` → [`subscribe`] (SSE stream of `TaskStatusUpdate`s)
 pub async fn a2a_handler(
     State(engine): State<Shared>,
+    State(auth): State<Arc<crate::ServerAuth>>,
     State(turn_gate): State<TurnGate>,
     State(a2a_ttl): State<A2aTtl>,
+    ctx: Option<axum::Extension<flux_auth::request::AuthContext>>,
     Json(req): Json<JsonRpcRequest>,
 ) -> Response {
     if req.jsonrpc != "2.0" {
         return rpc_err(req.id, -32600, "jsonrpc must be \"2.0\"").into_response();
     }
+    let ctx = ctx.map(|e| e.0);
     match req.method.as_str() {
-        "message/send" => send(engine, turn_gate, a2a_ttl, req.id, req.params)
+        "message/send" => send(engine, auth, turn_gate, a2a_ttl, ctx, req.id, req.params)
             .await
             .into_response(),
         "message/stream" => {
-            match subscribe(engine, turn_gate, a2a_ttl, req.id.clone(), req.params).await {
+            match subscribe(
+                engine,
+                auth,
+                turn_gate,
+                a2a_ttl,
+                ctx,
+                req.id.clone(),
+                req.params,
+            )
+            .await
+            {
                 Ok(sse) => sse.into_response(),
                 // Format pre-SSE errors as JSON-RPC so the `id` is not silently dropped.
                 Err(msg) => rpc_err(req.id, -32602, msg).into_response(),
@@ -238,8 +381,10 @@ pub async fn a2a_handler(
 
 async fn send(
     engine: Shared,
+    auth: Arc<crate::ServerAuth>,
     turn_gate: TurnGate,
     ttl: A2aTtl,
+    ctx: Option<flux_auth::request::AuthContext>,
     id: Option<Value>,
     params: Option<Value>,
 ) -> Json<Value> {
@@ -252,12 +397,21 @@ async fn send(
         None => return rpc_err(id, -32602, "No text found in message parts"),
     };
     let requested_context = server::extract_context_id(&params);
-    // Acquire the gate BEFORE minting (C-29) — see `create_a2a_session`'s doc for why.
+    // Acquire the gate BEFORE minting (C-29) — see `create_a2a_session`'s doc for why. The
+    // identity swap + realm derivation happen through `enter_turn` under the same gate hold:
+    // the realm used for continuity keying is obtainable only from the function that also sets
+    // the executor identity (D-69 coupling).
     let _turn = turn_gate.lock().await;
-    let session_id = match create_a2a_session(&engine, ttl, requested_context.as_deref()) {
-        Ok(s) => s,
-        Err(e) => return rpc_err(id, -32603, format!("Session error: {e}")),
+    let realm = match crate::enter_turn(&auth, &engine, ctx.as_ref(), &_turn) {
+        Ok(r) => r,
+        // Constant text: unreachable behind `require_auth`, fail-closed if a mount forgets it.
+        Err(_) => return rpc_err(id, -32603, crate::UNAUTHORIZED_BODY),
     };
+    let session_id =
+        match create_a2a_session(&engine, ttl, requested_context.as_deref(), realm.as_deref()) {
+            Ok(s) => s,
+            Err(e) => return rpc_err(id, -32603, format!("Session error: {e}")),
+        };
     let context_id = requested_context.unwrap_or_else(|| session_id.clone());
     let mut sink = Collect::default();
     match engine.run_turn(&session_id, &input, &mut sink).await {
@@ -281,8 +435,10 @@ async fn send(
 
 async fn subscribe(
     engine: Shared,
+    auth: Arc<crate::ServerAuth>,
     turn_gate: TurnGate,
     ttl: A2aTtl,
+    ctx: Option<flux_auth::request::AuthContext>,
     id: Option<Value>,
     params: Option<Value>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, String> {
@@ -290,6 +446,10 @@ async fn subscribe(
     let input =
         server::extract_text(&params).ok_or_else(|| "No text in message parts".to_string())?;
     let requested_context = server::extract_context_id(&params);
+    // Fail closed before the SSE response is established (unreachable behind `require_auth`).
+    if matches!(auth.as_ref(), crate::ServerAuth::Principal(_)) && ctx.is_none() {
+        return Err(crate::UNAUTHORIZED_BODY.to_string());
+    }
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     // `drop_guard` cancels `cancel` when the SSE stream is dropped (client disconnect), which
@@ -305,8 +465,30 @@ async fn subscribe(
         // which is why the mint and the initial "working" frame both live inside the gate below
         // rather than before `tokio::spawn`.
         let _turn = turn_gate.lock().await;
+        // Identity swap + realm under the gate (pre-checked above; error frame is belt+braces).
+        let realm = match crate::enter_turn(&auth, &engine_clone, ctx.as_ref(), &_turn) {
+            Ok(r) => r,
+            Err(_) => {
+                let _ = tx.send(
+                    Event::default().data(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": -32603, "message": crate::UNAUTHORIZED_BODY },
+                        })
+                        .to_string(),
+                    ),
+                );
+                return;
+            }
+        };
         let session_id =
-            match create_a2a_session(&engine_clone, ttl, requested_context.as_deref()) {
+            match create_a2a_session(
+                &engine_clone,
+                ttl,
+                requested_context.as_deref(),
+                realm.as_deref(),
+            ) {
                 Ok(s) => s,
                 Err(e) => {
                     // The SSE response is already established by the time minting can fail here, so
@@ -513,8 +695,10 @@ mod tests {
         let x_task = tokio::spawn(async move {
             send(
                 engine_x,
+                Arc::new(crate::ServerAuth::Open),
                 gate_x,
                 ttl,
+                None,
                 Some(json!(1)),
                 Some(send_params("hi")),
             )
@@ -529,7 +713,7 @@ mod tests {
 
         // Request Y arrives while X is still queued: its mint runs the lazy TTL sweep — the exact
         // moment the bug prunes a queued session out from under the queue.
-        let _session_y = create_a2a_session(&engine, ttl, None).unwrap();
+        let _session_y = create_a2a_session(&engine, ttl, None, None).unwrap();
 
         // Release the gate: X's queued turn can finally run.
         drop(held);

@@ -65,10 +65,19 @@ explicit `agent`. On startup flux prints the agent-card and endpoint URLs.
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | `GET` | `/.well-known/agent-card.json` | exempt | A2A discovery card |
-| `POST` | `/a2a` | Bearer token | JSON-RPC 2.0 dispatcher (`message/send`, `message/stream`) |
+| `POST` | `/a2a` | per mode | JSON-RPC 2.0 dispatcher (`message/send`, `message/stream`) |
 
 The discovery card is always public so external agents can find flux without a token. Every other
-route requires `Authorization: Bearer <token>` when a token is configured.
+route requires authentication per the configured mode (see [Security](#security)).
+
+### Serving many agents from one server
+
+One server can serve **N agents keyed by path** — `GET /:agent_id/.well-known/agent-card.json` and
+`POST /:agent_id/a2a` — each with the same session machinery (TTL, `contextId` continuity, SSE).
+Each agent's card advertises its own `/:agent_id/a2a` endpoint, agents are resolved per request
+(a fixed set, or a dynamic per-tenant resolver keyed on the authenticated principal), and an unknown
+agent id is an indistinguishable `404`. Agents are isolated by construction — each has its own
+engine and event store. Embedders reach this via `flux_server::router_multi`.
 
 ### `message/send` — synchronous
 
@@ -113,11 +122,32 @@ in-flight turn cleanly between plan rounds.
 
 ## Security
 
-- A non-loopback bind **requires** `FLUX_SERVER_TOKEN`. The server refuses to start otherwise — an
-  open listener with `--yes` is effectively remote code execution.
-- The discovery card is the only route exempt from auth, and the exemption is structural (registered
-  outside the middleware layer), not a path-string comparison, so encoding tricks cannot bypass it.
-- Each A2A task creates a fresh session (stateless mode).
+Three authentication modes:
+
+- **Open** — no auth; the server refuses a non-loopback bind in this mode (auto-approve + open
+  listener is remote code execution).
+- **Shared secret** — set `FLUX_SERVER_TOKEN`; every request presents `Authorization: Bearer <token>`
+  (constant-time compared). The whole server is one auth realm. On a non-loopback bind also set
+  `[server] external_url` so the public card advertises a trusted endpoint rather than a
+  `Host`-header-derived one.
+- **Per-request principal auth** — set `[server] introspect_url` in `.flux/config.toml`. Every
+  request's bearer is resolved to a principal via RFC 7662 token introspection (with TTL + negative
+  caching); sessions are tagged with and scoped to the caller's tenant realm, cross-tenant access
+  returns an indistinguishable `404`, and each turn runs under the caller's identity. `[server]
+  external_url` is required (it is what the public card advertises). A program's `a2a` channel takes
+  the same knobs.
+
+Whenever auth is enabled the discovery card **declares** its bearer scheme (`securitySchemes` /
+`security`), and in principal mode the card's `url` comes from `external_url`, never the request
+`Host` header. The card and `/health` are the only auth-exempt routes, and the exemption is
+structural (registered outside the middleware), not a path-string comparison, so encoding tricks
+cannot bypass it.
+
+**Stateful sessions (A-48).** A request whose `contextId` matches a live A2A session continues it
+(multi-turn memory); a request without one gets a fresh session per task. Sessions are pruned by a
+TTL (`[server] a2a_session_ttl_secs`, default 1h). In principal mode continuity is realm-keyed — the
+same `contextId` under two tenants is two isolated conversations (`contextId` is a grouping key, not
+a security boundary).
 
 ## See also
 

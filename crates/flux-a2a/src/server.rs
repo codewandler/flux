@@ -56,6 +56,12 @@ pub trait A2aTurn: Send + Sync {
 #[derive(Debug, Clone, Default)]
 pub struct A2aTurnContext {
     pub context_id: Option<String>,
+    /// The authenticated realm (tenancy key) of the caller, set exclusively by the mount from
+    /// its own request authentication — NEVER derived from message content. `None` = the mount
+    /// runs unauthenticated/single-realm. A stateful implementor keys `contextId` continuity
+    /// *within* this realm (D-69): the spec is explicit that `contextId` is a grouping
+    /// mechanism, not a security boundary.
+    pub realm: Option<String>,
 }
 
 /// A rich turn reply: the final answer text plus extra reply-message parts (see
@@ -85,7 +91,9 @@ pub fn card_url(forwarded_proto: Option<&str>, host: &str, path: &str) -> String
 /// `<base>/a2a`); `version` is the serving agent's version; `skills` are `(id, name, description)`
 /// triples surfaced as the card's skills (pass `id == name` when there is no separate identifier).
 /// Set `streaming` only when the surface actually implements `message/stream` (the blocking
-/// [`dispatch`] does not).
+/// [`dispatch`] does not). The security fields default to `None`; an auth-enforcing surface
+/// declares its schemes on the result via [`AgentCard::with_security_schemes`] /
+/// [`AgentCard::with_security`].
 pub fn agent_card(
     name: &str,
     description: &str,
@@ -117,6 +125,8 @@ pub fn agent_card(
             })
             .collect(),
         interfaces: Vec::new(),
+        security_schemes: None,
+        security: None,
     }
 }
 
@@ -125,7 +135,13 @@ pub fn agent_card(
 /// Handle one JSON-RPC 2.0 request body for the **blocking** A2A methods, running `message/send`
 /// through `runner`. Returns the JSON-RPC response value: success carries a completed [`Task`] (the
 /// answer in `status.message`); an unknown method or bad params carry a JSON-RPC error.
-pub async fn dispatch(runner: &dyn A2aTurn, body: &Value) -> Value {
+///
+/// `realm` is the caller's authenticated realm (tenancy key). It MUST come from the mount's
+/// request-authentication layer — never from the request body — and rides
+/// [`A2aTurnContext::realm`] into the runner, so a stateful implementor keys `contextId`
+/// continuity within the caller's realm (D-69). Pass `None` when the mount runs
+/// unauthenticated/single-realm.
+pub async fn dispatch(runner: &dyn A2aTurn, realm: Option<&str>, body: &Value) -> Value {
     let id = body.get("id").cloned().unwrap_or(Value::Null);
     if body.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return rpc_err(id, -32600, "jsonrpc must be \"2.0\"");
@@ -135,13 +151,18 @@ pub async fn dispatch(runner: &dyn A2aTurn, body: &Value) -> Value {
         .and_then(Value::as_str)
         .unwrap_or_default()
     {
-        "message/send" => send(runner, id, body.get("params")).await,
+        "message/send" => send(runner, realm, id, body.get("params")).await,
         other => rpc_err(id, -32601, format!("method not found: {other}")),
     }
 }
 
 /// `message/send`: extract the user's text, run one turn, and wrap the answer in a completed `Task`.
-async fn send(runner: &dyn A2aTurn, id: Value, params: Option<&Value>) -> Value {
+async fn send(
+    runner: &dyn A2aTurn,
+    realm: Option<&str>,
+    id: Value,
+    params: Option<&Value>,
+) -> Value {
     let Some(params) = params else {
         return rpc_err(id, -32602, "missing params");
     };
@@ -154,6 +175,7 @@ async fn send(runner: &dyn A2aTurn, id: Value, params: Option<&Value>) -> Value 
     let context_id = extract_context_id(params);
     let turn_ctx = A2aTurnContext {
         context_id: context_id.clone(),
+        realm: realm.map(str::to_string),
     };
     match runner.run_in_context(&turn_ctx, &input).await {
         Ok(reply) => {
@@ -336,7 +358,7 @@ mod tests {
     /// (StubRunner above, exercised by the sibling test) keeps text-only runners unchanged.
     #[tokio::test]
     async fn rich_replies_attach_data_parts_beside_the_text() {
-        let resp = dispatch(&BlockRunner, &send_body("hello")).await;
+        let resp = dispatch(&BlockRunner, None, &send_body("hello")).await;
         let parts = &resp["result"]["status"]["message"]["parts"];
         assert_eq!(parts[0]["kind"], "text");
         assert_eq!(parts[0]["text"], "you said: hello");
@@ -347,7 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn message_send_returns_a_completed_task_with_the_answer() {
-        let resp = dispatch(&StubRunner, &send_body("hello")).await;
+        let resp = dispatch(&StubRunner, None, &send_body("hello")).await;
         let result = &resp["result"];
         assert_eq!(result["kind"], "task");
         assert_eq!(result["status"]["state"], "completed");
@@ -362,7 +384,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_method_is_method_not_found() {
         let body = json!({ "jsonrpc": "2.0", "id": 2, "method": "tasks/send", "params": {} });
-        let resp = dispatch(&StubRunner, &body).await;
+        let resp = dispatch(&StubRunner, None, &body).await;
         assert_eq!(resp["error"]["code"], -32601);
     }
 
@@ -372,20 +394,20 @@ mod tests {
             "jsonrpc": "2.0", "id": 3, "method": "message/send",
             "params": { "message": { "parts": [] } },
         });
-        let resp = dispatch(&StubRunner, &body).await;
+        let resp = dispatch(&StubRunner, None, &body).await;
         assert_eq!(resp["error"]["code"], -32602);
     }
 
     #[tokio::test]
     async fn bad_jsonrpc_version_is_invalid_request() {
         let body = json!({ "jsonrpc": "1.0", "id": 4, "method": "message/send" });
-        let resp = dispatch(&StubRunner, &body).await;
+        let resp = dispatch(&StubRunner, None, &body).await;
         assert_eq!(resp["error"]["code"], -32600);
     }
 
     #[tokio::test]
     async fn runner_error_is_internal_error() {
-        let resp = dispatch(&FailRunner, &send_body("hi")).await;
+        let resp = dispatch(&FailRunner, None, &send_body("hi")).await;
         assert_eq!(resp["error"]["code"], -32603);
     }
 
@@ -490,9 +512,9 @@ mod tests {
                 .to_string()
         };
 
-        let r1 = dispatch(&runner, &body_with_ctx("one", "ctx-s")).await;
-        let r2 = dispatch(&runner, &body_with_ctx("two", "ctx-s")).await;
-        let other = dispatch(&runner, &body_with_ctx("hi", "ctx-other")).await;
+        let r1 = dispatch(&runner, None, &body_with_ctx("one", "ctx-s")).await;
+        let r2 = dispatch(&runner, None, &body_with_ctx("two", "ctx-s")).await;
+        let other = dispatch(&runner, None, &body_with_ctx("hi", "ctx-other")).await;
         assert_eq!(answer(&r1), "turns:1");
         assert_eq!(answer(&r2), "turns:2", "same contextId accumulates: {r2}");
         assert_eq!(
@@ -500,6 +522,61 @@ mod tests {
             "turns:1",
             "a different contextId is isolated"
         );
+    }
+
+    /// D-69 (failing-first acceptance): the mount's authenticated realm crosses the seam as an
+    /// explicit `dispatch` parameter and lands on [`A2aTurnContext::realm`] — while the
+    /// `contextId` extraction from the body stays exactly as before.
+    #[tokio::test]
+    async fn dispatch_threads_the_authenticated_realm_into_the_turn_context() {
+        use std::sync::Mutex;
+
+        struct CaptureRunner {
+            seen: Mutex<Vec<A2aTurnContext>>,
+        }
+
+        #[async_trait]
+        impl A2aTurn for CaptureRunner {
+            async fn run(&self, _input: &str) -> Result<String, String> {
+                Err("capture runner must be driven through run_in_context".into())
+            }
+            async fn run_in_context(
+                &self,
+                ctx: &A2aTurnContext,
+                _input: &str,
+            ) -> Result<A2aReply, String> {
+                self.seen.lock().unwrap().push(ctx.clone());
+                Ok(A2aReply {
+                    text: "ok".to_string(),
+                    extra_parts: Vec::new(),
+                })
+            }
+        }
+
+        let runner = CaptureRunner {
+            seen: Mutex::new(Vec::new()),
+        };
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "message/send",
+            "params": { "message": {
+                "kind": "message", "messageId": "m1", "role": "user",
+                "contextId": "ctx-9",
+                "parts": [{ "kind": "text", "text": "hi" }],
+            }},
+        });
+
+        dispatch(&runner, Some("acme"), &body).await;
+        dispatch(&runner, None, &body).await;
+
+        let seen = runner.seen.lock().unwrap();
+        assert_eq!(seen[0].realm.as_deref(), Some("acme"));
+        assert_eq!(
+            seen[0].context_id.as_deref(),
+            Some("ctx-9"),
+            "contextId extraction is unchanged"
+        );
+        assert_eq!(seen[1].realm, None, "unauthenticated mount passes None");
+        assert_eq!(seen[1].context_id.as_deref(), Some("ctx-9"));
     }
 
     #[test]

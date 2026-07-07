@@ -716,6 +716,38 @@ pub trait PreToolHook: Send + Sync {
     fn pre_tool(&self, tool: &str, input: &serde_json::Value) -> HookOutcome;
 }
 
+/// The resolved `(Caller, Trust)` the policy floor evaluates against, behind a shared handle.
+///
+/// One cell can back an [`Executor`] *and* the sub-agent spawner, so a per-request surface that
+/// swaps the identity between turns (D-69: flux-server's principal mode) changes it for the whole
+/// tree at once — a child agent must never keep executing under the service identity after the
+/// surface resolved a request principal. Contract: [`set`](Self::set) is called only between turns,
+/// under the surface's turn serialization (e.g. the server's turn gate); mid-turn swaps would race
+/// the dispatch reads.
+#[derive(Clone)]
+pub struct IdentityCell(Arc<Mutex<(Caller, Trust)>>);
+
+impl IdentityCell {
+    pub fn new(caller: Caller, trust: Trust) -> Self {
+        Self(Arc::new(Mutex::new((caller, trust))))
+    }
+
+    /// The local single-user identity (the default when a surface never resolves one).
+    pub fn local() -> Self {
+        Self::new(default_local_caller(), default_local_trust())
+    }
+
+    /// Snapshot the current identity (cloned — dispatch holds no lock across evaluation).
+    pub fn get(&self) -> (Caller, Trust) {
+        self.0.lock().unwrap().clone()
+    }
+
+    /// Swap the identity. Per-request surfaces call this between turns, under turn serialization.
+    pub fn set(&self, caller: Caller, trust: Trust) {
+        *self.0.lock().unwrap() = (caller, trust);
+    }
+}
+
 /// A local single-user caller used when no identity is supplied (matches `flux-auth`'s
 /// `LocalIdentity`, duplicated here so the runtime needn't depend on the auth layer).
 fn default_local_caller() -> Caller {
@@ -798,8 +830,9 @@ pub struct Executor {
     hooks: Vec<Arc<dyn PreToolHook>>,
     /// The authorization floor. `None` disables the policy layer (permission rules only).
     policy: Option<AuthorizationPolicy>,
-    caller: Caller,
-    trust: Trust,
+    /// The resolved identity the policy evaluates against — a shared cell (see [`IdentityCell`])
+    /// so per-request surfaces can swap it between turns and spawners can inherit the live value.
+    identity: IdentityCell,
     /// Depth of the active "pre-approved plan" scope. `>0` means the ops being dispatched belong to a
     /// plan the user already approved as a whole, so the per-op approval gate is skipped (deny rules
     /// still win). A depth (not a bool) so a plan that runs a nested plan stays approved throughout.
@@ -897,8 +930,7 @@ impl Executor {
             ctx,
             hooks: Vec::new(),
             policy: None,
-            caller: default_local_caller(),
-            trust: default_local_trust(),
+            identity: IdentityCell::local(),
             plan_scope: AtomicU32::new(0),
             destructive_scope: Mutex::new(Vec::new()),
             trust_all: AtomicBool::new(false),
@@ -1038,10 +1070,31 @@ impl Executor {
 
     /// Set the resolved caller + trust the policy evaluates against (default: the local
     /// single-user identity). Surfaces resolve this via `flux-auth` before constructing the agent.
+    /// Replaces the identity cell with a fresh, unshared one — to share a cell with a spawner,
+    /// use [`with_identity_cell`](Self::with_identity_cell).
     pub fn with_identity(mut self, caller: Caller, trust: Trust) -> Self {
-        self.caller = caller;
-        self.trust = trust;
+        self.identity = IdentityCell::new(caller, trust);
         self
+    }
+
+    /// Share an externally-owned identity cell (the surface keeps a handle and may swap the
+    /// identity between turns; the sub-agent spawner may hold the same cell so children inherit
+    /// the live value). See [`IdentityCell`] for the turn-serialization contract.
+    pub fn with_identity_cell(mut self, cell: IdentityCell) -> Self {
+        self.identity = cell;
+        self
+    }
+
+    /// The shared identity handle (for surfaces that need to swap identity per request and for
+    /// wiring the same cell into spawners after construction).
+    pub fn identity(&self) -> IdentityCell {
+        self.identity.clone()
+    }
+
+    /// Swap the identity on the shared cell — a per-request surface calls this between turns,
+    /// under its turn serialization (see [`IdentityCell::set`]).
+    pub fn set_identity(&self, caller: Caller, trust: Trust) {
+        self.identity.set(caller, trust);
     }
 
     pub fn registry(&self) -> &ToolRegistry {
@@ -1137,10 +1190,13 @@ impl Executor {
         //    allow-rule would otherwise satisfy it — the policy is the floor, rules can't widen it.
         let mut policy_requires_approval = false;
         if let Some(policy) = &self.policy {
+            // Snapshot once per dispatch: the cell may be swapped between turns (never mid-turn,
+            // per the IdentityCell contract), and no lock is held across evaluation.
+            let (caller, trust) = self.identity.get();
             for (action, resource) in effect_requests(&spec, &subjects) {
                 let req = PolicyRequest {
-                    caller: &self.caller,
-                    trust: &self.trust,
+                    caller: &caller,
+                    trust: &trust,
                     action: &action,
                     resource: &resource,
                 };
@@ -1949,6 +2005,92 @@ mod tests {
         let r = ex.dispatch("save", json!({})).await;
         assert!(r.is_error);
         assert!(r.content.contains("denied by policy"), "got: {}", r.content);
+    }
+
+    /// A read-effect tool gated only by the policy floor (permissive rules, auto-approve).
+    struct ReadishTool;
+    #[async_trait]
+    impl Tool for ReadishTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only("peek", "read", json!({"type": "object"}))
+                .with_effects(vec![Effect::Read])
+        }
+        async fn execute(&self, _c: &ToolContext, _p: Value) -> Result<ToolResult> {
+            Ok(ToolResult::ok("read"))
+        }
+    }
+
+    /// D-69 invariant: on a SHARED executor, `set_identity` swaps the policy subject between
+    /// turns — a deny for caller B is not bypassed because caller A ran first (and A's grant is
+    /// not sticky once B's identity is set). This is the per-request server mode's envelope
+    /// guarantee, proven at the layer that enforces it.
+    #[tokio::test]
+    async fn set_identity_swaps_the_policy_subject_between_turns() {
+        use flux_policy::{Grant, SubjectKind, SubjectRef};
+        let ident = |id: &str| {
+            (
+                Caller {
+                    principal: Principal {
+                        id: id.into(),
+                        name: id.into(),
+                        kind: CallerKind::User,
+                    },
+                    groups: Vec::new(),
+                    source: "test".into(),
+                },
+                Trust {
+                    kind: TrustKind::Invocation,
+                    level: TrustLevel::Verified,
+                    scopes: Vec::new(),
+                },
+            )
+        };
+        // Reads granted to alice ONLY — default-deny for every other principal.
+        let alice_only = AuthorizationPolicy {
+            grants: vec![Grant {
+                subjects: vec![SubjectRef {
+                    kind: SubjectKind::User,
+                    id: "alice".into(),
+                }],
+                resources: vec![ResourceRef::path("*")],
+                actions: vec![Action::from("workspace.read")],
+                required_trust: TrustLevel::Untrusted,
+                required_scopes: Vec::new(),
+                requires_approval: false,
+            }],
+        };
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(ReadishTool));
+        let (caller, trust) = ident("bob");
+        let ex = Executor::new(
+            reg,
+            PermissionManager::from_rules(&["peek".into()], &[]),
+            Arc::new(AllowApprover),
+            test_ctx(),
+        )
+        .with_policy(alice_only)
+        .with_identity(caller, trust);
+
+        let r = ex.dispatch("peek", json!({})).await;
+        assert!(
+            r.is_error && r.content.contains("denied by policy"),
+            "bob is outside the grant set: {}",
+            r.content
+        );
+
+        let (caller, trust) = ident("alice");
+        ex.set_identity(caller, trust);
+        let r = ex.dispatch("peek", json!({})).await;
+        assert!(!r.is_error, "alice is granted reads: {}", r.content);
+
+        let (caller, trust) = ident("bob");
+        ex.set_identity(caller, trust);
+        let r = ex.dispatch("peek", json!({})).await;
+        assert!(
+            r.is_error,
+            "alice's grant must not stick to bob's turn: {}",
+            r.content
+        );
     }
 
     #[test]

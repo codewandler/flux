@@ -125,7 +125,11 @@ pub fn test_engine(provider: Arc<dyn flux_provider::Provider>) -> Arc<FlowEngine
 /// build the engine/router directly with [`test_engine`] and `flux_server::router`.
 pub fn app(token: Option<String>) -> Router {
     let engine = test_engine(Arc::new(ProseProvider));
-    flux_server::router(engine, token, flux_server::CardInfo::flux_coding())
+    flux_server::router(
+        engine,
+        flux_server::ServerAuth::from_token(token),
+        flux_server::CardInfo::flux_coding(),
+    )
 }
 
 /// `POST path` with a JSON body and no `Authorization` header; returns `(status, parsed JSON

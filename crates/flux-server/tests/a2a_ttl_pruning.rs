@@ -118,7 +118,11 @@ async fn expired_a2a_session_is_swept_at_the_next_mint() {
     let _cwd = CwdGuard::enter(&project);
 
     let engine = support::test_engine(Arc::new(support::ProseProvider));
-    let app = flux_server::router(engine.clone(), None, flux_server::CardInfo::flux_coding());
+    let app = flux_server::router(
+        engine.clone(),
+        flux_server::ServerAuth::Open,
+        flux_server::CardInfo::flux_coding(),
+    );
 
     // Mint session A.
     let session_a = send_and_get_task_id(app.clone(), "ctx-a").await;
@@ -152,7 +156,11 @@ async fn ttl_zero_disables_pruning_through_http() {
     let _cwd = CwdGuard::enter(&project);
 
     let engine = support::test_engine(Arc::new(support::ProseProvider));
-    let app = flux_server::router(engine.clone(), None, flux_server::CardInfo::flux_coding());
+    let app = flux_server::router(
+        engine.clone(),
+        flux_server::ServerAuth::Open,
+        flux_server::CardInfo::flux_coding(),
+    );
 
     let session_a = send_and_get_task_id(app.clone(), "ctx-a").await;
     tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;

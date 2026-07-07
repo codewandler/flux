@@ -35,7 +35,7 @@ flux-channels.workspace = true
 flux-eval.workspace = true
 flux-orchestrate.workspace = true
 flux-a2a.workspace = true
-flux-server.workspace = true
+flux-server = { workspace = true, features = ["introspect"] }
 flux-tui.workspace = true
 flux-capabilities.workspace = true
 flux-datasource.workspace = true

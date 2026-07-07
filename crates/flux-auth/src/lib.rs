@@ -1,10 +1,23 @@
 //! `flux-auth` — authenticates *callers to flux* (distinct from `flux-credentials`, which
 //! authenticates flux to LLM providers).
 //!
-//! An [`IdentityProvider`] resolves the caller into a `flux_policy::Caller` + `Trust` *before*
-//! a session runs; policy then sees a typed actor. v1 ships [`LocalIdentity`] (the machine owner,
-//! `Privileged` trust, no login). OIDC/multi-user is an optional provider added when flux runs as
-//! a shared server — implement [`IdentityProvider`] and swap it in.
+//! Two seams, both terminating in the same `(Caller, Trust)` the policy layer evaluates:
+//!
+//! - **Ambient, per-process:** an [`IdentityProvider`] resolves the caller *once*, before a
+//!   session runs — [`LocalIdentity`] (the machine owner, `Privileged` trust, no login) for the
+//!   CLI, [`OidcIdentity`] for deployments that validate claims out of band.
+//! - **Per-request:** [`request::RequestAuthenticator`] authenticates one bearer token per call —
+//!   the seam multi-tenant surfaces use. The shipped RFC 7662 introspection impl and its caching
+//!   decorator live in [`introspect`] behind the `introspect` cargo feature. Design:
+//!   `docs/designs/request-auth-seam.md`.
+//!
+//! Either way the authenticator only **authenticates**; the safety envelope (policy →
+//! approval → guarded IO) stays the sole authorization source of truth.
+
+pub mod request;
+
+#[cfg(feature = "introspect")]
+pub mod introspect;
 
 use flux_policy::{Caller, CallerKind, Principal, Scope, Trust, TrustKind, TrustLevel};
 

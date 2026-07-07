@@ -10,7 +10,7 @@ flux-app.workspace = true
 flux-core.workspace = true
 flux-credentials.workspace = true
 flux-flow.workspace = true
-flux-server.workspace = true
+flux-server = { workspace = true, features = ["introspect"] }
 flux-lang.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

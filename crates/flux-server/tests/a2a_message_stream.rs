@@ -21,7 +21,11 @@ use serde_json::json;
 #[tokio::test]
 async fn message_stream_emits_a_working_frame_then_a_final_completed_frame() {
     let engine = support::test_engine(Arc::new(support::MultiDeltaProvider));
-    let app = flux_server::router(engine, None, flux_server::CardInfo::flux_coding());
+    let app = flux_server::router(
+        engine,
+        flux_server::ServerAuth::Open,
+        flux_server::CardInfo::flux_coding(),
+    );
 
     let body = json!({
         "jsonrpc": "2.0",

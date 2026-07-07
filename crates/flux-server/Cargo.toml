@@ -5,9 +5,15 @@ version.workspace = true
 license.workspace = true
 description = "flux HTTP API daemon: create/drive/inspect agent sessions over REST (axum)"
 
+[features]
+# Pull in flux-auth's RFC 7662 introspection so `PrincipalAuth::from_introspection` (the one
+# construction point for per-request principal auth) is available to surfaces that enable it.
+introspect = ["flux-auth/introspect"]
+
 [dependencies]
 flux-core.workspace = true
 flux-a2a.workspace = true
+flux-auth.workspace = true
 flux-config.workspace = true
 flux-credentials.workspace = true
 flux-events.workspace = true
@@ -20,13 +26,14 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 async-stream.workspace = true
+async-trait.workspace = true
 futures.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
 reqwest.workspace = true
 tower = { version = "0.5", features = ["util"] }
+flux-policy.workspace = true
 flux-provider.workspace = true
 flux-system.workspace = true
 flux-tools.workspace = true
-async-trait.workspace = true

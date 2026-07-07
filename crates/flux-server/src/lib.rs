@@ -21,21 +21,251 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::{FromRef, Path, Query, Request, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use futures::Stream;
 use serde_json::{json, Value};
 
+use flux_auth::request::{AuthContext, AuthError, RequestAuthenticator};
 use flux_core::Usage;
 use flux_flow::engine::FlowEngine;
 use flux_flow::AgentSink;
 
 type Shared = Arc<FlowEngine>;
 pub(crate) type TurnGate = Arc<tokio::sync::Mutex<()>>;
+
+// ── Auth modes (D-69) ─────────────────────────────────────────────────────────
+
+/// How the server authenticates requests — three explicit modes.
+#[derive(Clone)]
+pub enum ServerAuth {
+    /// No authentication. [`serve_on`] refuses this mode on a non-loopback bind.
+    Open,
+    /// One static shared secret for the whole deployment (the pre-D-69 mode): every request
+    /// presents `Authorization: Bearer <secret>`, compared in constant time. There is no
+    /// principal — the whole server is one auth realm. `external_url`, when set, is the base the
+    /// public agent card advertises instead of the request `Host` header (a Host-poisoned card
+    /// fetch would otherwise phish the shared secret to an attacker host — set it for any
+    /// non-loopback bind).
+    SharedSecret {
+        secret: String,
+        external_url: Option<String>,
+    },
+    /// Per-request bearer → principal resolution: every request is authenticated by the injected
+    /// [`RequestAuthenticator`], sessions are tagged with and scoped to the caller's realm, and
+    /// every turn runs under the request principal's `(Caller, Trust)` — never the service
+    /// identity (see [`enter_turn`]).
+    Principal(PrincipalAuth),
+}
+
+impl ServerAuth {
+    /// The pre-D-69 token knob mapped onto the explicit modes: `Some` → shared secret, `None` →
+    /// open (loopback-only). Kept for the surfaces whose config still speaks "optional token"
+    /// (the CLI's `FLUX_SERVER_TOKEN`, the `a2a` channel adapter).
+    pub fn from_token(token: Option<String>) -> Self {
+        Self::shared_secret(token, None)
+    }
+
+    /// Shared-secret mode with an optional advertised base URL (see [`ServerAuth::SharedSecret`]);
+    /// `None` token → [`ServerAuth::Open`].
+    pub fn shared_secret(token: Option<String>, external_url: Option<String>) -> Self {
+        match token {
+            Some(secret) => ServerAuth::SharedSecret {
+                secret,
+                external_url,
+            },
+            None => ServerAuth::Open,
+        }
+    }
+
+    /// The configured externally-reachable base the agent card should advertise (never the request
+    /// `Host` header), when this mode has one. `None` → the card falls back to `Host` derivation,
+    /// acceptable only for a loopback/dev bind.
+    fn card_external_url(&self) -> Option<&str> {
+        match self {
+            ServerAuth::Open => None,
+            ServerAuth::SharedSecret { external_url, .. } => external_url.as_deref(),
+            ServerAuth::Principal(p) => Some(&p.external_url),
+        }
+    }
+}
+
+impl std::fmt::Debug for ServerAuth {
+    /// Redacting: never renders the shared secret (or the authenticator's internals) — a `Debug`
+    /// of the server config is exactly where an auth secret leaks into a log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServerAuth::Open => f.write_str("Open"),
+            ServerAuth::SharedSecret { external_url, .. } => f
+                .debug_struct("SharedSecret")
+                .field("secret", &"<redacted>")
+                .field("external_url", external_url)
+                .finish(),
+            ServerAuth::Principal(p) => f.debug_tuple("Principal").field(p).finish(),
+        }
+    }
+}
+
+/// The principal-auth mode's configuration. Constructing this requires the externally reachable
+/// base URL up front: the agent card advertises where to send bearer tokens, so in this mode the
+/// card's `url` must derive from deployment config — deriving it from the request's `Host` header
+/// would let a Host-poisoned request on the (public, auth-exempt) card route redirect clients'
+/// tokens to an attacker host.
+#[derive(Clone)]
+pub struct PrincipalAuth {
+    pub(crate) authenticator: Arc<dyn RequestAuthenticator>,
+    pub(crate) external_url: String,
+}
+
+impl std::fmt::Debug for PrincipalAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrincipalAuth")
+            .field("external_url", &self.external_url)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PrincipalAuth {
+    /// `external_url` is the externally reachable base (e.g. `https://agents.example.com`); the
+    /// card advertises `<external_url>/a2a`.
+    pub fn new(
+        authenticator: Arc<dyn RequestAuthenticator>,
+        external_url: impl Into<String>,
+    ) -> Self {
+        Self {
+            authenticator,
+            external_url: external_url.into(),
+        }
+    }
+
+    /// Build principal-mode auth from RFC 7662 introspection parameters — the ONE construction
+    /// point for the introspection authenticator, shared by every surface (the CLI's `--serve`
+    /// and the `a2a` channel adapter) so the security-critical claim mapping and client wiring
+    /// never diverge. Wraps the `Introspector` in the caching decorator. Requires the `introspect`
+    /// feature.
+    #[cfg(feature = "introspect")]
+    pub fn from_introspection(params: IntrospectionParams) -> Result<Self, String> {
+        use flux_auth::introspect::{CachedAuthenticator, IntrospectionConfig, Introspector};
+        // Fail-open footgun: a tenancy deployment that maps an account claim but leaves
+        // `require_account` off silently admits account-less tokens into per-principal (`user:`)
+        // realms alongside its `acct:` realms. Warn loudly — realm namespaces are disjoint so this
+        // is not a leak, but it is almost never intended.
+        if params.account_claim.is_some() && !params.require_account {
+            eprintln!(
+                "(warning: [server] introspect_account_claim is set but require_account is false — \
+                 tokens lacking the account claim will authenticate into per-principal realms; set \
+                 introspect_require_account=true to reject them)"
+            );
+        }
+        let mut ic = IntrospectionConfig::new(params.endpoint);
+        ic.client = params.client;
+        ic.allow_http = params.allow_http;
+        ic.account_claim = params.account_claim;
+        ic.roles_claim = params.roles_claim;
+        ic.require_account = params.require_account;
+        let introspector = Introspector::new(ic).map_err(|e| e.to_string())?;
+        Ok(PrincipalAuth::new(
+            Arc::new(CachedAuthenticator::new(introspector)),
+            params.external_url,
+        ))
+    }
+}
+
+/// Parameters for [`PrincipalAuth::from_introspection`] — the surface-agnostic inputs each caller
+/// gathers from its own config source (flux-config for the CLI, program settings for the channel
+/// adapter) before handing them to the one construction point. `client` carries the ALREADY-
+/// RESOLVED `(client_id, client_secret)`, never a secret literal read from a committed config file.
+#[cfg(feature = "introspect")]
+pub struct IntrospectionParams {
+    pub endpoint: String,
+    pub client: Option<(String, String)>,
+    pub allow_http: bool,
+    pub account_claim: Option<String>,
+    pub roles_claim: Option<String>,
+    pub require_account: bool,
+    pub external_url: String,
+}
+
+/// Constant wire bodies — auth failures never carry backend detail (an introspection error's text
+/// can leak internal endpoint topology, and interpolating into a header would be CRLF injection).
+/// The `Unavailable` payload is logged server-side only.
+pub(crate) const UNAUTHORIZED_BODY: &str = "unauthorized";
+const UNAVAILABLE_BODY: &str = "authentication backend unavailable";
+/// One constant 404 shape for the realm guard: a session that does not exist and a session owned
+/// by another realm are byte-identical to the caller (A2A §13.1 — never reveal existence).
+const NOT_FOUND_BODY: &str = "not found";
+
+/// 401 with the byte-constant RFC 6750 challenge (identical across all causes — no oracle).
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(
+            header::WWW_AUTHENTICATE,
+            flux_auth::request::WWW_AUTHENTICATE,
+        )],
+        UNAUTHORIZED_BODY,
+    )
+        .into_response()
+}
+
+/// 503 with a constant body — the auth backend failing must fail closed, distinguishably from 401.
+fn auth_unavailable() -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, UNAVAILABLE_BODY).into_response()
+}
+
+/// The realm guard's constant 404 (see [`NOT_FOUND_BODY`]).
+pub(crate) fn realm_not_found() -> Response {
+    (StatusCode::NOT_FOUND, NOT_FOUND_BODY).into_response()
+}
+
+/// The caller's realm: the tenancy key every principal-mode session is tagged with and scoped by.
+/// Deliberately NON-optional — a principal without an account claim gets a principal-derived realm
+/// rather than joining a shared "no account" pool (`None == None` would let all account-less
+/// callers read and continue each other's sessions).
+///
+/// The two sources live in **disjoint namespaces** (`acct:` / `user:`) so an account-claim value
+/// can never collide with the principal-derived form: without the prefix, an attacker whose IdP
+/// emits `account = "user:victim"` would land in the same realm as an account-less principal
+/// `victim` and read/continue their sessions. This is the same reserved-prefix discipline the
+/// claim mapping applies to `account:` mirror groups, extended to the realm key itself.
+fn realm_of(ctx: &AuthContext) -> String {
+    match &ctx.account {
+        Some(account) => format!("acct:{account}"),
+        None => format!("user:{}", ctx.caller.principal.id),
+    }
+}
+
+/// Principal-mode turn entry: swaps the engine's executor identity to the request principal and
+/// returns the caller's realm. The `_gate` witness makes this uncallable without holding the
+/// single-turn gate — the identity cell must never be swapped while another request's turn is
+/// draining — and a turn's realm is obtainable *only* from this function, so realm-scoped minting
+/// structurally cannot happen without the identity swap (the D-69 type-coupling: principal mode
+/// cannot ship with turns running under the service identity).
+///
+/// Non-principal modes return `Ok(None)` and touch nothing (byte-for-byte pre-D-69 behavior).
+/// In principal mode a missing [`AuthContext`] is a constant 401 — unreachable behind
+/// [`require_auth`], but fail-closed rather than fail-open if a future route forgets the layer.
+pub(crate) fn enter_turn(
+    auth: &ServerAuth,
+    engine: &FlowEngine,
+    ctx: Option<&AuthContext>,
+    _gate: &tokio::sync::MutexGuard<'_, ()>,
+) -> Result<Option<String>, Box<Response>> {
+    match auth {
+        ServerAuth::Open | ServerAuth::SharedSecret { .. } => Ok(None),
+        ServerAuth::Principal(_) => {
+            let ctx = ctx.ok_or_else(|| Box::new(unauthorized()))?;
+            engine
+                .executor
+                .set_identity(ctx.caller.clone(), ctx.trust.clone());
+            Ok(Some(realm_of(ctx)))
+        }
+    }
+}
 
 /// The A2A session TTL in seconds (C-18): A2A-minted sessions whose last activity is older than
 /// this are swept lazily before the next A2A session is created. `0` disables pruning.
@@ -94,6 +324,7 @@ pub struct ServerState {
     card: Arc<CardInfo>,
     turn_gate: TurnGate,
     a2a_ttl: A2aTtl,
+    auth: Arc<ServerAuth>,
 }
 
 impl FromRef<ServerState> for Arc<FlowEngine> {
@@ -120,26 +351,31 @@ impl FromRef<ServerState> for A2aTtl {
     }
 }
 
-/// Bind `addr` and serve until shutdown. When `token` is `Some`, every route except `/health`
-/// requires `Authorization: Bearer <token>`; when `None`, no authentication is enforced and the
-/// listener must be loopback.
-pub async fn serve(addr: &str, agent: FlowEngine, token: Option<String>) -> anyhow::Result<()> {
+impl FromRef<ServerState> for Arc<ServerAuth> {
+    fn from_ref(s: &ServerState) -> Self {
+        s.auth.clone()
+    }
+}
+
+/// Bind `addr` and serve until shutdown, authenticating per `auth` (see [`ServerAuth`] for the
+/// three modes). [`ServerAuth::Open`] requires a loopback bind.
+pub async fn serve(addr: &str, agent: FlowEngine, auth: ServerAuth) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let addr = listener.local_addr()?;
     eprintln!("flux server listening on http://{addr}");
     eprintln!("  A2A agent card:  http://{addr}/.well-known/agent-card.json");
     eprintln!("  A2A endpoint:    http://{addr}/a2a  (message/send, message/stream)");
-    serve_on(listener, agent, token).await
+    serve_on(listener, agent, auth).await
 }
 
 /// Serve on an already-bound listener (lets callers pick an ephemeral port).
 pub async fn serve_on(
     listener: tokio::net::TcpListener,
     agent: FlowEngine,
-    token: Option<String>,
+    auth: ServerAuth,
 ) -> anyhow::Result<()> {
     let addr = listener.local_addr()?;
-    if token.is_none() && !unauthenticated_bind_allowed(addr) {
+    if matches!(auth, ServerAuth::Open) && !unauthenticated_bind_allowed(addr) {
         anyhow::bail!(
             "refusing unauthenticated non-loopback bind on {addr}; set FLUX_SERVER_TOKEN or bind \
              to 127.0.0.1/::1"
@@ -147,7 +383,7 @@ pub async fn serve_on(
     }
     axum::serve(
         listener,
-        router(Arc::new(agent), token, CardInfo::flux_coding()),
+        router(Arc::new(agent), auth, CardInfo::flux_coding()),
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;
@@ -156,6 +392,39 @@ pub async fn serve_on(
 
 fn unauthenticated_bind_allowed(addr: SocketAddr) -> bool {
     addr.ip().is_loopback()
+}
+
+/// Serve a resolver-keyed multi-agent mount (D-63) until shutdown — the guarded entry point for
+/// [`router_multi`]. Refuses an unauthenticated ([`ServerAuth::Open`]) non-loopback bind, exactly
+/// as [`serve`] does for the single-agent surface: an open, auto-approving `/:agent_id/a2a` is
+/// remote code execution.
+pub async fn serve_multi(
+    addr: &str,
+    resolver: Arc<dyn AgentResolver>,
+    auth: ServerAuth,
+) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    serve_multi_on(listener, resolver, auth).await
+}
+
+/// [`serve_multi`] on an already-bound listener (ephemeral-port callers). Enforces the same
+/// Open-on-non-loopback refusal as [`serve_on`].
+pub async fn serve_multi_on(
+    listener: tokio::net::TcpListener,
+    resolver: Arc<dyn AgentResolver>,
+    auth: ServerAuth,
+) -> anyhow::Result<()> {
+    let addr = listener.local_addr()?;
+    if matches!(auth, ServerAuth::Open) && !unauthenticated_bind_allowed(addr) {
+        anyhow::bail!(
+            "refusing unauthenticated non-loopback bind on {addr} for the multi-agent mount; \
+             configure auth or bind to 127.0.0.1/::1"
+        );
+    }
+    axum::serve(listener, router_multi(resolver, auth))
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    Ok(())
 }
 
 /// Wait for the process-level shutdown signals a daemon should honor.
@@ -190,12 +459,12 @@ pub async fn shutdown_signal() {
     ctrl_c.await;
 }
 
-/// Build the API router over `engine`, advertising `card` on the A2A discovery endpoint. When `token`
-/// is `Some`, every route except `/health` and the agent card requires `Authorization: Bearer <token>`.
-/// Public so the `a2a` channel ([`flux_channels`]) can mount it onto a program agent's engine with its
-/// own graceful-shutdown serve.
-pub fn router(engine: Arc<FlowEngine>, token: Option<String>, card: CardInfo) -> Router {
-    router_with_ttl(engine, token, card, a2a_ttl_from_config())
+/// Build the API router over `engine`, advertising `card` on the A2A discovery endpoint and
+/// authenticating per `auth` (every route except `/health` and the agent card). Public so the
+/// `a2a` channel ([`flux_channels`]) can mount it onto a program agent's engine with its own
+/// graceful-shutdown serve.
+pub fn router(engine: Arc<FlowEngine>, auth: ServerAuth, card: CardInfo) -> Router {
+    router_with_ttl(engine, auth, card, a2a_ttl_from_config())
 }
 
 /// Resolve the A2A session TTL from the layered flux config (`[server] a2a_session_ttl_secs`,
@@ -220,15 +489,17 @@ fn a2a_ttl_from_config() -> A2aTtl {
 /// [`router`] with an explicit A2A session TTL (tests inject one; production resolves from config).
 fn router_with_ttl(
     engine: Arc<FlowEngine>,
-    token: Option<String>,
+    auth: ServerAuth,
     card: CardInfo,
     a2a_ttl: A2aTtl,
 ) -> Router {
+    let auth = Arc::new(auth);
     let state = ServerState {
         engine,
         card: Arc::new(card),
         turn_gate: Arc::new(tokio::sync::Mutex::new(())),
         a2a_ttl,
+        auth: auth.clone(),
     };
     // Auth-exempt routes — registered outside the middleware layer so path-string comparison
     // cannot be bypassed by percent-encoding or double-slash tricks.
@@ -237,45 +508,283 @@ fn router_with_ttl(
         .route("/.well-known/agent-card.json", get(a2a::agent_card))
         .route("/.well-known/agent.json", get(a2a::agent_card));
 
-    // Every other route requires a valid Bearer token when one is configured.
-    let protected = Router::new()
-        .route("/a2a", post(a2a::a2a_handler))
-        .route("/sessions", post(create_session))
+    // Session-addressed routes: ONE structural realm guard wraps the whole `/sessions/:id/*`
+    // subtree — including the write path (`POST …/messages`) — so a route added here later is
+    // realm-guarded by construction, never by per-handler enumeration. (Session ids are guessable
+    // `s_<n>`; guarding reads while leaving a write route open would be cross-tenant read+write.)
+    let sessions = Router::new()
         .route("/sessions/:id", get(get_session))
         .route("/sessions/:id/messages", post(post_message))
         .route("/sessions/:id/stream", get(stream_message))
         .route("/sessions/:id/usage", get(get_session_usage))
+        .route_layer(middleware::from_fn_with_state(state.clone(), realm_guard));
+
+    // Every other route requires auth per the configured mode. `require_auth` (the outer
+    // route_layer, applied after the merge) runs BEFORE `realm_guard`, so authentication always
+    // precedes any existence signal (A2A §13.1).
+    let protected = Router::new()
+        .route("/a2a", post(a2a::a2a_handler))
+        .route("/sessions", post(create_session))
         .route("/usage", get(get_usage_all))
         .route("/webhook", post(webhook))
-        .route_layer(middleware::from_fn_with_state(
-            Arc::new(token),
-            require_auth,
-        ));
+        .merge(sessions)
+        .route_layer(middleware::from_fn_with_state(auth, require_auth));
 
     exempt.merge(protected).with_state(state)
 }
 
-/// Bearer-token gate. With no configured token this is a pass-through; otherwise the request
-/// must present a matching `Authorization: Bearer` header (compared in constant time).
-/// Exempt routes (`/health`, `/.well-known/agent.json`) are registered outside this middleware's
-/// scope in [`router`] — no path-string bypass is possible.
+// ── Multi-agent A2A mount (D-63) ────────────────────────────────────────────────
+
+/// Resolves a path segment (`/:agent_id/…`) to the agent that serves it — the seam that turns
+/// flux-server's single-agent A2A surface into an N-agent mount keyed by path, so a multi-tenant
+/// host gets flux's A2A session lifecycle (TTL retention, `message/stream` SSE, `contextId`
+/// continuity) instead of rebuilding it.
+///
+/// `resolve` receives the **already-authenticated** [`AuthContext`] on the JSON-RPC path (the auth
+/// layer runs first), so a resolver may scope which agents a principal can even see — but it never
+/// authenticates (auth stays one layer, D-63's answered open question). Returning `None` yields a
+/// constant 404 indistinguishable from any other unknown resource (A2A §13.1). The resolved engine
+/// is pinned for the whole request — including a streaming turn's lifetime — so re-resolution can
+/// never swap the agent mid-stream.
+///
+/// **Card-route caveat:** the discovery card is public (A2A requires it), so `resolve` is called
+/// there with `auth = None` and a 200-vs-404 distinguishes a known `agent_id` from an unknown one
+/// *before* any token check. If a deployment's `agent_id`s are themselves sensitive (per-tenant
+/// existence must not be enumerable), do not key them on guessable strings — the public card
+/// cannot hide existence without violating the spec.
+#[async_trait::async_trait]
+pub trait AgentResolver: Send + Sync {
+    async fn resolve(&self, agent_id: &str, auth: Option<&AuthContext>) -> Option<ResolvedAgent>;
+}
+
+/// What an [`AgentResolver`] yields: the engine that runs turns for this agent plus its discovery
+/// card. (Each agent owns its own `FlowEngine` — and thus its own event store — so A2A session
+/// TTL, `contextId` continuity, and per-principal realm scoping are already isolated per agent.)
+///
+/// **Principal-mode contract:** the mount swaps *this engine's executor identity* to the request
+/// principal each turn ([`enter_turn`]). For a sub-agent (`task`) spawned within that turn to run
+/// under the same principal — rather than a stale build-time identity — the engine must have been
+/// built with its **executor's identity cell shared into the spawner** (i.e. one
+/// `Executor::identity()` cell fed to both the executor and `SubAgents::with_authorization_cell`,
+/// as the CLI wires it). Building the engine's spawner with a fresh unshared cell
+/// (`SubAgents::with_authorization`) instead would leave sub-agents authorized as the service
+/// identity. There is no runtime check for this — it is the engine builder's responsibility.
+#[derive(Clone)]
+pub struct ResolvedAgent {
+    pub engine: Arc<FlowEngine>,
+    pub card: Arc<CardInfo>,
+}
+
+/// A fixed set of agents keyed by name — the built-in resolver for a program that declares its
+/// agents up front (`flux app run`). Dynamic hosts (per-tenant agents minted at runtime)
+/// implement [`AgentResolver`] themselves.
+pub struct StaticResolver(std::collections::HashMap<String, ResolvedAgent>);
+
+impl StaticResolver {
+    pub fn new() -> Self {
+        Self(std::collections::HashMap::new())
+    }
+
+    pub fn with_agent(
+        mut self,
+        name: impl Into<String>,
+        engine: Arc<FlowEngine>,
+        card: CardInfo,
+    ) -> Self {
+        self.0.insert(
+            name.into(),
+            ResolvedAgent {
+                engine,
+                card: Arc::new(card),
+            },
+        );
+        self
+    }
+}
+
+impl Default for StaticResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentResolver for StaticResolver {
+    async fn resolve(&self, agent_id: &str, _auth: Option<&AuthContext>) -> Option<ResolvedAgent> {
+        self.0.get(agent_id).cloned()
+    }
+}
+
+/// Router state for the multi-agent A2A mount. Like [`ServerState`] but the engine/card are
+/// resolved per request from the path rather than baked in.
+#[derive(Clone)]
+pub struct MultiState {
+    pub(crate) resolver: Arc<dyn AgentResolver>,
+    pub(crate) turn_gate: TurnGate,
+    pub(crate) a2a_ttl: A2aTtl,
+    pub(crate) auth: Arc<ServerAuth>,
+}
+
+impl FromRef<MultiState> for TurnGate {
+    fn from_ref(s: &MultiState) -> Self {
+        s.turn_gate.clone()
+    }
+}
+impl FromRef<MultiState> for A2aTtl {
+    fn from_ref(s: &MultiState) -> Self {
+        s.a2a_ttl
+    }
+}
+impl FromRef<MultiState> for Arc<ServerAuth> {
+    fn from_ref(s: &MultiState) -> Self {
+        s.auth.clone()
+    }
+}
+impl FromRef<MultiState> for Arc<dyn AgentResolver> {
+    fn from_ref(s: &MultiState) -> Self {
+        s.resolver.clone()
+    }
+}
+
+/// Build a resolver-keyed multi-agent A2A mount (D-63): each agent is served under `/:agent_id/`
+/// with flux's full A2A machinery. Routes:
+/// - `GET  /health`
+/// - `GET  /:agent_id/.well-known/agent-card.json` (+ `/agent.json` alias) — discovery, public
+/// - `POST /:agent_id/a2a` — JSON-RPC 2.0 (`message/send`, `message/stream`)
+///
+/// Auth is one outer layer ([`require_auth`], same three modes), so the resolver sees the
+/// authenticated principal and every A2A turn runs the safety envelope under it. Per-agent REST
+/// session routes (`/:agent_id/sessions/*`) are intentionally out of scope here — the mount serves
+/// the A2A protocol surface a multi-agent host actually needs; the single-agent [`router`] remains
+/// the way to expose the full REST surface for one engine.
+///
+/// This only *builds* the router; prefer [`serve_multi`]/[`serve_multi_on`], which refuse an
+/// unauthenticated non-loopback bind. A caller wiring `axum::serve` directly must enforce that
+/// itself — an [`ServerAuth::Open`] mount on a public interface auto-approves every tool call.
+pub fn router_multi(resolver: Arc<dyn AgentResolver>, auth: ServerAuth) -> Router {
+    router_multi_with_ttl(resolver, auth, a2a_ttl_from_config())
+}
+
+fn router_multi_with_ttl(
+    resolver: Arc<dyn AgentResolver>,
+    auth: ServerAuth,
+    a2a_ttl: A2aTtl,
+) -> Router {
+    let auth = Arc::new(auth);
+    let state = MultiState {
+        resolver,
+        turn_gate: Arc::new(tokio::sync::Mutex::new(())),
+        a2a_ttl,
+        auth: auth.clone(),
+    };
+    // Discovery card is public (structurally auth-exempt), exactly as in the single-agent mount.
+    let exempt = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route(
+            "/:agent_id/.well-known/agent-card.json",
+            get(a2a::agent_card_multi),
+        )
+        .route(
+            "/:agent_id/.well-known/agent.json",
+            get(a2a::agent_card_multi),
+        );
+    let protected = Router::new()
+        .route("/:agent_id/a2a", post(a2a::a2a_handler_multi))
+        .route_layer(middleware::from_fn_with_state(auth, require_auth));
+    exempt.merge(protected).with_state(state)
+}
+
+/// The auth gate, per [`ServerAuth`] mode. Exempt routes (`/health`, the agent card) are
+/// registered outside this middleware's scope in [`router`] — no path-string bypass is possible.
+///
+/// - `Open` — pass-through (loopback-only bind enforced in [`serve_on`]).
+/// - `SharedSecret` — constant-time compare of `Authorization: Bearer <secret>` (pre-D-69, plus
+///   the RFC 7235-required `WWW-Authenticate` challenge on 401).
+/// - `Principal` — resolve the bearer to an [`AuthContext`] via the configured
+///   [`RequestAuthenticator`] and stash it in request extensions.
+///
+/// BOTH authenticated modes reject a request carrying more than one `Authorization` header (a
+/// front proxy honoring a different copy than we read is a smuggling-style divergence) via the
+/// shared [`single_auth_header`].
 async fn require_auth(
-    State(token): State<Arc<Option<String>>>,
-    req: Request,
+    State(auth): State<Arc<ServerAuth>>,
+    mut req: Request,
     next: Next,
-) -> Result<Response, StatusCode> {
-    if let Some(expected) = token.as_ref() {
-        let presented = req
-            .headers()
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .unwrap_or("");
-        if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
-            return Err(StatusCode::UNAUTHORIZED);
+) -> Response {
+    match auth.as_ref() {
+        ServerAuth::Open => next.run(req).await,
+        ServerAuth::SharedSecret { secret, .. } => {
+            let header = match single_auth_header(&req) {
+                Ok(h) => h,
+                Err(resp) => return *resp,
+            };
+            let presented = header.and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
+            if !constant_time_eq(presented.as_bytes(), secret.as_bytes()) {
+                return unauthorized();
+            }
+            next.run(req).await
+        }
+        ServerAuth::Principal(p) => {
+            let header = match single_auth_header(&req) {
+                Ok(h) => h.map(str::to_owned),
+                Err(resp) => return *resp,
+            };
+            let token = match flux_auth::request::bearer_from_header(header.as_deref()) {
+                Ok(t) => t.to_owned(),
+                Err(_) => return unauthorized(),
+            };
+            match p.authenticator.authenticate(&token).await {
+                Ok(ctx) => {
+                    req.extensions_mut().insert(ctx);
+                    next.run(req).await
+                }
+                Err(AuthError::Unauthorized) => unauthorized(),
+                Err(AuthError::Unavailable(detail)) => {
+                    // Log-only payload: the wire response stays a constant string.
+                    eprintln!("(auth backend unavailable: {detail})");
+                    auth_unavailable()
+                }
+            }
         }
     }
-    Ok(next.run(req).await)
+}
+
+/// The single `Authorization` header value, or a constant 401 if more than one is present — a
+/// front proxy that validates/normalizes a different copy than axum reads is a request-smuggling
+/// divergence. Applied uniformly by both authenticated modes in [`require_auth`]. (`Box`ed error
+/// to keep the `Ok` path small — the caller un-boxes on the single reject.)
+fn single_auth_header(req: &Request) -> Result<Option<&str>, Box<Response>> {
+    let mut it = req.headers().get_all(header::AUTHORIZATION).iter();
+    let first = it.next();
+    if it.next().is_some() {
+        return Err(Box::new(unauthorized()));
+    }
+    Ok(first.and_then(|v| v.to_str().ok()))
+}
+
+/// Realm guard for every `/sessions/:id/*` route (principal mode only; other modes pass through
+/// untouched). A session that does not exist and a session owned by another realm produce the
+/// same constant 404 ([`realm_not_found`]) — indistinguishable by status, body, or headers.
+async fn realm_guard(State(state): State<ServerState>, mut req: Request, next: Next) -> Response {
+    if !matches!(state.auth.as_ref(), ServerAuth::Principal(_)) {
+        return next.run(req).await;
+    }
+    // Fail closed: no resolved principal on a principal-mode session route is a constant 401
+    // (unreachable behind `require_auth`, which runs first).
+    let Some(ctx) = req.extensions().get::<AuthContext>() else {
+        return unauthorized();
+    };
+    let realm = realm_of(ctx);
+    use axum::RequestExt;
+    let id = match req.extract_parts::<Path<String>>().await {
+        Ok(Path(id)) => id,
+        Err(_) => return realm_not_found(),
+    };
+    match state.engine.events.info(&id) {
+        Ok(info) if info.context.account.as_deref() == Some(realm.as_str()) => next.run(req).await,
+        // Missing session, unreadable store row, or another realm's session: one constant shape.
+        _ => realm_not_found(),
+    }
 }
 
 /// Length-aware constant-time byte comparison (avoids leaking the token via response timing).
@@ -294,8 +803,39 @@ fn err500(e: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
-async fn create_session(State(agent): State<Shared>) -> Result<Json<Value>, (StatusCode, String)> {
-    let id = agent.events.create_session(&agent.model).map_err(err500)?;
+/// Mint a session tagged with the caller's realm in principal mode (`EventContext.account`, the
+/// D-02 substrate the realm guard and `find_correlated_in_realm` scope by); untagged otherwise
+/// (byte-for-byte pre-D-69). Fail closed: principal mode without a resolved principal is an error.
+fn mint_session(
+    agent: &FlowEngine,
+    auth: &ServerAuth,
+    ctx: Option<&AuthContext>,
+) -> Result<String, Box<Response>> {
+    match auth {
+        ServerAuth::Open | ServerAuth::SharedSecret { .. } => agent
+            .events
+            .create_session(&agent.model)
+            .map_err(|e| Box::new(err500(e).into_response())),
+        ServerAuth::Principal(_) => {
+            let ctx = ctx.ok_or_else(|| Box::new(unauthorized()))?;
+            let evctx = flux_events::EventContext {
+                account: Some(realm_of(ctx)),
+                ..Default::default()
+            };
+            agent
+                .events
+                .create_session_with_context(&agent.model, &evctx)
+                .map_err(|e| Box::new(err500(e).into_response()))
+        }
+    }
+}
+
+async fn create_session(
+    State(agent): State<Shared>,
+    State(auth): State<Arc<ServerAuth>>,
+    ctx: Option<Extension<AuthContext>>,
+) -> Result<Json<Value>, Response> {
+    let id = mint_session(&agent, &auth, ctx.as_ref().map(|e| &e.0)).map_err(|e| *e)?;
     Ok(Json(json!({ "id": id, "model": agent.model })))
 }
 
@@ -321,16 +861,19 @@ struct MessageRequest {
 
 async fn post_message(
     State(agent): State<Shared>,
+    State(auth): State<Arc<ServerAuth>>,
     State(turn_gate): State<TurnGate>,
+    ctx: Option<Extension<AuthContext>>,
     Path(id): Path<String>,
     Json(req): Json<MessageRequest>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> Result<Json<Value>, Response> {
     let mut sink = Collect::default();
     let _turn = turn_gate.lock().await;
+    enter_turn(&auth, &agent, ctx.as_ref().map(|e| &e.0), &_turn).map_err(|e| *e)?;
     agent
         .run_turn(&id, &req.input, &mut sink)
         .await
-        .map_err(err500)?;
+        .map_err(|e| err500(e).into_response())?;
     Ok(Json(json!({
         "text": sink.text,
         "tool_calls": sink.tools,
@@ -378,10 +921,31 @@ async fn get_session_usage(
     })))
 }
 
-/// `GET /usage` — per-model token tiers + cost across every session (C-06).
-async fn get_usage_all(State(agent): State<Shared>) -> Result<Json<Value>, (StatusCode, String)> {
+/// `GET /usage` — per-model token tiers + cost (C-06). Across every session in the open/shared-
+/// secret modes; in principal mode, scoped to the caller's realm (summed over the realm's own
+/// streams — another tenant's spend must not be readable, A2A §13.1).
+async fn get_usage_all(
+    State(agent): State<Shared>,
+    State(auth): State<Arc<ServerAuth>>,
+    ctx: Option<Extension<AuthContext>>,
+) -> Result<Json<Value>, Response> {
     let pricing = flux_credentials::load_pricing_table();
-    let rows = agent.events.cost_summary_all(&pricing).map_err(err500)?;
+    let rows = match auth.as_ref() {
+        ServerAuth::Open | ServerAuth::SharedSecret { .. } => agent
+            .events
+            .cost_summary_all(&pricing)
+            .map_err(|e| err500(e).into_response())?,
+        ServerAuth::Principal(_) => {
+            // Realm-scoped, but through the SAME store-level fold as the unscoped rollup
+            // (pricing + legacy/canonical key de-splitting), so the two modes never disagree for
+            // the same data — only the stream set differs.
+            let ctx = ctx.as_ref().map(|e| &e.0).ok_or_else(unauthorized)?;
+            agent
+                .events
+                .cost_summary_for_account(&realm_of(ctx), &pricing)
+                .map_err(|e| err500(e).into_response())?
+        }
+    };
     Ok(Json(json!({
         "models": rows.iter().map(model_cost_json).collect::<Vec<_>>(),
     })))
@@ -397,15 +961,29 @@ struct StreamQuery {
 /// mpsc channel that backs the SSE stream.
 async fn stream_message(
     State(agent): State<Shared>,
+    State(auth): State<Arc<ServerAuth>>,
     State(turn_gate): State<TurnGate>,
+    ctx: Option<Extension<AuthContext>>,
     Path(id): Path<String>,
     Query(q): Query<StreamQuery>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
+    // Fail closed BEFORE the SSE response is established: principal mode with no resolved
+    // principal is a 401, not a stream (unreachable behind `require_auth`).
+    if matches!(auth.as_ref(), ServerAuth::Principal(_)) && ctx.is_none() {
+        return Err(unauthorized());
+    }
+    let ctx = ctx.map(|e| e.0);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let agent = agent.clone();
     tokio::spawn(async move {
         let mut sink = SseSink { tx: tx.clone() };
         let _turn = turn_gate.lock().await;
+        // Identity swap inside the gate (the SSE response is already up, so a — pre-checked,
+        // unreachable — failure surfaces as an error frame rather than an HTTP status).
+        if enter_turn(&auth, &agent, ctx.as_ref(), &_turn).is_err() {
+            let _ = tx.send(Event::default().event("error").data(UNAUTHORIZED_BODY));
+            return;
+        }
         if let Err(e) = agent.run_turn(&id, &q.input, &mut sink).await {
             let _ = tx.send(Event::default().event("error").data(e.to_string()));
         }
@@ -416,7 +994,7 @@ async fn stream_message(
             yield Ok(ev);
         }
     };
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 /// Forwards a turn's deltas as SSE events over an mpsc channel.
@@ -437,16 +1015,21 @@ impl AgentSink for SseSink {
 /// the trigger surface for integrations (a CI hook, or a chat message bridged by an external adapter).
 async fn webhook(
     State(agent): State<Shared>,
+    State(auth): State<Arc<ServerAuth>>,
     State(turn_gate): State<TurnGate>,
+    ctx: Option<Extension<AuthContext>>,
     Json(req): Json<MessageRequest>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    let session_id = agent.events.create_session(&agent.model).map_err(err500)?;
+) -> Result<Json<Value>, Response> {
+    // In principal mode the webhook's fresh session is tagged with the caller's realm, like
+    // every other mint — an untagged session would be unreachable to its own creator.
+    let session_id = mint_session(&agent, &auth, ctx.as_ref().map(|e| &e.0)).map_err(|e| *e)?;
     let mut sink = Collect::default();
     let _turn = turn_gate.lock().await;
+    enter_turn(&auth, &agent, ctx.as_ref().map(|e| &e.0), &_turn).map_err(|e| *e)?;
     agent
         .run_turn(&session_id, &req.input, &mut sink)
         .await
-        .map_err(err500)?;
+        .map_err(|e| err500(e).into_response())?;
     Ok(Json(json!({
         "session_id": session_id,
         "text": sink.text,
@@ -500,7 +1083,7 @@ mod tests {
     /// the gate can be exercised without standing up a full `Agent`.
     /// Mirror the split-router structure from [`router`]: exempt routes outside the middleware,
     /// protected routes inside.
-    fn guarded_app(token: Option<String>) -> Router {
+    fn guarded_app(auth: ServerAuth) -> Router {
         let exempt = Router::new()
             .route("/health", get(|| async { "ok" }))
             .route(
@@ -510,10 +1093,7 @@ mod tests {
             .route("/.well-known/agent.json", get(|| async { Json(json!({})) }));
         let protected = Router::new()
             .route("/protected", get(|| async { "data" }))
-            .route_layer(middleware::from_fn_with_state(
-                Arc::new(token),
-                require_auth,
-            ));
+            .route_layer(middleware::from_fn_with_state(Arc::new(auth), require_auth));
         exempt.merge(protected)
     }
 
@@ -530,7 +1110,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_required_when_token_configured() {
-        let app = || guarded_app(Some("s3cr3t".to_string()));
+        let app = || guarded_app(ServerAuth::from_token(Some("s3cr3t".to_string())));
         // No / wrong token → 401 on a protected route.
         assert_eq!(
             status(app(), "/protected", None).await,
@@ -561,7 +1141,7 @@ mod tests {
     async fn no_token_configured_is_pass_through() {
         // With no configured token (loopback-only mode), routes are open.
         assert_eq!(
-            status(guarded_app(None), "/protected", None).await,
+            status(guarded_app(ServerAuth::Open), "/protected", None).await,
             StatusCode::OK
         );
     }
@@ -697,7 +1277,7 @@ mod tests {
             .end_turn(&sid, turn_id, "accepted", 1, "done", None)
             .unwrap();
 
-        let app = router(engine, None, CardInfo::flux_coding());
+        let app = router(engine, ServerAuth::Open, CardInfo::flux_coding());
         let (status, body) = get_json(app.clone(), &format!("/sessions/{sid}/usage")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["session_id"], sid);
@@ -764,7 +1344,12 @@ mod tests {
 
         // Mint the A2A session through the REAL handler (message/send), proving creation-time
         // tagging on the production path.
-        let app = router_with_ttl(engine, None, CardInfo::flux_coding(), A2aTtl(60));
+        let app = router_with_ttl(
+            engine,
+            ServerAuth::Open,
+            CardInfo::flux_coding(),
+            A2aTtl(60),
+        );
         let body = json!({
             "jsonrpc": "2.0", "id": 1, "method": "message/send",
             "params": { "message": {

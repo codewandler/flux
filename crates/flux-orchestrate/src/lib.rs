@@ -22,8 +22,8 @@ use flux_flow::AgentSink;
 use flux_policy::{AuthorizationPolicy, Caller, Trust};
 use flux_provider::Provider;
 use flux_runtime::{
-    ApprovalChoice, Approver, Executor, PermissionManager, SpawnOutcome, SpawnRequest, Spawner,
-    Tool, ToolContext, ToolRegistry, ToolResult,
+    ApprovalChoice, Approver, Executor, IdentityCell, PermissionManager, SpawnOutcome,
+    SpawnRequest, Spawner, Tool, ToolContext, ToolRegistry, ToolResult,
 };
 use flux_spec::{tool_input_schema, Idempotency, IntentSet, Risk, ToolSpec};
 use flux_system::System;
@@ -117,9 +117,12 @@ pub struct LocalSpawner {
     /// (auto-approve non-destructive, deny destructive). A multi-tenant consumer injects an approver
     /// that approval-gates its mutations.
     approver: Option<Arc<dyn Approver>>,
-    /// Authorization the sub-agents inherit (policy floor + caller/trust). When unset, sub-agents
-    /// still run under the headless approver but without the policy gate.
-    auth: Option<(AuthorizationPolicy, Caller, Trust)>,
+    /// Authorization the sub-agents inherit (policy floor + a shared identity cell). The cell is
+    /// read at *spawn time*, so a per-request surface that swaps the parent identity between turns
+    /// (server principal mode) has children run under the current request's principal — never a
+    /// stale build-time service identity. When unset, sub-agents still run under the headless
+    /// approver but without the policy gate.
+    auth: Option<(AuthorizationPolicy, IdentityCell)>,
     /// When set, child runs persist into this shared (tenant) event store instead of a throwaway
     /// in-memory one, so a sub-agent's inner tool calls land in the audit log the parent reads.
     audit: Option<Arc<EventStore>>,
@@ -154,14 +157,27 @@ impl LocalSpawner {
     }
 
     /// Bound spawned sub-agents by an authorization policy + resolved identity (inherited from the
-    /// parent). Sub-agents then traverse the same policy floor as the top-level agent.
+    /// parent). Sub-agents then traverse the same policy floor as the top-level agent. Wraps the
+    /// identity in a fresh, unshared cell — a per-request surface shares its live cell via
+    /// [`with_authorization_cell`](Self::with_authorization_cell) instead.
     pub fn with_authorization(
-        mut self,
+        self,
         policy: AuthorizationPolicy,
         caller: Caller,
         trust: Trust,
     ) -> Self {
-        self.auth = Some((policy, caller, trust));
+        self.with_authorization_cell(policy, IdentityCell::new(caller, trust))
+    }
+
+    /// Like [`with_authorization`](Self::with_authorization), but sharing an externally-owned
+    /// identity cell (typically the parent executor's — see `Executor::identity`), so identity
+    /// swaps on the parent propagate to every subsequently spawned child.
+    pub fn with_authorization_cell(
+        mut self,
+        policy: AuthorizationPolicy,
+        cell: IdentityCell,
+    ) -> Self {
+        self.auth = Some((policy, cell));
         self
     }
 
@@ -299,10 +315,15 @@ impl Spawner for LocalSpawner {
             .clone()
             .unwrap_or_else(|| Arc::new(SubAgentApprover));
         let mut executor = Executor::new(registry, PermissionManager::new(), approver, ctx);
-        if let Some((policy, caller, trust)) = &self.auth {
+        if let Some((policy, cell)) = &self.auth {
+            // Snapshot the *current* identity at spawn time: under a per-request surface the cell
+            // holds the request principal, not the build-time service identity. The child gets a
+            // snapshot rather than the live cell — a child completes within one serialized turn,
+            // and sharing would let a later request's identity bleed into a still-draining child.
+            let (caller, trust) = cell.get();
             executor = executor
                 .with_policy(policy.clone())
-                .with_identity(caller.clone(), trust.clone());
+                .with_identity(caller, trust);
         }
 
         // The role *is* the agent definition: body → system prompt, `tools` already applied to the
@@ -411,7 +432,7 @@ pub struct SubAgents {
     pub default_model: String,
     pub limits: SpawnLimits,
     pub approver: Option<Arc<dyn Approver>>,
-    pub auth: Option<(AuthorizationPolicy, Caller, Trust)>,
+    pub auth: Option<(AuthorizationPolicy, IdentityCell)>,
     pub audit: Option<Arc<EventStore>>,
     /// Max delegation depth (default `1` = children are leaves). `> 1` is a bounded opt-in for nested
     /// delegation; see [`LocalSpawner::with_max_depth`].
@@ -442,13 +463,26 @@ impl SubAgents {
     }
 
     /// Inherit an authorization policy + resolved identity (the parent's floor) for every sub-agent.
+    /// Wraps the identity in a fresh cell; a per-request surface shares its live cell via
+    /// [`with_authorization_cell`](Self::with_authorization_cell).
     pub fn with_authorization(
-        mut self,
+        self,
         policy: AuthorizationPolicy,
         caller: Caller,
         trust: Trust,
     ) -> Self {
-        self.auth = Some((policy, caller, trust));
+        self.with_authorization_cell(policy, IdentityCell::new(caller, trust))
+    }
+
+    /// Like [`with_authorization`](Self::with_authorization), but sharing an externally-owned
+    /// identity cell (typically the parent executor's), so per-turn identity swaps propagate to
+    /// every subsequently spawned child.
+    pub fn with_authorization_cell(
+        mut self,
+        policy: AuthorizationPolicy,
+        cell: IdentityCell,
+    ) -> Self {
+        self.auth = Some((policy, cell));
         self
     }
 
@@ -494,8 +528,8 @@ impl SubAgents {
         if let Some(approver) = self.approver {
             spawner = spawner.with_approver(approver);
         }
-        if let Some((policy, caller, trust)) = self.auth {
-            spawner = spawner.with_authorization(policy, caller, trust);
+        if let Some((policy, cell)) = self.auth {
+            spawner = spawner.with_authorization_cell(policy, cell);
         }
         if let Some(store) = self.audit {
             spawner = spawner.with_audit(store);

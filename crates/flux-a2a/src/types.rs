@@ -8,6 +8,8 @@
 //! Types are deliberately permissive: unknown fields are ignored and most fields default, so cards
 //! and messages from other A2A agents parse even when they carry extensions we don't model.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -435,6 +437,19 @@ pub struct AgentCard {
     pub skills: Vec<Skill>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interfaces: Vec<AgentInterface>,
+    /// Declared authentication schemes, keyed by scheme name. The A2A spec (v1.0) requires
+    /// clients to authenticate "using one of the schemes declared" in the card's
+    /// `securitySchemes`/`security` fields — so an auth-enforcing server must populate these to
+    /// be conformant. Values stay raw [`Value`]s because scheme objects are polymorphic
+    /// (`http` / `apiKey` / `oauth2` / `openIdConnect` / `mutualTLS`). Absent → the key is
+    /// omitted entirely, so pre-existing cards serialize byte-identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_schemes: Option<BTreeMap<String, Value>>,
+    /// The spec's security requirement array: each entry maps a scheme name (a key of
+    /// [`security_schemes`](Self::security_schemes)) to the scopes the caller must hold (empty =
+    /// the scheme with no particular scopes). Absent → the key is omitted, as above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<Vec<BTreeMap<String, Vec<String>>>>,
 }
 
 impl AgentCard {
@@ -454,6 +469,21 @@ impl AgentCard {
             })
             .and_then(|i| i.url.clone())
             .or_else(|| self.interfaces.iter().find_map(|i| i.url.clone()))
+    }
+
+    /// Declare the card's authentication schemes (builder-style): scheme name → scheme object,
+    /// serialized as the spec's `securitySchemes`. See
+    /// [`security_schemes`](Self::security_schemes).
+    pub fn with_security_schemes(mut self, schemes: BTreeMap<String, Value>) -> Self {
+        self.security_schemes = Some(schemes);
+        self
+    }
+
+    /// Declare the card's security requirements (builder-style): each entry maps a declared
+    /// scheme name to the scopes the caller must hold. See [`security`](Self::security).
+    pub fn with_security(mut self, security: Vec<BTreeMap<String, Vec<String>>>) -> Self {
+        self.security = Some(security);
+        self
     }
 }
 
@@ -562,6 +592,8 @@ mod schema_tests {
             "defaultOutputModes",
             "skills",
             "interfaces",
+            "securitySchemes",
+            "security",
         ] {
             assert!(
                 obj.properties.contains_key(field),
