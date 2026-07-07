@@ -6,8 +6,11 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-07
+
 The hardening/docs/cleanup push: nine stories from the 2026-07-07 repo survey, closing the
-release-gate rot, docs drift, and drift-guard holes the survey verified.
+release-gate rot, docs drift, and drift-guard holes the survey verified. No API breakage
+(the one new surface, `App::with_events`, is additive) — a patch release.
 
 ### Fixed
 
