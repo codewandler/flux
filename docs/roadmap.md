@@ -78,6 +78,25 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 
 ## Next
 
+### A2A protocol conformance (epic) — **proposed 2026-07-07**
+
+After v0.4.0 (multi-tenant principal auth + multi-agent mount) the A2A wire surface is stable enough
+to measure against the [spec](https://a2a-protocol.org/) (v1.0), so the gaps become a ranked backlog.
+The root of most gaps is one deliberate choice: **flux runs an A2A request as one synchronous turn and
+returns a `completed` Task** — there is no retained, addressable async task, so the whole
+task-management half of the spec is out of reach until that changes. The gaps therefore split into
+*conformance polish that fits today's model* and *a deliberate model change*. **Tier 1 (ready)** —
+[A-49](stories/A-49-agent-card-conformance-fields.md) (the card gains `protocolVersion`, honest
+`interfaces`/`preferredTransport`, optional metadata) and
+[A-50](stories/A-50-a2a-error-codes.md) (A2A-specific error codes: `-32004` for unsupported methods,
+`-32005` for unusable content). **Tier 2 (backlog)** —
+[A-51](stories/A-51-inbound-multimodal-parts.md) (inbound file/data parts) and
+[A-52](stories/A-52-outbound-task-fidelity.md) (`Task.history` + artifact emission). **Tier 3
+(design-first)** — [A-53](stories/A-53-stateful-a2a-task-model.md), the stateful task model that
+unlocks `tasks/get` server-side, cancel, resubscribe, non-blocking send, `input-required`, and push.
+Non-goals: gRPC/REST bindings, extensions negotiation, `tasks/list`. Living support matrix:
+[a2a-conformance.md](a2a-conformance.md); design: [designs/a2a-conformance.md](designs/a2a-conformance.md).
+
 ### Time Machine (epic) — **SHIPPED 2026-07-07 (phases 0–3: C-43 · A-45 · A-46 · C-44; A-47 cockpit optional)**
 
 The capstone of *the LLM is not the runtime*: because a flux run is a deterministic artifact (the

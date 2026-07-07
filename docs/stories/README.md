@@ -27,12 +27,21 @@ _None._
 ## Next (ready — take the top one unless the user named a story)
 - [D-62 — Async paged live-backend datasource seam](D-62-async-live-datasource-seam.md) · Agent · design-first (2026-07-06 downstream-consumer review): flux's DatasourceBackend is sync + index-shaped — wrong for live paginated APIs; the reviewed consumer built its own paged list/get tool projection
 
+### A2A protocol conformance (epic)
+- [A-49 — AgentCard conformance fields — protocolVersion, honest interfaces/preferredTransport, optional metadata](A-49-agent-card-conformance-fields.md) · Agent · Tier-1 quick-win: the card omits protocolVersion (spec-required) and emits interfaces: [] though it serves a JSON-RPC endpoint
+- [A-50 — A2A-specific JSON-RPC error codes — UnsupportedOperation / ContentTypeNotSupported (and the -32001..-32007 set)](A-50-a2a-error-codes.md) · Agent · Tier-1 quick-win: unsupported A2A methods return generic -32601 and non-text input is silently dropped; the A2A binding defines dedicated codes
+
 ## Blocked
 _None._
 
 ## Backlog
 - [I-01 — Statistically clean self-improvement headline gain (trials ≥ 3)](I-01-headline-gain.md) · Improve · DE-PRIORITIZED 2026-07-06 (user call — focus shifts to hardening/docs/cleanup; resume via I-05's queued fixes first); offline half done; 2026-07-02 calibration VERDICT — the synthetic suite is stable but SATURATED (Sonnet 4.6 AND Haiku 4.5 via OpenRouter both score 1000/1000, mean_iters 1.0, twice) → zero headroom, it is a regression floor not a gain vehicle; the headline gain must come from terminal-bench (tb + Docker + musl all present; OpenRouter key forwards into the container) — full loop run postponed by user 2026-07-02
 - [I-05 — Sharpen the improve round — stable scored task set, severity-ordered planner picks](I-05-sharpen-improve-round.md) · Improve · ON HOLD + DE-PRIORITIZED (user call 2026-07-06; focus shifts to hardening/docs/cleanup after v0.2.23) — resume by implementing the two queued fixes below, then fund round 4; the 2026-07-06 funded round proved the machinery and exposed the two odds-killers: chess-best-move is too flaky to score (vision + tb-registry 429s; baseline swung 28↔42%), and the planner skipped the reviewer's severity-5 candidate
+
+### A2A protocol conformance (epic)
+- [A-51 — Inbound multimodal parts — accept file/data Parts or refuse cleanly](A-51-inbound-multimodal-parts.md) · Agent · Tier-2: file/data input parts are silently dropped in extract_text; the turn runs on empty input
+- [A-52 — Outbound Task fidelity — populate Task.history/historyLength and emit artifacts](A-52-outbound-task-fidelity.md) · Agent · Tier-2: Task.history/artifacts and TaskArtifactUpdateEvent are modeled and client-decodable but never produced by the server
+- [A-53 — Stateful A2A task model (design) — addressable async tasks for get/cancel/resubscribe/non-blocking/push](A-53-stateful-a2a-task-model.md) · Agent · Tier-3 design-first: the whole task-management half of the spec depends on flux retaining an addressable async Task; produces its own design, then fans into impl stories
 
 ### flux-planner: from trained-and-usable to shippable
 - [L-40 — Re-run the emission A/B with the fine-tuned local model as the text arm](L-40-emission-ab-finetuned-arm.md) · Language · the ONE pre-registered condition allowed to re-open L-20's keep-json decision: a model that natively speaks the text syntax; blocked on flux-model M-15 producing a candidate that passes the ship gate

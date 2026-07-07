@@ -319,3 +319,10 @@ whether accessed directly or through a reverse proxy.
   the same `contextId` under two realms is two isolated conversations (`contextId` is a grouping
   key, not a security boundary — per the A2A spec). In the shared-secret mode the whole server
   remains one realm, as before.
+
+## Protocol support
+
+Which A2A methods, AgentCard fields, task states, and error codes flux supports today — and which are
+partial or not yet — is tracked in the living support matrix:
+[a2a-conformance.md](a2a-conformance.md). The gap-closing work is sequenced in the
+[`a2a-conformance`](designs/a2a-conformance.md) epic.

@@ -33,6 +33,7 @@ Everything else (providers, tools, skills, orchestration, plugins) is machinery 
 | Choosing a model/provider | [model.md](model.md) |
 | The self-hosted agent loop | [agent-loop.md](agent-loop.md) |
 | Agent-to-agent (A2A) | [a2a.md](a2a.md) |
+| A2A protocol support (what's supported / partial / not yet) | [a2a-conformance.md](a2a-conformance.md) |
 | **Language pillar** (essence) | [language.md](language.md) — Flux-Lang semantics in one place |
 | **Language pillar** (deep) | [../crates/flux-lang/docs/](../crates/flux-lang/docs/) — PRD, reference, syntax, STATUS |
 | Generated agent skills | [designs/generated-flux-skills.md](designs/generated-flux-skills.md) — `flux skill` root/section skills grounded in live catalogs |

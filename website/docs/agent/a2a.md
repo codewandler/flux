@@ -151,6 +151,8 @@ a security boundary).
 
 ## See also
 
+- [A2A protocol support](./a2a-conformance.md) — which methods, card fields, task states, and error
+  codes are supported / partial / not yet.
 - [CLI](./cli.md) — the reference flux surface.
 - [Concepts](../concepts.md) — plans, symbols, and the safety envelope every operation runs through.
 - [flux on GitHub](https://github.com/codewandler/flux)
