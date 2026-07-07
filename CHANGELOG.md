@@ -6,10 +6,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
-## [0.2.24] - 2026-07-07
+## [0.3.0] - 2026-07-07
 
 The consumer-gaps release: a review of flux's first production SDK consumer surfaced the places it
 had to re-implement or work around flux — this release closes them upstream.
+
+> Re-cut of v0.2.24 with the correct version signal: the C-38 realtime-seam change is breaking, and
+> pre-1.0 SemVer puts breaking changes in the minor position. Content is identical to v0.2.24,
+> which remains published but superseded.
 
 ### Changed (BREAKING)
 
