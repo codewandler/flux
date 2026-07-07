@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-07-07
+
 The **Time Machine** (epic, phases 0–3: C-43 → A-45 → A-46 → C-44): hermetic replay,
 fork-at-any-decision, and run-diff of agent runs — the capstone of *the LLM is not the runtime*.
 Because every accepted plan already persists as re-parseable Flux-Lang (`plan_source`) and the
