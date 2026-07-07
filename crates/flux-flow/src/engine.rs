@@ -229,6 +229,21 @@ impl FlowEngine {
         self.executor.context().set_cancel(cancel.clone());
         self.executor.context().set_session(session_id);
 
+        // C-43: arm the per-turn cassette recorder — every leaf-op dispatch this turn lands as a
+        // redacted `OpRecorded` cell on the session stream, making the turn hermetically
+        // replayable (`flux replay`). Off with FLUX_CASSETTE=0; the recorder is telemetry-grade
+        // (append failures never fail the turn).
+        if crate::cassette::enabled() {
+            self.flow.set_cassette(Some(std::sync::Arc::new(
+                crate::cassette::CassetteScope::Record(crate::cassette::RecordScope::new(
+                    self.events.clone(),
+                    session_id,
+                )),
+            )));
+        } else {
+            self.flow.set_cassette(None);
+        }
+
         // Per-turn iteration count: snapshot the cumulative `turn.iteration` evidence now so we can
         // report only THIS turn's rounds. The executor (and its evidence log) is shared and persists
         // across turns, so an unscoped count grows monotonically over a long-lived served agent.
@@ -3231,5 +3246,475 @@ mod tests {
 
         // Non-API errors use their own Display.
         assert_eq!(planner_error(&Error::Other("boom".into())), "boom");
+    }
+
+    /// C-43 (failing-first acceptance): a turn's dispatched ops land as durable, REDACTED
+    /// `OpRecorded` cassette cells on the session stream — and the loop-machinery ops
+    /// (`plan`/`run_plan`) are never cassetted.
+    #[tokio::test]
+    async fn cassette_records_redacted_cells_for_dispatched_ops() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        const SECRET: &str = "cassettesecretvalue987";
+        let plan_ast = json!({
+            "body": [{
+                "kind": "bind", "name": "greeting",
+                "value": { "kind": "call", "op": "echo",
+                           "args": [{ "kind": "lit", "value": SECRET }] }
+            }]
+        });
+        let responses = VecDeque::from(vec![emit_plan(plan_ast), prose("done")]);
+        let engine = engine_with(responses, store.clone());
+        engine.executor.context().redactor.add_secret(SECRET);
+        let mut sink = CollectSink::default();
+        engine.run_turn(&sid, "run it", &mut sink).await.unwrap();
+
+        let trace = store.run_trace(&sid).unwrap();
+        let cells: Vec<(String, String, bool)> = trace
+            .iter()
+            .filter_map(|ev| match ev {
+                flux_lang::ast::RunEvent::OpRecorded {
+                    op,
+                    content,
+                    redacted,
+                    ..
+                } => Some((op.clone(), content.clone(), *redacted)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cells.iter().filter(|(op, ..)| op == "echo").count(),
+            1,
+            "the one dispatched op has exactly one cell: {cells:?}"
+        );
+        assert!(
+            cells
+                .iter()
+                .all(|(op, ..)| op != "plan" && op != "run_plan"),
+            "loop machinery is never cassetted: {cells:?}"
+        );
+        // NO field of any cell — content, view, or even the input HASH — carries the secret.
+        // (Empirically the engine path is redaction-stable end-to-end: the envelope scrubs the
+        // `plan` op's own output, so a secret literal in a model-emitted plan is destroyed before
+        // the inner plan executes — the echo tool received and output `[redacted]`.)
+        for ev in &trace {
+            if matches!(ev, flux_lang::ast::RunEvent::OpRecorded { .. }) {
+                let raw = serde_json::to_string(ev).unwrap();
+                assert!(!raw.contains(SECRET), "a cell leaked the secret: {raw}");
+            }
+        }
+        let redacted_input_hash = flux_lang::runtime::sha256_hex(r#"{"text":"[redacted]"}"#);
+        assert!(
+            trace.iter().any(|ev| matches!(ev,
+                flux_lang::ast::RunEvent::OpRecorded { op, input_hash, .. }
+                    if op == "echo" && *input_hash == redacted_input_hash)),
+            "the echo cell's input hash covers the REDACTED input — no raw-secret hash oracle"
+        );
+    }
+
+    /// C-43/A-45 (hermetic-serve mechanism): rebuild the tape from a recorded turn's trace and
+    /// re-execute the same plan under a `Replay` scope in a FRESH store — the recorded (redacted)
+    /// outputs are served back and the side-effecting tool is NOT re-fired.
+    #[tokio::test]
+    async fn cassette_replay_serves_recorded_cells_without_refiring_side_effects() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let plan_ast = json!({
+            "body": [{
+                "kind": "bind", "name": "res",
+                "value": { "kind": "call", "op": "write_file",
+                           "args": [{ "kind": "lit", "value": "notes.txt" }] }
+            }]
+        });
+        let responses = VecDeque::from(vec![emit_plan(plan_ast.clone()), prose("done")]);
+        let (engine, write_calls) = engine_with_write_tool(responses, store.clone());
+        let mut sink = CollectSink::default();
+        engine.run_turn(&sid, "write it", &mut sink).await.unwrap();
+        assert_eq!(
+            write_calls.lock().unwrap().len(),
+            1,
+            "the live run wrote once"
+        );
+
+        // Hermetic replay: fresh store + scratch event log, tape from the recorded trace.
+        let tape = crate::cassette::ReplayTape::from_trace(&store.run_trace(&sid).unwrap());
+        assert_eq!(tape.len(), 1, "one recorded cell (write_file)");
+        let scratch = Arc::new(EventStore::in_memory().unwrap());
+        let rsid = scratch.create_session("replay").unwrap();
+        let rstore = FlowStore::in_memory_with_events(scratch).unwrap();
+        rstore.set_cassette(Some(Arc::new(crate::cassette::CassetteScope::Replay(tape))));
+
+        let ast: crate::ast::DraftAst = serde_json::from_value(plan_ast).unwrap();
+        let mut rsink = CollectSink::default();
+        let out = crate::runtime::execute_flow_resumable_with_composites(
+            &rstore,
+            &engine.executor,
+            &rsid,
+            &ast,
+            &[],
+            None,
+            None,
+            &mut rsink,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.failure.is_none(),
+            "replay completes cleanly: {:?}",
+            out.failure
+        );
+        // The killer assertion: the side effect did NOT re-fire.
+        assert_eq!(
+            write_calls.lock().unwrap().len(),
+            1,
+            "replay served the cell from tape — the write tool never ran again"
+        );
+        // And the replayed binding equals the recorded content.
+        let scope = rstore.cassette().unwrap();
+        if let crate::cassette::CassetteScope::Replay(t) = scope.as_ref() {
+            assert_eq!(t.remaining(), 0, "every cell was consumed");
+            assert!(t.diverged().is_none(), "no divergence: {:?}", t.diverged());
+        }
+    }
+
+    /// A-45 (failing-first acceptance): the full driver — `replay_session` re-executes a recorded
+    /// agent turn from `plan_source` + cassette alone: no model (the executor has no provider on
+    /// this path), no side-effect re-fire, every cell consumed, zero divergence.
+    #[tokio::test]
+    async fn replay_session_reproduces_a_recorded_turn_hermetically() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let plan_ast = json!({
+            "body": [
+                { "kind": "bind", "name": "res",
+                  "value": { "kind": "call", "op": "write_file",
+                             "args": [{ "kind": "lit", "value": "notes.txt" }] } },
+                { "kind": "bind", "name": "back",
+                  "value": { "kind": "call", "op": "echo",
+                             "args": [{ "kind": "lit", "value": "after-write" }] } }
+            ]
+        });
+        let responses = VecDeque::from(vec![emit_plan(plan_ast), prose("done")]);
+        let (engine, write_calls) = engine_with_write_tool(responses, store.clone());
+        let mut sink = CollectSink::default();
+        engine.run_turn(&sid, "write it", &mut sink).await.unwrap();
+        assert_eq!(write_calls.lock().unwrap().len(), 1);
+
+        // The driver: recorded events + an executor for the CATALOG only. The mock provider's
+        // canned responses are exhausted — any planner call would fail loudly.
+        let mut rsink = CollectSink::default();
+        let report =
+            crate::replay::replay_session(&store, &engine.executor, &sid, None, &mut rsink)
+                .await
+                .unwrap();
+        assert_eq!(report.plans.len(), 1, "one recorded execution: {report:?}");
+        assert!(report.diverged.is_none(), "faithful replay: {report:?}");
+        assert_eq!(report.cells_consumed, report.cells_total);
+        assert_eq!(report.missing_sources, 0);
+        assert!(report.plans[0].halted.is_none());
+        // Hermetic: the side-effecting tool did NOT run again.
+        assert_eq!(write_calls.lock().unwrap().len(), 1);
+        // The replayed transcript surfaced the same ops through the sink.
+        assert_eq!(rsink.tools, vec!["write_file", "echo"]);
+    }
+
+    /// A-46 (failing-first acceptance): fork reproduces the prefix from tape (no side-effect
+    /// re-fire), then diverges by injection — the injected symbol replaces the fork statement's
+    /// recorded binding, and the tail runs LIVE (its dispatches record fresh cells on the fork
+    /// session, which only a real dispatch under a `Record` scope can produce).
+    #[tokio::test]
+    async fn fork_replays_prefix_then_diverges_by_injection() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let plan_ast = json!({
+            "body": [
+                { "kind": "bind", "name": "res",
+                  "value": { "kind": "call", "op": "write_file",
+                             "args": [{ "kind": "lit", "value": "notes.txt" }] } },
+                { "kind": "bind", "name": "mid",
+                  "value": { "kind": "call", "op": "echo",
+                             "args": [{ "kind": "lit", "value": "original" }] } },
+                { "kind": "bind", "name": "fin",
+                  "value": { "kind": "call", "op": "echo",
+                             "args": [{ "kind": "lit", "value": "tail" }] } }
+            ]
+        });
+        let responses = VecDeque::from(vec![emit_plan(plan_ast), prose("done")]);
+        let (engine, write_calls) = engine_with_write_tool(responses, store.clone());
+        let mut sink = CollectSink::default();
+        engine.run_turn(&sid, "go", &mut sink).await.unwrap();
+        assert_eq!(write_calls.lock().unwrap().len(), 1);
+
+        // Fork at statement 1 (`mid`): a new session, correlated to the source.
+        let fork_sid = store
+            .create_session_with_context(
+                "mock",
+                &flux_events::EventContext {
+                    correlation_id: Some(sid.clone()),
+                    agent_id: Some(format!("fork:{sid}@1")),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let fstore = FlowStore::in_memory_with_events(store.clone()).unwrap();
+        let mut fsink = CollectSink::default();
+        let prefix = crate::fork::replay_prefix(
+            &store,
+            &fstore,
+            &engine.executor,
+            &sid,
+            &fork_sid,
+            1,
+            &mut fsink,
+        )
+        .await
+        .unwrap();
+        // The prefix (write_file) was served from tape — no re-fire.
+        assert_eq!(write_calls.lock().unwrap().len(), 1);
+
+        let out = crate::fork::diverge_inject(
+            &fstore,
+            &engine.executor,
+            &fork_sid,
+            &prefix,
+            &serde_json::json!("INJECTED"),
+            &mut fsink,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.failure.is_none(),
+            "live tail completes: {:?}",
+            out.failure
+        );
+
+        // The injected value is bound in the fork session…
+        let view = fstore.view(&fork_sid).unwrap();
+        let mid = view.symbols.iter().find(|s| s.name.0 == "mid").unwrap();
+        assert!(mid.summary.contains("INJECTED"), "injected bind: {mid:?}");
+        // …and the tail's echo dispatched LIVE: a fresh cell landed on the FORK session's stream
+        // (Replay mode never records — only the post-boundary Record scope can have).
+        let fork_cells: Vec<String> = store
+            .run_trace(&fork_sid)
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                flux_lang::ast::RunEvent::OpRecorded { op, content, .. } if op == "echo" => {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fork_cells,
+            vec!["tail".to_string()],
+            "live tail recorded its own cell"
+        );
+    }
+
+    /// A-46 (failing-first acceptance): the fork tail runs through the REAL approval envelope —
+    /// a denying approver refuses the tail op (the cassette-vs-live boundary grants nothing).
+    #[tokio::test]
+    async fn fork_tail_keeps_the_envelope() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let plan_ast = json!({
+            "body": [
+                { "kind": "bind", "name": "res",
+                  "value": { "kind": "call", "op": "write_file",
+                             "args": [{ "kind": "lit", "value": "notes.txt" }] } },
+                { "kind": "bind", "name": "fin",
+                  "value": { "kind": "call", "op": "write_file",
+                             "args": [{ "kind": "lit", "value": "danger.txt" }] } }
+            ]
+        });
+        let responses = VecDeque::from(vec![emit_plan(plan_ast), prose("done")]);
+        let (engine, write_calls) = engine_with_write_tool(responses, store.clone());
+        let mut sink = CollectSink::default();
+        engine.run_turn(&sid, "go", &mut sink).await.unwrap();
+        let live_writes = write_calls.lock().unwrap().len();
+
+        // A tail executor whose approver DENIES everything and whose permission rules grant
+        // nothing — the real envelope, hostile mode.
+        struct DenyAll;
+        #[async_trait]
+        impl flux_runtime::Approver for DenyAll {
+            async fn request(
+                &self,
+                _t: &str,
+                _s: &[String],
+                _i: &flux_spec::IntentSet,
+            ) -> flux_runtime::ApprovalChoice {
+                flux_runtime::ApprovalChoice::Deny
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("flux-fork-deny-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        registry.register(Arc::new(WriteTool(write_calls.clone())));
+        let deny_exec = Executor::new(
+            registry,
+            PermissionManager::from_rules(&[], &[]),
+            Arc::new(DenyAll),
+            ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap()))),
+        );
+
+        let fork_sid = store.create_session("mock").unwrap();
+        let fstore = FlowStore::in_memory_with_events(store.clone()).unwrap();
+        let mut fsink = CollectSink::default();
+        // Prefix replay needs no approvals (tape-served) even under the hostile executor.
+        let prefix =
+            crate::fork::replay_prefix(&store, &fstore, &deny_exec, &sid, &fork_sid, 1, &mut fsink)
+                .await
+                .unwrap();
+        assert_eq!(
+            write_calls.lock().unwrap().len(),
+            live_writes,
+            "prefix re-fired nothing"
+        );
+
+        // The tail's write_file must be REFUSED by the envelope, and must not run.
+        let out = crate::fork::diverge_edit(
+            &fstore,
+            &deny_exec,
+            &fork_sid,
+            &prefix,
+            &prefix.plan.clone(),
+            &mut fsink,
+        )
+        .await
+        .unwrap();
+        let halt = out.failure.expect("the denied tail halts the plan");
+        assert!(
+            matches!(
+                halt.kind,
+                crate::ast::FailureKind::Denied | crate::ast::FailureKind::ConfirmDenied
+            ),
+            "refused by the envelope: {halt:?}"
+        );
+        assert_eq!(
+            write_calls.lock().unwrap().len(),
+            live_writes,
+            "the denied tail op never executed"
+        );
+    }
+
+    /// A-45: a recorded `parallel` plan replays green — the out-of-order-tolerant matcher absorbs
+    /// whatever branch interleaving the recording happened to capture (`try_join_all` makes
+    /// record-time dispatch order nondeterministic across branches).
+    #[tokio::test]
+    async fn replay_session_absorbs_parallel_branch_interleaving() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let plan_ast = json!({
+            "body": [{
+                "kind": "parallel",
+                "branches": [
+                    { "name": "a", "body": [ { "kind": "call", "op": "echo",
+                        "args": [{ "kind": "lit", "value": "left" }] } ] },
+                    { "name": "b", "body": [ { "kind": "call", "op": "echo",
+                        "args": [{ "kind": "lit", "value": "right" }] } ] }
+                ]
+            }]
+        });
+        let responses = VecDeque::from(vec![emit_plan(plan_ast), prose("done")]);
+        let engine = engine_with(responses, store.clone());
+        let mut sink = CollectSink::default();
+        engine.run_turn(&sid, "fan out", &mut sink).await.unwrap();
+
+        let mut rsink = CollectSink::default();
+        let report =
+            crate::replay::replay_session(&store, &engine.executor, &sid, None, &mut rsink)
+                .await
+                .unwrap();
+        assert!(
+            report.diverged.is_none(),
+            "parallel replay is green: {report:?}"
+        );
+        assert_eq!(report.cells_consumed, report.cells_total);
+        assert_eq!(report.cells_total, 2, "both branch cells recorded");
+    }
+
+    /// A-45: a recording whose plan diverges from its cells (here: a hand-built session whose
+    /// `plan_source` names a DIFFERENT input than the recorded cell) surfaces `diverged` loudly —
+    /// never a silent wrong-output replay.
+    #[tokio::test]
+    async fn replay_session_surfaces_divergence_loudly() {
+        // Record a real turn to harvest a well-formed trace shape.
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let plan_ast = json!({
+            "body": [{
+                "kind": "bind", "name": "greeting",
+                "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "x" }] }
+            }]
+        });
+        let responses = VecDeque::from(vec![emit_plan(plan_ast), prose("done")]);
+        let engine = engine_with(responses, store.clone());
+        let mut sink = CollectSink::default();
+        engine.run_turn(&sid, "run", &mut sink).await.unwrap();
+
+        // Hand-build session B: same recorded CELLS, but a plan_source calling echo("y") — the
+        // replayed dispatch's input hash matches no cell.
+        let sid_b = store.create_session("mock").unwrap();
+        let ast_y: crate::ast::DraftAst = serde_json::from_value(json!({
+            "body": [{
+                "kind": "bind", "name": "greeting",
+                "value": { "kind": "call", "op": "echo", "args": [{ "kind": "lit", "value": "y" }] }
+            }]
+        }))
+        .unwrap();
+        let key_y = flux_lang::runtime::flow_key(None, &ast_y.body);
+        let turn_id = store.begin_turn(&sid_b, "run", "mock").unwrap();
+        store
+            .record_plan_attempt(
+                &sid_b,
+                turn_id,
+                flux_events::PlanAttempt {
+                    step: 1,
+                    outcome: "accepted".into(),
+                    error: None,
+                    fingerprint: Some("f".into()),
+                    plan_text: None,
+                    phase: None,
+                    plan_source: Some(flux_lang::format::format(&ast_y)),
+                },
+            )
+            .unwrap();
+        for ev in store.run_trace(&sid).unwrap() {
+            let ev = match ev {
+                flux_lang::ast::RunEvent::StatementCompleted {
+                    node,
+                    stmt,
+                    value,
+                    skipped,
+                    ..
+                } => flux_lang::ast::RunEvent::StatementCompleted {
+                    plan: key_y.clone(),
+                    node,
+                    stmt,
+                    value,
+                    skipped,
+                },
+                other => other,
+            };
+            store
+                .append(&sid_b, flux_events::NewEvent::run(ev))
+                .unwrap();
+        }
+
+        let mut rsink = CollectSink::default();
+        let report =
+            crate::replay::replay_session(&store, &engine.executor, &sid_b, None, &mut rsink)
+                .await
+                .unwrap();
+        assert!(
+            report
+                .diverged
+                .as_deref()
+                .is_some_and(|d| d.contains("no matching unconsumed recorded cell")),
+            "divergence is loud: {report:?}"
+        );
     }
 }

@@ -991,6 +991,36 @@ pub enum RunEvent {
     ApprovalGranted {
         step: StepId,
     },
+    /// The hermetic-replay **cassette cell** (C-43): the REDACTED output of one leaf-op dispatch,
+    /// durable so a later replay serves it back by lookup instead of re-executing the op — no
+    /// model, no live IO, side effects NOT re-fired. `seq` is the recording scope's monotonic
+    /// dispatch ordinal (diagnostic; replay ordering comes from event-stream order). The match key
+    /// is `(op, input_hash)`; `input_hash_redacted` exists because the live run hashes the
+    /// UNredacted input while a replayed input downstream of a redacted output re-hashes
+    /// differently — the replay matcher accepts either hash. `redacted` marks content the scrub
+    /// actually changed; `truncated` marks an over-cap cell (kept head only — NOT hermetically
+    /// replayable). Every field defaults so pre-C-43 logs still decode.
+    OpRecorded {
+        #[serde(default)]
+        seq: u32,
+        step: StepId,
+        op: String,
+        input_hash: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_hash_redacted: Option<String>,
+        #[serde(default)]
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<String>,
+        #[serde(default)]
+        is_error: bool,
+        #[serde(default)]
+        denied: bool,
+        #[serde(default)]
+        redacted: bool,
+        #[serde(default)]
+        truncated: bool,
+    },
     /// The flow suspended on an `await`, to be resumed on a later turn.
     Awaiting {
         run: RunId,
@@ -1084,6 +1114,37 @@ pub enum RunEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C-43 back-compat: an `OpRecorded` cell with ONLY its required fields decodes — every
+    /// additive field defaults, so a cell written by any C-43-era binary reads back under any
+    /// later schema extension (the same posture as flux-events' EventKind back-compat tests).
+    #[test]
+    fn op_recorded_minimal_fields_decode_with_defaults() {
+        let raw = r#"{"event":"op_recorded","step":"step_read_abc","op":"read","input_hash":"h"}"#;
+        let ev: RunEvent = serde_json::from_str(raw).unwrap();
+        match ev {
+            RunEvent::OpRecorded {
+                seq,
+                op,
+                input_hash_redacted,
+                content,
+                view,
+                is_error,
+                denied,
+                redacted,
+                truncated,
+                ..
+            } => {
+                assert_eq!(seq, 0);
+                assert_eq!(op, "read");
+                assert!(input_hash_redacted.is_none());
+                assert!(content.is_empty());
+                assert!(view.is_none());
+                assert!(!is_error && !denied && !redacted && !truncated);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
 
     /// A representative Draft AST round-trips through JSON unchanged.
     #[test]

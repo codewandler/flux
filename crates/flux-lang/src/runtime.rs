@@ -68,7 +68,10 @@ fn call_failure(label: &str, outcome: &CallOutcome) -> FlowError {
     }
 }
 
-fn sha256_hex(s: &str) -> String {
+/// `pub` (C-43): the cassette recorder must key cells with the EXACT hash [`execute_call`] stamps
+/// on `StepStarted.input_hash` — one shared derivation, never a host-layer reimplementation (the
+/// same rationale that made [`stmt_hash16`] public for A-16).
+pub fn sha256_hex(s: &str) -> String {
     let mut h = Sha256::new();
     h.update(s.as_bytes());
     format!("{:x}", h.finalize())
@@ -78,8 +81,10 @@ fn sha256_hex(s: &str) -> String {
 /// a stable content hash of its top-level body. The hash means an *edited* flow never fast-forwards
 /// past changed statements; the name scopes two identical bodies apart. This is the ONE derivation
 /// shared by [`execute_flow`] and [`resume_flow_named`], so a flow's run and resume agree on its
-/// checkpoint keys (F17 — previously run keyed by name only and resume by hash only).
-fn flow_key(name: Option<&str>, body: &[Node]) -> String {
+/// checkpoint keys (F17 — previously run keyed by name only and resume by hash only). `pub`
+/// (A-45): the replay driver maps a recorded trace's `StatementCompleted.plan` keys back to their
+/// `plan_source` plans through this same derivation — never a host-layer reimplementation.
+pub fn flow_key(name: Option<&str>, body: &[Node]) -> String {
     let hash = sha256_hex(&serde_json::to_string(body).unwrap_or_default());
     match name {
         Some(n) if !n.trim().is_empty() => format!("{n}#{}", &hash[..16]),
@@ -4197,6 +4202,21 @@ fn lit_text(v: &serde_json::Value) -> String {
         serde_json::Value::Null => String::new(),
         other => serde_json::to_string(other).unwrap_or_default(),
     }
+}
+
+/// The canonical stored [`Value`] for a host-supplied JSON literal — exactly what the interpreter
+/// binds for a flow-body `lit` node (`lit_text` semantics: a JSON string is itself, `null` is the
+/// empty string, anything else its compact JSON text), wrapped as the JSON-as-string
+/// [`Value::String`] every op result takes.
+///
+/// This is the one canonicalization a host must apply when injecting a value from *outside* the
+/// flow (D-67: `FlowStore::seed` stores seeded inputs through here), so an injected `$name` is
+/// indistinguishable from a literal-bound one everywhere downstream — same text, same arg
+/// marshaling. Storing the raw structural value instead is observably different: a lone seeded
+/// *object* argument would pass through as the op's whole input, where a `lit`-bound one
+/// string-wraps under the op's sole required param.
+pub fn lit_value(v: &serde_json::Value) -> Value {
+    Value::String(lit_text(v))
 }
 
 /// Wall-clock milliseconds since the Unix epoch (0 if the clock is before it).

@@ -648,6 +648,147 @@ pub(crate) fn merge_legacy_keys(per_model: BTreeMap<String, RowAcc>) -> BTreeMap
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// C-44: run diff — align two run traces, classify plan vs output divergence
+// ---------------------------------------------------------------------------
+
+/// One executed top-level statement of a run, with the cassette cells its dispatches recorded —
+/// the C-44 diff unit. `stmt` is the interpreter's `stmt_hash16` (content identity, already on
+/// `StatementCompleted`/`PlanHalted`); `cells` are the `(op, content)` pairs attributed by trace
+/// interleaving (cells land before their statement's completion row).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StmtRow {
+    pub node: u32,
+    pub stmt: String,
+    pub halted: bool,
+    pub cells: Vec<(String, String)>,
+}
+
+/// One aligned row of a two-run diff (C-44).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DiffRow {
+    /// Same statement content, same op outputs.
+    Same { node: u32, stmt: String },
+    /// The PLANS diverge at this position: the statement content differs (or exists on only one
+    /// side — the other field is `None`).
+    Plan {
+        node: u32,
+        a_stmt: Option<String>,
+        b_stmt: Option<String>,
+    },
+    /// The same statement hit a DIFFERENT WORLD: identical content, differing recorded output.
+    /// `op` is the first differing dispatch; `a`/`b` are its recorded (redacted) contents.
+    Output {
+        node: u32,
+        stmt: String,
+        op: String,
+        a: String,
+        b: String,
+    },
+}
+
+/// The C-44 two-run diff: `rows` in execution order, `identical` when every row is `Same`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunDiff {
+    pub rows: Vec<DiffRow>,
+    pub identical: bool,
+}
+
+/// Fold a trace into its executed-statement rows: cells accumulate and attach to the next
+/// statement boundary (`StatementCompleted` or `PlanHalted` — the interpreter appends the
+/// boundary AFTER the statement's dispatches).
+pub fn stmt_rows(trace: &[RunEvent]) -> Vec<StmtRow> {
+    let mut rows = Vec::new();
+    let mut cells: Vec<(String, String)> = Vec::new();
+    for ev in trace {
+        match ev {
+            RunEvent::OpRecorded { op, content, .. } => {
+                cells.push((op.clone(), content.clone()));
+            }
+            RunEvent::StatementCompleted { node, stmt, .. } => rows.push(StmtRow {
+                node: node.0,
+                stmt: stmt.clone(),
+                halted: false,
+                cells: std::mem::take(&mut cells),
+            }),
+            RunEvent::PlanHalted { node, stmt, .. } => rows.push(StmtRow {
+                node: node.0,
+                stmt: stmt.clone(),
+                halted: true,
+                cells: std::mem::take(&mut cells),
+            }),
+            _ => {}
+        }
+    }
+    rows
+}
+
+/// Diff two run traces (C-44): positional alignment over the executed-statement sequence — the
+/// natural shape for "a run and its fork" (shared prefix, then divergence). Classification:
+/// differing `stmt_hash16` → the plan changed (`DiffRow::Plan`); same statement but differing
+/// recorded op output → the world changed (`DiffRow::Output`); else `Same`.
+pub fn run_diff(a: &[RunEvent], b: &[RunEvent]) -> RunDiff {
+    let ra = stmt_rows(a);
+    let rb = stmt_rows(b);
+    let mut rows = Vec::new();
+    let n = ra.len().max(rb.len());
+    for i in 0..n {
+        match (ra.get(i), rb.get(i)) {
+            (Some(x), Some(y)) if x.stmt == y.stmt => {
+                let differing = x
+                    .cells
+                    .iter()
+                    .zip(y.cells.iter())
+                    .find(|((oa, ca), (ob, cb))| oa != ob || ca != cb);
+                match differing {
+                    Some(((op, ca), (_, cb))) => rows.push(DiffRow::Output {
+                        node: x.node,
+                        stmt: x.stmt.clone(),
+                        op: op.clone(),
+                        a: ca.clone(),
+                        b: cb.clone(),
+                    }),
+                    None if x.cells.len() != y.cells.len() => {
+                        // One side dispatched more (e.g. a halt cut the statement short) — an
+                        // output divergence with the first unpaired cell.
+                        let (longer, shorter_is_a) = if x.cells.len() > y.cells.len() {
+                            (&x.cells[y.cells.len()], false)
+                        } else {
+                            (&y.cells[x.cells.len()], true)
+                        };
+                        rows.push(DiffRow::Output {
+                            node: x.node,
+                            stmt: x.stmt.clone(),
+                            op: longer.0.clone(),
+                            a: if shorter_is_a {
+                                String::new()
+                            } else {
+                                longer.1.clone()
+                            },
+                            b: if shorter_is_a {
+                                longer.1.clone()
+                            } else {
+                                String::new()
+                            },
+                        });
+                    }
+                    None => rows.push(DiffRow::Same {
+                        node: x.node,
+                        stmt: x.stmt.clone(),
+                    }),
+                }
+            }
+            (xa, xb) => rows.push(DiffRow::Plan {
+                node: xa.or(xb).map(|r| r.node).unwrap_or_default(),
+                a_stmt: xa.map(|r| r.stmt.clone()),
+                b_stmt: xb.map(|r| r.stmt.clone()),
+            }),
+        }
+    }
+    let identical = rows.iter().all(|r| matches!(r, DiffRow::Same { .. }));
+    RunDiff { rows, identical }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1827,5 +1968,82 @@ mod tests {
             shape(&with_custom_turns[0]),
             "Custom rows must not perturb what the turns fold computes"
         );
+    }
+
+    /// C-44 (failing-first acceptance): `run_diff` classifies the two divergence kinds exactly —
+    /// a differing `stmt_hash16` at a position → one `Plan` row; the same statement with one
+    /// differing recorded output → one `Output` row at the right node; identical traces → all
+    /// `Same` + `identical`.
+    #[test]
+    fn run_diff_classifies_plan_vs_output_divergence() {
+        use flux_lang::ast::{NodeId, RunEvent, StepId};
+        fn cell(op: &str, content: &str) -> RunEvent {
+            RunEvent::OpRecorded {
+                seq: 0,
+                step: StepId(format!("step_{op}_x")),
+                op: op.into(),
+                input_hash: "h".into(),
+                input_hash_redacted: None,
+                content: content.into(),
+                view: None,
+                is_error: false,
+                denied: false,
+                redacted: false,
+                truncated: false,
+            }
+        }
+        fn done(node: u32, stmt: &str) -> RunEvent {
+            RunEvent::StatementCompleted {
+                plan: "p".into(),
+                node: NodeId(node),
+                stmt: stmt.into(),
+                value: None,
+                skipped: false,
+            }
+        }
+
+        let a = vec![
+            cell("read", "alpha"),
+            done(0, "s0"),
+            cell("write", "W"),
+            done(1, "s1"),
+        ];
+
+        // Same plan, different world at node 0.
+        let b_world = vec![
+            cell("read", "BETA"),
+            done(0, "s0"),
+            cell("write", "W"),
+            done(1, "s1"),
+        ];
+        let d = run_diff(&a, &b_world);
+        assert!(!d.identical);
+        assert_eq!(
+            d.rows
+                .iter()
+                .filter(|r| matches!(r, DiffRow::Output { node: 0, op, .. } if op == "read"))
+                .count(),
+            1,
+            "exactly one Output row at node 0: {:?}",
+            d.rows
+        );
+        assert!(matches!(d.rows[1], DiffRow::Same { node: 1, .. }));
+
+        // Different plan at position 1.
+        let b_plan = vec![
+            cell("read", "alpha"),
+            done(0, "s0"),
+            cell("write", "W"),
+            done(1, "sX"),
+        ];
+        let d = run_diff(&a, &b_plan);
+        assert!(matches!(
+            &d.rows[1],
+            DiffRow::Plan { a_stmt: Some(x), b_stmt: Some(y), .. } if x == "s1" && y == "sX"
+        ));
+
+        // Identical traces.
+        let d = run_diff(&a, &a);
+        assert!(d.identical, "{:?}", d.rows);
     }
 }

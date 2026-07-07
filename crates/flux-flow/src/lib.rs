@@ -19,17 +19,23 @@
 //! real tool registry, the [`runtime`] interpreter, the [`engine`] turn loop, and the [`state`] store.
 
 pub mod agent_sink;
+pub mod cassette;
 pub mod compile;
 pub mod composites;
 pub mod engine;
+pub mod fork;
 pub mod loop_host;
 pub mod registry;
+pub mod replay;
 pub mod runtime;
 pub mod state;
 pub mod voice;
 
 pub use agent_sink::AgentSink;
-pub use voice::{tool_defs_from_registry, VoiceSessionDriver, VoiceSink, VoiceTurnHandler};
+pub use voice::{
+    tool_defs_from_registry, TranscriptAccumulator, UsageRecording, VoiceSessionDriver, VoiceSink,
+    VoiceTurnHandler,
+};
 
 // Facade: the language core + reference interpreter live in `flux-lang`. Re-export them so the
 // language surface stays available from the engine crate (no consumer churn) and

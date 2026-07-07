@@ -226,6 +226,32 @@ enum Commands {
         #[command(flatten)]
         agent: AgentFlags,
     },
+    /// Fork a recorded session at a decision point (A-46): the prefix replays hermetically from
+    /// the cassette (no side effects), then the tail DIVERGES live through the real approval
+    /// envelope — inject a different value, run an edited plan, or let the model re-plan.
+    Fork {
+        /// Session id (`s_42`), or `last` for the most recent session.
+        session: String,
+        /// Top-level statement index (0-based) of the run's FINAL executed plan to diverge at.
+        #[arg(long)]
+        at: usize,
+        /// Mode A: inject this JSON value as the fork statement's result, then run the rest live.
+        #[arg(long, conflicts_with_all = ["edit", "replan"])]
+        inject: Option<String>,
+        /// Mode C: continue with this edited plan file (.flux text or JSON DraftAst) — unchanged
+        /// leading statements fast-forward against the replayed prefix, edits run live.
+        #[arg(long, conflicts_with_all = ["inject", "replan"])]
+        edit: Option<String>,
+        /// Mode B (default): let the model re-plan the tail live from the forked state.
+        #[arg(long)]
+        replan: bool,
+        /// With --replan: the instruction for the re-planned tail (default: continue the
+        /// recorded task).
+        #[arg(long)]
+        prompt: Option<String>,
+        #[command(flatten)]
+        agent: AgentFlags,
+    },
     /// Connect to a remote A2A agent and chat with it like a local agent. With prompt words or
     /// piped stdin it runs a single turn and exits; otherwise it opens an interactive REPL.
     A2a {
@@ -309,6 +335,35 @@ enum Commands {
     },
     /// Per-model token usage + cost: the current/last session, and an all-sessions total.
     Usage,
+    /// Hermetically replay a recorded session (A-45): plans re-parse from the durable
+    /// `plan_source`, op outputs are served from the C-43 cassette — no model call, no live IO,
+    /// side effects never re-fired. Divergence from the recording fails loudly.
+    Replay {
+        /// Session id (`s_42`), or `last` for the most recent session.
+        #[arg(default_value = "last")]
+        session: String,
+        /// Replay only this turn's plans (1-based). Cross-turn symbol references fail honestly.
+        #[arg(long)]
+        turn: Option<usize>,
+        /// Also replay this session's sub-agent child streams (A-08 correlation), in spawn order.
+        #[arg(long)]
+        sub_agents: bool,
+        /// Emit a machine-readable JSON report instead of the human summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Diff two recorded runs (C-44): align their executed statements and show exactly where the
+    /// PLAN changed (differing statement content) vs where the same plan hit a DIFFERENT WORLD
+    /// (differing recorded op output). Exit code 1 when the runs diverge, `diff`-style.
+    Diff {
+        /// First session id (`s_42`), or `last`.
+        a: String,
+        /// Second session id (e.g. a fork of the first).
+        b: String,
+        /// Emit a machine-readable JSON report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Mine `~/.flux/events.db` for flux-native NL→Flux-Lang training data (D-53).
     Corpus {
         #[command(subcommand)]
@@ -998,6 +1053,421 @@ fn run_usage_with(store: &EventStore, pricing: &flux_core::PricingTable) -> Resu
     let all_rows = store.cost_summary_all(pricing)?;
     print_usage_rows(&all_rows);
     print_efficiency_line(store.efficiency_all()?.as_ref());
+    Ok(())
+}
+
+/// A-45: `flux replay <SESSION|last>` — hermetic offline re-execution of a recorded session.
+/// Plans re-parse from the durable `plan_source`, op outputs are served from the C-43 cassette;
+/// the lazy provider is never constructed (no model op is ever reached), and no live IO or side
+/// effect can fire (a served dispatch never touches the executor). Non-zero exit on divergence,
+/// so a recording can be pinned in CI.
+async fn run_replay(
+    session_arg: &str,
+    turn: Option<usize>,
+    sub_agents: bool,
+    json: bool,
+) -> Result<()> {
+    let events = Arc::new(open_event_store()?);
+    let sid = if session_arg == "last" {
+        events
+            .latest_session()
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .context("no recorded sessions in ~/.flux/events.db")?
+    } else {
+        events
+            .info(session_arg)
+            .with_context(|| format!("unknown session `{session_arg}`"))?;
+        session_arg.to_string()
+    };
+    drop(events);
+
+    // Reuse the target session id so no fresh session record is minted; the driver writes only to
+    // its own scratch store — replay is a pure read of the recording. `--yes` is safe by
+    // construction here: a served op never executes, and the Replay scope auto-allows `confirm`.
+    let flags = AgentFlags::from_model_yes(None, true);
+    let (engine, _session, _spec, _spawner) = build_agent_lazy(&flags, Some(sid.clone())).await?;
+    eprintln!(
+        "{}",
+        style::dim(&format!(
+            "replay · session {sid} · offline (no model call, no live IO)"
+        ))
+    );
+
+    let mut sink = CliSink::new(0);
+    let report =
+        flux_flow::replay::replay_session(&engine.events, &engine.executor, &sid, turn, &mut sink)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // A-08 tree: child streams replay after the parent, in spawn order (their `task` cells on the
+    // parent tape carried only the child's summarized result — each child has its own tape).
+    let mut child_reports = Vec::new();
+    if sub_agents {
+        for child in engine.events.children_of(&sid)? {
+            eprintln!("{}", style::dim(&format!("replay · sub-agent {child}")));
+            match flux_flow::replay::replay_session(
+                &engine.events,
+                &engine.executor,
+                &child,
+                None,
+                &mut sink,
+            )
+            .await
+            {
+                Ok(r) => child_reports.push(r),
+                // A child recorded before C-43 (or with the cassette off) must not sink the
+                // parent's result — report it honestly and continue.
+                Err(e) => eprintln!("{}", style::dim(&format!("  {child}: {e}"))),
+            }
+        }
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "session": report.session,
+                "plans": report
+                    .plans
+                    .iter()
+                    .map(|p| serde_json::json!({ "flow_key": p.flow_key, "halted": p.halted }))
+                    .collect::<Vec<_>>(),
+                "cells_total": report.cells_total,
+                "cells_consumed": report.cells_consumed,
+                "missing_sources": report.missing_sources,
+                "diverged": report.diverged,
+                "sub_agents": child_reports.iter().map(|r| serde_json::json!({
+                    "session": r.session,
+                    "cells_total": r.cells_total,
+                    "cells_consumed": r.cells_consumed,
+                    "diverged": r.diverged,
+                })).collect::<Vec<_>>(),
+            })
+        );
+    } else {
+        println!(
+            "replayed {} plan(s) · {}/{} recorded cell(s) served",
+            report.plans.len(),
+            report.cells_consumed,
+            report.cells_total
+        );
+        for p in &report.plans {
+            match &p.halted {
+                Some(h) => println!("  ✗ {} — halted (reproduced): {h}", p.flow_key),
+                None => println!("  ✓ {}", p.flow_key),
+            }
+        }
+        if report.missing_sources > 0 {
+            eprintln!(
+                "{}",
+                style::dim(&format!(
+                    "note: {} recorded execution(s) have no stored plan_source (pre-L-38 or \
+                     oversized) and were skipped",
+                    report.missing_sources
+                ))
+            );
+        }
+    }
+    if let Some(d) = report.diverged {
+        bail!("replay diverged from the recording: {d}");
+    }
+    for r in &child_reports {
+        if let Some(d) = &r.diverged {
+            bail!(
+                "sub-agent {} replay diverged from the recording: {d}",
+                r.session
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A-46: `flux fork <SESSION> --at <N>` — branch a recorded run at a decision point. The prefix
+/// replays hermetically from the cassette into a NEW session (correlated to the source; no side
+/// effects), then the tail diverges LIVE through the real approval envelope: `--inject` a value,
+/// `--edit` a corrected plan, or (default) `--replan` via the model. The forked session records
+/// its own cassette, so the fork is itself replayable and diffable against its parent.
+async fn run_fork(
+    session_arg: &str,
+    at: usize,
+    inject: Option<String>,
+    edit: Option<String>,
+    replan: bool,
+    prompt: Option<String>,
+    flags: &AgentFlags,
+) -> Result<()> {
+    let _ = replan; // mode B is the default; the flag exists for explicitness.
+    let events = Arc::new(open_event_store()?);
+    let sid = if session_arg == "last" {
+        events
+            .latest_session()
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .context("no recorded sessions in ~/.flux/events.db")?
+    } else {
+        events
+            .info(session_arg)
+            .with_context(|| format!("unknown session `{session_arg}`"))?;
+        session_arg.to_string()
+    };
+    let src_info = events.info(&sid).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let last_input = events
+        .turns(&sid)
+        .ok()
+        .and_then(|ts| ts.last().map(|t| t.user_input.clone()));
+
+    // Mint the fork session, correlated to its source (the A-08 linkage `flux replay
+    // --sub-agents` and cost rollups already understand), and seed its conversation with the
+    // parent's messages so a re-planned tail has the recorded context.
+    let fork_sid = events
+        .create_session_with_context(
+            &src_info.model,
+            &flux_events::EventContext {
+                correlation_id: Some(sid.clone()),
+                agent_id: Some(format!("fork:{sid}@{at}")),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    for m in events
+        .conversation(&sid)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+    {
+        events
+            .record_message(&fork_sid, &m)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    drop(events);
+
+    let (engine, _session, model_spec, _spawner) =
+        build_agent_lazy(flags, Some(fork_sid.clone())).await?;
+    eprintln!(
+        "{}",
+        style::dim(&format!(
+            "fork · {sid} @ statement {at} → {fork_sid} · prefix from tape, tail live"
+        ))
+    );
+    let mut sink = CliSink::new(0).with_cost(model_spec, flux_credentials::load_pricing_table());
+
+    let prefix = flux_flow::fork::replay_prefix(
+        &engine.events,
+        &engine.flow,
+        &engine.executor,
+        &sid,
+        &fork_sid,
+        at,
+        &mut sink,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let outcome = if let Some(raw) = inject {
+        let value: serde_json::Value = serde_json::from_str(&raw)
+            .with_context(|| format!("--inject is not valid JSON: {raw}"))?;
+        Some(
+            flux_flow::fork::diverge_inject(
+                &engine.flow,
+                &engine.executor,
+                &fork_sid,
+                &prefix,
+                &value,
+                &mut sink,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        )
+    } else if let Some(file) = edit {
+        let src = std::fs::read_to_string(&file).with_context(|| format!("read {file}"))?;
+        let ast: flux_flow::ast::DraftAst = if src.trim_start().starts_with('{') {
+            serde_json::from_str(&src)
+                .with_context(|| format!("parse {file} as a Flux-Lang DraftAst (JSON)"))?
+        } else {
+            match flux_lang::program::Module::parse_str(&src)
+                .map_err(|e| anyhow::anyhow!("parse {file} as Flux-Lang text: {e}"))?
+            {
+                flux_lang::program::Module::Flow(ast) => ast,
+                flux_lang::program::Module::Program(_) => {
+                    bail!("--edit needs a bare flow, not a multi-agent program")
+                }
+            }
+        };
+        Some(
+            flux_flow::fork::diverge_edit(
+                &engine.flow,
+                &engine.executor,
+                &fork_sid,
+                &prefix,
+                &ast,
+                &mut sink,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        )
+    } else {
+        // Mode B: a live turn on the forked session — the planner sees the copied conversation
+        // plus the replayed prefix's symbols, and plans a fresh tail through the full envelope.
+        let instruction = prompt.unwrap_or_else(|| match &last_input {
+            Some(input) => {
+                format!("Continue from the current forked state. The original task was: {input}")
+            }
+            None => "Continue from the current forked state.".to_string(),
+        });
+        engine
+            .run_turn(&fork_sid, &instruction, &mut sink)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        None
+    };
+
+    if let Some(out) = outcome {
+        if let Some(halt) = out.failure {
+            eprintln!("{}", style::dim(&format!("forked session: {fork_sid}")));
+            bail!("fork tail halted: {}", halt.message);
+        }
+        if !out.result.is_empty() {
+            println!("{}", out.result);
+        }
+    }
+    println!(
+        "forked session: {fork_sid}  (replay it with `flux replay {fork_sid}`; compare with \
+         `flux diff {sid} {fork_sid}`)"
+    );
+    Ok(())
+}
+
+/// C-44: `flux diff <A> <B>` — align two recorded runs and pinpoint the divergence: the PLAN
+/// changed (statement content differs) vs the same plan hit a DIFFERENT WORLD (recorded op
+/// output differs). Pure read over the two run traces; statement hashes are re-humanized through
+/// each session's stored `plan_source`. Exit 1 when the runs diverge, `diff`-style.
+fn run_diff_cmd(a_arg: &str, b_arg: &str, json: bool) -> Result<()> {
+    let events = Arc::new(open_event_store()?);
+    let resolve = |arg: &str| -> Result<String> {
+        if arg == "last" {
+            events
+                .latest_session()
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .context("no recorded sessions")
+        } else {
+            events
+                .info(arg)
+                .with_context(|| format!("unknown session `{arg}`"))?;
+            Ok(arg.to_string())
+        }
+    };
+    let (a, b) = (resolve(a_arg)?, resolve(b_arg)?);
+
+    // Humanize statement hashes: every stored plan_source's top-level statements, formatted one
+    // at a time, keyed by the SAME stmt_hash16 the trace rows carry.
+    let mut texts: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for sid in [&a, &b] {
+        for turn in events.turns(sid).map_err(|e| anyhow::anyhow!("{e}"))? {
+            for att in turn.plan_attempts {
+                let Some(src) = att.plan_source else { continue };
+                let Ok(ast) = flux_lang::parse::parse(&src) else {
+                    continue;
+                };
+                for node in &ast.body {
+                    let h = flux_lang::runtime::stmt_hash16(node);
+                    let one = flux_lang::format::format(&flux_flow::ast::DraftAst {
+                        name: None,
+                        params: vec![],
+                        returns: None,
+                        body: vec![node.clone()],
+                    });
+                    texts.insert(h, one.trim().replace('\n', " ⏎ "));
+                }
+            }
+        }
+    }
+    let text = |stmt: &Option<String>| -> String {
+        match stmt {
+            Some(h) => texts.get(h).cloned().unwrap_or_else(|| format!("<{h}>")),
+            None => "∅ (no statement at this position)".into(),
+        }
+    };
+    let excerpt = |s: &str| -> String {
+        let mut end = 96.min(s.len());
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end < s.len() {
+            format!("{}…", &s[..end].replace('\n', " "))
+        } else {
+            s.replace('\n', " ")
+        }
+    };
+
+    let diff = flux_events::run_diff(
+        &events.run_trace(&a).map_err(|e| anyhow::anyhow!("{e}"))?,
+        &events.run_trace(&b).map_err(|e| anyhow::anyhow!("{e}"))?,
+    );
+
+    if json {
+        let rows: Vec<serde_json::Value> = diff
+            .rows
+            .iter()
+            .map(|r| match r {
+                flux_events::DiffRow::Same { node, stmt } => serde_json::json!({
+                    "kind": "same", "node": node, "stmt": stmt,
+                }),
+                flux_events::DiffRow::Plan {
+                    node,
+                    a_stmt,
+                    b_stmt,
+                } => {
+                    serde_json::json!({
+                        "kind": "plan", "node": node, "a_stmt": a_stmt, "b_stmt": b_stmt,
+                    })
+                }
+                flux_events::DiffRow::Output {
+                    node,
+                    stmt,
+                    op,
+                    a,
+                    b,
+                } => {
+                    serde_json::json!({
+                        "kind": "output", "node": node, "stmt": stmt, "op": op, "a": a, "b": b,
+                    })
+                }
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({ "a": a, "b": b, "identical": diff.identical, "rows": rows })
+        );
+    } else {
+        println!("diff {a} ↔ {b}");
+        for r in &diff.rows {
+            match r {
+                flux_events::DiffRow::Same { stmt, .. } => {
+                    println!(
+                        "{}",
+                        style::dim(&format!("  = {}", text(&Some(stmt.clone()))))
+                    );
+                }
+                flux_events::DiffRow::Plan { a_stmt, b_stmt, .. } => {
+                    println!("  ~ plan diverges:");
+                    println!("    - {}", text(a_stmt));
+                    println!("    + {}", text(b_stmt));
+                }
+                flux_events::DiffRow::Output { stmt, op, a, b, .. } => {
+                    println!(
+                        "  ≠ same statement, different world — {}",
+                        text(&Some(stmt.clone()))
+                    );
+                    println!("    op `{op}`:");
+                    println!("    - {}", excerpt(a));
+                    println!("    + {}", excerpt(b));
+                }
+            }
+        }
+        if diff.identical {
+            println!("runs are identical ({} statement(s))", diff.rows.len());
+        }
+    }
+    if !diff.identical {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -2292,6 +2762,40 @@ pub(crate) async fn run_draft_ast_with_composites_resumable(
         "{}",
         style::dim(&format!("flow · {} · session {session_id}", engine.model))
     );
+    // C-43: authored flow runs record the cassette too (the engine arms it per agent turn; this
+    // path executes directly, so it arms its own) — and persist the executed plan as an accepted
+    // `plan_source` attempt (this path has no loop host to record it), so `flux flow run`
+    // results are replayable with `flux replay` exactly like agent turns. Off with
+    // FLUX_CASSETTE=0.
+    if flux_flow::cassette::enabled() {
+        engine
+            .flow
+            .set_cassette(Some(Arc::new(flux_flow::cassette::CassetteScope::Record(
+                flux_flow::cassette::RecordScope::new(engine.events.clone(), &session_id),
+            ))));
+        if let Ok(turn_id) = engine
+            .events
+            .begin_turn(&session_id, "<flow run>", &engine.model)
+        {
+            let source = flux_lang::format::format(ast);
+            let redactor = &engine.executor.context().redactor;
+            let _ = engine.events.record_plan_attempt(
+                &session_id,
+                turn_id,
+                flux_events::PlanAttempt {
+                    step: 1,
+                    outcome: "accepted".into(),
+                    error: None,
+                    fingerprint: Some(flux_lang::runtime::sha256_hex(
+                        &serde_json::to_string(ast).unwrap_or_default(),
+                    )),
+                    plan_text: None,
+                    phase: None,
+                    plan_source: Some(redactor.redact(&source)),
+                },
+            );
+        }
+    }
     engine
         .composites
         .ensure_session_loaded(&engine.flow, &session_id)
@@ -2409,16 +2913,10 @@ pub(crate) async fn run_draft_ast_with_composites_resumable(
             &mut sink,
         )
         .await
-    } else if active_composites.is_empty() {
-        flux_flow::runtime::execute_flow(
-            engine.flow.as_ref(),
-            engine.executor.as_ref(),
-            &session_id,
-            ast,
-            &mut sink,
-        )
-        .await
     } else {
+        // Also the no-composites case (empty slice is equivalent): this entry point self-wires
+        // the C-43 cassette scope from the store — plain `execute_flow` deliberately does not
+        // (it is shared with the outer agent loop, whose machinery is never cassetted).
         flux_flow::runtime::execute_flow_with_composites(
             engine.flow.as_ref(),
             engine.executor.as_ref(),
@@ -4964,6 +5462,18 @@ async fn main() -> Result<()> {
                 apply_agent_env(&agent);
                 run_tui(agent).await
             }
+            Some(Commands::Fork {
+                session,
+                at,
+                inject,
+                edit,
+                replan,
+                prompt,
+                agent,
+            }) => {
+                apply_agent_env(&agent);
+                run_fork(&session, at, inject, edit, replan, prompt, &agent).await
+            }
             // Non-agent subcommands.
             Some(Commands::A2a { url, prompt, token }) => run_a2a(url, prompt, token).await,
             Some(Commands::Eval {
@@ -5009,6 +5519,13 @@ async fn main() -> Result<()> {
             Some(Commands::Loop { action }) => run_loop_cmd(action),
             Some(Commands::Sessions { prune }) => run_sessions(prune),
             Some(Commands::Usage) => run_usage(),
+            Some(Commands::Replay {
+                session,
+                turn,
+                sub_agents,
+                json,
+            }) => run_replay(&session, turn, sub_agents, json).await,
+            Some(Commands::Diff { a, b, json }) => run_diff_cmd(&a, &b, json),
             Some(Commands::Corpus { action }) => run_corpus(action),
             Some(Commands::Auth { action }) => run_auth(action).await,
             Some(Commands::Plugin { action }) => run_plugin(action).await,

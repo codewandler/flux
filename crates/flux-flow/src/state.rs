@@ -164,6 +164,10 @@ pub struct FlowStore {
     conn: Mutex<Connection>,
     /// The unified event log this store forwards run-trace events to (and reads them back from).
     events: Arc<EventStore>,
+    /// C-43: the active cassette scope (record / replay), if any. Rides on the store — the one
+    /// handle every execution path already threads — so each `ExecutorHost` construction
+    /// self-wires without signature churn (the A-20 `reads` precedent). `None` = cassette off.
+    cassette: Mutex<Option<Arc<crate::cassette::CassetteScope>>>,
 }
 
 impl FlowStore {
@@ -232,7 +236,26 @@ impl FlowStore {
         Ok(Self {
             conn: Mutex::new(conn),
             events,
+            cassette: Mutex::new(None),
         })
+    }
+
+    /// C-43: install (or clear) the active cassette scope. The engine arms a fresh `Record` scope
+    /// per turn; the replay driver installs `Replay`; the fork engine swaps `Replay` → `Record` at
+    /// the divergence point so the forked tail is itself replayable.
+    pub fn set_cassette(&self, scope: Option<Arc<crate::cassette::CassetteScope>>) {
+        *self.cassette.lock().unwrap() = scope;
+    }
+
+    /// The active cassette scope, if any (read by every `ExecutorHost` construction).
+    pub fn cassette(&self) -> Option<Arc<crate::cassette::CassetteScope>> {
+        self.cassette.lock().unwrap().clone()
+    }
+
+    /// The unified event log this store forwards to (C-43: the recorder appends cells here; the
+    /// replay/fork drivers read traces back from it).
+    pub fn event_store(&self) -> Arc<EventStore> {
+        self.events.clone()
     }
 
     /// Store an immutable value and return its id. Values are append-only — a revision creates a new
@@ -317,8 +340,12 @@ impl FlowStore {
 
     /// Pre-bind a named input so a flow's `$name` resolves to `value` **before** the run — the
     /// per-invocation value-injection seam a behaviour runner needs (run a stored flow with these
-    /// settings, without baking them into the AST as `lit` nodes). `value` is natural JSON, stored via
-    /// the same [`Value::from_json`] the interpreter uses for literals.
+    /// settings, without baking them into the AST as `lit` nodes). `value` is natural JSON,
+    /// canonicalized via [`flux_lang::runtime::lit_value`] to the same JSON-as-string shape the
+    /// interpreter binds for a flow-body `lit` node — so a seeded `$name` is indistinguishable
+    /// from a literal-bound one everywhere downstream, arg marshaling included (D-67: a lone
+    /// seeded object string-wraps under an op's sole required param exactly like a literal;
+    /// stored structurally it would pass through as the op's whole input instead).
     ///
     /// Bound [`Visibility::Hidden`]: the interpreter's [`resolve`](Self::resolve) sees it (so `$name`
     /// works), but it stays out of the model-facing [`view`](Self::view). A flow-local `bind` to the
@@ -329,7 +356,7 @@ impl FlowStore {
         name: &SymbolName,
         value: &serde_json::Value,
     ) -> Result<()> {
-        let vid = self.put_value(session_id, &Value::from_json(value))?;
+        let vid = self.put_value(session_id, &flux_lang::runtime::lit_value(value))?;
         self.bind(
             session_id,
             name,
@@ -669,14 +696,16 @@ mod tests {
             s.get_value(&vid).unwrap(),
             Some(Value::String("hej".into()))
         );
-        // A structured seed round-trips through the value model. Numbers are `f64` in the value model,
-        // so an integer `3` reads back as `3.0` — assert against that reality, not the input literal.
+        // A structured seed stores the interpreter's literal canonicalization (D-67): the compact
+        // JSON *text* as a `Value::String` — the exact shape a flow-body `lit` bind produces — not
+        // the structural value. (Bonus over the old structural form: no f64 round-trip, so the
+        // integer `3` survives as `3`, not `3.0`.)
         let cfg = SymbolName("cfg".into());
         s.seed("sess", &cfg, &serde_json::json!({"n": 3})).unwrap();
         let vid = s.resolve("sess", &cfg).unwrap().unwrap();
         assert_eq!(
-            s.get_value(&vid).unwrap().unwrap().to_json(),
-            serde_json::json!({"n": 3.0})
+            s.get_value(&vid).unwrap(),
+            Some(Value::String("{\"n\":3}".into()))
         );
     }
 

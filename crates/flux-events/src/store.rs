@@ -371,6 +371,22 @@ impl EventStore {
             .map_err(map_sql)
     }
 
+    /// A-45/C-44: the sub-agent children of `stream` — every stream whose `correlation_id` points
+    /// at it (the A-08 spawn linkage: `agent_id = "subagent:<role>"`, `correlation_id` = the
+    /// parent session). Oldest-first, so a replay recurses children in spawn order. One level per
+    /// call; a grandchild's `correlation_id` points at ITS parent, so tree walks recurse.
+    pub fn children_of(&self, stream: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT n FROM streams WHERE correlation_id = ?1 ORDER BY n ASC")
+            .map_err(map_sql)?;
+        let rows = stmt
+            .query_map([stream], |r| Ok(format!("s_{}", r.get::<_, i64>(0)?)))
+            .map_err(map_sql)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_sql)
+    }
+
     /// Switch the session's model (records a `ModelChanged` event; the registry follows).
     pub fn set_model(&self, stream: &str, model: &str) -> Result<()> {
         self.append(

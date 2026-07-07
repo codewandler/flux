@@ -178,6 +178,25 @@ flux flow run <file.flux>        # run one checked-in Flux-Lang flow directly (n
                                  #                        statement; `last` needs the flow to declare a name
                                  #                        (`flow <name> -> …`) to find its session unambiguously
 flux sessions                    # list recent sessions
+flux replay <session|last>       # TIME MACHINE (C-43/A-45): hermetically re-execute a recorded run —
+                                 #   plans re-parse from the durable plan_source, op outputs are served
+                                 #   from the recorded cassette: NO model call, NO live IO, side effects
+                                 #   never re-fire; transcript renders like the original minus latency.
+                                 #   --turn N · --sub-agents (replay the A-08 child streams too) ·
+                                 #   --json; exit 1 if the replay diverges from the recording.
+                                 #   Capture is on by default (per-op cap FLUX_CASSETTE_MAX_BYTES,
+                                 #   1 MiB); disable with FLUX_CASSETTE=0 — then nothing is replayable.
+flux fork <session> --at N       # TIME MACHINE (A-46): branch a recorded run at top-level statement N
+                                 #   of its final plan — the prefix replays from tape (no side effects),
+                                 #   the tail diverges LIVE through the real approval envelope:
+                                 #   --inject '<json>'    bind a different value there, run the rest
+                                 #   --edit <file.flux>   continue with a corrected plan (unchanged
+                                 #                        statements fast-forward, edits run live)
+                                 #   (default) --replan   let the model re-plan from the forked state
+                                 #   The forked session records its own cassette → replayable/diffable.
+flux diff <A> <B>                # TIME MACHINE (C-44): align two recorded runs; shows where the PLAN
+                                 #   changed vs where the same plan hit a DIFFERENT WORLD (op output
+                                 #   differs); --json; exit 1 when the runs diverge (diff-style)
 flux plugin install <name>       # the plugin CLI — verified install from the signed plugin pack (@<version>, --all;
                                  #   --dir registers local builds); also ls / status / call / pin / rollback / uninstall / skill
 flux eval synthetic --watch      # run a benchmark suite (synthetic riddles / mock / terminal-bench / multi);

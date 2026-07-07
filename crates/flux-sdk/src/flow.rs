@@ -1081,6 +1081,63 @@ mod tests {
         );
     }
 
+    /// D-67: a seeded object must marshal into an op **exactly** like a literal-bound one. The
+    /// interpreter canonicalizes every `lit` bind to the JSON-as-string `Value::String` (the shape
+    /// op results take), so a lone `$input` argument reaches arg marshaling as a *string* and
+    /// wraps under the op's sole required param. `FlowStore::seed` used to store the raw
+    /// structural value instead — the same flow then delivered the *bare object* as the op's whole
+    /// input: a different input shape depending on how `$input` was bound (found adopting D-56 in
+    /// ai-agents, where preset ops broke exactly this way).
+    #[tokio::test]
+    async fn a_seeded_object_marshals_exactly_like_a_literal_bound_one() {
+        let mut client = FlowClient::builder()
+            .auto_approve(true)
+            .build(MockProvider::one("noop"), temp_root("seed-parity"))
+            .unwrap();
+        client.register_op(Arc::new(EchoArgsTool));
+
+        // Baseline: the pre-D-56 workaround — the object arrives via a prepended `lit` bind.
+        let lit_flow: DraftAst = serde_json::from_value(json!({
+            "body": [
+                { "kind": "bind", "name": "input",
+                  "value": { "kind": "lit", "value": {"query": "flux", "limit": 3} } },
+                { "kind": "return", "value": { "kind": "call", "op": "echo_args",
+                    "args": [ { "kind": "var", "name": "input" } ] } }
+            ]
+        }))
+        .unwrap();
+        let lit_out = client
+            .execute_with(&lit_flow, serde_json::Map::new())
+            .await
+            .unwrap();
+
+        // The same call, but the object arrives via `execute_with` seeding (the D-56 seam).
+        let seeded_flow: DraftAst = serde_json::from_value(json!({
+            "body": [ { "kind": "return", "value": { "kind": "call", "op": "echo_args",
+                "args": [ { "kind": "var", "name": "input" } ] } } ]
+        }))
+        .unwrap();
+        let seeded_out = client
+            .execute_with(
+                &seeded_flow,
+                one_input("input", json!({"query": "flux", "limit": 3})),
+            )
+            .await
+            .unwrap();
+
+        // The lit-bound lone object canonicalizes to text and string-wraps under the sole
+        // required param (`value`) — and the seeded run is indistinguishable from it.
+        assert!(
+            lit_out.result.contains("\"value\""),
+            "a lit-bound lone object string-wraps under the sole required param, got: {}",
+            lit_out.result
+        );
+        assert_eq!(
+            seeded_out.result, lit_out.result,
+            "a seeded $input must reach the op exactly like a literal-bound one"
+        );
+    }
+
     /// A consumer-injected approver (`FlowClientBuilder::approver`) — not the `auto_approve`
     /// binary — decides per op: the policy allows the echo but denies the boom, with no permission
     /// rules involved. The seam a multi-tenant consumer needs for a risk-aware confirm gate

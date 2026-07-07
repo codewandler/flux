@@ -78,6 +78,22 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 
 ## Next
 
+### Time Machine (epic) — **SHIPPED 2026-07-07 (phases 0–3: C-43 · A-45 · A-46 · C-44; A-47 cockpit optional)**
+
+The capstone of *the LLM is not the runtime*: because a flux run is a deterministic artifact (the
+accepted plan of every turn already persists as re-parseable Flux-Lang, the execution core is
+deterministic, and `RunEvent` is literally the "replayable record"), flux can do what no
+LLM-as-runtime framework can — **hermetic replay, fork-at-any-decision, and run-diff of agent runs**.
+The one missing piece is durability of op *outputs* (values are ephemeral today; only references
+persist) — a redacted op-output "cassette" closes it. Three verbs: `flux replay <run>` (re-execute
+exactly, offline, zero API spend), `flux fork <run> --at <node>` (branch and explore a different
+path, live tail gated by the real approval envelope), `flux diff <A> <B>` (align two runs, show where
+the plan or the world diverged). Phased C-43 (cassette capture) → A-45 (replay — the vertical slice
+that proves it) → A-46 (fork) → C-44 (diff) → A-47 (optional TUI cockpit). Design:
+[time-machine.md](designs/time-machine.md). Done = a `-m mock` run replays byte-identically with no
+provider constructed, forks explore a divergent tail through the real envelope, and diff pinpoints
+the divergence.
+
 ### Plugin distribution (epic) — **complete 2026-07-05 (D-46..D-49 all shipped)**
 
 A flux user without the source tree had no way to obtain the integration plugin pack.

@@ -6,6 +6,62 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+The **Time Machine** (epic, phases 0–3: C-43 → A-45 → A-46 → C-44): hermetic replay,
+fork-at-any-decision, and run-diff of agent runs — the capstone of *the LLM is not the runtime*.
+Because every accepted plan already persists as re-parseable Flux-Lang (`plan_source`) and the
+runtime is deterministic, the one missing piece was durable op outputs; with the cassette closing
+it, a flux run is a fully reproducible artifact. Design: `docs/designs/time-machine.md`.
+
+### Added
+
+- **C-43** — The op-output cassette: every leaf-op dispatch records a REDACTED
+  `RunEvent::OpRecorded` cell (op, dual input hashes, content/view, error/denied flags) on the
+  session's event stream — riding `EventKind::Run`, no new table, decodable by every existing log.
+  Captured at the one dispatch chokepoint (`ExecutorHost`, self-wired from the store like the A-20
+  read ledger; the outer agent-loop machinery is never cassetted), scrubbed through the same
+  redactor as `plan_source` (C-22), per-op cap `FLUX_CASSETTE_MAX_BYTES` (1 MiB; an over-cap cell
+  keeps a `truncated` head that replay refuses loudly), kill-switch `FLUX_CASSETTE=0`. On by
+  default — measured cost: ~442 bytes/cell on representative ops, 0.01% of a heavily-used
+  `events.db`. Also armed on the `flux flow run` path (which now persists its executed plan as an
+  accepted `plan_source` attempt, so authored runs replay too).
+- **A-45** — `flux replay <session|last>`: hermetically re-execute a recorded run — plans re-parse
+  from `plan_source` (no model; the lazy provider is never constructed), op outputs served from
+  the cassette (no live IO, side effects never re-fire), `confirm` gates auto-allow (nothing can
+  execute from tape). The driver derives the execution list from the trace itself, reproducing the
+  loop host's dispositions (A-05 identical-skip, halted prefixes, revision fast-forwards); the
+  matcher is out-of-order-tolerant (absorbs nondeterministic `parallel` interleavings) and
+  dual-hash (redaction-shifted inputs match); any miss is a loud `ReplayDiverged` + exit 1, never
+  silent continuation. `--turn N`, `--sub-agents` (recurses the A-08 child streams via the new
+  `EventStore::children_of`), `--json`. Live-verified: a recorded write-turn replays
+  transcript-identical in ~400µs with the deleted artifact NOT recreated.
+- **A-46** — `flux fork <session> --at N`: branch a recorded run at a top-level statement of its
+  final plan. The prefix replays from tape into a NEW session (`correlation_id` = source, parent
+  conversation copied); at the divergence point the cassette scope swaps Replay→Record — THE
+  cassette-vs-live boundary — so the tail runs through the REAL approval envelope (pinned by a
+  deny-approver test) and the forked run records its own cassette + `plan_source` rows, making
+  forks first-class replayable/diffable sessions. Three modes: `--inject <json>` (a synthetic
+  bind-plan, D-67 lit-canonicalization parity), `--edit <file>` (unchanged statements fast-forward
+  via the content-hash ledger, edits run live), `--replan` (default: a live model turn from the
+  forked state).
+- **C-44** — `flux diff <A> <B>`: align two runs' executed statements (positional — the natural
+  shape for run-vs-fork) and classify each row: the PLAN changed (`stmt_hash16` differs) vs the
+  same plan hit a DIFFERENT WORLD (recorded op output differs) vs identical. Statement hashes are
+  re-humanized through each session's stored `plan_source`; `--json`; exit 1 on divergence,
+  diff-style. Pure L2 read-model (`flux_events::run_diff`/`stmt_rows`).
+
+### Fixed
+
+- **D-67** — `FlowStore::seed` literal-canonicalization parity: seeded values are stored via the
+  new public `flux_lang::runtime::lit_value` (JSON string → the raw string, null → `""`, everything
+  else → compact JSON text) — exactly how the interpreter's `Node::Lit` bind arm stores literals —
+  so a seeded `$var` is indistinguishable from a literal-bound one everywhere downstream, including
+  `map_args_to_input`'s lone-argument string-wrap (before, an `execute_with`-seeded object reached
+  an op as the bare object while the equivalent `Bind{Lit}` delivered `{"<param>": "<json text>"}`;
+  the structural path was also f64-lossy). Parity pinned by flux-sdk's
+  `a_seeded_object_marshals_exactly_like_a_literal_bound_one`. Found adopting D-56 downstream
+  (ai-agents C-14). Rider: `TranscriptAccumulator` + `UsageRecording` are re-exported at the
+  `flux-flow` crate root alongside the other voice types.
+
 ## [0.3.1] - 2026-07-07
 
 The hardening/docs/cleanup push: nine stories from the 2026-07-07 repo survey, closing the

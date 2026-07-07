@@ -379,6 +379,12 @@ struct ExecutorHost<'a> {
     /// The loop host's per-turn read-resource ledger (A-20) — `Some` only on the `run_plan`
     /// execution path; every other flow path (pre-authored `flow run`, journeys) runs untracked.
     reads: Option<Arc<ReadTracker>>,
+    /// C-43: the active cassette scope, self-wired from [`FlowStore::cassette`] by the plan
+    /// execution entry points. `Record` appends a redacted cell after every dispatch (the live
+    /// outcome flows back unredacted); `Replay` serves cells without ever touching the executor,
+    /// so no side effect re-fires. `None` on the outer agent-loop path (its `plan`/`run_plan`
+    /// machinery is never cassetted) and whenever the cassette is off.
+    cassette: Option<Arc<crate::cassette::CassetteScope>>,
 }
 
 impl<'a> ExecutorHost<'a> {
@@ -388,6 +394,7 @@ impl<'a> ExecutorHost<'a> {
             executor,
             cap_scope_guards: std::sync::Mutex::new(Vec::new()),
             reads: None,
+            cassette: None,
         }
     }
 
@@ -397,6 +404,19 @@ impl<'a> ExecutorHost<'a> {
             executor,
             cap_scope_guards: std::sync::Mutex::new(Vec::new()),
             reads: None,
+            cassette: None,
+        }
+    }
+
+    /// C-43: append the cell for one completed dispatch when a `Record` scope is active. Both
+    /// return paths of [`dispatch`](OpHost::dispatch) — the real dispatch AND the A-20
+    /// cache-served repeat — must record, or a cache-served repeat would leave a hole in the tape
+    /// that reads as divergence on replay.
+    fn record_cell(&self, op: &str, input_json: &str, out: &OpOutcome) {
+        if let Some(scope) = &self.cassette {
+            if let crate::cassette::CassetteScope::Record(rec) = scope.as_ref() {
+                rec.record(&self.executor.context().redactor, op, input_json, out);
+            }
         }
     }
 }
@@ -404,6 +424,34 @@ impl<'a> ExecutorHost<'a> {
 #[async_trait]
 impl OpHost for ExecutorHost<'_> {
     async fn dispatch(&self, op: &str, input: serde_json::Value) -> OpOutcome {
+        // C-43: serialize the input once when a cassette scope is active — the recorder keys cells
+        // on the EXACT string `execute_call` hashes for `StepStarted.input_hash`, and replay
+        // re-derives the same key from the same serialization.
+        let input_json = if self.cassette.is_some() {
+            serde_json::to_string(&input).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        // C-43 replay: serve from the tape and never touch the live executor — no side effect can
+        // re-fire. A miss is a latched divergence surfaced as an in-band op error (the statement
+        // halts; the driver reports `ReplayTape::diverged`), never silent continuation.
+        if let Some(scope) = &self.cassette {
+            if let crate::cassette::CassetteScope::Replay(tape) = scope.as_ref() {
+                return match tape.serve(op, &input_json) {
+                    Some(out) => out,
+                    None => OpOutcome {
+                        denied: false,
+                        content: format!(
+                            "replay diverged: {}",
+                            tape.diverged()
+                                .unwrap_or_else(|| "unknown divergence".into())
+                        ),
+                        view: None,
+                        is_error: true,
+                    },
+                };
+            }
+        }
         // A-20: fold this dispatch into the turn's read-resource ledger. A local-state-mutating op
         // clears the reuse cache; a read is keyed on `op + resolved args` — and a CACHEABLE read
         // whose exact call already ran this turn is served from the cache with a legible note
@@ -429,12 +477,14 @@ impl OpHost for ExecutorHost<'_> {
             if self.cap_scope_guards.lock().unwrap().is_empty() {
                 if let Some((content, symbol)) = tracker.serve(key) {
                     let view = reuse_note(op, symbol.as_deref());
-                    return OpOutcome {
+                    let out = OpOutcome {
                         denied: false,
                         content,
                         view: Some(view),
                         is_error: false,
                     };
+                    self.record_cell(op, &input_json, &out);
+                    return out;
                 }
             }
         }
@@ -459,6 +509,7 @@ impl OpHost for ExecutorHost<'_> {
                 tracker.record(key, window, content, generation.unwrap_or_default());
             }
         }
+        self.record_cell(op, &input_json, &out);
         out
     }
 
@@ -485,6 +536,14 @@ impl OpHost for ExecutorHost<'_> {
         label: &str,
         intents: &IntentSet,
     ) -> flux_lang::host::ApprovalChoice {
+        // C-43 replay: the recorded run already passed its `confirm` gates, and no op can execute
+        // from tape — auto-allow so hermetic replay needs no interactive approver. Record and live
+        // paths fall through to the real approver unchanged.
+        if let Some(scope) = &self.cassette {
+            if matches!(scope.as_ref(), crate::cassette::CassetteScope::Replay(_)) {
+                return flux_lang::host::ApprovalChoice::Allow;
+            }
+        }
         let subjects = [label.to_string()];
         let choice = self
             .executor
@@ -627,7 +686,9 @@ pub async fn execute_flow_with_composites(
     composites: &[CompositeOpDecl],
     sink: &mut dyn AgentSink,
 ) -> Result<FlowOutcome> {
-    let host = ExecutorHost::new_with_composites(executor, composites);
+    let mut host = ExecutorHost::new_with_composites(executor, composites);
+    // C-43: plan execution self-wires the store's active cassette scope (record or replay).
+    host.cassette = store.cassette();
     let mut bridge = SinkBridge {
         inner: sink,
         trace: false,
@@ -658,6 +719,10 @@ pub async fn execute_flow_resumable_with_composites(
     // A-20: the loop host's per-turn read-resource ledger rides along so every inner dispatch is
     // classified/tracked (and an exact-repeat cacheable read is served with a reuse note).
     host.reads = reads;
+    // C-43: plan execution self-wires the store's active cassette scope (record or replay). The
+    // OUTER agent-loop path (`execute_flow_traced`) deliberately stays unwired — its
+    // `plan`/`run_plan` machinery is never cassetted.
+    host.cassette = store.cassette();
     let mut bridge = SinkBridge {
         inner: sink,
         trace: false,
