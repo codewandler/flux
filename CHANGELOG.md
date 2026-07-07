@@ -6,8 +6,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-08
+
 **Postgres backend post-ship hardening** (the `pg-backend` epic's review follow-ups, D-76..D-79).
-One breaking signature (`PostgresBackend::new`) → the next release is a minor bump.
+One breaking signature (`PostgresBackend::new`) → a minor bump.
 
 ### Added
 
