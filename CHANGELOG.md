@@ -6,6 +6,55 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.2.24] - 2026-07-07
+
+The consumer-gaps release: a review of flux's first production SDK consumer surfaced the places it
+had to re-implement or work around flux — this release closes them upstream.
+
+### Changed (BREAKING)
+
+- **C-38** — Realtime usage/cost capture end-to-end: `RealtimeEvent::ResponseDone` gains
+  `{ usage: Option<Usage> }` and `VoiceSink::response_done` now receives `Option<&Usage>` (default
+  no-op retained) — a **breaking change on the realtime seam** for sinks that override it. The
+  OpenAI Realtime codec parses `response.usage` tolerantly (malformed/missing → `None`, never a
+  stream error); `Usage` gains `audio_input_tokens`/`audio_output_tokens` subset fields and
+  `Rates`/`RateOverride` gain audio **surcharge** tiers with builtin `gpt-realtime`/`gpt-realtime-2`
+  rows, so voice responses price correctly; the new optional
+  `VoiceSessionDriver::with_usage_recording(UsageRecording)` appends one `EventKind::CallUsage` row
+  per usage-bearing response — voice sessions reach cost parity with the text engine. Plus:
+  `TranscriptAccumulator` (voice delta buffers → whole per-turn `Message`s, hangup-safe close
+  flush), `RealtimeConfig::{with_voice, with_temperature}`, and a `default_model` re-export.
+  Design: `docs/designs/realtime-usage-capture.md`.
+
+### Added
+
+- **D-55** — `EventKind::Custom { name, payload }`: one open variant in the otherwise-closed event
+  enum so applications can append their own facts (audit trails, domain events) to the unified
+  `events.db` with account scoping — flux never interprets the payload; all flux projections
+  verified to skip it.
+- **D-56** — `FlowClient::analyze_seeded` / `optimize_seeded`: analyze a stored flow with
+  intended `execute_with` seed names counted as bound — no more flow-param declarations or
+  hand-prepended Bind nodes for per-invocation values (completes the D-01 seam).
+- **D-57** — flux-a2a schema derives behind an off-by-default `utoipa` feature (v5) on the full
+  wire-type closure, so consumers derive OpenAPI docs from flux types instead of maintaining
+  mirrors; shared `flux_a2a::server::card_url` helper (x-forwarded-proto aware), now also used by
+  flux-server.
+- **D-58** — `RiskApprover`: the middle ground between Allow and Deny — reads free, writes gated by
+  declared `Risk` tier behind a consent marker in the permission subjects (default
+  `"user-confirmed"`, threshold `High`), unknown tools pass through, plan gate fails closed.
+- **D-59** — Closure-backed tools: `tool_fn(spec, handler)` / `FnTool` (handler errors fold to soft
+  `ToolResult::error`) + a runtime object-schema builder in flux-spec
+  (`req`/`opt`/`object_schema`/`empty_schema`) — dynamic tool families without bespoke structs.
+- **D-60** — Provider/lang ergonomics: `NullProvider` + `StaticProvider` exported for
+  deterministic/key-free flows and tests; Bedrock haiku alias profile overridable via
+  `FLUX_BEDROCK_HAIKU_PROFILE`; `openai_from_env` accepts the `OPENAI_KEY` alias;
+  `DraftAst::scoped(tools)` wraps a parsed flow in a capability scope.
+- **D-61** — New `flux-audio` L0 crate: PCM16 LE/BE codecs, stateless resampling, a streaming
+  `Resampler` that carries phase across packets, and a `Framer` re-chunker — the sample-math layer
+  every realtime-voice consumer previously had to write itself.
+- **D-62/D-63/D-64** — design-first stories filed: async paged live-backend datasource seam,
+  multi-agent A2A mount, per-request bearer→principal auth seam.
+
 ## [0.2.23] - 2026-07-06
 
 ### Added
