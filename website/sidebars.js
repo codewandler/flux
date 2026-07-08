@@ -64,7 +64,7 @@ const sidebars = {
     {
       type: 'category',
       label: 'Plugins',
-      items: ['plugins/using-plugins', 'plugins/authoring'],
+      items: ['plugins/using-plugins', 'plugins/gitlab', 'plugins/authoring'],
     },
     {
       type: 'category',
