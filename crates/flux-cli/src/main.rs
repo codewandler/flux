@@ -8,6 +8,7 @@ mod plugin_skill;
 mod preset;
 mod skill_cmd;
 mod style;
+mod usage;
 
 use std::io::{IsTerminal, Write};
 
@@ -73,6 +74,15 @@ struct Cli {
     /// warning. Prefer `--add-dir` for read-only access to specific directories.
     #[arg(long = "allow-all-paths", global = true)]
     allow_all_paths: bool,
+
+    /// Temporarily allow egress to private/internal network addresses for THIS invocation only —
+    /// the ephemeral, audited equivalent of a `[private_net]` config grant (no config edit, nothing
+    /// persisted). Plugins still only reach the private hosts their manifest declares; `web_fetch`
+    /// is opened for the run (its guard has no manifest safeguard, so this re-exposes cloud-metadata
+    /// and RFC-1918 ranges to any fetched URL). Prefer a scoped `[private_net.plugins]` grant for
+    /// anything recurring. Exported as `FLUX_ALLOW_PRIVATE_NET` so `app run`/`plugin call` inherit it.
+    #[arg(long = "allow-private-net", global = true)]
+    allow_private_net: bool,
 }
 
 /// The flags for running an agent turn — flattened into each agent-path subcommand (`run`, `plan`,
@@ -333,8 +343,8 @@ enum Commands {
         #[arg(long)]
         prune: bool,
     },
-    /// Per-model token usage + cost: the current/last session, and an all-sessions total.
-    Usage,
+    /// Per-model token usage + cost across flux and detected local agent harnesses.
+    Usage(usage::UsageArgs),
     /// Hermetically replay a recorded session (A-45): plans re-parse from the durable
     /// `plan_source`, op outputs are served from the C-43 cassette — no model call, no live IO,
     /// side effects never re-fired. Divergence from the recording fails loudly.
@@ -526,6 +536,7 @@ enum AuthAction {
 #[derive(clap::Subcommand, Debug)]
 enum PluginAction {
     /// List installed plugins (the default).
+    #[command(alias = "list")]
     Ls,
     /// Add a plugin: `add <name> <program> [args…]`.
     Add {
@@ -777,6 +788,22 @@ const KNOWN_PROVIDERS: &[&str] = &[
     "ollama-anthropic",
 ];
 
+/// The provider prefix a `provider/model` spec resolves to — the part before `/`, or a bare short
+/// alias mapped to its provider (`sonnet`/`opus`/`haiku`/`mock` → `anthropic`, bare `codex`/`aws` →
+/// themselves). `None` for a bare word that is not a known alias. The single source of truth for the
+/// bare-alias set, shared by [`build_provider`] and [`auth_row_for_spec`] so the two can never drift.
+fn spec_provider_prefix(spec: &str) -> Option<&str> {
+    match spec.split_once('/') {
+        Some((p, _)) => Some(p),
+        None => match spec {
+            "sonnet" | "opus" | "haiku" | "mock" => Some("anthropic"),
+            "codex" => Some("codex"),
+            "aws" => Some("aws"),
+            _ => None,
+        },
+    }
+}
+
 /// Parse a fully-qualified `provider/model` spec and build the matching provider from environment
 /// credentials. Provider must be an explicit prefix (`anthropic/`, `claude/`, `openai/`, `codex/`,
 /// `openrouter/`, `openrouter-anthropic/`, `ollama/`, `ollama-anthropic/`). Bare short aliases
@@ -791,21 +818,21 @@ fn build_provider(spec: &str) -> Result<(NativeProvider, String, String)> {
             "unknown provider `{p}` — use one of: {}",
             KNOWN_PROVIDERS.join(", ")
         ),
-        None => {
-            // Allow bare short aliases only; everything else requires an explicit provider prefix.
-            match spec {
-                "sonnet" | "opus" | "haiku" | "mock" => ("anthropic".to_string(), spec.to_string()),
-                // Bare `codex` → the ChatGPT-subscription main model (resolved in `build_provider`).
-                "codex" => ("codex".to_string(), String::new()),
-                // Bare `aws` → the Bedrock default (sonnet cross-region profile, resolved below).
-                "aws" => ("aws".to_string(), String::new()),
-                other => bail!(
-                    "model spec `{other}` has no provider prefix — use `provider/model`, e.g. \
-                     `anthropic/{other}` or `claude/{other}` (providers: {})",
-                    KNOWN_PROVIDERS.join(", ")
-                ),
+        // Bare short aliases only; everything else needs an explicit provider prefix. The alias set
+        // lives in `spec_provider_prefix`; the bare model string is the alias itself for the anthropic
+        // short-names (`sonnet`/`opus`/`haiku`/`mock`), else the provider's default — bare `codex` →
+        // the ChatGPT-subscription main model, bare `aws` → the Bedrock default — resolved below.
+        None => match spec_provider_prefix(spec) {
+            Some(provider) => {
+                let model = if provider == "anthropic" { spec } else { "" };
+                (provider.to_string(), model.to_string())
             }
-        }
+            None => bail!(
+                "model spec `{spec}` has no provider prefix — use `provider/model`, e.g. \
+                 `anthropic/{spec}` or `claude/{spec}` (providers: {})",
+                KNOWN_PROVIDERS.join(", ")
+            ),
+        },
     };
 
     let native = match provider.as_str() {
@@ -1049,31 +1076,16 @@ fn run_sessions(prune: bool) -> Result<()> {
 /// `flux usage` — per-model tokens + cost for the current/last session, and an all-sessions total.
 /// Reads the unified event store's `cost_summary` projection (C-06); pricing is the builtin table
 /// overlaid by `~/.flux/pricing.toml` (same loader the live turn-end annotation uses).
-fn run_usage() -> Result<()> {
-    let store = open_event_store()?;
+fn run_usage(args: usage::UsageArgs) -> Result<()> {
     let pricing = flux_credentials::load_pricing_table();
-    run_usage_with(&store, &pricing)
+    usage::run_usage(args, &pricing)
 }
 
 /// The store-parameterized body of [`run_usage`] (tests pass an in-memory store so they don't touch
 /// `HOME`'s real `~/.flux/events.db`).
+#[cfg(test)]
 fn run_usage_with(store: &EventStore, pricing: &flux_core::PricingTable) -> Result<()> {
-    let Some(session_id) = store.latest_session()? else {
-        eprintln!("no sessions yet — start one with `flux` or `flux run`");
-        return Ok(());
-    };
-
-    println!("{} {session_id}", style::bold("session:"));
-    let session_rows = store.cost_summary(&session_id, pricing)?;
-    print_usage_rows(&session_rows);
-    print_efficiency_line(store.efficiency(&session_id)?.as_ref());
-
-    println!();
-    println!("{}", style::bold("all sessions:"));
-    let all_rows = store.cost_summary_all(pricing)?;
-    print_usage_rows(&all_rows);
-    print_efficiency_line(store.efficiency_all()?.as_ref());
-    Ok(())
+    usage::run_usage_with(store, pricing)
 }
 
 /// A-45: `flux replay <SESSION|last>` — hermetic offline re-execution of a recorded session.
@@ -1489,90 +1501,6 @@ fn run_diff_cmd(a_arg: &str, b_arg: &str, json: bool) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
-}
-
-/// One turn-efficiency line per `flux usage` section (C-15): turns, calls/turn, iterations/turn,
-/// plans/turn, cache-read share, uncached-input and output per turn — the Improve pillar's
-/// tokens-per-task trend at a glance. Logs written by the phased loop (A-14) add gather/revise
-/// rounds per turn (I-03); pre-A-14 logs omit that segment — there the figures are unrecorded,
-/// not zero. Prints nothing when the section has no completed turns.
-fn print_efficiency_line(eff: Option<&flux_events::EfficiencySummary>) {
-    let Some(e) = eff else {
-        return;
-    };
-    let phases = if e.has_phase_rounds() {
-        format!(
-            " · gather {:.1}/turn · revise {:.1}/turn",
-            e.avg_gather_rounds_per_turn(),
-            e.avg_revise_rounds_per_turn(),
-        )
-    } else {
-        String::new()
-    };
-    println!(
-        "  {} {} turn{} · {:.1} calls/turn · {:.1} iters/turn · {:.1} plans/turn{} · cache-read {:.0}% · uncached-in {}/turn · out {}/turn",
-        style::dim("efficiency:"),
-        e.turns,
-        if e.turns == 1 { "" } else { "s" },
-        e.avg_calls_per_turn(),
-        e.avg_iterations_per_turn(),
-        e.avg_plans_per_turn(),
-        phases,
-        e.cache_read_share() * 100.0,
-        style::fmt_tokens(e.uncached_input_per_turn() as u64),
-        style::fmt_tokens(e.output_per_turn() as u64),
-    );
-}
-
-/// Print one `cost_summary` table: model, call count, token tiers, and cost (when priced). Shared by
-/// the per-session and all-sessions sections of `flux usage`.
-fn print_usage_rows(rows: &[flux_events::ModelCost]) {
-    if rows.is_empty() {
-        eprintln!("  (no usage recorded)");
-        return;
-    }
-    let mut total_usd = 0.0_f64;
-    let mut any_priced = false;
-    for row in rows {
-        let cost = match row.cost {
-            Some(money) => {
-                any_priced = true;
-                total_usd += money.usd;
-                cost_annotation(&money)
-            }
-            None => String::new(),
-        };
-        // Reads and writes are different money (reads ≈ 0.1× input, writes ≈ 1.25×) — label them
-        // distinctly so a cache-thrash pattern (all writes, no reads) is visible at a glance.
-        println!(
-            "  {:<28} {:>3} call{}  ctx {} · out {}{}{}{}",
-            row.model,
-            row.calls,
-            if row.calls == 1 { " " } else { "s" },
-            style::fmt_tokens(row.usage.context_tokens()),
-            style::fmt_tokens(row.usage.output_tokens),
-            if row.usage.cache_read_input_tokens > 0 {
-                format!(
-                    " · cache read {}",
-                    style::fmt_tokens(row.usage.cache_read_input_tokens)
-                )
-            } else {
-                String::new()
-            },
-            if row.usage.cache_creation_input_tokens > 0 {
-                format!(
-                    " · cache write {}",
-                    style::fmt_tokens(row.usage.cache_creation_input_tokens)
-                )
-            } else {
-                String::new()
-            },
-            cost,
-        );
-    }
-    if any_priced && rows.len() > 1 {
-        println!("  {:<28} total ${:.4}", "", total_usd);
-    }
 }
 
 /// `flux corpus …` (D-53).
@@ -2013,6 +1941,15 @@ fn load_roles(cwd: &std::path::Path) -> RoleRegistry {
     reg
 }
 
+/// Read-only ops pre-allowed by default when no `[permissions].allow` is configured, so the common
+/// case needs no config. `read`/`glob`/`grep`/`search` are the workspace reads; `now`/`cwd`/`home_dir`/
+/// `sys_info` are zero-arg ambient reads (no IO, no permission subjects) that carry no approval-worthy
+/// effect — gating them only adds friction (e.g. a `now()` in a stored flow would otherwise prompt, and
+/// auto-deny on a non-TTY). A configured allow-list replaces this default entirely.
+const DEFAULT_ALLOW: &[&str] = &[
+    "read", "glob", "grep", "search", "now", "cwd", "home_dir", "sys_info",
+];
+
 /// Agentic mode: run a tool-enabled, policy-gated, session-persisted turn.
 /// Build a tool-enabled agent (provider + safety envelope + session) for agentic mode / the REPL.
 /// Eager provider construction: an agentic turn always calls the model, so a credential problem
@@ -2182,7 +2119,7 @@ async fn build_agent_with(
     // Guarded web access (policy-gated as network egress; private/loopback scoped to web_fetch).
     registry.register(Arc::new(
         flux_capabilities::browser::WebFetchTool::default().private_net(
-            flux_system::net::PrivateNetAllow::from_hosts(cfg.web_fetch_private_hosts()),
+            flux_system::net::PrivateNetAllow::from_hosts(effective_web_fetch_private_hosts(&cfg)),
         ),
     ));
 
@@ -2283,13 +2220,14 @@ async fn build_agent_with(
                 redactor: redactor.clone(),
             }) as Arc<dyn flux_plugin::SecretSink>;
             let make_caps = move |m: &flux_plugin::PluginManifest| {
-                let plugin_private_hosts = cfg_for_caps.plugin_private_hosts(&m.name);
+                let plugin_private_hosts = effective_plugin_private_hosts(&cfg_for_caps, &m.name);
                 // Inject the broker as the resolver (ref-based IO + the `credential` capability) and the
                 // redactor-backed secret sink BEFORE wrapping with the broker host-caps.
                 let inner = Arc::new(
                     flux_plugin::SystemHostCaps::new(caps_system)
                         .with_manifest(m)
                         .with_private_net_grants(plugin_private_hosts)
+                        .with_grant_source(private_net_grant_source_for(&m.name))
                         .with_egress_audit(audit)
                         .with_resolver(resolver_for_caps)
                         .with_secret_sink(secret_sink),
@@ -2339,10 +2277,10 @@ async fn build_agent_with(
     }
 
     // Read-only tools are pre-allowed by default so the common case needs no config; network/
-    // mutating tools still gate. A configured allow-list replaces this default entirely.
+    // mutating tools still gate. See [`DEFAULT_ALLOW`]. A configured allow-list replaces it entirely.
     let mut allow = cfg.permissions.allow.clone();
     if allow.is_empty() {
-        allow.extend(["read", "glob", "grep", "search"].map(String::from));
+        allow.extend(DEFAULT_ALLOW.iter().map(|s| s.to_string()));
     }
     let perms = PermissionManager::from_rules(&allow, &cfg.permissions.deny);
     let approver: Arc<dyn Approver> = if flags.yes {
@@ -5283,12 +5221,16 @@ impl Provider for MockCliProvider {
                 }]
             })
         } else {
+            // `write` takes its parameters as a single named object (positional args are rejected
+            // by plan validation for multi-param ops) — pass one `lit` object, not two positionals.
             serde_json::json!({
                 "body": [{
                     "kind": "call", "op": "write",
                     "args": [
-                        { "kind": "lit", "value": "flux-mock.txt" },
-                        { "kind": "lit", "value": "created by flux mock\n" }
+                        { "kind": "lit", "value": {
+                            "path": "flux-mock.txt",
+                            "content": "created by flux mock\n"
+                        } }
                     ]
                 }]
             })
@@ -5500,6 +5442,59 @@ fn apply_workspace_access_env(cli: &Cli) {
             style::red("warning:")
         );
     }
+
+    // Ephemeral private-network egress grant for this invocation (D-96). Exported so surfaces that do
+    // not receive the `Cli` (e.g. `flux plugin call`, `app run`) observe the same override.
+    if cli.allow_private_net {
+        std::env::set_var("FLUX_ALLOW_PRIVATE_NET", "1");
+        eprintln!(
+            "{} private-network egress allowed for this run (--allow-private-net): plugins may reach \
+             the private hosts their manifest declares, and web_fetch may reach any private/loopback \
+             address (incl. cloud metadata). Prefer a scoped [private_net.plugins] grant for recurring use.",
+            style::red("warning:")
+        );
+    }
+}
+
+/// Whether `--allow-private-net` is in effect for this process. It is propagated as
+/// `FLUX_ALLOW_PRIVATE_NET` by [`apply_workspace_access_env`], so surfaces that never receive the
+/// [`Cli`] (notably `flux plugin call`) observe it too.
+fn private_net_cli_override() -> bool {
+    std::env::var_os("FLUX_ALLOW_PRIVATE_NET").is_some()
+}
+
+/// The per-plugin private-net host grant, widened to `*` when `--allow-private-net` is active. This
+/// only widens the *operator grant* side; `SystemHostCaps::private_net_allow` still intersects it with
+/// the plugin's manifest-declared `private_hosts`, so a plugin declaring none stays refused — the
+/// deny-by-default envelope (D-20) is preserved, this is just an ephemeral grant equivalent to config.
+fn effective_plugin_private_hosts(cfg: &flux_config::Config, name: &str) -> Vec<String> {
+    if private_net_cli_override() {
+        vec!["*".to_string()]
+    } else {
+        cfg.plugin_private_hosts(name)
+    }
+}
+
+/// The `web_fetch` private-net host grant, widened to `*` when `--allow-private-net` is active. Unlike
+/// the plugin path there is no manifest safeguard, so this fully opens `web_fetch` to private ranges
+/// for the run.
+fn effective_web_fetch_private_hosts(cfg: &flux_config::Config) -> Vec<String> {
+    if private_net_cli_override() {
+        vec!["*".to_string()]
+    } else {
+        cfg.web_fetch_private_hosts()
+    }
+}
+
+/// The `grant_source` recorded in the `PrivateNetAdmit` audit for a plugin caller: the CLI-flag label
+/// when `--allow-private-net` is active, else the normal per-plugin config source (`config:plugin/<name>`,
+/// matching [`SystemHostCaps::with_manifest`]'s default).
+fn private_net_grant_source_for(name: &str) -> String {
+    if private_net_cli_override() {
+        "cli:--allow-private-net".to_string()
+    } else {
+        format!("config:plugin/{name}")
+    }
 }
 
 /// Restore the default `SIGPIPE` disposition (`SIG_DFL`) that Rust's std overrides to `SIG_IGN` at
@@ -5634,7 +5629,7 @@ async fn main() -> Result<()> {
             }
             Some(Commands::Loop { action }) => run_loop_cmd(action),
             Some(Commands::Sessions { prune }) => run_sessions(prune),
-            Some(Commands::Usage) => run_usage(),
+            Some(Commands::Usage(args)) => run_usage(args),
             Some(Commands::Replay {
                 session,
                 turn,
@@ -5738,6 +5733,7 @@ fn app_plugin_caps(
         flux_plugin::SystemHostCaps::new(system)
             .with_manifest(manifest)
             .with_private_net_grants(private_hosts)
+            .with_grant_source(private_net_grant_source_for(&manifest.name))
             .with_egress_audit(audit)
             .with_resolver(resolver)
             .with_secret_sink(secret_sink),
@@ -5977,7 +5973,7 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
                 redactor: redactor.clone(),
             }) as Arc<dyn flux_plugin::SecretSink>;
             let make_caps = move |m: &flux_plugin::PluginManifest| {
-                let plugin_private_hosts = cfg_for_caps.plugin_private_hosts(&m.name);
+                let plugin_private_hosts = effective_plugin_private_hosts(&cfg_for_caps, &m.name);
                 // Parity with the `build_agent` path (D-20 egress audit + D-27 secret sink) — the SAME
                 // function both `run_app`'s wiring and its own unit test call (flux D-65).
                 app_plugin_caps(
@@ -6495,7 +6491,8 @@ async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> R
             let caps = flux_capabilities::DatasourceHostCaps::new(
                 flux_plugin::SystemHostCaps::new(system)
                     .with_manifest(&manifest)
-                    .with_private_net_grants(cfg.plugin_private_hosts(&manifest.name)),
+                    .with_private_net_grants(effective_plugin_private_hosts(&cfg, &manifest.name))
+                    .with_grant_source(private_net_grant_source_for(&manifest.name)),
                 backend.clone(),
             );
             let result = host.call_with_host(&resolved_op, input, &caps).await;
@@ -6887,6 +6884,71 @@ fn print_plugin_status_report(r: &PluginStatusReport) {
                 );
             }
         }
+        // Resolution status per declared auth purpose / endpoint — which env key (if any) is
+        // set, or whether an endpoint falls back to its declared default, WITHOUT ever printing
+        // a resolved secret value. Endpoint base URLs are not secret (`flux endpoint
+        // show`/`resolve` already print them), so those are shown in full.
+        for a in &m.auth {
+            println!("    auth:      {}", describe_auth_resolution(&r.name, a));
+        }
+        for e in &m.endpoints {
+            println!("    endpoint:  {}", describe_endpoint_resolution(e));
+        }
+    }
+}
+
+/// Describe how a declared auth purpose would resolve right now — which env key (if any) is set,
+/// or whether a stored OAuth token exists — without ever printing the resolved secret value.
+fn describe_auth_resolution(plugin: &str, m: &flux_plugin::AuthMethod) -> String {
+    if m.oauth2.is_some() {
+        let key = format!("plugin:{plugin}:{}", m.purpose);
+        if flux_credentials::load_token(&key).is_some() {
+            return format!(
+                "✓ {} — stored OAuth token (`flux auth login {plugin}`)",
+                m.purpose
+            );
+        }
+    }
+    for key in &m.env {
+        if std::env::var(key).is_ok() {
+            return format!("✓ {} — env ${key}", m.purpose);
+        }
+    }
+    match (m.oauth2.is_some(), m.env.is_empty()) {
+        (true, true) => format!(
+            "· {} — not configured (`flux auth login {plugin}`)",
+            m.purpose
+        ),
+        (true, false) => format!(
+            "· {} — not configured (env: {}, or `flux auth login {plugin}`)",
+            m.purpose,
+            m.env.join(", ")
+        ),
+        (false, true) => format!("· {} — no env keys declared", m.purpose),
+        (false, false) => format!(
+            "· {} — not configured (env: {})",
+            m.purpose,
+            m.env.join(", ")
+        ),
+    }
+}
+
+/// Describe how a declared endpoint would resolve right now. Base URLs are not secret, so the
+/// resolved value itself is shown (the plugin-declared `default` fallback is likewise not secret).
+fn describe_endpoint_resolution(ep: &flux_plugin::EndpointSpec) -> String {
+    for key in &ep.env {
+        if let Ok(v) = std::env::var(key) {
+            return format!("✓ {} — {v} (env ${key})", ep.name);
+        }
+    }
+    match &ep.default {
+        Some(d) => format!("· {} — env not set, defaults to {d}", ep.name),
+        None if ep.env.is_empty() => format!("· {} — no env keys declared", ep.name),
+        None => format!(
+            "· {} — not configured (env: {})",
+            ep.name,
+            ep.env.join(", ")
+        ),
     }
 }
 
@@ -7353,13 +7415,108 @@ fn plugin_binaries_in(dir: &std::path::Path) -> Result<Vec<(String, String)>> {
 }
 
 /// `flux auth status | login <provider>`.
+/// Map a resolved `provider/model` spec to the `flux auth status` row it authenticates against, so
+/// the status view can flag the active default provider. Returns `None` for specs that need no
+/// listed credential (local `ollama*`, or `aws`, which isn't a listed row).
+fn auth_row_for_spec(spec: &str) -> Option<&'static str> {
+    // The offline `mock` provider needs no credential (bare `mock` resolves to `anthropic` in
+    // `spec_provider_prefix` for provider construction, but there is no key to flag here).
+    if spec == "mock" {
+        return None;
+    }
+    match spec_provider_prefix(spec)? {
+        "anthropic" => Some("anthropic"),
+        "claude" => Some("claude"),
+        "openai" => Some("openai"),
+        "codex" => Some("codex"),
+        "openrouter" | "openrouter-anthropic" => Some("openrouter"),
+        // `aws` (not a listed status row) and local `ollama*` (keyless) have no row to mark active.
+        _ => None,
+    }
+}
+
+/// Render `flux auth status` grouped by state (Available / Not configured), with a summary line and
+/// an active-default-provider marker. Pure (returns the block) so it is unit-testable.
+fn format_auth_status(
+    rows: &[flux_credentials::ProviderAuth],
+    default_spec: &str,
+    active: Option<&str>,
+) -> String {
+    let total = rows.len();
+    let avail = rows.iter().filter(|r| r.available).count();
+    let mut out = String::new();
+    out.push_str(&format!("Providers · {avail} of {total} configured\n"));
+
+    // Default-model line: name the resolved default provider and whether its credential is present.
+    match active {
+        Some(p) => {
+            let mark = match rows.iter().find(|r| r.provider == p).map(|r| r.available) {
+                Some(true) => " ✓",
+                Some(false) => " ·",
+                None => "",
+            };
+            out.push_str(&format!("default model: {default_spec} → {p}{mark}\n"));
+        }
+        None => out.push_str(&format!("default model: {default_spec}\n")),
+    }
+
+    let w = rows.iter().map(|r| r.provider.len()).max().unwrap_or(0);
+    let available: Vec<_> = rows.iter().filter(|r| r.available).collect();
+    let missing: Vec<_> = rows.iter().filter(|r| !r.available).collect();
+
+    if !available.is_empty() {
+        out.push_str("\n  Available\n");
+        let show_marker = available.iter().any(|r| active == Some(r.provider));
+        for r in &available {
+            if show_marker {
+                let act = if active == Some(r.provider) {
+                    "← active"
+                } else {
+                    ""
+                };
+                out.push_str(&format!(
+                    "    ✓ {:<w$}   {:<8}   {}\n",
+                    r.provider, act, r.source
+                ));
+            } else {
+                out.push_str(&format!("    ✓ {:<w$}   {}\n", r.provider, r.source));
+            }
+        }
+    }
+    if !missing.is_empty() {
+        out.push_str("\n  Not configured\n");
+        // Mark the active default here too if it's unconfigured — otherwise the `← active` tag would
+        // vanish exactly when the user most needs to see which missing provider is the default.
+        let show_marker = missing.iter().any(|r| active == Some(r.provider));
+        for r in &missing {
+            let hint = r.hint.as_deref().unwrap_or(r.source.as_str());
+            if show_marker {
+                let act = if active == Some(r.provider) {
+                    "← active"
+                } else {
+                    ""
+                };
+                out.push_str(&format!(
+                    "    · {:<w$}   {:<8}   {}\n",
+                    r.provider, act, hint
+                ));
+            } else {
+                out.push_str(&format!("    · {:<w$}   {}\n", r.provider, hint));
+            }
+        }
+    }
+    out
+}
+
 async fn run_auth(action: Option<AuthAction>) -> Result<()> {
     match action.unwrap_or(AuthAction::Status) {
         AuthAction::Status => {
-            for s in flux_credentials::auth_status() {
-                let mark = if s.available { "✓" } else { "·" };
-                println!("{mark} {:<11} {}", s.provider, s.source);
-            }
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let cfg = flux_config::load(&cwd).unwrap_or_default();
+            let default_spec = resolve_model_spec(&None, &cfg);
+            let active = auth_row_for_spec(&default_spec);
+            let rows = flux_credentials::auth_status();
+            print!("{}", format_auth_status(&rows, &default_spec, active));
             Ok(())
         }
         AuthAction::Login { provider, password } => match provider.as_str() {
@@ -7779,6 +7936,102 @@ mod tests {
         use flux_provider::Provider as _;
         let p = super::LazyProvider::new("anthropic/claude-sonnet-4-6".to_string());
         assert_eq!(p.name(), "anthropic");
+    }
+
+    /// F6: `flux plugin list` is accepted as an alias of the terse `ls` default.
+    #[test]
+    fn plugin_list_is_alias_for_ls() {
+        use super::{Cli, Commands};
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["flux", "plugin", "list"]).expect("`plugin list` parses");
+        assert!(
+            matches!(
+                cli.command,
+                Some(Commands::Plugin {
+                    action: Some(PluginAction::Ls)
+                })
+            ),
+            "`plugin list` should resolve to the Ls action"
+        );
+        // The terse form still resolves the same way.
+        let cli2 = Cli::try_parse_from(["flux", "plugin", "ls"]).expect("`plugin ls` parses");
+        assert!(matches!(
+            cli2.command,
+            Some(Commands::Plugin {
+                action: Some(PluginAction::Ls)
+            })
+        ));
+    }
+
+    /// F2: the zero-arg ambient reads (`now`/`cwd`/`home_dir`/`sys_info`) are pre-allowed by the
+    /// default permission set, so a `now()` in a stored flow never reaches the approval gate (which
+    /// auto-denies on a non-TTY). Workspace reads stay allowed; a mutating op still gates.
+    #[test]
+    fn default_allow_covers_ambient_reads() {
+        use flux_runtime::{PermDecision, PermissionManager};
+        let allow: Vec<String> = super::DEFAULT_ALLOW.iter().map(|s| s.to_string()).collect();
+        let m = PermissionManager::from_rules(&allow, &[]);
+        for op in ["now", "cwd", "home_dir", "sys_info", "read"] {
+            assert_eq!(
+                m.check(op, &[]),
+                PermDecision::Allow,
+                "`{op}` should be pre-allowed by the default permission set"
+            );
+        }
+        // A mutating op is not in the default set — it still gates.
+        assert_eq!(m.check("write", &[]), PermDecision::Ask);
+    }
+
+    /// The grouped `flux auth status` renderer: summary line, active-default marker, the two state
+    /// groups, and per-provider setup hints.
+    #[test]
+    fn auth_status_groups_by_state() {
+        use flux_credentials::ProviderAuth;
+        let rows = vec![
+            ProviderAuth {
+                provider: "anthropic",
+                available: true,
+                source: "ANTHROPIC_API_KEY (env)".into(),
+                hint: None,
+            },
+            ProviderAuth {
+                provider: "claude",
+                available: false,
+                source: "not found".into(),
+                hint: Some("flux auth login claude".into()),
+            },
+            ProviderAuth {
+                provider: "openai",
+                available: true,
+                source: "OPENAI_API_KEY (env)".into(),
+                hint: None,
+            },
+        ];
+        let out = super::format_auth_status(&rows, "sonnet", Some("anthropic"));
+        assert!(out.contains("Providers · 2 of 3 configured"), "{out}");
+        assert!(out.contains("default model: sonnet → anthropic ✓"), "{out}");
+        assert!(out.contains("Available"));
+        assert!(out.contains("Not configured"));
+        assert!(out.contains("flux auth login claude"), "{out}");
+        // The active marker lands on anthropic only.
+        let active_line = out
+            .lines()
+            .find(|l| l.contains("← active"))
+            .expect("an active row");
+        assert!(active_line.contains("anthropic"));
+        assert!(!out.contains("openai   ← active"));
+    }
+
+    /// The `provider/model` spec → auth-status-row mapping used to flag the active provider.
+    #[test]
+    fn auth_row_mapping() {
+        assert_eq!(super::auth_row_for_spec("sonnet"), Some("anthropic"));
+        assert_eq!(super::auth_row_for_spec("claude/sonnet"), Some("claude"));
+        assert_eq!(
+            super::auth_row_for_spec("openrouter-anthropic/x"),
+            Some("openrouter")
+        );
+        assert_eq!(super::auth_row_for_spec("ollama/llama"), None);
     }
 
     #[test]
@@ -10259,6 +10512,45 @@ mod tests {
             }
             other => panic!("expected PrivateNetAdmit, got {other:?}"),
         }
+    }
+
+    /// D-96: the ephemeral `--allow-private-net` override widens the *operator* grant to `*` for this
+    /// process and stamps a distinct `cli:--allow-private-net` audit grant-source, while its absence
+    /// preserves deny-by-default (an empty config yields no private grant). The manifest-declaration
+    /// intersection that still gates each plugin lives in `flux_plugin::SystemHostCaps` and is covered
+    /// there; this pins the CLI-surface wiring.
+    #[test]
+    fn allow_private_net_override_widens_grant_and_labels_audit() {
+        let cfg = flux_config::Config::default();
+
+        // Off (default): deny-by-default. Empty config → no private grant; audit source is the normal
+        // per-plugin config label (matching SystemHostCaps::with_manifest's default).
+        std::env::remove_var("FLUX_ALLOW_PRIVATE_NET");
+        assert!(!super::private_net_cli_override());
+        assert!(super::effective_plugin_private_hosts(&cfg, "gitlab").is_empty());
+        assert!(super::effective_web_fetch_private_hosts(&cfg).is_empty());
+        assert_eq!(
+            super::private_net_grant_source_for("gitlab"),
+            "config:plugin/gitlab"
+        );
+
+        // On: the operator grant widens to `*` and the audit source becomes the CLI-flag label.
+        std::env::set_var("FLUX_ALLOW_PRIVATE_NET", "1");
+        assert!(super::private_net_cli_override());
+        assert_eq!(
+            super::effective_plugin_private_hosts(&cfg, "gitlab"),
+            vec!["*".to_string()]
+        );
+        assert_eq!(
+            super::effective_web_fetch_private_hosts(&cfg),
+            vec!["*".to_string()]
+        );
+        assert_eq!(
+            super::private_net_grant_source_for("gitlab"),
+            "cli:--allow-private-net"
+        );
+
+        std::env::remove_var("FLUX_ALLOW_PRIVATE_NET");
     }
 
     /// Direct unit test of the `flux_capabilities::CrossPluginAudit` L6 binding

@@ -1004,7 +1004,12 @@ fn urlencode(s: &str) -> String {
 pub struct ProviderAuth {
     pub provider: &'static str,
     pub available: bool,
+    /// Where the credential resolved from when available — e.g. `ANTHROPIC_API_KEY (env)`,
+    /// `flux store`, `imported ~/.claude/.credentials.json`. A short status when not (`not set`).
     pub source: String,
+    /// How to configure this provider when it is NOT available — e.g. `flux auth login claude`,
+    /// `set ANTHROPIC_API_KEY`. `None` once the provider is available.
+    pub hint: Option<String>,
 }
 
 /// The environment variables whose values are provider credentials — the single source hosts use
@@ -1032,9 +1037,14 @@ pub fn auth_status() -> Vec<ProviderAuth> {
             provider,
             available: ok,
             source: if ok {
-                format!("${var}")
+                format!("{var} (env)")
             } else {
                 "not set".into()
+            },
+            hint: if ok {
+                None
+            } else {
+                Some(format!("set ${var}"))
             },
         }
     };
@@ -1044,6 +1054,7 @@ pub fn auth_status() -> Vec<ProviderAuth> {
                 provider,
                 available: true,
                 source: "flux store".into(),
+                hint: None,
             }
         } else if imported.is_some() {
             let file = if stored_key == "claude" {
@@ -1055,12 +1066,14 @@ pub fn auth_status() -> Vec<ProviderAuth> {
                 provider,
                 available: true,
                 source: format!("imported {file}"),
+                hint: None,
             }
         } else {
             ProviderAuth {
                 provider,
                 available: false,
                 source: "not found".into(),
+                hint: Some(format!("flux auth login {provider}")),
             }
         }
     };

@@ -178,6 +178,10 @@ flux flow run <file.flux>        # run one checked-in Flux-Lang flow directly (n
                                  #                        statement; `last` needs the flow to declare a name
                                  #                        (`flow <name> -> …`) to find its session unambiguously
 flux sessions                    # list recent sessions
+flux usage                       # aligned token/cost dashboard for flux + detected Codex,
+                                 #   Claude Code, and opencode stores; use --no-external for
+                                 #   flux-only, --harness flux,codex,claude,opencode to filter,
+                                 #   or --json for normalized machine-readable rows
 flux replay <session|last>       # TIME MACHINE (C-43/A-45): hermetically re-execute a recorded run —
                                  #   plans re-parse from the durable plan_source, op outputs are served
                                  #   from the recorded cassette: NO model call, NO live IO, side effects

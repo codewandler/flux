@@ -1768,6 +1768,7 @@ dependencies = [
  "libc",
  "reedline",
  "rpassword",
+ "rusqlite",
  "rustls",
  "serde",
  "serde_json",
