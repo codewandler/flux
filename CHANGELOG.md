@@ -6,6 +6,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-08
+
+**Minor bump** (pre-1.0 SemVer, where the minor position is the breaking-change signal): `AuthMethod`
+gained a public `oauth2` field — a breaking change for code that constructs it by listing every field
+exhaustively (see Changed); additive for manifests and for constructor / `..Default::default()` callers.
+
+**Host-side OAuth for plugins** (the `plugin-oauth` epic, D-80..D-83) — a plugin declares its OAuth2
+endpoints and stays a pure bearer consumer, while the host runs every token grant, refresh, and the
+token store.
+
 ### Added
 
 - **Plugin OAuth2 (the `plugin-oauth` epic, D-80..D-83).** A plugin can declare an OAuth2-backed auth

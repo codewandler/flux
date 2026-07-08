@@ -269,7 +269,7 @@ dependencies = [
 
 [[package]]
 name = "flux-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "flux-credentials"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -295,7 +295,7 @@ dependencies = [
 
 [[package]]
 name = "flux-datasource"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -303,7 +303,7 @@ dependencies = [
 
 [[package]]
 name = "flux-evidence"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -311,7 +311,7 @@ dependencies = [
 
 [[package]]
 name = "flux-plugin"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -340,14 +340,14 @@ dependencies = [
 
 [[package]]
 name = "flux-policy"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "flux-provider"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "flux-runtime"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "flux-core",
@@ -379,14 +379,14 @@ dependencies = [
 
 [[package]]
 name = "flux-secret"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "flux-spec"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "schemars",
  "serde",
@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "flux-system"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "flux-core",
  "tokio",
