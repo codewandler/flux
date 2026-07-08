@@ -85,7 +85,31 @@ Pure:
 | `merge` | `lists` | Concatenate an array of arrays |
 | `filter` | `items[, by, equals]` | Keep items where a field is truthy or equals a value |
 | `len` / `first` / `last` | `items` | Count, first item, last item |
+| `regex_match` | `s, pattern` | Returns `"true"` or `"false"` if `s` matches the regex pattern (ReDoS-free) |
+| `regex_extract` | `s, pattern[, group, all]` | Extract text matching pattern; returns first match or null, or all matches with `all: true` |
 | `cite` | `claims` | A markdown citation list, one line per claim |
+
+**Examples:**
+
+```flux
+// Check if a log line contains ERROR
+let has_error = regex_match { s: log_line, pattern: "ERROR" };
+when { cond: has_error } call { op: "alert", msg: "Error detected" };
+
+// Extract SemVer from a version string
+let version = regex_extract {
+  s: "flux-cli v1.2.3",
+  pattern: r"v(\d+\.\d+\.\d+)",
+  group: 1
+};  // returns "1.2.3"
+
+// Extract all email addresses from text
+let emails = regex_extract {
+  s: body_text,
+  pattern: r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
+  all: true
+};  // returns array of email strings
+```
 
 Model-backed:
 

@@ -612,6 +612,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "codewandler-flux-credentials"
+version = "0.9.3"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "codewandler-flux-core",
+ "codewandler-flux-provider",
+ "rand 0.8.6",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "toml",
+]
+
+[[package]]
+name = "codewandler-flux-datasource"
+version = "0.9.3"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "codewandler-flux-events"
 version = "0.9.3"
 dependencies = [
@@ -725,6 +750,37 @@ dependencies = [
  "tokio",
  "ulid",
  "url",
+]
+
+[[package]]
+name = "codewandler-flux-plugin"
+version = "0.9.3"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "codewandler-flux-core",
+ "codewandler-flux-credentials",
+ "codewandler-flux-datasource",
+ "codewandler-flux-evidence",
+ "codewandler-flux-runtime",
+ "codewandler-flux-secret",
+ "codewandler-flux-spec",
+ "codewandler-flux-system",
+ "hmac",
+ "lzma-rs",
+ "minisign",
+ "minisign-verify",
+ "rand 0.8.6",
+ "reqwest",
+ "rquickjs",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tokio",
+ "toml",
+ "url",
+ "zip",
 ]
 
 [[package]]
@@ -859,6 +915,7 @@ dependencies = [
  "async-trait",
  "codewandler-flux-core",
  "codewandler-flux-evidence",
+ "codewandler-flux-lang",
  "codewandler-flux-policy",
  "codewandler-flux-runtime",
  "codewandler-flux-spec",
@@ -1624,14 +1681,14 @@ version = "0.9.3"
 dependencies = [
  "async-trait",
  "codewandler-flux-core",
+ "codewandler-flux-datasource",
  "codewandler-flux-pg",
+ "codewandler-flux-plugin",
  "codewandler-flux-runtime",
  "codewandler-flux-secret",
  "codewandler-flux-spec",
  "codewandler-flux-system",
  "fastembed",
- "flux-datasource",
- "flux-plugin",
  "reqwest",
  "rusqlite",
  "serde",
@@ -1653,11 +1710,11 @@ dependencies = [
  "axum",
  "chrono",
  "codewandler-flux-core",
+ "codewandler-flux-credentials",
  "codewandler-flux-flow",
  "codewandler-flux-lang",
  "cron",
  "flux-app",
- "flux-credentials",
  "flux-server",
  "serde",
  "serde_json",
@@ -1678,12 +1735,15 @@ dependencies = [
  "codewandler-flux-agent",
  "codewandler-flux-cognition",
  "codewandler-flux-core",
+ "codewandler-flux-credentials",
+ "codewandler-flux-datasource",
  "codewandler-flux-events",
  "codewandler-flux-evidence",
  "codewandler-flux-flow",
  "codewandler-flux-lang",
  "codewandler-flux-markdown",
  "codewandler-flux-orchestrate",
+ "codewandler-flux-plugin",
  "codewandler-flux-policy",
  "codewandler-flux-provider",
  "codewandler-flux-providers",
@@ -1701,10 +1761,7 @@ dependencies = [
  "flux-capabilities",
  "flux-channels",
  "flux-config",
- "flux-credentials",
- "flux-datasource",
  "flux-eval",
- "flux-plugin",
  "flux-server",
  "flux-tui",
  "futures",
@@ -1738,31 +1795,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flux-credentials"
-version = "0.9.3"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "codewandler-flux-core",
- "codewandler-flux-provider",
- "rand 0.8.6",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "toml",
-]
-
-[[package]]
-name = "flux-datasource"
-version = "0.9.3"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "flux-eval"
 version = "0.9.3"
 dependencies = [
@@ -1789,37 +1821,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flux-plugin"
-version = "0.9.3"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "codewandler-flux-core",
- "codewandler-flux-evidence",
- "codewandler-flux-runtime",
- "codewandler-flux-secret",
- "codewandler-flux-spec",
- "codewandler-flux-system",
- "flux-credentials",
- "flux-datasource",
- "hmac",
- "lzma-rs",
- "minisign",
- "minisign-verify",
- "rand 0.8.6",
- "reqwest",
- "rquickjs",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "tokio",
- "toml",
- "url",
- "zip",
-]
-
-[[package]]
 name = "flux-server"
 version = "0.9.3"
 dependencies = [
@@ -1828,6 +1829,7 @@ dependencies = [
  "async-trait",
  "axum",
  "codewandler-flux-core",
+ "codewandler-flux-credentials",
  "codewandler-flux-events",
  "codewandler-flux-flow",
  "codewandler-flux-policy",
@@ -1838,7 +1840,6 @@ dependencies = [
  "flux-a2a",
  "flux-auth",
  "flux-config",
- "flux-credentials",
  "futures",
  "reqwest",
  "serde",
@@ -1856,13 +1857,13 @@ dependencies = [
  "anyhow",
  "async-trait",
  "codewandler-flux-core",
+ "codewandler-flux-credentials",
  "codewandler-flux-evidence",
  "codewandler-flux-flow",
  "codewandler-flux-markdown",
  "codewandler-flux-runtime",
  "codewandler-flux-spec",
  "crossterm 0.28.1",
- "flux-credentials",
  "ratatui",
  "serde_json",
  "tokio",

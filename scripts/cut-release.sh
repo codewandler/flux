@@ -43,10 +43,16 @@ echo "$NEW" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "bad target version:
 echo "== cutting $OLD -> $NEW =="
 
 # 1) bump every flux version string in the root manifest (workspace.package.version + the publish
-#    closure's dependency versions all read "$OLD").
+#    closure's dependency versions all read "$OLD") and the plugins workspace (flux-* dep versions
+#    that host-kit resolves from crates.io on publish).
 before=$(grep -c "\"$OLD\"" Cargo.toml || true)
 sed -i "s/\"$OLD\"/\"$NEW\"/g" Cargo.toml
 echo "   bumped $before version string(s) in Cargo.toml"
+plugins_before=$(grep -c "\"$OLD\"" plugins/Cargo.toml || true)
+if [ "$plugins_before" -gt 0 ]; then
+  sed -i "s/\"$OLD\"/\"$NEW\"/g" plugins/Cargo.toml
+  echo "   bumped $plugins_before version string(s) in plugins/Cargo.toml"
+fi
 
 # 2) re-lock both workspaces (root + the nested plugins pack) so the lockfiles carry $NEW.
 cargo update --workspace >/dev/null 2>&1
@@ -77,7 +83,7 @@ else
 fi
 
 # 5) commit ONLY the release files, then tag. Never `git add -A` (protects concurrent work).
-git add Cargo.toml Cargo.lock plugins/Cargo.lock CHANGELOG.md
+git add Cargo.toml plugins/Cargo.toml Cargo.lock plugins/Cargo.lock CHANGELOG.md
 git commit -m "chore(release): cut $NEW" -m "- Bump workspace + publish-closure versions $OLD -> $NEW and re-lock both workspaces.
 - Roll CHANGELOG [Unreleased] -> [$NEW]."
 git tag "v$NEW"

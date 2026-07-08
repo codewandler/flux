@@ -21,7 +21,7 @@ dependencies = [
 name = "alertmanager"
 version = "0.1.0"
 dependencies = [
- "host-kit",
+ "codewandler-host-kit",
  "schemars",
  "serde",
  "serde_json",
@@ -31,7 +31,7 @@ dependencies = [
 name = "asterisk"
 version = "0.1.0"
 dependencies = [
- "host-kit",
+ "codewandler-host-kit",
  "schemars",
  "serde",
  "serde_json",
@@ -58,7 +58,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 name = "aws"
 version = "0.1.0"
 dependencies = [
- "host-kit",
+ "codewandler-host-kit",
  "schemars",
  "serde",
  "serde_json",
@@ -135,11 +135,66 @@ dependencies = [
 ]
 
 [[package]]
+name = "codewandler-flux-credentials"
+version = "0.9.3"
+dependencies = [
+ "async-trait",
+ "base64",
+ "codewandler-flux-core",
+ "codewandler-flux-provider",
+ "rand 0.8.6",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "toml",
+]
+
+[[package]]
+name = "codewandler-flux-datasource"
+version = "0.9.3"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "codewandler-flux-evidence"
 version = "0.9.3"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "codewandler-flux-plugin"
+version = "0.9.3"
+dependencies = [
+ "async-trait",
+ "base64",
+ "codewandler-flux-core",
+ "codewandler-flux-credentials",
+ "codewandler-flux-datasource",
+ "codewandler-flux-evidence",
+ "codewandler-flux-runtime",
+ "codewandler-flux-secret",
+ "codewandler-flux-spec",
+ "codewandler-flux-system",
+ "hmac",
+ "lzma-rs",
+ "minisign-verify",
+ "rand 0.8.6",
+ "reqwest",
+ "rquickjs",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tokio",
+ "toml",
+ "url",
+ "zip",
 ]
 
 [[package]]
@@ -207,11 +262,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "codewandler-host-kit"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "codewandler-flux-datasource",
+ "codewandler-flux-plugin",
+ "codewandler-flux-spec",
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "confluence"
 version = "0.1.0"
 dependencies = [
  "base64",
- "host-kit",
+ "codewandler-host-kit",
  "pulldown-cmark",
  "quick-xml",
  "schemars",
@@ -294,7 +362,7 @@ dependencies = [
 name = "docker"
 version = "0.1.0"
 dependencies = [
- "host-kit",
+ "codewandler-host-kit",
  "schemars",
  "serde",
  "serde_json",
@@ -349,65 +417,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "flux-credentials"
-version = "0.9.3"
-dependencies = [
- "async-trait",
- "base64",
- "codewandler-flux-core",
- "codewandler-flux-provider",
- "rand 0.8.6",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "toml",
-]
-
-[[package]]
-name = "flux-datasource"
-version = "0.9.3"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "flux-plugin"
-version = "0.9.3"
-dependencies = [
- "async-trait",
- "base64",
- "codewandler-flux-core",
- "codewandler-flux-evidence",
- "codewandler-flux-runtime",
- "codewandler-flux-secret",
- "codewandler-flux-spec",
- "codewandler-flux-system",
- "flux-credentials",
- "flux-datasource",
- "hmac",
- "lzma-rs",
- "minisign-verify",
- "rand 0.8.6",
- "reqwest",
- "rquickjs",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "tokio",
- "toml",
- "url",
- "zip",
-]
-
-[[package]]
 name = "flux-plugin-onepassword"
 version = "0.1.0"
 dependencies = [
- "host-kit",
+ "codewandler-host-kit",
  "schemars",
  "serde",
  "serde_json",
@@ -417,7 +430,7 @@ dependencies = [
 name = "flux-plugin-vault"
 version = "0.1.0"
 dependencies = [
- "host-kit",
+ "codewandler-host-kit",
  "schemars",
  "serde",
  "serde_json",
@@ -561,7 +574,7 @@ dependencies = [
 name = "gitlab"
 version = "0.1.0"
 dependencies = [
- "host-kit",
+ "codewandler-host-kit",
  "regex",
  "schemars",
  "serde",
@@ -572,8 +585,8 @@ dependencies = [
 name = "grafana"
 version = "0.1.0"
 dependencies = [
+ "codewandler-host-kit",
  "hex",
- "host-kit",
  "schemars",
  "serde",
  "serde_json",
@@ -605,20 +618,7 @@ dependencies = [
 name = "homer"
 version = "0.1.0"
 dependencies = [
- "host-kit",
- "schemars",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "host-kit"
-version = "0.1.0"
-dependencies = [
- "base64",
- "codewandler-flux-spec",
- "flux-datasource",
- "flux-plugin",
+ "codewandler-host-kit",
  "schemars",
  "serde",
  "serde_json",
@@ -667,7 +667,7 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 name = "huggingface"
 version = "0.1.0"
 dependencies = [
- "host-kit",
+ "codewandler-host-kit",
  "schemars",
  "serde",
  "serde_json",
@@ -862,7 +862,7 @@ name = "jira"
 version = "0.1.0"
 dependencies = [
  "base64",
- "host-kit",
+ "codewandler-host-kit",
  "schemars",
  "serde",
  "serde_json",
@@ -883,7 +883,7 @@ dependencies = [
 name = "kubernetes"
 version = "0.1.0"
 dependencies = [
- "host-kit",
+ "codewandler-host-kit",
  "schemars",
  "serde",
  "serde_json",
@@ -926,7 +926,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 name = "loki"
 version = "0.1.0"
 dependencies = [
- "host-kit",
+ "codewandler-host-kit",
  "schemars",
  "serde",
  "serde_json",
@@ -999,7 +999,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 name = "opsgenie"
 version = "0.1.0"
 dependencies = [
- "host-kit",
+ "codewandler-host-kit",
  "schemars",
  "serde",
  "serde_json",
@@ -1086,7 +1086,7 @@ dependencies = [
 name = "prometheus"
 version = "0.1.0"
 dependencies = [
- "host-kit",
+ "codewandler-host-kit",
  "schemars",
  "serde",
  "serde_json",
@@ -1587,7 +1587,7 @@ name = "slack"
 version = "0.1.0"
 dependencies = [
  "base64",
- "host-kit",
+ "codewandler-host-kit",
  "schemars",
  "serde",
  "serde_json",
@@ -1613,7 +1613,7 @@ dependencies = [
 name = "sql"
 version = "0.1.0"
 dependencies = [
- "host-kit",
+ "codewandler-host-kit",
  "schemars",
  "serde",
  "serde_json",
@@ -2101,7 +2101,7 @@ dependencies = [
 name = "websearch"
 version = "0.1.0"
 dependencies = [
- "host-kit",
+ "codewandler-host-kit",
  "schemars",
  "serde",
  "serde_json",

@@ -33,17 +33,36 @@ pub fn register_cognition(registry: &mut ToolRegistry) {
     registry.register(Arc::new(NeedTool));
     registry.register(Arc::new(GapsTool));
     registry.register(Arc::new(CompareTool));
-    registry.register(Arc::new(DedupeTool));
-    registry.register(Arc::new(SortTool));
     registry.register(Arc::new(TopTool));
     registry.register(Arc::new(MergeTool));
     registry.register(Arc::new(CiteTool));
     registry.register(Arc::new(LenTool));
     registry.register(Arc::new(FirstTool));
     registry.register(Arc::new(LastTool));
-    registry.register(Arc::new(FilterTool));
+    registry.register(Arc::new(FilterToolExtended));
+    registry.register(Arc::new(MapTool));
+    registry.register(Arc::new(FlattenTool));
+    registry.register(Arc::new(SkipTool));
+    registry.register(Arc::new(JoinTool));
+    registry.register(Arc::new(SplitTool));
+    registry.register(Arc::new(DedupeToolExtended));
+    registry.register(Arc::new(SortToolExtended));
     registry.register(Arc::new(ReviewNormalizeTool));
     registry.register(Arc::new(ReviewAggregateTool));
+    registry.register(Arc::new(RegexMatchTool));
+    registry.register(Arc::new(RegexExtractTool));
+    registry.register(Arc::new(PickTool));
+    registry.register(Arc::new(OmitTool));
+    registry.register(Arc::new(MergeObjTool));
+    registry.register(Arc::new(CoalesceTool));
+    registry.register(Arc::new(KeysTool));
+    registry.register(Arc::new(ValuesTool));
+    registry.register(Arc::new(SumTool));
+    registry.register(Arc::new(CountByTool));
+    registry.register(Arc::new(GroupByTool));
+    registry.register(Arc::new(AnyTool));
+    registry.register(Arc::new(AllTool));
+    registry.register(Arc::new(HasTool));
 }
 
 // ---------------------------------------------------------------------------
@@ -1204,6 +1223,1226 @@ impl Tool for CiteTool {
 }
 
 // ---------------------------------------------------------------------------
+// regex_match
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RegexMatchInput {
+    /// The string to search in
+    s: String,
+    /// The regex pattern to match against
+    pattern: String,
+}
+
+pub struct RegexMatchTool;
+
+#[async_trait]
+impl Tool for RegexMatchTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "regex_match",
+            "Test if a string matches a regex pattern, returning \"true\" or \"false\" (strings, \
+             matching the boolean-emitter convention). Uses Rust's `regex` crate (Thompson NFA, \
+             linear-time, ReDoS-free). Pattern length > 512 chars or invalid patterns yield clear \
+             errors.",
+            flux_spec::tool_input_schema::<RegexMatchInput>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let s = str_param(&params, "s", "regex_match")?.to_string();
+        let pattern = str_param(&params, "pattern", "regex_match")?;
+
+        // Check pattern length before compiling
+        if pattern.len() > 512 {
+            return Err(Error::Other(
+                "regex_match: pattern exceeds 512 chars".into(),
+            ));
+        }
+
+        // Compile with size limit to prevent pathological patterns
+        let regex = regex::RegexBuilder::new(pattern)
+            .size_limit(1_048_576)
+            .build()
+            .map_err(|e| Error::Other(format!("regex_match: invalid pattern: {e}")))?;
+
+        let matched = regex.is_match(&s);
+        Ok(ToolResult::ok(if matched { "true" } else { "false" }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// regex_extract
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RegexExtractInput {
+    /// The string to search in
+    s: String,
+    /// The regex pattern to match against
+    pattern: String,
+    /// Capture group index to extract (default 0 = whole match)
+    #[serde(default)]
+    group: Option<usize>,
+    /// Extract all matches instead of just the first (default false)
+    #[serde(default)]
+    all: Option<bool>,
+}
+
+pub struct RegexExtractTool;
+
+#[async_trait]
+impl Tool for RegexExtractTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "regex_extract",
+            "Extract text from a string using a regex pattern. Returns the first match as a string, \
+             or `null` if no match. With `group` (default 0 = whole match), extracts that capture \
+             group. With `all: true`, returns a JSON array of all matches. Missing capture group \
+             index yields a clear error.",
+            flux_spec::tool_input_schema::<RegexExtractInput>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let s = str_param(&params, "s", "regex_extract")?.to_string();
+        let pattern = str_param(&params, "pattern", "regex_extract")?;
+        let group = params
+            .get("group")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(0);
+        let all = params.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        // Check pattern length before compiling
+        if pattern.len() > 512 {
+            return Err(Error::Other(
+                "regex_extract: pattern exceeds 512 chars".into(),
+            ));
+        }
+
+        // Compile with size limit
+        let regex = regex::RegexBuilder::new(pattern)
+            .size_limit(1_048_576)
+            .build()
+            .map_err(|e| Error::Other(format!("regex_extract: invalid pattern: {e}")))?;
+
+        if all {
+            // Extract all matches of the requested group
+            let mut matches = Vec::new();
+            for caps in regex.captures_iter(&s) {
+                if group > 0 {
+                    match caps.get(group) {
+                        Some(m) => matches.push(m.as_str().to_string()),
+                        None => {
+                            return Err(Error::Other(format!(
+                                "regex_extract: no capture group {group} in pattern"
+                            )))
+                        }
+                    }
+                } else {
+                    // group 0 is the whole match, always available if captures matched
+                    if let Some(m) = caps.get(0) {
+                        matches.push(m.as_str().to_string());
+                    }
+                }
+            }
+            Ok(ToolResult::ok(serde_json::to_string(&matches)?))
+        } else {
+            // Extract first match of the requested group
+            match regex.captures(&s) {
+                None => Ok(ToolResult::ok("null".to_string())),
+                Some(caps) => {
+                    if group > 0 {
+                        match caps.get(group) {
+                            Some(m) => Ok(ToolResult::ok(serde_json::to_string(m.as_str())?)),
+                            None => Err(Error::Other(format!(
+                                "regex_extract: no capture group {group} in pattern"
+                            ))),
+                        }
+                    } else {
+                        // group 0 always available
+                        match caps.get(0) {
+                            Some(m) => Ok(ToolResult::ok(serde_json::to_string(m.as_str())?)),
+                            None => Ok(ToolResult::ok("null".to_string())),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// pick / omit / merge_obj / coalesce / keys / values (L-49)
+// ---------------------------------------------------------------------------
+
+/// Helper: apply pick/omit to a single object.
+fn pick_omit_single(obj: &Value, keys: &[String], keep: bool) -> Result<Value> {
+    let map = obj
+        .as_object()
+        .ok_or_else(|| Error::Other("item is not an object".into()))?;
+    let mut out = serde_json::Map::new();
+    for (k, v) in map {
+        let should_keep = keys.iter().any(|key| key == k);
+        if (keep && should_keep) || (!keep && !should_keep) {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PickInput {
+    /// One object or an array of objects
+    items: Value,
+    /// Field names to keep
+    keys: Vec<String>,
+}
+
+pub struct PickTool;
+
+#[async_trait]
+impl Tool for PickTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "pick",
+            "Keep only the listed keys from an object (or per element of an array of objects). \
+             Missing keys simply don't appear. Returns an object if `items` is an object, or an \
+             array if `items` is an array.",
+            flux_spec::tool_input_schema::<PickInput>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let items = params
+            .get("items")
+            .ok_or_else(|| Error::Other("pick: required param `items` missing".into()))?;
+        let keys = arr_param(&params, "keys", "pick")?
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect::<Vec<_>>();
+
+        let result = match items {
+            Value::Object(_) => pick_omit_single(items, &keys, true)?,
+            Value::Array(arr) => {
+                let picked: Result<Vec<Value>> = arr
+                    .iter()
+                    .map(|obj| pick_omit_single(obj, &keys, true))
+                    .collect();
+                Value::Array(picked?)
+            }
+            _ => {
+                return Err(Error::Other(
+                    "pick: param `items` must be an object or an array of objects".into(),
+                ))
+            }
+        };
+        Ok(ToolResult::ok(serde_json::to_string(&result)?))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct OmitInput {
+    /// One object or an array of objects
+    items: Value,
+    /// Field names to remove
+    keys: Vec<String>,
+}
+
+pub struct OmitTool;
+
+#[async_trait]
+impl Tool for OmitTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "omit",
+            "Remove the listed keys from an object (or per element of an array of objects), \
+             keeping everything else. Returns an object if `items` is an object, or an array if \
+             `items` is an array.",
+            flux_spec::tool_input_schema::<OmitInput>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let items = params
+            .get("items")
+            .ok_or_else(|| Error::Other("omit: required param `items` missing".into()))?;
+        let keys = arr_param(&params, "keys", "omit")?
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect::<Vec<_>>();
+
+        let result = match items {
+            Value::Object(_) => pick_omit_single(items, &keys, false)?,
+            Value::Array(arr) => {
+                let omitted: Result<Vec<Value>> = arr
+                    .iter()
+                    .map(|obj| pick_omit_single(obj, &keys, false))
+                    .collect();
+                Value::Array(omitted?)
+            }
+            _ => {
+                return Err(Error::Other(
+                    "omit: param `items` must be an object or an array of objects".into(),
+                ))
+            }
+        };
+        Ok(ToolResult::ok(serde_json::to_string(&result)?))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct MergeObjInput {
+    /// Array of objects to shallow-merge (later keys win)
+    objects: Vec<Value>,
+}
+
+pub struct MergeObjTool;
+
+#[async_trait]
+impl Tool for MergeObjTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "merge_obj",
+            "Shallow-merge an array of objects left-to-right (later keys win). Returns one merged \
+             object. Distinct from the list-concat `merge` tool.",
+            flux_spec::tool_input_schema::<MergeObjInput>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let objects = arr_param(&params, "objects", "merge_obj")?;
+        let mut merged = serde_json::Map::new();
+        for (i, obj) in objects.into_iter().enumerate() {
+            match obj.as_object() {
+                Some(map) => {
+                    for (k, v) in map {
+                        merged.insert(k.clone(), v.clone());
+                    }
+                }
+                None => {
+                    return Err(Error::Other(format!(
+                        "merge_obj: element {i} is not an object"
+                    )))
+                }
+            }
+        }
+        Ok(ToolResult::ok(serde_json::to_string(&Value::Object(
+            merged,
+        ))?))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CoalesceInput {
+    /// Array of candidate values
+    values: Vec<Value>,
+    /// Optional default if nothing qualifies
+    #[serde(default)]
+    default: Option<Value>,
+}
+
+pub struct CoalesceTool;
+
+fn is_empty_for_coalesce(v: &Value) -> bool {
+    match v {
+        Value::Null => true,
+        Value::String(s) => s.is_empty(),
+        _ => false,
+    }
+}
+
+#[async_trait]
+impl Tool for CoalesceTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "coalesce",
+            "Return the first value that is not `null` and not `\"\"` (empty string). Zero and \
+             false ARE kept. If nothing qualifies, return `default` if provided, else `null`.",
+            flux_spec::tool_input_schema::<CoalesceInput>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let values = arr_param(&params, "values", "coalesce")?;
+        let default = params.get("default").cloned().unwrap_or(Value::Null);
+
+        let chosen = values
+            .into_iter()
+            .find(|v| !is_empty_for_coalesce(v))
+            .unwrap_or(default);
+        Ok(ToolResult::ok(serde_json::to_string(&chosen)?))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct KeysInput {
+    /// An object
+    item: Value,
+}
+
+pub struct KeysTool;
+
+#[async_trait]
+impl Tool for KeysTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "keys",
+            "Return the keys of an object as a JSON array of strings, in deterministic order.",
+            flux_spec::tool_input_schema::<KeysInput>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let item = params
+            .get("item")
+            .ok_or_else(|| Error::Other("keys: required param `item` missing".into()))?;
+        match item.as_object() {
+            Some(map) => {
+                let keys: Vec<String> = map.keys().cloned().collect();
+                Ok(ToolResult::ok(serde_json::to_string(&keys)?))
+            }
+            None => Err(Error::Other("keys: param `item` must be an object".into())),
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ValuesInput {
+    /// An object
+    item: Value,
+}
+
+pub struct ValuesTool;
+
+#[async_trait]
+impl Tool for ValuesTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "values",
+            "Return the values of an object as a JSON array, in the same order as `keys`.",
+            flux_spec::tool_input_schema::<ValuesInput>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let item = params
+            .get("item")
+            .ok_or_else(|| Error::Other("values: required param `item` missing".into()))?;
+        match item.as_object() {
+            Some(map) => {
+                let values: Vec<Value> = map.values().cloned().collect();
+                Ok(ToolResult::ok(serde_json::to_string(&values)?))
+            }
+            None => Err(Error::Other(
+                "values: param `item` must be an object".into(),
+            )),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// L-47 transform ops: map, filter.where, flatten, skip, join, split
+// ---------------------------------------------------------------------------
+
+fn descend_path(v: &Value, path: &str) -> Value {
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut current = v.clone();
+    for part in parts {
+        match &current {
+            Value::Object(map) => {
+                if let Some(next) = map.get(part) {
+                    current = next.clone();
+                } else {
+                    return Value::Null;
+                }
+            }
+            Value::String(s) => {
+                if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(s) {
+                    if let Some(next) = map.get(part) {
+                        current = next.clone();
+                        continue;
+                    }
+                }
+                return Value::Null;
+            }
+            _ => return Value::Null,
+        }
+    }
+    current
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct MapInput {
+    items: Vec<Value>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    expr: Option<String>,
+    #[serde(default)]
+    vars: Option<serde_json::Map<String, Value>>,
+}
+
+pub struct MapTool;
+
+#[async_trait]
+impl Tool for MapTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "map",
+            "Project each element: `path` plucks a dotted field (missing → `null`); `expr` evaluates \
+             a formula with `it` bound to the element. Exactly one of `path` or `expr` required.",
+            flux_spec::tool_input_schema::<MapInput>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let items = arr_or_empty(&params, "items", "map")?;
+        let path = params.get("path").and_then(|v| v.as_str());
+        let expr = params.get("expr").and_then(|v| v.as_str());
+
+        match (path, expr) {
+            (None, None) => {
+                return Err(Error::Other(
+                    "map: exactly one of `path` or `expr` required".into(),
+                ))
+            }
+            (Some(_), Some(_)) => {
+                return Err(Error::Other(
+                    "map: `path` and `expr` are mutually exclusive".into(),
+                ))
+            }
+            _ => {}
+        }
+
+        let result: Result<Vec<Value>> = if let Some(path_str) = path {
+            Ok(items
+                .iter()
+                .map(|elem| descend_path(elem, path_str))
+                .collect())
+        } else if let Some(expr_str) = expr {
+            let user_vars = params
+                .get("vars")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+
+            items
+                .iter()
+                .map(|elem| {
+                    let mut vars = std::collections::BTreeMap::new();
+                    vars.insert("it".to_string(), flux_lang::expr::ExprVal::from_json(elem));
+                    for (k, v) in &user_vars {
+                        vars.insert(k.clone(), flux_lang::expr::ExprVal::from_json(v));
+                    }
+                    let result = flux_lang::expr::eval_expr_value(expr_str, &vars)
+                        .map_err(|e| Error::Other(format!("map: expr evaluation failed: {e}")))?;
+                    let text = result.as_text();
+                    Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
+                })
+                .collect()
+        } else {
+            unreachable!()
+        };
+
+        Ok(ToolResult::ok(serde_json::to_string(&result?)?))
+    }
+}
+
+pub struct FilterToolExtended;
+
+#[async_trait]
+impl Tool for FilterToolExtended {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "filter",
+            "Keep array items that satisfy a predicate. With `where` (formula with `it` bound), keeps \
+             elements where the formula is truthy. With `by` (dotted path), inspects that field; with \
+             `equals`, matches value. `where` and `by`/`equals` are mutually exclusive.",
+            flux_spec::tool_input_schema::<FilterInputExtended>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let items = arr_or_empty(&params, "items", "filter")?;
+        let by = params.get("by").and_then(|v| v.as_str());
+        let equals = params.get("equals");
+        let where_formula = params.get("where").and_then(|v| v.as_str());
+
+        if where_formula.is_some() && (by.is_some() || equals.is_some()) {
+            return Err(Error::Other(
+                "filter: `where` and `by`/`equals` are mutually exclusive".into(),
+            ));
+        }
+
+        let out: Result<Vec<Value>> = if let Some(formula) = where_formula {
+            if formula.starts_with('.') {
+                return Err(Error::Other(
+                    "filter: element fields are `it.<field>`, not `.<field>`".into(),
+                ));
+            }
+            if formula.contains('$') {
+                return Err(Error::Other(
+                    "filter: symbols go in `vars`, elements are `it.<field>`".into(),
+                ));
+            }
+
+            let user_vars = params
+                .get("vars")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+
+            items
+                .into_iter()
+                .filter_map(|elem| {
+                    let mut vars = std::collections::BTreeMap::new();
+                    vars.insert("it".to_string(), flux_lang::expr::ExprVal::from_json(&elem));
+                    for (k, v) in &user_vars {
+                        vars.insert(k.clone(), flux_lang::expr::ExprVal::from_json(v));
+                    }
+                    match flux_lang::expr::eval_expr_value(formula, &vars) {
+                        Ok(result) if result.truthy() => Some(Ok(elem)),
+                        Ok(_) => None,
+                        Err(e) => Some(Err(Error::Other(format!(
+                            "filter: where evaluation failed: {e}"
+                        )))),
+                    }
+                })
+                .collect()
+        } else {
+            Ok(items
+                .into_iter()
+                .filter(|it| {
+                    let probe = match by {
+                        Some(path) => descend_path(it, path),
+                        None => it.clone(),
+                    };
+                    match equals {
+                        Some(eq) => &probe == eq,
+                        None => flux_lang::expr::ExprVal::from_json(&probe).truthy(),
+                    }
+                })
+                .collect())
+        };
+
+        Ok(ToolResult::ok(serde_json::to_string(&out?)?))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct FilterInputExtended {
+    items: Vec<Value>,
+    #[serde(default)]
+    by: Option<String>,
+    #[serde(default)]
+    equals: Option<Value>,
+    #[serde(default, rename = "where")]
+    where_formula: Option<String>,
+    #[serde(default)]
+    vars: Option<serde_json::Map<String, Value>>,
+}
+
+pub struct DedupeToolExtended;
+
+#[async_trait]
+impl Tool for DedupeToolExtended {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "dedupe",
+            "Remove duplicates from an array, preserving first-seen order. Pass `by` (dotted path) \
+             to de-duplicate on that field.",
+            flux_spec::tool_input_schema::<DedupeInputExtended>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let items = arr_or_empty(&params, "items", "dedupe")?;
+        let by = params.get("by").and_then(|v| v.as_str());
+
+        let mut out: Vec<Value> = Vec::new();
+        let mut keys: Vec<Value> = Vec::new();
+        for it in items {
+            let key = match by {
+                Some(path) => descend_path(&it, path),
+                None => it.clone(),
+            };
+            if !keys.contains(&key) {
+                keys.push(key);
+                out.push(it);
+            }
+        }
+        Ok(ToolResult::ok(serde_json::to_string(&out)?))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DedupeInputExtended {
+    items: Vec<Value>,
+    #[serde(default)]
+    by: Option<String>,
+}
+
+pub struct SortToolExtended;
+
+#[async_trait]
+impl Tool for SortToolExtended {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "sort",
+            "Stably sort an array. Pass `by` (dotted path) to sort on a field, and `order` \
+             (\"asc\" | \"desc\", default \"asc\").",
+            flux_spec::tool_input_schema::<SortInputExtended>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let mut items = arr_or_empty(&params, "items", "sort")?;
+        let by = params.get("by").and_then(|v| v.as_str());
+        let desc = match params.get("order") {
+            None | Some(Value::Null) => false,
+            Some(Value::String(s)) if s == "asc" => false,
+            Some(Value::String(s)) if s == "desc" => true,
+            Some(_) => {
+                return Err(Error::Other(
+                    "sort: param `order` must be \"asc\" or \"desc\"".into(),
+                ))
+            }
+        };
+        let key = |v: &Value| -> Value {
+            match by {
+                Some(path) => descend_path(v, path),
+                None => v.clone(),
+            }
+        };
+        items.sort_by(|a, b| {
+            let ord = cmp_value(&key(a), &key(b));
+            if desc {
+                ord.reverse()
+            } else {
+                ord
+            }
+        });
+        Ok(ToolResult::ok(serde_json::to_string(&items)?))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SortInputExtended {
+    items: Vec<Value>,
+    #[serde(default)]
+    by: Option<String>,
+    #[serde(default)]
+    order: Option<String>,
+}
+
+pub struct FlattenTool;
+
+#[async_trait]
+impl Tool for FlattenTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "flatten",
+            "Flatten nested arrays `depth` levels (default 1, max 8). Non-array elements pass through; \
+             string elements that are JSON arrays re-parse first.",
+            flux_spec::tool_input_schema::<FlattenInput>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let items = arr_or_empty(&params, "items", "flatten")?;
+        let depth = params.get("depth").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+
+        if depth > 8 {
+            return Err(Error::Other("flatten: depth must be <= 8".into()));
+        }
+
+        fn flatten_level(items: Vec<Value>, remaining: u32) -> Vec<Value> {
+            if remaining == 0 {
+                return items;
+            }
+            let mut out = Vec::new();
+            for item in items {
+                let item = parse_json_array_string(item);
+                match item {
+                    Value::Array(arr) => out.extend(arr),
+                    other => out.push(other),
+                }
+            }
+            if remaining > 1 {
+                flatten_level(out, remaining - 1)
+            } else {
+                out
+            }
+        }
+
+        let result = flatten_level(items, depth);
+        Ok(ToolResult::ok(serde_json::to_string(&result)?))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct FlattenInput {
+    items: Vec<Value>,
+    #[serde(default)]
+    depth: Option<u32>,
+}
+
+pub struct SkipTool;
+
+#[async_trait]
+impl Tool for SkipTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "skip",
+            "Drop first `n` items (mirror of `top`); `n <= 0` returns unchanged; `n >= len` returns `[]`.",
+            flux_spec::tool_input_schema::<SkipInput>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let items = arr_or_empty(&params, "items", "skip")?;
+        let n = params
+            .get("n")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| Error::Other("skip: required integer param `n` missing".into()))?;
+
+        let result: Vec<Value> = if n <= 0 {
+            items
+        } else {
+            items.into_iter().skip(n as usize).collect()
+        };
+        Ok(ToolResult::ok(serde_json::to_string(&result)?))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SkipInput {
+    items: Vec<Value>,
+    n: i64,
+}
+
+pub struct JoinTool;
+
+#[async_trait]
+impl Tool for JoinTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "join",
+            "Stringify each element (strings as-is, others compact JSON) and join with separator \
+             (default \"\\n\"). Returns plain text, not JSON.",
+            flux_spec::tool_input_schema::<JoinInput>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let items = arr_or_empty(&params, "items", "join")?;
+        let sep = params.get("sep").and_then(|v| v.as_str()).unwrap_or("\n");
+
+        let parts: Vec<String> = items
+            .iter()
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                other => serde_json::to_string(other).unwrap_or_default(),
+            })
+            .collect();
+
+        Ok(ToolResult::ok(parts.join(sep)))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct JoinInput {
+    items: Vec<Value>,
+    #[serde(default)]
+    sep: Option<String>,
+}
+
+pub struct SplitTool;
+
+#[async_trait]
+impl Tool for SplitTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "split",
+            "Split string on separator (default \"\\n\"). If `trim` is true, trim each part. \
+             Empty input returns `[]`. Returns JSON array of strings.",
+            flux_spec::tool_input_schema::<SplitInput>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let s = str_param(&params, "s", "split")?;
+        let sep = params.get("sep").and_then(|v| v.as_str()).unwrap_or("\n");
+        let trim = params
+            .get("trim")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if s.is_empty() {
+            return Ok(ToolResult::ok("[]".to_string()));
+        }
+
+        let parts: Vec<Value> = s
+            .split(sep)
+            .map(|part| {
+                let p = if trim { part.trim() } else { part };
+                Value::String(p.to_string())
+            })
+            .collect();
+
+        Ok(ToolResult::ok(serde_json::to_string(&parts)?))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SplitInput {
+    s: String,
+    #[serde(default)]
+    sep: Option<String>,
+    #[serde(default)]
+    trim: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// sum / count_by / group_by / any / all / has (L-48)
+// ---------------------------------------------------------------------------
+
+/// Extract a value at a dotted path from an object.
+fn extract_dotted_path(obj: &Value, path: &str) -> Value {
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut current = obj.clone();
+    for part in parts {
+        current = current.get(part).cloned().unwrap_or(Value::Null);
+    }
+    current
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SumInput {
+    items: Vec<Value>,
+    #[serde(default)]
+    path: Option<String>,
+}
+
+pub struct SumTool;
+
+#[async_trait]
+impl Tool for SumTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "sum",
+            "Sum numeric values in an array. If `path` is provided, extracts that dotted field from \
+             each element and sums the extracted values. Non-numeric elements yield a clear error.",
+            flux_spec::tool_input_schema::<SumInput>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let items = arr_or_empty(&params, "items", "sum")?;
+        let path = params.get("path").and_then(|v| v.as_str());
+
+        let mut total = 0.0;
+        for (i, item) in items.iter().enumerate() {
+            let val = match path {
+                Some(p) => extract_dotted_path(item, p),
+                None => item.clone(),
+            };
+            match val.as_f64() {
+                Some(n) => total += n,
+                None => {
+                    return Err(Error::Other(format!(
+                        "sum: element {i} is not numeric (got {})",
+                        serde_json::to_string(&val).unwrap_or_else(|_| "?".into())
+                    )))
+                }
+            }
+        }
+
+        Ok(ToolResult::ok(flux_lang::expr::format_number(total)))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CountByInput {
+    items: Vec<Value>,
+    path: String,
+}
+
+pub struct CountByTool;
+
+#[async_trait]
+impl Tool for CountByTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "count_by",
+            "Group array items by a field and count each group. Returns `[{key, count}]` sorted by \
+             count descending, then key ascending (deterministic).",
+            flux_spec::tool_input_schema::<CountByInput>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let items = arr_or_empty(&params, "items", "count_by")?;
+        let path = str_param(&params, "path", "count_by")?;
+
+        use std::collections::BTreeMap;
+        let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+        for item in items {
+            let val = extract_dotted_path(&item, path);
+            let key = match &val {
+                Value::String(s) => s.clone(),
+                other => serde_json::to_string(other)?,
+            };
+            *counts.entry(key).or_insert(0) += 1;
+        }
+
+        let mut results: Vec<Value> = counts
+            .into_iter()
+            .map(|(key, count)| json!({"key": key, "count": count}))
+            .collect();
+
+        results.sort_by(|a, b| {
+            let count_a = a["count"].as_u64().unwrap_or(0);
+            let count_b = b["count"].as_u64().unwrap_or(0);
+            count_b.cmp(&count_a).then_with(|| {
+                let key_a = a["key"].as_str().unwrap_or("");
+                let key_b = b["key"].as_str().unwrap_or("");
+                key_a.cmp(key_b)
+            })
+        });
+
+        Ok(ToolResult::ok(serde_json::to_string(&results)?))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GroupByInput {
+    items: Vec<Value>,
+    path: String,
+}
+
+pub struct GroupByTool;
+
+#[async_trait]
+impl Tool for GroupByTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "group_by",
+            "Group array items by a field. Returns `[{key, items}]` in first-seen key order.",
+            flux_spec::tool_input_schema::<GroupByInput>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let items = arr_or_empty(&params, "items", "group_by")?;
+        let path = str_param(&params, "path", "group_by")?;
+
+        let mut order: Vec<String> = Vec::new();
+        let mut groups: std::collections::HashMap<String, Vec<Value>> =
+            std::collections::HashMap::new();
+
+        for item in items {
+            let val = extract_dotted_path(&item, path);
+            let key = match &val {
+                Value::String(s) => s.clone(),
+                other => serde_json::to_string(other)?,
+            };
+            if !groups.contains_key(&key) {
+                order.push(key.clone());
+            }
+            groups.entry(key).or_default().push(item);
+        }
+
+        let results: Vec<Value> = order
+            .into_iter()
+            .map(|key| {
+                let items = groups.remove(&key).unwrap_or_default();
+                json!({"key": key, "items": items})
+            })
+            .collect();
+
+        Ok(ToolResult::ok(serde_json::to_string(&results)?))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AnyInput {
+    items: Vec<Value>,
+    #[serde(default, rename = "where")]
+    where_formula: Option<String>,
+    #[serde(default)]
+    vars: Option<serde_json::Map<String, Value>>,
+}
+
+pub struct AnyTool;
+
+#[async_trait]
+impl Tool for AnyTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "any",
+            "Returns \"true\" if any element satisfies the predicate, \"false\" otherwise. With \
+             `where`, evaluates the formula per element with `it` bound. Without `where`, checks if \
+             any element is truthy. Empty list → \"false\".",
+            flux_spec::tool_input_schema::<AnyInput>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        use flux_lang::expr::{eval_expr_value, ExprVal};
+
+        let items = arr_or_empty(&params, "items", "any")?;
+        let where_formula = params.get("where").and_then(|v| v.as_str());
+
+        let satisfied = items.iter().any(|element| {
+            if let Some(formula) = where_formula {
+                let mut vars = std::collections::BTreeMap::new();
+                vars.insert("it".to_string(), ExprVal::from_json(element));
+                if let Some(user_vars) = params.get("vars").and_then(|v| v.as_object()) {
+                    for (k, v) in user_vars {
+                        vars.insert(k.clone(), ExprVal::from_json(v));
+                    }
+                }
+                match eval_expr_value(formula, &vars) {
+                    Ok(result) => result.truthy(),
+                    Err(_) => false,
+                }
+            } else {
+                ExprVal::from_json(element).truthy()
+            }
+        });
+
+        Ok(ToolResult::ok(if satisfied { "true" } else { "false" }))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AllInput {
+    items: Vec<Value>,
+    #[serde(default, rename = "where")]
+    where_formula: Option<String>,
+    #[serde(default)]
+    vars: Option<serde_json::Map<String, Value>>,
+}
+
+pub struct AllTool;
+
+#[async_trait]
+impl Tool for AllTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "all",
+            "Returns \"true\" if all elements satisfy the predicate, \"false\" otherwise. With \
+             `where`, evaluates the formula per element with `it` bound. Without `where`, checks if \
+             all elements are truthy. Empty list → vacuously \"true\" (documented).",
+            flux_spec::tool_input_schema::<AllInput>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        use flux_lang::expr::{eval_expr_value, ExprVal};
+
+        let items = arr_or_empty(&params, "items", "all")?;
+        let where_formula = params.get("where").and_then(|v| v.as_str());
+
+        let all_satisfy = items.iter().all(|element| {
+            if let Some(formula) = where_formula {
+                let mut vars = std::collections::BTreeMap::new();
+                vars.insert("it".to_string(), ExprVal::from_json(element));
+                if let Some(user_vars) = params.get("vars").and_then(|v| v.as_object()) {
+                    for (k, v) in user_vars {
+                        vars.insert(k.clone(), ExprVal::from_json(v));
+                    }
+                }
+                match eval_expr_value(formula, &vars) {
+                    Ok(result) => result.truthy(),
+                    Err(_) => false,
+                }
+            } else {
+                ExprVal::from_json(element).truthy()
+            }
+        });
+
+        Ok(ToolResult::ok(if all_satisfy { "true" } else { "false" }))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct HasInput {
+    items: Vec<Value>,
+    value: Value,
+}
+
+pub struct HasTool;
+
+#[async_trait]
+impl Tool for HasTool {
+    fn spec(&self) -> ToolSpec {
+        pure_spec(
+            "has",
+            "Test if an array contains a value (JSON equality). Returns \"true\" or \"false\".",
+            flux_spec::tool_input_schema::<HasInput>(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let items = arr_or_empty(&params, "items", "has")?;
+        let value = params
+            .get("value")
+            .ok_or_else(|| Error::Other("has: required param `value` missing".into()))?;
+
+        let found = items.iter().any(|item| item == value);
+        Ok(ToolResult::ok(if found { "true" } else { "false" }))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // tests (hermetic — no filesystem, no network)
 // ---------------------------------------------------------------------------
 
@@ -1260,20 +2499,39 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "all",
+                "any",
                 "cite",
+                "coalesce",
                 "compare",
+                "count_by",
                 "dedupe",
                 "filter",
                 "first",
+                "flatten",
                 "gaps",
+                "group_by",
+                "has",
+                "join",
+                "keys",
                 "last",
                 "len",
+                "map",
                 "merge",
+                "merge_obj",
                 "need",
+                "omit",
+                "pick",
+                "regex_extract",
+                "regex_match",
                 "review.aggregate",
                 "review.normalize",
+                "skip",
                 "sort",
-                "top"
+                "split",
+                "sum",
+                "top",
+                "values"
             ]
         );
     }
@@ -1801,5 +3059,356 @@ mod tests {
         );
         assert_eq!(findings[3]["agreement"], 2);
         assert_eq!(findings[4]["agreement"], 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // regex_match / regex_extract (L-50)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn regex_match_true_false() {
+        let c = ctx();
+        // Match found -> "true"
+        let r = RegexMatchTool
+            .execute(&c, json!({"s": "hello world", "pattern": r"w\w+d"}))
+            .await
+            .unwrap();
+        assert_eq!(r.content, "true");
+
+        // No match -> "false"
+        let r2 = RegexMatchTool
+            .execute(&c, json!({"s": "hello world", "pattern": r"xyz"}))
+            .await
+            .unwrap();
+        assert_eq!(r2.content, "false");
+    }
+
+    #[tokio::test]
+    async fn regex_match_rejects_oversize_pattern() {
+        let c = ctx();
+        let long_pattern = "a".repeat(513);
+        let err = RegexMatchTool
+            .execute(&c, json!({"s": "test", "pattern": long_pattern}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pattern exceeds 512 chars"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn regex_match_reports_bad_pattern() {
+        let c = ctx();
+        let err = RegexMatchTool
+            .execute(&c, json!({"s": "test", "pattern": "[unclosed"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid pattern"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn regex_extract_first_and_all() {
+        let c = ctx();
+        // Extract first match of group 0 (whole match)
+        let r = RegexExtractTool
+            .execute(
+                &c,
+                json!({"s": "v1.2.3 and v4.5.6", "pattern": r"v\d+\.\d+\.\d+"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.content, r#""v1.2.3""#);
+
+        // Extract all matches of group 0
+        let r2 = RegexExtractTool
+            .execute(
+                &c,
+                json!({"s": "v1.2.3 and v4.5.6", "pattern": r"v\d+\.\d+\.\d+", "all": true}),
+            )
+            .await
+            .unwrap();
+        let arr: Vec<String> = serde_json::from_str(&r2.content).unwrap();
+        assert_eq!(arr, vec!["v1.2.3", "v4.5.6"]);
+
+        // Extract first match of a capture group
+        let r3 = RegexExtractTool
+            .execute(
+                &c,
+                json!({"s": "version 1.2.3", "pattern": r"version (\d+\.\d+\.\d+)", "group": 1}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r3.content, r#""1.2.3""#);
+
+        // Extract all matches of a capture group
+        let r4 = RegexExtractTool
+            .execute(&c, json!({"s": "v1.2.3 and v4.5.6", "pattern": r"v(\d+)\.\d+\.\d+", "group": 1, "all": true}))
+            .await
+            .unwrap();
+        let arr2: Vec<String> = serde_json::from_str(&r4.content).unwrap();
+        assert_eq!(arr2, vec!["1", "4"]);
+    }
+
+    #[tokio::test]
+    async fn regex_extract_null_on_no_match() {
+        let c = ctx();
+        let r = RegexExtractTool
+            .execute(&c, json!({"s": "hello", "pattern": r"xyz"}))
+            .await
+            .unwrap();
+        assert_eq!(r.content, "null");
+    }
+
+    #[tokio::test]
+    async fn regex_extract_bad_group_errors() {
+        let c = ctx();
+        let err = RegexExtractTool
+            .execute(&c, json!({"s": "hello", "pattern": r"h(e)llo", "group": 5}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no capture group 5"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // pick / omit / merge_obj / coalesce / keys / values (L-49)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pick_single_object() {
+        let c = ctx();
+        let r = PickTool
+            .execute(
+                &c,
+                json!({"items": {"a": 1, "b": 2, "c": 3}, "keys": ["a", "c"]}),
+            )
+            .await
+            .unwrap();
+        let out: Value = serde_json::from_str(&r.content).unwrap();
+        assert_eq!(out, json!({"a": 1, "c": 3}));
+    }
+
+    #[tokio::test]
+    async fn pick_over_array_of_objects() {
+        let c = ctx();
+        let r = PickTool
+            .execute(
+                &c,
+                json!({"items": [{"x": 1, "y": 2}, {"x": 3, "y": 4, "z": 5}], "keys": ["x", "z"]}),
+            )
+            .await
+            .unwrap();
+        let out: Vec<Value> = serde_json::from_str(&r.content).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], json!({"x": 1}));
+        assert_eq!(out[1], json!({"x": 3, "z": 5}));
+    }
+
+    #[tokio::test]
+    async fn omit_removes_keys_leaves_others() {
+        let c = ctx();
+        let r = OmitTool
+            .execute(
+                &c,
+                json!({"items": {"a": 1, "b": 2, "c": 3}, "keys": ["b"]}),
+            )
+            .await
+            .unwrap();
+        let out: Value = serde_json::from_str(&r.content).unwrap();
+        assert_eq!(out, json!({"a": 1, "c": 3}));
+    }
+
+    #[tokio::test]
+    async fn merge_obj_shallow_later_wins() {
+        let c = ctx();
+        let r = MergeObjTool
+            .execute(&c, json!({"objects": [{"a": 1, "b": 2}, {"b": 3, "c": 4}]}))
+            .await
+            .unwrap();
+        let out: Value = serde_json::from_str(&r.content).unwrap();
+        assert_eq!(out, json!({"a": 1, "b": 3, "c": 4}));
+    }
+
+    #[tokio::test]
+    async fn coalesce_returns_first_non_empty() {
+        let c = ctx();
+        let r = CoalesceTool
+            .execute(&c, json!({"values": [null, "", "first"]}))
+            .await
+            .unwrap();
+        assert_eq!(r.content, "\"first\"");
+    }
+
+    #[tokio::test]
+    async fn coalesce_keeps_zero_and_false() {
+        let c = ctx();
+        let r1 = CoalesceTool
+            .execute(&c, json!({"values": [null, "", 0, "later"]}))
+            .await
+            .unwrap();
+        assert_eq!(r1.content, "0");
+
+        let r2 = CoalesceTool
+            .execute(&c, json!({"values": [null, false, "later"]}))
+            .await
+            .unwrap();
+        assert_eq!(r2.content, "false");
+    }
+
+    #[tokio::test]
+    async fn keys_and_values_deterministic_order() {
+        let c = ctx();
+        let obj = json!({"z": 3, "a": 1, "m": 2});
+        let r_keys = KeysTool
+            .execute(&c, json!({"item": obj.clone()}))
+            .await
+            .unwrap();
+        let keys: Vec<String> = serde_json::from_str(&r_keys.content).unwrap();
+        assert_eq!(keys, vec!["a", "m", "z"]);
+
+        let r_values = ValuesTool.execute(&c, json!({"item": obj})).await.unwrap();
+        let values: Vec<i64> = serde_json::from_str(&r_values.content).unwrap();
+        assert_eq!(values, vec![1, 2, 3]);
+    }
+
+    // -----------------------------------------------------------------------
+    // sum / count_by / group_by / any / all / has (L-48)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn sum_of_numbers() {
+        let c = ctx();
+        let r = SumTool
+            .execute(&c, json!({"items": [1, 2, 3]}))
+            .await
+            .unwrap();
+        assert_eq!(r.content, "6");
+        let r2 = SumTool.execute(&c, json!({"items": []})).await.unwrap();
+        assert_eq!(r2.content, "0");
+    }
+
+    #[tokio::test]
+    async fn sum_with_path_and_bad_element_errors() {
+        let c = ctx();
+        let r = SumTool
+            .execute(
+                &c,
+                json!({"items": [{"price": 10}, {"price": 20}, {"price": 5}], "path": "price"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.content, "35");
+
+        let err = SumTool
+            .execute(&c, json!({"items": [1, 2, "nope"]}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("element 2") && err.contains("not numeric"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn count_by_orders_count_desc_then_key() {
+        let c = ctx();
+        let items = json!([
+            {"status": "ok"}, {"status": "fail"}, {"status": "ok"},
+            {"status": "ok"}, {"status": "pending"}, {"status": "fail"}
+        ]);
+        let r = CountByTool
+            .execute(&c, json!({"items": items, "path": "status"}))
+            .await
+            .unwrap();
+        let out: Vec<Value> = serde_json::from_str(&r.content).unwrap();
+        assert_eq!(out[0]["key"], "ok");
+        assert_eq!(out[0]["count"], 3);
+        assert_eq!(out[1]["key"], "fail");
+        assert_eq!(out[1]["count"], 2);
+        assert_eq!(out[2]["key"], "pending");
+        assert_eq!(out[2]["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn group_by_first_seen_key_order() {
+        let c = ctx();
+        let items = json!([
+            {"type": "bug", "id": 1}, {"type": "feature", "id": 2},
+            {"type": "bug", "id": 3}, {"type": "chore", "id": 4}
+        ]);
+        let r = GroupByTool
+            .execute(&c, json!({"items": items, "path": "type"}))
+            .await
+            .unwrap();
+        let out: Vec<Value> = serde_json::from_str(&r.content).unwrap();
+        assert_eq!(out[0]["key"], "bug");
+        assert_eq!(out[0]["items"].as_array().unwrap().len(), 2);
+        assert_eq!(out[1]["key"], "feature");
+        assert_eq!(out[2]["key"], "chore");
+    }
+
+    #[tokio::test]
+    async fn any_true_on_match_false_on_empty() {
+        let c = ctx();
+        let r = AnyTool
+            .execute(
+                &c,
+                json!({"items": [{"score": 10}, {"score": 50}], "where": "it.score > 40"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.content, "true");
+        let r2 = AnyTool
+            .execute(
+                &c,
+                json!({"items": [{"score": 10}], "where": "it.score > 40"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.content, "false");
+        let r3 = AnyTool.execute(&c, json!({"items": []})).await.unwrap();
+        assert_eq!(r3.content, "false");
+    }
+
+    #[tokio::test]
+    async fn all_vacuously_true_on_empty_list() {
+        let c = ctx();
+        let r = AllTool
+            .execute(
+                &c,
+                json!({"items": [{"ok": true}, {"ok": true}], "where": "it.ok"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.content, "true");
+        let r2 = AllTool
+            .execute(
+                &c,
+                json!({"items": [{"ok": true}, {"ok": false}], "where": "it.ok"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.content, "false");
+        let r3 = AllTool
+            .execute(&c, json!({"items": [], "where": "it > 0"}))
+            .await
+            .unwrap();
+        assert_eq!(r3.content, "true");
+    }
+
+    #[tokio::test]
+    async fn has_equality_membership() {
+        let c = ctx();
+        let r = HasTool
+            .execute(&c, json!({"items": [1, 2, 3], "value": 2}))
+            .await
+            .unwrap();
+        assert_eq!(r.content, "true");
+        let r2 = HasTool
+            .execute(&c, json!({"items": [1, 2, 3], "value": 5}))
+            .await
+            .unwrap();
+        assert_eq!(r2.content, "false");
     }
 }

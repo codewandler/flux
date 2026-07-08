@@ -116,8 +116,10 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
         ToolGroup {
             name: "cognition".into(),
             description: "Pure cognition helpers: needs/gaps, list shaping (compare, dedupe, sort, \
-                          top, merge, cite, len, first, last, filter), and strict-review \
-                          normalize/aggregate."
+                          top, merge, cite, len, first, last, filter), aggregation & predicates \
+                          (sum, count_by, group_by, any, all, has), object shaping (pick, omit, \
+                          merge_obj, coalesce, keys, values), regex (match, extract), and \
+                          strict-review normalize/aggregate."
                 .into(),
             tools: names(&[
                 "need",
@@ -132,6 +134,25 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
                 "first",
                 "last",
                 "filter",
+                "map",
+                "flatten",
+                "skip",
+                "join",
+                "split",
+                "sum",
+                "count_by",
+                "group_by",
+                "any",
+                "all",
+                "has",
+                "pick",
+                "omit",
+                "merge_obj",
+                "coalesce",
+                "keys",
+                "values",
+                "regex_match",
+                "regex_extract",
                 "review.normalize",
                 "review.aggregate",
             ]),

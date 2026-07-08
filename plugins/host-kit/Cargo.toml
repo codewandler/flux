@@ -1,9 +1,13 @@
 [package]
-name = "host-kit"
+name = "codewandler-host-kit"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 description = "Shared SDK for flux integration plugins: typed host-capability calls (secret-by-purpose, http+bearer, endpoint, datasource records) + a manifest/op builder over flux-plugin's guest protocol"
+repository = "https://github.com/codewandler/flux"
+
+[lib]
+name = "host_kit"
 
 [dependencies]
 flux-plugin.workspace = true

@@ -327,8 +327,67 @@ fn fmt_expr(node: &Node, multiline: bool) -> String {
             let parts: Vec<String> = items.iter().map(|n| fmt_expr(n, multiline)).collect();
             format!("[ {} ]", parts.join(", "))
         }
+        // Native `Expr` rendering when invertible: every var maps to {name: Var(name)}.
+        // The formula has variable names without `$`, so we re-insert `$` before each var name.
+        Node::Expr { formula, vars } if is_invertible_expr(vars) => {
+            // Re-insert $ before each variable name in the formula
+            let mut result = formula.clone();
+            // Sort variable names by length (longest first) to avoid partial replacements
+            let mut var_names: Vec<&String> = vars.keys().collect();
+            var_names.sort_by_key(|b| std::cmp::Reverse(b.len()));
+
+            for var_name in var_names {
+                // Replace whole-word occurrences of the variable name with $name
+                // Use a simple approach: replace identifiers that match exactly
+                result = replace_ident(&result, var_name, &format!("${}", var_name));
+            }
+            result
+        }
         other => format!("@json {}", compact(other)),
     }
+}
+
+/// Whether an `Expr` node's vars map is invertible — every entry is exactly `{name: Var(name)}`.
+/// When true, the formatter can render the expr natively by re-inserting `$` before variable names.
+fn is_invertible_expr(vars: &std::collections::BTreeMap<String, Box<Node>>) -> bool {
+    vars.iter().all(
+        |(name, node)| matches!(node.as_ref(), Node::Var { name: var_name } if var_name.0 == *name),
+    )
+}
+
+/// Replace whole-word occurrences of `ident` with `replacement` in `text`.
+/// Only replaces when `ident` appears as a complete identifier (not part of a larger identifier).
+fn replace_ident(text: &str, ident: &str, replacement: &str) -> String {
+    let mut result = String::new();
+    let mut i = 0;
+    let text_chars: Vec<char> = text.chars().collect();
+
+    while i < text_chars.len() {
+        // Check if we're at the start of the identifier
+        if i + ident.len() <= text_chars.len() {
+            let slice: String = text_chars[i..i + ident.len()].iter().collect();
+            if slice == ident {
+                // Check that it's a whole identifier (not part of a larger one)
+                let before_ok = i == 0 || !is_ident_continue(text_chars[i - 1]);
+                let after_ok = i + ident.len() >= text_chars.len()
+                    || !is_ident_continue(text_chars[i + ident.len()]);
+
+                if before_ok && after_ok {
+                    result.push_str(replacement);
+                    i += ident.len();
+                    continue;
+                }
+            }
+        }
+        result.push(text_chars[i]);
+        i += 1;
+    }
+    result
+}
+
+/// Whether a character can continue an identifier (alphanumeric, underscore, or dot for field access).
+fn is_ident_continue(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '.'
 }
 
 /// Whether a node's subtree carries any dynamic (non-`Lit`) leaf. A value-template (`Obj`/`List`)

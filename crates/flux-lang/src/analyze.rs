@@ -1363,7 +1363,7 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, bound: &HashSet<String>, d: &mut
             // formula is a plan the runtime rejects — reject it here first with zero false positives
             // (L-27). Reuses the runtime tokenizer/parser so the two agree exactly.
             let keys: std::collections::BTreeSet<&str> = vars.keys().map(String::as_str).collect();
-            for msg in crate::runtime::validate_expr_formula(formula, &keys) {
+            for msg in crate::expr::validate_expr_formula(formula, &keys) {
                 d.add(msg);
             }
         }

@@ -17,6 +17,7 @@ flux-evidence.workspace = true
 flux-spec.workspace = true
 flux-system.workspace = true
 flux-policy.workspace = true
+flux-lang.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true

@@ -71,10 +71,10 @@ flux-orchestrate = { package = "codewandler-flux-orchestrate", version = "0.9.3"
 flux-lang = { package = "codewandler-flux-lang", version = "0.9.3", path = "crates/flux-lang" }
 flux-flow = { package = "codewandler-flux-flow", version = "0.9.3", path = "crates/flux-flow" }
 flux-eval = { path = "crates/flux-eval" }
-flux-plugin = { path = "crates/flux-plugin" }
+flux-plugin = { package = "codewandler-flux-plugin", version = "0.9.3", path = "crates/flux-plugin" }
 flux-auth = { path = "crates/flux-auth" }
 flux-evidence = { package = "codewandler-flux-evidence", version = "0.9.3", path = "crates/flux-evidence" }
-flux-datasource = { path = "crates/flux-datasource" }
+flux-datasource = { package = "codewandler-flux-datasource", version = "0.9.3", path = "crates/flux-datasource" }
 flux-a2a = { path = "crates/flux-a2a" }
 flux-pg = { package = "codewandler-flux-pg", version = "0.9.3", path = "crates/flux-pg" }
 flux-server = { path = "crates/flux-server" }
@@ -83,7 +83,7 @@ flux-sdk = { package = "codewandler-flux-sdk", version = "0.9.3", path = "crates
 flux-tui = { path = "crates/flux-tui" }
 flux-provider = { package = "codewandler-flux-provider", version = "0.9.3", path = "crates/flux-provider" }
 flux-providers = { package = "codewandler-flux-providers", version = "0.9.3", path = "crates/flux-providers" }
-flux-credentials = { path = "crates/flux-credentials" }
+flux-credentials = { package = "codewandler-flux-credentials", version = "0.9.3", path = "crates/flux-credentials" }
 flux-cognition = { package = "codewandler-flux-cognition", version = "0.9.3", path = "crates/flux-cognition" }
 flux-app = { path = "crates/flux-app" }
 flux-markdown = { package = "codewandler-flux-markdown", version = "0.9.3", path = "crates/flux-markdown" }

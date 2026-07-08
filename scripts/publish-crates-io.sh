@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Publish the flux-sdk + flux-providers crates.io closure — the 20 `codewandler-flux-*` crates — in
-# strict dependency order. See crates/flux-sdk/PUBLISHING.md for the why.
+# Publish the flux crates.io closure — the 24 `codewandler-*` crates — in strict dependency order.
+# See crates/flux-sdk/PUBLISHING.md for the why.
 #
 #   - Idempotent: a crate@version already on crates.io is treated as done and skipped, so the script is
 #     safe to re-run after a partial/failed publish (it resumes at the first unpublished crate).
@@ -21,6 +21,7 @@ DRY_RUN=""
 CRATES=(
   codewandler-flux-core
   codewandler-flux-markdown
+  codewandler-flux-datasource
   codewandler-flux-spec
   codewandler-flux-policy
   codewandler-flux-secret
@@ -28,12 +29,15 @@ CRATES=(
   codewandler-flux-skill
   codewandler-flux-system
   codewandler-flux-provider
+  codewandler-flux-credentials
   codewandler-flux-pg
   codewandler-flux-lang
   codewandler-flux-events
   codewandler-flux-runtime
   codewandler-flux-tools
   codewandler-flux-cognition
+  codewandler-flux-plugin
+  codewandler-host-kit
   codewandler-flux-flow
   codewandler-flux-agent
   codewandler-flux-orchestrate
@@ -47,8 +51,14 @@ for c in "${CRATES[@]}"; do
   # trips it (burst then ~1/10min). We parse the "try again after <GMT>" hint and wait it out, so a
   # single run grinds through the whole closure unattended.
   while true; do
-    echo "==> cargo publish -p $c $DRY_RUN"
-    if out=$(cargo publish -p "$c" $DRY_RUN 2>&1); then
+    # host-kit lives in the nested plugins/ workspace (excluded from root); publish via manifest path.
+    if [ "$c" = "codewandler-host-kit" ]; then
+      publish_args="--manifest-path plugins/host-kit/Cargo.toml $DRY_RUN"
+    else
+      publish_args="-p $c $DRY_RUN"
+    fi
+    echo "==> cargo publish $publish_args"
+    if out=$(cargo publish $publish_args 2>&1); then
       echo "    ok: $c"
       [ -z "$DRY_RUN" ] && sleep 15
       break

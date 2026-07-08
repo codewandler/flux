@@ -1,9 +1,13 @@
 [package]
-name = "flux-plugin"
+name = "codewandler-flux-plugin"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "flux subprocess plugin protocol + host + SDK: any-language plugins over framed (NDJSON) stdio"
+
+[lib]
+name = "flux_plugin"
 
 # The `echo_plugin` / `caps_plugin` binaries are protocol test fixtures, not shippable artifacts.
 [package.metadata.dist]

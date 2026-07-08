@@ -1,9 +1,13 @@
 [package]
-name = "flux-credentials"
+name = "codewandler-flux-credentials"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "flux provider credentials: token store, CLI-credential import, OAuth refresh + PKCE login, TokenSource impl"
+
+[lib]
+name = "flux_credentials"
 
 [dependencies]
 flux-core.workspace = true

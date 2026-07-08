@@ -1109,7 +1109,7 @@ fn parse_stmt(lines: &[Line], indent: usize) -> Result<(Node, usize)> {
 }
 
 fn parse_when(cond_str: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
-    let cond = parse_full_expr(cond_str, "when condition")?;
+    let cond = parse_condition_expr(cond_str, "when condition")?;
     let then_region = child_region(lines, indent);
     let (then, _) = parse_stmts(then_region, indent)?;
     let mut used = 1 + then_region.len();
@@ -1136,7 +1136,7 @@ fn parse_when(cond_str: &str, lines: &[Line], indent: usize) -> Result<(Node, us
 }
 
 fn parse_unless(cond_str: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
-    let cond = parse_full_expr(cond_str, "unless condition")?;
+    let cond = parse_condition_expr(cond_str, "unless condition")?;
     let region = child_region(lines, indent);
     let (body, _) = parse_stmts(region, indent)?;
     Ok((
@@ -1257,7 +1257,8 @@ fn split_until(region: &[Line]) -> Result<(Option<Box<Node>>, &[Line])> {
     match region.first() {
         Some(first) => match kw(&first.text, "until") {
             Some(u) => {
-                let uexpr = parse_full_expr(u, "until condition").map_err(|e| err_at(first, e))?;
+                let uexpr =
+                    parse_condition_expr(u, "until condition").map_err(|e| err_at(first, e))?;
                 Ok((Some(Box::new(uexpr)), &region[1..]))
             }
             None => Ok((None, region)),
@@ -1581,23 +1582,26 @@ fn parse_return(rest: &str) -> Result<(Node, usize)> {
 /// (the first top-level `,` after it begins the optional message, so commas inside `op(a,b)`/`{…}`/
 /// `[…]`/strings are already consumed by `parse_expr`).
 fn parse_assert(rest: &str) -> Result<(Node, usize)> {
-    let (cond, tail) = parse_expr(rest)?;
-    let tail = tail.trim_start();
-    let message = if tail.is_empty() {
-        None
-    } else {
-        let after = tail
-            .strip_prefix(',')
-            .ok_or_else(|| perr("expected `,` before the `assert` message"))?;
-        let (v, rest2) = take_json(after.trim_start())?;
+    // First, try to split by comma to separate condition from message
+    let rest = rest.trim();
+    let (cond_str, message) = if let Some(comma_pos) = find_top_level_comma(rest) {
+        let cond_part = &rest[..comma_pos];
+        let msg_part = rest[comma_pos + 1..].trim();
+        let (v, rest2) = take_json(msg_part)?;
         if !rest2.trim().is_empty() {
             return Err(perr("trailing text after `assert` message"));
         }
         match v {
-            serde_json::Value::String(m) => Some(m),
+            serde_json::Value::String(m) => (cond_part, Some(m)),
             _ => return Err(perr("`assert` message must be a quoted string")),
         }
+    } else {
+        (rest, None)
     };
+
+    // Now parse the condition with native-expr fallback
+    let cond = parse_condition_expr(cond_str, "assert condition")?;
+
     Ok((
         Node::Assert {
             cond: Box::new(cond),
@@ -1605,6 +1609,36 @@ fn parse_assert(rest: &str) -> Result<(Node, usize)> {
         },
         1,
     ))
+}
+
+/// Find the position of a top-level comma (not inside parens, brackets, braces, or strings).
+fn find_top_level_comma(s: &str) -> Option<usize> {
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut string_char = ' ';
+    let mut chars = s.char_indices().peekable();
+
+    while let Some((i, c)) = chars.next() {
+        if in_string {
+            if c == '\\' {
+                chars.next(); // Skip escaped character
+            } else if c == string_char {
+                in_string = false;
+            }
+        } else {
+            match c {
+                '"' | '\'' => {
+                    in_string = true;
+                    string_char = c;
+                }
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ',' if depth == 0 => return Some(i),
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 /// A `$name`-led statement: a bare var, a ctx_append (`+=`), or a bind (`=` / `: T =`).
@@ -1641,7 +1675,7 @@ fn parse_dollar(t: &str) -> Result<(Node, usize)> {
             .find('=')
             .ok_or_else(|| perr("expected `=` in typed bind"))?;
         let ty = parse_type(r[..eq].trim());
-        let value = parse_full_expr(&r[eq + 1..], "bind value")?;
+        let value = parse_condition_expr(&r[eq + 1..], "bind value")?;
         return Ok((
             Node::Bind {
                 name: name.into(),
@@ -1653,7 +1687,7 @@ fn parse_dollar(t: &str) -> Result<(Node, usize)> {
         ));
     }
     if let Some(r) = rest.strip_prefix('=') {
-        let value = parse_full_expr(r, "bind value")?;
+        let value = parse_condition_expr(r, "bind value")?;
         return Ok((
             Node::Bind {
                 name: name.into(),
@@ -1693,6 +1727,68 @@ fn parse_do_call(rest: &str) -> Result<(Node, usize)> {
 // Expressions
 // ---------------------------------------------------------------------------
 
+/// Try to parse a native `expr` formula with `$var` syntax. Scans for `$`-prefixed identifiers,
+/// extracts them as variables, strips the `$` from the formula text, and builds an `Expr` node
+/// with `vars: {name: Var(name)}`. Returns `Some(Node::Expr)` if at least one `$var` is found,
+/// or `None` if the text has no variables (so it's not a valid native expr — ordinary expression
+/// parsing should handle it).
+fn try_parse_native_expr(text: &str) -> Option<Node> {
+    let mut var_names = std::collections::BTreeSet::new();
+    let mut vars = std::collections::BTreeMap::new();
+    let mut formula = String::new();
+
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '$' {
+            // Check if this is followed by a valid identifier start
+            if let Some(&next_c) = chars.peek() {
+                if next_c.is_ascii_alphabetic() || next_c == '_' {
+                    // Collect the full identifier (with dots for field access)
+                    let mut ident = String::new();
+                    while let Some(&id_c) = chars.peek() {
+                        if id_c.is_ascii_alphanumeric() || id_c == '_' || id_c == '.' {
+                            ident.push(id_c);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    // Extract the root name (before the first dot)
+                    let root_name = ident.split('.').next().unwrap_or(&ident).to_string();
+                    var_names.insert(root_name);
+                    // Add to formula without the $
+                    formula.push_str(&ident);
+                } else {
+                    // Not a valid identifier, keep the $ in the formula
+                    formula.push(c);
+                }
+            } else {
+                // $ at end of string
+                formula.push(c);
+            }
+        } else {
+            formula.push(c);
+        }
+    }
+
+    // If no variables found, this isn't a native expr
+    if var_names.is_empty() {
+        return None;
+    }
+
+    // Build the vars map with each name -> Var(name)
+    for name in &var_names {
+        vars.insert(
+            name.clone(),
+            Box::new(Node::Var {
+                name: SymbolName::from(name.as_str()),
+            }),
+        );
+    }
+
+    Some(Node::Expr { formula, vars })
+}
+
 /// Parse exactly one expression that must span the whole of `s` (no trailing tokens).
 fn parse_full_expr(s: &str, ctx: &str) -> Result<Node> {
     let (node, tail) = parse_expr(s)?;
@@ -1700,6 +1796,36 @@ fn parse_full_expr(s: &str, ctx: &str) -> Result<Node> {
         return Err(perr(&format!("trailing text in {ctx}: `{tail}`")));
     }
     Ok(node)
+}
+
+/// Parse a condition expression with native-expr fallback. First tries the normal expression parser;
+/// if that fails or leaves a tail (operator tokens), attempts to parse as a native expr formula with
+/// `$var` syntax. This enables conditions like `when $count > 3` and `until len($queue) == 0`.
+fn parse_condition_expr(s: &str, ctx: &str) -> Result<Node> {
+    let s = s.trim();
+    // Try normal parsing first
+    match parse_expr(s) {
+        Ok((node, tail)) => {
+            let tail_trimmed = tail.trim();
+            // If there's no tail or the tail is empty, we got a complete expression
+            if tail_trimmed.is_empty() {
+                return Ok(node);
+            }
+            // There's a tail — likely operator tokens like `> 3` or `== 'ok'`
+            // Fall through to native expr parsing
+        }
+        Err(_) => {
+            // Normal parsing failed, fall through to native expr parsing
+        }
+    }
+
+    // Try native expr parsing
+    if let Some(expr_node) = try_parse_native_expr(s) {
+        return Ok(expr_node);
+    }
+
+    // Neither worked, return the original parse error
+    parse_full_expr(s, ctx)
 }
 
 /// Parse a single expression from the front of `s`, returning it and the unconsumed remainder.
@@ -3516,5 +3642,183 @@ journey greet
     fn an_unknown_top_level_decl_is_a_clean_error() {
         let err = parse_program("widget foo\n  x 1\n").unwrap_err();
         assert!(format!("{err}").contains("unknown top-level declaration"));
+    }
+
+    #[test]
+    fn parse_when_native_comparison() {
+        let src = "flow test\n  when $count > 3\n    return true\n";
+        let ast = parse(src).unwrap();
+        assert_eq!(ast.body.len(), 1);
+        let Node::When { cond, .. } = &ast.body[0] else {
+            panic!("expected When node");
+        };
+        match cond.as_ref() {
+            Node::Expr { formula, vars } => {
+                assert_eq!(formula, "count > 3");
+                assert_eq!(vars.len(), 1);
+                assert!(vars.contains_key("count"));
+                match vars.get("count").unwrap().as_ref() {
+                    Node::Var { name } => assert_eq!(name.0, "count"),
+                    _ => panic!("expected Var node"),
+                }
+            }
+            _ => panic!("expected Expr node, got {:?}", cond),
+        }
+    }
+
+    #[test]
+    fn parse_until_native_call_predicate() {
+        let src = "flow test\n  repeat 10\n    until len($queue) == 0\n    return null\n";
+        let ast = parse(src).unwrap();
+        assert_eq!(ast.body.len(), 1);
+        let Node::Repeat { until, .. } = &ast.body[0] else {
+            panic!("expected Repeat node");
+        };
+        let Some(until_node) = until else {
+            panic!("expected until condition");
+        };
+        match until_node.as_ref() {
+            Node::Expr { formula, vars } => {
+                assert!(formula.contains("len(queue)"));
+                assert!(formula.contains("== 0"));
+                assert_eq!(vars.len(), 1);
+                assert!(vars.contains_key("queue"));
+            }
+            _ => panic!("expected Expr node, got {:?}", until_node),
+        }
+    }
+
+    #[test]
+    fn parse_bind_rhs_native_expr() {
+        let src = "flow test\n  $ok = $score >= 0.8\n";
+        let ast = parse(src).unwrap();
+        assert_eq!(ast.body.len(), 1);
+        let Node::Bind { name, value, .. } = &ast.body[0] else {
+            panic!("expected Bind node");
+        };
+        assert_eq!(name.0, "ok");
+        match value.as_ref() {
+            Node::Expr { formula, vars } => {
+                assert_eq!(formula, "score >= 0.8");
+                assert_eq!(vars.len(), 1);
+                assert!(vars.contains_key("score"));
+            }
+            _ => panic!("expected Expr node, got {:?}", value),
+        }
+    }
+
+    #[test]
+    fn parse_assert_native_expr_with_message() {
+        let src = "flow test\n  assert $n > 0, \"must be positive\"\n";
+        let ast = parse(src).unwrap();
+        assert_eq!(ast.body.len(), 1);
+        let Node::Assert { cond, message } = &ast.body[0] else {
+            panic!("expected Assert node");
+        };
+        match cond.as_ref() {
+            Node::Expr { formula, vars } => {
+                assert_eq!(formula, "n > 0");
+                assert_eq!(vars.len(), 1);
+                assert!(vars.contains_key("n"));
+            }
+            _ => panic!("expected Expr node, got {:?}", cond),
+        }
+        assert_eq!(message.as_ref().unwrap(), "must be positive");
+    }
+
+    #[test]
+    fn roundtrip_native_expr_preserves_json() {
+        use crate::format::format;
+
+        let test_cases = vec![
+            "flow test\n  when $count > 3\n    return true\n",
+            "flow test\n  $ok = $score >= 0.8\n",
+            "flow test\n  unless $flag == false\n    return null\n",
+            "flow test\n  assert $n > 0, \"positive\"\n",
+        ];
+
+        for src in test_cases {
+            let ast = parse(src).unwrap();
+            let formatted = format(&ast);
+            let reparsed = parse(&formatted).unwrap();
+            assert_eq!(ast, reparsed, "roundtrip failed for: {}", src);
+        }
+    }
+
+    #[test]
+    fn parse_when_with_dotted_access() {
+        let src = "flow test\n  when $issue.state == 'opened'\n    return true\n";
+        let ast = parse(src).unwrap();
+        assert_eq!(ast.body.len(), 1);
+        let Node::When { cond, .. } = &ast.body[0] else {
+            panic!("expected When node");
+        };
+        match cond.as_ref() {
+            Node::Expr { formula, vars } => {
+                // The formula should have issue.state (without $)
+                assert!(formula.contains("issue.state"));
+                assert!(formula.contains("== 'opened'"));
+                // Only the root name should be in vars
+                assert_eq!(vars.len(), 1);
+                assert!(vars.contains_key("issue"));
+            }
+            _ => panic!("expected Expr node, got {:?}", cond),
+        }
+    }
+
+    #[test]
+    fn format_native_expr_with_dollar() {
+        use crate::format::format;
+        let src = "flow test\n  when $count > 3\n    return true\n";
+        let ast = parse(src).unwrap();
+        let formatted = format(&ast);
+        // The formatted output should contain the native expr with $
+        assert!(
+            formatted.contains("when $count > 3"),
+            "formatted: {}",
+            formatted
+        );
+        // Should not fall back to @json
+        assert!(!formatted.contains("@json"), "formatted: {}", formatted);
+    }
+
+    #[test]
+    fn comprehensive_native_expr_integration() {
+        use crate::format::format;
+
+        let src = r#"flow test
+  $count = 10
+  $score = 0.85
+
+  when $count > 5
+    $high = true
+
+  $ok = $score >= 0.8
+
+  unless $count == 0
+    return true
+
+  assert $score > 0.5, "score too low"
+
+  repeat 3
+    until $count == 0
+    $count = 1
+
+  return false
+"#;
+
+        let ast = parse(src).unwrap();
+        let formatted = format(&ast);
+
+        // All native expressions should be preserved with $
+        assert!(formatted.contains("when $count > 5"));
+        assert!(formatted.contains("$ok = $score >= 0.8"));
+        assert!(formatted.contains("unless $count == 0"));
+        assert!(formatted.contains("assert $score > 0.5"));
+        assert!(formatted.contains("until $count == 0"));
+
+        // Roundtrip test
+        let reparsed = parse(&formatted).unwrap();
+        assert_eq!(ast, reparsed, "Roundtrip failed");
     }
 }

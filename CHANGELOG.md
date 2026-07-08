@@ -6,6 +6,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **`regex_match` and `regex_extract` cognition ops.** Two new pure operations bring
+  deterministic, ReDoS-free regex matching and extraction into Flux-Lang flows. `regex_match`
+  returns `"true"`/`"false"` for boolean predicates (drop-in for `when` conditions), and
+  `regex_extract` returns the first match or all matches of a capture group (with `all: true`).
+  Both use Rust's `regex` crate (Thompson NFA, linear-time guarantee) with pattern length and
+  size limits, so malicious patterns cannot exhaust resources. Use for log classification, SemVer
+  extraction, and other structured-text parsing where regex is the natural tool.
+
 ## [0.9.3] - 2026-07-08
 
 ### Changed

@@ -29,6 +29,7 @@ pub mod ast;
 pub mod dsl;
 pub mod effects;
 pub mod error;
+pub mod expr;
 pub mod format;
 pub mod host;
 pub mod opspec;
