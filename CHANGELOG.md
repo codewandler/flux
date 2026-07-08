@@ -6,6 +6,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-08
+
+**Minor bump** (pre-1.0 SemVer, where the minor position is the breaking-change signal): the
+beta-hardening pass includes a breaking runtime behavior change — scalar text binds now preserve
+number/bool type and integral numbers render as `5` not `5.0` (L-43 / F-008), so a flow relying on the
+old stringified form changes output.
+
 **v0.6.0 beta hardening** (the `beta-hardening` epic — triaged from the first external beta test of a
 shipped release). Targeted fixes and docs alignment across the CLI, Flux-Lang, and the
 served/program surfaces; no redesign.
