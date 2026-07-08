@@ -14,6 +14,9 @@ on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
+  # Manual trigger to resume a publish (e.g. after a crates.io new-crate rate-limit) from the current
+  # branch, so an updated scripts/publish-crates-io.sh is used. Idempotent, so it skips what's live.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -41,6 +44,7 @@ jobs:
         run: rustup toolchain install stable --profile minimal --no-self-update
 
       - name: Verify the tag matches the workspace version
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           tag="${GITHUB_REF_NAME#v}"
           wsver=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
