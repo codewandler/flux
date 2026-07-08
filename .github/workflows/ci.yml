@@ -125,10 +125,10 @@ jobs:
       - name: Clippy (postgres feature, deny warnings)
         run: |
           cargo clippy -p codewandler-flux-pg --all-targets -- -D warnings
-          cargo clippy -p codewandler-flux-events -p flux-capabilities --features postgres --all-targets -- -D warnings
+          cargo clippy -p codewandler-flux-events -p codewandler-flux-capabilities --features postgres --all-targets -- -D warnings
 
       - name: Test flux-pg (bridge + pool + DSN)
         run: cargo test -p codewandler-flux-pg
 
       - name: Test Postgres backends (flux-events + flux-capabilities)
-        run: cargo test -p codewandler-flux-events -p flux-capabilities --features postgres
+        run: cargo test -p codewandler-flux-events -p codewandler-flux-capabilities --features postgres
