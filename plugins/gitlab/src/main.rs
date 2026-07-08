@@ -773,6 +773,129 @@ struct RepositoryArchiveInput {
     format: Option<String>,
 }
 
+/// `gitlab.ci.job_token.scope.show`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CiJobTokenScopeShowInput {
+    project: String,
+}
+
+/// `gitlab.ci.job_token.scope.set`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CiJobTokenScopeSetInput {
+    project: String,
+    enabled: bool,
+}
+
+/// `gitlab.ci.job_token.allowlist.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CiJobTokenAllowlistListInput {
+    project: String,
+}
+
+/// `gitlab.ci.job_token.allowlist.add`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CiJobTokenAllowlistAddInput {
+    project: String,
+    target_project_id: i64,
+}
+
+/// `gitlab.ci.job_token.allowlist.remove`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CiJobTokenAllowlistRemoveInput {
+    project: String,
+    target_project_id: i64,
+    confirm_target_project_id: Option<i64>,
+}
+
+/// `gitlab.ci.job_token.groups_allowlist.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CiJobTokenGroupsAllowlistListInput {
+    project: String,
+}
+
+/// `gitlab.ci.job_token.groups_allowlist.add`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CiJobTokenGroupsAllowlistAddInput {
+    project: String,
+    target_group_id: i64,
+}
+
+/// `gitlab.ci.job_token.groups_allowlist.remove`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct CiJobTokenGroupsAllowlistRemoveInput {
+    project: String,
+    target_group_id: i64,
+    confirm_target_group_id: Option<i64>,
+}
+
+/// `gitlab.repository.protected_tag.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct RepositoryProtectedTagListInput {
+    project: String,
+}
+
+/// `gitlab.repository.protected_tag.show`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct RepositoryProtectedTagShowInput {
+    project: String,
+    name: String,
+}
+
+/// `gitlab.repository.protected_tag.protect`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct RepositoryProtectedTagProtectInput {
+    project: String,
+    name: String,
+    create_access_level: Option<i64>,
+}
+
+/// `gitlab.repository.protected_tag.unprotect`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct RepositoryProtectedTagUnprotectInput {
+    project: String,
+    name: String,
+    confirm_name: Option<String>,
+}
+
+/// `gitlab.deploy_token.list`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct DeployTokenListInput {
+    project: String,
+}
+
+/// `gitlab.deploy_token.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct DeployTokenCreateInput {
+    project: String,
+    name: String,
+    scopes: Vec<Value>,
+    expires_at: Option<String>,
+    username: Option<String>,
+}
+
+/// `gitlab.deploy_token.revoke`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct DeployTokenRevokeInput {
+    project: String,
+    token_id: i64,
+    confirm_token_id: Option<i64>,
+}
+
 fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("gitlab", "0.1.0")
         .capabilities(Caps {
@@ -1275,6 +1398,129 @@ fn manifest_builder() -> PluginBuilder {
                 "Download a repository archive (tar.gz/zip/tar) at a ref into the host blob store.",
             ),
             repository_archive,
+        )
+        // ---- CI/CD job-token scope (inbound token access allowlist) ----
+        .operation(
+            read_op_typed::<CiJobTokenScopeShowInput>(
+                "gitlab.ci.job_token.scope.show",
+                "Show a project's CI/CD job-token inbound/outbound access scope settings.",
+            ),
+            ci_job_token_scope_show,
+        )
+        .operation(
+            write_op_typed::<CiJobTokenScopeSetInput>(
+                "gitlab.ci.job_token.scope.set",
+                "Enable/disable a project's inbound CI/CD job-token access enforcement (enabled=true restricts to the allowlist).",
+            ),
+            ci_job_token_scope_set,
+        )
+        .operation(
+            read_op_typed::<CiJobTokenAllowlistListInput>(
+                "gitlab.ci.job_token.allowlist.list",
+                "List the projects allowed to use their CI_JOB_TOKEN to access this project.",
+            ),
+            ci_job_token_allowlist_list,
+        )
+        .operation(
+            write_op_typed::<CiJobTokenAllowlistAddInput>(
+                "gitlab.ci.job_token.allowlist.add",
+                "Add a project (by numeric id) to this project's CI job-token allowlist, letting its CI clone/access this project via CI_JOB_TOKEN.",
+            ),
+            ci_job_token_allowlist_add,
+        )
+        .operation(
+            risked(
+                write_op_typed::<CiJobTokenAllowlistRemoveInput>(
+                    "gitlab.ci.job_token.allowlist.remove",
+                    "Remove a project from this project's CI job-token allowlist (may break that project's CI access). Pass confirm_target_project_id to guard against mistakes.",
+                ),
+                Risk::High,
+            ),
+            ci_job_token_allowlist_remove,
+        )
+        .operation(
+            read_op_typed::<CiJobTokenGroupsAllowlistListInput>(
+                "gitlab.ci.job_token.groups_allowlist.list",
+                "List the groups allowed to use their CI_JOB_TOKEN to access this project.",
+            ),
+            ci_job_token_groups_allowlist_list,
+        )
+        .operation(
+            write_op_typed::<CiJobTokenGroupsAllowlistAddInput>(
+                "gitlab.ci.job_token.groups_allowlist.add",
+                "Add a group (by numeric id) to this project's CI job-token groups allowlist.",
+            ),
+            ci_job_token_groups_allowlist_add,
+        )
+        .operation(
+            risked(
+                write_op_typed::<CiJobTokenGroupsAllowlistRemoveInput>(
+                    "gitlab.ci.job_token.groups_allowlist.remove",
+                    "Remove a group from this project's CI job-token groups allowlist. Pass confirm_target_group_id to guard against mistakes.",
+                ),
+                Risk::High,
+            ),
+            ci_job_token_groups_allowlist_remove,
+        )
+        // ---- protected tags ----
+        .operation(
+            read_op_typed::<RepositoryProtectedTagListInput>(
+                "gitlab.repository.protected_tag.list",
+                "List a project's protected tags with their create-access levels.",
+            ),
+            protected_tag_list,
+        )
+        .operation(
+            read_op_typed::<RepositoryProtectedTagShowInput>(
+                "gitlab.repository.protected_tag.show",
+                "Show one protected tag (by name or wildcard pattern).",
+            ),
+            protected_tag_show,
+        )
+        .operation(
+            write_op_typed::<RepositoryProtectedTagProtectInput>(
+                "gitlab.repository.protected_tag.protect",
+                "Protect a tag or wildcard pattern (create_access_level defaults to 40 = maintainer).",
+            ),
+            protected_tag_protect,
+        )
+        .operation(
+            risked(
+                write_op_typed::<RepositoryProtectedTagUnprotectInput>(
+                    "gitlab.repository.protected_tag.unprotect",
+                    "Unprotect a tag or wildcard pattern. Pass confirm_name equal to name to guard against mistakes.",
+                ),
+                Risk::High,
+            ),
+            protected_tag_unprotect,
+        )
+        // ---- deploy tokens ----
+        .operation(
+            read_op_typed::<DeployTokenListInput>(
+                "gitlab.deploy_token.list",
+                "List a project's deploy tokens (metadata only; the secret is never returned by list).",
+            ),
+            deploy_token_list,
+        )
+        .operation(
+            risked(
+                write_op_typed::<DeployTokenCreateInput>(
+                    "gitlab.deploy_token.create",
+                    "Create a project deploy token (scopes e.g. read_repository, read_registry). The response `token` is a secret returned ONCE — store it now.",
+                ),
+                Risk::High,
+            ),
+            deploy_token_create,
+        )
+        .operation(
+            risked(
+                write_op_typed::<DeployTokenRevokeInput>(
+                    "gitlab.deploy_token.revoke",
+                    "Revoke (delete) a project deploy token by numeric id. Pass confirm_token_id equal to token_id to guard against mistakes.",
+                ),
+                Risk::High,
+            ),
+            deploy_token_revoke,
         )
 }
 
@@ -3382,6 +3628,209 @@ fn cap_bytes(s: &str, max: usize) -> Option<String> {
     Some(format!("{}\n[diff truncated]", &s[..end]))
 }
 
+// ---------------------------------------------------------------------------
+// CI/CD job-token scope, protected tags, deploy tokens (CI governance).
+// ---------------------------------------------------------------------------
+
+/// Fat-finger guard for a destructive op: when a `confirm_*` integer field is supplied it must equal
+/// the target, else the op is refused; an absent confirm is allowed (so automation stays ergonomic).
+fn confirm_i64(input: &Value, field: &str, expected: i64) -> Result<(), String> {
+    match flex_i64(input, &[field]) {
+        Some(c) if c == expected => Ok(()),
+        Some(_) => Err(format!(
+            "`{field}` does not match the target — refusing to proceed"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// String counterpart of [`confirm_i64`].
+fn confirm_str(input: &Value, field: &str, expected: &str) -> Result<(), String> {
+    match flex_str(input, field) {
+        Some(c) if c == expected => Ok(()),
+        Some(_) => Err(format!(
+            "`{field}` does not match the target — refusing to proceed"
+        )),
+        None => Ok(()),
+    }
+}
+
+fn ci_job_token_scope_show(input: Value, host: &mut Host) -> Result<Value, String> {
+    let project = req_project(&input)?;
+    gl_get(
+        host,
+        &format!("/projects/{}/job_token_scope", enc(&project)),
+    )
+}
+
+fn ci_job_token_scope_set(input: Value, host: &mut Host) -> Result<Value, String> {
+    let project = req_project(&input)?;
+    let enabled = input
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .ok_or("`enabled` (boolean) required")?;
+    // GitLab replies 204 No Content to this PATCH, so synthesize the confirmation.
+    gl_request(
+        host,
+        "PATCH",
+        &format!("/projects/{}/job_token_scope", enc(&project)),
+        Some(&json!({ "enabled": enabled })),
+    )?;
+    Ok(json!({ "project": project, "enabled": enabled, "message": "job token scope updated" }))
+}
+
+fn ci_job_token_allowlist_list(input: Value, host: &mut Host) -> Result<Value, String> {
+    let project = req_project(&input)?;
+    gl_get(
+        host,
+        &format!("/projects/{}/job_token_scope/allowlist", enc(&project)),
+    )
+}
+
+fn ci_job_token_allowlist_add(input: Value, host: &mut Host) -> Result<Value, String> {
+    let project = req_project(&input)?;
+    let target =
+        flex_i64(&input, &["target_project_id"]).ok_or("`target_project_id` (integer) required")?;
+    gl_post(
+        host,
+        &format!("/projects/{}/job_token_scope/allowlist", enc(&project)),
+        &json!({ "target_project_id": target }),
+    )
+}
+
+fn ci_job_token_allowlist_remove(input: Value, host: &mut Host) -> Result<Value, String> {
+    let project = req_project(&input)?;
+    let target =
+        flex_i64(&input, &["target_project_id"]).ok_or("`target_project_id` (integer) required")?;
+    confirm_i64(&input, "confirm_target_project_id", target)?;
+    gl_delete(
+        host,
+        &format!(
+            "/projects/{}/job_token_scope/allowlist/{target}",
+            enc(&project)
+        ),
+    )?;
+    Ok(json!({
+        "project": project,
+        "target_project_id": target,
+        "message": "removed from job token allowlist"
+    }))
+}
+
+fn ci_job_token_groups_allowlist_list(input: Value, host: &mut Host) -> Result<Value, String> {
+    let project = req_project(&input)?;
+    gl_get(
+        host,
+        &format!(
+            "/projects/{}/job_token_scope/groups_allowlist",
+            enc(&project)
+        ),
+    )
+}
+
+fn ci_job_token_groups_allowlist_add(input: Value, host: &mut Host) -> Result<Value, String> {
+    let project = req_project(&input)?;
+    let target =
+        flex_i64(&input, &["target_group_id"]).ok_or("`target_group_id` (integer) required")?;
+    gl_post(
+        host,
+        &format!(
+            "/projects/{}/job_token_scope/groups_allowlist",
+            enc(&project)
+        ),
+        &json!({ "target_group_id": target }),
+    )
+}
+
+fn ci_job_token_groups_allowlist_remove(input: Value, host: &mut Host) -> Result<Value, String> {
+    let project = req_project(&input)?;
+    let target =
+        flex_i64(&input, &["target_group_id"]).ok_or("`target_group_id` (integer) required")?;
+    confirm_i64(&input, "confirm_target_group_id", target)?;
+    gl_delete(
+        host,
+        &format!(
+            "/projects/{}/job_token_scope/groups_allowlist/{target}",
+            enc(&project)
+        ),
+    )?;
+    Ok(json!({
+        "project": project,
+        "target_group_id": target,
+        "message": "removed from job token groups allowlist"
+    }))
+}
+
+fn protected_tag_list(input: Value, host: &mut Host) -> Result<Value, String> {
+    let project = req_project(&input)?;
+    gl_get(host, &format!("/projects/{}/protected_tags", enc(&project)))
+}
+
+fn protected_tag_show(input: Value, host: &mut Host) -> Result<Value, String> {
+    let project = req_project(&input)?;
+    let name = flex_str(&input, "name").ok_or("`name` (string) required")?;
+    gl_get(
+        host,
+        &format!("/projects/{}/protected_tags/{}", enc(&project), enc(&name)),
+    )
+}
+
+fn protected_tag_protect(input: Value, host: &mut Host) -> Result<Value, String> {
+    let project = req_project(&input)?;
+    let name = flex_str(&input, "name").ok_or("`name` (string) required")?;
+    let create_access_level = flex_i64(&input, &["create_access_level"]).unwrap_or(40);
+    gl_post(
+        host,
+        &format!("/projects/{}/protected_tags", enc(&project)),
+        &json!({ "name": name, "create_access_level": create_access_level }),
+    )
+}
+
+fn protected_tag_unprotect(input: Value, host: &mut Host) -> Result<Value, String> {
+    let project = req_project(&input)?;
+    let name = flex_str(&input, "name").ok_or("`name` (string) required")?;
+    confirm_str(&input, "confirm_name", &name)?;
+    gl_delete(
+        host,
+        &format!("/projects/{}/protected_tags/{}", enc(&project), enc(&name)),
+    )?;
+    Ok(json!({ "project": project, "name": name, "message": "tag unprotected" }))
+}
+
+fn deploy_token_list(input: Value, host: &mut Host) -> Result<Value, String> {
+    let project = req_project(&input)?;
+    gl_get(host, &format!("/projects/{}/deploy_tokens", enc(&project)))
+}
+
+fn deploy_token_create(input: Value, host: &mut Host) -> Result<Value, String> {
+    let project = req_project(&input)?;
+    let name = flex_str(&input, "name").ok_or("`name` (string) required")?;
+    let scopes = input
+        .get("scopes")
+        .and_then(|v| v.as_array())
+        .filter(|a| !a.is_empty())
+        .ok_or("`scopes` (non-empty array, e.g. [\"read_repository\"]) required")?;
+    let mut body = body_from(&input, &["expires_at", "username"]);
+    body.insert("name".into(), json!(name));
+    body.insert("scopes".into(), json!(scopes));
+    gl_post(
+        host,
+        &format!("/projects/{}/deploy_tokens", enc(&project)),
+        &Value::Object(body),
+    )
+}
+
+fn deploy_token_revoke(input: Value, host: &mut Host) -> Result<Value, String> {
+    let project = req_project(&input)?;
+    let token_id = flex_i64(&input, &["token_id", "id"]).ok_or("`token_id` (integer) required")?;
+    confirm_i64(&input, "confirm_token_id", token_id)?;
+    gl_delete(
+        host,
+        &format!("/projects/{}/deploy_tokens/{token_id}", enc(&project)),
+    )?;
+    Ok(json!({ "project": project, "token_id": token_id, "message": "deploy token revoked" }))
+}
+
 fn main() {
     manifest_builder().serve();
 }
@@ -4408,7 +4857,7 @@ mod tests {
     #[test]
     fn manifest_declares_ops_auth_and_datasources() {
         let m = manifest_builder().build().manifest();
-        assert_eq!(m.operations.len(), 64);
+        assert_eq!(m.operations.len(), 79);
         assert_eq!(m.auth[0].purpose, "personal_token");
         assert_eq!(m.endpoints[0].name, "gitlab.endpoint");
         assert_eq!(
@@ -4424,6 +4873,212 @@ mod tests {
             .datasources
             .iter()
             .any(|d| d.entity == "gitlab.merge_request"));
+    }
+
+    // ---- CI governance: job-token scope, protected tags, deploy tokens ----
+
+    #[test]
+    fn job_token_scope_show_and_set() {
+        let mut host = base().with_http(
+            "/api/v4/projects/group%2Fapp/job_token_scope",
+            json!({ "inbound_enabled": true, "outbound_enabled": false }),
+        );
+        let shown = run(
+            "gitlab.ci.job_token.scope.show",
+            json!({ "project": "group/app" }),
+            &mut host,
+        );
+        assert_eq!(shown["inbound_enabled"], true);
+        // PATCH replies 204 → the op synthesizes a confirmation.
+        let set = run(
+            "gitlab.ci.job_token.scope.set",
+            json!({ "project": "group/app", "enabled": true }),
+            &mut host,
+        );
+        assert_eq!(set["enabled"], true);
+        assert_eq!(set["message"], "job token scope updated");
+    }
+
+    #[test]
+    fn job_token_allowlist_lifecycle() {
+        // The add-then-list pair hits the same URL, so use the sequential mock; the DELETE has a
+        // distinct id-suffixed path. Project path is URL-encoded (group%2Fapp) throughout.
+        let mut host = base()
+            .with_http(
+                "/api/v4/projects/group%2Fapp/job_token_scope/allowlist/123",
+                json!({ "removed": true }),
+            )
+            .with_http_seq(
+                "/api/v4/projects/group%2Fapp/job_token_scope/allowlist",
+                json!({ "target_project_id": 123, "target_project_path": "grp/b" }),
+            )
+            .with_http_seq(
+                "/api/v4/projects/group%2Fapp/job_token_scope/allowlist",
+                json!([{ "target_project_id": 123 }]),
+            );
+        let added = run(
+            "gitlab.ci.job_token.allowlist.add",
+            json!({ "project": "group/app", "target_project_id": 123 }),
+            &mut host,
+        );
+        assert_eq!(added["target_project_id"], 123);
+        let listed = run(
+            "gitlab.ci.job_token.allowlist.list",
+            json!({ "project": "group/app" }),
+            &mut host,
+        );
+        assert_eq!(listed[0]["target_project_id"], 123);
+        let removed = run(
+            "gitlab.ci.job_token.allowlist.remove",
+            json!({ "project": "group/app", "target_project_id": 123, "confirm_target_project_id": 123 }),
+            &mut host,
+        );
+        assert_eq!(removed["message"], "removed from job token allowlist");
+    }
+
+    #[test]
+    fn job_token_groups_allowlist_lifecycle() {
+        let mut host = base()
+            .with_http(
+                "/job_token_scope/groups_allowlist/456",
+                json!({ "removed": true }),
+            )
+            .with_http_seq(
+                "/job_token_scope/groups_allowlist",
+                json!({ "target_group_id": 456 }),
+            )
+            .with_http_seq(
+                "/job_token_scope/groups_allowlist",
+                json!([{ "target_group_id": 456 }]),
+            );
+        let added = run(
+            "gitlab.ci.job_token.groups_allowlist.add",
+            json!({ "project": "group/app", "target_group_id": 456 }),
+            &mut host,
+        );
+        assert_eq!(added["target_group_id"], 456);
+        let listed = run(
+            "gitlab.ci.job_token.groups_allowlist.list",
+            json!({ "project": "group/app" }),
+            &mut host,
+        );
+        assert_eq!(listed[0]["target_group_id"], 456);
+        let removed = run(
+            "gitlab.ci.job_token.groups_allowlist.remove",
+            json!({ "project": "group/app", "target_group_id": 456, "confirm_target_group_id": 456 }),
+            &mut host,
+        );
+        assert_eq!(
+            removed["message"],
+            "removed from job token groups allowlist"
+        );
+    }
+
+    #[test]
+    fn protected_tag_lifecycle() {
+        // `v*` percent-encodes to `v%2A`; show/unprotect target the encoded suffixed path.
+        let mut host = base()
+            .with_http("/protected_tags/v%2A", json!({ "name": "v*" }))
+            .with_http_seq(
+                "/protected_tags",
+                json!({ "name": "v*", "create_access_level": 40 }),
+            )
+            .with_http_seq("/protected_tags", json!([{ "name": "v*" }]));
+        let protected = run(
+            "gitlab.repository.protected_tag.protect",
+            json!({ "project": "group/app", "name": "v*" }),
+            &mut host,
+        );
+        assert_eq!(protected["name"], "v*");
+        let listed = run(
+            "gitlab.repository.protected_tag.list",
+            json!({ "project": "group/app" }),
+            &mut host,
+        );
+        assert_eq!(listed[0]["name"], "v*");
+        let shown = run(
+            "gitlab.repository.protected_tag.show",
+            json!({ "project": "group/app", "name": "v*" }),
+            &mut host,
+        );
+        assert_eq!(shown["name"], "v*");
+        let unprotected = run(
+            "gitlab.repository.protected_tag.unprotect",
+            json!({ "project": "group/app", "name": "v*", "confirm_name": "v*" }),
+            &mut host,
+        );
+        assert_eq!(unprotected["message"], "tag unprotected");
+    }
+
+    #[test]
+    fn deploy_token_lifecycle_surfaces_token_once() {
+        let mut host = base()
+            .with_http("/deploy_tokens/7", json!({ "revoked": true }))
+            .with_http_seq(
+                "/deploy_tokens",
+                json!({ "id": 7, "name": "ci", "token": "gLdeadbeef", "scopes": ["read_repository"] }),
+            )
+            .with_http_seq("/deploy_tokens", json!([{ "id": 7, "name": "ci" }]));
+        let created = run(
+            "gitlab.deploy_token.create",
+            json!({ "project": "group/app", "name": "ci", "scopes": ["read_repository"] }),
+            &mut host,
+        );
+        // The one-time secret is surfaced to the operator (this is the deliverable).
+        assert_eq!(created["token"], "gLdeadbeef");
+        let listed = run(
+            "gitlab.deploy_token.list",
+            json!({ "project": "group/app" }),
+            &mut host,
+        );
+        assert_eq!(listed[0]["id"], 7);
+        let revoked = run(
+            "gitlab.deploy_token.revoke",
+            json!({ "project": "group/app", "token_id": 7, "confirm_token_id": 7 }),
+            &mut host,
+        );
+        assert_eq!(revoked["message"], "deploy token revoked");
+    }
+
+    #[test]
+    fn destructive_confirm_guard_blocks_mismatch() {
+        // Canned responses are present, so the ONLY reason these fail is the confirm guard firing
+        // before the HTTP call — a matching confirm proceeds.
+        let mut host = base()
+            .with_http("/job_token_scope/allowlist/123", json!({ "ok": true }))
+            .with_http("/deploy_tokens/7", json!({ "ok": true }))
+            .with_http("/protected_tags/v%2A", json!({ "ok": true }));
+        let built = manifest_builder().build();
+
+        let bad = built.call(
+            "gitlab.ci.job_token.allowlist.remove",
+            json!({ "project": "group/app", "target_project_id": 123, "confirm_target_project_id": 999 }),
+            &mut host,
+        );
+        assert!(bad.is_err());
+        assert!(bad.unwrap_err().contains("confirm_target_project_id"));
+
+        let bad_tok = built.call(
+            "gitlab.deploy_token.revoke",
+            json!({ "project": "group/app", "token_id": 7, "confirm_token_id": 8 }),
+            &mut host,
+        );
+        assert!(bad_tok.is_err());
+
+        let bad_tag = built.call(
+            "gitlab.repository.protected_tag.unprotect",
+            json!({ "project": "group/app", "name": "v*", "confirm_name": "nope" }),
+            &mut host,
+        );
+        assert!(bad_tag.is_err());
+
+        // A matching confirm proceeds (guard does not block).
+        let ok = built.call(
+            "gitlab.ci.job_token.allowlist.remove",
+            json!({ "project": "group/app", "target_project_id": 123, "confirm_target_project_id": 123 }),
+            &mut host,
+        );
+        assert!(ok.is_ok());
     }
 }
 
@@ -5315,6 +5970,122 @@ mod schema_contract {
                         p("format", Kind::Str),
                     ],
                     vec!["project"],
+                ),
+            ),
+            (
+                "gitlab.ci.job_token.scope.show",
+                c(vec![p("project", Kind::Str)], vec!["project"]),
+            ),
+            (
+                "gitlab.ci.job_token.scope.set",
+                c(
+                    vec![p("project", Kind::Str), p("enabled", Kind::Bool)],
+                    vec!["project", "enabled"],
+                ),
+            ),
+            (
+                "gitlab.ci.job_token.allowlist.list",
+                c(vec![p("project", Kind::Str)], vec!["project"]),
+            ),
+            (
+                "gitlab.ci.job_token.allowlist.add",
+                c(
+                    vec![p("project", Kind::Str), p("target_project_id", Kind::Int)],
+                    vec!["project", "target_project_id"],
+                ),
+            ),
+            (
+                "gitlab.ci.job_token.allowlist.remove",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("target_project_id", Kind::Int),
+                        p("confirm_target_project_id", Kind::Int),
+                    ],
+                    vec!["project", "target_project_id"],
+                ),
+            ),
+            (
+                "gitlab.ci.job_token.groups_allowlist.list",
+                c(vec![p("project", Kind::Str)], vec!["project"]),
+            ),
+            (
+                "gitlab.ci.job_token.groups_allowlist.add",
+                c(
+                    vec![p("project", Kind::Str), p("target_group_id", Kind::Int)],
+                    vec!["project", "target_group_id"],
+                ),
+            ),
+            (
+                "gitlab.ci.job_token.groups_allowlist.remove",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("target_group_id", Kind::Int),
+                        p("confirm_target_group_id", Kind::Int),
+                    ],
+                    vec!["project", "target_group_id"],
+                ),
+            ),
+            (
+                "gitlab.repository.protected_tag.list",
+                c(vec![p("project", Kind::Str)], vec!["project"]),
+            ),
+            (
+                "gitlab.repository.protected_tag.show",
+                c(
+                    vec![p("project", Kind::Str), p("name", Kind::Str)],
+                    vec!["project", "name"],
+                ),
+            ),
+            (
+                "gitlab.repository.protected_tag.protect",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("name", Kind::Str),
+                        p("create_access_level", Kind::Int),
+                    ],
+                    vec!["project", "name"],
+                ),
+            ),
+            (
+                "gitlab.repository.protected_tag.unprotect",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("name", Kind::Str),
+                        p("confirm_name", Kind::Str),
+                    ],
+                    vec!["project", "name"],
+                ),
+            ),
+            (
+                "gitlab.deploy_token.list",
+                c(vec![p("project", Kind::Str)], vec!["project"]),
+            ),
+            (
+                "gitlab.deploy_token.create",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("name", Kind::Str),
+                        p("scopes", Kind::ArrayAny),
+                        p("expires_at", Kind::Str),
+                        p("username", Kind::Str),
+                    ],
+                    vec!["project", "name", "scopes"],
+                ),
+            ),
+            (
+                "gitlab.deploy_token.revoke",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("token_id", Kind::Int),
+                        p("confirm_token_id", Kind::Int),
+                    ],
+                    vec!["project", "token_id"],
                 ),
             ),
         ]
