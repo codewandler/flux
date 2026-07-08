@@ -112,6 +112,17 @@ stays documented.
 - When a scoped grant *is* configured (the smoke can set one in its isolated `$HOME`), an internal GitLab is a
   real `PASS`.
 
+## Addendum — ephemeral `--allow-private-net` override (D-96)
+
+A global `flux --allow-private-net` flag gives operators a **this-process-only** grant without editing
+config: it widens the *operator-grant side* to `*` at every egress-wiring site (propagated via
+`FLUX_ALLOW_PRIVATE_NET` so `plugin call` / `app run` inherit it). The model above is otherwise
+unchanged — the plugin path still intersects with each manifest's declared `private_hosts` (a plugin
+declaring none stays refused), and admissions still audit, now with `grant_source =
+"cli:--allow-private-net"`. `web_fetch` has no manifest safeguard, so the flag fully opens it to
+private ranges for the run; a scoped `[private_net.plugins]` grant remains the right tool for anything
+recurring. Story: [D-96](../stories/D-96-allow-private-net-cli-override.md).
+
 ## Out of scope
 
 - TLS termination / cert pinning for internal hosts (orthogonal; `conn.dial` TLS is already deferred in D-12).

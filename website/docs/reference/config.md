@@ -48,6 +48,19 @@ The network guard refuses private, loopback, and link-local addresses by default
 `true` for any), and `[private_net.plugins]` grants a plugin access to specific hosts — always
 intersected with the hosts the plugin declares in its manifest, so nothing undeclared is reachable.
 
+To reach a private endpoint **once** without editing config — for a quick test, or a one-off
+`flux plugin call` against internal infrastructure — pass the global `--allow-private-net` flag:
+
+```bash
+flux --allow-private-net plugin call gitlab gitlab.ci.job_token.allowlist.list '{"project":"group/app"}'
+```
+
+It is the ephemeral equivalent of a `[private_net.plugins]` grant for this invocation only (nothing
+is persisted) and is audited like any config grant. Plugins still only reach the private hosts their
+manifest declares; `web_fetch`, which has no manifest safeguard, is opened to **all** private ranges
+(including cloud-metadata `169.254.169.254`) for the run — so prefer a scoped `[private_net.plugins]`
+grant for anything recurring.
+
 ## Environment overrides
 
 A few environment variables tune behavior without editing config: `FLUX_VERBOSE=1` (un-cap tool
