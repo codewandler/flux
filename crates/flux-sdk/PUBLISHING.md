@@ -55,10 +55,10 @@ classification. Non-closure crates (`flux-cli`, `flux-app`, `flux-server`, `flux
 13. flux-runtime
 14. flux-tools
 15. flux-cognition
-16. flux-agent          (→ markdown, skill, …)
-17. flux-flow
-18. flux-orchestrate
-19. flux-sdk
+16. flux-flow           (→ lang, events, runtime, provider, skill, evidence, system, spec, secret, core)
+17. flux-agent          (→ flow, markdown, skill, tools, runtime, provider, events, evidence, core)
+18. flux-orchestrate    (→ agent, flow, …)
+19. flux-sdk            (→ orchestrate, agent, flow, cognition, …)
 20. flux-providers      (→ core, provider)  — the concrete clients (plural)
 ```
 

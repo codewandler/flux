@@ -34,8 +34,8 @@ CRATES=(
   codewandler-flux-runtime
   codewandler-flux-tools
   codewandler-flux-cognition
-  codewandler-flux-agent
   codewandler-flux-flow
+  codewandler-flux-agent
   codewandler-flux-orchestrate
   codewandler-flux-sdk
   codewandler-flux-providers
