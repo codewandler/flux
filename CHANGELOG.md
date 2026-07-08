@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-07-08
+
 ### Fixed
 
 - **Clearer planner repair diagnostics.** When a plan is rejected for a missing required parameter,
