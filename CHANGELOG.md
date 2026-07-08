@@ -6,6 +6,17 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **`flux usage` now reports time-window metrics and unpriced reasons.** The dashboard can be
+  narrowed with `--last`, `--since`, and `--until`; it renders period/session/wall-time/cache/cost
+  metrics above each table, starts with a per-harness plus absolute total summary, explains `$?` rows
+  as unknown-model or missing-usage cases, and shows TTY-only scan progress while reading large Codex,
+  Claude Code, and opencode histories. The built-in pricing table now covers the current high-volume
+  Claude/Codex/OpenRouter model ids seen in those histories, including Claude Fable/Sonnet 5,
+  GPT-5.4, GPT-5.3-Codex, and route-suffixed OpenRouter slugs. JSON output now carries the same
+  normalized period, summary, metric, row, and cost-status data without progress noise.
+
 ## [0.11.0] - 2026-07-09
 
 ### Changed

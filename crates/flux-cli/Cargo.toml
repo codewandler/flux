@@ -54,6 +54,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_norway.workspace = true
 rusqlite.workspace = true
+chrono.workspace = true
 reedline = "0.48.0"
 # Restore the default SIGPIPE disposition at startup so piping into `head`/`less` ends the process
 # quietly instead of panicking on EPIPE (A-61). A no-op on non-unix; usage is `#[cfg(unix)]`-gated.

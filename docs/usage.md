@@ -179,9 +179,12 @@ flux flow run <file.flux>        # run one checked-in Flux-Lang flow directly (n
                                  #                        (`flow <name> -> …`) to find its session unambiguously
 flux sessions                    # list recent sessions
 flux usage                       # aligned token/cost dashboard for flux + detected Codex,
-                                 #   Claude Code, and opencode stores; use --no-external for
-                                 #   flux-only, --harness flux,codex,claude,opencode to filter,
-                                 #   or --json for normalized machine-readable rows
+                                 #   Claude Code, and opencode stores. Shows period/session/time
+                                 #   metrics, a per-harness + absolute total summary, cache share,
+                                 #   priced/unpriced rows, and TTY scan progress for large local
+                                 #   histories. Use --last 7d,
+                                 #   --since/--until, --no-external, --harness ..., --progress ...,
+                                 #   or --json for normalized machine-readable metrics + rows
 flux replay <session|last>       # TIME MACHINE (C-43/A-45): hermetically re-execute a recorded run —
                                  #   plans re-parse from the durable plan_source, op outputs are served
                                  #   from the recorded cassette: NO model call, NO live IO, side effects

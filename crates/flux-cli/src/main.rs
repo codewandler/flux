@@ -9497,10 +9497,7 @@ mod tests {
         let table = flux_core::PricingTable::builtin();
         // A cloud provider with a model the table doesn't know → marker.
         let unpriced = super::CliSink::new(0)
-            .with_cost(
-                "openrouter/deepseek/deepseek-v4-flash:nitro".into(),
-                table.clone(),
-            )
+            .with_cost("openrouter/acme/not-in-table".into(), table.clone())
             .cost_inline(Some(&u));
         assert_eq!(unpriced, " · $? (unpriced)", "got: {unpriced:?}");
         // Local ollama and unknown/mock specs: silent, as before.
@@ -9512,7 +9509,7 @@ mod tests {
         }
         // No usage → silent regardless.
         let none = super::CliSink::new(0)
-            .with_cost("openrouter/deepseek/deepseek-v4-flash:nitro".into(), table)
+            .with_cost("openrouter/acme/not-in-table".into(), table)
             .cost_inline(None);
         assert_eq!(none, "");
     }

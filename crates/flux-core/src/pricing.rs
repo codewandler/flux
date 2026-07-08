@@ -268,15 +268,19 @@ pub fn resolve_role_model(parent_provider: &str, role_model: &str) -> crate::Res
 impl PricingTable {
     /// The built-in curated rate table. Prices are USD per 1M tokens.
     ///
-    /// Verified against the vendors' public pricing pages on **2026-07-02**:
+    /// Verified against the vendors' public pricing pages on **2026-07-09**:
     /// - Anthropic: <https://platform.claude.com/docs/en/about-claude/pricing>
     /// - OpenAI: <https://developers.openai.com/api/docs/pricing> (base `gpt-5` is off the main
     ///   sheet but still served at its published rate, confirmed on the per-model page
     ///   <https://developers.openai.com/api/docs/models/gpt-5>)
     /// - AWS Bedrock: <https://aws.amazon.com/bedrock/pricing/> — Anthropic models bill at the
     ///   direct Anthropic list rates
-    /// - OpenRouter: <https://openrouter.ai/anthropic/claude-sonnet-4.6> and
-    ///   <https://openrouter.ai/meta-llama/llama-3.3-70b-instruct>
+    /// - OpenRouter: <https://openrouter.ai/api/v1/models> plus the public model pages for
+    ///   `anthropic/claude-sonnet-4.6`, `deepseek/deepseek-v4-flash`,
+    ///   `poolside/laguna-xs-2.1`, `qwen/qwen3.7-max`, `z-ai/glm-5.2`, and
+    ///   `meta-llama/llama-3.3-70b-instruct`
+    /// - models.dev: <https://models.dev/api.json> as a cross-check for provider-specific model
+    ///   ids, context windows, and cache tiers where vendor pages expose only input/output prices
     ///
     /// `gpt-realtime`/`gpt-realtime-2` (C-38) verified separately against
     /// <https://developers.openai.com/api/docs/pricing> on **2026-07-06**.
@@ -296,47 +300,41 @@ impl PricingTable {
     /// - Bedrock regional/multi-region cross-region profiles (`us.`/`eu.`/`apac.`) carry a ~10%
     ///   premium over `global.` endpoints on 4.5+ models; this table prices every routing prefix
     ///   at the base (global) rate.
-    /// - OpenAI's gpt-5.5 long-context premium (input beyond 272K tokens bills 2× input /
-    ///   1.5× output) is not modelled.
+    /// - OpenAI's gpt-5.4/gpt-5.5 long-context premium (input beyond 272K tokens bills 2× input /
+    ///   1.5× output) and priority service-tier premium are not modelled.
     /// - Rows with no current public sheet are marked **estimated** inline (`gpt-5-codex`,
-    ///   delisted); the OpenRouter llama row is the listed price as of the verification date but
-    ///   floats across serving providers.
+    ///   delisted; `gpt-5.3-codex-spark`, documented by OpenAI as a Codex research-preview model);
+    ///   the OpenRouter routed rows are listed prices as of the verification date but can float
+    ///   across serving providers.
     pub fn builtin() -> Self {
         let mut rates = BTreeMap::new();
+        let text = |input: f64, output: f64, cache_write: f64, cache_read: f64| Rates {
+            input,
+            output,
+            cache_write,
+            cache_read,
+            reasoning: 0.0,
+            audio_input: 0.0,
+            audio_output: 0.0,
+        };
 
         // --- Anthropic / Claude (input, output, cache_write, cache_read, reasoning) ---------------
-        let opus = Rates {
-            input: 5.0,
-            output: 25.0,
-            cache_write: 6.25,
-            cache_read: 0.50,
-            reasoning: 0.0,
-            audio_input: 0.0,
-            audio_output: 0.0,
-        };
+        let fable = text(10.0, 50.0, 12.50, 1.00);
+        rates.insert("claude-fable-5".to_string(), fable);
+        let opus = text(5.0, 25.0, 6.25, 0.50);
         rates.insert("claude-opus-4-8".to_string(), opus);
         rates.insert("claude-opus-4-7".to_string(), opus);
-        rates.insert(
-            "claude-sonnet-4-6".to_string(),
-            Rates {
-                input: 3.0,
-                output: 15.0,
-                cache_write: 3.75,
-                cache_read: 0.30,
-                reasoning: 0.0,
-                audio_input: 0.0,
-                audio_output: 0.0,
-            },
-        );
-        let haiku = Rates {
-            input: 1.0,
-            output: 5.0,
-            cache_write: 1.25,
-            cache_read: 0.10,
-            reasoning: 0.0,
-            audio_input: 0.0,
-            audio_output: 0.0,
-        };
+        rates.insert("claude-opus-4-6".to_string(), opus);
+        rates.insert("claude-opus-4-5".to_string(), opus);
+        // Anthropic's introductory Sonnet 5 pricing runs through 2026-08-31. `PricingTable` is
+        // deliberately static/IO-free, so this row should be revisited when that window closes.
+        let sonnet5_intro = text(2.0, 10.0, 2.50, 0.20);
+        rates.insert("claude-sonnet-5".to_string(), sonnet5_intro);
+        let sonnet = text(3.0, 15.0, 3.75, 0.30);
+        rates.insert("claude-sonnet-4-6".to_string(), sonnet);
+        rates.insert("claude-sonnet-4-5-20250929".to_string(), sonnet);
+        rates.insert("claude-sonnet-4-5".to_string(), sonnet);
+        let haiku = text(1.0, 5.0, 1.25, 0.10);
         rates.insert("claude-haiku-4-5-20251001".to_string(), haiku);
         rates.insert("claude-haiku-4-5".to_string(), haiku);
 
@@ -345,47 +343,38 @@ impl PricingTable {
         // inference-profile ids (`us.`/`eu.`/`global.` + the id) whose price is the same in every
         // region, and `rates_for` strips that routing prefix before this lookup. Bedrock is
         // metered (pay-per-token via AWS), not a subscription.
+        rates.insert("anthropic.claude-fable-5".to_string(), fable);
+        rates.insert("anthropic.claude-sonnet-5".to_string(), sonnet5_intro);
+        rates.insert("anthropic.claude-sonnet-4-6".to_string(), sonnet);
+        rates.insert("anthropic.claude-sonnet-4-6-v1:0".to_string(), sonnet);
+        rates.insert("anthropic.claude-sonnet-4-5-20250929".to_string(), sonnet);
         rates.insert(
-            "anthropic.claude-sonnet-4-6".to_string(),
-            Rates {
-                input: 3.0,
-                output: 15.0,
-                cache_write: 3.75,
-                cache_read: 0.30,
-                reasoning: 0.0,
-                audio_input: 0.0,
-                audio_output: 0.0,
-            },
+            "anthropic.claude-sonnet-4-5-20250929-v1:0".to_string(),
+            sonnet,
         );
+        rates.insert("anthropic.claude-opus-4-8".to_string(), opus);
+        rates.insert("anthropic.claude-opus-4-7".to_string(), opus);
+        rates.insert("anthropic.claude-opus-4-6".to_string(), opus);
         rates.insert("anthropic.claude-opus-4-6-v1".to_string(), opus);
+        rates.insert("anthropic.claude-opus-4-5".to_string(), opus);
         rates.insert(
             "anthropic.claude-haiku-4-5-20251001-v1:0".to_string(),
             haiku,
         );
 
         // --- OpenAI / Codex (GPT-5 family; cache_write == input, no write premium) ----------------
-        let gpt5 = Rates {
-            input: 1.25,
-            output: 10.0,
-            cache_write: 1.25,
-            cache_read: 0.125,
-            reasoning: 0.0,
-            audio_input: 0.0,
-            audio_output: 0.0,
-        };
+        let gpt5 = text(1.25, 10.0, 1.25, 0.125);
         rates.insert("gpt-5".to_string(), gpt5);
-        rates.insert(
-            "gpt-5.5".to_string(),
-            Rates {
-                input: 5.0,
-                output: 30.0,
-                cache_write: 5.0,
-                cache_read: 0.50,
-                reasoning: 0.0,
-                audio_input: 0.0,
-                audio_output: 0.0,
-            },
-        );
+        rates.insert("gpt-5.5".to_string(), text(5.0, 30.0, 5.0, 0.50));
+        rates.insert("gpt-5.4".to_string(), text(2.5, 15.0, 2.5, 0.25));
+        rates.insert("gpt-5.4-mini".to_string(), text(0.75, 4.5, 0.75, 0.075));
+        rates.insert("gpt-5.4-nano".to_string(), text(0.20, 1.25, 0.20, 0.020));
+        let gpt53_codex = text(1.75, 14.0, 1.75, 0.175);
+        rates.insert("gpt-5.3-codex".to_string(), gpt53_codex);
+        // ESTIMATED: OpenAI documents Spark as a Codex research-preview model, while the public API
+        // pricing sheet publishes only `gpt-5.3-codex`; models.dev currently tracks Spark at the
+        // same token price. Keep historical Codex-session spend visible instead of `$?`.
+        rates.insert("gpt-5.3-codex-spark".to_string(), gpt53_codex);
         // Legacy alias: the `codex` provider resolves `*-codex` → `gpt-5.5` before cost, but keep the
         // key so a raw `codex/gpt-5-codex` spec still prices (defence-in-depth, never the live path).
         // ESTIMATED: delisted from OpenAI's current sheet; kept at its last published list price
@@ -415,17 +404,29 @@ impl PricingTable {
         rates.insert("gpt-realtime-2".to_string(), gpt_realtime);
 
         // --- OpenRouter passthrough models (keyed by the OpenRouter model id, slash and all) -------
+        rates.insert("anthropic/claude-sonnet-4.6".to_string(), sonnet);
+        let deepseek_v4_flash = text(0.09, 0.18, 0.09, 0.018);
+        rates.insert("deepseek/deepseek-v4-flash".to_string(), deepseek_v4_flash);
         rates.insert(
-            "anthropic/claude-sonnet-4.6".to_string(),
-            Rates {
-                input: 3.0,
-                output: 15.0,
-                cache_write: 3.75,
-                cache_read: 0.30,
-                reasoning: 0.0,
-                audio_input: 0.0,
-                audio_output: 0.0,
-            },
+            "deepseek/deepseek-v4-flash:nitro".to_string(),
+            deepseek_v4_flash,
+        );
+        rates.insert(
+            "poolside/laguna-xs-2.1".to_string(),
+            text(0.06, 0.12, 0.06, 0.03),
+        );
+        rates.insert(
+            "qwen/qwen3.7-max".to_string(),
+            text(1.25, 3.75, 1.5625, 0.25),
+        );
+        rates.insert(
+            "qwen/qwen3.7-max-20260520".to_string(),
+            text(1.25, 3.75, 1.5625, 0.25),
+        );
+        rates.insert("z-ai/glm-5.2".to_string(), text(0.42, 1.32, 0.42, 0.078));
+        rates.insert(
+            "z-ai/glm-5.2-20260616".to_string(),
+            text(0.42, 1.32, 0.42, 0.078),
         );
         // ESTIMATED: multi-provider routed — the OpenRouter listed price as of 2026-07-02; the
         // effective rate floats with the serving provider. No caching tiers published (cache
@@ -729,7 +730,7 @@ mod tests {
     }
 
     /// C-20: pin the headline rows to the vendor-verified rates so accidental edits are caught.
-    /// Values verified against the vendor pricing pages on 2026-07-02 (source URLs in the
+    /// Values verified against the vendor pricing pages on 2026-07-09 (source URLs in the
     /// [`PricingTable::builtin`] doc comment). Failing-first: `gpt-5.5` shipped at gpt-5's launch
     /// rates (1.25 / 10.0 / cached 0.125) — OpenAI's current sheet prices it at 5.0 / 30.0 with
     /// 0.50 cached input — and the OpenRouter llama row shipped as 0.12 / 0.30 vs the listed
@@ -758,14 +759,22 @@ mod tests {
         };
 
         // Anthropic (5-minute ephemeral cache: write = 1.25x input, read = 0.1x input).
+        pin("claude-fable-5", 10.0, 50.0, 12.50, 1.00);
         pin("claude-opus-4-8", 5.0, 25.0, 6.25, 0.50);
         pin("claude-opus-4-7", 5.0, 25.0, 6.25, 0.50);
+        pin("claude-opus-4-6", 5.0, 25.0, 6.25, 0.50);
+        pin("claude-sonnet-5", 2.0, 10.0, 2.50, 0.20);
         pin("claude-sonnet-4-6", 3.0, 15.0, 3.75, 0.30);
+        pin("claude-sonnet-4-5-20250929", 3.0, 15.0, 3.75, 0.30);
         pin("claude-haiku-4-5", 1.0, 5.0, 1.25, 0.10);
 
         // OpenAI (no cache-write tier: cache_write == input; cached input = 0.1x input).
         pin("gpt-5", 1.25, 10.0, 1.25, 0.125);
         pin("gpt-5.5", 5.0, 30.0, 5.0, 0.50);
+        pin("gpt-5.4", 2.5, 15.0, 2.5, 0.25);
+        pin("gpt-5.4-mini", 0.75, 4.5, 0.75, 0.075);
+        pin("gpt-5.3-codex", 1.75, 14.0, 1.75, 0.175);
+        pin("codex/gpt-5.3-codex-spark", 1.75, 14.0, 1.75, 0.175);
 
         // AWS Bedrock bills Anthropic models at the direct Anthropic list rates (global endpoint).
         assert_eq!(
@@ -773,10 +782,49 @@ mod tests {
             t.rates_for("claude-sonnet-4-6"),
             "Bedrock Sonnet must match the direct Anthropic rates"
         );
+        assert_eq!(
+            t.rates_for("anthropic.claude-fable-5"),
+            t.rates_for("claude-fable-5"),
+            "Bedrock Fable must match the direct Anthropic rates"
+        );
+        assert_eq!(
+            t.rates_for("anthropic.claude-sonnet-5"),
+            t.rates_for("claude-sonnet-5"),
+            "Bedrock Sonnet 5 must match the direct Anthropic rates"
+        );
 
-        // OpenRouter passthrough + the listed llama price as of 2026-07-02 (floats across routes).
+        // OpenRouter passthrough + listed route prices as of 2026-07-09.
         pin("anthropic/claude-sonnet-4.6", 3.0, 15.0, 3.75, 0.30);
+        pin(
+            "openrouter/deepseek/deepseek-v4-flash:nitro",
+            0.09,
+            0.18,
+            0.09,
+            0.018,
+        );
+        pin("openrouter/poolside/laguna-xs-2.1", 0.06, 0.12, 0.06, 0.03);
+        pin("openrouter/qwen/qwen3.7-max", 1.25, 3.75, 1.5625, 0.25);
+        pin("openrouter/z-ai/glm-5.2", 0.42, 1.32, 0.42, 0.078);
         pin("meta-llama/llama-3.3-70b-instruct", 0.10, 0.32, 0.10, 0.10);
+    }
+
+    #[test]
+    fn codex_prefixed_models_price_as_subscription_equivalents() {
+        let t = PricingTable::builtin();
+        let u = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+
+        let spark = t.cost(&u, "codex/gpt-5.3-codex-spark").unwrap();
+        assert!(spark.subscription);
+        assert_eq!(spark.source, CostSource::Estimated);
+        assert!((spark.usd - 15.75).abs() < 1e-9);
+
+        let mini = t.cost(&u, "codex/gpt-5.4-mini").unwrap();
+        assert!(mini.subscription);
+        assert!((mini.usd - 5.25).abs() < 1e-9);
     }
 
     /// C-38: the `gpt-realtime` family's headline rates, INCLUDING the audio surcharges — pinned
