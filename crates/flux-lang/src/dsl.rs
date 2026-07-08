@@ -113,6 +113,9 @@ pub fn jq(path: impl Into<String>, input: Node) -> Node {
     Node::Jq {
         path: path.into(),
         input: Box::new(input),
+        // Host/DSL-constructed `jq` keeps the lenient "absent means empty" traversal (native
+        // `$x.field` sugar is the strict surface — see [`Node::Jq`]).
+        optional: true,
     }
 }
 
@@ -1230,6 +1233,7 @@ mod tests {
             jq(".a", var("raw")),
             Node::Jq {
                 path: ".a".into(),
+                optional: true,
                 input: Box::new(Node::Var { name: "raw".into() }),
             }
         );

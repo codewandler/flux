@@ -3288,12 +3288,16 @@ fn eval_pure_node(
             interpolate_str(template, store, session_id),
             None,
         ),
-        Node::Jq { path, input } => {
+        Node::Jq {
+            path,
+            input,
+            optional,
+        } => {
             // Op results are stored as JSON *strings* (the canonical `content`), so a string input
             // that is really JSON is parsed first — this is what lets a flow pull
             // `.kind`/`.transcript` out of a `plan`/`run_plan` result.
             let jv = jq_parse_input(eval_arg(input, store, session_id)?);
-            let result = eval_jq_path(path, &jv)?;
+            let result = eval_jq_path(path, &jv, *optional)?;
             // A scalar number/bool field extract keeps its JSON type (`$n = $obj.n` binds the
             // number 42, not `"42"`), mirroring the `Lit` arm — so a rebuilt object stays typed
             // and typed `match` arms / structured output see the real value (F-008). Strings,
@@ -3441,11 +3445,15 @@ fn eval_template(
             }
             Ok(J::Array(out))
         }
-        Node::Jq { path, input } => {
+        Node::Jq {
+            path,
+            input,
+            optional,
+        } => {
             // Field access / sub-path: keep the raw extracted JSON value (objects/arrays nest as-is),
             // unlike the bind arm which text-ifies it.
             let jv = jq_parse_input(eval_arg(input, store, session_id)?);
-            eval_jq_path(path, &jv)
+            eval_jq_path(path, &jv, *optional)
         }
         Node::Expr { formula, vars } => {
             let resolved = resolve_expr_vars(vars, store, session_id)?;
@@ -3759,21 +3767,35 @@ fn jq_parse_input(value: serde_json::Value) -> serde_json::Value {
     value
 }
 
-/// Extract `path` from `value`, real-`jq` style (L-36): traversal through MISSING data — an absent
-/// key, or an array index past the end — yields `null` rather than erroring, and cascades (`.a.b.c`
-/// on an object that only has `.a` bottoms out at `null`, not a fatal at the first gap). `$a.b` is
-/// native-text sugar for `jq(".b", $a)` (ast.rs's `SymbolName::is_identifier` doc), so ordinary
-/// field access shares this leniency — s_362 turn 17535 died on `jq(".transcript", $x)` fatally
-/// discarding a fully-gathered turn's evidence for exactly this reason. A genuinely MALFORMED path
-/// (unmatched `[`, a non-numeric index) is a syntax error, not missing data, and still errors loudly.
-fn eval_jq_path(path: &str, value: &serde_json::Value) -> Result<serde_json::Value> {
-    let path = path.trim().trim_start_matches('.');
-    if path.is_empty() {
+/// Extract `path` from `value`, real-`jq` style. The `optional` flag selects the missing-data policy
+/// (L-53):
+///
+/// - `optional == true` (LENIENT — the default for a model-/host-emitted `jq`, and for native
+///   `$x.field?` sugar): traversal through MISSING data — an absent key, an out-of-range index, a
+///   field access on a non-object — yields `null` rather than erroring, and cascades (`.a.b.c` on an
+///   object that only has `.a` bottoms out at `null`). This is the battle-tested leniency real agent
+///   turns depend on — s_362 turn 17535 died on `jq(".transcript", $x)` fatally discarding a
+///   fully-gathered turn's evidence, which this mode prevents.
+/// - `optional == false` (STRICT — the default for native `$x.field` sugar): the same misses are a
+///   loud error (`jq_access_error`), so a typo'd field name fails fast instead of silently reading
+///   empty. A dotted numeric segment (`.0`) indexes a list.
+///
+/// In BOTH modes a PRESENT key whose value is `null` returns `null` (never an error — the
+/// present-but-optional idiom, e.g. `run_plan`'s `failure`), and a genuinely MALFORMED path
+/// (unmatched `[`, a non-numeric bracket index) is a syntax error that always errors loudly.
+fn eval_jq_path(
+    path: &str,
+    value: &serde_json::Value,
+    optional: bool,
+) -> Result<serde_json::Value> {
+    use serde_json::Value as J;
+    let trimmed = path.trim().trim_start_matches('.');
+    if trimmed.is_empty() {
         return Ok(value.clone());
     }
     let mut cur = value.clone();
     // Split on `.` and handle `[n]` inside each segment.
-    for raw_seg in path.split('.') {
+    for raw_seg in trimmed.split('.') {
         let seg = raw_seg.trim();
         if seg.is_empty() {
             continue;
@@ -3782,10 +3804,55 @@ fn eval_jq_path(path: &str, value: &serde_json::Value) -> Result<serde_json::Val
         let mut parts = seg.splitn(2, '[');
         let key = parts.next().unwrap_or("");
         if !key.is_empty() {
-            // Missing key (or `cur` isn't an object at all) → null, not fatal. `.get()` misses the
-            // same way on `Value::Null`, so a chain of absent segments cascades to `null` instead of
-            // erroring on the first gap.
-            cur = cur.get(key).cloned().unwrap_or(serde_json::Value::Null);
+            cur = match &cur {
+                // A PRESENT key returns its value (even `null` — that is the load-bearing
+                // present-but-optional idiom, e.g. `run_plan`'s `failure`, and is never an error).
+                // An ABSENT key is missing data: `null` when `optional`, else a loud error (L-53) so
+                // a typo'd field name fails fast instead of silently reading empty.
+                J::Object(map) => match map.get(key) {
+                    Some(v) => v.clone(),
+                    None if optional => J::Null,
+                    None => {
+                        return Err(jq_access_error(
+                            path,
+                            &format!("has no field `{key}`{}", present_keys_hint(map)),
+                        ))
+                    }
+                },
+                // Dotted numeric index into a list: `$nums.0` is the first element (L-53). A
+                // non-numeric field name on a list, or an out-of-range index, is missing data.
+                J::Array(arr) => match key.parse::<usize>() {
+                    Ok(idx) => match arr.get(idx) {
+                        Some(v) => v.clone(),
+                        None if optional => J::Null,
+                        None => {
+                            return Err(jq_access_error(
+                                path,
+                                &format!(
+                                    "index {idx} is past the end of a {}-element list",
+                                    arr.len()
+                                ),
+                            ))
+                        }
+                    },
+                    Err(_) if optional => J::Null,
+                    Err(_) => {
+                        return Err(jq_access_error(
+                            path,
+                            &format!(
+                                "cannot read field `{key}` of a list (use an index like `.0`)"
+                            ),
+                        ))
+                    }
+                },
+                _ if optional => J::Null,
+                other => {
+                    return Err(jq_access_error(
+                        path,
+                        &format!("cannot read field `{key}` of {}", json_type_name(other)),
+                    ))
+                }
+            };
         }
         if let Some(rest) = parts.next() {
             // rest is like `0]` or `0][1]`
@@ -3798,14 +3865,67 @@ fn eval_jq_path(path: &str, value: &serde_json::Value) -> Result<serde_json::Val
                 let idx: usize = idx_str
                     .parse()
                     .map_err(|_| Error::Other(format!("`jq` path: invalid index `{idx_str}`")))?;
-                // Out-of-bounds index is missing data too (real `jq`'s `.a[10]` on a short array is
-                // `null`, not an error) — only the syntax checks above are fatal.
-                cur = cur.get(idx).cloned().unwrap_or(serde_json::Value::Null);
+                cur = match &cur {
+                    J::Array(arr) => match arr.get(idx) {
+                        Some(v) => v.clone(),
+                        None if optional => J::Null,
+                        None => {
+                            return Err(jq_access_error(
+                                path,
+                                &format!(
+                                    "index [{idx}] is past the end of a {}-element list",
+                                    arr.len()
+                                ),
+                            ))
+                        }
+                    },
+                    _ if optional => J::Null,
+                    other => {
+                        return Err(jq_access_error(
+                            path,
+                            &format!("cannot index [{idx}] into {}", json_type_name(other)),
+                        ))
+                    }
+                };
                 bracket = bracket[end + 1..].to_string();
             }
         }
     }
     Ok(cur)
+}
+
+/// A strict field/index access hit missing data (L-53). The message names the path and points at the
+/// `?` opt-out so a flow that legitimately reads an optional field has a clear fix.
+fn jq_access_error(path: &str, detail: &str) -> FlowError {
+    FlowError::Core(Error::Other(format!(
+        "field access `{}` {detail}. If the field may be absent, mark the access optional with `?` \
+         (e.g. `$x.field?`) to read `null` instead of erroring.",
+        path.trim()
+    )))
+}
+
+/// A human-readable JSON type name for a field-access error message.
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "a list",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// A short "present keys" hint for a missing-field error — the first few keys actually on the object.
+fn present_keys_hint(map: &serde_json::Map<String, serde_json::Value>) -> String {
+    if map.is_empty() {
+        return " (the object is empty)".to_string();
+    }
+    let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    let shown = keys.iter().take(8).cloned().collect::<Vec<_>>().join(", ");
+    let more = if keys.len() > 8 { ", …" } else { "" };
+    format!(" (present: {shown}{more})")
 }
 
 /// Render a stored value as text (a string value is itself; anything else is its compact JSON).
@@ -5342,6 +5462,7 @@ mod tests {
         let store = MemStore::new();
         let obj_field = |name: &str| Node::Jq {
             path: format!(".{name}"),
+            optional: false,
             input: Box::new(flow_var("obj")),
         };
         let ast = DraftAst {
@@ -7085,6 +7206,7 @@ mod tests {
                 flow_bind("x", flow_lit(json!({"a": 1}))),
                 Node::Jq {
                     path: ".a".into(),
+                    optional: false,
                     input: Box::new(flow_var("x")),
                 },
             ],
@@ -7123,6 +7245,7 @@ mod tests {
                     "failure",
                     Node::Jq {
                         path: ".failure".into(),
+                        optional: false,
                         input: Box::new(flow_var("obj")),
                     },
                 ),
@@ -7163,6 +7286,9 @@ mod tests {
                     "missing",
                     Node::Jq {
                         path: ".b".into(),
+                        // Directly-constructed (host/model) `jq` stays lenient — this is the L-36
+                        // missing-key-yields-null behavior real agent turns depend on.
+                        optional: true,
                         input: Box::new(flow_var("obj")),
                     },
                 ),
@@ -7187,6 +7313,7 @@ mod tests {
                     "deep",
                     Node::Jq {
                         path: ".a.b.c".into(),
+                        optional: true,
                         input: Box::new(flow_var("obj")),
                     },
                 ),
@@ -7206,24 +7333,39 @@ mod tests {
         );
     }
 
-    /// L-36: `$a.b` is native-text sugar for `jq(".b", $a)` — the same missing-key-yields-null
-    /// semantics must hold at the sugar surface, since it lowers to the identical `Jq` node before
-    /// execution.
+    /// L-53: at the native `$a.b` sugar surface a MISSING field is now a loud error (strict), so a
+    /// typo'd field name fails fast instead of silently reading empty. The `$a.b?` opt-out restores
+    /// the lenient missing-key-yields-null behavior.
     #[tokio::test]
-    async fn dollar_dot_sugar_on_a_missing_field_yields_null_not_a_fatal_error() {
+    async fn dollar_dot_sugar_strict_errors_on_missing_and_optional_yields_null() {
         let host = CfHost::new();
         let store = MemStore::new();
-        let ast = crate::parse::parse(
+
+        // Strict `$obj.b` on a missing field is a loud error.
+        let strict = crate::parse::parse(
             "flow f\n  $obj = {\"a\":1}\n  $missing = $obj.b\n  return $missing\n",
         )
         .unwrap();
-        let mut sink = BufferSink::default();
-        let out = execute_flow(&store, &host, "s", &ast, &mut sink)
+        let err = execute_flow(&store, &host, "s", &strict, &mut BufferSink::default())
             .await
-            .unwrap_or_else(|e| panic!("`$a.b` sugar on a missing field must not be fatal: {e}"));
+            .expect_err("strict `$obj.b` on a missing field must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no field `b`") && msg.contains('?'),
+            "the error should name the missing field and the `?` opt-out: {msg}"
+        );
+
+        // Optional `$obj.b?` on a missing field reads null (empty text), as before.
+        let opt = crate::parse::parse(
+            "flow f\n  $obj = {\"a\":1}\n  $missing = $obj.b?\n  return $missing\n",
+        )
+        .unwrap();
+        let out = execute_flow(&store, &host, "s2", &opt, &mut BufferSink::default())
+            .await
+            .unwrap_or_else(|e| panic!("`$obj.b?` optional access must not be fatal: {e}"));
         assert_eq!(
             out.result, "",
-            "missing field via `$a.b` sugar renders as null (empty text)"
+            "missing field via `$a.b?` optional sugar renders as null (empty text)"
         );
     }
 
@@ -7240,6 +7382,7 @@ mod tests {
                     "bad",
                     Node::Jq {
                         path: ".a[0".into(),
+                        optional: true,
                         input: Box::new(flow_var("obj")),
                     },
                 ),
@@ -7265,6 +7408,7 @@ mod tests {
                     "bad",
                     Node::Jq {
                         path: ".a[x]".into(),
+                        optional: true,
                         input: Box::new(flow_var("obj")),
                     },
                 ),
@@ -7282,6 +7426,45 @@ mod tests {
             err2.to_string().contains("invalid index"),
             "non-numeric index still errors: {err2}"
         );
+    }
+
+    /// L-53: dotted numeric access `$nums.0` indexes into a list (previously it read a non-existent
+    /// object key `"0"` and silently returned empty). Out-of-range is missing data: a loud error
+    /// under strict access, `null` under the `?` opt-out.
+    #[tokio::test]
+    async fn dotted_numeric_access_indexes_a_list() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+
+        // `$nums.0` → the first element.
+        let first =
+            crate::parse::parse("flow f\n  $nums = [10, 20, 30]\n  $x = $nums.0\n  return $x\n")
+                .unwrap();
+        let out = execute_flow(&store, &host, "s", &first, &mut BufferSink::default())
+            .await
+            .expect("`$nums.0` indexes the list");
+        assert_eq!(out.result, "10", "`$nums.0` is the first element");
+
+        // Out-of-range strict access errors loudly.
+        let oob =
+            crate::parse::parse("flow f\n  $nums = [10, 20, 30]\n  $x = $nums.5\n  return $x\n")
+                .unwrap();
+        let err = execute_flow(&store, &host, "s2", &oob, &mut BufferSink::default())
+            .await
+            .expect_err("out-of-range strict index must error");
+        assert!(
+            err.to_string().contains("past the end"),
+            "out-of-range names the problem: {err}"
+        );
+
+        // Out-of-range optional access reads null (empty text).
+        let oob_opt =
+            crate::parse::parse("flow f\n  $nums = [10, 20, 30]\n  $x = $nums.5?\n  return $x\n")
+                .unwrap();
+        let out2 = execute_flow(&store, &host, "s3", &oob_opt, &mut BufferSink::default())
+            .await
+            .expect("`$nums.5?` optional is not fatal");
+        assert_eq!(out2.result, "", "out-of-range optional reads empty");
     }
 
     /// L-35: op results are stored as JSON *strings* (the same F13 quirk `jq` re-parses for) — a

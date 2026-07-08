@@ -536,6 +536,13 @@ impl Tool for MergeTool {
             let l = parse_json_array_string(l);
             match l {
                 Value::Array(a) => out.extend(a),
+                // An ABSENT list contributes nothing: `null` or the empty-string "absent" idiom (what
+                // an optional `$x.field?` read of a missing list binds to) is treated as `[]`, so a
+                // fan-out where some branches produced no list still merges the rest instead of
+                // hard-erroring. A genuine non-array value (e.g. a number, or a non-array string) is
+                // still a type error.
+                Value::Null => {}
+                Value::String(ref s) if s.is_empty() => {}
                 _ => {
                     return Err(Error::Other(format!(
                         "merge: element {i} of `lists` is not an array"

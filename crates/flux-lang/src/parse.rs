@@ -1100,11 +1100,9 @@ fn parse_stmt(lines: &[Line], indent: usize) -> Result<(Node, usize)> {
         return parse_dollar(t);
     }
 
-    // Otherwise the whole line is a single expression statement (e.g. a paren-form bare call).
-    let (node, tail) = parse_expr(t)?;
-    if !tail.trim().is_empty() {
-        return Err(perr(&format!("trailing text after expression: `{tail}`")));
-    }
+    // Otherwise the whole line is a single expression statement (e.g. a paren-form bare call, or a
+    // bare `expr` like `$a + 1`). Parse it as a full expression so an operator formula round-trips.
+    let node = parse_condition_expr(t, "expression statement")?;
     Ok((node, 1))
 }
 
@@ -1158,7 +1156,13 @@ fn parse_each(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)
         return Err(perr("`each` has an empty item symbol"));
     }
     let r = kw(r.trim_start(), "in").ok_or_else(|| perr("`each` expects `in`"))?;
-    let (source, after) = parse_expr(r)?;
+    // The source is a full expression up to an optional `-> $collect`; splitting at the top-level
+    // arrow first lets an operator source (`each $x in $a + 1`) round-trip, not just a leaf.
+    let (source_str, after) = match find_top_level_arrow(r) {
+        Some(pos) => (&r[..pos], &r[pos..]),
+        None => (r, ""),
+    };
+    let source = parse_condition_expr(source_str.trim(), "each source")?;
     let after = after.trim_start();
 
     let (collect, flat) = if let Some(a) = after.strip_prefix("->") {
@@ -1308,12 +1312,14 @@ fn parse_arms(region: &[Line], arm_kw: &str) -> Result<(Vec<(String, Vec<Node>)>
 }
 
 fn parse_match(subject_str: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
-    let subject = parse_full_expr(subject_str, "match subject")?;
+    // Subject and case values are full expressions (like bind values) so a formatted operator
+    // expr round-trips in either position.
+    let subject = parse_condition_expr(subject_str, "match subject")?;
     let region = child_region(lines, indent);
     let (arms, default) = parse_arms(region, "case")?;
     let mut cases = Vec::with_capacity(arms.len());
     for (value_str, body) in arms {
-        let value = parse_full_expr(&value_str, "case value")?;
+        let value = parse_condition_expr(&value_str, "case value")?;
         cases.push(crate::ast::MatchCase { value, body });
     }
     Ok((
@@ -1327,7 +1333,8 @@ fn parse_match(subject_str: &str, lines: &[Line], indent: usize) -> Result<(Node
 }
 
 fn parse_route(selector_str: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
-    let selector = parse_full_expr(selector_str, "route selector")?;
+    // A full expression (like a bind value) so a formatted operator selector round-trips.
+    let selector = parse_condition_expr(selector_str, "route selector")?;
     let region = child_region(lines, indent);
     let (arms, default) = parse_arms(region, "case")?;
     let mut cases = Vec::with_capacity(arms.len());
@@ -1568,7 +1575,10 @@ fn parse_return(rest: &str) -> Result<(Node, usize)> {
             value: serde_json::Value::Null,
         }
     } else {
-        parse_full_expr(rest, "return value")?
+        // A return value is a full expression (like a bind value), so `return $a + 1` /
+        // `return len($xs) > 0` work — not just a single leaf. `parse_condition_expr` falls through
+        // to native-`expr` parsing when a leaf parse leaves operator tokens.
+        parse_condition_expr(rest, "return value")?
     };
     Ok((
         Node::Return {
@@ -1634,6 +1644,80 @@ fn find_top_level_comma(s: &str) -> Option<usize> {
                 '(' | '[' | '{' => depth += 1,
                 ')' | ']' | '}' => depth -= 1,
                 ',' if depth == 0 => return Some(i),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Byte offset of the first TOP-LEVEL `,` or closing `)`/`]`/`}` in `s` (or `s.len()` if none) — the
+/// boundary of one argument / template-element expression. Commas/closers inside nested `(`/`[`/`{`
+/// or strings don't count.
+fn split_arg_end(s: &str) -> usize {
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut string_char = ' ';
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if in_string {
+            if c == '\\' {
+                chars.next();
+            } else if c == string_char {
+                in_string = false;
+            }
+        } else {
+            match c {
+                '"' | '\'' => {
+                    in_string = true;
+                    string_char = c;
+                }
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' if depth == 0 => return i,
+                ')' | ']' | '}' => depth -= 1,
+                ',' if depth == 0 => return i,
+                _ => {}
+            }
+        }
+    }
+    s.len()
+}
+
+/// Parse one full argument / template-element expression from the front of `s`, stopping at the
+/// first top-level `,` or closing bracket (left in the returned rest). Unlike [`parse_expr`] (a
+/// single leaf) this consumes operators, so a call arg or template value can be a full `expr`
+/// (`op($a + 1, $b)`, `{ n: $a * 2 }`) and round-trip a formatted operator expression.
+fn parse_delimited_expr(s: &str) -> Result<(Node, &str)> {
+    let end = split_arg_end(s);
+    let node = parse_condition_expr(s[..end].trim(), "argument")?;
+    Ok((node, &s[end..]))
+}
+
+/// The byte offset of a top-level `->` (the `each … -> $collect` separator), outside strings and
+/// brackets. `->` is not an `expr` operator, so it never occurs inside a valid source expression —
+/// this lets an `each` source be parsed as a full expression up to the arrow.
+fn find_top_level_arrow(s: &str) -> Option<usize> {
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut string_char = ' ';
+    let mut chars = s.char_indices().peekable();
+
+    while let Some((i, c)) = chars.next() {
+        if in_string {
+            if c == '\\' {
+                chars.next();
+            } else if c == string_char {
+                in_string = false;
+            }
+        } else {
+            match c {
+                '"' | '\'' => {
+                    in_string = true;
+                    string_char = c;
+                }
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                '-' if depth == 0 && matches!(chars.peek(), Some((_, '>'))) => return Some(i),
                 _ => {}
             }
         }
@@ -1845,15 +1929,23 @@ fn parse_expr(s: &str) -> Result<(Node, &str)> {
             // so the whole `plan.kind` is taken as one token; split on the first `.` to recover the
             // symbol + the jq path. The formatter only emits this sugar for simple dotted paths, so it
             // round-trips; anything else (array indices, non-Var input) goes through `@json`.
+            //
+            // L-53 optional-access: a trailing `?` (`$plan.kind?`) marks the access lenient — an absent
+            // key/out-of-range index yields `null` instead of erroring. Plain `$plan.kind` is strict.
             if let Some(dot) = name.find('.') {
                 let (var, path) = name.split_at(dot); // `path` keeps the leading `.`
                 if var.is_empty() {
                     return Err(perr("field access needs a symbol before `.`"));
                 }
+                let (optional, rest) = match rest.strip_prefix('?') {
+                    Some(after) => (true, after),
+                    None => (false, rest),
+                };
                 return Ok((
                     Node::Jq {
                         path: path.to_string(),
                         input: Box::new(Node::Var { name: var.into() }),
+                        optional,
                     },
                     rest,
                 ));
@@ -1947,7 +2039,7 @@ fn parse_call_args(s: &str) -> Result<(Vec<Node>, &str)> {
         return Ok((args, r));
     }
     loop {
-        let (node, rest) = parse_expr(s)?;
+        let (node, rest) = parse_delimited_expr(s)?;
         args.push(node);
         let rest = rest.trim_start();
         if let Some(r) = rest.strip_prefix(',') {
@@ -1968,7 +2060,7 @@ fn parse_arg_list(s: &str) -> Result<Vec<Node>> {
     let mut args = Vec::new();
     let mut s = s.trim_start();
     loop {
-        let (node, rest) = parse_expr(s)?;
+        let (node, rest) = parse_delimited_expr(s)?;
         args.push(node);
         let rest = rest.trim_start();
         if rest.is_empty() {
@@ -2001,7 +2093,7 @@ fn parse_obj_template(s: &str) -> Result<(Node, &str)> {
             .trim_start()
             .strip_prefix(':')
             .ok_or_else(|| perr(&format!("expected `:` after object key `{key}`")))?;
-        let (val, rest) = parse_expr(rest)?;
+        let (val, rest) = parse_delimited_expr(rest)?;
         fields.insert(key, Box::new(val));
         let rest = rest.trim_start();
         if let Some(r) = rest.strip_prefix(',') {
@@ -2027,7 +2119,7 @@ fn parse_list_template(s: &str) -> Result<(Node, &str)> {
         return Ok((Node::List { items }, r));
     }
     loop {
-        let (item, rest) = parse_expr(s)?;
+        let (item, rest) = parse_delimited_expr(s)?;
         items.push(item);
         let rest = rest.trim_start();
         if let Some(r) = rest.strip_prefix(',') {
@@ -2194,6 +2286,7 @@ mod tests {
     }
     fn jq(path: &str, input: Node) -> Node {
         Node::Jq {
+            optional: false,
             path: path.into(),
             input: Box::new(input),
         }
@@ -2867,6 +2960,7 @@ mod tests {
                     value: Box::new(Node::Jq {
                         path: ".prices[0]".into(),
                         input: Box::new(var("raw")),
+                        optional: false,
                     }),
                     ty: None,
                     effect: None,

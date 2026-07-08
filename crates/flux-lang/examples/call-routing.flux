@@ -36,36 +36,41 @@ flow route-call(utterance: String, caller_id: String) -> RouteResult
   # look up any existing booking for this caller (deterministic, no token cost)
   $context = booking_lookup($caller_id)
 
-  when $extract.intent == "book_flight"
-    $slots = $extract.slots
-    assert $slots.destination, "no destination found in utterance"
+  # `$extract` is model output — read its fields with the `?` opt-out so an omitted
+  # intent/slot falls through to `else` instead of hard-erroring (L-53 makes bare
+  # `$x.field` strict; `?` restores the lenient "absent means empty" read).
+  $intent = $extract.intent?
+  $slots  = $extract.slots?
+
+  when $intent == "book_flight"
+    assert $slots.destination?, "no destination found in utterance"
     confirm "Create booking to {slots.destination} on {slots.date}?", risk: medium
       $booking  = booking_create({ slots: $slots, caller: $caller_id })
       $response = fmt("Booking confirmed. Reference {booking.ref}, departing {slots.date}.")
       return {
-        intent:    $extract.intent,
+        intent:    $intent,
         slots:     $slots,
         response:  $response,
         escalated: false
       }
 
-  when $extract.intent == "change_booking"
+  when $intent == "change_booking"
     assert $context, "no existing booking found for caller"
-    $response = booking_modify({ context: $context, slots: $extract.slots })
+    $response = booking_modify({ context: $context, slots: $slots })
     return {
-      intent:    $extract.intent,
-      slots:     $extract.slots,
+      intent:    $intent,
+      slots:     $slots,
       response:  $response,
       escalated: false
     }
 
-  when $extract.intent == "cancel_booking"
+  when $intent == "cancel_booking"
     assert $context, "no existing booking found for caller"
     confirm "Cancel booking {context.ref} for caller {caller_id}?", risk: high
       booking_cancel($context)
       return {
-        intent:    $extract.intent,
-        slots:     $extract.slots,
+        intent:    $intent,
+        slots:     $slots,
         response:  "Your booking has been cancelled.",
         escalated: false
       }
@@ -74,13 +79,13 @@ flow route-call(utterance: String, caller_id: String) -> RouteResult
   else
     $ticket = support_ticket_create({
       caller_id: $caller_id,
-      intent:    $extract.intent,
-      slots:     $extract.slots,
+      intent:    $intent,
+      slots:     $slots,
       utterance: $utterance
     })
     return {
-      intent:    $extract.intent,
-      slots:     $extract.slots,
+      intent:    $intent,
+      slots:     $slots,
       response:  "Connecting you to an agent. Ticket {ticket.id}.",
       escalated: true
     }

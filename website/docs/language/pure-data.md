@@ -38,11 +38,22 @@ $price = $raw.bitcoin.usd
 $kind  = $plan.kind
 ```
 
-This lowers to a `jq` node. Two constraints:
+This lowers to a `jq` node. Notes:
 
 - It is a **bind-value** form: valid on the right-hand side of `$x = …`, not inline as a call
   argument or `match` subject. Bind first, then use the symbol.
-- Dotted fields only — array indexing needs the explicit `jq` node below.
+- `$obj.field` reads an object field; `$list.0` indexes into a list (`$list.0` is the first
+  element).
+- Access is **strict**: a missing field, an out-of-range index, or a field access on a non-object
+  is a loud error — a typo fails fast instead of silently reading empty. A field that is *present
+  but `null`* is never an error.
+- Mark an access **optional** with a trailing `?` — `$x.field?`, `$list.0?` — to read `null`
+  instead of erroring when a field may legitimately be absent.
+- **Strictness is a reference-position rule.** A bare `$x.field` in a bind value, condition,
+  value template, or `match`/`route` subject is strict (with the `?` opt-out). Field access
+  *inside an `expr` computation* — `$x.field == y`, `$x.field + 1`, `filter`/`map` predicates —
+  stays **lenient** (missing reads empty), since expr is for computed values where absent-as-empty
+  is the established behaviour; a `?` there is accepted but redundant.
 
 ## `jq` — JSON path extraction
 
@@ -55,8 +66,9 @@ of its input. Bracket paths and non-symbol inputs are written via `@json`:
 
 The path grammar is a strict subset of jq — dot-separated field names with optional `[n]`
 suffixes (`.field`, `.field.nested`, `.field[0].nested`). No filters, pipes, or conditionals.
-The extracted value keeps its natural JSON type; a missing path errors rather than yielding
-null.
+The extracted value keeps its natural JSON type. A model- or host-emitted `jq` node traverses
+missing data leniently (an absent key or out-of-range index yields `null`); the native
+`$x.field` sugar above is strict on missing data unless you add the `?` opt-out.
 
 ## `expr` — safe inline computation
 

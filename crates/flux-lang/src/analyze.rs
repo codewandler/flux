@@ -2961,6 +2961,7 @@ mod tests {
                 name: "k".into(),
                 value: Box::new(Node::Jq {
                     path: ".kind".into(),
+                    optional: false,
                     input: Box::new(Node::Call {
                         op: "read".into(),
                         args: vec![Node::Lit {
@@ -3059,6 +3060,7 @@ mod tests {
                     name: "k".into(),
                     value: Box::new(Node::Jq {
                         path: ".kind".into(),
+                        optional: false,
                         input: Box::new(Node::Var { name: "raw".into() }),
                     }),
                     ty: None,
@@ -3107,6 +3109,7 @@ mod tests {
                     // `jq` is not a `call`, so the runtime would `eval_arg` it and error.
                     selector: Box::new(Node::Jq {
                         path: ".intent".into(),
+                        optional: false,
                         input: Box::new(Node::Var { name: "raw".into() }),
                     }),
                     cases: vec![crate::ast::RouteCase {

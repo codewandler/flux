@@ -17,7 +17,8 @@ sequence of statements, indented two spaces.
 ```flux
 flow hello -> String
   $when = now()
-  $greeting = fmt("hello — the time is {when}")
+  $utc  = $when.utc
+  $greeting = fmt("hello — the time is {utc}")
   return $greeting
 ```
 
@@ -25,10 +26,10 @@ flow hello -> String
 flux flow run hello.flux
 ```
 
-`$when = now()` **binds** the result of the `now` operation to a symbol. Symbols are immutable
-named values — `{when}` inside a string interpolates the bound value at evaluation time.
-`return` ends the flow with a value. This flow never touches a model, so it runs without any
-API credentials.
+`$when = now()` **binds** the result of the `now` operation — an object with `unix` and `utc`
+fields — to a symbol. `$utc = $when.utc` reads one field; symbols are immutable named values, and
+`{utc}` inside a string interpolates the bound value at evaluation time. `return` ends the flow
+with a value. This flow never touches a model, so it runs without any API credentials.
 
 ## Calls and named arguments
 
@@ -62,9 +63,11 @@ flow price-check
   return { price: $price, label: $label }
 ```
 
-`$raw.bitcoin.usd` is field access into a JSON value. `fmt("…")` interpolates bound symbols.
-`{ price: $price, label: $label }` is a **value template** — a record assembled from computed
-symbols. More in [Pure data](./pure-data.md).
+`$raw.bitcoin.usd` is field access into a JSON value (`$list.0` indexes a list). Access is
+**strict** — a missing field or out-of-range index is a loud error, not a silent empty — so a
+typo fails fast; add a trailing `?` (`$raw.bitcoin.usd?`) to read `null` when a field may be
+absent. `fmt("…")` interpolates bound symbols. `{ price: $price, label: $label }` is a **value
+template** — a record assembled from computed symbols. More in [Pure data](./pure-data.md).
 
 ## Branching
 

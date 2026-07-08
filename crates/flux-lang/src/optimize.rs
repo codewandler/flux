@@ -697,6 +697,7 @@ mod tests {
                 1 => Node::List { items: vec![inner] },
                 2 => Node::Jq {
                     path: ".p".into(),
+                    optional: false,
                     input: Box::new(inner),
                 },
                 3 => Node::Parse {

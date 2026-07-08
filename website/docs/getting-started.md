@@ -77,8 +77,9 @@ Flux-Lang text can be parsed and executed without asking a model to compile a ne
 ```flux
 flow hello -> String
   $when = now()
-  $message = fmt("hello — the time is {when}")
-  return $message
+  $utc  = $when.utc
+  $greeting = fmt("hello — the time is {utc}")
+  return $greeting
 ```
 
 ```bash

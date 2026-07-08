@@ -384,7 +384,7 @@ fn head(node: &Node, p: &Palette) -> String {
             paint(p.keyword, "fmt"),
             paint(p.string, &format!("\"{template}\""))
         ),
-        Node::Jq { path, input } => format!(
+        Node::Jq { path, input, .. } => format!(
             "{} {} {}",
             paint(p.keyword, "jq"),
             paint(p.string, &format!("\"{path}\"")),
@@ -471,7 +471,7 @@ fn expr(node: &Node, p: &Palette) -> String {
             let is: Vec<String> = items.iter().map(|x| expr(x, p)).collect();
             format!("[{}]", is.join(", "))
         }
-        Node::Jq { path, input } => format!(
+        Node::Jq { path, input, .. } => format!(
             "{}({}, {})",
             paint(p.op, "jq"),
             paint(p.string, &format!("\"{path}\"")),
@@ -755,6 +755,7 @@ mod tests {
             "intent".to_string(),
             Box::new(Node::Jq {
                 path: ".intent".into(),
+                optional: false,
                 input: Box::new(Node::Var {
                     name: SymbolName("extract".into()),
                 }),

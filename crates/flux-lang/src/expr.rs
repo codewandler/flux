@@ -144,9 +144,12 @@ pub fn validate_expr_formula(formula: &str, var_keys: &BTreeSet<&str>) -> Vec<St
         if name == "true" || name == "false" {
             continue;
         }
-        // L-46: dotted identifiers — check only the root part against var_keys
+        // L-46: dotted identifiers — check only the root part against var_keys, and seed the dummy
+        // under the ROOT (what `expr_atom` looks up before descending fields), not the full dotted
+        // name — otherwise a valid dotted comparison like `$x.field == y` is wrongly flagged
+        // "malformed" because `eval_expr_value` can't resolve the root against the dummy.
         let root = name.split('.').next().unwrap_or(name);
-        dummy.insert(name.clone(), ExprVal::Num(1.0));
+        dummy.insert(root.to_string(), ExprVal::Num(1.0));
         if !var_keys.contains(root) {
             diags.push(format!(
                 "`expr` formula references `{root}` which is not declared in `vars` — add it to \
@@ -229,6 +232,13 @@ pub fn tokenize_expr(s: &str) -> VecDeque<Tok> {
                     } else {
                         break;
                     }
+                }
+                // L-53: absorb a trailing `?` optional-access marker on a field access (`x.field?`).
+                // Field access inside an `expr` is always lenient (a missing key reads empty), so `?`
+                // is a no-op here — but it must be accepted, not tokenized as an unknown op, so
+                // `$x.field? == y` parses instead of failing as a "malformed formula".
+                if ident.contains('.') && matches!(chars.peek(), Some(&'?')) {
+                    chars.next();
                 }
                 tokens.push_back(Tok::Ident(ident));
             }
@@ -692,6 +702,31 @@ pub fn format_number(n: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L-53 (code-review #5): a dotted field access in a comparison validates — and the `?` opt-out
+    /// composes with it. Before the fix, `validate_expr_formula` seeded the dummy under the full
+    /// dotted name (not the root), so `eval_expr_value` couldn't resolve the root and wrongly flagged
+    /// `x.field == y` "malformed"; and a `?` marker was tokenized as an unknown op, failing harder.
+    #[test]
+    fn dotted_comparison_and_optional_marker_validate() {
+        let var_keys: BTreeSet<&str> = ["rec"].into_iter().collect();
+        assert!(
+            validate_expr_formula("rec.a == 1", &var_keys).is_empty(),
+            "a dotted comparison must validate: {:?}",
+            validate_expr_formula("rec.a == 1", &var_keys)
+        );
+        assert!(
+            validate_expr_formula("rec.missing? == \"z\"", &var_keys).is_empty(),
+            "the `?` opt-out must compose with a comparison: {:?}",
+            validate_expr_formula("rec.missing? == \"z\"", &var_keys)
+        );
+        // The `?` is a no-op in expr (field access there is already lenient): the tokenizer drops it,
+        // so both forms tokenize identically.
+        assert_eq!(
+            tokenize_expr("rec.missing? == \"z\"").len(),
+            tokenize_expr("rec.missing == \"z\"").len(),
+        );
+    }
 
     #[test]
     fn expr_dotted_access_descends_objects_and_nulls_missing() {

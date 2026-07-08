@@ -71,7 +71,7 @@ follow are hand-written.
 | `thing` | A reference to an external thing. |
 | `expr` | Pure inline computation. `formula` is a safe whitelist expression over named variables: arithmetic (`+ - * /`, `round(x,n)`, `abs`, `min(a,b)`, `max(a,b)`), comparison (`== != < <= > >=`), boolean (`&& || !`, `true`/`false`), string functions (`len/lower/upper/trim/replace/repeat/reverse/contains/concat`), and string literals (`'…'`/`"…"`). `+` adds when both sides are numeric and concatenates otherwise. Because it yields a bool, an `expr` is also a valid `when`/`unless`/`until`/`assert` condition. `vars` maps variable names to node expressions (only `Lit` and `Var` are valid). No IO, no approval gate. Examples: `expr("price * 2", {"price": $btc})`, `expr("status == 'ok' && n > 0", …)`. |
 | `fmt` | Pure string interpolation. `template` is a string with `{name}` placeholders substituted from already-bound session symbols (same `{name}`/`{{name}}` syntax as `Lit` interpolation). No IO, no approval gate. Example: `fmt("BTC: {price} | Double: {doubled}")`. |
-| `jq` | Pure JSON path extraction. `path` is a dot-path string (e.g. `".bitcoin.usd"` or `"results[0].value"`) applied to the JSON content of `input` (a `Var` or `Lit` node). No IO, no approval gate. Example: `jq(".bitcoin.usd", $raw)`. |
+| `jq` | Pure JSON path extraction. `path` is a dot-path string (e.g. `".bitcoin.usd"` or `"results[0].value"`) applied to the JSON content of `input` (a `Var` or `Lit` node). No IO, no approval gate. Example: `jq(".bitcoin.usd", $raw)`.  `optional` selects the traversal-through-missing-data policy (L-53). When `false` — the default for native `$x.field` sugar — an absent object key, an out-of-range index, or a field access on a non-object is a loud error, so a typo'd field name fails fast instead of silently reading empty. When `true` — native `$x.field?` sugar, and the default for a model- or host-emitted `jq` (so real agent turns keep the battle-tested "absent means empty" leniency) — such a miss yields `null`. A present-but-`null` field is never an error in either mode. |
 | `parse` | Pure type coercion. Converts the string result of a `jq` or `fmt` node into a typed value. `as_type` is one of `"f64"`, `"i64"`, `"bool"`, `"json"`, `"string"`. No IO, no approval gate. Example: `parse(jq(".price", $raw), as: "f64")`. |
 | `ctx` | Build a bounded, budgeted **context pack** from existing symbols. Resolves `include` (minus `exclude`) to its members, then — when `budget` is set — shrinks the pack *at evaluation* by visibility tier then declared order until within the char budget, recording any dropped members in the run trace. Produces a `Ctx` value bound to `name`. Pure: it selects and labels existing values, performing no IO (the load-bearing elevation of PRD §13 explicit context management). |
 | `ctx_append` | Accrete more symbols into an existing context pack (the `+=` marker). Immutably rebinds `ctx` to a *new* `Ctx` value (preserving the audit chain `$pack@1 → @2`) with `add` appended, then re-applies the pack's budget. Pure. |
@@ -1100,13 +1100,18 @@ content of `input`. Supports dot-notation (`.bitcoin.usd`), array indexing
 | `input` | Node | yes | any node producing a JSON string or object (`Var` or `Lit`) |
 
 The extracted value is returned as the natural JSON type (`Number`, `String`,
-`Bool`, etc.). Traversal through **missing data** — an absent key, or an array
-index past the end — yields `null` (matching real `jq`), not an error; a chain
-of absent segments (e.g. `.a.b.c` on an object that only has `.a`) cascades to
-`null` at every hop instead of erroring on the first gap. `$a.b` field-access
-sugar lowers to `jq(".b", $a)`, so ordinary dotted field access shares this
-leniency. Only a **malformed path** — an unmatched `[`, or a non-numeric index
-— is a syntax error and still errors loudly.
+`Bool`, etc.). A `jq` node's `optional` flag selects the missing-data policy
+(L-53). A model- or host-emitted `jq` is **lenient**: traversal through **missing
+data** — an absent key, an out-of-range index, a field access on a non-object —
+yields `null` (matching real `jq`), and a chain of absent segments (`.a.b.c` on an
+object that only has `.a`) cascades to `null`. Native `$a.b` field-access sugar is
+**strict** by default: the same misses are a loud error, so a typo fails fast
+instead of silently reading empty — add the `?` opt-out (`$a.b?`, `$list.0?`) to
+read `null` when a field may be absent, and `$list.0` indexes a list. In both modes
+a **present-but-`null`** field returns `null` (never an error), and a **malformed
+path** — an unmatched `[`, or a non-numeric bracket index — always errors loudly.
+Field access inside an `expr` computation (`$a.b == x`, `filter`/`map` predicates)
+stays lenient.
 
 **The full BTC-double pattern in 4 nodes, 0 bash calls:**
 
@@ -1332,8 +1337,10 @@ gates on a shell exit-code wrapper or a boolean tool output work as expected.
   outside any concurrent branch is unaffected.
 - **`await` and `checkpoint` are top-level only** — they need stable resume cursors.
 - **`obj`/`list` are pure templates** — they cannot contain `call` or control-flow leaves.
-- **`jq` (and `$a.b` field-access sugar) yields `null` for MISSING data, not an error** —
-  an absent key or an out-of-range array index propagates `null` and cascades through
-  the rest of the path (`.a.b.c` on an object that only has `.a` bottoms out at `null`).
-  A genuinely malformed path (unmatched `[`, a non-numeric index) is a syntax error and
-  still errors loudly.
+- **Native `$a.b` field access is STRICT; a model/host `jq` node is lenient** (L-53) — a
+  bare `$a.b` errors on a missing key / out-of-range index / non-object (add `?` — `$a.b?`,
+  `$list.0?` — to read `null` instead; `$list.0` indexes a list). A model-emitted `jq`
+  propagates `null` for missing data and cascades (`.a.b.c` on an object with only `.a`
+  bottoms out at `null`). In both, a present-but-`null` field is `null`, not an error; a
+  malformed path (unmatched `[`, a non-numeric index) always errors. Field access inside an
+  `expr` computation stays lenient.

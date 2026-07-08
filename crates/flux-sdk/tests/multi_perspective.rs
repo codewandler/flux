@@ -56,6 +56,18 @@ fn scout_answer(summary: &str, marker: &str) -> String {
     .to_string()
 }
 
+/// A scout `Answer` with NO `evidence` key — the non-conforming case a real LLM can produce. Used to
+/// prove the flow's `$technical.evidence?` degrades to empty instead of hard-erroring (L-53).
+fn scout_answer_no_evidence(summary: &str) -> String {
+    json!({
+        "status": "answered",
+        "summary": summary,
+        "gaps": [],
+        "risks": []
+    })
+    .to_string()
+}
+
 /// The canned `synth` answer — the flow's final return value.
 fn synth_answer() -> String {
     json!({
@@ -78,6 +90,10 @@ fn synth_answer() -> String {
 struct MultiPerspectiveMockProvider {
     /// One entry per `stream()` call: `"SYSTEM:<system>\nUSER:<first user message text>"`.
     log: Arc<Mutex<Vec<String>>>,
+    /// L-53 regression guard: when true, each scout `Answer` OMITS the `evidence` key, so the flow's
+    /// `$technical.evidence?` reads a missing field. With the `?` opt-out this must degrade (empty
+    /// claim list) rather than hard-erroring the turn after the sub-agents were paid for.
+    omit_evidence: bool,
 }
 
 #[async_trait]
@@ -111,23 +127,28 @@ impl Provider for MultiPerspectiveMockProvider {
             return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
         }
 
-        let text = if system.contains("TECHNICAL scout") {
-            scout_answer(
+        let (summary, marker) = if system.contains("TECHNICAL scout") {
+            (
                 "Architecture supports incremental delivery of partial results.",
                 "TECH-MARKER-ALPHA",
             )
         } else if system.contains("PRODUCT scout") {
-            scout_answer(
+            (
                 "Users need a visible, low-friction way to notice and retry failures.",
                 "PROD-MARKER-BETA",
             )
         } else if system.contains("RISK scout") {
-            scout_answer(
+            (
                 "Partial failures must never silently drop events from the stream.",
                 "RISK-MARKER-GAMMA",
             )
         } else {
             panic!("unexpected system prompt (no scout/synth role matched): {system:?}");
+        };
+        let text = if self.omit_evidence {
+            scout_answer_no_evidence(summary)
+        } else {
+            scout_answer(summary, marker)
         };
 
         // A sub-agent `task` result is read from the engine's `Chat(text)` path, which is built
@@ -143,6 +164,10 @@ impl Provider for MultiPerspectiveMockProvider {
 }
 
 fn build_client() -> (FlowClient, Arc<Mutex<Vec<String>>>) {
+    build_client_variant(false)
+}
+
+fn build_client_variant(omit_evidence: bool) -> (FlowClient, Arc<Mutex<Vec<String>>>) {
     // Load the REAL checked-in scout role files.
     let roles = RoleRegistry::load(&[repo_root().join(".flux/agents")]);
     assert!(
@@ -167,11 +192,15 @@ fn build_client() -> (FlowClient, Arc<Mutex<Vec<String>>>) {
     let factory = Arc::new(move || {
         Ok(Box::new(MultiPerspectiveMockProvider {
             log: factory_log.clone(),
+            omit_evidence,
         }) as Box<dyn Provider>)
     });
     let sub_agents = SubAgents::new(roles, child_base, factory, "mock", 4096);
 
-    let top_level = Arc::new(MultiPerspectiveMockProvider { log: log.clone() });
+    let top_level = Arc::new(MultiPerspectiveMockProvider {
+        log: log.clone(),
+        omit_evidence,
+    });
     let mut client = FlowClient::builder()
         .model("mock")
         .auto_approve(true)
@@ -270,5 +299,32 @@ async fn multi_perspective_is_stable_across_repeated_runs() {
     assert_eq!(
         out1.result, out2.result,
         "multi-perspective must produce identical output for the same inputs across runs"
+    );
+}
+
+/// L-53 regression guard (code-review finding #1): when a scout omits the `evidence` key — which a
+/// real LLM can do — the flow's `$technical.evidence?` optional access must degrade to an empty
+/// claim list, NOT hard-error the turn after all three sub-agents were already paid for. Before the
+/// `?` migration this bound `$technical.evidence` strictly and aborted with `has no field evidence`.
+#[tokio::test]
+async fn multi_perspective_degrades_when_a_scout_omits_evidence() {
+    let (client, _log) = build_client_variant(/* omit_evidence */ true);
+    let text = read_flow();
+
+    let out = client
+        .run_flow(&text, seed_query())
+        .await
+        .expect("flow must complete (degrade) when scouts omit `evidence`, not error");
+
+    // It still fanned out to all three scouts and reached the synthesized answer.
+    let task_calls = out.tool_calls.iter().filter(|op| *op == "task").count();
+    assert_eq!(
+        task_calls, 3,
+        "all three lenses still run; got {task_calls}"
+    );
+    assert!(
+        !out.result.trim().is_empty(),
+        "the flow returns the synth answer even with no evidence: {:?}",
+        out.result
     );
 }

@@ -838,13 +838,23 @@ async fn compile_turn_inner(
                                 .map_err(|e| format!("emit_plan: invalid AST JSON: {e}"))
                         }
                         EmissionArm::Text => match input.get("source").and_then(|v| v.as_str()) {
-                            Some(src) => flux_lang::parse::parse(src).map_err(|e| {
-                                format!(
-                                    "emit_plan: invalid Flux-Lang source ({e}). Fix the source \
-                                     text — a `flow` header at column 0, statements indented 2 \
-                                     spaces per level, no tabs — and call emit_plan again."
-                                )
-                            }),
+                            Some(src) => flux_lang::parse::parse(src)
+                                .map(|mut ast| {
+                                    // L-53: a model-emitted plan's field access is LENIENT (like the
+                                    // JSON arm, whose `optional` defaults true and is hidden from the
+                                    // schema). Strict `$x.field` is a human-authored-`.flux` concern
+                                    // only; relax the model's native text so an absent key yields null
+                                    // rather than a fatal error mid-turn (s_362).
+                                    flux_lang::ast::relax_field_access(&mut ast);
+                                    ast
+                                })
+                                .map_err(|e| {
+                                    format!(
+                                        "emit_plan: invalid Flux-Lang source ({e}). Fix the source \
+                                         text — a `flow` header at column 0, statements indented 2 \
+                                         spaces per level, no tabs — and call emit_plan again."
+                                    )
+                                }),
                             None => Err("emit_plan: missing `source` — pass the plan as native \
                                          Flux-Lang text in the `source` string parameter."
                                 .to_string()),

@@ -31,9 +31,12 @@ flow multi-perspective(query: String) -> Answer
 
   observe({ kind: "lens-end", data: { perspectives: ["technical", "product", "risk"] } })
 
-  $claims_tech = $technical.evidence
-  $claims_prod = $product.evidence
-  $claims_risk = $risk.evidence
+  # Scout results are raw model output — read `.evidence` with the `?` opt-out so a scout that
+  # returns no `evidence` key degrades to an empty list instead of hard-erroring the whole turn
+  # after all three sub-agents were already paid for (L-53 strict field access).
+  $claims_tech = $technical.evidence?
+  $claims_prod = $product.evidence?
+  $claims_risk = $risk.evidence?
   $all_claims = merge({ lists: [$claims_tech, $claims_prod, $claims_risk] })
 
   $answer = synth({ claims: $all_claims, cite: true, format: "detailed" })

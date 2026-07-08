@@ -1221,7 +1221,13 @@ impl LoopHost for EngineLoopHost {
     async fn run_plan(&self, plan: Value) -> Result<Value> {
         let mut out = self.run_plan_dispatch(plan).await?;
         if let Some(obj) = out.as_object_mut() {
+            // The agent loop reads `$ran.failure` AND `$ran.transcript` with strict field access
+            // (L-53), so BOTH must be present on every return. `failure` is genuinely optional
+            // (absent on a clean round); `transcript` is included by every current dispatch path, but
+            // backfill it too so a future early-return that omits it can never hard-error the loop.
             obj.entry("failure").or_insert(Value::Null);
+            obj.entry("transcript")
+                .or_insert_with(|| Value::String(String::new()));
         }
         Ok(out)
     }

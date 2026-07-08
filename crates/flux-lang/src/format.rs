@@ -304,12 +304,17 @@ fn fmt_expr(node: &Node, multiline: bool) -> String {
         // `$var.path` (parse re-derives the same `Jq`). Bracket paths, non-`Var` inputs, or a
         // non-identifier input symbol can't be spelled this way, so they fall through to `@json` —
         // keeping the round-trip total.
-        Node::Jq { path, input }
-            if is_field_path(path)
-                && matches!(input.as_ref(), Node::Var { name } if name.is_identifier()) =>
+        Node::Jq {
+            path,
+            input,
+            optional,
+        } if is_field_path(path)
+            && matches!(input.as_ref(), Node::Var { name } if name.is_identifier()) =>
         {
+            // L-53: a lenient access renders with a trailing `?` (`$var.path?`); strict is bare.
+            let q = if *optional { "?" } else { "" };
             match input.as_ref() {
-                Node::Var { name } => format!("${}{}", name.0, path),
+                Node::Var { name } => format!("${}{}{}", name.0, path, q),
                 _ => unreachable!("guard checked Var"),
             }
         }
@@ -1152,6 +1157,43 @@ mod tests {
         let txt = format(&fmt_ast);
         assert!(txt.contains("fmt(\"\"\"hello\n{name}\"\"\")"), "got: {txt}");
         assert_eq!(crate::parse::parse(&txt).unwrap(), fmt_ast);
+    }
+
+    /// L-53: the optional-access `?` suffix round-trips through native sugar — `$obj.a?` parses to a
+    /// lenient `Jq`, formats back with the `?`, and stays distinct from strict `$obj.a`.
+    #[test]
+    fn optional_field_access_sugar_round_trips() {
+        let opt = crate::parse::parse("flow f\n  $x = $obj.a?\n  return $x\n").unwrap();
+        // The bind lowers to a lenient `Jq`.
+        let is_opt = matches!(
+            &opt.body[0],
+            Node::Bind { value, .. }
+                if matches!(value.as_ref(), Node::Jq { optional: true, path, .. } if path == ".a")
+        );
+        assert!(
+            is_opt,
+            "`$obj.a?` should lower to an optional Jq: {:?}",
+            opt.body[0]
+        );
+        let txt = format(&opt);
+        assert!(
+            txt.contains("$obj.a?"),
+            "optional access should format with `?`: {txt}"
+        );
+        assert_eq!(
+            crate::parse::parse(&txt).unwrap(),
+            opt,
+            "`?` must round-trip"
+        );
+
+        // Strict access has no `?` and lowers to a strict Jq.
+        let strict = crate::parse::parse("flow f\n  $x = $obj.a\n  return $x\n").unwrap();
+        let txt2 = format(&strict);
+        assert!(
+            txt2.contains("$obj.a") && !txt2.contains("$obj.a?"),
+            "strict access is bare: {txt2}"
+        );
+        assert_eq!(crate::parse::parse(&txt2).unwrap(), strict);
     }
 
     /// Golden nested case named by the story's Acceptance: a multi-line string inside an object

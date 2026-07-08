@@ -393,21 +393,42 @@ fn gen_node(rng: &mut Rng, depth: usize, seen: &mut BTreeSet<&'static str>) -> N
                 },
             },
         },
-        25 => Node::Expr {
-            formula: string(rng),
-            vars: {
-                let mut m = BTreeMap::new();
-                for _ in 0..rng.below(3) {
-                    m.insert(string(rng), Box::new(gen_node(rng, 0, seen)));
-                }
-                m
-            },
-        },
+        25 => {
+            // A valid, round-trippable `expr`: an operator formula (so it parses as `Expr`, not a
+            // bare `Var`) referencing only the vars it declares, each bound to its own `$symbol` —
+            // the exact shape `parse` reconstructs from native text. An arbitrary `string(rng)`
+            // formula (e.g. the bare word `hello`, or `he said "hi"`) is NOT a valid expr and could
+            // never round-trip; the property only holds over semantically-valid ASTs.
+            let (formula, keys): (&str, &[&str]) = *rng.pick(&[
+                ("a + 1", &["a"][..]),
+                ("a + b", &["a", "b"][..]),
+                ("a == b", &["a", "b"][..]),
+                ("len(xs) > 0", &["xs"][..]),
+            ]);
+            let vars = keys
+                .iter()
+                .map(|k| {
+                    (
+                        (*k).to_string(),
+                        Box::new(Node::Var {
+                            name: SymbolName::from(*k),
+                        }),
+                    )
+                })
+                .collect();
+            Node::Expr {
+                formula: formula.to_string(),
+                vars,
+            }
+        }
         26 => Node::Fmt {
             template: string(rng),
         },
         27 => Node::Jq {
             path: (*rng.pick(PATHS)).to_string(),
+            // Deterministic (no rng draw) so this generator arm doesn't shift the shared random
+            // stream; the `?`-optional round-trip is covered by a dedicated unit test in `format`.
+            optional: false,
             input: Box::new(gen_node(rng, d, seen)),
         },
         28 => Node::Parse {
