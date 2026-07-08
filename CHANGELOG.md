@@ -6,6 +6,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-07-08
+
+### Fixed
+
+- **Plugin workspace CI.** Updated the Kubernetes plugin's typed operation helper for the new
+  `OperationSpec::group` field so the full native plugin workspace clippy gate stays green.
+
 ## [0.9.0] - 2026-07-08
 
 **Minor bump** (pre-1.0 SemVer, where the minor position is the breaking-change signal):
