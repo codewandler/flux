@@ -1,0 +1,54 @@
+# Publishes the flux-sdk + flux-providers closure (the 20 `codewandler-flux-*` crates) to crates.io
+# when a version tag `vX.Y.Z` is pushed — alongside the binary `Release` workflow (release.yml).
+#
+# REQUIRED SECRET: `CARGO_REGISTRY_TOKEN` — a crates.io API token (https://crates.io/settings/tokens)
+# from an account that can publish the `codewandler-flux-*` names. Set it at
+# Settings → Secrets and variables → Actions on the `codewandler/flux` repo. Without it this job
+# fails fast with a clear message and nothing is published.
+#
+# Idempotent: a crate@version already on crates.io is skipped, so a failed run can be re-run (or the
+# tag re-pushed) to resume. The publish order lives in scripts/publish-crates-io.sh.
+name: crates.io
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crates-io-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the publish token is configured
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not set. Add it under Settings → Secrets and variables → Actions (a crates.io token that can publish the codewandler-flux-* crates)."
+            exit 1
+          fi
+
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Verify the tag matches the workspace version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          wsver=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "tag=$tag workspace=$wsver"
+          if [ "$tag" != "$wsver" ]; then
+            echo "::error::tag v$tag does not match [workspace.package].version $wsver"
+            exit 1
+          fi
+
+      - name: Publish the closure to crates.io
+        run: bash scripts/publish-crates-io.sh
