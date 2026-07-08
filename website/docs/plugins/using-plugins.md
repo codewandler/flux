@@ -101,12 +101,22 @@ The grant is **intersected** with what the plugin itself declares — you cannot
 manifest never named, and without a grant the private network is unreachable (deny-by-default).
 See [Configuration](../reference/config.md).
 
+A plugin that talks to an OAuth-protected API is logged in with `flux auth login <name>` — flux runs
+the OAuth flow host-side and the plugin never sees the token. For the whole capability model,
+references-only IO, and the manifest fields behind these grants, see
+[Plugin capability sandbox](../security/plugin-sandbox.md); for the login flow and token storage, see
+[Credentials & secrets](../security/credentials.md).
+
 ## Trust model
 
 The capability gates above are enforced on the **host** side; the plugin binary itself is trusted,
 pinned code — not OS-sandboxed. Review installed plugins the way you review dependencies. The
 signed pack, sha256 pinning, and spawn-time hash re-check tell you *which* code runs; the manifest
 gates and env-cleared spawn bound what that code can reach through flux.
+
+Both halves are documented in depth under Security: [Plugin trust & signing](../security/plugin-trust.md)
+for *which* code runs, and [Plugin capability sandbox](../security/plugin-sandbox.md) for what it can
+reach.
 
 ## Writing your own
 

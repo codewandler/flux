@@ -68,6 +68,10 @@ flux auth login codex            # ChatGPT/Codex subscription (OAuth)
 Credential precedence: an environment variable (`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, …) wins,
 then a stored credential from `flux auth login`, then an imported CLI credential (Claude/Codex).
 
+For the full credential model — where tokens are stored, how secret values are kept out of the
+model's context, the Vault backend, and OAuth login for plugins — see
+[Credentials & secrets](../security/credentials.md).
+
 ## Prompt caching
 
 Prompt caching is applied automatically for long contexts on providers that support it — no flag

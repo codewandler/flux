@@ -66,7 +66,9 @@ still prompt. See the [CLI reference](./cli.md) for the flags and
 
 Provider keys, program-declared `secret "NAME"` values, and host-materialized plugin credentials
 are registered with a redactor and scrubbed from **all** model-visible tool output and logs, on both
-success and error. The model plans against secret *names*, never their values.
+success and error. The model plans against secret *names*, never their values. See
+[Credentials & secrets](../security/credentials.md) for how references, resolution, and the redactor
+implement this.
 
 ## Sub-agents inherit the policy
 

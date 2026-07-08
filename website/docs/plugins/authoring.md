@@ -21,3 +21,5 @@ The canonical in-repo authoring guide is:
 https://github.com/codewandler/flux/blob/main/plugins/AUTHORING.md
 
 This public page is intentionally short until the plugin surface is packaged for non-source users.
+For the security surface a manifest declares — the deny-by-default capability set and the `oauth2`
+block — see [Plugin capability sandbox](../security/plugin-sandbox.md).

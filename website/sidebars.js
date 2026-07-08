@@ -68,6 +68,18 @@ const sidebars = {
     },
     {
       type: 'category',
+      label: 'Security',
+      items: [
+        'security/overview',
+        'security/credentials',
+        'security/plugin-sandbox',
+        'security/plugin-trust',
+        'security/server-auth',
+        { type: 'ref', id: 'agent/safety' },
+      ],
+    },
+    {
+      type: 'category',
       label: 'Reference',
       items: ['reference/config', 'reference/storage'],
     },
