@@ -6,6 +6,24 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **Clearer planner repair diagnostics.** When a plan is rejected for a missing required parameter,
+  the feedback now names the parameter's expected type and the operation's full accepted-parameter
+  shape (not just "add a key") — so the model can correct the call on the next attempt instead of
+  re-emitting the same broken node.
+- **Typed object-field reads.** Extracting a scalar field from an object (`$n = $obj.count`) now
+  preserves its JSON number/boolean type instead of stringifying it, so a rebuilt object stays typed
+  and numeric/boolean `match` arms fire. This closes the residual gap left by the earlier
+  typed-scalar-bind fix.
+- **`flux plugin install --dir` prunes stale local registrations.** A local re-scan now removes
+  descriptors for plugins whose binary is no longer in the scanned directory (e.g. after a partial
+  build), so the CLI stops warning about a missing binary on every later command. Verified pack
+  installs and plugins registered from elsewhere are never touched, and an empty scan prunes nothing.
+- **Agent guidance for line-numbered reads.** The default system prompt now notes that `read`'s
+  line-number prefixes are a citing/editing aid, not part of the file content — so an agent asked to
+  return a line verbatim strips the prefix instead of echoing it.
+
 ## [0.9.1] - 2026-07-08
 
 ### Fixed

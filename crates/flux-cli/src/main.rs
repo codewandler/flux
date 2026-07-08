@@ -6525,13 +6525,13 @@ async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> R
                     );
                 }
                 let bin_dir = std::path::PathBuf::from(bin_dir);
+                let binaries = plugin_binaries_in(&bin_dir)
+                    .with_context(|| format!("scan {}", bin_dir.display()))?;
                 let mut installed = 0usize;
-                for (name, program) in plugin_binaries_in(&bin_dir)
-                    .with_context(|| format!("scan {}", bin_dir.display()))?
-                {
+                for (name, program) in &binaries {
                     flux_plugin::add_descriptor(
                         dir,
-                        &name,
+                        name,
                         &flux_plugin::PluginDescriptor {
                             program: program.clone(),
                             args: Vec::new(),
@@ -6549,6 +6549,40 @@ async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> R
                              `cd plugins && cargo build --release`)",
                         bin_dir.display()
                     );
+                } else {
+                    // Prune stale local registrations from an EARLIER scan of this same dir whose
+                    // binary is now absent (e.g. a plugin that failed to build in a partial pack
+                    // build) — otherwise its descriptor lingers and every later command prints a
+                    // "failed to load" warning (N-003). Only unverified/local descriptors whose
+                    // recorded program is the `flux-plugin-<name>` binary directly inside THIS dir
+                    // are eligible; verified pack installs (a recorded sha256) and plugins
+                    // registered elsewhere are never touched. Gated on `installed > 0`, so a
+                    // typo'd/empty `--dir` never wipes a whole set of registrations.
+                    let canon_dir = bin_dir.canonicalize().unwrap_or_else(|_| bin_dir.clone());
+                    let present: std::collections::HashSet<&str> =
+                        binaries.iter().map(|(n, _)| n.as_str()).collect();
+                    for d in flux_plugin::discover(dir) {
+                        if present.contains(d.name.as_str()) || d.descriptor.sha256.is_some() {
+                            continue;
+                        }
+                        let prog = std::path::Path::new(&d.descriptor.program);
+                        let owned_here = prog
+                            .parent()
+                            .is_some_and(|p| p == canon_dir.as_path() || p == bin_dir.as_path());
+                        let fname = prog.file_name().and_then(|f| f.to_str()).unwrap_or("");
+                        let name_matches = fname == format!("flux-plugin-{}", d.name)
+                            || fname == format!("flux-plugin-{}.exe", d.name);
+                        if owned_here
+                            && name_matches
+                            && flux_plugin::remove_descriptor(dir, &d.name).unwrap_or(false)
+                        {
+                            println!(
+                                "pruned stale `{}` (binary no longer in {})",
+                                d.name,
+                                bin_dir.display()
+                            );
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -8193,6 +8227,96 @@ mod tests {
         assert!(err.is_err(), "uninstall of a missing name is a clean error");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// N-003: `flux plugin install --dir` prunes a stale LOCAL descriptor whose binary is absent
+    /// from the re-scanned dir (a partial pack build), but never touches a verified pack install or
+    /// a plugin registered from elsewhere, and an empty scan prunes nothing.
+    #[tokio::test]
+    async fn plugin_install_dir_prunes_absent_local_descriptors() {
+        let base =
+            std::env::temp_dir().join(format!("flux-installdir-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let desc_dir = base.join("descriptors");
+        let bin_dir = base.join("bin");
+        std::fs::create_dir_all(&desc_dir).unwrap();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let write_bin =
+            |name: &str| std::fs::write(bin_dir.join(format!("flux-plugin-{name}")), b"x").unwrap();
+        write_bin("alpha");
+        write_bin("beta");
+
+        let install = |d: &std::path::Path| PluginAction::Install {
+            names: vec![],
+            all: false,
+            dir: Some(d.to_string_lossy().into_owned()),
+        };
+        let names = |d: &std::path::Path| {
+            let mut v: Vec<String> = flux_plugin::discover(d)
+                .into_iter()
+                .map(|p| p.name)
+                .collect();
+            v.sort();
+            v
+        };
+
+        // First scan registers both local binaries.
+        run_plugin_in(&desc_dir, Some(install(&bin_dir)))
+            .await
+            .unwrap();
+        assert_eq!(names(&desc_dir), vec!["alpha", "beta"]);
+
+        // A plugin `add`ed from elsewhere and a synthetic VERIFIED pack install — both must survive.
+        flux_plugin::add_descriptor(
+            &desc_dir,
+            "gamma",
+            &flux_plugin::PluginDescriptor {
+                program: "/bin/true".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        flux_plugin::add_descriptor(
+            &desc_dir,
+            "delta",
+            &flux_plugin::PluginDescriptor {
+                program: bin_dir
+                    .join("flux-plugin-delta")
+                    .to_string_lossy()
+                    .into_owned(),
+                sha256: Some("deadbeef".into()),
+                version: Some("1.0.0".into()),
+                source: Some("plugins-v1.0.0".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // `beta` fails to rebuild: its binary disappears from the scan dir.
+        std::fs::remove_file(bin_dir.join("flux-plugin-beta")).unwrap();
+        run_plugin_in(&desc_dir, Some(install(&bin_dir)))
+            .await
+            .unwrap();
+        assert_eq!(
+            names(&desc_dir),
+            vec!["alpha", "delta", "gamma"],
+            "absent local `beta` is pruned; alpha (present), gamma (elsewhere), delta (verified) \
+             survive"
+        );
+
+        // An empty scan dir prunes NOTHING (a typo'd `--dir` can't wipe the set).
+        let empty_dir = base.join("empty");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        run_plugin_in(&desc_dir, Some(install(&empty_dir)))
+            .await
+            .unwrap();
+        assert_eq!(
+            names(&desc_dir),
+            vec!["alpha", "delta", "gamma"],
+            "an empty scan prunes nothing"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// `flux plugin uninstall <name>` rejects a path-traversal name (non-zero) and deletes nothing

@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::{
     is_valid_decl_name, is_valid_op_name, DraftAst, FlowEffect, HirFlow, Node, SymbolName, TypeRef,
 };
-use crate::opspec::OpCatalog;
+use crate::opspec::{OpCatalog, OpSignature};
 
 /// A single analyzer diagnostic, suitable for UI display or feeding back into the compile/repair
 /// loop. The JSON-pointer-style node path (`body[3].then[1]`) is rendered into `message` — the
@@ -474,10 +474,7 @@ fn check_call_types(
     if let [Node::Lit { value }] = args {
         if let Some(obj) = value.as_object() {
             for req in sig.required_params.iter().filter(|r| !obj.contains_key(*r)) {
-                d.add(format!(
-                    "op `{op}` is missing required parameter `{req}` — add the key to the \
-                     argument object"
-                ));
+                d.add(missing_param_diag(op, req, &sig));
             }
             if let Some(props_types) = Some(&sig.param_types).filter(|m| !m.is_empty()) {
                 for (name, val) in obj {
@@ -505,10 +502,7 @@ fn check_call_types(
             .iter()
             .filter(|r| !fields.contains_key(*r))
         {
-            d.add(format!(
-                "op `{op}` is missing required parameter `{req}` — add the key to the \
-                 argument object"
-            ));
+            d.add(missing_param_diag(op, req, &sig));
         }
         return;
     }
@@ -556,6 +550,45 @@ fn check_call_types(
                 check_call_types(inner, iargs, ops, scope, d)
             });
         }
+    }
+}
+
+/// Build the "missing required parameter" repair diagnostic. It names the missing param's expected
+/// type and the op's full accepted-parameter shape (both already carried by the `OpSignature`), so a
+/// repairing model gets the type and the exact key set — not just "add a key" — and can add the right
+/// field on the next attempt instead of re-emitting the same broken call (F-002). Degrades cleanly on
+/// an untyped catalog: the `(expected …)` clause and per-param types are simply omitted.
+fn missing_param_diag(op: &str, req: &str, sig: &OpSignature) -> String {
+    let expected = sig
+        .param_types
+        .get(req)
+        .map(|t| format!(" (expected {})", t.label()))
+        .unwrap_or_default();
+    format!(
+        "op `{op}` is missing required parameter `{req}`{expected} — add `{req}` to the argument \
+         object. `{op}` accepts: {}",
+        describe_params(sig)
+    )
+}
+
+/// Render an op's accepted parameters for a repair diagnostic, e.g.
+/// `ask (String, required), ctx (Ctx, optional)`. A param whose type is unknown (untyped catalog) is
+/// shown as `name (required)`.
+fn describe_params(sig: &OpSignature) -> String {
+    let one = |name: &str, kind: &str| match sig.param_types.get(name) {
+        Some(t) => format!("{name} ({}, {kind})", t.label()),
+        None => format!("{name} ({kind})"),
+    };
+    let mut parts: Vec<String> = sig
+        .required_params
+        .iter()
+        .map(|p| one(p, "required"))
+        .collect();
+    parts.extend(sig.optional_params.iter().map(|p| one(p, "optional")));
+    if parts.is_empty() {
+        "no parameters".to_string()
+    } else {
+        parts.join(", ")
     }
 }
 
@@ -2815,6 +2848,43 @@ mod tests {
             &HashSet::new(),
         )
         .is_ok());
+    }
+
+    /// F-002: the missing-required-parameter diagnostic names the param's expected TYPE and the op's
+    /// full accepted shape (not just "add a key"), so a repairing model can fix the call instead of
+    /// re-emitting the same broken node. Uses the typed `dbl(n: Number)` catalog so a type is present.
+    #[test]
+    fn missing_param_diag_names_the_expected_type_and_shape() {
+        let ops = TypeCat;
+        // `dbl` requires `n: Number`; a lone empty object omits `n`.
+        let err = lower(
+            &DraftAst {
+                body: vec![Node::Call {
+                    op: "dbl".into(),
+                    args: vec![Node::Lit {
+                        value: serde_json::json!({}),
+                    }],
+                }],
+                ..Default::default()
+            },
+            &ops,
+            &HashSet::new(),
+        )
+        .unwrap_err();
+        let msg = err
+            .iter()
+            .map(|d| d.message.clone())
+            .find(|m| m.contains("missing required parameter"))
+            .expect("a missing-required-parameter diagnostic");
+        assert!(msg.contains("`n`"), "names the missing param: {msg}");
+        assert!(
+            msg.contains("expected Number"),
+            "names the expected type: {msg}"
+        );
+        assert!(
+            msg.contains("accepts") && msg.contains("n (Number, required)"),
+            "lists the accepted parameter shape: {msg}"
+        );
     }
 
     // ---- L-16: expression positions the runtime rejects (F7) ----

@@ -49,6 +49,9 @@ or a destructive action is unclear — otherwise decide and proceed.\n\
 a regex by default (word boundaries, character classes, …); pass `literal: true` for a plain \
 substring. `glob`'s `*` matches across `/`, so `*.rs` finds every Rust file. Scope with `glob`/`path` \
 when you can; `path` is a directory.\n\
+- `read` returns a **line-numbered view**: every line is prefixed with its line number and a tab. \
+Those prefixes are a citing/editing aid and are NOT part of the file content — strip the leading \
+number and tab when you quote a line back or return file content verbatim.\n\
 - `edit` requires `old_string` to occur EXACTLY ONCE in the file (or pass `replace_all`). Read \
 enough of the file first to make `old_string` unambiguous — include surrounding lines when a short \
 snippet would match in several places. Prefer a targeted `edit` over rewriting a file with `write`.\n\
@@ -322,6 +325,21 @@ mod tests {
             DEFAULT_SYSTEM_PROMPT
                 .contains("never write files and exit silently when the server never started"),
             "bash bullet must forbid writing files and exiting silently when the server never started"
+        );
+    }
+
+    /// N-004: the `# Tools` section must tell the agent the `read` line-number prefixes are a
+    /// reference aid, not file content — so a sub-agent asked to return a line verbatim strips the
+    /// leading number+tab instead of echoing it (the retest saw `1\talpha` where `alpha` was wanted).
+    #[test]
+    fn default_system_prompt_read_bullet_flags_line_number_view() {
+        assert!(
+            DEFAULT_SYSTEM_PROMPT.contains("line-numbered view"),
+            "read bullet must describe the line-numbered view"
+        );
+        assert!(
+            DEFAULT_SYSTEM_PROMPT.contains("NOT part of the file content"),
+            "read bullet must say the line-number prefixes are not part of the file content"
         );
     }
 

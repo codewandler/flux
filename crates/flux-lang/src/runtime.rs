@@ -3277,7 +3277,18 @@ fn eval_pure_node(
             // `.kind`/`.transcript` out of a `plan`/`run_plan` result.
             let jv = jq_parse_input(eval_arg(input, store, session_id)?);
             let result = eval_jq_path(path, &jv)?;
-            (format!("jq {path}"), lit_text(&result), None)
+            // A scalar number/bool field extract keeps its JSON type (`$n = $obj.n` binds the
+            // number 42, not `"42"`), mirroring the `Lit` arm — so a rebuilt object stays typed
+            // and typed `match` arms / structured output see the real value (F-008). Strings,
+            // `null` (the null→`""` truthiness idiom), and object/array stay canonical
+            // JSON-as-string.
+            let existing_vid = match &result {
+                serde_json::Value::Number(_) | serde_json::Value::Bool(_) => {
+                    Some(store.put_value(session_id, &Value::from_json(&result))?)
+                }
+                _ => None,
+            };
+            (format!("jq {path}"), lit_text(&result), existing_vid)
         }
         Node::Parse {
             value: inner,
@@ -5788,6 +5799,72 @@ mod tests {
         assert!(
             matches!(val("s"), Value::String(_)),
             "$s = \"1\" stays a string"
+        );
+    }
+
+    #[tokio::test]
+    async fn object_field_extract_preserves_number_and_bool() {
+        // F-008 (residual): extracting a scalar field from a bound object keeps its JSON type —
+        // `$a = $obj.a` binds the boolean/number, not `"true"`/`"42"` — so re-assembling the fields
+        // into an object (`return {a:$a,b:$b,n:$n}`) yields real bool/number. Before the fix the
+        // field-extract bind stringified every value, so the object came back
+        // `{"a":"true","b":"false","n":"42"}` (the exact retest symptom).
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let obj_field = |name: &str| Node::Jq {
+            path: format!(".{name}"),
+            input: Box::new(flow_var("obj")),
+        };
+        let ast = DraftAst {
+            body: vec![
+                flow_bind("obj", flow_lit(json!({"a": true, "b": false, "n": 42}))),
+                flow_bind("a", obj_field("a")),
+                flow_bind("b", obj_field("b")),
+                flow_bind("n", obj_field("n")),
+                Node::Return {
+                    value: Box::new(Node::Obj {
+                        fields: ["a", "b", "n"]
+                            .into_iter()
+                            .map(|k| (k.to_string(), Box::new(flow_var(k))))
+                            .collect(),
+                    }),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let out = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+
+        // Store-level: each extracted field kept its JSON scalar type (the load-bearing assertion).
+        let val = |name: &str| {
+            let vid = store
+                .resolve("s", &SymbolName(name.into()))
+                .unwrap()
+                .unwrap();
+            store.get_value(&vid).unwrap().unwrap()
+        };
+        assert!(
+            matches!(val("a"), Value::Bool(true)),
+            "$obj.a binds a boolean"
+        );
+        assert!(
+            matches!(val("b"), Value::Bool(false)),
+            "$obj.b binds a boolean"
+        );
+        assert!(
+            matches!(val("n"), Value::Number(_)),
+            "$obj.n binds a number"
+        );
+
+        // The rebuilt object is typed JSON, not stringified scalars.
+        let got: serde_json::Value = serde_json::from_str(&out.result).unwrap();
+        assert_eq!(
+            got,
+            json!({"a": true, "b": false, "n": 42}),
+            "rebuilt object keeps real bool/number types: {}",
+            out.result
         );
     }
 
