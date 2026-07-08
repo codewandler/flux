@@ -79,6 +79,8 @@ endpoint-reference forms/`run`/`contribute`), a `PluginBuilder` (collect a manif
 | `sql` | PostgreSQL read-only query + database/table/index introspection | SQL DSN + username/password | `sql.query_result` |
 | `asterisk` | AMI ping / channels / peers / queues / device states / originate / hangup / command | AMI username/secret | — |
 | `homer` | SIP search / calls / QoS / PCAP export / aliases | Homer username/password JWT login | `homer.message` / `call` / `alias` |
+| `vault` | Vault sys diagnostics + KV-v2 list/read/write/version ops | `X-Vault-Token` from `VAULT_TOKEN` | `vault.kv_key` metadata only |
+| `onepassword` | 1Password Connect server/vault/item/file ops | Bearer `OP_CONNECT_TOKEN` | `onepassword.vault` / `item` / `file` metadata only |
 
 The **Surface** column is indicative; each plugin now carries its fluxplane counterpart's full op set
 (D-14 through D-17). Run `flux plugin skill` for the live per-plugin op reference, or see the

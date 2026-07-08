@@ -2215,6 +2215,7 @@ async fn build_agent_with(
 
     // Discover subprocess plugins (~/.flux/plugins/*.toml) and project their operations as tools.
     // Each plugin's host capabilities are the guarded System (same boundary as built-in tools).
+    let mut plugin_groups: Vec<flux_evidence::ToolGroup> = Vec::new();
     if let Some(dir) = plugins_dir() {
         // The cross-plugin endpoint-discovery broker (D-26/D-27): a registry of loaded plugins + the
         // shared endpoint registry, so a consumer plugin's `endpoint.discover` capability fans out to
@@ -2321,6 +2322,7 @@ async fn build_agent_with(
                             caps: lp.caps.clone(),
                         },
                     );
+                    plugin_groups.extend(lp.manifest.groups.clone());
                     // The registered tools hold the host alive for the session.
                     for t in lp.tools {
                         registry.register(t);
@@ -2378,6 +2380,7 @@ async fn build_agent_with(
     // advertises only the surfaced groups' ops; an empty manifest would disable gating.
     let mut groups = flux_tools::groups::builtin_groups();
     groups.push(flux_eval::eval_group());
+    groups.extend(plugin_groups);
     let groups = flux_config::merge_groups(groups, flux_config::load_groups(&cwd));
     // Record the current workspace signals as a startup observation (audit; per-turn resolution
     // re-probes these live so groups can surface/un-surface as the workspace changes).

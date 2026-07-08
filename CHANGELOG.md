@@ -6,6 +6,21 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-08
+
+**Minor bump** (pre-1.0 SemVer, where the minor position is the breaking-change signal):
+`OperationSpec` gained an optional public `group` field and `PluginManifest` gained a public
+`groups` field. Additive for serialized manifests (serde defaults preserve legacy manifests), but
+breaking for Rust callers that construct either struct by listing every field exhaustively.
+
+### Added
+
+- **Secret-management plugins (D-84..D-86).** Plugin manifests can now declare operation groups, and
+  the plugin pack adds native Vault (`vault.admin` + `vault.kv`) and 1Password Connect
+  (`onepassword.server` / `vaults` / `items` / `files`) plugins. Both plugins use host-managed HTTP
+  and auth injection; datasource contributions are metadata-only and never include secret values or
+  file bytes.
+
 ## [0.8.0] - 2026-07-08
 
 **Minor bump** (pre-1.0 SemVer, where the minor position is the breaking-change signal): `AuthMethod`

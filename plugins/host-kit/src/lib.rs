@@ -33,6 +33,7 @@ pub use flux_datasource::{Declaration, EntitySchema, Link, Record, SchemaField, 
 pub use flux_plugin::{
     AuthMethod, AuthScheme, ConfigSpec, EndpointSpec, GuestHost, OAuth2Spec, OAuthGrant,
     OAuthRedirect, OperationSpec, PluginCapabilities as Caps, PluginHandler, PluginManifest,
+    ToolGroup,
 };
 pub use flux_spec::{Effect, Idempotency, Risk};
 
@@ -57,6 +58,13 @@ pub fn op_input_schema<T: schemars::JsonSchema + 'static>() -> Value {
 /// A typed view over the host-capability channel, handed to each op handler.
 pub struct Host<'a> {
     inner: &'a mut dyn GuestHost,
+}
+
+impl<'a> Host<'a> {
+    /// Wrap a guest-host implementation. Mostly used by plugin unit tests around [`MockHost`].
+    pub fn new(inner: &'a mut dyn GuestHost) -> Self {
+        Self { inner }
+    }
 }
 
 /// A host HTTP response.
@@ -860,6 +868,12 @@ impl PluginBuilder {
         self
     }
 
+    /// Declare a model-catalog operation group owned by this plugin.
+    pub fn group(mut self, group: ToolGroup) -> Self {
+        self.manifest.groups.push(group);
+        self
+    }
+
     /// Declare a product this plugin can **discover** endpoints for as a provider (D-26). The host's
     /// fan-out broker routes a consumer's discovery query for this product to this plugin's
     /// `endpoint.discover` op. Call once per product.
@@ -877,6 +891,11 @@ impl PluginBuilder {
         self.ops.insert(spec.name.clone(), Box::new(handler));
         self.manifest.operations.push(spec);
         self
+    }
+
+    /// Return a clone of the manifest accumulated so far, useful for plugin manifest tests.
+    pub fn manifest(&self) -> PluginManifest {
+        self.manifest.clone()
     }
 
     /// Finish building (without serving) — used by tests to call ops against a mock host.
@@ -929,6 +948,7 @@ pub fn read_op(name: &str, description: &str, input_schema: Value) -> OperationS
         risk: Some(Risk::Low),
         idempotency: Some(Idempotency::Idempotent),
         secret_purposes: Vec::new(),
+        group: None,
         internal: false,
     }
 }
@@ -943,6 +963,7 @@ pub fn write_op(name: &str, description: &str, input_schema: Value) -> Operation
         risk: Some(Risk::Medium),
         idempotency: Some(Idempotency::NonIdempotent),
         secret_purposes: Vec::new(),
+        group: None,
         internal: false,
     }
 }
@@ -987,7 +1008,42 @@ pub fn internal_op(name: &str, description: &str, input_schema: Value) -> Operat
         risk: Some(Risk::Low),
         idempotency: Some(Idempotency::Idempotent),
         secret_purposes: Vec::new(),
+        group: None,
         internal: true,
+    }
+}
+
+/// Assign an operation to a plugin-declared operation group.
+pub fn grouped(mut op: OperationSpec, group: &str) -> OperationSpec {
+    op.group = Some(group.into());
+    op
+}
+
+/// Override an operation's risk classification.
+pub fn risked(mut op: OperationSpec, risk: Risk) -> OperationSpec {
+    op.risk = Some(risk);
+    op
+}
+
+/// A force-on group for organizing plugin operations. Empty `surface_when` means the group is active
+/// whenever the plugin is loaded, so grouping does not hide installed plugin ops.
+pub fn op_group(name: &str, description: &str, tools: &[&str]) -> ToolGroup {
+    ToolGroup {
+        name: name.into(),
+        description: description.into(),
+        tools: tools.iter().map(|s| (*s).into()).collect(),
+        surface_when: Vec::new(),
+    }
+}
+
+/// A standard datasource declaration for plugins that contribute records to the host index.
+pub fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
+    Declaration {
+        name: name.into(),
+        entity: entity.into(),
+        description: Some(desc.into()),
+        capabilities: vec!["search".into(), "get".into(), "index".into()],
+        entity_schema: None,
     }
 }
 

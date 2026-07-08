@@ -25,6 +25,8 @@
 #   SQL_DSN or SQL_URL (+ optional SQL_USERNAME/PASSWORD) → sql.test
 #   ASTERISK_AMI_USERNAME + ASTERISK_AMI_SECRET (+ host/port) → asterisk.ami.ping
 #   HOMER_URL + HOMER_USERNAME + HOMER_PASSWORD → homer.test
+#   VAULT_ADDR + VAULT_TOKEN               → vault.health
+#   OP_CONNECT_HOST + OP_CONNECT_TOKEN     → onepassword.health
 #   FLUX_EMBEDDINGS_API_KEY (or OPENAI_API_KEY) → an embeddings build note (see end)
 #
 # Override the flux binary with FLUX_BIN. Run before releasing anything that touches the plugins.
@@ -139,6 +141,18 @@ if [ -n "${HOMER_URL:-}" ] && [ -n "${HOMER_USERNAME:-}" ] && [ -n "${HOMER_PASS
   run_case homer homer.test '{}' HOMER_URL
 else
   skip "homer.test (HOMER_URL / HOMER_USERNAME / HOMER_PASSWORD not set)"
+fi
+
+if [ -n "${VAULT_ADDR:-}" ] && [ -n "${VAULT_TOKEN:-}" ]; then
+  run_case vault vault.health '{}' VAULT_ADDR
+else
+  skip "vault.health (VAULT_ADDR / VAULT_TOKEN not set)"
+fi
+
+if [ -n "${OP_CONNECT_HOST:-}" ] && [ -n "${OP_CONNECT_TOKEN:-}" ]; then
+  run_case onepassword onepassword.health '{}' OP_CONNECT_HOST
+else
+  skip "onepassword.health (OP_CONNECT_HOST / OP_CONNECT_TOKEN not set)"
 fi
 
 # kubernetes needs a reachable cluster + kubectl; opt in explicitly.

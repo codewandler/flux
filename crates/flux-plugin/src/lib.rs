@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 
 use flux_core::{Error, Result};
+pub use flux_evidence::ToolGroup;
 use flux_runtime::{Tool, ToolContext, ToolResult};
 use flux_spec::{Effect, Idempotency, Risk, ToolSpec};
 use flux_system::net::PrivateNetAllow;
@@ -126,6 +127,10 @@ pub struct OperationSpec {
     /// Secret purposes (auth-method names) this op needs the host to resolve (e.g. `"api_token"`).
     #[serde(default)]
     pub secret_purposes: Vec<String>,
+    /// Optional evidence/catalog group this operation belongs to. Plugin-authored groups are declared
+    /// on the manifest and merged into the runtime group list when the plugin loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     /// **Host-only op** (C-09a): when `true` this op is NOT advertised to the LLM as a callable
     /// tool — it is an internal host-dispatched channel. The canonical case is the `aws-bedrock`
     /// plugin's `auth` op, which returns raw AWS credentials: the model must never call it, or the
@@ -428,6 +433,10 @@ pub struct PluginManifest {
     /// host's datasource capability). Uses the shared `flux-datasource` schema.
     #[serde(default)]
     pub datasources: Vec<flux_datasource::Declaration>,
+    /// Plugin-authored operation groups. These travel with the manifest so a plugin can organize its
+    /// projected tools without requiring each workspace to define `.flux/groups.toml` entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<ToolGroup>,
     /// Configurable API endpoints (base URLs) the host resolves from env.
     #[serde(default)]
     pub endpoints: Vec<EndpointSpec>,
@@ -2271,46 +2280,51 @@ impl PluginTool {
         plugin: &str,
         op: &OperationSpec,
     ) -> Self {
-        // Project the operation's declared effects so the authorization floor gates it like any
-        // built-in tool. An operation that declares none could still touch the network or run a
-        // process via host capabilities, so default to those — under the default grants that forces
-        // approval rather than letting the op slip the envelope.
-        let effects = if op.effects.is_empty() {
-            vec![Effect::Process, Effect::Network]
-        } else {
-            op.effects.clone()
-        };
-        // The model-facing tool name is the operation's fully-qualified name. flux plugin ops are
-        // authored already qualified (e.g. `slack.message.send`), and the plugin's own dispatch,
-        // `flux plugin call`, and the generated skill docs all use that name — so adopt it verbatim when
-        // it is already prefixed, and only add the `{plugin}.` prefix for an un-qualified op name.
-        // (Unconditionally prefixing double-qualified the common case to `slack.slack.message.send`, so
-        // an agent's `tools` grant — `slack.message.send` — never matched and every plugin op was
-        // silently dropped from the agent surface.)
-        let qualified = if op.name == plugin || op.name.starts_with(&format!("{plugin}.")) {
-            op.name.clone()
-        } else {
-            format!("{plugin}.{}", op.name)
-        };
-        let spec = ToolSpec {
-            name: qualified,
-            description: op.description.clone(),
-            input_schema: op.input_schema.clone(),
-            output_schema: None,
-            effects,
-            risk: op.risk.unwrap_or(Risk::Medium),
-            idempotency: op.idempotency.unwrap_or(Idempotency::NonIdempotent),
-            access: Vec::new(),
-            group: None,
-        };
+        let (operation, spec) = plugin_tool_spec(plugin, op);
         Self {
             host,
             caps,
             plugin: plugin.to_string(),
-            operation: op.name.clone(),
+            operation,
             spec,
         }
     }
+}
+
+fn plugin_tool_spec(plugin: &str, op: &OperationSpec) -> (String, ToolSpec) {
+    // Project the operation's declared effects so the authorization floor gates it like any
+    // built-in tool. An operation that declares none could still touch the network or run a
+    // process via host capabilities, so default to those — under the default grants that forces
+    // approval rather than letting the op slip the envelope.
+    let effects = if op.effects.is_empty() {
+        vec![Effect::Process, Effect::Network]
+    } else {
+        op.effects.clone()
+    };
+    // The model-facing tool name is the operation's fully-qualified name. flux plugin ops are
+    // authored already qualified (e.g. `slack.message.send`), and the plugin's own dispatch,
+    // `flux plugin call`, and the generated skill docs all use that name — so adopt it verbatim when
+    // it is already prefixed, and only add the `{plugin}.` prefix for an un-qualified op name.
+    // (Unconditionally prefixing double-qualified the common case to `slack.slack.message.send`, so
+    // an agent's `tools` grant — `slack.message.send` — never matched and every plugin op was
+    // silently dropped from the agent surface.)
+    let qualified = if op.name == plugin || op.name.starts_with(&format!("{plugin}.")) {
+        op.name.clone()
+    } else {
+        format!("{plugin}.{}", op.name)
+    };
+    let spec = ToolSpec {
+        name: qualified,
+        description: op.description.clone(),
+        input_schema: op.input_schema.clone(),
+        output_schema: None,
+        effects,
+        risk: op.risk.unwrap_or(Risk::Medium),
+        idempotency: op.idempotency.unwrap_or(Idempotency::NonIdempotent),
+        access: Vec::new(),
+        group: op.group.clone(),
+    };
+    (op.name.clone(), spec)
 }
 
 #[async_trait]
@@ -2785,6 +2799,48 @@ mod tests {
         }))
         .unwrap();
         assert!(!op.internal);
+    }
+
+    #[test]
+    fn plugin_operation_group_projects_to_tool_spec() {
+        let op = OperationSpec {
+            name: "vault.kv.read".into(),
+            description: "read kv".into(),
+            group: Some("vault.kv".into()),
+            effects: vec![Effect::Read],
+            risk: Some(Risk::Low),
+            idempotency: Some(Idempotency::Idempotent),
+            ..Default::default()
+        };
+        let (_, spec) = plugin_tool_spec("vault", &op);
+        assert_eq!(spec.name, "vault.kv.read");
+        assert_eq!(spec.group.as_deref(), Some("vault.kv"));
+    }
+
+    #[test]
+    fn plugin_manifest_groups_are_backward_compatible() {
+        let legacy = serde_json::from_value::<PluginManifest>(serde_json::json!({
+            "name": "legacy",
+            "operations": [{"name": "legacy.ping"}]
+        }))
+        .unwrap();
+        assert!(legacy.groups.is_empty());
+        assert!(legacy.operations[0].group.is_none());
+
+        let grouped = serde_json::from_value::<PluginManifest>(serde_json::json!({
+            "name": "vault",
+            "operations": [{"name": "vault.kv.read", "group": "vault.kv"}],
+            "groups": [{
+                "name": "vault.kv",
+                "description": "Vault KV-v2",
+                "tools": ["vault.kv.read"],
+                "surface_when": []
+            }]
+        }))
+        .unwrap();
+        assert_eq!(grouped.groups[0].name, "vault.kv");
+        assert!(grouped.groups[0].surface_when.is_empty());
+        assert_eq!(grouped.operations[0].group.as_deref(), Some("vault.kv"));
     }
 
     // --- C-09a piece 2: the path-scoped deny-by-default `fs.read` capability ----------------------

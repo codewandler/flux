@@ -25,6 +25,9 @@ members = [
     "sql",
     "docker",
     "asterisk",
+    # secret-management plugins (D-85/D-86)
+    "vault",
+    "onepassword",
     # release tooling (D-46) — NOT a plugin: generates the signed pack-release index
     "pack-index",
 ]
