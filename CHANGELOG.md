@@ -6,11 +6,74 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-09
+
 ### Changed
 
+- **BREAKING — Flux-Lang field access is now strict, with an opt-out.** Native `$x.field` / `$x.0`
+  raises a loud error on a missing object key, an out-of-range index, or a field access on a
+  non-object, so a typo fails fast instead of silently binding empty. Mark an access **optional**
+  with a trailing `?` (`$x.field?`, `$list.0?`) to read `null` when a field may legitimately be
+  absent; a present-but-`null` field is never an error. Dotted numeric access now indexes lists
+  (`$nums.0` is the first element). Strictness is a **reference-position** rule (bind value,
+  condition, value template, `match`/`route` subject); field access *inside an `expr` computation*
+  (`$x.field == y`, `filter`/`map` predicates) stays lenient. A model- or host-emitted `jq` keeps
+  the lenient "absent means `null`" traversal, so agent turns are unaffected. Note: a session
+  recorded before 0.11 that read a missing field may diverge on `flux replay`/`fork`/`diff` — an
+  inherent consequence of the semantics change; divergence fails loudly (never silent).
+- **`merge` tolerates an absent list.** A `null` or empty-string element of `lists` (what an optional
+  `$x.field?` read of a missing list binds to) is treated as `[]` and contributes nothing, so a
+  fan-out where some branches produced no list still merges the rest instead of hard-erroring. A
+  genuine non-array element is still a type error.
+- **Full expressions in every value position.** `return`, `each` sources, `route`/`match` subjects
+  and `case` values, call arguments, and `{…}`/`[…]` template values now accept a full `expr`
+  (`return $a + 1`, `op($x * 2)`, `[ $n - 1 ]`), not just a single leaf — consistent with `bind`.
+  This also restores Flux-Lang round-trip totality (`parse(format(ast)) == ast` for every AST).
+- **`flux auth status` regrouped by state.** Providers are split into *Available* / *Not
+  configured* with a `N of M configured` summary, an active-default-provider marker, the resolved
+  source (`ANTHROPIC_API_KEY (env)`, `flux store`, imported file), and a per-provider setup hint
+  (`flux auth login …` / `set $VAR`).
 - **Overhauled the public documentation.** Reworked the root README and every public website
   markdown page with clearer opening guidance, consistent metadata, normalized related-doc links,
   and tighter navigation across the agent, Flux-Lang, SDK, plugin, reference, and security sections.
+
+### Added
+
+- **Unified `flux usage` dashboard.** The command now renders an aligned, color-aware usage table
+  and, by default, folds in detected local Codex, Claude Code, and opencode state alongside flux's
+  own event store. Use `--no-external`, `--harness flux,codex,claude,opencode`, or `--json` to
+  narrow or script the report.
+- **Zero-arg ambient reads are pre-allowed by default.** `now`, `cwd`, `home_dir`, and `sys_info`
+  (read-only, no IO, no permission subjects) no longer trip the approval gate, so a `now()` in a
+  stored flow runs without a prompt — and no longer auto-denies on a non-TTY. A configured
+  `[permissions].allow` still replaces the default entirely.
+- **`flux plugin list`** is now accepted as an alias of the terse `flux plugin ls`.
+- **`flux --allow-private-net` — an ephemeral private-network egress grant.** A global flag that, for
+  the current invocation only, allows egress to private/internal/loopback addresses without editing
+  `config.toml`. It widens only the *operator-grant* side of the scoped model: plugins still only reach
+  the private hosts their manifest declares, every admission is still audited (with a distinct
+  `cli:--allow-private-net` grant source), and nothing is persisted. `web_fetch` is opened for the run
+  too — its guard has no manifest safeguard, so prefer a scoped `[private_net.plugins]` grant for
+  recurring use.
+- **GitLab plugin: CI/CD job-token, protected-tag, and deploy-token management.** 15 new operations —
+  `gitlab.ci.job_token.scope.{show,set}`, `gitlab.ci.job_token.allowlist.{list,add,remove}` plus the
+  `groups_allowlist.*` counterpart, `gitlab.repository.protected_tag.{list,show,protect,unprotect}`,
+  and `gitlab.deploy_token.{list,create,revoke}`. The job-token allowlist is what lets one project's CI
+  use its `CI_JOB_TOKEN` to clone/access another project. Destructive removes/unprotect/revoke and the
+  credential-minting `deploy_token.create` carry High risk metadata; the destructive ops accept an
+  optional `confirm_*` field that must echo the target.
+
+### Fixed
+
+- **`flux run -m mock` writes `flux-mock.txt` again.** The offline mock's canned plan emitted the
+  `write` op with two positional arguments, which current plan validation rejects (multi-parameter
+  ops take a single named object); the rejected plan was silently repaired into a prose `Finished.`
+  with a zero exit, so the documented smoke test looked successful but did nothing. The fixture now
+  emits `{path, content}` as one object, and a gate-level end-to-end test guards it. Also fixes
+  `flux plan -o json -m mock`, which now emits the plan.
+- **Getting-started / tour `hello` example prints a readable time.** `now()` returns an object, so
+  `fmt("… {when}")` spliced the whole `{"unix":…,"utc":…}` blob; the example now binds
+  `$utc = $when.utc` and interpolates `{utc}`.
 
 ## [0.10.1] - 2026-07-08
 
