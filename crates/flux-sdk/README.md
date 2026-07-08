@@ -7,6 +7,17 @@ root; the SDK wires the agent loop, the built-in tools, the safety envelope, and
 The guiding idea is **"the LLM is not the runtime"**: the model emits a Flux-Lang plan (an execution
 graph), and a deterministic engine runs it through a non-bypassable safety envelope.
 
+## Install
+
+```sh
+cargo add codewandler-flux-sdk codewandler-flux-providers
+```
+
+The closure is published under a `codewandler-` prefix (the bare `flux-*` names are taken on crates.io),
+but the **import paths are unprefixed** — the crate `codewandler-flux-sdk` is `use flux_sdk::…` and
+`codewandler-flux-providers` is `use flux_providers::…`. `flux-providers` supplies the concrete
+`anthropic`/`openai`/`openrouter`/`ollama` backends; the SDK itself is provider-agnostic.
+
 ## Three front doors
 
 | Surface | What it is | Example |

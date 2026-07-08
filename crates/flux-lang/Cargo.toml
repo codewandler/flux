@@ -1,5 +1,5 @@
 [package]
-name = "flux-lang"
+name = "codewandler-flux-lang"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -7,7 +7,7 @@ repository.workspace = true
 homepage.workspace = true
 description = "Flux-Lang: the pure language core — AST, renderer, analyzer, effect/op types, a Rust eDSL, and the schema/skill single-source-of-truth. No runtime, provider, or concrete tools."
 readme = "README.md"
-documentation = "https://docs.rs/flux-lang"
+documentation = "https://docs.rs/codewandler-flux-lang"
 keywords = ["flux", "dsl", "ast", "agent", "language"]
 categories = ["development-tools", "compilers"]
 
@@ -15,6 +15,9 @@ categories = ["development-tools", "compilers"]
 # so exclude this crate from the release artifacts — only `flux` (flux-cli) ships.
 [package.metadata.dist]
 dist = false
+
+[lib]
+name = "flux_lang"
 
 [dependencies]
 flux-core.workspace = true

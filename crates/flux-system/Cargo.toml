@@ -1,9 +1,14 @@
 [package]
-name = "flux-system"
+name = "codewandler-flux-system"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "flux guarded IO boundary: workspace path resolution (escape/symlink rejection), argv-only process exec, env"
+
+[lib]
+name = "flux_system"
 
 [dependencies]
 flux-core.workspace = true

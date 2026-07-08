@@ -1,9 +1,14 @@
 [package]
-name = "flux-skill"
+name = "codewandler-flux-skill"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "flux skills: markdown + frontmatter knowledge packs with triggers, discovered from skill directories"
+
+[lib]
+name = "flux_skill"
 
 [dependencies]
 serde.workspace = true

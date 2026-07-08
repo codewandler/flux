@@ -126,6 +126,87 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
+name = "codewandler-flux-core"
+version = "0.9.2"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "codewandler-flux-evidence"
+version = "0.9.2"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "codewandler-flux-policy"
+version = "0.9.2"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "codewandler-flux-provider"
+version = "0.9.2"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "codewandler-flux-core",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "codewandler-flux-runtime"
+version = "0.9.2"
+dependencies = [
+ "async-trait",
+ "codewandler-flux-core",
+ "codewandler-flux-evidence",
+ "codewandler-flux-policy",
+ "codewandler-flux-secret",
+ "codewandler-flux-spec",
+ "codewandler-flux-system",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "codewandler-flux-secret"
+version = "0.9.2"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "codewandler-flux-spec"
+version = "0.9.2"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "codewandler-flux-system"
+version = "0.9.2"
+dependencies = [
+ "codewandler-flux-core",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "confluence"
 version = "0.1.0"
 dependencies = [
@@ -268,22 +349,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "flux-core"
-version = "0.9.2"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
 name = "flux-credentials"
 version = "0.9.2"
 dependencies = [
  "async-trait",
  "base64",
- "flux-core",
- "flux-provider",
+ "codewandler-flux-core",
+ "codewandler-flux-provider",
  "rand 0.8.6",
  "reqwest",
  "serde",
@@ -302,27 +374,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "flux-evidence"
-version = "0.9.2"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "flux-plugin"
 version = "0.9.2"
 dependencies = [
  "async-trait",
  "base64",
- "flux-core",
+ "codewandler-flux-core",
+ "codewandler-flux-evidence",
+ "codewandler-flux-runtime",
+ "codewandler-flux-secret",
+ "codewandler-flux-spec",
+ "codewandler-flux-system",
  "flux-credentials",
  "flux-datasource",
- "flux-evidence",
- "flux-runtime",
- "flux-secret",
- "flux-spec",
- "flux-system",
  "hmac",
  "lzma-rs",
  "minisign-verify",
@@ -357,70 +421,6 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "flux-policy"
-version = "0.9.2"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "flux-provider"
-version = "0.9.2"
-dependencies = [
- "async-trait",
- "bytes",
- "flux-core",
- "futures",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "flux-runtime"
-version = "0.9.2"
-dependencies = [
- "async-trait",
- "flux-core",
- "flux-evidence",
- "flux-policy",
- "flux-secret",
- "flux-spec",
- "flux-system",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "flux-secret"
-version = "0.9.2"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "flux-spec"
-version = "0.9.2"
-dependencies = [
- "schemars",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "flux-system"
-version = "0.9.2"
-dependencies = [
- "flux-core",
- "tokio",
- "url",
 ]
 
 [[package]]
@@ -616,9 +616,9 @@ name = "host-kit"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "codewandler-flux-spec",
  "flux-datasource",
  "flux-plugin",
- "flux-spec",
  "schemars",
  "serde",
  "serde_json",

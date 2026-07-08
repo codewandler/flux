@@ -1,9 +1,14 @@
 [package]
-name = "flux-flow"
+name = "codewandler-flux-flow"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Flux-Lang: compile an instruction into a typed, deterministic execution graph — the LLM plans, the runtime runs"
+
+[lib]
+name = "flux_flow"
 
 [dependencies]
 flux-lang.workspace = true

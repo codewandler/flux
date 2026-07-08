@@ -1,9 +1,14 @@
 [package]
-name = "flux-runtime"
+name = "codewandler-flux-runtime"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "flux safety envelope: Tool trait, registry, permission rules, approval gate, and the dispatcher that enforces them"
+
+[lib]
+name = "flux_runtime"
 
 [dependencies]
 flux-core.workspace = true

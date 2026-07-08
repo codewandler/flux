@@ -1,9 +1,14 @@
 [package]
-name = "flux-policy"
+name = "codewandler-flux-policy"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "flux pure authorization: default-deny grant evaluation with trust levels, scopes, and wildcard/path matching"
+
+[lib]
+name = "flux_policy"
 
 [dependencies]
 serde.workspace = true

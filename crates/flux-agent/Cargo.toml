@@ -1,9 +1,14 @@
 [package]
-name = "flux-agent"
+name = "codewandler-flux-agent"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "flux Agent pillar: agent definitions (AgentSpec, markdown Roles) assembled onto the flux-flow engine"
+
+[lib]
+name = "flux_agent"
 
 [dependencies]
 flux-core.workspace = true

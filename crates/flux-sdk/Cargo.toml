@@ -1,5 +1,5 @@
 [package]
-name = "flux-sdk"
+name = "codewandler-flux-sdk"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -7,9 +7,12 @@ repository.workspace = true
 homepage.workspace = true
 description = "flux high-level library API: build a tool-enabled, policy-gated agent and run turns"
 readme = "README.md"
-documentation = "https://docs.rs/flux-sdk"
+documentation = "https://docs.rs/codewandler-flux-sdk"
 keywords = ["agent", "llm", "ai", "tools", "flux"]
 categories = ["development-tools", "api-bindings"]
+
+[lib]
+name = "flux_sdk"
 
 [dependencies]
 flux-core.workspace = true

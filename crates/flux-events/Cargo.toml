@@ -1,14 +1,19 @@
 [package]
-name = "flux-events"
+name = "codewandler-flux-events"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "flux unified append-only event store: one ordered log projected into conversations, run traces, and turn metrics (SQLite/WAL)"
 
 [features]
 # Opt-in Postgres backend for the EventStore (D-73). The default build stays DB-free and
 # rusqlite-only: `flux-pg` (the sole sqlx owner) is pulled in only when this feature is on.
 postgres = ["dep:flux-pg"]
+
+[lib]
+name = "flux_events"
 
 [dependencies]
 flux-core.workspace = true

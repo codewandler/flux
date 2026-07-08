@@ -1,146 +1,125 @@
-# Publishing `flux-sdk` to crates.io — runbook
+# Publishing `flux-sdk` (+ `flux-providers`) to crates.io — runbook
 
-`flux-sdk` is the top of a **16-crate publish closure**: publishing it means publishing every crate it
-transitively depends on, in dependency order. This document is the pre-flight + step-by-step. It does
-**not** publish anything — running the real `cargo publish` is a deliberate, irreversible act (crates.io
-versions are permanent; you can only *yank*) that needs your crates.io token.
+`flux-sdk` sits at the top of a **20-crate publish closure**: publishing it means publishing every crate
+it transitively depends on, in dependency order. This release also publishes **`flux-providers`** (the
+concrete LLM clients) so `cargo add codewandler-flux-sdk codewandler-flux-providers` yields an agent that
+can actually talk to a provider out of the box.
 
-> Status: **prepared, blocked on a name decision** (unchanged as of 2026-07-08). The packaging and
-> ordering are done and validated. A name-availability check surfaced one blocker (see §1) that needs
-> a decision before the first publish. Version numbers below were pinned at 0.2.4 when this runbook
-> was validated — re-pin to the current workspace version before executing.
+> Status: **prepared, validated, and automated.** The closure is vanity-prefixed `codewandler-flux-*`
+> (§1), every packaging blocker is closed (§3), both workspaces build and the full gate is green. The
+> actual publish runs **in CI** on a version tag (§5) — the only manual step is configuring one secret.
 
-## 1. ⚠️ Name availability — read this first
+## 1. Naming — resolved: `codewandler-flux-*` vanity prefix
 
-A crates.io check on `2026-06-27` of the 16 closure crates found:
+`flux-core` is TAKEN on crates.io by an unrelated crate (newest `0.5.2`) and every crate depends on it,
+so the bare `flux-*` names cannot be used. **Decision: vanity-prefix the whole closure
+`codewandler-flux-*`** (all 20 names verified available). Already applied in the manifests. Per crate:
 
-| Name | Status |
-|---|---|
-| **`flux-core`** | **TAKEN** — an unrelated crate already owns it (newest `0.5.2`) |
-| `flux-spec`, `flux-policy`, `flux-secret`, `flux-evidence`, `flux-skill`, `flux-system`, `flux-provider`, `flux-lang`, `flux-events`, `flux-runtime`, `flux-tools`, `flux-cognition`, `flux-agent`, `flux-flow`, `flux-sdk` | available |
-
-`flux-core` is the root every other crate depends on, so **the publish cannot proceed under the current
-names.** You can verify the squat yourself:
-
-```sh
-cargo package -p flux-lang --allow-dirty   # fails: flux-core ^0.2.4 resolves to the foreign 0.5.2
-curl -A 'you (you@example.com)' https://crates.io/api/v1/crates/flux-core | jq .crate.newest_version
+```toml
+# crates/flux-core/Cargo.toml
+[package]
+name = "codewandler-flux-core"   # the crates.io name
+[lib]
+name = "flux_core"               # the import path stays `flux_core` — zero source churn
+```
+```toml
+# root Cargo.toml [workspace.dependencies] — alias key stays `flux-core`, so every
+# `flux-core.workspace = true` consumer and all `use flux_core::…` are untouched:
+flux-core = { package = "codewandler-flux-core", version = "0.9.3", path = "crates/flux-core" }
 ```
 
-### Options (a decision for the maintainer)
-
-1. **Vanity-prefix the whole namespace** (recommended for a clean brand): publish as
-   `codewandler-flux-*` while keeping the Rust import paths unchanged. For each crate set the *package*
-   name but pin the *lib* name:
-   ```toml
-   [package]
-   name = "codewandler-flux-core"   # the crates.io name
-   [lib]
-   name = "flux_core"               # the import path stays `flux_core`
-   ```
-   and have dependents reference it via the `package` key:
-   ```toml
-   # [workspace.dependencies]
-   flux-core = { package = "codewandler-flux-core", version = "0.2.4", path = "crates/flux-core" }
-   ```
-   Re-run the §1 availability check against the prefixed names first.
-2. **Rename only `flux-core`** to an available name (e.g. `flux-kernel`) using the same package/lib-name
-   split, leaving the other 15 names as-is. Smaller diff, but a mixed naming scheme.
-3. **Publish to a private/alternate registry** (no crates.io name contention). Set `[registries]` and
-   `--registry`.
-
-Until one of these is chosen and applied, treat the steps below as a dry template.
+The nested `plugins/` workspace carries the same `package =` key for the closure crates it references by
+path (`flux-secret`, `flux-spec`). `flux-codegate` strips the `codewandler-` prefix before layer
+classification. Non-closure crates (`flux-cli`, `flux-app`, `flux-server`, `flux-tui`, `flux-plugin`,
+`flux-datasource`, `flux-a2a`, `flux-credentials`, `flux-auth`, `flux-capabilities`, `flux-channels`,
+`flux-audio`, `flux-config`, `flux-eval`, `flux-codegate`) stay **bare and path-only** — not published.
 
 ## 2. The closure & topological publish order
 
-16 crates. Publish in this order (each crate's dependencies precede it). This order is derived from the
-crate dependency graph and verified against `cargo tree -p flux-sdk -e normal`:
+**20 crates.** Each crate's dependencies precede it (verified against `cargo tree`). The list lives in
+`scripts/publish-crates-io.sh`; keep the two in sync. Publish the `codewandler-flux-*` package for each:
 
 ```
 1.  flux-core          ← root (no flux-* deps)
-2.  flux-spec
-3.  flux-policy
-4.  flux-secret
-5.  flux-evidence
-6.  flux-skill
-7.  flux-system        (→ core)
-8.  flux-provider      (→ core)
-9.  flux-lang          (→ core, spec, policy, evidence)
-10. flux-events        (→ core, lang)
-11. flux-runtime       (→ core, spec, secret, system, policy, evidence)
-12. flux-tools         (→ core, runtime, evidence, spec, system, policy)
-13. flux-cognition     (→ core, spec, runtime, provider, lang, system)
-14. flux-agent         (→ core, provider, runtime, events, spec, evidence, skill, system, tools)
-15. flux-flow          (→ lang, core, spec, runtime, provider, events, agent, evidence, skill, tools, system)
-16. flux-sdk           (→ core, provider, runtime, system, tools, events, agent, lang, flow, cognition)
+2.  flux-markdown       (pure leaf — no flux-* deps; enters via flux-skill/flux-agent)
+3.  flux-spec
+4.  flux-policy
+5.  flux-secret
+6.  flux-evidence
+7.  flux-skill          (→ markdown)
+8.  flux-system
+9.  flux-provider       (the abstraction, singular)
+10. flux-pg             (→ core)   — the sole sqlx owner; flux-events' optional `postgres` backend
+11. flux-lang
+12. flux-events         (→ core, lang; optional → flux-pg behind `postgres`)
+13. flux-runtime
+14. flux-tools
+15. flux-cognition
+16. flux-agent          (→ markdown, skill, …)
+17. flux-flow
+18. flux-orchestrate
+19. flux-sdk
+20. flux-providers      (→ core, provider)  — the concrete clients (plural)
 ```
 
-Crates **not** in the closure (`flux-app`, `flux-tui`, `flux-server`, `flux-eval`, `flux-codegate`, the
-provider backends, …) are **not** published by this runbook and stay path-only in
-`[workspace.dependencies]`.
-
-> **Provider backends.** `flux-sdk` is provider-agnostic, so `flux-providers` (the concrete clients) is
-> *not* in the closure. A user embedding the SDK still needs a concrete provider — publishing it (and its
-> own small closure: `flux-credentials`, …) is a sensible follow-on, scoped separately.
+Why `flux-pg` is in the closure: crates.io requires **every** dependency — including optional ones — to
+be published. `flux-events` (which `flux-agent` needs) has an optional `postgres` feature that pulls
+`flux-pg`, so `flux-pg` must ship too. `sqlx` is only compiled when a consumer enables `postgres`, so
+default SDK users pay nothing for it. `flux-providers`' own normal closure is just `flux-core` +
+`flux-provider` + itself. `flux-datasource` is **not** in the closure and is deliberately excluded.
 
 ## 3. Version metadata (already applied)
 
-Every closure crate carries `version = "0.2.4"` alongside `path` in `[workspace.dependencies]` (root
-`Cargo.toml`) — cargo uses the path locally and the version in the *published* manifest. **On every
-release, bump these in lockstep with `[workspace.package].version`** (a `cargo-release`/`cargo-dist`
-config can automate this). Non-closure crates remain path-only.
+Every closure crate carries `version` alongside `package`+`path` in `[workspace.dependencies]`. The
+refactors that pulled `flux-markdown`, `flux-orchestrate`, and `flux-pg` into the closure had left them
+path-only; all three now carry a `version` (the last packaging blockers). The stray `version` on the
+non-closure `flux-datasource` was dropped. `scripts/cut-release.sh` keeps these in lockstep with
+`[workspace.package].version` on every release.
 
 ## 4. Pre-flight (no registry writes)
 
-```sh
-# Per-crate packaging validation (build + metadata) — works offline against local path deps:
-for c in flux-core flux-spec flux-policy flux-secret flux-evidence flux-skill \
-         flux-system flux-provider flux-lang flux-events flux-runtime flux-tools \
-         flux-cognition flux-agent flux-flow flux-sdk; do
-  cargo package -p "$c" --allow-dirty || echo "FAILED: $c"
-done
-```
-
-Note: a **full-graph `cargo publish --dry-run` is not possible before the deps are actually on
-crates.io** — a downstream crate's dry-run verify build resolves its `flux-*` deps from the registry,
-which won't have them yet. Only the **leaf** (`flux-core`, and the other dep-less crates) can be fully
-dry-run today:
+Only the **leaves** can be fully validated before their deps are on crates.io — a non-leaf's package step
+resolves its `flux-*` deps against the index (empty until we publish), so it reports "no matching
+package" until then. That's expected, not a blocker.
 
 ```sh
-cargo publish --dry-run -p flux-core   # leaf: fully meaningful (no unpublished deps)
+cargo publish --dry-run -p codewandler-flux-core       # leaf: fully meaningful (name now free)
+cargo publish --dry-run -p codewandler-flux-markdown   # leaf: no flux-* deps
+scripts/publish-crates-io.sh --dry-run                 # runs the whole ordered list in --dry-run
 ```
 
-(With the current names this leaf dry-run *packages* fine but a real publish would be rejected — the
-name is owned by someone else; see §1.)
+## 5. The actual publish — automated in CI
 
-## 5. The actual publish (needs your token — irreversible)
+Pushing a `vX.Y.Z` tag triggers **`.github/workflows/crates-io.yml`**, which runs
+`scripts/publish-crates-io.sh` (the §2 order, idempotent — an already-published crate@version is
+skipped, so a failed run is re-runnable).
 
-Once §1 is resolved and §4 is green:
+**One-time setup — the required secret:** add **`CARGO_REGISTRY_TOKEN`** under
+*Settings → Secrets and variables → Actions* on the `codewandler/flux` repo. It is a crates.io API token
+(https://crates.io/settings/tokens) from an account that can publish the `codewandler-flux-*` names.
+Without it the job fails fast with a clear message and nothing is published.
 
+To release: cut the version (`scripts/cut-release.sh <ver>`), then `git push --follow-tags origin main`.
+The tag fans out to both the binary `Release` workflow and this crates.io publish.
+
+**Manual fallback** (from a maintainer machine with a token):
 ```sh
-export CARGO_REGISTRY_TOKEN=...           # from https://crates.io/settings/tokens
-
-# Reserve/confirm ownership of each name BEFORE publishing (after a first publish you own it):
-#   cargo owner --add <github-team-or-user> <crate>     # post-publish ownership
-
-# Publish in the §2 order. crates.io needs a few seconds to index each crate before the next
-# (dependent) crate can resolve it, hence the wait.
-for c in flux-core flux-spec flux-policy flux-secret flux-evidence flux-skill \
-         flux-system flux-provider flux-lang flux-events flux-runtime flux-tools \
-         flux-cognition flux-agent flux-flow flux-sdk; do
-  cargo publish -p "$c" || { echo "stopped at $c"; break; }
-  sleep 20   # let the index update before the next crate resolves it
-done
+cargo login                      # or: export CARGO_REGISTRY_TOKEN=…
+scripts/publish-crates-io.sh     # same ordered, idempotent loop
 ```
 
-- **Irreversible.** A published `name@version` can never be reused — only yanked. Triple-check the
-  version and that §4 is clean.
-- **Tag the release** (`git tag v0.2.x && git push --tags`) so the published source is reproducible; the
-  repo's `cargo-dist` pipeline already builds binaries on a tag.
-- If a mid-sequence publish fails, fix and resume from the failed crate (earlier ones are already live).
+- **Irreversible.** A published `name@version` can never be reused — only yanked.
+- If a mid-sequence publish fails, fix and re-run — already-published crates are skipped.
 
 ## 6. Post-publish
 
-- `cargo owner --add` the maintainers/team on each crate.
-- Confirm docs.rs built each crate (the `documentation` field points at docs.rs).
-- Smoke-test from a scratch project: `cargo add flux-sdk` then run the README quick-start.
+- `cargo owner --add <github-team-or-user> <crate>` on each crate.
+- Confirm docs.rs built each crate (`https://docs.rs/codewandler-flux-sdk`, …).
+- Smoke-test from a scratch project: `cargo add codewandler-flux-sdk codewandler-flux-providers`, then
+  run the README quick-start (imports stay `use flux_sdk::…` / `use flux_providers::…`).
+
+## 7. Follow-on (out of scope here)
+
+The rest of the platform (`flux-cli`, `flux-app`, `flux-server`, `flux-tui`, `flux-plugin`,
+`flux-datasource`, `flux-credentials`, `flux-auth`, `flux-a2a`, `flux-capabilities`, `flux-channels`,
+`flux-audio`, `flux-config`, `flux-eval`) stays path-only and unpublished — a separate, later decision.

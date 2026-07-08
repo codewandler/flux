@@ -15,6 +15,11 @@
 /// The layer of a flux crate (0 = innermost contracts, 6 = outermost surfaces), or `None` if the
 /// crate is unknown (which the lint treats as a failure — new crates must be classified here).
 pub fn layer(name: &str) -> Option<u8> {
+    // The published flux-sdk/flux-providers closure carries a `codewandler-` vanity prefix on its
+    // crates.io *package* names (the bare `flux-*` names are squatted); the crate keeps its bare
+    // identity everywhere else (import paths, `[workspace.dependencies]` alias keys). Normalize so
+    // the layer map stays keyed on the logical `flux-*` name.
+    let name = name.strip_prefix("codewandler-").unwrap_or(name);
     Some(match name {
         // L0 — pure contracts: no IO, no flux deps except other L0. Safe for anything to use.
         "flux-core" | "flux-policy" | "flux-secret" | "flux-spec" | "flux-config"
