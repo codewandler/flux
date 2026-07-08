@@ -118,6 +118,8 @@ live in `flux-providers` (modules `anthropic`/`openai`/`openrouter`/`ollama`) so
 
 MIT OR Apache-2.0.
 
-[`Client`]: https://docs.rs/flux-sdk/latest/flux_sdk/struct.Client.html
-[`FlowClient`]: https://docs.rs/flux-sdk/latest/flux_sdk/struct.FlowClient.html
-[`dsl`]: https://docs.rs/flux-lang/latest/flux_lang/dsl/index.html
+<!-- The crates are not on crates.io yet, so these link into the repo (docs.rs pages don't exist).
+     Swap back to docs.rs links once the publish closure ships (see PUBLISHING.md). -->
+[`Client`]: src/lib.rs
+[`FlowClient`]: src/flow.rs
+[`dsl`]: ../flux-lang/src/dsl.rs

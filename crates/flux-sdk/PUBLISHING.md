@@ -5,9 +5,10 @@ transitively depends on, in dependency order. This document is the pre-flight + 
 **not** publish anything — running the real `cargo publish` is a deliberate, irreversible act (crates.io
 versions are permanent; you can only *yank*) that needs your crates.io token.
 
-> Status: **prepared, blocked on a name decision.** The version metadata, packaging, and ordering are
-> done and validated. A name-availability check surfaced one blocker (see §1) that needs a decision
-> before the first publish.
+> Status: **prepared, blocked on a name decision** (unchanged as of 2026-07-08). The packaging and
+> ordering are done and validated. A name-availability check surfaced one blocker (see §1) that needs
+> a decision before the first publish. Version numbers below were pinned at 0.2.4 when this runbook
+> was validated — re-pin to the current workspace version before executing.
 
 ## 1. ⚠️ Name availability — read this first
 

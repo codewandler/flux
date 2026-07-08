@@ -6,6 +6,22 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Documentation
+
+- **Public docs coverage for shipped features.** Added seven pages to the public documentation
+  site (`codewandler.github.io/flux`) that previously had no user-facing coverage: the Time Machine
+  (`flux replay`/`fork`/`diff`, cassettes, resumable flows), storage & persistence (the append-only
+  event log; the opt-in Postgres backend), using plugins (install/verify/pin/call the signed pack),
+  an expanded SDK overview (the `Client`/`FlowClient`/`dsl` front doors + recipes), usage & cost
+  (`flux usage`, `pricing.toml` overrides), experimental realtime voice, and a troubleshooting/FAQ
+  page. All are wired into the sidebar and the "Start here" funnel; the README now links the docs
+  site and adds time-travel to the thesis pitch. An `examples/` index README documents each runnable
+  `.flux` file and how to run it.
+- **Accuracy fixes.** Removed the incorrect claim that `--think`/`--effort` are wired into the plan
+  engine (they only affect the raw `-p` path); replaced the flux-sdk README's dead docs.rs links
+  with in-repo links (crates.io publication is still pending); refreshed the roadmap status header to
+  0.6.0; genericized a downstream-consumer reference and an SSO profile name in the internal docs.
+
 ## [0.6.0] - 2026-07-08
 
 **A2A conformance Tier 3 — the stateful task model** (the `a2a-conformance` epic, A-54..A-57,

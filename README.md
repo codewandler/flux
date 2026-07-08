@@ -6,7 +6,10 @@
 
 [![CI](https://github.com/codewandler/flux/actions/workflows/ci.yml/badge.svg)](https://github.com/codewandler/flux/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/codewandler/flux)](https://github.com/codewandler/flux/releases/latest)
+[![Docs](https://img.shields.io/badge/docs-codewandler.github.io%2Fflux-blue)](https://codewandler.github.io/flux/)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+
+**Documentation: [codewandler.github.io/flux](https://codewandler.github.io/flux/)** — getting started, the agent guide, the Flux-Lang language tour and reference, SDK, and plugins.
 
 **The LLM is not your runtime.** Most coding agents let the model drive execution step by step — slow, expensive, and hard to audit. flux inverts that: the model compiles your request into a typed **Flux-Lang plan** (a small graph), and a deterministic Rust runtime executes it through one mandatory safety envelope. You see the plan before it runs. Every file read, shell command, and web fetch is a node in that graph, not a hidden black box.
 
@@ -15,6 +18,7 @@ What that buys you:
 - **Safety by construction** — a single non-bypassable chain (authorization → approval → guarded IO) covers every operation; no tool, plugin, or sub-agent can route around it
 - **Token efficiency** — tool outputs are stored as symbols; the model sees a bounded digest of summaries, never the raw outputs re-sent per turn
 - **Repeatability** — a plan is an artifact; re-running a stored plan (`flux flow run`) makes no model calls at all, and a live turn costs the fewest calls that still keep the model the planner
+- **Time travel** — every turn records model/tool cassettes, so a past session can be **replayed hermetically** (`flux replay`, no API calls), **forked** at any step to explore a different path (`flux fork`), and **diffed** run-against-run (`flux diff`)
 
 flux is one platform on that thesis, with three **co-equal pillars**:
 
@@ -132,8 +136,6 @@ flux auth login claude           # PKCE login for the Claude subscription path
 flux run -m claude/opus "hi"
 flux run -m openrouter/anthropic/claude-sonnet-4.5 "hi"
 ```
-
-`--think` toggles adaptive thinking; `--effort low|medium|high|xhigh|max` controls depth.
 
 > The subscription paths (`claude`, `codex`) reuse credentials from existing CLI tools. They are
 > opt-in and never the default; the API-key paths are the supported way to run flux.

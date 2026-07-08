@@ -5,6 +5,7 @@ const sidebars = {
     'intro',
     'getting-started',
     'concepts',
+    'troubleshooting',
     {
       type: 'category',
       label: 'Agent',
@@ -15,6 +16,9 @@ const sidebars = {
         'agent/safety',
         'agent/a2a',
         'agent/programs',
+        'agent/time-machine',
+        'agent/cost',
+        'agent/realtime',
       ],
     },
     {
@@ -55,17 +59,17 @@ const sidebars = {
     {
       type: 'category',
       label: 'SDK',
-      items: ['sdk/flow-client'],
+      items: ['sdk/overview', 'sdk/flow-client'],
     },
     {
       type: 'category',
       label: 'Plugins',
-      items: ['plugins/authoring'],
+      items: ['plugins/using-plugins', 'plugins/authoring'],
     },
     {
       type: 'category',
       label: 'Reference',
-      items: ['reference/config'],
+      items: ['reference/config', 'reference/storage'],
     },
   ],
 };

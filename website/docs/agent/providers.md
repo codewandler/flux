@@ -54,13 +54,13 @@ flux auth login codex            # ChatGPT/Codex subscription (OAuth)
 Credential precedence: an environment variable (`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, …) wins,
 then a stored credential from `flux auth login`, then an imported CLI credential (Claude/Codex).
 
-## Thinking & effort
+## Prompt caching
 
-```bash
-flux run --think -m opus "plan a refactor of the parser"
-flux run --effort high -m opus "…"     # low | medium | high | xhigh | max
-```
+Prompt caching is applied automatically for long contexts on providers that support it — no flag
+needed.
 
-`--think` enables extended thinking on supported models; `--effort` controls the thinking budget.
-Prompt caching is applied automatically for long contexts. Don't pass `--effort` to non-reasoning
-local models — it sends a field they may not understand.
+:::note
+`--think` / `--effort` flags exist but are hidden and **not yet wired into the plan engine** — they
+currently only affect the raw `-p` prompt path. Extended-thinking control for full agent turns is
+planned.
+:::

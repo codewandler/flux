@@ -56,10 +56,10 @@ AWS Bedrock is the compliance-friendly path to Claude for orgs that cannot send 
 
 ```bash
 # One-time: log in (re-run only when the refresh token expires — ~days, not the ~8h access token)
-aws sso login --profile babelforce-dev
+aws sso login --profile your-sso-profile
 
 # Then just:
-AWS_PROFILE=babelforce-dev flux run -m aws "refactor this module"
+AWS_PROFILE=your-sso-profile flux run -m aws "refactor this module"
 ```
 
 No `AWS_REGION` override needed — the chain resolves it from `~/.aws/config` (`eu-central-1`, `us-east-1`, …). The access token auto-refreshes on each run when expired (~8h); you only re-login when the refresh token dies.

@@ -40,4 +40,6 @@ when contributing to flux, but they are intentionally more detailed and more vol
 - How a turn works: read [Concepts](./concepts.md) and [The agent loop](./agent/agent-loop.md).
 - What flux is allowed to do: read [Safety & approvals](./agent/safety.md).
 - Interested in the language: read [Flux-Lang overview](./language/overview.md).
-- Embedding flux: read [FlowClient](./sdk/flow-client.md).
+- Embedding flux: read the [SDK overview](./sdk/overview.md).
+- Replay, fork, and diff past runs: read [Time Machine](./agent/time-machine.md).
+- Something not working: check [Troubleshooting](./troubleshooting.md).
