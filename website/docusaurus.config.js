@@ -38,6 +38,21 @@ const config = {
     ],
   ],
 
+  themes: [
+    [
+      require.resolve('@easyops-cn/docusaurus-search-local'),
+      {
+        // Offline, index-based search — no external service (Algolia) needed.
+        hashed: true,
+        indexBlog: false,
+        docsRouteBasePath: 'docs',
+        highlightSearchTermsOnTargetPage: true,
+      },
+    ],
+  ],
+
+  plugins: [require.resolve('./plugins/llms-txt')],
+
   themeConfig: {
     navbar: {
       title: 'flux',
