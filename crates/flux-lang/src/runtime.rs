@@ -3263,8 +3263,25 @@ fn eval_pure_node(
     let (tag, text, existing_vid) = match node {
         Node::Expr { formula, vars } => {
             let resolved = resolve_expr_vars(vars, store, session_id)?;
-            let text = eval_expr_value(formula, &resolved)?.as_text();
-            (format!("expr {formula}"), text, None)
+            let val = eval_expr_value(formula, &resolved)?;
+            // A scalar number/bool result keeps its JSON type (`$ok = expr($a > $b)` binds the
+            // boolean, `$n = expr($x + 1)` the number), mirroring the `Lit`/`Jq` arms (F-008).
+            // Strings and lists stay canonical text; a non-finite number falls back to text too.
+            let existing_vid = match &val {
+                ExprVal::Num(n) => serde_json::Number::from_f64(*n)
+                    .map(|num| {
+                        store.put_value(
+                            session_id,
+                            &Value::from_json(&serde_json::Value::Number(num)),
+                        )
+                    })
+                    .transpose()?,
+                ExprVal::Bool(b) => Some(
+                    store.put_value(session_id, &Value::from_json(&serde_json::Value::Bool(*b)))?,
+                ),
+                _ => None,
+            };
+            (format!("expr {formula}"), val.as_text(), existing_vid)
         }
         Node::Fmt { template } => (
             "fmt".to_string(),
@@ -3295,11 +3312,20 @@ fn eval_pure_node(
             as_type,
         } => {
             let jv = eval_arg(inner, store, session_id)?;
-            (
-                format!("parse {as_type}"),
-                coerce_parse(&jv, as_type)?,
-                None,
-            )
+            let text = coerce_parse(&jv, as_type)?;
+            // A numeric/bool parse target binds the typed value (`parse($x, i64)` → 42, not "42"),
+            // mirroring the other pure-node binds (F-008). `coerce_parse` already returns canonical
+            // text that is a JSON number / `true` / `false` for these targets, so recover the type
+            // from it; `string`/`json`/unknown stay canonical text.
+            let existing_vid = match as_type.as_str() {
+                "f64" | "i64" | "bool" => serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .filter(|v| v.is_number() || v.is_boolean())
+                    .map(|v| store.put_value(session_id, &Value::from_json(&v)))
+                    .transpose()?,
+                _ => None,
+            };
+            (format!("parse {as_type}"), text, existing_vid)
         }
         Node::Var { name: src } => {
             // Alias a symbol: `$b = $a` shares `$a`'s current ValueId. Pure — values are immutable,
@@ -5865,6 +5891,108 @@ mod tests {
             json!({"a": true, "b": false, "n": 42}),
             "rebuilt object keeps real bool/number types: {}",
             out.result
+        );
+    }
+
+    #[tokio::test]
+    async fn expr_scalar_bind_preserves_number_and_bool() {
+        // F-008 (siblings): `$ok = expr($a > $b)` binds the boolean and `$sum = expr($a + $b)` the
+        // number — not `"true"`/`"8"` — so typed `match` arms fire and structured output stays typed,
+        // matching the `Lit`/`Jq` binds. A string-producing expr stays a string.
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let expr = |formula: &str| Node::Expr {
+            formula: formula.into(),
+            vars: [
+                ("a".to_string(), Box::new(flow_var("a"))),
+                ("b".to_string(), Box::new(flow_var("b"))),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let ast = DraftAst {
+            body: vec![
+                flow_bind("a", flow_lit(json!(5))),
+                flow_bind("b", flow_lit(json!(3))),
+                flow_bind("ok", expr("a > b")),
+                flow_bind("sum", expr("a + b")),
+                flow_bind(
+                    "label",
+                    Node::Expr {
+                        formula: "upper('hi')".into(),
+                        vars: Default::default(),
+                    },
+                ),
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        let val = |name: &str| {
+            let vid = store
+                .resolve("s", &SymbolName(name.into()))
+                .unwrap()
+                .unwrap();
+            store.get_value(&vid).unwrap().unwrap()
+        };
+        assert!(
+            matches!(val("ok"), Value::Bool(true)),
+            "$a > $b binds a boolean"
+        );
+        assert!(
+            matches!(val("sum"), Value::Number(_)),
+            "$a + $b binds a number"
+        );
+        assert!(
+            matches!(val("label"), Value::String(_)),
+            "a string-valued expr stays a string"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_scalar_bind_preserves_number_and_bool() {
+        // F-008 (siblings): `parse($s, i64)` / `parse($s, bool)` bind the typed number/boolean, not
+        // `"42"`/`"true"`, so a parsed value re-assembles typed; `parse($s, string)` stays a string.
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let parse = |sym: &str, ty: &str| Node::Parse {
+            value: Box::new(flow_var(sym)),
+            as_type: ty.into(),
+        };
+        let ast = DraftAst {
+            body: vec![
+                flow_bind("sn", flow_lit(json!("42"))),
+                flow_bind("sb", flow_lit(json!("true"))),
+                flow_bind("n", parse("sn", "i64")),
+                flow_bind("ok", parse("sb", "bool")),
+                flow_bind("str", parse("sn", "string")),
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        let val = |name: &str| {
+            let vid = store
+                .resolve("s", &SymbolName(name.into()))
+                .unwrap()
+                .unwrap();
+            store.get_value(&vid).unwrap().unwrap()
+        };
+        assert!(
+            matches!(val("n"), Value::Number(_)),
+            "parse(_, i64) binds a number"
+        );
+        assert!(
+            matches!(val("ok"), Value::Bool(true)),
+            "parse(_, bool) binds a boolean"
+        );
+        assert!(
+            matches!(val("str"), Value::String(_)),
+            "parse(_, string) stays a string"
         );
     }
 

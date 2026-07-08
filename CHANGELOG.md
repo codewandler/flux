@@ -12,10 +12,11 @@ All notable changes to this project are documented in this file. The format is b
   the feedback now names the parameter's expected type and the operation's full accepted-parameter
   shape (not just "add a key") — so the model can correct the call on the next attempt instead of
   re-emitting the same broken node.
-- **Typed object-field reads.** Extracting a scalar field from an object (`$n = $obj.count`) now
-  preserves its JSON number/boolean type instead of stringifying it, so a rebuilt object stays typed
-  and numeric/boolean `match` arms fire. This closes the residual gap left by the earlier
-  typed-scalar-bind fix.
+- **Typed scalar binds everywhere.** Binding a scalar out of a field access (`$n = $obj.count`), an
+  expression (`$ok = expr($a > $b)`), or a `parse` (`$n = parse($s, i64)`) now preserves its JSON
+  number/boolean type instead of stringifying it — so a rebuilt object stays typed and
+  numeric/boolean `match` arms fire. This closes the residual gaps left by the earlier
+  typed-scalar-literal fix, making every pure-node bind consistent.
 - **`flux plugin install --dir` prunes stale local registrations.** A local re-scan now removes
   descriptors for plugins whose binary is no longer in the scanned directory (e.g. after a partial
   build), so the CLI stops warning about a missing binary on every later command. Verified pack
