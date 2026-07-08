@@ -569,6 +569,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "codewandler-flux-a2a"
+version = "0.10.0"
+dependencies = [
+ "async-trait",
+ "eventsource-stream",
+ "futures",
+ "rand 0.8.6",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
+ "utoipa",
+]
+
+[[package]]
 name = "codewandler-flux-agent"
 version = "0.10.0"
 dependencies = [
@@ -583,6 +600,36 @@ dependencies = [
  "codewandler-flux-tools",
  "serde",
  "serde_norway",
+]
+
+[[package]]
+name = "codewandler-flux-audio"
+version = "0.10.0"
+
+[[package]]
+name = "codewandler-flux-capabilities"
+version = "0.10.0"
+dependencies = [
+ "async-trait",
+ "codewandler-flux-core",
+ "codewandler-flux-datasource",
+ "codewandler-flux-pg",
+ "codewandler-flux-plugin",
+ "codewandler-flux-runtime",
+ "codewandler-flux-secret",
+ "codewandler-flux-spec",
+ "codewandler-flux-system",
+ "fastembed",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sqlite-vec",
+ "tokio",
+ "toml",
+ "ulid",
+ "ureq",
+ "url",
 ]
 
 [[package]]
@@ -1615,23 +1662,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flux-a2a"
-version = "0.10.0"
-dependencies = [
- "async-trait",
- "eventsource-stream",
- "futures",
- "rand 0.8.6",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "url",
- "utoipa",
-]
-
-[[package]]
 name = "flux-app"
 version = "0.10.0"
 dependencies = [
@@ -1658,10 +1688,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flux-audio"
-version = "0.10.0"
-
-[[package]]
 name = "flux-auth"
 version = "0.10.0"
 dependencies = [
@@ -1673,32 +1699,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
-]
-
-[[package]]
-name = "flux-capabilities"
-version = "0.10.0"
-dependencies = [
- "async-trait",
- "codewandler-flux-core",
- "codewandler-flux-datasource",
- "codewandler-flux-pg",
- "codewandler-flux-plugin",
- "codewandler-flux-runtime",
- "codewandler-flux-secret",
- "codewandler-flux-spec",
- "codewandler-flux-system",
- "fastembed",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "sqlite-vec",
- "tokio",
- "toml",
- "ulid",
- "ureq",
- "url",
 ]
 
 [[package]]
@@ -1732,7 +1732,9 @@ dependencies = [
  "async-trait",
  "clap",
  "clap_complete",
+ "codewandler-flux-a2a",
  "codewandler-flux-agent",
+ "codewandler-flux-capabilities",
  "codewandler-flux-cognition",
  "codewandler-flux-core",
  "codewandler-flux-credentials",
@@ -1755,10 +1757,8 @@ dependencies = [
  "codewandler-flux-system",
  "codewandler-flux-tools",
  "crossterm 0.28.1",
- "flux-a2a",
  "flux-app",
  "flux-auth",
- "flux-capabilities",
  "flux-channels",
  "flux-config",
  "flux-eval",
@@ -1828,6 +1828,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
+ "codewandler-flux-a2a",
  "codewandler-flux-core",
  "codewandler-flux-credentials",
  "codewandler-flux-events",
@@ -1837,7 +1838,6 @@ dependencies = [
  "codewandler-flux-runtime",
  "codewandler-flux-system",
  "codewandler-flux-tools",
- "flux-a2a",
  "flux-auth",
  "flux-config",
  "futures",

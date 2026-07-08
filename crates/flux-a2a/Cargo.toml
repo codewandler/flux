@@ -1,8 +1,10 @@
 [package]
-name = "flux-a2a"
+name = "codewandler-flux-a2a"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "A2A (Agent-to-Agent) protocol: spec-conformant wire types + an HTTP/JSON-RPC client for driving remote A2A agents."
 
 [dependencies]

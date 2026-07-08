@@ -1,8 +1,10 @@
 [package]
-name = "flux-capabilities"
+name = "codewandler-flux-capabilities"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "flux agent capabilities: a guarded web_fetch tool (browser) + a knowledge datasource (records, a pluggable backend, and retrieval ops)"
 
 [dependencies]

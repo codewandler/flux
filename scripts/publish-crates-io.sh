@@ -20,6 +20,8 @@ DRY_RUN=""
 # Dependency order: every crate's flux-* deps appear before it. Keep in sync with PUBLISHING.md §2.
 CRATES=(
   codewandler-flux-core
+  codewandler-flux-audio
+  codewandler-flux-a2a
   codewandler-flux-markdown
   codewandler-flux-datasource
   codewandler-flux-spec
@@ -37,6 +39,7 @@ CRATES=(
   codewandler-flux-tools
   codewandler-flux-cognition
   codewandler-flux-plugin
+  codewandler-flux-capabilities
   codewandler-host-kit
   codewandler-flux-flow
   codewandler-flux-agent
