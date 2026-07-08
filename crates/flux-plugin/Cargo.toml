@@ -16,6 +16,7 @@ flux-runtime.workspace = true
 flux-spec.workspace = true
 flux-system.workspace = true
 flux-secret.workspace = true
+flux-credentials.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

@@ -442,6 +442,208 @@ async fn parse_token_resp(resp: reqwest::Response) -> Result<Refreshed> {
 }
 
 // ---------------------------------------------------------------------------
+// Generic plugin OAuth (plugin-oauth epic, D-81) — the host runs every grant so a
+// plugin only declares its endpoints and consumes a fresh bearer.
+// ---------------------------------------------------------------------------
+
+/// Run a generic RFC-6749 token grant (form-encoded) against `token_url` and return the storable
+/// token. The host runs every plugin OAuth grant through here — the plugin never touches
+/// `/oauth/token` (plugin-oauth, D-81). `params` is the grant body (e.g. `grant_type=refresh_token`,
+/// `authorization_code`, `password`, or `client_credentials` + the matching credentials).
+pub async fn oauth_token_grant(token_url: &str, params: &[(&str, &str)]) -> Result<OAuthToken> {
+    let resp = reqwest::Client::new()
+        .post(token_url)
+        .form(params)
+        .send()
+        .await
+        .map_err(|e| Error::Http(e.to_string()))?;
+    let r = parse_token_resp(resp).await?;
+    Ok(OAuthToken {
+        access: r.access,
+        refresh: r.refresh,
+        expires_at_ms: r.expires_at_ms,
+        account_id: r.id_token.as_deref().and_then(account_id_from_id_token),
+    })
+}
+
+/// Persist a token for `key` in the credential store (file backend, `~/.flux/credentials.toml`,
+/// 0600). Keyed by an arbitrary string, so a plugin token is stored under `plugin:<name>:<purpose>`
+/// while provider tokens keep their `claude`/`codex` keys (plugin-oauth, D-81/D-83).
+pub fn save_token(key: &str, token: &OAuthToken) -> Result<()> {
+    save_stored(key, token)
+}
+
+/// Load a stored token for `key`, if any.
+pub fn load_token(key: &str) -> Option<OAuthToken> {
+    load_stored(key)
+}
+
+/// Resolve a fresh bearer access token for `key` from the credential store, refreshing it via a
+/// generic `refresh_token` grant against `token_url` when the stored token is within the refresh
+/// buffer of expiry (plugin-oauth, D-81). Returns `Ok(None)` when nothing is stored under `key` — the
+/// caller then falls back to a declared env secret. A refreshed/rotated token is persisted back
+/// (best-effort: a failed write must not fail the request).
+pub async fn resolve_stored_bearer(
+    store: &dyn CredentialStore,
+    key: &str,
+    token_url: &str,
+    client_id: &str,
+) -> Result<Option<String>> {
+    let Some(mut tok) = store.load(key).await else {
+        return Ok(None);
+    };
+    let stale = tok
+        .expires_at_ms
+        .map(|exp| now_ms() + REFRESH_BUFFER_MS >= exp)
+        .unwrap_or(false);
+    if stale {
+        if let Some(refresh) = tok.refresh.clone() {
+            let refreshed = oauth_token_grant(
+                token_url,
+                &[
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", &refresh),
+                    ("client_id", client_id),
+                ],
+            )
+            .await?;
+            tok.access = refreshed.access;
+            if refreshed.refresh.is_some() {
+                tok.refresh = refreshed.refresh;
+            }
+            tok.expires_at_ms = refreshed.expires_at_ms;
+            let _ = store.save(key, &tok).await;
+        }
+        // Stale with no refresh token: return the stale access and let the API 401.
+    }
+    Ok(Some(tok.access))
+}
+
+// ---------------------------------------------------------------------------
+// Credential store backends (plugin-oauth epic, D-83) — a pluggable store so
+// tokens live in a local 0600 file for dev/CLI, or in Vault when deployed.
+// ---------------------------------------------------------------------------
+
+/// A backend that persists OAuth tokens, keyed by an arbitrary string (`plugin:<name>:<purpose>` for
+/// a plugin, `claude`/`codex` for a provider). The default is [`FileCredentialStore`]; a host app can
+/// inject a [`VaultCredentialStore`] (or its own) the way it injects custom host capabilities, so
+/// credentials never sit in a file on a pod (plugin-oauth, D-83).
+#[async_trait]
+pub trait CredentialStore: Send + Sync {
+    /// Load the token stored under `key`, if any.
+    async fn load(&self, key: &str) -> Option<OAuthToken>;
+    /// Persist `token` under `key`.
+    async fn save(&self, key: &str, token: &OAuthToken) -> Result<()>;
+}
+
+/// The default backend: `~/.flux/credentials.toml` (0600), the same store provider logins use — so
+/// `claude`/`codex` keep working unchanged.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FileCredentialStore;
+
+#[async_trait]
+impl CredentialStore for FileCredentialStore {
+    async fn load(&self, key: &str) -> Option<OAuthToken> {
+        load_stored(key)
+    }
+    async fn save(&self, key: &str, token: &OAuthToken) -> Result<()> {
+        save_stored(key, token)
+    }
+}
+
+/// A HashiCorp Vault KV-v2 backend (plugin-oauth, D-83): tokens are read/written at
+/// `<addr>/v1/<mount>/data/<prefix>/<key>` with an `X-Vault-Token` header. Host-injectable for a
+/// deployment where per-customer tokens must live in Vault, not a file on a pod. Key `:` separators
+/// map to Vault path segments.
+pub struct VaultCredentialStore {
+    addr: String,
+    token: String,
+    mount: String,
+    prefix: String,
+    http: reqwest::Client,
+}
+
+impl VaultCredentialStore {
+    /// `addr` = the Vault base URL, `token` = a Vault token, `mount` = the KV-v2 mount (e.g.
+    /// `secret`), `prefix` = a path prefix under the mount (e.g. `flux`).
+    pub fn new(
+        addr: impl Into<String>,
+        token: impl Into<String>,
+        mount: impl Into<String>,
+        prefix: impl Into<String>,
+    ) -> Self {
+        Self {
+            addr: addr.into().trim_end_matches('/').to_string(),
+            token: token.into(),
+            mount: mount.into(),
+            prefix: prefix.into(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    /// Build from the standard Vault env (`VAULT_ADDR`, `VAULT_TOKEN`) plus optional
+    /// `FLUX_VAULT_MOUNT` (default `secret`) / `FLUX_VAULT_PREFIX` (default `flux`). `None` when the
+    /// address or token is unset — the caller then keeps the file backend.
+    pub fn from_env() -> Option<Self> {
+        let addr = std::env::var("VAULT_ADDR").ok().filter(|s| !s.is_empty())?;
+        let token = std::env::var("VAULT_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        let mount = std::env::var("FLUX_VAULT_MOUNT").unwrap_or_else(|_| "secret".to_string());
+        let prefix = std::env::var("FLUX_VAULT_PREFIX").unwrap_or_else(|_| "flux".to_string());
+        Some(Self::new(addr, token, mount, prefix))
+    }
+
+    fn data_url(&self, key: &str) -> String {
+        let path = key.replace(':', "/");
+        format!(
+            "{}/v1/{}/data/{}/{}",
+            self.addr, self.mount, self.prefix, path
+        )
+    }
+}
+
+#[async_trait]
+impl CredentialStore for VaultCredentialStore {
+    async fn load(&self, key: &str) -> Option<OAuthToken> {
+        let resp = self
+            .http
+            .get(self.data_url(key))
+            .header("X-Vault-Token", &self.token)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None; // 404 = no such secret
+        }
+        let v: serde_json::Value = resp.json().await.ok()?;
+        // KV v2 nests the payload under data.data.
+        let s = v.get("data")?.get("data")?.get("token")?.as_str()?;
+        serde_json::from_str(s).ok()
+    }
+    async fn save(&self, key: &str, token: &OAuthToken) -> Result<()> {
+        let payload = serde_json::json!({
+            "data": { "token": serde_json::to_string(token).map_err(|e| Error::Config(e.to_string()))? }
+        });
+        let resp = self
+            .http
+            .post(self.data_url(key))
+            .header("X-Vault-Token", &self.token)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| Error::Http(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(Error::Http(format!(
+                "vault write failed: {}",
+                resp.status()
+            )));
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RefreshingToken — the TokenSource handed to OAuth credentials
 // ---------------------------------------------------------------------------
 
@@ -698,6 +900,31 @@ pub fn codex_authorize_url(pkce: &Pkce, state: &str) -> String {
             ("code_challenge_method", "S256"),
             ("id_token_add_organizations", "true"),
             ("codex_cli_simplified_flow", "true"),
+            ("state", state),
+        ],
+    )
+}
+
+/// Build a generic RFC-6749 `authorization_code` + PKCE authorize URL (plugin-oauth, D-82) — the
+/// provider-agnostic form of [`codex_authorize_url`], parameterized on a plugin's manifest config
+/// instead of provider constants.
+pub fn oauth_authorize_url(
+    authorize_url: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    scope: &str,
+    pkce: &Pkce,
+    state: &str,
+) -> String {
+    build_url(
+        authorize_url,
+        &[
+            ("response_type", "code"),
+            ("client_id", client_id),
+            ("redirect_uri", redirect_uri),
+            ("scope", scope),
+            ("code_challenge", &pkce.challenge),
+            ("code_challenge_method", "S256"),
             ("state", state),
         ],
     )
@@ -1068,6 +1295,210 @@ mod tests {
         assert_eq!(stored.refresh.as_deref(), Some("rt_c08"));
         assert_eq!(stored.account_id.as_deref(), Some("acct_c08"));
         assert!(stored.expires_at_ms.unwrap() > now_ms());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // HOME_LOCK only serializes the HOME-env tests
+    async fn resolve_stored_bearer_returns_stored_refreshes_stale_and_none_when_absent() {
+        // D-81: resolve_stored_bearer returns a fresh stored bearer, refreshes a stale one via the
+        // token endpoint (persisting the result), and returns None when nothing is stored (the caller
+        // then falls back to a declared env secret).
+        let tmp = std::env::temp_dir().join(format!(
+            "flux-cred-d81-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _home = HOME_LOCK.lock().unwrap();
+        std::env::set_var("HOME", &tmp);
+
+        let key = "plugin:acme:api";
+
+        // No entry → None (env fallback happens on the caller side).
+        assert!(
+            resolve_stored_bearer(&FileCredentialStore, key, "http://unused/token", "cid")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Fresh token → returned as-is, no network call.
+        save_token(
+            key,
+            &OAuthToken {
+                access: "fresh".into(),
+                refresh: Some("rt".into()),
+                expires_at_ms: Some(now_ms() + 3_600_000),
+                account_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_stored_bearer(&FileCredentialStore, key, "http://unused/token", "cid")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("fresh")
+        );
+
+        // Stale token → refreshed via the mock endpoint, persisted, new access returned.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body =
+            serde_json::json!({"access_token":"refreshed","refresh_token":"rt2","expires_in":3600})
+                .to_string();
+        let server = tokio::spawn(serve_one_token_response(listener, body));
+        save_token(
+            key,
+            &OAuthToken {
+                access: "stale".into(),
+                refresh: Some("rt".into()),
+                expires_at_ms: Some(now_ms() - 1000),
+                account_id: None,
+            },
+        )
+        .unwrap();
+        let got = resolve_stored_bearer(
+            &FileCredentialStore,
+            key,
+            &format!("http://{addr}/oauth/token"),
+            "cid",
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.as_deref(), Some("refreshed"));
+        let req = server.await.unwrap();
+        assert!(req.contains("grant_type=refresh_token"));
+        assert!(req.contains("refresh_token=rt"));
+        assert_eq!(load_token(key).unwrap().access, "refreshed");
+        assert_eq!(load_token(key).unwrap().refresh.as_deref(), Some("rt2"));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn credential_store_trait_round_trips_and_is_injectable() {
+        // D-83: tokens round-trip through the `CredentialStore` trait, and `resolve_stored_bearer`
+        // reads from the INJECTED store (proven by an in-memory mock) — not always the file backend.
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        struct MockStore {
+            map: Mutex<std::collections::HashMap<String, OAuthToken>>,
+            loads: AtomicUsize,
+        }
+        #[async_trait]
+        impl CredentialStore for MockStore {
+            async fn load(&self, key: &str) -> Option<OAuthToken> {
+                self.loads.fetch_add(1, Ordering::SeqCst);
+                self.map.lock().unwrap().get(key).cloned()
+            }
+            async fn save(&self, key: &str, token: &OAuthToken) -> Result<()> {
+                self.map
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_string(), token.clone());
+                Ok(())
+            }
+        }
+
+        let store = MockStore {
+            map: Mutex::new(std::collections::HashMap::new()),
+            loads: AtomicUsize::new(0),
+        };
+        // Round-trip through the trait.
+        store
+            .save(
+                "plugin:acme:api",
+                &OAuthToken {
+                    access: "tok".into(),
+                    refresh: None,
+                    expires_at_ms: None,
+                    account_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.load("plugin:acme:api").await.unwrap().access, "tok");
+
+        // `resolve_stored_bearer` reads from the injected mock (no file/network).
+        let got = resolve_stored_bearer(&store, "plugin:acme:api", "http://unused/", "cid")
+            .await
+            .unwrap();
+        assert_eq!(got.as_deref(), Some("tok"));
+        assert!(
+            store.loads.load(Ordering::SeqCst) >= 2,
+            "the injected store was consulted"
+        );
+        assert!(
+            resolve_stored_bearer(&store, "plugin:absent:x", "http://unused/", "cid")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn vault_credential_store_round_trips_via_kv_v2() {
+        // D-83: the Vault backend composes the KV-v2 path (`:` key separators → path segments), POSTs
+        // the token, and reads the KV-v2-nested payload back. A stateful loopback stub stands in for
+        // Vault (no server needed).
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let vs = VaultCredentialStore::new("http://vault.example/", "tok", "secret", "flux");
+        assert_eq!(
+            vs.data_url("plugin:acme:api"),
+            "http://vault.example/v1/secret/data/flux/plugin/acme/api"
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // POST then GET are handled sequentially by one task, so a plain local var carries the token
+        // between them — no shared lock (which clippy would flag as held across the write await).
+        let server = tokio::spawn(async move {
+            let mut saved: Option<String> = None;
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let body = if req.starts_with("POST") {
+                    let sent = req.split("\r\n\r\n").nth(1).unwrap_or("");
+                    let v: serde_json::Value = serde_json::from_str(sent).unwrap();
+                    saved = v["data"]["token"].as_str().map(|s| s.to_string());
+                    "{}".to_string()
+                } else {
+                    let tok = saved.clone().unwrap_or_default();
+                    serde_json::json!({ "data": { "data": { "token": tok } } }).to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+
+        let vs = VaultCredentialStore::new(format!("http://{addr}"), "vault-tok", "secret", "flux");
+        vs.save(
+            "plugin:acme:api",
+            &OAuthToken {
+                access: "va".into(),
+                refresh: Some("vr".into()),
+                expires_at_ms: None,
+                account_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let got = vs
+            .load("plugin:acme:api")
+            .await
+            .expect("token round-trips through Vault KV-v2");
+        assert_eq!(got.access, "va");
+        assert_eq!(got.refresh.as_deref(), Some("vr"));
+        server.await.unwrap();
     }
 
     #[test]

@@ -249,6 +249,7 @@ fn manifest_builder() -> PluginBuilder {
             user_env: vec!["GRAFANA_USERNAME".into()],
             env: vec!["GRAFANA_PASSWORD".into()],
             description: "Grafana HTTP Basic auth fallback.".into(),
+            ..Default::default()
         })
         .endpoint(EndpointSpec {
             name: "grafana.endpoint".into(),

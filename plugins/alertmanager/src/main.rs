@@ -112,6 +112,7 @@ fn manifest_builder() -> PluginBuilder {
             user_env: vec!["ALERTMANAGER_USERNAME".into()],
             description: "HTTP Basic auth (optional — Alertmanager is often unauthenticated)."
                 .into(),
+            ..Default::default()
         })
         .endpoint(EndpointSpec {
             name: "alertmanager.endpoint".into(),

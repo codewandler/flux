@@ -2,7 +2,7 @@
 id: D-81
 title: Host-side OAuth token exchange + resolve-and-refresh for plugins
 pillar: Core
-status: backlog
+status: done
 design: docs/designs/plugin-oauth.md
 epic: plugin-oauth
 note: "the host performs every /oauth/token grant + auto-refresh; resolve an OAuth2 purpose from the credential store → the plugin only ever gets a fresh bearer. Unblocks a downstream consumer's OAuth-wrapping plugin."
@@ -24,7 +24,16 @@ Make the host do all OAuth token work so a plugin stays a pure bearer consumer �
       endpoint; an expired token triggers a refresh; env fallback still works when there's no store entry.
 
 ## Progress
-- Proposed. Depends on D-80 (the manifest OAuth2 declaration).
+- 2026-07-08 **DONE.** flux-credentials gained generic host-side OAuth: `oauth_token_grant` (a
+  form-encoded RFC-6749 grant → `OAuthToken`, covering refresh/authorization_code/password/
+  client_credentials), `resolve_stored_bearer` (load → refresh-if-stale via the token endpoint →
+  persist → bearer), and `save_token`/`load_token`. flux-plugin's `resolve_purpose` (made **async**,
+  rippling through `resolve_auth` + the `secret`/`http.do` handlers) resolves an OAuth2 purpose from
+  the credential store keyed `plugin:<name>:<purpose>`, builds the token URL from the method's
+  **declared** endpoint (SSRF- + host-allow-list-guarded, never plugin-supplied), registers the bearer
+  with the redactor, and falls back to the declared env secret when no token is stored. flux-plugin
+  gained a flux-credentials dep (L4→L1, legal). Tests: `resolve_stored_bearer_...` (flux-credentials,
+  stored/refresh/absent) + `oauth2_purpose_resolves_stored_bearer_else_env_fallback` (flux-plugin).
 
 ## Notes
 - Design: [plugin-oauth.md](../designs/plugin-oauth.md). **This unblocks** a downstream consumer's

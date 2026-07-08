@@ -2,7 +2,7 @@
 id: D-80
 title: OAuth2 auth-method in the plugin manifest
 pillar: Core
-status: backlog
+status: done
 design: docs/designs/plugin-oauth.md
 epic: plugin-oauth
 note: "extend AuthMethod/PluginCapabilities with an OAuth2 block (authorize/token paths, client_id, scopes, grants, loopback redirect); backward-compatible. First step of plugin-oauth."
@@ -24,7 +24,13 @@ the vocabulary the rest of `plugin-oauth` builds on.
 - [ ] host-kit exposes the declaration (a plugin author sets it via `PluginBuilder`).
 
 ## Progress
-- Proposed.
+- 2026-07-08 **DONE.** Added the OAuth2 vocabulary to the plugin manifest (`crates/flux-plugin`):
+  `OAuth2Spec` (endpoint / authorize_path / token_path / client_id / scopes / grants / loopback
+  redirect) + `OAuthGrant` + `OAuthRedirect`, an optional `AuthMethod.oauth2` field
+  (`skip_serializing_if`, all-default → legacy manifests round-trip unchanged), an
+  `AuthMethod::oauth2()` constructor, and host-kit re-exports so an author declares it via
+  `.auth(AuthMethod::oauth2(...))`. The resulting access token injects as `Bearer`. Test:
+  `manifest_oauth2_and_legacy_auth_round_trip` (backward-compat + OAuth2 round-trip).
 
 ## Notes
 - Design: [plugin-oauth.md](../designs/plugin-oauth.md). First consumer: a downstream consumer's

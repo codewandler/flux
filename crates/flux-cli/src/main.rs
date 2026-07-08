@@ -511,10 +511,14 @@ enum CorpusAction {
 enum AuthAction {
     /// Show which providers are configured (the default).
     Status,
-    /// Log in to a provider (`claude` or `codex`).
+    /// Log in to a provider (`claude`/`codex`) or an installed OAuth2 plugin (by name).
     Login {
-        /// Provider to log in to.
+        /// Provider (`claude`/`codex`) or installed plugin name to log in to.
         provider: String,
+        /// Use the OAuth2 password grant (prompt for username + password) instead of the browser
+        /// PKCE flow — for a plugin whose OAuth2 method supports it.
+        #[arg(long)]
+        password: bool,
     },
 }
 
@@ -599,6 +603,15 @@ enum PluginAction {
         /// Also remove the plugin's versioned binary store (all downloaded versions).
         #[arg(long)]
         purge: bool,
+    },
+    /// Log in to this plugin's OAuth2 provider (alias for `flux auth login <name>`): runs the browser
+    /// PKCE flow (or `--password`) and stores the tokens so a later `call` needs no env token.
+    Login {
+        /// Installed plugin name.
+        name: String,
+        /// Use the OAuth2 password grant instead of the browser PKCE flow.
+        #[arg(long)]
+        password: bool,
     },
     /// Inspect installed plugins — liveness + declared surface: `status [<name>]`.
     /// With no argument it summarizes every installed plugin; `ls` stays the terse default.
@@ -6303,6 +6316,7 @@ async fn run_plugin(action: Option<PluginAction>) -> Result<()> {
 /// The dir-parameterized body of [`run_plugin`] (tests pass a temp dir so they don't touch `HOME`).
 async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> Result<()> {
     match action.unwrap_or(PluginAction::Ls) {
+        PluginAction::Login { name, password } => login_plugin(&name, password).await,
         PluginAction::Ls => {
             let found = flux_plugin::discover(dir);
             if found.is_empty() {
@@ -7311,10 +7325,11 @@ async fn run_auth(action: Option<AuthAction>) -> Result<()> {
             }
             Ok(())
         }
-        AuthAction::Login { provider } => match provider.as_str() {
+        AuthAction::Login { provider, password } => match provider.as_str() {
             "claude" => login_claude().await,
             "codex" => login_codex().await,
-            other => bail!("`flux auth login` expects `claude` or `codex` (got `{other}`)"),
+            // Any other name is treated as an installed OAuth2 plugin (plugin-oauth, D-82).
+            name => login_plugin(name, password).await,
         },
     }
 }
@@ -7444,6 +7459,207 @@ fn parse_codex_callback(query: &str) -> Result<(String, String)> {
     match (code, state) {
         (Some(c), Some(s)) if !c.is_empty() => Ok((c, s)),
         _ => bail!("OAuth callback did not include an authorization code and state"),
+    }
+}
+
+/// Log in to an installed OAuth2 plugin (plugin-oauth, D-82): load its manifest, resolve its declared
+/// OAuth2 endpoint, run the browser PKCE `authorization_code` flow (or the `--password` grant), and
+/// store the tokens under `plugin:<name>:<purpose>` — the same key the host resolves at call time, so
+/// a subsequent `flux plugin call` needs no env token.
+async fn login_plugin(name: &str, password: bool) -> Result<()> {
+    let dir = plugins_dir().ok_or_else(|| anyhow::anyhow!("HOME is not set — no plugin store"))?;
+    let desc = flux_plugin::load_descriptor(&dir, name)
+        .context("load plugin descriptor")?
+        .ok_or_else(|| anyhow::anyhow!("no such plugin `{name}` — install it first"))?;
+    let manifest = spawn_and_load_manifest(name, &desc).await?;
+    let method = manifest
+        .auth
+        .iter()
+        .find(|a| a.oauth2.is_some())
+        .ok_or_else(|| anyhow::anyhow!("plugin `{name}` declares no OAuth2 auth method"))?;
+    let oauth = method.oauth2.as_ref().expect("filtered to Some above");
+    let base = resolve_manifest_endpoint(&manifest, &oauth.endpoint).ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot resolve OAuth endpoint `{}` for plugin `{name}` — set its declared env or default",
+            oauth.endpoint
+        )
+    })?;
+    let token_url = join_endpoint_path(&base, &oauth.token_path);
+    let key = format!("plugin:{name}:{}", method.purpose);
+    let scope = oauth.scopes.join(" ");
+
+    let token = if password {
+        let username = prompt_line("username: ")?;
+        let secret = rpassword::prompt_password("password: ").context("read password")?;
+        flux_credentials::oauth_token_grant(
+            &token_url,
+            &[
+                ("grant_type", "password"),
+                ("username", username.trim()),
+                ("password", &secret),
+                ("client_id", &oauth.client_id),
+                ("scope", &scope),
+            ],
+        )
+        .await
+        .context("password grant")?
+    } else {
+        let redirect = oauth.redirect.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("plugin `{name}` OAuth2 declares no loopback redirect; use --password")
+        })?;
+        let redirect_uri = format!("http://localhost:{}{}", redirect.port, redirect.path);
+        let authorize_url = join_endpoint_path(&base, &oauth.authorize_path);
+        let (port, path) = (redirect.port, redirect.path.clone());
+        plugin_oauth_code_grant(
+            &token_url,
+            &authorize_url,
+            &oauth.client_id,
+            &scope,
+            &redirect_uri,
+            |url, _state| async move {
+                println!(
+                    "Open this URL and approve access — flux is listening on localhost:{port} for the redirect:\n\n{url}\n"
+                );
+                wait_for_oauth_callback(port, &path).await
+            },
+        )
+        .await?
+    };
+    flux_credentials::save_token(&key, &token)?;
+    println!(
+        "\u{2713} stored OAuth credentials for plugin `{name}` (purpose `{}`) in ~/.flux/credentials.toml",
+        method.purpose
+    );
+    Ok(())
+}
+
+/// The `authorization_code` + PKCE half of a plugin login (plugin-oauth, D-82): build the authorize
+/// URL, run the browser callback (injected — the interactive path binds the loopback listener; the
+/// test injects a canned callback), verify the CSRF state, and exchange the code against `token_url`.
+async fn plugin_oauth_code_grant<F, Fut>(
+    token_url: &str,
+    authorize_url: &str,
+    client_id: &str,
+    scope: &str,
+    redirect_uri: &str,
+    callback: F,
+) -> Result<flux_credentials::OAuthToken>
+where
+    F: FnOnce(String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    let pkce = flux_credentials::generate_pkce();
+    let state = flux_credentials::generate_state();
+    let url = flux_credentials::oauth_authorize_url(
+        authorize_url,
+        client_id,
+        redirect_uri,
+        scope,
+        &pkce,
+        &state,
+    );
+    let code_state = callback(url, state.clone()).await?;
+    let (code, ret_state) = code_state
+        .split_once('#')
+        .unwrap_or((code_state.as_str(), ""));
+    if ret_state != state {
+        bail!("OAuth callback state mismatch — possible CSRF, aborting login");
+    }
+    flux_credentials::oauth_token_grant(
+        token_url,
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("client_id", client_id),
+            ("code_verifier", &pkce.verifier),
+        ],
+    )
+    .await
+    .context("exchange authorization code")
+}
+
+/// Resolve a manifest endpoint's base URL for login (declared env keys → default). Templated
+/// endpoints are resolved host-side at call time, not here.
+fn resolve_manifest_endpoint(m: &flux_plugin::PluginManifest, name: &str) -> Option<String> {
+    let ep = m.endpoints.iter().find(|e| e.name == name)?;
+    for k in &ep.env {
+        if let Ok(v) = std::env::var(k) {
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    ep.default.clone()
+}
+
+/// Join an endpoint base URL and a declared path (`https://host` + `/oauth/token`).
+fn join_endpoint_path(base: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
+/// Prompt on the terminal and read one trimmed line (visible echo — for a non-secret like a username).
+fn prompt_line(msg: &str) -> Result<String> {
+    print!("{msg}");
+    std::io::stdout().flush().ok();
+    let mut s = String::new();
+    std::io::stdin().read_line(&mut s)?;
+    Ok(s.trim().to_string())
+}
+
+/// Bind `127.0.0.1:{port}` and wait for the OAuth redirect at `path`, answering the browser with a
+/// small confirmation page (plugin-oauth, D-82 — the generic form of [`wait_for_codex_callback`],
+/// with a bounded wait). Non-callback requests get a 404 and the wait continues. Returns `code#state`.
+async fn wait_for_oauth_callback(port: u16, path: &str) -> Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .with_context(|| {
+            format!("bind localhost:{port} for the OAuth callback (is another login running?)")
+        })?;
+    let accept = async {
+        loop {
+            let (mut sock, _) = listener.accept().await.context("accept OAuth callback")?;
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let target = req.split_whitespace().nth(1).unwrap_or("");
+            let (req_path, query) = target.split_once('?').unwrap_or((target, ""));
+            if req_path != path {
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                continue;
+            }
+            let result = parse_codex_callback(query);
+            let page = if result.is_ok() {
+                "Login complete — you can return to the terminal."
+            } else {
+                "Login failed — see the terminal for details."
+            };
+            let body = format!("<!doctype html><html><body><p>{page}</p></body></html>");
+            let _ = sock
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+            let (code, state) = result?;
+            return Ok(format!("{code}#{state}"));
+        }
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(300), accept).await {
+        Ok(r) => r,
+        Err(_) => bail!("timed out waiting for the OAuth callback on localhost:{port}"),
     }
 }
 
@@ -7703,6 +7919,78 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
         assert!(store.contains("[codex]"), "stored under `codex`: {store}");
         assert!(store.contains("at_cli_c08"));
+    }
+
+    /// D-82: the plugin `authorization_code` login builds a PKCE authorize URL from the manifest
+    /// config and exchanges the callback code against the token endpoint, yielding a storable token
+    /// (the store→resolve path a later `plugin call` uses is covered in flux-plugin). No `$HOME`
+    /// mutation, so it can't race the codex login test.
+    #[tokio::test]
+    async fn plugin_oauth_code_grant_builds_pkce_url_and_exchanges() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&tmp[..n]);
+                let text = String::from_utf8_lossy(&req);
+                if let Some(head_end) = text.find("\r\n\r\n") {
+                    let len = text
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if req.len() >= head_end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let body =
+                r#"{"access_token":"at_plugin","refresh_token":"rt_plugin","expires_in":3600}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&req).into_owned()
+        });
+
+        let token = super::plugin_oauth_code_grant(
+            &format!("http://{addr}/oauth/token"),
+            "https://auth.example.com/oauth/authorize",
+            "plugin-client",
+            "read write",
+            "http://localhost:9876/cb",
+            |url, state| async move {
+                assert!(url.starts_with("https://auth.example.com/oauth/authorize?"));
+                assert!(url.contains("client_id=plugin-client"));
+                assert!(url.contains("code_challenge="));
+                assert!(url.contains("code_challenge_method=S256"));
+                assert!(url.contains(&format!("state={state}")));
+                Ok(format!("plugin-code#{state}"))
+            },
+        )
+        .await
+        .expect("plugin code grant completes against the stub endpoint");
+
+        assert_eq!(token.access, "at_plugin");
+        assert_eq!(token.refresh.as_deref(), Some("rt_plugin"));
+
+        let req = server.await.unwrap();
+        assert!(req.contains("grant_type=authorization_code"));
+        assert!(req.contains("code=plugin-code"));
+        assert!(req.contains("code_verifier="));
+        assert!(req.contains("client_id=plugin-client"));
     }
 
     /// C-08: the OAuth callback parser — happy path, provider error, and junk.

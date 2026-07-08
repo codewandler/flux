@@ -1,6 +1,6 @@
 # Design — Plugin OAuth (generalize the provider-only auth flow to plugins)
 
-**Status:** Proposed — epic shell · **Pillar:** Core · **Epic:** `plugin-oauth` · **Stories:** D-80..D-83
+**Status:** ✅ implemented 2026-07-08 (D-80..D-83 all done; full gate green) · **Pillar:** Core · **Epic:** `plugin-oauth` · **Stories:** D-80..D-83
 
 ## Why
 

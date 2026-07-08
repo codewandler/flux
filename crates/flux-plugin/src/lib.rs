@@ -163,6 +163,66 @@ pub enum AuthScheme {
     Query { name: String },
 }
 
+/// A token grant an [`OAuth2Spec`] method allows the host to run on the plugin's behalf
+/// (plugin-oauth, D-80). The plugin performs none of these itself — it only declares which are
+/// supported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthGrant {
+    /// Browser + loopback-callback PKCE (`flux auth login <plugin>`).
+    AuthorizationCode,
+    /// Resource-owner password grant (`flux auth login <plugin> --password`).
+    Password,
+    /// Refresh an expired access token from a stored refresh token.
+    RefreshToken,
+    /// Two-legged client-credentials grant (no user).
+    ClientCredentials,
+}
+
+/// The loopback redirect a plugin's `authorization_code` login binds — a local `127.0.0.1:{port}{path}`
+/// listener the browser is redirected to with the auth code. Local-only: never an outbound host, so it
+/// is outside the plugin egress allow-list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OAuthRedirect {
+    /// The loopback port to bind (e.g. `1456`).
+    pub port: u16,
+    /// The callback path the browser is redirected to (e.g. `/auth/callback`).
+    pub path: String,
+}
+
+/// Declares that an [`AuthMethod`]'s purpose is **OAuth2-backed** (plugin-oauth, D-80): the host runs
+/// every token grant (login + refresh) and injects only a fresh bearer, so the plugin performs no
+/// OAuth itself. `authorize_path`/`token_path` are joined onto the auth method's declared `endpoint`
+/// base URL, so the token host stays host-declared and egress-gated (never a plugin-supplied URL).
+/// Every field deserializes with a default and `AuthMethod.oauth2` is `None` for a plain env→secret
+/// method, so legacy manifests round-trip unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OAuth2Spec {
+    /// The declared [`EndpointSpec`] name whose base URL `authorize_path`/`token_path` resolve
+    /// against — its host allow-list is what admits the token exchange through the egress gate.
+    #[serde(default)]
+    pub endpoint: String,
+    /// The authorize endpoint path (the browser redirect target for `authorization_code`), joined
+    /// onto the endpoint base URL.
+    #[serde(default)]
+    pub authorize_path: String,
+    /// The token endpoint path (every grant + refresh POSTs here), joined onto the endpoint base URL.
+    #[serde(default)]
+    pub token_path: String,
+    /// The OAuth2 client id.
+    #[serde(default)]
+    pub client_id: String,
+    /// Requested scopes.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// The grants the host may run for this method.
+    #[serde(default)]
+    pub grants: Vec<OAuthGrant>,
+    /// The loopback redirect for the `authorization_code` login flow (required for that grant).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect: Option<OAuthRedirect>,
+}
+
 /// An authentication method the plugin needs, resolved **by purpose**: the host maps `purpose` (e.g.
 /// `"bot_token"`) to a secret value by trying `env` keys in order (each must also be a granted secret).
 /// A plugin asks `secret { "purpose": "bot_token" }` or `http.do { "auth_purpose": "api_token" }`; the
@@ -184,6 +244,12 @@ pub struct AuthMethod {
     /// config (not a gated secret), so they resolve directly from declared env like an endpoint.
     #[serde(default)]
     pub user_env: Vec<String>,
+    /// When set, this purpose is OAuth2-backed (plugin-oauth, D-80): the host runs the token grants
+    /// (login/refresh) and injects the resulting Bearer access token. `None` for a plain env→secret
+    /// method — a method with no `oauth2` block resolves exactly as before. When both `oauth2` and
+    /// `env` are set, `env` is the fallback used until a login stores tokens (D-81).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth2: Option<OAuth2Spec>,
 }
 
 impl AuthMethod {
@@ -216,6 +282,17 @@ impl AuthMethod {
             scheme: AuthScheme::Header {
                 name: header.into(),
             },
+            ..Self::default()
+        }
+    }
+
+    /// An OAuth2 method (plugin-oauth, D-80): the host runs the grants and injects a Bearer access
+    /// token. `env` may still be supplied as a pre-login fallback (D-81).
+    pub fn oauth2(purpose: impl Into<String>, spec: OAuth2Spec) -> Self {
+        Self {
+            purpose: purpose.into(),
+            scheme: AuthScheme::Bearer,
+            oauth2: Some(spec),
             ..Self::default()
         }
     }
@@ -692,6 +769,10 @@ pub struct SystemHostCaps {
     /// model-visible output. Backed at the surface by the same [`Redactor`](flux_secret::Redactor) the
     /// executor redacts with.
     secret_sink: Option<Arc<dyn SecretSink>>,
+    /// Optional injected credential store for OAuth2 auth methods (plugin-oauth, D-83). `None` uses
+    /// the default file backend (`~/.flux/credentials.toml`); a host app can inject a Vault-backed
+    /// store the same way it injects a resolver / secret sink, so per-customer tokens live in Vault.
+    cred_store: Option<Arc<dyn flux_credentials::CredentialStore>>,
     /// Open `conn.dial` connections for this call scope, keyed by an opaque id. A tokio mutex so a
     /// `conn.read`/`write` can hold the stream across its await without making the guard non-Send.
     conns: tokio::sync::Mutex<std::collections::HashMap<u64, flux_system::net::DialStream>>,
@@ -724,6 +805,7 @@ impl SystemHostCaps {
             resolver: None,
             consumer: "plugin".to_string(),
             secret_sink: None,
+            cred_store: None,
             conns: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             next_conn: std::sync::atomic::AtomicU64::new(1),
             blobs: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -751,6 +833,17 @@ impl SystemHostCaps {
     /// Restrict this host's callbacks to the capabilities the plugin declared in its manifest.
     pub fn with_grants(mut self, grants: PluginCapabilities) -> Self {
         self.grants = grants;
+        self
+    }
+
+    /// Inject a custom credential store (e.g. a Vault backend) for OAuth2 auth-method resolution
+    /// (plugin-oauth, D-83). Without one, the default file backend (`~/.flux/credentials.toml`) is
+    /// used, so provider logins and the CLI keep working unchanged.
+    pub fn with_credential_store(
+        mut self,
+        store: Arc<dyn flux_credentials::CredentialStore>,
+    ) -> Self {
+        self.cred_store = Some(store);
         self
     }
 
@@ -809,14 +902,53 @@ impl SystemHostCaps {
         }
     }
 
-    /// Resolve a secret **by purpose**: find the auth method, try its env keys in order; each key must
-    /// also be in the plugin's granted `secrets`. Returns the first value set, else an error.
-    fn resolve_purpose(&self, purpose: &str) -> std::result::Result<String, String> {
+    /// Resolve a secret **by purpose**. An OAuth2-backed method (plugin-oauth, D-81) resolves a fresh
+    /// bearer from the credential store — refreshing via the declared `token_path` when stale — and
+    /// falls back to the declared env keys until a login stores tokens. A plain method just tries its
+    /// env keys in order (each must also be a granted `secret`), returning the first value set.
+    async fn resolve_purpose(&self, purpose: &str) -> std::result::Result<String, String> {
         let method = self
             .auth
             .iter()
             .find(|a| a.purpose == purpose)
             .ok_or_else(|| format!("no auth method declared for purpose `{purpose}`"))?;
+        // OAuth2-backed: the HOST runs the grant/refresh and hands back only a fresh bearer. The token
+        // endpoint is built from the method's DECLARED endpoint (never a plugin-supplied URL) and
+        // still passes the SSRF guard + the manifest host allow-list, so it can't be pointed at an
+        // internal address. A resolved bearer is registered with the redactor.
+        if let Some(oauth) = &method.oauth2 {
+            let base = self.resolve_endpoint(&oauth.endpoint)?;
+            let token_url = format!(
+                "{}/{}",
+                base.trim_end_matches('/'),
+                oauth.token_path.trim_start_matches('/')
+            );
+            let url = guard_http_url(&token_url, &self.private_net_allow())?;
+            self.ensure_http_host_allowed(&url)?;
+            let key = format!("plugin:{}:{}", self.caller, purpose);
+            // Use the injected store (D-83) or fall back to the default file backend.
+            let file_store = flux_credentials::FileCredentialStore;
+            let store: &dyn flux_credentials::CredentialStore =
+                self.cred_store.as_deref().unwrap_or(&file_store);
+            match flux_credentials::resolve_stored_bearer(
+                store,
+                &key,
+                url.as_str(),
+                &oauth.client_id,
+            )
+            .await
+            {
+                Ok(Some(bearer)) => {
+                    if let Some(sink) = &self.secret_sink {
+                        sink.register_secret(&bearer);
+                    }
+                    return Ok(bearer);
+                }
+                // No token stored yet (pre-login) — fall through to the env fallback below.
+                Ok(None) => {}
+                Err(e) => return Err(format!("oauth resolve for purpose `{purpose}`: {e}")),
+            }
+        }
         for key in &method.env {
             if !self.grants.secrets.iter().any(|k| k == key) {
                 continue; // not a granted secret — skip
@@ -1033,9 +1165,9 @@ impl SystemHostCaps {
     /// Decide what auth the host injects into an `http.do` request: the legacy `bearer_purpose` (always
     /// Bearer) or `auth_purpose` (respects the declared [`AuthScheme`]). Pure given the resolved env, so
     /// it is unit-testable without a network round-trip.
-    fn resolve_auth(&self, payload: &Value) -> std::result::Result<AuthInjection, String> {
+    async fn resolve_auth(&self, payload: &Value) -> std::result::Result<AuthInjection, String> {
         if let Some(p) = payload.get("bearer_purpose").and_then(|v| v.as_str()) {
-            return Ok(AuthInjection::Bearer(self.resolve_purpose(p)?));
+            return Ok(AuthInjection::Bearer(self.resolve_purpose(p).await?));
         }
         let Some(p) = payload.get("auth_purpose").and_then(|v| v.as_str()) else {
             return Ok(AuthInjection::None);
@@ -1047,7 +1179,7 @@ impl SystemHostCaps {
             .ok_or_else(|| format!("no auth method declared for purpose `{p}`"))?;
         let scheme = method.scheme.clone();
         let user_env = method.user_env.clone();
-        let secret = self.resolve_purpose(p)?;
+        let secret = self.resolve_purpose(p).await?;
         Ok(match scheme {
             AuthScheme::Bearer => AuthInjection::Bearer(secret),
             AuthScheme::Basic => AuthInjection::Basic {
@@ -1206,7 +1338,10 @@ impl HostCapabilities for SystemHostCaps {
                 // Resolve by `purpose` (auth-method indirection) or a direct `key`. Either way only
                 // granted env keys are read — never arbitrary host secrets.
                 if let Some(purpose) = payload.get("purpose").and_then(|v| v.as_str()) {
-                    return self.resolve_purpose(purpose).map(|v| json!({ "value": v }));
+                    return self
+                        .resolve_purpose(purpose)
+                        .await
+                        .map(|v| json!({ "value": v }));
                 }
                 let key = payload.get("key").and_then(|v| v.as_str()).unwrap_or("");
                 if !self.grants.secrets.iter().any(|k| k == key) {
@@ -1491,7 +1626,7 @@ impl HostCapabilities for SystemHostCaps {
                 // Auth injection by purpose: the host resolves the secret and injects it per the
                 // method's declared scheme — the plugin never sees raw tokens on this path. `Query`
                 // mutates the URL, so resolve before building the request.
-                let inject = self.resolve_auth(payload)?;
+                let inject = self.resolve_auth(payload).await?;
                 if let AuthInjection::Query { name, value } = &inject {
                     url.query_pairs_mut().append_pair(name, value);
                 }
@@ -2937,6 +3072,79 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// D-81: an OAuth2-backed purpose resolves a fresh bearer from the credential store (keyed by
+    /// `plugin:<name>:<purpose>`); with no stored token it falls back to the declared env secret. The
+    /// token endpoint is built from the DECLARED endpoint and still passes the SSRF + host allow-list
+    /// guards. (The store→refresh mechanics themselves are covered in flux-credentials.)
+    #[tokio::test]
+    async fn oauth2_purpose_resolves_stored_bearer_else_env_fallback() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!("flux-oauth-d81-{}", std::process::id()));
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        std::env::set_var("HOME", &home);
+        std::env::set_var("FLUX_TEST_OAUTH_ENV", "env-fallback-tok");
+
+        let mut method = AuthMethod::oauth2(
+            "api",
+            OAuth2Spec {
+                endpoint: "api".into(),
+                token_path: "/oauth/token".into(),
+                client_id: "cid".into(),
+                grants: vec![OAuthGrant::RefreshToken],
+                ..Default::default()
+            },
+        );
+        method.env = vec!["FLUX_TEST_OAUTH_ENV".into()];
+        let manifest = PluginManifest {
+            name: "acme".into(),
+            auth: vec![method],
+            endpoints: vec![EndpointSpec {
+                name: "api".into(),
+                default: Some("https://api.example.com".into()),
+                http_hosts: vec!["api.example.com".into()],
+                ..Default::default()
+            }],
+            capabilities: PluginCapabilities {
+                secrets: vec!["FLUX_TEST_OAUTH_ENV".into()],
+                http: true,
+                http_hosts: vec!["api.example.com".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let caps = SystemHostCaps::new(sys).with_manifest(&manifest);
+
+        // No stored token → env fallback.
+        let got = caps
+            .handle("secret", &json!({"purpose": "api"}))
+            .await
+            .unwrap();
+        assert_eq!(got["value"], "env-fallback-tok");
+
+        // A stored token (no expiry → never auto-refreshes) is returned as the bearer, over env.
+        flux_credentials::save_token(
+            "plugin:acme:api",
+            &flux_credentials::OAuthToken {
+                access: "stored-bearer".into(),
+                refresh: Some("rt".into()),
+                expires_at_ms: None,
+                account_id: None,
+            },
+        )
+        .unwrap();
+        let got = caps
+            .handle("secret", &json!({"purpose": "api"}))
+            .await
+            .unwrap();
+        assert_eq!(got["value"], "stored-bearer");
+
+        std::env::remove_var("HOME");
+        std::env::remove_var("FLUX_TEST_OAUTH_ENV");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// D-32: the gated `config` capability reads a DECLARED non-secret config value (e.g. jira's
     /// Atlassian `cloud_id`); undeclared names are denied; and a secret-classified env key (a
     /// granted `secrets` entry or an auth method's secret env) is REFUSED even when declared as
@@ -3315,6 +3523,57 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn manifest_oauth2_and_legacy_auth_round_trip() {
+        // D-80: an OAuth2 auth method round-trips through the manifest JSON, and a legacy env→secret
+        // method (no `scheme`, no `oauth2`) still deserializes to Bearer + `oauth2: None` and
+        // re-serializes without an `oauth2` key — backward compatibility.
+        use serde_json::json;
+
+        let legacy: AuthMethod =
+            serde_json::from_value(json!({ "purpose": "api_token", "env": ["GITLAB_TOKEN"] }))
+                .unwrap();
+        assert_eq!(
+            legacy.scheme,
+            AuthScheme::Bearer,
+            "an omitted scheme defaults to Bearer"
+        );
+        assert!(
+            legacy.oauth2.is_none(),
+            "a legacy method has no oauth2 block"
+        );
+        let legacy_json = serde_json::to_value(&legacy).unwrap();
+        assert!(
+            legacy_json.get("oauth2").is_none(),
+            "a legacy method serializes without an oauth2 key"
+        );
+
+        let spec = OAuth2Spec {
+            endpoint: "api".into(),
+            authorize_path: "/oauth/authorize".into(),
+            token_path: "/oauth/token".into(),
+            client_id: "cid".into(),
+            scopes: vec!["read".into(), "write".into()],
+            grants: vec![OAuthGrant::AuthorizationCode, OAuthGrant::RefreshToken],
+            redirect: Some(OAuthRedirect {
+                port: 1456,
+                path: "/auth/callback".into(),
+            }),
+        };
+        let method = AuthMethod::oauth2("bot_token", spec.clone());
+        let back: AuthMethod =
+            serde_json::from_value(serde_json::to_value(&method).unwrap()).unwrap();
+        assert_eq!(back.oauth2, Some(spec));
+        assert_eq!(
+            back.scheme,
+            AuthScheme::Bearer,
+            "the OAuth access token injects as Bearer"
+        );
+        // Grants serialize snake_case.
+        let j = serde_json::to_value(&method).unwrap();
+        assert_eq!(j["oauth2"]["grants"][0], "authorization_code");
+    }
+
     #[tokio::test]
     async fn auth_injection_resolves_per_scheme() {
         use flux_system::{System, Workspace};
@@ -3363,16 +3622,20 @@ mod tests {
         // legacy bearer_purpose → Bearer (unchanged behaviour)
         assert_eq!(
             caps.resolve_auth(&json!({"bearer_purpose": "bear"}))
+                .await
                 .unwrap(),
             AuthInjection::Bearer("bear-tok".into())
         );
         // auth_purpose respects each declared scheme
         assert_eq!(
-            caps.resolve_auth(&json!({"auth_purpose": "bear"})).unwrap(),
+            caps.resolve_auth(&json!({"auth_purpose": "bear"}))
+                .await
+                .unwrap(),
             AuthInjection::Bearer("bear-tok".into())
         );
         assert_eq!(
             caps.resolve_auth(&json!({"auth_purpose": "basic"}))
+                .await
                 .unwrap(),
             AuthInjection::Basic {
                 user: "user@example.com".into(),
@@ -3381,6 +3644,7 @@ mod tests {
         );
         assert_eq!(
             caps.resolve_auth(&json!({"auth_purpose": "genie"}))
+                .await
                 .unwrap(),
             AuthInjection::Header {
                 name: "GenieKey".into(),
@@ -3388,15 +3652,23 @@ mod tests {
             }
         );
         assert_eq!(
-            caps.resolve_auth(&json!({"auth_purpose": "qry"})).unwrap(),
+            caps.resolve_auth(&json!({"auth_purpose": "qry"}))
+                .await
+                .unwrap(),
             AuthInjection::Query {
                 name: "apikey".into(),
                 value: "qry-tok".into()
             }
         );
         // no auth requested → None; undeclared purpose → error
-        assert_eq!(caps.resolve_auth(&json!({})).unwrap(), AuthInjection::None);
-        assert!(caps.resolve_auth(&json!({"auth_purpose": "nope"})).is_err());
+        assert_eq!(
+            caps.resolve_auth(&json!({})).await.unwrap(),
+            AuthInjection::None
+        );
+        assert!(caps
+            .resolve_auth(&json!({"auth_purpose": "nope"}))
+            .await
+            .is_err());
 
         for k in [
             "FLUX_TEST_BEARER_AJ",

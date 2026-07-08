@@ -6,6 +6,32 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **Plugin OAuth2 (the `plugin-oauth` epic, D-80..D-83).** A plugin can declare an OAuth2-backed auth
+  purpose and stay a pure bearer consumer — the host runs every token grant and refresh, so the
+  plugin never touches `/oauth/token`:
+  - **D-80** — an `oauth2` block on a manifest `AuthMethod` (authorize/token paths, client_id,
+    scopes, grants, loopback redirect); backward-compatible — legacy manifests round-trip unchanged.
+  - **D-81** — the host resolves an OAuth2 purpose from the credential store (keyed
+    `plugin:<name>:<purpose>`) and auto-refreshes a stale access token via the declared token endpoint
+    (SSRF- + host-allow-list-guarded), handing the plugin only a fresh bearer; falls back to a
+    declared env secret before login.
+  - **D-82** — `flux auth login <plugin>` (and the `flux plugin login` alias) runs the browser PKCE
+    flow (or `--password`) from the plugin's manifest and stores the tokens, so a later
+    `flux plugin call` needs no env token.
+  - **D-83** — a pluggable async `CredentialStore` (the 0600 file backend by default; a
+    host-injectable Vault KV-v2 backend for deployment). Provider logins (`claude`/`codex`) keep
+    working through the file backend.
+
+### Changed
+
+- **`AuthMethod` gained an optional `oauth2` field** (plugin-oauth D-80). Additive for manifests
+  (serde default — legacy manifests round-trip unchanged) and for code that builds an `AuthMethod`
+  via a constructor or with `..Default::default()`. It is, however, a breaking change for any code
+  that constructs `AuthMethod { … }` by listing every field exhaustively: add `..Default::default()`
+  or switch to a constructor (`AuthMethod::bearer`/`basic`/`oauth2`/…).
+
 ## [0.7.0] - 2026-07-08
 
 **Minor bump** (pre-1.0 SemVer, where the minor position is the breaking-change signal): the

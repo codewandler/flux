@@ -31,8 +31,8 @@ use serde_json::{json, Value};
 // Re-export the protocol vocabulary so a plugin depends only on host-kit.
 pub use flux_datasource::{Declaration, EntitySchema, Link, Record, SchemaField, Source};
 pub use flux_plugin::{
-    AuthMethod, AuthScheme, ConfigSpec, EndpointSpec, GuestHost, OperationSpec,
-    PluginCapabilities as Caps, PluginHandler, PluginManifest,
+    AuthMethod, AuthScheme, ConfigSpec, EndpointSpec, GuestHost, OAuth2Spec, OAuthGrant,
+    OAuthRedirect, OperationSpec, PluginCapabilities as Caps, PluginHandler, PluginManifest,
 };
 pub use flux_spec::{Effect, Idempotency, Risk};
 
