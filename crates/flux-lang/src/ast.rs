@@ -589,7 +589,7 @@ pub enum Node {
     /// `"results[0].value"`) applied to the JSON content of `input` (a `Var` or `Lit` node).
     /// No IO, no approval gate. Example: `jq(".bitcoin.usd", $raw)`.
     ///
-    /// `optional` selects the traversal-through-missing-data policy (L-53). When `false` — the
+    /// `optional` selects the traversal-through-missing-data policy. When `false` — the
     /// default for native `$x.field` sugar — an absent object key, an out-of-range index, or a field
     /// access on a non-object is a loud error, so a typo'd field name fails fast instead of silently
     /// reading empty. When `true` — native `$x.field?` sugar, and the default for a model- or
@@ -598,11 +598,10 @@ pub enum Node {
     Jq {
         path: String,
         input: Box<Node>,
-        // Not advertised to the model (`schemars(skip)`): the emit_plan JSON arm always deserializes a
-        // model `jq` with the lenient serde default, so a model can never make its own field access
-        // strict (which would reintroduce the s_362 fatal-missing-field discard). Strictness is a
-        // native-`$x.field`-only concern, set by the parser; the field still (de)serializes for the
-        // durable plan_source round-trip.
+        // Not advertised to the model (`schemars(skip)`): model-facing JSON schema omits this field,
+        // and the engine normalizes model-ingress plans to lenient access. Strictness is a
+        // human-authored native-`$x.field` concern, set by the parser; the field still (de)serializes
+        // for durable plan_source and human-authored `.flux` round-trips.
         #[serde(default = "jq_optional_default")]
         #[schemars(skip)]
         optional: bool,
@@ -870,10 +869,10 @@ impl DraftAst {
 }
 
 /// Set every `jq` node's `optional` flag to `true` throughout `ast` — the LENIENT "absent means empty"
-/// traversal (L-53). Applied to MODEL-emitted **native text** (the emit_plan Text arm) so field access
-/// there matches the lenient JSON arm; human-authored `.flux` text keeps the strict default. Walks the
-/// serialized form so it covers a `jq` nested anywhere without a full node match, and is a no-op on a
-/// plan that already used the `?` opt-out (its `jq` are already `optional: true`).
+/// traversal. Applied to model-emitted plans so both `emit_plan` surfaces share one contract;
+/// human-authored `.flux` text keeps the strict default. Walks the serialized form so it covers a `jq`
+/// nested anywhere without a full node match, and is a no-op on a plan that already used the `?`
+/// opt-out (its `jq` are already `optional: true`).
 pub fn relax_field_access(ast: &mut DraftAst) {
     // A `DraftAst` always (de)serializes losslessly (it is the `@json` wire form); on the impossible
     // error path leave the ast untouched rather than panic.
@@ -1191,8 +1190,9 @@ pub enum RunEvent {
 mod tests {
     use super::*;
 
-    /// L-53: `relax_field_access` flips every `jq` node to lenient (`optional: true`) — the transform
-    /// the emit_plan Text arm applies to model-authored native text so it matches the lenient JSON arm.
+    /// `relax_field_access` flips every `jq` node to lenient (`optional: true`) — the transform the
+    /// engine applies to model-authored plans so both emit_plan surfaces share one field-access
+    /// contract.
     #[test]
     fn relax_field_access_makes_every_jq_lenient() {
         // A strict field access nested inside a bind (`$x = $obj.field`).
@@ -1219,9 +1219,9 @@ mod tests {
         );
     }
 
-    /// L-53 (code-review #3): the `jq` node's `optional` flag is NOT advertised in the model-facing
-    /// schema (`schemars(skip)`), so a model can never emit a strict `jq` (which would reintroduce the
-    /// s_362 fatal-missing-field discard) — strictness is a native-`$x.field`-parser-only concern.
+    /// The `jq` node's `optional` flag is NOT advertised in the model-facing schema
+    /// (`schemars(skip)`). The engine also normalizes model-ingress plans to lenient access; strictness
+    /// is a human-authored native-`$x.field` parser concern.
     #[test]
     fn jq_optional_is_hidden_from_the_model_schema() {
         let schema = serde_json::to_string(&schemars::schema_for!(Node)).unwrap();

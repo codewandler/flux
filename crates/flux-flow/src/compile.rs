@@ -835,16 +835,23 @@ async fn compile_turn_inner(
                                 v => v,
                             };
                             serde_json::from_value::<DraftAst>(ast_val)
+                                .map(|mut ast| {
+                                    // Model-authored plans are lenient at field-access sites. The
+                                    // schema hides `jq.optional`, but a provider may still pass
+                                    // extra JSON fields through; normalize the accepted AST so the
+                                    // JSON and native-text emit_plan arms share the same contract.
+                                    flux_lang::ast::relax_field_access(&mut ast);
+                                    ast
+                                })
                                 .map_err(|e| format!("emit_plan: invalid AST JSON: {e}"))
                         }
                         EmissionArm::Text => match input.get("source").and_then(|v| v.as_str()) {
                             Some(src) => flux_lang::parse::parse(src)
                                 .map(|mut ast| {
-                                    // L-53: a model-emitted plan's field access is LENIENT (like the
-                                    // JSON arm, whose `optional` defaults true and is hidden from the
-                                    // schema). Strict `$x.field` is a human-authored-`.flux` concern
-                                    // only; relax the model's native text so an absent key yields null
-                                    // rather than a fatal error mid-turn (s_362).
+                                    // A model-emitted plan's field access is LENIENT. Strict `$x.field`
+                                    // is a human-authored-`.flux` concern only; relax the model's native
+                                    // text so an absent key yields null rather than a fatal error mid-turn
+                                    // (s_362).
                                     flux_lang::ast::relax_field_access(&mut ast);
                                     ast
                                 })
@@ -2958,6 +2965,45 @@ mod tests {
             }
             TurnOutput::Chat(t) => panic!("expected a plan, got chat: {t}"),
         }
+    }
+
+    /// The JSON arm's schema hides `jq.optional`, but providers may still pass through an explicitly
+    /// supplied extra field. Model-authored ASTs are normalized on ingress so a strict `jq` cannot
+    /// reintroduce fatal missing-field behavior; strict access remains a human `.flux` surface concern.
+    #[tokio::test]
+    async fn json_arm_relaxes_explicit_strict_jq() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let p = mock(vec![tool_call(
+            "emit_plan",
+            json!({
+                "ast": {
+                    "body": [
+                        {"kind": "bind", "name": "obj", "value": {"kind": "lit", "value": {"a": 1}}},
+                        {"kind": "bind", "name": "x", "value": {
+                            "kind": "jq",
+                            "path": ".missing",
+                            "input": {"kind": "var", "name": "obj"},
+                            "optional": false
+                        }},
+                        {"kind": "return", "value": {"kind": "var", "name": "x"}}
+                    ]
+                }
+            }),
+        )]);
+
+        let (out, _) = turn_with_arm(&p, &ops, EmissionArm::Json, CompileOptions::default())
+            .await
+            .expect("strict jq from model JSON should be accepted after normalization");
+        let TurnOutput::Plan(c) = out else {
+            panic!("expected a plan");
+        };
+        let ast = serde_json::to_value(&c.ast).expect("accepted AST serializes");
+        assert_eq!(
+            ast["body"][1]["value"]["optional"],
+            json!(true),
+            "model-ingress normalization must force jq.optional=true"
+        );
     }
 
     /// A-30: tolerance is encoding-level ONLY — a string-encoded plan naming a hidden op is

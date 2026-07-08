@@ -41,9 +41,9 @@ genuinely fuzzy inputs stay), and close with the full workspace gate.
 - [ ] `examples/data-transforms.flux` — one new example flow that exercises every new
       op end-to-end (bounded, hermetic, no network). Auto-validated by
       `crates/flux-eval/tests/examples_validate.rs`.
-- [ ] Full regen sweep: `UPDATE=1 cargo test -p flux-lang --test skill_in_sync`,
-      `UPDATE=1 cargo test -p flux-lang --test website_in_sync`, and
-      `UPDATE=1 cargo test -p flux-flow --test skill_docs_in_sync` all leave zero
+- [ ] Full regen sweep: `UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync`,
+      `UPDATE=1 cargo test -p codewandler-flux-lang --test website_in_sync`, and
+      `UPDATE=1 cargo test -p codewandler-flux-flow --test skill_docs_in_sync` all leave zero
       further diff.
 - [ ] Closing gate green: `cargo build --workspace` · `cargo test --workspace` ·
       `cargo clippy --workspace --all-targets -- -D warnings` ·

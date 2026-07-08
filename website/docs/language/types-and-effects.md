@@ -75,7 +75,7 @@ artifact is an ordinary structured value whose named type points at a registered
 
 <!-- Generated from the same `flux_lang::prelude::prelude_type_catalog()` source of truth as
      crates/flux-lang/docs/reference.md and the SKILL.md language skills — do not hand-edit the
-     table below. Regenerate with: `UPDATE=1 cargo test -p flux-lang --test website_in_sync`. -->
+     table below. Regenerate with: `UPDATE=1 cargo test -p codewandler-flux-lang --test website_in_sync`. -->
 
 The table below is derived from the generated prelude catalog in the repository's
 [language reference](https://github.com/codewandler/flux/blob/main/crates/flux-lang/docs/reference.md).

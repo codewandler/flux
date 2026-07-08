@@ -12,7 +12,7 @@
 //! treats an unescaped `|` inside a cell as a new column boundary (unlike the plain-markdown crate
 //! docs and skills, which tolerate it), so cell content is escaped with `\|` for this consumer only.
 //!
-//! Regenerate with: `UPDATE=1 cargo test -p flux-lang --test website_in_sync`
+//! Regenerate with: `UPDATE=1 cargo test -p codewandler-flux-lang --test website_in_sync`
 
 use std::path::PathBuf;
 
@@ -82,7 +82,7 @@ fn website_node_reference_node_kinds_block_is_in_sync() {
     assert_eq!(
         content, expected,
         "website/docs/language/node-reference.md node-kinds block is out of date — regenerate \
-         with `UPDATE=1 cargo test -p flux-lang --test website_in_sync`"
+         with `UPDATE=1 cargo test -p codewandler-flux-lang --test website_in_sync`"
     );
 }
 
@@ -106,6 +106,6 @@ fn website_types_and_effects_prelude_types_block_is_in_sync() {
     assert_eq!(
         content, expected,
         "website/docs/language/types-and-effects.md prelude-types block is out of date — \
-         regenerate with `UPDATE=1 cargo test -p flux-lang --test website_in_sync`"
+         regenerate with `UPDATE=1 cargo test -p codewandler-flux-lang --test website_in_sync`"
     );
 }

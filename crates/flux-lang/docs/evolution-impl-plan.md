@@ -76,7 +76,7 @@ change.
   binding-metadata accessor (the "couples to the symbol table" point); add it on the trait + `MemStore` +
   `FlowStore`.
 - `analyze.rs`: validate `ctx`/`ctx_append` member references.
-- Docs sync: `UPDATE=1 cargo test -p flux-lang --test skill_in_sync` + `UPDATE=1 cargo test -p flux-flow
+- Docs sync: `UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync` + `UPDATE=1 cargo test -p codewandler-flux-flow
   --test skill_docs_in_sync`; hand-write `reference.md` sections for `ctx`/`ctx_append`.
 - Tests: a **build→append→budget-shrink** trace with drops recorded (so `ctx` isn't a glorified struct
   literal); a `need`→`gaps`→`repeat until $open.empty` loop (ops + existing nodes, no new machinery).

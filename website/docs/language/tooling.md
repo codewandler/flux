@@ -51,7 +51,7 @@ like `flux app run` — see [Multi-agent programs](../agent/programs.md).
 ## The `fluxlang` developer CLI
 
 A standalone binary for working with the language itself, built from the repository
-(`cargo run -p flux-lang --features cli --bin fluxlang -- <command>`):
+(`cargo run -p codewandler-flux-lang --features cli --bin fluxlang -- <command>`):
 
 | command | does |
 |---|---|
@@ -65,7 +65,7 @@ A standalone binary for working with the language itself, built from the reposit
 ```bash
 echo 'flow t
   $x = read("README.md")
-  return $x' | cargo run -p flux-lang --features cli --bin fluxlang -- compile
+  return $x' | cargo run -p codewandler-flux-lang --features cli --bin fluxlang -- compile
 ```
 
 ## The round-trip guarantee

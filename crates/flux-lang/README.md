@@ -120,9 +120,9 @@ before running it (see `flux-sdk`'s `FlowClient` for a runnable build → analyz
 Inspect the language without the engine (built with `--features cli`):
 
 ```bash
-cargo run -p flux-lang --features cli --bin fluxlang -- skill    # the language skill (markdown)
-cargo run -p flux-lang --features cli --bin fluxlang -- schema   # the AST JSON Schema
-echo '<json-ast>' | cargo run -p flux-lang --features cli --bin fluxlang -- render   # AST → tree
+cargo run -p codewandler-flux-lang --features cli --bin fluxlang -- skill    # the language skill (markdown)
+cargo run -p codewandler-flux-lang --features cli --bin fluxlang -- schema   # the AST JSON Schema
+echo '<json-ast>' | cargo run -p codewandler-flux-lang --features cli --bin fluxlang -- render   # AST → tree
 ```
 
 ## Docs

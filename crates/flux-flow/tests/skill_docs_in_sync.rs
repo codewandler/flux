@@ -3,7 +3,7 @@
 //! hand-maintained. This test regenerates the marked region and fails if the on-disk copy drifts.
 //! (The language reference + language skill are checked in `flux-lang`'s own `docs_in_sync` test.)
 //!
-//! Regenerate with: `UPDATE=1 cargo test -p flux-flow --test skill_docs_in_sync`
+//! Regenerate with: `UPDATE=1 cargo test -p codewandler-flux-flow --test skill_docs_in_sync`
 
 use std::path::PathBuf;
 
@@ -57,7 +57,7 @@ fn generated_node_kind_tables_are_in_sync() {
     assert!(
         stale.is_empty(),
         "node-kind tables are out of date in:\n  {}\nregenerate with: \
-         `UPDATE=1 cargo test -p flux-flow --test skill_docs_in_sync`",
+         `UPDATE=1 cargo test -p codewandler-flux-flow --test skill_docs_in_sync`",
         stale.join("\n  ")
     );
 }

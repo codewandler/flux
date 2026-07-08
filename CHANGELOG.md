@@ -6,6 +6,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **Tracked the Flux-Lang agent-speed epic.** New epic design and L-53..L-56 stories cover the
+  four KF items: whole-flow dependency scheduling, content-addressed op caching, plan-delta
+  emission, and automatic context slicing.
+
 ### Changed
 
 - **`flux usage` now reports time-window metrics and unpriced reasons.** The dashboard can be
@@ -16,6 +22,16 @@ All notable changes to this project are documented in this file. The format is b
   Claude/Codex/OpenRouter model ids seen in those histories, including Claude Fable/Sonnet 5,
   GPT-5.4, GPT-5.3-Codex, and route-suffixed OpenRouter slugs. JSON output now carries the same
   normalized period, summary, metric, row, and cost-status data without progress noise.
+
+### Fixed
+
+- **Planner field-access ingress is consistently lenient.** JSON `emit_plan` ASTs are now
+  normalized like native-text plans so a model-provided `jq.optional = false` cannot make agent
+  field access strict; strict `$x.field` remains the native text authoring behavior.
+- **Flux-Lang docs use the published Cargo package ids.** Active docs, sync tests, and website
+  examples now use `codewandler-flux-lang` / `codewandler-flux-flow`; generated public tables no
+  longer leak an internal ticket label, and the website overview reflects that planners may emit
+  JSON AST or native text before normalization.
 
 ## [0.11.0] - 2026-07-09
 

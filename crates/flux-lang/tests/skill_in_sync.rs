@@ -3,7 +3,7 @@
 //!  - `docs/reference.md` carries a generated `node-kinds` block (`node_kind_catalog()`).
 //!
 //! Both derive from the `Node` doc-comments via `flux_lang::schema`, so they can never drift from the
-//! types. Regenerate with: `UPDATE=1 cargo test -p flux-lang --test skill_in_sync`
+//! types. Regenerate with: `UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync`
 
 use std::path::PathBuf;
 
@@ -36,14 +36,14 @@ fn skill_artifact_is_in_sync() {
 
     let actual = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
-            "read {}: {e}\nrun `UPDATE=1 cargo test -p flux-lang --test skill_in_sync` to generate it",
+            "read {}: {e}\nrun `UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync` to generate it",
             path.display()
         )
     });
     assert_eq!(
         actual, expected,
         "skill/SKILL.md is out of date — regenerate with \
-         `UPDATE=1 cargo test -p flux-lang --test skill_in_sync`"
+         `UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync`"
     );
 }
 
@@ -71,7 +71,7 @@ fn reference_node_kinds_block_is_in_sync() {
     assert_eq!(
         content, expected,
         "docs/reference.md node-kinds block is out of date — regenerate with \
-         `UPDATE=1 cargo test -p flux-lang --test skill_in_sync`"
+         `UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync`"
     );
 }
 
@@ -106,6 +106,6 @@ fn reference_prelude_types_block_is_in_sync() {
     assert_eq!(
         content, expected,
         "docs/reference.md prelude-types block is out of date — regenerate with \
-         `UPDATE=1 cargo test -p flux-lang --test skill_in_sync`"
+         `UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync`"
     );
 }

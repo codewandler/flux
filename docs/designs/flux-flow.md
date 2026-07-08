@@ -131,7 +131,7 @@ The node-kind grammar in the planner prompt is generated from the `Node` doc-com
 `flux_lang::schema::node_kind_catalog()` (schemars-derived; no build-time `syn` parsing). The same
 generator feeds the `generated:node-kinds` tables in `crates/flux-lang/docs/reference.md`, the
 `flux-lang` language skill, and the `flux-flow` engine skill — CI-checked by
-`cargo test -p flux-lang --test skill_in_sync` and `cargo test -p flux-flow --test skill_docs_in_sync`.
+`cargo test -p codewandler-flux-lang --test skill_in_sync` and `cargo test -p codewandler-flux-flow --test skill_docs_in_sync`.
 Op packs and
 resolver impls that need L5 capabilities (`flux-capabilities`' `datasource`/`browser`) and the fluxplane/plugin op
 packs are registered **externally** (e.g. in `flux-cli`); L3 cannot depend on L5, and ops are

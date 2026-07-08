@@ -37,8 +37,8 @@ engine skill. **Never hand-edit a generated `<!-- BEGIN/END generated:node-kinds
 changing a `Node` variant or its doc-comment, regenerate:
 
 ```bash
-UPDATE=1 cargo test -p flux-lang --test skill_in_sync          # language skill + docs/reference.md
-UPDATE=1 cargo test -p flux-flow --test skill_docs_in_sync     # engine skill
+UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync          # language skill + docs/reference.md
+UPDATE=1 cargo test -p codewandler-flux-flow --test skill_docs_in_sync     # engine skill
 ```
 
 Hand-written prose (the detailed per-node sections in `docs/reference.md`, the examples in `skill.rs`)
@@ -47,10 +47,10 @@ still needs manual updates in the same commit.
 ## Dev loop
 
 ```bash
-cargo build -p flux-lang
+cargo build -p codewandler-flux-lang
 cargo test  -p flux-lang                       # lib + interpreter + in-sync tests
 cargo test  -p flux-lang --features cli        # also the fluxlang CLI tests
-cargo clippy -p flux-lang --all-targets --features cli -- -D warnings
+cargo clippy -p codewandler-flux-lang --all-targets --features cli -- -D warnings
 cargo test  -p flux-codegate                   # confirm flux-lang is still L0
 cargo fmt --all
 ```

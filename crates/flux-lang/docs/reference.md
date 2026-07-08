@@ -7,7 +7,7 @@ statements and flow-level constructs).
 
 The "Node kinds at a glance" table below is generated from the `Node` doc-comments in
 `crates/flux-lang/src/ast.rs` (via `flux_lang::schema::node_kind_catalog()`) — do not edit it by hand;
-regenerate with `UPDATE=1 cargo test -p flux-lang --test skill_in_sync`. The operations a `call`
+regenerate with `UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync`. The operations a `call`
 targets are an engine concern — see [`flux-flow/docs/ops-reference.md`](../../flux-flow/docs/ops-reference.md).
 
 ---
@@ -35,7 +35,7 @@ the runtime executes top-to-bottom.
 Every `kind` and its one-line summary. This table is the single source of truth for the node
 surface: it is generated from the `Node` enum's doc-comments in `flux-lang` (`crates/flux-lang/src/ast.rs`)
 via `flux_lang::schema::node_kind_catalog()` — do not edit it by hand. Regenerate with
-`UPDATE=1 cargo test -p flux-lang --test skill_in_sync`. The detailed per-node sections that
+`UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync`. The detailed per-node sections that
 follow are hand-written.
 
 > These nodes also have a writable **text form** — see [`syntax.md`](syntax.md) (`format`/`parse`); this
@@ -71,7 +71,7 @@ follow are hand-written.
 | `thing` | A reference to an external thing. |
 | `expr` | Pure inline computation. `formula` is a safe whitelist expression over named variables: arithmetic (`+ - * /`, `round(x,n)`, `abs`, `min(a,b)`, `max(a,b)`), comparison (`== != < <= > >=`), boolean (`&& || !`, `true`/`false`), string functions (`len/lower/upper/trim/replace/repeat/reverse/contains/concat`), and string literals (`'…'`/`"…"`). `+` adds when both sides are numeric and concatenates otherwise. Because it yields a bool, an `expr` is also a valid `when`/`unless`/`until`/`assert` condition. `vars` maps variable names to node expressions (only `Lit` and `Var` are valid). No IO, no approval gate. Examples: `expr("price * 2", {"price": $btc})`, `expr("status == 'ok' && n > 0", …)`. |
 | `fmt` | Pure string interpolation. `template` is a string with `{name}` placeholders substituted from already-bound session symbols (same `{name}`/`{{name}}` syntax as `Lit` interpolation). No IO, no approval gate. Example: `fmt("BTC: {price} | Double: {doubled}")`. |
-| `jq` | Pure JSON path extraction. `path` is a dot-path string (e.g. `".bitcoin.usd"` or `"results[0].value"`) applied to the JSON content of `input` (a `Var` or `Lit` node). No IO, no approval gate. Example: `jq(".bitcoin.usd", $raw)`.  `optional` selects the traversal-through-missing-data policy (L-53). When `false` — the default for native `$x.field` sugar — an absent object key, an out-of-range index, or a field access on a non-object is a loud error, so a typo'd field name fails fast instead of silently reading empty. When `true` — native `$x.field?` sugar, and the default for a model- or host-emitted `jq` (so real agent turns keep the battle-tested "absent means empty" leniency) — such a miss yields `null`. A present-but-`null` field is never an error in either mode. |
+| `jq` | Pure JSON path extraction. `path` is a dot-path string (e.g. `".bitcoin.usd"` or `"results[0].value"`) applied to the JSON content of `input` (a `Var` or `Lit` node). No IO, no approval gate. Example: `jq(".bitcoin.usd", $raw)`.  `optional` selects the traversal-through-missing-data policy. When `false` — the default for native `$x.field` sugar — an absent object key, an out-of-range index, or a field access on a non-object is a loud error, so a typo'd field name fails fast instead of silently reading empty. When `true` — native `$x.field?` sugar, and the default for a model- or host-emitted `jq` (so real agent turns keep the battle-tested "absent means empty" leniency) — such a miss yields `null`. A present-but-`null` field is never an error in either mode. |
 | `parse` | Pure type coercion. Converts the string result of a `jq` or `fmt` node into a typed value. `as_type` is one of `"f64"`, `"i64"`, `"bool"`, `"json"`, `"string"`. No IO, no approval gate. Example: `parse(jq(".price", $raw), as: "f64")`. |
 | `ctx` | Build a bounded, budgeted **context pack** from existing symbols. Resolves `include` (minus `exclude`) to its members, then — when `budget` is set — shrinks the pack *at evaluation* by visibility tier then declared order until within the char budget, recording any dropped members in the run trace. Produces a `Ctx` value bound to `name`. Pure: it selects and labels existing values, performing no IO (the load-bearing elevation of PRD §13 explicit context management). |
 | `ctx_append` | Accrete more symbols into an existing context pack (the `+=` marker). Immutably rebinds `ctx` to a *new* `Ctx` value (preserving the audit chain `$pack@1 → @2`) with `add` appended, then re-applies the pack's budget. Pure. |
@@ -100,7 +100,7 @@ of these schemas, so an op's `Named("Claim")` input lowers to a `#/$defs/Claim` 
 
 This table is generated from the prelude struct doc-comments via
 `flux_lang::prelude::prelude_type_catalog()` — do not edit it by hand; regenerate with
-`UPDATE=1 cargo test -p flux-lang --test skill_in_sync`.
+`UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync`.
 
 <!-- BEGIN generated:prelude-types -->
 | type | description |
@@ -1100,8 +1100,8 @@ content of `input`. Supports dot-notation (`.bitcoin.usd`), array indexing
 | `input` | Node | yes | any node producing a JSON string or object (`Var` or `Lit`) |
 
 The extracted value is returned as the natural JSON type (`Number`, `String`,
-`Bool`, etc.). A `jq` node's `optional` flag selects the missing-data policy
-(L-53). A model- or host-emitted `jq` is **lenient**: traversal through **missing
+`Bool`, etc.). A `jq` node's `optional` flag selects the missing-data policy. A
+model- or host-emitted `jq` is **lenient**: traversal through **missing
 data** — an absent key, an out-of-range index, a field access on a non-object —
 yields `null` (matching real `jq`), and a chain of absent segments (`.a.b.c` on an
 object that only has `.a`) cascades to `null`. Native `$a.b` field-access sugar is
@@ -1337,7 +1337,7 @@ gates on a shell exit-code wrapper or a boolean tool output work as expected.
   outside any concurrent branch is unaffected.
 - **`await` and `checkpoint` are top-level only** — they need stable resume cursors.
 - **`obj`/`list` are pure templates** — they cannot contain `call` or control-flow leaves.
-- **Native `$a.b` field access is STRICT; a model/host `jq` node is lenient** (L-53) — a
+- **Native `$a.b` field access is STRICT; a model/host `jq` node is lenient** — a
   bare `$a.b` errors on a missing key / out-of-range index / non-object (add `?` — `$a.b?`,
   `$list.0?` — to read `null` instead; `$list.0` indexes a list). A model-emitted `jq`
   propagates `null` for missing data and cascades (`.a.b.c` on an object with only `.a`

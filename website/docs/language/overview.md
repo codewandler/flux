@@ -58,8 +58,9 @@ Every flow has two interchangeable representations:
 
 - **Text** — `.flux` files. Human-writable, comment-friendly, version-controllable. This is what
   you write in an editor and what the docs mostly show.
-- **JSON AST** — the wire and storage format. This is what the planner emits, what sessions store,
-  and what SDKs pass around. Not meant to be hand-written.
+- **JSON AST** — the canonical wire and storage format. The planner may emit either JSON AST or
+  native text depending on the configured `emit_plan` surface; sessions store the AST, and SDKs pass
+  it around. Not meant to be hand-written.
 
 The two forms are semantically identical: a `.flux` file parses to exactly the AST the JSON expresses,
 and the formatter turns any AST back into canonical text. The same flow, both ways:
@@ -81,9 +82,10 @@ flow check-readme
 }
 ```
 
-Humans write the text form; the model writes the JSON form. A handful of node kinds have no native
-text spelling yet — in text they are written with a one-line `@json` escape. The
-[node reference](./node-reference.md) covers every kind in both shapes.
+Humans usually write the text form; models may emit either surface, and both are normalized into the
+same AST before analysis and execution. A handful of node kinds have no native text spelling yet — in
+text they are written with a one-line `@json` escape. The [node reference](./node-reference.md)
+covers every kind in both shapes.
 
 ## How a plan runs
 
